@@ -24,7 +24,8 @@
 namespace compiler::deps::dep_resolver;
 
 import utils::log::{ Log, LogArea };
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
+import std::collections::string::{ String };
 import std::fmt;
 import compiler::project_config::{ Dependency, DepKind, GitRefKind, ProjectConfig };
 import compiler::deps::{ cache, git, semver, lockfile };
@@ -88,17 +89,16 @@ type struct ResolveOutcome {
 /// Identity keys we hand to the visited set.  Two deps with the
 /// same key produce the same source roots, so we resolve each
 /// only once even when the dep graph has diamonds.
-type struct DepKey {
+type struct DepKey with [Eq] {
     /// "path:<abs>" or "git:<sanitized-url>@<sha>".
-    val: string;
+    val: String;
 
-    static for_path(abs_path_text: string) -> DepKey {
-        const abs_path: string = abs_path_text;
-        return DepKey { val: fmt::format("path:%s", abs_path).into_raw() };
+    static for_path(abs_path: str::Str) -> DepKey {
+        return DepKey { val: f"path:{abs_path}" };
     }
-    static for_git(url_text: string, sha_text: string) -> DepKey {
-        const sha: string = sha_text;
-        return DepKey { val: fmt::format("git:%s@%s", Cache::sanitize_url(url_text), sha).into_raw() };
+    static for_git(url: str::Str, sha: str::Str) -> DepKey {
+        const sanitized: String = Cache::sanitize_url(url);
+        return DepKey { val: f"git:{sanitized}@{sha}" };
     }
 }
 
@@ -118,7 +118,7 @@ type struct DepResolver {
                      mode: ResolveMode,
                      lock_path_text: string) -> ResolveOutcome {
         mut outcome: ResolveOutcome = ResolveOutcome::empty();
-        mut visited: [string] = [];
+        mut visited: [DepKey] = [];
 
         // Existing lockfile drives Build mode and seeds Fetch mode's
         // "reuse the entry if spec unchanged" optimization.  Update
@@ -185,7 +185,7 @@ type struct DepResolver {
                        mode: ResolveMode,
                        existing: Lockfile*,
                        new_lock: mut Lockfile*,
-                       visited: mut [string]*,
+                       visited: mut [DepKey]*,
                        outcome: mut ResolveOutcome*) -> void {
         for (mut i: i64 = 0; i < cfg.dependencies.length(); i++) {
             const dep: Dependency = cfg.dependencies[i];
@@ -215,7 +215,7 @@ type struct DepResolver {
                               mode: ResolveMode,
                               existing: Lockfile*,
                               new_lock: mut Lockfile*,
-                              visited: mut [string]*,
+                              visited: mut [DepKey]*,
                               outcome: mut ResolveOutcome*) -> void {
         const dep_root: string = if (cfg.project_root.eq(".")) { dep.path }
             else { Path::from(cfg.project_root).join(dep.path).into_raw() };
@@ -226,8 +226,8 @@ type struct DepResolver {
         }
 
         const key: DepKey = DepKey::for_path(dep_root);
-        if (visited.contains(&key.val)) { return; }
-        visited.push(key.val);
+        if (visited.contains(&key)) { return; }
+        visited.push(key);
 
         const dep_cfg: ProjectConfig = ProjectConfig::parse(dep_config);
         if (dep_cfg.error_count > 0) {
@@ -248,7 +248,7 @@ type struct DepResolver {
                              mode: ResolveMode,
                              existing: Lockfile*,
                              new_lock: mut Lockfile*,
-                             visited: mut [string]*,
+                             visited: mut [DepKey]*,
                              outcome: mut ResolveOutcome*) -> void {
         mut sha: string = "";
 
@@ -289,7 +289,7 @@ type struct DepResolver {
                         outcome.failed = true;
                         return;
                     }
-                    sha = DepResolver::resolve_to_sha(dep);
+                    sha = DepResolver::resolve_to_sha(dep).into_raw();
                     if (sha.length() == 0) {
                         outcome.failed = true;
                         return;
@@ -312,14 +312,14 @@ type struct DepResolver {
 
         // Cycle detection: scoped to this URL@SHA pair.
         const key: DepKey = DepKey::for_git(dep.git_url, sha);
-        if (visited.contains(&key.val)) { return; }
-        visited.push(key.val);
+        if (visited.contains(&key)) { return; }
+        visited.push(key);
 
-        const co_dir: string = Git::checkout_path(dep.git_url, sha);
+        const checkout: PathBuf = Git::checkout_path(dep.git_url, sha);
         const dep_root: string = if (dep.subdir.length() > 0) {
-            Path::from(co_dir).join(dep.subdir).into_raw()
+            checkout.join(dep.subdir).into_raw()
         } else {
-            co_dir
+            checkout.into_raw()
         };
 
         const dep_cryo: string = Path::from(dep_root).join("cryoconfig").into_raw();
@@ -344,22 +344,22 @@ type struct DepResolver {
 
     /// Resolve a git dep's ref-spec to a 40-char SHA.  Handles each
     /// `GitRefKind` flavour; returns "" on failure (and prints).
-    static resolve_to_sha(dep: Dependency) -> string {
+    static resolve_to_sha(dep: Dependency) -> String {
         match (dep.ref_kind) {
             GitRefKind::Version => {
                 const c: Constraint = Constraint::parse(dep.ref_val);
                 if (!c.valid) {
                     fmt::eprintln(f"error: dependency '{dep.name}' has invalid version constraint '{dep.ref_val}'");
-                    return "";
+                    return String::new();
                 }
-                const tags: [string] = Git::list_tags(dep.git_url);
-                const best: string = Constraint::select_best_tag(c, tags);
+                const tags: [String] = Git::list_tags(dep.git_url);
+                const best: String = Constraint::select_best_tag(c, &tags);
                 if (best.length() == 0) {
                     fmt::eprintln(f"error: no tag in {dep.git_url} satisfies version '{dep.ref_val}'");
-                    return "";
+                    return String::new();
                 }
                 return Git::resolve_ref_to_sha(
-                    dep.git_url, GitRefKind::Tag, best);
+                    dep.git_url, GitRefKind::Tag, best.as_str());
             }
             GitRefKind::Tag => {
                 return Git::resolve_ref_to_sha(
@@ -375,7 +375,7 @@ type struct DepResolver {
             }
             GitRefKind::None => {
                 // parse_inline_table_into_dep would have flagged this.
-                return "";
+                return String::new();
             }
         }
     }

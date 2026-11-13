@@ -12,11 +12,10 @@
 namespace compiler::deps::git;
 
 import std::fs::directory::{ Directory };
-import std::fs::path::{ Path };
+import std::fs::path::{ PathBuf };
 import std::fmt;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
-import std::core::slice::{ Slice };
 import std::process::command::{ Command, Output, Stdio };
 import compiler::deps::cache::{ Cache };
 import compiler::project_config::{ GitRefKind };
@@ -32,20 +31,22 @@ type struct Git {
 
     /// Ensure the bare clone for `url` exists and (when `refresh` is true)
     /// has the latest remote refs. Idempotent.  Returns true on success.
-    static ensure_bare_clone(url_text: string, refresh: boolean) -> boolean {
-        const url: string = url_text;
-        const dir: string = Cache::git_dir_for(url_text);
+    static ensure_bare_clone(url: Str, refresh: boolean) -> boolean {
+        const dir: PathBuf = Cache::git_dir_for(url);
 
-        if (!Path::from(dir).exists()) {
+        if (!dir.as_path().exists()) {
             // First-time clone.  `--bare` skips materialising a working
             // tree (we make those on demand via `materialize_checkout`).
             // `--quiet` keeps `cryo fetch` output focused on what's
             // happening across multiple deps.
-            Cache::create_directory(dir.parent_dir());
+            match (dir.as_path().parent()) {
+                Option::Some(parent) => { Cache::create_directory(parent); }
+                Option::None         => { }
+            }
             fmt::println(f"[deps] cloning {url}");
-            mut clone_args: [string] = ["clone", "--bare", "--quiet", url, dir];
-            const status: i32 = Git::run_git(&clone_args);
-            if (status != 0) {
+            mut clone: Command = Command::new("git");
+            clone.arg("clone").arg("--bare").arg("--quiet").arg(url).arg(dir.as_path().as_str());
+            if (Git::run(&clone) != 0) {
                 fmt::eprintln(f"error: git clone failed for {url}");
                 return false;
             }
@@ -54,11 +55,9 @@ type struct Git {
 
         if (refresh) {
             fmt::println(f"[deps] refreshing {url}");
-            mut fetch_args: [string] = [
-                fmt::format("--git-dir=%s", dir).into_raw(),
-                "fetch", "--quiet", "--tags", "--prune", "--all"];
-            const status: i32 = Git::run_git(&fetch_args);
-            if (status != 0) {
+            mut fetch: Command = Git::on_bare_clone(&dir);
+            fetch.arg("fetch").arg("--quiet").arg("--tags").arg("--prune").arg("--all");
+            if (Git::run(&fetch) != 0) {
                 fmt::eprintln(f"warning: git fetch failed for {url} (using stale refs)");
                 // Soft-fail: an offline build with a populated cache is
                 // still useful, and an unreachable remote shouldn't kill
@@ -78,62 +77,63 @@ type struct Git {
     /// Branch refs have to be qualified; `git fetch` from a bare clone
     /// doesn't track local branches, so we look at the remote-tracking
     /// `refs/heads/<branch>` ref directly.
-    static resolve_ref_to_sha(url_text: string, ref_kind: GitRefKind, ref_val_text: string) -> string {
-        const ref_val: string = ref_val_text;
-        const url: string = url_text;
-        const dir: string = Cache::git_dir_for(url_text);
+    static resolve_ref_to_sha(url: Str, ref_kind: GitRefKind, ref_value: Str) -> String {
+        const dir: PathBuf = Cache::git_dir_for(url);
 
         // Build the candidate refspec list.  We try them in order; the
         // first one that resolves wins.  `git rev-parse` succeeds (exit 0)
         // and prints the SHA; on failure it prints to stderr and exits
         // non-zero.
-        mut candidates: [string] = [];
+        mut candidates: [String] = [];
         match (ref_kind) {
             GitRefKind::Tag => {
-                candidates.push(fmt::format("refs/tags/%s", ref_val).into_raw());
-                candidates.push(ref_val);  // bare name in case user wrote `tag = "0.1.0"` and the tag is also `0.1.0`
+                candidates.push(f"refs/tags/{ref_value}");
+                // The bare name, in case the user wrote `tag = "0.1.0"` and
+                // the tag is also `0.1.0`.
+                candidates.push(String::from_str(ref_value));
             }
             GitRefKind::Branch => {
-                candidates.push(fmt::format("refs/heads/%s", ref_val).into_raw());
-                candidates.push(ref_val);
+                candidates.push(f"refs/heads/{ref_value}");
+                candidates.push(String::from_str(ref_value));
             }
             GitRefKind::Rev => {
-                candidates.push(ref_val);
+                candidates.push(String::from_str(ref_value));
             }
             GitRefKind::Version => {
                 // Caller resolves Version -> tag separately via list_tags;
                 // by the time we land here it should have been rewritten.
                 fmt::eprintf("internal error: resolve_ref_to_sha called with raw Version ref\n");
-                return "";
+                return String::new();
             }
             GitRefKind::None => {
                 fmt::eprintf("internal error: resolve_ref_to_sha called with no ref\n");
-                return "";
+                return String::new();
             }
         }
 
         for (mut i: i64 = 0; i < candidates.length(); i++) {
-            mut rp_args: [string] = [
-                fmt::format("--git-dir=%s", dir).into_raw(),
-                "rev-parse", "--verify", "--quiet",
-                fmt::format("%s^{commit}", candidates[i]).into_raw()];
-            const lines: [string] = Git::capture_git(&rp_args);
-            if (lines.length() > 0 && lines[0].length() > 0) {
-                return lines[0];
+            mut commit: String = String::from_str(candidates[i].as_str());
+            commit.push(Str::new("^{commit}"));
+            mut rev_parse: Command = Git::on_bare_clone(&dir);
+            rev_parse.arg("rev-parse").arg("--verify").arg("--quiet").arg(commit.as_str());
+            const lines: [String] = Git::capture(&rev_parse);
+            if (lines.length() > 0) {
+                return String::from_str(lines[0].as_str());
             }
         }
 
-        fmt::eprintln(f"error: could not resolve '{ref_val}' inside {url}");
-        return "";
+        fmt::eprintln(f"error: could not resolve '{ref_value}' inside {url}");
+        return String::new();
     }
 
     /// List every tag in the bare clone for `url`, one per element.
     /// Used for semver-range resolution against `version = "..."`.
     /// Returns an empty list on failure (and prints a diagnostic).
-    static list_tags(url_text: string) -> [string] {
-        const dir: string = Cache::git_dir_for(url_text);
-        mut tag_args: [string] = [fmt::format("--git-dir=%s", dir).into_raw(), "tag", "--list"];
-        return Git::capture_git(&tag_args);
+    static list_tags(url: Str) -> [String] {
+        const dir: PathBuf = Cache::git_dir_for(url);
+        mut list: Command = Git::on_bare_clone(&dir);
+        list.arg("tag").arg("--list");
+        return Git::capture(&list);
     }
 
 
@@ -141,53 +141,57 @@ type struct Git {
 
     /// Path to the working tree for (`url`, `sha`).  Does not check
     /// existence; callers use `is_checkout_present` for that.
-    static checkout_path(url_text: string, sha_text: string) -> string {
-        return Cache::checkout_dir_for(url_text, sha_text);
+    static checkout_path(url: Str, sha: Str) -> PathBuf {
+        return Cache::checkout_dir_for(url, sha);
     }
 
     /// True when the working tree at (`url`, `sha`) is fully materialised.
     /// We probe for `.git` rather than the directory itself because an
     /// interrupted clone may leave a half-populated dir behind.
-    static is_checkout_present(url_text: string, sha_text: string) -> boolean {
-        const dir: string = Cache::checkout_dir_for(url_text, sha_text);
-        if (!Path::from(dir).exists()) { return false; }
-        return Path::from(dir).join(".git").as_path().exists();
+    static is_checkout_present(url: Str, sha: Str) -> boolean {
+        const dir: PathBuf = Cache::checkout_dir_for(url, sha);
+        if (!dir.as_path().exists()) { return false; }
+        return dir.join(".git").as_path().exists();
     }
 
     /// Clone the bare cache into a fresh working tree at `<checkout>/<sha>`,
     /// then `checkout` the requested SHA.  `--local` uses hardlinks where
     /// the filesystem permits, so per-SHA storage cost is dominated by the
     /// working tree itself rather than the .git history.
-    static materialize_checkout(url_text: string, sha_text: string) -> boolean {
-        const sha: string = sha_text;
-        if (Git::is_checkout_present(url_text, sha_text)) { return true; }
+    static materialize_checkout(url: Str, sha: Str) -> boolean {
+        if (Git::is_checkout_present(url, sha)) { return true; }
 
-        const bare:    string = Cache::git_dir_for(url_text);
-        const wt:      string = Cache::checkout_dir_for(url_text, sha_text);
-        const wt_par:  string = wt.parent_dir();
+        const bare: PathBuf = Cache::git_dir_for(url);
+        const tree: PathBuf = Cache::checkout_dir_for(url, sha);
+        const tree_text: Str = tree.as_path().as_str();
 
-        Cache::create_directory(wt_par);
+        match (tree.as_path().parent()) {
+            Option::Some(parent) => { Cache::create_directory(parent); }
+            Option::None         => { }
+        }
 
         // If a previous run left a partial tree behind (e.g., crash
         // mid-checkout), clear it so the clone starts from a clean slate.
-        if (Path::from(wt).exists()) {
-            match (Directory::remove_all(Path::from(wt))) {
+        if (tree.as_path().exists()) {
+            match (Directory::remove_all(tree.as_path())) {
                 Result::Ok(_)      => { }
                 Result::Err(error) => {
-                    fmt::eprintln(f"error: cannot clear the partial working tree at {wt}: {error}");
+                    fmt::eprintln(f"error: cannot clear the partial working tree at {tree_text}: {error}");
                     return false;
                 }
             }
         }
 
-        mut clone_args: [string] = ["clone", "--local", "--quiet", bare, wt];
-        if (Git::run_git(&clone_args) != 0) {
-            fmt::eprintln(f"error: failed to materialize working tree at {wt}");
+        mut clone: Command = Command::new("git");
+        clone.arg("clone").arg("--local").arg("--quiet").arg(bare.as_path().as_str()).arg(tree_text);
+        if (Git::run(&clone) != 0) {
+            fmt::eprintln(f"error: failed to materialize working tree at {tree_text}");
             return false;
         }
-        mut co_args: [string] = ["-C", wt, "checkout", "--quiet", "--detach", sha];
-        if (Git::run_git(&co_args) != 0) {
-            fmt::eprintln(f"error: failed to checkout {sha} in {wt}");
+        mut checkout: Command = Command::new("git");
+        checkout.arg("-C").arg(tree_text).arg("checkout").arg("--quiet").arg("--detach").arg(sha);
+        if (Git::run(&checkout) != 0) {
+            fmt::eprintln(f"error: failed to checkout {sha} in {tree_text}");
             return false;
         }
         return true;
@@ -196,16 +200,21 @@ type struct Git {
 
     // Subprocess helpers (argv via std::process::Command, no shell)
 
-    /// Run `git` with `args`, inheriting stdio, and return the child's exit
+    /// `git --git-dir=<dir>`: a command on the bare clone at `dir`, which
+    /// the caller gives its arguments.
+    static on_bare_clone(dir: &PathBuf) -> Command {
+        const flag: String = f"--git-dir={dir.as_path().as_str()}";
+        mut command: Command = Command::new("git");
+        command.arg(flag.as_str());
+        return command;
+    }
+
+    /// Run a `git` command, inheriting stdio, and return the child's exit
     /// code (0 on success), or -1 if git could not be spawned / was signalled.
     /// Used for clone/fetch/checkout, whose `--quiet` progress goes to the
     /// terminal.
-    static run_git(args: &[string]) -> i32 {
-        mut c: Command = Command::new(Str::new("git"));
-        for (mut i: i64 = 0; i < args.length(); i++) {
-            c.arg(Str::new(args[i]));
-        }
-        match (c.status()) {
+    static run(command: &Command) -> i32 {
+        match (command.status()) {
             Result::Ok(st) => {
                 match (st.exit_code()) {
                     Option::Some(code) => { return code; }
@@ -216,34 +225,25 @@ type struct Git {
         }
     }
 
-    /// Run `git` with `args`, capturing stdout with stderr suppressed (the
+    /// Run a `git` command, capturing stdout with stderr suppressed (the
     /// argv equivalent of `2>/dev/null`), and return every non-empty
     /// line trimmed of surrounding whitespace, in source order.  Returns an
-    /// empty list on spawn failure or empty output.
-    static capture_git(args: &[string]) -> [string] {
-        mut out: [string] = [];
-        mut c: Command = Command::new(Str::new("git"));
-        for (mut i: i64 = 0; i < args.length(); i++) {
-            c.arg(Str::new(args[i]));
-        }
-        c.stderr(Stdio::Null);
-        match (c.output()) {
+    /// empty list on spawn failure, empty output, or output that is not
+    /// UTF-8.
+    static capture(command: mut &Command) -> [String] {
+        mut out: [String] = [];
+        command.stderr(Stdio::Null);
+        match (command.output()) {
             Result::Ok(res) => {
                 mut o: Output = res;
-                const bytes: &Slice<u8> = o.stdout();
-                if (bytes.length() > 0) {
-                    mut buf: String = String::new();
-                    mut i: i64 = 0;
-                    while (i < bytes.length()) {
-                        buf.push_byte(bytes.get(i).unwrap_or(0 as u8));
-                        i++;
+                match (Str::from_utf8(o.stdout())) {
+                    Result::Ok(text) => {
+                        for (line in text.lines()) {
+                            const trimmed: Str = line.trim();
+                            if (trimmed.length() > 0) { out.push(String::from_str(trimmed)); }
+                        }
                     }
-                    const raw: string = buf.into_raw();
-                    mut lines: [string] = raw.split_char('\n' as i8);
-                    for (mut j: i64 = 0; j < lines.length(); j++) {
-                        const t: string = lines[j].trim();
-                        if (t.length() > 0) { out.push(t); }
-                    }
+                    Result::Err(_) => { }
                 }
             }
             Result::Err(_) => {}

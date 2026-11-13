@@ -19,11 +19,10 @@ namespace compiler::deps::cache;
 import std::env;
 
 import std::fs::directory::{ Directory };
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::fmt;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
-import std::ffi::libc;
 
 
 /// Stateless namespace for the per-machine dependency cache layout.
@@ -42,32 +41,37 @@ type struct Cache {
     ///        Windows  `%LOCALAPPDATA%\cryo`  ->  `%USERPROFILE%\.cache\cryo`
     ///        Unix     `$XDG_CACHE_HOME/cryo` ->  `$HOME/.cache/cryo`
     ///   3. a temp dir (warned) only when no user directory resolves at all.
-    static cache_root() -> string {
+    static cache_root() -> PathBuf {
         // An EMPTY env var counts as unset (Windows shells often export "").
-        match (env::var(Str::new("CRYO_HOME"))) {
-            Option::Some(v) => {
-                mut s: String = v;
-                if (s.length() > 0) {
-                    s.push(Str::new("/cache"));
-                    const root: string = s.into_raw();
-                    Cache::create_directory(root);
-                    return root;
-                }
-            }
-            Option::None => {}
-        }
-        const root: string = Cache::default_cache_root();
-        Cache::create_directory(root);
+        const root: PathBuf = match (Cache::variable_with_suffix("CRYO_HOME", "/cache")) {
+            Option::Some(home) => { home }
+            Option::None       => { Cache::default_cache_root() }
+        };
+        Cache::create_directory(root.as_path());
         return root;
+    }
+
+    /// The environment variable `name` with `suffix` appended, when it is
+    /// set to anything but the empty string.
+    static variable_with_suffix(name: Str, suffix: Str) -> Option<PathBuf> {
+        match (env::var(name)) {
+            Option::Some(value) => {
+                mut text: String = value;
+                if (text.length() == 0) { return Option::None; }
+                text.push(suffix);
+                return Option::Some(PathBuf::from(text.as_str()));
+            }
+            Option::None => { return Option::None; }
+        }
     }
 
     /// Create the directory `path` names, and its parents.  One that cannot
     /// be created is reported with the reason here; what is written into it
     /// next then fails with its own error.
-    static create_directory(path: string) -> void {
-        match (Directory::create_all(Path::from(path))) {
+    static create_directory(path: Path) -> void {
+        match (Directory::create_all(path)) {
             Result::Ok(_)      => { }
-            Result::Err(error) => { fmt::eprintln(f"warning: cannot create {path}: {error}"); }
+            Result::Err(error) => { fmt::eprintln(f"warning: cannot create {path.as_str()}: {error}"); }
         }
     }
 
@@ -76,70 +80,54 @@ type struct Cache {
     /// then a `%TEMP%` last resort.  Forward slashes join the suffix to match
     /// the `/`-joined paths layered on top (Windows accepts mixed separators).
     ![target(windows)]
-    static default_cache_root() -> string {
-        match (env::var(Str::new("LOCALAPPDATA"))) {
-            Option::Some(v) => {
-                mut s: String = v;
-                if (s.length() > 0) { s.push(Str::new("/cryo")); return s.into_raw(); }
-            }
-            Option::None => {}
+    static default_cache_root() -> PathBuf {
+        match (Cache::variable_with_suffix("LOCALAPPDATA", "/cryo")) {
+            Option::Some(root) => { return root; }
+            Option::None       => { }
         }
-        match (env::var(Str::new("USERPROFILE"))) {
-            Option::Some(v) => {
-                mut s: String = v;
-                if (s.length() > 0) { s.push(Str::new("/.cache/cryo")); return s.into_raw(); }
-            }
-            Option::None => {}
+        match (Cache::variable_with_suffix("USERPROFILE", "/.cache/cryo")) {
+            Option::Some(root) => { return root; }
+            Option::None       => { }
         }
-        match (env::var(Str::new("TEMP"))) {
-            Option::Some(v) => {
-                mut s: String = v;
-                if (s.length() > 0) {
-                    fmt::eprintf("warning: LOCALAPPDATA and USERPROFILE unset; using %%TEMP%% for the cryo cache\n");
-                    s.push(Str::new("/cryo-cache"));
-                    return s.into_raw();
-                }
+        match (Cache::variable_with_suffix("TEMP", "/cryo-cache")) {
+            Option::Some(root) => {
+                fmt::eprintf("warning: LOCALAPPDATA and USERPROFILE unset; using %%TEMP%% for the cryo cache\n");
+                return root;
             }
-            Option::None => {}
+            Option::None => { }
         }
         fmt::eprintf("warning: no user directory resolved; using C:/tmp/cryo-cache\n");
-        return "C:/tmp/cryo-cache";
+        return PathBuf::from("C:/tmp/cryo-cache");
     }
 
     /// Unix per-user cache root: `$XDG_CACHE_HOME/cryo` (XDG Base Directory),
     /// then `$HOME/.cache/cryo`, then `/tmp/cryo-cache`.
     ![target(unix)]
-    static default_cache_root() -> string {
-        match (env::var(Str::new("XDG_CACHE_HOME"))) {
-            Option::Some(v) => {
-                mut s: String = v;
-                if (s.length() > 0) { s.push(Str::new("/cryo")); return s.into_raw(); }
-            }
-            Option::None => {}
+    static default_cache_root() -> PathBuf {
+        match (Cache::variable_with_suffix("XDG_CACHE_HOME", "/cryo")) {
+            Option::Some(root) => { return root; }
+            Option::None       => { }
         }
-        match (env::var(Str::new("HOME"))) {
-            Option::Some(v) => {
-                mut s: String = v;
-                if (s.length() > 0) { s.push(Str::new("/.cache/cryo")); return s.into_raw(); }
-            }
-            Option::None => {}
+        match (Cache::variable_with_suffix("HOME", "/.cache/cryo")) {
+            Option::Some(root) => { return root; }
+            Option::None       => { }
         }
         fmt::eprintf("warning: $HOME and $XDG_CACHE_HOME unset; using /tmp/cryo-cache\n");
-        return "/tmp/cryo-cache";
+        return PathBuf::from("/tmp/cryo-cache");
     }
 
     /// `<cache_root>/git/<sanitized>`: bare clone for a given remote URL.
-    static git_dir_for(url_text: string) -> string {
-        return Path::from(Cache::cache_root()).join("git").join(Cache::sanitize_url(url_text)).into_raw();
+    static git_dir_for(url: Str) -> PathBuf {
+        const sanitized: String = Cache::sanitize_url(url);
+        return Cache::cache_root().join("git").join(sanitized.as_str());
     }
 
     /// `<cache_root>/checkouts/<sanitized>/<sha>`: working tree at a
     /// specific resolved commit.  Multiple SHAs from the same remote can
     /// coexist (e.g., when two projects pin different versions).
-    static checkout_dir_for(url_text: string, sha_text: string) -> string {
-        const sha: string = sha_text;
-        return Path::from(Cache::cache_root()).join("checkouts")
-            .join(Cache::sanitize_url(url_text)).join(sha).into_raw();
+    static checkout_dir_for(url: Str, sha: Str) -> PathBuf {
+        const sanitized: String = Cache::sanitize_url(url);
+        return Cache::cache_root().join("checkouts").join(sanitized.as_str()).join(sha);
     }
 
 
@@ -156,34 +144,26 @@ type struct Cache {
     /// are theoretically possible but vanishingly unlikely for real-world
     /// remotes; we accept the risk for a much friendlier cache layout
     /// than a raw hash would give.
-    static sanitize_url(url_text: string) -> string {
-        const url: string = url_text;
-        mut s: string = url;
-
-        // Strip recognized scheme prefixes.
-        s = s.strip_prefix("https://");
-        s = s.strip_prefix("http://");
-        s = s.strip_prefix("ssh://");
-        s = s.strip_prefix("git://");
-        s = s.strip_prefix("git@");
-
-        // Strip trailing ".git" if present.
-        const slen: i64 = s.length() as i64;
-        if (slen >= 4
-                && s[slen-4] == '.' && s[slen-3] == 'g'
-                && s[slen-2] == 'i' && s[slen-1] == 't') {
-            s = s.substr(0, slen - 4);
+    static sanitize_url(url: Str) -> String {
+        // Stripped in this order, so `ssh://git@host` loses both.
+        const schemes: [Str; 5] = [Str::new("https://"), Str::new("http://"), Str::new("ssh://"),
+                                   Str::new("git://"), Str::new("git@")];
+        mut rest: Str = url;
+        for (mut i: i64 = 0; i < 5; i++) {
+            rest = rest.strip_prefix(&schemes[i]).unwrap_or(rest);
         }
+        const git_suffix: Str = Str::new(".git");
+        rest = rest.strip_suffix(&git_suffix).unwrap_or(rest);
 
-        // Replace path-unfriendly characters with '_'.
-        const out_len: i64 = s.length() as i64;
-        mut buf: mut i8* = libc::malloc(out_len as u64 + 1) as mut i8*;
-        for (mut i: i64 = 0; i < out_len; i++) {
-            const c: char = s[i];
+        // Replace path-unfriendly bytes with '_'; a byte is kept as it is,
+        // so a name in UTF-8 stays the same bytes.
+        mut out: String = String::with_capacity(rest.length());
+        for (mut i: i64 = 0; i < rest.length(); i++) {
+            const byte: u8 = rest.byte_at(i).unwrap_or(0);
+            const c: char = byte as char;
             const safe: boolean = c.is_alphanumeric() || c == '.' || c == '-' || c == '_';
-            buf[i as u64] = if (safe) { c as i8 } else { '_' as i8 };
+            out.push_byte(if (safe) { byte } else { '_' as u8 });
         }
-        buf[out_len as u64] = 0;
-        return buf as string;
+        return out;
     }
 }
