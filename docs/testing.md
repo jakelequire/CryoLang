@@ -367,6 +367,12 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 | `"ignore"` | `true` skips the project (reported as ignored) |
 | `"expect"` | per-outcome assertions (below) |
 
+`make test-census` runs the suite with `-Werror=W0017`, which `cryo test`
+hands to every project's build too: a unit test or a project that discards a
+`![must_use]` result fails to build there, and `make examples` holds every
+example to the same.  A project that wants to show the warning asserts it
+from a compile-fail file instead, which is checked without the flag.
+
 ### Outcomes
 
 - **`collect`** - build the package and run *its own* `![test]` functions
