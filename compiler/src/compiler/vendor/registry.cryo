@@ -31,7 +31,6 @@ import std::process;
 import std::sys::syscall;
 import compiler::deps::cache::{ Cache };
 import compiler::project_config::{ ProjectConfig };
-import std::fs::directory::{ Directory };
 import std::fs::file::{ File, OpenOptions };
 import std::fs::path::{ Path };
 import std::fmt;
@@ -158,7 +157,7 @@ type struct VendorRegistry {
     /// `<cache_root>/vendor`: the vendor subtree of the shared cache.
     static vendor_root() -> string {
         const root: string = Path::from(Cache::cache_root()).join("vendor").into_raw();
-        Directory::create_all(Path::from(root));
+        Cache::create_directory(root);
         return root;
     }
 
@@ -171,7 +170,7 @@ type struct VendorRegistry {
     static cache_dir_for(key: string, triple: string) -> string {
         const d: string = Path::from(VendorRegistry::vendor_root()).join(key)
             .join(VendorRegistry::normalize_triple(triple)).into_raw();
-        Directory::create_all(Path::from(d));
+        Cache::create_directory(d);
         return d;
     }
 
@@ -307,7 +306,12 @@ type struct VendorRegistry {
         // `rename_to` replaces an existing registry in one step, so a reader
         // never sees it half written.
         if (Path::from(tmp).rename_to(path).is_err()) {
-            File::remove(tmp);   // leave no stray temp file on a failed swap
+            match (File::remove(tmp)) {
+                Result::Ok(_)  => { }
+                // A temporary file left behind is never read: its name
+                // carries this process's id, and nothing looks for it.
+                Result::Err(_) => { }
+            }
             return false;
         }
         return true;
@@ -554,7 +558,12 @@ type struct VendorLock {
     /// on a handle returned from a timed-out `acquire`.
     release(mut &this) -> void {
         if (this.held) {
-            File::remove(Path::from(this.path));
+            match (File::remove(Path::from(this.path))) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => {
+                    fmt::eprintln(f"warning: cannot remove the vendor registry lock {this.path}: {error}; delete that file before the next `cryo` run waits on it");
+                }
+            }
             this.held = false;
         }
     }

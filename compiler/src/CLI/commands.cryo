@@ -2006,6 +2006,16 @@ type struct Executor {
         return fmt::format("%s.%llu", tmp, k).into_raw();
     }
 
+    /// Remove a job's capture file once it has been read.
+    static remove_capture(capture_path: string) -> void {
+        match (File::remove(path::Path::from(capture_path))) {
+            Result::Ok(_)  => { }
+            // One left behind is harmless: a job's command redirects into its
+            // capture, which rewrites the file whole before anything reads it.
+            Result::Err(_) => { }
+        }
+    }
+
     static run_negative_suite(self_exe: string, stdlib_abs: string,
                               neg_dir: string, pattern: string,
                               fmt_choice: string, col_choice: string,
@@ -2162,7 +2172,7 @@ type struct Executor {
                 Executor::wait_job(done.as_ptr(), k);
                 const out_path: string = Executor::job_tmp_path(tmp, k);
                 const out: string = Executor::read_file_or_empty(out_path);
-                File::remove(path::Path::from(out_path));
+                Executor::remove_capture(out_path);
                 // Warning codes (`W....`) render as `warning[Wxxxx]`; everything else
                 // as `error[Exxxx]`.  A warning-only file still exits 0, but the suite
                 // asserts on the rendered marker, not the exit status.
@@ -2536,7 +2546,8 @@ type struct Executor {
         // this order, whatever order the children finish in.
         //   verdict_of[i]: 0 run job_of[i], 1 malformed test.json, 2 ignored,
         //                  3 unknown requirement, 4 unmet requirement,
-        //                  5 project directory missing
+        //                  5 project directory missing, 6 an earlier run's
+        //                  `expect.file` that could not be removed
         const tmp: string = neg_tmp_path();
         mut names:      [string]   = [];
         mut verdict_of: [i32]      = [];
@@ -2588,6 +2599,8 @@ type struct Executor {
                         verdict = 4; reason = unmet;
                     } else if (!path::Path::from(proj_dir).exists()) {
                         verdict = 5; reason = proj_dir;
+                    } else if (!Executor::remove_project_file(proj_dir, &spec)) {
+                        verdict = 6; reason = spec.file;
                     }
                 }
             }
@@ -2595,29 +2608,29 @@ type struct Executor {
             verdict_of.push(verdict);
             reason_of.push(reason);
             if (verdict == 0) {
-                Executor::remove_project_file(proj_dir, &spec);
                 const out_path: string = Executor::job_tmp_path(tmp, cmds.length() as u64);
                 job_of.push(cmds.length() as i64);
                 cmds.push(Executor::project_command(self_exe, stdlib_abs, proj_dir, &spec, out_path));
                 // The fixes are made in a copy, never in the tree's own
                 // sources; the copy's build output is left behind so its
                 // first build analyses the source as written.  A copy that
-                // cannot be made fails the project (-2).
+                // cannot be made, or that still holds an earlier run's copy or
+                // build output it could not remove, fails the project (-2).
                 mut applied_job: i64 = -1;
                 if (spec.applied) {
                     const copy_dir: string = fmt::format("%s.applied.%llu", tmp, cmds.length() as u64).into_raw();
-                    if (path::Path::from(copy_dir).exists()) { Directory::remove_all(path::Path::from(copy_dir)); }
                     applied_job = -2;
-                    match (Directory::copy_all(path::Path::from(proj_dir), path::Path::from(copy_dir))) {
-                        Result::Ok(_) => {
-                            const copied_build: path::PathBuf = path::Path::from(copy_dir).join(str::Str::new("build"));
-                            if (copied_build.as_path().exists()) { Directory::remove_all(copied_build.as_path()); }
-                            const applied_spec: ProjSpec = spec.applied_run();
-                            applied_job = cmds.length() as i64;
-                            cmds.push(Executor::project_command(self_exe, stdlib_abs, copy_dir,
-                                &applied_spec, Executor::job_tmp_path(tmp, applied_job as u64)));
-                        }
-                        Result::Err(_) => { }
+                    const fresh: boolean = !path::Path::from(copy_dir).exists()
+                        || Directory::remove_all(path::Path::from(copy_dir)).is_ok();
+                    const copied: boolean = fresh
+                        && Directory::copy_all(path::Path::from(proj_dir), path::Path::from(copy_dir)).is_ok();
+                    const copied_build: path::PathBuf = path::Path::from(copy_dir).join(str::Str::new("build"));
+                    if (copied && (!copied_build.as_path().exists()
+                            || Directory::remove_all(copied_build.as_path()).is_ok())) {
+                        const applied_spec: ProjSpec = spec.applied_run();
+                        applied_job = cmds.length() as i64;
+                        cmds.push(Executor::project_command(self_exe, stdlib_abs, copy_dir,
+                            &applied_spec, Executor::job_tmp_path(tmp, applied_job as u64)));
                     }
                 }
                 applied_job_of.push(applied_job);
@@ -2690,13 +2703,21 @@ type struct Executor {
                         fmt::format("cannot chdir to %s", reason_of[i]).into_raw());
                     failures += 1; ran += 1; continue;
                 }
+                if (verdict == 6) {
+                    Executor::proj_report(is_pretty, is_compact, color_on, false,
+                        fmt::format("cannot remove the earlier run's %s", reason_of[i]).into_raw());
+                    failures += 1; ran += 1; continue;
+                }
 
                 const k: u64 = job_of[i] as u64;
                 Executor::wait_job(done.as_ptr(), k);
                 const out_path: string = Executor::job_tmp_path(tmp, k);
                 const proj_dir: string = path::Path::from(projects_dir).join(name).into_raw();
                 mut res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path, proj_dir);
-                Executor::remove_project_file(proj_dir, &specs[i]);
+                if (!Executor::remove_project_file(proj_dir, &specs[i]) && res.passed) {
+                    res = ProjOutcome { passed: false,
+                        detail: fmt::format("cannot remove the %s it wrote", specs[i].file).into_raw() };
+                }
                 // The run of the copy with its fixes applied is judged on its
                 // own, and fails the project when the project itself passed.
                 mut shown_path: string = out_path;
@@ -2716,7 +2737,12 @@ type struct Executor {
                             detail: fmt::format("with its fixes applied: %s", applied.detail).into_raw() };
                         shown_path = applied_out;
                     }
-                    Directory::remove_all(path::Path::from(copy_dir));
+                    match (Directory::remove_all(path::Path::from(copy_dir))) {
+                        Result::Ok(_)  => { }
+                        // A copy left behind is removed before the next run
+                        // copies the project there, or fails that project.
+                        Result::Err(_) => { }
+                    }
                 }
                 Executor::proj_report(is_pretty, is_compact, color_on, res.passed, res.detail);
                 if (!res.passed) {
@@ -2730,11 +2756,11 @@ type struct Executor {
                         if (err.length() > 0) { fmt::printf("%s\n", err); }
                     }
                 }
-                File::remove(path::Path::from(out_path));
-                File::remove(path::Path::from(Executor::stderr_path(out_path)));
+                Executor::remove_capture(out_path);
+                Executor::remove_capture(Executor::stderr_path(out_path));
                 if (applied_out.length() > 0) {
-                    File::remove(path::Path::from(applied_out));
-                    File::remove(path::Path::from(Executor::stderr_path(applied_out)));
+                    Executor::remove_capture(applied_out);
+                    Executor::remove_capture(Executor::stderr_path(applied_out));
                 }
                 ran += 1;
             }
@@ -2823,12 +2849,13 @@ type struct Executor {
         return shell_in_dir(proj_dir_text, command.into_raw());
     }
 
-    /// Remove the file a project's expectations read (`expect.file`), if any.
-    static remove_project_file(proj_dir: string, spec: &ProjSpec) -> void {
-        if (spec.file.length() > 0) {
-            const file_path: path::PathBuf = path::Path::from(proj_dir).join(spec.file);
-            File::remove(file_path.as_path());
-        }
+    /// Remove the file a project's expectations read (`expect.file`), if any,
+    /// so they read only what the run writes there.  False when one is there
+    /// that could not be removed.
+    static remove_project_file(proj_dir: string, spec: &ProjSpec) -> boolean {
+        if (spec.file.length() == 0) { return true; }
+        const file_path: path::PathBuf = path::Path::from(proj_dir).join(spec.file);
+        return !file_path.as_path().exists() || File::remove(file_path.as_path()).is_ok();
     }
 
     /// Where a project's command captures its stderr, beside `stdout_path`.
