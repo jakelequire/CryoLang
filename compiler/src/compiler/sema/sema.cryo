@@ -1981,12 +1981,32 @@ type struct SemaVisitor {
     /// reports nothing - and its spelling is refused at the `<` (E0111); the
     /// fix inserting the `::` is offered only when the call is accepted, the
     /// one case where writing it is certain to give a call that compiles.
+    ///
+    /// A method call's expected type reaches its receiver through the method
+    /// (`state.receiver_of`): a static call there binds its owner from what
+    /// the method returns on it.
     resolve_written_call(mut &this, expr: mut ExpressionNode*, call: mut CallExpr*) -> TypeRef {
-        if (!call.turbofish_left_out.has_location()) { return this.calls.resolve_call(this, expr, call); }
         const angle: SourceSpan = call.turbofish_left_out;
         call.turbofish_left_out = SourceSpan::none();
         const errors_before: u32 = this.ctx.diagnostics.error_count;
+        const saved_receiver_of: ExpressionNode* = this.state.receiver_of;
+        const saved_receiver_method: SymbolStr = this.state.receiver_method;
+        const saved_receiver_expected: TypeRef = this.state.receiver_expected;
+        const method: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
+        if (method != null && this.state.expected_type.is_valid()) {
+            this.state.receiver_of = method.object;
+            this.state.receiver_method = method.member;
+            this.state.receiver_expected = this.state.expected_type;
+        } else if (this.state.receiver_of != expr) {
+            // Only the receiver itself is typed under the expectation, not
+            // a call inside it.
+            this.state.receiver_of = null;
+        }
         const typed: TypeRef = this.calls.resolve_call(this, expr, call);
+        this.state.receiver_of = saved_receiver_of;
+        this.state.receiver_method = saved_receiver_method;
+        this.state.receiver_expected = saved_receiver_expected;
+        if (!angle.has_location()) { return typed; }
         const accepted: boolean = typed.is_valid() && this.ctx.diagnostics.error_count == errors_before;
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0111_INVALID_SYNTAX,
             "type arguments in an expression are written with `::<`");
