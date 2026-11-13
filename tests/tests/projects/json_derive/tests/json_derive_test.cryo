@@ -1,0 +1,232 @@
+///! A derived `ToJson` writes a struct as an object holding each field under
+///! its key and an enum whose variants carry nothing as its variant's name;
+///! the derived `FromJson` reads them back.  A member the struct does not
+///! name is ignored, an absent one reads as what its field's type makes of
+///! `null`, and `![json(...)]` renames a member, skips a field, reads an
+///! absent member as the type's `default()`, or leaves out a member that
+///! writes `null`.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::JsonDerive;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::json::value::{ JsonValue };
+import std::json::parser;
+import std::json::serializer;
+import std::json::convert::{ FromJson, JsonDecodeError, ToJson };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_eq };
+
+type enum Mode with [Eq, ToJson, FromJson] {
+    Quiet;
+    Loud;
+}
+
+type struct Limits with [Eq, ToJson, FromJson] {
+    count: i64;
+    ratio: f64;
+}
+
+type struct Settings with [Eq, ToJson, FromJson] {
+    name: String;
+    enabled: boolean;
+    mode: Mode;
+    limits: Limits;
+    tags: Array<String>;
+    note: Option<String>;
+}
+
+type struct Renamed with [ToJson, FromJson] {
+    ![json(rename = "port_number")]
+    port: u16;
+}
+
+type struct Skipping with [ToJson, FromJson] {
+    kept: i64;
+    ![json(skip)]
+    cache: i64;
+}
+
+type struct Defaulted with [ToJson, FromJson] {
+    ![json(default)]
+    retries: i64;
+    ![json(default)]
+    label: String;
+}
+
+type struct Sparse with [ToJson, FromJson] {
+    ![json(skip_none)]
+    nickname: Option<String>;
+    always: Option<String>;
+}
+
+type struct Pair<T> with [ToJson, FromJson] {
+    first: T;
+    second: T;
+}
+
+/// `text` parsed into a value; a text that does not parse fails the test.
+function parsed(text: Str) -> Result<JsonValue, TestError> {
+    return match (parser::parse(text)) {
+        Result::Ok(value) => { Result::Ok(value) }
+        Result::Err(_) => { Result::Err(TestError::failed(Str::from("the text must parse"))) }
+    };
+}
+
+/// `text` read as a `T`; a decoding error fails the test with its message.
+function read_as<T>(text: Str) -> Result<T, TestError> where T: FromJson {
+    const value: JsonValue = parsed(text)?;
+    return match (T::from_json(&value)) {
+        Result::Ok(read) => { Result::Ok(read) }
+        Result::Err(error) => {
+            const message: String = f"{error}";
+            Result::Err(TestError::failed(message.as_str()))
+        }
+    };
+}
+
+/// The refusal reading `text` as a `T`, printed.
+function refusal<T>(text: Str) -> Result<String, TestError> where T: FromJson {
+    const value: JsonValue = parsed(text)?;
+    return match (T::from_json(&value)) {
+        Result::Ok(_) => { Result::Err(TestError::failed(Str::from("the value must be refused"))) }
+        Result::Err(error) => { Result::Ok(f"{error}") }
+    };
+}
+
+function sample() -> Settings {
+    mut tags: Array<String> = Array::new();
+    tags.push(String::from_str(Str::new("fast")));
+    tags.push(String::from_str(Str::new("safe")));
+    return Settings {
+        name: String::from_str(Str::new("main")),
+        enabled: true,
+        mode: Mode::Loud,
+        limits: Limits { count: 12, ratio: 0.5 },
+        tags: tags,
+        note: Option::Some(String::from_str(Str::new("checked"))),
+    };
+}
+
+/// Every field, a nested derived struct and enum among them, is written
+/// and read back as it was.
+![test]
+function a_struct_round_trips() -> Result<(), TestError> {
+    const original: Settings = sample();
+    const text: String = serializer::stringify(&original.to_json());
+    const back: Settings = read_as::<Settings>(text.as_str())?;
+    return expect(back == original, Str::new("the struct read back is the struct written"));
+}
+
+/// A struct is an object of its fields in declaration order; an enum is
+/// its variant's name.
+![test]
+function the_written_form_is_an_object_of_fields() -> Result<(), TestError> {
+    const text: String = serializer::stringify(&Limits { count: 3, ratio: 1.5 }.to_json());
+    expect_eq(text, String::from_str(Str::new("{\"count\":3,\"ratio\":1.5}")))?;
+    const mode: String = serializer::stringify(&Mode::Quiet.to_json());
+    return expect_eq(mode, String::from_str(Str::new("\"Quiet\"")));
+}
+
+/// `rename` names the member in both directions; the field's own name is
+/// not read.
+![test]
+function rename_names_the_member() -> Result<(), TestError> {
+    const text: String = serializer::stringify(&Renamed { port: 8080 }.to_json());
+    expect_eq(text, String::from_str(Str::new("{\"port_number\":8080}")))?;
+    const back: Renamed = read_as::<Renamed>(Str::new("{\"port_number\":443}"))?;
+    expect_eq(back.port, 443 as u16)?;
+    const refused: String = refusal::<Renamed>(Str::new("{\"port\":443}"))?;
+    return expect_eq(refused, String::from_str(Str::new("at .port_number: expected a value, found nothing")));
+}
+
+/// A skipped field is never written, and is read as its type's default
+/// even when the member is there.
+![test]
+function skip_leaves_the_field_out() -> Result<(), TestError> {
+    const text: String = serializer::stringify(&Skipping { kept: 1, cache: 99 }.to_json());
+    expect_eq(text, String::from_str(Str::new("{\"kept\":1}")))?;
+    const back: Skipping = read_as::<Skipping>(Str::new("{\"kept\":2,\"cache\":7}"))?;
+    expect_eq(back.kept, 2 as i64)?;
+    return expect_eq(back.cache, 0 as i64);
+}
+
+/// `default` reads an absent member as the type's default, and a present
+/// one as written.
+![test]
+function default_fills_an_absent_member() -> Result<(), TestError> {
+    const absent: Defaulted = read_as::<Defaulted>(Str::new("{}"))?;
+    expect_eq(absent.retries, 0 as i64)?;
+    expect_eq(absent.label, String::new())?;
+    const present: Defaulted = read_as::<Defaulted>(Str::new("{\"retries\":5,\"label\":\"x\"}"))?;
+    expect_eq(present.retries, 5 as i64)?;
+    return expect_eq(present.label, String::from_str(Str::new("x")));
+}
+
+/// `skip_none` leaves out a member that writes `null`; one without it
+/// writes the `null`.  Either reads an absent member as `None`.
+![test]
+function skip_none_leaves_out_a_null_member() -> Result<(), TestError> {
+    const empty: Sparse = Sparse { nickname: Option::None, always: Option::None };
+    expect_eq(serializer::stringify(&empty.to_json()), String::from_str(Str::new("{\"always\":null}")))?;
+    const full: Sparse = Sparse { nickname: Option::Some(String::from_str(Str::new("n"))), always: Option::None };
+    expect_eq(serializer::stringify(&full.to_json()), String::from_str(Str::new("{\"nickname\":\"n\",\"always\":null}")))?;
+    const back: Sparse = read_as::<Sparse>(Str::new("{}"))?;
+    expect(back.nickname.is_none(), Str::new("an absent member reads as None"))?;
+    return expect(back.always.is_none(), Str::new("an absent member reads as None without skip_none too"));
+}
+
+/// A member the struct does not name is ignored.
+![test]
+function unknown_members_are_ignored() -> Result<(), TestError> {
+    const back: Limits = read_as::<Limits>(Str::new("{\"count\":4,\"extra\":[1,2],\"ratio\":2.0}"))?;
+    return expect(back == Limits { count: 4, ratio: 2.0 }, Str::new("the named members are read"));
+}
+
+/// An absent member whose type reads nothing from `null` is refused as
+/// missing, by its key.
+![test]
+function an_absent_member_is_missing() -> Result<(), TestError> {
+    const refused: String = refusal::<Limits>(Str::new("{\"ratio\":1.0}"))?;
+    return expect_eq(refused, String::from_str(Str::new("at .count: expected a value, found nothing")));
+}
+
+/// A member of the wrong shape is refused with the path to it, through
+/// nested structs and arrays.
+![test]
+function a_wrong_member_is_refused_with_its_path() -> Result<(), TestError> {
+    const nested: String = refusal::<Settings>(Str::new(
+        "{\"name\":\"a\",\"enabled\":true,\"mode\":\"Quiet\",\"limits\":{\"count\":\"many\",\"ratio\":1.0},\"tags\":[],\"note\":null}"))?;
+    expect_eq(nested, String::from_str(Str::new("at .limits.count: expected an i64, found a string")))?;
+    const element: String = refusal::<Settings>(Str::new(
+        "{\"name\":\"a\",\"enabled\":true,\"mode\":\"Quiet\",\"limits\":{\"count\":1,\"ratio\":1.0},\"tags\":[\"x\",2],\"note\":null}"))?;
+    return expect_eq(element, String::from_str(Str::new("at .tags[1]: expected a string, found a number")));
+}
+
+/// A struct is read only from an object, an enum only from one of its
+/// variants' names.
+![test]
+function the_wrong_kind_of_value_is_refused() -> Result<(), TestError> {
+    const not_object: String = refusal::<Limits>(Str::new("[1,2]"))?;
+    expect_eq(not_object, String::from_str(Str::new("expected an object, found an array")))?;
+    const unknown_variant: String = refusal::<Mode>(Str::new("\"Silent\""))?;
+    expect_eq(unknown_variant, String::from_str(Str::new("expected a Mode, found a string")))?;
+    const read: Mode = read_as::<Mode>(Str::new("\"Loud\""))?;
+    return expect(read == Mode::Loud, Str::new("a variant is read by its name"));
+}
+
+/// A generic struct's derivation reads and writes each instance through
+/// its argument's own `ToJson` and `FromJson`.
+![test]
+function a_generic_struct_round_trips() -> Result<(), TestError> {
+    const numbers: Pair<i64> = Pair::<i64> { first: -3, second: 9 };
+    const text: String = serializer::stringify(&numbers.to_json());
+    expect_eq(text, String::from_str(Str::new("{\"first\":-3,\"second\":9}")))?;
+    const words: Pair<String> = read_as::<Pair<String>>(Str::new("{\"first\":\"a\",\"second\":\"b\"}"))?;
+    expect_eq(words.first, String::from_str(Str::new("a")))?;
+    return expect_eq(words.second, String::from_str(Str::new("b")));
+}

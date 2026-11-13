@@ -59,7 +59,7 @@ import compiler::passes::type_resolution::{ TypeResolutionPasses, TypeResolution
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
-    EnumVariant, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock, MethodDecl,
+    EnumVariant, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock, JsonFieldOptions, MethodDecl,
     StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -4147,6 +4147,19 @@ type struct SemaVisitor {
                     const field: FieldDecl* = DeclarationNode::field_of(s.fields[i]);
                     if (field == null) { continue; }
                     const field_name: string = this.intern.resolve(field.name);
+                    const json: boolean = item == LangItem::ToJson || item == LangItem::FromJson;
+                    const options: JsonFieldOptions = JsonFieldOptions::of(s.fields[i], field_name);
+                    // A field read as its type's `default()` - always when
+                    // skipped, when its member is absent with `default` - needs
+                    // that type to have `Default`, which the implementation's
+                    // bounds do not give a parameter.
+                    if (item == LangItem::FromJson && (options.skip || options.defaulted)
+                            && !this.json_field_default_holds(field.resolved_type, owner_name, field_name,
+                                   if (options.skip) { "skip" } else { "default" }, annotation_span(field.type_annotation))) {
+                        holds = false;
+                    }
+                    // A skipped field is neither written nor read.
+                    if (json && options.skip) { continue; }
                     if (!this.derived_part_holds(field.resolved_type, standard, item, &f"field `{field_name}`",
                             owner_name, annotation_span(field.type_annotation), node.derived_removal)) {
                         holds = false;
@@ -4205,6 +4218,39 @@ type struct SemaVisitor {
             d = d.help(f"give `{shown_part}` `{trait_name}` - `with [{trait_name}]` on its declaration, or an implementation by hand - or remove `{trait_name}` from `{owner_name}`'s `with` clause");
         } else {
             d = d.help(f"implement `{trait_name}` for `{owner_name}` by hand, or remove it from the `with` clause");
+        }
+        this.ctx.emit_diagnostic(d);
+        return false;
+    }
+
+    /// Whether a field a derived `FromJson` reads as its type's `default()`
+    /// - `![json(skip)]` or `![json(default)]`, `option` naming which - has a
+    /// type with `Default`; refused at `span` when it has not.  A parameter
+    /// of the type has no `Default`: the implementation bounds each by
+    /// `FromJson` alone.
+    json_field_default_holds(mut &this, part: TypeRef, owner_name: string, field_name: string, option: string,
+                             span: SourceSpan) -> boolean {
+        const t: Type* = this.arena.lookup(part);
+        const default_trait: DefId = this.ctx.generic_registry.wellknown(LangItem::Default);
+        if (t == null || !default_trait.is_valid()) { return true; }
+        const holds: boolean = if (t.kind == TypeKind::GenericParam) {
+            false
+        } else {
+            if (this.arena.contains_generic_param(part)) {
+                this.ctx.generic_registry.heads_for(default_trait, part, this.intern).length() > 0
+            } else {
+                this.trait_checker().type_implements_trait(part, default_trait, 0)
+            }
+        };
+        if (holds) { return true; }
+        const shown_part: string = this.arena.format_display(t);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0318_CANNOT_DERIVE,
+            f"`{owner_name}` cannot derive `FromJson`: field `{field_name}` is `![json({option})]`, so it is read as its type's `default()`, and `{shown_part}` does not implement `Default`");
+        d = d.at(span);
+        if (t.kind == TypeKind::GenericParam) {
+            d = d.help(f"a derived `FromJson` bounds `{shown_part}` by `FromJson` only: implement `FromJson` for `{owner_name}` by hand, or remove `{option}` from the field's `![json]`");
+        } else {
+            d = d.help(f"give `{shown_part}` `Default` - `with [Default]` on its declaration, or an implementation by hand - or remove `{option}` from the field's `![json]`");
         }
         this.ctx.emit_diagnostic(d);
         return false;
