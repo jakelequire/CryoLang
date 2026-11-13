@@ -6,11 +6,10 @@
 ///! same status `wait` reports, and genuine concurrency.
 ///!
 ///! `two_children_join_concurrently` is the one that earns the feature. Both
-///! children sleep, and the assertion is on WALL-CLOCK time against a
-///! single-worker executor: a `join` that blocked its worker would serialize
-///! them and blow the bound. It measures with `Instant::elapsed` rather than
-///! counting sleeps, because a sleep loop stretches unevenly under a loaded
-///! suite and would report the wrong thing.
+///! children sleep and are joined on a single-worker executor, and the
+///! assertion is on the ORDER of their spawns and reaps: a `join` that blocked
+///! its worker would reap the first before the second was ever spawned. An
+///! order does not stretch under a loaded host the way elapsed time does.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::ProcessAsync;
@@ -24,7 +23,6 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::io::error::{ IoError };
 import std::future;
-import std::time::clock::{ Instant };
 import std::process::command::{ Command, Output };
 import std::process::child::{ Child, ExitStatus };
 import std::test::error::{ TestError };
@@ -95,11 +93,59 @@ async function join_code(cmd: Command) -> i64 {
     return out;
 }
 
-/// Await two sleeping children through one task. Returns 0 when both exited
-/// cleanly, or a negative marker naming the one that did not.
-async function join_two_sleepers() -> i64 {
-    const p: (i64, i64) = await Futures::join(join_code(cmd_sleep()),
-                                              join_code(cmd_sleep()));
+/// When each of two children was spawned and reaped, as ticks of one counter.
+/// Both were alive at once exactly when each was spawned before the other was
+/// reaped.
+type struct ChildTimeline {
+    tick:           i64;
+    first_spawned:  i64;
+    first_reaped:   i64;
+    second_spawned: i64;
+    second_reaped:  i64;
+
+    static new() -> ChildTimeline {
+        return ChildTimeline {
+            tick: 0, first_spawned: -1, first_reaped: -1, second_spawned: -1, second_reaped: -1,
+        };
+    }
+
+    next(mut &this) -> i64 {
+        this.tick += 1;
+        return this.tick;
+    }
+
+    both_alive_at_once(&this) -> boolean {
+        return this.first_spawned < this.second_reaped
+            && this.second_spawned < this.first_reaped;
+    }
+}
+
+/// `join_code`, recording on `timeline` when the child was spawned and when
+/// it was reaped, as the `second` child or the first.
+async function join_code_recorded(cmd: Command, timeline: mut ChildTimeline*, second: boolean) -> i64 {
+    mut c: Command = cmd;
+    mut child: Child = match (c.spawn()) {
+        Result::Ok(ch)  => { ch }
+        Result::Err(_)  => { return -1; }
+    };
+    const spawned: i64 = timeline.next();
+    if (second) { timeline.second_spawned = spawned; } else { timeline.first_spawned = spawned; }
+    mut out: i64 = -2;
+    match (await child.join()) {
+        Result::Ok(st) => { out = st.exit_code().unwrap_or(-3) as i64; }
+        Result::Err(_) => { out = -4; }
+    }
+    const reaped: i64 = timeline.next();
+    if (second) { timeline.second_reaped = reaped; } else { timeline.first_reaped = reaped; }
+    return out;
+}
+
+/// Await two sleeping children through one task, recording them on
+/// `timeline`. Returns 0 when both exited cleanly, or a negative marker naming
+/// the one that did not.
+async function join_two_sleepers(timeline: mut ChildTimeline*) -> i64 {
+    const p: (i64, i64) = await Futures::join(join_code_recorded(cmd_sleep(), timeline, false),
+                                              join_code_recorded(cmd_sleep(), timeline, true));
     if (p.0 != 0) { return -10; }
     if (p.1 != 0) { return -11; }
     return 0;
@@ -146,46 +192,24 @@ function join_agrees_with_the_blocking_wait() -> Result<(), TestError> {
 
 /// The property the feature exists for. One executor worker, two sleeping
 /// children: awaiting them must overlap. A `join` that blocked its worker would
-/// run them back to back instead.
+/// run them back to back instead, reaping the first before the second's future
+/// was polled at all.
 ///
-/// The bound is a RATIO against a single child measured the same way, not an
-/// absolute time. How long the sleep command actually takes varies by platform
-/// and host - `ping -n 3` is ~2.1s where `sleep 1` is ~1.0s - so an absolute
-/// threshold either passes trivially or fails a working implementation. The
-/// ratio is ~1.0 when the waits overlap and ~2.0 when they serialize, and 1.6
-/// sits between with room for load on either side. Measured against a swap of
-/// `join` for the blocking `wait`, which moves it from 1.01 to 1.99.
-///
-/// `one_ms` is floor-checked because the ratio is only meaningful if the
-/// baseline really slept: a sleep command that failed to spawn and returned
-/// instantly would otherwise make any pair time look concurrent.
+/// Nothing here is timed. Between the first spawn and the second the worker
+/// only polls, so the first child, which sleeps for a second or more, is still
+/// running when the second is spawned however loaded the host is.
 ![test]
 function two_children_join_concurrently() -> Result<(), TestError> {
-    mut ex1: Executor = Executor::with_threads(1);
-    const t0: Instant = Instant::now();
-    const single: i64 = ex1.block_on(join_code(cmd_sleep()));
-    const one_ms: u64 = t0.elapsed().as_millis();
+    mut timeline: ChildTimeline = ChildTimeline::new();
+    mut ex: Executor = Executor::with_threads(1);
+    const both: i64 = ex.block_on(join_two_sleepers(&timeline));
 
-    mut ex2: Executor = Executor::with_threads(1);
-    const t1: Instant = Instant::now();
-    const both: i64 = ex2.block_on(join_two_sleepers());
-    const two_ms: u64 = t1.elapsed().as_millis();
-
-    match (expect_eq(single, 0 as i64)) {
-        Result::Ok(_)  => { }
-        Result::Err(e) => { return Result::Err(e); }
-    }
     match (expect_eq(both, 0 as i64)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
     }
-    match (expect(one_ms >= 300,
-                  Str::new("the sleeping child should actually sleep; baseline too short to compare against"))) {
-        Result::Ok(_)  => { }
-        Result::Err(e) => { return Result::Err(e); }
-    }
-    return expect(two_ms * 10 < one_ms * 16,
-                  Str::new("two joined children should overlap, not serialize"));
+    return expect(timeline.both_alive_at_once(),
+                  Str::new("two joined children should both be alive at once, not run back to back"));
 }
 
 /// Off an executor there is neither reactor nor pool, so a `ChildWait` polled
