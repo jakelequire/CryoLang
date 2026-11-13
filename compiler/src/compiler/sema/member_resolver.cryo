@@ -17,7 +17,7 @@ import compiler::types::{
     type_ref, type_base, arena, compound, user_defined, generic, checker, ownership, trait_checker, TypeKind
 };
 import compiler::resolver::{ symbol_str, intern_table };
-import compiler::ast::{ declaration, expression, MemberPin, node, TypeAnnotation, Visibility };
+import compiler::ast::{ declaration, expression, MemberPin, node, TraitRef, TypeAnnotation, Visibility };
 import compiler::lex::{ Token, TokenType };
 import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
 import compiler::compilation_context::{ CompilationContext };
@@ -716,6 +716,19 @@ type struct MemberResolver {
         const element_expected: TypeRef = visitor.state.expected_type;
         visitor.state.expected_type = TypeRef::invalid();
         const array_type: TypeRef = visitor.resolve_expr(access.array);
+        // A type parameter one bound in scope gives `IndexView` at a
+        // written index type is indexed at that type: `0..2` under
+        // `C: IndexView<Range<i64>>` is a `Range<i64>`.
+        const view_id: DefId = this.ctx.generic_registry.wellknown(LangItem::IndexView);
+        const viewed_base: TypeRef = this.types.peel_indirection(array_type);
+        const viewed_t: Type* = this.arena.lookup(if (viewed_base.is_valid()) { viewed_base } else { array_type });
+        if (view_id.is_valid() && viewed_t != null && viewed_t.kind == TypeKind::GenericParam) {
+            const bounds: [const TraitRef*] = visitor.binding.bounds_naming(
+                if (viewed_base.is_valid()) { viewed_base } else { array_type }, view_id);
+            if (bounds.length() == 1 && bounds[0].argument_types.length() == 1) {
+                visitor.state.expected_type = bounds[0].argument_types[0];
+            }
+        }
         const index_type: TypeRef = visitor.resolve_expr(access.index);
         visitor.state.expected_type = element_expected;
         if (!array_type.is_valid()) { return TypeRef::invalid(); }
@@ -874,8 +887,10 @@ type struct MemberResolver {
     /// its call reports: the view was what `[]` asked for.  A base that
     /// carries the walked body's parameters (`&Array<T>`) is viewed when an
     /// implementation's where-clause holds for it as written, and the
-    /// body's copies specialize the call.  A base that IS a parameter, or
-    /// an index in the body's parameters, is indexed by `Index` alone.
+    /// body's copies specialize the call.  A base that IS a parameter is
+    /// viewed when a bound in scope gives it `IndexView` at the index's
+    /// type, and the call is answered by that bound.  An index in the body's
+    /// parameters is indexed by `Index` alone.
     try_index_view(mut &this, visitor: mut SemaVisitor*, e: ExpressionNode*, access: ArrayAccessExpr*,
                    ty: TypeRef, index_ty: TypeRef) -> mut ExpressionNode* {
         const view_id: DefId = this.ctx.generic_registry.wellknown(LangItem::IndexView);
@@ -886,20 +901,25 @@ type struct MemberResolver {
             base_ty = t.as_reference().referent;
             t = this.arena.lookup(base_ty);
         }
-        if (t == null || t.kind == TypeKind::GenericParam || this.types.contains_generic_param(index_ty)) {
-            return null;
-        }
-        // No implementation can name a fixed array's length, so a `[T; N]`
-        // is viewed through the slice over its elements that the compiler
-        // builds for it, as its reference converts to one.
+        if (t == null || this.types.contains_generic_param(index_ty)) { return null; }
         mut receiver: mut ExpressionNode* = access.array;
-        if (t.kind == TypeKind::Array) {
-            receiver = visitor.slice_view(access.array);
-            if (receiver == null || !receiver.resolved_type.is_valid()) { return null; }
-            base_ty = this.arena.lookup(receiver.resolved_type).as_reference().referent;
-        }
         const index_args: [TypeRef] = [index_ty];
-        if (this.trait_checker().implementation_at(view_id, &index_args, base_ty) == null) { return null; }
+        if (t.kind == TypeKind::GenericParam) {
+            if (!this.binding.param_bounded_by(t.as_generic_param(), view_id)
+                    || !visitor.calls.scope_gives(base_ty, view_id, &index_args, 0)) {
+                return null;
+            }
+        } else {
+            // No implementation can name a fixed array's length, so a `[T; N]`
+            // is viewed through the slice over its elements that the compiler
+            // builds for it, as its reference converts to one.
+            if (t.kind == TypeKind::Array) {
+                receiver = visitor.slice_view(access.array);
+                if (receiver == null || !receiver.resolved_type.is_valid()) { return null; }
+                base_ty = this.arena.lookup(receiver.resolved_type).as_reference().referent;
+            }
+            if (this.trait_checker().implementation_at(view_id, &index_args, base_ty) == null) { return null; }
+        }
         const member: mut ExpressionNode* = this.lang_method_callee(receiver, LangItem::IndexViewView, e.span);
         if (member == null) { return null; }
         mut call: mut ExpressionNode* = ExpressionNode::call_expr(member, e.span);
