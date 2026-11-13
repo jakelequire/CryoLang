@@ -2827,7 +2827,10 @@ or the method takes `mut &this` - the smart-pointer pattern.  On each
 pointee a call `b.m()` names the method `m` before a field `m`, as a call on
 the pointee itself does, so a private field never hides a public method of
 its name; a pointee with no such method has its field `m` called, when the
-field holds a function.
+field holds a function.  A receiver reached through a reference or a raw
+pointer (`b: &Boxed<Vec2>`, `b: Boxed<Vec2>*`) coerces the same way: its
+members are the referenced value's, so they are that value's `Target`'s
+where it has none.
 
 ```cryo
 type struct Boxed<T> { value: T; }
