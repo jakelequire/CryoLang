@@ -178,6 +178,30 @@ def tag(vis):
     return vis if vis in ("private", "internal") else ""
 
 
+def method_entry(m, owner, label):
+    """The index entry for a METHOD_RE match on `owner`, whose body's current
+    visibility label is `label`."""
+    vis, static, name, generics, args, ret = m.groups()
+    joiner = "::" if static else "."
+    sig = f"{owner}{joiner}{name}{clean_sig(generics)}({clean_sig(args)})"
+    if ret:
+        sig += f" -> {clean_sig(ret)}"
+    return ("method", sig, tag(vis or label))
+
+
+def members_on_opening_line(owner, code):
+    """The methods a body declares on the line that opens it, as a one-line
+    trait does: `type trait Add<Rhs, Output> { add(&this, rhs: &Rhs) -> Output; }`.
+    Each ends in `;`, so the text after the `{` is read one `;`-ended piece
+    at a time; the lines after this one are read as members already."""
+    found = []
+    for piece in code.split("{", 1)[1].split(";"):
+        m = METHOD_RE.match(piece + ";")
+        if m and m.group(3) not in KEYWORDS:
+            found.append(method_entry(m, owner, None))
+    return found
+
+
 def scan_file(path):
     """Return (namespace, [entries]) for one .cryo file."""
     ns = None
@@ -251,6 +275,7 @@ def scan_file(path):
             if "{" in code:
                 type_stack.append([name, depth, None])
                 opened_type = True
+                entries.extend(members_on_opening_line(name, code))
 
         if not opened_type:
             m = TRAIT_RE.match(code)
@@ -260,6 +285,7 @@ def scan_file(path):
                 if "{" in code:
                     type_stack.append([name, depth, None])
                     opened_type = True
+                    entries.extend(members_on_opening_line(name, code))
 
         if not opened_type:
             m = IMPL_RE.match(code)
@@ -298,13 +324,7 @@ def scan_file(path):
             elif in_body and member_depth:
                 m = METHOD_RE.match(code)
                 if m and m.group(3) not in KEYWORDS:
-                    vis, static, name, generics, args, ret = m.groups()
-                    owner = type_stack[-1][0]
-                    joiner = "::" if static else "."
-                    sig = f"{owner}{joiner}{name}{clean_sig(generics)}({clean_sig(args)})"
-                    if ret:
-                        sig += f" -> {clean_sig(ret)}"
-                    entries.append(("method", sig, tag(vis or label)))
+                    entries.append(method_entry(m, type_stack[-1][0], label))
 
             # A module's constant is at the top level and a type's directly in
             # the type's body or inherent block; one deeper is a function's
