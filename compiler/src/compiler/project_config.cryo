@@ -124,7 +124,7 @@ type struct BinTarget {
 // Dependency: entries under [dependencies]
 
 /// What kind of source a `[dependencies]` entry points at.
-type enum DepKind {
+type enum DepKind with [Clone] {
     /// Local filesystem path (relative to the consumer's project root).
     Path;
     /// Remote git repository fetched into the global cryo cache and
@@ -138,7 +138,7 @@ type enum DepKind {
 /// Which kind of ref selects a git dep's commit.  At most one of
 /// `version`, `tag`, `branch`, `rev` may appear in the inline table.
 /// `None` is only valid for non-git deps.
-type enum GitRefKind {
+type enum GitRefKind with [Clone] {
     None;
     /// `version = "0.1.0"` or `version = "^0.1.0"`.  Resolves to the
     /// highest matching tag at fetch time.
@@ -168,41 +168,40 @@ type enum GitRefKind {
 /// `alias` is the top-level namespace the consumer expects, currently
 /// informational; a future warning fires if the dep's source declares
 /// a different one.
-type struct Dependency {
-    name:  string;
+type struct Dependency with [Clone] {
+    name:  String;
     kind:  DepKind;
-    alias: string;
+    alias: String;
 
     // ---- Path deps ----
     /// Filesystem path relative to the consumer's project root.
     /// Empty for git deps.
-    path:  string;
+    path:  String;
 
     // ---- Git deps ----
     /// `https://...`, `git@...:...`, etc.  Empty for path deps.
-    git_url:  string;
+    git_url:  String;
     /// Which of `version`/`tag`/`branch`/`rev` was supplied.
     /// `None` for path deps.
     ref_kind: GitRefKind;
     /// The literal value of whichever ref-key was supplied.
-    ref_val:  string;
+    ref_val:  String;
     /// Subpath into the repo where the dep's `cryoconfig` lives.
     /// Empty <=> repo root.
-    subdir:   string;
+    subdir:   String;
 
-    static empty() -> Dependency {
+    static named(name: str::Str) -> Dependency {
         return Dependency {
-            name:     "",
+            name:     String::from_str(name),
             kind:     DepKind::Path,  // overwritten by parse_inline_table_into_dep
-            alias:    "",
-            path:     "",
-            git_url:  "",
+            alias:    String::new(),
+            path:     String::new(),
+            git_url:  String::new(),
             ref_kind: GitRefKind::None,
-            ref_val:  "",
-            subdir:   "",
+            ref_val:  String::new(),
+            subdir:   String::new(),
         };
     }
-
 }
 
 /// One `[vendor.<Name>]` project pin.  Locks `import vendor::<Name>` for this
@@ -222,7 +221,7 @@ type struct Dependency {
 /// (`[vendor.RayLib]` -> "RayLib"); an empty `triple` means "use the build's
 /// own `target_triple`", which makes the pin a no-op.  Both fields are
 /// non-owning `string`s, so `VendorPin` is Copy and safe to pass/return by
-/// value (mirrors `BinTarget` / `Dependency`).
+/// value (mirrors `BinTarget`).
 type struct VendorPin {
     name:   string;
     triple: string;
@@ -765,9 +764,8 @@ type struct ProjectConfig {
                 "dependencies" => {
                     // KEY = { path = "...", alias = "..." }   (path dep)
                     // KEY = { git = "...", version = "..." }  (git dep)
-                    config.dependencies.push(Dependency::empty());
+                    config.dependencies.push(Dependency::named(str::Str::from(key)));
                     const idx: i64 = config.dependencies.length() as i64 - 1;
-                    config.dependencies[idx].name = key;
                     config.error_count = config.error_count
                         + ProjectConfig::parse_inline_table_into_dep(raw_val, &config.dependencies[idx]);
                 }
@@ -1208,32 +1206,32 @@ type struct ProjectConfig {
             }
 
             if (key.eq("path")) {
-                dep.path = value;
+                dep.path = String::from_string(value);
                 saw_path = true;
             } else if (key.eq("git")) {
-                dep.git_url = value;
+                dep.git_url = String::from_string(value);
                 saw_git = true;
             } else if (key.eq("version")) {
                 dep.ref_kind = GitRefKind::Version;
-                dep.ref_val  = value;
+                dep.ref_val  = String::from_string(value);
                 saw_version  = true;
             } else if (key.eq("tag")) {
                 dep.ref_kind = GitRefKind::Tag;
-                dep.ref_val  = value;
+                dep.ref_val  = String::from_string(value);
                 saw_tag      = true;
             } else if (key.eq("branch")) {
                 dep.ref_kind = GitRefKind::Branch;
-                dep.ref_val  = value;
+                dep.ref_val  = String::from_string(value);
                 saw_branch   = true;
             } else if (key.eq("rev")) {
                 dep.ref_kind = GitRefKind::Rev;
-                dep.ref_val  = value;
+                dep.ref_val  = String::from_string(value);
                 saw_rev      = true;
             } else if (key.eq("subdir")) {
-                dep.subdir = value;
+                dep.subdir = String::from_string(value);
                 saw_subdir = true;
             } else if (key.eq("alias")) {
-                dep.alias = value;
+                dep.alias = String::from_string(value);
             } else {
                 fmt::eprintln(f"error: dependency '{dep.name}' uses unknown key '{key}'");
                 fmt::eprintf("  recognized keys: path, git, version, tag, branch, rev, subdir, alias\n");
@@ -1255,10 +1253,9 @@ type struct ProjectConfig {
 
         // Catch the most common authoring mistake: someone pasted a URL
         // into the `path` field instead of using `git`.
-        if (saw_path && ProjectConfig::looks_like_url(dep.path)) {
+        if (saw_path && ProjectConfig::looks_like_url(dep.path.as_str())) {
             fmt::eprintln(f"error: dependency '{dep.name}' has a URL in `path`; use `git = \"...\"` for remote sources");
-            fmt::eprintf("  e.g. `%s = { git = \"%s\", version = \"0.1.0\" }`\n",
-                dep.name, dep.path);
+            fmt::eprintln(f"  e.g. `{dep.name} = {{ git = \"{dep.path}\", version = \"0.1.0\" }}`");
             errors += 1;
         }
 
@@ -1301,21 +1298,21 @@ type struct ProjectConfig {
     /// Heuristic: does this look like a URL the user accidentally put in
     /// `path`?  Catches `https://`, `http://`, `git://`, `ssh://`, the
     /// `git@host:path` SCP-ish form, and bare `*.git` paths.
-    static looks_like_url(s_text: string) -> boolean {
-        const s: string = s_text;
-        if (s.starts_with("http://"))  { return true; }
-        if (s.starts_with("https://")) { return true; }
-        if (s.starts_with("git://"))   { return true; }
-        if (s.starts_with("ssh://"))   { return true; }
-        if (s.starts_with("git@"))     { return true; }
-        return s.ends_with(".git");
+    static looks_like_url(s: str::Str) -> boolean {
+        if (s.starts_with(&str::Str::from("http://")))  { return true; }
+        if (s.starts_with(&str::Str::from("https://"))) { return true; }
+        if (s.starts_with(&str::Str::from("git://")))   { return true; }
+        if (s.starts_with(&str::Str::from("ssh://")))   { return true; }
+        if (s.starts_with(&str::Str::from("git@")))     { return true; }
+        return s.ends_with(&str::Str::from(".git"));
     }
 }
 
 /// Deep copy.  All scalar fields are Copy; the owning arrays
 /// (`link_system`/`link_search`/`link_static`/`source_paths`/`bins`/
-/// `dependencies`) hold Copy elements (strings / BinTarget / Dependency),
-/// so each is rebuilt element-wise into an independent buffer.  Used by
+/// `vendor_pins`) hold Copy elements (strings / BinTarget / VendorPin), so
+/// each is rebuilt element-wise into an independent buffer; a `Dependency`
+/// owns its text and is cloned.  Used by
 /// multi-target builds to derive a per-target view without consuming the
 /// shared base config.
 implement trait Clone for struct ProjectConfig {
@@ -1346,7 +1343,7 @@ implement trait Clone for struct ProjectConfig {
         for (mut i: i64 = 0; i < this.source_paths.length(); i++)  { source_paths_c.push(this.source_paths[i]); }
         for (mut i: i64 = 0; i < this.bins.length(); i++)          { bins_c.push(this.bins[i]); }
         for (mut i: i64 = 0; i < this.libs.length(); i++)          { libs_c.push(this.libs[i]); }
-        for (mut i: i64 = 0; i < this.dependencies.length(); i++)  { deps_c.push(this.dependencies[i]); }
+        for (mut i: i64 = 0; i < this.dependencies.length(); i++)  { deps_c.push(this.dependencies[i].clone()); }
         for (mut i: i64 = 0; i < this.vendor_pins.length(); i++)   { vendor_pins_c.push(this.vendor_pins[i]); }
         return ProjectConfig {
             project_name:  this.project_name,
