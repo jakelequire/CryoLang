@@ -2275,6 +2275,47 @@ type struct FieldDecl {
     }
 }
 
+/// What a field's `![json(...)]` directive asks of the `ToJson` and
+/// `FromJson` a `with` clause generates: the member's key, and whether the
+/// field is left out of both (`skip`), read as its type's `default()` when
+/// its member is absent (`default`), or left out of the written object when
+/// it writes `null` (`skip_none`).  A field with no such directive is the
+/// member named as the field, read and written always.
+type struct JsonFieldOptions {
+    /// The key as the content of a string literal, escapes as written.
+    key:       string;
+    skip:      boolean;
+    defaulted: boolean;
+    skip_none: boolean;
+
+    /// The options `field`'s directives give it; `name` is the field's own
+    /// name, the key unless a `rename` replaces it.  An option this does not
+    /// know is left to the directive check, which refuses it.
+    static of(field: DeclarationNode*, name: string) -> JsonFieldOptions {
+        mut options: JsonFieldOptions = JsonFieldOptions {
+            key: name, skip: false, defaulted: false, skip_none: false,
+        };
+        if (field == null) { return options; }
+        for (mut d: i64 = 0; d < field.attached_directives.length(); d++) {
+            const directive: DirectiveNode* = field.attached_directives[d];
+            if (directive == null || directive.directive_kind.as_string() != "json") { continue; }
+            for (mut a: i64 = 0; a < directive.args.length(); a++) {
+                const argument_name: string = directive.args[a].name;
+                if (directive.args[a].kind == DirectiveArgKind::KeyValue) {
+                    if (argument_name == "rename" && directive.args[a].value_kind == DirectiveArgKind::StringLit) {
+                        options.key = directive.args[a].str_value;
+                    }
+                } else if (directive.args[a].kind == DirectiveArgKind::Ident) {
+                    if (argument_name == "skip") { options.skip = true; }
+                    if (argument_name == "default") { options.defaulted = true; }
+                    if (argument_name == "skip_none") { options.skip_none = true; }
+                }
+            }
+        }
+        return options;
+    }
+}
+
 implement trait Allocate for struct FieldDecl {
     static allocate(size: u64, align: u64) -> mut void* {
         return cryo_ast_arena_alloc(size, align);
