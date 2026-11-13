@@ -41,6 +41,7 @@ import compiler::types::{
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name, resolver };
 import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResBase, ResSlot };
 import compiler::decl_index::{ DeclarationIndex, GlobalEntry, OverloadId };
+import utils::keyword::{ Keyword };
 import compiler::sema::{
     state, helpers, scope_manager, type_utils, literal_resolver, diagnostics,
     symbolic_checker, method_binding, pattern_resolver,
@@ -1137,7 +1138,54 @@ type struct SemaVisitor {
     }
 
     visit_expr_stmt(mut &this, stmt: Stmt*, node: ExprStmt*) -> void {
-        this.resolve_expr(node.expression);
+        const value_type: TypeRef = this.resolve_expr(node.expression);
+        this.warn_discarded_must_use(node.expression, value_type);
+    }
+
+    /// Warn when a statement discards a value that must be read: a value of
+    /// a type marked `![must_use]`, or the value a function or method marked
+    /// `![must_use]` returns.  A `Result` dropped this way is a failure
+    /// nobody sees.  Asked once the expression is typed, so the type is the
+    /// value's own and a call's callee is the one sema selected.
+    warn_discarded_must_use(mut &this, expression: ExpressionNode*, value_type: TypeRef) -> void {
+        if (expression == null || expression.generated || !value_type.is_valid()) { return; }
+        const marker: Keyword = Keyword::new("must_use");
+        const index: DeclarationIndex* = this.ctx.decl_index;
+        const type_declaration: DeclarationNode* =
+            index.declaration_of(index.def_of(value_type, this.ctx.type_arena));
+        const marked_type: boolean = type_declaration != null && type_declaration.has_directive(marker);
+        const shown: string = this.arena.resolve_display_name_short(value_type);
+        mut warning: Diagnostic = Diagnostic::warning(ErrorCode::W0017_MUST_USE_DISCARDED,
+            fmt::format("this statement discards a value of type `%s`, which must be used", shown));
+        if (!marked_type) {
+            const call: CallExpr* = ExpressionNode::call_of(expression);
+            if (call == null) { return; }
+            // A generic free function's call records its template, whose
+            // instance has no entry until monomorphization; a call pinned
+            // to an entry is answered by it; a method call monomorphization
+            // has not pinned yet names its definition.
+            mut callee: DeclarationNode* = null;
+            if (call.resolved_template.is_valid()) {
+                const template: const TemplateEntry* =
+                    this.ctx.generic_registry.template_of_type(call.resolved_template);
+                if (template != null) { callee = template.ast_node; }
+            } else if (call.resolved_callee.is_some()) {
+                callee = index.entry_decl(call.resolved_callee.entry(index));
+            } else {
+                callee = call.method_named(index);
+            }
+            if (callee == null || !callee.has_directive(marker)) { return; }
+            const method: MethodDecl* = DeclarationNode::method_of(callee);
+            const callee_function: FunctionDecl* =
+                DeclarationNode::fn_of(if (method != null) { method.func } else { callee });
+            warning = Diagnostic::warning(ErrorCode::W0017_MUST_USE_DISCARDED,
+                fmt::format("this statement discards the value `%s` returns, which must be used",
+                    this.intern.resolve(callee_function.name)));
+        }
+        warning = warning.at_with_label(expression.span, "never read");
+        warning = warning.help(fmt::format(
+            "read the value, or bind it to `_` to discard it on purpose: `const _: %s = ...;`", shown));
+        this.ctx.emit_diagnostic(warning);
     }
 
     visit_return(mut &this, stmt: Stmt*, node: mut ReturnStmt*) -> void {

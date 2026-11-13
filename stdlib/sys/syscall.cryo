@@ -2377,3 +2377,136 @@ public extern "C" {
     function getaddrinfo(node: u8*, service: u8*, hints: u8*, res: mut (mut u8*)*) -> i32;
     function freeaddrinfo(res: mut u8*) -> void;
 }
+
+// ---------------------------------------------------------------------------
+// crypt32.dll: certificate stores and chain building, which std::net::tls
+// verifies a server's certificate through on Windows.  Like ws2_32 it is not
+// auto-linked by mingw; the windows-gnu link line adds -lcrypt32.
+//
+// Handles (HCERTSTORE, PCCERT_CONTEXT, PCCERT_CHAIN_CONTEXT) cross as
+// `void*`.  A store provider or policy given as a small integer cast to
+// LPCSTR crosses as `u64`.
+// ---------------------------------------------------------------------------
+
+/// X509_ASN_ENCODING | PKCS_7_ASN_ENCODING: the encoding every certificate
+/// handed to crypt32 here is in.
+![target(windows)]
+public const CERTIFICATE_ENCODING: u32 = 0x00010001;
+/// CERT_STORE_PROV_MEMORY: a store that lives in memory and is gone when
+/// it is closed.
+![target(windows)]
+public const CERT_STORE_PROV_MEMORY: u64 = 2;
+/// CERT_STORE_ADD_ALWAYS: add a certificate without looking for a copy
+/// already in the store.
+![target(windows)]
+public const CERT_STORE_ADD_ALWAYS: u32 = 4;
+/// CERT_CHAIN_POLICY_SSL: the policy of a TLS peer's chain.
+![target(windows)]
+public const CERT_CHAIN_POLICY_SSL: u64 = 4;
+/// AUTHTYPE_SERVER: the chain checked is a server's.
+![target(windows)]
+public const AUTHTYPE_SERVER: u32 = 2;
+
+/// CERT_ENHKEY_USAGE: the extended key usages a chain is asked to allow.
+![target(windows)]
+![repr(C)]
+public type struct CertificateEnhancedKeyUsage {
+    /// `cUsageIdentifier`: how many identifiers `identifiers` holds.
+    public identifier_count: u32;
+    /// `rgpszUsageIdentifier`: the usages' object identifiers, or null.
+    public identifiers: void*;
+}
+
+/// CERT_USAGE_MATCH: how a chain's usages must meet `usage`.
+![target(windows)]
+![repr(C)]
+public type struct CertificateUsageMatch {
+    /// `dwType`: every usage (0, USAGE_MATCH_TYPE_AND) or any one.
+    public match_type: u32;
+    /// `Usage`: the usages asked for; none asks for nothing.
+    public usage: CertificateEnhancedKeyUsage;
+}
+
+/// CERT_CHAIN_PARA: what `CertGetCertificateChain` builds a chain for.
+![target(windows)]
+![repr(C)]
+public type struct CertificateChainParameters {
+    /// `cbSize`: this structure's size in bytes, 32.
+    public size: u32;
+    /// `RequestedUsage`: the usages the chain must allow.
+    public requested_usage: CertificateUsageMatch;
+}
+
+/// SSL_EXTRA_CERT_CHAIN_POLICY_PARA: the TLS policy's own parameters.
+![target(windows)]
+![repr(C)]
+public type struct SslChainPolicyParameters {
+    /// `cbSize`: this structure's size in bytes, 24.
+    public size: u32;
+    /// `dwAuthType`: AUTHTYPE_SERVER for a server's chain.
+    public authentication_type: u32;
+    /// `fdwChecks`: checks to leave out; 0 leaves none out.
+    public ignored_checks: u32;
+    /// `pwszServerName`: the UTF-16 name the leaf must carry, or null to
+    /// check no name.
+    public server_name: u16*;
+}
+
+/// CERT_CHAIN_POLICY_PARA: what `CertVerifyCertificateChainPolicy` checks
+/// a chain under.
+![target(windows)]
+![repr(C)]
+public type struct CertificateChainPolicyParameters {
+    /// `cbSize`: this structure's size in bytes, 16.
+    public size: u32;
+    /// `dwFlags`: errors to ignore; 0 ignores none.
+    public flags: u32;
+    /// `pvExtraPolicyPara`: the policy's own parameters.
+    public extra: SslChainPolicyParameters*;
+}
+
+/// CERT_CHAIN_POLICY_STATUS: the verdict of
+/// `CertVerifyCertificateChainPolicy`.
+![target(windows)]
+![repr(C)]
+public type struct CertificateChainPolicyStatus {
+    /// `cbSize`: this structure's size in bytes, 24.
+    public size: u32;
+    /// `dwError`: 0 when the chain meets the policy, else the reason.
+    public error: u32;
+    /// `lChainIndex`: the chain the error is in.
+    public chain_index: i32;
+    /// `lElementIndex`: the certificate in that chain the error is at.
+    public element_index: i32;
+    /// `pvExtraPolicyStatus`: the policy's own status, or null.
+    public extra: void*;
+}
+
+![target(windows)]
+![link("crypt32")]
+public extern "C" {
+    // Stores.
+    function CertOpenStore(lpszStoreProvider: u64, dwEncodingType: u32, hCryptProv: u64,
+                           dwFlags: u32, pvPara: void*) -> void*;
+    function CertCloseStore(hCertStore: void*, dwFlags: u32) -> i32;
+    function CertAddEncodedCertificateToStore(hCertStore: void*, dwCertEncodingType: u32,
+                                              pbCertEncoded: u8*, cbCertEncoded: u32,
+                                              dwAddDisposition: u32, ppCertContext: void*) -> i32;
+
+    // Certificates.
+    function CertCreateCertificateContext(dwCertEncodingType: u32, pbCertEncoded: u8*,
+                                          cbCertEncoded: u32) -> void*;
+    function CertFreeCertificateContext(pCertContext: void*) -> i32;
+
+    // Chains: built by an engine (null: the current user's, trusting the
+    // system's roots and fetching one it does not hold), checked against a
+    // policy.
+    function CertGetCertificateChain(hChainEngine: void*, pCertContext: void*, pTime: void*,
+                                     hAdditionalStore: void*, pChainPara: CertificateChainParameters*,
+                                     dwFlags: u32, pvReserved: void*,
+                                     ppChainContext: mut (void*)*) -> i32;
+    function CertFreeCertificateChain(pChainContext: void*) -> void;
+    function CertVerifyCertificateChainPolicy(pszPolicyOID: u64, pChainContext: void*,
+                                              pPolicyPara: CertificateChainPolicyParameters*,
+                                              pPolicyStatus: mut CertificateChainPolicyStatus*) -> i32;
+}
