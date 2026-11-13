@@ -21,7 +21,7 @@ namespace CryoTests::Tests::Stdlib::IterT;
 
 import std::core::result::{ Result };
 import std::core::option::{ Option };
-import std::core::iter::{ EnumerateIter, Iterator, MapIter, TakeIter, ZipIter };
+import std::core::iter::{ Iterator };
 import std::core::ops::{ Range, RangeInclusive };
 import std::collections::pair::{ Pair };
 import std::collections::str::{ Str };
@@ -275,43 +275,20 @@ function range_char_walks_ascii_letters() -> Result<(), TestError> {
 }
 
 // ============================================================================
-// TakeIter adapter - lazy `take(n)` combinator
+// `take(n)` - lazy combinator
 // ============================================================================
 //
-// `take(this, n)` is a self-returning trait default: it consumes the
-// iterator by value and returns a `TakeIter<Self>` yielding at most `n`
-// elements.  It's instantiated lazily at the call site (eager
-// materialization would self-apply `TakeIter::take` forever).  Keeping the
-// where-clause-generic `Iterator` impl on `TakeIter` (its `next` introduces
-// the element type `A` only via `where I: Iterator<A>`) requires the
-// monomorphizer to recover a concrete spec arg's InstantiatedType wrapper
-// when checking/deriving the impl's bounds; without it the impl was dropped
-// and `count`/`next` never registered for the spec.  These pin the
-// consumption paths that work today: a named-iterator receiver consumed
-// inline by a terminal default (`count`) or driven by `for`-in, plus
-// binding the adapter to an explicit-typed local
-// (`mut t: TakeIter<..> = it.take(n)`) and consuming THAT with `count` /
-// `for`-in.  The typed-local binding requires the two textual
-// occurrences of `TakeIter<Range<i32>>` (the annotation, resolved before
-// monomorphization, and the `take(n)` return, resolved during it) to
-// monomorphize to ONE concrete struct; the monomorphizer keys its spec cache
-// on the arena's canonical instantiation id (`create_instantiation`, which
-// interns on `(base, type_args)`), so a nested arg that arrives as an
-// InstantiatedType wrapper in one and a concrete struct in the other is
-// already the same id and dedupes, instead of producing two structs that
-// compare unequal.
-//
-// Consuming the adapter with `fold` (an own-generic default whose signature
-// names the element type via `(Acc, Item) -> Acc`) also works: the adapter's
-// element type comes from the impl's where-clause (`I: Iterator<A>`), and the
-// lazy method-specializer recovers it from the spec'd impl's already-resolved
-// signature when re-resolution of the cloned annotation can't bind it.
-//
-// Chaining adapters (`it.take(a).take(b)`) works too: the nested
-// `TakeIter<TakeIter<..>>` monomorphizes recursively (its where-clause `A` is
-// derived through the inner adapter's own Iterator impl), and its by-value
-// `this` receiver - now larger than 8 bytes - is reconstructed from its two
-// DirectPair LLVM slots in the method prologue.
+// `take(this, n)` is a trait default returning `implement Iterator`: it
+// consumes the iterator by value and returns an adapter yielding at most `n`
+// elements, instantiated lazily at the call site (the adapter's own copy of
+// the default would otherwise instantiate itself without end).  The
+// adapter's element type is read from its implementation's where-clause
+// (`I: Iterator<A>`).  These pin a receiver consumed inline by a terminal
+// default (`count`, `fold`) or driven by `for`-in, the result bound to a
+// local typed `implement Iterator<i32>` and consumed there, and chained
+// adapters (`it.take(a).take(b)`), whose by-value `this` receiver - larger
+// than 8 bytes - is reconstructed from its two LLVM slots in the method
+// prologue.
 
 ![test]
 function take_caps_count_at_n() -> Result<(), TestError> {
@@ -346,13 +323,10 @@ function take_drives_for_in_loop() -> Result<(), TestError> {
 
 ![test]
 function take_bound_to_typed_local_counts() -> Result<(), TestError> {
-    // Bind the adapter to an explicit `TakeIter<Range<i32>>` local, then
-    // count it.  The annotation and the `take(3)` return must denote ONE
-    // concrete type; before the spec-key canonicalization they monomorphized
-    // to two distinct structs and this failed type-checking (`expected
-    // TakeIter<Range<i32>>, found TakeIter<Range<i32>>`).
+    // Bind the adapter to a local typed `implement Iterator<i32>`, then
+    // count it: the local holds the one type `take(3)` returns.
     mut r: Range<i32> = Range::new(0, 10);
-    mut t: TakeIter<Range<i32>> = r.take(3);
+    mut t: implement Iterator<i32> = r.take(3);
     return expect_eq(t.count(), 3);
 }
 
@@ -362,7 +336,7 @@ function take_typed_local_caps_when_n_exceeds_len() -> Result<(), TestError> {
     // capped at 100 still counts 4.  This exercises the inner iterator end
     // to end (a broken `inner` would not stop at the source's true length).
     mut r: Range<i32> = Range::new(5, 9);
-    mut t: TakeIter<Range<i32>> = r.take(100);
+    mut t: implement Iterator<i32> = r.take(100);
     return expect_eq(t.count(), 4);
 }
 
@@ -372,7 +346,7 @@ function take_typed_local_drives_for_in() -> Result<(), TestError> {
     // a count), proving the bound local carries a correct `inner`: the first
     // 4 of 2.. -> 2+3+4+5 = 14.
     mut r: Range<i32> = Range::new(2, 100);
-    mut t: TakeIter<Range<i32>> = r.take(4);
+    mut t: implement Iterator<i32> = r.take(4);
     mut sum: i32 = 0;
     for (x in t) { sum = sum + x; }
     return expect_eq(sum, 14);
@@ -384,7 +358,7 @@ function take_on_call_expression_receiver_counts() -> Result<(), TestError> {
     // binding.  The receiver `Range<i32>::new(..)` produces its instantiation
     // during the same inference walk that specializes `take`, so it must be
     // monomorphized on demand; otherwise `take` resolves to the unspecialized
-    // `TakeIter<This>` template (E0636) or crashes the mangler.
+    // adapter template (E0636) or crashes the mangler.
     return expect_eq(Range::<i32>::new(0, 100).take(4).count(), 4);
 }
 
@@ -402,7 +376,7 @@ function take_typed_local_folds() -> Result<(), TestError> {
     // The adapter's element type (`A` from `where I: Iterator<A>`) is recovered
     // for fold's `(Acc, Item) -> Acc` signature from the spec'd impl.
     mut r: Range<i32> = Range::new(5, 9);
-    mut t: TakeIter<Range<i32>> = r.take(100);
+    mut t: implement Iterator<i32> = r.take(100);
     return expect_eq(t.fold(0, iter_add_i32), 26);
 }
 
@@ -423,7 +397,7 @@ function take_on_call_expression_receiver_folds() -> Result<(), TestError> {
 ![test]
 function take_chain_caps_at_inner_min() -> Result<(), TestError> {
     // `r.take(10).take(3)`: the outer cap (3) wins -> count 3, not 10.
-    // Requires the nested `TakeIter<TakeIter<Range<i32>>>` to monomorphize and
+    // Requires the nested adapter over an adapter to monomorphize and
     // its >8-byte by-value `this` receiver to round-trip through both
     // DirectPair slots (a single-slot prologue dropped the upper half and
     // miscounted).
@@ -444,7 +418,7 @@ function take_call_expr_receiver_drives_for_in_twice() -> Result<(), TestError> 
     // receiver in the same function.  Regression: the second loop's iterator
     // binding was mistyped as the inner `Range<i32>` (the constructor's owner,
     // captured by the static-constructor side channel) instead of the
-    // `TakeIter` chain result, only when more than one such loop appeared.
+    // `take` chain's result, only when more than one such loop appeared.
     mut s1: i32 = 0;
     for (x in Range::<i32>::new(0, 100).take(5)) { s1 = s1 + x; }   // 0+1+2+3+4
     mut s2: i32 = 0;
@@ -464,18 +438,17 @@ function take_chain_drives_for_in_with_values() -> Result<(), TestError> {
 }
 
 // ============================================================================
-// MapIter / FilterIter adapters - `map` / `filter` combinators
+// `map` / `filter` combinators
 // ============================================================================
 //
-// `map<B>` is an own-generic self-returning default; `filter` is a
-// zero-own-generic one.  Both store a non-capturing function in a field, so
-// the element type(s) are struct parameters (`MapIter<I, A, O>`,
-// `FilterIter<I, A>`) rather than where-clause-only generics.  These pin
-// map/filter applied directly to an iterator and `map().filter()`.
+// `map<B>` is an own-generic default returning `implement Iterator<B>`;
+// `filter` is a zero-own-generic one.  Both adapters hold the callable in a
+// field.  These pin map/filter applied directly to an iterator and
+// `map().filter()`.
 //
 // Combinator-following-combinator chaining (a `map`/`filter` applied to
-// another adapter's result) now works for every adapter, including a
-// `TakeIter` receiver whose element lives only in its `where I: Iterator<A>`
+// another adapter's result) works for every adapter, including `take`'s,
+// whose element lives only in its implementation's `where I: Iterator<A>`
 // bound: the concrete element (`A := i32`) is cached on the spec'd impl at
 // monomorphization time and re-seeded when the trailing combinator's default
 // is lazily specialized.  The `chain_*` tests below pin `r.take(n).map(f)`,
@@ -531,10 +504,10 @@ function map_then_filter_composes() -> Result<(), TestError> {
 // ============================================================================
 //
 // An own-generic (`map<B>`) or zero-own-generic (`filter`) combinator applied
-// to ANOTHER adapter's result.  The hard case is a `TakeIter` receiver: its
-// element type is where-clause-only (`implement<I,A> Iterator<A> for
-// TakeIter<I> where I: Iterator<A>`), so the trailing combinator's default
-// must recover `A` from the cached impl-spec binding rather than a struct arg.
+// to ANOTHER adapter's result.  The hard case is `take`'s adapter: its
+// element type is where-clause-only (`implement<I, A> Iterator<A> for ...
+// where I: Iterator<A>`), so the trailing combinator's default must recover
+// `A` from the cached impl-spec binding rather than a struct arg.
 
 ![test]
 function chain_take_then_map_counts() -> Result<(), TestError> {
@@ -613,11 +586,11 @@ function chain_take_then_filter_then_map_folds() -> Result<(), TestError> {
 }
 
 // ============================================================================
-// ChainIter adapter - `chain` combinator
+// `chain` combinator
 // ============================================================================
 //
-// `chain` concatenates two iterators of the same element type; like `take`,
-// `ChainIter`'s element is where-bound-only (`where I: Iterator<A>,
+// `chain` concatenates two iterators of the same element type; like `take`'s,
+// its adapter's element is where-bound-only (`where I: Iterator<A>,
 // J: Iterator<A>`).  The second iterator is passed as a named/typed-local
 // argument (the supported operand form, same as combinator receivers).
 
@@ -687,7 +660,7 @@ function enumerate_pairs_index_with_value() -> Result<(), TestError> {
     // Range(10,13) -> (0,10), (1,11), (2,12).  Assert both halves of each
     // pair, walking the index and the value in lockstep.
     mut r: Range<i32> = Range::new(10, 13);
-    mut e: EnumerateIter<Range<i32>> = r.enumerate();
+    mut e: implement Iterator<Pair<i64, i32>> = r.enumerate();
     mut want_idx: i64 = 0;
     mut want_val: i32 = 10;
     mut seen: i32 = 0;
@@ -713,7 +686,7 @@ function enumerate_pairs_index_with_value() -> Result<(), TestError> {
 ![test]
 function enumerate_empty_yields_nothing() -> Result<(), TestError> {
     mut r: Range<i32> = Range::new(5, 5);
-    mut e: EnumerateIter<Range<i32>> = r.enumerate();
+    mut e: implement Iterator<Pair<i64, i32>> = r.enumerate();
     const first: Option<Pair<i64, i32>> = e.next();
     return expect_none(&first,
         Str::new("enumerate over empty range should be immediately empty"));
@@ -730,9 +703,7 @@ function enumerate_count_matches_length() -> Result<(), TestError> {
 function take_then_enumerate_indexes_capped_run() -> Result<(), TestError> {
     // take(3) of 0..100, then enumerate -> three pairs (0,0),(1,1),(2,2);
     // sum first+second over all = (0+0)+(1+1)+(2+2) = 6.  Apply enumerate to
-    // the chained call expression directly (the nested adapter bound to a
-    // typed local then iterated is a separate pre-existing codegen gap,
-    // unrelated to enumerate - same failure with `MapIter<TakeIter<..>>`).
+    // the chained call expression directly.
     mut r: Range<i32> = Range::new(0, 100);
     mut total: i64 = 0;
     for (p in r.take(3).enumerate()) {
@@ -750,7 +721,7 @@ function zip_pairs_two_ranges() -> Result<(), TestError> {
     // (0,10), (1,11), (2,12): walk both halves of each pair in lockstep.
     mut a: Range<i32> = Range::new(0, 3);
     mut b: Range<i32> = Range::new(10, 13);
-    mut z: ZipIter<Range<i32>, Range<i32>> = a.zip(b);
+    mut z: implement Iterator<Pair<i32, i32>> = a.zip(b);
     mut want_a: i32 = 0;
     mut want_b: i32 = 10;
     mut seen: i32 = 0;
@@ -785,7 +756,7 @@ function zip_stops_at_shorter_side() -> Result<(), TestError> {
 function zip_empty_side_yields_nothing() -> Result<(), TestError> {
     mut a: Range<i32> = Range::new(0, 4);
     mut b: Range<i32> = Range::new(7, 7);
-    mut z: ZipIter<Range<i32>, Range<i32>> = a.zip(b);
+    mut z: implement Iterator<Pair<i32, i32>> = a.zip(b);
     const first: Option<Pair<i32, i32>> = z.next();
     return expect_none(&first,
         Str::new("zip with an empty side should be immediately empty"));
@@ -835,14 +806,12 @@ function zip_two_coexisting_combos_each_correct() -> Result<(), TestError> {
 
 ![test]
 function nested_adapter_typed_local_consumes() -> Result<(), TestError> {
-    // Regression: a 2-level nested adapter bound to an explicit-typed local,
-    // then iterated.  The typed-local annotation
-    // (`MapIter<TakeIter<Range<i32>>, (i32) -> i32, i32>`, whose first arg is
-    // itself a where-bound adapter) must resolve in sema; if it doesn't, the
-    // binding's alloca is skipped and `m.next()` reads a null receiver.
-    // Single-level adapter locals resolve fine; only the nested form is at risk.
+    // A 2-level nested adapter (`map` over `take`, the inner one where-bound)
+    // bound to a typed local, then iterated: if the local's type does not
+    // resolve in sema, the binding's alloca is skipped and `m.next()` reads a
+    // null receiver.
     mut r: Range<i32> = Range::new(0, 100);
-    mut m: MapIter<TakeIter<Range<i32>>, (i32) -> i32, i32> = r.take(3).map(iter_double_i32);
+    mut m: implement Iterator<i32> = r.take(3).map(iter_double_i32);
     mut total: i32 = 0;
     loop {
         match (m.next()) {
@@ -856,10 +825,10 @@ function nested_adapter_typed_local_consumes() -> Result<(), TestError> {
 
 ![test]
 function nested_zip_typed_local_count() -> Result<(), TestError> {
-    // A ZipIter whose first inner is itself an adapter, bound to a typed local.
+    // A `zip` whose first inner is itself an adapter, bound to a typed local.
     mut r: Range<i32> = Range::new(0, 100);
     mut s: Range<i32> = Range::new(10, 13);
-    mut z: ZipIter<TakeIter<Range<i32>>, Range<i32>> = r.take(5).zip(s);
+    mut z: implement Iterator<Pair<i32, i32>> = r.take(5).zip(s);
     return expect_eq(z.count(), 3);
 }
 
