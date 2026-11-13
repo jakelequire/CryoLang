@@ -553,6 +553,185 @@ async function h2_join_bad_preface(port: u16, server: Http2Server) -> (i64, i64)
                                h2_bad_preface_client(port));
 }
 
+// ---- a client written frame by frame ------------------------------------------
+
+/// Queue a WINDOW_UPDATE granting `increment` octets on `stream_id`.
+function h2_queue_window_update(c: mut &BufStream<TcpStream>, stream_id: u32, increment: u32) -> boolean {
+    mut payload: Array<u8> = Array::<u8>::with_capacity(4);
+    mut writer: ByteWriter = ByteWriter::new(&payload);
+    writer.write_u32_big_endian(increment);
+    return c.queue_h2_frame(frame::FRAME_WINDOW_UPDATE, 0, stream_id, payload.as_slice()).is_ok();
+}
+
+/// Queue a GET for `/` on `stream_id`, its header block written from HPACK's
+/// static table alone: `:method GET`, `:path /`, `:scheme http`.
+function h2_queue_get(c: mut &BufStream<TcpStream>, stream_id: u32) -> boolean {
+    mut block: Array<u8> = Array::<u8>::new();
+    block.push(0x82);
+    block.push(0x84);
+    block.push(0x86);
+    return c.queue_h2_frame(frame::FRAME_HEADERS, frame::FLAG_END_HEADERS | frame::FLAG_END_STREAM,
+                            stream_id, block.as_slice()).is_ok();
+}
+
+/// A client that writes its frames by hand, for what the public client
+/// never sends, against the public server. After the preface it sends a
+/// SETTINGS frame - INITIAL_WINDOW_SIZE = 10 for cases 11 and 12, empty
+/// otherwise - and then for each case:
+///   10 - a GET on stream 1; once its response has ended, a WINDOW_UPDATE
+///        of 2^31 - 1 naming the closed stream 1, then a GET on stream 3;
+///   11 - a GET on stream 1; once 10 octets of its response are in, a
+///        WINDOW_UPDATE of 100 naming stream 5, which was never opened, and
+///        a PING; once the PING is acknowledged, a WINDOW_UPDATE of 4 on
+///        stream 1 for the rest of the response;
+///   12 - a GET on stream 1; once 10 octets of its response are in, a
+///        WINDOW_UPDATE of 1000 on stream 1; once the response has ended,
+///        SETTINGS INITIAL_WINDOW_SIZE = 2^31 - 1, then a GET on stream 3;
+///   13 - a header block of 17 fragments of 16384 octets on stream 1, past
+///        the server's 256 KiB limit;
+///   14 - a header block HPACK cannot decode;
+///   15 - a header block that decodes to a response's `:status` field,
+///        which no request carries.
+/// Cases 10 and 12 return the DATA octets of both responses, case 11 the
+/// octets that arrived before the PING's acknowledgement, and cases 13 to 15
+/// the error code of the server's GOAWAY. A GOAWAY where a response belongs
+/// returns -1000 minus its code, and any other failure a negative step code.
+async function h2_raw_client_of_server(port: u16, case: i64) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -400; }
+    };
+    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    mut queued: boolean =
+        c.pending().try_append(Str::new("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").as_bytes()).is_ok();
+    if (case == 11 || case == 12) {
+        queued = queued && h2_queue_setting(&c, settings::SETTINGS_INITIAL_WINDOW_SIZE, 10);
+    } else {
+        mut empty: Array<u8> = Array::<u8>::new();
+        queued = queued && c.queue_h2_frame(frame::FRAME_SETTINGS, 0, 0, empty.as_slice()).is_ok();
+    }
+    if (case <= 12) {
+        queued = queued && h2_queue_get(&c, 1);
+    } else if (case == 14 || case == 15) {
+        // 0x80 names entry 0 of the HPACK tables, which none has; 0x88 is
+        // the static table's `:status: 200`.
+        const field: u8 = if (case == 14) { 0x80 } else { 0x88 };
+        mut block: Array<u8> = Array::<u8>::new();
+        block.push(field);
+        queued = queued && c.queue_h2_frame(frame::FRAME_HEADERS,
+            frame::FLAG_END_HEADERS | frame::FLAG_END_STREAM, 1, block.as_slice()).is_ok();
+    }
+    if (!queued) { return -401; }
+    match (await c.flush()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -402; }
+    }
+    if (case == 13) {
+        mut fragment: Array<u8> = Array::<u8>::new();
+        for (mut i: i64 = 0; i < 16384; i++) { fragment.push(0); }
+        for (mut sent: i64 = 0; sent < 17; sent++) {
+            const ftype_out: u8 = if (sent == 0) { frame::FRAME_HEADERS } else { frame::FRAME_CONTINUATION };
+            if (!c.queue_h2_frame(ftype_out, 0, 1, fragment.as_slice()).is_ok()) { return -403; }
+            match (await c.flush()) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { return -404; }
+            }
+        }
+    }
+    mut sid: u32 = 1;
+    mut data: i64 = 0;
+    mut total: i64 = 0;
+    mut before_ack: i64 = -1;
+    mut ended: boolean = false;
+    mut granted: boolean = false;
+    loop {
+        mut fr: Frame = match (await c.read_h2_frame(16384)) {
+            Result::Ok(f)  => { f }
+            Result::Err(_) => { return -405; }
+        };
+        const ftype: u8 = fr.ftype;
+        const ack: boolean = fr.has_flag(frame::FLAG_ACK);
+        const end: boolean = fr.has_flag(frame::FLAG_END_STREAM);
+        const stream: u32 = fr.stream_id;
+        const length: i64 = fr.payload.length();
+        mut fields: ByteReader = ByteReader::new(fr.payload.as_slice());
+        const _last_stream: u32 = fields.read_u32_big_endian().unwrap_or(0);
+        const code: u32 = fields.read_u32_big_endian().unwrap_or(999);
+        mem::drop(fr);
+        if (ftype == frame::FRAME_GOAWAY) {
+            if (case >= 13) { return code as i64; }
+            return -1000 - (code as i64);
+        }
+        if (case == 11 && ftype == frame::FRAME_PING && ack) {
+            before_ack = total + data;
+            if (!h2_queue_window_update(&c, 1, 4)) { return -406; }
+            match (await c.flush()) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { return -407; }
+            }
+        }
+        if (ftype == frame::FRAME_DATA && stream == sid) {
+            data = data + length;
+            if (!granted && data >= 10 && (case == 11 || case == 12)) {
+                if (case == 11) {
+                    queued = h2_queue_window_update(&c, 5, 100)
+                        && c.queue_h2_frame(frame::FRAME_PING, 0, 0, Str::new("12345678").as_bytes()).is_ok();
+                } else {
+                    queued = h2_queue_window_update(&c, 1, 1000);
+                }
+                if (!queued) { return -408; }
+                match (await c.flush()) {
+                    Result::Ok(_)  => { }
+                    Result::Err(_) => { return -409; }
+                }
+                granted = true;
+            }
+            if (end) {
+                total = total + data;
+                data = 0;
+                if (case == 11) {
+                    ended = true;
+                } else if (sid == 3) {
+                    return total;
+                } else {
+                    if (case == 10) {
+                        queued = h2_queue_window_update(&c, 1, 2147483647);
+                    } else {
+                        queued = h2_queue_setting(&c, settings::SETTINGS_INITIAL_WINDOW_SIZE, 2147483647);
+                    }
+                    queued = queued && h2_queue_get(&c, 3);
+                    if (!queued) { return -410; }
+                    match (await c.flush()) {
+                        Result::Ok(_)  => { }
+                        Result::Err(_) => { return -411; }
+                    }
+                    sid = 3;
+                }
+            }
+        }
+        if (ended && before_ack >= 0) { return before_ack; }
+    }
+}
+
+async function h2_join_raw_client(port: u16, server: Http2Server, case: i64) -> (i64, i64) {
+    return await Futures::join(h2_serve_one(server, h2_handler),
+                               h2_raw_client_of_server(port, case));
+}
+
+/// The public server's result and the hand-written client's for one case.
+function h2_server_case(case: i64) -> (i64, i64) {
+    mut server: Http2Server = match (h2_bind()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return (-1000, -1000); }
+    };
+    const port: u16 = match (server.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { return (-1001, -1001); }
+    };
+    mut ex: Executor = Executor::new();
+    return ex.block_on(h2_join_raw_client(port, server, case));
+}
+
 // ---- joins ------------------------------------------------------------------
 
 /// The server's result and the client's, unchanged, so the test can tell
@@ -817,6 +996,62 @@ function an_undecodable_header_block_is_answered_with_goaway() -> Result<(), Tes
     const r: (i64, i64) = h2_raw_case(4);
     expect_eq(r.1, 1 as i64)?;
     return expect_eq(r.0, frame::COMPRESSION_ERROR as i64);
+}
+
+/// A WINDOW_UPDATE for a stream that has ended credits no window, so the
+/// next stream is served.
+![test]
+function a_window_update_naming_a_closed_stream_credits_nothing() -> Result<(), TestError> {
+    const r: (i64, i64) = h2_server_case(10);
+    expect_eq(r.1, 2 * REPLY_LEN)?;
+    return expect_eq(r.0, 1 as i64);
+}
+
+/// A WINDOW_UPDATE for a stream never opened does not credit the stream
+/// being sent: the response stops at its 10-octet window until its own
+/// stream is credited.
+![test]
+function a_window_update_naming_an_unopened_stream_credits_nothing() -> Result<(), TestError> {
+    const r: (i64, i64) = h2_server_case(11);
+    expect_eq(r.1, 10 as i64)?;
+    return expect_eq(r.0, 1 as i64);
+}
+
+/// An initial window change between streams moves no stream's window:
+/// the ended stream's credited window is not lifted past 2^31 - 1, and
+/// the next stream opens at the new value.
+![test]
+function an_initial_window_change_between_streams_moves_no_window() -> Result<(), TestError> {
+    const r: (i64, i64) = h2_server_case(12);
+    expect_eq(r.1, 2 * REPLY_LEN)?;
+    return expect_eq(r.0, 1 as i64);
+}
+
+/// A request header block past what the server accepts ends the connection
+/// with a GOAWAY, ENHANCE_YOUR_CALM.
+![test]
+function a_server_answers_an_oversized_request_header_block_with_goaway() -> Result<(), TestError> {
+    const r: (i64, i64) = h2_server_case(13);
+    expect_eq(r.1, frame::ENHANCE_YOUR_CALM as i64)?;
+    return expect_eq(r.0, -1 as i64);
+}
+
+/// A request header block HPACK cannot decode ends the connection with a
+/// GOAWAY, COMPRESSION_ERROR.
+![test]
+function a_server_answers_an_undecodable_request_header_block_with_goaway() -> Result<(), TestError> {
+    const r: (i64, i64) = h2_server_case(14);
+    expect_eq(r.1, frame::COMPRESSION_ERROR as i64)?;
+    return expect_eq(r.0, -1 as i64);
+}
+
+/// A request header block that decodes but is not a request ends the
+/// connection with a GOAWAY, PROTOCOL_ERROR.
+![test]
+function a_server_answers_a_malformed_request_with_goaway() -> Result<(), TestError> {
+    const r: (i64, i64) = h2_server_case(15);
+    expect_eq(r.1, frame::PROTOCOL_ERROR as i64)?;
+    return expect_eq(r.0, -1 as i64);
 }
 
 /// A connection that does not open with HTTP/2's preface is answered with a
