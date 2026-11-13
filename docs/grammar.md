@@ -283,7 +283,10 @@ TypeAlias          ::= "type" Ident Generics? "=" Type ";"
     (`struct`/`enum`/`union`) on the target, and generic arguments
     on the target type.                                              *)
 
-ImplBlock          ::= "implement" Generics?
+ImplBlock          ::= "implement" ( Generics | "<" ">" )?
+                       (* a leading list, even the empty one, makes
+                          the target's GenericArgs arguments; without
+                          one an inherent head declares them *)
                        ( "trait" Type "for" )?
                        ("enum" | "struct" | "union")?
                        TargetType
