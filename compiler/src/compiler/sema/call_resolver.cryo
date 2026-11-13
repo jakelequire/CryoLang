@@ -143,10 +143,13 @@ type struct Selection {
     /// Not null when the selection only records the candidates it tries,
     /// for the argument check, and binds nothing.
     collect:    mut ArgCandidates*;
+    /// Whether the selection bound nothing because it refused the call
+    /// and reported why; the call is not reported again as naming no method.
+    reported:   boolean;
 
     static none() -> Selection {
         return Selection { owner_inst: TypeRef::invalid(), recv: TypeRef::invalid(), chosen: null,
-                           ret: TypeRef::invalid(), tier: 0, info: null, collect: null };
+                           ret: TypeRef::invalid(), tier: 0, info: null, collect: null, reported: false };
     }
 
     /// A call already bound: its pin, and the pin's declared return.
@@ -154,7 +157,7 @@ type struct Selection {
         const mn: MethodDecl* = DeclarationNode::method_of(mn_decl);
         const r: TypeRef = if (mn != null && mn.func != null) { DeclarationNode::fn_of(mn.func).resolved_return_type } else { TypeRef::invalid() };
         return Selection { owner_inst: TypeRef::invalid(), recv: TypeRef::invalid(), chosen: mn_decl, ret: r,
-                           tier: 0, info: null, collect: null };
+                           tier: 0, info: null, collect: null, reported: false };
     }
 }
 
@@ -4379,7 +4382,9 @@ type struct CallResolver {
             this.pin_minted_method(call, sel, base_ref);
             return this.commit_selection(visitor, call, sel);
         }
-        return Selection::none();
+        mut unbound: Selection = Selection::none();
+        unbound.reported = sel.reported;
+        return unbound;
     }
 
     /// Record on a call in a generic body the method selected for it, when
@@ -5188,6 +5193,7 @@ type struct CallResolver {
                 const unmet: const TraitRef* = this.unmet_clause_in_scope(block, sel.owner_inst, 0, &unmet_subject);
                 if (unmet != null) {
                     this.report_clause_not_in_scope(block, sel.owner_inst, member, unmet, unmet_subject);
+                    sel.reported = true;
                     return false;
                 }
             }
@@ -6011,8 +6017,19 @@ type struct CallResolver {
             const param: GenericParamType* = this.binding.receiver_type_param(obj_type);
             if (param != null) {
                 this.report_param_receiver_call(member_e, member, param, this.binding.param_is_bounded(param), call);
+                return TypeRef::invalid();
             }
-            return TypeRef::invalid();
+            // An instantiation still naming the body's parameters names its
+            // methods through its template, and none bound: the call is
+            // through a field or through `Deref`, or names no method, which
+            // the lookup below answers as it does for any receiver.  Left
+            // unanswered here, every copy of the body reaches code generation
+            // with the call bound to nothing.  A copy the compiler made is
+            // checked where its body is written; a call the selection
+            // refused is reported already.
+            if (!on_instantiation || selected.chosen != null || selected.reported || !this.walks_written_body()) {
+                return TypeRef::invalid();
+            }
         }
         mut unbound_at: i64 = -1;
         const unbound_method: DeclarationNode* = this.binding.stash_method_call_bindings(obj_type, member, call,
