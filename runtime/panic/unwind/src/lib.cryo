@@ -5,8 +5,8 @@
 ///! instead of terminating. A panic then unwinds
 ///! the native stack: each frame the compiler marked with a cleanup landing pad
 ///! (`--panic=unwind`, see `compiler .../call_emitter.cryo`) runs its local
-///! destructors and `resume`s; a root `catch_unwind` (a later phase) stops the
-///! unwind and turns the panic into an error. This tier is chosen at LINK time —
+///! destructors and `resume`s; a `catch_unwind`, or the root catch the compiler
+///! wraps `main` in, stops the unwind and turns the panic into an error. This tier is chosen at LINK time —
 ///! callers never change; swapping this archive for `panic/abort` swaps the
 ///! strategy.
 ///!
@@ -67,15 +67,60 @@ mut g_exn: UnwindException = UnwindException {
 /// transfers control straight to a landing pad, so the funnel can never return
 /// these values — hence the stash. Per-thread alongside `g_exn`: a `catch_unwind`
 /// on one thread must read ITS panic's message and place, not another thread's.
-/// The place is copied, not pointed at: the caller's `Location` may live in a
-/// frame the unwind leaves.
 ///
-/// `null`-initialized `string` pointers zero-init cleanly and are only read
-/// after `__cryo_panic` has stashed a real message and place into them.
+/// Both are COPIES. The message is read after the cleanup pads have run - by
+/// the root report and by every `catch_unwind` - and its bytes may belong to
+/// what those pads destroy: a message formatted into a local `String`, a check
+/// handler's stack buffer. The place likewise may live in a frame the unwind
+/// leaves. A message longer than the copy holds is cut at a character boundary
+/// and ends in `TRUNCATION_MARKER`; the copy stays valid until the thread's next
+/// panic.
+const HELD_MESSAGE_CAPACITY: u64 = 1024;
+const TRUNCATION_MARKER: string = "...";
 ![thread_local]
-mut g_panic_msg: string = null;
+mut held_message: [u8; 1024] = [0; 1024];
 ![thread_local]
 mut g_panic_loc: Sys::Location = Sys::Location { file: null, line: 0, column: 0, function: null };
+
+/// Copy `message` into `held_message`, NUL-terminated. A message that does not
+/// fit keeps as many whole characters as leave room for the marker. Copying
+/// forward from the start makes a message already held copy onto itself.
+function hold_message(message: string) -> void {
+    const limit: u64 = HELD_MESSAGE_CAPACITY - 1;
+    mut length: u64 = 0;
+    while (length < limit && message[length] != 0) { length = length + 1; }
+    const truncated: boolean = message[length] != 0;
+    mut kept: u64 = length;
+    if (truncated) {
+        kept = limit - Sys::cstr_len(TRUNCATION_MARKER);
+        // A UTF-8 continuation byte (10xxxxxx) at the cut means the cut
+        // splits a character: back up to the byte that starts it.
+        while (kept > 0 && ((message[kept] as u8) & 0xC0) == 0x80) { kept = kept - 1; }
+    }
+    mut index: u64 = 0;
+    while (index < kept) {
+        held_message[index] = message[index] as u8;
+        index = index + 1;
+    }
+    if (truncated) {
+        Sys::append_cstr(&held_message[0], &index, TRUNCATION_MARKER);
+    }
+    held_message[index] = 0;
+}
+
+/// The held message as a `string`, for the report and the accessors.
+function held_message_text() -> string {
+    return &held_message[0] as string;
+}
+
+/// Hold the payload of an exception a Cryo panic did not raise - a C++ throw,
+/// a thread-exit unwind - for the catch about to take it, so `catch_unwind` and
+/// the root report name it as foreign rather than reading what an earlier panic
+/// on this thread left (or nothing).
+function hold_foreign_exception() -> void {
+    hold_message("foreign exception: an unwind not raised by a Cryo panic");
+    g_panic_loc = Sys::Location { file: "<foreign code>", line: 0, column: 0, function: null };
+}
 
 // --- Unwinder Level-1 ABI ---------------------------------------------------
 // All handles are opaque pointers passed as i64. `_Unwind_RaiseException`
@@ -137,14 +182,14 @@ function __cryo_panic(msg: string, loc: Sys::Location*) -> never {
     // Stash the payload BEFORE raising: the raise transfers control to a
     // landing pad and never returns here, so a root `catch_unwind` reads these
     // back through the accessors to build its `Err(PanicInfo)`.
-    g_panic_msg = msg;
+    hold_message(msg);
     g_panic_loc = *loc;
     g_exn.exception_class   = CRYO_EXCEPTION_CLASS;
     g_exn.exception_cleanup = 0;
     mut i: u64 = 0;
     while (i < 6) { g_exn.private_[i] = 0; i = i + 1; }
     _Unwind_RaiseException(&g_exn as i64);
-    Sys::write_panic_report(msg, loc);
+    Sys::write_panic_report(held_message_text(), &g_panic_loc);
     Sys::rt_exit(101);
 }
 
@@ -152,8 +197,10 @@ function __cryo_panic(msg: string, loc: Sys::Location*) -> never {
 // OS-agnostic reads of the stashed payload, called from the stdlib
 // `catch_unwind` Err arm (`core::panic_unwind`, declared there as `extern "C"`).
 
+/// The caught panic's message: the runtime's per-thread copy, valid until this
+/// thread panics again.
 ![no_mangle]
-function __cryo_panic_taken_message() -> string { return g_panic_msg; }
+function __cryo_panic_taken_message() -> string { return held_message_text(); }
 
 ![no_mangle]
 function __cryo_panic_taken_file() -> string { return g_panic_loc.file; }
@@ -169,7 +216,7 @@ function __cryo_panic_taken_line() -> u32 { return g_panic_loc.line; }
 /// 2), so all pending destructors executed before this point.
 ![no_mangle]
 function __cryo_panic_finish() -> never {
-    Sys::write_panic_report(g_panic_msg, &g_panic_loc);
+    Sys::write_panic_report(held_message_text(), &g_panic_loc);
     Sys::rt_exit(101);
 }
 
@@ -256,7 +303,12 @@ function cryo_personality_imp(version: i32, actions: i32, exception_class: u64,
                 // selector (0 drives cleanup-then-resume; 1 enters a catch arm).
                 _Unwind_SetGR(context, 0, exception_object);
                 mut selector: i64 = 0;
-                if (cs_action != 0) { selector = 1; }
+                if (cs_action != 0) {
+                    selector = 1;
+                    // A catch takes every exception that reaches it; one a
+                    // Cryo panic did not raise carries no held payload.
+                    if (exception_class != CRYO_EXCEPTION_CLASS) { hold_foreign_exception(); }
+                }
                 _Unwind_SetGR(context, 1, selector);
                 _Unwind_SetIP(context, landing_pad);
                 return URC_INSTALL_CONTEXT;

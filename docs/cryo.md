@@ -4769,7 +4769,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 
 | Module               | What it brings in                                                                                                     |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `core`               | `panic(message: string, loc: intrinsics::Location) -> never` (does not return; aborts the process)                    |
+| `core`               | `panic(message: string, loc: intrinsics::Location) -> never` (does not return; see §23.2, Panic strategies)           |
 | `core::option`       | `Option<T>` (`Some` / `None`) and its methods                                                                         |
 | `core::result`       | `Result<T, E>` (`Ok` / `Err`) and its methods                                                                         |
 | `core::primitives`   | Methods on built-in types (`(-5 as i32).abs()`, `(2.0).sqrt()`, `x.clamp(lo, hi)`, `char::is_digit`, ...)             |
@@ -5055,6 +5055,7 @@ optimize   = "O2"                   # O0 | O1 | O2 | O3 (default O2)
 emit_llvm  = false                  # also write LLVM IR (.ll) beside the object
 no_std     = false                  # build without linking the standard library
 no_runtime = false                  # freestanding: no crt0 / libc / panic runtime
+panic      = "unwind"               # unwind | abort (see Panic strategies below)
 ```
 
 **`no_std` vs `no_runtime`.** These are orthogonal knobs, each also settable
@@ -5066,17 +5067,51 @@ never off):
 | `false`  | `false`      | Default hosted build: prelude + stdlib linked, crt0 + libc, the `@panic` runtime.                                                                                                                   |
 | `true`   | `false`      | No prelude/stdlib, but still hosted: crt0, libc, and the `@panic` runtime remain.                                                                                                                   |
 | `false`  | `true`       | Freestanding link (no crt0/libc/`libcryo.a`) but the stdlib source is still in scope — rarely useful.                                                                                               |
-| `true`   | `true`       | Fully freestanding: no stdlib, no crt0/libc, `main` is not widened, and check failures diverge through `llvm.trap` instead of the libc-backed `@panic`. This is how a `runtime/core` tier is built. |
+| `true`   | `true`       | Fully freestanding: no stdlib, no crt0/libc, `main` is not widened, and a failed check calls the runtime's check handler, which reports it and exits 101. This is how the freestanding runtime is built. |
 
 `no_runtime = true` normally implies `no_std = true`: a freestanding link drops
 `libcryo.a`, so any stdlib symbol the program references would fail to resolve.
-A freestanding program supplies its own entry point (an `![naked] _start`);
-without one the linker warns that `_start` is missing.  The optimizer never
+The runtime's freestanding entry (`_start`) is the program's entry point; it
+captures the arguments, runs `main` and exits with its result.  The optimizer never
 turns a freestanding program's code into a call to a C library function it
 did not write (a byte loop into `memset`), since nothing would answer it.
 
 `![config(no_runtime)]` / `![config(not(no_runtime))]` gate a declaration on the
 freestanding build flag, exactly like the OS atoms (`![config(linux)]`, …).
+
+#### Panic strategies
+
+A panic - `core::panic`, a failed `expect` or `unwrap` - ends in the runtime's
+panic funnel, which reports `panicked at <file>:<line>:<column> in <function>:
+<message>` on stderr (no column when it is unknown, no function when it has no
+name). What happens next is the build's panic strategy, `panic = "unwind"` or
+`"abort"` in `[compiler]`, or `--panic=unwind|abort` on the command line, which
+takes precedence:
+
+- **`unwind`**, the default for a hosted build: the panic unwinds the stack and
+  each frame's destructors run on the way out. `catch_unwind` stops it and
+  returns `Err(PanicInfo)`. A panic no `catch_unwind` stops reaches the catch
+  the compiler wraps `main` in, which writes the report and exits with code
+  101.
+- **`abort`**: the report is written and the process exits with code 101 at
+  once. No destructor runs, and `catch_unwind` does not compile.
+- A freestanding build (`no_runtime = true`) always aborts.
+
+Under `unwind`:
+
+- `PanicInfo.msg` is the runtime's per-thread copy of the message, so it reads
+  back whole even when the panicking code built the message in a value the
+  unwind destroyed. It stays valid until the same thread panics again. A
+  message longer than 1023 bytes is cut at a character boundary and ends in
+  `...`.
+- An exception that foreign code raised (a C++ `throw`, a thread-exit unwind)
+  and that unwinds into Cryo frames runs their destructors like a panic.
+  `catch_unwind` catches it, with a `PanicInfo` whose message names it as a
+  foreign exception and whose file is `<foreign code>`; the catch around
+  `main` reports it the same way and exits 101.
+- A destructor that panics while an unwind is running it starts a new panic,
+  which replaces the first: the first panic's message is not reported, and the
+  unwind continues from the destructor's frame with the new one.
 
 **Build profiles.** A build runs under a named *profile* that supplies a
 default optimization level and debug-info setting and names the per-profile
