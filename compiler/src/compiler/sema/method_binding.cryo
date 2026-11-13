@@ -2115,6 +2115,29 @@ type struct MethodBinding {
         }
         ret_ctx.set_this_type(recv_type);
         mut refined: TypeRef = this.ctx.type_resolver.resolve(ret_ann, &ret_ctx);
+        // An opaque return its body decided is cached on the annotation in
+        // the method's parameters and its owner's, and resolving the
+        // annotation hands it back as it is: the call's bindings, by each
+        // parameter's symbol, are put into it here.
+        match (*ret_ann) {
+            TypeAnnotation::ImplTrait(_) => {
+                mut params: [TypeRef] = [];
+                this.arena.generic_params_in(refined, &params);
+                mut replacements: [TypeRef] = [];
+                for (mut p: i64 = 0; p < params.length(); p++) {
+                    const sym: SymbolID = this.arena.lookup(params[p]).as_generic_param().param_sym;
+                    mut bound: TypeRef = params[p];
+                    for (mut b: i64 = 0; b < ret_ctx.generic_bindings.length(); b++) {
+                        if (ret_ctx.generic_bindings[b].sym.equals(sym)) { bound = ret_ctx.generic_bindings[b].ty; }
+                    }
+                    replacements.push(bound);
+                }
+                if (params.length() > 0) {
+                    refined = TypeSubstitution::from_params(&params, &replacements).apply(refined, this.arena);
+                }
+            }
+            _ => { }
+        }
         refined = this.reduce_assoc_projections(refined);
         if (!refined.is_valid()) { return fallback; }
         // In a generic body's walk the return is in the body's parameters

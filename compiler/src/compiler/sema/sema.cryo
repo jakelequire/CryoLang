@@ -400,15 +400,34 @@ type struct SemaVisitor {
                 this.check_undecided_opaque_methods(st.methods,
                     this.ctx.decl_index.type_of_decl(st.def, "sema/undecided opaque methods"));
             }
+            if (st != null && st.is_generic()) {
+                this.check_undecided_opaque_template_methods(st.methods,
+                    this.ctx.decl_index.type_of_decl(st.def, "sema/undecided opaque methods"),
+                    &st.generic_params, st.def, null);
+            }
             const un: UnionDecl* = DeclarationNode::union_of(decl);
             if (un != null && !un.is_generic()) {
                 this.check_undecided_opaque_methods(un.methods,
                     this.ctx.decl_index.type_of_decl(un.def, "sema/undecided opaque methods"));
             }
-            const block: ImplBlock* = DeclarationNode::impl_of(decl);
+            if (un != null && un.is_generic()) {
+                this.check_undecided_opaque_template_methods(un.methods,
+                    this.ctx.decl_index.type_of_decl(un.def, "sema/undecided opaque methods"),
+                    &un.generic_params, un.def, null);
+            }
+            const block: mut ImplBlock* = DeclarationNode::impl_of(decl);
             if (block != null && !block.is_trait_impl() && !block.is_template() && !block.is_generic()) {
                 this.check_undecided_opaque_methods(block.methods,
                     this.ctx.decl_index.impl_owner(block, "sema/undecided opaque methods"));
+            }
+            if (block != null && !block.is_trait_impl() && block.is_template()) {
+                const template: DefId = match (block.res) {
+                    ResSlot::Answered(r) => { r.def_id() }
+                    _                    => { DefId::invalid() }
+                };
+                this.check_undecided_opaque_template_methods(block.methods,
+                    this.ctx.decl_index.impl_owner(block, "sema/undecided opaque methods"),
+                    &block.generic_params, template, block);
             }
             const func: FunctionDecl* = DeclarationNode::fn_of(decl);
             if (func == null || func.body == null || !SemaVisitor::opaque_return_decided_by_body(func)) {
@@ -433,7 +452,7 @@ type struct SemaVisitor {
             const method: MethodDecl* = DeclarationNode::method_of(methods[i]);
             if (method == null || method.func == null) { continue; }
             const func: FunctionDecl* = DeclarationNode::fn_of(method.func);
-            if (func.body == null || func.is_generic() || !SemaVisitor::opaque_return_decided_by_body(func)) {
+            if (func.body == null || !SemaVisitor::opaque_return_decided_by_body(func)) {
                 continue;
             }
             this.state.current_func = null;
@@ -446,6 +465,42 @@ type struct SemaVisitor {
             this.ctx.decl_index.register_methods(owner, &decided, this.ctx.intern_table, this.arena,
                 "sema/undecided opaque methods");
         }
+    }
+
+    /// Walk symbolically each of `methods`, of the generic `owner`, whose
+    /// opaque return its signature left undecided, and register it again on
+    /// the template `template` with the type its body decided, in the
+    /// owner's parameters: a caller reads the template's entry and
+    /// substitutes its receiver's arguments, and an instance's copy of the
+    /// method carries its literal typed.  `impl_node` is the implementation
+    /// the methods are written in, null for a type's own body.
+    check_undecided_opaque_template_methods(mut &this, methods: &[DeclarationNode*], owner: TypeRef,
+                                            owner_params: &[DeclarationNode*], template: DefId,
+                                            impl_node: mut ImplBlock*) -> void {
+        mut undecided: [DeclarationNode*] = [];
+        for (mut i: i64 = 0; i < methods.length(); i++) {
+            const method: MethodDecl* = DeclarationNode::method_of(methods[i]);
+            if (method == null || method.func == null) { continue; }
+            const func: FunctionDecl* = DeclarationNode::fn_of(method.func);
+            if (func.body == null || !SemaVisitor::opaque_return_decided_by_body(func)) { continue; }
+            undecided.push(methods[i]);
+        }
+        if (undecided.length() == 0) { return; }
+        const saved_impl: mut ImplBlock* = this.state.symbolic_impl_node;
+        if (impl_node != null) { this.state.symbolic_impl_node = impl_node; }
+        this.state.current_func = null;
+        this.symbolic_check_owner_methods(&undecided, owner, owner_params);
+        this.state.symbolic_impl_node = saved_impl;
+        for (mut i: i64 = 0; i < undecided.length(); i++) {
+            const func: FunctionDecl* = DeclarationNode::fn_of(DeclarationNode::method_of(undecided[i]).func);
+            match (*func.return_type_annotation) {
+                TypeAnnotation::ImplTrait(opaque) => { opaque.body_checked_first = true; }
+                _ => { }
+            }
+        }
+        this.ctx.decl_index.register_template_methods(template, &undecided, this.arena);
+        this.ctx.decl_index.register_methods(owner, &undecided, this.ctx.intern_table, this.arena,
+            "sema/undecided opaque template methods");
     }
 
     /// Whether `func`'s signature left its opaque return (`-> implement
@@ -1048,6 +1103,7 @@ type struct SemaVisitor {
             const method_decl: DeclarationNode* = methods[i];
             const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null || DeclarationNode::fn_of(method.func).body == null) { continue; }
+            if (SemaVisitor::opaque_return_checked_first(DeclarationNode::fn_of(method.func))) { continue; }
             const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
             // A method on a GENERIC owner reaches sema only here, whether or not
             // it has generic parameters of its own — so this is where an `async`

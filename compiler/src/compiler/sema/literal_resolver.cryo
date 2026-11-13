@@ -24,7 +24,7 @@ import compiler::diag::{ ErrorCode };
 import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::state::{ SemaState };
 import compiler::sema::helpers::{
-    int_literal_exceeds, is_constant_numeric_expr, is_numeric_literal_expr, sema_default_int_type,
+    int_literal_exceeds, is_constant_numeric_expr, is_negative_numeric_literal_expr, is_numeric_literal_expr, sema_default_int_type,
     sema_int_unsigned_bound, sema_numeric_suffix_type, try_fold_const_integer
 };
 import std::fmt;
@@ -318,16 +318,23 @@ type struct LiteralResolver {
         return e != null && e.kind == TypeKind::Int;
     }
 
-    /// Whether an integer-literal argument fits the target integer type's width.
+    /// Whether an integer-literal argument fits the target integer type's
+    /// width.  A negated literal (`-3`) fits a signed type down to its
+    /// minimum and no unsigned type.
     int_literal_fits_target(&this, arg: ExpressionNode*, target: TypeRef) -> boolean {
-        if (!is_numeric_literal_expr(arg)) { return false; }
-        const lit: LiteralExpr* = ExpressionNode::literal_of(arg);
+        const negated: boolean = is_negative_numeric_literal_expr(arg);
+        const written: ExpressionNode* = if (negated) { ExpressionNode::unary_of(arg).operand } else { arg };
+        if (!is_numeric_literal_expr(written)) { return false; }
+        const lit: LiteralExpr* = ExpressionNode::literal_of(written);
         if (lit.literal_kind != LiteralKind::Integer) { return false; }
         const t: Type* = this.arena.lookup(target);
         if (t == null || t.kind != TypeKind::Int) { return false; }
         const it: IntegerKind = t.int_kind();
         const max_mag: u64 = sema_int_unsigned_bound(it.narrowest_bit_width());
         if (max_mag == 0) { return false; }
+        if (negated) {
+            return it.is_signed() && !int_literal_exceeds(lit, (max_mag >> 1) + 1);
+        }
         if (it.is_pointer_sized() && it.is_signed()) {
             return !int_literal_exceeds(lit, (max_mag >> 1) + 1);
         }

@@ -1,0 +1,88 @@
+namespace OpaqueGenericMethodReturnOfInferredGenericLiteral;
+
+// A method returning `implement Trait` built from a generic struct's
+// literal without type arguments, where the method's body is checked in
+// type parameters: a method of a generic type (an instance method, one
+// whose literal holds the owner's parameter, a static one, one in an
+// implement block), a method with type parameters of its own on a type
+// that is not generic, and one with its own on a generic type.  A trait's
+// default naming its own parameter in an opaque return is called too.
+// Each is called from a function written before the types.
+
+type trait Source { next_value(mut &this) -> i64; }
+
+function main() -> i32 {
+    const maker: Maker<i64> = Maker { tag: 9 };
+    mut made = maker.make();
+    if (made.next_value() != 4) { return 1; }
+    mut holding = maker.holding();
+    if (holding.next_value() != 9) { return 2; }
+    mut made_static = Maker::<i64>::made();
+    if (made_static.next_value() != 4) { return 3; }
+    mut from_block = maker.from_block();
+    if (from_block.next_value() != 9) { return 4; }
+    const plain: Plain = Plain { tag: 0 };
+    mut with_source = plain.with_source(four);
+    if (with_source.next_value() != 4) { return 5; }
+    mut paired = maker.paired(four);
+    if (paired.next_value() != 13) { return 6; }
+    mut doubled = holding.doubled(four);
+    if (doubled.next_value() != 8) { return 7; }
+    return 0;
+}
+
+type struct Gen<F> where F: () -> i64 { f: F; }
+
+implement<F> trait Source for Gen<F> where F: () -> i64 {
+    next_value(mut &this) -> i64 { return this.f(); }
+}
+
+type struct Hold<T> { v: T; }
+
+implement trait Source for Hold<i64> {
+    next_value(mut &this) -> i64 { return this.v; }
+}
+
+type struct Twin<T, F> where F: () -> i64 { tag: T; f: F; }
+
+implement<F> trait Source for Twin<i64, F> where F: () -> i64 {
+    next_value(mut &this) -> i64 { return this.tag + this.f(); }
+}
+
+type trait Doubling {
+    doubled<F>(this, f: F) -> implement Source where F: () -> i64 {
+        return Twice::<F> { f: f };
+    }
+}
+
+implement trait Doubling for Hold<i64> { }
+
+type struct Twice<F> where F: () -> i64 { f: F; }
+
+implement<F> trait Source for Twice<F> where F: () -> i64 {
+    next_value(mut &this) -> i64 { return this.f() * 2; }
+}
+
+function four() -> i64 { return 4; }
+
+type struct Maker<T> {
+    tag: T;
+
+    make(&this) -> implement Source { return Gen { f: four }; }
+
+    holding(&this) -> implement Source { return Hold { v: this.tag }; }
+
+    static made() -> implement Source { return Gen { f: four }; }
+
+    paired<G>(&this, g: G) -> implement Source where G: () -> i64 { return Twin { tag: this.tag, f: g }; }
+}
+
+implement<T> struct Maker<T> {
+    from_block(&this) -> implement Source { return Hold { v: this.tag }; }
+}
+
+type struct Plain {
+    tag: i64;
+
+    with_source<G>(&this, g: G) -> implement Source where G: () -> i64 { return Gen { f: g }; }
+}

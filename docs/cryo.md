@@ -167,7 +167,7 @@ const b: u8 = 200 + 100;   // error: 300 does not fit `u8`, and would silently t
 const c: i8 = 0 - 128;     // -128: held
 ```
 
-A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value.
+A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value. An argument is held to its parameter the same way, including a parameter whose type the call's expected type decides: `const h: Holder<i16> = Holder::make(-3);` passes `-3` as an `i16`, while `-129` for an `i8` or `-3` for a `u16` is refused (`E0214`).
 
 A shift's amount does not type the value shifted: a literal shifted by an amount not made only of literals takes the integer type expected of the result, where one is - an initializer's, an assignment's, an argument's or a return's - so `const p: u64 = 1 << (u64::BITS - 1);` shifts at 64 bits, not at the `u32` amount's 32.  A shift's result is always the shifted value's type, and the amount's type never changes it: `b << n` with `b: u8` and `n: u64` is a `u8`.  Where no integer type is expected, a shifted literal takes the amount's type.
 
@@ -927,16 +927,18 @@ declaration* it introduces an implement block - the two never overlap.)
   (e.g. `return SliceIter::<T> { ... }`), which is how every standard-library
   iterator is written.  A generic struct's literal may leave its type
   arguments out (`return Gen { f: move () -> i64 { ... } };`) in a free
-  function, generic or not, and in a method of a type that is not generic,
-  written in the type or in an `implement struct` block for it: the type is
-  then the instance the literal's field values give it, decided when the
-  function's body is checked, which happens before any other body of its
-  module.  A generic function's is decided in its own parameters
-  (`Holder<T>` for `return Holder { value: value };` with `value: T`), and
-  each specialization returns its arguments' instance.  This is the only
-  way to return a value holding a closure, whose type has no spelling.  A
-  method of a generic type, or of an instance of one, or a method with type
-  parameters of its own, still writes the literal's type arguments.
+  function, generic or not, and in a method, written in its type or in an
+  `implement struct` block for it: the type is then the instance the
+  literal's field values give it, decided when the function's body is
+  checked, which happens before any other body of its module.  A generic
+  function's is decided in its own parameters (`Holder<T>` for `return
+  Holder { value: value };` with `value: T`), a method's in its own and its
+  type's (`Hold<T>` for `return Hold { v: this.tag };` in `Maker<T>`), and
+  each call returns its arguments' instance - the receiver's and its own.
+  This is the only way to return a value holding a closure, whose type has
+  no spelling.  A trait's default method still writes the literal's type
+  arguments; its own parameters among them (`return Doubled::<This, F> {
+  ... };`) take each call's.
 - **Variable binding** - `mut it: implement Iterator<i32> = expr;`. The type
   is taken from the initialiser, which is then checked to actually implement
   the named trait; a mismatch is `E0200`:
