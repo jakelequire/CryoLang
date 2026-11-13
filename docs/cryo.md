@@ -1012,6 +1012,13 @@ mut it         = arr.iter();   // inferred: the concrete iterator type
 mut y: int;                     // declared without an initialiser; assigned later
 ```
 
+**One name per scope; `_` is no name.** Declaring a local whose name the same block already declares is a redeclaration (`E0205`); a nested block may shadow it. A local named `_` declares no name: it holds its value to the end of its block and is released there like any other local, but no expression can read it (`E0201`), so a block may declare any number of them.
+
+```cryo
+const _ = open_log();           // kept until the block ends
+const _ = open_lock();          // a second `_` in the same block
+```
+
 **Globals.** Module-level `const` declares an immutable global; module-level `mut` declares mutable global state. Use the latter sparingly. An initializer that is a constant expression is folded into the program: a number, a `null` or string literal, an array literal of those, and a struct literal writing every field with one of those; array and struct literals nest in each other. Any other - a call, another global's value - is computed once, before `main` runs, a module's globals after those of the modules it imports, in the order they are declared. The standard library's are computed before any of the program's, its modules in one order whichever of them a program reaches: the order of the standard library's own build. A folded integer constant's value is its initializer's wrapped to the declared type, the value the program reads at run time: with `const B: u8 = 100;`, `const A: u8 = B + 200;` is 44 wherever it is used - an array size, a `static_assert`, another constant's initializer - never 300. Read as a value, an integer of any width, boolean, `char` or float constant whose initializer folds is compiled as that value itself rather than as a read of its global; the global remains, and `&NAME` is its address. A `![thread_local]` global gets its folded initializer in every thread's copy, so its initializer must fold: one that would be computed would reach the main thread's copy only, and is refused (`E0646`).
 
 ```cryo
