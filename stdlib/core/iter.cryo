@@ -7,8 +7,8 @@
 ///! Lazy adapters live in this module: `map`, `filter`, `take`, `skip`,
 ///! `chain`, `enumerate`, `zip`, `rev` and `flat_map` each return
 ///! `implement Iterator<...>`, a wrapper iterator that is itself an
-///! `Iterator`, so they compose; `peekable` returns a `PeekableIter`, which
-///! adds `peek`. Eager consumers (`for_each`,
+///! `Iterator`, so they compose; `peekable` returns `implement Peekable<...>`,
+///! an iterator that adds `peek`. Eager consumers (`for_each`,
 ///! `fold`, `any`, `all`, `find`, `count`, `collect`, `sum`) and
 ///! `for (x in iter)` drive the chain. The adapters resolve directly on any concrete `Iterator` receiver,
 ///! including a user struct that `implement`s `Iterator`
@@ -157,8 +157,8 @@ public type trait Iterator {
 
     /// Yield the same elements, with `peek` reading the next one without
     /// taking it.
-    peekable(this) -> PeekableIter<This> {
-        return PeekableIter::new(this);
+    peekable(this) -> implement Peekable<This::Item> {
+        return PeekableIter { inner: this, peeked: Option::None, has_peeked: false };
     }
 
     /// Map each element to an iterator with `f`, and yield the elements of
@@ -465,23 +465,30 @@ where I: DoubleEndedIterator {
     }
 }
 
+/// An iterator whose next element can be read without taking it:
+///
+/// ```cryo
+/// mut ahead = (1..4).peekable();
+/// // ahead.peek() borrows 1, and ahead.next() still yields it
+/// ```
+public type trait Peekable<T> : Iterator<T> {
+    /// The next element, borrowed, or `None` when there is none.  The element
+    /// is still the one `next` yields.
+    peek(mut &this) -> Option<const T*>;
+}
+
 /// Adapter that reads its next element without taking it.  The element
 /// `peek` reads is held until `next` yields it.
-public type struct PeekableIter<I> where I: Iterator {
+internal type struct PeekableIter<I> where I: Iterator {
     private inner: I;
     private peeked: Option<I::Item>;
     /// Whether `peeked` holds what `inner` yielded last, `None` included.
     private has_peeked: boolean;
+}
 
-    /// `inner`'s elements, with `peek` to look at the next one without
-    /// drawing it; `inner.peekable()` makes the same.
-    public static new(inner: I) -> PeekableIter<I> {
-        return PeekableIter::<I> { inner: inner, peeked: Option::None, has_peeked: false };
-    }
-
-    /// The next element, borrowed, or `None` when there is none.  The element
-    /// is still the one `next` yields.
-    public peek(mut &this) -> Option<const I::Item*> {
+implement<I, T> trait Peekable<T> for struct PeekableIter<I>
+where I: Iterator<T> {
+    peek(mut &this) -> Option<const T*> {
         if (!this.has_peeked) {
             this.peeked = this.inner.next();
             this.has_peeked = true;
