@@ -960,8 +960,10 @@ declaration* it introduces an implement block - the two never overlap.)
   `implement Iterator<...>`), the concrete cursor is hidden behind that opaque
   return, so the local has no concrete receiver to specialise against - chain
   the combinator on the producing expression instead
-  (`arr.iter().take(2).count()`), or bind to the concrete adapter type when you
-  need a named local (`mut z: ZipIter<Range<i32>, Range<i32>> = a.zip(b);`).
+  (`arr.iter().take(2).count()`).  The standard library's adapters are
+  themselves returned as `implement Iterator<...>`, so a named local holding
+  one is typed by the trait (`mut z: implement Iterator<Pair<i32, i32>> =
+  a.zip(b);`) and driven with `next`, `for` or a consuming method.
 
 To accept *any* iterator as a **parameter**, use a generic with a trait bound
 instead - that is the tool for the input side:

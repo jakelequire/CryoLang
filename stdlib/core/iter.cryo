@@ -5,9 +5,10 @@
 ///! call `next` in a loop or use one of the defaults below.
 ///!
 ///! Lazy adapters live in this module: `map`, `filter`, `take`, `skip`,
-///! `chain`, `enumerate`, `zip`, `rev`, `peekable` and `flat_map` each return
-///! a wrapper iterator (`MapIter`, `FilterIter`, ..., `FlatMapIter`) that is
-///! itself an `Iterator`, so they compose. Eager consumers (`for_each`,
+///! `chain`, `enumerate`, `zip`, `rev` and `flat_map` each return
+///! `implement Iterator<...>`, a wrapper iterator that is itself an
+///! `Iterator`, so they compose; `peekable` returns a `PeekableIter`, which
+///! adds `peek`. Eager consumers (`for_each`,
 ///! `fold`, `any`, `all`, `find`, `count`, `collect`, `sum`) and
 ///! `for (x in iter)` drive the chain. The adapters resolve directly on any concrete `Iterator` receiver,
 ///! including a user struct that `implement`s `Iterator`
@@ -88,44 +89,43 @@ public type trait Iterator {
 
     /// Yield at most the first `n` elements, then stop.  A negative `n`
     /// yields nothing, as `0` does.
-    take(this, n: i64) -> TakeIter<This> {
-        return TakeIter::new(this, n);
+    take(this, n: i64) -> implement Iterator<This::Item> {
+        return TakeIter { inner: this, remaining: n };
     }
 
     /// Discard the first `n` elements, then yield the rest. An iterator with
     /// fewer than `n` elements is drained and yields nothing.  A negative `n`
     /// discards nothing, as `0` does.
-    skip(this, n: i64) -> SkipIter<This> {
-        return SkipIter::new(this, n);
+    skip(this, n: i64) -> implement Iterator<This::Item> {
+        return SkipIter { inner: this, remaining: n };
     }
 
     /// Transform each element with `f`, yielding the results. `f` is any
     /// callable - a function, or a closure, capturing or not - and the
     /// adapter holds it.
-    map<B, F>(this, f: F) -> MapIter<This, F, B> where F: (This::Item) -> B {
-        return MapIter::new(this, f);
+    map<B, F>(this, f: F) -> implement Iterator<B> where F: (This::Item) -> B {
+        return MapIter::<This, F, B> { inner: this, f: f };
     }
 
     /// Yield only the elements for which `pred` returns `true`. `pred` is any
     /// callable, held by the adapter.  It BORROWS each element: the element it
     /// keeps is the one yielded, so it cannot also be handed to `pred`.
-    filter<P>(this, pred: P) -> FilterIter<This, P> where P: (&This::Item) -> boolean {
-        return FilterIter::new(this, pred);
+    filter<P>(this, pred: P) -> implement Iterator<This::Item> where P: (&This::Item) -> boolean {
+        return FilterIter { inner: this, pred: pred };
     }
 
-    /// Yield every element of `this`, then every element of `other`.  `other`
-    /// must be an `Iterator` with the same `Item` type - the shared element
-    /// type is enforced by `ChainIter`'s impl bounds.
-    chain<J>(this, other: J) -> ChainIter<This, J> {
-        return ChainIter::new(this, other);
+    /// Yield every element of `this`, then every element of `other`, an
+    /// `Iterator` with the same `Item` type.
+    chain<J>(this, other: J) -> implement Iterator<This::Item> where J: Iterator<This::Item> {
+        return ChainIter { first: this, second: other, first_done: false };
     }
 
     /// Yield `(index, value)` pairs, the index counting up from 0 as an
     /// `i64`.  The pair is `Pair<i64, Item>`: `p.first` is the index,
     /// `p.second` the element.  (Cryo has no heterogeneous tuple literal,
     /// so `Pair` is the element type.)
-    enumerate(this) -> EnumerateIter<This> {
-        return EnumerateIter::new(this);
+    enumerate(this) -> implement Iterator<Pair<i64, This::Item>> {
+        return EnumerateIter { inner: this, index: 0 };
     }
 
     /// Yield pairs `(a, b)` drawing `a` from `this` and `b` from `other`,
@@ -133,8 +133,8 @@ public type trait Iterator {
     /// `Pair<Item, B>` where `B` is `other`'s element type: `p.first` comes
     /// from `this`, `p.second` from `other`.  (Cryo has no heterogeneous
     /// tuple literal, so `Pair` is the element type.)
-    zip<J>(this, other: J) -> ZipIter<This, J> {
-        return ZipIter::new(this, other);
+    zip<J>(this, other: J) -> implement Iterator<Pair<This::Item, J::Item>> where J: Iterator {
+        return ZipIter { first: this, second: other };
     }
 
     /// Build a collection of every element, in order: the collection is the
@@ -150,10 +150,9 @@ public type trait Iterator {
     }
 
     /// Yield the elements back to front.  Only an iterator that also yields
-    /// from its back end reverses: `RevIter`'s implementation asks for
-    /// `DoubleEndedIterator`.
-    rev(this) -> RevIter<This> {
-        return RevIter::new(this);
+    /// from its back end, a `DoubleEndedIterator`, reverses.
+    rev(this) -> implement Iterator<This::Item> where This: DoubleEndedIterator {
+        return RevIter { inner: this };
     }
 
     /// Yield the same elements, with `peek` reading the next one without
@@ -164,8 +163,8 @@ public type trait Iterator {
 
     /// Map each element to an iterator with `f`, and yield the elements of
     /// each of those in turn.
-    flat_map<B, F>(this, f: F) -> FlatMapIter<This, F, B> where F: (This::Item) -> B {
-        return FlatMapIter::new(this, f);
+    flat_map<B, F>(this, f: F) -> implement Iterator<B::Item> where F: (This::Item) -> B, B: Iterator {
+        return FlatMapIter::<This, F, B> { inner: this, f: f, current: Option::None };
     }
 
 
@@ -252,15 +251,9 @@ public type trait Iterator {
 }
 
 /// Adapter yielding at most `remaining` elements from `inner`.
-public type struct TakeIter<I> {
+internal type struct TakeIter<I> {
     private inner: I;
     private remaining: i64;
-
-    /// At most the first `n` elements of `inner`; `inner.take(n)` makes
-    /// the same.
-    public static new(inner: I, n: i64) -> TakeIter<I> {
-        return TakeIter::<I> { inner: inner, remaining: n };
-    }
 }
 
 implement<I, A> trait Iterator<A> for struct TakeIter<I>
@@ -277,15 +270,9 @@ where I: Iterator<A> {
 /// Adapter that drops the first `remaining` elements of `inner` on the first
 /// `next`, then passes the rest through. `remaining` counts DOWN as elements
 /// are skipped; once it hits 0 the adapter is transparent.
-public type struct SkipIter<I> {
+internal type struct SkipIter<I> {
     private inner: I;
     private remaining: i64;
-
-    /// `inner`'s elements after the first `n`; `inner.skip(n)` makes the
-    /// same.
-    public static new(inner: I, n: i64) -> SkipIter<I> {
-        return SkipIter::<I> { inner: inner, remaining: n };
-    }
 }
 
 implement<I, A> trait Iterator<A> for struct SkipIter<I>
@@ -315,15 +302,9 @@ where I: Iterator<A> {
 /// inherited default - its own generics included - to the receiver's
 /// arguments, leaving the default's generic of that name unbindable.  So the
 /// result-type parameter is `O`, not `B`.
-public type struct MapIter<I, Mapper, O> where I: Iterator, Mapper: (I::Item) -> O {
+internal type struct MapIter<I, Mapper, O> where I: Iterator, Mapper: (I::Item) -> O {
     private inner: I;
     private f:     Mapper;
-
-    /// `f` applied to each of `inner`'s elements, as they are drawn;
-    /// `inner.map(f)` makes the same.
-    public static new(inner: I, f: Mapper) -> MapIter<I, Mapper, O> {
-        return MapIter::<I, Mapper, O> { inner: inner, f: f };
-    }
 }
 
 implement<I, Mapper, O> trait Iterator<O> for struct MapIter<I, Mapper, O>
@@ -337,15 +318,9 @@ where I: Iterator, Mapper: (I::Item) -> O {
 }
 
 /// Adapter yielding only the elements of `inner` for which `pred` holds.
-public type struct FilterIter<I, Predicate> where I: Iterator, Predicate: (&I::Item) -> boolean {
+internal type struct FilterIter<I, Predicate> where I: Iterator, Predicate: (&I::Item) -> boolean {
     private inner: I;
     private pred:  Predicate;
-
-    /// The elements of `inner` that `pred` holds for; `inner.filter(pred)`
-    /// makes the same.
-    public static new(inner: I, pred: Predicate) -> FilterIter<I, Predicate> {
-        return FilterIter::<I, Predicate> { inner: inner, pred: pred };
-    }
 }
 
 implement<I, Predicate> trait Iterator<I::Item> for struct FilterIter<I, Predicate>
@@ -367,16 +342,10 @@ where I: Iterator, Predicate: (&I::Item) -> boolean {
 /// Adapter concatenating two iterators of the same element type: it drains
 /// `first`, then `second`.  Both inner element types are pinned to the shared
 /// `A` by the `where`-bounds.
-public type struct ChainIter<I, J> {
+internal type struct ChainIter<I, J> {
     private first:      I;
     private second:     J;
     private first_done: boolean;
-
-    /// Every element of `first`, then every element of `second`;
-    /// `first.chain(second)` makes the same.
-    public static new(first: I, second: J) -> ChainIter<I, J> {
-        return ChainIter::<I, J> { first: first, second: second, first_done: false };
-    }
 }
 
 implement<I, J, A> trait Iterator<A> for struct ChainIter<I, J>
@@ -395,15 +364,9 @@ where I: Iterator<A>, J: Iterator<A> {
 /// Adapter pairing each element of `inner` with its 0-based index.  The
 /// element type is the inner iterator's associated item `I::Item`; the yielded
 /// item is `Pair<i64, I::Item>`.
-public type struct EnumerateIter<I> {
+internal type struct EnumerateIter<I> {
     private inner: I;
     private index: i64;
-
-    /// Each of `inner`'s elements paired with its position, counting from
-    /// 0; `inner.enumerate()` makes the same.
-    public static new(inner: I) -> EnumerateIter<I> {
-        return EnumerateIter::<I> { inner: inner, index: 0 };
-    }
 }
 
 implement<I> trait Iterator<Pair<i64, I::Item>> for struct EnumerateIter<I>
@@ -424,15 +387,9 @@ where I: Iterator {
 /// either side runs out.  Chain-shaped: the element types `A` (from `I`) and
 /// `O` (from `J`) live only in the impl `where`-bounds, not as struct
 /// parameters, so the receiver type only mentions the two inner iterators.
-public type struct ZipIter<I, J> {
+internal type struct ZipIter<I, J> {
     private first:  I;
     private second: J;
-
-    /// Pairs of one element from each of `first` and `second`, in step,
-    /// ending when either ends; `first.zip(second)` makes the same.
-    public static new(first: I, second: J) -> ZipIter<I, J> {
-        return ZipIter::<I, J> { first: first, second: second };
-    }
 }
 
 implement<I, J, A, O> trait Iterator<Pair<A, O>> for struct ZipIter<I, J>
@@ -490,13 +447,8 @@ public type trait DoubleEndedIterator : Iterator {
 
 /// Adapter yielding `inner`'s elements back to front.  Its own back end is
 /// `inner`'s front, so a reversed iterator reverses back.
-public type struct RevIter<I> {
+internal type struct RevIter<I> {
     private inner: I;
-
-    /// `inner`'s elements back to front; `inner.rev()` makes the same.
-    public static new(inner: I) -> RevIter<I> {
-        return RevIter::<I> { inner: inner };
-    }
 }
 
 implement<I> trait Iterator<I::Item> for struct RevIter<I>
@@ -553,16 +505,10 @@ where I: Iterator {
 /// yielding that iterator's elements, then the next one's.  `U` is the
 /// iterator `f` returns; the element type `O` it yields lives in the
 /// implementation's bounds.
-public type struct FlatMapIter<I, Mapper, U> where I: Iterator, Mapper: (I::Item) -> U {
+internal type struct FlatMapIter<I, Mapper, U> where I: Iterator, Mapper: (I::Item) -> U {
     private inner: I;
     private f:     Mapper;
     private current: Option<U>;
-
-    /// For each of `inner`'s elements, every element of the iterator `f`
-    /// makes from it; `inner.flat_map(f)` makes the same.
-    public static new(inner: I, f: Mapper) -> FlatMapIter<I, Mapper, U> {
-        return FlatMapIter::<I, Mapper, U> { inner: inner, f: f, current: Option::None };
-    }
 }
 
 implement<I, Mapper, U, O> trait Iterator<O> for struct FlatMapIter<I, Mapper, U>
