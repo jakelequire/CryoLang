@@ -116,7 +116,7 @@ type struct DepResolver {
     /// it.
     static resolve(top_config: ProjectConfig*,
                      mode: ResolveMode,
-                     lock_path_text: string) -> ResolveOutcome {
+                     lock_path: Path) -> ResolveOutcome {
         mut outcome: ResolveOutcome = ResolveOutcome::empty();
         mut visited: [DepKey] = [];
 
@@ -125,7 +125,7 @@ type struct DepResolver {
         // ignores it entirely.
         mut existing: Lockfile = match (mode) {
             ResolveMode::Update => { Lockfile::empty() }
-            _ => { Lockfile::read(lock_path_text) }
+            _ => { Lockfile::read(lock_path) }
         };
         mut new_lock: Lockfile = Lockfile::empty();
 
@@ -140,18 +140,12 @@ type struct DepResolver {
             // The lockfile has two independently-managed sections: `packages`
             // (this resolver) and `vendor` (the build's reproducibility pins).
             // We only rebuilt `packages`, so carry the on-disk `vendor` section
-            // over verbatim instead of clobbering it with our empty one.  The
-            // `string` fields are non-owning pointers into leaked buffers, so a
-            // field-wise copy is safe and `disk` drops without a double free.
-            mut disk: Lockfile = Lockfile::read(lock_path_text);
+            // over verbatim instead of clobbering it with our empty one.
+            const disk: Lockfile = Lockfile::read(lock_path);
             for (mut vi: i64 = 0; vi < disk.vendor.length(); vi++) {
-                new_lock.vendor.push(LockedVendor {
-                    name:        disk.vendor[vi].name,
-                    triple:      disk.vendor[vi].triple,
-                    binding_sha: disk.vendor[vi].binding_sha,
-                });
+                new_lock.vendor.push(disk.vendor[vi].clone());
             }
-            Lockfile::write(lock_path_text, &new_lock);
+            Lockfile::write(lock_path, &new_lock);
         }
 
         // Each arm consumes BOTH lockfiles: one is moved into the outcome,
@@ -250,7 +244,7 @@ type struct DepResolver {
                              new_lock: mut Lockfile*,
                              visited: mut [DepKey]*,
                              outcome: mut ResolveOutcome*) -> void {
-        mut sha: string = "";
+        mut sha: String = String::new();
 
         match (mode) {
             ResolveMode::Build => {
@@ -265,9 +259,9 @@ type struct DepResolver {
                     outcome.failed = true;
                     return;
                 }
-                sha = locked.sha;
-                if (!Git::is_checkout_present(dep.git_url, sha)) {
-                    if (!Git::materialize_checkout(dep.git_url, sha)) {
+                sha = locked.sha.clone();
+                if (!Git::is_checkout_present(dep.git_url, sha.as_str())) {
+                    if (!Git::materialize_checkout(dep.git_url, sha.as_str())) {
                         outcome.failed = true;
                         return;
                     }
@@ -280,7 +274,7 @@ type struct DepResolver {
                 if (mode == ResolveMode::Fetch) {
                     const locked: const LockedDep* = existing.find(dep.name);
                     if (locked != null && DepResolver::locked_matches_dep(locked, dep)) {
-                        sha    = locked.sha;
+                        sha    = locked.sha.clone();
                         reused = true;
                     }
                 }
@@ -289,33 +283,33 @@ type struct DepResolver {
                         outcome.failed = true;
                         return;
                     }
-                    sha = DepResolver::resolve_to_sha(dep).into_raw();
+                    sha = DepResolver::resolve_to_sha(dep);
                     if (sha.length() == 0) {
                         outcome.failed = true;
                         return;
                     }
                 }
-                if (!Git::materialize_checkout(dep.git_url, sha)) {
+                if (!Git::materialize_checkout(dep.git_url, sha.as_str())) {
                     outcome.failed = true;
                     return;
                 }
                 // Append to the new lockfile.
-                mut entry: LockedDep = LockedDep::empty();
-                entry.name     = dep.name;
-                entry.url      = dep.git_url;
-                entry.ref_kind = DepResolver::ref_kind_label(dep.ref_kind);
-                entry.ref_val  = dep.ref_val;
-                entry.sha      = sha;
-                new_lock.packages.push(entry);
+                new_lock.packages.push(LockedDep {
+                    name:     String::from_string(dep.name),
+                    url:      String::from_string(dep.git_url),
+                    ref_kind: String::from_string(DepResolver::ref_kind_label(dep.ref_kind)),
+                    ref_val:  String::from_string(dep.ref_val),
+                    sha:      sha.clone(),
+                });
             }
         }
 
         // Cycle detection: scoped to this URL@SHA pair.
-        const key: DepKey = DepKey::for_git(dep.git_url, sha);
+        const key: DepKey = DepKey::for_git(dep.git_url, sha.as_str());
         if (visited.contains(&key)) { return; }
         visited.push(key);
 
-        const checkout: PathBuf = Git::checkout_path(dep.git_url, sha);
+        const checkout: PathBuf = Git::checkout_path(dep.git_url, sha.as_str());
         const dep_root: string = if (dep.subdir.length() > 0) {
             checkout.join(dep.subdir).into_raw()
         } else {
@@ -384,9 +378,9 @@ type struct DepResolver {
     /// Comparing on (url, ref_kind, ref_val) catches the "user changed
     /// `version = ...`" case and forces a re-resolve.
     static locked_matches_dep(locked: const LockedDep*, dep: Dependency) -> boolean {
-        if (!locked.url.eq(dep.git_url)) { return false; }
-        if (locked.ref_kind != DepResolver::ref_kind_label(dep.ref_kind)) { return false; }
-        if (!locked.ref_val.eq(dep.ref_val)) { return false; }
+        if (locked.url.as_str() != str::Str::from(dep.git_url)) { return false; }
+        if (locked.ref_kind.as_str() != str::Str::from(DepResolver::ref_kind_label(dep.ref_kind))) { return false; }
+        if (locked.ref_val.as_str() != str::Str::from(dep.ref_val)) { return false; }
         return true;
     }
 

@@ -39,7 +39,7 @@ import utils;
 import utils::log::{ Log, LogArea, LogLevel };
 import utils::time_trace::{ TimeTrace };
 import std::fmt;
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::env;
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::thread;
@@ -954,9 +954,9 @@ type struct CompilerInstance {
         // dep roots and reporting confusing "namespace not found"
         // diagnostics later.
         mut stage_start: i64 = TimeTrace::now();
-        const lock_path: string = CompilerInstance::lock_path_for(config.project_root);
+        const lock_path: PathBuf = CompilerInstance::lock_path_for(config.project_root);
         const dep_outcome: ResolveOutcome = DepResolver::resolve(
-            &config, ResolveMode::Build, lock_path);
+            &config, ResolveMode::Build, lock_path.as_path());
         if (dep_outcome.failed) {
             return CompilationResult::failed(1, 0);
         }
@@ -1063,7 +1063,7 @@ type struct CompilerInstance {
         // system header or libclang upgrade silently changed the bound API).
         const used_locks: [LockedVendor] = loader.collect_vendor_locks();
         if (used_locks.length() > 0) {
-            if (!CompilerInstance::sync_vendor_lock(lock_path, &used_locks, this.config.locked)) {
+            if (!CompilerInstance::sync_vendor_lock(lock_path.as_path(), &used_locks, this.config.locked)) {
                 // Only `--locked` returns false (a drift/missing-entry gate
                 // failure); the diagnostic was already printed.
                 return CompilationResult::failed(1, 0);
@@ -3063,12 +3063,11 @@ type struct CompilerInstance {
     }
 
     /// Path to the lockfile next to a given cryoconfig.
-    static lock_path_for(consumer_root_text: string) -> string {
-        const consumer_root: string = consumer_root_text;
-        if (consumer_root.length() == 0 || consumer_root.eq(".")) {
-            return "cryoconfig.lock";
+    static lock_path_for(consumer_root: Str) -> PathBuf {
+        if (consumer_root.is_empty() || consumer_root == Str::new(".")) {
+            return PathBuf::from(Str::new("cryoconfig.lock"));
         }
-        return Path::from(consumer_root).join("cryoconfig.lock").into_raw();
+        return Path::from(consumer_root).join(Str::new("cryoconfig.lock"));
     }
 
     /// Reconcile `used` (the vendor bindings this build resolved) with the
@@ -3080,44 +3079,33 @@ type struct CompilerInstance {
     ///     content hash drifted.  Returns true when every binding matches.
     /// The packages section is preserved because `read` loads it and `write`
     /// emits it back untouched.
-    static sync_vendor_lock(lock_path_text: string, used: &[LockedVendor], locked: boolean) -> boolean {
-        const lock_path: string = lock_path_text;
-        mut lock: Lockfile = Lockfile::read(lock_path_text);
+    static sync_vendor_lock(lock_path: Path, used: &[LockedVendor], locked: boolean) -> boolean {
+        mut lock: Lockfile = Lockfile::read(lock_path);
         mut changed: boolean = false;
         mut drift:   boolean = false;
         for (mut i: i64 = 0; i < used.length(); i++) {
             mut found: i64 = -1;
             for (mut j: i64 = 0; j < lock.vendor.length(); j++) {
-                if (lock.vendor[j].name.eq(used[i].name)
-                        && lock.vendor[j].triple.eq(used[i].triple)) {
+                if (lock.vendor[j].name == used[i].name && lock.vendor[j].triple == used[i].triple) {
                     found = j;
                     break;
                 }
             }
             if (found < 0) {
                 if (locked) {
-                    fmt::eprintf("error: --locked: vendor '%s' (triple '%s') has no entry in %s.\n        Run a normal build to record it, then commit the lockfile.\n",
-                        used[i].name, used[i].triple, lock_path);
+                    fmt::eprintln(f"error: --locked: vendor '{used[i].name}' (triple '{used[i].triple}') has no entry in {lock_path.as_str()}.\n        Run a normal build to record it, then commit the lockfile.");
                     drift = true;
                 } else {
-                    lock.vendor.push(LockedVendor {
-                        name:        used[i].name,
-                        triple:      used[i].triple,
-                        binding_sha: used[i].binding_sha,
-                    });
+                    lock.vendor.push(used[i].clone());
                     changed = true;
                 }
-            } else if (!lock.vendor[found].binding_sha.eq(used[i].binding_sha)) {
+            } else if (lock.vendor[found].binding_sha != used[i].binding_sha) {
                 if (locked) {
-                    fmt::eprintf("error: --locked: vendor '%s' (triple '%s') bindings drifted from %s.\n        locked %s, built %s. Run `cryo vendor rebuild %s` and re-lock, or restore the toolchain.\n",
-                        used[i].name, used[i].triple, lock_path,
-                        lock.vendor[found].binding_sha, used[i].binding_sha, used[i].name);
+                    fmt::eprintln(f"error: --locked: vendor '{used[i].name}' (triple '{used[i].triple}') bindings drifted from {lock_path.as_str()}.\n        locked {lock.vendor[found].binding_sha}, built {used[i].binding_sha}. Run `cryo vendor rebuild {used[i].name}` and re-lock, or restore the toolchain.");
                     drift = true;
                 } else {
-                    fmt::eprintf("note: vendor '%s' (triple '%s') bindings changed; updating %s (%s -> %s).\n",
-                        used[i].name, used[i].triple, lock_path,
-                        lock.vendor[found].binding_sha, used[i].binding_sha);
-                    lock.vendor[found].binding_sha = used[i].binding_sha;
+                    fmt::eprintln(f"note: vendor '{used[i].name}' (triple '{used[i].triple}') bindings changed; updating {lock_path.as_str()} ({lock.vendor[found].binding_sha} -> {used[i].binding_sha}).");
+                    lock.vendor[found].binding_sha = used[i].binding_sha.clone();
                     changed = true;
                 }
             }
@@ -3125,8 +3113,8 @@ type struct CompilerInstance {
         if (locked) {
             return !drift;
         }
-        if (changed && !Lockfile::write(lock_path_text, &lock)) {
-            fmt::eprintf("warning: could not write vendor pins to %s\n", lock_path);
+        if (changed && !Lockfile::write(lock_path, &lock)) {
+            fmt::eprintln(f"warning: could not write vendor pins to {lock_path.as_str()}");
         }
         return true;
     }

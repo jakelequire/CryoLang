@@ -5274,6 +5274,7 @@ color  = "auto"                     # auto | always | never
 | `cryo check <file>`      | Front-end + semantic analysis only; no codegen.                                                                     |
 | `cryo init [dir]`        | Scaffold a new project (`cryoconfig` + `main.cryo`).                                                                |
 | `cryo demangle <sym>`    | Decode a mangled symbol to its source form.                                                                         |
+| `cryo api-index write\|check <root> <file>` | Write, or check that `<file>` already holds, the one-line-per-declaration index of the standard library under `<root>`. |
 | `cryo fetch`             | Fetch dependencies and write `cryoconfig.lock`.                                                                     |
 | `cryo update`            | Re-resolve every dependency, ignoring the lockfile.                                                                 |
 | `cryo vendor <sub>`      | Manage the per-machine registry of vendored C libraries: `<path>` \| `list` \| `remove <name>` \| `rebuild [name]`. |

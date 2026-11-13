@@ -45,17 +45,11 @@ import std::json::value::{ JsonObject, JsonValue };
 
 /// A single git dependency pinned in the lockfile.
 type struct LockedDep {
-    name:     string;
-    url:      string;
-    ref_kind: string;   // "version" | "tag" | "branch" | "rev"
-    ref_val:  string;
-    sha:      string;   // 40-char full SHA
-
-    static empty() -> LockedDep {
-        return LockedDep {
-            name: "", url: "", ref_kind: "", ref_val: "", sha: "",
-        };
-    }
+    name:     String;
+    url:      String;
+    ref_kind: String;   // "version" | "tag" | "branch" | "rev"
+    ref_val:  String;
+    sha:      String;   // 40-char full SHA
 }
 
 /// A single vendored binding pinned by the content hash of its generated
@@ -63,20 +57,20 @@ type struct LockedDep {
 /// the bytes the compiler actually consumes), not the provenance/input key - so
 /// a cosmetic toolchain bump that produces byte-identical bindings does not read
 /// as drift, while any real change to the bound API does.
-type struct LockedVendor {
-    name:        string;   // the import namespace, e.g. "RayLib"
-    triple:      string;   // normalized target triple ("host" for a host build)
-    binding_sha: string;   // hex FNV-1a of the generated bindings file
+type struct LockedVendor with [Clone] {
+    name:        String;   // the import namespace, e.g. "RayLib"
+    triple:      String;   // normalized target triple ("host" for a host build)
+    binding_sha: String;   // hex FNV-1a of the generated bindings file
 
-    /// Content hash of a generated bindings file, or "" when it can't be read.
-    /// Reuses the build manifest's FNV-1a folding so the whole compiler hashes
-    /// one way (and this matches how `provenance_key` folds file bytes).
-    static file_sha(path_text: string) -> string {
-        const path: string = path_text;
-        if (!Path::from(path).exists()) { return ""; }
+    /// Content hash of a generated bindings file, or empty when it can't be
+    /// read.  Reuses the build manifest's FNV-1a folding so the whole
+    /// compiler hashes one way (and this matches how `provenance_key` folds
+    /// file bytes).
+    static file_sha(path: Path) -> String {
+        if (!path.exists()) { return String::new(); }
         mut h: Fnv128Hasher = Fnv128Hasher::new();
-        Manifest::fold_file(&h, path_text);
-        return Manifest::hex128(h.finish128());
+        Manifest::fold_file(&h, path.as_str());
+        return String::from_string(Manifest::hex128(h.finish128()));
     }
 }
 
@@ -93,9 +87,9 @@ type struct Lockfile {
     }
 
     /// Find the locked package for `name`, or null if absent.
-    find(&this, name: string) -> const LockedDep* {
+    find(&this, name: Str) -> const LockedDep* {
         for (mut i: i64 = 0; i < this.packages.length(); i++) {
-            if (this.packages[i].name.eq(name)) {
+            if (this.packages[i].name.as_str() == name) {
                 return &this.packages[i];
             }
         }
@@ -103,33 +97,29 @@ type struct Lockfile {
     }
 
 
-    /// Read a string field off a JSON object, or "" when absent/non-string.
-    static jstr(parent: JsonValue*, key: string) -> string {
-        match (parent.get(Str::from(key))) {
+    /// Read a string field off a JSON object, or an empty one when it is
+    /// absent or not a string.
+    static jstr(parent: JsonValue*, key: Str) -> String {
+        match (parent.get(key)) {
             Option::Some(vp) => {
                 match (vp.as::<Str>()) {
-                    Option::Some(vs) => {
-                        mut owned: String = String::from_str(vs);
-                        return owned.into_raw();
-                    }
-                    Option::None => { return ""; }
+                    Option::Some(vs) => { return String::from_str(vs); }
+                    Option::None => { return String::new(); }
                 }
             }
-            Option::None => { return ""; }
+            Option::None => { return String::new(); }
         }
     }
 
     /// Read and parse `path`.  A missing, malformed, or legacy (pre-JSON INI)
     /// file yields an empty Lockfile - never an error, since the next
     /// `cryo fetch` / build rebuilds it cleanly.
-    static read(path_text: string) -> Lockfile {
-        const path: string = path_text;
-        mut content: string = "";
-        match (File::read_text(Path::from(path))) {
-            Result::Ok(s)  => { content = s.into_raw(); }
+    static read(path: Path) -> Lockfile {
+        const content: String = match (File::read_text(path)) {
+            Result::Ok(text) => { text }
             Result::Err(_) => { return Lockfile::empty(); }
-        }
-        mut root: JsonValue = match (parser::parse(Str::from(content))) {
+        };
+        mut root: JsonValue = match (parser::parse(content.as_str())) {
             Result::Ok(v)      => { v }
             Result::Err(e)     => { mem::drop(e); return Lockfile::empty(); }
         };
@@ -152,11 +142,11 @@ type struct Lockfile {
                     match (pkgs.at(i)) {
                         Option::Some(ep) => {
                             lock.packages.push(LockedDep {
-                                name:     Lockfile::jstr(ep, "name"),
-                                url:      Lockfile::jstr(ep, "url"),
-                                ref_kind: Lockfile::jstr(ep, "ref_kind"),
-                                ref_val:  Lockfile::jstr(ep, "ref_val"),
-                                sha:      Lockfile::jstr(ep, "sha"),
+                                name:     Lockfile::jstr(ep, Str::new("name")),
+                                url:      Lockfile::jstr(ep, Str::new("url")),
+                                ref_kind: Lockfile::jstr(ep, Str::new("ref_kind")),
+                                ref_val:  Lockfile::jstr(ep, Str::new("ref_val")),
+                                sha:      Lockfile::jstr(ep, Str::new("sha")),
                             });
                         }
                         Option::None => { }
@@ -173,9 +163,9 @@ type struct Lockfile {
                     match (vens.at(i)) {
                         Option::Some(ep) => {
                             lock.vendor.push(LockedVendor {
-                                name:        Lockfile::jstr(ep, "name"),
-                                triple:      Lockfile::jstr(ep, "triple"),
-                                binding_sha: Lockfile::jstr(ep, "binding_sha"),
+                                name:        Lockfile::jstr(ep, Str::new("name")),
+                                triple:      Lockfile::jstr(ep, Str::new("triple")),
+                                binding_sha: Lockfile::jstr(ep, Str::new("binding_sha")),
                             });
                         }
                         Option::None => { }
@@ -187,26 +177,25 @@ type struct Lockfile {
 
         mem::drop(root);
         if (lock.schema_version != CURRENT_SCHEMA_VERSION) {
-            fmt::eprintln(f"warning: {path} has schema_version={lock.schema_version}; expected {CURRENT_SCHEMA_VERSION}; regenerate via `cryo fetch`");
+            fmt::eprintln(f"warning: {path.as_str()} has schema_version={lock.schema_version}; expected {CURRENT_SCHEMA_VERSION}; regenerate via `cryo fetch`");
         }
         return lock;
     }
 
     /// Write `lock` to `path`, overwriting any existing file.  Entries are
     /// emitted in insertion order so diffs stay readable.
-    static write(path_text: string, lock: Lockfile*) -> boolean {
-        const path: string = path_text;
+    static write(path: Path, lock: &Lockfile) -> boolean {
         mut root: JsonObject = JsonObject::new();
         root.put("schema_version", JsonValue::int_value(CURRENT_SCHEMA_VERSION));
 
         mut pkgs: Array<JsonValue> = Array::<JsonValue>::new();
         for (mut i: i64 = 0; i < lock.packages.length(); i++) {
             mut o: JsonObject = JsonObject::new();
-            o.put("name",     JsonValue::from(lock.packages[i].name));
-            o.put("url",      JsonValue::from(lock.packages[i].url));
-            o.put("ref_kind", JsonValue::from(lock.packages[i].ref_kind));
-            o.put("ref_val",  JsonValue::from(lock.packages[i].ref_val));
-            o.put("sha",      JsonValue::from(lock.packages[i].sha));
+            o.put("name",     JsonValue::from(lock.packages[i].name.as_str()));
+            o.put("url",      JsonValue::from(lock.packages[i].url.as_str()));
+            o.put("ref_kind", JsonValue::from(lock.packages[i].ref_kind.as_str()));
+            o.put("ref_val",  JsonValue::from(lock.packages[i].ref_val.as_str()));
+            o.put("sha",      JsonValue::from(lock.packages[i].sha.as_str()));
             pkgs.push(JsonValue::Object(o));
         }
         root.put("packages", JsonValue::Array(pkgs));
@@ -214,9 +203,9 @@ type struct Lockfile {
         mut vens: Array<JsonValue> = Array::<JsonValue>::new();
         for (mut i: i64 = 0; i < lock.vendor.length(); i++) {
             mut o: JsonObject = JsonObject::new();
-            o.put("name",        JsonValue::from(lock.vendor[i].name));
-            o.put("triple",      JsonValue::from(lock.vendor[i].triple));
-            o.put("binding_sha", JsonValue::from(lock.vendor[i].binding_sha));
+            o.put("name",        JsonValue::from(lock.vendor[i].name.as_str()));
+            o.put("triple",      JsonValue::from(lock.vendor[i].triple.as_str()));
+            o.put("binding_sha", JsonValue::from(lock.vendor[i].binding_sha.as_str()));
             vens.push(JsonValue::Object(o));
         }
         root.put("vendor", JsonValue::Array(vens));
@@ -229,7 +218,7 @@ type struct Lockfile {
         const ok: boolean = match (File::write_bytes(Path::from(path), text.as_bytes())) {
             Result::Ok(_)  => { true }
             Result::Err(_) => {
-                fmt::eprintln(f"error: cannot open {path} for writing");
+                fmt::eprintln(f"error: cannot open {path.as_str()} for writing");
                 false
             }
         };
