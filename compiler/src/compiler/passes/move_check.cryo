@@ -39,6 +39,8 @@ import std::collections::hashmap::{ HashMap };
 import compiler::types::generic::{ InstantiatedType };
 import compiler::types::user_defined::{ StructType };
 import std::fmt;
+import std::fmt::display::{ Display };
+import std::collections::string::{ String };
 import compiler::ast::declaration::{
     DeclarationNode, DestructureBinding, DestructureDecl, FunctionDecl,
     DeclKind, ImplBlock, MethodDecl, StructDecl, UnionDecl,
@@ -638,9 +640,9 @@ type struct MoveChecker {
     /// storage, so moving it now leaves that pointer naming the old bytes.
     emit_moved_after_poll(mut &this, name: SymbolStr, sym: SymbolID,
                           move_span: SourceSpan) -> void {
-        const headline: string = fmt::format(
+        const headline: String = fmt::format(
             "future `%s` is moved after it has been polled",
-            this.intern.resolve(name)).into_raw();
+            this.intern.resolve(name));
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0459_MOVED_AFTER_POLL, headline);
         diag = diag.at_with_label(move_span, "moved here");
@@ -1051,9 +1053,9 @@ type struct MoveChecker {
     /// the same allocation - a double free.  The pass is fatal_on_failure,
     /// so a non-zero `fatal` aborts the pipeline before codegen and the
     /// unsound binary is never emitted.
-    emit_use_after_move(mut &this, code: ErrorCode, headline_text: string,
-                        use_span: SourceSpan, move_span: SourceSpan, value_type: TypeRef) -> void {
-        mut diag: Diagnostic = Diagnostic::error(code, headline_text);
+    emit_use_after_move<T>(mut &this, code: ErrorCode, headline: T,
+                        use_span: SourceSpan, move_span: SourceSpan, value_type: TypeRef) -> void where T: Display {
+        mut diag: Diagnostic = Diagnostic::error(code, headline);
         diag = diag.at_with_label(use_span, "value used here after move");
         if (move_span.has_location()) {
             diag = diag.also_at(move_span, "value moved here");
@@ -1081,7 +1083,7 @@ type struct MoveChecker {
         mut checker: TraitChecker = TraitChecker::new(
             this.arena, this.registry, this.intern, this.ctx.diagnostics);
         if (checker.type_implements_trait(ty, clone_trait, 0)) {
-            const message: string = fmt::format("`%s` implements `Clone`: move a copy where the value is first moved", shown).into_raw();
+            const message: String = fmt::format("`%s` implements `Clone`: move a copy where the value is first moved", shown);
             if (moved == null || moved.takes_postfix_directly()) {
                 return diag.suggest(Suggestion::machine_applicable(moved_at.end_point(), ".clone()", message));
             }
@@ -1094,7 +1096,7 @@ type struct MoveChecker {
         if (this.aggregate_type_of(ty) == null && !is_enum) { return diag; }
         return diag.help_with_example(fmt::format(
             "`%s` does not implement `Clone`; derive it on its declaration, or implement it, to move a copy and keep the original",
-            shown), fmt::format("type %s %s with [Clone] { ... }", if (is_enum) { "enum" } else { "struct" }, shown).into_raw());
+            shown), fmt::format("type %s %s with [Clone] { ... }", if (is_enum) { "enum" } else { "struct" }, shown));
     }
 
     /// Whether `ty`, its instantiations seen through, is an enum.
@@ -1124,9 +1126,8 @@ type struct MoveChecker {
 
     /// As `emit_loop_carried`, for a value named by written text: a field
     /// path such as `h.items`.
-    emit_loop_carried_text(mut &this, name: string, use_span: SourceSpan) -> void {
-        const headline: string = fmt::format(
-            "value `%s` moved inside a loop is used again on the next iteration", name).into_raw();
+    emit_loop_carried_text<T>(mut &this, name: T, use_span: SourceSpan) -> void where T: Display {
+        const headline: String = f"value `{name}` moved inside a loop is used again on the next iteration";
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0452_USE_AFTER_MOVE, headline);
         diag = diag.at_with_label(use_span,
@@ -1780,7 +1781,7 @@ type struct MoveChecker {
     /// the value is released again after the move.
     emit_capture_move_out(mut &this, name: SymbolStr, span: SourceSpan, ty: TypeRef) -> void {
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
-            fmt::format("cannot move captured `%s` out of a closure", this.intern.resolve(name)).into_raw());
+            fmt::format("cannot move captured `%s` out of a closure", this.intern.resolve(name)));
         diag = diag.at_with_label(span,
             "moving the capture out here leaves the closure's owner of it to release it again (double free)");
         diag = diag.with_note(
@@ -1797,13 +1798,13 @@ type struct MoveChecker {
         const shown: string = this.intern.resolve(name);
         const site: SourceSpan = this.borrow_sites[entry];
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0457_NON_COPY_CAPTURE,
-            fmt::format("cannot move `%s` while a closure borrows it", shown).into_raw());
-        diag = diag.at_with_label(span, fmt::format("`%s` is moved here", shown).into_raw());
-        diag = diag.also_at(site, fmt::format("this closure borrows `%s` and can still run", shown).into_raw());
+            fmt::format("cannot move `%s` while a closure borrows it", shown));
+        diag = diag.at_with_label(span, fmt::format("`%s` is moved here", shown));
+        diag = diag.also_at(site, fmt::format("this closure borrows `%s` and can still run", shown));
         diag = diag.with_note(
             "a closure written without `move` borrows each captured value that is not `Copy`, so the value has to stay where it is while the closure can run");
         diag = diag.help(fmt::format(
-            "to keep the move, make the closure own `%s`: a `move` closure takes what it captures where it is made", shown).into_raw());
+            "to keep the move, make the closure own `%s`: a `move` closure takes what it captures where it is made", shown));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1814,12 +1815,12 @@ type struct MoveChecker {
     emit_use_after_closure_move(mut &this, name: SymbolStr, use_span: SourceSpan, closure: SourceSpan) -> void {
         const shown: string = this.intern.resolve(name);
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0452_USE_AFTER_MOVE,
-            fmt::format("use of moved value `%s`", shown).into_raw());
+            fmt::format("use of moved value `%s`", shown));
         diag = diag.at_with_label(use_span, "value used here after move");
-        diag = diag.also_at(closure, fmt::format("`%s` was moved into this `move` closure", shown).into_raw());
+        diag = diag.also_at(closure, fmt::format("`%s` was moved into this `move` closure", shown));
         diag = diag.help(fmt::format(
             "a `move` closure owns what it captures; to keep `%s`, capture a clone made before the closure, or leave out `move` so the closure borrows it",
-            shown).into_raw());
+            shown));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -2218,8 +2219,8 @@ type struct MoveChecker {
     emit_double_field_move(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*,
                            moved_at: SourceSpan) -> void {
         const field: string = this.intern.resolve(ma.member);
-        const headline: string = fmt::format(
-            "field `%s` moved out of a value more than once", field).into_raw();
+        const headline: String = fmt::format(
+            "field `%s` moved out of a value more than once", field);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0452_USE_AFTER_MOVE, headline);
         diag = diag.at_with_label(e.span,
@@ -2312,7 +2313,7 @@ type struct MoveChecker {
             if (this.suppress_emit) { return; }
             const field: string = this.intern.resolve(ma.member);
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
-                fmt::format("cannot move field `%s` out of a value that owns a destructor", field).into_raw());
+                fmt::format("cannot move field `%s` out of a value that owns a destructor", field));
             diag = diag.at_with_label(expr.span,
                 "the destructor is run over the whole value when the statement ends, this field with it");
             diag = diag.help(
@@ -2340,7 +2341,7 @@ type struct MoveChecker {
             if (!this.suppress_emit) {
                 const owner: string = this.intern.resolve(ExpressionNode::identifier_of(ma.object).name);
                 this.emit_loop_carried_text(
-                    fmt::format("%s.%s", owner, this.intern.resolve(ma.member)).into_raw(), expr.span);
+                    fmt::format("%s.%s", owner, this.intern.resolve(ma.member)), expr.span);
             }
             return;
         }
@@ -2376,8 +2377,8 @@ type struct MoveChecker {
         if (!this.is_receiver_value_place(ma.object)) { return; }
         if (!this.type_needs_drop(field_ty)) { return; }
         const field: string = this.intern.resolve(ma.member);
-        const headline: string = fmt::format(
-            "cannot move field `%s` out of `this` in a destructor", field).into_raw();
+        const headline: String = fmt::format(
+            "cannot move field `%s` out of `this` in a destructor", field);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0453_DOUBLE_FREE, headline);
         diag = diag.at_with_label(e.span,
@@ -2573,7 +2574,7 @@ type struct MoveChecker {
         if (this.suppress_emit) { return; }
         const name: string = this.intern.resolve(id.name);
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
-            fmt::format("cannot move `%s` out through a reference", name).into_raw());
+            fmt::format("cannot move `%s` out through a reference", name));
         diag = diag.at_with_label(expr.span,
             "this copies the value's owning handle into a second owner; the storage it refers to still drops it too (double free)");
         diag = diag.help(
@@ -2602,21 +2603,21 @@ type struct MoveChecker {
     /// not tracked one by one.
     emit_move_out_error(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*) -> void {
         const field: string = this.intern.resolve(ma.member);
-        mut headline: string = fmt::format("cannot move field `%s` out of a value that drops it at scope exit", field).into_raw();
-        mut label: string = "moving this field out leaves the source to drop it again at scope exit (double free)";
+        mut headline: String = fmt::format("cannot move field `%s` out of a value that drops it at scope exit", field);
+        mut label: String = String::from("moving this field out leaves the source to drop it again at scope exit (double free)");
         if (this.has_user_drop(ma.object.resolved_type)) {
-            headline = fmt::format("cannot move field `%s` out of a value that owns a destructor", field).into_raw();
+            headline = fmt::format("cannot move field `%s` out of a value that owns a destructor", field);
         } else if (this.branch_depth != 0 && this.partial_move_shape(ma)) {
             const owner: string = this.intern.resolve(ExpressionNode::identifier_of(ma.object).name);
-            headline = fmt::format("cannot move field `%s` out of `%s` on only some paths", field, owner).into_raw();
+            headline = fmt::format("cannot move field `%s` out of `%s` on only some paths", field, owner);
             label = fmt::format("moved only when this runs, so `%s` cannot tell at scope exit whether to drop `%s` (double free)",
-                owner, field).into_raw();
+                owner, field);
         }
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE, headline);
         diag = diag.at_with_label(e.span, label);
         diag = diag.help_with_example(
             "swap the field out with `core::mem::swap`, leaving a valid value to be dropped in place; or use a `Copy` field type",
-            fmt::format("mut taken = <a value to leave behind>;\ncore::mem::swap(&taken, &owner.%s);", field).into_raw());
+            fmt::format("mut taken = <a value to leave behind>;\ncore::mem::swap(&taken, &owner.%s);", field));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -2728,8 +2729,8 @@ type struct MoveChecker {
         // stay fine; only a real move (`real`) is rejected.
         if (in_move_context && real && this.pm_has_binding(sym.key())) {
             if (!this.suppress_emit) {
-                const headline: string = fmt::format(
-                    "use of partially-moved value `%s`", this.intern.resolve(name)).into_raw();
+                const headline: String = fmt::format(
+                    "use of partially-moved value `%s`", this.intern.resolve(name));
                 mut diag: Diagnostic = Diagnostic::error(
                     ErrorCode::E0452_USE_AFTER_MOVE, headline);
                 diag = diag.at_with_label(e.span,
@@ -2759,8 +2760,8 @@ type struct MoveChecker {
                 this.emit_use_after_closure_move(name, e.span, into_closure);
                 return;
             }
-            const headline: string = fmt::format("use of moved value `%s`",
-                this.intern.resolve(name)).into_raw();
+            const headline: String = fmt::format("use of moved value `%s`",
+                this.intern.resolve(name));
             this.emit_use_after_move(ErrorCode::E0452_USE_AFTER_MOVE,
                 headline, e.span, move_span, ty);
             return;

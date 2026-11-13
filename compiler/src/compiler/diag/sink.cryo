@@ -7,8 +7,9 @@
 namespace compiler::diag::sink;
 
 import compiler::diag::{ severity, diagnostic, snapshot, config, renderer };
-import std::collections::hashmap::{ HashMap };
+import std::collections::hashset::{ HashSet };
 import std::collections::string::{ String };
+import std::collections::str::{ Str };
 import utils::log::{ Log, LogArea };
 import utils::diag_sink::{ DiagSink };
 import std::fmt;
@@ -29,7 +30,7 @@ type struct DiagnosticSink {
     renderer:          mut DiagRenderer*;
     config:            DiagConfig;
     reached_max_errors: boolean;
-    seen_keys:         HashMap<string, boolean, GlobalAlloc, FnvHasher>;
+    seen_keys:         HashSet<String, GlobalAlloc, FnvHasher>;
 
     // Speculative-suppression scope. While `suppress_depth > 0` every emit()
     // is counted (errors only) but neither stored, deduped, nor rendered.
@@ -45,7 +46,7 @@ type struct DiagnosticSink {
     // does own. Errors from these files still surface - an error stops the
     // build, and the author needs to see what stopped it.
     // Populated after module discovery has classified each module's origin.
-    vendor_files:      [string];
+    vendor_files:      [String];
     suppressed_vendor_warnings: u32;
 
     static new() -> DiagnosticSink {
@@ -56,7 +57,7 @@ type struct DiagnosticSink {
             renderer:          null,
             config:            DiagConfig::default(),
             reached_max_errors: false,
-            seen_keys:         HashMap::<string, boolean, GlobalAlloc, FnvHasher>::new(),
+            seen_keys:         HashSet::<String, GlobalAlloc, FnvHasher>::new(),
             suppress_depth:    0,
             suppressed_errors: 0,
             vendor_files:      [],
@@ -67,20 +68,18 @@ type struct DiagnosticSink {
     /// Record that `path` is a generated vendor binding, so warnings pointing
     /// into it are dropped.  Called once per vendored module, after discovery
     /// has classified module origins.
-    mark_vendor_file(mut &this, path_text: string) -> void {
-        const path: string = path_text;
+    mark_vendor_file(mut &this, path: Str) -> void {
         for (mut i: i64 = 0; i < this.vendor_files.length(); i++) {
-            if (this.vendor_files[i].eq(path)) { return; }
+            if (this.vendor_files[i].as_str() == path) { return; }
         }
-        this.vendor_files.push(path);
+        this.vendor_files.push(String::from_str(path));
     }
 
     /// True when `path` is one of the generated vendor bindings.
-    is_vendor_file(&this, path_text: string) -> boolean {
-        const path: string = path_text;
-        if (path.length() == 0) { return false; }
+    is_vendor_file(&this, path: Str) -> boolean {
+        if (path.is_empty()) { return false; }
         for (mut i: i64 = 0; i < this.vendor_files.length(); i++) {
-            if (this.vendor_files[i].eq(path)) { return true; }
+            if (this.vendor_files[i].as_str() == path) { return true; }
         }
         return false;
     }
@@ -142,12 +141,10 @@ type struct DiagnosticSink {
         // (common: many distinct conditions funnel through E0100/E0102/E0104)
         // stay distinct instead of collapsing into one with the second
         // silently dropped.
-        mut key_text: String = f"{effective_diag.code.to_u32()}:{effective_diag.span.file}:{effective_diag.span.start_line}:{effective_diag.span.start_col}:{effective_diag.message}";
-        const dedup_key: string = key_text.into_raw();
-        if (this.seen_keys.contains_key(&dedup_key)) {
+        const dedup_key: String = f"{effective_diag.code.to_u32()}:{effective_diag.span.file}:{effective_diag.span.start_line}:{effective_diag.span.start_col}:{effective_diag.message}";
+        if (!this.seen_keys.insert(dedup_key)) {
             return;  // Duplicate; skip
         }
-        this.seen_keys.insert(dedup_key, true);
 
         // 6. Update counters
         if (effective_diag.severity.is_error()) {
