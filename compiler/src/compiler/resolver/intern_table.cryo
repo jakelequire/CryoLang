@@ -23,6 +23,7 @@ import std::alloc::allocator;
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::decl_name::{ DeclName };
 import std::collections::hashmap::{ HashMap };
+import std::collections::str::{ Str };
 import std::core::hash::{ FnvHasher };
 import std::alloc::allocator::{ GlobalAlloc };
 
@@ -32,19 +33,20 @@ private:
     /// Entry 0 is always "".
     strings: [string];
 
-    /// Fast dedup index: string -> SymbolStr ID.
-    lookup: HashMap<string, u32, GlobalAlloc, FnvHasher>;
+    /// Fast dedup index: text -> SymbolStr ID.  Each key views the entry
+    /// in `strings` it indexes.
+    lookup: HashMap<Str, u32, GlobalAlloc, FnvHasher>;
 
 public:
     /// Create a new table with the empty string pre-seeded at index 0.
     static new() -> InternTable {
         mut table: InternTable = InternTable {
             strings: [],
-            lookup:  HashMap::<string, u32, GlobalAlloc, FnvHasher>::new(),
+            lookup:  HashMap::<Str, u32, GlobalAlloc, FnvHasher>::new(),
         };
         // Seed index 0 = "" so SymbolStr::empty() always resolves.
         table.strings.push("");
-        table.lookup.insert("", 0);
+        table.lookup.insert(Str::new(""), 0);
         return table;
     }
 
@@ -54,33 +56,33 @@ public:
     ///
     /// Intern a string.  Returns the existing SymbolStr if the text was
     /// already interned, or allocates a new entry and returns it.
-    intern(mut &this, text: string) -> SymbolStr {
+    intern(mut &this, text: Str) -> SymbolStr {
         const existing: Option<u32> = this.lookup.get(&text);
         if (existing.is_some()) {
             return SymbolStr::from_id(existing.unwrap());
         }
 
         // Not found; allocate a new entry.
-        // Copy the string into a fresh heap allocation so the intern table
-        // owns the data.  Without this, callers that pass format() results
-        // (which may use a shared static buffer) would cause all entries to
-        // alias the same memory, returning the last-written value for every ID.
-        const len: i64 = text.length() as i64;
+        // The table owns a NUL-terminated copy: the caller's text may be a
+        // temporary `String` freed as soon as this returns, and `resolve`
+        // hands the entry to code that reads it as a C string.
+        const len: i64 = text.length();
         // Align 1: the copy is a raw char buffer with no alignment requirement,
         // so the arena packs entries tight (no padding waste on short
         // identifiers).  Routes to the per-target arena while active, libc
         // otherwise (see the `allocator` import note above).
         const copy: string = allocator::alloc((len + 1) as u64, 1) as string;
+        const bytes: &Slice<u8> = text.as_bytes();
         for (mut ci: i64 = 0; ci < len; ci++) {
             const dst: void* = (copy + ci) as void*;
-            *(dst as mut i8*) = text[ci] as i8;
+            *(dst as mut u8*) = bytes[ci];
         }
         const term: void* = (copy + len) as void*;
         *(term as mut i8*) = 0 as i8;
 
         mut id: u32 = this.strings.length() as u32;
         this.strings.push(copy);
-        this.lookup.insert(copy, id);
+        this.lookup.insert(Str::from_raw(copy as u8*, len), id);
         return SymbolStr::from_id(id);
     }
 
