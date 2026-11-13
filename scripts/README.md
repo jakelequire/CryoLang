@@ -24,7 +24,6 @@ one; the history keeps it.
 | `vendor-consts-gate.py` | Registers a fixture C header under a throwaway `$CRYO_HOME`, then builds and runs a consumer of every constant `cryo vendor` emitted | `make vendor-check`, CI |
 | `selfhost-check.py` | Byte-identity fixed point of the compiler and of the stdlib archives its stages build: the Linux chain, the Windows chain natively or under wine; on a Windows host both at once, the Linux one from a digest-checked copy of its sources on WSL's own filesystem (`--mirror`) | `make selfhost-check`, `selfhost-check-windows.cmd`, CI |
 | `selfhost-check-windows.cmd` | Windows host: checks for Python and WSL, then runs `selfhost-check.py` | `make selfhost-check` (Windows) |
-| `api-index.py` | Generates `docs/stdlib-api.txt` from the stdlib archive's symbols and a source scan; `--check` fails if it is stale | `make api-index`, `make api-index-check`, CI |
 
 ## Pins
 

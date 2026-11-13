@@ -9,6 +9,7 @@ import compiler::{ compilation_context, instance, project_config };
 import compiler::codegen::{ llvm_types };
 import compiler::deps::dep_resolver;
 import compiler::resolver::demangler;
+import cli::api_index;
 import compiler::vendor::registry;
 import compiler::bindgen::generator;
 import utils;
@@ -355,6 +356,7 @@ type enum CommandKind {
     Test;
     Check;
     Demangle;
+    ApiIndex;
     Fetch;
     Update;
     Vendor;
@@ -373,6 +375,7 @@ implement enum CommandKind {
             CommandKind::Test    => { "test"    }
             CommandKind::Check   => { "check"   }
             CommandKind::Demangle => { "demangle" }
+            CommandKind::ApiIndex => { "api-index" }
             CommandKind::Fetch    => { "fetch"    }
             CommandKind::Update   => { "update"   }
             CommandKind::Vendor   => { "vendor"   }
@@ -391,6 +394,7 @@ implement enum CommandKind {
             CommandKind::Test     => { "Build and run the project's tests"             }
             CommandKind::Check    => { "Check a file for errors (no codegen)"         }
             CommandKind::Demangle => { "Decode a mangled symbol to its source form"   }
+            CommandKind::ApiIndex => { "Write or check the standard library's one-line-per-declaration index" }
             CommandKind::Fetch    => { "Fetch dependencies and write cryoconfig.lock" }
             CommandKind::Update   => { "Re-resolve every dependency, ignoring the lockfile" }
             CommandKind::Vendor   => { "Register a C library for `import vendor::Name`" }
@@ -409,6 +413,7 @@ implement enum CommandKind {
             CommandKind::Test     => { "cryo test [pattern] [flags]"       }
             CommandKind::Check    => { "cryo check <file> [flags]"       }
             CommandKind::Demangle => { "cryo demangle <mangled-symbol>"  }
+            CommandKind::ApiIndex => { "cryo api-index write|check <stdlib root> <index file>" }
             CommandKind::Fetch    => { "cryo fetch"                        }
             CommandKind::Update   => { "cryo update"                       }
             CommandKind::Vendor   => { "cryo vendor <path>|list|remove <name>|clean|rebuild [name]" }
@@ -536,6 +541,12 @@ implement enum CommandKind {
                 fmt::printf("argument, reads newline-separated symbols from stdin.\n\n");
                 fmt::printf("Note: wrap mangled names in SINGLE quotes so the shell does not\n");
                 fmt::printf("expand `$`-segments (`$F`, `$L`, ...) into empty strings.\n");
+            }
+            CommandKind::ApiIndex => {
+                fmt::printf("Lists every declaration of the standard library under <stdlib root>,\n");
+                fmt::printf("one line each, as its source writes it, grouped by namespace.\n");
+                fmt::printf("`write` writes the list to <index file>; `check` fails when\n");
+                fmt::printf("<index file> is not what `write` would write.\n");
             }
             CommandKind::Fetch => {
                 fmt::printf("Resolves every dependency declared in cryoconfig against its\n");
@@ -786,6 +797,9 @@ type struct Executor {
         const demangle: CommandKind = CommandKind::Demangle;
         runner.add_command(cli::Command::new(demangle.name(), demangle.description(), demangle.usage()));
 
+        const api_index_command: CommandKind = CommandKind::ApiIndex;
+        runner.add_command(cli::Command::new(api_index_command.name(), api_index_command.description(), api_index_command.usage()));
+
         const fetch: CommandKind = CommandKind::Fetch;
         runner.add_command(cli::Command::new(fetch.name(), fetch.description(), fetch.usage()));
 
@@ -926,6 +940,7 @@ type struct Executor {
             "test"     => { CommandKind::Test }
             "check"    => { CommandKind::Check }
             "demangle" => { CommandKind::Demangle }
+            "api-index" => { CommandKind::ApiIndex }
             "fetch"    => { CommandKind::Fetch }
             "update"   => { CommandKind::Update }
             "vendor"   => { CommandKind::Vendor }
@@ -969,6 +984,14 @@ type struct Executor {
             CommandKind::Test    => { return Executor::cmd_test(args); }
             CommandKind::Check   => { return Executor::cmd_check(args); }
             CommandKind::Demangle => { return Executor::cmd_demangle(args); }
+            CommandKind::ApiIndex => {
+                if (args.positional_count() != 3) {
+                    fmt::eprintf("Usage: cryo api-index write|check <stdlib root> <index file>\n");
+                    return 2;
+                }
+                return api_index::run(str::Str::new(args.positional_at(0)), str::Str::new(args.positional_at(1)),
+                                      str::Str::new(args.positional_at(2)));
+            }
             CommandKind::Fetch    => { return Executor::cmd_fetch(args); }
             CommandKind::Update   => { return Executor::cmd_update(args); }
             CommandKind::Vendor   => { return Executor::cmd_vendor(args); }

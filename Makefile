@@ -812,19 +812,19 @@ endif
 
 # ---- stdlib API index --------------------------------------------------
 # Regenerate docs/stdlib-api.txt, the one-file answer to "does this already
-# exist?".  The index is a declaration scan of stdlib/**/*.cryo (complete --
-# it sees generic templates the stdlib never instantiates, which have no
-# symbol), cross-checked on stdout against `nm` over the newest stdlib archive
-# under stdlib/.bin/<triple>/prebuilt/, decoded by the compiler's OWN
-# demangler; with no archive built yet the cross-check says so and is skipped.
+# exist?".  `cryo api-index` reads every stdlib/**/*.cryo with the compiler
+# under test's own lexer and parser, so the index lists what the parser
+# reads as a declaration, written as the source writes it.
 #
 # `api-index-check` is the CI half: a hand-edited or stale index is worse than
 # no index, because it gets trusted.
-api-index:
-	@$(PYTHON) scripts/api-index.py
-
-api-index-check:
-	@$(PYTHON) scripts/api-index.py --check
+ifeq ($(HOST_OS),windows)
+api-index api-index-check: $(STAGE2_EXE)
+	@"$(STAGE2_EXE)" api-index $(if $(filter api-index-check,$@),check,write) stdlib docs/stdlib-api.txt
+else
+api-index api-index-check: $(STAGE2)
+	@"$(STAGE2)" api-index $(if $(filter api-index-check,$@),check,write) stdlib docs/stdlib-api.txt
+endif
 
 # ---- documentation coverage -------------------------------------------
 # docs/doc-coverage.txt is the standard library's public declarations with

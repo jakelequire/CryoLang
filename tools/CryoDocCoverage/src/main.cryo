@@ -32,14 +32,11 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::env;
 import std::fmt::{ println, eprintln };
-import std::fs::{ Directory, DirectoryEntries, File, Path, PathBuf };
-import std::thread;
+import std::fs::{ File, Path };
 
 import compiler::compilation_context::{ BuildOptions, CompilationContext };
 import compiler::compile_mode::{ CompileMode };
-import compiler::lex::{ Token, TokenType };
-import compiler::lex::lexer::{ Lexer };
-import compiler::parser::cursor::{ Parser };
+import compiler::parser::source_tree::{ SourceTree };
 import compiler::ast::{ Visibility };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::ast::node::{ Node, ProgramNode };
@@ -47,9 +44,6 @@ import compiler::ast::declaration::{ DeclarationNode, MethodDecl, FunctionDecl, 
                                      EnumDecl, TraitDecl, TypeAliasDecl, ImplBlock, VarDecl,
                                      ModuleDecl };
 
-// The parser recurses once per level of nesting; a thread of its own gives
-// it the stack the compiler's own parsing pass gives it.
-const PARSER_STACK_BYTES: u64 = 64 << 20;
 // The parser writes a derived implementation at a column no source line
 // reaches; such a declaration is not written in the file.
 const GENERATED_COLUMN: u32 = 0x8000;
@@ -65,10 +59,9 @@ type struct Undocumented {
 /// The undocumented public declarations of one source tree.
 type struct CoverageScan {
     context: mut CompilationContext*;
-    programs: Array<mut ProgramNode*>;
-    /// Each program's file, by the same index.
-    paths: Array<String>;
-    /// The file being walked; the parser leaves a declaration's own empty.
+    tree: SourceTree;
+    /// The file being walked, `<root>/<path below it>`; the parser leaves
+    /// a declaration's own empty.
     current_path: String;
     /// Every `internal module`'s path, `::`-wrapped: `::http2::hpack::`.
     internal_modules: Array<String>;
@@ -81,20 +74,18 @@ type struct CoverageScan {
     static over(root: Str, context: mut CompilationContext*) -> Result<CoverageScan, String> {
         mut scan: CoverageScan = CoverageScan {
             context: context,
-            programs: Array::new(),
-            paths: Array::new(),
+            tree: SourceTree::parse(Path::from(root), context)?,
             current_path: String::new(),
             internal_modules: Array::new(),
             hidden_types: Array::new(),
             found: Array::new(),
         };
-        scan.parse_directory(Path::from(root))?;
-        for (mut i: i64 = 0; i < scan.programs.length(); i++) {
-            scan.note_hidden(scan.programs[i]);
+        for (mut i: i64 = 0; i < scan.tree.length(); i++) {
+            scan.note_hidden(scan.tree.programs[i]);
         }
-        for (mut i: i64 = 0; i < scan.programs.length(); i++) {
-            scan.current_path = scan.paths[i].clone();
-            scan.walk(scan.programs[i]);
+        for (mut i: i64 = 0; i < scan.tree.length(); i++) {
+            scan.current_path = f"{root}/{scan.tree.paths[i]}";
+            scan.walk(scan.tree.programs[i]);
         }
         scan.found.sort_by_key((entry: &Undocumented) -> String { return entry.name.clone(); });
         return Result::Ok(scan);
@@ -118,55 +109,6 @@ type struct CoverageScan {
             if (this.found[i].name == *name) { return this.found[i].location.as_str(); }
         }
         return Str::new("?");
-    }
-
-    parse_directory(mut &this, directory: Path) -> Result<(), String> {
-        mut entries: DirectoryEntries = match (Directory::entries(directory)) {
-            Result::Ok(entries) => { entries }
-            Result::Err(error) => { return Result::Err(f"{directory.as_str()}: {error}"); }
-        };
-        loop {
-            match (entries.next()) {
-                Option::Some(entry) => {
-                    if (entry.is_directory()) {
-                        this.parse_directory(entry.path())?;
-                    } else if (entry.name().ends_with(&Str::new(".cryo"))) {
-                        this.parse_file(entry.path())?;
-                    }
-                }
-                Option::None => { break; }
-            }
-        }
-        return Result::Ok(());
-    }
-
-    parse_file(mut &this, path: Path) -> Result<(), String> {
-        const text: String = match (File::read_text(path)) {
-            Result::Ok(text) => { text }
-            Result::Err(error) => { return Result::Err(f"{path.as_str()}: {error}"); }
-        };
-        // The tokens point into both strings for as long as the tree lives.
-        const path_text: string = String::from_str(path.as_str()).into_raw();
-        mut lexer: Lexer = Lexer::new(path_text, text.into_raw(), this.context.diagnostics);
-        const tokens: [Token] = lexer.lex();
-        mut kept: [Token] = [];
-        for (mut i: i64 = 0; i < tokens.length(); i++) {
-            if (tokens[i].kind != TokenType::Unknown && tokens[i].kind != TokenType::Comment) {
-                kept.push(tokens[i]);
-            }
-        }
-        mut parser: Parser = Parser::new(kept, path_text, this.context);
-        const parser_at: mut Parser* = &parser;
-        const parsing: thread::JoinHandle<mut ProgramNode*> = thread::Builder::new()
-            .stack_size(PARSER_STACK_BYTES)
-            .spawn(move () -> mut ProgramNode* { return parser_at.parse(); });
-        const root: mut ProgramNode* = parsing.join();
-        if (root == null || this.context.diagnostics.has_errors()) {
-            return Result::Err(f"{path.as_str()}: does not parse");
-        }
-        this.programs.push(root);
-        this.paths.push(String::from_str(path.as_str()));
-        return Result::Ok(());
     }
 
     /// Record the internal modules and the types that are not public, which
