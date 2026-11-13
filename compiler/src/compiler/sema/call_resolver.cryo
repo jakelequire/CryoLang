@@ -9999,24 +9999,65 @@ type struct CallResolver {
     /// the owner nested inside the return (`-> Result<Array<T,A>, E>`), which the
     /// narrow base-equality expected-type source can't.  Returns a length-`want`
     /// all-bound binding set (declaration order) or `[]`.
-    infer_static_owner_bindings_from_expected(mut &this, tmpl: const TemplateEntry*,
+    /// What the declared return `abstract_ret` of the static call `call_e` is
+    /// unified against to bind its owner's parameters, that type written to
+    /// `*actual`: the call's own expected type, against the return itself;
+    /// or, for the receiver of a method call whose value has an expected type
+    /// (`Box::try_new(41).unwrap()` where a `Box<i64>` is expected), that type,
+    /// against what the method returns on the receiver - `unwrap` on a
+    /// `Result<Box<T>, AllocError>` returns a `Box<T>`.  Invalid when neither
+    /// is known, or the method is not one method of the receiver's own
+    /// without type parameters of its own.
+    expected_return_formal(mut &this, call_e: ExpressionNode*, abstract_ret: TypeRef,
+                           actual: mut TypeRef*) -> TypeRef {
+        if (this.state.expected_type.is_valid()) {
+            *actual = this.state.expected_type;
+            return abstract_ret;
+        }
+        if (this.state.receiver_of == null || call_e == null || this.state.receiver_of != call_e) {
+            return TypeRef::invalid();
+        }
+        const inst: InstantiatedType* = this.types.peel_to_instantiation(abstract_ret);
+        if (inst == null) { return TypeRef::invalid(); }
+        const entries: [OverloadId] = this.member_entries(FamilyOwner::Type(inst.generic_base), this.state.receiver_method);
+        mut declared: TypeRef = TypeRef::invalid();
+        mut found: i64 = 0;
+        for (mut i: i64 = 0; i < entries.length(); i++) {
+            const m: MethodDecl* = DeclarationNode::method_of(this.ctx.decl_index.entry_method(entries[i]));
+            if (m == null || m.func == null || m.is_static) { continue; }
+            if (DeclarationNode::fn_of(m.func).generic_params.length() > 0) { return TypeRef::invalid(); }
+            found += 1;
+            declared = this.ctx.decl_index.entry_owner_return(entries[i]);
+        }
+        if (found != 1 || !declared.is_valid()) { return TypeRef::invalid(); }
+        const on_receiver: TypeRef = this.binding.subst_this_in_type(
+            this.types.subst_owner_params_from_receiver(abstract_ret, this.types.canonicalize_method_return(declared)),
+            abstract_ret);
+        if (!on_receiver.is_valid()) { return TypeRef::invalid(); }
+        *actual = this.state.receiver_expected;
+        return on_receiver;
+    }
+
+    infer_static_owner_bindings_from_expected(mut &this, tmpl: const TemplateEntry*, call_e: ExpressionNode*,
                                               func_decl: DeclarationNode*, seeds: &[TypeRef]) -> [TypeRef] {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return []; }
         if (tmpl.param_types.length() == 0) { return []; }
-        if (!this.state.expected_type.is_valid()) { return []; }
         const abstract_ret: TypeRef = func.resolved_return_type;
         if (!abstract_ret.is_valid()) { return []; }
         // Nothing to recover if the return is already concrete.
         if (!this.types.contains_generic_param(abstract_ret)) { return []; }
+        mut actual: TypeRef = TypeRef::invalid();
+        const formal: TypeRef = this.expected_return_formal(call_e, abstract_ret, &actual);
+        if (!formal.is_valid()) { return []; }
         mut pids: [TypeRef] = [];
         for (mut i: i64 = 0; i < tmpl.param_types.length(); i++) { pids.push(tmpl.param_types[i]); }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
         for (mut i: i64 = 0; i < seeds.length(); i++) {
             if (seeds[i].is_valid()) { ictx.bind_slot(i, seeds[i]); }
         }
-        // formal = abstract (carries owner params), actual = the expected type.
-        if (!ictx.unify(abstract_ret, this.state.expected_type)) { return []; }
+        // formal carries the owner params, actual is what is expected of it.
+        if (!ictx.unify(formal, actual)) { return []; }
         mut bindings: [TypeRef] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length(); i++) { bindings.push(ictx.bindings[i]); }
         for (mut i: i64 = 0; i < bindings.length(); i++) {
@@ -10032,7 +10073,7 @@ type struct CallResolver {
     /// param be backfilled from its declared default when it appears in neither the
     /// params nor the return (`Arc<T, A = GlobalAlloc>::try_new`, whose `A` is
     /// hardcoded GlobalAlloc in the signature).  Empty when nothing binds.
-    infer_static_owner_prefix(mut &this, tmpl: const TemplateEntry*, func_decl: DeclarationNode*,
+    infer_static_owner_prefix(mut &this, tmpl: const TemplateEntry*, call_e: ExpressionNode*, func_decl: DeclarationNode*,
                               call: CallExpr*) -> [TypeRef] {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null) { return []; }
@@ -10057,11 +10098,11 @@ type struct CallResolver {
         }
         // Source B: the abstract return unified against the expected type, which
         // recovers a param the args don't determine (incl. one nested in the return).
-        if (this.state.expected_type.is_valid()) {
-            const abstract_ret: TypeRef = func.resolved_return_type;
-            if (abstract_ret.is_valid() && this.types.contains_generic_param(abstract_ret)) {
-                ictx.unify(abstract_ret, this.state.expected_type);
-            }
+        const abstract_ret: TypeRef = func.resolved_return_type;
+        if (abstract_ret.is_valid() && this.types.contains_generic_param(abstract_ret)) {
+            mut actual: TypeRef = TypeRef::invalid();
+            const formal: TypeRef = this.expected_return_formal(call_e, abstract_ret, &actual);
+            if (formal.is_valid()) { ictx.unify(formal, actual); }
         }
         // Contiguous bound prefix: stop at the first param no source bound so
         // `expand_default_type_args` backfills the trailing defaulted params.
@@ -10131,7 +10172,7 @@ type struct CallResolver {
         // - its owner param `T` is in no parameter, only in the annotation
         // `Result<Array<u64,GlobalAlloc>, E>`, so structural unification of the
         // declared return against the expected type is the only source.
-        const eb_unify: [TypeRef] = this.infer_static_owner_bindings_from_expected(tmpl, func_decl, &seeds);
+        const eb_unify: [TypeRef] = this.infer_static_owner_bindings_from_expected(tmpl, call_e, func_decl, &seeds);
         if (eb_unify.length() == want) { return eb_unify; }
 
         // 2. Expected-type derived (e.g. `const s: &Slice<i32> = Slice::from_raw(..)`).
@@ -10175,7 +10216,7 @@ type struct CallResolver {
         // determine, then backfill the rest.  Runs AFTER step 2 so a
         // non-default owner arg from a base-matching expected type still wins,
         // and BEFORE step 3, so a default beats a literal's guessed type.
-        const prefix: [TypeRef] = this.infer_static_owner_prefix(tmpl, func_decl, call);
+        const prefix: [TypeRef] = this.infer_static_owner_prefix(tmpl, call_e, func_decl, call);
         if (prefix.length() < want) {
             mut rc_d: ResolutionContext = ResolutionContext::new("");
             this.symbolic.bind_body_scope(&rc_d);
