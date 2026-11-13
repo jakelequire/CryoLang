@@ -2778,7 +2778,12 @@ reference converts to: `fixed[r]` is `fixed.as_slice().view(r)`, written
 written in the body's parameters (`&Array<T>`, `&[T; N]`, `&Slice<T>`) is
 viewed when an implementation applies to it as written, and each copy of
 the body calls that implementation for its own `T`.  A base that is itself
-a type parameter is indexed through `Index` alone.
+a type parameter is viewed when a bound in scope gives it `IndexView` at the
+index's type, and its view is the parameter's `View`; a range literal
+indexing a parameter one bound gives `IndexView<Range<i64>>` is typed
+`Range<i64>` (`function first_two<C>(c: &C) -> C::View where C:
+IndexView<Range<i64>> { return c[0..2]; }`).  Any other parameter base is
+indexed through `Index` alone.
 
 The standard library slices by a range.  On an `Array<T>`, a `[T]` or a
 `Slice<T>`, `xs[r]` is a `&Slice<T>` of the elements `r` names, and written a
