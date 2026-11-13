@@ -18,6 +18,8 @@ import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::io::error::{ IoError, IoErrorKind, IoOperation };
 import std::io::traits;
+import std::io::stdio::{ stdout, Stdout };
+import std::thread;
 import std::collections::string::{ String };
 import std::env;
 import std::process::command::{ Command, Output, Stdio };
@@ -364,40 +366,61 @@ function kill_tree_needs_a_grouped_child() -> Result<(), TestError> {
     }
 }
 
+/// The child the interrupt test ends: it says it is running once its own
+/// code runs, then sleeps past the test's wait, with the default handling
+/// of the interrupt.
+![test_child]
+function says_ready_then_sleeps() -> Result<(), TestError> {
+    mut out: Stdout = stdout();
+    out.write(Str::new("ready\n").as_bytes())?;
+    out.flush()?;
+    thread::sleep_ms(5000);
+    return bail(Str::new("the interrupt did not end the child"));
+}
+
 /// The interrupt reaches a grouped child and ends it - SIGINT on POSIX,
 /// Ctrl-Break to the child's own console process group on Windows - long
-/// before its five seconds are up, and this process carries on. The child
-/// is given time to start first: an event that lands while it is still
-/// loading ends it with a startup failure, which says nothing about where
-/// the event was aimed.
+/// before its five seconds are up, and this process carries on. The
+/// interrupt is sent only once the child says it is running: one that
+/// lands while a Windows child is still loading ends it with a startup
+/// failure (STATUS_DLL_INIT_FAILED) instead, and no fixed pause outlasts
+/// loading on a loaded machine.
 ![test]
 function interrupt_ends_a_grouped_child() -> Result<(), TestError> {
-    mut cmd: Command = cmd_sleep();
+    mut cmd: Command = TestChild::command(Str::new("CryoTests::Tests::Stdlib::ProcessCommand::says_ready_then_sleeps"))?;
+    cmd.stdout(Stdio::Piped);
     cmd.group_descendants();
     mut child: Child = cmd.spawn().unwrap();
-    const running: boolean = child.wait_timeout(Duration::from_millis(500)).unwrap().is_none();
+    mut stdout_pipe: ChildStdout = child.stdout.take().unwrap();
+    mut line: Array<u8> = Array::new();
+    mem::drop(stdout_pipe.read_until('\n' as u8, &line));
+    const running: boolean = Str::from_raw(line.as_ptr(), line.length()).equals(&Str::new("ready\n"));
     const outcome: Result<(), IoError> = child.send_signal(Signal::interrupt());
     const status: Option<ExitStatus> = child.wait_timeout(Duration::from_millis(3000)).unwrap();
     if (status.is_none()) {
         mem::drop(child.kill_tree());
         mem::drop(child.wait());
     }
-    expect(running, Str::new("the child is running before the interrupt"))?;
+    expect(running, Str::new("the child says it is running before the interrupt"))?;
     expect(outcome.is_ok(), Str::new("the interrupt is delivered to a grouped child"))?;
     expect(status.is_some(), Str::new("the child ends at the interrupt"))?;
-    return expect(ended_by_interrupt(status.unwrap()), Str::new("the child is ended by the interrupt itself"));
+    return expect_eq(ending_of(status.unwrap()), interrupt_ending());
 }
 
+// What ended a child: the signal on POSIX, the exit code on Windows, 0 for
+// none.
 ![target(unix)]
-function ended_by_interrupt(status: ExitStatus) -> boolean {
-    return status.terminating_signal().unwrap_or(0) == Signal::interrupt().as_i32();
-}
-// The default console control handler ends a process with
-// STATUS_CONTROL_C_EXIT, for Ctrl-Break as for Ctrl-C.
+function ending_of(status: ExitStatus) -> i32 { return status.terminating_signal().unwrap_or(0); }
 ![target(windows)]
-function ended_by_interrupt(status: ExitStatus) -> boolean {
-    return status.exit_code().unwrap_or(0) == 0xC000013A as i32;
-}
+function ending_of(status: ExitStatus) -> i32 { return status.exit_code().unwrap_or(0); }
+
+// How the interrupt's default action ends a process. The default console
+// control handler ends it with STATUS_CONTROL_C_EXIT, for Ctrl-Break as for
+// Ctrl-C.
+![target(unix)]
+function interrupt_ending() -> i32 { return Signal::interrupt().as_i32(); }
+![target(windows)]
+function interrupt_ending() -> i32 { return 0xC000013A as i32; }
 
 /// Windows can aim Ctrl-Break only at a process group, so an ungrouped child
 /// cannot be interrupted alone.
