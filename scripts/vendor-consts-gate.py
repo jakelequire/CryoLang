@@ -91,6 +91,12 @@ GENERATED_MUST_CONTAIN = [
     "function vc_name() -> const i8*;",
     "lines: const (const i8*)*",
     "slots: const (mut i8*)*",
+    # Records and enums are named, never `void*` / `i32`: the generator's
+    # extern block must carry the vendor module, or the type mapper has
+    # nothing to name them under.
+    "fill: VcColor;",
+    "function vc_tint(color: VcColor, kind: VcKind) -> VcColor;",
+    "function vc_paint(target: mut VcBox*, color: VcColor) -> void;",
 ]
 
 
