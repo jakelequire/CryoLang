@@ -9825,26 +9825,39 @@ type struct CallResolver {
             this.resolve_scope_owner_template(scope);
         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
         if (tmpl.param_types.length() == 0) { return TypeRef::invalid(); }
-        const empty_methods: [DeclarationNode*] = [];
-        mut methods: &[DeclarationNode*] = &empty_methods;
-        if (tmpl.kind == TemplateKind::Struct) { methods = &(DeclarationNode::struct_of(tmpl.ast_node)).methods; }
-        else if (tmpl.kind == TemplateKind::Union) { methods = &(DeclarationNode::union_of(tmpl.ast_node)).methods; }
-        else { return TypeRef::invalid(); }
-        mut found_count: i64 = 0;
         mut abstract_ret: TypeRef = TypeRef::invalid();
-        mut matched: DeclarationNode* = null;
-        const named: [DeclarationNode*] = this.ctx.decl_index.methods_named(FamilyOwner::Template(tmpl.def), scope.member_name);
-        for (mut i: i64 = 0; i < methods.length(); i++) {
-            const m_decl: DeclarationNode* = methods[i];
-            const m: MethodDecl* = DeclarationNode::method_of(m_decl);
-            if (m == null || m.func == null || !m.is_static) { continue; }
-            if (!DeclarationIndex::holds_method(&named, m_decl)) { continue; }
-            if (DeclarationNode::fn_of(m.func).generic_params.length() > 0) { return TypeRef::invalid(); }
-            found_count += 1;
-            abstract_ret = DeclarationNode::fn_of(m.func).resolved_return_type;
-            matched = m_decl;
+        mut matched_func: DeclarationNode* = null;
+        // A trait's declared method recorded where the call is written - an
+        // impl-qualified path through the generic owner - returns in the
+        // owner's own parameters (`This` the owner over them), so it takes
+        // the owner's bindings as a method of the owner's body does.
+        const recorded: DefId = if (call != null) { call.template_method } else { DefId::invalid() };
+        if (recorded.is_valid() && this.ctx.generic_registry.trait_item_position(recorded) >= 0) {
+            matched_func = this.ctx.decl_index.method_func_of(recorded);
+            const recorded_func: FunctionDecl* = DeclarationNode::fn_of(matched_func);
+            if (recorded_func == null || recorded_func.generic_params.length() > 0) { return TypeRef::invalid(); }
+            abstract_ret = this.selected_static_return(call, scope, tmpl.base_type);
+        } else {
+            const empty_methods: [DeclarationNode*] = [];
+            mut methods: &[DeclarationNode*] = &empty_methods;
+            if (tmpl.kind == TemplateKind::Struct) { methods = &(DeclarationNode::struct_of(tmpl.ast_node)).methods; }
+            else if (tmpl.kind == TemplateKind::Union) { methods = &(DeclarationNode::union_of(tmpl.ast_node)).methods; }
+            else { return TypeRef::invalid(); }
+            mut found_count: i64 = 0;
+            const named: [DeclarationNode*] = this.ctx.decl_index.methods_named(FamilyOwner::Template(tmpl.def), scope.member_name);
+            for (mut i: i64 = 0; i < methods.length(); i++) {
+                const m_decl: DeclarationNode* = methods[i];
+                const m: MethodDecl* = DeclarationNode::method_of(m_decl);
+                if (m == null || m.func == null || !m.is_static) { continue; }
+                if (!DeclarationIndex::holds_method(&named, m_decl)) { continue; }
+                if (DeclarationNode::fn_of(m.func).generic_params.length() > 0) { return TypeRef::invalid(); }
+                found_count += 1;
+                abstract_ret = DeclarationNode::fn_of(m.func).resolved_return_type;
+                matched_func = m.func;
+            }
+            if (found_count != 1) { return TypeRef::invalid(); }
         }
-        if (found_count != 1 || !abstract_ret.is_valid()) { return TypeRef::invalid(); }
+        if (!abstract_ret.is_valid() || matched_func == null) { return TypeRef::invalid(); }
         // Owner type args come from ONE authority: `compute_static_owner_bindings`
         // (turbofish -> concrete args -> expected-type unify -> expected-base ->
         // literal-default; it also emits the E0307 for a literal-only binding).  Its
@@ -9854,7 +9867,7 @@ type struct CallResolver {
         // static call, so this normally no-ops; it just guarantees the stash on any
         // path that reaches us without the pre-stash (absence of a stash means mono
         // cannot specialize this owner-generic static call).
-        this.stash_static_owner_bindings(scope, call_e, call, tmpl, DeclarationNode::method_of(matched).func);
+        this.stash_static_owner_bindings(scope, call_e, call, tmpl, matched_func);
         if (!this.types.contains_generic_param(abstract_ret)) { return abstract_ret; }
 
         // B2a: the return type is the abstract return with the SAME owner bindings the
