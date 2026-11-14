@@ -37,7 +37,7 @@ import std::core::ops::{ Bound, RangeBounds };
 import std::core::ptr;
 import std::core::ptr::{ NonNull };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ AllocError, Allocator, GlobalAlloc };
+import std::alloc::allocator::{ AllocationError, Allocator, GlobalAllocator };
 import std::collections::pair::{ Pair };
 
 /// Every node other than the root holds at least `MINIMUM_DEGREE - 1`
@@ -184,16 +184,16 @@ private type struct KeyPosition<K, V> {
 /// scores.insert(1, Str::new("first"));
 /// // iterating visits key 1, then key 2
 /// ```
-public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
+public type struct BTreeMap<K, V, A = GlobalAllocator> where A: Allocator {
     /// Null while the map is empty.
     private root: mut BTreeNode<K, V>*;
     private length: i64;
     private alloc: A;
 
-    /// An empty map backed by `GlobalAlloc`. Allocates nothing until the
+    /// An empty map backed by `GlobalAllocator`. Allocates nothing until the
     /// first insert.
-    public static new() -> BTreeMap<K, V, GlobalAlloc> {
-        return BTreeMap::<K, V, GlobalAlloc> { root: null, length: 0, alloc: GlobalAlloc::new() };
+    public static new() -> BTreeMap<K, V, GlobalAllocator> {
+        return BTreeMap::<K, V, GlobalAllocator> { root: null, length: 0, alloc: GlobalAllocator::new() };
     }
 
     /// An empty map that allocates through `alloc`.
@@ -213,12 +213,12 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
 
     /// True when the map holds `key`.
     public contains_key(&this, key: &K) -> boolean where K: Ord {
-        return this.get_ref(key).is_some();
+        return this.get_reference(key).is_some();
     }
 
     /// A copy of the value for `key`, or `None` when the key is absent.
     public get(&this, key: &K) -> Option<V> where K: Ord, V: Copy {
-        match (this.get_ref(key)) {
+        match (this.get_reference(key)) {
             Option::Some(value) => { return Option::Some(*value); }
             Option::None => { return Option::None; }
         }
@@ -226,7 +226,7 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
 
     /// A read-only borrow of the value for `key`, or `None` when the key is
     /// absent. Valid until the next insert or remove.
-    public get_ref(&this, key: &K) -> Option<V*> where K: Ord {
+    public get_reference(&this, key: &K) -> Option<V*> where K: Ord {
         mut node: mut BTreeNode<K, V>* = this.root;
         while (node != null) {
             const position: Pair<i64, boolean> = node.search(key);
@@ -261,9 +261,9 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
         }
     }
 
-    /// `insert` that returns `Err(AllocError)` instead of panicking when a
+    /// `insert` that returns `Err(AllocationError)` instead of panicking when a
     /// node cannot be allocated. The map is unchanged by a failed insert.
-    public try_insert(mut &this, key: K, value: V) -> Result<Option<V>, AllocError> where K: Ord {
+    public try_insert(mut &this, key: K, value: V) -> Result<Option<V>, AllocationError> where K: Ord {
         const position: KeyPosition<K, V> = this.find_or_make_room(&key)?;
         if (position.found) {
             mut previous: V;
@@ -278,7 +278,7 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
     }
 
     /// Borrow the value for `key`, inserting `default` first if the key is
-    /// absent: one descent, unlike `get_ref` then `insert`. When the key is
+    /// absent: one descent, unlike `get_reference` then `insert`. When the key is
     /// present, `key` and `default` are released. Panics on allocation
     /// failure.
     public get_or_insert(mut &this, key: K, default: V) -> mut V* where K: Ord {
@@ -288,9 +288,9 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
         }
     }
 
-    /// `get_or_insert` that returns `Err(AllocError)` instead of panicking
+    /// `get_or_insert` that returns `Err(AllocationError)` instead of panicking
     /// when a node cannot be allocated.
-    public try_get_or_insert(mut &this, key: K, default: V) -> Result<mut V*, AllocError> where K: Ord {
+    public try_get_or_insert(mut &this, key: K, default: V) -> Result<mut V*, AllocationError> where K: Ord {
         const position: KeyPosition<K, V> = this.find_or_make_room(&key)?;
         if (!position.found) {
             position.node.insert_entry(position.index, key, default);
@@ -394,12 +394,12 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
     }
 
     /// Every key by borrow, in ascending order.
-    public keys_ref(&this) -> implement Iterator<K*> + DoubleEndedIterator {
+    public key_references(&this) -> implement Iterator<K*> + DoubleEndedIterator {
         return KeysRefIter::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Every value by borrow, in ascending key order.
-    public values_ref(&this) -> implement Iterator<V*> + DoubleEndedIterator {
+    public value_references(&this) -> implement Iterator<V*> + DoubleEndedIterator {
         return ValuesRefIter::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
@@ -413,7 +413,7 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
     /// leaf an insert ends in has room. Answers where the key is, or the
     /// leaf slot it belongs in. A failed allocation leaves a valid tree:
     /// every split made before it is complete.
-    private find_or_make_room(mut &this, key: &K) -> Result<KeyPosition<K, V>, AllocError> where K: Ord {
+    private find_or_make_room(mut &this, key: &K) -> Result<KeyPosition<K, V>, AllocationError> where K: Ord {
         if (this.root == null) {
             this.root = this.allocate_node(true)?;
         } else if (this.root.length == NODE_CAPACITY) {
@@ -596,9 +596,9 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
         this.free_node(right);
     }
 
-    private allocate_node(mut &this, leaf: boolean) -> Result<mut BTreeNode<K, V>*, AllocError> {
+    private allocate_node(mut &this, leaf: boolean) -> Result<mut BTreeNode<K, V>*, AllocationError> {
         const raw: NonNull<u8> = this.alloc.allocate(Layout::of::<BTreeNode<K, V>>())?;
-        const node: mut BTreeNode<K, V>* = raw.cast::<BTreeNode<K, V>>().as_ptr();
+        const node: mut BTreeNode<K, V>* = raw.cast::<BTreeNode<K, V>>().as_pointer();
         node.length = 0;
         node.leaf = leaf;
         return Result::Ok(node);
@@ -1005,9 +1005,9 @@ implement<K, V, A> trait Drop for struct BTreeMap<K, V, A> where A: Allocator {
 }
 
 /// Deep copy: a fresh map owning clones of every key and value.
-implement<K, V> trait Clone for struct BTreeMap<K, V, GlobalAlloc> where K: Ord + Clone, V: Clone {
-    clone(&this) -> BTreeMap<K, V, GlobalAlloc> {
-        mut out: BTreeMap<K, V, GlobalAlloc> = BTreeMap::<K, V, GlobalAlloc>::new();
+implement<K, V> trait Clone for struct BTreeMap<K, V, GlobalAllocator> where K: Ord + Clone, V: Clone {
+    clone(&this) -> BTreeMap<K, V, GlobalAllocator> {
+        mut out: BTreeMap<K, V, GlobalAllocator> = BTreeMap::<K, V, GlobalAllocator>::new();
         for (entry in this.entries()) {
             out.insert((*entry.first).clone(), (*entry.second).clone());
         }
@@ -1016,18 +1016,18 @@ implement<K, V> trait Clone for struct BTreeMap<K, V, GlobalAlloc> where K: Ord 
 }
 
 /// A fresh empty map, allocating nothing until the first insert.
-implement<K, V> trait Default for struct BTreeMap<K, V, GlobalAlloc> {
-    static default() -> BTreeMap<K, V, GlobalAlloc> {
-        return BTreeMap::<K, V, GlobalAlloc>::new();
+implement<K, V> trait Default for struct BTreeMap<K, V, GlobalAllocator> {
+    static default() -> BTreeMap<K, V, GlobalAllocator> {
+        return BTreeMap::<K, V, GlobalAllocator>::new();
     }
 }
 
 /// A map of every key-value pair an iterator yields: what `collect` builds
 /// for `BTreeMap`. A later pair's value replaces an earlier one's for the
 /// same key.
-implement<K, V> trait FromIterator<Pair<K, V>> for struct BTreeMap<K, V, GlobalAlloc> where K: Ord {
-    static from_iterator<I>(source: I) -> BTreeMap<K, V, GlobalAlloc> where I: Iterator<Pair<K, V>> {
-        mut out: BTreeMap<K, V, GlobalAlloc> = BTreeMap::<K, V, GlobalAlloc>::new();
+implement<K, V> trait FromIterator<Pair<K, V>> for struct BTreeMap<K, V, GlobalAllocator> where K: Ord {
+    static from_iterator<I>(source: I) -> BTreeMap<K, V, GlobalAllocator> where I: Iterator<Pair<K, V>> {
+        mut out: BTreeMap<K, V, GlobalAllocator> = BTreeMap::<K, V, GlobalAllocator>::new();
         for (pair in source) {
             out.insert(pair.first, pair.second);
         }

@@ -12,7 +12,7 @@ import std::core::mem;
 import std::core::cmp::{ Ord, Ordering };
 import std::collections::array::{ Array };
 import std::collections::string::{ String };
-import std::alloc::allocator::{ AllocError, Allocator, GlobalAlloc };
+import std::alloc::allocator::{ AllocationError, Allocator, GlobalAllocator };
 import std::alloc::layout::{ Layout };
 import std::core::ptr::{ NonNull };
 import std::test::error::{ TestError };
@@ -257,14 +257,14 @@ type struct ArrayCountingAlloc {
 }
 
 implement trait Allocator for struct ArrayCountingAlloc {
-    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocationError> {
         *this.allocated = *this.allocated + 1;
-        mut global: GlobalAlloc = GlobalAlloc::new();
+        mut global: GlobalAllocator = GlobalAllocator::new();
         return global.allocate(layout);
     }
     deallocate(mut &this, ptr: NonNull<u8>, layout: Layout) -> void {
         *this.released = *this.released + 1;
-        mut global: GlobalAlloc = GlobalAlloc::new();
+        mut global: GlobalAllocator = GlobalAllocator::new();
         global.deallocate(ptr, layout);
     }
 }
@@ -352,19 +352,19 @@ function array_of_arrays_releases_every_buffer() -> Result<(), TestError> {
 
 ![test]
 function get_ptr_reads_in_place_and_none_oob() -> Result<(), TestError> {
-    // `get_ref` borrows the element rather than copying it. Reading
+    // `get_reference` borrows the element rather than copying it. Reading
     // through the returned pointer must observe the stored value, and
     // an out-of-range index must yield None.
     mut arr: Array<i32> = Array::new();
     arr.push(100);
     arr.push(200);
     mut val: i32 = -1;
-    match (arr.get_ref(1)) {
+    match (arr.get_reference(1)) {
         Option::Some(p) => { val = *p; }
         Option::None    => { }
     }
     mut oob_present: boolean = true;
-    match (arr.get_ref(5)) {
+    match (arr.get_reference(5)) {
         Option::Some(_) => { oob_present = true; }
         Option::None    => { oob_present = false; }
     }
@@ -373,13 +373,13 @@ function get_ptr_reads_in_place_and_none_oob() -> Result<(), TestError> {
         Result::Err(e) => { return Result::Err(e); }
     }
     return expect(!oob_present,
-        Str::new("get_ref(5) on length-2 should be None"));
+        Str::new("get_reference(5) on length-2 should be None"));
 }
 
 ![test]
 function get_ptr_borrows_owning_elements_no_double_free() -> Result<(), TestError> {
     // The headline soundness case: `get` is gated on `T: Copy`, so
-    // owning elements are read through `get_ref`, which borrows in
+    // owning elements are read through `get_reference`, which borrows in
     // place. The array retains ownership, so `arr.drop()` frees each
     // String exactly once. If the borrow ever copied, dropping the
     // copy here plus the array's element drop would double-free and
@@ -388,7 +388,7 @@ function get_ptr_borrows_owning_elements_no_double_free() -> Result<(), TestErro
     arr.push(String::from_str(Str::new("alpha")));
     arr.push(String::from_str(Str::new("beta")));
     mut ok: boolean = false;
-    match (arr.get_ref(1)) {
+    match (arr.get_reference(1)) {
         Option::Some(p) => {
             const s: Str = p.as_str();
             const want: Str = Str::new("beta");
@@ -397,7 +397,7 @@ function get_ptr_borrows_owning_elements_no_double_free() -> Result<(), TestErro
         Option::None => { }
     }
     return expect(ok,
-        Str::new("get_ref should borrow 'beta' from the array in place"));
+        Str::new("get_reference should borrow 'beta' from the array in place"));
 }
 
 // Sort ------------------------------------------------------------------------
@@ -552,12 +552,12 @@ function reserve_near_i64_max_fails_cleanly() -> Result<(), TestError> {
     // Regression: reserve_grow's capacity-doubling loop must cap at i64::MAX
     // instead of wrapping to a tiny value (infinite loop / undersized alloc).
     // For a 1-byte element there is no `cap * elem_size` overflow, so the
-    // request reaches the allocator and fails gracefully with an AllocError
+    // request reaches the allocator and fails gracefully with an AllocationError
     // rather than hanging or corrupting memory.
     mut a: Array<u8> = Array::<u8>::new();
     a.push(1 as u8);
     a.push(2 as u8);
-    const r: Result<(), AllocError> = a.reserve(i64::MAX - 615);
+    const r: Result<(), AllocationError> = a.reserve(i64::MAX - 615);
     expect_true(r.is_err(),
         Str::new("reserve(~i64::MAX) must return Err, not loop forever"))?;
     // The failed reservation must leave the array untouched.
@@ -572,8 +572,8 @@ function try_with_capacity_layout_overflow_returns_err() -> Result<(), TestError
     // inside the layout computation; the try_ path must catch that via
     // Layout::try_array and return Err, not abort the process.
     const huge: i64 = i64::MAX;   // * sizeof(u64)=8 overflows
-    const r: Result<Array<u64, GlobalAlloc>, AllocError> =
-        Array::try_with_capacity_in(huge, GlobalAlloc::new());
+    const r: Result<Array<u64, GlobalAllocator>, AllocationError> =
+        Array::try_with_capacity_in(huge, GlobalAllocator::new());
     expect_true(r.is_err(),
         Str::new("try_with_capacity_in with overflowing byte size must Err, not panic"))?;
     return Result::Ok(());
@@ -586,15 +586,15 @@ function reserve_exact_wrapping_additional_fails() -> Result<(), TestError> {
     // small value (< length); without the guard reserve_exact would see
     // `required <= capacity`, return Ok WITHOUT growing, and a later
     // try_append would memcpy `additional` elements past the buffer.
-    // The guard must reject the wrapped request as an AllocError. `reserve`
+    // The guard must reject the wrapped request as an AllocationError. `reserve`
     // shares the same guard.
     mut a: Array<u8> = Array::<u8>::new();
     a.push(1 as u8);
     a.push(2 as u8);                                   // length 2, capacity >= 2
-    const re: Result<(), AllocError> = a.reserve_exact(i64::MAX);
+    const re: Result<(), AllocationError> = a.reserve_exact(i64::MAX);
     expect_true(re.is_err(),
         Str::new("reserve_exact with wrapping additional must return Err"))?;
-    const rg: Result<(), AllocError> = a.reserve(i64::MAX);
+    const rg: Result<(), AllocationError> = a.reserve(i64::MAX);
     expect_true(rg.is_err(),
         Str::new("reserve with wrapping additional must return Err"))?;
     expect_eq(a.length(), 2 as i64)?;                  // array untouched

@@ -32,7 +32,7 @@ import std::time::duration::{ Duration };
 import std::io::error::{ IoError };
 import std::io::traits;
 import std::io::buf::{ BufStream };
-import std::net::addr::socket_addr::{ SocketAddr };
+import std::net::addr::socket_addr::{ SocketAddress };
 import std::net::socket::tcp::{ TcpConnect, TcpListener, TcpStream };
 import std::net::http::method::{ Method };
 import std::net::http::status::{ StatusCode };
@@ -58,14 +58,14 @@ function hs_echo_path(req: Request) -> Response {
 /// port: moving one field out of a tuple that owns a destructor would leave
 /// the other to be dropped twice.
 function hs_bind() -> Result<TcpListener, IoError> {
-    mut l: TcpListener = TcpListener::bind(SocketAddr::localhost_v4(0))?;
+    mut l: TcpListener = TcpListener::bind(SocketAddress::localhost_v4(0))?;
     l.set_nonblocking(true)?;
     return Result::Ok(l);
 }
 
 /// The port the kernel assigned, or 0 if it cannot be read.
 function hs_port(l: &TcpListener) -> u16 {
-    return match (l.local_addr()) {
+    return match (l.local_address()) {
         Result::Ok(a)  => { a.port }
         Result::Err(_) => { 0 }
     };
@@ -74,7 +74,7 @@ function hs_port(l: &TcpListener) -> u16 {
 /// `n` requests down ONE connection, each path distinct, each response matched
 /// against the path that produced it. Returns `n`, or a negative step code.
 async function hs_client_n(port: u16, n: i64) -> i64 {
-    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -10; }
     };
@@ -120,7 +120,7 @@ async function hs_client_n(port: u16, n: i64) -> i64 {
 /// server never completes on its own, so `select` is what ends the pair;
 /// dropping the losing side cancels the accept loop.
 async function hs_drive(listener: TcpListener, port: u16, n: i64, timeout: Duration) -> i64 {
-    mut s: HttpServer = HttpServer::new(SocketAddr::localhost_v4(port), hs_echo_path);
+    mut s: HttpServer = HttpServer::new(SocketAddress::localhost_v4(port), hs_echo_path);
     s.with_read_timeout(timeout);
     const sel: Selected<Result<(), IoError>, i64> =
         await Futures::select(s.run_on(listener), hs_client_n(port, n));
@@ -138,9 +138,9 @@ function server_serves_four_requests_on_one_connection() -> Result<(), TestError
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
     const port: u16 = hs_port(&l);
-    if (port == 0) { return bail(Str::new("local_addr failed")); }
+    if (port == 0) { return bail(Str::new("local_address failed")); }
     mut ex: Executor = Executor::new();
-    const r: i64 = ex.block_on(hs_drive(l, port, 4 as i64, Duration::from_secs(30)));
+    const r: i64 = ex.block_on(hs_drive(l, port, 4 as i64, Duration::from_seconds(30)));
     return expect_eq(r, 4 as i64);
 }
 
@@ -154,9 +154,9 @@ function server_serves_one_request_on_one_connection() -> Result<(), TestError> 
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
     const port: u16 = hs_port(&l);
-    if (port == 0) { return bail(Str::new("local_addr failed")); }
+    if (port == 0) { return bail(Str::new("local_address failed")); }
     mut ex: Executor = Executor::new();
-    const r: i64 = ex.block_on(hs_drive(l, port, 1 as i64, Duration::from_secs(30)));
+    const r: i64 = ex.block_on(hs_drive(l, port, 1 as i64, Duration::from_seconds(30)));
     return expect_eq(r, 1 as i64);
 }
 
@@ -164,7 +164,7 @@ function server_serves_one_request_on_one_connection() -> Result<(), TestError> 
 /// proven to survive being handed back by `TcpAccepted` and carried round the
 /// accept loop. The keep-alive tests never re-enter that arm.
 async function hs_two_connections(listener: TcpListener, port: u16) -> i64 {
-    mut s: HttpServer = HttpServer::new(SocketAddr::localhost_v4(port), hs_echo_path);
+    mut s: HttpServer = HttpServer::new(SocketAddress::localhost_v4(port), hs_echo_path);
     const sel: Selected<Result<(), IoError>, i64> =
         await Futures::select(s.run_on(listener), hs_two_clients(port));
     return match (sel) {
@@ -188,7 +188,7 @@ function server_accepts_two_separate_connections() -> Result<(), TestError> {
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
     const port: u16 = hs_port(&l);
-    if (port == 0) { return bail(Str::new("local_addr failed")); }
+    if (port == 0) { return bail(Str::new("local_address failed")); }
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(hs_two_connections(l, port));
     return expect_eq(r, 2 as i64);
@@ -198,7 +198,7 @@ function server_accepts_two_separate_connections() -> Result<(), TestError> {
 /// server must answer the truncated first request with 400 rather than
 /// hanging or serving it.
 async function hs_truncated_client(port: u16) -> i64 {
-    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -20; }
     };
@@ -226,7 +226,7 @@ async function hs_truncated_client(port: u16) -> i64 {
 }
 
 async function hs_truncated(listener: TcpListener, port: u16) -> i64 {
-    mut s: HttpServer = HttpServer::new(SocketAddr::localhost_v4(port), hs_echo_path);
+    mut s: HttpServer = HttpServer::new(SocketAddress::localhost_v4(port), hs_echo_path);
     const sel: Selected<Result<(), IoError>, i64> =
         await Futures::select(s.run_on(listener), hs_truncated_client(port));
     return match (sel) {
@@ -242,7 +242,7 @@ function server_answers_a_truncated_request_with_400() -> Result<(), TestError> 
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
     const port: u16 = hs_port(&l);
-    if (port == 0) { return bail(Str::new("local_addr failed")); }
+    if (port == 0) { return bail(Str::new("local_address failed")); }
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(hs_truncated(l, port));
     return expect_eq(r, 400 as i64);
@@ -251,7 +251,7 @@ function server_answers_a_truncated_request_with_400() -> Result<(), TestError> 
 /// Send one whole request framed by `Transfer-Encoding` and answer the
 /// status the server replies with.
 async function hs_coded_client(port: u16, text: string) -> i64 {
-    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -20; }
     };
@@ -273,7 +273,7 @@ async function hs_coded_client(port: u16, text: string) -> i64 {
 }
 
 async function hs_coded(listener: TcpListener, port: u16, text: string) -> i64 {
-    mut s: HttpServer = HttpServer::new(SocketAddr::localhost_v4(port), hs_echo_path);
+    mut s: HttpServer = HttpServer::new(SocketAddress::localhost_v4(port), hs_echo_path);
     const sel: Selected<Result<(), IoError>, i64> =
         await Futures::select(s.run_on(listener), hs_coded_client(port, text));
     return match (sel) {
@@ -326,7 +326,7 @@ function server_refuses_a_request_framed_both_ways() -> Result<(), TestError> {
 /// unrelated reason) reports a small number, which is why the assertion is a
 /// lower bound rather than "it closed".
 async function hs_idle_client(port: u16) -> i64 {
-    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -10; }
     };
@@ -338,13 +338,13 @@ async function hs_idle_client(port: u16) -> i64 {
         Result::Ok(_)  => { return -11; }
         Result::Err(_) => { }
     }
-    return (started.elapsed().as_millis()) as i64;
+    return (started.elapsed().as_milliseconds()) as i64;
 }
 
 /// A ONE-second cap, so the test spends about a second rather than the 30 the
 /// default would cost.
 async function hs_idle(listener: TcpListener, port: u16) -> i64 {
-    mut s: HttpServer = HttpServer::new(SocketAddr::localhost_v4(port), hs_echo_path);
+    mut s: HttpServer = HttpServer::new(SocketAddress::localhost_v4(port), hs_echo_path);
     s.with_read_timeout(Duration::second());
     const sel: Selected<Result<(), IoError>, i64> =
         await Futures::select(s.run_on(listener), hs_idle_client(port));
@@ -361,7 +361,7 @@ function server_read_timeout_closes_an_idle_connection() -> Result<(), TestError
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
     const port: u16 = hs_port(&l);
-    if (port == 0) { return bail(Str::new("local_addr failed")); }
+    if (port == 0) { return bail(Str::new("local_address failed")); }
     mut ex: Executor = Executor::new();
     const ms: i64 = ex.block_on(hs_idle(l, port));
     if (ms < 0) { return bail(Str::new("idle client failed before the cap")); }

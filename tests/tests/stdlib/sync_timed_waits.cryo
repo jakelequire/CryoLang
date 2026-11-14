@@ -10,7 +10,7 @@ import std::core::result::{ Result };
 import std::core::mem;
 import std::collections::str::{ Str };
 import std::collections::pair::{ Pair };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 import std::sync::condvar::{ CondVar };
 import std::sync::mutex::{ Mutex, MutexGuard };
 import std::sync::mpsc;
@@ -25,11 +25,11 @@ import std::test::assert::{ expect, expect_eq };
 function condvar_wait_timeout_reports_the_time_running_out() -> Result<(), TestError> {
     const lock: Mutex<i64> = Mutex::new(0);
     const signal: CondVar = CondVar::new();
-    mut guard: MutexGuard<i64, GlobalAlloc> = lock.lock();
+    mut guard: MutexGuard<i64, GlobalAllocator> = lock.lock();
     const start: Instant = Instant::now();
-    const timed_out: boolean = signal.wait_timeout(&lock, &guard, Duration::from_millis(60));
+    const timed_out: boolean = signal.wait_timeout(&lock, &guard, Duration::from_milliseconds(60));
     expect(timed_out, Str::new("the wait timed out"))?;
-    expect(start.elapsed().as_millis() >= 50, Str::new("the wait lasted the duration"))?;
+    expect(start.elapsed().as_milliseconds() >= 50, Str::new("the wait lasted the duration"))?;
     return Result::Ok(());
 }
 
@@ -37,12 +37,12 @@ function condvar_wait_timeout_reports_the_time_running_out() -> Result<(), TestE
 function receive_timeout_times_out_with_a_sender_alive() -> Result<(), TestError> {
     const { first: sender, second: receiver }: Pair<Sender<i64>, Receiver<i64>> = mpsc::Channel::unbounded::<i64>();
     const start: Instant = Instant::now();
-    match (receiver.receive_timeout(Duration::from_millis(60))) {
+    match (receiver.receive_timeout(Duration::from_milliseconds(60))) {
         Result::Ok(_) => { return Result::Err(TestError::failed(Str::new("no value was sent"))); }
         Result::Err(ReceiveTimeoutError::Disconnected) => { return Result::Err(TestError::failed(Str::new("a sender is alive"))); }
         Result::Err(ReceiveTimeoutError::Timeout) => { }
     }
-    expect(start.elapsed().as_millis() >= 50, Str::new("the wait lasted the duration"))?;
+    expect(start.elapsed().as_milliseconds() >= 50, Str::new("the wait lasted the duration"))?;
     return expect(sender.send(1).is_ok(), Str::new("the receiver still takes a value"));
 }
 
@@ -50,7 +50,7 @@ function receive_timeout_times_out_with_a_sender_alive() -> Result<(), TestError
 function receive_timeout_returns_a_queued_value_at_once() -> Result<(), TestError> {
     const { first: sender, second: receiver }: Pair<Sender<i64>, Receiver<i64>> = mpsc::Channel::unbounded::<i64>();
     expect(sender.send(7).is_ok(), Str::new("the value is queued"))?;
-    match (receiver.receive_timeout(Duration::from_secs(10))) {
+    match (receiver.receive_timeout(Duration::from_seconds(10))) {
         Result::Ok(value) => { expect_eq(value, 7)?; }
         Result::Err(_) => { return Result::Err(TestError::failed(Str::new("the queued value"))); }
     }
@@ -61,16 +61,16 @@ function receive_timeout_returns_a_queued_value_at_once() -> Result<(), TestErro
 function receive_timeout_takes_a_value_sent_while_it_waits() -> Result<(), TestError> {
     const { first: sender, second: receiver }: Pair<Sender<i64>, Receiver<i64>> = mpsc::Channel::unbounded::<i64>();
     const worker = thread::spawn(move () -> i64 {
-        thread::sleep(Duration::from_millis(30));
+        thread::sleep(Duration::from_milliseconds(30));
         // The test reads the send's outcome from the thread's result.
         return if (sender.send(9).is_ok()) { 0 } else { 1 };
     });
     const start: Instant = Instant::now();
-    match (receiver.receive_timeout(Duration::from_secs(20))) {
+    match (receiver.receive_timeout(Duration::from_seconds(20))) {
         Result::Ok(value) => { expect_eq(value, 9)?; }
         Result::Err(_) => { return Result::Err(TestError::failed(Str::new("the value sent while waiting"))); }
     }
-    expect(start.elapsed().as_secs() < 10, Str::new("woken by the send, not the timeout"))?;
+    expect(start.elapsed().as_seconds() < 10, Str::new("woken by the send, not the timeout"))?;
     return expect_eq(worker.join(), 0);
 }
 
@@ -79,11 +79,11 @@ function receive_timeout_reports_a_channel_without_senders() -> Result<(), TestE
     const { first: sender, second: receiver }: Pair<Sender<i64>, Receiver<i64>> = mpsc::Channel::unbounded::<i64>();
     mem::drop(sender);
     const start: Instant = Instant::now();
-    match (receiver.receive_timeout(Duration::from_secs(20))) {
+    match (receiver.receive_timeout(Duration::from_seconds(20))) {
         Result::Err(ReceiveTimeoutError::Disconnected) => { }
         Result::Err(ReceiveTimeoutError::Timeout) => { return Result::Err(TestError::failed(Str::new("no sender exists"))); }
         Result::Ok(_) => { return Result::Err(TestError::failed(Str::new("no value was sent"))); }
     }
-    expect(start.elapsed().as_secs() < 10, Str::new("answered at once"))?;
+    expect(start.elapsed().as_seconds() < 10, Str::new("answered at once"))?;
     return Result::Ok(());
 }

@@ -13,8 +13,8 @@
 ///!
 ///! IMPORTANT - import-cycle discipline: this module deliberately does
 ///! NOT import `alloc::allocator`.  The `Allocator` and `Drop` trait
-///! impls for `Arena` live in `alloc::arena_alloc` instead.  The reason
-///! is the per-target global arena (`g_alloc_arena` below): `GlobalAlloc`
+///! impls for `Arena` live in `alloc::arena_allocator` instead.  The reason
+///! is the per-target global arena (`g_alloc_arena` below): `GlobalAllocator`
 ///! in `alloc::allocator` consults it on every allocation, so
 ///! `allocator` must be able to `import alloc::arena`.  Were `arena` to
 ///! import `allocator` back, the module topological sort (which rejects
@@ -41,7 +41,7 @@ import std::sys::syscall;
 // the module into the importer's graph for discovery WITHOUT adding a
 // dependency edge (see ModuleLoader::discover_module), so this does not
 // recreate the `allocator`<->`arena` cycle the split exists to avoid.
-module alloc::arena_alloc;
+module alloc::arena_allocator;
 
 /// Default chunk size: 1 MiB.  Each chunk's data buffer is mapped directly
 /// from the OS (see `Chunk::os_alloc`), so `release()` returns it to the OS
@@ -229,7 +229,7 @@ public type struct Arena {
     // These inherent methods are the bump allocator proper, expressed in
     // raw `void*` terms so this module needs no dependency on
     // `alloc::allocator`.  The `Allocator` trait impl in
-    // `alloc::arena_alloc` is a thin Layout/Result wrapper over them.
+    // `alloc::arena_allocator` is a thin Layout/Result wrapper over them.
 
     /// Hand out `size` bytes aligned to `align` from the arena.  Returns
     /// `null` on out-of-memory or a zero-sized request.  Marches through
@@ -287,7 +287,7 @@ public type struct Arena {
     }
 
     /// True when `ptr` lies inside any chunk this arena owns.  Used by
-    /// `GlobalAlloc`'s free/realloc routing to recognise arena-backed
+    /// `GlobalAllocator`'s free/realloc routing to recognise arena-backed
     /// pointers so they are never handed to libc `free`.  Range-scan of
     /// the chunk list (mirrors `capacity`); a pointer one-past-the-end of
     /// a chunk is intentionally excluded.
@@ -346,7 +346,7 @@ public type struct Arena {
     }
 
     /// Release every chunk back to the platform allocator.  Invoked by the
-    /// `Drop` impl in `alloc::arena_alloc`; exposed as an inherent method
+    /// `Drop` impl in `alloc::arena_allocator`; exposed as an inherent method
     /// so the drop logic lives next to the allocation logic.
     public release(mut &this) -> void {
         mut chunk: mut Chunk* = this.head;
@@ -364,11 +364,11 @@ public type struct Arena {
 // Per-target global arena (the OOM fix)
 //
 // The compiler builds `[lib]` then `[[bin]]` in one process, each with a
-// heap-leaked `CompilationContext`.  Routing the compiler's `GlobalAlloc`
+// heap-leaked `CompilationContext`.  Routing the compiler's `GlobalAllocator`
 // through a single per-target arena, reset in bulk between targets, caps
 // peak RSS near one target instead of the sum.  These globals are the
 // hand-off point: the compiler driver publishes its arena and toggles the
-// active flag around the heavy pipeline; `GlobalAlloc` (alloc::allocator)
+// active flag around the heavy pipeline; `GlobalAllocator` (alloc::allocator)
 // consults them via `GlobalArena`.  In every other program both stay
 // null/false, so the arena is physically incapable of activating - zero
 // user impact.
@@ -377,8 +377,8 @@ private mut g_alloc_arena: mut Arena* = null;
 private mut g_alloc_arena_active: boolean = false;
 
 /// The process-wide per-target arena routing slot.  Zero-sized: all state
-/// lives in the two module globals above (mirrors how `GlobalAlloc` is a ZST
-/// handle over the platform allocator).  `GlobalAlloc::allocate/deallocate/
+/// lives in the two module globals above (mirrors how `GlobalAllocator` is a ZST
+/// handle over the platform allocator).  `GlobalAllocator::allocate/deallocate/
 /// reallocate` route every heap allocation through these statics; the compiler
 /// driver `publish`es its arena and brackets `set_active` around the heavy
 /// pipeline.  Null/inactive everywhere else -> the consult branches are dead.

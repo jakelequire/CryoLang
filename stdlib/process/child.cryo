@@ -50,7 +50,7 @@ import std::time::duration::{ Duration };
 import std::time::clock;
 import std::time::clock::{ Instant };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 import std::io::error::{ IoError, IoErrorKind };
 import std::io::fd;
 import std::io::fd::{ BorrowedFileDescriptor };
@@ -172,8 +172,8 @@ private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitSt
 ![target(unix)]
 private function os_proc_wait_timeout(pid: i32, handle: u64, timeout: Duration) -> Result<Option<ExitStatus>, IoError> {
     const started: Instant = Instant::now();
-    const longest_pause: Duration = Duration::from_millis(50);
-    mut pause: Duration = Duration::from_millis(1);
+    const longest_pause: Duration = Duration::from_milliseconds(50);
+    mut pause: Duration = Duration::from_milliseconds(1);
     loop {
         match (os_proc_try_wait(pid, handle)?) {
             Option::Some(status) => { return Result::Ok(Option::Some(status)); }
@@ -189,7 +189,7 @@ private function os_proc_wait_timeout(pid: i32, handle: u64, timeout: Duration) 
 private function os_proc_wait_timeout(pid: i32, handle: u64, timeout: Duration) -> Result<Option<ExitStatus>, IoError> {
     const h: u8* = handle as u8*;
     // INFINITE is 0xFFFFFFFF, so the longest finite wait is one below it.
-    const milliseconds: u32 = min(timeout.as_millis_ceil(), 0xFFFFFFFE) as u32;
+    const milliseconds: u32 = min(timeout.as_milliseconds_ceiling(), 0xFFFFFFFE) as u32;
     const waited: u32 = syscall::WaitForSingleObject(h, milliseconds);
     if (waited == 0x102) {   // WAIT_TIMEOUT
         return Result::Ok(Option::None);
@@ -421,11 +421,11 @@ private const MAXRSS_UNIT: u64 = 1;
 public type struct ChildStdin {
     private fd: i32;
 
-    /// Wrap `raw_fd`, a pipe descriptor this handle now owns and closes when
+    /// Wrap `raw_file_descriptor`, a pipe descriptor this handle now owns and closes when
     /// it drops. `Command::spawn` builds these; a descriptor of -1 makes an
     /// empty handle whose drop closes nothing.
-    public static from_fd(raw_fd: i32) -> ChildStdin {
-        return ChildStdin { fd: raw_fd };
+    public static from_file_descriptor(raw_file_descriptor: i32) -> ChildStdin {
+        return ChildStdin { fd: raw_file_descriptor };
     }
 
     /// Hand the pipe's descriptor over to the caller, who must close it, and
@@ -451,11 +451,11 @@ implement trait Write for struct ChildStdin {
 public type struct ChildStdout {
     private fd: i32;
 
-    /// Wrap `raw_fd`, a pipe descriptor this handle now owns and closes when
+    /// Wrap `raw_file_descriptor`, a pipe descriptor this handle now owns and closes when
     /// it drops. `Command::spawn` builds these; a descriptor of -1 makes an
     /// empty handle whose drop closes nothing.
-    public static from_fd(raw_fd: i32) -> ChildStdout {
-        return ChildStdout { fd: raw_fd };
+    public static from_file_descriptor(raw_file_descriptor: i32) -> ChildStdout {
+        return ChildStdout { fd: raw_file_descriptor };
     }
 
     /// Hand the pipe's descriptor over to the caller, who must close it, and
@@ -477,11 +477,11 @@ implement trait Read for struct ChildStdout {
 public type struct ChildStderr {
     private fd: i32;
 
-    /// Wrap `raw_fd`, a pipe descriptor this handle now owns and closes when
+    /// Wrap `raw_file_descriptor`, a pipe descriptor this handle now owns and closes when
     /// it drops. `Command::spawn` builds these; a descriptor of -1 makes an
     /// empty handle whose drop closes nothing.
-    public static from_fd(raw_fd: i32) -> ChildStderr {
-        return ChildStderr { fd: raw_fd };
+    public static from_file_descriptor(raw_file_descriptor: i32) -> ChildStderr {
+        return ChildStderr { fd: raw_file_descriptor };
     }
 
     /// Hand the pipe's descriptor over to the caller, who must close it, and
@@ -711,7 +711,7 @@ private function child_wait_job_run(raw: mut u8*) -> void {
 private function child_wait_job_free(raw: mut u8*) -> void {
     mut j: ChildWaitJob* = raw as ChildWaitJob*;
     os_proc_close_dup(j.handle);
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(raw), Layout::of::<ChildWaitJob>());
 }
 
@@ -873,10 +873,10 @@ implement trait Future for struct ChildWait {
                     return Poll::Ready(os_proc_wait(this.pid, this.handle));
                 }
             }
-            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            mut alloc: GlobalAllocator = GlobalAllocator::new();
             mut j: mut ChildWaitJob* = null;
             match (alloc.allocate(Layout::of::<ChildWaitJob>())) {
-                Result::Ok(raw) => { j = raw.cast::<ChildWaitJob>().as_ptr(); }
+                Result::Ok(raw) => { j = raw.cast::<ChildWaitJob>().as_pointer(); }
                 Result::Err(_)  => {
                     os_proc_close_dup(owned);
                     return Poll::Ready(Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)));
@@ -999,7 +999,7 @@ private function pipe_drain_job_free(raw: mut u8*) -> void {
         j.fd = -1;
     }
     ptr::drop_in_place::<Array<u8>>(&j.buf);
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(raw), Layout::of::<PipeDrainJob>());
 }
 
@@ -1038,12 +1038,12 @@ internal type struct PipeDrain {
     private routed:     boolean;        // true once the first poll chose a route
     private on_reactor: boolean;        // which route that was
 
-    /// Begin draining `raw_fd`, which this future now owns. Nothing is read or
+    /// Begin draining `raw_file_descriptor`, which this future now owns. Nothing is read or
     /// submitted until the first poll, so a `PipeDrain` that is never awaited
     /// costs nothing beyond closing the descriptor.
-    internal static start(raw_fd: i32) -> PipeDrain {
+    internal static start(raw_file_descriptor: i32) -> PipeDrain {
         return PipeDrain {
-            fd: raw_fd,
+            fd: raw_file_descriptor,
             buf: Array::new(),
             rt: null,
             job: null,
@@ -1139,10 +1139,10 @@ implement trait Future for struct PipeDrain {
                 mut inline_r: Result<i64, IoError> = inline_pipe.read_to_end(&this.buf);
                 return this.finish(inline_r);
             }
-            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            mut alloc: GlobalAllocator = GlobalAllocator::new();
             mut j: mut PipeDrainJob* = null;
             match (alloc.allocate(Layout::of::<PipeDrainJob>())) {
-                Result::Ok(raw) => { j = raw.cast::<PipeDrainJob>().as_ptr(); }
+                Result::Ok(raw) => { j = raw.cast::<PipeDrainJob>().as_pointer(); }
                 Result::Err(_)  => {
                     return this.finish(Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)));
                 }

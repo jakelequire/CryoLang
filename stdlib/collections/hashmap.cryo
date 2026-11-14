@@ -5,7 +5,7 @@
 ///! `H`, by default `SipHasher` (SipHash-1-3) under a key drawn per map
 ///! from a per-process random value, so which keys share a bucket cannot
 ///! be worked out by whoever chooses the keys. A map whose keys are
-///! trusted can name a faster hasher, `HashMap<K, V, GlobalAlloc,
+///! trusted can name a faster hasher, `HashMap<K, V, GlobalAllocator,
 ///! FnvHasher>`; `with_hasher` builds a map around a given hasher, for
 ///! a fixed key or a reproducible layout.
 ///!
@@ -27,7 +27,7 @@ import std::core::default::{ Default };
 import std::core::iter::{ FromIterator, Iterator };
 import std::core::ptr::{ NonNull };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ AllocError, AllocErrorKind, Allocator, GlobalAlloc };
+import std::alloc::allocator::{ AllocationError, AllocationErrorKind, Allocator, GlobalAllocator };
 import std::collections::pair::{ Pair };
 import std::random::secure::{ SecureRng };
 import std::ffi::libc;
@@ -97,7 +97,7 @@ internal type struct Entry<K, V> {
 /// ages.insert(Str::new("ada"), 36);
 /// if (ages.contains_key(&Str::new("ada"))) { println("found"); }
 /// ```
-public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Allocator {
+public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Allocator {
     private buckets: mut (mut Entry<K, V>*)*;
     private bucket_count: u64;
     private length: i64;
@@ -106,10 +106,10 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
     /// finished, so one map hashes every key the same way.
     private hasher: H;
 
-    /// An empty map backed by `GlobalAlloc`, hashing with `H`'s default.
-    public static new() -> HashMap<K, V, GlobalAlloc, H>
+    /// An empty map backed by `GlobalAllocator`, hashing with `H`'s default.
+    public static new() -> HashMap<K, V, GlobalAllocator, H>
     where H: Default {
-        return HashMap::<K, V, GlobalAlloc, H>::with_hasher(H::default());
+        return HashMap::<K, V, GlobalAllocator, H>::with_hasher(H::default());
     }
 
     /// An empty map that allocates through `alloc`, hashing with `H`'s
@@ -121,8 +121,8 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
 
     /// An empty map whose keys are hashed starting from `hasher`: a fixed key,
     /// or a fixed layout and iteration order for a test.
-    public static with_hasher(hasher: H) -> HashMap<K, V, GlobalAlloc, H> {
-        return HashMap::<K, V, GlobalAlloc, H>::with_hasher_in(hasher, GlobalAlloc::new());
+    public static with_hasher(hasher: H) -> HashMap<K, V, GlobalAllocator, H> {
+        return HashMap::<K, V, GlobalAllocator, H>::with_hasher_in(hasher, GlobalAllocator::new());
     }
 
     /// `with_hasher` in a caller-supplied allocator.
@@ -146,9 +146,9 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
     /// Preallocate for at least `capacity` entries at the default load
     /// factor. The actual bucket count is the smallest power of two
     /// that keeps the load factor below 1.0.
-    public static with_capacity(capacity: i64) -> HashMap<K, V, GlobalAlloc, H>
+    public static with_capacity(capacity: i64) -> HashMap<K, V, GlobalAllocator, H>
     where H: Default {
-        mut map: HashMap<K, V, GlobalAlloc, H> = HashMap::<K, V, GlobalAlloc, H>::new();
+        mut map: HashMap<K, V, GlobalAllocator, H> = HashMap::<K, V, GlobalAllocator, H>::new();
         if (capacity > 0) {
             // A hint of at most `i64::MAX` rounds to at most 2^63 buckets,
             // whose allocation then fails loudly.
@@ -198,7 +198,7 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
     /// duplicated out (which would alias map-owned storage and
     /// double-free). To walk a map of owning types, borrow each entry
     /// in place with `entries()`. The iterator is invalidated by any mutation that inserts, removes,
-    /// or resizes; same contract as `as_ptr` / `get_ref`.
+    /// or resizes; same contract as `as_pointer` / `get_reference`.
     public iter(&this) -> implement Iterator<Pair<K, V>>
     where K: Copy, V: Copy {
         return HashMapIter::<K, V> {
@@ -239,7 +239,7 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
     /// Copy) because it hands out borrows, never bitcopies - so it is the way
     /// to walk a `HashMap<String, Foo>` without cloning. The pointers borrow
     /// map-owned storage and are invalidated by any mutation that inserts,
-    /// removes, or resizes; same contract as `get_ref`. Order is bucket-major
+    /// removes, or resizes; same contract as `get_reference`. Order is bucket-major
     /// and unstable across resizes.
     public entries(&this) -> implement Iterator<Pair<K*, V*>> {
         return EntriesRefIter::<K, V> {
@@ -254,7 +254,7 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
     /// `K` (owning or Copy); this is how to walk the keys of a
     /// `HashMap<String, V>` - the common case - without the `K: Copy` gate on
     /// `keys`. Same borrow/invalidation contract as `entries`.
-    public keys_ref(&this) -> implement Iterator<K*> {
+    public key_references(&this) -> implement Iterator<K*> {
         return KeysRefIter::<K, V> {
             buckets: this.buckets,
             bucket_count: this.bucket_count,
@@ -267,7 +267,7 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
     /// `V` (owning or Copy). Same borrow/invalidation contract as `entries`;
     /// use this to read owning values in place without the `V: Copy` gate on
     /// `values`, and `values_mutable` to change them.
-    public values_ref(&this) -> implement Iterator<V*> {
+    public value_references(&this) -> implement Iterator<V*> {
         return ValuesRefIter::<K, V> {
             buckets: this.buckets,
             bucket_count: this.bucket_count,
@@ -278,7 +278,7 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
 
     /// Iterate over the values by writable borrow, yielding `mut V*`: the
     /// way to change owning values in place. Same invalidation contract as
-    /// `entries`, and the same order as `values_ref`.
+    /// `entries`, and the same order as `value_references`.
     public values_mutable(mut &this) -> implement Iterator<mut V*> {
         return ValuesMutableIter::<K, V> {
             buckets: this.buckets,
@@ -293,14 +293,14 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
     where K: Hash + Eq, H: Hasher + Copy {
         // Borrow rather than copy out, so this stays sound for owning V
         // (a `where V: Copy` on `get` would otherwise leak in here).
-        return this.get_ref(key).is_some();
+        return this.get_reference(key).is_some();
     }
 
     /// Look up a value by key, returning a bitwise copy. Gated on
     /// `V: Copy` for the same reason as `Array::get`: handing back a
     /// duplicate of an owning value would alias storage the map still
     /// owns, double-freeing on drop. For owning `V`, borrow in place
-    /// with `get_ref` (or move it out with `remove`).
+    /// with `get_reference` (or move it out with `remove`).
     public get(&this, key: &K) -> Option<V>
     where K: Hash + Eq, V: Copy, H: Hasher + Copy {
         if (this.bucket_count == 0) {
@@ -328,7 +328,7 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
     /// removes this key or drops the map.  `resize_buckets` is safe;
     /// it relinks bucket heads but never relocates entry storage,
     /// because each entry is its own heap allocation.
-    public get_ref(&this, key: &K) -> Option<V*>
+    public get_reference(&this, key: &K) -> Option<V*>
     where K: Hash + Eq, H: Hasher + Copy {
         if (this.bucket_count == 0) {
             return Option::None;
@@ -346,8 +346,8 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
         return Option::None;
     }
 
-    /// Like `get_ref`, but the borrow is writable: change the stored
-    /// value in place through it.  Valid for as long as `get_ref`'s.
+    /// Like `get_reference`, but the borrow is writable: change the stored
+    /// value in place through it.  Valid for as long as `get_reference`'s.
     public get_mutable(mut &this, key: &K) -> Option<mut V*>
     where K: Hash + Eq, H: Hasher + Copy {
         if (this.bucket_count == 0) {
@@ -379,10 +379,10 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
         }
     }
 
-    /// `insert` that returns `Err(AllocError)` instead of panicking when
+    /// `insert` that returns `Err(AllocationError)` instead of panicking when
     /// the map cannot grow. `Ok` holds the value `key` had before, or
     /// `None`.
-    public try_insert(mut &this, key: K, value: V) -> Result<Option<V>, AllocError>
+    public try_insert(mut &this, key: K, value: V) -> Result<Option<V>, AllocationError>
     where K: Hash + Eq, H: Hasher + Copy {
         if (this.bucket_count == 0) {
             this.resize_buckets(INITIAL_BUCKETS)?;
@@ -423,7 +423,7 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
     /// is absent. Returns a pointer to the (existing or freshly inserted)
     /// value, valid until the next mutation that removes this key or
     /// drops the map (a resize keeps entry storage in place). A single
-    /// lookup, unlike `get_ref`-then-`insert`. Panics on allocation
+    /// lookup, unlike `get_reference`-then-`insert`. Panics on allocation
     /// failure; the common case (key present) never allocates.
     ///
     /// When the key is already present, the passed `key` and `default`
@@ -439,9 +439,9 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
         }
     }
 
-    /// Fallible `get_or_insert`: returns `Err(AllocError)` instead of
+    /// Fallible `get_or_insert`: returns `Err(AllocationError)` instead of
     /// panicking when a needed resize or entry allocation fails.
-    public try_get_or_insert(mut &this, key: K, default: V) -> Result<mut V*, AllocError>
+    public try_get_or_insert(mut &this, key: K, default: V) -> Result<mut V*, AllocationError>
     where K: Hash + Eq, H: Hasher + Copy {
         if (this.bucket_count == 0) {
             this.resize_buckets(INITIAL_BUCKETS)?;
@@ -548,16 +548,16 @@ public type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> where A: Alloca
 
     // Rehash / grow.
 
-    private resize_buckets(mut &this, new_count: u64) -> Result<(), AllocError> {
+    private resize_buckets(mut &this, new_count: u64) -> Result<(), AllocationError> {
         const new_layout: Layout = match (Layout::try_array::<Entry<K, V>*>(new_count as i64)) {
             Option::Some(l) => { l }
             Option::None    => {
-                return Result::Err(AllocError::new(
-                    AllocErrorKind::OutOfMemory, Layout::of::<Entry<K, V>*>()));
+                return Result::Err(AllocationError::new(
+                    AllocationErrorKind::OutOfMemory, Layout::of::<Entry<K, V>*>()));
             }
         };
         const raw: NonNull<u8> = this.alloc.allocate(new_layout)?;
-        const new_buckets: mut (mut Entry<K, V>*)* = raw.as_ptr() as mut (mut Entry<K, V>*)*;
+        const new_buckets: mut (mut Entry<K, V>*)* = raw.as_pointer() as mut (mut Entry<K, V>*)*;
         // Zero the bucket array; null pointers are "empty bucket".
         libc::memset(
             new_buckets,
@@ -705,7 +705,7 @@ implement<K, V> trait Iterator<V> for struct ValuesIter<K, V> {
 //
 // `EntriesRefIter` mirrors `HashMapIter`; the projections mirror
 // `KeysIter`/`ValuesIter`. `KeysRefIter` is `internal` because
-// `HashSet::iter_ref` wraps it; the others are only produced as opaque
+// `HashSet::iterate_references` wraps it; the others are only produced as opaque
 // `implement Iterator<...>` and stay private.
 
 private type struct EntriesRefIter<K, V> {
@@ -843,11 +843,11 @@ public function hash_integer(value: u64) -> u64 {
 private function alloc_entry<K, V, A, H>(map: mut &HashMap<K, V, A, H>,
                               h: u64,
                               key: K,
-                              value: V) -> Result<Entry<K, V>*, AllocError>
+                              value: V) -> Result<Entry<K, V>*, AllocationError>
 where A: Allocator {
     const block: Layout = Layout::of::<Entry<K, V>>();
     const raw: NonNull<u8> = map.alloc.allocate(block)?;
-    const entry: mut Entry<K, V>* = raw.as_ptr() as mut Entry<K, V>*;
+    const entry: mut Entry<K, V>* = raw.as_pointer() as mut Entry<K, V>*;
     entry.hash = h;
     entry.key = key;
     entry.value = value;
@@ -885,10 +885,10 @@ where A: Allocator {
 /// the two maps own independent storage and independent entries; the copy
 /// hashes with the original's hasher. Requires `K: Hash + Eq + Clone` and
 /// `V: Clone`.
-implement<K, V, H> trait Clone for struct HashMap<K, V, GlobalAlloc, H>
+implement<K, V, H> trait Clone for struct HashMap<K, V, GlobalAllocator, H>
 where K: Hash + Eq + Clone, V: Clone, H: Hasher + Copy {
-    clone(&this) -> HashMap<K, V, GlobalAlloc, H> {
-        mut out: HashMap<K, V, GlobalAlloc, H> = HashMap::<K, V, GlobalAlloc, H>::with_hasher(this.hasher);
+    clone(&this) -> HashMap<K, V, GlobalAllocator, H> {
+        mut out: HashMap<K, V, GlobalAllocator, H> = HashMap::<K, V, GlobalAllocator, H>::with_hasher(this.hasher);
         mut b: u64 = 0;
         while (b < this.bucket_count) {
             mut node: Entry<K, V>* = this.buckets[b];
@@ -904,20 +904,20 @@ where K: Hash + Eq + Clone, V: Clone, H: Hasher + Copy {
 
 /// A fresh empty map is `HashMap`'s canonical "zero value", so it can satisfy
 /// a `Default` bound. Allocates no buckets until the first insert.
-implement<K, V, H> trait Default for struct HashMap<K, V, GlobalAlloc, H>
+implement<K, V, H> trait Default for struct HashMap<K, V, GlobalAllocator, H>
 where H: Default {
-    static default() -> HashMap<K, V, GlobalAlloc, H> {
-        return HashMap::<K, V, GlobalAlloc, H>::new();
+    static default() -> HashMap<K, V, GlobalAllocator, H> {
+        return HashMap::<K, V, GlobalAllocator, H>::new();
     }
 }
 
 /// A map of every key-value pair an iterator yields: what `collect` builds
 /// for `HashMap`.  A later pair's value replaces an earlier one's for the
 /// same key.
-implement<K, V, H> trait FromIterator<Pair<K, V>> for struct HashMap<K, V, GlobalAlloc, H>
+implement<K, V, H> trait FromIterator<Pair<K, V>> for struct HashMap<K, V, GlobalAllocator, H>
 where K: Hash + Eq, H: Hasher + Copy + Default {
-    static from_iterator<I>(source: I) -> HashMap<K, V, GlobalAlloc, H> where I: Iterator<Pair<K, V>> {
-        mut out: HashMap<K, V, GlobalAlloc, H> = HashMap::<K, V, GlobalAlloc, H>::new();
+    static from_iterator<I>(source: I) -> HashMap<K, V, GlobalAllocator, H> where I: Iterator<Pair<K, V>> {
+        mut out: HashMap<K, V, GlobalAllocator, H> = HashMap::<K, V, GlobalAllocator, H>::new();
         for (pair in source) {
             out.insert(pair.first, pair.second);
         }

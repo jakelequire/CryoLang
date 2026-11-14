@@ -64,7 +64,7 @@ import std::collections::string::{ String };
 import std::fmt::display::{ Debug, Display, Formatter };
 import std::fmt::error::{ FormatError };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ AllocError, GlobalAlloc };
+import std::alloc::allocator::{ AllocationError, GlobalAllocator };
 import std::alloc::arc::{ Arc };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::sync::mutex::{ Mutex, MutexGuard };
@@ -134,7 +134,7 @@ private function detach_shared<O>(sh: mut TaskShared<O>*) -> void {
     const prev: u8 = ctl.hs.swap(HS_HANDLE_GONE, MemoryOrder::AcqRel);
     if (prev == HS_TASK_FIN) {
         const outcome: u8 = ctl.outcome.load(MemoryOrder::Acquire);
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         if (outcome == OUTCOME_READY) {
             ptr::drop_in_place::<O>(&sh.result);
         }
@@ -258,7 +258,7 @@ private type struct Task {
             // hs.swap above (Release) published HS_TASK_FIN — our last touch of
             // the block; the joiner observes it and then owns reading+freeing the
             // block, so we must not touch `ctl` after the broadcast below.
-            const held: MutexGuard<(), GlobalAlloc> = exec.done_lock.lock();
+            const held: MutexGuard<(), GlobalAllocator> = exec.done_lock.lock();
             exec.task_done.notify_all();
             mem::drop(held);
         }
@@ -316,8 +316,8 @@ private type struct ExecInner {
     /// caller has already set `task.run_state = ST_SCHEDULED`, so a concurrent
     /// `wake()` sees SCHEDULED and does not double-link.
     private enqueue(mut &this, task: mut Task*) -> void {
-        mut held: MutexGuard<ReadyQueue, GlobalAlloc> = this.queue.lock();
-        const queue: mut ReadyQueue* = held.as_mutable_ptr();
+        mut held: MutexGuard<ReadyQueue, GlobalAllocator> = this.queue.lock();
+        const queue: mut ReadyQueue* = held.as_mutable_pointer();
         task.next = null;
         if (queue.tail == null) {
             queue.head = task;
@@ -335,8 +335,8 @@ private type struct ExecInner {
     /// worker can claim it), or null once shutdown is set (leaving any remaining
     /// queued tasks for `Executor::drop` to reclaim).
     private take(mut &this) -> mut Task* {
-        mut held: MutexGuard<ReadyQueue, GlobalAlloc> = this.queue.lock();
-        const queue: mut ReadyQueue* = held.as_mutable_ptr();
+        mut held: MutexGuard<ReadyQueue, GlobalAllocator> = this.queue.lock();
+        const queue: mut ReadyQueue* = held.as_mutable_pointer();
         while (queue.head == null && !queue.shutdown) {
             this.work_ready.wait(&this.queue, &held);
         }
@@ -382,8 +382,8 @@ private type struct ExecInner {
     /// this same lock, and that task is then drained in turn.
     private drain_cancelled(mut &this) -> void {
         loop {
-            mut held: MutexGuard<ReadyQueue, GlobalAlloc> = this.queue.lock();
-            const t: Task* = held.as_mutable_ptr().pop();
+            mut held: MutexGuard<ReadyQueue, GlobalAllocator> = this.queue.lock();
+            const t: Task* = held.as_mutable_pointer().pop();
             mem::drop(held);
             if (t == null) { return; }
             task_decref(t);
@@ -396,7 +396,7 @@ private type struct ExecInner {
 /// and the wake path (handing the ready queue its own reference) call this; it
 /// pairs one-for-one with `task_decref`.
 private function task_incref(task: Task*) -> void {
-    Arc::<Task, GlobalAlloc>::increment_strong_count(task);
+    Arc::<Task, GlobalAllocator>::increment_strong_count(task);
 }
 
 /// Release one strong reference to `task`'s box. The last release runs
@@ -404,7 +404,7 @@ private function task_incref(task: Task*) -> void {
 /// `task_incref`, the initial `Arc::new` scheduling reference, and each stored
 /// waker.
 private function task_decref(task: Task*) -> void {
-    Arc::<Task, GlobalAlloc>::decrement_strong_count(task);
+    Arc::<Task, GlobalAllocator>::decrement_strong_count(task);
 }
 
 /// `Waker` `clone_fn` for an owning task waker: acquire a reference and return
@@ -544,7 +544,7 @@ private function task_drop_thunk<F>(fut_raw: mut u8*) -> void {
     // destructor, so taking the future out leaves exactly one owner.
     mut _owned: F;
     unsafe { _owned = *fut; }
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(fut_raw), Layout::of::<F>());
     // `_owned` drops here, after its storage has been released.
 }
@@ -558,7 +558,7 @@ private function dispose_shared_thunk<O>(shared_raw: mut u8*, drop_result: u8) -
     if (drop_result == 1) {
         ptr::drop_in_place::<O>(&sh.result);
     }
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(shared_raw), Layout::of::<TaskShared<O>>());
 }
 
@@ -570,11 +570,11 @@ private function dispose_shared_thunk<O>(shared_raw: mut u8*, drop_result: u8) -
 /// stays a free function rather than an `Executor` method body.
 private function spawn_on<F, O>(inner: mut ExecInner*, fut: F) -> JoinHandle<O>
 where F: Future<O> {
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
 
     mut sh: mut TaskShared<O>* = null;
     match (alloc.allocate(Layout::of::<TaskShared<O>>())) {
-        Result::Ok(raw) => { sh = raw.cast::<TaskShared<O>>().as_ptr(); }
+        Result::Ok(raw) => { sh = raw.cast::<TaskShared<O>>().as_pointer(); }
         Result::Err(_)  => { panic("Executor::spawn: shared allocation failed", intrinsics::location()); }
     }
     sh.ctl.outcome = Atomic::<u8>::new(OUTCOME_PENDING);
@@ -584,7 +584,7 @@ where F: Future<O> {
 
     mut fbox: mut F* = null;
     match (alloc.allocate(Layout::of::<F>())) {
-        Result::Ok(raw) => { fbox = raw.cast::<F>().as_ptr(); }
+        Result::Ok(raw) => { fbox = raw.cast::<F>().as_pointer(); }
         Result::Err(_)  => {
             alloc.deallocate(NonNull::new(sh as mut u8*), Layout::of::<TaskShared<O>>());
             panic("Executor::spawn: future allocation failed", intrinsics::location());
@@ -596,7 +596,7 @@ where F: Future<O> {
     // lifetime. `Arc::new`'s initial count of 1 IS the scheduling reference,
     // handed to the ready queue by `into_raw` (which suppresses the handle's own
     // drop). The `Task*` it yields is what `task_incref`/`task_decref` take.
-    mut arc_res: Result<Arc<Task, GlobalAlloc>, AllocError> =
+    mut arc_res: Result<Arc<Task, GlobalAllocator>, AllocationError> =
         Arc::try_new(Task::new(task_poll_thunk::<F, O>, task_drop_thunk::<F>,
                                dispose_shared_thunk::<O>, fbox as mut u8*, sh as mut u8*, inner));
     match (arc_res) {
@@ -679,13 +679,13 @@ public type struct JoinHandle<O> {
         const exec:   ExecInner*     = this.exec;
         this.shared = null;
         const ctl: TaskCtl* = &shared.ctl;
-        mut held: MutexGuard<(), GlobalAlloc> = exec.done_lock.lock();
+        mut held: MutexGuard<(), GlobalAllocator> = exec.done_lock.lock();
         while (ctl.hs.load(MemoryOrder::Acquire) != HS_TASK_FIN) {
             exec.task_done.wait(&exec.done_lock, &held);
         }
         mem::drop(held);
         const outcome: u8 = ctl.outcome.load(MemoryOrder::Acquire);
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         if (outcome == OUTCOME_READY) {
             // A take: the block is freed without dropping `result`, so the
             // value read out of it is its only owner.
@@ -774,10 +774,10 @@ public type struct Executor {
     public static with_threads_and_blocking(n: u32, blocking: u32) -> Executor {
         mut count: u32 = n;
         if (count == 0) { count = 1; }
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         mut inner: mut ExecInner* = null;
         match (alloc.allocate(Layout::of::<ExecInner>())) {
-            Result::Ok(raw) => { inner = raw.cast::<ExecInner>().as_ptr(); }
+            Result::Ok(raw) => { inner = raw.cast::<ExecInner>().as_pointer(); }
             Result::Err(_)  => { panic("Executor::new: allocation failed", intrinsics::location()); }
         }
         inner.queue      = Mutex::new(ReadyQueue { head: null, tail: null, shutdown: false });
@@ -855,8 +855,8 @@ implement trait Drop for struct Executor {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner: mut ExecInner* = this.inner;
-        mut held: MutexGuard<ReadyQueue, GlobalAlloc> = inner.queue.lock();
-        held.as_mutable_ptr().shutdown = true;
+        mut held: MutexGuard<ReadyQueue, GlobalAllocator> = inner.queue.lock();
+        held.as_mutable_pointer().shutdown = true;
         mem::drop(held);
         inner.work_ready.notify_all();
         // Join every worker (each exits `take()` once it observes shutdown).
@@ -880,7 +880,7 @@ implement trait Drop for struct Executor {
         BlockingPool::free(inner.blocking);
         inner.blocking = null;
         ptr::drop_in_place::<ExecInner>(inner);
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         alloc.deallocate(NonNull::new(inner as mut u8*), Layout::of::<ExecInner>());
         this.inner = null;
     }

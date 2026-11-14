@@ -173,7 +173,7 @@ yet is recorded with the change that builds it, not here.
 703. **A hash map's bucket layer is internal.**  `Entry`, the node of a
      bucket's chain, and `HashMap::get_bucket`, which hands one out, are
      internal: a caller outside the standard library walks a map through
-     `entries`, `keys_ref`, `values_ref` and `values_mutable`, which
+     `entries`, `key_references`, `value_references` and `values_mutable`, which
      borrow in place for any key and value type.  `bucket_count` stays
      public.  Supersedes the part of 636 that kept `Entry` public for
      callers walking a map in place.  (Jake)
@@ -364,11 +364,11 @@ yet is recorded with the change that builds it, not here.
 683. **A lookup that hands out a pointer has a read-only form and a
      writable one, and code that writes takes the writable one.**
      `Slice::as_const_ptr(&this)` returns the read-only `const T*` where
-     `as_ptr` returns `mut T*`, and `mem::const_offset<T>(ptr: const T*,
+     `as_pointer` returns `mut T*`, and `mem::const_offset<T>(ptr: const T*,
      count) -> const T*` is `mem::offset`'s read-only counterpart.
      `HashMap::get_mutable(mut &this, key: &K) -> Option<mut V*>` and
      `HashMap::values_mutable(mut &this)`, yielding `mut V*`, are the
-     writable counterparts of `get_ref` and `values_ref`, and
+     writable counterparts of `get_reference` and `value_references`, and
      `JsonObject::get_mutable(mut &this, key: Str) -> Option<mut
      JsonValue*>` that of `JsonObject::get`.  (Jake)
 
@@ -393,9 +393,9 @@ yet is recorded with the change that builds it, not here.
 
 686. **A bare struct literal takes the type's defaults inside the type's
      own body too.**  In the methods of a generic type whose parameters
-     all have defaults, `String { .. }` is a `String<GlobalAlloc>`, as a
+     all have defaults, `String { .. }` is a `String<GlobalAllocator>`, as a
      bare `String` in a return type is, and its fields are judged as
-     `String<GlobalAlloc>`'s; one spelling has one meaning wherever it is
+     `String<GlobalAllocator>`'s; one spelling has one meaning wherever it is
      written.  A literal of the owner itself is written with its
      arguments, `String::<A> { .. }`.  (Jake)
 
@@ -479,12 +479,12 @@ yet is recorded with the change that builds it, not here.
      which borrow is wanted, and a read-only place never gives a writable
      one.  (Jake)
 
-669. **`as_ref` borrows read-only; `as_mutable_ref` borrows writable.**
-     `Option::as_ref(&this)` returns `Option<const T*>` and
-     `Result::as_ref(&this)` returns `Result<const T*, const E*>`; the
-     writable forms are `as_mutable_ref(mut &this)`, returning
+669. **`as_reference` borrows read-only; `as_mutable_reference` borrows writable.**
+     `Option::as_reference(&this)` returns `Option<const T*>` and
+     `Result::as_reference(&this)` returns `Result<const T*, const E*>`; the
+     writable forms are `as_mutable_reference(mut &this)`, returning
      `Option<T*>` and `Result<T*, E*>`.  A caller that writes through the
-     borrow calls `as_mutable_ref`.  (Jake)
+     borrow calls `as_mutable_reference`.  (Jake)
 
 670. **E0217 is reserved.**  It named a const violation and was never
      reported; a write through a read-only place is E0250.  Like every
@@ -593,7 +593,7 @@ yet is recorded with the change that builds it, not here.
 599. **The rest of `net` is marked item by item.**  `Headers` keeps its
      map private and hands out its entries through a public `entries()`
      iterator, which HTTP/2 walks.  An allocation failure converts to an
-     I/O error, `OutOfMemory`, through a public `From<AllocError>` for
+     I/O error, `OutOfMemory`, through a public `From<AllocationError>` for
      `IoError`.  In HTTP/2 the protocol's constants (frame types, flags,
      the frame header length, settings identifiers, the preface's length
      and bytes, the default connection window) are public and the limits
@@ -669,16 +669,16 @@ yet is recorded with the change that builds it, not here.
      type Jake)
 
 605. **Addresses, URLs, methods and status codes are `Display`.**  An
-     `IpV4Addr` writes dotted decimal; an `IpV6Addr` its canonical text
+     `IpV4Address` writes dotted decimal; an `IpV6Address` its canonical text
      (RFC 5952): lowercase hex groups without leading zeros, the longest
      run of two or more zero groups written `::`, the first of equally
-     long runs, and no dotted tail; an `IpAddr` writes its address.  A
-     `SocketAddr` writes `ip:port`, an IPv6 address in brackets.  A `Url`
+     long runs, and no dotted tail; an `IpAddress` writes its address.  A
+     `SocketAddress` writes `ip:port`, an IPv6 address in brackets.  A `Url`
      writes `scheme://host[:port]path[?query][#fragment]`: an IPv6 host
      in brackets, the port only when it is not the scheme's default, and
      no userinfo, which the parser does not keep.  A `Method` writes its
      wire form and a `StatusCode` its code in decimal.  The HTTP client
-     writes its `Host` header through `SocketAddr`'s, so an IPv6 host is
+     writes its `Host` header through `SocketAddress`'s, so an IPv6 host is
      sent compressed, and its own address writers are deleted.  (Jake for
      the types and the compressed form; the URL's port and userinfo and
      the bare status code delegated)
@@ -750,7 +750,7 @@ yet is recorded with the change that builds it, not here.
 
 610. **`Str`, `Slice` and `Path` are marked item by item.**  `Str`,
      `Slice<T>`, `Path` and `PathBuf` and all their methods are public,
-     their storage private behind `as_ptr`, `as_bytes`, `as_str` and
+     their storage private behind `as_pointer`, `as_bytes`, `as_str` and
      `as_path`.  `Str`'s `SplitIter`, `Chars` and `CharIndices` are
      internal: `Str`'s methods return them as `implement Iterator<...>`,
      and `String` reads them through `Str` by `Deref`, so no public
@@ -992,12 +992,12 @@ yet is recorded with the change that builds it, not here.
      drain whose buffer cannot grow now reports `OutOfMemory` rather
      than stopping the process.  (Jake)
 
-626. **Time converts one way.**  `Duration.as_millis_ceil()` is the
+626. **Time converts one way.**  `Duration.as_milliseconds_ceiling()` is the
      whole milliseconds a span takes, a partial one rounded up so a wait
      never ends early, saturating at `u64::MAX`; Windows' `Sleep` and the
      reactor's wait timeout both round through it.
      `Instant.saturating_add(dur)` is `checked_add` that answers the
-     latest reading instead of `None`, and `Instant.as_nanos()` saturates
+     latest reading instead of `None`, and `Instant.as_nanoseconds()` saturates
      at `i64::MAX`, so a timer's deadline for an over-long sleep lies in
      the far future instead of wrapping into the past.
      `thread::sleep(duration)` is `time::clock::sleep` and has no copy of
@@ -1103,7 +1103,7 @@ yet is recorded with the change that builds it, not here.
      delegated)
 
 634. **`process` is marked.**  `Command`, `Stdio`, `Output`, `Child`,
-     its pipe handles with `from_fd`, `ExitStatus`'s methods, `SigNo`,
+     its pipe handles with `from_file_descriptor`, `ExitStatus`'s methods, `SigNo`,
      `Signal` and `id` are public.  A command's settings, an output's
      captures and a signal's number are private behind their methods.
      The spawn, pipe, environment and command-line steps, the Windows
@@ -1143,9 +1143,9 @@ yet is recorded with the change that builds it, not here.
      seed generator, a map's seeded hashing and its node allocation are
      private, while `hash_str` and `hash_integer` stay public.  The iterator
      adapters are private, with `KeysRefIter` internal for the set built
-     on it; `copied` and `cloned`, reached through `iter_ref`'s opaque
+     on it; `copied` and `cloned`, reached through `iterate_references`'s opaque
      result, are public.  `HashMapIter` is not marked: the compiler names
-     it.  JSON reads its arrays through `get_ref` and indexing, and the
+     it.  JSON reads its arrays through `get_reference` and indexing, and the
      adapters' unused constructors are gone.  (Jake; each split
      delegated)
 
@@ -1427,7 +1427,7 @@ yet is recorded with the change that builds it, not here.
      arguments, and any trait on an object, is still asked of the type
      alone.  Head arguments are compared as the types they denote: one a
      head leaves to its parameter's default is that default (`Array<u8>`
-     unifies with `[u8]`, `Array<u8, GlobalAlloc>`), and a name the
+     unifies with `[u8]`, `Array<u8, GlobalAllocator>`), and a name the
      compiler wrote with its type already attached is compared as that
      type.  An implementation's where-clause is checked the same way
      (660).  (the regression fix delegated)
@@ -1491,8 +1491,8 @@ yet is recorded with the change that builds it, not here.
      private to `alloc::arc`, and the executor holds its tasks through
      `Arc`'s raw API alone.  `Rc` has no raw API, so nothing changes
      there.  `datetime`'s seconds per day, hour and minute are private to
-     it, and `Duration` has public `SECS_PER_MINUTE`, `SECS_PER_HOUR` and
-     `SECS_PER_DAY` beside `NANOS_PER_SEC`.  The `public`, `internal` and
+     it, and `Duration` has public `SECONDS_PER_MINUTE`, `SECONDS_PER_HOUR` and
+     `SECONDS_PER_DAY` beside `NANOSECONDS_PER_SECOND`.  The `public`, `internal` and
      `private` keywords on an `extern` block stay the block's default, as
      593 built.  (Jake)
 
@@ -1502,12 +1502,12 @@ yet is recorded with the change that builds it, not here.
      Winsock error normaliser, the connect-status probe behind
      `os_connect_status`, the timeout packer) are private.  In
      `net::addr`, `dns` and `http`, plain records keep public fields
-     (`IpV4Addr`, `SocketAddr`, `Url`, `Request`, `Response`); a type
+     (`IpV4Address`, `SocketAddress`, `Url`, `Request`, `Response`); a type
      that guards state keeps it private behind its methods
-     (`ResolvedAddrs`, `Resolve`, `Router`, `HttpServer`, `StatusCode`);
+     (`ResolvedAddresses`, `Resolve`, `Router`, `HttpServer`, `StatusCode`);
      parse steps, formatting steps and the URL parser's byte constants
      are private; the limits and defaults a program may name
-     (`HTTP_VERSION`, `MAX_BODY`, `DEFAULT_READ_TIMEOUT_SECS`, ...) are
+     (`HTTP_VERSION`, `MAX_BODY`, `DEFAULT_READ_TIMEOUT_SECONDS`, ...) are
      public.  (Jake for `net::sys`; the rest delegated under 587)
 
 ### 2026-10-25
@@ -1527,7 +1527,7 @@ yet is recorded with the change that builds it, not here.
      arena's routing calls are internal.**  `arena::DEFAULT_CHUNK_SIZE`
      and `pool::DEFAULT_SLOTS_PER_BLOCK` are the sizes `Arena::new` and
      `Pool::new` choose, and a program may name them.  `GlobalArena`'s
-     `routing`, `take`, `holds` and `grow` are how `GlobalAlloc` serves
+     `routing`, `take`, `holds` and `grow` are how `GlobalAllocator` serves
      and releases a block from the published arena, and reach the
      standard library alone; `publish` and `set_active` stay public.
      The C bindings of `libc`, `syscall` and `openssl` are each a
@@ -1537,7 +1537,7 @@ yet is recorded with the change that builds it, not here.
 
 595. **A `Duration`, an `Instant` and a `SystemTime` are read through
      their accessors.**  Their seconds and nanoseconds are private fields
-     behind `as_secs`, `subsec_nanos`, `as_nanos` and `unix_secs`, so the
+     behind `as_seconds`, `subsecond_nanoseconds`, `as_nanoseconds` and `unix_seconds`, so the
      library's own clocks and timers call those; `Duration`'s unit
      constants stay public, and the clocks' conversion constants and the
      calendar algorithm's are private.  A `DateTime`'s fields are its
@@ -1611,9 +1611,9 @@ yet is recorded with the change that builds it, not here.
      allocator `NativeHeap`;** this replaces 587 for both.  The reactor
      and everything in it reach the standard library alone, as before
      587.  `alloc::heap` is a public module whose public item is
-     `NativeHeap`, a type implementing `Allocator` like `GlobalAlloc`, so
+     `NativeHeap`, a type implementing `Allocator` like `GlobalAllocator`, so
      `Array<T, NativeHeap>` keeps its storage on the mmap-backed heap
-     whatever `GlobalAlloc` is backed by; the raw `alloc`, `free` and
+     whatever `GlobalAllocator` is backed by; the raw `alloc`, `free` and
      `realloc` stay internal and the segment and lock machinery private.
      (Jake; the name `NativeHeap`, delegated)
 
@@ -1629,15 +1629,15 @@ yet is recorded with the change that builds it, not here.
      generic type over its own parameters, an `implement` block's target
      as its head writes it.  The owner's bare name denoted the defaults'
      instantiation when every parameter of the owner has a default, so
-     each method of `String<A = GlobalAlloc>` and of `implement<A> trait
-     Eq for String<A>` was a method of `String<GlobalAlloc>` alone, and
+     each method of `String<A = GlobalAllocator>` and of `implement<A> trait
+     Eq for String<A>` was a method of `String<GlobalAllocator>` alone, and
      `String<NativeHeap>` had none.  (Jake asked for the fix; the rule
      follows from 98's `This` naming the enclosing type)
 
 592. **A `Box` is made only by its constructors, and gives its pointer up
      only through `into_raw`.**  Its pointer and allocator are private
      fields; `Box::from_raw_in(ptr, alloc)` re-wraps a pointer from a box
-     on any allocator, as `from_raw` does for `GlobalAlloc`'s, and `leak`,
+     on any allocator, as `from_raw` does for `GlobalAllocator`'s, and `leak`,
      which did what `into_raw` does, is gone.  `next_capacity`, the growth
      curve `Array` and `RawBuffer` share, is internal; the allocator's
      platform calls are private to it; `Rc`, `Arc`, `Weak`, `Arena` and
@@ -1658,7 +1658,7 @@ yet is recorded with the change that builds it, not here.
 
 576. **A negative length or position means what the method's kind says,
      never a huge unsigned one.**  A lookup that answers `Option` (`get`,
-     `get_ref`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`; a
+     `get_reference`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`; a
      method that writes or cuts at a position (`set`, `insert`, `remove`,
      `swap_remove`, `sub_bytes`, `subslice`) panics "out of range";
      `truncate` and `resize` panic "negative length"; `reserve`,
@@ -2569,7 +2569,7 @@ yet is recorded with the change that builds it, not here.
 
 380. **The demangler prints the full `Array<...>` type a `[T]` symbol
      names** - `std::collections::array::Array<i64,
-     std::alloc::allocator::GlobalAlloc>` - rather than sugaring it back to
+     std::alloc::allocator::GlobalAllocator>` - rather than sugaring it back to
      `[i64]`.  (Dispatch, delegated)
 
 381. **A call-site argument error spells a dynamic array `[T]`;** only
@@ -4112,7 +4112,7 @@ check is being deleted and the seals are what hold.  (Jake)
     (ruling 18). The test's expected output changes in the same commit.
 
 94. **The help on a `Copy`-gated method's bound error is correct for the
-    method it names.** "borrow the element in place with `get_ref` instead
+    method it names.** "borrow the element in place with `get_reference` instead
     of copying it out with `append`" is wrong advice for `append`.
 
 ### 2026-10-01
@@ -4123,7 +4123,7 @@ check is being deleted and the seals are what hold.  (Jake)
 
 71. **The internal check after monomorphization uses plain wording** that
     names the method, the specialization and the template call site:
-    "internal: call to `push` in `String<GlobalAlloc>::from_str` reached
+    "internal: call to `push` in `String<GlobalAllocator>::from_str` reached
     codegen with no resolved method (written at string.cryo:120)".
 
 72. **The temporary identity-first, by-name fallback for the calls whose
@@ -4640,7 +4640,7 @@ check is being deleted and the seals are what hold.  (Jake)
     wins" rule; the call names the trait it means.
 
     ```cryo
-    implement trait Debug for struct String<GlobalAlloc> {
+    implement trait Debug for struct String<GlobalAllocator> {
         fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FormatError> where W: FormatWrite {
             const view: Str = this.as_str();
             return view.fmt(f);                    // error[E0156]: Display::fmt and Debug::fmt
@@ -4748,7 +4748,7 @@ dropped or deferred says so; a deferred one is listed in
 - **D16.** An `implement` head writes every parameter of the template it
   names, as its own parameters or as a concrete instantiation; one left
   out is E0302.  `implement<A> trait Display for String<A>`, or `for
-  String<GlobalAlloc>`.  The concrete spelling is honoured by selection:
+  String<GlobalAllocator>`.  The concrete spelling is honoured by selection:
   `for Wrap<T, Alpha>` is not selected for `Wrap<i32, Beta>`.
 - **D17.** An `extern "C"` function is public unless written `private`.
 - **D18.** The primitive type names stop being keywords, and the alias
@@ -4763,7 +4763,7 @@ dropped or deferred says so; a deferred one is listed in
 - **D21.** An unknown type in expression or type-argument position
   (`sizeof(Nope)`, `1 as Nope`, `String<Nope>`) is an error.  A defaulted
   type parameter resolves in the module where the type is declared, so
-  `String` fills in `GlobalAlloc` without the user importing it; a user who
+  `String` fills in `GlobalAllocator` without the user importing it; a user who
   writes the argument needs it in scope.
 - **D22.** A trait head's trailing type list declares nothing: a name there
   declared nowhere is E0302, and the head is written `implement<T> trait

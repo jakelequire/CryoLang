@@ -31,7 +31,7 @@ import std::core::result::{ Result };
 import std::core::ptr::{ NonNull };
 import std::core::mem;
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::collections::array;
 import std::collections::str::{ Str };
@@ -89,7 +89,7 @@ function flag_job_run(raw: mut u8*) -> void {
     // bound outlast another's by an amount that depends on scheduling, which is
     // precisely what a test comparing two waiters must not depend on.
     const started: Instant = Instant::now();
-    while (started.elapsed().as_millis() < FLAG_WAIT_MS) {
+    while (started.elapsed().as_milliseconds() < FLAG_WAIT_MS) {
         mut group_ready: boolean = true;
         if (j.barrier != null) {
             group_ready = j.barrier.load(MemoryOrder::Acquire) >= j.need;
@@ -98,7 +98,7 @@ function flag_job_run(raw: mut u8*) -> void {
             j.saw = 1;
             return;
         }
-        clock::sleep(Duration::from_millis(5));
+        clock::sleep(Duration::from_milliseconds(5));
     }
     if (j.barrier != null) { j.barrier.fetch_subtract(1, MemoryOrder::AcqRel); }
     j.saw = 0;
@@ -107,17 +107,17 @@ function flag_job_run(raw: mut u8*) -> void {
 /// `drop_fn`: the payload owns nothing (the barrier belongs to the test that
 /// allocated it), so this is just the free.
 function flag_job_free(raw: mut u8*) -> void {
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(raw), Layout::of::<FlagJob>());
 }
 
 /// Allocate and initialize a `FlagJob`, or null if the heap refused. Pass a null
 /// `barrier` for a job that answers to the flag alone.
 function flag_job_new(barrier: mut Atomic<u32>*, need: u32) -> mut FlagJob* {
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     mut j: mut FlagJob* = null;
     match (alloc.allocate(Layout::of::<FlagJob>())) {
-        Result::Ok(raw) => { j = raw.cast::<FlagJob>().as_ptr(); }
+        Result::Ok(raw) => { j = raw.cast::<FlagJob>().as_pointer(); }
         Result::Err(_)  => { return null; }
     }
     BlockingJob::init(&j.job, flag_job_run, flag_job_free);
@@ -131,10 +131,10 @@ function flag_job_new(barrier: mut Atomic<u32>*, need: u32) -> mut FlagJob* {
 /// A heap-pinned arrival counter shared by a group of jobs. Heap rather than a
 /// local because the pool threads outlive the frame that starts them.
 function counter_new() -> mut Atomic<u32>* {
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     mut c: mut Atomic<u32>* = null;
     match (alloc.allocate(Layout::of::<Atomic<u32>>())) {
-        Result::Ok(raw) => { c = raw.cast::<Atomic<u32>>().as_ptr(); }
+        Result::Ok(raw) => { c = raw.cast::<Atomic<u32>>().as_pointer(); }
         Result::Err(_)  => { return null; }
     }
     *c = Atomic::<u32>::new(0);
@@ -142,7 +142,7 @@ function counter_new() -> mut Atomic<u32>* {
 }
 
 function counter_free(c: mut Atomic<u32>*) -> void {
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(c as mut u8*), Layout::of::<Atomic<u32>>());
 }
 
@@ -193,7 +193,7 @@ implement trait Drop for struct FlagFuture {
 /// The sibling: sleep, then set the flag the pool thread is waiting on. Reaching
 /// this at all is the thing under test.
 async function set_flag(j: mut FlagJob*) -> i64 {
-    await Sleep::new(Duration::from_millis(FLAG_SET_DELAY_MS));
+    await Sleep::new(Duration::from_milliseconds(FLAG_SET_DELAY_MS));
     j.flag.store(1, MemoryOrder::Release);
     return 1;
 }
@@ -242,7 +242,7 @@ async function four_way(a: mut FlagJob*, b: mut FlagJob*, c: mut FlagJob*, d: mu
 }
 
 async function set_flag_all(a: mut FlagJob*, b: mut FlagJob*, c: mut FlagJob*, d: mut FlagJob*) -> i64 {
-    await Sleep::new(Duration::from_millis(FLAG_SET_DELAY_MS));
+    await Sleep::new(Duration::from_milliseconds(FLAG_SET_DELAY_MS));
     a.flag.store(1, MemoryOrder::Release);
     b.flag.store(1, MemoryOrder::Release);
     c.flag.store(1, MemoryOrder::Release);
@@ -276,7 +276,7 @@ function blocking_pool_runs_jobs_concurrently() -> Result<(), TestError> {
 /// and the executor must still shut down. `Elapsed` is the expected answer —
 /// the point is that the teardown after it is clean.
 async function abandon_in_flight(j: mut FlagJob*) -> i64 {
-    match (await Futures::timeout(Duration::from_millis(60), FlagFuture::start(j))) {
+    match (await Futures::timeout(Duration::from_milliseconds(60), FlagFuture::start(j))) {
         Result::Ok(_)  => { return -20; }   // the flag is never set here
         Result::Err(_) => { return 1; }
     }
@@ -340,9 +340,9 @@ function blocking_pool_default_ceiling_admits_more_than_eight() -> Result<(), Te
         i = i + 1;
     }
     const started: Instant = Instant::now();
-    while (started.elapsed().as_millis() < FLAG_WAIT_MS) {
+    while (started.elapsed().as_milliseconds() < FLAG_WAIT_MS) {
         if (arrived.load(MemoryOrder::Acquire) >= CEILING_PROBE) { break; }
-        clock::sleep(Duration::from_millis(5));
+        clock::sleep(Duration::from_milliseconds(5));
     }
     // Stop before reading `saw`: it joins every pool thread, so each job has
     // left `run_fn` and its payload is final.
@@ -392,14 +392,14 @@ function blocking_pool_a_configured_ceiling_is_enforced() -> Result<(), TestErro
     // no-op waker it stores has nothing to wake.
     mut all_ran: boolean = false;
     const started: Instant = Instant::now();
-    while (started.elapsed().as_millis() < CEILING_WAIT_MS) {
+    while (started.elapsed().as_milliseconds() < CEILING_WAIT_MS) {
         if (a.job.arm(Waker::noop()) != JOB_PENDING
          && b.job.arm(Waker::noop()) != JOB_PENDING
          && c.job.arm(Waker::noop()) != JOB_PENDING) {
             all_ran = true;
             break;
         }
-        clock::sleep(Duration::from_millis(5));
+        clock::sleep(Duration::from_milliseconds(5));
     }
     // A bound reached here is its own failure, not a result to interpret: the
     // readings below would then describe cancelled jobs rather than the ceiling.

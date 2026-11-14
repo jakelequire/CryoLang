@@ -60,7 +60,7 @@ import std::core::result::{ Result };
 import std::core::ptr::{ NonNull };
 import std::core::drop;
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::sync::mutex::{ Mutex, MutexGuard };
 import std::thread;
@@ -118,7 +118,7 @@ private type struct Registration {
 /// while an insert happens once per armed sleep, so the cheap side is the hot one.
 private type struct Timer {
     private id:       u64;      // identifies this arming; never 0, never reused
-    private deadline: i64;      // monotonic nanoseconds, as `Instant::as_nanos` reports
+    private deadline: i64;      // monotonic nanoseconds, as `Instant::as_nanoseconds` reports
     private waker:    Waker;
     private next:     mut Timer*;
 }
@@ -158,10 +158,10 @@ private type struct ReactorTable {
     /// Create an empty (nothing armed) registration for `fd` and link it into
     /// its bucket. The caller has checked there is none.
     private insert(mut &this, fd: i32) -> mut Registration* {
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         mut reg: mut Registration* = null;
         match (alloc.allocate(Layout::of::<Registration>())) {
-            Result::Ok(raw) => { reg = raw.cast::<Registration>().as_ptr(); }
+            Result::Ok(raw) => { reg = raw.cast::<Registration>().as_pointer(); }
             Result::Err(_)  => { panic("Reactor::register: registration allocation failed", intrinsics::location()); }
         }
         reg.fd            = fd;
@@ -212,10 +212,10 @@ internal:
     /// reactor would park I/O futures that could never be woken, so failing
     /// loudly at construction beats hanging later.
     static start() -> mut Reactor* {
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         mut rt: mut Reactor* = null;
         match (alloc.allocate(Layout::of::<Reactor>())) {
-            Result::Ok(raw) => { rt = raw.cast::<Reactor>().as_ptr(); }
+            Result::Ok(raw) => { rt = raw.cast::<Reactor>().as_pointer(); }
             Result::Err(_)  => { panic("Reactor::start: allocation failed", intrinsics::location()); }
         }
         rt.table = Mutex::new(ReactorTable { buckets: [null; 64], timers: null, timer_seq: 0 });
@@ -261,8 +261,8 @@ internal:
             loop {
                 mut wr: Waker = Waker::noop();
                 mut ww: Waker = Waker::noop();
-                mut held: MutexGuard<ReactorTable, GlobalAlloc> = rt.table.lock();
-                const table: mut ReactorTable* = held.as_mutable_ptr();
+                mut held: MutexGuard<ReactorTable, GlobalAllocator> = rt.table.lock();
+                const table: mut ReactorTable* = held.as_mutable_pointer();
                 const reg: mut Registration* = table.buckets[b];
                 if (reg != null) {
                     wr = Waker::take(&reg.read_waker);
@@ -280,8 +280,8 @@ internal:
         // list that no longer names it.
         loop {
             mut tw: Waker = Waker::noop();
-            mut held: MutexGuard<ReactorTable, GlobalAlloc> = rt.table.lock();
-            const table: mut ReactorTable* = held.as_mutable_ptr();
+            mut held: MutexGuard<ReactorTable, GlobalAllocator> = rt.table.lock();
+            const table: mut ReactorTable* = held.as_mutable_pointer();
             const t: mut Timer* = table.timers;
             if (t != null) {
                 table.timers = t.next;
@@ -289,7 +289,7 @@ internal:
             }
             mem::drop(held);
             if (t == null) { break; }
-            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            mut alloc: GlobalAllocator = GlobalAllocator::new();
             alloc.deallocate(NonNull::new(t as mut u8*), Layout::of::<Timer>());
             // `tw` drops here, outside the lock.
         }
@@ -301,7 +301,7 @@ internal:
     static free(rt: mut Reactor*) -> void {
         if (rt == null) { return; }
         ptr::drop_in_place::<Reactor>(rt);
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         alloc.deallocate(NonNull::new(rt as mut u8*), Layout::of::<Reactor>());
     }
 
@@ -342,8 +342,8 @@ internal:
         // `failed` is this one handed straight back when the OS refuses.
         mut replaced: Waker = Waker::noop();
         mut failed:   Waker = Waker::noop();
-        mut held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-        const table: mut ReactorTable* = held.as_mutable_ptr();
+        mut held: MutexGuard<ReactorTable, GlobalAllocator> = this.table.lock();
+        const table: mut ReactorTable* = held.as_mutable_pointer();
         mut reg: mut Registration* = table.find(fd);
         if (reg == null) { reg = table.insert(fd); }
         if ((direction & INTEREST_READ) != 0) { replaced = Waker::replace(&reg.read_waker, w); }
@@ -374,8 +374,8 @@ internal:
     /// reads or owns can close, so the registration is gone by then.
     cancel(mut &this, fd: i32, direction: u32) -> void {
         mut taken: Waker = Waker::noop();
-        mut held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-        const table: mut ReactorTable* = held.as_mutable_ptr();
+        mut held: MutexGuard<ReactorTable, GlobalAllocator> = this.table.lock();
+        const table: mut ReactorTable* = held.as_mutable_pointer();
         const reg: mut Registration* = table.find(fd);
         if (reg != null && (reg.interest & direction) != 0) {
             if ((direction & INTEREST_READ) != 0) { taken = Waker::take(&reg.read_waker); }
@@ -405,12 +405,12 @@ internal:
     /// fire every timer that came due. Keeping the wait bound here leaves
     /// `poll_once` a pure "wait at most this long" primitive.
     private run_once(mut &this) -> void {
-        this.poll_once(this.next_timeout_ms(Instant::now().as_nanos()));
-        this.fire_expired(Instant::now().as_nanos());
+        this.poll_once(this.next_timeout_ms(Instant::now().as_nanoseconds()));
+        this.fire_expired(Instant::now().as_nanoseconds());
     }
 
     /// Arm a one-shot timer firing `w` at `deadline` (monotonic nanoseconds, the
-    /// scale `Instant::as_nanos` reports) and return the id that disarms it.
+    /// scale `Instant::as_nanoseconds` reports) and return the id that disarms it.
     ///
     /// Ids start at 1 and are never reused, so a stale id — one whose timer has
     /// already fired — cancels nothing instead of disarming an unrelated timer
@@ -420,17 +420,17 @@ internal:
     /// already be waiting on a bound computed from a later deadline, or on no
     /// bound at all, and nothing else would break that wait in time.
     register_timer(mut &this, deadline: i64, w: Waker) -> u64 {
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         mut t: mut Timer* = null;
         match (alloc.allocate(Layout::of::<Timer>())) {
-            Result::Ok(raw) => { t = raw.cast::<Timer>().as_ptr(); }
+            Result::Ok(raw) => { t = raw.cast::<Timer>().as_pointer(); }
             Result::Err(_)  => { panic("Reactor::register_timer: allocation failed", intrinsics::location()); }
         }
         t.deadline = deadline;
         t.waker    = w;
         t.next     = null;
-        mut held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-        const table: mut ReactorTable* = held.as_mutable_ptr();
+        mut held: MutexGuard<ReactorTable, GlobalAllocator> = this.table.lock();
+        const table: mut ReactorTable* = held.as_mutable_pointer();
         table.timer_seq = table.timer_seq + 1;
         t.id = table.timer_seq;
         const id: u64 = t.id;
@@ -456,8 +456,8 @@ internal:
         if (id == 0) { return; }
         mut taken: Waker  = Waker::noop();
         mut found: mut Timer* = null;
-        mut held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-        const table: mut ReactorTable* = held.as_mutable_ptr();
+        mut held: MutexGuard<ReactorTable, GlobalAllocator> = this.table.lock();
+        const table: mut ReactorTable* = held.as_mutable_pointer();
         mut prev: mut Timer* = null;
         mut cur:  mut Timer* = table.timers;
         while (cur != null) {
@@ -473,7 +473,7 @@ internal:
         }
         mem::drop(held);
         if (found != null) {
-            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            mut alloc: GlobalAllocator = GlobalAllocator::new();
             alloc.deallocate(NonNull::new(found as mut u8*), Layout::of::<Timer>());
         }
         // `taken` drops here, outside the lock.
@@ -487,8 +487,8 @@ internal:
     /// late is what a caller of `sleep` would actually notice. A deadline
     /// already past yields 0 — poll what is ready, then fire it.
     private next_timeout_ms(mut &this, now: i64) -> i32 {
-        const held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-        const head: Timer* = held.as_ptr().timers;
+        const held: MutexGuard<ReactorTable, GlobalAllocator> = this.table.lock();
+        const head: Timer* = held.as_pointer().timers;
         const armed: boolean = head != null;
         mut due: i64 = 0;
         if (armed) { due = head.deadline; }
@@ -496,7 +496,7 @@ internal:
         if (!armed) { return -1; }
         const delta: i64 = due - now;
         if (delta <= 0) { return 0; }
-        const ms: u64 = Duration::from_nanos(delta as u64).as_millis_ceil();
+        const ms: u64 = Duration::from_nanoseconds(delta as u64).as_milliseconds_ceiling();
         if (ms > i32::MAX as u64) { return i32::MAX; }
         return ms as i32;
     }
@@ -509,8 +509,8 @@ internal:
         loop {
             mut w: Waker = Waker::noop();
             mut expired: mut Timer* = null;
-            mut held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-            const table: mut ReactorTable* = held.as_mutable_ptr();
+            mut held: MutexGuard<ReactorTable, GlobalAllocator> = this.table.lock();
+            const table: mut ReactorTable* = held.as_mutable_pointer();
             const head: mut Timer* = table.timers;
             if (head != null && head.deadline <= now) {
                 table.timers = head.next;
@@ -519,7 +519,7 @@ internal:
             }
             mem::drop(held);
             if (expired == null) { return; }
-            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            mut alloc: GlobalAllocator = GlobalAllocator::new();
             alloc.deallocate(NonNull::new(expired as mut u8*), Layout::of::<Timer>());
             w.wake();
             // `w` drops at the end of this iteration, outside the lock.
@@ -537,8 +537,8 @@ internal:
     private dispatch(mut &this, fd: i32, ready: u32) -> void {
         mut wr: Waker = Waker::noop();
         mut ww: Waker = Waker::noop();
-        mut held: MutexGuard<ReactorTable, GlobalAlloc> = this.table.lock();
-        const table: mut ReactorTable* = held.as_mutable_ptr();
+        mut held: MutexGuard<ReactorTable, GlobalAllocator> = this.table.lock();
+        const table: mut ReactorTable* = held.as_mutable_pointer();
         const reg: mut Registration* = table.find(fd);
         if (reg != null) {
             if ((ready & reg.interest & INTEREST_READ) != 0) {
@@ -570,7 +570,7 @@ internal:
     private remove(mut &this, table: mut ReactorTable*, reg: mut Registration*) -> void {
         table.unlink(reg);
         rt_disarm(&this, reg);
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         alloc.deallocate(NonNull::new(reg as mut u8*), Layout::of::<Registration>());
     }
 
@@ -877,7 +877,7 @@ private function rt_backend_close(rt: mut Reactor*) -> void {
 
 ![target(windows)]
 private function afd_op_free(op: mut AfdOp*) -> void {
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(op as mut u8*), Layout::of::<AfdOp>());
 }
 
@@ -900,10 +900,10 @@ private function rt_arm(rt: Reactor*, reg: mut Registration*) -> boolean {
         events = events | syscall::AFD_POLL_SEND;
     }
 
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     mut op: mut AfdOp* = null;
     match (alloc.allocate(Layout::of::<AfdOp>())) {
-        Result::Ok(raw) => { op = raw.cast::<AfdOp>().as_ptr(); }
+        Result::Ok(raw) => { op = raw.cast::<AfdOp>().as_pointer(); }
         Result::Err(_)  => { return false; }
     }
     mem::zero::<AfdOp>(op, 1);

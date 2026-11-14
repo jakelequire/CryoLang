@@ -1861,7 +1861,7 @@ type struct CallResolver {
         d = d.at(arg.span);
         if (actual == PF_STRUCT && expected == PF_STRING) {
             d = d.with_note("`%s` needs a C `string` (`i8*`); `Str`/`String` are length-prefixed structs, not NUL-terminated pointers");
-            d = d.help("format via an f-string instead, e.g. `println(f\"{value}\")`, or pass `value.as_ptr()` / `value.with_null()`");
+            d = d.help("format via an f-string instead, e.g. `println(f\"{value}\")`, or pass `value.as_pointer()` / `value.with_null()`");
         }
         this.ctx.emit_diagnostic(d);
     }
@@ -5116,7 +5116,7 @@ type struct CallResolver {
         for (mut tier: i32 = 0; tier <= 3; tier++) {
             if (tier == 3 && this.state.in_implicit_conversion) { break; }
             for (mut mi: i64 = 0; mi < methods_ref.length(); mi++) {
-                const m: MethodInfo* = methods_ref.get_ref(mi).unwrap();
+                const m: MethodInfo* = methods_ref.get_reference(mi).unwrap();
                 if (!DeclarationIndex::holds_method(&named, m.ast_node)) { continue; }
                 // A static function takes no receiver: no call through a
                 // value names one.
@@ -8916,7 +8916,7 @@ type struct CallResolver {
         // typed from the method it selects (`type_static_call`) never calls
         // `resolve_static_method_return_via_template`, which is otherwise the
         // ONLY stash site - so a call like
-        // `const r: Result<Array<u64,GlobalAlloc>, E> = Array::try_with_capacity_in(..)`
+        // `const r: Result<Array<u64,GlobalAllocator>, E> = Array::try_with_capacity_in(..)`
         // would reach mono with an empty stash and fail to specialize the owner
         // (E0636).  Run it here, while `expected_type` is still live, so the
         // expected-type-unify source can recover an owner param the args don't
@@ -10037,8 +10037,8 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < ictx.bindings.length(); i++) {
             // With the guess allowed, the parameters after the bound prefix
             // that nothing binds take their declared defaults, as they do
-            // when nothing is guessed: `Box<T, A = GlobalAlloc>::new(41)`
-            // guesses `T` and is `Box<i32, GlobalAlloc>`, and is refused for
+            // when nothing is guessed: `Box<T, A = GlobalAllocator>::new(41)`
+            // guesses `T` and is `Box<i32, GlobalAllocator>`, and is refused for
             // the guess, not left over `T`.
             if (allow_literal_default && !ictx.bindings[i].is_valid()) {
                 mut rc: ResolutionContext = ResolutionContext::new("");
@@ -10068,7 +10068,7 @@ type struct CallResolver {
     /// or, for the receiver of a method call whose value has an expected type
     /// (`Box::try_new(41).unwrap()` where a `Box<i64>` is expected), that type,
     /// against what the method returns on the receiver - `unwrap` on a
-    /// `Result<Box<T>, AllocError>` returns a `Box<T>`.  Invalid when neither
+    /// `Result<Box<T>, AllocationError>` returns a `Box<T>`.  Invalid when neither
     /// is known, or the method is not one method of the receiver's own
     /// without type parameters of its own.
     expected_return_formal(mut &this, call_e: ExpressionNode*, abstract_ret: TypeRef,
@@ -10134,8 +10134,8 @@ type struct CallResolver {
     /// source leaves unbound).  Unlike `infer_static_owner_bindings_from_args` /
     /// `_from_expected` (all-or-nothing), a prefix lets a trailing DEFAULTED owner
     /// param be backfilled from its declared default when it appears in neither the
-    /// params nor the return (`Arc<T, A = GlobalAlloc>::try_new`, whose `A` is
-    /// hardcoded GlobalAlloc in the signature).  Empty when nothing binds.
+    /// params nor the return (`Arc<T, A = GlobalAllocator>::try_new`, whose `A` is
+    /// hardcoded GlobalAllocator in the signature).  Empty when nothing binds.
     infer_static_owner_prefix(mut &this, tmpl: const TemplateEntry*, call_e: ExpressionNode*, func_decl: DeclarationNode*,
                               call: CallExpr*) -> [TypeRef] {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
@@ -10233,7 +10233,7 @@ type struct CallResolver {
         // the narrow base-match in step 2 below misses: an owner that appears
         // NESTED in the return type (`Array::try_with_capacity_in -> Result<Array<T,A>, E>`)
         // - its owner param `T` is in no parameter, only in the annotation
-        // `Result<Array<u64,GlobalAlloc>, E>`, so structural unification of the
+        // `Result<Array<u64,GlobalAllocator>, E>`, so structural unification of the
         // declared return against the expected type is the only source.
         const eb_unify: [TypeRef] = this.infer_static_owner_bindings_from_expected(tmpl, call_e, func_decl, &seeds);
         if (eb_unify.length() == want) { return eb_unify; }
@@ -10245,7 +10245,7 @@ type struct CallResolver {
             // sitting at the former wrapper's id, for which `peel` returns null.
             // The view reads `(generic_base, type_args)` off the concrete itself,
             // so a bare static call on a generic owner (`RawBuffer::new()` typed by
-            // the field annotation `RawBuffer<u8, GlobalAlloc>`) still binds its
+            // the field annotation `RawBuffer<u8, GlobalAllocator>`) still binds its
             // owner params here instead of falling through to the literal-default guess.
             const exp_ref_s: TypeRef = this.state.expected_type;
             if (this.types.view_generic_base(exp_ref_s).equals(tmpl.base_type)
@@ -10273,8 +10273,8 @@ type struct CallResolver {
         // nothing at the call decides.  That covers an owner whose every
         // parameter is defaulted and nothing binds (`Defaulted::plain(7)`,
         // `String::new()`), and an owner NESTED in the expected type, which
-        // step 2's base-match misses: `Arc<T, A = GlobalAlloc>::try_new(x) ->
-        // Result<Arc<T, GlobalAlloc>, E>`, whose `A` is in no parameter and no
+        // step 2's base-match misses: `Arc<T, A = GlobalAllocator>::try_new(x) ->
+        // Result<Arc<T, GlobalAllocator>, E>`, whose `A` is in no parameter and no
         // free return position.  Bind the leading params the args/return DO
         // determine, then backfill the rest.  Runs AFTER step 2 so a
         // non-default owner arg from a base-matching expected type still wins,
@@ -10916,7 +10916,7 @@ type struct CallResolver {
     /// home, not the home: `default_expansion` splices a CLONE of the
     /// template's own default annotation into the argument list, and the clone
     /// keeps the template's span.  Resolving that clone against the scope's
-    /// module would bind `String<A = GlobalAlloc>`'s default in whichever
+    /// module would bind `String<A = GlobalAllocator>`'s default in whichever
     /// module happened to name `String`.  Each argument therefore resolves in
     /// the module that WROTE IT, which its own span records; the scope's
     /// module answers only when an argument carries no file of its own.
@@ -10983,14 +10983,14 @@ type struct CallResolver {
         const instantiated: boolean = ret_t.kind == TypeKind::InstantiatedType;
         if (instantiated && ret_t.as_instantiated().has_resolved_type()) { return ret; }
         if (!instantiated && !this.types.contains_generic_param(ret)) { return ret; }
-        // Turbofish owner args (`Arc<Thing, GlobalAlloc>::try_new`): map them to the
+        // Turbofish owner args (`Arc<Thing, GlobalAllocator>::try_new`): map them to the
         // OWNER's generic params and substitute throughout the return type. This
         // handles BOTH a return that IS the owner (`-> Arc<T, A>`) and one where the
-        // owner is NESTED (`-> Result<Arc<T, GlobalAlloc>, E>`). The former positional
+        // owner is NESTED (`-> Result<Arc<T, GlobalAllocator>, E>`). The former positional
         // `instantiate(ret_base, args)` was valid only when the return's outermost
         // base WAS the owner; for a nested owner it substituted the owner args into
-        // the OUTER generic - `Arc<Thing, GlobalAlloc>::try_new` typed as
-        // `Result<Thing, GlobalAlloc>` instead of `Result<Arc<Thing, GlobalAlloc>, E>`
+        // the OUTER generic - `Arc<Thing, GlobalAllocator>::try_new` typed as
+        // `Result<Thing, GlobalAllocator>` instead of `Result<Arc<Thing, GlobalAllocator>, E>`
         // (it fired only because the arg counts coincidentally matched).
         if (scope != null && scope.scope_generic_args.length() > 0) {
             mut tmpl: const TemplateEntry* = this.resolve_scope_owner_template(scope);

@@ -55,8 +55,8 @@ import std::io::error::{ IoError, IoErrorKind };
 import std::io::fd;
 import std::io::traits::{ AsyncTransport, Transfer };
 import std::ffi::libc;
-import std::net::addr::ip::{ IpAddr };
-import std::net::addr::socket_addr::{ SocketAddr };
+import std::net::addr::ip::{ IpAddress };
+import std::net::addr::socket_addr::{ SocketAddress };
 import std::net::addr::sockaddr;
 import std::net::sys::{ ConnectStatus };
 import std::future::poll::{ Poll };
@@ -71,10 +71,10 @@ import std::future::reactor::{ INTEREST_READ, INTEREST_WRITE, Reactor };
 
 // Open a TCP socket of the family matching `addr` (AF_INET vs AF_INET6).
 // Lives here, not in `net::sys`, so `sys` stays free of net::addr::ip imports.
-private function tcp_socket_for(addr: &SocketAddr) -> i32 {
+private function tcp_socket_for(addr: &SocketAddress) -> i32 {
     match (addr.ip) {
-        IpAddr::V4(_) => { return sys::os_socket_tcp(); }
-        IpAddr::V6(_) => { return sys::os_socket_tcp6(); }
+        IpAddress::V4(_) => { return sys::os_socket_tcp(); }
+        IpAddress::V6(_) => { return sys::os_socket_tcp6(); }
     }
 }
 
@@ -84,7 +84,7 @@ private function tcp_socket_for(addr: &SocketAddr) -> i32 {
 /// (server), both of which leave it in non-blocking mode; bytes move through
 /// the `TcpRead`/`TcpWrite` futures, or through `BufStream<TcpStream>` via
 /// its `AsyncTransport` implementation. Owns its socket and closes it on
-/// `drop`. A stream made with `from_fd(-1)` is a closed placeholder that
+/// `drop`. A stream made with `from_file_descriptor(-1)` is a closed placeholder that
 /// `drop` leaves alone.
 public type struct TcpStream {
     private fd: i32;
@@ -93,7 +93,7 @@ public type struct TcpStream {
     /// `drop` will close it. Used by `TcpAccept` to hand over the socket it
     /// produced, and to leave a closed placeholder behind when a future takes
     /// the real one.
-    public static from_fd(sock: i32) -> TcpStream {
+    public static from_file_descriptor(sock: i32) -> TcpStream {
         return TcpStream { fd: sock };
     }
 
@@ -101,7 +101,7 @@ public type struct TcpStream {
     /// ownership. The `TcpStream` still closes it on `drop`. Used by
     /// `net::tls` to hand the fd to OpenSSL's socket BIO (which is
     /// created `BIO_NOCLOSE`, so the fd stays this stream's to close).
-    public raw_fd(&this) -> i32 {
+    public raw_file_descriptor(&this) -> i32 {
         return this.fd;
     }
 
@@ -150,7 +150,7 @@ implement trait Drop for struct TcpStream {
 /// import std::future::combinator::{ Futures };
 /// import std::future::executor::{ Executor };
 /// import std::io::error::{ IoError };
-/// import std::net::addr::socket_addr::{ SocketAddr };
+/// import std::net::addr::socket_addr::{ SocketAddress };
 /// import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
 ///
 /// async function accept_one(listener: TcpListener) -> boolean {
@@ -161,7 +161,7 @@ implement trait Drop for struct TcpStream {
 ///
 /// async function connect_to(port: u16) -> boolean {
 ///     const connected: Result<TcpStream, IoError> =
-///         await TcpConnect::start(SocketAddr::localhost_v4(port));
+///         await TcpConnect::start(SocketAddress::localhost_v4(port));
 ///     return connected.is_ok();
 /// }
 ///
@@ -169,10 +169,10 @@ implement trait Drop for struct TcpStream {
 ///     return await Futures::join(accept_one(listener), connect_to(port));
 /// }
 ///
-/// // Port 0: the system picks a free port, read back with `local_addr`.
-/// mut listener: TcpListener = TcpListener::bind(SocketAddr::localhost_v4(0)).unwrap();
+/// // Port 0: the system picks a free port, read back with `local_address`.
+/// mut listener: TcpListener = TcpListener::bind(SocketAddress::localhost_v4(0)).unwrap();
 /// listener.set_nonblocking(true).unwrap();
-/// const port: u16 = listener.local_addr().unwrap().port;
+/// const port: u16 = listener.local_address().unwrap().port;
 /// mut executor: Executor = Executor::new();
 /// const outcome: (boolean, boolean) = executor.block_on(both(listener, port));
 /// // outcome is (true, true)
@@ -184,7 +184,7 @@ public type struct TcpListener {
     /// restarts don't wait out the TIME_WAIT window. Backlog defaults to
     /// 128, the same number Linux uses for `/proc/sys/net/core/somaxconn`
     /// these days.
-    public static bind(local: SocketAddr) -> Result<TcpListener, IoError> {
+    public static bind(local: SocketAddress) -> Result<TcpListener, IoError> {
         // Pack first so an unsupported address family doesn't leak
         // a freshly-opened socket fd. 28 bytes holds a v6 sockaddr_in6.
         mut sockaddr_buf: [u8; 28];
@@ -215,12 +215,12 @@ public type struct TcpListener {
 
     /// Wrap a raw listening descriptor. The caller transfers ownership;
     /// `drop` closes it. Used by `TcpAccept` to hand the listener back.
-    public static from_fd(sock: i32) -> TcpListener {
+    public static from_file_descriptor(sock: i32) -> TcpListener {
         return TcpListener { fd: sock };
     }
 
     /// Borrow the underlying descriptor without transferring ownership.
-    public raw_fd(&this) -> i32 {
+    public raw_file_descriptor(&this) -> i32 {
         return this.fd;
     }
 
@@ -238,7 +238,7 @@ public type struct TcpListener {
     /// this reports the kernel-assigned ephemeral port - the only way to
     /// learn it (and the hermetic alternative to guessing a fixed port).
     /// Handles both v4 and v6 listeners.
-    public local_addr(&this) -> Result<SocketAddr, IoError> {
+    public local_address(&this) -> Result<SocketAddress, IoError> {
         mut sockaddr_buf: [u8; 28];
         mut addrlen: u32 = 28;
         if (sys::os_getsockname(this.fd, &sockaddr_buf[0], &addrlen) < 0) {
@@ -280,7 +280,7 @@ public type struct TcpIo {
     /// Take the socket back. Calling it twice yields a closed stream the second
     /// time — the outcome holds the socket exactly once.
     public take_stream(mut &this) -> TcpStream {
-        mut out: TcpStream = TcpStream::from_fd(-1);
+        mut out: TcpStream = TcpStream::from_file_descriptor(-1);
         mem::swap::<TcpStream>(&out, &this.stream);
         return out;
     }
@@ -312,7 +312,7 @@ public type struct TcpAccepted {
 
     /// Take the listener back, so the next accept can be started on it.
     public take_listener(mut &this) -> TcpListener {
-        mut out: TcpListener = TcpListener::from_fd(-1);
+        mut out: TcpListener = TcpListener::from_file_descriptor(-1);
         mem::swap::<TcpListener>(&out, &this.listener);
         return out;
     }
@@ -365,7 +365,7 @@ public type struct TcpRead {
     private finish(mut &this, kept: i64, result: Result<i64, IoError>) -> Poll<TcpIo> {
         this.rt = null;
         this.buf.truncate(kept);
-        mut out: TcpStream = TcpStream::from_fd(-1);
+        mut out: TcpStream = TcpStream::from_file_descriptor(-1);
         mem::swap::<TcpStream>(&out, &this.stream);
         mut b: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&b, &this.buf);
@@ -377,8 +377,8 @@ implement trait Future for struct TcpRead {
     type Output = TcpIo;
 
     poll(mut &this, cx: Context*) -> Poll<TcpIo> {
-        const fd: i32 = this.stream.raw_fd();
-        match (sys::sock_read(fd, this.buf.as_mutable_ptr(), this.buf.length())) {
+        const fd: i32 = this.stream.raw_file_descriptor();
+        match (sys::sock_read(fd, this.buf.as_mutable_pointer(), this.buf.length())) {
             Result::Ok(n)  => { return this.finish(n, Result::Ok(n)); }
             Result::Err(e) => {
                 match (e.kind) {
@@ -405,7 +405,7 @@ implement trait Future for struct TcpRead {
 implement trait Drop for struct TcpRead {
     drop(mut &this) -> void {
         if (this.rt != null) {
-            this.rt.cancel(this.stream.raw_fd(), INTEREST_READ);
+            this.rt.cancel(this.stream.raw_file_descriptor(), INTEREST_READ);
             this.rt = null;
         }
     }
@@ -430,7 +430,7 @@ public type struct TcpWrite {
 
     private finish(mut &this, result: Result<i64, IoError>) -> Poll<TcpIo> {
         this.rt = null;
-        mut out: TcpStream = TcpStream::from_fd(-1);
+        mut out: TcpStream = TcpStream::from_file_descriptor(-1);
         mem::swap::<TcpStream>(&out, &this.stream);
         mut b: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&b, &this.buf);
@@ -442,8 +442,8 @@ implement trait Future for struct TcpWrite {
     type Output = TcpIo;
 
     poll(mut &this, cx: Context*) -> Poll<TcpIo> {
-        const fd: i32 = this.stream.raw_fd();
-        match (sys::sock_write(fd, this.buf.as_ptr(), this.buf.length())) {
+        const fd: i32 = this.stream.raw_file_descriptor();
+        match (sys::sock_write(fd, this.buf.as_pointer(), this.buf.length())) {
             Result::Ok(n)  => { return this.finish(Result::Ok(n)); }
             Result::Err(e) => {
                 match (e.kind) {
@@ -463,7 +463,7 @@ implement trait Future for struct TcpWrite {
 implement trait Drop for struct TcpWrite {
     drop(mut &this) -> void {
         if (this.rt != null) {
-            this.rt.cancel(this.stream.raw_fd(), INTEREST_WRITE);
+            this.rt.cancel(this.stream.raw_file_descriptor(), INTEREST_WRITE);
             this.rt = null;
         }
     }
@@ -485,7 +485,7 @@ public type struct TcpAccept {
 
     private finish(mut &this, result: Result<TcpStream, IoError>) -> Poll<TcpAccepted> {
         this.rt = null;
-        mut out: TcpListener = TcpListener::from_fd(-1);
+        mut out: TcpListener = TcpListener::from_file_descriptor(-1);
         mem::swap::<TcpListener>(&out, &this.listener);
         return Poll::Ready(TcpAccepted { listener: out, result: result });
     }
@@ -495,7 +495,7 @@ implement trait Future for struct TcpAccept {
     type Output = TcpAccepted;
 
     poll(mut &this, cx: Context*) -> Poll<TcpAccepted> {
-        const fd: i32 = this.listener.raw_fd();
+        const fd: i32 = this.listener.raw_file_descriptor();
         mut addr_buf: [u8; 28] = [0; 28];
         mut addrlen:  u32    = 28;
         loop {
@@ -503,7 +503,7 @@ implement trait Future for struct TcpAccept {
             if (client >= 0) {
                 // A connection left blocking would stall the reactor's thread
                 // on its first read, so it is refused, and closed as it drops.
-                mut s: TcpStream = TcpStream::from_fd(client);
+                mut s: TcpStream = TcpStream::from_file_descriptor(client);
                 match (s.set_nonblocking(true)) {
                     Result::Ok(_)      => { return this.finish(Result::Ok(s)); }
                     Result::Err(error) => { return this.finish(Result::Err(error)); }
@@ -527,7 +527,7 @@ implement trait Future for struct TcpAccept {
 implement trait Drop for struct TcpAccept {
     drop(mut &this) -> void {
         if (this.rt != null) {
-            this.rt.cancel(this.listener.raw_fd(), INTEREST_READ);
+            this.rt.cancel(this.listener.raw_file_descriptor(), INTEREST_READ);
             this.rt = null;
         }
     }
@@ -546,7 +546,7 @@ public type struct TcpConnect {
     private rt: mut Reactor*;
 
     /// Open a non-blocking socket and start connecting to `remote`.
-    public static start(remote: SocketAddr) -> TcpConnect {
+    public static start(remote: SocketAddress) -> TcpConnect {
         mut c: TcpConnect = TcpConnect { fd: -1, addr: [0; 28], addrlen: 0,
                                          err: Option::None,
                                          rt:  null };
@@ -579,7 +579,7 @@ public type struct TcpConnect {
         const sock: i32 = this.fd;
         this.fd = -1;
         this.rt = null;
-        return Poll::Ready(Result::Ok(TcpStream::from_fd(sock)));
+        return Poll::Ready(Result::Ok(TcpStream::from_file_descriptor(sock)));
     }
 }
 
@@ -648,7 +648,7 @@ implement trait Drop for struct TcpConnect {
 /// future owns the socket, so dropping that future closes the connection.
 implement trait AsyncTransport for struct TcpStream {
     async read_into(mut &this, buf: Array<u8>) -> Transfer {
-        mut s: TcpStream = TcpStream::from_fd(-1);
+        mut s: TcpStream = TcpStream::from_file_descriptor(-1);
         mem::swap::<TcpStream>(&s, this);
 
         mut io: TcpIo = await TcpRead::start(s, buf);
@@ -662,7 +662,7 @@ implement trait AsyncTransport for struct TcpStream {
     }
 
     async write_from(mut &this, buf: Array<u8>) -> Transfer {
-        mut s: TcpStream = TcpStream::from_fd(-1);
+        mut s: TcpStream = TcpStream::from_file_descriptor(-1);
         mem::swap::<TcpStream>(&s, this);
 
         mut io: TcpIo = await TcpWrite::start(s, buf);

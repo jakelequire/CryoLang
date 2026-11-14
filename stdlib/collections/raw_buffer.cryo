@@ -21,25 +21,25 @@ import std::core::ptr::{ NonNull };
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{
-    AllocError, AllocErrorKind, Allocator, GlobalAlloc, next_capacity
+    AllocationError, AllocationErrorKind, Allocator, GlobalAllocator, next_capacity
 };
 
 /// Room for `capacity` values of `T` from allocator `A`, none of them
 /// tracked as initialized: the storage a growable container builds on.
 /// The container records which slots hold values and drops them; the
 /// buffer releases only the storage.
-public type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
+public type struct RawBuffer<T, A = GlobalAllocator> where A: Allocator {
     private ptr: mut T*;
     private capacity: i64;
     private alloc: A;
 
-    /// Empty buffer backed by `GlobalAlloc`. No heap storage until
+    /// Empty buffer backed by `GlobalAllocator`. No heap storage until
     /// the first `reserve` call.
     public static new() -> RawBuffer<T> {
         return RawBuffer::<T> {
             ptr: null,
             capacity: 0,
-            alloc: GlobalAlloc::new()
+            alloc: GlobalAllocator::new()
         };
     }
 
@@ -54,7 +54,7 @@ public type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
     }
 
     /// The start of the storage; null while nothing has been allocated.
-    public ptr(&this) -> mut T* {
+    public pointer(&this) -> mut T* {
         return this.ptr;
     }
 
@@ -80,7 +80,7 @@ public type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
     public reserve(mut &this,
             used: i64,
             additional: i64,
-            min_capacity: i64) -> Result<(), AllocError> {
+            min_capacity: i64) -> Result<(), AllocationError> {
         if (additional <= 0) {
             return Result::Ok(());
         }
@@ -89,8 +89,8 @@ public type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
         // never be satisfied - report it instead of silently under-sizing.
         const required: i64 = used + additional;
         if (required < used) {
-            return Result::Err(AllocError::new(
-                AllocErrorKind::OutOfMemory, Layout::array::<T>(used)));
+            return Result::Err(AllocationError::new(
+                AllocationErrorKind::OutOfMemory, Layout::array::<T>(used)));
         }
         if (required <= this.capacity) {
             return Result::Ok(());
@@ -104,7 +104,7 @@ public type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
     /// less is already satisfied.
     public reserve_exact(mut &this,
                   used: i64,
-                  additional: i64) -> Result<(), AllocError> {
+                  additional: i64) -> Result<(), AllocationError> {
         if (additional <= 0) {
             return Result::Ok(());
         }
@@ -112,8 +112,8 @@ public type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
         // under-allocating and overrunning the buffer in the caller's memcpy.
         const required: i64 = used + additional;
         if (required < used) {
-            return Result::Err(AllocError::new(
-                AllocErrorKind::OutOfMemory, Layout::array::<T>(used)));
+            return Result::Err(AllocationError::new(
+                AllocationErrorKind::OutOfMemory, Layout::array::<T>(used)));
         }
         if (required <= this.capacity) {
             return Result::Ok(());
@@ -148,20 +148,20 @@ public type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
     /// A method (not a free function) so the monomorphizer specializes it
     /// alongside the rest of `RawBuffer<T, A>`'s body, mirroring
     /// `Array::resize_storage`.
-    public resize(mut &this, new_capacity: i64) -> Result<(), AllocError> {
+    public resize(mut &this, new_capacity: i64) -> Result<(), AllocationError> {
         if (new_capacity == this.capacity) {
             return Result::Ok(());
         }
         const new_layout: Layout = match (Layout::try_array::<T>(new_capacity)) {
             Option::Some(l) => { l }
             Option::None    => {
-                return Result::Err(AllocError::new(
-                    AllocErrorKind::OutOfMemory, Layout::of::<T>()));
+                return Result::Err(AllocationError::new(
+                    AllocationErrorKind::OutOfMemory, Layout::of::<T>()));
             }
         };
         if (this.ptr == null) {
             const raw: NonNull<u8> = this.alloc.allocate(new_layout)?;
-            this.ptr = raw.as_ptr() as mut T*;
+            this.ptr = raw.as_pointer() as mut T*;
             this.capacity = new_capacity;
             return Result::Ok(());
         }
@@ -171,7 +171,7 @@ public type struct RawBuffer<T, A = GlobalAlloc> where A: Allocator {
             old_layout,
             new_layout
         )?;
-        this.ptr = raw.as_ptr() as mut T*;
+        this.ptr = raw.as_pointer() as mut T*;
         this.capacity = new_capacity;
         return Result::Ok(());
     }

@@ -260,7 +260,7 @@ Notes:
 
 - A dynamic array `[T]` is the generic instance `Array<T>` with the default
   allocator and is encoded as that instance:
-  `[int]` -> `N$L3std.11collections.5array.5Array$Li_N$L3std.5alloc.9allocator.11GlobalAlloc$G$G$G`.
+  `[int]` -> `N$L3std.11collections.5array.5Array$Li_N$L3std.5alloc.9allocator.15GlobalAllocator$G$G$G`.
 - A fixed array's length
   is part of the mangling, so `[int; 4]` and `[int; 8]` are distinct symbols.
   The length is written before the element, so a nested fixed array writes its

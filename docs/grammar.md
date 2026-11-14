@@ -98,14 +98,14 @@ DirectiveArg       ::= StringLit | Ident | NumLit | BoolLit
 
 (*  Declarations =============================================== *)
 
-VarDecl            ::= ("const" | "mut") Ident ":" Type ("=" Expr)? ";"
+VarDecl            ::= ("const" | "mut") BindingName ":" Type ("=" Expr)? ";"
                      | ("const" | "mut") StructDestructure ":" Type "=" Expr ";"
 (*  Struct-destructuring binding: moves each named field of a struct value
     into a like-named local.  Idiomatic with a by-value `this` receiver to
     move fields out of a consumed value (see cryo.md S8.3).                *)
 StructDestructure  ::= "{" Ident ("," Ident)* "}"
 
-FunctionDecl       ::= Visibility? "async"? "function" Ident Generics?
+FunctionDecl       ::= Visibility? "async"? "function" BindingName Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)? Block
 
@@ -150,7 +150,7 @@ StaticAssert       ::= "static_assert" "(" Expr ("," StringLit)? ")" ";"
 
 ParamList          ::= Param ("," Param)* ("," VariadicParam)?
                      | VariadicParam
-Param              ::= Ident ":" Type
+Param              ::= BindingName ":" Type
                      | "&this" | "mut" "&this"    (* borrowing receiver *)
                      | "const" "&this"            (* `&this`, written with `const` *)
                      | "this"  | "mut" "this"     (* by-value (consuming) receiver *)
@@ -208,8 +208,18 @@ VisibilityBlock    ::= Visibility ":" (Field | Method | MemberConstant)*
    reads FIRST: `public`/`internal`/`private` (a visibility label), `static`/`async`
    (a member modifier), `const` followed by a name (a constant: `const:`
    is still a field named `const`, and `const(` a method) and
-   `protected`/`virtual`/`override` (refused).                          *)
+   `protected`/`virtual`/`override` (refused).
+   A bare name - a free function, a variable, a parameter, a pattern
+   binding - is read where a statement or an expression begins, so a
+   keyword that opens a declaration, a statement or a primary expression
+   cannot be one (E0100); see `BindingName`.                           *)
 MemberName         ::= Ident | Keyword
+
+(* `this` is also accepted as a parameter name: the by-value receiver.  *)
+BindingName        ::= Ident | NameKeyword
+NameKeyword        ::= (* a Keyword that opens no declaration, statement
+                          or primary expression: `default`, `string`,
+                          `from`, `in`, the primitive type names, ... *)
 
 (* A type's constant, reached as `Type::NAME`.  It is written with a
    value (E0248).  Refused in a trait (E0245), a trait implementation
@@ -309,7 +319,7 @@ GenericParam       ::= Ident (":" BoundEntry ("+" BoundEntry)*)? ("=" Type)?
                           own WhereClause; it is accepted wherever a
                           WhereClause is (not on a trait or a type alias).
                           The optional "=" Type is a default type argument,
-                          e.g. `<A = GlobalAlloc>`. *)
+                          e.g. `<A = GlobalAllocator>`. *)
 GenericArgs        ::= "<" Type ("," Type)* ">"
 TurbofishArgs      ::= "::" "<" TypeArg ("," TypeArg)* ">"
                        (* generic arguments in EXPRESSION position: `<`
@@ -575,8 +585,9 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 
 (*   Reserved Keywords =========================================    *)
 (*                                                                  *)
-(*  These names are reserved by the lexer and may not be used as    *)
-(*  identifiers.  Some (e.g. `from`, `yield`, `auto`, `tuple`)      *)
+(*  These names are reserved by the lexer.  Any of them may name a  *)
+(*  member (`MemberName`); only those in `NameKeyword` may name a   *)
+(*  free function or a binding.  Some (e.g. `from`, `yield`, `auto`, `tuple`) *)
 (*  are lexed but have no semantics yet - see section 21 of         *)
 (*  `cryo.md` for the reserved-syntax table.  `async` and `await`   *)
 (*  are implemented (cryo.md section 18).                           *)

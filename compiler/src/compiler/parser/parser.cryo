@@ -462,7 +462,7 @@ implement struct Parser {
 
         // Function declaration
         if (tok.kind == TokenType::KwFunction) {
-            const func_decl: mut DeclarationNode* = this.parse_function_declaration(visibility);
+            const func_decl: mut DeclarationNode* = this.parse_function_declaration(visibility, false);
             const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func != null && doc != "") {
                 func_decl.set_documentation(doc_text);
@@ -476,7 +476,7 @@ implement struct Parser {
         if (tok.kind == TokenType::KwAsync && this.peek_at(1).kind == TokenType::KwFunction) {
             const async_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'async'
-            const func_decl: mut DeclarationNode* = this.parse_function_declaration(visibility);
+            const func_decl: mut DeclarationNode* = this.parse_function_declaration(visibility, false);
             const func: mut FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func != null) {
                 func.set_async(true);
@@ -539,8 +539,9 @@ implement struct Parser {
             }
 
             // Type alias: type Alias = Target;
-            const ad: DeclarationNode* = this.parse_type_alias_declaration();
+            const ad: mut DeclarationNode* = this.parse_type_alias_declaration();
             if (ad != null && DeclarationNode::alias_of(ad) != null) { DeclarationNode::alias_of(ad).visibility = visibility; }
+            if (ad != null && doc_text != "") { ad.set_documentation(doc_text); }
             return Node::Decl(ad);
         }
 
@@ -548,7 +549,7 @@ implement struct Parser {
         if (tok.kind == TokenType::KwStatic && this.peek_at(1).kind == TokenType::KwFunction) {
             const static_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'static'
-            const func_decl: mut DeclarationNode* = this.parse_function_declaration(visibility);
+            const func_decl: mut DeclarationNode* = this.parse_function_declaration(visibility, false);
             const func: mut FunctionDecl* = DeclarationNode::fn_of(func_decl);
             if (func != null) {
                 func.set_static(true);
@@ -770,14 +771,19 @@ implement struct Parser {
     /// Parse a function declaration: `function name<T>(params) -> RetType { body }`.
     /// The leading `function` keyword is optional: trait bodies use the
     /// keyword-less `name(params) -> RetType;` form for declarations.
-    parse_function_declaration(mut &this, visibility: Visibility) -> mut DeclarationNode* {
+    /// `names_a_member` says the function is an implement block's method,
+    /// named only after `.` or `::`, so any keyword may name it; a free
+    /// function is named bare and takes the binding rule for keywords.
+    parse_function_declaration(mut &this, visibility: Visibility, names_a_member: boolean) -> mut DeclarationNode* {
         const start: Token = this.current();
         if (this.check(TokenType::KwFunction)) {
             this.advance(); // consume 'function'
         }
-        // Accept keywords as function names (e.g., any, type, default)
         mut name_tok: Token = this.current();
         if (name_tok.kind == TokenType::Identifier || name_tok.kind.is_keyword()) {
+            if (!names_a_member) {
+                this.refuse_declaration_keyword_name(name_tok, "a function name");
+            }
             this.advance();
         } else {
             name_tok = this.consume(TokenType::Identifier, "function name");
@@ -1077,12 +1083,13 @@ implement struct Parser {
             return param_decl;
         }
 
-        // Accept keywords as parameter names (e.g., this, default, type, value).
-        // Keywords like 'this' for pass-by-value self, 'default' for fallback values, etc.
-        // are common parameter names that shouldn't be reserved.
+        // A keyword that opens nothing (`default`, `string`) is a legal
+        // parameter name; `this` is the by-value receiver.
         mut name_tok: Token = this.current();
         if (name_tok.kind == TokenType::Identifier || name_tok.kind.is_keyword()) {
-            this.refuse_declaration_keyword_name(name_tok, "a parameter name");
+            if (name_tok.kind != TokenType::KwThis) {
+                this.refuse_declaration_keyword_name(name_tok, "a parameter name");
+            }
             this.advance();
         } else {
             name_tok = this.consume(TokenType::Identifier, "parameter name");
@@ -1847,7 +1854,7 @@ implement struct Parser {
             const head: TokenType = this.current().kind;
             if (head == TokenType::Identifier || head == TokenType::KwFunction
                 || head.is_keyword()) {
-                const func_decl: mut DeclarationNode* = this.parse_function_declaration(Visibility::Private);
+                const func_decl: mut DeclarationNode* = this.parse_function_declaration(Visibility::Private, true);
                 const func: mut FunctionDecl* = DeclarationNode::fn_of(func_decl);
                 if (func != null) {
                     if (is_static) { func.set_static(true); }
@@ -1898,7 +1905,7 @@ implement struct Parser {
     }
 
     /// Parse a type alias: type Alias = Target; or type Alias<T> = Target;
-    parse_type_alias_declaration(mut &this) -> DeclarationNode* {
+    parse_type_alias_declaration(mut &this) -> mut DeclarationNode* {
         const start: Token = this.advance(); // consume 'type'
         const name_tok: Token = this.consume(TokenType::Identifier, "type alias name");
         const alias: mut TypeAliasDecl* = TypeAliasDecl::new(this.intern_lexeme(name_tok));
@@ -2760,7 +2767,7 @@ implement struct Parser {
 
     /// Parse an extern function declaration (no body).
     parse_extern_function(mut &this, visibility: Visibility) -> mut DeclarationNode* {
-        const func_decl: mut DeclarationNode* = this.parse_function_declaration(visibility);
+        const func_decl: mut DeclarationNode* = this.parse_function_declaration(visibility, false);
         return func_decl;
     }
 
