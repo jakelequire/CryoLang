@@ -6,16 +6,16 @@
 ///! TCP it is connectionless, so it deliberately does NOT implement the
 ///! `AsyncRead` / `AsyncWrite` / `AsyncTransport` stream traits - datagram
 ///! boundaries don't survive a byte-stream abstraction. Instead it exposes
-///! `UdpSendTo`/`UdpRecvFrom` (each datagram carries its peer address) and,
+///! `UdpSendTo`/`UdpReceiveFrom` (each datagram carries its peer address) and,
 ///! once `connect` has pinned a default peer, the address-less
-///! `UdpSend`/`UdpRecv`.
+///! `UdpSend`/`UdpReceive`.
 ///!
 ///! **Every operation that can wait is a future**, as in `net::socket::tcp`.
 ///! `bind`, `unbound`, `connect`, `local_addr` and `set_broadcast` stay plain
 ///! calls because none of them waits - UDP `connect` is local bookkeeping and
 ///! exchanges no packets. Sending and receiving are `UdpSend` / `UdpSendTo` /
-///! `UdpRecv` / `UdpRecvFrom`. There is deliberately no blocking `send` or
-///! `recv`: a datagram source that sleeps its calling thread cannot be composed
+///! `UdpReceive` / `UdpReceiveFrom`. There is deliberately no blocking `send` or
+///! `receive`: a datagram source that sleeps its calling thread cannot be composed
 ///! with anything that suspends, and it would stall an executor worker inside
 ///! the syscall.
 ///!
@@ -55,15 +55,15 @@ import std::future::traits::{ Future };
 import std::future::reactor::{ INTEREST_READ, INTEREST_WRITE, Reactor };
 
 /// An IPv4 datagram socket. `bind` or `unbound` opens one in non-blocking
-/// mode; datagrams move through the `UdpSendTo`/`UdpRecvFrom` futures, or
-/// `UdpSend`/`UdpRecv` once `connect` has pinned a peer. Owns its socket and
+/// mode; datagrams move through the `UdpSendTo`/`UdpReceiveFrom` futures, or
+/// `UdpSend`/`UdpReceive` once `connect` has pinned a peer. Owns its socket and
 /// closes it on `drop`.
 ///
 /// ```cryo
 /// import std::collections::array::{ Array };
 /// import std::future::executor::{ Executor };
 /// import std::net::addr::socket_addr::{ SocketAddr };
-/// import std::net::socket::udp::{ UdpIo, UdpReceived, UdpRecvFrom, UdpSendTo, UdpSocket };
+/// import std::net::socket::udp::{ UdpIo, UdpReceived, UdpReceiveFrom, UdpSendTo, UdpSocket };
 ///
 /// async function round_trip(receiver: UdpSocket, sender: UdpSocket, to: SocketAddr) -> i64 {
 ///     mut payload: Array<u8> = Array::<u8>::new();
@@ -73,7 +73,7 @@ import std::future::reactor::{ INTEREST_READ, INTEREST_WRITE, Reactor };
 ///
 ///     mut buffer: Array<u8> = Array::<u8>::new();
 ///     buffer.resize(64, 0);                                    // room to receive into
-///     mut got: UdpReceived = await UdpRecvFrom::start(receiver, buffer);
+///     mut got: UdpReceived = await UdpReceiveFrom::start(receiver, buffer);
 ///     mut _receiver: UdpSocket = got.take_socket();
 ///     return got.take_buf().length();                          // 2
 /// }
@@ -137,7 +137,7 @@ public type struct UdpSocket {
         return this.fd;
     }
 
-    /// Pin a default peer. After this, `UdpSend`/`UdpRecv` talk to `remote`
+    /// Pin a default peer. After this, `UdpSend`/`UdpReceive` talk to `remote`
     /// and the kernel filters incoming datagrams to that source. Does
     /// not exchange packets - UDP `connect` is local bookkeeping only,
     /// so it cannot block and stays a plain call.
@@ -238,7 +238,7 @@ public type struct UdpIo {
     }
 }
 
-/// The outcome of a `UdpRecvFrom`: as `UdpIo`, plus the peer that sent the
+/// The outcome of a `UdpReceiveFrom`: as `UdpIo`, plus the peer that sent the
 /// datagram. A separate type rather than an optional field on `UdpIo` because a
 /// peer address is either always meaningful or never so, and a slot that is
 /// only sometimes filled is the kind of thing callers read anyway.
@@ -416,15 +416,15 @@ implement trait Drop for struct UdpSend {
 /// It receives up to `buf.length()` bytes. An array exposes only `[0, length)`,
 /// so a buffer from `with_capacity` alone has nothing to receive into: size it
 /// with `resize(n, 0)`.
-public type struct UdpRecvFrom {
+public type struct UdpReceiveFrom {
     private socket: UdpSocket;
     private buf:    Array<u8>;
     private rt: mut Reactor*;
 
     /// Begin a receive on `socket`, filling `buf` - both owned by this future
     /// until it completes.
-    public static start(socket: UdpSocket, buf: Array<u8>) -> UdpRecvFrom {
-        return UdpRecvFrom { socket: socket, buf: buf, rt: null };
+    public static start(socket: UdpSocket, buf: Array<u8>) -> UdpReceiveFrom {
+        return UdpReceiveFrom { socket: socket, buf: buf, rt: null };
     }
 
     /// `kept` is how much of the buffer holds bytes that actually arrived;
@@ -442,7 +442,7 @@ public type struct UdpRecvFrom {
     }
 }
 
-implement trait Future for struct UdpRecvFrom {
+implement trait Future for struct UdpReceiveFrom {
     type Output = UdpReceived;
 
     poll(mut &this, cx: Context*) -> Poll<UdpReceived> {
@@ -453,7 +453,7 @@ implement trait Future for struct UdpRecvFrom {
         mut sockaddr_buf: [u8; 28];
         mut addrlen: u32 = 28;
         loop {
-            const n: i64 = sys::os_recvfrom(fd, this.buf.as_mutable_ptr(), this.buf.length(),
+            const n: i64 = sys::os_receive_from(fd, this.buf.as_mutable_ptr(), this.buf.length(),
                                             &sockaddr_buf[0], &addrlen);
             if (n >= 0) {
                 const peer: SocketAddr = sockaddr::unpack_sockaddr_in(&sockaddr_buf);
@@ -477,7 +477,7 @@ implement trait Future for struct UdpRecvFrom {
 /// Dropping a parked receive releases its registration; a send parked on the
 /// same socket keeps waiting. The socket is closed and the buffer freed unless
 /// the operation completed and handed them back.
-implement trait Drop for struct UdpRecvFrom {
+implement trait Drop for struct UdpReceiveFrom {
     drop(mut &this) -> void {
         if (this.rt != null) {
             this.rt.cancel(this.socket.raw_fd(), INTEREST_READ);
@@ -488,15 +488,15 @@ implement trait Drop for struct UdpRecvFrom {
 
 
 /// Receive on a `connect`ed socket, dropping the peer address - it can only be
-/// the connected peer. Truncates an oversized datagram, as `UdpRecvFrom` does.
-public type struct UdpRecv {
+/// the connected peer. Truncates an oversized datagram, as `UdpReceiveFrom` does.
+public type struct UdpReceive {
     private socket: UdpSocket;
     private buf:    Array<u8>;
     private rt: mut Reactor*;
 
     /// Begin a receive on `socket`, filling `buf`.
-    public static start(socket: UdpSocket, buf: Array<u8>) -> UdpRecv {
-        return UdpRecv { socket: socket, buf: buf, rt: null };
+    public static start(socket: UdpSocket, buf: Array<u8>) -> UdpReceive {
+        return UdpReceive { socket: socket, buf: buf, rt: null };
     }
 
     private finish(mut &this, kept: i64, result: Result<i64, IoError>) -> Poll<UdpIo> {
@@ -510,13 +510,13 @@ public type struct UdpRecv {
     }
 }
 
-implement trait Future for struct UdpRecv {
+implement trait Future for struct UdpReceive {
     type Output = UdpIo;
 
     poll(mut &this, cx: Context*) -> Poll<UdpIo> {
         const fd: i32 = this.socket.raw_fd();
         loop {
-            const n: i64 = sys::os_recv(fd, this.buf.as_mutable_ptr(), this.buf.length());
+            const n: i64 = sys::os_receive(fd, this.buf.as_mutable_ptr(), this.buf.length());
             if (n >= 0) { return this.finish(n, Result::Ok(n)); }
             const e: IoError = sys::last_io_error();
             match (e.kind) {
@@ -533,7 +533,7 @@ implement trait Future for struct UdpRecv {
     }
 }
 
-implement trait Drop for struct UdpRecv {
+implement trait Drop for struct UdpReceive {
     drop(mut &this) -> void {
         if (this.rt != null) {
             this.rt.cancel(this.socket.raw_fd(), INTEREST_READ);

@@ -2,7 +2,7 @@
 ///!
 ///! Every type that wants to be printable implements `Display` (for
 ///! user output) or `Debug` (for inspection). Both write through a
-///! `Formatter` that holds any `FmtWrite` sink as a trait object, so
+///! `Formatter` that holds any `FormatWrite` sink as a trait object, so
 ///! formatting a value to `Stdout`, to a `String`, or to a file all
 ///! share one compiled `fmt`.
 ///!
@@ -31,8 +31,8 @@ import std::core::convert::{ ConversionError };
 import std::core::error::{ Error };
 import std::core::iter::{ Iterator };
 import std::fmt::float;
-import std::fmt::error::{ FmtError };
-import std::fmt::write::{ FmtWrite };
+import std::fmt::error::{ FormatError };
+import std::fmt::write::{ FormatWrite };
 import std::fmt::interp::{ Arguments };
 import std::json::error::{ JsonError };
 import std::json::convert::{ JsonDecodeError };
@@ -46,17 +46,17 @@ import std::random::error::{ RandomError };
 /// value's members.
 ![language("formatter")]
 public type struct Formatter {
-    private writer: virtual mut &FmtWrite;
+    private writer: virtual mut &FormatWrite;
     /// `debug_struct` and `debug_tuple` write one member per line.
     private pretty: boolean;
     /// How many `debug_struct` / `debug_tuple` builders are open, which is
     /// how far a pretty member line is indented.
     private depth: i64;
 
-    /// Construct over any `FmtWrite` sink, which the formatter borrows
+    /// Construct over any `FormatWrite` sink, which the formatter borrows
     /// as a trait object: every `fmt` is compiled once and writes to
     /// whatever sink it is given through the sink's table.
-    public static new(writer: virtual mut &FmtWrite) -> Formatter {
+    public static new(writer: virtual mut &FormatWrite) -> Formatter {
         return Formatter { writer: writer, pretty: false, depth: 0 };
     }
 
@@ -67,7 +67,7 @@ public type struct Formatter {
     ///         x: 1,
     ///         y: 2,
     ///     }
-    public static pretty(writer: virtual mut &FmtWrite) -> Formatter {
+    public static pretty(writer: virtual mut &FormatWrite) -> Formatter {
         return Formatter { writer: writer, pretty: true, depth: 0 };
     }
 
@@ -78,7 +78,7 @@ public type struct Formatter {
     /// `f.debug_struct("Point").field("x", &this.x).field("y", &this.y).finish()`
     /// writes `Point { x: 1, y: 2 }`, and a value with no fields its name alone.
     public debug_struct(mut &this, name: string) -> DebugStruct {
-        mut result: Result<(), FmtError> = this.write_str(Str::new(name));
+        mut result: Result<(), FormatError> = this.write_str(Str::new(name));
         this.depth += 1;
         return DebugStruct { formatter: &this, result: result, has_fields: false };
     }
@@ -88,13 +88,13 @@ public type struct Formatter {
     /// `f.debug_tuple("Some").field(&value).finish()` writes `Some(1)`, and a
     /// value with no members its name alone.
     public debug_tuple(mut &this, name: string) -> DebugTuple {
-        mut result: Result<(), FmtError> = this.write_str(Str::new(name));
+        mut result: Result<(), FormatError> = this.write_str(Str::new(name));
         this.depth += 1;
         return DebugTuple { formatter: &this, result: result, has_fields: false };
     }
 
     /// The four-space indent of a pretty member line at the current depth.
-    private write_indent(mut &this) -> Result<(), FmtError> {
+    private write_indent(mut &this) -> Result<(), FormatError> {
         for (mut level: i64 = 0; level < this.depth; level++) {
             this.write_str(Str::new("    "))?;
         }
@@ -103,25 +103,25 @@ public type struct Formatter {
 
     /// Write a `Str`. The usual path for fixed text and for
     /// pre-rendered ASCII (integer digits, escapes) wrapped as a `Str`.
-    public write_str(mut &this, source: Str) -> Result<(), FmtError> {
+    public write_str(mut &this, source: Str) -> Result<(), FormatError> {
         return this.writer.write_str(source);
     }
 
     /// Write a single Unicode scalar, UTF-8-encoded.
-    public write_char(mut &this, c: char) -> Result<(), FmtError> {
+    public write_char(mut &this, c: char) -> Result<(), FormatError> {
         return this.writer.write_char(c);
     }
 
     /// Write an f-string, `f.write(f"{a}..{b}")`, each hole formatted
-    /// straight into the sink, as `FmtWrite.write` does.
-    public write(mut &this, arguments: Arguments) -> Result<(), FmtError> {
+    /// straight into the sink, as `FormatWrite.write` does.
+    public write(mut &this, arguments: Arguments) -> Result<(), FormatError> {
         return arguments.write_to(this);
     }
 
     /// Surface the underlying writer. For advanced composition where
     /// the caller wants to dispatch a second formatter against the
     /// same sink, or to flush mid-stream.
-    public get_writer(&this) -> virtual mut &FmtWrite {
+    public get_writer(&this) -> virtual mut &FormatWrite {
         return this.writer;
     }
 }
@@ -131,7 +131,7 @@ public type struct Formatter {
 /// step met, after which the later steps write nothing.
 public type struct DebugStruct {
     private formatter: mut &Formatter;
-    private result: Result<(), FmtError>;
+    private result: Result<(), FormatError>;
     private has_fields: boolean;
 
     /// Write the field `name` with `value`'s `Debug` text.
@@ -146,13 +146,13 @@ public type struct DebugStruct {
 
     /// Close the value: ` }`, or on a pretty formatter `}` on a line of its
     /// own.  A value with no fields was written as its name alone.
-    public finish(mut this) -> Result<(), FmtError> {
+    public finish(mut this) -> Result<(), FormatError> {
         this.formatter.depth -= 1;
         if (this.result.is_ok() && this.has_fields) { this.result = this.write_close(); }
         return this.result;
     }
 
-    private write_close(mut &this) -> Result<(), FmtError> {
+    private write_close(mut &this) -> Result<(), FormatError> {
         if (this.formatter.pretty) {
             this.formatter.write_indent()?;
             return this.formatter.write_str(Str::new("}"));
@@ -160,7 +160,7 @@ public type struct DebugStruct {
         return this.formatter.write_str(Str::new(" }"));
     }
 
-    private write_field<T>(mut &this, name: string, value: &T) -> Result<(), FmtError>
+    private write_field<T>(mut &this, name: string, value: &T) -> Result<(), FormatError>
     where T: Debug {
         if (this.formatter.pretty) {
             if (!this.has_fields) { this.formatter.write_str(Str::new(" {\n"))?; }
@@ -182,7 +182,7 @@ public type struct DebugStruct {
 /// error any step met, after which the later steps write nothing.
 public type struct DebugTuple {
     private formatter: mut &Formatter;
-    private result: Result<(), FmtError>;
+    private result: Result<(), FormatError>;
     private has_fields: boolean;
 
     /// Write the next member, `value`'s `Debug` text.
@@ -197,18 +197,18 @@ public type struct DebugTuple {
 
     /// Close the value: `)`, on a line of its own on a pretty formatter.
     /// A value with no members was written as its name alone.
-    public finish(mut this) -> Result<(), FmtError> {
+    public finish(mut this) -> Result<(), FormatError> {
         this.formatter.depth -= 1;
         if (this.result.is_ok() && this.has_fields) { this.result = this.write_close(); }
         return this.result;
     }
 
-    private write_close(mut &this) -> Result<(), FmtError> {
+    private write_close(mut &this) -> Result<(), FormatError> {
         if (this.formatter.pretty) { this.formatter.write_indent()?; }
         return this.formatter.write_str(Str::new(")"));
     }
 
-    private write_field<T>(mut &this, value: &T) -> Result<(), FmtError>
+    private write_field<T>(mut &this, value: &T) -> Result<(), FormatError>
     where T: Debug {
         if (this.formatter.pretty) {
             if (!this.has_fields) { this.formatter.write_str(Str::new("(\n"))?; }
@@ -228,12 +228,12 @@ public type struct DebugTuple {
 ///
 /// ```cryo
 /// import std::fmt::display::{ Display, Formatter };
-/// import std::fmt::error::{ FmtError };
+/// import std::fmt::error::{ FormatError };
 ///
 /// type struct Point { public x: i64; public y: i64; }
 ///
 /// implement trait Display for struct Point {
-///     fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+///     fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
 ///         return f.write_str(f"({this.x}, {this.y})".as_str());
 ///     }
 /// }
@@ -241,7 +241,7 @@ public type struct DebugTuple {
 public type trait Display {
     /// Write this value's text to `f`, passing on the first error the
     /// sink reports.
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError>;
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError>;
 }
 
 /// How a value reads to a programmer: what `{x:?}` writes, and `{x:#?}`
@@ -251,29 +251,29 @@ public type trait Display {
 public type trait Debug {
     /// Write this value's debugging text to `f`, passing on the first
     /// error the sink reports.
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError>;
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError>;
 }
 
 
-private function write_u64(f: mut &Formatter,value: u64) -> Result<(), FmtError> {
+private function write_u64(f: mut &Formatter,value: u64) -> Result<(), FormatError> {
     mut buffer: [u8; 20];
     const digits: i64 =value.to_decimal_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
-private function write_i64(f: mut &Formatter,value: i64) -> Result<(), FmtError> {
+private function write_i64(f: mut &Formatter,value: i64) -> Result<(), FormatError> {
     mut buffer: [u8; 21];
     const digits: i64 =value.to_decimal_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
-private function write_u128(f: mut &Formatter,value: u128) -> Result<(), FmtError> {
+private function write_u128(f: mut &Formatter,value: u128) -> Result<(), FormatError> {
     mut buffer: [u8; 39];
     const digits: i64 =value.to_decimal_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
-private function write_i128(f: mut &Formatter,value: i128) -> Result<(), FmtError> {
+private function write_i128(f: mut &Formatter,value: i128) -> Result<(), FormatError> {
     mut buffer: [u8; 40];
     const digits: i64 =value.to_decimal_buf(&buffer[0]);
     return f.write_str(Str::from_raw(&buffer[0], digits));
@@ -281,7 +281,7 @@ private function write_i128(f: mut &Formatter,value: i128) -> Result<(), FmtErro
 
 
 /// Display-side wrapper for the float printer.
-private function write_float64(f: mut &Formatter,value: f64) -> Result<(), FmtError> {
+private function write_float64(f: mut &Formatter,value: f64) -> Result<(), FormatError> {
     mut buffer: [u8; 32];
     const digits: i64 = value.to_buf(&buffer).unwrap();
     return f.write_str(Str::from_raw(&buffer[0], digits));
@@ -290,81 +290,81 @@ private function write_float64(f: mut &Formatter,value: f64) -> Result<(), FmtEr
 // Primitive Display impls
 
 implement trait Display for u8 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Display for u16 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Display for u32 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Display for u64 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_u64(f, this);
     }
 }
 implement trait Display for u128 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_u128(f, this);
     }
 }
 
 implement trait Display for i8 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Display for i16 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Display for i32 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Display for i64 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_i64(f, this);
     }
 }
 implement trait Display for i128 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_i128(f, this);
     }
 }
 implement trait Display for usize {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Display for isize {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_i64(f, this as i64);
     }
 }
 
 implement trait Display for f32 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_float64(f, this as f64);
     }
 }
 
 implement trait Display for f64 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_float64(f, this);
     }
 }
 
 implement trait Display for boolean {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         if (this) {
             return f.write_str(Str::new("true"));
         }
@@ -373,7 +373,7 @@ implement trait Display for boolean {
 }
 
 implement trait Display for string {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         const view: Str = Str::new(this);
         return f.write_str(view);
     }
@@ -384,20 +384,20 @@ implement trait Display for string {
 /// `write_char`; a value in the surrogate range (0xD800..=0xDFFF) is not a
 /// scalar and is written as the replacement character U+FFFD.
 implement trait Display for char {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_char(this);
     }
 }
 
 implement trait Display for struct Str {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(this);
     }
 }
 
 implement<A> trait Display for struct String<A>
 where A: Allocator {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(this.as_str());
     }
 }
@@ -405,7 +405,7 @@ where A: Allocator {
 /// A reference prints as the value it refers to.
 implement<T> trait Display for &T
 where T: Display {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return (*this).fmt(f);
     }
 }
@@ -414,77 +414,77 @@ where T: Display {
 // Primitive Debug impls: default to Display for numeric types
 
 implement trait Debug for u8 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Debug for u16 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Debug for u32 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Debug for u64 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_u64(f, this);
     }
 }
 implement trait Debug for u128 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_u128(f, this);
     }
 }
 implement trait Debug for i8 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Debug for i16 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Debug for i32 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Debug for i64 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_i64(f, this);
     }
 }
 implement trait Debug for i128 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_i128(f, this);
     }
 }
 implement trait Debug for usize {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_u64(f, this as u64);
     }
 }
 implement trait Debug for isize {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_i64(f, this as i64);
     }
 }
 implement trait Debug for f32 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_float64(f, this as f64);
     }
 }
 implement trait Debug for f64 {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return write_float64(f, this);
     }
 }
 implement trait Debug for boolean {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         if (this) {
             return f.write_str(Str::new("true"));
         }
@@ -496,7 +496,7 @@ implement trait Debug for boolean {
 /// escapes the same set `Debug<Str>` does, so `print('\n' as debug)`
 /// is unambiguous.
 implement trait Debug for char {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_char(0x27 as char)?; // '\''
         write_debug_scalar(f, this as u32, 0x27)?;
         return f.write_char(0x27 as char);
@@ -509,7 +509,7 @@ implement trait Debug for char {
 /// source. Round-trippable by a parser that understands `\n`,
 /// `\r`, `\t`, `\\`, `\"`, `\xNN`.
 implement trait Debug for struct Str {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_char(0x22 as char)?; // '"'
         const bytes: &Slice<u8> = this.as_bytes();
         const base: u8* = bytes.as_ptr();
@@ -546,7 +546,7 @@ implement trait Debug for struct Str {
 }
 
 implement trait Debug for struct String<GlobalAlloc> {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         const view: Str = this.as_str();
         return (Debug for Str)::fmt(&view, f);
     }
@@ -555,7 +555,7 @@ implement trait Debug for struct String<GlobalAlloc> {
 /// Escape a single byte for Debug output. `quote` is the surrounding
 /// delimiter: a quote matching the delimiter is escaped, a quote
 /// of the other flavor is passed through.
-private function write_debug_byte(f: mut &Formatter,byte: u8, quote: u8) -> Result<(), FmtError> {
+private function write_debug_byte(f: mut &Formatter,byte: u8, quote: u8) -> Result<(), FormatError> {
     if (byte == 0x5C) {
         return f.write_str(Str::new("\\\\"));
     }
@@ -596,7 +596,7 @@ private function write_debug_byte(f: mut &Formatter,byte: u8, quote: u8) -> Resu
 
 /// Escape one Unicode scalar for Debug<char> output. Non-ASCII
 /// scalars are emitted as `\u{XXXX}` to keep terminal output safe.
-private function write_debug_scalar(f: mut &Formatter,scalar: u32, quote: u8) -> Result<(), FmtError> {
+private function write_debug_scalar(f: mut &Formatter,scalar: u32, quote: u8) -> Result<(), FormatError> {
     if (scalar < 0x80) {
         return write_debug_byte(f, scalar as u8, quote);
     }
@@ -618,7 +618,7 @@ private function write_debug_scalar(f: mut &Formatter,scalar: u32, quote: u8) ->
 
 implement<T> trait Display for enum Option<T>
 where T: Display {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         match (&this) {
             Option::Some(value) => {
                 f.write_str(Str::new("Some("))?;
@@ -632,18 +632,18 @@ where T: Display {
     }
 }
 
-/// Construct a `Result<(), FmtError>` error.  Defined OUTSIDE the
+/// Construct a `Result<(), FormatError>` error.  Defined OUTSIDE the
 /// `implement ... for Result` blocks below because inside them the bare
 /// `Result::Err` constructor binds to the Self enum (`Result<T, E>`)
-/// rather than `Result<(), FmtError>`, producing a type mismatch.  As a
+/// rather than `Result<(), FormatError>`, producing a type mismatch.  As a
 /// free function the name resolves unambiguously.
-private function fmt_err(e: FmtError) -> Result<(), FmtError> {
+private function fmt_err(e: FormatError) -> Result<(), FormatError> {
     return Result::Err(e);
 }
 
 implement<T, E> trait Display for enum Result<T, E>
 where T: Display, E: Display {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         match (&this) {
             Result::Ok(value) => {
                 match (f.write_str(Str::new("Ok("))) {
@@ -681,7 +681,7 @@ where T: Display, E: Display {
 
 implement<T, A> trait Display for struct Array<T, A>
 where T: Display, A: Allocator {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_str(Str::new("["))?;
         const n: i64 = this.length();
         mut i: i64 = 0;
@@ -703,7 +703,7 @@ where T: Display, A: Allocator {
 
 implement<T, A> trait Debug for struct Array<T, A>
 where T: Debug, A: Allocator {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_str(Str::new("["))?;
         const n: i64 = this.length();
         mut i: i64 = 0;
@@ -725,7 +725,7 @@ where T: Debug, A: Allocator {
 
 implement<K, V, A, H> trait Display for struct HashMap<K, V, A, H>
 where K: Display, V: Display, A: Allocator {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_str(Str::new("{"))?;
         mut first: boolean = true;
         for (entry in this.entries()) {
@@ -743,7 +743,7 @@ where K: Display, V: Display, A: Allocator {
 
 implement<K, V, A, H> trait Debug for struct HashMap<K, V, A, H>
 where K: Debug, V: Debug, A: Allocator {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_str(Str::new("{"))?;
         mut first: boolean = true;
         for (entry in this.entries()) {
@@ -766,7 +766,7 @@ where K: Debug, V: Debug, A: Allocator {
 
 implement<T, A, H> trait Display for struct HashSet<T, A, H>
 where T: Display, A: Allocator {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_str(Str::new("{"))?;
         mut it: implement Iterator<T*> = this.iter_ref();
         mut first: boolean = true;
@@ -786,7 +786,7 @@ where T: Display, A: Allocator {
 
 implement<T, A, H> trait Debug for struct HashSet<T, A, H>
 where T: Debug, A: Allocator {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_str(Str::new("{"))?;
         mut it: implement Iterator<T*> = this.iter_ref();
         mut first: boolean = true;
@@ -814,7 +814,7 @@ where T: Debug, A: Allocator {
 // - the same shape `Array`/`HashMap` use for their elements.
 implement<A, B> trait Display for struct Pair<A, B>
 where A: Display, B: Display {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_str(Str::new("("))?;
         const fst: const A* = &this.first;
         fst.fmt(f)?;
@@ -827,7 +827,7 @@ where A: Display, B: Display {
 
 implement<A, B> trait Debug for struct Pair<A, B>
 where A: Debug, B: Debug {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_str(Str::new("("))?;
         const fst: const A* = &this.first;
         fst.fmt(f)?;
@@ -842,7 +842,7 @@ where A: Debug, B: Debug {
 
 /// Format `value` into a fresh heap-backed `String`. Caller owns the
 /// result and is responsible for dropping it.
-public function format_to_string<T>(value: &T) -> Result<String, FmtError>
+public function format_to_string<T>(value: &T) -> Result<String, FormatError>
 where T: Display {
     mut out: String = String::new();
     mut f: Formatter = Formatter::new(&out);
@@ -851,7 +851,7 @@ where T: Display {
 }
 
 /// Same shape for `Debug`.
-public function format_debug_to_string<T>(value: &T) -> Result<String, FmtError>
+public function format_debug_to_string<T>(value: &T) -> Result<String, FormatError>
 where T: Debug {
     mut out: String = String::new();
     mut f: Formatter = Formatter::new(&out);
@@ -873,7 +873,7 @@ where T: Debug {
 /// `could not open config.toml: not found` when the error records the
 /// operation and the path it failed on, the bare description otherwise.
 implement trait Display for struct IoError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         match (this.operation()) {
             Option::Some(operation) => {
                 f.write_str(Str::new("could not "))?;
@@ -895,7 +895,7 @@ implement trait Display for struct IoError {
 /// The kind's slug and the operating system's code, then the operation
 /// and the path: `not_found (os 2): could not open config.toml`.
 implement trait Debug for struct IoError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_str(this.kind.label())?;
         f.write_str(Str::new(" (os "))?;
         write_i64(f, this.os_code as i64)?;
@@ -919,14 +919,14 @@ implement trait Debug for struct IoError {
 
 /// `invalid UTF-8 at byte 12`.
 implement trait Display for struct Utf8Error {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_str(this.describe())?;
         f.write_str(Str::new(" at byte "))?;
         return write_i64(f, this.valid_up_to);
     }
 }
 implement trait Debug for struct Utf8Error {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_str(this.describe())?;
         f.write_str(Str::new(" at byte "))?;
         return write_i64(f, this.valid_up_to);
@@ -934,12 +934,12 @@ implement trait Debug for struct Utf8Error {
 }
 
 implement trait Display for struct JsonError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(this.describe());
     }
 }
 implement trait Debug for struct JsonError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(this.describe());
     }
 }
@@ -947,7 +947,7 @@ implement trait Debug for struct JsonError {
 /// `at .servers[2].port: expected a u16, found a string`; without the
 /// `at` part for the value read itself.
 implement trait Display for struct JsonDecodeError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         if (this.path().length() > 0) {
             f.write_str(Str::new("at "))?;
             f.write_str(this.path())?;
@@ -960,51 +960,51 @@ implement trait Display for struct JsonDecodeError {
     }
 }
 implement trait Debug for struct JsonDecodeError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return Display::fmt(this, f);
     }
 }
 
 implement trait Display for enum RandomError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(this.describe());
     }
 }
 implement trait Debug for enum RandomError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(this.describe());
     }
 }
 
 implement trait Display for struct AllocError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(this.describe());
     }
 }
 implement trait Debug for struct AllocError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(this.describe());
     }
 }
 
 implement trait Display for struct ConversionError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(this.describe());
     }
 }
 implement trait Debug for struct ConversionError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(this.describe());
     }
 }
 
-implement trait Display for enum FmtError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+implement trait Display for enum FormatError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(this.describe());
     }
 }
-implement trait Debug for enum FmtError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+implement trait Debug for enum FormatError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(this.describe());
     }
 }
@@ -1016,4 +1016,4 @@ implement trait Error for struct JsonDecodeError { }
 implement trait Error for enum RandomError { }
 implement trait Error for struct AllocError { }
 implement trait Error for struct ConversionError { }
-implement trait Error for enum FmtError { }
+implement trait Error for enum FormatError { }

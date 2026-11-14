@@ -14,7 +14,7 @@
 ///!       tx.send(42);
 ///!       return 0;       // `tx` is released with the closure as the thread ends
 ///!   });
-///!   match (rx.recv()) { Result::Ok(v) => { use(v); } Result::Err(_) => {} }
+///!   match (rx.receive()) { Result::Ok(v) => { use(v); } Result::Err(_) => {} }
 ///!   h.join();
 ///!   ```
 ///!
@@ -23,17 +23,24 @@
 ///! An unbounded channel queues every value sent. A bounded one holds at
 ///! most `capacity` values: `send` on a full channel blocks until the
 ///! receiver takes one, or returns the value in `Err(SendError)` if the
-///! receiver is dropped meanwhile.
+///! receiver is dropped meanwhile. `try_send` never waits: on a full
+///! channel it hands the value back in `Err(TrySendError::Full)`.
+///!
+///! ## Iterating
+///!
+///! A `Receiver<T>` is an `Iterator<T>`: `for (value in rx)` takes each
+///! value as it arrives and ends once every sender has dropped.
 ///!
 ///! ## Disconnection
 ///!
-///! When every `Sender` has been dropped, a blocked `recv()` returns
-///! `Err(RecvError::Disconnected)` and `try_recv()` returns
-///! `Err(TryRecvError::Disconnected)`. A disconnected channel stays
+///! When every `Sender` has been dropped, a blocked `receive()` returns
+///! `Err(ReceiveError::Disconnected)` and `try_receive()` returns
+///! `Err(TryReceiveError::Disconnected)`. A disconnected channel stays
 ///! disconnected: a sender is made only with the channel or by cloning a
 ///! live one. When the `Receiver` is dropped, `send()` returns
-///! `Err(SendError)` (handing the value back) instead of queueing into a
-///! channel no one will drain.
+///! `Err(SendError)` and `try_send()` `Err(TrySendError::Disconnected)`
+///! (each handing the value back) instead of queueing into a channel no
+///! one will drain.
 ///!
 ///! ## Implementation
 ///!
@@ -51,6 +58,8 @@ import std::core::intrinsics;
 import std::core::ptr::{ NonNull };
 import std::core::result::{ Result };
 import std::core::option;
+import std::core::option::{ Option };
+import std::core::iter::{ Iterator };
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{ GlobalAlloc };
@@ -59,7 +68,7 @@ import std::collections::str::{ Str };
 import std::core::error::{ Error };
 import std::core::mem;
 import std::fmt::display::{ Debug, Display, Formatter };
-import std::fmt::error::{ FmtError };
+import std::fmt::error::{ FormatError };
 import std::sync::mutex::{ Mutex, MutexGuard };
 import std::sync::condvar::{ CondVar };
 import std::time::clock::{ Instant };
@@ -92,6 +101,33 @@ private type struct ChannelState<T> {
         if (this.head == null) { this.tail = null; }
         this.length = this.length - 1;
         return node;
+    }
+
+    /// Move `value` into the fresh `node` and queue it at the enqueue end.
+    private push(mut &this, node: mut ChanNode<T>*, value: T) -> void {
+        (*node).next = null;
+        // Move `value` into the node through a raw pointer so no drop is
+        // synthesized on the uninitialized destination.
+        const slot: mut T* = &(*node).value;
+        *slot = value;
+        if (this.tail == null) {
+            this.head = node;
+            this.tail = node;
+        } else {
+            (*this.tail).next = node;
+            this.tail = node;
+        }
+        this.length = this.length + 1;
+    }
+}
+
+/// Allocate an uninitialized queue node, or return null when no memory
+/// could be had.
+private function allocate_node<T>() -> mut ChanNode<T>* {
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    match (alloc.allocate(Layout::of::<ChanNode<T>>())) {
+        Result::Ok(raw) => { return raw.cast::<ChanNode<T>>().as_ptr(); }
+        Result::Err(_)  => { return null; }
     }
 }
 
@@ -139,51 +175,85 @@ public type struct SendError<T> {
 
 /// `the receiver has been dropped`; the value it carries is not printed.
 implement<T> trait Display for struct SendError<T> {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(Str::new("the receiver has been dropped"));
     }
 }
 
 /// `SendError`; the value it carries is not printed.
 implement<T> trait Debug for struct SendError<T> {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(Str::new("SendError"));
     }
 }
 
 implement<T> trait Error for struct SendError<T> { }
 
-/// Error returned by a blocking `Receiver::recv`.
-public type enum RecvError with [Eq, Clone, Debug] {
+/// Why `Sender::try_send` did not queue its value. Each variant carries
+/// the value back so the caller does not lose it.
+public type enum TrySendError<T> {
+    /// The channel already holds as many values as it can, or no memory
+    /// could be had for one more.
+    Full(T);
+    /// The receiver has been dropped.
+    Disconnected(T);
+}
+
+/// `the channel is full` or `the receiver has been dropped`; the value it
+/// carries is not printed.
+implement<T> trait Display for enum TrySendError<T> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        match (&this) {
+            TrySendError::Full(_)         => { return f.write_str(Str::new("the channel is full")); }
+            TrySendError::Disconnected(_) => { return f.write_str(Str::new("the receiver has been dropped")); }
+        }
+    }
+}
+
+/// `TrySendError::Full` or `TrySendError::Disconnected`; the value it
+/// carries is not printed.
+implement<T> trait Debug for enum TrySendError<T> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        match (&this) {
+            TrySendError::Full(_)         => { return f.write_str(Str::new("TrySendError::Full")); }
+            TrySendError::Disconnected(_) => { return f.write_str(Str::new("TrySendError::Disconnected")); }
+        }
+    }
+}
+
+implement<T> trait Error for enum TrySendError<T> { }
+
+/// Error returned by a blocking `Receiver::receive`.
+public type enum ReceiveError with [Eq, Clone, Debug] {
     Disconnected;   // all senders dropped and the queue is empty
 }
 
 /// `every sender has been dropped`.
-implement trait Display for enum RecvError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+implement trait Display for enum ReceiveError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return f.write_str(Str::new("every sender has been dropped"));
     }
 }
 
-implement trait Error for enum RecvError { }
+implement trait Error for enum ReceiveError { }
 
-/// Error returned by the non-blocking `Receiver::try_recv`.
-public type enum TryRecvError with [Eq, Clone, Debug] {
+/// Error returned by the non-blocking `Receiver::try_receive`.
+public type enum TryReceiveError with [Eq, Clone, Debug] {
     Empty;          // no value ready, but senders remain
     Disconnected;   // all senders dropped and the queue is empty
 }
 
 /// `no value is ready` or `every sender has been dropped`.
-implement trait Display for enum TryRecvError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+implement trait Display for enum TryReceiveError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         match (&this) {
-            TryRecvError::Empty        => { return f.write_str(Str::new("no value is ready")); }
-            TryRecvError::Disconnected => { return f.write_str(Str::new("every sender has been dropped")); }
+            TryReceiveError::Empty        => { return f.write_str(Str::new("no value is ready")); }
+            TryReceiveError::Disconnected => { return f.write_str(Str::new("every sender has been dropped")); }
         }
     }
 }
 
-implement trait Error for enum TryRecvError { }
+implement trait Error for enum TryReceiveError { }
 
 /// Why `Receiver::receive_timeout` returned no value.
 public type enum ReceiveTimeoutError with [Eq, Clone, Debug] {
@@ -195,7 +265,7 @@ public type enum ReceiveTimeoutError with [Eq, Clone, Debug] {
 
 /// `the time ran out` or `every sender has been dropped`.
 implement trait Display for enum ReceiveTimeoutError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         match (&this) {
             ReceiveTimeoutError::Timeout      => { return f.write_str(Str::new("the time ran out")); }
             ReceiveTimeoutError::Disconnected => { return f.write_str(Str::new("every sender has been dropped")); }
@@ -222,28 +292,36 @@ public type struct Sender<T> {
         if (!state.rx_open) {
             return Result::Err(SendError::<T> { value: value });
         }
-        mut node: mut ChanNode<T>* = null;
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
-        match (alloc.allocate(Layout::of::<ChanNode<T>>())) {
-            Result::Ok(raw) => { node = raw.cast::<ChanNode<T>>().as_ptr(); }
-            Result::Err(_)  => {
-                return Result::Err(SendError::<T> { value: value });
-            }
+        const node: mut ChanNode<T>* = allocate_node::<T>();
+        if (node == null) {
+            return Result::Err(SendError::<T> { value: value });
         }
-        (*node).next = null;
-        // Move `value` into the node through a raw pointer so no drop is
-        // synthesized on the uninitialized destination.
-        const slot: mut T* = &(*node).value;
-        *slot = value;
-        if (state.tail == null) {
-            state.head = node;
-            state.tail = node;
-        } else {
-            (*state.tail).next = node;
-            state.tail = node;
-        }
-        state.length = state.length + 1;
+        state.push(node, value);
         // Wake one blocked receiver (there is at most one).
+        inner.ready.notify_one();
+        mem::drop(held);
+        return Result::Ok(());
+    }
+
+    /// Enqueue `value` without waiting. Returns `Err(Full(value))` when a
+    /// bounded channel already holds its capacity (or no memory could be
+    /// had for the value), `Err(Disconnected(value))` when the receiver has
+    /// been dropped; either hands the value back unconsumed.
+    public try_send(&this, value: T) -> Result<(), TrySendError<T>> {
+        const inner: ChannelInner<T>* = this.inner;
+        mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        const state: mut ChannelState<T>* = held.as_mutable_ptr();
+        if (!state.rx_open) {
+            return Result::Err(TrySendError::Disconnected(value));
+        }
+        if (state.length >= state.capacity) {
+            return Result::Err(TrySendError::Full(value));
+        }
+        const node: mut ChanNode<T>* = allocate_node::<T>();
+        if (node == null) {
+            return Result::Err(TrySendError::Full(value));
+        }
+        state.push(node, value);
         inner.ready.notify_one();
         mem::drop(held);
         return Result::Ok(());
@@ -270,7 +348,7 @@ public type struct Sender<T> {
 }
 
 /// Decrement the sender/handle counts; wake the receiver if this was the
-/// last sender (so a blocked `recv` observes disconnection); free the
+/// last sender (so a blocked `receive` observes disconnection); free the
 /// inner if this was the last handle of any kind.
 private function release_sender<T>(inner: mut ChannelInner<T>*) -> void {
     mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
@@ -301,7 +379,7 @@ public type struct Receiver<T> {
     /// Block until a value is available and return it, or return
     /// `Err(Disconnected)` once every sender has dropped and the queue is
     /// drained.
-    public recv(&this) -> Result<T, RecvError> {
+    public receive(&this) -> Result<T, ReceiveError> {
         const inner: ChannelInner<T>* = this.inner;
         mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_mutable_ptr();
@@ -314,7 +392,7 @@ public type struct Receiver<T> {
         mem::drop(held);
         if (node == null) {
             // No value and no senders left.
-            return Result::Err(RecvError::Disconnected);
+            return Result::Err(ReceiveError::Disconnected);
         }
         // Move the value out of the node, then free the node without running
         // the slot's destructor, so the value is owned exactly once.
@@ -347,7 +425,7 @@ public type struct Receiver<T> {
         if (node == null) {
             return Result::Err(ReceiveTimeoutError::Disconnected);
         }
-        // Moved out and released as in `recv`.
+        // Moved out and released as in `receive`.
         const slot: T* = &(*node).value;
         mut value: T;
         unsafe { value = *slot; }
@@ -359,18 +437,18 @@ public type struct Receiver<T> {
     /// Non-blocking receive. Returns `Err(Empty)` if no value is ready but
     /// senders remain, `Err(Disconnected)` if the channel is drained and
     /// all senders have dropped.
-    public try_recv(&this) -> Result<T, TryRecvError> {
+    public try_receive(&this) -> Result<T, TryReceiveError> {
         const inner: ChannelInner<T>* = this.inner;
         mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_mutable_ptr();
         const node: mut ChanNode<T>* = state.pop();
         if (node == null) {
-            if (state.senders == 0) { return Result::Err(TryRecvError::Disconnected); }
-            return Result::Err(TryRecvError::Empty);
+            if (state.senders == 0) { return Result::Err(TryReceiveError::Disconnected); }
+            return Result::Err(TryReceiveError::Empty);
         }
         inner.room.notify_one();
         mem::drop(held);
-        // Same balance as `recv`: the node is released without running the
+        // Same balance as `receive`: the node is released without running the
         // slot's destructor, so the value is owned exactly once.
         const slot: T* = &(*node).value;
         mut value: T;
@@ -409,6 +487,18 @@ implement<T> trait Drop for struct Receiver<T> {
     }
 }
 
+/// A receiver iterates the values sent, in order, waiting for each as
+/// `receive` does; the iteration ends once every sender has dropped and
+/// the queue is drained. `for (value in receiver)` takes the receiver.
+implement<T> trait Iterator<T> for struct Receiver<T> {
+    next(mut &this) -> Option<T> {
+        match (this.receive()) {
+            Result::Ok(value) => { return Option::Some(value); }
+            Result::Err(_)    => { return Option::None; }
+        }
+    }
+}
+
 
 /// Opens channels. A channel's two ends come out together, its `Sender<T>`
 /// first; more senders are clones of that one:
@@ -417,7 +507,7 @@ implement<T> trait Drop for struct Receiver<T> {
 ///   const { first: tx, second: rx }: Pair<mpsc::Sender<i32>, mpsc::Receiver<i32>> =
 ///       mpsc::Channel::unbounded::<i32>();
 ///   thread::spawn(move () -> i32 { tx.send(1); return 0; });
-///   match (rx.recv()) { Result::Ok(v) => {} Result::Err(_) => {} }
+///   match (rx.receive()) { Result::Ok(v) => {} Result::Err(_) => {} }
 ///   ```
 ///
 /// Panics only on allocation / lock-initialization failure.

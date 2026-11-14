@@ -6,12 +6,12 @@
 ///!   - **The handshake and the first frame may arrive in ONE write.** Because
 ///!     `WebSocket<S>` OWNS its `BufStream<S>`, the read buffer outlives the
 ///!     handshake, so frame bytes that landed in the same fill as the
-///!     terminating blank line survive into the first `recv`. The borrowed,
+///!     terminating blank line survive into the first `receive`. The borrowed,
 ///!     byte-at-a-time version could only avoid over-reading by never
 ///!     buffering; this one has to KEEP what it over-read.
 ///!     `pipelined_upgrade_and_frame_round_trip` sends the upgrade request and
 ///!     the first frame in a single flush and still expects the message.
-///!   - **The connection survives several frames.** `recv` carries its
+///!   - **The connection survives several frames.** `receive` carries its
 ///!     accumulator, and `read_frame` carries a masking key and a length,
 ///!     across suspension points inside a loop. A desynchronized carrier shows
 ///!     up as a wrong count, so every test asserts numbers.
@@ -136,7 +136,7 @@ async function ws_client_n(port: u16, n: i64) -> i64 {
             Result::Ok(_)  => { }
             Result::Err(_) => { return -12; }
         }
-        mut back: Message = match (await ws.recv()) {
+        mut back: Message = match (await ws.receive()) {
             Result::Ok(v)  => { v }
             Result::Err(_) => { return -13; }
         };
@@ -174,7 +174,7 @@ async function ws_server_n(listener: TcpListener, n: i64) -> i64 {
 
     mut seen: i64 = 0;
     while (seen < n) {
-        mut msg: Message = match (await ws.recv()) {
+        mut msg: Message = match (await ws.receive()) {
             Result::Ok(v)  => { v }
             Result::Err(_) => { return -102; }
         };
@@ -204,7 +204,7 @@ async function ws_pair(listener: TcpListener, port: u16, n: i64) -> i64 {
 
 /// One message each way: the control for the loop below. If this passes and
 /// the three-message test does not, the fault is in carrying the connection
-/// round the recv loop rather than in the upgrade or the framing.
+/// round the receive loop rather than in the upgrade or the framing.
 ![test]
 function upgrade_and_one_text_frame_round_trip() -> Result<(), TestError> {
     mut l: TcpListener = match (ws_bind()) {
@@ -300,9 +300,9 @@ async function ws_pipelined_client(port: u16) -> i64 {
 
     // The upgrade is done and the frame the server echoes may already be
     // sitting in `c`'s buffer -- wrapping it now is what carries those bytes
-    // into `recv` instead of discarding them with a handshake-owned buffer.
+    // into `receive` instead of discarding them with a handshake-owned buffer.
     mut ws: WebSocket<TcpStream> = WebSocket::<TcpStream>::of(c, true);
-    mut echoed: Message = match (await ws.recv()) {
+    mut echoed: Message = match (await ws.receive()) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -18; }
     };
@@ -335,7 +335,7 @@ function pipelined_upgrade_and_frame_round_trip() -> Result<(), TestError> {
 // ============================================================================
 
 /// Client that sends a Ping BEFORE its text message. The server must answer
-/// the Ping with a Pong from inside `recv` and still deliver the text, so the
+/// the Ping with a Pong from inside `receive` and still deliver the text, so the
 /// client sees its echo AND a Pong-free message stream.
 async function ws_ping_client(port: u16) -> i64 {
     mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
@@ -355,9 +355,9 @@ async function ws_ping_client(port: u16) -> i64 {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -13; }
     }
-    // The server's Pong is a control frame; `recv` skips it and yields the
-    // echo, so one `recv` is enough.
-    mut back: Message = match (await ws.recv()) {
+    // The server's Pong is a control frame; `receive` skips it and yields the
+    // echo, so one `receive` is enough.
+    mut back: Message = match (await ws.receive()) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -14; }
     };
@@ -478,7 +478,7 @@ function close_status_is(ws: &WebSocket<TcpStream>, code: u16, reason: Str) -> i
     }
 }
 
-/// Accept, upgrade and read one message. Returns 1 when `recv` answered as
+/// Accept, upgrade and read one message. Returns 1 when `receive` answered as
 /// the case requires - `Message::Close` carrying the sent status for cases
 /// 0 and 5, an error and no status otherwise - and a negative step code
 /// when it did not.
@@ -491,7 +491,7 @@ async function ws_raw_server(listener: TcpListener, case: i64) -> i64 {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -101; }
     };
-    match (await ws.recv()) {
+    match (await ws.receive()) {
         Result::Ok(msg) => {
             const closed: boolean = match (msg) {
                 Message::Close     => { true }

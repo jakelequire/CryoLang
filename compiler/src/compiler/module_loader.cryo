@@ -122,10 +122,10 @@ type struct DirectoryListings {
     /// holds no entry the next component names under any spelling; such a
     /// path exists on no filesystem.  True otherwise, including when a
     /// directory on the way cannot be listed.
-    may_hold(mut &this, base: string, relative: string) -> boolean {
+    may_hold(mut &this, base: string, relative: Str) -> boolean {
         mut directory: PathBuf = PathBuf::from(base);
         const separator: Str = Str::new("/");
-        for (component in Str::new(relative).split(&separator)) {
+        for (component in relative.split(&separator)) {
             if (component.is_empty()) { continue; }
             const listing: DirectoryListing* = this.listing_of(directory.as_path().as_str());
             if (!listing.listed) { return true; }
@@ -608,7 +608,8 @@ public:
     resolve_import_path(mut &this, intern: InternTable*, written: SymbolStr, from_dir: string) -> string {
         const found: string = this.resolve_written_path(intern.resolve(written));
         if (found.length() > 0 || from_dir.length() == 0) { return found; }
-        return this.search_location(from_dir, intern.resolve(written).replace("::", "/"));
+        // A path found here names a module for the rest of the build.
+        return this.search_location(from_dir, intern.resolve(written).replace("::", "/")).into_raw();
     }
 
     /// `resolve_import_path`'s search before the writing file's directory.
@@ -668,15 +669,16 @@ public:
 
         const fs_path: string = import_path.replace("::", "/");
 
-        // Search locations in priority order
+        // Search locations in priority order.  A path found names a module
+        // for the rest of the build.
         // 1. Project root
-        const from_root: string = this.search_location(this.project_root, fs_path);
-        if (from_root.length() > 0) { return from_root; }
+        mut from_root: String = this.search_location(this.project_root, fs_path);
+        if (from_root.length() > 0) { return from_root.into_raw(); }
 
         // 2. Entry point directory (if different from root)
         if (!this.entry_dir.eq(this.project_root) && this.entry_dir.length() > 0) {
-            const from_entry: string = this.search_location(this.entry_dir, fs_path);
-            if (from_entry.length() > 0) { return from_entry; }
+            mut from_entry: String = this.search_location(this.entry_dir, fs_path);
+            if (from_entry.length() > 0) { return from_entry.into_raw(); }
         }
 
         // 3. Stdlib (unless no_std)
@@ -690,8 +692,8 @@ public:
                 fs_path[2] == 'd' && fs_path[3] == '/') {
                 stdlib_fs_path = fs_path + 4;  // skip "std/"
             }
-            const from_stdlib: string = this.search_location(this.stdlib_root, stdlib_fs_path);
-            if (from_stdlib.length() > 0) { return from_stdlib; }
+            mut from_stdlib: String = this.search_location(this.stdlib_root, stdlib_fs_path);
+            if (from_stdlib.length() > 0) { return from_stdlib.into_raw(); }
         }
 
         return "";
@@ -1250,38 +1252,38 @@ public:
     /// variation found it: a filesystem that ignores case answers the
     /// first variation, and the path's spelling becomes the file name of
     /// every span in the module.
-    search_location(mut &this, base_dir: string, fs_path: string) -> string {
+    search_location(mut &this, base_dir: string, fs_path: string) -> String {
         // 1. Directory module: base_dir/fs_path/_module.cryo
-        const dir_module: string = Path::from(fs_path).join("_module.cryo").into_raw();
-        if (this.exists_under(base_dir, dir_module)) {
-            return this.spelled_as_on_disk(base_dir, dir_module);
+        const dir_module: PathBuf = Path::from(fs_path).join("_module.cryo");
+        if (this.exists_under(base_dir, dir_module.as_path().as_str())) {
+            return this.spelled_as_on_disk(base_dir, dir_module.as_path().as_str());
         }
 
         // 2. Exact case: base_dir/fs_path.cryo
-        const exact: string = fmt::format("%s.cryo", fs_path).into_raw();
-        if (this.exists_under(base_dir, exact)) {
-            return this.spelled_as_on_disk(base_dir, exact);
+        const exact: String = f"{fs_path}.cryo";
+        if (this.exists_under(base_dir, exact.as_str())) {
+            return this.spelled_as_on_disk(base_dir, exact.as_str());
         }
 
         // 3. Lowercase: base_dir/lowercase.cryo
-        const lower: string = fmt::format("%s.cryo", fs_path.to_ascii_lower()).into_raw();
-        if (this.exists_under(base_dir, lower)) {
-            return this.spelled_as_on_disk(base_dir, lower);
+        const lower: String = f"{fs_path.to_ascii_lower()}.cryo";
+        if (this.exists_under(base_dir, lower.as_str())) {
+            return this.spelled_as_on_disk(base_dir, lower.as_str());
         }
 
         // 4. Snake case: base_dir/snake_case.cryo
-        const snake: string = fmt::format("%s.cryo", ModuleLoader::to_snake_case(fs_path)).into_raw();
-        if (this.exists_under(base_dir, snake)) {
-            return this.spelled_as_on_disk(base_dir, snake);
+        const snake: String = f"{ModuleLoader::to_snake_case(fs_path)}.cryo";
+        if (this.exists_under(base_dir, snake.as_str())) {
+            return this.spelled_as_on_disk(base_dir, snake.as_str());
         }
 
         // 5. Lowercase directory module
-        const lower_dir: string = Path::from(fs_path.to_ascii_lower()).join("_module.cryo").into_raw();
-        if (this.exists_under(base_dir, lower_dir)) {
-            return this.spelled_as_on_disk(base_dir, lower_dir);
+        const lower_dir: PathBuf = Path::from(fs_path.to_ascii_lower()).join("_module.cryo");
+        if (this.exists_under(base_dir, lower_dir.as_path().as_str())) {
+            return this.spelled_as_on_disk(base_dir, lower_dir.as_path().as_str());
         }
 
-        return "";
+        return String::new();
     }
 
     /// Whether `base_dir/relative` exists.  A path one of whose directories
@@ -1289,7 +1291,7 @@ public:
     /// filesystem, which the listings answer; any other is the operating
     /// system's to answer, since whether a spelling differing only in case
     /// names an entry is the filesystem's rule.
-    exists_under(mut &this, base_dir: string, relative: string) -> boolean {
+    exists_under(mut &this, base_dir: string, relative: Str) -> boolean {
         if (!this.listings.may_hold(base_dir, relative)) { return false; }
         const candidate: PathBuf = Path::from(base_dir).join(relative);
         return candidate.as_path().exists();
@@ -1297,14 +1299,14 @@ public:
 
     /// `base_dir/relative`, each component of `relative` replaced by the
     /// entry of its directory that it names.
-    spelled_as_on_disk(mut &this, base_dir: string, relative: string) -> string {
+    spelled_as_on_disk(mut &this, base_dir: string, relative: Str) -> String {
         mut spelled: PathBuf = PathBuf::from(base_dir);
         const separator: Str = Str::new("/");
-        for (component in Str::new(relative).split(&separator)) {
+        for (component in relative.split(&separator)) {
             const entry: String = this.listings.entry_named(spelled.as_path().as_str(), component);
             spelled.push(entry.as_str());
         }
-        return spelled.into_raw();
+        return String::from_str(spelled.as_path().as_str());
     }
 
 
@@ -1748,7 +1750,7 @@ public:
     /// is lowercase (a word after a lowercase run) or the one after it is
     /// (the last capital of an acronym, the `V` in "ASTValidation") - never
     /// at the start, and never after a `/` or `_`.
-    static to_snake_case(s: string) -> string {
+    static to_snake_case(s: string) -> String {
         const length: i64 = s.length() as i64;
         mut out: String = String::with_capacity(length);
         for (mut i: i64 = 0; i < length; i++) {
@@ -1762,7 +1764,7 @@ public:
             }
             out.push_byte(ch.to_ascii_lowercase() as u8);
         }
-        return out.into_raw();
+        return out;
     }
 
     /// Extract a module name from a file path (filename without extension).
