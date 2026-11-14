@@ -40,7 +40,7 @@ import std::collections::string::{ String };
 import std::future;
 import std::io::error::{ IoError };
 import std::io::traits;
-import std::io::buf::{ BufStream };
+import std::io::buf::{ BufferedStream };
 import std::net::addr::socket_addr::{ SocketAddress };
 import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
 import std::net::http::method::{ Method };
@@ -211,7 +211,7 @@ async function h2_many_headers(port: u16, count: u64) -> i64 {
         Result::Err(_) => { return -30; }
     };
     mut conn: Http2Connection<TcpStream> =
-        Http2Connection::<TcpStream>::new_client(BufStream::<TcpStream>::of(sock));
+        Http2Connection::<TcpStream>::new_client(BufferedStream::<TcpStream>::of(sock));
     match (await conn.handshake_client()) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -31; }
@@ -250,7 +250,7 @@ async function h2_sequential(port: u16, n: i64) -> i64 {
         Result::Err(_) => { return -40; }
     };
     mut conn: Http2Connection<TcpStream> =
-        Http2Connection::<TcpStream>::new_client(BufStream::<TcpStream>::of(sock));
+        Http2Connection::<TcpStream>::new_client(BufferedStream::<TcpStream>::of(sock));
     match (await conn.handshake_client()) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -41; }
@@ -281,7 +281,7 @@ async function h2_handshake_then_close(port: u16) -> i64 {
         Result::Err(_) => { return -50; }
     };
     mut conn: Http2Connection<TcpStream> =
-        Http2Connection::<TcpStream>::new_client(BufStream::<TcpStream>::of(sock));
+        Http2Connection::<TcpStream>::new_client(BufferedStream::<TcpStream>::of(sock));
     match (await conn.handshake_client()) {
         Result::Ok(_)  => { return 1; }
         Result::Err(_) => { return -51; }
@@ -298,7 +298,7 @@ async function h2_bad_settings_client(port: u16) -> i64 {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -60; }
     };
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    mut c: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(sock);
     match (c.pending().try_append(Str::new("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").as_bytes())) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -61; }
@@ -336,7 +336,7 @@ async function h2_bad_settings_client(port: u16) -> i64 {
 // ---- a server written frame by frame ------------------------------------------
 
 /// Queue a SETTINGS frame carrying one entry.
-function h2_queue_setting(c: mut &BufStream<TcpStream>, id: u16, value: u32) -> boolean {
+function h2_queue_setting(c: mut &BufferedStream<TcpStream>, id: u16, value: u32) -> boolean {
     mut payload: Array<u8> = Array::<u8>::new();
     settings::push_entry(&payload, id, value);
     return c.queue_h2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice()).is_ok();
@@ -369,7 +369,7 @@ async function h2_raw_server(listener: TcpListener, case: i64) -> i64 {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -200; }
     };
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    mut c: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(sock);
     match (await c.ensure(24)) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -201; }
@@ -486,7 +486,7 @@ async function h2_raw_client(port: u16, case: i64) -> i64 {
         Result::Err(_) => { return -300; }
     };
     mut conn: Http2Connection<TcpStream> =
-        Http2Connection::<TcpStream>::new_client(BufStream::<TcpStream>::of(sock));
+        Http2Connection::<TcpStream>::new_client(BufferedStream::<TcpStream>::of(sock));
     match (await conn.handshake_client()) {
         Result::Ok(_)  => { if (case == 0) { return -301; } }
         Result::Err(_) => { if (case == 0) { return 1; } return -302; }
@@ -532,7 +532,7 @@ async function h2_bad_preface_client(port: u16) -> i64 {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -70; }
     };
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    mut c: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(sock);
     match (c.pending().try_append(Str::new("PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n").as_bytes())) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -71; }
@@ -559,7 +559,7 @@ async function h2_join_bad_preface(port: u16, server: Http2Server) -> (i64, i64)
 // ---- a client written frame by frame ------------------------------------------
 
 /// Queue a WINDOW_UPDATE granting `increment` octets on `stream_id`.
-function h2_queue_window_update(c: mut &BufStream<TcpStream>, stream_id: u32, increment: u32) -> boolean {
+function h2_queue_window_update(c: mut &BufferedStream<TcpStream>, stream_id: u32, increment: u32) -> boolean {
     mut payload: Array<u8> = Array::<u8>::with_capacity(4);
     mut writer: ByteWriter = ByteWriter::new(&payload);
     writer.write_u32_big_endian(increment);
@@ -568,7 +568,7 @@ function h2_queue_window_update(c: mut &BufStream<TcpStream>, stream_id: u32, in
 
 /// Queue a GET for `/` on `stream_id`, its header block written from HPACK's
 /// static table alone: `:method GET`, `:path /`, `:scheme http`.
-function h2_queue_get(c: mut &BufStream<TcpStream>, stream_id: u32) -> boolean {
+function h2_queue_get(c: mut &BufferedStream<TcpStream>, stream_id: u32) -> boolean {
     mut block: Array<u8> = Array::<u8>::new();
     block.push(0x82);
     block.push(0x84);
@@ -604,7 +604,7 @@ async function h2_raw_client_of_server(port: u16, case: i64) -> i64 {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -400; }
     };
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    mut c: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(sock);
     mut queued: boolean =
         c.pending().try_append(Str::new("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").as_bytes()).is_ok();
     if (case == 11 || case == 12) {

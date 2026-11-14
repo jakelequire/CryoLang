@@ -1074,7 +1074,7 @@ yet is recorded with the change that builds it, not here.
 
 632. **`io` and `fs` are marked.**  The I/O traits, `SeekFrom`, the
      buffered readers and writers, `Cursor`, the standard streams with
-     their locks, `is_tty`, the descriptor numbers and calls of
+     their locks, `is_terminal`, the descriptor numbers and calls of
      `io::fd`, the newline constants, `read_dir`, the directory and file
      calls, `DirEntry`, `ReadDir`, `OpenOptions` and `File` are public,
      and so are the default buffer size, file mode and directory mode.
@@ -4497,12 +4497,12 @@ check is being deleted and the seals are what hold.  (Jake)
     }
     ```
 
-15. **`BufStream::drop`'s explicit `this.inner.drop()` is deleted**; the
+15. **`BufferedStream::drop`'s explicit `this.inner.drop()` is deleted**; the
     field glue releases `inner` after the body. Explicit drop calls already
     warn, and they become an error at the v1.0 freeze.
 
     ```cryo
-    implement<S> Drop for BufStream<S> {
+    implement<S> Drop for BufferedStream<S> {
         drop(mut &this) -> void {
             this.inner.drop();   // deleted: `inner` is released by field glue
         }
@@ -4539,7 +4539,7 @@ check is being deleted and the seals are what hold.  (Jake)
     is accepted**: both of its runs compile against the working tree's
     standard library. A library change that alters behaviour is proven by a
     test project of its own, the way a counting transport proves that a
-    `BufStream` releases what it wraps once. verify is not extended.
+    `BufferedStream` releases what it wraps once. verify is not extended.
 
 21. *Superseded by ruling 22 the same day.* **A generic inherent method and
     a non-generic trait method of the same name that both apply to a call

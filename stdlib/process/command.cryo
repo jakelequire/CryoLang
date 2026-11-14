@@ -484,7 +484,7 @@ private function child_remap(setting: Stdio, pipe: &PipePair, target_fd: i32,
             }
             if (nullfd < 0) { return false; }
             if (libc::dup2(nullfd, target_fd) < 0) { return false; }
-            fd::close_fd(nullfd);
+            fd::close_file_descriptor(nullfd);
             return true;
         }
         Stdio::Piped => {
@@ -492,13 +492,13 @@ private function child_remap(setting: Stdio, pipe: &PipePair, target_fd: i32,
             if (libc::dup2(src, target_fd) < 0) { return false; }
             // Close both ends after dup2; the target_fd now refers
             // to whichever end we wanted.
-            if (pipe.read_end >= 0) { fd::close_fd(pipe.read_end); }
-            if (pipe.write_end >= 0) { fd::close_fd(pipe.write_end); }
+            if (pipe.read_end >= 0) { fd::close_file_descriptor(pipe.read_end); }
+            if (pipe.write_end >= 0) { fd::close_file_descriptor(pipe.write_end); }
             return true;
         }
         Stdio::Fd(raw) => {
             if (libc::dup2(raw, target_fd) < 0) { return false; }
-            fd::close_fd(raw);
+            fd::close_file_descriptor(raw);
             return true;
         }
         // Stdout is remapped before stderr, so fd 1 already names the
@@ -707,7 +707,7 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         // environment was assembled in the parent (`build_envp`) precisely
         // so the child performs no allocation and never calls
         // setenv/clearenv (which are NOT async-signal-safe).
-        fd::close_fd(failure_pipe.read_end);
+        fd::close_file_descriptor(failure_pipe.read_end);
         // The child leads a new group, so a signal to the group reaches
         // everything it starts.
         if (cmd.group_descendants_flag && libc::setpgid(0, 0) < 0) {
@@ -761,7 +761,7 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // -------- parent --------
     // The child's write end closes here; the read below then sees end of
     // file once the child has exec'd (close-on-exec) or written a failure.
-    fd::close_fd(failure_pipe.write_end);
+    fd::close_file_descriptor(failure_pipe.write_end);
     mut failure: [i32; 2];
     mut failure_read: i64 = 0;
     loop {
@@ -769,7 +769,7 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         if (failure_read >= 0) { break; }
         if (libc::errno() != libc::EINTR) { break; }
     }
-    fd::close_fd(failure_pipe.read_end);
+    fd::close_file_descriptor(failure_pipe.read_end);
     if (failure_read == 8) {
         // The child exited at once; reap it so no zombie is left behind.
         mut reaped_status: i32 = 0;
@@ -777,9 +777,9 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         close_pipe(&stdin_pipe);
         close_pipe(&stdout_pipe);
         close_pipe(&stderr_pipe);
-        match (cmd.stdin_cfg) { Stdio::Fd(raw) => { fd::close_fd(raw); } _ => { } }
-        match (cmd.stdout_cfg) { Stdio::Fd(raw) => { fd::close_fd(raw); } _ => { } }
-        match (cmd.stderr_cfg) { Stdio::Fd(raw) => { fd::close_fd(raw); } _ => { } }
+        match (cmd.stdin_cfg) { Stdio::Fd(raw) => { fd::close_file_descriptor(raw); } _ => { } }
+        match (cmd.stdout_cfg) { Stdio::Fd(raw) => { fd::close_file_descriptor(raw); } _ => { } }
+        match (cmd.stderr_cfg) { Stdio::Fd(raw) => { fd::close_file_descriptor(raw); } _ => { } }
         return Result::Err(spawn_error(cmd, IoError::from_errno(failure[1]), failure[0] == SPAWN_STEP_DIRECTORY));
     }
     // Close the ends of each pipe that belong to the child.
@@ -789,31 +789,31 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // every `Fd`-configured spawn (the doc on `Stdio::Fd` promised this).
     match (cmd.stdin_cfg) {
         Stdio::Piped => {
-            if (stdin_pipe.read_end >= 0) { fd::close_fd(stdin_pipe.read_end); }
+            if (stdin_pipe.read_end >= 0) { fd::close_file_descriptor(stdin_pipe.read_end); }
             stdin_pipe.read_end = -1;
         }
         Stdio::Fd(raw) => {
-            if (raw >= 0) { fd::close_fd(raw); }
+            if (raw >= 0) { fd::close_file_descriptor(raw); }
         }
         _ => { }
     }
     match (cmd.stdout_cfg) {
         Stdio::Piped => {
-            if (stdout_pipe.write_end >= 0) { fd::close_fd(stdout_pipe.write_end); }
+            if (stdout_pipe.write_end >= 0) { fd::close_file_descriptor(stdout_pipe.write_end); }
             stdout_pipe.write_end = -1;
         }
         Stdio::Fd(raw) => {
-            if (raw >= 0) { fd::close_fd(raw); }
+            if (raw >= 0) { fd::close_file_descriptor(raw); }
         }
         _ => { }
     }
     match (cmd.stderr_cfg) {
         Stdio::Piped => {
-            if (stderr_pipe.write_end >= 0) { fd::close_fd(stderr_pipe.write_end); }
+            if (stderr_pipe.write_end >= 0) { fd::close_file_descriptor(stderr_pipe.write_end); }
             stderr_pipe.write_end = -1;
         }
         Stdio::Fd(raw) => {
-            if (raw >= 0) { fd::close_fd(raw); }
+            if (raw >= 0) { fd::close_file_descriptor(raw); }
         }
         _ => { }
     }
@@ -881,8 +881,8 @@ private function spawn_error(cmd: &Command, error: IoError, in_directory: boolea
 
 ![target(unix)]
 private function close_pipe(pair: &PipePair) -> void {
-    if (pair.read_end >= 0) { fd::close_fd(pair.read_end); }
-    if (pair.write_end >= 0) { fd::close_fd(pair.write_end); }
+    if (pair.read_end >= 0) { fd::close_file_descriptor(pair.read_end); }
+    if (pair.write_end >= 0) { fd::close_file_descriptor(pair.write_end); }
 }
 
 implement trait Drop for struct EnvEntry {
@@ -1052,8 +1052,8 @@ private function collect_output(c: mut &Child) -> Result<Output, IoError> {
         }
     }
 
-    if (so_fd >= 0) { fd::close_fd(so_fd); }
-    if (se_fd >= 0) { fd::close_fd(se_fd); }
+    if (so_fd >= 0) { fd::close_file_descriptor(so_fd); }
+    if (se_fd >= 0) { fd::close_file_descriptor(se_fd); }
     match (failure) {
         Option::Some(e) => { return Result::Err(e); }
         Option::None    => { }
@@ -1102,7 +1102,7 @@ private type struct WinStdio {
     private child_handle: u8*;   // handle handed to the child via STARTUPINFO
     private parent_fd:    i32;   // parent pipe end as a CRT fd, or -1
     private extra_close:  u8*;   // child pipe end the parent must close post-spawn, or null
-    private close_fd:     i32;   // caller CRT fd to close post-spawn (Stdio::Fd ownership), or -1
+    private close_file_descriptor:     i32;   // caller CRT fd to close post-spawn (Stdio::Fd ownership), or -1
 }
 
 ![target(windows)]
@@ -1276,12 +1276,12 @@ private function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean)
                 // child reads `rd` (inheritable); parent writes `wr`.
                 syscall::SetHandleInformation(wr, syscall::HANDLE_FLAG_INHERIT, 0);
                 const f: i32 = libc::_open_osfhandle(wr as i64, 0);
-                return Result::Ok(WinStdio { child_handle: rd, parent_fd: f, extra_close: rd, close_fd: -1 });
+                return Result::Ok(WinStdio { child_handle: rd, parent_fd: f, extra_close: rd, close_file_descriptor: -1 });
             }
             // child writes `wr` (inheritable); parent reads `rd`.
             syscall::SetHandleInformation(rd, syscall::HANDLE_FLAG_INHERIT, 0);
             const f: i32 = libc::_open_osfhandle(rd as i64, 0);
-            return Result::Ok(WinStdio { child_handle: wr, parent_fd: f, extra_close: wr, close_fd: -1 });
+            return Result::Ok(WinStdio { child_handle: wr, parent_fd: f, extra_close: wr, close_file_descriptor: -1 });
         }
         Stdio::Null => {
             // Discard the child's stream by handing it an inheritable handle
@@ -1304,7 +1304,7 @@ private function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean)
                 return Result::Err(IoError::last_os_error());
             }
             // Parent owns the NUL handle; close it after the child inherits it.
-            return Result::Ok(WinStdio { child_handle: h, parent_fd: -1, extra_close: h, close_fd: -1 });
+            return Result::Ok(WinStdio { child_handle: h, parent_fd: -1, extra_close: h, close_file_descriptor: -1 });
         }
         Stdio::Fd(raw) => {
             // Recover the Win32 HANDLE backing the caller's CRT fd and
@@ -1324,13 +1324,13 @@ private function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean)
                 return Result::Err(IoError::last_os_error());
             }
             // child inherits `dup`; parent closes both `dup` and the caller's fd.
-            return Result::Ok(WinStdio { child_handle: dup, parent_fd: -1, extra_close: dup, close_fd: raw });
+            return Result::Ok(WinStdio { child_handle: dup, parent_fd: -1, extra_close: dup, close_file_descriptor: raw });
         }
         _ => {
             // Inherit: hand the child our own std handle; nothing for the
             // parent to close or wrap.
             return Result::Ok(WinStdio { child_handle: syscall::GetStdHandle(std_id),
-                                         parent_fd: -1, extra_close: null, close_fd: -1 });
+                                         parent_fd: -1, extra_close: null, close_file_descriptor: -1 });
         }
     }
 }
@@ -1343,7 +1343,7 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // that wiring owns it, so there is nothing more to close or wrap.
     const serr: WinStdio = match (cmd.stderr_cfg) {
         Stdio::SameAsStdout => {
-            WinStdio { child_handle: sout.child_handle, parent_fd: -1, extra_close: null, close_fd: -1 }
+            WinStdio { child_handle: sout.child_handle, parent_fd: -1, extra_close: null, close_file_descriptor: -1 }
         }
         _ => { win_setup_stdio(cmd.stderr_cfg, syscall::STD_ERROR_HANDLE, false)? }
     };
@@ -1404,14 +1404,14 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // `Stdio::Fd` transfers ownership: close the caller's fd in the parent
     // now that the child has inherited a duplicate (runs on success or
     // failure, mirroring the POSIX `Stdio::Fd` parent-close).
-    if (sin.close_fd  >= 0) { fd::close_fd(sin.close_fd); }
-    if (sout.close_fd >= 0) { fd::close_fd(sout.close_fd); }
-    if (serr.close_fd >= 0) { fd::close_fd(serr.close_fd); }
+    if (sin.close_file_descriptor  >= 0) { fd::close_file_descriptor(sin.close_file_descriptor); }
+    if (sout.close_file_descriptor >= 0) { fd::close_file_descriptor(sout.close_file_descriptor); }
+    if (serr.close_file_descriptor >= 0) { fd::close_file_descriptor(serr.close_file_descriptor); }
 
     if (ok == 0) {
-        if (sin.parent_fd  >= 0) { fd::close_fd(sin.parent_fd); }
-        if (sout.parent_fd >= 0) { fd::close_fd(sout.parent_fd); }
-        if (serr.parent_fd >= 0) { fd::close_fd(serr.parent_fd); }
+        if (sin.parent_fd  >= 0) { fd::close_file_descriptor(sin.parent_fd); }
+        if (sout.parent_fd >= 0) { fd::close_file_descriptor(sout.parent_fd); }
+        if (serr.parent_fd >= 0) { fd::close_file_descriptor(serr.parent_fd); }
         // CreateProcess reports a working directory it cannot enter as
         // ERROR_DIRECTORY.
         const in_directory: boolean = create_error.os_code == syscall::ERROR_DIRECTORY as i32;
@@ -1429,9 +1429,9 @@ private function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
             if (job != null) { syscall::CloseHandle(job); }
             syscall::CloseHandle(pi.hThread);
             syscall::CloseHandle(pi.hProcess);
-            if (sin.parent_fd  >= 0) { fd::close_fd(sin.parent_fd); }
-            if (sout.parent_fd >= 0) { fd::close_fd(sout.parent_fd); }
-            if (serr.parent_fd >= 0) { fd::close_fd(serr.parent_fd); }
+            if (sin.parent_fd  >= 0) { fd::close_file_descriptor(sin.parent_fd); }
+            if (sout.parent_fd >= 0) { fd::close_file_descriptor(sout.parent_fd); }
+            if (serr.parent_fd >= 0) { fd::close_file_descriptor(serr.parent_fd); }
             return Result::Err(spawn_error(cmd, job_error, false));
         }
         syscall::ResumeThread(pi.hThread);
@@ -1486,7 +1486,7 @@ private function win_drain_interleaved(so_fd0: i32, se_fd0: i32,
             } else if (av > 0) {
                 mut want: i64 = chunk_len;
                 if (av < want) { want = av; }
-                match (fd::read_fd(so, chunk, want)) {
+                match (fd::read_file_descriptor(so, chunk, want)) {
                     Result::Ok(n) => {
                         if (n == 0) { so = -1; }
                         else {
@@ -1507,7 +1507,7 @@ private function win_drain_interleaved(so_fd0: i32, se_fd0: i32,
             } else if (av > 0) {
                 mut want: i64 = chunk_len;
                 if (av < want) { want = av; }
-                match (fd::read_fd(se, chunk, want)) {
+                match (fd::read_file_descriptor(se, chunk, want)) {
                     Result::Ok(n) => {
                         if (n == 0) { se = -1; }
                         else {
@@ -1565,8 +1565,8 @@ private function collect_output(c: mut &Child) -> Result<Output, IoError> {
         }
     }
 
-    if (so_fd >= 0) { fd::close_fd(so_fd); }
-    if (se_fd >= 0) { fd::close_fd(se_fd); }
+    if (so_fd >= 0) { fd::close_file_descriptor(so_fd); }
+    if (se_fd >= 0) { fd::close_file_descriptor(se_fd); }
     match (failure) {
         Option::Some(e) => { return Result::Err(e); }
         Option::None    => { }

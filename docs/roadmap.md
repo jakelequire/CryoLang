@@ -99,7 +99,7 @@ sweep.  Counted (`grep -E '^\s*implement(<[^>]*>)? (struct|union) '`):
   `cursor.cryo`, the struct's own file, goes inline.  The others are
   `AsmPiece`, `InlineBodies`, `DirectiveRegistry`, and `StampSlot`,
   `BuildStamp`, `VersionReport` in `utils/build_stamp.cryo`.
-- standard library: 4.  Three are `BufStream<S>` extended from the
+- standard library: 4.  Three are `BufferedStream<S>` extended from the
   HTTP/1.1, HTTP/2 and WebSocket modules, the split-type exception; one is
   `Array<T, A>`'s second block in its own file, to fold inline (its bound
   becomes a `where` on the methods that need it, or stays on the type).

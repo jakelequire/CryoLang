@@ -401,7 +401,7 @@ entry_point = "src/tool/main.cryo"
 | `core`        | Language foundations: `Option`, `Result`, `Slice`, `NonNull`, `Range`, `Ordering`. Traits: `Copy`, `Drop`, `Clone`, `Default`, `Eq`, `Ord`, `Hash`, `Iterator<Item>`, `From`/`Into`/`TryFrom`, `Step`. Memory utilities. FNV-1a hasher.                                                     |
 | `alloc`       | `Layout`, `Allocator` trait, `GlobalAllocator`, `Box<T>`, `Arena` (bump), `Pool` (slab), `Rc<T>`, `Arc<T>`.                                                                                                                                                                                     |
 | `collections` | `Array<T, A>`, `Str` (borrowed UTF-8), `String<A>` (owned UTF-8), `HashMap<K, V, A, H>`, `HashSet<T, A, H>` (keyed `SipHasher` by default). Allocator-generic with `GlobalAllocator` default.                                                                                                                                        |
-| `io`          | `Read` and `Write` traits with rich defaults; `Stdin` / `Stdout` / `Stderr`; `BufWriter` / `LineWriter` / `BufReader`; POSIX `IoError` mapping.                                                                                                                                             |
+| `io`          | `Read` and `Write` traits with rich defaults; `Stdin` / `Stdout` / `Stderr`; `BufferedWriter` / `LineWriter` / `BufferedReader`; POSIX `IoError` mapping.                                                                                                                                             |
 | `fmt`         | `Display`, `Debug`, `Formatter`, `FormatWrite`. Heap-free integer and float writers. `print` / `println` / `eprint` / `eprintln`.                                                                                                                                                           |
 | `json`        | RFC 8259 parser + serializer. `JsonValue`, `JsonNumber`, ordered `JsonObject`.                                                                                                                                                                                                              |
 | `encoding`    | Byte<->text codecs: `base64` (RFC 4648) `encode`/`decode`, and `sha1` (RFC 3174) 20-byte digest.                                                                                                                                                                                            |
@@ -443,7 +443,7 @@ A failure prints with the path it happened at: `not found: config.toml`.
 A path can be written as a string where one is expected. For anything
 beyond one whole-file call, `File::open` / `File::create` / `OpenOptions`
 give a handle that implements `Read`, `Write` and `Seek`; read it a line
-at a time with `for (line in BufReader::new(&file).lines()) { ... }`.
+at a time with `for (line in BufferedReader::new(&file).lines()) { ... }`.
 `TempDirectory::create()` and `TempFile::create()` give scratch space that
 is removed when the value is dropped. [`examples/15-files`](./examples/15-files/)
 runs all of it.
