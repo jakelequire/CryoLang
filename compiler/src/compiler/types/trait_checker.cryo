@@ -2,9 +2,10 @@
 ///!
 ///! Standalone trait-satisfaction query engine. Answers read-only questions of
 ///! the form "does this concrete type implement this trait?" and the diagnostics
-///! that hang off them. It depends on nothing but the four shared read-only
-///! components - the TypeArena, the GenericRegistry, the InternTable, and the
-///! DiagnosticSink - and holds no mutable analysis state (no worklist, no
+///! that hang off them. It depends on nothing but the shared components - the
+///! TypeArena, the GenericRegistry, the InternTable, the DiagnosticSink, and
+///! the TypeResolver, which reduces the projections an implementation's head
+///! writes - and holds no mutable analysis state (no worklist, no
 ///! instantiation cache, no inference scratch buffers).
 ///!
 ///! This is deliberately severable from the Monomorphizer: semantic analysis
@@ -44,6 +45,7 @@ import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
+import compiler::types::resolver::{ TypeResolver };
 
 
 /// Read-only trait-satisfaction query engine. See file header.
@@ -52,14 +54,19 @@ type struct TraitChecker {
     generic_registry:  GenericRegistry*;
     intern_table:      mut InternTable*;
     diagnostics:       mut DiagnosticSink*;
+    /// Reduces a projection an implementation's head writes, once the head
+    /// is bound, to the type it names.
+    type_resolver:     TypeResolver*;
 
     static new(arena: mut TypeArena*, generic_registry: GenericRegistry*,
-               intern_table: mut InternTable*, diagnostics: mut DiagnosticSink*) -> TraitChecker {
+               intern_table: mut InternTable*, diagnostics: mut DiagnosticSink*,
+               type_resolver: TypeResolver*) -> TraitChecker {
         return TraitChecker {
             arena:            arena,
             generic_registry: generic_registry,
             intern_table:     intern_table,
             diagnostics:      diagnostics,
+            type_resolver:    type_resolver,
         };
     }
 
@@ -413,7 +420,12 @@ type struct TraitChecker {
         this.add_head_param_bindings(block, &value_args, &head);
         for (mut i: i64 = 0; i < args.length() && i < block.trait_arg_types.length(); i++) {
             if (!args[i].is_valid() || this.arena.contains_generic_param(args[i])) { continue; }
-            const written: TypeRef = head.apply(block.trait_arg_types[i], this.arena);
+            // A head writing the argument as a projection of its own
+            // parameter (`Peekable<I::Item>`) leaves `Range<i64>::Item`
+            // once the head is bound; only its reduction compares with
+            // an argument.
+            const written: TypeRef = this.type_resolver.reduce_projections(
+                head.apply(block.trait_arg_types[i], this.arena), false);
             if (!written.is_valid() || this.arena.contains_generic_param(written)) { continue; }
             if (!this.generic_registry.type_unifies(written, args[i], this.intern_table)) { return false; }
         }
