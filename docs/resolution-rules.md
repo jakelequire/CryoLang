@@ -149,6 +149,10 @@ yet is recorded with the change that builds it, not here.
      still written `public`.  Supersedes the part of 597 that made
      `net::sys` a public low-level API.  (Jake)
 
+706. **`thread::sleep` takes a `Duration`**, as `time::clock::sleep`
+     does, and there is no `sleep_ms`: a length of time is written as a
+     `Duration` wherever the library takes one.  (Jake)
+
 ### 2026-11-12
 
 703. **A hash map's bucket layer is internal.**  `Entry`, the node of a
@@ -977,7 +981,7 @@ yet is recorded with the change that builds it, not here.
      latest reading instead of `None`, and `Instant.as_nanos()` saturates
      at `i64::MAX`, so a timer's deadline for an over-long sleep lies in
      the far future instead of wrapping into the past.
-     `thread::sleep(nanos)` is `time::clock::sleep` and has no copy of
+     `thread::sleep(duration)` is `time::clock::sleep` and has no copy of
      its own, which also leaves `clock`'s POSIX sleep the only
      `Duration`-to-`timespec` conversion, so it needs none named.
      `SystemTime::from_filetime` (internal) is the one `FILETIME`
