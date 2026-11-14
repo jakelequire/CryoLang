@@ -45,6 +45,7 @@ import compiler::ast::expression::{ CallExpr, ExpressionNode };
 import compiler::decl_index::{ DeclarationIndex };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::resolver::res::{ DefId };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{
@@ -67,7 +68,16 @@ type struct OwnershipQuery {
     /// Top-level Copy predicate. See module doc for the full rule.
     static is_copy(arena: mut TypeArena*, registry: GenericRegistry*,
                    intern: mut InternTable*, ty: TypeRef) -> boolean {
-        return OwnershipQuery::is_copy_at_depth(arena, registry, intern, ty, 0);
+        const none: [SymbolID] = [];
+        return OwnershipQuery::is_copy_at_depth(arena, registry, intern, ty, &none, 0);
+    }
+
+    /// `is_copy` in a generic body whose bounds make the type parameters
+    /// `copy_params` declare `Copy`: such a parameter is Copy, and so is a
+    /// type built of Copy parts that names it (`(T, T)` under `T: Copy`).
+    static is_copy_given(arena: mut TypeArena*, registry: GenericRegistry*,
+                         intern: mut InternTable*, ty: TypeRef, copy_params: &[SymbolID]) -> boolean {
+        return OwnershipQuery::is_copy_at_depth(arena, registry, intern, ty, copy_params, 0);
     }
 
     /// Worker for `is_copy` carrying recursion depth.  A struct that
@@ -79,7 +89,7 @@ type struct OwnershipQuery {
     /// never UAF).
     static is_copy_at_depth(arena: mut TypeArena*, registry: GenericRegistry*,
                              intern: mut InternTable*, ty: TypeRef,
-                             depth: i32) -> boolean {
+                             copy_params: &[SymbolID], depth: i32) -> boolean {
         if (depth >= 32) { return false; }
         if (arena == null) { return false; }
         const t: Type* = arena.lookup(ty);
@@ -107,17 +117,17 @@ type struct OwnershipQuery {
         if (k == TypeKind::Array) {
             const at: ArrayType* = t.as_array();
             return OwnershipQuery::is_copy_at_depth(arena, registry, intern,
-                                                     at.element, depth + 1);
+                                                     at.element, copy_params, depth + 1);
         }
         if (k == TypeKind::Optional) {
             const ot: OptionalType* = t.as_optional();
             return OwnershipQuery::is_copy_at_depth(arena, registry, intern,
-                                                     ot.wrapped, depth + 1);
+                                                     ot.wrapped, copy_params, depth + 1);
         }
         if (k == TypeKind::Tuple) {
             const tt: TupleType* = t.as_tuple();
             return OwnershipQuery::all_copy(arena, registry, intern,
-                                             tt.elements, depth + 1);
+                                             tt.elements, copy_params, depth + 1);
         }
 
         // User-defined aggregates: Copy if (a) no `Drop` implementation
@@ -136,7 +146,7 @@ type struct OwnershipQuery {
                 return true;
             }
             return OwnershipQuery::all_fields_copy(arena, registry, intern,
-                                                    st.fields, depth + 1);
+                                                    st.fields, copy_params, depth + 1);
         }
         if (k == TypeKind::Enum) {
             const et: EnumType* = t.as_enum();
@@ -144,7 +154,7 @@ type struct OwnershipQuery {
                 return false;
             }
             return OwnershipQuery::all_variants_copy(arena, registry, intern,
-                                                      et.variants, depth + 1);
+                                                      et.variants, copy_params, depth + 1);
         }
 
         // Aliases delegate to the target type.
@@ -152,7 +162,7 @@ type struct OwnershipQuery {
             const al: TypeAliasType* = t.as_alias();
             if (!al.target.is_valid()) { return false; }
             return OwnershipQuery::is_copy_at_depth(arena, registry, intern,
-                                                     al.target, depth + 1);
+                                                     al.target, copy_params, depth + 1);
         }
 
         // InstantiatedType wrappers route Drop lookup through the trait-impl
@@ -165,30 +175,37 @@ type struct OwnershipQuery {
             }
             if (inst.has_resolved_type()) {
                 return OwnershipQuery::is_copy_at_depth(arena, registry, intern,
-                                                         inst.resolved_type, depth + 1);
+                                                         inst.resolved_type, copy_params, depth + 1);
             }
             if (OwnershipQuery::instance_of_union(registry, inst)) { return true; }
             match (OwnershipQuery::instance_components(arena, registry, inst)) {
                 Option::Some(components) => {
-                    return OwnershipQuery::all_copy(arena, registry, intern, &components, depth + 1);
+                    return OwnershipQuery::all_copy(arena, registry, intern, &components, copy_params, depth + 1);
                 }
                 Option::None => { return false; }
             }
         }
 
-        // Generic params, traits, function templates, error placeholders
-        // aren't valid value-positions for the Copy query; non-Copy is
-        // the safe answer.
+        // A type parameter is Copy where a bound in scope makes it so.
+        if (k == TypeKind::GenericParam) {
+            for (mut i: i64 = 0; i < copy_params.length(); i++) {
+                if (t.as_generic_param().declared_by(copy_params[i])) { return true; }
+            }
+            return false;
+        }
+
+        // Traits, function templates, error placeholders aren't valid
+        // value-positions for the Copy query; non-Copy is the safe answer.
         return false;
     }
 
     /// True when every TypeRef in `tys` is Copy. Empty list trivially yes.
     static all_copy(arena: mut TypeArena*, registry: GenericRegistry*,
                     intern: mut InternTable*, tys: &[TypeRef],
-                    depth: i32) -> boolean {
+                    copy_params: &[SymbolID], depth: i32) -> boolean {
         for (mut i: i64 = 0; i < tys.length(); i++) {
             if (!OwnershipQuery::is_copy_at_depth(arena, registry, intern,
-                                                   tys[i], depth)) {
+                                                   tys[i], copy_params, depth)) {
                 return false;
             }
         }
@@ -198,10 +215,10 @@ type struct OwnershipQuery {
     /// True when every FieldInfo in `fields` has a Copy field type.
     static all_fields_copy(arena: mut TypeArena*, registry: GenericRegistry*,
                             intern: mut InternTable*, fields: &[FieldInfo],
-                            depth: i32) -> boolean {
+                            copy_params: &[SymbolID], depth: i32) -> boolean {
         for (mut i: i64 = 0; i < fields.length(); i++) {
             if (!OwnershipQuery::is_copy_at_depth(arena, registry, intern,
-                                                   fields[i].field_type, depth)) {
+                                                   fields[i].field_type, copy_params, depth)) {
                 return false;
             }
         }
@@ -212,10 +229,10 @@ type struct OwnershipQuery {
     /// enums (no payloads) trivially qualify.
     static all_variants_copy(arena: mut TypeArena*, registry: GenericRegistry*,
                               intern: mut InternTable*, variants: &[EnumVariantInfo],
-                              depth: i32) -> boolean {
+                              copy_params: &[SymbolID], depth: i32) -> boolean {
         for (mut i: i64 = 0; i < variants.length(); i++) {
             if (!OwnershipQuery::all_copy(arena, registry, intern,
-                                            variants[i].payload_types, depth)) {
+                                            variants[i].payload_types, copy_params, depth)) {
                 return false;
             }
         }

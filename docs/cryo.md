@@ -2505,7 +2505,7 @@ function first<I>(it: mut &I) -> Option<I::Item> where I: DoubleEnded {   // Ite
 type struct Loose<I> { f: () -> I::Item; }   // error[E0203]: associated type `Item` not found for `I`
 ```
 
-A projection may be the subject of a bound itself: `where C: Source, C::Item: Put` gives a value of type `C::Item` the methods of `Put` in the body, and each copy of the body calls the implementation of `Put` for its own `Item`, which may be an implementation for every reference (`implement<T> trait Put for mut &T where T: Put`) when `Item` is one.
+A projection may be the subject of a bound itself: `where C: Source, C::Item: Put` gives a value of type `C::Item` the methods of `Put` in the body, and each copy of the body calls the implementation of `Put` for its own `Item`, which may be an implementation for every reference (`implement<T> trait Put for mut &T where T: Put`) when `Item` is one. Such a bound is checked where a call binds the parameters, as a bound on a parameter is: `store(&plain)` with `plain`'s `Item` an `i64` is refused there (E0306, "the trait bound `i64: Put` is not satisfied").
 
 **A trait with parameters.** A type may implement a trait that has generic
 parameters more than once, at different arguments, and each implementation
@@ -3822,7 +3822,7 @@ A type is `Copy` if it can be duplicated by a bitwise copy of its bytes. The com
 
 - All primitive types (integers, floats, `boolean`, `char`, `string` (the raw `u8*` view), pointers, references, function pointers).
 - Struct, enum, and tuple aggregates **iff** every field is `Copy` **and** the type does not implement `Drop`.
-- Generic parameters are conservatively non-`Copy` unless bound by `T: Copy`.
+- Generic parameters are conservatively non-`Copy` unless a bound in scope makes them `Copy`: `T: Copy`, or a bound naming a trait `Copy` is a supertrait of, written in the function's own `where` clause, in its owner's (`type struct Holder<T> where T: Copy`), or in its implementation's. A method's own `where T: Copy` on its owner's parameter makes `T` `Copy` in that method only. A type built of `Copy` parts that names such a parameter (`(T, T)`) is `Copy` there too.
 
 `Copy` is a marker trait declared in `stdlib/core/marker.cryo`; you do not implement it explicitly. Implementing `Drop` automatically makes a type non-`Copy`.
 

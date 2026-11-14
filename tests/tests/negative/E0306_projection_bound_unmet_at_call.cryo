@@ -1,0 +1,74 @@
+///! A `where` bound on an associated type of a function's parameters
+///! (`C::Item: Put`) is checked where the call binds them: `C = Plain`,
+///! whose `Item` is `i64`, does not meet `i64: Put`, and the call is refused
+///! there, as an unmet bound on a parameter is.  A bound written with
+///! arguments is met only at them.  `ByCell`, whose `Item` meets the bound,
+///! is called as before.
+
+![config(testing)]
+![config(negative, E0306)]
+namespace CryoTests::Negative::E0306ProjectionBoundUnmetAtCall;
+
+type trait Put {
+    put(mut &this, value: i64) -> void;
+}
+
+type trait Scale<T> {
+    scale(&this, by: T) -> i64;
+}
+
+type trait Source {
+    type Item;
+    take(mut &this) -> This::Item;
+}
+
+type struct Cell {
+    value: i64;
+}
+
+implement trait Put for struct Cell {
+    put(mut &this, value: i64) -> void { this.value = value; }
+}
+
+implement trait Scale<i64> for struct Cell {
+    scale(&this, by: i64) -> i64 { return this.value * by; }
+}
+
+type struct Plain {
+    value: i64;
+}
+
+implement trait Source for struct Plain {
+    type Item = i64;
+    take(mut &this) -> i64 { return this.value; }
+}
+
+type struct ByCell {
+    value: i64;
+}
+
+implement trait Source for struct ByCell {
+    type Item = Cell;
+    take(mut &this) -> Cell { return Cell { value: this.value }; }
+}
+
+function store<C>(source: mut &C, value: i64) -> void where C: Source, C::Item: Put {
+    mut item = source.take();
+    item.put(value);
+}
+
+function scaled<C>(source: mut &C) -> i64 where C: Source, C::Item: Scale<boolean> {
+    const item = source.take();
+    return item.scale(true);
+}
+
+function main() -> i32 {
+    mut plain = Plain { value: 1 };
+    store(&plain, 5);
+    //~^ ERROR[E0306] the trait bound `i64: Put` is not satisfied
+    mut by_cell = ByCell { value: 2 };
+    store(&by_cell, 5);
+    scaled(&by_cell);
+    //~^ ERROR[E0306] Cell: Scale<boolean>` is not satisfied
+    return 0;
+}
