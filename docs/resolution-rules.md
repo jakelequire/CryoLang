@@ -393,9 +393,9 @@ yet is recorded with the change that builds it, not here.
 
 686. **A bare struct literal takes the type's defaults inside the type's
      own body too.**  In the methods of a generic type whose parameters
-     all have defaults, `String { .. }` is a `String<GlobalAlloc>`, as a
+     all have defaults, `String { .. }` is a `String<GlobalAllocator>`, as a
      bare `String` in a return type is, and its fields are judged as
-     `String<GlobalAlloc>`'s; one spelling has one meaning wherever it is
+     `String<GlobalAllocator>`'s; one spelling has one meaning wherever it is
      written.  A literal of the owner itself is written with its
      arguments, `String::<A> { .. }`.  (Jake)
 
@@ -593,7 +593,7 @@ yet is recorded with the change that builds it, not here.
 599. **The rest of `net` is marked item by item.**  `Headers` keeps its
      map private and hands out its entries through a public `entries()`
      iterator, which HTTP/2 walks.  An allocation failure converts to an
-     I/O error, `OutOfMemory`, through a public `From<AllocError>` for
+     I/O error, `OutOfMemory`, through a public `From<AllocationError>` for
      `IoError`.  In HTTP/2 the protocol's constants (frame types, flags,
      the frame header length, settings identifiers, the preface's length
      and bytes, the default connection window) are public and the limits
@@ -1427,7 +1427,7 @@ yet is recorded with the change that builds it, not here.
      arguments, and any trait on an object, is still asked of the type
      alone.  Head arguments are compared as the types they denote: one a
      head leaves to its parameter's default is that default (`Array<u8>`
-     unifies with `[u8]`, `Array<u8, GlobalAlloc>`), and a name the
+     unifies with `[u8]`, `Array<u8, GlobalAllocator>`), and a name the
      compiler wrote with its type already attached is compared as that
      type.  An implementation's where-clause is checked the same way
      (660).  (the regression fix delegated)
@@ -1527,7 +1527,7 @@ yet is recorded with the change that builds it, not here.
      arena's routing calls are internal.**  `arena::DEFAULT_CHUNK_SIZE`
      and `pool::DEFAULT_SLOTS_PER_BLOCK` are the sizes `Arena::new` and
      `Pool::new` choose, and a program may name them.  `GlobalArena`'s
-     `routing`, `take`, `holds` and `grow` are how `GlobalAlloc` serves
+     `routing`, `take`, `holds` and `grow` are how `GlobalAllocator` serves
      and releases a block from the published arena, and reach the
      standard library alone; `publish` and `set_active` stay public.
      The C bindings of `libc`, `syscall` and `openssl` are each a
@@ -1611,9 +1611,9 @@ yet is recorded with the change that builds it, not here.
      allocator `NativeHeap`;** this replaces 587 for both.  The reactor
      and everything in it reach the standard library alone, as before
      587.  `alloc::heap` is a public module whose public item is
-     `NativeHeap`, a type implementing `Allocator` like `GlobalAlloc`, so
+     `NativeHeap`, a type implementing `Allocator` like `GlobalAllocator`, so
      `Array<T, NativeHeap>` keeps its storage on the mmap-backed heap
-     whatever `GlobalAlloc` is backed by; the raw `alloc`, `free` and
+     whatever `GlobalAllocator` is backed by; the raw `alloc`, `free` and
      `realloc` stay internal and the segment and lock machinery private.
      (Jake; the name `NativeHeap`, delegated)
 
@@ -1629,15 +1629,15 @@ yet is recorded with the change that builds it, not here.
      generic type over its own parameters, an `implement` block's target
      as its head writes it.  The owner's bare name denoted the defaults'
      instantiation when every parameter of the owner has a default, so
-     each method of `String<A = GlobalAlloc>` and of `implement<A> trait
-     Eq for String<A>` was a method of `String<GlobalAlloc>` alone, and
+     each method of `String<A = GlobalAllocator>` and of `implement<A> trait
+     Eq for String<A>` was a method of `String<GlobalAllocator>` alone, and
      `String<NativeHeap>` had none.  (Jake asked for the fix; the rule
      follows from 98's `This` naming the enclosing type)
 
 592. **A `Box` is made only by its constructors, and gives its pointer up
      only through `into_raw`.**  Its pointer and allocator are private
      fields; `Box::from_raw_in(ptr, alloc)` re-wraps a pointer from a box
-     on any allocator, as `from_raw` does for `GlobalAlloc`'s, and `leak`,
+     on any allocator, as `from_raw` does for `GlobalAllocator`'s, and `leak`,
      which did what `into_raw` does, is gone.  `next_capacity`, the growth
      curve `Array` and `RawBuffer` share, is internal; the allocator's
      platform calls are private to it; `Rc`, `Arc`, `Weak`, `Arena` and
@@ -2569,7 +2569,7 @@ yet is recorded with the change that builds it, not here.
 
 380. **The demangler prints the full `Array<...>` type a `[T]` symbol
      names** - `std::collections::array::Array<i64,
-     std::alloc::allocator::GlobalAlloc>` - rather than sugaring it back to
+     std::alloc::allocator::GlobalAllocator>` - rather than sugaring it back to
      `[i64]`.  (Dispatch, delegated)
 
 381. **A call-site argument error spells a dynamic array `[T]`;** only
@@ -4123,7 +4123,7 @@ check is being deleted and the seals are what hold.  (Jake)
 
 71. **The internal check after monomorphization uses plain wording** that
     names the method, the specialization and the template call site:
-    "internal: call to `push` in `String<GlobalAlloc>::from_str` reached
+    "internal: call to `push` in `String<GlobalAllocator>::from_str` reached
     codegen with no resolved method (written at string.cryo:120)".
 
 72. **The temporary identity-first, by-name fallback for the calls whose
@@ -4640,7 +4640,7 @@ check is being deleted and the seals are what hold.  (Jake)
     wins" rule; the call names the trait it means.
 
     ```cryo
-    implement trait Debug for struct String<GlobalAlloc> {
+    implement trait Debug for struct String<GlobalAllocator> {
         fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FormatError> where W: FormatWrite {
             const view: Str = this.as_str();
             return view.fmt(f);                    // error[E0156]: Display::fmt and Debug::fmt
@@ -4748,7 +4748,7 @@ dropped or deferred says so; a deferred one is listed in
 - **D16.** An `implement` head writes every parameter of the template it
   names, as its own parameters or as a concrete instantiation; one left
   out is E0302.  `implement<A> trait Display for String<A>`, or `for
-  String<GlobalAlloc>`.  The concrete spelling is honoured by selection:
+  String<GlobalAllocator>`.  The concrete spelling is honoured by selection:
   `for Wrap<T, Alpha>` is not selected for `Wrap<i32, Beta>`.
 - **D17.** An `extern "C"` function is public unless written `private`.
 - **D18.** The primitive type names stop being keywords, and the alias
@@ -4763,7 +4763,7 @@ dropped or deferred says so; a deferred one is listed in
 - **D21.** An unknown type in expression or type-argument position
   (`sizeof(Nope)`, `1 as Nope`, `String<Nope>`) is an error.  A defaulted
   type parameter resolves in the module where the type is declared, so
-  `String` fills in `GlobalAlloc` without the user importing it; a user who
+  `String` fills in `GlobalAllocator` without the user importing it; a user who
   writes the argument needs it in scope.
 - **D22.** A trait head's trailing type list declares nothing: a name there
   declared nowhere is E0302, and the head is written `implement<T> trait

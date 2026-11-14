@@ -62,7 +62,7 @@ import std::core::option::{ Option };
 import std::core::iter::{ Iterator };
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 import std::collections::pair::{ Pair };
 import std::collections::str::{ Str };
 import std::core::error::{ Error };
@@ -77,15 +77,15 @@ import std::time::duration::{ Duration };
 
 /// A queued value plus a raw link to the next node. Allocated per `send`,
 /// freed when the value is dequeued (or when the channel is torn down).
-private type struct ChanNode<T> {
-    private next:  mut ChanNode<T>*;
+private type struct ChannelNode<T> {
+    private next:  mut ChannelNode<T>*;
     private value: T;
 }
 
 /// The queue and the handle counts, reached only through the channel's lock.
 private type struct ChannelState<T> {
-    private head:     mut ChanNode<T>*;   // dequeue end (null when empty)
-    private tail:     mut ChanNode<T>*;   // enqueue end
+    private head:     mut ChannelNode<T>*;   // dequeue end (null when empty)
+    private tail:     mut ChannelNode<T>*;   // enqueue end
     private length:   i64;            // values queued
     private capacity: i64;            // most values queued at once; `i64::MAX` when unbounded
     private senders:  i64;            // live Sender handles
@@ -94,8 +94,8 @@ private type struct ChannelState<T> {
 
     /// Unlink and return the oldest queued node, or null when the queue is
     /// empty.
-    private pop(mut &this) -> mut ChanNode<T>* {
-        const node: mut ChanNode<T>* = this.head;
+    private pop(mut &this) -> mut ChannelNode<T>* {
+        const node: mut ChannelNode<T>* = this.head;
         if (node == null) { return null; }
         this.head = (*node).next;
         if (this.head == null) { this.tail = null; }
@@ -104,7 +104,7 @@ private type struct ChannelState<T> {
     }
 
     /// Move `value` into the fresh `node` and queue it at the enqueue end.
-    private push(mut &this, node: mut ChanNode<T>*, value: T) -> void {
+    private push(mut &this, node: mut ChannelNode<T>*, value: T) -> void {
         (*node).next = null;
         // Move `value` into the node through a raw pointer so no drop is
         // synthesized on the uninitialized destination.
@@ -123,10 +123,10 @@ private type struct ChannelState<T> {
 
 /// Allocate an uninitialized queue node, or return null when no memory
 /// could be had.
-private function allocate_node<T>() -> mut ChanNode<T>* {
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
-    match (alloc.allocate(Layout::of::<ChanNode<T>>())) {
-        Result::Ok(raw) => { return raw.cast::<ChanNode<T>>().as_pointer(); }
+private function allocate_node<T>() -> mut ChannelNode<T>* {
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
+    match (alloc.allocate(Layout::of::<ChannelNode<T>>())) {
+        Result::Ok(raw) => { return raw.cast::<ChannelNode<T>>().as_pointer(); }
         Result::Err(_)  => { return null; }
     }
 }
@@ -142,7 +142,7 @@ private type struct ChannelInner<T> {
 /// Allocate + initialize a fresh `ChannelInner<T>` holding at most
 /// `capacity` values, with its two handles: one `Sender` and the `Receiver`.
 private function new_inner<T>(capacity: i64) -> mut ChannelInner<T>* {
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     mut inner: mut ChannelInner<T>* = null;
     match (alloc.allocate(Layout::of::<ChannelInner<T>>())) {
         Result::Ok(raw) => { inner = raw.cast::<ChannelInner<T>>().as_pointer(); }
@@ -162,7 +162,7 @@ private function new_inner<T>(capacity: i64) -> mut ChannelInner<T>* {
 /// drains it on its way out).
 private function free_inner<T>(inner: mut ChannelInner<T>*) -> void {
     ptr::drop_in_place::<ChannelInner<T>>(inner);
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(inner as mut u8*), Layout::of::<ChannelInner<T>>());
 }
 
@@ -284,7 +284,7 @@ public type struct Sender<T> {
     /// dropped (the value is handed back unconsumed).
     public send(&this, value: T) -> Result<(), SendError<T>> {
         const inner: ChannelInner<T>* = this.inner;
-        mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        mut held: MutexGuard<ChannelState<T>, GlobalAllocator> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_mutable_pointer();
         while (state.rx_open && state.length >= state.capacity) {
             inner.room.wait(&inner.state, &held);
@@ -292,7 +292,7 @@ public type struct Sender<T> {
         if (!state.rx_open) {
             return Result::Err(SendError::<T> { value: value });
         }
-        const node: mut ChanNode<T>* = allocate_node::<T>();
+        const node: mut ChannelNode<T>* = allocate_node::<T>();
         if (node == null) {
             return Result::Err(SendError::<T> { value: value });
         }
@@ -309,7 +309,7 @@ public type struct Sender<T> {
     /// been dropped; either hands the value back unconsumed.
     public try_send(&this, value: T) -> Result<(), TrySendError<T>> {
         const inner: ChannelInner<T>* = this.inner;
-        mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        mut held: MutexGuard<ChannelState<T>, GlobalAllocator> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_mutable_pointer();
         if (!state.rx_open) {
             return Result::Err(TrySendError::Disconnected(value));
@@ -317,7 +317,7 @@ public type struct Sender<T> {
         if (state.length >= state.capacity) {
             return Result::Err(TrySendError::Full(value));
         }
-        const node: mut ChanNode<T>* = allocate_node::<T>();
+        const node: mut ChannelNode<T>* = allocate_node::<T>();
         if (node == null) {
             return Result::Err(TrySendError::Full(value));
         }
@@ -330,7 +330,7 @@ public type struct Sender<T> {
     /// Create another sender on the same channel (multi-producer).
     public clone(&this) -> Sender<T> {
         const inner: mut ChannelInner<T>* = this.inner;
-        mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        mut held: MutexGuard<ChannelState<T>, GlobalAllocator> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_mutable_pointer();
         state.senders = state.senders + 1;
         state.refs    = state.refs + 1;
@@ -351,7 +351,7 @@ public type struct Sender<T> {
 /// last sender (so a blocked `receive` observes disconnection); free the
 /// inner if this was the last handle of any kind.
 private function release_sender<T>(inner: mut ChannelInner<T>*) -> void {
-    mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+    mut held: MutexGuard<ChannelState<T>, GlobalAllocator> = inner.state.lock();
     const state: mut ChannelState<T>* = held.as_mutable_pointer();
     state.senders = state.senders - 1;
     if (state.senders == 0) {
@@ -381,12 +381,12 @@ public type struct Receiver<T> {
     /// drained.
     public receive(&this) -> Result<T, ReceiveError> {
         const inner: ChannelInner<T>* = this.inner;
-        mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        mut held: MutexGuard<ChannelState<T>, GlobalAllocator> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_mutable_pointer();
         while (state.head == null && state.senders > 0) {
             inner.ready.wait(&inner.state, &held);
         }
-        const node: mut ChanNode<T>* = state.pop();
+        const node: mut ChannelNode<T>* = state.pop();
         // A value taken is room made: wake a sender waiting on a full queue.
         if (node != null) { inner.room.notify_one(); }
         mem::drop(held);
@@ -399,8 +399,8 @@ public type struct Receiver<T> {
         const slot: T* = &(*node).value;
         mut value: T;
         unsafe { value = *slot; }
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChanNode<T>>());
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
+        alloc.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChannelNode<T>>());
         return Result::Ok(value);
     }
 
@@ -410,7 +410,7 @@ public type struct Receiver<T> {
     public receive_timeout(&this, duration: Duration) -> Result<T, ReceiveTimeoutError> {
         const deadline: Instant = Instant::now().saturating_add(&duration);
         const inner: ChannelInner<T>* = this.inner;
-        mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        mut held: MutexGuard<ChannelState<T>, GlobalAllocator> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_mutable_pointer();
         while (state.head == null && state.senders > 0) {
             const remaining: Duration = deadline.saturating_duration_since(&Instant::now());
@@ -419,7 +419,7 @@ public type struct Receiver<T> {
             }
             inner.ready.wait_timeout(&inner.state, &held, remaining);
         }
-        const node: mut ChanNode<T>* = state.pop();
+        const node: mut ChannelNode<T>* = state.pop();
         if (node != null) { inner.room.notify_one(); }
         mem::drop(held);
         if (node == null) {
@@ -429,8 +429,8 @@ public type struct Receiver<T> {
         const slot: T* = &(*node).value;
         mut value: T;
         unsafe { value = *slot; }
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChanNode<T>>());
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
+        alloc.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChannelNode<T>>());
         return Result::Ok(value);
     }
 
@@ -439,9 +439,9 @@ public type struct Receiver<T> {
     /// all senders have dropped.
     public try_receive(&this) -> Result<T, TryReceiveError> {
         const inner: ChannelInner<T>* = this.inner;
-        mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        mut held: MutexGuard<ChannelState<T>, GlobalAllocator> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_mutable_pointer();
-        const node: mut ChanNode<T>* = state.pop();
+        const node: mut ChannelNode<T>* = state.pop();
         if (node == null) {
             if (state.senders == 0) { return Result::Err(TryReceiveError::Disconnected); }
             return Result::Err(TryReceiveError::Empty);
@@ -453,8 +453,8 @@ public type struct Receiver<T> {
         const slot: T* = &(*node).value;
         mut value: T;
         unsafe { value = *slot; }
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChanNode<T>>());
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
+        alloc.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChannelNode<T>>());
         return Result::Ok(value);
     }
 }
@@ -463,17 +463,17 @@ implement<T> trait Drop for struct Receiver<T> {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner: mut ChannelInner<T>* = this.inner;
-        mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
+        mut held: MutexGuard<ChannelState<T>, GlobalAllocator> = inner.state.lock();
         const state: mut ChannelState<T>* = held.as_mutable_pointer();
         state.rx_open = false;
         // Drain and drop any values still queued: with the receiver gone
         // they would otherwise leak.
-        mut node: mut ChanNode<T>* = state.pop();
+        mut node: mut ChannelNode<T>* = state.pop();
         while (node != null) {
             const slot: T* = &(*node).value;
             ptr::drop_in_place::<T>(slot);
-            mut a: GlobalAlloc = GlobalAlloc::new();
-            a.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChanNode<T>>());
+            mut a: GlobalAllocator = GlobalAllocator::new();
+            a.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChannelNode<T>>());
             node = state.pop();
         }
         // A sender waiting for room would wait for ever: wake every one, to

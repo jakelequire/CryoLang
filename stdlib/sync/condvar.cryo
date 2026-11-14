@@ -8,10 +8,10 @@
 ///! ```cryo
 ///! import std::sync::mutex::{ Mutex, MutexGuard };
 ///! import std::sync::condvar::{ CondVar };
-///! import std::alloc::allocator::{ GlobalAlloc };
+///! import std::alloc::allocator::{ GlobalAllocator };
 ///!
 ///! // shared with the producer: `queued: Mutex<i64>` and `cond: CondVar`
-///! mut guard: MutexGuard<i64, GlobalAlloc> = queued.lock();
+///! mut guard: MutexGuard<i64, GlobalAllocator> = queued.lock();
 ///! while (*guard.as_pointer() == 0) {
 ///!     cond.wait(&queued, &guard);
 ///! }
@@ -37,7 +37,7 @@ import std::core::ptr::{ NonNull };
 import std::core::result::{ Result };
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ AllocError, AllocErrorKind, GlobalAlloc };
+import std::alloc::allocator::{ AllocationError, AllocationErrorKind, GlobalAllocator };
 import std::core::option::{ Option };
 import std::ffi::libc::{
     ClockId, ETIMEDOUT, clock_gettime, pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init,
@@ -156,11 +156,11 @@ public type struct CondVar {
     }
 
     /// Construct a condition variable, or `Err` when it cannot be made:
-    /// an `OutOfMemory` `AllocError` both when its storage cannot be
+    /// an `OutOfMemory` `AllocationError` both when its storage cannot be
     /// allocated and when `pthread_cond_init` fails (unix; the Windows
     /// initialisation cannot fail).
-    public static try_new() -> Result<CondVar, AllocError> {
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+    public static try_new() -> Result<CondVar, AllocationError> {
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         const header: Layout = Layout::of::<CondVarInner>();
         const raw: NonNull<u8> = alloc.allocate(header)?;
         const typed: NonNull<CondVarInner> = raw.cast::<CondVarInner>();
@@ -169,7 +169,7 @@ public type struct CondVar {
         const rc: i32 = cond_init_raw(buf_ptr);
         if (rc != 0) {
             alloc.deallocate(raw, header);
-            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, header));
+            return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, header));
         }
         return Result::Ok(CondVar { inner: inner_ptr });
     }
@@ -232,7 +232,7 @@ implement trait Drop for struct CondVar {
         const inner_ptr: mut CondVarInner* = this.inner;
         const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
         cond_destroy_raw(buf_ptr);
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         const header: Layout = Layout::of::<CondVarInner>();
         alloc.deallocate(NonNull::new(this.inner as mut u8*), header);
         this.inner = null;

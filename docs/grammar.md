@@ -319,7 +319,7 @@ GenericParam       ::= Ident (":" BoundEntry ("+" BoundEntry)*)? ("=" Type)?
                           own WhereClause; it is accepted wherever a
                           WhereClause is (not on a trait or a type alias).
                           The optional "=" Type is a default type argument,
-                          e.g. `<A = GlobalAlloc>`. *)
+                          e.g. `<A = GlobalAllocator>`. *)
 GenericArgs        ::= "<" Type ("," Type)* ">"
 TurbofishArgs      ::= "::" "<" TypeArg ("," TypeArg)* ">"
                        (* generic arguments in EXPRESSION position: `<`

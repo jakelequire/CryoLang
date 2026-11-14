@@ -12,7 +12,7 @@ import std::core::mem;
 import std::core::cmp::{ Ord, Ordering };
 import std::collections::array::{ Array };
 import std::collections::string::{ String };
-import std::alloc::allocator::{ AllocError, Allocator, GlobalAlloc };
+import std::alloc::allocator::{ AllocationError, Allocator, GlobalAllocator };
 import std::alloc::layout::{ Layout };
 import std::core::ptr::{ NonNull };
 import std::test::error::{ TestError };
@@ -257,14 +257,14 @@ type struct ArrayCountingAlloc {
 }
 
 implement trait Allocator for struct ArrayCountingAlloc {
-    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocationError> {
         *this.allocated = *this.allocated + 1;
-        mut global: GlobalAlloc = GlobalAlloc::new();
+        mut global: GlobalAllocator = GlobalAllocator::new();
         return global.allocate(layout);
     }
     deallocate(mut &this, ptr: NonNull<u8>, layout: Layout) -> void {
         *this.released = *this.released + 1;
-        mut global: GlobalAlloc = GlobalAlloc::new();
+        mut global: GlobalAllocator = GlobalAllocator::new();
         global.deallocate(ptr, layout);
     }
 }
@@ -552,12 +552,12 @@ function reserve_near_i64_max_fails_cleanly() -> Result<(), TestError> {
     // Regression: reserve_grow's capacity-doubling loop must cap at i64::MAX
     // instead of wrapping to a tiny value (infinite loop / undersized alloc).
     // For a 1-byte element there is no `cap * elem_size` overflow, so the
-    // request reaches the allocator and fails gracefully with an AllocError
+    // request reaches the allocator and fails gracefully with an AllocationError
     // rather than hanging or corrupting memory.
     mut a: Array<u8> = Array::<u8>::new();
     a.push(1 as u8);
     a.push(2 as u8);
-    const r: Result<(), AllocError> = a.reserve(i64::MAX - 615);
+    const r: Result<(), AllocationError> = a.reserve(i64::MAX - 615);
     expect_true(r.is_err(),
         Str::new("reserve(~i64::MAX) must return Err, not loop forever"))?;
     // The failed reservation must leave the array untouched.
@@ -572,8 +572,8 @@ function try_with_capacity_layout_overflow_returns_err() -> Result<(), TestError
     // inside the layout computation; the try_ path must catch that via
     // Layout::try_array and return Err, not abort the process.
     const huge: i64 = i64::MAX;   // * sizeof(u64)=8 overflows
-    const r: Result<Array<u64, GlobalAlloc>, AllocError> =
-        Array::try_with_capacity_in(huge, GlobalAlloc::new());
+    const r: Result<Array<u64, GlobalAllocator>, AllocationError> =
+        Array::try_with_capacity_in(huge, GlobalAllocator::new());
     expect_true(r.is_err(),
         Str::new("try_with_capacity_in with overflowing byte size must Err, not panic"))?;
     return Result::Ok(());
@@ -586,15 +586,15 @@ function reserve_exact_wrapping_additional_fails() -> Result<(), TestError> {
     // small value (< length); without the guard reserve_exact would see
     // `required <= capacity`, return Ok WITHOUT growing, and a later
     // try_append would memcpy `additional` elements past the buffer.
-    // The guard must reject the wrapped request as an AllocError. `reserve`
+    // The guard must reject the wrapped request as an AllocationError. `reserve`
     // shares the same guard.
     mut a: Array<u8> = Array::<u8>::new();
     a.push(1 as u8);
     a.push(2 as u8);                                   // length 2, capacity >= 2
-    const re: Result<(), AllocError> = a.reserve_exact(i64::MAX);
+    const re: Result<(), AllocationError> = a.reserve_exact(i64::MAX);
     expect_true(re.is_err(),
         Str::new("reserve_exact with wrapping additional must return Err"))?;
-    const rg: Result<(), AllocError> = a.reserve(i64::MAX);
+    const rg: Result<(), AllocationError> = a.reserve(i64::MAX);
     expect_true(rg.is_err(),
         Str::new("reserve with wrapping additional must return Err"))?;
     expect_eq(a.length(), 2 as i64)?;                  // array untouched

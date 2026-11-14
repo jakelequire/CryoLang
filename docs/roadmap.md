@@ -457,7 +457,7 @@ Left over from that: the async entry point calls `Executor::new` and
    attributed accessors (`length`, `capacity`, `Str::new`,
    `String::from_string`, `Location`'s four) are public.  HPACK
    is tested through `Http2Connection` against RFC 7541's examples, and
-   the heap through `GlobalAlloc` with `native_alloc` on and as the
+   the heap through `GlobalAllocator` with `native_alloc` on and as the
    allocator of an array, a hash map and a string without it.  An `internal module` line now hides its
    module from other packages whichever files a build loads, so the
    standard library's internal modules are refused at the import as a
@@ -531,7 +531,7 @@ alike first.  What stays open:
   argument mismatch shows the parameter as `[T]` even where the parameter
   was written `Array<T>`: the check holds the types, not the annotations.
 - **The demangler prints `[T]` as the instance it is**,
-  `std::collections::array::Array<i64, std::alloc::allocator::GlobalAlloc>`.
+  `std::collections::array::Array<i64, std::alloc::allocator::GlobalAllocator>`.
 
 ## Build the compiler with LLVM optimisation, then derive `TypeKind`
 

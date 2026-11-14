@@ -1,6 +1,6 @@
 ///! Allocator: the trait every heap strategy implements.
 ///!
-///! `GlobalAlloc` is the default implementation. Its memory operations are
+///! `GlobalAllocator` is the default implementation. Its memory operations are
 ///! delegated to the `backend_*` functions below — libc
 ///! (`aligned_alloc`/`aligned_free`/`realloc`) by default, or the
 ///! mmap-backed `alloc::heap` when the build sets `[low_level]
@@ -20,8 +20,8 @@ import std::core::result::{ Result };
 import std::alloc::layout::{ Layout };
 import std::collections::str::{ Str };
 // One-way edge: `arena` is allocator-free (its `Allocator`/`Drop` impls
-// live in `arena_alloc`), so importing it here forms no cycle.  Brings the
-// per-target global-arena routing hooks into scope; `GlobalAlloc` consults
+// live in `arena_allocator`), so importing it here forms no cycle.  Brings the
+// per-target global-arena routing hooks into scope; `GlobalAllocator` consults
 // them so the compiler's whole `[T]`/`HashMap`/`Box`/`String` heap can be
 // arena-backed and bulk-reclaimed between targets.  Null/inactive in every
 // other program -> the branches below are never taken.
@@ -31,12 +31,12 @@ import std::alloc::arena::{ GlobalArena };
 // `native_alloc` backend arms and `NativeHeap`'s implementation below.
 import std::alloc::heap::{ NativeHeap };
 
-/// Why an `Allocator` call failed: the `kind` field of an `AllocError`.
+/// Why an `Allocator` call failed: the `kind` field of an `AllocationError`.
 /// The stdlib's allocators report `OutOfMemory` and `ZeroSized`, and a
 /// `Pool` reports `InvalidLayout` for a layout its slot cannot hold; none
 /// of them reports `Exhausted`, which is there for an allocator written
 /// outside the stdlib.
-public type enum AllocErrorKind with [Eq, Clone] {
+public type enum AllocationErrorKind with [Eq, Clone] {
     /// The underlying allocator returned null; the system is out of
     /// memory or hit an address-space limit.
     OutOfMemory;
@@ -58,26 +58,26 @@ public type enum AllocErrorKind with [Eq, Clone] {
 /// The error an `Allocator` returns: what went wrong (`kind`) and the
 /// layout that was requested when it did (`layout`; for a `reallocate`,
 /// the new layout).
-public type struct AllocError {
-    public kind: AllocErrorKind;
+public type struct AllocationError {
+    public kind: AllocationErrorKind;
     public layout: Layout;
 
     /// An error of `kind` for a request of `layout`.
-    public static new(kind: AllocErrorKind, layout: Layout) -> AllocError {
-        return AllocError { kind: kind, layout: layout };
+    public static new(kind: AllocationErrorKind, layout: Layout) -> AllocationError {
+        return AllocationError { kind: kind, layout: layout };
     }
 
     /// A short, stable description of what went wrong, as a borrowed `Str`.
     /// The convergent accessor every stdlib error type exposes
-    /// (`describe(&this) -> Str`); `Display`/`Debug` for `AllocError` delegate
+    /// (`describe(&this) -> Str`); `Display`/`Debug` for `AllocationError` delegate
     /// to it. The requested `layout` remains available as a field. Borrows a
-    /// static string literal, so the view outlives any `AllocError`.
+    /// static string literal, so the view outlives any `AllocationError`.
     public describe(&this) -> Str {
         return match (this.kind) {
-            AllocErrorKind::OutOfMemory   => { Str::new("out of memory") }
-            AllocErrorKind::ZeroSized     => { Str::new("zero-sized allocation request") }
-            AllocErrorKind::Exhausted     => { Str::new("allocator exhausted") }
-            AllocErrorKind::InvalidLayout => { Str::new("layout incompatible with allocator") }
+            AllocationErrorKind::OutOfMemory   => { Str::new("out of memory") }
+            AllocationErrorKind::ZeroSized     => { Str::new("zero-sized allocation request") }
+            AllocationErrorKind::Exhausted     => { Str::new("allocator exhausted") }
+            AllocationErrorKind::InvalidLayout => { Str::new("layout incompatible with allocator") }
         };
     }
 }
@@ -85,17 +85,17 @@ public type struct AllocError {
 /// A source of heap memory: hands out blocks described by a `Layout` and
 /// takes them back. Collections, `Box` and `String` take an
 /// `A: Allocator` type parameter, so the storage strategy is the caller's
-/// choice; `GlobalAlloc` is the default.
+/// choice; `GlobalAllocator` is the default.
 ///
 /// ```cryo
-/// import std::alloc::allocator::{ Allocator, GlobalAlloc, AllocError };
+/// import std::alloc::allocator::{ Allocator, GlobalAllocator, AllocationError };
 /// import std::alloc::layout::{ Layout };
 /// import std::core::ptr::{ NonNull };
 /// import std::core::result::{ Result };
 ///
-/// mut heap: GlobalAlloc = GlobalAlloc::new();
+/// mut heap: GlobalAllocator = GlobalAllocator::new();
 /// const layout: Layout = Layout::array::<u64>(4);
-/// const r: Result<NonNull<u8>, AllocError> = heap.allocate(layout);
+/// const r: Result<NonNull<u8>, AllocationError> = heap.allocate(layout);
 /// if (r.is_ok()) {
 ///     heap.deallocate(r.unwrap(), layout);
 /// }
@@ -104,7 +104,7 @@ public type trait Allocator {
     /// Return a pointer to at least `layout.size` bytes aligned to
     /// `layout.alignment`. The returned memory is uninitialized; the
     /// caller writes to it before any read.
-    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocError>;
+    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocationError>;
 
     /// Return memory to the allocator. `ptr` must have come from a
     /// previous `allocate` on **this** allocator with a matching
@@ -117,7 +117,7 @@ public type trait Allocator {
     reallocate(mut &this,
                ptr: NonNull<u8>,
                old_layout: Layout,
-               new_layout: Layout) -> Result<NonNull<u8>, AllocError> {
+               new_layout: Layout) -> Result<NonNull<u8>, AllocationError> {
         const new_ptr: NonNull<u8> = this.allocate(new_layout)?;
         mut copy_size: u64 = old_layout.size();
         if (new_layout.size() < copy_size) {
@@ -158,7 +158,7 @@ internal function next_capacity(current: i64, required: i64, min_capacity: i64) 
 
 // Platform backend
 //
-// `GlobalAlloc`'s trait methods keep the policy (zero-size rejection, arena
+// `GlobalAllocator`'s trait methods keep the policy (zero-size rejection, arena
 // routing) and delegate the actual memory operations to these three
 // config-gated functions.  Default: libc.  Under `[low_level] native_alloc`:
 // the mmap-backed `alloc::heap`.  All three return null for "out of memory".
@@ -220,23 +220,23 @@ private function backend_realloc(ptr: mut void*, old_layout: Layout,
                                      new_layout.alignment());
 }
 
-// GlobalAlloc: the process-wide allocator
+// GlobalAllocator: the process-wide allocator
 
 /// Zero-sized handle to the process-wide allocator. Construct with
-/// `GlobalAlloc::new()`; all instances dispatch through the same
+/// `GlobalAllocator::new()`; all instances dispatch through the same
 /// underlying backend.
-public type struct GlobalAlloc {
+public type struct GlobalAllocator {
     /// A handle to the process-wide allocator. Holds no state, so it costs
     /// nothing to make one per call.
-    public static new() -> GlobalAlloc {
-        return GlobalAlloc { };
+    public static new() -> GlobalAllocator {
+        return GlobalAllocator { };
     }
 }
 
-implement trait Allocator for struct GlobalAlloc {
-    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+implement trait Allocator for struct GlobalAllocator {
+    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocationError> {
         if (layout.size() == 0) {
-            return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, layout));
+            return Result::Err(AllocationError::new(AllocationErrorKind::ZeroSized, layout));
         }
         // Per-target arena routing.  Active only inside the compiler driver's
         // bracket (global null/inactive everywhere else -> branch not taken).
@@ -245,11 +245,11 @@ implement trait Allocator for struct GlobalAlloc {
             if (ap != null) {
                 return Result::Ok(NonNull::new(ap as mut u8*));
             }
-            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, layout));
+            return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, layout));
         }
         const raw: mut void* =backend_alloc(layout);
         if (raw == null) {
-            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, layout));
+            return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, layout));
         }
         return Result::Ok(NonNull::new(raw as mut u8*));
     }
@@ -270,9 +270,9 @@ implement trait Allocator for struct GlobalAlloc {
     reallocate(mut &this,
                ptr: NonNull<u8>,
                old_layout: Layout,
-               new_layout: Layout) -> Result<NonNull<u8>, AllocError> {
+               new_layout: Layout) -> Result<NonNull<u8>, AllocationError> {
         if (new_layout.size() == 0) {
-            return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, new_layout));
+            return Result::Err(AllocationError::new(AllocationErrorKind::ZeroSized, new_layout));
         }
         // Arena-owned blocks grow inside the arena (frontier grow-in-place or
         // alloc-new + copy); never hand them to the backend.  Consulted
@@ -286,12 +286,12 @@ implement trait Allocator for struct GlobalAlloc {
             if (np != null) {
                 return Result::Ok(NonNull::new(np as mut u8*));
             }
-            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
+            return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, new_layout));
         }
         const raw: mut void* = backend_realloc(ptr.as_pointer() as mut void*,
                                            old_layout, new_layout);
         if (raw == null) {
-            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
+            return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, new_layout));
         }
         return Result::Ok(NonNull::new(raw as mut u8*));
     }
@@ -301,13 +301,13 @@ implement trait Allocator for struct GlobalAlloc {
 // implemented here because `heap` may not import this module.
 
 implement trait Allocator for struct NativeHeap {
-    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+    allocate(mut &this, layout: Layout) -> Result<NonNull<u8>, AllocationError> {
         if (layout.size() == 0) {
-            return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, layout));
+            return Result::Err(AllocationError::new(AllocationErrorKind::ZeroSized, layout));
         }
         const raw: mut void* =heap::alloc(layout.size(), layout.alignment());
         if (raw == null) {
-            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, layout));
+            return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, layout));
         }
         return Result::Ok(NonNull::new(raw as mut u8*));
     }
@@ -323,27 +323,27 @@ implement trait Allocator for struct NativeHeap {
     reallocate(mut &this,
                ptr: NonNull<u8>,
                old_layout: Layout,
-               new_layout: Layout) -> Result<NonNull<u8>, AllocError> {
+               new_layout: Layout) -> Result<NonNull<u8>, AllocationError> {
         if (new_layout.size() == 0) {
-            return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, new_layout));
+            return Result::Err(AllocationError::new(AllocationErrorKind::ZeroSized, new_layout));
         }
         const raw: mut void* = heap::realloc(ptr.as_pointer() as mut void*, old_layout.size(),
                                          new_layout.size(), new_layout.alignment());
         if (raw == null) {
-            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
+            return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, new_layout));
         }
         return Result::Ok(NonNull::new(raw as mut u8*));
     }
 }
 
 // `new` / `delete` codegen lowering allocates through THIS pair rather than a
-// parallel routing path: both delegate to the canonical `GlobalAlloc`, so a
+// parallel routing path: both delegate to the canonical `GlobalAllocator`, so a
 // `new T()` shares the exact arena routing as every `[T]`/`Box`/`String`
 // (the active per-target arena while the compiler builds itself, libc
 // otherwise).  They add no allocation logic of their own - they only bridge
 // codegen's raw `call`/`void*` world to the typed `Allocator` API.
 
-/// Allocate `size` bytes aligned to `align` via `GlobalAlloc`.  Null/zero
+/// Allocate `size` bytes aligned to `align` via `GlobalAllocator`.  Null/zero
 /// guarded; returns null on OOM so the emitter's existing null-check on the
 /// old `malloc` result is unchanged.
 ![language("alloc")]
@@ -352,13 +352,13 @@ public function alloc(size: u64, align: u64) -> mut void* {
     if (sz == 0) { sz = 1; }
     mut al: u64 = align;
     if (al == 0) { al = 16; }
-    mut ga: GlobalAlloc = GlobalAlloc::new();
-    const r: Result<NonNull<u8>, AllocError> = ga.allocate(Layout::new(sz, al));
+    mut ga: GlobalAllocator = GlobalAllocator::new();
+    const r: Result<NonNull<u8>, AllocationError> = ga.allocate(Layout::new(sz, al));
     if (r.is_ok()) { return r.unwrap().as_pointer() as mut void*; }
     return null;
 }
 
-/// Free a block from `alloc` via `GlobalAlloc::deallocate`, which
+/// Free a block from `alloc` via `GlobalAllocator::deallocate`, which
 /// already no-ops arena-owned pointers (bulk-reclaimed at the target
 /// boundary) and frees libc-owned ones.  `align` must match the `new` site;
 /// `deallocate` ignores the layout size, so a 1-byte placeholder is fine.
@@ -367,6 +367,6 @@ public function free(ptr: mut void*, align: u64) -> void {
     if (ptr == null) { return; }
     mut al: u64 = align;
     if (al == 0) { al = 16; }
-    mut ga: GlobalAlloc = GlobalAlloc::new();
+    mut ga: GlobalAllocator = GlobalAllocator::new();
     ga.deallocate(NonNull::new(ptr as mut u8*), Layout::new(1, al));
 }

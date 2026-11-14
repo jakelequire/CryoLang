@@ -30,7 +30,7 @@ import std::core::iter::{ FromIterator, Iterator };
 import std::core::ops::{ Index, IndexMutable, IndexView, IndexViewMutable };
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{
-    AllocError, AllocErrorKind, Allocator, GlobalAlloc, next_capacity
+    AllocationError, AllocationErrorKind, Allocator, GlobalAllocator, next_capacity
 };
 import std::collections::raw_buffer::{ RawBuffer };
 import std::ffi::libc;
@@ -54,7 +54,7 @@ private const INITIAL_CAPACITY: i64 = 4;
 /// const last: Option<i32> = numbers.pop();   // Some(4)
 /// ```
 ![language("array")]
-public type struct Array<T, A = GlobalAlloc> where A: Allocator {
+public type struct Array<T, A = GlobalAllocator> where A: Allocator {
     // Layout: { ptr, length, capacity, alloc }.  ABI-compatible with
     // the legacy `[T]` fat pointer the self-hosted compiler emits.
     private ptr:      mut T*;
@@ -62,13 +62,13 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     private capacity: i64;
     private alloc:    A;
 
-    /// Empty array backed by `GlobalAlloc`.
-    public static new() -> Array<T, GlobalAlloc> {
-        return Array::<T, GlobalAlloc> {
+    /// Empty array backed by `GlobalAllocator`.
+    public static new() -> Array<T, GlobalAllocator> {
+        return Array::<T, GlobalAllocator> {
             ptr: null,
             length: 0,
             capacity: 0,
-            alloc: GlobalAlloc::new()
+            alloc: GlobalAllocator::new()
         };
     }
 
@@ -85,8 +85,8 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// Preallocate room for `capacity` elements; a `capacity` of zero or
     /// less allocates nothing. Panics on allocation failure; use
     /// `try_with_capacity_in` to recover.
-    public static with_capacity(capacity: i64) -> Array<T, GlobalAlloc> {
-        match (Array::<T, GlobalAlloc>::try_with_capacity_in(capacity, GlobalAlloc::new())) {
+    public static with_capacity(capacity: i64) -> Array<T, GlobalAllocator> {
+        match (Array::<T, GlobalAllocator>::try_with_capacity_in(capacity, GlobalAllocator::new())) {
             Result::Ok(array) => { return array; }
             Result::Err(_) => {
                 core::panic("Array::with_capacity: allocation failed", intrinsics::location());
@@ -107,9 +107,9 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     }
 
     /// An empty array with room for `capacity` elements, allocated through
-    /// `alloc`, or the `AllocError` when the storage cannot be had. A
+    /// `alloc`, or the `AllocationError` when the storage cannot be had. A
     /// `capacity` of zero or less allocates nothing.
-    public static try_with_capacity_in(capacity: i64, alloc: A) -> Result<Array<T, A>, AllocError> {
+    public static try_with_capacity_in(capacity: i64, alloc: A) -> Result<Array<T, A>, AllocationError> {
         mut array: Array<T, A> = Array::<T, A> {
             ptr: null,
             length: 0,
@@ -210,9 +210,9 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
         }
     }
 
-    /// `push` that returns `Err(AllocError)` instead of panicking when the
+    /// `push` that returns `Err(AllocationError)` instead of panicking when the
     /// storage cannot grow; the array is unchanged by a failed push.
-    public try_push(mut &this, value: T) -> Result<(), AllocError> {
+    public try_push(mut &this, value: T) -> Result<(), AllocationError> {
         if (this.length == this.capacity) {
             this.reserve_grow(1)?;
         }
@@ -528,7 +528,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// partial copies are impossible; either all elements are appended
     /// or none are. Gated on `T: Copy` (see `append`): the append is a
     /// bitwise `memcpy` out of the borrowed `source`.
-    public try_append(mut &this, source: &Slice<T>) -> Result<(), AllocError> where T: Copy {
+    public try_append(mut &this, source: &Slice<T>) -> Result<(), AllocationError> where T: Copy {
         const add: i64 = source.length();
         if (add == 0) { return Result::Ok(()); }
         this.reserve_grow(add)?;
@@ -564,7 +564,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
 
     /// Fallible `resize`. Reserves the whole growth up front, so the array is
     /// either resized or left exactly as it was - never partially grown.
-    public try_resize(mut &this, new_length: i64, value: T) -> Result<(), AllocError>
+    public try_resize(mut &this, new_length: i64, value: T) -> Result<(), AllocationError>
     where T: Copy {
         if (new_length <= this.length) {
             this.truncate(new_length);
@@ -582,13 +582,13 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
 
     /// Room for at least `additional` more elements; zero or less is a
     /// no-op.
-    public reserve(mut &this, additional: i64) -> Result<(), AllocError> {
+    public reserve(mut &this, additional: i64) -> Result<(), AllocationError> {
         return this.reserve_grow(additional);
     }
 
     /// Room for exactly `additional` more elements; zero or less is a
     /// no-op.
-    public reserve_exact(mut &this, additional: i64) -> Result<(), AllocError> {
+    public reserve_exact(mut &this, additional: i64) -> Result<(), AllocationError> {
         if (additional <= 0) {
             return Result::Ok(());
         }
@@ -598,8 +598,8 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
         // otherwise see `required <= capacity`, skip the realloc, and memcpy
         // `additional` elements past the end of the buffer.
         if (required < this.length) {
-            return Result::Err(AllocError::new(
-                AllocErrorKind::OutOfMemory, Layout::array::<T>(this.length)));
+            return Result::Err(AllocationError::new(
+                AllocationErrorKind::OutOfMemory, Layout::array::<T>(this.length)));
         }
         if (required <= this.capacity) {
             return Result::Ok(());
@@ -609,7 +609,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
 
     /// Ensure at least `additional` more slots fit, doubling past
     /// `INITIAL_CAPACITY`.
-    private reserve_grow(mut &this, additional: i64) -> Result<(), AllocError> {
+    private reserve_grow(mut &this, additional: i64) -> Result<(), AllocationError> {
         if (additional <= 0) {
             return Result::Ok(());
         }
@@ -617,8 +617,8 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
         // See reserve_exact: reject a `length + additional` that does not fit
         // rather than under-allocating and overrunning the caller's memcpy.
         if (required < this.length) {
-            return Result::Err(AllocError::new(
-                AllocErrorKind::OutOfMemory, Layout::array::<T>(this.length)));
+            return Result::Err(AllocationError::new(
+                AllocationErrorKind::OutOfMemory, Layout::array::<T>(this.length)));
         }
         if (required <= this.capacity) {
             return Result::Ok(());
@@ -656,15 +656,15 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     // `resize_array<T, A>(...)` would link as the unspecialized
     // GenericParam-named symbol from `try_with_capacity_in`'s callers.
 
-    private resize_storage(mut &this, new_capacity: i64) -> Result<(), AllocError> {
+    private resize_storage(mut &this, new_capacity: i64) -> Result<(), AllocationError> {
         if (new_capacity == this.capacity) {
             return Result::Ok(());
         }
         const new_layout: Layout = match (Layout::try_array::<T>(new_capacity)) {
             Option::Some(l) => { l }
             Option::None    => {
-                return Result::Err(AllocError::new(
-                    AllocErrorKind::OutOfMemory, Layout::of::<T>()));
+                return Result::Err(AllocationError::new(
+                    AllocationErrorKind::OutOfMemory, Layout::of::<T>()));
             }
         };
 
@@ -725,7 +725,7 @@ where A: Allocator {
 
 /// An array of every element an iterator yields, in order: what `collect`
 /// builds for `Array<T>`.
-implement<T> trait FromIterator<T> for struct Array<T, GlobalAlloc> {
+implement<T> trait FromIterator<T> for struct Array<T, GlobalAllocator> {
     static from_iterator<I>(source: I) -> Array<T> where I: Iterator<T> {
         mut out: Array<T> = Array::<T>::new();
         for (value in source) {
@@ -913,7 +913,7 @@ private function introsort<T, F>(items: mut T*, length: i64, compare: F) -> void
 /// Deep copy: allocate a fresh buffer sized to `length` and clone each
 /// element into it, so the two arrays own independent storage and their
 /// elements are independent. Requires `T: Clone`.
-implement<T> trait Clone for struct Array<T, GlobalAlloc>
+implement<T> trait Clone for struct Array<T, GlobalAllocator>
 where T: Clone {
     clone(&this) -> Array<T> {
         mut out: Array<T> = Array::<T>::with_capacity(this.length);
@@ -928,7 +928,7 @@ where T: Clone {
 
 /// A fresh empty `Array` - the canonical "zero value" so `Array<T>` can be a
 /// `T: Default` field / satisfy a `Default` bound. Allocates nothing.
-implement<T> trait Default for struct Array<T, GlobalAlloc> {
+implement<T> trait Default for struct Array<T, GlobalAllocator> {
     static default() -> Array<T> {
         return Array::<T>::new();
     }
@@ -938,7 +938,7 @@ implement<T> trait Default for struct Array<T, GlobalAlloc> {
 // defaulted-allocator `<T>` form `Clone` uses: a bare-name method call
 // (`.equals()`) resolves against either, but a *trait bound* - `Array<i32>` as
 // a `HashMap` key, or `T: Eq`/`T: Hash` on a fully-applied
-// `Array<i32, GlobalAlloc>` - is only satisfied when the impl names the
+// `Array<i32, GlobalAllocator>` - is only satisfied when the impl names the
 // allocator param too.
 
 /// Element-wise equality: equal length and every element equal in order.

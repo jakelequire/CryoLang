@@ -4,7 +4,7 @@
 ///! ownership of a heap-allocated value among many holders, but the
 ///! reference counts are `Atomic<u64>`, so multiple threads can clone
 ///! and drop `Arc`/`Weak` handles concurrently without a data race.  `A`
-///! defaults to `GlobalAlloc`, matching `Rc`.
+///! defaults to `GlobalAllocator`, matching `Rc`.
 ///!
 ///! `Arc<T, A>` itself is structurally `Send + Sync` if both `T` and
 ///! `A` are `Send + Sync` - the compiler's auto-derive (see
@@ -49,7 +49,7 @@ import std::core::result::{ Result };
 import std::core::option::{ Option };
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ AllocError, Allocator, GlobalAlloc };
+import std::alloc::allocator::{ AllocationError, Allocator, GlobalAllocator };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::core::mem;
 import std::math;
@@ -111,15 +111,15 @@ where A: Allocator {
 /// const b: Arc<i32> = a.clone();
 /// // a.strong_count() == 2, and *b.get_reference() == 7
 /// ```
-public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
+public type struct Arc<T, A = GlobalAllocator> where A: Allocator {
     // Raw (nullable) so each handle's `drop` can null it and stay
     // idempotent.  Non-null while the handle is live; only a post-drop
     // husk holds null.
     private inner: mut ArcInner<T, A>*;
 
-    /// Allocate a new `Arc` backed by `GlobalAlloc` with an initial
+    /// Allocate a new `Arc` backed by `GlobalAllocator` with an initial
     /// count of 1.  Panics on allocation failure; use `try_new`.
-    public static new(value: T) -> Arc<T, GlobalAlloc> {
+    public static new(value: T) -> Arc<T, GlobalAllocator> {
         match (Arc::try_new(value)) {
             Result::Ok(r) => { return r; }
             Result::Err(_) => {
@@ -138,26 +138,26 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
         }
     }
 
-    /// Fallible constructor backed by `GlobalAlloc`.  Returns
-    /// `Err(AllocError)` if the allocator refuses the request.
-    public static try_new(value: T) -> Result<Arc<T, GlobalAlloc>, AllocError> {
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
-        const header: Layout = Layout::of::<ArcInner<T, GlobalAlloc>>();
+    /// Fallible constructor backed by `GlobalAllocator`.  Returns
+    /// `Err(AllocationError)` if the allocator refuses the request.
+    public static try_new(value: T) -> Result<Arc<T, GlobalAllocator>, AllocationError> {
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
+        const header: Layout = Layout::of::<ArcInner<T, GlobalAllocator>>();
         const raw: NonNull<u8> = alloc.allocate(header)?;
-        const typed: NonNull<ArcInner<T, GlobalAlloc>> = raw.cast::<ArcInner<T, GlobalAlloc>>();
-        const inner_ptr: mut ArcInner<T, GlobalAlloc>* = typed.as_pointer();
+        const typed: NonNull<ArcInner<T, GlobalAllocator>> = raw.cast::<ArcInner<T, GlobalAllocator>>();
+        const inner_ptr: mut ArcInner<T, GlobalAllocator>* = typed.as_pointer();
         inner_ptr.strong = Atomic::<u64>::new(1);
         inner_ptr.weak   = Atomic::<u64>::new(1);
         inner_ptr.value  = value;
         inner_ptr.alloc  = alloc;
         inner_ptr.block  = inner_ptr;
-        return Result::Ok(Arc::<T, GlobalAlloc> { inner: inner_ptr });
+        return Result::Ok(Arc::<T, GlobalAllocator> { inner: inner_ptr });
     }
 
     /// Fallible constructor with a caller-supplied allocator.  The
     /// allocator instance is stored in the inner header and is used
     /// to free the inner when the last reference drops.
-    public static try_new_in(value: T, alloc: A) -> Result<Arc<T, A>, AllocError> {
+    public static try_new_in(value: T, alloc: A) -> Result<Arc<T, A>, AllocationError> {
         mut a: A = alloc;
         const header: Layout = Layout::of::<ArcInner<T, A>>();
         const raw: NonNull<u8> = a.allocate(header)?;
@@ -296,15 +296,15 @@ public type struct Arc<T, A = GlobalAlloc> where A: Allocator {
 /// A non-owning reference to an `Arc`-managed value.  Obtain one with
 /// `Arc::downgrade`; recover a strong `Arc` (if the value still lives) with
 /// `upgrade`.  Holding a `Weak` keeps the header mapped but not the value.
-public type struct Weak<T, A = GlobalAlloc> {
+public type struct Weak<T, A = GlobalAllocator> {
     // Nullable, like `Arc::inner`: a dangling `Weak::new()` carries null and
     // a dropped handle is nulled for idempotency.
     private inner: mut ArcInner<T, A>*;
 
     /// A `Weak` that never upgrades.  Allocates nothing; `upgrade` always
     /// returns `None`.
-    public static new() -> Weak<T, GlobalAlloc> {
-        return Weak::<T, GlobalAlloc> { inner: null };
+    public static new() -> Weak<T, GlobalAllocator> {
+        return Weak::<T, GlobalAllocator> { inner: null };
     }
 
     /// Try to obtain a strong `Arc`.  Returns `None` once the last strong

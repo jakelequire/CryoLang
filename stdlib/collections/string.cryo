@@ -16,7 +16,7 @@ import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::slice::{ Slice, SliceRange };
 import std::core::ops::{ Deref, IndexView };
-import std::alloc::allocator::{ AllocError, AllocErrorKind, Allocator, GlobalAlloc };
+import std::alloc::allocator::{ AllocationError, AllocationErrorKind, Allocator, GlobalAllocator };
 import std::collections::raw_buffer::{ RawBuffer };
 import std::collections::str::{ Str, Utf8Error };
 import std::collections::array::{ Array };
@@ -45,7 +45,7 @@ private const INITIAL_CAPACITY: i64 = 8;
 /// greeting.push(", world");
 /// const shouted: String = greeting.to_ascii_uppercase();   // "HELLO, WORLD"
 /// ```
-public type struct String<A = GlobalAlloc> {
+public type struct String<A = GlobalAllocator> {
     private buffer: RawBuffer<u8, A>;
     private view: Str;
 
@@ -70,7 +70,7 @@ public type struct String<A = GlobalAlloc> {
     /// Preallocate room for `capacity` bytes; a `capacity` of zero or
     /// less allocates nothing. Panics on allocation failure.
     public static with_capacity(capacity: i64) -> String {
-        match (String::try_with_capacity_in(capacity, GlobalAlloc::new())) {
+        match (String::try_with_capacity_in(capacity, GlobalAllocator::new())) {
             Result::Ok(string) => { return string; }
             Result::Err(_) => {
                 core::panic("String::with_capacity: allocation failed", intrinsics::location());
@@ -79,9 +79,9 @@ public type struct String<A = GlobalAlloc> {
     }
 
     /// An empty string with room for `capacity` bytes, allocated through
-    /// `alloc`, or the `AllocError` when the storage cannot be had. A
+    /// `alloc`, or the `AllocationError` when the storage cannot be had. A
     /// `capacity` of zero or less allocates nothing.
-    public static try_with_capacity_in(capacity: i64, alloc: A) -> Result<String<A>, AllocError> {
+    public static try_with_capacity_in(capacity: i64, alloc: A) -> Result<String<A>, AllocationError> {
         mut string: String<A> = String::new_in(alloc);
         string.reserve_exact(capacity)?;
         return Result::Ok(string);
@@ -163,9 +163,9 @@ public type struct String<A = GlobalAlloc> {
         }
     }
 
-    /// Fallible `push`: returns `AllocError` instead of panicking.  Text is
+    /// Fallible `push`: returns `AllocationError` instead of panicking.  Text is
     /// copied in directly; every other type is formatted into the string.
-    public try_push<T>(mut &this, item: T) -> Result<(), AllocError>
+    public try_push<T>(mut &this, item: T) -> Result<(), AllocationError>
     where T: Display {
         return static match (T) {
             String  => { this.push_view_bytes(item.as_str()) }
@@ -225,9 +225,9 @@ public type struct String<A = GlobalAlloc> {
         }
     }
 
-    /// Fallible `push_byte`: append one raw byte, returning `AllocError`
+    /// Fallible `push_byte`: append one raw byte, returning `AllocationError`
     /// instead of panicking.
-    public try_push_byte(mut &this, byte: u8) -> Result<(), AllocError> {
+    public try_push_byte(mut &this, byte: u8) -> Result<(), AllocationError> {
         return this.push_one_byte(byte);
     }
 
@@ -349,14 +349,14 @@ public type struct String<A = GlobalAlloc> {
     }
 
     /// Room for at least `additional` more bytes; zero or less is a no-op.
-    public reserve(mut &this, additional: i64) -> Result<(), AllocError> {
+    public reserve(mut &this, additional: i64) -> Result<(), AllocationError> {
         this.buffer.reserve(this.view.length(), additional, INITIAL_CAPACITY)?;
         this.view.set_bytes(this.buffer.pointer());
         return Result::Ok(());
     }
 
     /// Room for exactly `additional` more bytes; zero or less is a no-op.
-    public reserve_exact(mut &this, additional: i64) -> Result<(), AllocError> {
+    public reserve_exact(mut &this, additional: i64) -> Result<(), AllocationError> {
         this.buffer.reserve_exact(this.view.length(), additional)?;
         this.view.set_bytes(this.buffer.pointer());
         return Result::Ok(());
@@ -371,7 +371,7 @@ public type struct String<A = GlobalAlloc> {
 private:
     /// Append the bytes of a `Str` view verbatim (backs the `Str` / `string`
     /// arms of `try_push`).  Empty input is a no-op.
-    push_view_bytes(mut &this, source: Str) -> Result<(), AllocError> {
+    push_view_bytes(mut &this, source: Str) -> Result<(), AllocationError> {
         const add: i64 = source.length();
         if (add == 0) {
             return Result::Ok(());
@@ -389,7 +389,7 @@ private:
 
     /// Append a single raw byte to the buffer (backs `push_byte` and the
     /// internal C-string NUL terminators).
-    push_one_byte(mut &this, byte: u8) -> Result<(), AllocError> {
+    push_one_byte(mut &this, byte: u8) -> Result<(), AllocationError> {
         this.reserve(1)?;
         const length: i64 = this.view.length();
         this.buffer.pointer()[length] = byte;
@@ -399,24 +399,24 @@ private:
 
     /// Render `item`'s `Display` text and append it (backs every non-text
     /// arm of `try_push`).  Formats into a temporary `String` (always
-    /// `GlobalAlloc`, so this works regardless of `A`) and copies the bytes
+    /// `GlobalAllocator`, so this works regardless of `A`) and copies the bytes
     /// in.  An in-memory sink only ever fails on allocation, so a `FormatError`
-    /// is mapped back to an `AllocError`.
-    push_display<D>(mut &this, item: D) -> Result<(), AllocError>
+    /// is mapped back to an `AllocationError`.
+    push_display<D>(mut &this, item: D) -> Result<(), AllocationError>
     where D: Display {
         match (format_to_string(&item)) {
             Result::Ok(rendered) => {
-                const r: Result<(), AllocError> = this.push_view_bytes(rendered.as_str());
+                const r: Result<(), AllocationError> = this.push_view_bytes(rendered.as_str());
                 return r;
             }
             Result::Err(fe) => {
                 match (fe) {
-                    FormatError::Alloc(ae) => { return Result::Err(ae); }
+                    FormatError::Allocation(ae) => { return Result::Err(ae); }
                     FormatError::Io(_) => {
                         // Unreachable for an in-memory String sink (no fd), but
                         // the match must be total; surface it as OOM.
-                        return Result::Err(AllocError::new(
-                            AllocErrorKind::OutOfMemory, Layout::new(1, 1)));
+                        return Result::Err(AllocationError::new(
+                            AllocationErrorKind::OutOfMemory, Layout::new(1, 1)));
                     }
                 }
             }
@@ -482,7 +482,7 @@ where A: Allocator {
 /// Deep copy: allocate fresh storage and copy the bytes, yielding a
 /// String that owns its buffer independently of `this`. Cloning the
 /// empty string allocates nothing (`from_str` reserves `length` bytes).
-implement trait Clone for struct String<GlobalAlloc> {
+implement trait Clone for struct String<GlobalAllocator> {
     clone(&this) -> String {
         return String::from_str(this.view);
     }
@@ -490,7 +490,7 @@ implement trait Clone for struct String<GlobalAlloc> {
 
 /// The empty string is `String`'s canonical "zero value". Allocates nothing
 /// until first mutated, so `String` can satisfy a `Default` bound.
-implement trait Default for struct String<GlobalAlloc> {
+implement trait Default for struct String<GlobalAllocator> {
     static default() -> String {
         return String::new();
     }
@@ -498,7 +498,7 @@ implement trait Default for struct String<GlobalAlloc> {
 
 /// The string of every scalar an iterator yields, in order: what `collect`
 /// builds for `String` from `char`s.
-implement trait FromIterator<char> for struct String<GlobalAlloc> {
+implement trait FromIterator<char> for struct String<GlobalAllocator> {
     static from_iterator<I>(source: I) -> String where I: Iterator<char> {
         mut out: String = String::new();
         for (c in source) {
