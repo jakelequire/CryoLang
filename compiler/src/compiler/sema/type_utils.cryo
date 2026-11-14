@@ -402,7 +402,8 @@ type struct TypeUtils {
 
     /// Substitute a receiver instantiation's arguments for its owner's
     /// parameters in a type declared on the owner - a method's return or a
-    /// field's type: `Slice<u8>::get -> Option<u8>`.  In a generic body the
+    /// field's type: `Slice<u8>::get -> Option<u8>`, and a field `Option<I::Item>`
+    /// of `Ahead<Range<i64>>` is `Option<i64>` (`apply_reduced`).  In a generic body the
     /// receiver's arguments may themselves be parameters - `Holder<X>`
     /// inside `run<X>`, or `Conn<U>` as `this` in `implement struct
     /// Conn<U>` over `Conn<S>` - and those are the ones in scope, so they are
@@ -426,12 +427,26 @@ type struct TypeUtils {
         for (mut i: i64 = 0; i < inst.type_args.length(); i++) {
             if (this.contains_generic_param(inst.type_args[i])) { abstract_recv = true; }
         }
-        mut subst: TypeSubstitution = TypeSubstitution::from_params(
+        const subst: TypeSubstitution = TypeSubstitution::from_params(
             tmpl.param_types, inst.type_args);
-        const out: TypeRef = subst.apply(ty, this.arena);
+        const out: TypeRef = this.apply_reduced(&subst, ty);
         if (!out.is_valid()) { return ty; }
         if (!abstract_recv && this.contains_generic_param(out)) { return ty; }
         return out;
+    }
+
+    /// `ty` under `subst`, each projection the substitution made concrete
+    /// reduced to the type its implementation binds: with `I` bound to
+    /// `Range<i64>`, `Option<I::Item>` is `Option<i64>`.  The unreduced form
+    /// is built without demanding it - nothing monomorphizes an
+    /// instantiation holding a projection, so a demanded one is left
+    /// unresolved.
+    apply_reduced(&this, subst: &TypeSubstitution, ty: TypeRef) -> TypeRef {
+        const was: boolean = this.arena.symbolic_no_demand_active;
+        this.arena.set_symbolic_no_demand(true);
+        const applied: TypeRef = subst.apply(ty, this.arena);
+        this.arena.set_symbolic_no_demand(was);
+        return this.ctx.type_resolver.reduce_projections(applied, false);
     }
 
     // -- Generic-identity views (carrier-free) ---------------------------------
