@@ -2503,6 +2503,8 @@ function first<I>(it: mut &I) -> Option<I::Item> where I: DoubleEnded {   // Ite
 type struct Loose<I> { f: () -> I::Item; }   // error[E0203]: associated type `Item` not found for `I`
 ```
 
+A projection may be the subject of a bound itself: `where C: Source, C::Item: Put` gives a value of type `C::Item` the methods of `Put` in the body, and each copy of the body calls the implementation of `Put` for its own `Item`, which may be an implementation for every reference (`implement<T> trait Put for mut &T where T: Put`) when `Item` is one.
+
 **A trait with parameters.** A type may implement a trait that has generic
 parameters more than once, at different arguments, and each implementation
 binds the trait's associated types for itself. A projection is taken at the
@@ -2790,8 +2792,10 @@ written in the body's parameters (`&Array<T>`, `&[T; N]`, `&Slice<T>`) is
 viewed when an implementation applies to it as written, and each copy of
 the body calls that implementation for its own `T`.  A base that is itself
 a type parameter is viewed when a bound in scope gives it `IndexView` at the
-index's type, and its view is the parameter's `View`; a range literal
-indexing a parameter one bound gives `IndexView<Range<i64>>` is typed
+index's type - naming it, or naming a trait it is a supertrait of, at the
+arguments that trait writes on it, so `C: IndexViewMutable<Range<i64>>` gives
+`IndexView<Range<i64>>` - and its view is the parameter's `View`; a range
+literal indexing a parameter its bounds give `IndexView<Range<i64>>` is typed
 `Range<i64>` (`function first_two<C>(c: &C) -> C::View where C:
 IndexView<Range<i64>> { return c[0..2]; }`).  Any other parameter base is
 indexed through `Index` alone.

@@ -741,17 +741,25 @@ type struct MemberResolver {
         visitor.state.expected_type = TypeRef::invalid();
         const array_type: TypeRef = visitor.resolve_expr(access.array);
         // A type parameter one bound in scope gives `IndexView` at a
-        // written index type is indexed at that type: `0..2` under
-        // `C: IndexView<Range<i64>>` is a `Range<i64>`.
+        // written index type - naming it, or a trait it is a supertrait of -
+        // is indexed at that type: `0..2` under `C: IndexView<Range<i64>>`
+        // or `C: IndexViewMutable<Range<i64>>` is a `Range<i64>`.
         const view_id: DefId = this.ctx.generic_registry.wellknown(LangItem::IndexView);
         const viewed_base: TypeRef = this.types.peel_indirection(array_type);
         const viewed_t: Type* = this.arena.lookup(if (viewed_base.is_valid()) { viewed_base } else { array_type });
         if (view_id.is_valid() && viewed_t != null && viewed_t.kind == TypeKind::GenericParam) {
-            const bounds: [const TraitRef*] = visitor.binding.bounds_naming(
-                if (viewed_base.is_valid()) { viewed_base } else { array_type }, view_id);
-            if (bounds.length() == 1 && bounds[0].argument_types.length() == 1) {
-                visitor.state.expected_type = bounds[0].argument_types[0];
+            const bounds: [const TraitRef*] = visitor.binding.bounds_on(
+                if (viewed_base.is_valid()) { viewed_base } else { array_type });
+            // Bounds that give it at different index types type nothing.
+            mut index_at: TypeRef = TypeRef::invalid();
+            mut agreed: boolean = true;
+            for (mut i: i64 = 0; i < bounds.length(); i++) {
+                mut given: [TypeRef] = [];
+                if (!visitor.binding.bound_gives(bounds[i], view_id, &given)) { continue; }
+                if (given.length() != 1 || (index_at.is_valid() && !index_at.equals(given[0]))) { agreed = false; }
+                if (given.length() == 1) { index_at = given[0]; }
             }
+            if (agreed && index_at.is_valid()) { visitor.state.expected_type = index_at; }
         }
         const index_type: TypeRef = visitor.resolve_expr(access.index);
         visitor.state.expected_type = element_expected;
