@@ -66,7 +66,7 @@ The compiler does not enforce naming, but the standard library and ecosystem use
 
 ### 1.2 Keywords
 
-Keywords are reserved identifiers. They cannot be used as variable, function, or type names — but they **can name a member**: a field or a method, declared and used.
+Keywords are reserved identifiers. They cannot be used as variable, free-function, or type names — but they **can name a member**: a field or a method, declared and used.
 
 ```cryo
 ![repr(C)]
@@ -83,11 +83,13 @@ A member position is never a declaration or an operator, so the keyword is unamb
 
 The exceptions are the keywords a member position reads *first*: `public`, `internal` and `private` open a visibility label, `static` and `async` are member modifiers, and `protected`, `virtual` and `override` are read there to be refused (`E0117`). A field with one of those eight names cannot be declared, and a C struct carrying one still needs a `![repr(C)]` shadow struct.
 
-A **binding** is the other way round. A statement that begins with a keyword opening a declaration is parsed as that declaration, so a local named by one could never be assigned or called through: `module = q;` is not an assignment. The 20 keywords that open a declaration - `function`, `const`, `mut`, `type`, `struct`, `class`, `enum`, `trait`, `import`, `module`, `extern`, `implement`, `public`, `internal`, `private`, `protected`, `namespace`, `intrinsic`, `static`, `async` - therefore cannot name a variable, a parameter, a pattern binding or a destructured local (`E0100`): a keyword is never an identifier. Keywords that open nothing (`default`, `string`) remain legal names, and a destructuring shorthand over a field named by one of the 20 needs a rename: `const { type: t }: S = s;`.
+A **binding** is the other way round. A statement that begins with a keyword opening a declaration is parsed as that declaration, so a local named by one could never be assigned or called through: `module = q;` is not an assignment. The 20 keywords that open a declaration - `function`, `const`, `mut`, `type`, `struct`, `class`, `enum`, `trait`, `import`, `module`, `extern`, `implement`, `public`, `internal`, `private`, `protected`, `namespace`, `intrinsic`, `static`, `async` - therefore cannot name a variable, a parameter, a pattern binding or a destructured local (`E0100`): a keyword is never an identifier. The same holds for the 23 keywords a statement or an expression begins with - `if`, `while`, `do`, `loop`, `for`, `match`, `return`, `break`, `continue`, `unsafe`, `asm`, `true`, `false`, `null`, `this`, `new`, `sizeof`, `alignof`, `typeof`, `delete`, `await`, `yield`, `move` - since every bare use of such a name reads as the keyword: `delete()` is the delete operator and `match;` the head of a match. A **free function** is named bare too, so neither group names one; a method, reached only after `.` or `::`, may take any of them (`Router.delete`). `this` stays a parameter name: it is the by-value receiver. Keywords that open nothing (`default`, `string`) remain legal names, and a destructuring shorthand over a field named by one of these keywords needs a rename: `const { type: t }: S = s;`.
 
 ```cryo
 const module: i32 = 42;                  // E0100: expected a variable name, found `module`, which is a reserved word
 match (r) { R::D(static) => { .. } }     // E0100: expected a binding name
+function delete() -> i32 { .. }          // E0100: expected a function name, found `delete`, which is a reserved word
+router.delete(Str::new("/items"), on_delete);   // a method: named after `.`
 ```
 
 | Control flow | Declarations    |             | Modifiers   | Operator keywords | Special values | Reserved for future use |
