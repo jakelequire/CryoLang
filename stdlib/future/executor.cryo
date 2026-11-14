@@ -54,10 +54,10 @@
 namespace std::future::executor;
 
 import std::core::intrinsics;
-import std::core::ptr::{ NonNull };
+import std::core::pointer::{ NonNull };
 import std::core::result::{ Result };
 import std::core::drop::{ Drop };
-import std::core::panic_unwind::{ PanicInfo };
+import std::core::panic_unwind::{ PanicInformation };
 import std::core::error::{ Error };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
@@ -68,7 +68,7 @@ import std::alloc::allocator::{ AllocationError, GlobalAllocator };
 import std::alloc::arc::{ Arc };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::sync::mutex::{ Mutex, MutexGuard };
-import std::sync::condvar::{ CondVar };
+import std::sync::condition_variable::{ ConditionVariable };
 import std::thread;
 import std::thread::{ JoinHandle as ThreadJoinHandle };
 import std::core::mem;
@@ -103,13 +103,13 @@ private const ST_NOTIFIED:  u8 = 3;   // woken while RUNNING; reschedule after t
 
 /// Non-generic control header, laid out at offset 0 of every `TaskShared<O>`, so
 /// the type-erased executor reads/writes a task's outcome, handshake, cancel
-/// flag, and (on the panic path) captured `PanicInfo` through a `TaskCtl*`
+/// flag, and (on the panic path) captured `PanicInformation` through a `TaskCtl*`
 /// without knowing `O`.
 private type struct TaskCtl {
     private outcome: Atomic<u8>;   // OUTCOME_*
     private hs:      Atomic<u8>;   // HS_*
     private cancel:  Atomic<u8>;   // 1 == abort requested by the handle
-    private panic:   PanicInfo;    // valid only when outcome == OUTCOME_PANICKED
+    private panic:   PanicInformation;    // valid only when outcome == OUTCOME_PANICKED
 }
 
 /// The control block shared between a task and its `JoinHandle<O>`. Outlives the
@@ -136,7 +136,7 @@ private function detach_shared<O>(sh: mut TaskShared<O>*) -> void {
         const outcome: u8 = ctl.outcome.load(MemoryOrder::Acquire);
         mut alloc: GlobalAllocator = GlobalAllocator::new();
         if (outcome == OUTCOME_READY) {
-            ptr::drop_in_place::<O>(&sh.result);
+            pointer::drop_in_place::<O>(&sh.result);
         }
         alloc.deallocate(NonNull::new(sh as mut u8*), Layout::of::<TaskShared<O>>());
     }
@@ -203,7 +203,7 @@ private type struct Task {
         task_incref(&this);
         mut cx: Context = Context::new(Waker::new(task_wake, waker_arc_clone,
                                                   waker_arc_drop, &this as mut u8*));
-        mut pinfo: PanicInfo = PanicInfo { msg: "", file: "", line: 0 };
+        mut pinfo: PanicInformation = PanicInformation { msg: "", file: "", line: 0 };
         const status: u8 = poll_boundary(this.poll_fn, this.fut, this.shared, &cx, &pinfo);
         if (status == 2) {
             ctl.panic = pinfo;
@@ -304,11 +304,11 @@ private type struct ReadyQueue {
 /// back-pointer and the worker threads reference a stable address.
 private type struct ExecInner {
     private queue: Mutex<ReadyQueue>;
-    private work_ready: CondVar;     // workers wait here for work
+    private work_ready: ConditionVariable;     // workers wait here for work
     // Guards no data: a joiner's predicate is its task's handshake atomic, and
     // this lock only orders that check against the finishing worker's notify.
     private done_lock:  Mutex<()>;
-    private task_done:  CondVar;     // joiners wait here for a task to finish
+    private task_done:  ConditionVariable;     // joiners wait here for a task to finish
     private reactor: mut Reactor*; // the I/O driver this pool's workers publish while polling
     private blocking: mut BlockingPool*;   // where workers offload calls the reactor cannot drive
 
@@ -488,13 +488,13 @@ private function run_poll(data: mut u8*) -> void {
 /// free function — ConfigGating strips declarations, not method bodies.
 ![config(panic_unwind)]
 private function poll_boundary(poll_fn: (mut u8*, mut u8*, Context*) -> u8, fut: mut u8*, shared: mut u8*,
-                       cx: Context*, out_panic: mut PanicInfo*) -> u8 {
+                       cx: Context*, out_panic: mut PanicInformation*) -> u8 {
     mut pc: PollCtx = PollCtx { poll_fn: poll_fn, fut: fut, shared: shared,
                                cx: cx, status: 0 };
     const tramp: (mut u8*) -> void = run_poll;
     const caught: boolean = intrinsics::try_catch(tramp as void*, &pc as mut void*);
     if (caught) {
-        *out_panic = panic_unwind::taken_panic_info();
+        *out_panic = panic_unwind::taken_panic_information();
         return 2;
     }
     return pc.status;
@@ -505,7 +505,7 @@ private function poll_boundary(poll_fn: (mut u8*, mut u8*, Context*) -> u8, fut:
 /// without unwinding). `out_panic` is unused here.
 ![config(not(panic_unwind))]
 private function poll_boundary(poll_fn: (mut u8*, mut u8*, Context*) -> u8, fut: mut u8*, shared: mut u8*,
-                       cx: Context*, out_panic: PanicInfo*) -> u8 {
+                       cx: Context*, out_panic: PanicInformation*) -> u8 {
     return poll_fn(fut, shared, cx);
 }
 
@@ -556,7 +556,7 @@ private function task_drop_thunk<F>(fut_raw: mut u8*) -> void {
 private function dispose_shared_thunk<O>(shared_raw: mut u8*, drop_result: u8) -> void {
     const sh: TaskShared<O>* = shared_raw as TaskShared<O>*;
     if (drop_result == 1) {
-        ptr::drop_in_place::<O>(&sh.result);
+        pointer::drop_in_place::<O>(&sh.result);
     }
     mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(shared_raw), Layout::of::<TaskShared<O>>());
@@ -580,7 +580,7 @@ where F: Future<O> {
     sh.ctl.outcome = Atomic::<u8>::new(OUTCOME_PENDING);
     sh.ctl.hs      = Atomic::<u8>::new(HS_LIVE);
     sh.ctl.cancel  = Atomic::<u8>::new(0);
-    sh.ctl.panic   = PanicInfo { msg: "", file: "", line: 0 };
+    sh.ctl.panic   = PanicInformation { msg: "", file: "", line: 0 };
 
     mut fbox: mut F* = null;
     match (alloc.allocate(Layout::of::<F>())) {
@@ -618,7 +618,7 @@ where F: Future<O> {
 /// Why a `join` did not yield a value.
 public type enum JoinError {
     Cancelled;              // the task was aborted, or could not make progress
-    Panicked(PanicInfo);    // the task panicked (only under --panic=unwind)
+    Panicked(PanicInformation);    // the task panicked (only under --panic=unwind)
 }
 
 /// `the task was cancelled`, or `the task panicked: ` and the panic's
@@ -697,7 +697,7 @@ public type struct JoinHandle<O> {
             }
         }
         if (outcome == OUTCOME_PANICKED) {
-            const info: PanicInfo = ctl.panic;
+            const info: PanicInformation = ctl.panic;
             alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<TaskShared<O>>());
             return Result::Err(JoinError::Panicked(info));
         }
@@ -781,14 +781,14 @@ public type struct Executor {
             Result::Err(_)  => { panic("Executor::new: allocation failed", intrinsics::location()); }
         }
         inner.queue      = Mutex::new(ReadyQueue { head: null, tail: null, shutdown: false });
-        inner.work_ready = CondVar::new();
+        inner.work_ready = ConditionVariable::new();
         inner.done_lock  = Mutex::new(());
-        inner.task_done  = CondVar::new();
+        inner.task_done  = ConditionVariable::new();
         // Before any worker starts: each publishes these handles as it comes up.
         // The blocking pool starts empty — it creates its first thread only if
         // something actually offloads work — so this costs an allocation.
         inner.reactor  = Reactor::start();
-        inner.blocking = BlockingPool::with_max(blocking);
+        inner.blocking = BlockingPool::with_maximum(blocking);
         mut workers: [ThreadJoinHandle<()>] = [];
         for (mut i: u32 = 0; i < count; i = i + 1) {
             workers.push(thread::spawn(move () -> () { inner.work(); return (); }));
@@ -879,7 +879,7 @@ implement trait Drop for struct Executor {
         inner.reactor = null;
         BlockingPool::free(inner.blocking);
         inner.blocking = null;
-        ptr::drop_in_place::<ExecInner>(inner);
+        pointer::drop_in_place::<ExecInner>(inner);
         mut alloc: GlobalAllocator = GlobalAllocator::new();
         alloc.deallocate(NonNull::new(inner as mut u8*), Layout::of::<ExecInner>());
         this.inner = null;

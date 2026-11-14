@@ -67,7 +67,7 @@
 namespace std::thread;
 
 import std::core::intrinsics;
-import std::core::ptr::{ NonNull };
+import std::core::pointer::{ NonNull };
 import std::core::result::{ Result };
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
@@ -219,7 +219,7 @@ private function thread_body<F, T>(arg: mut u8*) -> void where F: () -> T {
     // one will ever read the result, so we own teardown here.
     const prev: u8 = (*shared).state.swap(STATE_THREAD_DONE, MemoryOrder::AcqRel);
     if (prev == STATE_DETACHED) {
-        ptr::drop_in_place::<T>(rptr);
+        pointer::drop_in_place::<T>(rptr);
         alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
     }
 }
@@ -290,7 +290,7 @@ private function reap_detached<T>(tid: u64, shared: mut Shared<T>*) -> void {
     if (prev == STATE_THREAD_DONE) {
         // Thread already finished and left the result for us; drop it.
         const rptr: T* = &(*shared).result;
-        ptr::drop_in_place::<T>(rptr);
+        pointer::drop_in_place::<T>(rptr);
         mut alloc: GlobalAllocator = GlobalAllocator::new();
         alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
     }
@@ -371,13 +371,13 @@ implement<T> trait Drop for struct JoinHandle<T> {
 /// owns) and `T: Send` (the result handed back through
 /// `JoinHandle::join`). Both are computed structurally - primitives, raw
 /// pointers, references, and the standard containers built on them
-/// (`Box`, `Arc`, `Array`, `String`, `mpsc::Sender`, ...) are `Send`. The
+/// (`Box`, `Arc`, `Array`, `String`, `channel::Sender`, ...) are `Send`. The
 /// bound rejects a closure written without `move`, which borrows from the
 /// spawning function, and the types on the thread-safety deny-list
 /// (`Rc<T>` and the lock guards).
 public function spawn<F, T>(body: F) -> JoinHandle<T>
 where F: () -> T + Send, T: Send {
-    match (spawn_with_attr::<F, T>(body, 0)) {
+    match (spawn_with_attributes::<F, T>(body, 0)) {
         Result::Ok(h)  => { return h; }
         Result::Err(_) => {
             core::panic("thread::spawn: failed to create thread", intrinsics::location());
@@ -388,7 +388,7 @@ where F: () -> T + Send, T: Send {
 /// Fallible spawn with an optional stack size (`0` == OS default). The
 /// per-OS thread creator (`os_create_thread`) applies it - via a
 /// `pthread_attr_t` on POSIX, or `CreateThread`'s `dwStackSize` on Windows.
-public function spawn_with_attr<F, T>(body: F, stack_bytes: u64) -> Result<JoinHandle<T>, SpawnError>
+public function spawn_with_attributes<F, T>(body: F, stack_bytes: u64) -> Result<JoinHandle<T>, SpawnError>
 where F: () -> T + Send, T: Send {
     mut alloc: GlobalAllocator = GlobalAllocator::new();
 
@@ -416,7 +416,7 @@ where F: () -> T + Send, T: Send {
             // The thread never started, so we still own both boxes. The
             // body was moved in; release it in place so what it owns is not
             // leaked, then free both boxes.
-            ptr::drop_in_place::<F>(&(*p).body);
+            pointer::drop_in_place::<F>(&(*p).body);
             alloc.deallocate(NonNull::new(p as mut u8*), Layout::of::<Payload<F, T>>());
             alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
             return Result::Err(e);
@@ -474,7 +474,7 @@ implement trait Error for enum SpawnError { }
 ///   ```
 public function try_spawn<F, T>(body: F) -> Result<JoinHandle<T>, SpawnError>
 where F: () -> T + Send, T: Send {
-    return spawn_with_attr::<F, T>(body, 0);
+    return spawn_with_attributes::<F, T>(body, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -567,7 +567,7 @@ public type struct Builder {
         // `pthread_attr_t` on POSIX, `dwStackSize` on Windows), so the
         // builder just forwards the configured size.
         mut result: Result<JoinHandle<T>, SpawnError> =
-            spawn_with_attr::<F, T>(body, this.stack_bytes);
+            spawn_with_attributes::<F, T>(body, this.stack_bytes);
 
         match (result) {
             Result::Ok(h) => {

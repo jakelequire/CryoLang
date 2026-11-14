@@ -13,8 +13,8 @@
 ///! NaN / +/-Infinity / +/-0 are all handled explicitly. Negative zero
 ///! prints as `-0` so the sign isn't lost.
 ///!
-///! The public API is `f64.to_buf(buffer)` / `f64.to_buf_with(buffer,
-///! decimals)` / `f64.to_buf_roundtrip(buffer)`: extension methods on the
+///! The public API is `f64.to_buffer(buffer)` / `f64.to_buffer_with(buffer,
+///! decimals)` / `f64.to_buffer_roundtrip(buffer)`: extension methods on the
 ///! primitive, each writing at the front of a `mut &Slice<u8>` and
 ///! returning how many bytes it wrote, or `None`, writing nothing, when
 ///! the slice is shorter than the writer needs. Integer formatting
@@ -114,16 +114,16 @@ private const SCALED_DECIMALS: i64 = 17;
 // f64 path itself gains Grisu/Ryu; same future work, same code path.
 
 implement f32 {
-    /// `f64.to_buf` of this value widened to `f64`.
-    public to_buf(&this, buffer: mut &Slice<u8>) -> Option<i64> {
+    /// `f64.to_buffer` of this value widened to `f64`.
+    public to_buffer(&this, buffer: mut &Slice<u8>) -> Option<i64> {
         const v: f64 = this as f64;
-        return v.to_buf(buffer);
+        return v.to_buffer(buffer);
     }
 
-    /// `f64.to_buf_with` of this value widened to `f64`.
-    public to_buf_with(&this, buffer: mut &Slice<u8>, decimals: i64) -> Option<i64> {
+    /// `f64.to_buffer_with` of this value widened to `f64`.
+    public to_buffer_with(&this, buffer: mut &Slice<u8>, decimals: i64) -> Option<i64> {
         const v: f64 = this as f64;
-        return v.to_buf_with(buffer, decimals);
+        return v.to_buffer_with(buffer, decimals);
     }
 
     /// True when this value is `-0.0`, which compares equal to `0.0` but
@@ -150,21 +150,21 @@ implement f64 {
     /// Write `this` with `DEFAULT_DECIMALS` fractional digits at the front
     /// of `buffer`, and return how many bytes that took; `None`, writing
     /// nothing, when `buffer` is shorter than `F64_MAX_DIGITS`.
-    public to_buf(&this, buffer: mut &Slice<u8>) -> Option<i64> {
-        return this.to_buf_with(buffer, DEFAULT_DECIMALS);
+    public to_buffer(&this, buffer: mut &Slice<u8>) -> Option<i64> {
+        return this.to_buffer_with(buffer, DEFAULT_DECIMALS);
     }
 
-    /// As `to_buf`, with `decimals` fractional digits in the fixed-point
+    /// As `to_buffer`, with `decimals` fractional digits in the fixed-point
     /// form and in the scientific form's mantissa; zero or less writes
     /// none. `buffer` needs `F64_MAX_DIGITS` bytes, and one more for each
     /// decimal past 13; a shorter one is refused with `None`.
-    public to_buf_with(&this, buffer: mut &Slice<u8>, decimals: i64) -> Option<i64> {
+    public to_buffer_with(&this, buffer: mut &Slice<u8>, decimals: i64) -> Option<i64> {
         return write_float(buffer, this, decimals, false);
     }
 
     /// Write `this` in scientific form whatever its magnitude, `decimals`
     /// digits after the mantissa's point: `1234.5` at 2 is `1.23e+3`, and
-    /// zero is `0.00e+0`.  `buffer` needs what `to_buf_with` needs.
+    /// zero is `0.00e+0`.  `buffer` needs what `to_buffer_with` needs.
     internal to_scientific_buf(&this, buffer: mut &Slice<u8>, decimals: i64) -> Option<i64> {
         return write_float(buffer, this, decimals, true);
     }
@@ -176,7 +176,7 @@ implement f64 {
     /// exactly, so typical values stay compact (`0.1`, not the noisy
     /// `0.10000000000000001`). Returns bytes written (excluding the NUL).
     ///
-    /// This exists because `to_buf`'s fixed-6-decimal form silently TRUNCATES
+    /// This exists because `to_buffer`'s fixed-6-decimal form silently TRUNCATES
     /// precision - `3.141592653589793` became `3.141593` - which made JSON
     /// serialization lossy despite advertising strtod round-tripping. JSON
     /// (and any caller that must preserve f64 values) should use this.
@@ -184,10 +184,10 @@ implement f64 {
     /// Non-finite inputs (NaN/Inf) have no round-trippable form; callers
     /// handle them first, but as a guard we fall back to the debug spelling.
     /// The decimal point is `.` whatever numeric locale the program has set.
-    public to_buf_roundtrip(&this, buffer: mut &Slice<u8>) -> Option<i64> {
+    public to_buffer_roundtrip(&this, buffer: mut &Slice<u8>) -> Option<i64> {
         const value: f64 = this;
         if (!value.is_finite()) {
-            return this.to_buf_with(buffer, DEFAULT_DECIMALS);
+            return this.to_buffer_with(buffer, DEFAULT_DECIMALS);
         }
         if (buffer.length() < F64_MAX_DIGITS) { return Option::None; }
         const out: mut u8* = buffer.as_mutable_pointer();
@@ -275,7 +275,7 @@ private function write_fixed(buffer: mut u8*, value: f64, decimals: i64) -> i64 
     mut integer_part: u64 = value as u64;
 
     if (decimals == 0) {
-        return integer_part.to_decimal_buf(buffer);
+        return integer_part.to_decimal_buffer(buffer);
     }
 
     // Round the fractional part half-up at the requested precision rather
@@ -295,10 +295,10 @@ private function write_fixed(buffer: mut u8*, value: f64, decimals: i64) -> i64 
         integer_part = integer_part + 1;
     }
 
-    mut cursor: i64 = integer_part.to_decimal_buf(buffer);
+    mut cursor: i64 = integer_part.to_decimal_buffer(buffer);
     buffer[cursor] = 0x2E; // '.'
     cursor = cursor + 1;
-    cursor = cursor + frac_scaled.to_decimal_padded_buf(buffer + cursor, scaled_places);
+    cursor = cursor + frac_scaled.to_decimal_padded_buffer(buffer + cursor, scaled_places);
     for (mut place: i64 = scaled_places; place < decimals; place++) {
         buffer[cursor] = 0x30; // '0'
         cursor = cursor + 1;
@@ -347,7 +347,7 @@ private function write_scientific(buffer: mut u8*, value: f64, decimals: i64) ->
         cursor = cursor + 1;
         exp_magnitude = e as u64;
     }
-    cursor = cursor + exp_magnitude.to_decimal_buf(buffer + cursor);
+    cursor = cursor + exp_magnitude.to_decimal_buffer(buffer + cursor);
     return cursor;
 }
 

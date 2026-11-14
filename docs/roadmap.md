@@ -99,7 +99,7 @@ sweep.  Counted (`grep -E '^\s*implement(<[^>]*>)? (struct|union) '`):
   `cursor.cryo`, the struct's own file, goes inline.  The others are
   `AsmPiece`, `InlineBodies`, `DirectiveRegistry`, and `StampSlot`,
   `BuildStamp`, `VersionReport` in `utils/build_stamp.cryo`.
-- standard library: 4.  Three are `BufStream<S>` extended from the
+- standard library: 4.  Three are `BufferedStream<S>` extended from the
   HTTP/1.1, HTTP/2 and WebSocket modules, the split-type exception; one is
   `Array<T, A>`'s second block in its own file, to fold inline (its bound
   becomes a `where` on the methods that need it, or stays on the type).
@@ -422,7 +422,7 @@ Left over from that: the async entry point calls `Executor::new` and
    `internal`; implementation modules become `internal module`.
    `internal` is for plumbing only the library uses; an API a program
    could build on stays public, and an item nothing calls yet is not
-   hidden for that (587).  `net::addr::sockaddr` stays public: low-level
+   hidden for that (587).  `net::address::socket_address_storage` stays public: low-level
    programming is not hidden.  The C bindings (`libc`, `syscall`, `openssl`) stay public,
    outside the 1.0 stability promise.  Tests that reach internals are
    rewritten through the public API, or deleted where they pinned only
@@ -447,7 +447,7 @@ Left over from that: the async entry point calls `Executor::new` and
    keep their seconds and nanoseconds private behind accessors (595).
    `encoding`'s base64 and SHA-1 internals are
    private, behind `Base64`'s methods and `sha1`.  `net::sys` is an
-   internal module (705), and `net::addr`, `dns` and `http` are marked
+   internal module (705), and `net::address`, `dns` and `http` are marked
    item by item (597), and the rest of `net` (599) - HTTP/2, HTTPS,
    sockets, TLS and WebSocket - so all of `net` is marked: its three
    private `push_all` copies are gone, the encoders writing
@@ -470,7 +470,7 @@ Left over from that: the async entry point calls `Executor::new` and
    `io::error`, which is marked (612).  A float classifies itself and an
    integer rotates itself (613).  The executor, the reactor, the
    blocking pool and the channels lock with `sync`'s `Mutex` and
-   `CondVar` and start their threads through `thread`, which creates
+   `ConditionVariable` and start their threads through `thread`, which creates
    every thread one way (622), and each lock holds the state it guards
    (624).  A descriptor's non-blocking mode has one switch, and a drain
    reads through a borrowed descriptor's `read_to_end` (625).  A
@@ -730,7 +730,7 @@ the only way to release a value early.  An ordinary method that happens to
 be named `drop` on a type with no `Drop` is not a destructor call, and is
 told apart before the warning becomes an error.
 
-Open: whether `ptr::drop_in_place` stays the spelling for releasing a
+Open: whether `pointer::drop_in_place` stays the spelling for releasing a
 value through a raw pointer.
 
 ## Typed JSON through the derive list

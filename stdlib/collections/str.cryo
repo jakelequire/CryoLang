@@ -133,9 +133,9 @@ public type struct Str {
     /// `[start, end)` byte sub-slice. Panics if `start` is negative, if
     /// `start > end`, or if `end > length`. **Not UTF-8-aware**; splitting
     /// inside a multi-byte scalar is the caller's responsibility.
-    public sub_bytes(&this, start: i64, end: i64) -> Str {
+    public byte_substring(&this, start: i64, end: i64) -> Str {
         if (start < 0 || start > end || end > this.length) {
-            core::panic("Str::sub_bytes: out of range", intrinsics::location());
+            core::panic("Str::byte_substring: out of range", intrinsics::location());
         }
         return Str {
             bytes: this.bytes + start,
@@ -201,7 +201,7 @@ public type struct Str {
 
     /// Byte index of the last occurrence of `needle`, or `None`. An empty
     /// needle matches at `length()`. **Not UTF-8-aware** (matches on bytes).
-    public rfind(&this, needle: &Str) -> Option<i64> {
+    public find_last(&this, needle: &Str) -> Option<i64> {
         const nl: i64 = needle.length();
         if (nl > this.length) { return Option::None; }
         mut i: i64 = this.length - nl;
@@ -227,7 +227,7 @@ public type struct Str {
     }
 
     /// Index of the last `byte`, or `None`.
-    public rfind_byte(&this, byte: u8) -> Option<i64> {
+    public find_last_byte(&this, byte: u8) -> Option<i64> {
         mut i: i64 = this.length - 1;
         while (i >= 0) {
             if (this.bytes[i] == byte) { return Option::Some(i); }
@@ -241,8 +241,8 @@ public type struct Str {
     public split_once(&this, separator: &Str) -> Option<Pair<Str, Str>> {
         match (this.find(separator)) {
             Option::Some(at) => {
-                return Option::Some(Pair::new(this.sub_bytes(0, at),
-                    this.sub_bytes(at + separator.length(), this.length)));
+                return Option::Some(Pair::new(this.byte_substring(0, at),
+                    this.byte_substring(at + separator.length(), this.length)));
             }
             Option::None => { return Option::None; }
         }
@@ -250,11 +250,11 @@ public type struct Str {
 
     /// The text before and after the last `separator`, or `None` when it
     /// does not occur. Neither half includes the separator.
-    public rsplit_once(&this, separator: &Str) -> Option<Pair<Str, Str>> {
-        match (this.rfind(separator)) {
+    public split_once_from_end(&this, separator: &Str) -> Option<Pair<Str, Str>> {
+        match (this.find_last(separator)) {
             Option::Some(at) => {
-                return Option::Some(Pair::new(this.sub_bytes(0, at),
-                    this.sub_bytes(at + separator.length(), this.length)));
+                return Option::Some(Pair::new(this.byte_substring(0, at),
+                    this.byte_substring(at + separator.length(), this.length)));
             }
             Option::None => { return Option::None; }
         }
@@ -264,14 +264,14 @@ public type struct Str {
     /// with it. An empty prefix always matches.
     public strip_prefix(&this, prefix: &Str) -> Option<Str> {
         if (!this.starts_with(prefix)) { return Option::None; }
-        return Option::Some(this.sub_bytes(prefix.length(), this.length));
+        return Option::Some(this.byte_substring(prefix.length(), this.length));
     }
 
     /// The text before `suffix`, or `None` when this string does not end
     /// with it. An empty suffix always matches.
     public strip_suffix(&this, suffix: &Str) -> Option<Str> {
         if (!this.ends_with(suffix)) { return Option::None; }
-        return Option::Some(this.sub_bytes(0, this.length - suffix.length()));
+        return Option::Some(this.byte_substring(0, this.length - suffix.length()));
     }
 
     /// Length, in bytes, of the longest prefix this string shares with
@@ -372,7 +372,7 @@ public type struct Str {
     /// `Str` borrows from this one. `split` on a one-byte separator is
     /// the common case; multi-byte separators are supported too.
     public split(&this, sep: &Str) -> implement Iterator<Str> {
-        return SplitIter {
+        return SplitIterator {
             bytes: this.bytes,
             length: this.length,
             sep_bytes: sep.bytes,
@@ -387,7 +387,7 @@ public type struct Str {
     /// `split`, without the empty ones: a leading, trailing or doubled
     /// separator yields nothing, and an empty string yields no piece.
     public split_nonempty(&this, separator: &Str) -> implement Iterator<Str> {
-        return SplitIter {
+        return SplitIterator {
             bytes: this.bytes,
             length: this.length,
             sep_bytes: separator.bytes,
@@ -489,7 +489,7 @@ public type struct Str {
     }
 
     /// Whether byte offset `index` falls between two scalars, where
-    /// `sub_bytes` can cut without splitting one: the start, the end, and
+    /// `byte_substring` can cut without splitting one: the start, the end, and
     /// any byte that is not a UTF-8 continuation byte. An offset outside
     /// `[0, length]` is no boundary.
     public is_char_boundary(&this, index: i64) -> boolean {
@@ -530,7 +530,7 @@ public type struct Str {
 /// sequence. Yields borrowed `Str` views; see `Str::split` and
 /// `Str::split_nonempty`. Borrows from the source `Str`, which must
 /// outlive the iterator.
-internal type struct SplitIter {
+internal type struct SplitIterator {
     private bytes:      u8*;
     private length:     i64;
     private sep_bytes:  u8*;
@@ -540,7 +540,7 @@ internal type struct SplitIter {
     private skip_empty: boolean;
 }
 
-implement trait Iterator<Str> for struct SplitIter {
+implement trait Iterator<Str> for struct SplitIterator {
     next(mut &this) -> Option<Str> {
         while (!this.done) {
             // A piece runs to the next separator. With none left it is the
@@ -776,7 +776,7 @@ implement trait Eq for struct Str {
 implement trait Hash for struct Str {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hasher.write_uint(this.length as u128, 8);
+        hasher.write_unsigned_integer(this.length as u128, 8);
         hasher.write_bytes(this.as_bytes());
     }
 }
@@ -820,7 +820,7 @@ implement<R> trait IndexView<R> for struct Str where R: SliceRange {
         if (!this.is_char_boundary(bounds[1])) {
             core::panic("range end is inside a UTF-8 character: it is not a char boundary", intrinsics::location());
         }
-        return this.sub_bytes(bounds[0], bounds[1]);
+        return this.byte_substring(bounds[0], bounds[1]);
     }
 }
 
@@ -905,7 +905,7 @@ implement trait TryFrom<Str> for i64 {
         if (start == source.length()) {
             return Result::Err(ConversionError::new("sign with no digits"));
         }
-        const digits: Str = source.sub_bytes(start, source.length());
+        const digits: Str = source.byte_substring(start, source.length());
         const magnitude: u64 = u64::try_from(digits)?;
         if (negative) {
             if (magnitude > I64_MIN_MAGNITUDE) {

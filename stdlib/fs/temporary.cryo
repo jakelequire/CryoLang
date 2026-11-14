@@ -1,6 +1,6 @@
 ///! Temporary files and directories, removed when they are dropped.
 ///!
-///!     const scratch: TempDirectory = TempDirectory::create()?;
+///!     const scratch: TemporaryDirectory = TemporaryDirectory::create()?;
 ///!     File::write_text(scratch.path().join("input.txt").as_path(), "data")?;
 ///!     // ... the directory and everything in it is removed here
 ///!
@@ -18,7 +18,7 @@ import std::core::drop::{ Drop };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import std::io::error::{ IoError, IoErrorKind };
-import std::io::fd;
+import std::io::file_descriptor;
 import std::random::secure::{ SecureRng };
 import std::env;
 import std::fs::path::{ Path, PathBuf };
@@ -33,18 +33,18 @@ private const NAME_BYTES: i64 = 8;
 
 /// A directory that is removed, with everything in it, when this value is
 /// dropped.
-public type struct TempDirectory {
+public type struct TemporaryDirectory {
     private location: PathBuf;
     private kept: boolean;
 
     /// A new, empty directory under the temporary directory.
-    public static create() -> Result<TempDirectory, IoError> {
+    public static create() -> Result<TemporaryDirectory, IoError> {
         mut attempts: i64 = 0;
         loop {
-            const candidate: PathBuf = TempDirectory::unused_name()?;
+            const candidate: PathBuf = TemporaryDirectory::unused_name()?;
             match (Directory::create(candidate.as_path())) {
                 Result::Ok(_) => {
-                    return Result::Ok(TempDirectory { location: candidate, kept: false });
+                    return Result::Ok(TemporaryDirectory { location: candidate, kept: false });
                 }
                 Result::Err(error) => {
                     attempts = attempts + 1;
@@ -93,7 +93,7 @@ public type struct TempDirectory {
 
 /// The directory goes with everything in it; a failure to remove it is
 /// not reported, as a drop has no one to report to.
-implement trait Drop for struct TempDirectory {
+implement trait Drop for struct TemporaryDirectory {
     drop(mut &this) -> void {
         if (!this.kept) {
             match (Directory::remove_all(this.location.as_path())) {
@@ -106,22 +106,22 @@ implement trait Drop for struct TempDirectory {
 
 /// A file, open for reading and writing, that is closed and removed when
 /// this value is dropped.
-public type struct TempFile {
+public type struct TemporaryFile {
     private location: PathBuf;
     private handle: File;
     private kept: boolean;
 
     /// A new, empty file under the temporary directory, open for reading
     /// and writing.
-    public static create() -> Result<TempFile, IoError> {
+    public static create() -> Result<TemporaryFile, IoError> {
         mut options: OpenOptions = OpenOptions::new();
         options = options.read(true).write(true).create_new(true).share(true, true, true);
         mut attempts: i64 = 0;
         loop {
-            const candidate: PathBuf = TempDirectory::unused_name()?;
+            const candidate: PathBuf = TemporaryDirectory::unused_name()?;
             match (File::open_with(candidate.as_path(), &options)) {
                 Result::Ok(opened) => {
-                    return Result::Ok(TempFile { location: candidate, handle: opened, kept: false });
+                    return Result::Ok(TemporaryFile { location: candidate, handle: opened, kept: false });
                 }
                 Result::Err(error) => {
                     attempts = attempts + 1;
@@ -158,10 +158,10 @@ public type struct TempFile {
 /// Close the file first - Windows removes an open file only when every
 /// handle allows it - then remove it. A failure to remove it is not
 /// reported, as a drop has no one to report to.
-implement trait Drop for struct TempFile {
+implement trait Drop for struct TemporaryFile {
     drop(mut &this) -> void {
         const descriptor: i32 = this.handle.into_descriptor();
-        if (descriptor >= 0) { fd::close_fd(descriptor); }
+        if (descriptor >= 0) { file_descriptor::close_file_descriptor(descriptor); }
         if (!this.kept) {
             match (File::remove(this.location.as_path())) {
                 Result::Ok(_)  => { }

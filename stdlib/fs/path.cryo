@@ -115,7 +115,7 @@ public type struct Path {
     ///
     /// This is the floor for every traversal here: bytes below it are not a
     /// segment and splitting them would change which volume the path names.
-    public static root_len(source: Str) -> i64 {
+    public static root_length(source: Str) -> i64 {
         const bytes: &Slice<u8> = source.as_bytes();
         const n: i64 = bytes.length();
         if (n == 0) { return 0; }
@@ -181,10 +181,10 @@ public type struct Path {
     /// mistaken for segment breaks. On Windows either separator counts, so
     /// the later of the two answers.
     public static last_separator(source: Str, floor: i64) -> Option<i64> {
-        const segments: Str = source.sub_bytes(floor, source.length());
-        mut found: Option<i64> = segments.rfind_byte(SEPARATOR);
+        const segments: Str = source.byte_substring(floor, source.length());
+        mut found: Option<i64> = segments.find_last_byte(SEPARATOR);
         if (WINDOWS_SYNTAX) {
-            match (segments.rfind_byte(BACKSLASH)) {
+            match (segments.find_last_byte(BACKSLASH)) {
                 Option::Some(back) => {
                     if (back > found.unwrap_or(-1)) { found = Option::Some(back); }
                 }
@@ -215,7 +215,7 @@ public type struct Path {
         // (`C:` before `C:dir`), already ends at a component boundary.
         const base_bytes: &Slice<u8> = base.inner.as_bytes();
         if (Path::is_separator(base_bytes[base_length - 1])) { return true; }
-        if (Path::root_len(this.inner) == base_length) { return true; }
+        if (Path::root_length(this.inner) == base_length) { return true; }
         return Path::is_separator(this.inner.as_bytes()[base_length]);
     }
 
@@ -223,17 +223,17 @@ public type struct Path {
     /// empty, or is nothing but a root. Does not consult the filesystem.
     public file_name(&this) -> Option<Str> {
         const n: i64 = this.inner.length();
-        const root: i64 = Path::root_len(this.inner);
+        const root: i64 = Path::root_length(this.inner);
         if (n == 0 || n <= root) { return Option::None; }
 
         match (Path::last_separator(this.inner, root)) {
             Option::Some(k) => {
                 // Trailing separator: the path names a directory, not a file.
                 if (k == n - 1) { return Option::None; }
-                return Option::Some(this.inner.sub_bytes(k + 1, n));
+                return Option::Some(this.inner.byte_substring(k + 1, n));
             }
             // No separator past the root: everything after the root is the name.
-            Option::None => { return Option::Some(this.inner.sub_bytes(root, n)); }
+            Option::None => { return Option::Some(this.inner.byte_substring(root, n)); }
         }
     }
 
@@ -242,26 +242,26 @@ public type struct Path {
     /// last segment is stripped yields the root itself, never "". Trailing
     /// separators name no segment: the parent of `a/b/` is `a`, as of `a/b`.
     public parent(&this) -> Option<Path> {
-        const root: i64 = Path::root_len(this.inner);
+        const root: i64 = Path::root_length(this.inner);
         const bytes: &Slice<u8> = this.inner.as_bytes();
         mut n: i64 = this.inner.length();
         while (n > root && Path::is_separator(bytes[n - 1])) { n = n - 1; }
         if (n == 0 || n <= root) { return Option::None; }
-        const segments: Str = this.inner.sub_bytes(0, n);
+        const segments: Str = this.inner.byte_substring(0, n);
 
         match (Path::last_separator(segments, root)) {
             Option::Some(k) => {
                 // Cutting at the separator keeps the root's trailing separator
                 // when the split lands on it, so `/x` yields `/` and `C:\x`
                 // yields `C:\` rather than the volume-changing `C:`.
-                return Option::Some(Path { inner: this.inner.sub_bytes(0, k) });
+                return Option::Some(Path { inner: this.inner.byte_substring(0, k) });
             }
             Option::None => { }
         }
         // No separator past the root. A rooted path falls back to its root;
         // a single relative segment has no parent to give.
         if (root > 0) {
-            return Option::Some(Path { inner: this.inner.sub_bytes(0, root) });
+            return Option::Some(Path { inner: this.inner.byte_substring(0, root) });
         }
         return Option::None;
     }
@@ -286,11 +286,11 @@ public type struct Path {
             Option::Some(name) => {
                 // `..` carries a dot at index 1 but names no extension.
                 if (name == Str::new("..")) { return Option::None; }
-                match (name.rfind_byte(DOT)) {
+                match (name.find_last_byte(DOT)) {
                     // A dot only at index 0 (dotfile) is no extension.
                     Option::Some(dot) => {
                         if (dot == 0) { return Option::None; }
-                        return Option::Some(name.sub_bytes(dot + 1, name.length()));
+                        return Option::Some(name.byte_substring(dot + 1, name.length()));
                     }
                     Option::None => { return Option::None; }
                 }
@@ -322,7 +322,7 @@ public type struct Path {
             Option::Some(name) => {
                 match (this.extension()) {
                     Option::Some(extension) => {
-                        return Option::Some(name.sub_bytes(0, name.length() - extension.length() - 1));
+                        return Option::Some(name.byte_substring(0, name.length() - extension.length() - 1));
                     }
                     Option::None => { return Option::Some(name); }
                 }
@@ -340,7 +340,7 @@ public type struct Path {
             Option::None => { return PathBuf::from(this.inner); }
             Option::Some(stem) => {
                 const name_start: i64 = this.inner.length() - this.file_name().unwrap().length();
-                mut result: PathBuf = PathBuf::from(this.inner.sub_bytes(0, name_start + stem.length()));
+                mut result: PathBuf = PathBuf::from(this.inner.byte_substring(0, name_start + stem.length()));
                 if (!extension.is_empty()) {
                     mut dot: u8 = DOT;
                     result.append(Str::from_raw(&dot, 1));
@@ -495,7 +495,7 @@ public type struct PathBuf<A = GlobalAllocator> {
     /// replaces the current path rather than extending it, since appending
     /// one path's root inside another would name nothing.
     public push(mut &this, segment: Str) -> void {
-        if (Path::root_len(segment) > 0) {
+        if (Path::root_length(segment) > 0) {
             this.view.inner.set_length(0);
             this.append(segment);
             return;

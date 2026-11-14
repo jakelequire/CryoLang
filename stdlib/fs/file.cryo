@@ -8,7 +8,7 @@
 ///!
 ///! For more than one read or write, open a `File`: it implements `Read`,
 ///! `Write` and `Seek`, so code written against the I/O traits (and the
-///! `BufReader` / `BufWriter` in `io::buf`) works on it unchanged. The file
+///! `BufferedReader` / `BufferedWriter` in `io::buffered`) works on it unchanged. The file
 ///! is closed when the `File` is dropped. `OpenOptions` asks for anything
 ///! other than "read" (`open`) or "create or truncate, then write"
 ///! (`create`): appending, read and write together, or exclusive creation.
@@ -28,7 +28,7 @@ import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::core::drop::{ Drop };
 import std::io::error::{ IoError, IoErrorKind, IoOperation };
-import std::io::fd;
+import std::io::file_descriptor;
 import std::io::traits::{ Read, Seek, SeekFrom, Write };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
@@ -413,7 +413,7 @@ public type struct File {
     /// metadata included. Writes reach the OS without this; it is for data
     /// that must survive a power failure.
     ![target(unix)]
-    public sync_all(mut &this) -> Result<(), IoError> {
+    public synchronize_all(mut &this) -> Result<(), IoError> {
         if (libc::fsync(this.fd) != 0) {
             return Result::Err(IoError::last_os_error());
         }
@@ -422,7 +422,7 @@ public type struct File {
     /// Wait until everything written is on the storage device
     /// (`FlushFileBuffers`); as the copy above.
     ![target(windows)]
-    public sync_all(mut &this) -> Result<(), IoError> {
+    public synchronize_all(mut &this) -> Result<(), IoError> {
         const handle: u8* = this.handle()?;
         if (syscall::FlushFileBuffers(handle) == 0) {
             return Result::Err(IoError::last_os_error());
@@ -492,7 +492,7 @@ implement trait Seek for struct File {
 implement trait Drop for struct File {
     drop(mut &this) -> void {
         if (this.fd >= 0) {
-            fd::close_fd(this.fd);
+            file_descriptor::close_file_descriptor(this.fd);
             this.fd = -1;
         }
     }
@@ -500,16 +500,16 @@ implement trait Drop for struct File {
 
 implement trait Read for struct File {
     read(mut &this, buffer: mut u8*, length: i64) -> Result<i64, IoError> {
-        return fd::read_fd(this.fd, buffer, length);
+        return file_descriptor::read_file_descriptor(this.fd, buffer, length);
     }
 }
 
 implement trait Write for struct File {
     write_some(mut &this, bytes: &Slice<u8>) -> Result<i64, IoError> {
-        return fd::write_fd(this.fd, bytes);
+        return file_descriptor::write_file_descriptor(this.fd, bytes);
     }
 
-    /// `write(2)` is unbuffered, so there is nothing to push; `sync_all`
+    /// `write(2)` is unbuffered, so there is nothing to push; `synchronize_all`
     /// asks for durability.
     flush(mut &this) -> Result<(), IoError> {
         return Result::Ok(());

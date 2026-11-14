@@ -1,4 +1,4 @@
-///! BufWriter / BufReader - coalescing, overflow, bypass, flush, refill.
+///! BufferedWriter / BufferedReader - coalescing, overflow, bypass, flush, refill.
 ///!
 ///! Tests run against in-memory Write/Read doubles so behavior is
 ///! hermetic (no fds, no syscalls). `MemSink` counts how many writes
@@ -17,7 +17,7 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::io::error::{ IoError };
 import std::io::traits::{ Read, Write };
-import std::io::buf::{ BufReader, BufWriter };
+import std::io::buffered::{ BufferedReader, BufferedWriter };
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect, expect_eq };
 import std::ffi::libc;
@@ -76,7 +76,7 @@ implement trait Drop for struct MemSink {
 // ============================================================================
 // In-memory Read source: serves bytes from a borrowed Str. `chunk` caps
 // how many bytes a single `read` returns (0 = no cap), letting us simulate
-// a dribbling source that forces BufReader to refill repeatedly.
+// a dribbling source that forces BufferedReader to refill repeatedly.
 // ============================================================================
 
 type struct MemSource {
@@ -129,13 +129,13 @@ function slices_eq(a: &Slice<u8>, b: &Slice<u8>) -> boolean {
 }
 
 // ============================================================================
-// BufWriter
+// BufferedWriter
 // ============================================================================
 
 ![test]
 function small_writes_are_coalesced() -> Result<(), TestError> {
     mut sink: MemSink = MemSink::new(256);
-    mut bw: BufWriter<MemSink> = BufWriter::with_capacity(&sink, 16);
+    mut bw: BufferedWriter<MemSink> = BufferedWriter::with_capacity(&sink, 16);
     match (bw.write(Str::new("ab").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("write ab failed")); } }
     match (bw.write(Str::new("cd").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("write cd failed")); } }
     match (bw.write(Str::new("ef").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("write ef failed")); } }
@@ -157,7 +157,7 @@ function overflow_triggers_flush() -> Result<(), TestError> {
     // Capacity 4: "abc" buffers, then "def" overflows and forces a flush
     // of "abc" before buffering "def".
     mut sink: MemSink = MemSink::new(256);
-    mut bw: BufWriter<MemSink> = BufWriter::with_capacity(&sink, 4);
+    mut bw: BufferedWriter<MemSink> = BufferedWriter::with_capacity(&sink, 4);
     match (bw.write(Str::new("abc").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("write abc failed")); } }
     match (bw.write(Str::new("def").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("write def failed")); } }
     const sink_len_mid: i64 = sink.len;          // "abc" flushed by overflow
@@ -177,7 +177,7 @@ function large_write_bypasses_buffer() -> Result<(), TestError> {
     // A chunk larger than the buffer is sent straight to the sink with no
     // double-copy; nothing is left buffered.
     mut sink: MemSink = MemSink::new(256);
-    mut bw: BufWriter<MemSink> = BufWriter::with_capacity(&sink, 4);
+    mut bw: BufferedWriter<MemSink> = BufferedWriter::with_capacity(&sink, 4);
     match (bw.write(Str::new("abcdefgh").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("large write failed")); } }
     const buffered: i64 = bw.buffered();
     const writes: i64 = sink.writes;
@@ -190,9 +190,9 @@ function large_write_bypasses_buffer() -> Result<(), TestError> {
 
 ![test]
 function drop_flushes_pending() -> Result<(), TestError> {
-    // No explicit flush: BufWriter::drop must push the buffered bytes.
+    // No explicit flush: BufferedWriter::drop must push the buffered bytes.
     mut sink: MemSink = MemSink::new(256);
-    mut bw: BufWriter<MemSink> = BufWriter::with_capacity(&sink, 16);
+    mut bw: BufferedWriter<MemSink> = BufferedWriter::with_capacity(&sink, 16);
     match (bw.write(Str::new("hello").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("write failed")); } }
     mem::drop(bw);                                    // flush happens here
     const content_ok: boolean = slices_eq(sink.as_slice(), Str::new("hello").as_bytes());
@@ -205,7 +205,7 @@ function drop_flushes_pending() -> Result<(), TestError> {
 ![test]
 function clear_discards_buffered() -> Result<(), TestError> {
     mut sink: MemSink = MemSink::new(256);
-    mut bw: BufWriter<MemSink> = BufWriter::with_capacity(&sink, 16);
+    mut bw: BufferedWriter<MemSink> = BufferedWriter::with_capacity(&sink, 16);
     match (bw.write(Str::new("abc").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("write failed")); } }
     bw.clear();                                   // throw the buffered bytes away
     match (bw.flush()) { Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("flush failed")); } }
@@ -214,13 +214,13 @@ function clear_discards_buffered() -> Result<(), TestError> {
 }
 
 // ============================================================================
-// BufReader
+// BufferedReader
 // ============================================================================
 
 ![test]
 function read_serves_buffered_bytes() -> Result<(), TestError> {
     mut src: MemSource = MemSource::new(Str::new("hello"), 0);
-    mut br: BufReader<MemSource> = BufReader::with_capacity(&src, 8);
+    mut br: BufferedReader<MemSource> = BufferedReader::with_capacity(&src, 8);
     mut out: [u8; 16];
     mut got: i64 = 0;
     match (br.read(&out[0], 5)) {
@@ -239,7 +239,7 @@ function read_serves_buffered_bytes() -> Result<(), TestError> {
 ![test]
 function read_line_splits_on_newline() -> Result<(), TestError> {
     mut src: MemSource = MemSource::new(Str::new("line1\nline2\n"), 0);
-    mut br: BufReader<MemSource> = BufReader::with_capacity(&src, 32);
+    mut br: BufferedReader<MemSource> = BufferedReader::with_capacity(&src, 32);
 
     mut l1: String = String::new();
     match (br.read_line(&l1)) { Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("read_line 1 failed")); } }
@@ -262,10 +262,10 @@ function read_line_splits_on_newline() -> Result<(), TestError> {
 ![test]
 function dribbling_source_reassembles_line() -> Result<(), TestError> {
     // chunk=1: the source returns one byte per underlying read, forcing
-    // BufReader to refill many times. read_line must still assemble the
+    // BufferedReader to refill many times. read_line must still assemble the
     // whole line.
     mut src: MemSource = MemSource::new(Str::new("abcdef\n"), 1);
-    mut br: BufReader<MemSource> = BufReader::with_capacity(&src, 8);
+    mut br: BufferedReader<MemSource> = BufferedReader::with_capacity(&src, 8);
     mut line: String = String::new();
     match (br.read_line(&line)) { Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("read_line failed")); } }
     const ok: boolean = slices_eq(line.as_str().as_bytes(), Str::new("abcdef\n").as_bytes());
@@ -279,11 +279,11 @@ function dribbling_source_reassembles_line() -> Result<(), TestError> {
 ![test]
 function available_tracks_buffered_bytes() -> Result<(), TestError> {
     mut src: MemSource = MemSource::new(Str::new("hello"), 0);
-    mut br: BufReader<MemSource> = BufReader::with_capacity(&src, 8);
+    mut br: BufferedReader<MemSource> = BufferedReader::with_capacity(&src, 8);
     mut avail: i64 = 0;
-    match (br.fill_buf()) {
+    match (br.fill_buffer()) {
         Result::Ok(filled) => { avail = filled.length(); }
-        Result::Err(_) => { return bail(Str::new("fill_buf failed")); }
+        Result::Err(_) => { return bail(Str::new("fill_buffer failed")); }
     }
     const reported: i64 = br.available();
     br.consume(2);

@@ -1,4 +1,4 @@
-///! std::sync::mpsc: multi-producer, single-consumer channels.
+///! std::sync::channel: multi-producer, single-consumer channels.
 ///!
 ///! `Channel::unbounded::<T>()` and `Channel::bounded::<T>(capacity)` open a
 ///! channel and return both of its ends together, its `Sender<T>` first.
@@ -7,8 +7,8 @@
 ///! owned data like `String` - are moved through the FIFO queue.
 ///!
 ///!   ```cryo
-///!   const { first: tx, second: rx }: Pair<mpsc::Sender<i32>, mpsc::Receiver<i32>> =
-///!       mpsc::Channel::unbounded::<i32>();
+///!   const { first: tx, second: rx }: Pair<channel::Sender<i32>, channel::Receiver<i32>> =
+///!       channel::Channel::unbounded::<i32>();
 ///!   // move `tx` into a worker thread; keep `rx` here
 ///!   const h = thread::spawn(move () -> i32 {
 ///!       tx.send(42);
@@ -46,16 +46,16 @@
 ///!
 ///! A heap `ChannelInner<T>` holds a `Mutex` over the channel's state - a
 ///! raw singly-linked node queue with its length, plus a live-sender count
-///! and a total-handle refcount - a `CondVar` the receiver waits on, and one
+///! and a total-handle refcount - a `ConditionVariable` the receiver waits on, and one
 ///! a sender waits on for room. The inner is reclaimed when the last handle
 ///! (sender or receiver) drops. Values move out of dequeued nodes through
 ///! raw pointers, so the move-checker treats each as a clean transfer
 ///! (no aliasing, no double-free).
 
-namespace std::sync::mpsc;
+namespace std::sync::channel;
 
 import std::core::intrinsics;
-import std::core::ptr::{ NonNull };
+import std::core::pointer::{ NonNull };
 import std::core::result::{ Result };
 import std::core::option;
 import std::core::option::{ Option };
@@ -70,7 +70,7 @@ import std::core::mem;
 import std::fmt::display::{ Debug, Display, Formatter };
 import std::fmt::error::{ FormatError };
 import std::sync::mutex::{ Mutex, MutexGuard };
-import std::sync::condvar::{ CondVar };
+import std::sync::condition_variable::{ ConditionVariable };
 import std::time::clock::{ Instant };
 import std::time::duration::{ Duration };
 
@@ -134,8 +134,8 @@ private function allocate_node<T>() -> mut ChannelNode<T>* {
 /// Shared channel state, reached through a raw pointer by every handle.
 private type struct ChannelInner<T> {
     private state: Mutex<ChannelState<T>>;
-    private ready: CondVar;   // the receiver waits here for a value or the last sender
-    private room:  CondVar;   // a sender waits here for a full queue to shrink or the receiver to go
+    private ready: ConditionVariable;   // the receiver waits here for a value or the last sender
+    private room:  ConditionVariable;   // a sender waits here for a full queue to shrink or the receiver to go
 }
 
 
@@ -146,14 +146,14 @@ private function new_inner<T>(capacity: i64) -> mut ChannelInner<T>* {
     mut inner: mut ChannelInner<T>* = null;
     match (alloc.allocate(Layout::of::<ChannelInner<T>>())) {
         Result::Ok(raw) => { inner = raw.cast::<ChannelInner<T>>().as_pointer(); }
-        Result::Err(_)  => { core::panic("mpsc::Channel: allocation failed", intrinsics::location()); }
+        Result::Err(_)  => { core::panic("channel::Channel: allocation failed", intrinsics::location()); }
     }
     inner.state = Mutex::new(ChannelState::<T> {
         head: null, tail: null, length: 0, capacity: capacity,
         senders: 1, refs: 2, rx_open: true
     });
-    inner.ready = CondVar::new();
-    inner.room = CondVar::new();
+    inner.ready = ConditionVariable::new();
+    inner.room = ConditionVariable::new();
     return inner;
 }
 
@@ -161,7 +161,7 @@ private function new_inner<T>(capacity: i64) -> mut ChannelInner<T>* {
 /// by the last handle to drop; the queue is expected empty (the receiver
 /// drains it on its way out).
 private function free_inner<T>(inner: mut ChannelInner<T>*) -> void {
-    ptr::drop_in_place::<ChannelInner<T>>(inner);
+    pointer::drop_in_place::<ChannelInner<T>>(inner);
     mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(inner as mut u8*), Layout::of::<ChannelInner<T>>());
 }
@@ -471,7 +471,7 @@ implement<T> trait Drop for struct Receiver<T> {
         mut node: mut ChannelNode<T>* = state.pop();
         while (node != null) {
             const slot: T* = &(*node).value;
-            ptr::drop_in_place::<T>(slot);
+            pointer::drop_in_place::<T>(slot);
             mut a: GlobalAllocator = GlobalAllocator::new();
             a.deallocate(NonNull::new(node as mut u8*), Layout::of::<ChannelNode<T>>());
             node = state.pop();
@@ -504,8 +504,8 @@ implement<T> trait Iterator<T> for struct Receiver<T> {
 /// first; more senders are clones of that one:
 ///
 ///   ```cryo
-///   const { first: tx, second: rx }: Pair<mpsc::Sender<i32>, mpsc::Receiver<i32>> =
-///       mpsc::Channel::unbounded::<i32>();
+///   const { first: tx, second: rx }: Pair<channel::Sender<i32>, channel::Receiver<i32>> =
+///       channel::Channel::unbounded::<i32>();
 ///   thread::spawn(move () -> i32 { tx.send(1); return 0; });
 ///   match (rx.receive()) { Result::Ok(v) => {} Result::Err(_) => {} }
 ///   ```
@@ -522,7 +522,7 @@ public type struct Channel {
     /// less than 1.
     public static bounded<T>(capacity: i64) -> Pair<Sender<T>, Receiver<T>> {
         if (capacity < 1) {
-            core::panic("mpsc::Channel::bounded: the capacity must be at least 1", intrinsics::location());
+            core::panic("channel::Channel::bounded: the capacity must be at least 1", intrinsics::location());
         }
         return Channel::open::<T>(capacity);
     }

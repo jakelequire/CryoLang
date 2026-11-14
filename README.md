@@ -401,7 +401,7 @@ entry_point = "src/tool/main.cryo"
 | `core`        | Language foundations: `Option`, `Result`, `Slice`, `NonNull`, `Range`, `Ordering`. Traits: `Copy`, `Drop`, `Clone`, `Default`, `Eq`, `Ord`, `Hash`, `Iterator<Item>`, `From`/`Into`/`TryFrom`, `Step`. Memory utilities. FNV-1a hasher.                                                     |
 | `alloc`       | `Layout`, `Allocator` trait, `GlobalAllocator`, `Box<T>`, `Arena` (bump), `Pool` (slab), `Rc<T>`, `Arc<T>`.                                                                                                                                                                                     |
 | `collections` | `Array<T, A>`, `Str` (borrowed UTF-8), `String<A>` (owned UTF-8), `HashMap<K, V, A, H>`, `HashSet<T, A, H>` (keyed `SipHasher` by default). Allocator-generic with `GlobalAllocator` default.                                                                                                                                        |
-| `io`          | `Read` and `Write` traits with rich defaults; `Stdin` / `Stdout` / `Stderr`; `BufWriter` / `LineWriter` / `BufReader`; POSIX `IoError` mapping.                                                                                                                                             |
+| `io`          | `Read` and `Write` traits with rich defaults; `Stdin` / `Stdout` / `Stderr`; `BufferedWriter` / `LineWriter` / `BufferedReader`; POSIX `IoError` mapping.                                                                                                                                             |
 | `fmt`         | `Display`, `Debug`, `Formatter`, `FormatWrite`. Heap-free integer and float writers. `print` / `println` / `eprint` / `eprintln`.                                                                                                                                                           |
 | `json`        | RFC 8259 parser + serializer. `JsonValue`, `JsonNumber`, ordered `JsonObject`.                                                                                                                                                                                                              |
 | `encoding`    | Byte<->text codecs: `base64` (RFC 4648) `encode`/`decode`, and `sha1` (RFC 3174) 20-byte digest.                                                                                                                                                                                            |
@@ -413,8 +413,8 @@ entry_point = "src/tool/main.cryo"
 | `random`      | `SecureRng` over the kernel CSPRNG (`getrandom` / `RtlGenRandom`): `fill`, `next_u64`, unbiased range sampling, and shuffling.                                                                                                                                                              |
 | `net`         | TCP/UDP sockets, DNS, IPv4/IPv6 addressing, and TLS. HTTP/1.1 (`Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, a connection-per-request server `HttpServer::with_router(addr, &router).run()`, `Client::get`/`post`), HTTP/2 (h2c + HPACK), and WebSocket.              |
 | `process`     | POSIX subprocess spawning (`fork + execve`). `Command` builder, `Stdio`, `Child`, `ExitStatus`, `Signal`.                                                                                                                                                                                   |
-| `sync`        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`.                                                                                                                              |
-| `thread`      | `ThreadLocal<T>` via POSIX TLS, `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returns the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `current` / `yield_now` / `sleep(Duration)`. Channels live in `sync::mpsc` (`channel`, `Sender`, `Receiver`). |
+| `sync`        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`), `MemoryOrder`, `fence`, `Mutex<T>`, `ReadWriteLock<T>`, `ConditionVariable`, `Once`, `Barrier`.                                                                                                                              |
+| `thread`      | `ThreadLocal<T>` via POSIX TLS, `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returns the body's value on `join`), `spawn_with_attributes`, scoped threads (`thread::Scope`), `current` / `yield_now` / `sleep(Duration)`. Channels live in `sync::channel` (`channel`, `Sender`, `Receiver`). |
 | `test`        | The built-in unit-test framework.                                                                                                                                                                                                                                                           |
 
 ### Working with files
@@ -443,12 +443,12 @@ A failure prints with the path it happened at: `not found: config.toml`.
 A path can be written as a string where one is expected. For anything
 beyond one whole-file call, `File::open` / `File::create` / `OpenOptions`
 give a handle that implements `Read`, `Write` and `Seek`; read it a line
-at a time with `for (line in BufReader::new(&file).lines()) { ... }`.
-`TempDirectory::create()` and `TempFile::create()` give scratch space that
+at a time with `for (line in BufferedReader::new(&file).lines()) { ... }`.
+`TemporaryDirectory::create()` and `TemporaryFile::create()` give scratch space that
 is removed when the value is dropped. [`examples/15-files`](./examples/15-files/)
 runs all of it.
 
-The **prelude** (auto-imported into every file) currently re-exports `core::panic`, `core::option`, `core::result`, `core::primitives`, `core::intrinsics`, `core::varargs`, `core::slice`, `core::ops`, `core::iter`, `collections::array`, `alloc::box`, and `alloc::rc`.
+The **prelude** (auto-imported into every file) currently re-exports `core::panic`, `core::option`, `core::result`, `core::primitives`, `core::intrinsics`, `core::variadic_arguments`, `core::slice`, `core::ops`, `core::iter`, `collections::array`, `alloc::box`, and `alloc::rc`.
 
 ---
 
@@ -555,8 +555,8 @@ for the full 1.0 release notes.
 - Lambdas and capturing closures (let-bound, inline, multi-capture, nested, closure-as-fn-arg).
 - Automatic drop synthesis at scope exit; explicit `delete` for heap pointees.
 - Allocator-generic standard library: `Array`, `String`, `HashMap`, `HashSet`, `Box`, `Arena`, `Pool`, `Rc`, `Arc`.
-- Synchronization primitives: a generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. `Send` / `Sync` are computed structurally (never declared) with call-site enforcement; raw pointers are unconditionally `Send`, so treat a `Send` bound as a checked-what-it-can-see signal rather than a safety proof - see [`docs/cryo.md` section 15.4](./docs/cryo.md#154-the-send-and-sync-traits).
-- `ThreadLocal<T>` via POSIX TLS; OS threads via `thread::spawn` / `try_spawn` / `JoinHandle<T>` / `spawn_with_attr`, a named `thread::Builder` (stack size + OS thread name), scoped threads (`thread::Scope`), and `sync::mpsc` channels.
+- Synchronization primitives: a generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`), `MemoryOrder`, `fence`, `Mutex<T>`, `ReadWriteLock<T>`, `ConditionVariable`, `Once`, `Barrier`. `Send` / `Sync` are computed structurally (never declared) with call-site enforcement; raw pointers are unconditionally `Send`, so treat a `Send` bound as a checked-what-it-can-see signal rather than a safety proof - see [`docs/cryo.md` section 15.4](./docs/cryo.md#154-the-send-and-sync-traits).
+- `ThreadLocal<T>` via POSIX TLS; OS threads via `thread::spawn` / `try_spawn` / `JoinHandle<T>` / `spawn_with_attributes`, a named `thread::Builder` (stack size + OS thread name), scoped threads (`thread::Scope`), and `sync::channel` channels.
 - I/O over `Read` / `Write` traits with buffered wrappers.
 - `async` / `await` as a first-class language feature: `async` functions, methods, and trait methods compiled into state machines, `await` anywhere an expression may appear, and `async function main`. Futures are ordinary movable structs - no hidden allocation, no pinning discipline - which the language buys by rejecting a reference held live across a suspend (`E0455`) and carrying owned values across it for you. See [`docs/cryo.md` section 18](./docs/cryo.md#18-asynchronous-programming).
 - `std::future`: a worker-pool `Executor` with `spawn` / `JoinHandle`, a readiness reactor (epoll on Linux, `\Device\Afd` + IOCP on Windows), `Sleep` timers, a blocking thread pool for work no reactor can drive, and the `join` / `try_join` / `select` / `timeout` combinators. Cancelling a future is a plain drop.
