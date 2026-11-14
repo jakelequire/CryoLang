@@ -4307,13 +4307,13 @@ An ADT enum (variants with payloads) is laid out as a tag (`i32`) followed by a 
 `sizeof(T)` and `alignof(T)` return compile-time `u64` constants reflecting the type's chosen layout - including any `![repr]` or `![align]` directives applied to it. They are the recommended way to verify FFI struct layout against a C header in a test:
 
 ```cryo
-import std::test::assert::{ expect_eq };
+import std::test::assert::{ expect_equal };
 import std::test::error::{ TestError };
 
 ![test]
 function timespec_matches_c() -> Result<(), TestError> {
-    expect_eq(sizeof(timespec), 16 as u64)?;
-    return expect_eq(alignof(timespec), 8 as u64);
+    expect_equal(sizeof(timespec), 16 as u64)?;
+    return expect_equal(alignof(timespec), 8 as u64);
 }
 ```
 
@@ -4887,7 +4887,7 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | **`process`**     | Subprocess spawning: `fork + execve` on POSIX, `CreateProcessW` on Windows, with the command line, the environment block and the working directory in UTF-16, so non-ASCII arguments, variables and paths reach the child intact. `Command` builder (`argument`, `arguments` from an iterator of `Str`, `env`, `env_remove`, `env_clear`, `stdin`/`stdout`/`stderr`, `current_directory`; every setter returns the command, so `cmd.argument(a).argument(b).stdout(Stdio::Piped)` chains), `Command::shell(Str)` for a whole command line, `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal` (and its `SignalNumber`, both `Eq`: `Signal::from_i32(2).unwrap() == Signal::interrupt()`). A program that cannot be started is `spawn`'s `IoError`, naming the program (`could not start tool: not found`; `NotExecutable` for a file that is no program) or the working directory it could not enter. A piped stream is taken out of a running child with `child.stdout.take()`. `cmd.group_descendants()` starts the child as the root of its own process tree (a process group on POSIX; a job object and a console process group of its own on Windows), and `child.kill_tree()` then ends it together with everything it started. `ExitStatus.peak_memory_bytes()` is the most physical memory the child held at once; `process::memory::SystemMemory::query()` reads the machine's installed and available memory. On Windows, `send_signal` supports `Signal::kill()`, and `Signal::interrupt()` to a grouped child, delivered as Ctrl-Break; on every platform it refuses (`InvalidInput`) a child already waited for. `process::signal_handling::Signals::listen()` receives the interrupt and terminate signals for a clean shutdown (SIGINT/SIGTERM on POSIX; on Windows Ctrl-C and Ctrl-Break as interrupt, a console close, logoff or shutdown as terminate, after which Windows still ends the process at its own time limit, 5 seconds by default): while a `Signals` lives they no longer end the process, and `wait()`, `wait_timeout(d)` and `try_wait()` hand each one over once.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_subtract` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`, every one taking `&this`, so a cell is updated through any shared reference to it), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `ReadWriteLock<T, A>`, `ConditionVariable`, `Once`, `Barrier`. `channel::Channel::unbounded` / `bounded` open a channel: its `Sender<T>` sends (`send` waits for room in a full bounded channel, `try_send` hands the value back instead) and its `Receiver<T>` receives (`receive`, `receive_timeout`, `try_receive`) and is an `Iterator<T>` that ends once every sender has dropped. RAII guards (`MutexGuard`, `ReadWriteLockReadGuard`, `ReadWriteLockWriteGuard`) are `!Send`; each reads the guarded value through `as_pointer()` (a read-only `T*`), and the two exclusive guards, held writably, write it through `as_mutable_pointer()` (a `mut T*`). `Send` / `Sync` are computed structurally with call-site enforcement - see [section 15.4](#154-the-send-and-sync-traits).                                                                                                                                                                                                                                                                                                    |
 | **`thread`**      | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attributes`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep(Duration)`, plus `sync::channel` channels (`Channel::unbounded` / `Channel::bounded`, each giving a `Pair` of its `Sender` and `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn.                                                                                                                                                                                                                                                                                                             |
-| **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [section 20](#20-testing).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_equal`, `expect_not_equal`, `bail`, `bail_other`. See [section 20](#20-testing).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 ### 19.3 Naming Conventions in the Standard Library
 
@@ -4944,12 +4944,12 @@ Cryo ships a built-in unit-test framework. Tests live in `<project>/tests/` file
 ![config(testing)]
 namespace MyApp::Tests;
 
-import std::test::assert::{ expect_eq, expect, bail };
+import std::test::assert::{ expect_equal, expect, bail };
 import std::test::error::{ TestError };
 
 ![test]
 function addition_is_commutative() -> Result<(), TestError> {
-    return expect_eq(1 + 2, 2 + 1);
+    return expect_equal(1 + 2, 2 + 1);
 }
 
 ![test]
@@ -4971,8 +4971,8 @@ function unwrap_none_panics() -> Result<(), TestError> {
 A test function returns `Result<(), TestError>`. `Ok(())` is success; `Err(...)` is failure with a message. The `assert` module provides:
 
 - `expect(condition, message)`: fails if the condition is false.
-- `expect_eq(a, b)`: fails if `a != b` (requires `T: Eq + Display`).
-- `expect_ne(a, b)`: fails if `a == b`.
+- `expect_equal(a, b)`: fails if `a != b` (requires `T: Eq + Display`).
+- `expect_not_equal(a, b)`: fails if `a == b`.
 - `bail(message)`: unconditional failure.
 - `bail_other(message)`: non-assertion failure (treated as an error rather than a test fail).
 

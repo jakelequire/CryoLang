@@ -24,7 +24,7 @@ import std::test::*;
 
 ![test]
 function add_works() -> Result<(), TestError> {
-    expect_eq(2 + 2, 4)?;
+    expect_equal(2 + 2, 4)?;
     return Result::Ok(());
 }
 ```
@@ -59,14 +59,14 @@ A test is a `![test]` function returning `Result<(), TestError>`:
 | --- | --- |
 | `expect(cond, msg)` | `cond` is true |
 | `expect_true(cond)` / `expect_false(cond)` | boolean |
-| `expect_eq(a, b)` / `expect_ne(a, b)` | equality |
+| `expect_equal(a, b)` / `expect_not_equal(a, b)` | equality |
 | `expect_close_f64(a, b, eps)` | float within tolerance |
 | `expect_some(opt)` / `expect_none(opt)` | `Option` shape |
-| `expect_ok(res)` / `expect_err(res)` | `Result` shape |
+| `expect_ok(res)` / `expect_error(res)` | `Result` shape |
 | `bail(msg)` / `bail_other(msg)` | fail immediately |
 
 Each assertion returns a `Result<(), TestError>`; propagate failures with the
-`?` operator (`expect_eq(x, y)?;`) or by matching and returning `Err`.
+`?` operator (`expect_equal(x, y)?;`) or by matching and returning `Err`.
 
 ### Annotations
 
@@ -113,7 +113,7 @@ function prints_ready() -> Result<(), TestError> {
 function a_test_child_runs_by_name_and_exits_zero() -> Result<(), TestError> {
     const command: Command = TestChild::command(Str::new("CryoTests::Tests::TestChildren::prints_ready"))?;
     const output: Output = command.output()?;
-    return expect_eq(output.status().exit_code(), Option::Some(0));
+    return expect_equal(output.status().exit_code(), Option::Some(0));
 }
 ```
 
@@ -157,7 +157,7 @@ function writes_then_reads() -> Result<(), TestError> {
     };
     // `dir` is torn down on EVERY path below, including the failing `?`.
     write_file(dir.path.as_str(), Str::new("hi"))?;
-    return expect_eq(read_file(dir.path.as_str()), Str::new("hi"));
+    return expect_equal(read_file(dir.path.as_str()), Str::new("hi"));
 }
 ```
 
@@ -193,7 +193,7 @@ function doubling_table() -> Result<(), TestError> {
     mut i: i64 = 0;
     while (i < cases.length()) {
         const c: &Case = &cases[i];
-        match (expect_eq(c.input * 2, c.want)) {
+        match (expect_equal(c.input * 2, c.want)) {
             Result::Ok(_)  => { }
             Result::Err(e) => { return Result::Err(prefix_case(i as u64, e)); }
         }
