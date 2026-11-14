@@ -446,8 +446,8 @@ Left over from that: the async entry point calls `Executor::new` and
    hooks are a `private extern` block.  `time`'s clocks and `Duration`
    keep their seconds and nanoseconds private behind accessors (595).
    `encoding`'s base64 and SHA-1 internals are
-   private, behind `Base64`'s methods and `sha1`.  `net::sys` is public
-   but for its own helpers, and `net::addr`, `dns` and `http` are marked
+   private, behind `Base64`'s methods and `sha1`.  `net::sys` is an
+   internal module (705), and `net::addr`, `dns` and `http` are marked
    item by item (597), and the rest of `net` (599) - HTTP/2, HTTPS,
    sockets, TLS and WebSocket - so all of `net` is marked: its three
    private `push_all` copies are gone, the encoders writing

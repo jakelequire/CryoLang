@@ -141,6 +141,14 @@ yet is recorded with the change that builds it, not here.
      alias, and keeps filtering the system headers it includes, as a
      quoted header's are.  (Jake)
 
+705. **`net::sys` is internal.**  The per-OS socket, resolver and error
+     calls (`os_*`, `sock_*`, `net_init`, `last_io_error`), the
+     `addrinfo` layout and hint readings and `ConnectStatus` are the
+     standard library's plumbing for `net::socket` and `net::dns`, and the
+     module is declared `internal module net::sys;`.  `set_timeout` is
+     still written `public`.  Supersedes the part of 597 that made
+     `net::sys` a public low-level API.  (Jake)
+
 ### 2026-11-12
 
 703. **A hash map's bucket layer is internal.**  `Entry`, the node of a
