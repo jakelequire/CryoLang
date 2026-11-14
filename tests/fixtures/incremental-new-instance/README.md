@@ -13,7 +13,7 @@ defect needs a cached build followed by an edit.
 
 Each build also converts instantiations of `src/meters.cryo`'s `Gauge<T>`,
 which implements `Meter` generically, to trait objects; the edit converts a
-new one, `Gauge<i16>`, and a `String` to a `virtual mut &FmtWrite`.  The
+new one, `Gauge<i16>`, and a `String` to a `virtual mut &FormatWrite`.  The
 tables of those instantiations are emitted with them, in `meters.cryo`'s
 and `std::collections::string`'s objects, which the edit does not touch;
 reused from the first build, they would hold no such table.

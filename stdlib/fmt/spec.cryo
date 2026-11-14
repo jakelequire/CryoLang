@@ -16,7 +16,7 @@
 ///! Unicode scalars; `.precision` truncates a Display value to that many
 ///! scalars, or sets the fractional digits of a float.
 ///!
-///! The parser (`fmt_parse_spec`) turns the spec string into a `FmtSpec`;
+///! The parser (`fmt_parse_spec`) turns the spec string into a `FormatSpec`;
 ///! the render helpers here build the padded output. `fmt/interp.cryo`
 ///! owns the per-type dispatch (`static match (T)`) that picks the right
 ///! render helper - that is the only piece that must know `T`.
@@ -33,7 +33,7 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::collections::pair::{ Pair };
 import std::fmt::display::{ Display, format_to_string, Formatter };
-import std::fmt::error::{ FmtError };
+import std::fmt::error::{ FormatError };
 import std::fmt::float::{ DEFAULT_DECIMALS, F64_MAX_DIGITS };
 import std::core::mem;
 
@@ -59,7 +59,7 @@ private const FILL_ZERO:  u32 = 0x30;
 
 /// A parsed format spec. Field defaults describe an empty spec (plain
 /// Display, no padding).
-internal type struct FmtSpec {
+internal type struct FormatSpec {
     private fill:          u32;      // scalar fill char
     private align:         u8;       // ALIGN_*
     private plus_sign:     boolean;  // '+' - sign a non-negative decimal
@@ -71,8 +71,8 @@ internal type struct FmtSpec {
     private radix:         u8;       // RADIX_*
     private scientific:    boolean;  // 'e'
 
-    private static empty() -> FmtSpec {
-        return FmtSpec {
+    private static empty() -> FormatSpec {
+        return FormatSpec {
             fill: FILL_SPACE, align: ALIGN_DEFAULT, plus_sign: false, alternate: false,
             zero_pad: false, width: 0, has_precision: false, precision: 0,
             radix: RADIX_NONE, scientific: false,
@@ -93,10 +93,10 @@ private function align_of_byte(b: u8) -> u8 {
 }
 
 /// Parse a spec string (the text after the `:` in a hole) into a
-/// `FmtSpec`. The compiler has already validated the grammar, so this
+/// `FormatSpec`. The compiler has already validated the grammar, so this
 /// walks it without re-checking; an unexpected byte is simply ignored.
-internal function fmt_parse_spec(spec: Str) -> FmtSpec {
-    mut s: FmtSpec = FmtSpec::empty();
+internal function fmt_parse_spec(spec: Str) -> FormatSpec {
+    mut s: FormatSpec = FormatSpec::empty();
     const n: i64 = spec.length();
     const bytes: u8* = spec.as_ptr();
     mut i: i64 = 0;
@@ -167,7 +167,7 @@ internal function fmt_parse_spec(spec: Str) -> FmtSpec {
 
 /// Radix prefix for `#`: `0x` / `0o` / `0b`. Empty for decimal or when
 /// `alternate` is off.
-private function radix_prefix(spec: &FmtSpec) -> Str {
+private function radix_prefix(spec: &FormatSpec) -> Str {
     if (!spec.alternate) { return Str::new(""); }
     if (spec.radix == RADIX_HEX_LOWER) { return Str::new("0x"); }
     if (spec.radix == RADIX_HEX_UPPER) { return Str::new("0x"); }
@@ -182,7 +182,7 @@ internal const NUMBER_BODY_BYTES: i64 = 72;
 
 /// Write the magnitude `val` in the spec's radix into `out`; the number
 /// of bytes written.
-private function radix_digits(val: u64, spec: &FmtSpec, out: mut u8*) -> i64 {
+private function radix_digits(val: u64, spec: &FormatSpec, out: mut u8*) -> i64 {
     if (spec.radix == RADIX_HEX_LOWER) { return val.to_hex_buf(out); }
     if (spec.radix == RADIX_HEX_UPPER) { return val.to_hex_upper_buf(out); }
     if (spec.radix == RADIX_OCT)       { return val.to_oct_buf(out); }
@@ -192,7 +192,7 @@ private function radix_digits(val: u64, spec: &FmtSpec, out: mut u8*) -> i64 {
 
 /// Body for an unsigned integer, written into `out` (`NUMBER_BODY_BYTES`):
 /// optional radix prefix + digits, the prefix its `head_len`.
-internal function fmt_uint_body(val: u64, spec: &FmtSpec, out: mut u8*) -> BodyText {
+internal function fmt_uint_body(val: u64, spec: &FormatSpec, out: mut u8*) -> BodyText {
     if (spec.scientific) { return fmt_float_body(val as f64, spec, out); }
     mut head: i64 = 0;
     if (spec.radix != RADIX_NONE) {
@@ -210,7 +210,7 @@ internal function fmt_uint_body(val: u64, spec: &FmtSpec, out: mut u8*) -> BodyT
 /// Decimal keeps the sign; a radix formats the two's-complement bit
 /// pattern `masked` (already narrowed to the value's own width by the
 /// caller) with no sign: `-1i8` in hex is `ff`.
-internal function fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec, out: mut u8*) -> BodyText {
+internal function fmt_sint_body(val: i64, masked: u64, spec: &FormatSpec, out: mut u8*) -> BodyText {
     if (spec.scientific) { return fmt_float_body(val as f64, spec, out); }
     if (spec.radix != RADIX_NONE) {
         return fmt_uint_body(masked, spec, out);
@@ -233,7 +233,7 @@ internal function fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec, out: mut 
 /// body's `String`. The sign is part of the text - a `+` before a value
 /// that is not negative under `+`, none before NaN - so `head_len` marks it
 /// for zero-fill.
-internal function fmt_float_body(val: f64, spec: &FmtSpec, out: mut u8*) -> BodyText {
+internal function fmt_float_body(val: f64, spec: &FormatSpec, out: mut u8*) -> BodyText {
     const places: i64 = if (spec.has_precision) { spec.precision } else { DEFAULT_DECIMALS };
     const needed: i64 = F64_MAX_DIGITS + 1 + places;
     mut digits: mut u8* = out;
@@ -265,7 +265,7 @@ internal function fmt_float_body(val: f64, spec: &FmtSpec, out: mut u8*) -> Body
 
 /// Body for any Display value that is not an integer or float: render it,
 /// then truncate to `precision` scalars if one is set.
-internal function fmt_display_body<T>(value: &T, spec: &FmtSpec) -> BodyText
+internal function fmt_display_body<T>(value: &T, spec: &FormatSpec) -> BodyText
 where T: Display {
     mut out: String = String::new();
     match (format_to_string::<T>(value)) {
@@ -325,7 +325,7 @@ private function truncate_scalars(s: Str, n: i64) -> Str {
 
 /// Write `body` through `f`, padded to the spec's field width. `head_len`
 /// is the leading sign/prefix run for sign-aware zero-fill.
-internal function fmt_pad(f: mut &Formatter, body: Str, head_len: i64, spec: &FmtSpec) -> Result<(), FmtError> {
+internal function fmt_pad(f: mut &Formatter, body: Str, head_len: i64, spec: &FormatSpec) -> Result<(), FormatError> {
     const count: i64 = body.chars().count();
     if (count >= spec.width) { return f.write_str(body); }
     const padn: i64 = spec.width - count;

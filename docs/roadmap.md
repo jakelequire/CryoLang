@@ -78,9 +78,9 @@ implementations, each one a candidate for its trait.  Not started.
 - The HTTP status line, HTTP/2's `:status` and `set_body`'s Content-Length
   still write their decimals through a stack buffer by hand: they write
   into an `Array<u8>` and a header map's `Str`, neither of which is an
-  `FmtWrite` sink.  Open: whether `Array<u8>` (a byte buffer that would
-  only ever be given UTF-8 through `FmtWrite`) should implement
-  `FmtWrite`, so they become `out.write(f"...")`.
+  `FormatWrite` sink.  Open: whether `Array<u8>` (a byte buffer that would
+  only ever be given UTF-8 through `FormatWrite`) should implement
+  `FormatWrite`, so they become `out.write(f"...")`.
 - A spec on a non-numeric hole (`{name:>8}`) still formats the value into
   a `String` to measure it before padding.
 - The object conversion it needed (ruling 606) does not yet cover an
@@ -409,7 +409,7 @@ Left over from that: the async entry point calls `Executor::new` and
    and MIR pipeline lands.
 2. **`Display` and `Debug` over a trait object.**  Built: one
    non-generic `fmt(&this, f: mut &Formatter)` writing through the
-   `virtual mut &FmtWrite` a `Formatter` holds (423).  Since that `fmt`
+   `virtual mut &FormatWrite` a `Formatter` holds (423).  Since that `fmt`
    is no longer generic, the implementation for an instantiation of a
    generic type (`Pair<i64, Str>`, `Option<T>`) is emitted with every
    instantiation whose bound holds, as each of its other methods is,

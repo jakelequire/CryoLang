@@ -631,7 +631,7 @@ yet is recorded with the change that builds it, not here.
      `push` and `try_push` take any `T: Display`: text is copied in, every
      other type is formatted.  `push_char(c)` appends one scalar and
      `push_repeated(c, count)` appends `count` copies.  Every `char` is
-     encoded by the one private encoder behind `FmtWrite.write_char`, which
+     encoded by the one private encoder behind `FormatWrite.write_char`, which
      writes a surrogate or an out-of-range value as U+FFFD; `char`'s
      `Display` writes through `write_char`.  The format spec's fill, the
      JSON escape decoder and serializer, the HTTP client's decimal writers
@@ -672,7 +672,7 @@ yet is recorded with the change that builds it, not here.
      generic body, a value whose type names a parameter becomes a trait
      object where every copy of the body has an implementation of the
      trait for it: a type parameter whose own bound names the trait at
-     the object's arguments (`where W: FmtWrite`), `This` in a default
+     the object's arguments (`where W: FormatWrite`), `This` in a default
      of that trait itself, and the receiver of an implementation of the
      trait whose methods are checked over parameters - a generic
      implementation, or one written for an instantiation.  The template
@@ -682,7 +682,7 @@ yet is recorded with the change that builds it, not here.
      default - is E0315, and for a parameter the help names the bound to
      add.  A supertrait's object, and an instantiation over a parameter
      whose implementation holds for every argument, are not converted
-     yet.  (delegated; needed for `FmtWrite.write`, a default that makes
+     yet.  (delegated; needed for `FormatWrite.write`, a default that makes
      a `Formatter` over its receiver)
 
 607. **An f-string passed as `fmt::Arguments` is written where it goes.**
@@ -694,16 +694,16 @@ yet is recorded with the change that builds it, not here.
      initializer, a return, a field, an argument whose parameter is
      anything else, a generic `T` included - an f-string is a `String`,
      so no stored value keeps a borrow of a hole past the call.
-     `FmtWrite.write(arguments)` is a default every sink gets, and
+     `FormatWrite.write(arguments)` is a default every sink gets, and
      `Formatter.write(arguments)` writes through a formatter;
      `String.push(f"...")` still builds the text first.  A number in a
      hole with a spec is rendered on the stack.  `Stdout` and `Stderr`
-     are no longer `FmtWrite` sinks: they write text through
+     are no longer `FormatWrite` sinks: they write text through
      `io::Write.write`, whose name the default made ambiguous on them.
      The duration and date-time `Display`s and the JSON control escape
      write through `write`; their own decimal, padding and hex writers
-     are deleted.  (Jake for `write` on `FmtWrite`, the name
-     `fmt::Arguments` and the argument position; dropping `FmtWrite`
+     are deleted.  (Jake for `write` on `FormatWrite`, the name
+     `fmt::Arguments` and the argument position; dropping `FormatWrite`
      from `Stdout`/`Stderr` and `Formatter.write` delegated)
 
 608. **A byte classifies itself, by `char`'s rules.**  `u8` has
@@ -822,13 +822,13 @@ yet is recorded with the change that builds it, not here.
      maps a Winsock code on every target, as `from_windows_error` maps a
      system code, so the `WSAE*` codes it reads are declared on every
      target; the network layer's own mapper is deleted.  `Array<u8>`
-     implements `FmtWrite`, appending the text's bytes, and `IoError`
-     converts from `FmtError` (its I/O error, or the allocation failure),
+     implements `FormatWrite`, appending the text's bytes, and `IoError`
+     converts from `FormatError` (its I/O error, or the allocation failure),
      so the HTTP status line is written with `write(f"...")` and `?`, and
      HTTP/2's `:status` and both `set_body`s' Content-Length are formatted
      into a byte array, panicking where the array cannot grow.  (Jake for
-     `over`, `from_wsa` and the `FmtWrite` impl; `position`, the
-     `From<FmtError>` conversion and the ungated codes delegated)
+     `over`, `from_wsa` and the `FormatWrite` impl; `position`, the
+     `From<FormatError>` conversion and the ungated codes delegated)
 
 616. **A `where` bound may be written on any type.**  A bound's subject is
      a written type, stamped and resolved like every annotation: a
@@ -1050,7 +1050,7 @@ yet is recorded with the change that builds it, not here.
      opaque, compared through `equals`), the result block, the start
      payloads, their trampolines and the detached-thread reaper are
      private.  `fmt`'s print calls, `Formatter` (its writer private behind
-     `get_writer`), `Display`, `Debug`, `FmtWrite`, `FmtError`,
+     `get_writer`), `Display`, `Debug`, `FormatWrite`, `FormatError`,
      `Arguments`, `parse_f64` and the to-string calls are public.  The
      f-string `String` builders are internal language items, as the pieces
      builders are.  `fmt::spec` is the f-string spec's plumbing: what the
@@ -2477,7 +2477,7 @@ yet is recorded with the change that builds it, not here.
      &Iterator<i32>`.  (Jake, on the trait-object audit)
 
 423. **Printing goes through objects by a non-generic formatting method**
-     taking a `virtual mut &FmtWrite` formatter, added in the standard
+     taking a `virtual mut &FormatWrite` formatter, added in the standard
      library's visibility pass.  (Jake, on the trait-object audit)
 
 424. **A trait that declares two methods with the same name is refused**
@@ -4626,7 +4626,7 @@ check is being deleted and the seals are what hold.  (Jake)
 
     ```cryo
     implement trait Debug for struct String<GlobalAlloc> {
-        fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError> where W: FmtWrite {
+        fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FormatError> where W: FormatWrite {
             const view: Str = this.as_str();
             return view.fmt(f);                    // error[E0156]: Display::fmt and Debug::fmt
             return (Debug for Str)::fmt(&view, f); // the one meant
