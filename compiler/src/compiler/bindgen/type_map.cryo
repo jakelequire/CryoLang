@@ -65,22 +65,33 @@ type struct CTypeMapper {
     ctx:   mut CompilationContext*;
     /// The import's extern-module alias's module (`<mod>::alias`).
     alias: ModulePath;
-    /// The system header an angle-bracket import names (`<math.h>`), as its
-    /// CXFile; null for every other import.  Its declarations are bound, while
-    /// the system headers it includes stay filtered.
-    named_system_header: void*;
+    /// The system headers an angle-bracket import binds, as CXFiles: the one
+    /// it names (`<math.h>`) and each system header that one includes
+    /// directly, since a header commonly declares its interface in a file it
+    /// includes.  Empty for every other import.  A system header included
+    /// any deeper stays filtered.
+    bound_system_headers: [void*];
 
     static new(ctx: mut CompilationContext*, alias: ModulePath) -> CTypeMapper {
-        return CTypeMapper { ctx: ctx, alias: alias, named_system_header: null };
+        return CTypeMapper { ctx: ctx, alias: alias, bound_system_headers: [] };
+    }
+
+    /// True when `file` is one of the system headers this import binds.
+    is_bound_system_header(&this, file: void*) -> boolean {
+        if (file == null) { return false; }
+        for (mut i: i64 = 0; i < this.bound_system_headers.length(); i++) {
+            if (this.bound_system_headers[i] == file) { return true; }
+        }
+        return false;
     }
 
     /// True when `declaration` is in a header this import binds: any header
-    /// outside the system include path, or the system header the import
-    /// names.  A declaration anywhere else is not emitted, so a reference to
-    /// it cannot be spelled by name.
+    /// outside the system include path, or a system header the import binds.
+    /// A declaration anywhere else is not emitted, so a reference to it
+    /// cannot be spelled by name.
     is_bound_declaration(&this, declaration: CXCursor) -> boolean {
         if (!declaration.is_in_system_header()) { return true; }
-        return this.named_system_header != null && declaration.file() == this.named_system_header;
+        return this.is_bound_system_header(declaration.file());
     }
 
     /// Heap-allocate a PrimitiveAnnotation wrapped in a TypeAnnotation.

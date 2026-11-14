@@ -700,12 +700,13 @@ type struct Importer {
     /// common case backwards: a library's entry header is typically an umbrella
     /// of `#include`s that defines nothing itself, so every constant the library
     /// ships lives one level down and is silently invisible.
-    /// The system header an angle-bracket import names counts as one of the
-    /// library's own: it is the header the import asked for.
+    /// A system header an angle-bracket import binds counts as one of the
+    /// library's own: it is the header the import asked for, or one that
+    /// header includes directly.
     is_from_bound_header(&this, cursor: CXCursor) -> boolean {
         const file: void* = cursor.file();
         if (file == null) { return false; }
-        if (file == this.types.named_system_header) { return true; }
+        if (this.types.is_bound_system_header(file)) { return true; }
         for (mut i: i64 = 0; i < this.input_files.length(); i++) {
             if (this.input_files[i] == file) { return true; }
         }
@@ -2385,8 +2386,8 @@ type struct Importer {
     /// the C `CXInclusionVisitor` signature `(CXFile, CXSourceLocation*, unsigned,
     /// CXClientData) -> void`; the file's own location, via
     /// `clang_getLocationForOffset`, drives the filter, and `include_len` (0 for
-    /// the main file, 1 for a file it includes directly) picks out the header
-    /// an angle-bracket import names.
+    /// the main file, 1 for a file it includes directly) picks out the system
+    /// headers an angle-bracket import binds.
     static visit_inclusion(included_file: void*, inclusion_stack: CXSourceLocation*,
                            include_len: u32, client: void*) -> void {
         const imp: mut Importer* = client as mut Importer*;
@@ -2396,10 +2397,11 @@ type struct Importer {
             clang::clang_getLocationForOffset(imp.tu, included_file, 0);
         if (clang::clang_Location_isInSystemHeader(loc) != 0) {
             // The in-memory main file of an angle-bracket import holds one
-            // `#include` line, so the one system header it includes directly
-            // is the header the import names.
-            if (imp.names_system_header && include_len == 1) {
-                imp.types.named_system_header = included_file;
+            // `#include` line, so the one system header at depth 1 is the
+            // header the import names, and every one at depth 2 is a header
+            // that one includes directly.
+            if (imp.names_system_header && include_len >= 1 && include_len <= 2) {
+                imp.types.bound_system_headers.push(included_file);
             }
             return;
         }

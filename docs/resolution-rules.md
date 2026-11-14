@@ -133,6 +133,21 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-14
+
+707. **An angle-bracketed import also binds the headers its header
+     includes directly.**  `extern module m := "C" { #include <math.h> }`
+     binds the declarations and macros written in `<math.h>` and in each
+     system header `<math.h>` itself includes, one level down, since a C
+     library commonly declares a header's interface in such a file.  A
+     system header included any deeper stays filtered.  Supersedes the
+     part of 704 that filtered every header the named one includes.
+     (Jake)
+
+708. **`net::sys::set_timeout` is internal**, as every other item of
+     `net::sys` is; a socket's timeouts are set through `net::socket`.
+     Supersedes the part of 705 that left it public.  (Jake)
+
 ### 2026-11-13
 
 704. **An inline import of an angle-bracketed header binds that header.**
