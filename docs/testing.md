@@ -492,6 +492,33 @@ make test ARGS="--ignored some_filter"
 project with the freshly built compiler. Both `make test` and `make examples`
 run in CI on every push and pull request to `main`.
 
+### Declaring what a change moves
+
+`make verify ARGS="--baseline REV --require-identical"` compares every
+compiled object against the compiler built from `REV`, and fails on any
+program whose verdict or objects differ unless the change declares it.  A
+change declares a program, one line each with its reason, in one of two files
+the comparison reads:
+
+- `tests/started-compiling` - a project the baseline refuses with a
+  diagnostic and the change builds.
+- `tests/started-passing` - a program the baseline's census fails and the
+  change corrects: a project by its directory name, a compile-fail file as
+  `negative/<file>.cryo`, an example as `examples/<name>`, a unit-test file by
+  its path under `tests/tests` (its object must move), or `archive:<path>` for
+  a unit-test file the baseline fails through the stdlib archive.
+- `moved:<project>` in `tests/started-passing` - a project both compilers
+  build and pass whose objects the change moves on purpose (a codegen
+  correction no assertion of the project observes).  The baseline's census
+  must pass it, its objects are left out of the comparison, and at least one
+  of them must have moved; a declared project whose objects are all
+  unchanged fails, and so does any object that moved in a project nothing
+  declares.
+
+A line stays once committed: against a later baseline it is inert.
+Rewriting a line into another form with its reason kept declares nothing
+again.
+
 ## 9. The language server's tests
 
 `make lsp-check` builds `tools/CryoLSP` with the compiler under test and then
