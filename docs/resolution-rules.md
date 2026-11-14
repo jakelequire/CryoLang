@@ -978,12 +978,12 @@ yet is recorded with the change that builds it, not here.
      `Mutex<()>`.  Behaviour is unchanged.  (Jake)
 
 625. **One non-blocking switch, one borrowed reader.**
-     `io::fd::set_nonblocking(fd, on)` turns a descriptor's
+     `io::file_descriptor::set_nonblocking(fd, on)` turns a descriptor's
      non-blocking mode on or off, keeping its other file-status flags,
      and returns the OS error on failure; on Windows a C runtime
      descriptor has no such mode and the call fails with `Unsupported`.
      `net::sys`'s POSIX switch delegates to it, and the process module's
-     two copies are gone.  `io::fd::BorrowedFileDescriptor` reads a
+     two copies are gone.  `io::file_descriptor::BorrowedFileDescriptor` reads a
      descriptor it does not own - dropping it closes nothing - through
      `Read`, so a drain is `read_to_end`: to EOF for a blocking pipe, and
      to `WouldBlock` for a non-blocking one, with every byte read before
@@ -1068,14 +1068,14 @@ yet is recorded with the change that builds it, not here.
      `get_writer`), `Display`, `Debug`, `FormatWrite`, `FormatError`,
      `Arguments`, `parse_f64` and the to-string calls are public.  The
      f-string `String` builders are internal language items, as the pieces
-     builders are.  `fmt::spec` is the f-string spec's plumbing: what the
+     builders are.  `fmt::specification` is the f-string spec's plumbing: what the
      spec piece calls is internal, the rest private.  (Jake; each split
      delegated)
 
 632. **`io` and `fs` are marked.**  The I/O traits, `SeekFrom`, the
      buffered readers and writers, `Cursor`, the standard streams with
      their locks, `is_terminal`, the descriptor numbers and calls of
-     `io::fd`, the newline constants, `read_dir`, the directory and file
+     `io::file_descriptor`, the newline constants, `read_dir`, the directory and file
      calls, `DirEntry`, `ReadDir`, `OpenOptions` and `File` are public,
      and so are the default buffer size, file mode and directory mode.
      `Transfer` keeps public fields, since every `AsyncTransport`
@@ -1501,7 +1501,7 @@ yet is recorded with the change that builds it, not here.
      few functions that exist only to implement another one there (the
      Winsock error normaliser, the connect-status probe behind
      `os_connect_status`, the timeout packer) are private.  In
-     `net::addr`, `dns` and `http`, plain records keep public fields
+     `net::address`, `dns` and `http`, plain records keep public fields
      (`IpV4Address`, `SocketAddress`, `Url`, `Request`, `Response`); a type
      that guards state keeps it private behind its methods
      (`ResolvedAddresses`, `Resolve`, `Router`, `HttpServer`, `StatusCode`);
@@ -3679,7 +3679,7 @@ check is being deleted and the seals are what hold.  (Jake)
      counted.
 
 156. **Ruling 73's help names the pointer as written**: `(*q).drop()` gets
-     "use `std::core::ptr::drop_in_place(q)`", not a literal `p`.
+     "use `std::core::pointer::drop_in_place(q)`", not a literal `p`.
 
 157. **Store #2's leftover name-keyed instance registration is finished
      together with store #4.**
@@ -4131,7 +4131,7 @@ check is being deleted and the seals are what hold.  (Jake)
     fix**, which must remove it before the by-name finders are deleted.
 
 73. **E0358 on `(*p).drop()` gets a help of its own**: "use
-    `std::core::ptr::drop_in_place(p)`".
+    `std::core::pointer::drop_in_place(p)`".
 
 74. **The spelling-flow entry for `IntrinsicKind::from_name` is accepted.**
 
@@ -4486,14 +4486,14 @@ check is being deleted and the seals are what hold.  (Jake)
     ```
 
 14. **The drop-in-place intrinsic is `drop_in_place<T>(p: T*)` in a new
-    module `std::core::ptr`**, beside the pointer operations. It does not go in
+    module `std::core::pointer`**, beside the pointer operations. It does not go in
     `std::core::intrinsics`. This names the intrinsic ruling 7 left
     unnamed.
 
     ```cryo
-    import std::core::ptr;
+    import std::core::pointer;
     function release<T>(p: T*) -> void {
-        ptr::drop_in_place::<T>(p);
+        pointer::drop_in_place::<T>(p);
     }
     ```
 

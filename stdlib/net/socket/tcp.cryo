@@ -52,12 +52,12 @@ import std::core::slice;
 import std::core::drop::{ Drop };
 import std::core::mem;
 import std::io::error::{ IoError, IoErrorKind };
-import std::io::fd;
+import std::io::file_descriptor;
 import std::io::traits::{ AsyncTransport, Transfer };
 import std::ffi::libc;
-import std::net::addr::ip::{ IpAddress };
-import std::net::addr::socket_addr::{ SocketAddress };
-import std::net::addr::sockaddr;
+import std::net::address::ip::{ IpAddress };
+import std::net::address::socket_address::{ SocketAddress };
+import std::net::address::socket_address_storage;
 import std::net::sys::{ ConnectStatus };
 import std::future::poll::{ Poll };
 import std::future::waker::{ Context };
@@ -67,10 +67,10 @@ import std::future::reactor::{ INTEREST_READ, INTEREST_WRITE, Reactor };
 // Socket-domain / type / level / option / shutdown constants and
 // the `ShutdownHow` enum live in `ffi::libc`. `sockaddr_in` packing
 // and the `SO_*TIMEO` helper are shared with `net::socket::udp` in
-// `net::addr::sockaddr`.
+// `net::address::socket_address_storage`.
 
 // Open a TCP socket of the family matching `addr` (AF_INET vs AF_INET6).
-// Lives here, not in `net::sys`, so `sys` stays free of net::addr::ip imports.
+// Lives here, not in `net::sys`, so `sys` stays free of net::address::ip imports.
 private function tcp_socket_for(addr: &SocketAddress) -> i32 {
     match (addr.ip) {
         IpAddress::V4(_) => { return sys::os_socket_tcp(); }
@@ -150,7 +150,7 @@ implement trait Drop for struct TcpStream {
 /// import std::future::combinator::{ Futures };
 /// import std::future::executor::{ Executor };
 /// import std::io::error::{ IoError };
-/// import std::net::addr::socket_addr::{ SocketAddress };
+/// import std::net::address::socket_address::{ SocketAddress };
 /// import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
 ///
 /// async function accept_one(listener: TcpListener) -> boolean {
@@ -188,7 +188,7 @@ public type struct TcpListener {
         // Pack first so an unsupported address family doesn't leak
         // a freshly-opened socket fd. 28 bytes holds a v6 sockaddr_in6.
         mut sockaddr_buf: [u8; 28];
-        const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf, &local)?;
+        const len: u32 = socket_address_storage::pack_sockaddr_in(&sockaddr_buf, &local)?;
 
         // `SOCK_CLOEXEC` opens the listening socket close-on-exec so a
         // concurrent `fork`+`exec` does not leak it into the child. The
@@ -244,7 +244,7 @@ public type struct TcpListener {
         if (sys::os_getsockname(this.fd, &sockaddr_buf[0], &addrlen) < 0) {
             return Result::Err(sys::last_io_error());
         }
-        return Result::Ok(sockaddr::unpack_sockaddr(&sockaddr_buf));
+        return Result::Ok(socket_address_storage::unpack_sockaddr(&sockaddr_buf));
     }
 }
 
@@ -550,7 +550,7 @@ public type struct TcpConnect {
         mut c: TcpConnect = TcpConnect { fd: -1, addr: [0; 28], addrlen: 0,
                                          err: Option::None,
                                          rt:  null };
-        match (sockaddr::pack_sockaddr_in(&c.addr, &remote)) {
+        match (socket_address_storage::pack_sockaddr_in(&c.addr, &remote)) {
             Result::Ok(len) => { c.addrlen = len; }
             Result::Err(e)  => { c.err = Option::Some(e); return c; }
         }

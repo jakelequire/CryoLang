@@ -382,7 +382,7 @@ const v:  void* = malloc(64);  // type-erased
 
 A pointer converts to another pointer type without a cast only when the pointee is the same type (`mut T*` to `T*`, never back), or when either side is `void*`. A read-only level is made only at the outermost pointer: `mut (mut u8*)*` converts to `(mut u8*)*`, but not to `mut (u8*)*`, since through a `mut (u8*)*` a read-only pointer could be stored where the `mut (mut u8*)*` reads back a writable one. Below the outermost level every mark stays as written, in both directions, and only `as` converts across it. A pointer to any other type is written with `as`, including a pointee that converts to the wanted one: an `i32` converts to an `i64`, but an `i32*` addresses four bytes, so it is not an `i64*` (nor is an `i32**` an `i64**` or a `void**`). A value passed where a pointer parameter wants its address must be of the pointee type itself. The rule is the same wherever a value meets a declared type: an initializer, an assignment, a `return`, a struct field, and an argument of every kind of call - a method, a free or static function, a function reached by its path and a generic one (`E0214` at an argument, `E0200` elsewhere). It holds the same where a pointee is a type parameter: a generic body is checked once, against its own parameters, so a `T*` does not fill a `mut T*` field, variable or parameter there either. A borrow converts to a pointer to its referent: a `mut &T` to a `mut T*` or a `T*`, a `&T` to a `T*` only ([section 2.3](#23-references)).
 
-Raw pointers are unchecked. Validity, aliasing, and lifetime are the programmer's responsibility. For a pointer that is statically guaranteed non-null, see `core::ptr::NonNull<T>`. For owned heap allocations, prefer `Box<T>`. See [section 14](#14-pointers-and-memory).
+Raw pointers are unchecked. Validity, aliasing, and lifetime are the programmer's responsibility. For a pointer that is statically guaranteed non-null, see `core::pointer::NonNull<T>`. For owned heap allocations, prefer `Box<T>`. See [section 14](#14-pointers-and-memory).
 
 ### 2.3 References
 
@@ -1122,7 +1122,7 @@ extern "C" {
 }
 ```
 
-A user-defined variadic function names the bucket (`args...`). The compiler emits `va_start`/`va_end` around the body and binds `args` to the raw `va_list` pointer. Wrap it in a `VariadicArguments` (`std::core::varargs`, in the prelude) to read typed values without hand-rolling `va_arg`:
+A user-defined variadic function names the bucket (`args...`). The compiler emits `va_start`/`va_end` around the body and binds `args` to the raw `va_list` pointer. Wrap it in a `VariadicArguments` (`std::core::variadic_arguments`, in the prelude) to read typed values without hand-rolling `va_arg`:
 
 ```cryo
 function sum(count: i32, args...) -> i64 {
@@ -3026,7 +3026,7 @@ Type parameters are declared in angle brackets after the name. By convention the
 ### 11.2 Generic Structs
 
 ```cryo
-import std::core::ptr;
+import std::core::pointer;
 import std::core::intrinsics::{ malloc, free };
 
 type struct Box<T> {
@@ -3047,7 +3047,7 @@ type struct Box<T> {
 // merely named `drop` in the struct body would be an ordinary method.
 implement<T> trait Drop for Box<T> {
     drop(mut &this) -> void {
-        ptr::drop_in_place::<T>(this.ptr);   // release the boxed value
+        pointer::drop_in_place::<T>(this.ptr);   // release the boxed value
         free(this.ptr);                      // then its storage
     }
 }
@@ -3802,10 +3802,10 @@ Dereferencing a null pointer is undefined behaviour. For "may be absent" semanti
 
 ### 14.4 NonNull
 
-`core::ptr::NonNull<T>` is a thin wrapper around `T*` that statically guarantees non-nullness. Containers and smart pointers in the standard library use `NonNull<T>` internally so they never have to defensively null-check.
+`core::pointer::NonNull<T>` is a thin wrapper around `T*` that statically guarantees non-nullness. Containers and smart pointers in the standard library use `NonNull<T>` internally so they never have to defensively null-check.
 
 ```cryo
-import core::ptr::NonNull;
+import core::pointer::NonNull;
 
 const non_null: NonNull<u8> = NonNull::new(buf).unwrap();
 ```
@@ -3949,18 +3949,18 @@ leaves what it freed empty.
 
 **Only `implement trait Drop` defines a destructor.** A method merely named `drop` - declared in a struct body or an inherent `implement` block - is an ordinary method: it is not run at scope exit, it does not make the type satisfy `where T: Drop`, and calling it releases nothing else.
 
-**Releasing a value behind a pointer.** Code that owns a `T` through a raw `T*` (a container's storage, a box) releases it with the `drop_in_place` intrinsic from `std::core::ptr`. After monomorphisation it runs that type's destructor and field drop-glue, or nothing for a `Copy` type, so `T` needs no bound. Calling `.drop()` on an unbounded `T` is refused, and the error says what to write:
+**Releasing a value behind a pointer.** Code that owns a `T` through a raw `T*` (a container's storage, a box) releases it with the `drop_in_place` intrinsic from `std::core::pointer`. After monomorphisation it runs that type's destructor and field drop-glue, or nothing for a `Copy` type, so `T` needs no bound. Calling `.drop()` on an unbounded `T` is refused, and the error says what to write:
 
 ```cryo
-import std::core::ptr;
+import std::core::pointer;
 
 function release<T>(p: T*) -> void {
-    ptr::drop_in_place::<T>(p);   // fine for every T
+    pointer::drop_in_place::<T>(p);   // fine for every T
 }
 
 function release_wrong<T>(p: T*) -> void {
     (*p).drop();                  // error[E0358]: no method named `drop` found on type `T`
-                                  // help: use `std::core::ptr::drop_in_place(p)`
+                                  // help: use `std::core::pointer::drop_in_place(p)`
 }
 ```
 
@@ -4034,8 +4034,8 @@ caught by it:
 | ------------------------------------- | ------------------------------------------------------ |
 | `std::alloc::rc::Rc`                  | non-atomic refcount; use `Arc` across threads          |
 | `std::sync::mutex::MutexGuard`        | POSIX mutexes must be released by the acquiring thread |
-| `std::sync::rwlock::ReadWriteLockReadGuard`  | as above                                               |
-| `std::sync::rwlock::ReadWriteLockWriteGuard` | as above                                               |
+| `std::sync::read_write_lock::ReadWriteLockReadGuard`  | as above                                               |
+| `std::sync::read_write_lock::ReadWriteLockWriteGuard` | as above                                               |
 | `std::thread::Scope`                  | records its threads without a lock; see [scoped threads](#scoped-threads) |
 
 A value holding a closure that borrows from the frame it was made in (one
@@ -4105,7 +4105,7 @@ What the rule does **not** do is make `Send` a safety guarantee:
 
 - **Raw pointers are unconditionally `Send + Sync`.** This is deliberate -
   Cryo has no borrow checker, and the containers built on raw pointers
-  (`Box`, `Arc`, `Array`, `String`, `mpsc::Sender`) are structurally `Send`
+  (`Box`, `Arc`, `Array`, `String`, `channel::Sender`) are structurally `Send`
   because of it. A struct that hides a `T*` and reasons about it correctly
   does not have to fight the type system; a struct that hides a `T*` and
   reasons about it *incorrectly* is `Send` all the same.
@@ -4855,7 +4855,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `core::option`       | `Option<T>` (`Some` / `None`) and its methods                                                                         |
 | `core::result`       | `Result<T, E>` (`Ok` / `Err`) and its methods                                                                         |
 | `core::primitives`   | Methods on built-in types (`(-5 as i32).abs()`, `(2.0).sqrt()`, `x.clamp(lo, hi)`, `char::is_digit`, ...)             |
-| `core::varargs`      | `VariadicArguments`, the compiler-assigned type of a function's `args...` bucket                                                 |
+| `core::variadic_arguments`      | `VariadicArguments`, the compiler-assigned type of a function's `args...` bucket                                                 |
 | `core::drop`, `core::marker`, `core::cmp`, `core::clone` | `Drop`, the marker traits (`Copy`, `Send`, `Sync`), `Eq` / `Ord` / `Ordering`, `Clone` |
 | `collections::array` | `Array<T>`, the type `[T]` names                                                                                       |
 | `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: [T; N]`)                 |
@@ -4885,8 +4885,8 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | **`random`**      | Free functions over the thread's own OS-seeded generator: `random::range(low, high)`, `float()`, `boolean()`, `value::<T>()`, `choose(&items)`, `shuffle(&items)` - see [section 19.4](#194-random-numbers). The `RandomSource` trait: `next<T>` (any integer width, `boolean`, `f32`/`f64`, `char`), unbiased `next_below(bound)` / `next_range(lo, hi)` (rejection-sampled; integers, `f32` and `f64`), `fill`, `choose`, `shuffle`. `Rng`, a fast non-cryptographic xoshiro256** source seeded via `from_seed(u64)` (reproducible: a seed's stream is the same on every version), `from_operating_system()`, or the thread's own `for_current_thread()`. `SecureRng` draws from the kernel CSPRNG (`try_fill(&view)` reports `EntropyUnavailable` where `fill` panics); use it for keys/tokens/nonces - `Rng` is not cryptographic. Distributions (`UniformI64`, `Normal`, `Bernoulli`, `WeightedIndex`, ...) sample from any source.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | **`net`**         | `IpV4Address`, `IpV6Address`, `IpAddress`, `SocketAddress`, `TcpStream` (`AsyncTransport`), `TcpListener`. **Every operation that can wait is a future** driven by an `Executor` — there is no blocking socket surface. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers` (an ordered list of fields: `append` keeps a repeated name such as `Set-Cookie`, `insert` replaces every value, `get` is the first, `get_all` each in order), bodies framed by `Content-Length` or the chunked transfer coding (read by the connection, written with `chunked::ChunkedEncoder`; both framings at once, or two different lengths, are refused with 400, another transfer coding with 501, and a response with neither runs to the end of the connection), `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, and one `Client` (`net::http::client`) whose `get`/`post`/`send` take a `Url`: the scheme picks TCP or TLS, every address the host resolves to (IPv6 included) is tried in turn, HTTP/2 is offered by ALPN when it is built `with_http2()`, `with_timeout(Duration)` bounds the whole request with its redirects (`TimedOut`), and 301/302/303/307/308 are followed up to `with_redirect_limit` (20 by default), a 303 - or a 301/302 after a `POST` - as a body-less `GET`, without `Authorization`/`Cookie` when the redirect leaves the origin. `Url.join` resolves a reference such as a `Location` against a URL. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`; a `TlsConnector` trusts the system's roots - OpenSSL's default verify paths on Unix; on Windows a server's chain is built and checked by Windows itself, which fetches a root the machine does not hold yet - and any root added with `add_root_certificate(pem)`, which `Client` passes through), **UDP** (`UdpSocket`, datagram send/receive futures), **DNS** (`net::dns`; `Resolve` runs `getaddrinfo` on the executor's blocking pool rather than stalling a worker), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. A `TcpStream` connects to an IPv4 or IPv6 address. |
 | **`process`**     | Subprocess spawning: `fork + execve` on POSIX, `CreateProcessW` on Windows, with the command line, the environment block and the working directory in UTF-16, so non-ASCII arguments, variables and paths reach the child intact. `Command` builder (`argument`, `arguments` from an iterator of `Str`, `env`, `env_remove`, `env_clear`, `stdin`/`stdout`/`stderr`, `current_directory`; every setter returns the command, so `cmd.argument(a).argument(b).stdout(Stdio::Piped)` chains), `Command::shell(Str)` for a whole command line, `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal` (and its `SignalNumber`, both `Eq`: `Signal::from_i32(2).unwrap() == Signal::interrupt()`). A program that cannot be started is `spawn`'s `IoError`, naming the program (`could not start tool: not found`; `NotExecutable` for a file that is no program) or the working directory it could not enter. A piped stream is taken out of a running child with `child.stdout.take()`. `cmd.group_descendants()` starts the child as the root of its own process tree (a process group on POSIX; a job object and a console process group of its own on Windows), and `child.kill_tree()` then ends it together with everything it started. `ExitStatus.peak_memory_bytes()` is the most physical memory the child held at once; `process::memory::SystemMemory::query()` reads the machine's installed and available memory. On Windows, `send_signal` supports `Signal::kill()`, and `Signal::interrupt()` to a grouped child, delivered as Ctrl-Break; on every platform it refuses (`InvalidInput`) a child already waited for. `process::signal_handling::Signals::listen()` receives the interrupt and terminate signals for a clean shutdown (SIGINT/SIGTERM on POSIX; on Windows Ctrl-C and Ctrl-Break as interrupt, a console close, logoff or shutdown as terminate, after which Windows still ends the process at its own time limit, 5 seconds by default): while a `Signals` lives they no longer end the process, and `wait()`, `wait_timeout(d)` and `try_wait()` hand each one over once.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_subtract` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`, every one taking `&this`, so a cell is updated through any shared reference to it), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `ReadWriteLock<T, A>`, `ConditionVariable`, `Once`, `Barrier`. `mpsc::Channel::unbounded` / `bounded` open a channel: its `Sender<T>` sends (`send` waits for room in a full bounded channel, `try_send` hands the value back instead) and its `Receiver<T>` receives (`receive`, `receive_timeout`, `try_receive`) and is an `Iterator<T>` that ends once every sender has dropped. RAII guards (`MutexGuard`, `ReadWriteLockReadGuard`, `ReadWriteLockWriteGuard`) are `!Send`; each reads the guarded value through `as_pointer()` (a read-only `T*`), and the two exclusive guards, held writably, write it through `as_mutable_pointer()` (a `mut T*`). `Send` / `Sync` are computed structurally with call-site enforcement - see [section 15.4](#154-the-send-and-sync-traits).                                                                                                                                                                                                                                                                                                    |
-| **`thread`**      | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attributes`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep(Duration)`, plus `sync::mpsc` channels (`Channel::unbounded` / `Channel::bounded`, each giving a `Pair` of its `Sender` and `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn.                                                                                                                                                                                                                                                                                                             |
+| **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_subtract` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`, every one taking `&this`, so a cell is updated through any shared reference to it), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `ReadWriteLock<T, A>`, `ConditionVariable`, `Once`, `Barrier`. `channel::Channel::unbounded` / `bounded` open a channel: its `Sender<T>` sends (`send` waits for room in a full bounded channel, `try_send` hands the value back instead) and its `Receiver<T>` receives (`receive`, `receive_timeout`, `try_receive`) and is an `Iterator<T>` that ends once every sender has dropped. RAII guards (`MutexGuard`, `ReadWriteLockReadGuard`, `ReadWriteLockWriteGuard`) are `!Send`; each reads the guarded value through `as_pointer()` (a read-only `T*`), and the two exclusive guards, held writably, write it through `as_mutable_pointer()` (a `mut T*`). `Send` / `Sync` are computed structurally with call-site enforcement - see [section 15.4](#154-the-send-and-sync-traits).                                                                                                                                                                                                                                                                                                    |
+| **`thread`**      | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attributes`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep(Duration)`, plus `sync::channel` channels (`Channel::unbounded` / `Channel::bounded`, each giving a `Pair` of its `Sender` and `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn.                                                                                                                                                                                                                                                                                                             |
 | **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [section 20](#20-testing).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 ### 19.3 Naming Conventions in the Standard Library
@@ -4924,7 +4924,7 @@ const drawn: i32 = match (random::choose(&cards)) {   // Option<T*>: None for an
 A sequence that must repeat - a test, a simulation, a replayable game - comes from an `Rng` made from a seed, which has each of these as a method (`range` is `next_range`, `value` is `next`, `float` is `next::<f64>()`):
 
 ```cryo
-import std::random::rng::{ Rng };
+import std::random::generator::{ Rng };
 import std::random::source::{ RandomSource };
 
 mut generator: Rng = Rng::from_seed(42);        // the same seed draws the same values
