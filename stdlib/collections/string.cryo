@@ -1,11 +1,13 @@
 ///! String: owned, heap-allocated, length-typed UTF-8.
 ///!
-///! Mutable companion to `Str`. Byte buffer plus a length; no NUL
-///! terminator, no implicit encoding assumptions beyond "the bytes
-///! are valid UTF-8". UTF-8 in, UTF-8 out.
+///! Mutable companion to `Str`. Byte buffer plus a `Str` view of the text
+///! in it; no NUL terminator, no implicit encoding assumptions beyond "the
+///! bytes are valid UTF-8". UTF-8 in, UTF-8 out.
 ///!
 ///! Storage comes from `RawBuffer<u8, A>`; the doubling growth curve
-///! lives there.
+///! lives there. Every change to the text or its storage moves the view
+///! with it, so `String` dereferences to `Str` and reads through `Str`'s
+///! methods.
 
 namespace std::collections::string;
 
@@ -13,10 +15,10 @@ import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::slice::{ Slice, SliceRange };
-import std::core::ops::{ IndexView };
+import std::core::ops::{ Deref, IndexView };
 import std::alloc::allocator::{ AllocError, AllocErrorKind, Allocator, GlobalAlloc };
 import std::collections::raw_buffer::{ RawBuffer };
-import std::collections::str::{ CharIndices, Chars, SplitIter, Str, Utf8Error };
+import std::collections::str::{ Str, Utf8Error };
 import std::collections::array::{ Array };
 import std::core::cmp::{ Eq, Ord, Ordering };
 import std::core::hash::{ Hash, Hasher };
@@ -31,8 +33,10 @@ import std::ffi::libc;
 
 private const INITIAL_CAPACITY: i64 = 8;
 
-/// Owned, growable UTF-8 text. `as_str` borrows it as a `Str`, the
-/// read-only view most text functions take; an f-string builds one.
+/// Owned, growable UTF-8 text. It dereferences to `Str`, the read-only
+/// view most text functions take, so every `Str` method reads a `String`
+/// too (`s.contains(...)`, `s.split(...)`); `as_str` hands the view out.
+/// An f-string builds one.
 ///
 /// ```cryo
 /// import std::collections::string::{ String };
@@ -43,14 +47,14 @@ private const INITIAL_CAPACITY: i64 = 8;
 /// ```
 public type struct String<A = GlobalAlloc> {
     private buffer: RawBuffer<u8, A>;
-    private length: i64;
+    private view: Str;
 
     /// Empty string. No heap storage until the first `push_*` /
     /// `reserve`.
     public static new() -> String {
         return String {
             buffer: RawBuffer::new(),
-            length: 0
+            view: Str::from_raw(null, 0)
         };
     }
 
@@ -59,7 +63,7 @@ public type struct String<A = GlobalAlloc> {
     public static new_in(alloc: A) -> String<A> {
         return String::<A> {
             buffer: RawBuffer::new_in(alloc),
-            length: 0
+            view: Str::from_raw(null, 0)
         };
     }
 
@@ -78,11 +82,8 @@ public type struct String<A = GlobalAlloc> {
     /// `alloc`, or the `AllocError` when the storage cannot be had. A
     /// `capacity` of zero or less allocates nothing.
     public static try_with_capacity_in(capacity: i64, alloc: A) -> Result<String<A>, AllocError> {
-        mut string: String<A> = String::<A> {
-            buffer: RawBuffer::new_in(alloc),
-            length: 0
-        };
-        string.buffer.reserve_exact(0, capacity)?;
+        mut string: String<A> = String::new_in(alloc);
+        string.reserve_exact(capacity)?;
         return Result::Ok(string);
     }
 
@@ -130,7 +131,7 @@ public type struct String<A = GlobalAlloc> {
         string.push_byte(0 as u8);
         // Drop the terminator from the logical length; the byte stays in
         // the allocation at index `length`.
-        string.length = string.length() - 1;
+        string.truncate(source.length());
         return string;
     }
 
@@ -186,9 +187,9 @@ public type struct String<A = GlobalAlloc> {
     /// failure, and when the total length overflows `i64`.
     public push_repeated(mut &this, c: char, count: i64) -> void {
         if (count <= 0) { return; }
-        const start: i64 = this.length;
+        const start: i64 = this.view.length();
         this.push(c);
-        const width: i64 = this.length - start;
+        const width: i64 = this.view.length() - start;
         const additional: i64 = match (width.checked_multiply(count - 1)) {
             Option::Some(n) => { n }
             Option::None => {
@@ -203,11 +204,11 @@ public type struct String<A = GlobalAlloc> {
         }
         for (mut i: i64 = 1; i < count; i++) {
             libc::memcpy(
-                this.buffer.ptr() + this.length,
+                this.buffer.ptr() + this.view.length(),
                 this.buffer.ptr() + start,
                 width as u64
             );
-            this.length = this.length + width;
+            this.view.set_length(this.view.length() + width);
         }
     }
 
@@ -232,13 +233,7 @@ public type struct String<A = GlobalAlloc> {
 
     /// Remove all the text, keeping the storage for reuse.
     public clear(mut &this) -> void {
-        this.length = 0;
-    }
-
-    /// The length of the text in bytes, not characters.
-    ![inline]
-    public length(&this) -> i64 {
-        return this.length;
+        this.view.set_length(0);
     }
 
     /// How many bytes fit before the string must grow its storage.
@@ -247,27 +242,9 @@ public type struct String<A = GlobalAlloc> {
         return this.buffer.capacity();
     }
 
-    /// True when the string holds no text.
-    public is_empty(&this) -> boolean {
-        return this.length == 0;
-    }
-
     /// Borrow as a `Str`. Invalidated by the next mutating call.
     public as_str(&this) -> Str {
-        return Str::from_raw(this.buffer.ptr(), this.length);
-    }
-
-    /// The text's UTF-8 bytes, borrowed. Invalidated by the next mutating
-    /// call.
-    public as_bytes(&this) -> &Slice<u8> {
-        return Slice::from_raw(this.buffer.ptr(), this.length);
-    }
-
-    /// A pointer to the first byte of the text, not NUL-terminated (see
-    /// `as_cstr` for that); null while the string has no storage.
-    /// Invalidated by the next mutating call.
-    public as_ptr(&this) -> u8* {
-        return this.buffer.ptr();
+        return this.view;
     }
 
     /// Borrow this String as a NUL-terminated C string (`u8*` /
@@ -285,9 +262,9 @@ public type struct String<A = GlobalAlloc> {
     /// be freed by the caller. Like C, an interior NUL ends the string
     /// early; the bytes are not otherwise validated.
     public as_cstr(mut &this) -> u8* {
-        match (this.buffer.reserve(this.length, 1, INITIAL_CAPACITY)) {
+        match (this.reserve(1)) {
             Result::Ok(_) => {
-                this.buffer.ptr()[this.length] = 0 as u8;
+                this.buffer.ptr()[this.view.length()] = 0 as u8;
                 return this.buffer.ptr();
             }
             Result::Err(_) => {
@@ -303,112 +280,9 @@ public type struct String<A = GlobalAlloc> {
     /// handing an owned C-string across the FFI / raw-`string` boundary.
     public into_raw(mut this) -> string {
         this.push_byte(0 as u8);
-        const { buffer, length }: String<A> = this;
+        const { buffer, view }: String<A> = this;
         return buffer.into_raw() as string;
     }
-
-    // ---- Borrowed-view convenience (delegate to `Str`) ----
-    // These forward to the borrowed `as_str()` view so callers don't
-    // write `s.as_str().starts_with(...)` everywhere. Returned `Str` /
-    // `SplitIter` values borrow this String's buffer and are valid only
-    // while it lives and is not mutated.
-
-    /// True when the text begins with `prefix`.
-    public starts_with(&this, prefix: &Str) -> boolean {
-        return this.as_str().starts_with(prefix);
-    }
-
-    /// True when the text ends with `suffix`.
-    public ends_with(&this, suffix: &Str) -> boolean {
-        return this.as_str().ends_with(suffix);
-    }
-
-    /// The byte offset of the first occurrence of `needle`, or `None`.
-    public find(&this, needle: &Str) -> Option<i64> {
-        return this.as_str().find(needle);
-    }
-
-    /// True when `needle` occurs in the text.
-    public contains(&this, needle: &Str) -> boolean {
-        return this.as_str().contains(needle);
-    }
-
-    /// Borrowed sub-slice with surrounding ASCII whitespace removed.
-    public trim(&this) -> Str {
-        return this.as_str().trim();
-    }
-
-    /// Borrowed sub-slice with leading ASCII whitespace removed. Mirrors
-    /// `Str::trim_start`, closing the `String` vs `Str` method asymmetry.
-    public trim_start(&this) -> Str {
-        return this.as_str().trim_start();
-    }
-
-    /// Borrowed sub-slice with trailing ASCII whitespace removed. Mirrors
-    /// `Str::trim_end`.
-    public trim_end(&this) -> Str {
-        return this.as_str().trim_end();
-    }
-
-    /// A fresh `String` with every ASCII lowercase byte folded to
-    /// uppercase; other bytes are copied unchanged.
-    public to_ascii_uppercase(&this) -> String {
-        return this.as_str().to_ascii_uppercase();
-    }
-
-    /// Fresh `String` with every ASCII uppercase byte folded to lowercase.
-    /// Mirrors `Str::to_ascii_lowercase` and the existing
-    /// `String::to_ascii_uppercase`.
-    public to_ascii_lowercase(&this) -> String {
-        return this.as_str().to_ascii_lowercase();
-    }
-
-    /// Iterator over pieces separated by `sep` (borrows this String).
-    public split(&this, sep: &Str) -> SplitIter {
-        return this.as_str().split(sep);
-    }
-
-    /// Iterator over the non-empty pieces separated by `separator`
-    /// (borrows this String); see `Str::split_nonempty`.
-    public split_nonempty(&this, separator: &Str) -> SplitIter {
-        return this.as_str().split_nonempty(separator);
-    }
-
-    /// The text after `prefix`, or `None`; see `Str::strip_prefix`.
-    public strip_prefix(&this, prefix: &Str) -> Option<Str> {
-        return this.as_str().strip_prefix(prefix);
-    }
-
-    /// The text before `suffix`, or `None`; see `Str::strip_suffix`.
-    public strip_suffix(&this, suffix: &Str) -> Option<Str> {
-        return this.as_str().strip_suffix(suffix);
-    }
-
-    /// Length, in bytes, of the longest prefix shared with `other`; see
-    /// `Str::common_prefix_length`.
-    public common_prefix_length(&this, other: &Str) -> i64 {
-        return this.as_str().common_prefix_length(other);
-    }
-
-    /// A new `String` with every occurrence of `from` replaced by `to`; see
-    /// `Str::replace`.
-    public replace(&this, from: &Str, to: &Str) -> String {
-        return this.as_str().replace(from, to);
-    }
-
-    /// Iterator over Unicode scalar values (`u32`), decoding UTF-8 on the
-    /// fly. Borrows this String; see `Str::chars`.
-    public chars(&this) -> Chars {
-        return this.as_str().chars();
-    }
-
-    /// Iterator over `(byte_offset, scalar)` pairs. Borrows this String;
-    /// see `Str::char_indices`.
-    public char_indices(&this) -> CharIndices {
-        return this.as_str().char_indices();
-    }
-
-    
 
     /// Shrink `length` to `new_length`. No reallocation; capacity
     /// is unchanged. Bytes beyond `new_length` are no longer
@@ -426,8 +300,8 @@ public type struct String<A = GlobalAlloc> {
         if (new_length < 0) {
             core::panic("String::truncate: negative length", intrinsics::location());
         }
-        if (new_length < this.length) {
-            this.length = new_length;
+        if (new_length < this.view.length()) {
+            this.view.set_length(new_length);
         }
     }
 
@@ -435,12 +309,12 @@ public type struct String<A = GlobalAlloc> {
     /// moving the bytes after it along. Panics when `index` is not a char
     /// boundary (`Str::is_char_boundary`), and on allocation failure.
     public insert(mut &this, index: i64, c: char) -> void {
-        if (!this.as_str().is_char_boundary(index)) {
+        if (!this.view.is_char_boundary(index)) {
             core::panic("String::insert: index is not a char boundary", intrinsics::location());
         }
-        const old_length: i64 = this.length;
+        const old_length: i64 = this.view.length();
         this.push(c);
-        const width: i64 = this.length - old_length;
+        const width: i64 = this.view.length() - old_length;
         mut encoded: [u8; 4];
         libc::memcpy(&encoded[0], this.buffer.ptr() + old_length, width as u64);
         libc::memmove(this.buffer.ptr() + index + width, this.buffer.ptr() + index, (old_length - index) as u64);
@@ -451,43 +325,49 @@ public type struct String<A = GlobalAlloc> {
     /// moving the bytes after it back. Panics when `index` is the end of
     /// the string or not a char boundary.
     public remove(mut &this, index: i64) -> char {
-        if (index >= this.length || !this.as_str().is_char_boundary(index)) {
+        const length: i64 = this.view.length();
+        if (index >= length || !this.view.is_char_boundary(index)) {
             core::panic("String::remove: index is the end or not a char boundary", intrinsics::location());
         }
-        const text: Str = this.as_str();
+        const text: Str = this.view;
         mut width: i64 = 1;
         while (!text.is_char_boundary(index + width)) { width = width + 1; }
         const scalar: u32 = text.sub_bytes(index, index + width).chars().next().unwrap();
-        libc::memmove(this.buffer.ptr() + index, this.buffer.ptr() + index + width, (this.length - index - width) as u64);
-        this.length = this.length - width;
+        libc::memmove(this.buffer.ptr() + index, this.buffer.ptr() + index + width, (length - index - width) as u64);
+        this.view.set_length(length - width);
         return scalar as char;
     }
 
     /// Remove the last scalar and return it; `None` when the string is
     /// empty.
     public pop(mut &this) -> Option<char> {
-        if (this.length == 0) { return Option::None; }
-        const text: Str = this.as_str();
-        mut start: i64 = this.length - 1;
+        if (this.view.is_empty()) { return Option::None; }
+        const text: Str = this.view;
+        mut start: i64 = text.length() - 1;
         while (!text.is_char_boundary(start)) { start = start - 1; }
         return Option::Some(this.remove(start));
     }
 
     /// Room for at least `additional` more bytes; zero or less is a no-op.
     public reserve(mut &this, additional: i64) -> Result<(), AllocError> {
-        return this.buffer.reserve(this.length, additional, INITIAL_CAPACITY);
+        this.buffer.reserve(this.view.length(), additional, INITIAL_CAPACITY)?;
+        this.view.set_bytes(this.buffer.ptr());
+        return Result::Ok(());
     }
 
     /// Room for exactly `additional` more bytes; zero or less is a no-op.
     public reserve_exact(mut &this, additional: i64) -> Result<(), AllocError> {
-        return this.buffer.reserve_exact(this.length, additional);
+        this.buffer.reserve_exact(this.view.length(), additional)?;
+        this.view.set_bytes(this.buffer.ptr());
+        return Result::Ok(());
     }
 
     /// Give back the storage beyond the text's length.
     public shrink_to_fit(mut &this) -> void {
-        this.buffer.shrink_to(this.length);
+        this.buffer.shrink_to(this.view.length());
+        this.view.set_bytes(this.buffer.ptr());
     }
-    
+
 private:
     /// Append the bytes of a `Str` view verbatim (backs the `Str` / `string`
     /// arms of `try_push`).  Empty input is a no-op.
@@ -496,24 +376,24 @@ private:
         if (add == 0) {
             return Result::Ok(());
         }
-        this.buffer.reserve(this.length, add, INITIAL_CAPACITY)?;
+        this.reserve(add)?;
+        const length: i64 = this.view.length();
         libc::memcpy(
-            this.buffer.ptr() + this.length,
+            this.buffer.ptr() + length,
             source.as_ptr(),
             add as u64
         );
-        this.length = this.length + add;
+        this.view.set_length(length + add);
         return Result::Ok(());
     }
 
     /// Append a single raw byte to the buffer (backs `push_byte` and the
     /// internal C-string NUL terminators).
     push_one_byte(mut &this, byte: u8) -> Result<(), AllocError> {
-        if (this.length == this.buffer.capacity()) {
-            this.buffer.reserve(this.length, 1, INITIAL_CAPACITY)?;
-        }
-        this.buffer.ptr()[this.length] = byte;
-        this.length++;
+        this.reserve(1)?;
+        const length: i64 = this.view.length();
+        this.buffer.ptr()[length] = byte;
+        this.view.set_length(length + 1);
         return Result::Ok(());
     }
 
@@ -544,19 +424,28 @@ private:
     }
 }
 
+/// A `String` reads as the `Str` view of its text: `s.trim()`,
+/// `s.split(...)` and every other `Str` method answer on it, and `*s` is
+/// that view.
+implement<A> trait Deref for struct String<A>
+where A: Allocator {
+    type Target = Str;
+    deref(&this) -> const Str* { return &this.view; }
+}
+
 // `s[r]` with a range `r` of byte positions is the `Str` of the bytes `r`
 // names, and panics as `Str` does.
 implement<A, R> trait IndexView<R> for struct String<A>
 where A: Allocator, R: SliceRange {
     type View = Str;
     ![caller_location]
-    view(&this, range: R) -> Str { return this.as_str().view(range); }
+    view(&this, range: R) -> Str { return this.view.view(range); }
 }
 
 implement<A> trait Eq for struct String<A>
 where A: Allocator {
     equals(&this, other: &String<A>) -> boolean {
-        return this.as_str().equals(&other.as_str());
+        return this.view.equals(&other.view);
     }
 }
 
@@ -566,7 +455,7 @@ implement<A> trait Hash for struct String<A>
 where A: Allocator {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        this.as_str().hash(hasher);
+        this.view.hash(hasher);
     }
 }
 
@@ -577,7 +466,7 @@ where A: Allocator {
 implement<A> trait Ord for struct String<A>
 where A: Allocator {
     compare(&this, other: &String<A>) -> Ordering {
-        return this.as_str().compare(&other.as_str());
+        return this.view.compare(&other.view);
     }
 }
 
@@ -586,7 +475,7 @@ where A: Allocator {
 implement<A> trait Drop for struct String<A>
 where A: Allocator {
     drop(mut &this) -> void {
-        this.length = 0;
+        this.view.set_length(0);
     }
 }
 
@@ -595,7 +484,7 @@ where A: Allocator {
 /// empty string allocates nothing (`from_str` reserves `length` bytes).
 implement trait Clone for struct String<GlobalAlloc> {
     clone(&this) -> String {
-        return String::from_str(this.as_str());
+        return String::from_str(this.view);
     }
 }
 

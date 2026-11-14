@@ -28,11 +28,14 @@
 
 namespace std::fs::path;
 
+import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::core::drop::{ Drop };
+import std::core::ops::{ Deref };
 import std::core::mem;
+import std::collections::raw_buffer::{ RawBuffer };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::collections::array::{ Array };
@@ -47,6 +50,9 @@ private const SEPARATOR:     u8 = 0x2F;  // '/'
 private const BACKSLASH:     u8 = 0x5C;  // '\'
 private const COLON:         u8 = 0x3A;  // ':'
 private const DOT:           u8 = 0x2E;  // '.'
+
+// Room a path's storage starts with on its first byte.
+private const INITIAL_CAPACITY: i64 = 8;
 
 // Whether this target uses Windows path syntax. A compile-time constant
 // rather than duplicated per-target method bodies: the parsing RULES differ,
@@ -336,8 +342,9 @@ public type struct Path {
                 const name_start: i64 = this.inner.length() - this.file_name().unwrap().length();
                 mut result: PathBuf = PathBuf::from(this.inner.sub_bytes(0, name_start + stem.length()));
                 if (!extension.is_empty()) {
-                    result.inner.push_byte(DOT);
-                    result.inner.push(extension);
+                    mut dot: u8 = DOT;
+                    result.append(Str::from_raw(&dot, 1));
+                    result.append(extension);
                 }
                 return result;
             }
@@ -444,8 +451,7 @@ public type struct Path {
         }
         match (Utf16::decode(Slice::<u16>::from_raw(&buffer[0], count as i64))) {
             Result::Ok(text) => {
-                const owned: PathBuf = PathBuf { inner: text };
-                return Result::Ok(owned);
+                return Result::Ok(PathBuf::from(text.as_str()));
             }
             Result::Err(_) => {
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0).with_context(IoOperation::Canonicalize, *this));
@@ -457,37 +463,31 @@ public type struct Path {
 // PathBuf: owned
 
 /// An owned filesystem path that can be extended with `push` or built by
-/// `Path.join`. `as_path` borrows it as a `Path`.
+/// `Path.join`. It dereferences to `Path`, so every `Path` method reads a
+/// `PathBuf` too (`file_name`, `parent`, `exists`, ...); `as_path` hands
+/// the view out.
 public type struct PathBuf<A = GlobalAlloc> {
-    private inner: String<A>;
+    private buffer: RawBuffer<u8, A>;
+    private view: Path;
 
     /// An empty path.
     public static new() -> PathBuf {
-        return PathBuf { inner: String::new() };
+        return PathBuf { buffer: RawBuffer::new(), view: Path { inner: Str::from_raw(null, 0) } };
     }
 
     /// Own a copy of a `Str` (or, implicitly, a NUL-terminated `string`
     /// via `Str`'s `![implicit]` `new`).  The bytes are copied into the
     /// owned buffer, so `source` need not outlive the result.
     public static from(source: Str) -> PathBuf {
-        return PathBuf { inner: String::from_str(source) };
+        mut path: PathBuf = PathBuf::new();
+        path.append(source);
+        return path;
     }
 
     /// This path borrowed as a `Path`, valid until this one changes or
     /// is released.
     public as_path(&this) -> Path {
-        return Path::from(this.inner.as_str());
-    }
-
-    /// The length of the path's text in bytes.
-    ![inline]
-    public length(&this) -> i64 {
-        return this.inner.length();
-    }
-
-    /// True when the path is the empty text.
-    public is_empty(&this) -> boolean {
-        return this.inner.is_empty();
+        return this.view;
     }
 
     /// Append `segment`, inserting a separator if needed. A segment carrying
@@ -496,49 +496,31 @@ public type struct PathBuf<A = GlobalAlloc> {
     /// one path's root inside another would name nothing.
     public push(mut &this, segment: Str) -> void {
         if (Path::root_len(segment) > 0) {
-            this.inner.clear();
-            this.inner.push(segment);
+            this.view.inner.set_length(0);
+            this.append(segment);
             return;
         }
-        if (!this.inner.is_empty()) {
-            const last: u8 = this.inner.as_str().as_bytes()[this.inner.length() - 1];
-            if (!Path::is_separator(last)) {
-                this.inner.push_byte(SEPARATOR);
-            }
+        const length: i64 = this.view.inner.length();
+        if (length > 0 && !Path::is_separator(this.view.inner.as_bytes()[length - 1])) {
+            mut separator: u8 = SEPARATOR;
+            this.append(Str::from_raw(&separator, 1));
         }
-        this.inner.push(segment);
+        this.append(segment);
     }
 
     /// Remove the last segment. Returns `true` if anything was popped;
     /// `false` at a bare root or an empty path, so this cannot climb out
     /// of the volume the path names.
     public pop(mut &this) -> boolean {
-        match (this.as_path().parent()) {
+        match (this.view.parent()) {
             Option::Some(parent) => {
-                // Rewind the String's length in place; the backing
-                // buffer keeps its capacity so subsequent `push` is
-                // cheap.  Reassigning
-                // `this.inner = String::from_str(parent.as_str())`
-                // here would allocate a fresh buffer and silently leak
-                // this one, since the overwrite skips `inner.drop()`.
-                const new_len: i64 = parent.length();
-                this.inner.truncate(new_len);
+                // The text shortens in place; the storage keeps its
+                // capacity, so a later `push` is cheap.
+                this.view.inner.set_length(parent.length());
                 return true;
             }
             Option::None => { return false; }
         }
-    }
-
-    /// Append `segment` to a COPY of this path and return it, leaving `self`
-    /// intact. `push` mutates in place; `join` is the owning, non-mutating
-    /// twin. Same root semantics as `push` (a rooted `segment` replaces).
-    public join(&this, segment: Str) -> PathBuf {
-        return this.as_path().join(segment);
-    }
-
-    /// Extension of the final component; see `Path::extension`.
-    public extension(&this) -> Option<Str> {
-        return this.as_path().extension();
     }
 
     /// Consume the PathBuf and return its bytes as an owned, NUL-terminated
@@ -546,10 +528,38 @@ public type struct PathBuf<A = GlobalAlloc> {
     /// borrow lifetime. Mirrors `String::into_raw` for handing an owned
     /// C-string across the raw-`string` boundary.
     public into_raw(mut this) -> string {
-        const { inner }: PathBuf<A> = this;
-        return inner.into_raw();
+        mut terminator: u8 = 0;
+        this.append(Str::from_raw(&terminator, 1));
+        const { buffer, view }: PathBuf<A> = this;
+        return buffer.into_raw() as string;
     }
 
+private:
+    /// Append `text`'s bytes to the path as they are, growing the storage
+    /// and moving the view with it. Panics on allocation failure.
+    append(mut &this, text: Str) -> void {
+        const length: i64 = this.view.inner.length();
+        match (this.buffer.reserve(length, text.length(), INITIAL_CAPACITY)) {
+            Result::Ok(_) => { }
+            Result::Err(_) => {
+                core::panic("PathBuf: allocation failed", intrinsics::location());
+            }
+        }
+        if (text.length() > 0) {
+            libc::memcpy(this.buffer.ptr() + length, text.as_ptr(), text.length() as u64);
+        }
+        this.view.inner.set_bytes(this.buffer.ptr());
+        this.view.inner.set_length(length + text.length());
+    }
+}
+
+/// A `PathBuf` reads as the `Path` view of its text: `p.parent()`,
+/// `p.file_name()` and every other `Path` method answer on it, and `*p`
+/// is that view.
+implement<A> trait Deref for struct PathBuf<A>
+where A: Allocator {
+    type Target = Path;
+    deref(&this) -> const Path* { return &this.view; }
 }
 
 // `Path` is a borrowed view: its `inner: Str` is a non-owning (bytes, len)
@@ -557,9 +567,9 @@ public type struct PathBuf<A = GlobalAlloc> {
 // `Drop`. An empty `Drop` would still mark `Path` as needing a destructor,
 // which makes a by-value `Path` parameter (e.g. `File::create(p: Path)`)
 // look like an ownership-consuming move and falsely reject later reuse of
-// the argument. Only `PathBuf` owns a heap `String` and needs a destructor.
+// the argument. Only `PathBuf` owns storage and needs a destructor.
 
-/// The owned String backing is released by its field after this body.
+/// The storage is released by its field after this body.
 implement<A> trait Drop for struct PathBuf<A>
 where A: Allocator {
     drop(mut &this) -> void { }
