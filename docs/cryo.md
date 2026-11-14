@@ -2003,6 +2003,8 @@ const strs: Pair<string> = Pair::<string>::new("hello", "world");
 
 A generic struct's literal written without type arguments is one instance of it: the one its expected type names, or else the one its field values bind. Inside a generic body that instance may be over the body's own parameters, so `return Pair { first: a, second: b };` in `new` above is a `Pair<T>`, and `Holder { f: f }` returned from `function hold<F>(f: F) -> Holder<F>` is a `Holder<F>`. The owner's own literal follows the same rule: in a method of `type struct Two<A, B>` declared `-> Two<B, A>`, `return Two { a: this.b, b: this.a };` builds a `Two<B, A>`, not the `Two<A, B>` the method belongs to.
 
+Where the field values bind the instance, a value in a field written over the struct's parameters is typed on its own, as a generic function's argument is: `Holder { inner: 3, peeked: Option::Some(2) }` is a `Holder<i32>` because `3` and `Some(2)` say so, and a variant's payload binds the parameters it carries (`Result::Ok(5)` binds the `T` of a field `Result<T, E>`, leaving `E` to the other fields). A value that only its field can type - `Option::None`, an empty `[]` - takes the instance's field once the other values have bound it. Every value is then checked against the instance's field, so `Pair { a: 1, b: true }` for `type struct Pair<T> { a: T; b: T; }` is refused (E0200) at `true`.
+
 ### 8.7 Unions
 
 A `type union` is an untagged, C-style union: all fields occupy the **same** storage, overlapping at offset 0. The union's size is that of its largest member and its alignment that of its most-aligned member.
