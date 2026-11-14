@@ -1,4 +1,4 @@
-///! WebSocket connection: handshake + message send/recv over a buffered
+///! WebSocket connection: handshake + message send/receive over a buffered
 ///! async connection.
 ///!
 ///! `WebSocket<S>` OWNS its `BufStream<S>`. Ownership is forced rather than
@@ -12,7 +12,7 @@
 ///! Owning the connection is also what removes the byte-at-a-time handshake
 ///! read the borrowed version needed. The buffer outlives the handshake, so
 ///! frame bytes that arrived in the same fill as the terminating blank line
-///! survive into the first `recv` instead of being consumed and lost, and the
+///! survive into the first `receive` instead of being consumed and lost, and the
 ///! head can be read a line at a time.
 ///!
 ///! Messages are reassembled from frames (continuations joined, control frames
@@ -51,13 +51,13 @@ private const MAX_HEAD_LINES: u64 = 100;
 /// that is an OOM DoS. 64 MiB matches the single-frame cap in `ws::frame`.
 private const MAX_MESSAGE: i64 = 67108864;          // 64 MiB
 
-/// Cap on control frames (Ping/Pong) serviced within a single `recv` before a
+/// Cap on control frames (Ping/Pong) serviced within a single `receive` before a
 /// data frame arrives. A peer that streams only Pings would otherwise pin the
 /// connection in unbounded auto-Pong work and never yield a message.
 private const MAX_CONTROL_PER_RECV: u64 = 256;
 
 // Close status codes (RFC 6455 section 7.4.1), for `close` and for what
-// `recv` answers a Close frame with.
+// `receive` answers a Close frame with.
 /// Status 1000: the connection did what it was for.
 public const CLOSE_NORMAL:              u16 = 1000;
 /// Status 1001: the endpoint is going away, as a server shutting down.
@@ -105,7 +105,7 @@ public type enum Message {
 /// records which side it is, which decides the frame masking: a client
 /// masks what it sends and refuses masked frames, a server the reverse.
 /// `connect` and `accept` build one over a `TcpStream` and run the opening
-/// handshake; `of` adopts any other transport. The handshakes and `recv`
+/// handshake; `of` adopts any other transport. The handshakes and `receive`
 /// report a protocol violation by the peer as `InvalidData`.
 ///
 /// ```cryo
@@ -120,14 +120,14 @@ public type enum Message {
 /// async function hello(socket: TcpStream) -> Result<Message, IoError> {
 ///     mut ws: WebSocket<TcpStream> = (await conn::connect(socket, Str::new("localhost"), Str::new("/")))?;
 ///     (await ws.send_text(Str::new("hello")))?;
-///     return await ws.recv();
+///     return await ws.receive();
 /// }
 /// ```
 public type struct WebSocket<S> {
     private conn:      BufStream<S>;
     private is_client: boolean;
     private closed:    boolean;
-    // The status code of the peer's Close frame, 0 until `recv` has taken
+    // The status code of the peer's Close frame, 0 until `receive` has taken
     // a valid one, and its reason.
     private peer_close_code:   u16;
     private peer_close_reason: String;
@@ -155,8 +155,8 @@ public type struct WebSocket<S> {
     }
 
     /// The status code and reason of the Close frame the peer sent, once
-    /// `recv` has returned `Message::Close` for it; `None` before that, and
-    /// for a Close that broke the protocol, which `recv` reports as an error.
+    /// `receive` has returned `Message::Close` for it; `None` before that, and
+    /// for a Close that broke the protocol, which `receive` reports as an error.
     public close_status(&this) -> Option<CloseStatus> {
         if (this.peer_close_code == 0) { return Option::None; }
         return Option::Some(CloseStatus {
@@ -166,7 +166,7 @@ public type struct WebSocket<S> {
 
     /// Client handshake: send the GET upgrade, then verify the `101` and the
     /// `Sec-WebSocket-Accept` echo. Bytes that arrived after the blank line
-    /// stay buffered for `recv`.
+    /// stay buffered for `receive`.
     public async client_handshake(mut &this, host: Str, path: Str) -> Result<(), IoError>
     where S: AsyncTransport {
         mut key: String = handshake::generate_key();
@@ -294,7 +294,7 @@ public type struct WebSocket<S> {
     /// a text message that is not UTF-8, which is answered with
     /// `CLOSE_INVALID_PAYLOAD`, and a frame masked the wrong way for this
     /// side, which is answered with `CLOSE_PROTOCOL_ERROR`.
-    public async recv(mut &this) -> Result<Message, IoError>
+    public async receive(mut &this) -> Result<Message, IoError>
     where S: AsyncTransport {
         mut acc: Array<u8> = Array::<u8>::new();
         mut binary: boolean = false;
