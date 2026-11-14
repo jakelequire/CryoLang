@@ -5502,6 +5502,29 @@ type struct SemaVisitor {
                                                      e.span);
     }
 
+    /// A struct literal's field `i`, given a value of `value_type` where the
+    /// field is `field_type`: a value the field does not accept converts
+    /// through a trait or is refused (E0200).  A pair either side of which
+    /// names no one type is not checked here, and since a generic body is
+    /// checked once and its copies are not, it is never checked.
+    check_field_value(mut &this, lit: mut StructExpr*, i: i64, value_type: TypeRef, field_type: TypeRef) -> void {
+        const value_expr: mut ExpressionNode* = lit.field_inits[i].value;
+        if (!this.symbolic.symbolic_names_one_type(value_type) || !this.symbolic.symbolic_names_one_type(field_type)) {
+            return;
+        }
+        if (this.checker.can_assign(value_type, field_type)) { return; }
+        match (this.convert_through_trait(value_expr, value_type, field_type)) {
+            TraitConversionOutcome::Converted(c) => { lit.field_inits[i].value = c; }
+            TraitConversionOutcome::Refused => { }
+            TraitConversionOutcome::Mismatch => {
+                const field_name_str: string = this.intern.resolve(lit.field_inits[i].field_name);
+                this.diag.emit_type_mismatch_with_value(
+                    ErrorCode::E0200_TYPE_MISMATCH, value_expr.span, field_type, value_type,
+                    fmt::format("field `%s` expects this type", field_name_str).into_raw(), SourceSpan::none(), value_expr);
+            }
+        }
+    }
+
     resolve_struct_literal(mut &this, e: ExpressionNode*, lit: mut StructExpr*) -> TypeRef {
         mut struct_ref: TypeRef = TypeRef::invalid();
         // Monomorphization records a specialized literal's instantiation as the
@@ -5586,27 +5609,49 @@ type struct SemaVisitor {
         }
         mut infer_fields: [TypeRef] = [];
         mut infer_values: [TypeRef] = [];
+        mut infer_expressions: [ExpressionNode*] = [];
         const defaults_fill: boolean = infer_from != null && defaults.length() > 0;
         mut typed_last: [i64] = [];
+        mut retyped_last: [i64] = [];
+        mut checked_last: [i64] = [];
 
         const saved_expected: TypeRef = this.state.expected_type;
-        // Pass 0 types every field but the literals a default outranks; pass 1
-        // knows the instance and types those as its fields.
+        // Pass 0 types every field but the literals a default outranks, and
+        // the empty array literals only a field types; pass 1 knows the
+        // instance and types those as its fields.
         for (mut pass: i64 = 0; pass < 2; pass++) {
             if (pass == 1 && infer_from != null) {
                 const bound: TypeRef = this.calls.instance_from_fields(infer_from, &infer_fields, &infer_values,
-                    &written, &defaults);
+                    &infer_expressions, &written, &defaults);
                 lit_type = if (bound.is_valid()) { bound }
                     else { this.ctx.type_resolver.canonicalize_default_generic_type(struct_ref) };
                 field_owner = lit_type;
+                // A value pass 0 typed on its own is checked against the
+                // instance's field, and a variant its own payload left at its
+                // generic enum (`peeked: Option::None`) is that field.
+                for (mut n: i64 = 0; n < retyped_last.length(); n++) {
+                    const field_init: FieldInit = lit.field_inits[retyped_last[n]];
+                    const fa: FieldAnswer = this.member.field_of(field_owner, field_init.field_name);
+                    this.calls.retype_generic_variant(field_init.value, fa.ty);
+                }
+                for (mut n: i64 = 0; n < checked_last.length(); n++) {
+                    const field_init: FieldInit = lit.field_inits[checked_last[n]];
+                    const fa: FieldAnswer = this.member.field_of(field_owner, field_init.field_name);
+                    if (fa.ty.is_valid()) {
+                        this.check_field_value(lit, checked_last[n], field_init.value.resolved_type, fa.ty);
+                    }
+                }
             }
             const count: i64 = if (pass == 0) { lit.field_inits.length() } else { typed_last.length() };
             for (mut n: i64 = 0; n < count; n++) {
                 const i: i64 = if (pass == 0) { n } else { typed_last[n] };
                 const field_init: FieldInit = lit.field_inits[i];
                 const value_expr: mut ExpressionNode* = field_init.value;
-                if (pass == 0 && defaults_fill && value_expr != null
-                        && this.calls.sema_arg_is_polymorphic_literal(value_expr)) {
+                const empty_array: ArrayExpr* = if (value_expr != null) { ExpressionNode::array_of(value_expr) } else { null };
+                if (pass == 0 && value_expr != null
+                        && ((defaults_fill && this.calls.sema_arg_is_polymorphic_literal(value_expr))
+                            || (infer_from != null && empty_array != null && empty_array.elements.length() == 0
+                                && empty_array.repeat_count == 0 && empty_array.repeat_count_expr == null))) {
                     typed_last.push(i);
                     continue;
                 }
@@ -5637,33 +5682,36 @@ type struct SemaVisitor {
                     this.member.enforce_field_visibility(&fa, field_init.field_name, field_init.span);
                 }
                 if (value_expr == null) { field_type = TypeRef::invalid(); }
-                if (field_type.is_valid()) { this.state.expected_type = field_type; }
+                // Before the instance is known a field's type is the template's,
+                // over the template's parameters, which are types only in the
+                // struct's own body.  Anywhere else the value types itself, as
+                // a generic call's argument does against a parameter over the
+                // callee's own, and its type is what binds the instance; its
+                // array kind still holds, since only the field says an
+                // `[T]` literal is an `Array`.
+                const over_parameters: boolean = pass == 0 && infer_from != null && field_type.is_valid()
+                    && this.symbolic.names_param_out_of_scope(field_type);
+                if (field_type.is_valid() && !over_parameters) { this.state.expected_type = field_type; }
                 else { this.state.expected_type = TypeRef::invalid(); }
-                const value_type: TypeRef = this.resolve_expr(value_expr);
+                mut value_type: TypeRef = this.resolve_expr(value_expr);
+                if (over_parameters && value_type.is_valid()) {
+                    if (this.arena.default_array_element(field_type).is_valid()) {
+                        this.calls.adopt_dynamic_array_kind(value_expr);
+                        value_type = value_expr.resolved_type;
+                    }
+                    if (this.calls.is_generic_variant(value_expr)) { retyped_last.push(i); }
+                    checked_last.push(i);
+                }
                 if (pass == 0 && infer_from != null && field_type.is_valid() && value_type.is_valid()) {
                     infer_fields.push(field_type);
                     infer_values.push(value_type);
+                    infer_expressions.push(value_expr);
                 }
                 if (field_type.is_valid() && value_type.is_valid() && value_expr != null) {
-                    // A generic body is checked once and its copies are not, so a
-                    // pair skipped here is never checked.
-                    const skip: boolean = !this.symbolic.symbolic_names_one_type(value_type)
-                        || !this.symbolic.symbolic_names_one_type(field_type);
                     this.lambda.refuse_stored_closure(value_type, field_type, value_expr.span, "a field",
                         SourceSpan::none());
                     this.lambda.refuse_held_scope_handle(value_type, value_expr.span, "a field", false);
-                    if (!skip && !this.checker.can_assign(value_type, field_type)) {
-                        match (this.convert_through_trait(value_expr, value_type, field_type)) {
-                            TraitConversionOutcome::Converted(c) => { lit.field_inits[i].value = c; }
-                            TraitConversionOutcome::Refused => { }
-                            TraitConversionOutcome::Mismatch => {
-                                const field_name_str: string = this.intern.resolve(field_init.field_name);
-                                this.diag.emit_type_mismatch_with_value(
-                                    ErrorCode::E0200_TYPE_MISMATCH, value_expr.span, field_type, value_type,
-                                    fmt::format("field `%s` expects this type", field_name_str).into_raw(), SourceSpan::none(), value_expr);
-                            }
-                        }
-                    }
+                    if (!over_parameters) { this.check_field_value(lit, i, value_type, field_type); }
                 }
             }
         }

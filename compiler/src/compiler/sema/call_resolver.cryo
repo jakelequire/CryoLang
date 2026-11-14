@@ -2225,18 +2225,32 @@ type struct CallResolver {
             const arg: mut ExpressionNode* = call.arguments[i];
             const param_decl: DeclarationNode* = tmpl.parameters[i];
             const param: VarDecl* = DeclarationNode::var_of(param_decl);
-            if (arg == null || param == null || !arg.has_resolved_type()) { continue; }
-            const scope: mut ExpressionNode* = CallResolver::variant_scope_of(arg);
-            if (scope == null) { continue; }
-            const arg_tmpl: const TemplateEntry* = this.ctx.generic_registry.template_of_type(arg.resolved_type);
-            if (arg_tmpl == null || !arg_tmpl.base_type.equals(arg.resolved_type)) { continue; }
-            const want: TypeRef = this.subst_free_call_return(entry, bindings, param.resolved_type);
-            if (!want.is_valid() || this.types.contains_generic_param(want)) { continue; }
-            if (!this.ctx.decl_index.def_of(want, this.ctx.type_arena)
-                    .equals(this.ctx.decl_index.def_of(arg.resolved_type, this.ctx.type_arena))) { continue; }
-            arg.set_resolved_type(want);
-            scope.set_resolved_type(want);
+            if (param == null || !this.is_generic_variant(arg)) { continue; }
+            this.retype_generic_variant(arg, this.subst_free_call_return(entry, bindings, param.resolved_type));
         }
+    }
+
+    /// Whether `arg` is a variant - `E::V` or `E::V(..)` - typed as its
+    /// generic enum: no instance was written, and neither its payload nor an
+    /// expected type determined one.
+    is_generic_variant(&this, arg: ExpressionNode*) -> boolean {
+        if (arg == null || !arg.has_resolved_type()) { return false; }
+        if (CallResolver::variant_scope_of(arg) == null) { return false; }
+        const arg_tmpl: const TemplateEntry* = this.ctx.generic_registry.template_of_type(arg.resolved_type);
+        return arg_tmpl != null && arg_tmpl.base_type.equals(arg.resolved_type);
+    }
+
+    /// `arg`, a variant typed as its generic enum, takes the instance `want`
+    /// that the position it stands in names, once that is known: a generic
+    /// call's parameter after the call's bindings, a generic literal's field
+    /// after its instance.  A `want` of another type, or still over
+    /// parameters, leaves it as it is.
+    retype_generic_variant(mut &this, arg: mut ExpressionNode*, want: TypeRef) -> void {
+        if (!want.is_valid() || this.types.contains_generic_param(want)) { return; }
+        if (!this.ctx.decl_index.def_of(want, this.ctx.type_arena)
+                .equals(this.ctx.decl_index.def_of(arg.resolved_type, this.ctx.type_arena))) { return; }
+        arg.set_resolved_type(want);
+        CallResolver::variant_scope_of(arg).set_resolved_type(want);
     }
 
     /// When `call` is an EXPLICIT generic free call (`f<i32>(...)` on a bare
@@ -11022,7 +11036,9 @@ type struct CallResolver {
     /// arguments, or with a `_` among them, builds from its fields: the
     /// arguments `written` (invalid at each `_`, or empty) bound first, then
     /// each field's declared type, over the template's parameters, unified
-    /// with the type of the value given for it, then `defaults` (one per
+    /// with the type of the value given for it (`value_expressions`, beside
+    /// `values`, for a variant still typed as its generic enum, which binds
+    /// through its payload), then `defaults` (one per
     /// parameter, or empty) at each parameter still unbound.  Demanded, since the literal
     /// may flow where nothing else names the instance (a generic function's
     /// argument).  Invalid unless every parameter is bound to a concrete type,
@@ -11031,14 +11047,19 @@ type struct CallResolver {
     /// rewrites, referenced and not demanded, as the literal's written
     /// arguments would make it.
     instance_from_fields(mut &this, tmpl: const TemplateEntry*, fields: &[TypeRef], values: &[TypeRef],
-                         written: &[TypeRef], defaults: &[TypeRef]) -> TypeRef {
+                         value_expressions: &[ExpressionNode*], written: &[TypeRef], defaults: &[TypeRef]) -> TypeRef {
         mut pids: [TypeRef] = [];
         for (mut i: i64 = 0; i < tmpl.param_types.length(); i++) { pids.push(tmpl.param_types[i]); }
         mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
         for (mut i: i64 = 0; i < written.length(); i++) {
             if (written[i].is_valid()) { ictx.bind_slot(i, written[i]); }
         }
-        for (mut i: i64 = 0; i < fields.length() && i < values.length(); i++) { ictx.unify(fields[i], values[i]); }
+        for (mut i: i64 = 0; i < fields.length() && i < values.length(); i++) {
+            if (i < value_expressions.length() && this.bind_from_variant_payload(&ictx, fields[i], value_expressions[i])) {
+                continue;
+            }
+            ictx.unify(fields[i], values[i]);
+        }
         const owner_bounds: [TraitBound]* = tmpl.declared_where_bounds();
         if (owner_bounds != null) {
             this.ctx.type_resolver.unify_callable_bounds(owner_bounds, &tmpl.param_syms, &ictx, null);
