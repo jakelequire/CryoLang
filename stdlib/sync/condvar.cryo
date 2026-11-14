@@ -1,16 +1,16 @@
-///! CondVar: condition variable for blocking until a predicate holds.
+///! ConditionVariable: condition variable for blocking until a predicate holds.
 ///!
-///! A `CondVar` is the synchronization primitive that lets a thread
+///! A `ConditionVariable` is the synchronization primitive that lets a thread
 ///! atomically release a `Mutex<T>` and sleep until another thread
 ///! signals.  It is the standard producer/consumer primitive.
 ///!
 ///! Usage pattern:
 ///! ```cryo
 ///! import std::sync::mutex::{ Mutex, MutexGuard };
-///! import std::sync::condvar::{ CondVar };
+///! import std::sync::condvar::{ ConditionVariable };
 ///! import std::alloc::allocator::{ GlobalAllocator };
 ///!
-///! // shared with the producer: `queued: Mutex<i64>` and `cond: CondVar`
+///! // shared with the producer: `queued: Mutex<i64>` and `cond: ConditionVariable`
 ///! mut guard: MutexGuard<i64, GlobalAllocator> = queued.lock();
 ///! while (*guard.as_pointer() == 0) {
 ///!     cond.wait(&queued, &guard);
@@ -27,7 +27,7 @@
 ///! not to use the guarded value while inside `wait()`; doing so
 ///! reads through the guard while another thread holds the lock.
 ///!
-///! `CondVar` is `Send + Sync` unconditionally (pthread condition
+///! `ConditionVariable` is `Send + Sync` unconditionally (pthread condition
 ///! variables are designed for cross-thread use).
 
 namespace std::sync::condvar;
@@ -131,7 +131,7 @@ private function cond_destroy_raw(buf: mut u8*) -> void { }
 // 48-byte opaque pthread_cond_t buffer, heap-pinned for address
 // stability (pthread cond variables, like mutexes, must not move
 // after init).
-private type struct CondVarInner {
+private type struct ConditionVariableInner {
     private pthread_buf: [u8; 48];
 }
 
@@ -141,16 +141,16 @@ private type struct CondVarInner {
 /// `pthread_cond_t` on unix; on Windows a `CONDITION_VARIABLE` waited on
 /// with the mutex's SRW lock. Wakes can be spurious, so wait in a loop that
 /// re-checks the condition. Use it with only one `Mutex`.
-public type struct CondVar {
-    private inner: mut CondVarInner*;
+public type struct ConditionVariable {
+    private inner: mut ConditionVariableInner*;
 
     /// Construct a fresh condition variable with default attributes.
     /// Panics on allocation failure or pthread init failure.
-    public static new() -> CondVar {
-        match (CondVar::try_new()) {
+    public static new() -> ConditionVariable {
+        match (ConditionVariable::try_new()) {
             Result::Ok(c)  => { return c; }
             Result::Err(_) => {
-                core::panic("CondVar::new: allocation failed", intrinsics::location());
+                core::panic("ConditionVariable::new: allocation failed", intrinsics::location());
             }
         }
     }
@@ -159,19 +159,19 @@ public type struct CondVar {
     /// an `OutOfMemory` `AllocationError` both when its storage cannot be
     /// allocated and when `pthread_cond_init` fails (unix; the Windows
     /// initialisation cannot fail).
-    public static try_new() -> Result<CondVar, AllocationError> {
+    public static try_new() -> Result<ConditionVariable, AllocationError> {
         mut alloc: GlobalAllocator = GlobalAllocator::new();
-        const header: Layout = Layout::of::<CondVarInner>();
+        const header: Layout = Layout::of::<ConditionVariableInner>();
         const raw: NonNull<u8> = alloc.allocate(header)?;
-        const typed: NonNull<CondVarInner> = raw.cast::<CondVarInner>();
-        const inner_ptr: mut CondVarInner* = typed.as_pointer();
+        const typed: NonNull<ConditionVariableInner> = raw.cast::<ConditionVariableInner>();
+        const inner_ptr: mut ConditionVariableInner* = typed.as_pointer();
         const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
         const rc: i32 = cond_init_raw(buf_ptr);
         if (rc != 0) {
             alloc.deallocate(raw, header);
             return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, header));
         }
-        return Result::Ok(CondVar { inner: inner_ptr });
+        return Result::Ok(ConditionVariable { inner: inner_ptr });
     }
 
     /// Block the current thread until another thread signals this
@@ -189,7 +189,7 @@ public type struct CondVar {
         const mutex_buf: mut u8* = mutex.raw_pthread_buf();
         const rc: i32 = cond_wait_raw(cond_buf, mutex_buf);
         if (rc != 0) {
-            core::panic("CondVar::wait: cond_wait_raw failed", intrinsics::location());
+            core::panic("ConditionVariable::wait: cond_wait_raw failed", intrinsics::location());
         }
     }
 
@@ -203,7 +203,7 @@ public type struct CondVar {
         match (cond_wait_timeout_raw(cond_buf, mutex_buf, &duration)) {
             Option::Some(timed_out) => { return timed_out; }
             Option::None => {
-                core::panic("CondVar::wait_timeout: the wait failed", intrinsics::location());
+                core::panic("ConditionVariable::wait_timeout: the wait failed", intrinsics::location());
             }
         }
     }
@@ -226,14 +226,14 @@ public type struct CondVar {
     }
 }
 
-implement trait Drop for struct CondVar {
+implement trait Drop for struct ConditionVariable {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
-        const inner_ptr: mut CondVarInner* = this.inner;
+        const inner_ptr: mut ConditionVariableInner* = this.inner;
         const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
         cond_destroy_raw(buf_ptr);
         mut alloc: GlobalAllocator = GlobalAllocator::new();
-        const header: Layout = Layout::of::<CondVarInner>();
+        const header: Layout = Layout::of::<ConditionVariableInner>();
         alloc.deallocate(NonNull::new(this.inner as mut u8*), header);
         this.inner = null;
     }

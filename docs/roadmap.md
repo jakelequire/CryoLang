@@ -470,7 +470,7 @@ Left over from that: the async entry point calls `Executor::new` and
    `io::error`, which is marked (612).  A float classifies itself and an
    integer rotates itself (613).  The executor, the reactor, the
    blocking pool and the channels lock with `sync`'s `Mutex` and
-   `CondVar` and start their threads through `thread`, which creates
+   `ConditionVariable` and start their threads through `thread`, which creates
    every thread one way (622), and each lock holds the state it guards
    (624).  A descriptor's non-blocking mode has one switch, and a drain
    reads through a borrowed descriptor's `read_to_end` (625).  A

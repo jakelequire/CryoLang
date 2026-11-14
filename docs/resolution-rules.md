@@ -157,7 +157,7 @@ yet is recorded with the change that builds it, not here.
      quoted header's are.  (Jake)
 
 705. **`net::sys` is internal.**  The per-OS socket, resolver and error
-     calls (`os_*`, `sock_*`, `net_init`, `last_io_error`), the
+     calls (`os_*`, `sock_*`, `network_initialize`, `last_io_error`), the
      `addrinfo` layout and hint readings and `ConnectStatus` are the
      standard library's plumbing for `net::socket` and `net::dns`, and the
      module is declared `internal module net::sys;`.  `set_timeout` is
@@ -733,8 +733,8 @@ yet is recorded with the change that builds it, not here.
      these.  (Jake for the names and the whitespace set)
 
 609. **`Str` searches from either end; a `Slice` indexes and compares.**
-     `Str` has `rfind`, `find_byte`, `rfind_byte`, `split_once`,
-     `rsplit_once` (the text before and after the first or last
+     `Str` has `find_last`, `find_byte`, `find_last_byte`, `split_once`,
+     `split_once_from_end` (the text before and after the first or last
      separator, neither half including it) and `equals_case_insensitive`
      (ASCII letters folded, every other byte exact).  `Slice<T>`
      implements `Index` for every integer type, as `Array` does - an
@@ -751,7 +751,7 @@ yet is recorded with the change that builds it, not here.
 610. **`Str`, `Slice` and `Path` are marked item by item.**  `Str`,
      `Slice<T>`, `Path` and `PathBuf` and all their methods are public,
      their storage private behind `as_pointer`, `as_bytes`, `as_str` and
-     `as_path`.  `Str`'s `SplitIter`, `Chars` and `CharIndices` are
+     `as_path`.  `Str`'s `SplitIterator`, `Chars` and `CharIndices` are
      internal: `Str`'s methods return them as `implement Iterator<...>`,
      and `String` reads them through `Str` by `Deref`, so no public
      signature names them.  `Str`'s `set_bytes` and `set_length` are
@@ -761,7 +761,7 @@ yet is recorded with the change that builds it, not here.
      integer parser's `I64_MIN_MAGNITUDE` are private.  `SliceIter` is
      internal: `Slice` and `Array` both make one and no public signature
      names it.  `Path`'s syntax constants are private and its static
-     queries (`is_separator`, `root_len`, `is_absolute_str`,
+     queries (`is_separator`, `root_length`, `is_absolute_str`,
      `last_separator`) public.  Base64 looks its alphabet up by indexing
      a `Slice`, its own byte readers deleted.  (delegated)
 
@@ -943,7 +943,7 @@ yet is recorded with the change that builds it, not here.
 
 622. **One mutex, one condition variable, one thread creator.**  The
      executor, the reactor, the blocking pool and `mpsc` hold their
-     locks as `sync::Mutex` and `sync::CondVar` and start their threads
+     locks as `sync::Mutex` and `sync::ConditionVariable` and start their threads
      through `std::thread` (`Scope`, or `try_spawn` where a refused
      thread is not fatal), with no per-OS copy of their own; a module
      whose own type shares a name with one of `thread`'s imports it
@@ -1058,7 +1058,7 @@ yet is recorded with the change that builds it, not here.
      type is written `private`.  (Jake; each split delegated)
 
 631. **`thread` and `fmt` are marked.**  Spawning (`spawn`,
-     `spawn_with_attr`, `try_spawn`, `Builder`, `Scope`), `JoinHandle`,
+     `spawn_with_attributes`, `try_spawn`, `Builder`, `Scope`), `JoinHandle`,
      `ThreadId`, `Thread`, `ThreadLocal`, the scheduling calls and
      `MAX_THREAD_NAME`, the cap `Builder.name` truncates to, are public;
      every handle's OS id and shared block, `ThreadId`'s word (it is
@@ -1103,7 +1103,7 @@ yet is recorded with the change that builds it, not here.
      delegated)
 
 634. **`process` is marked.**  `Command`, `Stdio`, `Output`, `Child`,
-     its pipe handles with `from_file_descriptor`, `ExitStatus`'s methods, `SigNo`,
+     its pipe handles with `from_file_descriptor`, `ExitStatus`'s methods, `SignalNumber`,
      `Signal` and `id` are public.  A command's settings, an output's
      captures and a signal's number are private behind their methods.
      The spawn, pipe, environment and command-line steps, the Windows
@@ -1142,7 +1142,7 @@ yet is recorded with the change that builds it, not here.
      array, a string and a map start with, the sort steps, the per-process
      seed generator, a map's seeded hashing and its node allocation are
      private, while `hash_str` and `hash_integer` stay public.  The iterator
-     adapters are private, with `KeysRefIter` internal for the set built
+     adapters are private, with `KeysReferenceIterator` internal for the set built
      on it; `copied` and `cloned`, reached through `iterate_references`'s opaque
      result, are public.  `HashMapIter` is not marked: the compiler names
      it.  JSON reads its arrays through `get_reference` and indexing, and the
@@ -1164,17 +1164,17 @@ yet is recorded with the change that builds it, not here.
      `Ordering`, `min`, `max`, `clamp`, the conversion traits,
      `ConversionError`, the hashers, the FNV parameters and `digest`,
      `Iterator` with its adapters, `mem`'s calls, the operator traits,
-     `Range` and `RangeInclusive`, `Option`, `Result`, `PanicInfo`,
-     `catch_unwind`, `drop_in_place`, `NonNull`, `VaArg` and `VaArgs` are
+     `Range` and `RangeInclusive`, `Option`, `Result`, `PanicInformation`,
+     `catch_unwind`, `drop_in_place`, `NonNull`, `VariadicArgument` and `VariadicArguments` are
      public with their methods.  An adapter is named by the `Iterator`
      method that builds it, so it stays public, with its state private
      and its constructor public, since the trait's default bodies call it
-     from the implementing type's module.  `PanicInfo` and a range's
+     from the implementing type's module.  `PanicInformation` and a range's
      bounds stay public fields, as plain data.  A hasher's running state,
      a conversion error's reason, a pointer's address in `NonNull` and
-     `VaArgs`, and an inclusive range's exhaustion flag are private behind
+     `VariadicArguments`, and an inclusive range's exhaustion flag are private behind
      accessors, and the unwinding catch's trampoline and its context are
-     private.  `taken_panic_info`, the executor's read of a panic its
+     private.  `taken_panic_information`, the executor's read of a panic its
      `try_catch` caught, is left with `intrinsics`.  (Jake; each split
      delegated)
 
@@ -1220,7 +1220,7 @@ yet is recorded with the change that builds it, not here.
 642. **The intrinsics and the primitives are marked.**  Every intrinsic is
      public: they are the language's primitive operations, the
      allocation, bit, atomic, float, trap, unwinding, directory-entry and
-     variadic ones alike.  `taken_panic_info` is public beside
+     variadic ones alike.  `taken_panic_information` is public beside
      `try_catch`, as the way a caller catching through it reads the
      payload.  The primitives' constants and methods are public, but for
      the digit-table step behind the integers' hex writers
@@ -1254,7 +1254,7 @@ yet is recorded with the change that builds it, not here.
 
 645. **The compiler and the LSP split names and join paths through the
      standard library.**  A qualified name's head, leaf, parent and segment
-     count are `string.find`, `rfind`, `substr` and `Str.split`;
+     count are `string.find`, `find_last`, `substring` and `Str.split`;
      `QualifiedName::leaf_of` is the one leaf operation, which bindgen and
      completion use too.  `::` becomes `/` by `string.replace`, a name's
      segments are `string.split_nonempty` or `Str.split`, and a module's
@@ -1477,7 +1477,7 @@ yet is recorded with the change that builds it, not here.
 
 662. **No `ffi::cstr`; a chunked request is 501.**  The standard library
      has no `CStr`/`CString`/`NulError`: a C string is a `string`, read
-     with `Str::new` and made with `String::with_null` / `as_cstr`, and
+     with `Str::new` and made with `String::with_null` / `as_c_string`, and
      the specification no longer promises the module.  The HTTP/1 server
      answers a first request framed by `Transfer-Encoding`, which it reads
      but does not implement, with 501 Not Implemented; any other first
@@ -1649,7 +1649,7 @@ yet is recorded with the change that builds it, not here.
 575. **Every length, position and size in the standard library is an
      `i64`.**  `length()`, `capacity()`, `find`, `index_of` and
      `Iterator::count` answer one, and `get`, `set`, `insert`, `remove`,
-     `sub_bytes`, `subslice`, `truncate`, `reserve`, `with_capacity`,
+     `byte_substring`, `subslice`, `truncate`, `reserve`, `with_capacity`,
      `take`, `skip` and their kind take one, so a position found by one
      call is passed to the next with no cast.  This answers the question
      ruling 574 left open.  The checking cost of reaching a length through
@@ -1660,7 +1660,7 @@ yet is recorded with the change that builds it, not here.
      never a huge unsigned one.**  A lookup that answers `Option` (`get`,
      `get_reference`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`; a
      method that writes or cuts at a position (`set`, `insert`, `remove`,
-     `swap_remove`, `sub_bytes`, `subslice`) panics "out of range";
+     `swap_remove`, `byte_substring`, `subslice`) panics "out of range";
      `truncate` and `resize` panic "negative length"; `reserve`,
      `reserve_exact` and `with_capacity` treat zero or less as nothing to
      do; `take` of a negative count yields nothing and `skip` of one skips
@@ -1920,7 +1920,7 @@ yet is recorded with the change that builds it, not here.
      address.  (Jake)
 
 512. **The float types' limits are constants** - `EPSILON`, `MAX`, `MIN`,
-     `MIN_POSITIVE`, `INFINITY`, `NEG_INFINITY` and `NAN` on `f32` and
+     `MIN_POSITIVE`, `INFINITY`, `NEGATIVE_INFINITY` and `NAN` on `f32` and
      `f64`.  `math::F64_*` and `math::F32_*`, and `math::infinity()`,
      `math::neg_infinity()` and `math::nan()`, are removed and their
      callers moved to the constants.  `math::PI` and the other

@@ -124,7 +124,7 @@ public type struct String<A = GlobalAllocator> {
     /// `as_str()` / `length()` see only `source`. Matches C semantics on
     /// an interior NUL: the C side stops reading at the first one.  This is
     /// the produce-*for*-C direction; `from_string` is the consume-*from*-C
-    /// one.  Pairs with the `as_cstr()` borrow method.
+    /// one.  Pairs with the `as_c_string()` borrow method.
     public static with_null(source: Str) -> String {
         mut string: String = String::with_capacity(source.length() + 1);
         string.push(source);
@@ -251,7 +251,7 @@ public type struct String<A = GlobalAllocator> {
     /// `const char*`) for handing to an `extern "C"` API.
     ///
     /// A String built by `push`/`from_str` carries no trailing NUL, so
-    /// `as_pointer()` alone is not a valid C string. `as_cstr()` writes the
+    /// `as_pointer()` alone is not a valid C string. `as_c_string()` writes the
     /// terminator at index `length` - reserving one spare byte if the
     /// buffer is full - WITHOUT changing the logical length, mirroring
     /// the `with_null` invariant. The work is idempotent and zero-alloc
@@ -261,14 +261,14 @@ public type struct String<A = GlobalAllocator> {
     /// until the next mutating call (`push`, `clear`, drop) and must not
     /// be freed by the caller. Like C, an interior NUL ends the string
     /// early; the bytes are not otherwise validated.
-    public as_cstr(mut &this) -> u8* {
+    public as_c_string(mut &this) -> u8* {
         match (this.reserve(1)) {
             Result::Ok(_) => {
                 this.buffer.pointer()[this.view.length()] = 0 as u8;
                 return this.buffer.pointer();
             }
             Result::Err(_) => {
-                core::panic("String::as_cstr: allocation failed", intrinsics::location());
+                core::panic("String::as_c_string: allocation failed", intrinsics::location());
             }
         }
     }
@@ -276,7 +276,7 @@ public type struct String<A = GlobalAllocator> {
     /// Consume the String and return its NUL-terminated buffer as a raw
     /// `string` (C-string view), leaking the allocation so the caller
     /// owns the bytes with no borrow lifetime. A NUL terminator is
-    /// appended first. The owning companion of `Str::sub_bytes` etc. for
+    /// appended first. The owning companion of `Str::byte_substring` etc. for
     /// handing an owned C-string across the FFI / raw-`string` boundary.
     public into_raw(mut this) -> string {
         this.push_byte(0 as u8);
@@ -332,7 +332,7 @@ public type struct String<A = GlobalAllocator> {
         const text: Str = this.view;
         mut width: i64 = 1;
         while (!text.is_char_boundary(index + width)) { width = width + 1; }
-        const scalar: u32 = text.sub_bytes(index, index + width).chars().next().unwrap();
+        const scalar: u32 = text.byte_substring(index, index + width).chars().next().unwrap();
         libc::memmove(this.buffer.pointer() + index, this.buffer.pointer() + index + width, (length - index - width) as u64);
         this.view.set_length(length - width);
         return scalar as char;

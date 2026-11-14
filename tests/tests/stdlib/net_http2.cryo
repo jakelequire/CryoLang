@@ -128,7 +128,7 @@ function h2_pattern_byte(index: i64) -> u8 {
 
 function h2_push_decimal(out: mut &String, value: u64) -> void {
     mut temp: [u8; 24];
-    const digits: i64 = value.to_decimal_buf(&temp[0]);
+    const digits: i64 = value.to_decimal_buffer(&temp[0]);
     mut i: i64 = 0;
     while (i < digits) {
         out.push_byte(temp[i]);
@@ -307,21 +307,21 @@ async function h2_bad_settings_client(port: u16) -> i64 {
     {
         mut payload: Array<u8> = Array::<u8>::new();
         settings::push_entry(&payload, settings::SETTINGS_ENABLE_PUSH, 2);
-        queued = c.queue_h2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice()).is_ok();
+        queued = c.queue_http2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice()).is_ok();
     }
     if (!queued) { return -62; }
     match (await c.flush()) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -63; }
     }
-    mut first: Frame = match (await c.read_h2_frame(16384)) {
+    mut first: Frame = match (await c.read_http2_frame(16384)) {
         Result::Ok(f)  => { f }
         Result::Err(_) => { return -64; }
     };
     const first_is_settings: boolean = first.ftype == frame::FRAME_SETTINGS && !first.has_flag(frame::FLAG_ACK);
     mem::drop(first);
     if (!first_is_settings) { return -65; }
-    mut answer: Frame = match (await c.read_h2_frame(16384)) {
+    mut answer: Frame = match (await c.read_http2_frame(16384)) {
         Result::Ok(f)  => { f }
         Result::Err(_) => { return -67; }
     };
@@ -339,7 +339,7 @@ async function h2_bad_settings_client(port: u16) -> i64 {
 function h2_queue_setting(c: mut &BufferedStream<TcpStream>, id: u16, value: u32) -> boolean {
     mut payload: Array<u8> = Array::<u8>::new();
     settings::push_entry(&payload, id, value);
-    return c.queue_h2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice()).is_ok();
+    return c.queue_http2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice()).is_ok();
 }
 
 /// A server that writes its frames by hand, for what the public server
@@ -391,7 +391,7 @@ async function h2_raw_server(listener: TcpListener, case: i64) -> i64 {
     mut data: i64 = 0;
     mut changed: boolean = false;
     loop {
-        mut fr: Frame = match (await c.read_h2_frame(16384)) {
+        mut fr: Frame = match (await c.read_http2_frame(16384)) {
             Result::Ok(f)  => { f }
             Result::Err(_) => { return -204; }
         };
@@ -416,7 +416,7 @@ async function h2_raw_server(listener: TcpListener, case: i64) -> i64 {
                 if (end) { return data; }
                 if (!changed && data >= 10) {
                     queued = h2_queue_setting(&c, settings::SETTINGS_INITIAL_WINDOW_SIZE, 110);
-                    queued = queued && c.queue_h2_frame(frame::FRAME_PING, 0, 0,
+                    queued = queued && c.queue_http2_frame(frame::FRAME_PING, 0, 0,
                         Str::new("12345678").as_bytes()).is_ok();
                     if (!queued) { return -208; }
                     match (await c.flush()) {
@@ -433,7 +433,7 @@ async function h2_raw_server(listener: TcpListener, case: i64) -> i64 {
                     for (mut i: i64 = 0; i < 16384; i++) { fragment.push(0); }
                     for (mut sent: i64 = 0; sent < 17; sent++) {
                         const ftype_out: u8 = if (sent == 0) { frame::FRAME_HEADERS } else { frame::FRAME_CONTINUATION };
-                        if (!c.queue_h2_frame(ftype_out, 0, 1, fragment.as_slice()).is_ok()) { return -213; }
+                        if (!c.queue_http2_frame(ftype_out, 0, 1, fragment.as_slice()).is_ok()) { return -213; }
                         match (await c.flush()) {
                             Result::Ok(_)  => { }
                             Result::Err(_) => { return -214; }
@@ -443,7 +443,7 @@ async function h2_raw_server(listener: TcpListener, case: i64) -> i64 {
                     // 0x80 names entry 0 of the HPACK tables, which none has.
                     mut block: Array<u8> = Array::<u8>::new();
                     block.push(0x80);
-                    queued = c.queue_h2_frame(frame::FRAME_HEADERS,
+                    queued = c.queue_http2_frame(frame::FRAME_HEADERS,
                         frame::FLAG_END_HEADERS | frame::FLAG_END_STREAM, 1, block.as_slice()).is_ok();
                     mem::drop(block);
                     if (!queued) { return -215; }
@@ -460,7 +460,7 @@ async function h2_raw_server(listener: TcpListener, case: i64) -> i64 {
                 mut increment: Array<u8> = Array::<u8>::with_capacity(4);
                 mut writer: ByteWriter = ByteWriter::new(&increment);
                 writer.write_u32_big_endian(2147483647 - 1000);
-                queued = c.queue_h2_frame(frame::FRAME_WINDOW_UPDATE, 0, 1, increment.as_slice()).is_ok();
+                queued = c.queue_http2_frame(frame::FRAME_WINDOW_UPDATE, 0, 1, increment.as_slice()).is_ok();
                 mem::drop(increment);
                 queued = queued && h2_queue_setting(&c, settings::SETTINGS_INITIAL_WINDOW_SIZE, 1001);
                 if (!queued) { return -211; }
@@ -541,7 +541,7 @@ async function h2_bad_preface_client(port: u16) -> i64 {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -72; }
     }
-    mut answer: Frame = match (await c.read_h2_frame(16384)) {
+    mut answer: Frame = match (await c.read_http2_frame(16384)) {
         Result::Ok(f)  => { f }
         Result::Err(_) => { return -73; }
     };
@@ -563,7 +563,7 @@ function h2_queue_window_update(c: mut &BufferedStream<TcpStream>, stream_id: u3
     mut payload: Array<u8> = Array::<u8>::with_capacity(4);
     mut writer: ByteWriter = ByteWriter::new(&payload);
     writer.write_u32_big_endian(increment);
-    return c.queue_h2_frame(frame::FRAME_WINDOW_UPDATE, 0, stream_id, payload.as_slice()).is_ok();
+    return c.queue_http2_frame(frame::FRAME_WINDOW_UPDATE, 0, stream_id, payload.as_slice()).is_ok();
 }
 
 /// Queue a GET for `/` on `stream_id`, its header block written from HPACK's
@@ -573,7 +573,7 @@ function h2_queue_get(c: mut &BufferedStream<TcpStream>, stream_id: u32) -> bool
     block.push(0x82);
     block.push(0x84);
     block.push(0x86);
-    return c.queue_h2_frame(frame::FRAME_HEADERS, frame::FLAG_END_HEADERS | frame::FLAG_END_STREAM,
+    return c.queue_http2_frame(frame::FRAME_HEADERS, frame::FLAG_END_HEADERS | frame::FLAG_END_STREAM,
                             stream_id, block.as_slice()).is_ok();
 }
 
@@ -611,7 +611,7 @@ async function h2_raw_client_of_server(port: u16, case: i64) -> i64 {
         queued = queued && h2_queue_setting(&c, settings::SETTINGS_INITIAL_WINDOW_SIZE, 10);
     } else {
         mut empty: Array<u8> = Array::<u8>::new();
-        queued = queued && c.queue_h2_frame(frame::FRAME_SETTINGS, 0, 0, empty.as_slice()).is_ok();
+        queued = queued && c.queue_http2_frame(frame::FRAME_SETTINGS, 0, 0, empty.as_slice()).is_ok();
     }
     if (case <= 12) {
         queued = queued && h2_queue_get(&c, 1);
@@ -621,7 +621,7 @@ async function h2_raw_client_of_server(port: u16, case: i64) -> i64 {
         const field: u8 = if (case == 14) { 0x80 } else { 0x88 };
         mut block: Array<u8> = Array::<u8>::new();
         block.push(field);
-        queued = queued && c.queue_h2_frame(frame::FRAME_HEADERS,
+        queued = queued && c.queue_http2_frame(frame::FRAME_HEADERS,
             frame::FLAG_END_HEADERS | frame::FLAG_END_STREAM, 1, block.as_slice()).is_ok();
     }
     if (!queued) { return -401; }
@@ -634,7 +634,7 @@ async function h2_raw_client_of_server(port: u16, case: i64) -> i64 {
         for (mut i: i64 = 0; i < 16384; i++) { fragment.push(0); }
         for (mut sent: i64 = 0; sent < 17; sent++) {
             const ftype_out: u8 = if (sent == 0) { frame::FRAME_HEADERS } else { frame::FRAME_CONTINUATION };
-            if (!c.queue_h2_frame(ftype_out, 0, 1, fragment.as_slice()).is_ok()) { return -403; }
+            if (!c.queue_http2_frame(ftype_out, 0, 1, fragment.as_slice()).is_ok()) { return -403; }
             match (await c.flush()) {
                 Result::Ok(_)  => { }
                 Result::Err(_) => { return -404; }
@@ -648,7 +648,7 @@ async function h2_raw_client_of_server(port: u16, case: i64) -> i64 {
     mut ended: boolean = false;
     mut granted: boolean = false;
     loop {
-        mut fr: Frame = match (await c.read_h2_frame(16384)) {
+        mut fr: Frame = match (await c.read_http2_frame(16384)) {
             Result::Ok(f)  => { f }
             Result::Err(_) => { return -405; }
         };
@@ -678,7 +678,7 @@ async function h2_raw_client_of_server(port: u16, case: i64) -> i64 {
             if (!granted && data >= 10 && (case == 11 || case == 12)) {
                 if (case == 11) {
                     queued = h2_queue_window_update(&c, 5, 100)
-                        && c.queue_h2_frame(frame::FRAME_PING, 0, 0, Str::new("12345678").as_bytes()).is_ok();
+                        && c.queue_http2_frame(frame::FRAME_PING, 0, 0, Str::new("12345678").as_bytes()).is_ok();
                 } else {
                     queued = h2_queue_window_update(&c, 1, 1000);
                 }
