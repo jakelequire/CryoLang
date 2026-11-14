@@ -921,7 +921,9 @@ type struct MemberResolver {
     /// implementation's where-clause holds for it as written, and the
     /// body's copies specialize the call.  A base that IS a parameter is
     /// viewed when a bound in scope gives it `IndexView` at the index's
-    /// type, and the call is answered by that bound.  An index in the body's
+    /// type, and the call is answered by that bound; where the parameter is
+    /// writable and a bound gives it `IndexViewMutable` there too, the
+    /// desugar is `a.view_mutable(i)`, a value of `ViewMutable`.  An index in the body's
     /// parameters is indexed by `Index` alone.
     try_index_view(mut &this, visitor: mut SemaVisitor*, e: ExpressionNode*, access: ArrayAccessExpr*,
                    ty: TypeRef, index_ty: TypeRef) -> mut ExpressionNode* {
@@ -936,10 +938,22 @@ type struct MemberResolver {
         if (t == null || this.types.contains_generic_param(index_ty)) { return null; }
         mut receiver: mut ExpressionNode* = access.array;
         const index_args: [TypeRef] = [index_ty];
+        mut viewer: LangItem = LangItem::IndexViewView;
         if (t.kind == TypeKind::GenericParam) {
             if (!this.binding.param_bounded_by(t.as_generic_param(), view_id)
                     || !visitor.calls.scope_gives(base_ty, view_id, &index_args, 0)) {
                 return null;
+            }
+            // A writable parameter a bound gives `IndexViewMutable` at the
+            // index's type is viewed writably wherever it is viewed: its
+            // `View` and `ViewMutable` are different projections, and only
+            // the bounds on the one `[]` names reach the view's methods and
+            // elements.
+            const writer_id: DefId = this.ctx.generic_registry.wellknown(LangItem::IndexViewMutable);
+            if (writer_id.is_valid() && this.binding.param_bounded_by(t.as_generic_param(), writer_id)
+                    && visitor.calls.scope_gives(base_ty, writer_id, &index_args, 0)
+                    && visitor.access_within(access.array).is_writable()) {
+                viewer = LangItem::IndexViewMutableViewMutable;
             }
         } else {
             // No implementation can name a fixed array's length, so a `[T; N]`
@@ -952,7 +966,7 @@ type struct MemberResolver {
             }
             if (this.trait_checker().implementation_at(view_id, &index_args, base_ty) == null) { return null; }
         }
-        const member: mut ExpressionNode* = this.lang_method_callee(receiver, LangItem::IndexViewView, e.span);
+        const member: mut ExpressionNode* = this.lang_method_callee(receiver, viewer, e.span);
         if (member == null) { return null; }
         mut call: mut ExpressionNode* = ExpressionNode::call_expr(member, e.span);
         ExpressionNode::call_of(call).add_argument(access.index);
@@ -961,15 +975,13 @@ type struct MemberResolver {
     }
 
     /// The index desugar for a base that is a type parameter of the body
-    /// being walked, when a bound in scope gives the parameter
-    /// `std::core::ops::Index` - itself or as a supertrait of the trait it
-    /// names.  Null for any other base.
+    /// being walked, or an associated type of one (`C::ViewMutable`), when a
+    /// bound in scope gives it `std::core::ops::Index` - itself or as a
+    /// supertrait of the trait it names.  Null for any other base.
     try_bounded_index(mut &this, visitor: mut SemaVisitor*, e: ExpressionNode*, access: ArrayAccessExpr*,
                       ty: TypeRef) -> mut ExpressionNode* {
-        const param: GenericParamType* = this.binding.receiver_type_param(ty);
-        if (param == null) { return null; }
         const index_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Index);
-        if (!index_id.is_valid() || !this.binding.param_bounded_by(param, index_id)) { return null; }
+        if (!index_id.is_valid() || !this.binding.subject_bounded_by(ty, index_id)) { return null; }
         return this.build_index_desugar(visitor, e, access);
     }
 

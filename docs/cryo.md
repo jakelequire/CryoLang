@@ -2799,8 +2799,18 @@ arguments that trait writes on it, so `C: IndexViewMutable<Range<i64>>` gives
 `IndexView<Range<i64>>` - and its view is the parameter's `View`; a range
 literal indexing a parameter its bounds give `IndexView<Range<i64>>` is typed
 `Range<i64>` (`function first_two<C>(c: &C) -> C::View where C:
-IndexView<Range<i64>> { return c[0..2]; }`).  Any other parameter base is
-indexed through `Index` alone.
+IndexView<Range<i64>> { return c[0..2]; }`).  Where such a parameter is
+writable (`c: mut &C`, or a `mut` binding) and a bound gives it
+`IndexViewMutable` at the index's type, `c[r]` is always `c.view_mutable(r)`,
+a value of `C::ViewMutable`, read or written: the two associated types are
+different types in the body, and the methods and elements reached through
+the view are the ones the bounds on `C::ViewMutable` give it (`where
+C::ViewMutable: Put` makes `c[r].put(v)` a call, and `where C::ViewMutable:
+IndexMutable<i64>` makes `c[r][i] = v` an assignment).  A read-only one is
+`c.view(r)`, a value of `C::View`.  An associated type of a parameter has
+the methods its bounds give it and no others (E0358), and is indexed when a
+bound on it gives it `Index`.  Any other parameter base is indexed through
+`Index` alone.
 
 The standard library slices by a range.  On an `Array<T>`, a `[T]` or a
 `Slice<T>`, `xs[r]` is a `&Slice<T>` of the elements `r` names, and written a

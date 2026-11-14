@@ -519,6 +519,25 @@ type struct MethodBinding {
     /// copy of a trait default, an `async` lowering's `poll` - is skipped:
     /// its source is walked, with its own bounds, where it is written.
     receiver_type_param(&this, recv_type: TypeRef) -> GenericParamType* {
+        const t: Type* = this.receiver_written_type(recv_type);
+        if (t == null || t.kind != TypeKind::GenericParam) { return null; }
+        const param: GenericParamType* = t.as_generic_param();
+        if (this.arena.is_this_placeholder(param)) { return null; }
+        return param;
+    }
+
+    /// The associated type of a type parameter a receiver is
+    /// (`C::ViewMutable`), or null for any other receiver; skipped where
+    /// `receiver_type_param` skips a body.
+    receiver_type_projection(&this, recv_type: TypeRef) -> AssocProjectionType* {
+        const t: Type* = this.receiver_written_type(recv_type);
+        if (t == null || t.kind != TypeKind::AssocProjection) { return null; }
+        return t.as_assoc_projection();
+    }
+
+    /// `recv_type` behind its pointers and references, in a body the user
+    /// wrote where it stands; null in any other body.
+    receiver_written_type(&this, recv_type: TypeRef) -> Type* {
         const func_decl: DeclarationNode* = this.state.symbolic_current_func;
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.is_synth_default || func.is_synthesized_body) { return null; }
@@ -534,10 +553,21 @@ type struct MethodBinding {
             }
             depth += 1;
         }
-        if (t == null || t.kind != TypeKind::GenericParam) { return null; }
-        const param: GenericParamType* = t.as_generic_param();
-        if (this.arena.is_this_placeholder(param)) { return null; }
-        return param;
+        return t;
+    }
+
+    /// Whether a bound in scope of the body being walked gives a receiver
+    /// that is a type parameter, or an associated type of one, the trait
+    /// `trait_def`: names it, or names a trait it is a supertrait of.
+    subject_bounded_by(&this, recv_type: TypeRef, trait_def: DefId) -> boolean {
+        const param: GenericParamType* = this.receiver_type_param(recv_type);
+        if (param != null) { return this.param_bounded_by(param, trait_def); }
+        const projection: AssocProjectionType* = this.receiver_type_projection(recv_type);
+        if (projection == null) { return false; }
+        const func: FunctionDecl* = DeclarationNode::fn_of(this.state.symbolic_current_func);
+        if (func != null && this.projection_bounds_give(&func.trait_bounds, projection, trait_def)) { return true; }
+        return this.state.symbolic_impl_node != null
+            && this.projection_bounds_give(&this.state.symbolic_impl_node.where_bounds, projection, trait_def);
     }
 
     /// Whether a bound in scope of the body being walked names `param`: the
@@ -628,11 +658,28 @@ type struct MethodBinding {
     bounds_give(&this, bounds: &[TraitBound], param: GenericParamType*, trait_def: DefId) -> boolean {
         for (mut i: i64 = 0; i < bounds.length(); i++) {
             if (!MethodBinding::bound_names_param(&bounds[i], param)) { continue; }
-            for (mut ti: i64 = 0; ti < bounds[i].trait_refs.length(); ti++) {
-                const chain: [DefId] = this.trait_chain(bounds[i].trait_refs[ti].definition());
-                for (mut k: i64 = 0; k < chain.length(); k++) {
-                    if (chain[k].equals(trait_def)) { return true; }
-                }
+            if (this.bound_gives_trait(&bounds[i], trait_def)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether one of `bounds` on the associated type `proj` names
+    /// `trait_def` or a trait `trait_def` is a supertrait of.
+    projection_bounds_give(&this, bounds: &[TraitBound], proj: AssocProjectionType*, trait_def: DefId) -> boolean {
+        for (mut i: i64 = 0; i < bounds.length(); i++) {
+            if (!bounds[i].has_projection_subject() || !this.bound_subject_is(bounds[i].subject, proj)) { continue; }
+            if (this.bound_gives_trait(&bounds[i], trait_def)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether a trait the bound `b` writes is `trait_def` or has it as a
+    /// supertrait.
+    bound_gives_trait(&this, b: const TraitBound*, trait_def: DefId) -> boolean {
+        for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
+            const chain: [DefId] = this.trait_chain(b.trait_refs[ti].definition());
+            for (mut k: i64 = 0; k < chain.length(); k++) {
+                if (chain[k].equals(trait_def)) { return true; }
             }
         }
         return false;
