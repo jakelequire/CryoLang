@@ -347,6 +347,9 @@ type struct Importer {
     /// just the vendor one), because the filter needs it whenever a macro is
     /// considered.
     input_files:    [void*];
+    /// True for an angle-bracket import (`#include <math.h>`), whose main file
+    /// is an in-memory buffer naming one system header.
+    names_system_header: boolean;
     /// Macros neither token pass could bind, held back from the report until the
     /// constant-folding probe has had its turn (reporting them at classification
     /// time would announce a loss the probe is about to recover).
@@ -401,6 +404,7 @@ type struct Importer {
             is_cpp:         false,
             inputs:         [],
             input_files:    [],
+            names_system_header: false,
             probe_names:    [],
             probe_reasons:  [],
             probe_lost:     [],
@@ -416,13 +420,14 @@ type struct Importer {
 
     /// Top-level visitor.  Emits a FunctionDecl per top-level FunctionDecl,
     /// and (unless `functions_only`) typedef/struct/union/enum/macro decls.
-    /// System-header decls are filtered out (`is_in_system_header`) so a header's
-    /// own `#include <stddef.h>` does not drag glibc's ~100 internal typedefs
-    /// into the alias namespace.
+    /// System-header decls are filtered out (`is_bound_declaration`) so a
+    /// header's own `#include <stddef.h>` does not drag glibc's ~100 internal
+    /// typedefs into the alias namespace; the one system header an
+    /// angle-bracket import names is bound.
     static visit_decl(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
         const imp: mut Importer* = client as mut Importer*;
 
-        if (cursor.is_in_system_header()) {
+        if (!imp.types.is_bound_declaration(cursor)) {
             return clang::VISIT_CONTINUE;
         }
 
@@ -695,14 +700,12 @@ type struct Importer {
     /// common case backwards: a library's entry header is typically an umbrella
     /// of `#include`s that defines nothing itself, so every constant the library
     /// ships lives one level down and is silently invisible.
+    /// The system header an angle-bracket import names counts as one of the
+    /// library's own: it is the header the import asked for.
     is_from_bound_header(&this, cursor: CXCursor) -> boolean {
-        const loc: CXSourceLocation = clang::clang_getCursorLocation(cursor);
-        mut file: void* = null;
-        mut line: u32 = 0;
-        mut col: u32 = 0;
-        mut off: u32 = 0;
-        clang::clang_getFileLocation(loc, &file, &line, &col, &off);
+        const file: void* = cursor.file();
         if (file == null) { return false; }
+        if (file == this.types.named_system_header) { return true; }
         for (mut i: i64 = 0; i < this.input_files.length(); i++) {
             if (this.input_files[i] == file) { return true; }
         }
@@ -2380,8 +2383,10 @@ type struct Importer {
     /// already covered by the libclang-version fold in the provenance key, and
     /// hashing glibc/CRT headers on every cache check would be wasteful.  Matches
     /// the C `CXInclusionVisitor` signature `(CXFile, CXSourceLocation*, unsigned,
-    /// CXClientData) -> void`; `inclusion_stack`/`include_len` are unused (the
-    /// file's own location, via `clang_getLocationForOffset`, drives the filter).
+    /// CXClientData) -> void`; the file's own location, via
+    /// `clang_getLocationForOffset`, drives the filter, and `include_len` (0 for
+    /// the main file, 1 for a file it includes directly) picks out the header
+    /// an angle-bracket import names.
     static visit_inclusion(included_file: void*, inclusion_stack: CXSourceLocation*,
                            include_len: u32, client: void*) -> void {
         const imp: mut Importer* = client as mut Importer*;
@@ -2389,7 +2394,15 @@ type struct Importer {
         // fold); this also avoids allocating a path string for files we discard.
         const loc: CXSourceLocation =
             clang::clang_getLocationForOffset(imp.tu, included_file, 0);
-        if (clang::clang_Location_isInSystemHeader(loc) != 0) { return; }
+        if (clang::clang_Location_isInSystemHeader(loc) != 0) {
+            // The in-memory main file of an angle-bracket import holds one
+            // `#include` line, so the one system header it includes directly
+            // is the header the import names.
+            if (imp.names_system_header && include_len == 1) {
+                imp.types.named_system_header = included_file;
+            }
+            return;
+        }
         const fname: CXString = clang::clang_getFileName(included_file);
         const cstr: u8* = clang::clang_getCString(fname);
         if (cstr != null && (cstr as string).length() > 0) {
@@ -2475,6 +2488,8 @@ type struct Importer {
         // `#include` path passes null.  Function-alias wrappers ride this flag.
         imp.is_vendor = out_report != null;
         imp.is_cpp = is_cpp;
+        // Only an angle-bracket import parses an in-memory main file.
+        imp.names_system_header = unsaved != null;
         // Enumerate the inclusion set FIRST: it is what the macro filter asks
         // ("did one of this library's own headers write this?"), so it has to be
         // known before any macro is judged.  It doubles as the include-graph

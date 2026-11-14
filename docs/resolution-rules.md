@@ -133,6 +133,14 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-13
+
+704. **An inline import of an angle-bracketed header binds that header.**
+     `extern module c := "C" { #include <ctype.h> }` binds the
+     declarations and macros written in `<ctype.h>` itself under the
+     alias, and keeps filtering the system headers it includes, as a
+     quoted header's are.  (Jake)
+
 ### 2026-11-12
 
 703. **A hash map's bucket layer is internal.**  `Entry`, the node of a

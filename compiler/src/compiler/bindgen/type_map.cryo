@@ -65,9 +65,22 @@ type struct CTypeMapper {
     ctx:   mut CompilationContext*;
     /// The import's extern-module alias's module (`<mod>::alias`).
     alias: ModulePath;
+    /// The system header an angle-bracket import names (`<math.h>`), as its
+    /// CXFile; null for every other import.  Its declarations are bound, while
+    /// the system headers it includes stay filtered.
+    named_system_header: void*;
 
     static new(ctx: mut CompilationContext*, alias: ModulePath) -> CTypeMapper {
-        return CTypeMapper { ctx: ctx, alias: alias };
+        return CTypeMapper { ctx: ctx, alias: alias, named_system_header: null };
+    }
+
+    /// True when `declaration` is in a header this import binds: any header
+    /// outside the system include path, or the system header the import
+    /// names.  A declaration anywhere else is not emitted, so a reference to
+    /// it cannot be spelled by name.
+    is_bound_declaration(&this, declaration: CXCursor) -> boolean {
+        if (!declaration.is_in_system_header()) { return true; }
+        return this.named_system_header != null && declaration.file() == this.named_system_header;
     }
 
     /// Heap-allocate a PrimitiveAnnotation wrapped in a TypeAnnotation.
@@ -227,11 +240,12 @@ type struct CTypeMapper {
             if (pc.kind == clang::TK_Record) {
                 const pdecl: CXCursor = clang::clang_getTypeDeclaration(pc);
                 // A pointer to a record that won't be emitted top-level - one in
-                // a system header (`FILE`) or one nested inside another record
-                // (sqlite3's `sqlite3_index_constraint_usage`) - would name a
-                // dangling type, so use opaque `void*` (the right shape for an
-                // opaque C handle anyway).
-                if (pdecl.is_in_system_header() || pdecl.is_nested_in_record()) {
+                // a system header the import does not bind (`FILE`) or one
+                // nested inside another record (sqlite3's
+                // `sqlite3_index_constraint_usage`) - would name a dangling
+                // type, so use opaque `void*` (the right shape for an opaque C
+                // handle anyway).
+                if (!this.is_bound_declaration(pdecl) || pdecl.is_nested_in_record()) {
                     return this.ptr(this.prim("void"), is_const);
                 }
             }
@@ -267,13 +281,14 @@ type struct CTypeMapper {
                 if (sz > 0) { return this.aligned_blob(sz, al); }
                 return this.ptr(this.prim("void"), false);
             }
-            // A named record declared in a system header is filtered out of the
-            // bindings (like `FILE`), so a named reference would dangle.  Treat
+            // A named record declared in a system header the import does not
+            // bind is filtered out (like `FILE`), so a named reference would
+            // dangle.  Treat
             // it as opaque: a layout-faithful blob when sized (keeps an enclosing
             // struct's size right), else an opaque pointer.  (The common
             // pointer-to-system-record case is handled as `void*` above.)
             const rdecl: CXCursor = clang::clang_getTypeDeclaration(c);
-            if (rdecl.is_in_system_header() || rdecl.is_nested_in_record()) {
+            if (!this.is_bound_declaration(rdecl) || rdecl.is_nested_in_record()) {
                 const sz: i64 = clang::clang_Type_getSizeOf(c);
                 const al: i64 = clang::clang_Type_getAlignOf(c);
                 if (sz > 0) { return this.aligned_blob(sz, al); }
