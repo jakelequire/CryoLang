@@ -703,16 +703,22 @@ EXAMPLE_FAILED = re.compile(r"^\s*FAIL\s+(examples/\S+)")
 # fail the tests it holds).  A unit-test file written `archive:<path>` fails
 # on the baseline through the stdlib archive the baseline compiler built from
 # this tree's stdlib: the baseline may fail the tests it holds, its own object
-# is compared as any other, and an archive object must have moved.
+# is compared as any other, and an archive object must have moved.  A project
+# written `moved:<project>` passes on both compilers and the change moves its
+# objects on purpose: the baseline's census must pass it, its objects are left
+# out of the comparison, and one of them must have moved.
 NEGATIVE = "negative/"
 EXAMPLE = "examples/"
 ARCHIVE = "archive:"
+MOVED = "moved:"
 UNIT_DIR = "tests/tests"
 
 
 def declared_kind(name):
     if name.startswith(ARCHIVE):
         return "archive"
+    if name.startswith(MOVED):
+        return "moved"
     if name.startswith(NEGATIVE):
         return "negative"
     if name.startswith(EXAMPLE):
@@ -724,8 +730,11 @@ def declared_kind(name):
 
 def program_of(name):
     """The program a declaration line names, without the form it is written
-    in: `archive:stdlib/x.cryo` names `stdlib/x.cryo`."""
-    return name[len(ARCHIVE):] if name.startswith(ARCHIVE) else name
+    in: `archive:stdlib/x.cryo` names `stdlib/x.cryo`, `moved:p` names `p`."""
+    for form in (ARCHIVE, MOVED):
+        if name.startswith(form):
+            return name[len(form):]
+    return name
 
 
 def unit_namespace(name):
@@ -820,9 +829,13 @@ def judge_baseline_census(declared, accounted, unit_failed, neg_failed, failed, 
         problems.append("the baseline failed %s compile-fail test(s) and named %d"
                         % (neg_failed, len(neg_names)))
     for p in sorted(set(failed) - set(unit_names) - set(declared) - set(fixed)):
+        if MOVED + p in fixed:
+            problems.append("%s is declared in %s as moving its objects in a program both "
+                            "compilers pass, but the baseline census fails it" % (p, FIXED))
+            continue
         problems.append("the baseline fails %s, which neither %s nor %s declares"
                         % (p, DECLARED, FIXED))
-    judged = set(declared) | {p for p in fixed if declared_kind(p) not in ("unit", "archive")}
+    judged = set(declared) | {p for p in fixed if declared_kind(p) not in ("unit", "archive", "moved")}
     for p in sorted(judged - set(failed)):
         problems.append("%s is declared as changed by this change, but the baseline census "
                         "passes it; a program this change makes compile or corrects fails "
@@ -886,9 +899,13 @@ def check_declared(declared, base_exe, cryo, logdir, env, fixed=()):
                 problems.append("%s: declared in %s but %s/%s is not a unit-test file "
                                 "with a namespace" % (name, rel, UNIT_DIR, name))
             continue
-        if not os.path.isfile(os.path.join(ROOT, PROJECTS, name, "test.json")):
+        if not os.path.isfile(os.path.join(ROOT, PROJECTS, program_of(name), "test.json")):
             problems.append("%s: declared in %s but %s/%s is not a test project"
-                            % (name, rel, PROJECTS, name))
+                            % (name, rel, PROJECTS, program_of(name)))
+            continue
+        # Both censuses pass a project whose objects move on purpose; the
+        # claim is the comparison's.
+        if is_fixed and kind == "moved":
             continue
         brc, bout = build_copy(base_exe, name, os.path.join(logdir, "declared", "base", name))
         trc, tout = build_copy(cryo, name, os.path.join(logdir, "declared", "tree", name))
@@ -1001,6 +1018,27 @@ def selftest():
          judge_unit_moves({"u": "/U.o"}, {"x/U.o": "1"}, {"x/U.o": "1"}), 1),
         ("units: a declared object neither run compiled",
          judge_unit_moves({"u": "/U.o"}, {}, {}), 1),
+        ("census: a project declared moved that the baseline passes",
+         judge_baseline_census({}, True, 0, 0, [], {"moved:p"}), 0),
+        ("census: a project declared moved that the baseline fails",
+         judge_baseline_census({}, True, 0, 0, ["p"], {"moved:p"}), 1),
+        ("moved: a declared project whose object moved",
+         judge_project_moves(["moved:p"], {PROJECTS + "/p/a.o": "1", PROJECTS + "/p/b.o": "1"},
+                             {PROJECTS + "/p/a.o": "1", PROJECTS + "/p/b.o": "2"}), 0),
+        ("moved: a declared project whose objects did not move",
+         judge_project_moves(["moved:p"], {PROJECTS + "/p/a.o": "1"}, {PROJECTS + "/p/a.o": "1"}), 1),
+        ("moved: a declared project neither run compiled",
+         judge_project_moves(["moved:p"], {}, {}), 1),
+        ("moved: an object only the tree has counts as moved",
+         judge_project_moves(["moved:p"], {PROJECTS + "/p/a.o": "1"},
+                             {PROJECTS + "/p/a.o": "1", PROJECTS + "/p/c.o": "3"}), 0),
+        ("moved: another project's moved object is still compared",
+         [] if (lambda a, b: (judge_project_moves(["moved:p"], a, b), a, b))(
+             {PROJECTS + "/p/a.o": "1", PROJECTS + "/q/a.o": "1"},
+             {PROJECTS + "/p/a.o": "2", PROJECTS + "/q/a.o": "2"})[1:]
+         == ({PROJECTS + "/q/a.o": "1"}, {PROJECTS + "/q/a.o": "2"}) else ["bad"], 0),
+        ("declarations: a line rewritten into the moved form, reason kept",
+         [] if declarations_between("moved:p a\n", "p a\n") == {} else ["bad"], 0),
         ("declarations: parse skips comments and blanks",
          [] if parse_declared("# c\n\np why\nq\n") == {"p": "why", "q": ""} else ["bad"], 0),
         ("declarations: a new line applies",
@@ -1049,6 +1087,28 @@ def judge_unit_moves(suffixes, a, b):
     return problems
 
 
+def judge_project_moves(names, a, b):
+    """Problems with the projects `names` declared `moved:` over hash maps `a`
+    and `b`: each must have objects in both, and one of them must differ
+    (moved, or in one run only).  Their objects are removed from both."""
+    problems = []
+    for name in sorted(names):
+        prefix = "%s/%s/" % (PROJECTS, program_of(name))
+        ka = {p for p in a if p.startswith(prefix)}
+        kb = {p for p in b if p.startswith(prefix)}
+        if not ka or not kb:
+            problems.append("%s: %d baseline and %d tree objects under %s; a project declared "
+                            "as moving its objects is built by both" % (name, len(ka), len(kb), prefix))
+        elif ka == kb and all(a[p] == b[p] for p in ka):
+            problems.append("%s is declared as moving its objects, but none of its %d moved"
+                            % (name, len(ka)))
+        for p in ka:
+            del a[p]
+        for p in kb:
+            del b[p]
+    return problems
+
+
 def judge_archive_moves(names, archive_changed):
     """Problems with the unit-test files `names` declared as failing on the
     baseline through the stdlib archive: the archive is their cause, so some
@@ -1070,12 +1130,17 @@ def split_replaced(only_baseline, replaced_by_archive):
 
 
 def compare(tag_a, a_path, b_path, limit, excluded=(), units=None, problems=None,
-            replaced_by_archive=False):
+            replaced_by_archive=False, moved_projects=()):
     a, b = read_hashes(a_path), read_hashes(b_path)
     if units:
         found = judge_unit_moves(units, a, b)
         print("  %-9s declared unit-test objects left out: %d, %d problem(s)"
               % (tag_a, len(units), len(found)))
+        problems.extend(found)
+    if moved_projects:
+        found = judge_project_moves(moved_projects, a, b)
+        print("  %-9s declared moved projects left out: %d, %d problem(s)"
+              % (tag_a, len(moved_projects), len(found)))
         problems.extend(found)
     excluded = [n for n in excluded if declared_kind(n) in ("project", "example")]
     if excluded:
@@ -1237,7 +1302,9 @@ def main():
                               excluded=set(declared) | set(fixed),
                               units=units if base == "tests" else None,
                               problems=unit_problems,
-                              replaced_by_archive=counts["stdlib"] > 0)
+                              replaced_by_archive=counts["stdlib"] > 0,
+                              moved_projects=[n for n in fixed if declared_kind(n) == "moved"]
+                              if base == "tests" else ())
             diff += changed
             if base == "stdlib":
                 archive_changed = changed

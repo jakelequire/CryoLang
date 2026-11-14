@@ -793,6 +793,20 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(diag);
     }
 
+    /// E0358 for a method call on `receiver`, an associated type of a type
+    /// parameter (`C::View`), that no bound written on it answers.
+    report_projection_receiver_call(mut &this, member_e: ExpressionNode*, member: MemberAccessExpr*,
+                                    receiver: TypeRef) -> void {
+        const primary_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member_e.span };
+        const shown: string = this.arena.format_display(this.arena.lookup(this.binding.peel_all_indirection(receiver)));
+        const name: string = this.intern.resolve(member.member);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
+            fmt::format("no method named `%s` found on type `%s`", name, shown));
+        diag = diag.at(primary_span);
+        diag = diag.help(fmt::format("bound `%s` by a trait that declares `%s` in the `where` clause", shown, name));
+        this.ctx.emit_diagnostic(diag);
+    }
+
     /// The refusal of a member a type parameter's bounds do not give it,
     /// named on a receiver (`t.missing()`) or through a path
     /// (`T::missing()`), at `span`; the caller adds the help.
@@ -6035,6 +6049,12 @@ type struct CallResolver {
             const param: GenericParamType* = this.binding.receiver_type_param(obj_type);
             if (param != null) {
                 this.report_param_receiver_call(member_e, member, param, this.binding.param_is_bounded(param), call);
+                return TypeRef::invalid();
+            }
+            // An associated type of a parameter has the methods the bounds
+            // written on it give it and no others.
+            if (this.binding.receiver_type_projection(obj_type) != null) {
+                this.report_projection_receiver_call(member_e, member, obj_type);
                 return TypeRef::invalid();
             }
             // An instantiation still naming the body's parameters names its
