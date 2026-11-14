@@ -173,7 +173,7 @@ yet is recorded with the change that builds it, not here.
 703. **A hash map's bucket layer is internal.**  `Entry`, the node of a
      bucket's chain, and `HashMap::get_bucket`, which hands one out, are
      internal: a caller outside the standard library walks a map through
-     `entries`, `keys_ref`, `values_ref` and `values_mutable`, which
+     `entries`, `key_references`, `value_references` and `values_mutable`, which
      borrow in place for any key and value type.  `bucket_count` stays
      public.  Supersedes the part of 636 that kept `Entry` public for
      callers walking a map in place.  (Jake)
@@ -368,7 +368,7 @@ yet is recorded with the change that builds it, not here.
      count) -> const T*` is `mem::offset`'s read-only counterpart.
      `HashMap::get_mutable(mut &this, key: &K) -> Option<mut V*>` and
      `HashMap::values_mutable(mut &this)`, yielding `mut V*`, are the
-     writable counterparts of `get_ref` and `values_ref`, and
+     writable counterparts of `get_reference` and `value_references`, and
      `JsonObject::get_mutable(mut &this, key: Str) -> Option<mut
      JsonValue*>` that of `JsonObject::get`.  (Jake)
 
@@ -479,12 +479,12 @@ yet is recorded with the change that builds it, not here.
      which borrow is wanted, and a read-only place never gives a writable
      one.  (Jake)
 
-669. **`as_ref` borrows read-only; `as_mutable_ref` borrows writable.**
-     `Option::as_ref(&this)` returns `Option<const T*>` and
-     `Result::as_ref(&this)` returns `Result<const T*, const E*>`; the
-     writable forms are `as_mutable_ref(mut &this)`, returning
+669. **`as_reference` borrows read-only; `as_mutable_reference` borrows writable.**
+     `Option::as_reference(&this)` returns `Option<const T*>` and
+     `Result::as_reference(&this)` returns `Result<const T*, const E*>`; the
+     writable forms are `as_mutable_reference(mut &this)`, returning
      `Option<T*>` and `Result<T*, E*>`.  A caller that writes through the
-     borrow calls `as_mutable_ref`.  (Jake)
+     borrow calls `as_mutable_reference`.  (Jake)
 
 670. **E0217 is reserved.**  It named a const violation and was never
      reported; a write through a read-only place is E0250.  Like every
@@ -1143,9 +1143,9 @@ yet is recorded with the change that builds it, not here.
      seed generator, a map's seeded hashing and its node allocation are
      private, while `hash_str` and `hash_integer` stay public.  The iterator
      adapters are private, with `KeysRefIter` internal for the set built
-     on it; `copied` and `cloned`, reached through `iter_ref`'s opaque
+     on it; `copied` and `cloned`, reached through `iterate_references`'s opaque
      result, are public.  `HashMapIter` is not marked: the compiler names
-     it.  JSON reads its arrays through `get_ref` and indexing, and the
+     it.  JSON reads its arrays through `get_reference` and indexing, and the
      adapters' unused constructors are gone.  (Jake; each split
      delegated)
 
@@ -1658,7 +1658,7 @@ yet is recorded with the change that builds it, not here.
 
 576. **A negative length or position means what the method's kind says,
      never a huge unsigned one.**  A lookup that answers `Option` (`get`,
-     `get_ref`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`; a
+     `get_reference`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`; a
      method that writes or cuts at a position (`set`, `insert`, `remove`,
      `swap_remove`, `sub_bytes`, `subslice`) panics "out of range";
      `truncate` and `resize` panic "negative length"; `reserve`,
@@ -4112,7 +4112,7 @@ check is being deleted and the seals are what hold.  (Jake)
     (ruling 18). The test's expected output changes in the same commit.
 
 94. **The help on a `Copy`-gated method's bound error is correct for the
-    method it names.** "borrow the element in place with `get_ref` instead
+    method it names.** "borrow the element in place with `get_reference` instead
     of copying it out with `append`" is wrong advice for `append`.
 
 ### 2026-10-01

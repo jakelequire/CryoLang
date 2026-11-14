@@ -145,7 +145,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// result is an independent bitwise duplicate while the array retains
     /// ownership of the stored element, so handing back a copy is only
     /// sound when `T` carries no `Drop` obligation. For owning `T`, borrow
-    /// in place with `get_ref` (or move an element out with
+    /// in place with `get_reference` (or move an element out with
     /// `swap_remove`/`pop`).
     public get(&this, index: i64) -> Option<T> where T: Copy {
         if (index < 0 || index >= this.length) {
@@ -159,7 +159,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// ownership, so this is sound for every `T` (Copy or owning). The
     /// pointer is invalidated by any reallocating method (`push`,
     /// `reserve`, `shrink_to_fit`).
-    public get_ref(&this, index: i64) -> Option<T*> {
+    public get_reference(&this, index: i64) -> Option<T*> {
         if (index < 0 || index >= this.length) {
             return Option::None;
         }
@@ -181,7 +181,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// Iterate over the elements in order, yielding each by value
     /// (bitwise copy). Gated on `T: Copy` for the same reason as `get`:
     /// a yielded owning value would alias storage the array still owns.
-    /// For owning `T`, walk by index with `length()` + `get_ref`. The
+    /// For owning `T`, walk by index with `length()` + `get_reference`. The
     /// iterator is invalidated by any reallocating method on the array
     /// (`push`, `reserve`, `shrink_to_fit`).
     public iter(&this) -> implement Iterator<T> where T: Copy {
@@ -194,7 +194,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// are invalidated by any reallocating method (`push`, `reserve`,
     /// `insert`, `shrink_to_fit`). This is the way to walk an
     /// `Array<String>` / `Array<Box<...>>` without cloning.
-    public iter_ref(&this) -> implement Iterator<T*> {
+    public iterate_references(&this) -> implement Iterator<T*> {
         return RefIter::<T> { ptr: this.ptr, index: 0, length: this.length };
     }
 
@@ -241,7 +241,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
         if (index < 0 || index >= this.length) {
             core::panic("Array::set: index out of range", intrinsics::location());
         }
-        mut prev: T* = this.get_ref(index).unwrap();
+        mut prev: T* = this.get_reference(index).unwrap();
         ptr::drop_in_place::<T>(prev);
         this.ptr[index] = value;
     }
@@ -310,7 +310,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
             // force-emitted method body, so calling it leaves an
             // undefined symbol for `Array<T>` instantiations that never
             // call `sort`. `mem::offset` is already emitted for every
-            // `Array<T>` (used by `get_ref`), so it stays a call.
+            // `Array<T>` (used by `get_reference`), so it stays a call.
             const a: mut T* = mem::offset(this.ptr, lo);
             const b: mut T* = mem::offset(this.ptr, hi);
             // A permutation of two slots the array keeps owning: each value
@@ -972,11 +972,11 @@ where T: Hash, A: Allocator {
 
 
 /// Borrowing iterator over an `Array<T>`, yielding `T*` (a pointer to
-/// each element in place). Created by `Array::iter_ref`; sound for
+/// each element in place). Created by `Array::iterate_references`; sound for
 /// owning `T`. Invalidated by any reallocating method on the array.
 ///
 /// `private`: this cursor is an implementation detail. Callers obtain it
-/// only as the opaque `implement Iterator<T*>` returned by `iter_ref`, and
+/// only as the opaque `implement Iterator<T*>` returned by `iterate_references`, and
 /// never name it.
 private type struct RefIter<T> {
     private ptr:    T*;
@@ -984,7 +984,7 @@ private type struct RefIter<T> {
     private length: i64;
 
     /// Adapt this by-reference iterator into a by-value one that yields
-    /// each pointee `T` by bitwise copy: `arr.iter_ref().copied()`. Sound
+    /// each pointee `T` by bitwise copy: `arr.iterate_references().copied()`. Sound
     /// only when `T: Copy` (that bound lives on `CopiedIter`'s `Iterator`
     /// impl). Defined here, on the pointer-yielding cursor, rather than as
     /// an `Iterator` default - `copied` is meaningful only for iterators
@@ -997,7 +997,7 @@ private type struct RefIter<T> {
     }
 
     /// Like `copied`, but clones each pointee via `Clone` into an owned
-    /// value: `strings.iter_ref().cloned()` walks an `Array<String>` by
+    /// value: `strings.iterate_references().cloned()` walks an `Array<String>` by
     /// value, which the `Copy`-gated `iter()` can't.
     public cloned(this) -> implement Iterator<T> where T: Clone {
         // A struct literal; see `copied`.
@@ -1042,7 +1042,7 @@ where I: Iterator<T*>, T: Copy {
 
 /// Adapter cloning each `T*` yielded by `inner` into an owned `T` via `Clone`.
 /// The owning-type counterpart of `CopiedIter`: this is what lets a `loop`/`for`
-/// over `strings.iter_ref()` walk an `Array<String>` by value (each element an
+/// over `strings.iterate_references()` walk an `Array<String>` by value (each element an
 /// independent clone) - something the `Copy`-gated `iter()` can't express.
 ///
 /// `private`: same rationale as `CopiedIter`; produced only as the opaque

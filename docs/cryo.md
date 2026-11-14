@@ -442,7 +442,7 @@ An array's `length()` and `capacity()` are `i64`.  The fields behind them, and t
 
 Every length, capacity, position and size in the standard library is an `i64`, whether a method returns it (`length()`, `find`, `index_of`, `Iterator::count`) or takes it (`get`, `insert`, `sub_bytes`, `truncate`, `with_capacity`, `take`), so one integer type carries a position from where it is found to where it is used, with no cast.  A negative argument is never read as a huge unsigned one; what it means is fixed by the kind of method:
 
-- a lookup that answers `Option` (`get`, `get_ref`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`, as for any index past the end;
+- a lookup that answers `Option` (`get`, `get_reference`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`, as for any index past the end;
 - a method that writes or cuts at a position (`set`, `insert`, `remove`, `swap_remove`, `sub_bytes`, `subslice`) panics with "out of range";
 - `truncate` and `resize` panic with "negative length";
 - `reserve`, `reserve_exact` and `with_capacity` treat zero or less as nothing to do;
