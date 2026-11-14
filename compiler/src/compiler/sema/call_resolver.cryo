@@ -265,10 +265,10 @@ type struct CallResolver {
         this.scopes   = scopes;
     }
 
-    /// A fresh trait checker over the shared arena + registry (a 4-pointer view).
+    /// A fresh trait checker over the shared arena + registry (a view).
     trait_checker(&this) -> TraitChecker {
         return TraitChecker::new(this.arena, this.ctx.generic_registry,
-                                 this.intern, this.ctx.diagnostics);
+                                 this.intern, this.ctx.diagnostics, this.ctx.type_resolver);
     }
 
     /// The use site a bare CALL must be judged against: the module whose source
@@ -2490,17 +2490,8 @@ type struct CallResolver {
     subst_params(mut &this, params: &[TypeRef], bindings: &[TypeRef], ty: TypeRef) -> TypeRef {
         const symbolic: boolean = this.state.in_symbolic_check;
         const tmpl_ret: TypeRef = ty;
-        mut subst: TypeSubstitution = TypeSubstitution::from_params(params, bindings);
-        // A projection the substitution made concrete (`I::Item` with `I`
-        // bound to `Count`) is the type `Count`'s impl binds, not a
-        // projection: `Option<Count::Item>` is `Option<i32>` to the caller.
-        // The unreduced form is built without demanding it - nothing
-        // monomorphizes an instantiation holding a projection.
-        const was: boolean = this.arena.symbolic_no_demand_active;
-        this.arena.set_symbolic_no_demand(true);
-        const applied: TypeRef = subst.apply(tmpl_ret, this.arena);
-        this.arena.set_symbolic_no_demand(was);
-        const out: TypeRef = this.ctx.type_resolver.reduce_projections(applied, false);
+        const subst: TypeSubstitution = TypeSubstitution::from_params(params, bindings);
+        const out: TypeRef = this.types.apply_reduced(&subst, tmpl_ret);
         if (!out.is_valid()) { return TypeRef::invalid(); }
         if (!symbolic && this.types.contains_generic_param(out)) { return TypeRef::invalid(); }
         return out;

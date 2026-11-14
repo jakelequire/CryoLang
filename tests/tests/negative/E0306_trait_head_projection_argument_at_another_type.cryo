@@ -1,0 +1,52 @@
+// E0306: an implementation whose head writes a generic trait's plain
+// parameter as a projection of its own parameter (`Lookahead<I::Item>`)
+// gives the trait at the projection's reduction only: `Ahead<Range<i64>>`
+// has `Lookahead<i64>`, not `Lookahead<i32>`.
+![config(testing)]
+![config(negative, E0306)]
+namespace CryoTests::Negative::TraitHeadProjectionArgumentAtAnotherType;
+
+import std::core::iter::{ Iterator };
+
+type trait Lookahead<T> : Iterator<T> {
+    peek(mut &this) -> Option<const T*>;
+}
+
+type struct Ahead<I> where I: Iterator {
+    inner: I;
+    peeked: Option<I::Item>;
+    has_peeked: boolean;
+}
+
+implement<I> trait Lookahead<I::Item> for struct Ahead<I>
+where I: Iterator {
+    peek(mut &this) -> Option<const I::Item*> {
+        if (!this.has_peeked) {
+            this.peeked = this.inner.next();
+            this.has_peeked = true;
+        }
+        return this.peeked.as_ref();
+    }
+}
+
+implement<I> trait Iterator<I::Item> for struct Ahead<I>
+where I: Iterator {
+    next(mut &this) -> Option<I::Item> {
+        if (this.has_peeked) {
+            this.has_peeked = false;
+            return this.peeked.take();
+        }
+        return this.inner.next();
+    }
+}
+
+function first_at_least<P>(source: mut &P) -> boolean where P: Lookahead<i32> {
+    return source.peek().is_some();
+}
+
+function main() -> int {
+    const range: Range<i64> = 0..10;
+    mut ahead: Ahead<Range<i64>> = Ahead { inner: range, peeked: Option::None, has_peeked: false };
+    first_at_least(&ahead);   //~ ERROR[E0306] the trait bound `CryoTests::Negative::TraitHeadProjectionArgumentAtAnotherType::Ahead<std::core::ops::Range<i64>>: Lookahead<i32>` is not satisfied
+    return 0;
+}
