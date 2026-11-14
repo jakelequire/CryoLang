@@ -31,20 +31,20 @@ import std::future::timer::{ Sleep };
 mut ft_done: Atomic<i64>;
 
 async function nap(ms: u64) -> i64 {
-    await Sleep::new(Duration::from_millis(ms));
+    await Sleep::new(Duration::from_milliseconds(ms));
     return 1;
 }
 
 // The detached form: reports completion through the counter rather than a
 // `JoinHandle`, so the timer behaviour under test is observable without one.
 async function counted_nap(ms: u64) -> void {
-    await Sleep::new(Duration::from_millis(ms));
+    await Sleep::new(Duration::from_milliseconds(ms));
     ft_done.fetch_add(1, MemoryOrder::AcqRel);
 }
 
 async function two_naps(ms: u64) -> i64 {
-    await Sleep::new(Duration::from_millis(ms));
-    await Sleep::new(Duration::from_millis(ms));
+    await Sleep::new(Duration::from_milliseconds(ms));
+    await Sleep::new(Duration::from_milliseconds(ms));
     return 1;
 }
 
@@ -56,7 +56,7 @@ async function zero_nap() -> i64 {
 // Parks on a deadline far beyond the test's lifetime, so it is guaranteed to
 // still be armed when the executor tears down.
 async function forever_nap() -> i64 {
-    await Sleep::new(Duration::from_secs(3600));
+    await Sleep::new(Duration::from_seconds(3600));
     return 1;
 }
 
@@ -79,7 +79,7 @@ function a_sleep_does_not_complete_before_its_deadline() -> Result<(), TestError
     mut ex: Executor = Executor::new();
     const t0: Instant = Instant::now();
     const r: i64 = ex.block_on(nap(150));
-    const ms: u64 = t0.elapsed().as_millis();
+    const ms: u64 = t0.elapsed().as_milliseconds();
     match (expect_eq(r, 1 as i64)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -94,7 +94,7 @@ function sequential_sleeps_each_wait() -> Result<(), TestError> {
     mut ex: Executor = Executor::new();
     const t0: Instant = Instant::now();
     const r: i64 = ex.block_on(two_naps(100));
-    const ms: u64 = t0.elapsed().as_millis();
+    const ms: u64 = t0.elapsed().as_milliseconds();
     match (expect_eq(r, 1 as i64)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -118,10 +118,10 @@ function parallel_sleeps_overlap() -> Result<(), TestError> {
     // regression a failure rather than a hang.
     mut waited: u64 = 0;
     while (ft_done.load(MemoryOrder::Acquire) < 3 && waited < 5000) {
-        sleep(Duration::from_millis(10));
+        sleep(Duration::from_milliseconds(10));
         waited = waited + 10;
     }
-    const ms:  u64 = t0.elapsed().as_millis();
+    const ms:  u64 = t0.elapsed().as_milliseconds();
     const got: i64 = ft_done.load(MemoryOrder::Acquire);
     match (expect_eq(got, 3 as i64)) {
         Result::Ok(_)  => { }
@@ -140,7 +140,7 @@ function a_sleep_completes_without_a_reactor() -> Result<(), TestError> {
     // path: the sleep must still complete, and still not complete early.
     const t0: Instant = Instant::now();
     const r: i64 = future::block_on(nap(100));
-    const ms: u64 = t0.elapsed().as_millis();
+    const ms: u64 = t0.elapsed().as_milliseconds();
     match (expect_eq(r, 1 as i64)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
@@ -158,21 +158,21 @@ function an_armed_sleep_does_not_wedge_executor_teardown() -> Result<(), TestErr
     ex.spawn_detached(forever_nap());
     // Let the task reach its first poll, so the timer is genuinely armed in the
     // reactor rather than still sitting unpolled in the ready queue.
-    sleep(Duration::from_millis(50));
+    sleep(Duration::from_milliseconds(50));
     const t0: Instant = Instant::now();
     mem::drop(ex);  // the teardown is part of what is timed
-    const ms: u64 = t0.elapsed().as_millis();
+    const ms: u64 = t0.elapsed().as_milliseconds();
     return expect_true(ms < 10000, "executor teardown waited on an armed timer");
 }
 
 ![test]
 function until_accepts_an_absolute_deadline() -> Result<(), TestError> {
     const t0: Instant = Instant::now();
-    match (t0.checked_add(&Duration::from_millis(100))) {
+    match (t0.checked_add(&Duration::from_milliseconds(100))) {
         Option::Some(at) => {
             const _ex: Executor = Executor::new();
             future::block_on(Sleep::until(at));
-            const ms: u64 = t0.elapsed().as_millis();
+            const ms: u64 = t0.elapsed().as_milliseconds();
             return expect_true(ms >= 90, "an absolute deadline returned early");
         }
         Option::None => {
@@ -191,12 +191,12 @@ function a_deadline_already_past_completes_at_once() -> Result<(), TestError> {
 
 ![test]
 function an_over_long_duration_saturates_rather_than_wrapping() -> Result<(), TestError> {
-    // `Duration::as_nanos` would wrap a u64 here; a wrapped deadline would land
+    // `Duration::as_nanoseconds` would wrap a u64 here; a wrapped deadline would land
     // in the past and the sleep would complete immediately, which is the bug the
     // saturating construction exists to prevent.
-    mut s: Sleep = Sleep::new(Duration::from_secs(18446744073709551615));
+    mut s: Sleep = Sleep::new(Duration::from_seconds(18446744073709551615));
     const elapsed: boolean = s.is_elapsed();
-    const d: i64 = s.deadline_nanos();
+    const d: i64 = s.deadline_nanoseconds();
     match (expect_false(elapsed, "an over-long sleep wrapped into the past")) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }

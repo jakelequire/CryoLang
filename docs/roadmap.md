@@ -24,7 +24,7 @@ language server".  From there, in order, to the v1.0 freeze:
    Left for trait objects: owning boxes and upcasting; see "Trait objects"
    below.
 4. **Associated constants on concrete types.**  Built, on
-   `associated-constants`: `i32::MAX`, `f64::NAN`, `Duration::NANOS_PER_SEC`,
+   `associated-constants`: `i32::MAX`, `f64::NAN`, `Duration::NANOSECONDS_PER_SECOND`,
    with `max_value()` removed (ruling 510).  Trait constants used as
    values come after v1.0; trait constants as array lengths are not in
    v1.0; see "Associated constants" below.
@@ -474,7 +474,7 @@ Left over from that: the async entry point calls `Executor::new` and
    every thread one way (622), and each lock holds the state it guards
    (624).  A descriptor's non-blocking mode has one switch, and a drain
    reads through a borrowed descriptor's `read_to_end` (625).  A
-   millisecond wait rounds through `Duration.as_millis_ceil`, a deadline
+   millisecond wait rounds through `Duration.as_milliseconds_ceiling`, a deadline
    saturates through `Instant.saturating_add`, `thread::sleep` is
    `time::clock::sleep`, and a `FILETIME` becomes a `SystemTime` one way
    (626).  A process exits through `sys::exit` and shells out through

@@ -992,12 +992,12 @@ yet is recorded with the change that builds it, not here.
      drain whose buffer cannot grow now reports `OutOfMemory` rather
      than stopping the process.  (Jake)
 
-626. **Time converts one way.**  `Duration.as_millis_ceil()` is the
+626. **Time converts one way.**  `Duration.as_milliseconds_ceiling()` is the
      whole milliseconds a span takes, a partial one rounded up so a wait
      never ends early, saturating at `u64::MAX`; Windows' `Sleep` and the
      reactor's wait timeout both round through it.
      `Instant.saturating_add(dur)` is `checked_add` that answers the
-     latest reading instead of `None`, and `Instant.as_nanos()` saturates
+     latest reading instead of `None`, and `Instant.as_nanoseconds()` saturates
      at `i64::MAX`, so a timer's deadline for an over-long sleep lies in
      the far future instead of wrapping into the past.
      `thread::sleep(duration)` is `time::clock::sleep` and has no copy of
@@ -1491,8 +1491,8 @@ yet is recorded with the change that builds it, not here.
      private to `alloc::arc`, and the executor holds its tasks through
      `Arc`'s raw API alone.  `Rc` has no raw API, so nothing changes
      there.  `datetime`'s seconds per day, hour and minute are private to
-     it, and `Duration` has public `SECS_PER_MINUTE`, `SECS_PER_HOUR` and
-     `SECS_PER_DAY` beside `NANOS_PER_SEC`.  The `public`, `internal` and
+     it, and `Duration` has public `SECONDS_PER_MINUTE`, `SECONDS_PER_HOUR` and
+     `SECONDS_PER_DAY` beside `NANOSECONDS_PER_SECOND`.  The `public`, `internal` and
      `private` keywords on an `extern` block stay the block's default, as
      593 built.  (Jake)
 
@@ -1507,7 +1507,7 @@ yet is recorded with the change that builds it, not here.
      (`ResolvedAddrs`, `Resolve`, `Router`, `HttpServer`, `StatusCode`);
      parse steps, formatting steps and the URL parser's byte constants
      are private; the limits and defaults a program may name
-     (`HTTP_VERSION`, `MAX_BODY`, `DEFAULT_READ_TIMEOUT_SECS`, ...) are
+     (`HTTP_VERSION`, `MAX_BODY`, `DEFAULT_READ_TIMEOUT_SECONDS`, ...) are
      public.  (Jake for `net::sys`; the rest delegated under 587)
 
 ### 2026-10-25
@@ -1537,7 +1537,7 @@ yet is recorded with the change that builds it, not here.
 
 595. **A `Duration`, an `Instant` and a `SystemTime` are read through
      their accessors.**  Their seconds and nanoseconds are private fields
-     behind `as_secs`, `subsec_nanos`, `as_nanos` and `unix_secs`, so the
+     behind `as_seconds`, `subsecond_nanoseconds`, `as_nanoseconds` and `unix_seconds`, so the
      library's own clocks and timers call those; `Duration`'s unit
      constants stay public, and the clocks' conversion constants and the
      calendar algorithm's are private.  A `DateTime`'s fields are its
