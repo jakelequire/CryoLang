@@ -1460,6 +1460,18 @@ type struct MoveChecker {
         const snap:       i64 = this.snapshot_moves();
         const cap_snap:   i64 = this.captured_decl_keys.length();
         const carry_snap: i64 = this.carried_keys.length();
+        // The whole pre-loop moved-set, element-wise: an assignment in the
+        // body revives its binding by deleting an entry that may sit below
+        // `snap`, which a length rewind cannot put back, and a binding the
+        // body revives is still moved on the path that runs it zero times.
+        mut pre_keys:  [u64]        = [];
+        mut pre_spans: [SourceSpan] = [];
+        mut pre_real:  [boolean]    = [];
+        for (mut i: i64 = 0; i < this.moved_keys.length(); i++) {
+            pre_keys.push(this.moved_keys[i]);
+            pre_spans.push(this.moved_spans[i]);
+            pre_real.push(this.moved_real[i]);
+        }
         const walk: LoopWalk = LoopWalk {
             moves_start:        snap,
             declarations_start: cap_snap,
@@ -1502,7 +1514,7 @@ type struct MoveChecker {
             if (!staged) { this.carried_keys.push(k); }
         }
         this.truncate_loop_exits(walk);
-        this.restore_moves(snap);
+        this.restore_full(pre_keys, pre_spans, pre_real);
 
         // real walk: carried bindings are moved-on-entry, so the
         // re-move at the top of the body reports use-after-move.
@@ -1521,7 +1533,7 @@ type struct MoveChecker {
         // above.  A `break` leaves with its own moves, so they hold after
         // the loop too.
         this.truncate_carried(carry_snap);
-        this.restore_moves(snap);
+        this.restore_full(pre_keys, pre_spans, pre_real);
         for (mut i: i64 = walk.breaks_start; i < this.break_moves.length(); i++) {
             const exit: LoopExitMove = this.break_moves[i];
             this.mark_moved_key(exit.key, exit.span, true);

@@ -88,6 +88,7 @@ import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::sema::sema::{ SemaVisitor };
+import compiler::ast::walk::{ Walk };
 
 
 /// A local this pass writes a reference to: the binding it denotes and the
@@ -194,6 +195,26 @@ type struct LoopExitMove {
     key:    u64;
     line:   i32;
     writes: Stmt*;
+}
+
+/// The bindings a body assigns whole (`x = ...`), at any depth outside the
+/// lambdas written in it, whose bodies run where they are called.
+type struct WholeAssignments {
+    keys: [u64];
+}
+
+implement trait Walk for struct WholeAssignments {
+    walk_binary(mut &this, e: mut ExpressionNode*, n: BinaryExpr*) -> void {
+        if (n.op.kind == TokenType::Equal) {
+            const target: IdentifierExpr* = ExpressionNode::identifier_of(n.left);
+            if (target != null && target.res.local_sym().is_valid()) {
+                this.keys.push(target.res.local_sym().key());
+            }
+        }
+        BinaryExpr::walk_children(n, this);
+    }
+
+    walk_lambda(mut &this, e: mut ExpressionNode*, n: LambdaExpr*) -> void { }
 }
 
 
@@ -1532,7 +1553,7 @@ type struct DropInserter {
         // back edge is refused by MoveCheck (fatal_on_failure) before this
         // pass runs, so the loop's own exit sees the pre-loop moved-set;
         // only a `break` carries body moves past the loop (`leave_loop`).
-        this.enter_loop();
+        this.enter_loop(w.body, null);
         this.branch_depth += 1;
         if (w.body != null) {
             w.body = this.as_child_block(w.body);
@@ -1544,7 +1565,7 @@ type struct DropInserter {
 
     walk_do_while(mut &this, w: mut DoWhileStmt*) -> void {
         if (w == null) { return; }
-        this.enter_loop();
+        this.enter_loop(w.body, null);
         this.branch_depth += 1;
         if (w.body != null) {
             w.body = this.as_child_block(w.body);
@@ -1565,7 +1586,7 @@ type struct DropInserter {
             this.walk_var_decl(f.init.as_decl());
         }
         if (f.condition != null) { this.walk_expr_read(f.condition); }
-        this.enter_loop();
+        this.enter_loop(f.body, f.update);
         this.branch_depth += 1;
         if (f.body != null) {
             f.body = this.as_child_block(f.body);
@@ -1585,7 +1606,7 @@ type struct DropInserter {
 
     walk_loop(mut &this, l: mut LoopStmt*) -> void {
         if (l == null) { return; }
-        this.enter_loop();
+        this.enter_loop(l.body, null);
         this.branch_depth += 1;
         if (l.body != null) {
             l.body = this.as_child_block(l.body);
@@ -1595,9 +1616,32 @@ type struct DropInserter {
         this.leave_loop(null);
     }
 
-    /// Begin walking a loop statement's body.  Its flags are declared where
-    /// the loop statement's own are, ahead of it.
-    enter_loop(mut &this) -> void {
+    /// Begin walking a loop statement's body (and a `for`'s `update`).  Its
+    /// flags are declared where the loop statement's own are, ahead of it.
+    ///
+    /// A binding moved when the loop starts and assigned whole in the body
+    /// holds a value after the loop on the paths that ran the body and none
+    /// on the path that did not, so it is given its move flag here, set
+    /// moved ahead of the loop: the body's assignment clears it, the value
+    /// an assignment displaces is released where it is clear (none on the
+    /// first iteration, the previous iteration's after), and the scope-exit
+    /// drop runs where it is clear.
+    enter_loop(mut &this, body: Stmt*, update: Stmt*) -> void {
+        mut assigned: WholeAssignments = WholeAssignments { keys: [] };
+        if (body != null) { assigned.walk_stmt(body); }
+        if (update != null) { assigned.walk_stmt(update); }
+        for (mut i: i64 = 0; i < assigned.keys.length(); i++) {
+            const k: u64 = assigned.keys[i];
+            if (this.flag_declarations == null || !this.is_moved_id(k) || this.get_drop_flag(k).is_valid()) { continue; }
+            const flag: PassLocal = this.fresh_drop_flag(k);
+            const span: SourceSpan = this.binding_span_for(k, if (body != null) { body.span } else { update.span });
+            this.flag_declarations.push(this.make_drop_flag_decl(flag, span));
+            this.flag_declarations.push(this.make_drop_flag_write(flag, true, span));
+            this.register_drop_flag(k, flag);
+            for (mut m: i64 = 0; m < this.moved_keys.length(); m++) {
+                if (this.moved_keys[m] == k) { this.moved_gov[m] = true; }
+            }
+        }
         this.loops.push(LoopFrame {
             scope_boundary: this.scope_start_idx.length(),
             move_snapshot:  this.snapshot_moves(),
