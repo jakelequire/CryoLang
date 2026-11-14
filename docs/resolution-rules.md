@@ -1141,7 +1141,7 @@ yet is recorded with the change that builds it, not here.
      `get_bucket` hands to a caller walking a map in place.  The sizes an
      array, a string and a map start with, the sort steps, the per-process
      seed generator, a map's seeded hashing and its node allocation are
-     private, while `hash_str` and `hash_int` stay public.  The iterator
+     private, while `hash_str` and `hash_integer` stay public.  The iterator
      adapters are private, with `KeysRefIter` internal for the set built
      on it; `copied` and `cloned`, reached through `iter_ref`'s opaque
      result, are public.  `HashMapIter` is not marked: the compiler names
@@ -1230,7 +1230,7 @@ yet is recorded with the change that builds it, not here.
 
 643. **`hash_str` is gone.**  A string's hash is `core::hash::digest`,
      which `hash_str` only delegated to; the compiler's resolution map and
-     the LSP's diagnostic ids call `digest` directly.  `hash_int` stays
+     the LSP's diagnostic ids call `digest` directly.  `hash_integer` stays
      public.  (Jake)
 
 644. **The compiler and the LSP classify bytes and read numbers through the
