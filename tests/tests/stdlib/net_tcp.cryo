@@ -3,7 +3,7 @@
 ///! Every operation that can wait is a future, so both ends run as two futures
 ///! joined inside ONE `Executor` — its reactor is what the accept and every read
 ///! register with. Each test binds an EPHEMERAL port (`:0`) and reads the
-///! kernel-assigned port back via `TcpListener::local_addr()`, so concurrent runs
+///! kernel-assigned port back via `TcpListener::local_address()`, so concurrent runs
 ///! never collide and nothing is left to a fixed-port guess.
 ///!
 ///! What these cover that `net_tcp_conn` does not is the DIAL path rather than the
@@ -26,7 +26,7 @@ import std::io::error::{ IoError };
 import std::io::traits;
 import std::io::buf::{ BufStream };
 import std::net::addr::ip;
-import std::net::addr::socket_addr::{ SocketAddr };
+import std::net::addr::socket_addr::{ SocketAddress };
 import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
 import std::ffi::libc;
 import std::test::error::{ TestError };
@@ -56,7 +56,7 @@ async function ntcp_serve(listener: TcpListener) -> i64 {
     mut acc: TcpAccepted = await TcpAccept::start(listener);
     mut _lst: TcpListener = acc.take_listener();
 
-    mut stream: TcpStream = TcpStream::from_fd(-1);
+    mut stream: TcpStream = TcpStream::from_file_descriptor(-1);
     match (acc.take_result()) {
         Result::Ok(s)  => { stream = s; }
         Result::Err(_) => { return -1; }
@@ -75,7 +75,7 @@ async function ntcp_serve(listener: TcpListener) -> i64 {
 }
 
 /// Dial `addr`, send `ping`, read `pong`. Returns 4 on success.
-async function ntcp_client(addr: SocketAddr) -> i64 {
+async function ntcp_client(addr: SocketAddress) -> i64 {
     mut sock: TcpStream = match (await TcpConnect::start(addr)) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -10; }
@@ -93,7 +93,7 @@ async function ntcp_client(addr: SocketAddr) -> i64 {
     return 4;
 }
 
-async function ntcp_round(addr: SocketAddr, listener: TcpListener) -> i64 {
+async function ntcp_round(addr: SocketAddress, listener: TcpListener) -> i64 {
     const pair: (i64, i64) = await Futures::join(ntcp_serve(listener), ntcp_client(addr));
     if (pair.0 != 4) { return pair.0; }
     if (pair.1 != 4) { return pair.1; }
@@ -101,7 +101,7 @@ async function ntcp_round(addr: SocketAddr, listener: TcpListener) -> i64 {
 }
 
 /// A connect to a port nobody is listening on must be REFUSED, not parked.
-async function ntcp_refused(addr: SocketAddr) -> i64 {
+async function ntcp_refused(addr: SocketAddress) -> i64 {
     match (await TcpConnect::start(addr)) {
         Result::Ok(s)  => {
             mut _unexpected: TcpStream = s;
@@ -114,7 +114,7 @@ async function ntcp_refused(addr: SocketAddr) -> i64 {
 /// Bind an ephemeral port and put the listener in non-blocking mode, which
 /// `TcpAccept` requires: a blocking listener would stall an executor's whole
 /// worker thread inside `accept`.
-function ntcp_bind(addr: SocketAddr) -> Result<TcpListener, IoError> {
+function ntcp_bind(addr: SocketAddress) -> Result<TcpListener, IoError> {
     mut l: TcpListener = TcpListener::bind(addr)?;
     l.set_nonblocking(true)?;
     return Result::Ok(l);
@@ -122,16 +122,16 @@ function ntcp_bind(addr: SocketAddr) -> Result<TcpListener, IoError> {
 
 ![test]
 function loopback_round_trip() -> Result<(), TestError> {
-    mut listener: TcpListener = match (ntcp_bind(SocketAddr::localhost_v4(0))) {
+    mut listener: TcpListener = match (ntcp_bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(l)  => { l }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
-    const port: u16 = match (listener.local_addr()) {
+    const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_address failed")); }
     };
     mut ex: Executor = Executor::new();
-    const r: i64 = ex.block_on(ntcp_round(SocketAddr::localhost_v4(port), listener));
+    const r: i64 = ex.block_on(ntcp_round(SocketAddress::localhost_v4(port), listener));
     return expect_eq(r, 0 as i64);
 }
 
@@ -141,16 +141,16 @@ function loopback_round_trip() -> Result<(), TestError> {
 /// (returns Ok) rather than flaking.
 ![test]
 function loopback_round_trip_v6() -> Result<(), TestError> {
-    mut listener: TcpListener = match (ntcp_bind(SocketAddr::localhost_v6(0))) {
+    mut listener: TcpListener = match (ntcp_bind(SocketAddress::localhost_v6(0))) {
         Result::Ok(l)  => { l }
         Result::Err(_) => { return Result::Ok(()); }   // no v6 loopback -> skip
     };
-    const port: u16 = match (listener.local_addr()) {
+    const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { return bail(Str::new("v6 local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("v6 local_address failed")); }
     };
     mut ex: Executor = Executor::new();
-    const r: i64 = ex.block_on(ntcp_round(SocketAddr::localhost_v6(port), listener));
+    const r: i64 = ex.block_on(ntcp_round(SocketAddress::localhost_v6(port), listener));
     return expect_eq(r, 0 as i64);
 }
 
@@ -158,16 +158,16 @@ function loopback_round_trip_v6() -> Result<(), TestError> {
 function connect_to_unbound_port_fails() -> Result<(), TestError> {
     // Bind an ephemeral port, learn it, then release it; connecting to the
     // now-unbound port should be refused. Hermetic (no fixed-port guess).
-    mut listener: TcpListener = match (ntcp_bind(SocketAddr::localhost_v4(0))) {
+    mut listener: TcpListener = match (ntcp_bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(l)  => { l }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
-    const port: u16 = match (listener.local_addr()) {
+    const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_address failed")); }
     };
     mem::drop(listener);   // release the port so the connect is refused
     mut ex: Executor = Executor::new();
-    const r: i64 = ex.block_on(ntcp_refused(SocketAddr::localhost_v4(port)));
+    const r: i64 = ex.block_on(ntcp_refused(SocketAddress::localhost_v4(port)));
     return expect_eq(r, 1 as i64);
 }

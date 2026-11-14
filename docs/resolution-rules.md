@@ -669,16 +669,16 @@ yet is recorded with the change that builds it, not here.
      type Jake)
 
 605. **Addresses, URLs, methods and status codes are `Display`.**  An
-     `IpV4Addr` writes dotted decimal; an `IpV6Addr` its canonical text
+     `IpV4Address` writes dotted decimal; an `IpV6Address` its canonical text
      (RFC 5952): lowercase hex groups without leading zeros, the longest
      run of two or more zero groups written `::`, the first of equally
-     long runs, and no dotted tail; an `IpAddr` writes its address.  A
-     `SocketAddr` writes `ip:port`, an IPv6 address in brackets.  A `Url`
+     long runs, and no dotted tail; an `IpAddress` writes its address.  A
+     `SocketAddress` writes `ip:port`, an IPv6 address in brackets.  A `Url`
      writes `scheme://host[:port]path[?query][#fragment]`: an IPv6 host
      in brackets, the port only when it is not the scheme's default, and
      no userinfo, which the parser does not keep.  A `Method` writes its
      wire form and a `StatusCode` its code in decimal.  The HTTP client
-     writes its `Host` header through `SocketAddr`'s, so an IPv6 host is
+     writes its `Host` header through `SocketAddress`'s, so an IPv6 host is
      sent compressed, and its own address writers are deleted.  (Jake for
      the types and the compressed form; the URL's port and userinfo and
      the bare status code delegated)
@@ -1103,7 +1103,7 @@ yet is recorded with the change that builds it, not here.
      delegated)
 
 634. **`process` is marked.**  `Command`, `Stdio`, `Output`, `Child`,
-     its pipe handles with `from_fd`, `ExitStatus`'s methods, `SigNo`,
+     its pipe handles with `from_file_descriptor`, `ExitStatus`'s methods, `SigNo`,
      `Signal` and `id` are public.  A command's settings, an output's
      captures and a signal's number are private behind their methods.
      The spawn, pipe, environment and command-line steps, the Windows
@@ -1502,9 +1502,9 @@ yet is recorded with the change that builds it, not here.
      Winsock error normaliser, the connect-status probe behind
      `os_connect_status`, the timeout packer) are private.  In
      `net::addr`, `dns` and `http`, plain records keep public fields
-     (`IpV4Addr`, `SocketAddr`, `Url`, `Request`, `Response`); a type
+     (`IpV4Address`, `SocketAddress`, `Url`, `Request`, `Response`); a type
      that guards state keeps it private behind its methods
-     (`ResolvedAddrs`, `Resolve`, `Router`, `HttpServer`, `StatusCode`);
+     (`ResolvedAddresses`, `Resolve`, `Router`, `HttpServer`, `StatusCode`);
      parse steps, formatting steps and the URL parser's byte constants
      are private; the limits and defaults a program may name
      (`HTTP_VERSION`, `MAX_BODY`, `DEFAULT_READ_TIMEOUT_SECONDS`, ...) are
