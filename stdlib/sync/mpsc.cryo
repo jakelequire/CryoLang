@@ -126,7 +126,7 @@ private type struct ChannelState<T> {
 private function allocate_node<T>() -> mut ChanNode<T>* {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
     match (alloc.allocate(Layout::of::<ChanNode<T>>())) {
-        Result::Ok(raw) => { return raw.cast::<ChanNode<T>>().as_ptr(); }
+        Result::Ok(raw) => { return raw.cast::<ChanNode<T>>().as_pointer(); }
         Result::Err(_)  => { return null; }
     }
 }
@@ -145,7 +145,7 @@ private function new_inner<T>(capacity: i64) -> mut ChannelInner<T>* {
     mut alloc: GlobalAlloc = GlobalAlloc::new();
     mut inner: mut ChannelInner<T>* = null;
     match (alloc.allocate(Layout::of::<ChannelInner<T>>())) {
-        Result::Ok(raw) => { inner = raw.cast::<ChannelInner<T>>().as_ptr(); }
+        Result::Ok(raw) => { inner = raw.cast::<ChannelInner<T>>().as_pointer(); }
         Result::Err(_)  => { core::panic("mpsc::Channel: allocation failed", intrinsics::location()); }
     }
     inner.state = Mutex::new(ChannelState::<T> {
@@ -285,7 +285,7 @@ public type struct Sender<T> {
     public send(&this, value: T) -> Result<(), SendError<T>> {
         const inner: ChannelInner<T>* = this.inner;
         mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
-        const state: mut ChannelState<T>* = held.as_mutable_ptr();
+        const state: mut ChannelState<T>* = held.as_mutable_pointer();
         while (state.rx_open && state.length >= state.capacity) {
             inner.room.wait(&inner.state, &held);
         }
@@ -310,7 +310,7 @@ public type struct Sender<T> {
     public try_send(&this, value: T) -> Result<(), TrySendError<T>> {
         const inner: ChannelInner<T>* = this.inner;
         mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
-        const state: mut ChannelState<T>* = held.as_mutable_ptr();
+        const state: mut ChannelState<T>* = held.as_mutable_pointer();
         if (!state.rx_open) {
             return Result::Err(TrySendError::Disconnected(value));
         }
@@ -331,7 +331,7 @@ public type struct Sender<T> {
     public clone(&this) -> Sender<T> {
         const inner: mut ChannelInner<T>* = this.inner;
         mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
-        const state: mut ChannelState<T>* = held.as_mutable_ptr();
+        const state: mut ChannelState<T>* = held.as_mutable_pointer();
         state.senders = state.senders + 1;
         state.refs    = state.refs + 1;
         mem::drop(held);
@@ -352,7 +352,7 @@ public type struct Sender<T> {
 /// inner if this was the last handle of any kind.
 private function release_sender<T>(inner: mut ChannelInner<T>*) -> void {
     mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
-    const state: mut ChannelState<T>* = held.as_mutable_ptr();
+    const state: mut ChannelState<T>* = held.as_mutable_pointer();
     state.senders = state.senders - 1;
     if (state.senders == 0) {
         inner.ready.notify_all();
@@ -382,7 +382,7 @@ public type struct Receiver<T> {
     public receive(&this) -> Result<T, ReceiveError> {
         const inner: ChannelInner<T>* = this.inner;
         mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
-        const state: mut ChannelState<T>* = held.as_mutable_ptr();
+        const state: mut ChannelState<T>* = held.as_mutable_pointer();
         while (state.head == null && state.senders > 0) {
             inner.ready.wait(&inner.state, &held);
         }
@@ -411,7 +411,7 @@ public type struct Receiver<T> {
         const deadline: Instant = Instant::now().saturating_add(&duration);
         const inner: ChannelInner<T>* = this.inner;
         mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
-        const state: mut ChannelState<T>* = held.as_mutable_ptr();
+        const state: mut ChannelState<T>* = held.as_mutable_pointer();
         while (state.head == null && state.senders > 0) {
             const remaining: Duration = deadline.saturating_duration_since(&Instant::now());
             if (remaining.is_zero()) {
@@ -440,7 +440,7 @@ public type struct Receiver<T> {
     public try_receive(&this) -> Result<T, TryReceiveError> {
         const inner: ChannelInner<T>* = this.inner;
         mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
-        const state: mut ChannelState<T>* = held.as_mutable_ptr();
+        const state: mut ChannelState<T>* = held.as_mutable_pointer();
         const node: mut ChanNode<T>* = state.pop();
         if (node == null) {
             if (state.senders == 0) { return Result::Err(TryReceiveError::Disconnected); }
@@ -464,7 +464,7 @@ implement<T> trait Drop for struct Receiver<T> {
         if (this.inner == null) { return; }
         const inner: mut ChannelInner<T>* = this.inner;
         mut held: MutexGuard<ChannelState<T>, GlobalAlloc> = inner.state.lock();
-        const state: mut ChannelState<T>* = held.as_mutable_ptr();
+        const state: mut ChannelState<T>* = held.as_mutable_pointer();
         state.rx_open = false;
         // Drain and drop any values still queued: with the receiver gone
         // they would otherwise leak.

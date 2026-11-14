@@ -364,7 +364,7 @@ yet is recorded with the change that builds it, not here.
 683. **A lookup that hands out a pointer has a read-only form and a
      writable one, and code that writes takes the writable one.**
      `Slice::as_const_ptr(&this)` returns the read-only `const T*` where
-     `as_ptr` returns `mut T*`, and `mem::const_offset<T>(ptr: const T*,
+     `as_pointer` returns `mut T*`, and `mem::const_offset<T>(ptr: const T*,
      count) -> const T*` is `mem::offset`'s read-only counterpart.
      `HashMap::get_mutable(mut &this, key: &K) -> Option<mut V*>` and
      `HashMap::values_mutable(mut &this)`, yielding `mut V*`, are the
@@ -750,7 +750,7 @@ yet is recorded with the change that builds it, not here.
 
 610. **`Str`, `Slice` and `Path` are marked item by item.**  `Str`,
      `Slice<T>`, `Path` and `PathBuf` and all their methods are public,
-     their storage private behind `as_ptr`, `as_bytes`, `as_str` and
+     their storage private behind `as_pointer`, `as_bytes`, `as_str` and
      `as_path`.  `Str`'s `SplitIter`, `Chars` and `CharIndices` are
      internal: `Str`'s methods return them as `implement Iterator<...>`,
      and `String` reads them through `Str` by `Deref`, so no public

@@ -332,7 +332,7 @@ wrong:
 this seam on both targets.
 
 Inside Cryo code a `va_list` is always the alloca's address: the `args`
-bucket, `VaArgs::as_ptr()`, and a `va_list` parameter of a Cryo function,
+bucket, `VaArgs::as_pointer()`, and a `va_list` parameter of a Cryo function,
 which is passed that address as it is.  Only a call to a foreign function
 (one with no body: an `extern` binding) goes through `forward_va_list`, so a
 `va_list` handed through any number of Cryo functions reaches the C consumer
