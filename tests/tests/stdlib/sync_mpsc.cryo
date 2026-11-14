@@ -18,7 +18,7 @@ import std::core::mem;
 import std::collections::str::{ Str };
 import std::collections::pair::{ Pair };
 import std::sync::mpsc;
-import std::sync::mpsc::{ Channel, Receiver, ReceiveError, Sender, TryReceiveError };
+import std::sync::mpsc::{ Channel, Receiver, ReceiveError, Sender, TryReceiveError, TrySendError };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::thread;
 import std::time::duration::{ Duration };
@@ -187,6 +187,56 @@ function mpsc_bounded_send_returns_the_value_when_the_receiver_goes() -> Result<
     mem::drop(rx);
     expect_eq(worker.join(), 5)?;
     return Result::Ok(());
+}
+
+![test]
+function mpsc_try_send_hands_back_the_value_when_full_or_disconnected() -> Result<(), TestError> {
+    const { first: tx, second: rx }: Pair<Sender<i32>, Receiver<i32>> = Channel::bounded::<i32>(1);
+    match (tx.try_send(1)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("try_send into an empty open channel must queue the value")); }
+    }
+    match (tx.try_send(2)) {
+        Result::Ok(_)  => { return bail(Str::new("try_send into a full channel must not queue the value")); }
+        Result::Err(e) => {
+            match (e) {
+                TrySendError::Full(value)     => { expect_eq(value, 2)?; }
+                TrySendError::Disconnected(_) => { return bail(Str::new("the receiver is alive; must be Full")); }
+            }
+        }
+    }
+    receive_equals(&rx, 1)?;
+    mem::drop(rx);
+    match (tx.try_send(3)) {
+        Result::Ok(_)  => { return bail(Str::new("try_send after the receiver dropped must not queue the value")); }
+        Result::Err(e) => {
+            match (e) {
+                TrySendError::Disconnected(value) => { expect_eq(value, 3)?; }
+                TrySendError::Full(_)             => { return bail(Str::new("the receiver is gone; must be Disconnected")); }
+            }
+        }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function mpsc_receiver_iterates_until_every_sender_drops() -> Result<(), TestError> {
+    const { first: tx, second: rx }: Pair<Sender<i32>, Receiver<i32>> = Channel::unbounded::<i32>();
+    const worker = thread::spawn(move () -> i32 {
+        for (mut value: i32 = 1; value <= 4; value++) {
+            if (tx.send(value).is_err()) { return 1; }
+        }
+        return 0;
+    });
+    mut sum: i32 = 0;
+    mut count: i32 = 0;
+    for (value in rx) {
+        sum = sum + value;
+        count = count + 1;
+    }
+    expect_eq(worker.join(), 0)?;
+    expect_eq(count, 4)?;
+    return expect_eq(sum, 10);
 }
 
 ![test]
