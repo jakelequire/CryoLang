@@ -737,7 +737,11 @@ yet is recorded with the change that builds it, not here.
      `Slice<T>`, `Path` and `PathBuf` and all their methods are public,
      their storage private behind `as_ptr`, `as_bytes`, `as_str` and
      `as_path`.  `Str`'s `SplitIter`, `Chars` and `CharIndices` are
-     public, since `String`'s methods name them, with private fields; the
+     internal: `Str`'s methods return them as `implement Iterator<...>`,
+     and `String` reads them through `Str` by `Deref`, so no public
+     signature names them.  `Str`'s `set_bytes` and `set_length` are
+     internal, the setters `String` and `PathBuf` keep their views in
+     step with their storage through; the
      UTF-8 decoding step `decode_scalar`, its `REPLACEMENT_SCALAR` and the
      integer parser's `I64_MIN_MAGNITUDE` are private.  `SliceIter` is
      internal: `Slice` and `Array` both make one and no public signature
