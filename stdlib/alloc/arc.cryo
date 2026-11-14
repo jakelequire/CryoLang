@@ -13,7 +13,7 @@
 ///! deny-list keyed on its leaf name; `Arc` is not.
 ///!
 ///! The memory-ordering pattern below - `fetch_add(Relaxed)` for clone,
-///! `fetch_sub(Release)` + `fence(Acquire)` on the last-decrement path
+///! `fetch_subtract(Release)` + `fence(Acquire)` on the last-decrement path
 ///! - is the canonical reference-count implementation.  Relaxed is correct
 ///! for the clone bump because the new reference is observed only by
 ///! callers who already share the count with the cloning thread; the
@@ -88,7 +88,7 @@ where A: Allocator {
 /// order the free after every prior weak release from any thread.
 private function release_weak<T, A>(inner_ptr: mut ArcInner<T, A>*) -> void
 where A: Allocator {
-    const prev: u64 = inner_ptr.weak.fetch_sub(1, MemoryOrder::Release);
+    const prev: u64 = inner_ptr.weak.fetch_subtract(1, MemoryOrder::Release);
     if (prev == 1) {
         atomic::fence(MemoryOrder::Acquire);
         free_arc_inner::<T, A>(inner_ptr);
@@ -349,7 +349,7 @@ public type struct Weak<T, A = GlobalAlloc> {
 /// Decrement the strong count atomically.  When it reaches zero, release
 /// the shared value in place (`ptr::drop_in_place`) and release the strong group's shared
 /// weak unit; freeing the header falls to whichever weak release is last.
-/// The `Release` on `fetch_sub` plus the `Acquire` fence on the
+/// The `Release` on `fetch_subtract` plus the `Acquire` fence on the
 /// last-strong path establishes the happens-before edge that synchronizes
 /// the final destructor with every prior write from a thread that already
 /// dropped its own handle.
@@ -361,9 +361,9 @@ where A: Allocator {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
         const inner_ptr: mut ArcInner<T, A>* = this.inner;
-        // `fetch_sub` returns the value BEFORE the decrement, so the
+        // `fetch_subtract` returns the value BEFORE the decrement, so the
         // last owner is the one that observes `1` here.
-        const prev: u64 = inner_ptr.strong.fetch_sub(1, MemoryOrder::Release);
+        const prev: u64 = inner_ptr.strong.fetch_subtract(1, MemoryOrder::Release);
         if (prev == 1) {
             // We are the last strong owner.  Acquire-fence to pair with the
             // Release decrements of every prior thread, run the destructor,
