@@ -8,8 +8,9 @@
 ///!
 ///! The boundary cases at the bottom are equally load-bearing in the other
 ///! direction.  A destination the compiler cannot prove holds a live value -
-///! anything behind a raw pointer or a reference - must NOT be dropped, or the
-///! first write into freshly-reserved capacity frees stack or heap garbage.
+///! anything behind a raw pointer - must NOT be dropped, or the first write
+///! into freshly-reserved capacity frees stack or heap garbage.  A reference
+///! always names a value, so a store through one does release.
 ///! `Array::try_push` writes `this.ptr[this.length] = value` into exactly such
 ///! a slot, so widening the rule to cover it breaks every growing collection.
 
@@ -39,9 +40,9 @@ implement trait Drop for struct Tracked {
 type struct Holder { item: Tracked; }
 
 implement struct Holder {
-    // Field write through `mut &this`: the receiver is a reference, so the
-    // callee cannot know the pointee holds a live value.  See
-    // `field_write_through_reference_does_not_drop` below.
+    // Field write through `mut &this`: the receiver is a reference, whose
+    // referent always holds a value, so the displaced item is released.  See
+    // `field_write_through_reference_drops_old` below.
     set_item(mut &this, v: Tracked) -> void { this.item = v; }
 }
 
@@ -207,20 +208,23 @@ function deref_store_does_not_drop() -> Result<(), TestError> {
     return expect_equal(g_mask, 0x00);
 }
 
-// The documented limitation, encoded so that widening the rule to cover
-// references trips here first.  `h.item = v` written in the caller DOES drop
-// (see assign_over_live_field_drops_old); routed through `mut &this` it does
-// not, because a reference parameter may point at storage the caller has not
-// initialized - the out-parameter idiom in conditional_init_drop.cryo relies
-// on exactly that.
+// `h.item = v` written in the caller drops the old item (see
+// assign_over_live_field_drops_old), and so does the same store routed
+// through `mut &this`: a reference cannot name storage that holds nothing
+// yet (E0219), so its referent's field is live.  The out-parameter idiom in
+// conditional_init_drop.cryo passes a raw pointer instead.
 ![test]
-function field_write_through_reference_does_not_drop()
+function field_write_through_reference_drops_old()
         -> Result<(), TestError> {
     reset();
     {
         mut h: Holder = Holder { item: Tracked { id: 0 } };
         h.set_item(Tracked { id: 1 });
     }
-    // id 0 is leaked; only the scope-exit drop of `h` runs.
-    return expect_equal(g_mask, 0x02);
+    // id 0 is released by the store, id 1 by the scope-exit drop of `h`.
+    match (expect_equal(g_mask, 0x03)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_equal(g_count, 2);
 }

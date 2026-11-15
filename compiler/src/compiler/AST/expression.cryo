@@ -7,7 +7,9 @@ namespace compiler::ast::expression;
 import compiler::diag;
 import compiler::ast::{ ArgBinding, LiteralKind, MemberPin, TypeAnnotation };
 import compiler::diag::source_span::{ SourceSpan };
-import compiler::lex::{ Token };
+import compiler::lex::{ Token, TokenType };
+import compiler::lex::lexer::{ Lexer };
+import std::core::option::{ Option };
 import compiler::ast::node::{ Node };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::{ TypeKind };
@@ -135,6 +137,66 @@ type struct ExpressionNode {
             ExprKind::Tuple(_)           => { true }
             _                            => { false }
         };
+    }
+
+    /// The constant value of an index expression, or -1 when it is not a
+    /// plain integer literal that fits a `u32`.  A place's chain names one
+    /// slot by it, so an index decided at run time names no slot.
+    static constant_index_of(expr: ExpressionNode*) -> i64 {
+        const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
+        if (lit == null || lit.literal_kind != LiteralKind::Integer) { return -1; }
+        const parsed: Option<u128> = Lexer::integer_literal_value(lit.value, lit.suffix);
+        if (parsed.is_none()) { return -1; }
+        const v: u128 = parsed.unwrap();
+        if (v > u32::MAX as u128) { return -1; }
+        return v as i64;
+    }
+
+    /// Decompose a place into the local it is rooted at plus its projection
+    /// chain, appended root-first to `out_kind` (0 a field, 1 a constant
+    /// index, 2 an explicit dereference) and `out_key` (the field's name id,
+    /// the index, or 0).  Returns the root binding's identity, or an invalid
+    /// one when the shape is not a chain of those over a local.
+    ///
+    /// Purely syntactic: whether the chain stays inside the local's own
+    /// storage is a question of the types along it, which a caller asks.
+    /// A failure never leaves a partial chain behind: every push happens
+    /// after the recursive call has already succeeded.
+    static place_chain(expr: ExpressionNode*, out_kind: mut [u8]*, out_key: mut [u32]*) -> SymbolID {
+        if (expr == null) { return SymbolID::invalid(); }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
+        if (id != null) { return id.res.local_sym(); }
+        const ma: MemberAccessExpr* = ExpressionNode::member_access_of(expr);
+        if (ma != null) {
+            if (ma.object == null) { return SymbolID::invalid(); }
+            const root: SymbolID = ExpressionNode::place_chain(ma.object, out_kind, out_key);
+            if (!root.is_valid()) { return SymbolID::invalid(); }
+            out_kind.push(0 as u8);
+            out_key.push(ma.member.id);
+            return root;
+        }
+        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(expr);
+        if (aa != null) {
+            if (aa.array == null || aa.index == null) { return SymbolID::invalid(); }
+            const index: i64 = ExpressionNode::constant_index_of(aa.index);
+            if (index < 0) { return SymbolID::invalid(); }
+            const root: SymbolID = ExpressionNode::place_chain(aa.array, out_kind, out_key);
+            if (!root.is_valid()) { return SymbolID::invalid(); }
+            out_kind.push(1 as u8);
+            out_key.push(index as u32);
+            return root;
+        }
+        // An explicit dereference, `*r`.  One a `Deref` implementation answers
+        // is a call, not a step through the operand's own address.
+        const deref: UnaryExpr* = ExpressionNode::unary_of(expr);
+        if (deref != null && deref.op.kind == TokenType::Star && deref.desugared_call == null) {
+            const root: SymbolID = ExpressionNode::place_chain(deref.operand, out_kind, out_key);
+            if (!root.is_valid()) { return SymbolID::invalid(); }
+            out_kind.push(2 as u8);
+            out_key.push(0);
+            return root;
+        }
+        return SymbolID::invalid();
     }
 
     /// An expression of `kind` at `span`, with the header's defaults.
@@ -344,6 +406,7 @@ type struct ExpressionNode {
             is_synthetic:     false,
             desugared_call:   null,
             desugar_by_bound: false,
+            borrowed_as_pointer: false,
         }), span);
     }
 
@@ -945,6 +1008,12 @@ type struct UnaryExpr {
     /// operand is not a user type applies the primitive operator, so
     /// monomorphization drops the desugar there.
     desugar_by_bound: boolean;
+    /// An `&` whose value is wanted as a raw pointer (`T*`): passed to a
+    /// pointer parameter (`CallExpr.bind_arguments`), or where the type its
+    /// position expects is one (sema).  A pointer may address storage that
+    /// holds nothing yet, so the move check lets it name a local that is not
+    /// initialised; a reference may not.
+    borrowed_as_pointer: boolean;
 
     static walk_children<V>(n: UnaryExpr*, v: mut &V) -> void where V: Walk {
         v.walk_expr(n.operand);
@@ -1221,6 +1290,11 @@ type struct CallExpr {
                 continue;
             }
             arg.arg_binding = ArgBinding::Borrowed;
+            const address_of: mut UnaryExpr* = ExpressionNode::unary_of(arg);
+            if (pt.kind == TypeKind::Pointer && address_of != null
+                && address_of.op.kind == TokenType::Amp && address_of.desugared_call == null) {
+                address_of.borrowed_as_pointer = true;
+            }
             if (pt.kind == TypeKind::Reference) {
                 const at: Type* = arena.lookup(arg.resolved_type);
                 if (at == null || (at.kind != TypeKind::Reference && at.kind != TypeKind::Pointer)) {
