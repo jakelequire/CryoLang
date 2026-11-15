@@ -1850,7 +1850,7 @@ public:
 }
 ```
 
-A struct literal sets every field of the struct, including the ones it leaves to their defaults, so **a literal may be written only where every field is visible**. One private field and code outside the module cannot write the literal at all; it goes through a constructor the module provides. Setting a private field is the more dangerous operation, not the less: reading one leaks information, while setting one breaks the invariant the field exists to protect, so there is no exception for construction.
+A struct literal sets every field of the struct, including the ones it leaves to their defaults, so **a literal may be written only where every field is visible**. One private field and code outside the module cannot write the literal at all; it goes through a constructor the module provides. A field the literal leaves out and may not reach is refused by `E0353` alone, never also reported missing (`E0355`): writing it in would be refused the same way. Setting a private field is the more dangerous operation, not the less: reading one leaks information, while setting one breaks the invariant the field exists to protect, so there is no exception for construction.
 
 ```cryo
 // module app::money
