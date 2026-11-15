@@ -114,7 +114,8 @@ type struct ProjSpec {
     ignore:     boolean;
     /// Expected process exit code (default 0).  Ignored when `fails` is set.
     exit_code:  i64;
-    /// The build/run must exit NON-ZERO; `exit_code` is then not checked.
+    /// The build, run or project tests must exit NON-ZERO; `exit_code` is
+    /// then not checked.
     fails:      boolean;
     /// Single substring that must appear in the combined stdout+stderr.
     stdout_sub: string;
@@ -2939,34 +2940,26 @@ type struct Executor {
         const standard_error: string = Executor::read_file_or_empty(Executor::stderr_path(tmp_text));
         const out: string = fmt::format("%s%s", standard_output, standard_error).into_raw();
 
-        if (spec.outcome == 1 || spec.outcome == 2) {
-            // The fixture and the checks are orthogonal: a failing build is
-            // just build + `fails`, a diagnostic is `fails` + an
-            // `output_contains` marker (both folded in at parse time).
-            const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
-            const ec: i64 = st as i64;
-            if (spec.fails) {
-                passed = ec != 0;
-                if (!passed) { detail = fmt::format("expected %s to fail (exit non-zero)", verb).into_raw(); }
-            } else {
-                passed = ec == spec.exit_code;
-                if (!passed) { detail = fmt::format("exit %lld, expected %lld", ec, spec.exit_code).into_raw(); }
-            }
+        // The fixture and the checks are orthogonal: a failing build is just
+        // build + `fails`, a diagnostic is `fails` + an `output_contains`
+        // marker (both folded in at parse time).  A collect project runs its
+        // own `cryo test`, judged by the same exit rule: `exit_code` (0 when
+        // unwritten), or with `fails: true` any non-zero exit.  That is the
+        // known-fail canary - the test framework is compiled by the compiler
+        // under test, so a miscompile of expect_* / Result propagation /
+        // runner exit codes that converts failures into passes flips the
+        // canary's exit to 0 and fails the canary project (and the suite)
+        // instead of shipping silently.
+        const verb: string = if (spec.outcome == 1) { "build" } else {
+            if (spec.outcome == 2) { "run" } else { "project tests" }
+        };
+        const ec: i64 = st as i64;
+        if (spec.fails) {
+            passed = ec != 0;
+            if (!passed) { detail = fmt::format("expected %s to fail (exit non-zero)", verb).into_raw(); }
         } else {
-            // collect: run the project's own `cryo test`; exit 0 = all passed.
-            // With `fails: true` the polarity inverts: the run MUST exit
-            // non-zero.  That's the known-fail canary - the test framework is
-            // compiled by the compiler under test, so a miscompile of
-            // expect_* / Result propagation / runner exit codes that converts
-            // failures into passes flips the canary's exit to 0 and fails the
-            // canary project (and the suite) instead of shipping silently.
-            if (spec.fails) {
-                passed = st != 0;
-                if (!passed) { detail = "expected project tests to FAIL (exit non-zero)"; }
-            } else {
-                passed = st == 0;
-                if (!passed) { detail = "project tests failed"; }
-            }
+            passed = ec == spec.exit_code;
+            if (!passed) { detail = fmt::format("exit %lld, expected %lld", ec, spec.exit_code).into_raw(); }
         }
         // The output assertions hold for every fixture: a collect project's
         // stdout is its `cryo test` run, which is what a runner option that

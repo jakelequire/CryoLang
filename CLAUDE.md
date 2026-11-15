@@ -112,10 +112,11 @@ not done. The remaining limits are here so nobody rediscovers them:
   OS-gated entries - it keeps a golden entry whose test is still
   `![target]`-gated elsewhere in the SOURCE, and drops one whose test is
   actually gone.
-- **`outcome: "collect"` ignores `expect.exit_code`.** `project_outcome`
-  (`compiler/src/CLI/commands.cryo`) passes a `collect` project on exit 0
-  (or, with `fails`, on any other exit); its output and file assertions do
-  run, against the project's own `cryo test` output. What it does add is the child's own
+- **`outcome: "collect"` passes on its exit code alone.** `project_outcome`
+  (`compiler/src/CLI/commands.cryo`) judges a `collect` project's `cryo test`
+  exit as it judges a build's: `expect.exit_code` (default 0), or with
+  `fails` any non-zero exit; its output and file assertions run against
+  that `cryo test` output. What it does add is the child's own
   unit-test count on the verdict (`ok (12 tests)`), and `make test-census`
   refuses a passing `collect` project that ran none - a broken `![test]`
   discovery exits 0 too. `make test` does not check the count. The roster
