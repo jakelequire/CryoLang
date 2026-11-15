@@ -739,29 +739,35 @@ type struct CallResolver {
 
     // -- The central dispatcher --
 
-    /// Warn on a hand-written `x.drop()`.
+    /// Refuse a hand-written destructor call: a call that names the `drop`
+    /// of a `Drop` implementation, `x.drop()`.
     ///
-    /// Releasing a value is the compiler's job: it drops every owning local at
-    /// scope exit, and it drops an aggregate's fields after the type's own
-    /// `drop` body runs.  On a tracked local, `x.drop()` is read as a move by
-    /// both drop insertion and the move checker, so it releases once and a
-    /// later use is refused - what `mem::drop(x)` does, which says it.  On a
-    /// field, the owner's field glue releases the field again, which stays
-    /// correct only for as long as every leaf drop nulls what it frees.
+    /// Releasing a value is the compiler's job: it releases every owning
+    /// local at its scope's end, and an aggregate's fields after the type's
+    /// own `drop` body runs.  A destructor called through a reference runs
+    /// while the owner still releases the value; one called on a field runs
+    /// while the owner's field glue releases the field again.  `mem::drop(x)`
+    /// is the one way to release a value early.  The method the call NAMES
+    /// decides, not the member's spelling: a type with no `Drop` may have an
+    /// ordinary method called `drop`.
     ///
-    /// A warning rather than an error while the tree still carries the
-    /// hand-written releases that predate field glue; the message says so, so
-    /// nobody reads the current tolerance as the rule.
-    ///
-    /// Emitted from sema, which is the last stage that sees only what the
-    /// AUTHOR wrote: DropInsertion's scope-exit drops and codegen's field glue
-    /// are both synthesized later, so neither can trip this.
-    warn_explicit_drop_call(mut &this, call_e: ExpressionNode*, call: CallExpr*) -> void {
-        if (!this.is_explicit_drop_call(call)) { return; }
-        mut diag: Diagnostic = Diagnostic::warning(
-            ErrorCode::W0015_EXPLICIT_DROP_CALL,
-            "explicit destructor call; write `mem::drop(x)` instead. On a local, `x.drop()` releases the value there and ends the local as `mem::drop(x)` does: it is not released again at scope exit, and a later use is refused. On a field, the owner releases the field again when it is released itself. This is a warning while the tree is being cleaned up and will become an error");
-        diag = diag.at(call_e.span);
+    /// Asked in sema, the last stage that sees only what the author wrote:
+    /// drop insertion's releases and codegen's field glue are synthesized
+    /// later, so neither can trip this.
+    refuse_destructor_call(mut &this, call_e: ExpressionNode*, call: CallExpr*) -> void {
+        if (call.callee == null || ExpressionNode::member_access_of(call.callee) == null) { return; }
+        const named: DeclarationNode* = call.method_named(this.ctx.decl_index);
+        if (named == null) { return; }
+        const method: MethodDecl* = DeclarationNode::method_of(named);
+        const declared: FunctionDecl* = if (method != null) { DeclarationNode::fn_of(method.func) } else { DeclarationNode::fn_of(named) };
+        if (declared == null) { return; }
+        const drop_trait: DefId = this.ctx.get_generic_registry().wellknown(LangItem::Drop);
+        if (!drop_trait.is_valid() || !declared.origin_trait.equals(drop_trait)) { return; }
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0453_DOUBLE_FREE,
+            "explicit destructor call: the compiler releases this value itself, so calling its `drop` releases it twice");
+        diag = diag.at_with_label(call_e.span, "a destructor called by hand");
+        diag = diag.help("to release a local before its scope ends, pass it to `mem::drop`");
         this.ctx.emit_diagnostic(diag);
     }
 
@@ -1051,10 +1057,17 @@ type struct CallResolver {
         return false;
     }
 
+    /// The call's type, once resolved; a call that names a `Drop`
+    /// implementation's `drop` is refused once it is known to (E0453).
     resolve_call(mut &this, visitor: mut SemaVisitor*, call_e: ExpressionNode*, call: mut CallExpr*) -> TypeRef {
+        const answer: TypeRef = this.resolve_call_as_written(visitor, call_e, call);
+        this.refuse_destructor_call(call_e, call);
+        return answer;
+    }
+
+    resolve_call_as_written(mut &this, visitor: mut SemaVisitor*, call_e: ExpressionNode*, call: mut CallExpr*) -> TypeRef {
         // Closure-call rewrite: `f(args)` where `f` is a closure-struct value.
         this.lambda.maybe_rewrite_closure_call(call);
-        this.warn_explicit_drop_call(call_e, call);
 
         // Compute the callee's param types for expected-type propagation: an
         // overloaded family's agreed positions, or the one signature a
@@ -6176,12 +6189,6 @@ type struct CallResolver {
         const field_ret: TypeRef = this.resolve_field_call(lookup_ref, member_e, member);
         if (field_ret.is_valid()) {
             return field_ret;
-        }
-
-        if (this.ctx.get_generic_registry().names_lang_method(member.member, LangItem::DropDrop)
-                && OwnershipQuery::is_copy(this.arena, this.ctx.get_generic_registry(), this.intern, lookup_ref)) {
-            member_e.set_resolved_type(this.arena.get_void());
-            return this.arena.get_void();
         }
 
         // Deref coercion: no such method on the receiver, but if it implements

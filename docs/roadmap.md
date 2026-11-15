@@ -720,15 +720,6 @@ callers.
 Open: whether `Option::take` is enough on its own, or every owning type
 needs a take with a default left behind.
 
-## W0015 becomes an error
-
-An explicit destructor call, `x.drop()`, is a warning today, and the
-compiler, the standard library, the editor, the examples and the tests
-have none left outside the tests of the diagnostic itself.  The
-warning's own text says it will become an error; then `mem::drop(x)` is
-the only way to release a value early.  An ordinary method that happens to
-be named `drop` on a type with no `Drop` is not a destructor call, and is
-told apart before the warning becomes an error.
 
 Open: whether `pointer::drop_in_place` stays the spelling for releasing a
 value through a raw pointer.

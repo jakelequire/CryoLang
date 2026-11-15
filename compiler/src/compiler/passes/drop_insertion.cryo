@@ -28,13 +28,11 @@
 ///! declaration order.  Move-checked bindings are skipped, as are
 ///! types without a `Drop` impl (inherent or trait).
 ///!
-///! Consumption tracking covers two patterns:
-///!   - explicit `.drop()` calls,
-///!   - by-value receivers (`this` / `mut this`, e.g. `Box::into_raw`).
-///!
-///! Both mark the receiver as moved so synthesis skips it at the
+///! A call whose receiver is taken by value (`this` / `mut this`, e.g.
+///! `Box::into_raw`) marks the receiver moved, so synthesis skips it at the
 ///! enclosing scope's exit.  See `types/ownership.cryo`'s
-///! `method_consumes_receiver`.
+///! `method_consumes_receiver`.  A hand-written `x.drop()` never reaches
+///! here: sema refuses it.
 
 namespace compiler::passes::drop_insertion;
 
@@ -4341,32 +4339,6 @@ type struct DropInserter {
     read_call(mut &this, e: ExpressionNode*, c: mut CallExpr*) -> void {
         if (c == null) { return; }
         this.lower_drop_in_place(e, c);
-        // Recognise `<ident>.drop()` and treat it as a move: the user
-        // is explicitly releasing the binding here, so auto-drop must
-        // not emit a second `.drop()` at scope exit.  Without this, any
-        // file that hand-writes `b.drop();` would double-drop.  Same
-        // applies post-stdlib-migration for user code that opts out of
-        // auto-drop with an explicit consume.
-        if (c.callee != null && c.arguments.length() == 0 &&
-            ExpressionNode::member_access_of(c.callee) != null) {
-            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
-            const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
-            if (this.registry.names_lang_method(ma.member, LangItem::DropDrop) && id != null) {
-                // Only treat as a move when the identifier is a binding
-                // we're tracking (in the types map).  Pattern bindings
-                // introduced by `match` arms aren't currently registered,
-                // and treating their `.drop()` as a move would inflate
-                // the per-arm moved-set and cascade into spurious
-                // conditional-move errors at the match join.
-                const sym: SymbolID = id.res.local_sym();
-                if (this.lookup_type(sym).is_valid()) {
-                    if (!this.is_moved(sym)) {
-                        this.mark_moved(sym, ma.object.span);
-                    }
-                    return;
-                }
-            }
-        }
         // `--panic=unwind`: open a pending-arg frame for this call. Each
         // bare-identifier owning argument moved below is recorded on it; a panic
         // origin nested in a LATER argument drops them (the callee never ran).
