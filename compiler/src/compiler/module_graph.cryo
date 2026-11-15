@@ -526,8 +526,9 @@ private:
     /// The positions of the modules declaring a namespace, by the
     /// namespace's last segment, in the graph's order.  A written path names
     /// only a namespace that ends with the path's own last segment
-    /// (`ns_written_as`), so these are the only candidates for it.
-    leaf_index: HashMap<string, [u32], GlobalAllocator, FnvHasher>;
+    /// (`ns_written_as`), so these are the only candidates for it.  Each key
+    /// views the interned namespace it is the last segment of.
+    leaf_index: HashMap<Str, [u32], GlobalAllocator, FnvHasher>;
 
     /// Every module's definition, by the module's path:
     /// each module of this graph as it is added, and each module a C import
@@ -579,7 +580,7 @@ public:
             module_ast_cap:   initial_cap,
             name_index:       HashMap::<ModuleKey, u32, GlobalAllocator, FnvHasher>::new(),
             path_index:       HashMap::<String, u32, GlobalAllocator, FnvHasher>::new(),
-            leaf_index:       HashMap::<string, [u32], GlobalAllocator, FnvHasher>::new(),
+            leaf_index:       HashMap::<Str, [u32], GlobalAllocator, FnvHasher>::new(),
             module_defs:      HashMap::<ModuleKey, DefId, GlobalAllocator, FnvHasher>::new(),
             def_list:         [],
             def_paths:        [],
@@ -807,7 +808,7 @@ public:
     /// annotation named nothing.  With a `root`, the spelling continues a
     /// path that already named that module (`J::Inner` once `J` named
     /// `Json`).
-    modules_written_as(&this, spelling: string, use_module: ModulePath, root: ModulePath,
+    modules_written_as(&this, spelling: Str, use_module: ModulePath, root: ModulePath,
                        intern: mut InternTable*) -> ModuleSpellingMatch {
         return this.modules_in_view(spelling, use_module, root, intern);
     }
@@ -815,7 +816,7 @@ public:
     /// Every module, in the graph's order, whose declared namespace the
     /// written path `written` abbreviates: for a diagnostic's help naming
     /// the module an unknown import path was meant to be.
-    modules_abbreviated_by(&this, written: string, intern: InternTable*) -> [ModulePath] {
+    modules_abbreviated_by(&this, written: Str, intern: InternTable*) -> [ModulePath] {
         mut out: [ModulePath] = [];
         if (intern == null) { return out; }
         for (mut i: i64 = 0; i < this.modules.length(); i++) {
@@ -845,7 +846,7 @@ private:
     /// package root is addressable as written.  Only the whole one - an
     /// abbreviation like `core::option` is a proper suffix whose first
     /// segment binds nothing, and stays unreachable.
-    modules_in_view(&this, spelling: string, use_module: ModulePath, root: ModulePath,
+    modules_in_view(&this, spelling: Str, use_module: ModulePath, root: ModulePath,
                     intern: mut InternTable*) -> ModuleSpellingMatch {
         mut r: ModuleSpellingMatch = ModuleSpellingMatch {
             found:   ModulePath::none(),
@@ -860,7 +861,7 @@ private:
         const rooted: boolean = root.is_valid();
         const rooted_length: i64 =
             if (rooted) { intern.resolve(root.sym).length() + 2 + spelling.length() } else { 0 };
-        const head: string = QualifiedName::head_of(spelling);
+        const head: Str = QualifiedName::head_of(spelling);
         const continues: boolean = !rooted && head.length() < spelling.length();
         const tail_length: i64 = spelling.length() - head.length();
         mut heads: [ModulePath] = [];
@@ -869,12 +870,12 @@ private:
         mut cand_defs: [DefId] = [];
         mut cand_lengths: [i64] = [];
         mut cand_reach: [boolean] = [];
-        const in_reach: [u32] = this.modules_ending_in(spelling, if (continues) { head } else { "" });
+        const in_reach: [u32] = this.modules_ending_in(spelling, if (continues) { head } else { Str::from("") });
         for (mut at: i64 = 0; at < in_reach.length(); at++) {
             const i: i64 = in_reach[at] as i64;
             const cand_ns: SymbolStr = this.modules[i].namespace_name;
             const cand_path: ModulePath = this.modules[i].path();
-            const cand_str: string = intern.resolve(cand_ns);
+            const cand_str: Str = Str::from(intern.resolve(cand_ns));
             const names_head: boolean = continues && ModuleGraph::ns_written_as(cand_str, head);
             const names_spelling: boolean = ModuleGraph::ns_written_as(cand_str, spelling)
                 && !(rooted && (cand_str.length() != rooted_length
@@ -897,7 +898,7 @@ private:
             }
             const reachable: boolean = rooted
                 || cand_path.equals(use_module)
-                || cand_str.eq(spelling)
+                || cand_str == spelling
                 || in_prelude
                 || imported;
             cands.push(cand_path);
@@ -925,24 +926,24 @@ private:
     /// segments may be left off: whether `future` names `std::future` from
     /// here is a scope question, while a path that drops trailing segments
     /// would name a module that declares nothing it names.
-    static ns_written_as(mod_str: string, written: string) -> boolean {
-        const ml: i64 = mod_str.length() as i64;
-        const pl: i64 = written.length() as i64;
+    static ns_written_as(mod_str: Str, written: Str) -> boolean {
+        const ml: i64 = mod_str.length();
+        const pl: i64 = written.length();
         if (pl == 0 || pl > ml) { return false; }
         // Only one alignment can be a suffix, so this is a single check rather
         // than a scan.
         const i: i64 = ml - pl;
-        if (!mod_str.ends_with(written)) { return false; }
-        return i == 0 || (i >= 2 && mod_str[i - 1] == ':' && mod_str[i - 2] == ':');
+        if (!mod_str.ends_with(&written)) { return false; }
+        return i == 0 || (i >= 2 && mod_str.byte_substring(i - 2, i) == Str::from("::"));
     }
 
     /// The positions, in the graph's order, of the modules whose namespace
     /// ends in the same segment as `first` or as `second` ("" asks for
     /// none): every module either can name (`ns_written_as`), and others.
-    modules_ending_in(&this, first: string, second: string) -> [u32] {
+    modules_ending_in(&this, first: Str, second: Str) -> [u32] {
         mut out: [u32] = [];
-        const first_leaf: string = QualifiedName::leaf_of(first);
-        const second_leaf: string = QualifiedName::leaf_of(second);
+        const first_leaf: Str = QualifiedName::leaf_of(first);
+        const second_leaf: Str = QualifiedName::leaf_of(second);
         mut a: [u32]* = null;
         mut a_length: i64 = 0;
         match (this.leaf_index.get_reference(&first_leaf)) {
@@ -951,7 +952,7 @@ private:
         }
         mut b: [u32]* = null;
         mut b_length: i64 = 0;
-        if (second_leaf.length() > 0 && !second_leaf.eq(first_leaf)) {
+        if (second_leaf.length() > 0 && second_leaf != first_leaf) {
             match (this.leaf_index.get_reference(&second_leaf)) {
                 Option::Some(positions) => { b = positions; b_length = (*positions).length(); }
                 Option::None => { }
