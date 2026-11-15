@@ -44,6 +44,7 @@ import utils;
 import utils::log::{ Log, LogArea, LogLevel };
 import std::fmt;
 import std::fmt::float;
+import std::ffi::libc;
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import std::fs::path::{ Path };
@@ -144,6 +145,127 @@ private type struct CInteger {
             is_unsigned: type_suffix.find_byte('u' as u8).is_some()
                       || type_suffix.find_byte('U' as u8).is_some(),
         };
+    }
+}
+
+/// A C floating constant, read as C lexes one: decimal, or hexadecimal with
+/// a binary exponent (`0x1.8p1`), followed by at most one type suffix.
+private type struct CFloat {
+    value: f64;
+    /// The constant as a Cryo float literal.  A decimal spelling is kept as
+    /// written, less its suffix; a hexadecimal one is written out from its
+    /// value, because a Cryo float literal is decimal.
+    text:  string;
+
+    /// Read `spelling`.  `None` when it is not a floating constant C accepts
+    /// or its value is not finite: a constant that cannot be read is never
+    /// bound, since any value given it would be made up.
+    static parse(spelling: string) -> Option<CFloat> {
+        const digits: string = Importer::strip_float_suffix(spelling);
+        const bytes: &Slice<u8> = Str::new(digits).as_bytes();
+        const hexadecimal: boolean = bytes.length() > 2 && bytes[0] == '0' as u8
+                                  && bytes[1].to_ascii_lowercase() == 'x' as u8;
+        const read: Option<f64> = if (hexadecimal) {
+            CFloat::hexadecimal_value(bytes.subslice(2, bytes.length()))
+        } else {
+            CFloat::decimal_value(digits)
+        };
+        const value: f64 = match (read) {
+            Option::Some(v) => { v }
+            Option::None    => { return Option::None; }
+        };
+        if (!value.is_finite()) { return Option::None; }
+        const text: string = if (hexadecimal) { CFloat::literal_text(value) } else { digits };
+        return Option::Some(CFloat { value: value, text: text });
+    }
+
+    /// The value of a decimal constant: digits with at most one `.`, at
+    /// least one digit, then an optional `e` exponent with its own digits.
+    /// The whole spelling is checked first, because the reader stops at the
+    /// first byte it cannot use and would answer for a prefix.
+    static decimal_value(digits: string) -> Option<f64> {
+        const bytes: &Slice<u8> = Str::new(digits).as_bytes();
+        const whole: i64 = CFloat::decimal_digits(bytes, 0);
+        mut at: i64 = whole;
+        mut fraction: i64 = 0;
+        if (at < bytes.length() && bytes[at] == '.' as u8) {
+            fraction = CFloat::decimal_digits(bytes, at + 1);
+            at = at + 1 + fraction;
+        }
+        if (whole + fraction == 0) { return Option::None; }
+        if (at < bytes.length() && bytes[at].to_ascii_lowercase() == 'e' as u8) {
+            at = at + 1;
+            if (at < bytes.length() && (bytes[at] == '+' as u8 || bytes[at] == '-' as u8)) { at = at + 1; }
+            const exponent: i64 = CFloat::decimal_digits(bytes, at);
+            if (exponent == 0) { return Option::None; }
+            at = at + exponent;
+        }
+        if (at != bytes.length()) { return Option::None; }
+        return float::parse_f64(digits);
+    }
+
+    /// How many decimal digits run from `at` in `bytes`.
+    static decimal_digits(bytes: &Slice<u8>, at: i64) -> i64 {
+        mut end: i64 = at;
+        while (end < bytes.length() && bytes[end] >= '0' as u8 && bytes[end] <= '9' as u8) { end = end + 1; }
+        return end - at;
+    }
+
+    /// The value of a hexadecimal constant, `body` being what follows its
+    /// `0x`: hex digits with at most one `.`, then the binary exponent C
+    /// requires (`p`, a sign, decimal digits).  The digits are read exactly
+    /// into an integer and scaled by a power of two; more significant digits
+    /// than that integer holds are refused rather than rounded twice.
+    static hexadecimal_value(body: &Slice<u8>) -> Option<f64> {
+        mut mantissa: u64 = 0;
+        mut digits: i64 = 0;
+        mut scale: i64 = 0;
+        match (u64::parse_radix_prefix(body, 16)) {
+            Option::Some(read) => { mantissa = read.0; digits = read.1; }
+            Option::None => { }
+        }
+        mut at: i64 = digits;
+        if (at < body.length() && body[at] == '.' as u8) {
+            at = at + 1;
+            match (u64::parse_radix_prefix(body.subslice(at, body.length()), 16)) {
+                Option::Some(read) => {
+                    if (digits + read.1 >= u64::MAX_HEX_DIGITS) { return Option::None; }
+                    mantissa = (mantissa << ((4 * read.1) as u64)) | read.0;
+                    scale = -4 * read.1;
+                    digits = digits + read.1;
+                    at = at + read.1;
+                }
+                Option::None => { }
+            }
+        }
+        if (digits == 0 || at >= body.length() || body[at].to_ascii_lowercase() != 'p' as u8) {
+            return Option::None;
+        }
+        at = at + 1;
+        mut negative: boolean = false;
+        if (at < body.length() && (body[at] == '+' as u8 || body[at] == '-' as u8)) {
+            negative = body[at] == '-' as u8;
+            at = at + 1;
+        }
+        const exponent_digits: i64 = CFloat::decimal_digits(body, at);
+        if (exponent_digits == 0 || at + exponent_digits != body.length()) { return Option::None; }
+        // Past this bound every finite mantissa scales to zero or to an
+        // infinity, so a longer exponent changes nothing.
+        const bound: i64 = 100000;
+        mut exponent: i64 = 0;
+        for (mut i: i64 = at; i < body.length(); i++) {
+            if (exponent < bound) { exponent = exponent * 10 + ((body[i] - ('0' as u8)) as i64); }
+        }
+        if (negative) { exponent = 0 - exponent; }
+        return Option::Some(libc::ldexp(mantissa as f64, (exponent + scale) as i32));
+    }
+
+    /// `value` written as a Cryo float literal, at full double precision and
+    /// with a decimal point or exponent, so it does not read as an integer.
+    static literal_text(value: f64) -> string {
+        mut text: string = fmt::format("%.17g", value).into_raw();
+        if (!Importer::has_float_marker(text)) { text = text + ".0"; }
+        return text;
     }
 }
 
@@ -1526,15 +1648,17 @@ type struct Importer {
         }
 
         if (kind == CLiteralKind::Float) {
-            // Strip a trailing C float suffix (`f`/`F`/`l`/`L`, e.g. raylib's
-            // `#define PI 3.14...f`): codegen's sscanf("%lf") tolerates it, but a
-            // Cryo float literal carries no suffix, so a serialized binding would
-            // fail to re-parse without this.
-            const ftext: string = if (neg) { "-" + Importer::strip_float_suffix(spell) }
-                                  else      { Importer::strip_float_suffix(spell) };
-            mut flit: mut ExpressionNode* = ExpressionNode::literal(ftext, LiteralKind::Float, SourceSpan::none());
-            this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
-            this.record_macro_const(name_sym, "f64", ftext, true);
+            match (CFloat::parse(spell)) {
+                Option::Some(constant) => {
+                    const ftext: string = if (neg) { "-" + constant.text } else { constant.text };
+                    mut flit: mut ExpressionNode* = ExpressionNode::literal(ftext, LiteralKind::Float, SourceSpan::none());
+                    this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
+                    this.record_macro_const(name_sym, "f64", ftext, true);
+                }
+                Option::None => {
+                    this.report.skip(fmt::format("macro '%s' (unreadable floating constant %s)", name_str, spell));
+                }
+            }
             clang::clang_disposeTokens(this.tu, toks, ntok);
             return;
         }
@@ -1808,8 +1932,7 @@ type struct Importer {
             this.emit_alias_const(name_sym, this.types.prim(type_name), ilit);
             this.record_macro_const(name_sym, type_name, itext, false);
         } else if (kind == clang::EVAL_FLOAT) {
-            mut ftext: string = fmt::format("%.17g", clang::clang_EvalResult_getAsDouble(ev)).into_raw();
-            if (!Importer::has_float_marker(ftext)) { ftext = ftext + ".0"; }
+            const ftext: string = CFloat::literal_text(clang::clang_EvalResult_getAsDouble(ev));
             mut flit: mut ExpressionNode* =
                 ExpressionNode::literal(ftext, LiteralKind::Float, SourceSpan::none());
             this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
@@ -2033,7 +2156,13 @@ type struct Importer {
             mut text: string = raw;
             const kind: CLiteralKind = CLiteralKind::of(Str::new(raw));
             if (kind == CLiteralKind::Text) { return false; } // not a numeric color value
-            if (kind == CLiteralKind::Float) { lk = LiteralKind::Float; text = Importer::strip_float_suffix(raw); }
+            if (kind == CLiteralKind::Float) {
+                lk = LiteralKind::Float;
+                text = match (CFloat::parse(raw)) {
+                    Option::Some(constant) => { constant.text }
+                    Option::None => { return false; }
+                };
+            }
             mut vlit: mut ExpressionNode* = ExpressionNode::literal(text, lk, SourceSpan::none());
             slit.add_field_init(FieldInit {
                 field_name: DeclarationNode::field_of(struct_node.fields[i]).name,
@@ -2141,10 +2270,7 @@ type struct Importer {
             else { return false; }
             p = p + 2;
         }
-        // Full double precision, ensuring a Cryo float literal (a decimal point
-        // or exponent) so it doesn't re-lex as an integer.
-        mut text: string = fmt::format("%.17g", acc).into_raw();
-        if (!Importer::has_float_marker(text)) { text = text + ".0"; }
+        const text: string = CFloat::literal_text(acc);
         mut flit: mut ExpressionNode* = ExpressionNode::literal(text, LiteralKind::Float, SourceSpan::none());
         this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
         this.record_macro_const(name_sym, "f64", text, true);
@@ -2180,22 +2306,32 @@ type struct Importer {
     }
 
     /// Resolve a single arithmetic operand token to an f64: a numeric literal
-    /// (any C float/int suffix stripped) or a bound macro const referenced by
-    /// name.  Returns false for anything else.
+    /// or a bound macro const referenced by name.  Returns false for anything
+    /// else, and for a literal or const whose value cannot be read.
     arith_operand(&this, tok: CXToken, out: mut f64*) -> boolean {
         const k: i32 = clang::clang_getTokenKind(tok);
         const sp: string = tok.spelling(this.tu, this.ctx);
         if (k == clang::TOKEN_LITERAL) {
-            if (CLiteralKind::of(Str::new(sp)) == CLiteralKind::Text) { return false; }
-            *out = float::parse_f64(Importer::strip_float_suffix(sp)).unwrap_or(0.0);
-            return true;
+            const kind: CLiteralKind = CLiteralKind::of(Str::new(sp));
+            if (kind == CLiteralKind::Text) { return false; }
+            if (kind == CLiteralKind::Integer) {
+                *out = CInteger::parse(Str::new(sp)).magnitude as f64;
+                return true;
+            }
+            match (CFloat::parse(sp)) {
+                Option::Some(constant) => { *out = constant.value; return true; }
+                Option::None => { return false; }
+            }
         }
         if (k == clang::TOKEN_IDENTIFIER) {
             const tsym: SymbolStr = this.ctx.intern_table.intern(sp);
             for (mut i: i64 = 0; i < this.mac_names.length(); i++) {
                 if (!this.mac_names[i].equals(tsym)) { continue; }
-                *out = float::parse_f64(Importer::strip_float_suffix(this.mac_texts[i])).unwrap_or(0.0);
-                return true;
+                // A bound const's text is a literal this importer wrote.
+                match (float::parse_f64(this.mac_texts[i])) {
+                    Option::Some(value) => { *out = value; return true; }
+                    Option::None => { return false; }
+                }
             }
         }
         return false;

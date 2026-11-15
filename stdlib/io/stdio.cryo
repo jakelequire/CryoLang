@@ -421,7 +421,7 @@ public type struct Stdin {
     /// the lock on `drop`. See the module doc for the ownership rules.
     public lock(&this) -> StdinLock {
         stream_lock(&g_stdin_lock[0]);
-        return StdinLock { };
+        return StdinLock { slot: &g_stdin_lock[0] };
     }
 
     /// Read one line of input and return it as an owned `String`
@@ -510,7 +510,7 @@ public type struct Stdout {
     /// the lock on `drop`. See the module doc for the ownership rules.
     public lock(&this) -> StdoutLock {
         stream_lock(&g_stdout_lock[0]);
-        return StdoutLock { };
+        return StdoutLock { slot: &g_stdout_lock[0] };
     }
 }
 
@@ -554,7 +554,7 @@ public type struct Stderr {
     /// the lock on `drop`. See the module doc for the ownership rules.
     public lock(&this) -> StderrLock {
         stream_lock(&g_stderr_lock[0]);
-        return StderrLock { };
+        return StderrLock { slot: &g_stderr_lock[0] };
     }
 }
 
@@ -576,16 +576,20 @@ implement trait Write for struct Stderr {
 
 // Stream lock guards
 //
-// Each guard is a zero-field RAII token: it owns the process-global
-// lock for one stream and releases it on `drop`. Because it carries a
-// `Drop` impl it is move-only (never `Copy`), so the lock is released
-// exactly once. Do not move a guard to another thread: a POSIX mutex
-// must be unlocked by the thread that locked it.
+// Each guard is an RAII token: it owns the process-global lock for one
+// stream and releases it on `drop`. Its one field, the lock it holds, is
+// private, so only the stream's `lock()` makes a guard - one built anywhere
+// else would release a lock nobody took. Because it carries a `Drop` impl
+// it is move-only (never `Copy`), so the lock is released exactly once. Do
+// not move a guard to another thread: a POSIX mutex must be unlocked by
+// the thread that locked it.
 
 /// RAII guard over the stdin lock; reads through fd 0. Get one from
 /// `stdin().lock()`. Inherits the `Read` trait defaults (`read_line`,
 /// `read_to_string`, ...).
-public type struct StdinLock { }
+public type struct StdinLock {
+    private slot: mut u8*;
+}
 
 implement trait Read for struct StdinLock {
     read(mut &this, buffer: mut u8*, length: i64) -> Result<i64, IoError> {
@@ -595,14 +599,16 @@ implement trait Read for struct StdinLock {
 
 implement trait Drop for struct StdinLock {
     drop(mut &this) -> void {
-        stream_unlock(&g_stdin_lock[0]);
+        stream_unlock(this.slot);
     }
 }
 
 /// RAII guard over the stdout lock; writes through fd 1. Get one from
 /// `stdout().lock()`. Inherits the `Write` trait default `write` (generic
 /// over the payload).
-public type struct StdoutLock { }
+public type struct StdoutLock {
+    private slot: mut u8*;
+}
 
 implement trait Write for struct StdoutLock {
     write_some(mut &this, bytes: &Slice<u8>) -> Result<i64, IoError> {
@@ -616,13 +622,15 @@ implement trait Write for struct StdoutLock {
 
 implement trait Drop for struct StdoutLock {
     drop(mut &this) -> void {
-        stream_unlock(&g_stdout_lock[0]);
+        stream_unlock(this.slot);
     }
 }
 
 /// RAII guard over the stderr lock; writes through fd 2. Get one from
 /// `stderr().lock()`.
-public type struct StderrLock { }
+public type struct StderrLock {
+    private slot: mut u8*;
+}
 
 implement trait Write for struct StderrLock {
     write_some(mut &this, bytes: &Slice<u8>) -> Result<i64, IoError> {
@@ -636,6 +644,6 @@ implement trait Write for struct StderrLock {
 
 implement trait Drop for struct StderrLock {
     drop(mut &this) -> void {
-        stream_unlock(&g_stderr_lock[0]);
+        stream_unlock(this.slot);
     }
 }
