@@ -251,6 +251,21 @@ type struct MoveChecker {
     pm_field:   [u32];
     pm_site:    [SourceSpan];
 
+    /// The bindings of the function being walked that were declared without
+    /// a value, and where.  Each enters the moved-set at its declaration, so
+    /// the joins that answer "moved on some path" answer "not initialised on
+    /// some path" for it, and a use that finds the declaration's own entry
+    /// there is a use before initialisation (E0219).
+    uninitialised_keys:  [u64];
+    uninitialised_spans: [SourceSpan];
+    /// The direct members - fields and constant-index slots - assigned
+    /// unconditionally to a binding declared without a value, as parallel
+    /// arrays: the binding, and the member as `kind << 32 | key` of its
+    /// `ExpressionNode::place_chain`.  Once every member has been, the
+    /// binding holds a whole value.
+    assigned_member_keys: [u64];
+    assigned_members:     [u64];
+
     /// Depth of enclosing `unsafe` blocks.
     ///
     /// `unsafe` does NOT turn the pass off - a use-after-move is a
@@ -377,6 +392,10 @@ type struct MoveChecker {
             pm_binding:         [],
             pm_field:           [],
             pm_site:            [],
+            uninitialised_keys:  [],
+            uninitialised_spans: [],
+            assigned_member_keys: [],
+            assigned_members:     [],
             branch_depth:       0,
             loop_repeat:        false,
             unsafe_depth:        0,
@@ -425,6 +444,10 @@ type struct MoveChecker {
         this.pm_binding         = [];
         this.pm_field           = [];
         this.pm_site            = [];
+        this.uninitialised_keys  = [];
+        this.uninitialised_spans = [];
+        this.assigned_member_keys = [];
+        this.assigned_members     = [];
         this.branch_depth       = 0;
         this.loop_repeat        = false;
         this.unsafe_depth       = 0;
@@ -1596,6 +1619,98 @@ type struct MoveChecker {
         if (!vd.is_global) {
             this.register_binding(vd.sym_id, vd.resolved_type, vd.name, d.span);
         }
+        if (vd.initializer == null && !vd.is_global && vd.sym_id.is_valid()
+            && !this.is_copy(vd.resolved_type)) {
+            this.mark_moved(vd.sym_id, d.span, false);
+            this.uninitialised_keys.push(vd.sym_id.key());
+            this.uninitialised_spans.push(d.span);
+        }
+    }
+
+    /// Where `sym` was declared without a value, when the moved-set still
+    /// holds that declaration's own entry for it - it has not been given a
+    /// value on every path to here.  None otherwise.
+    uninitialised_at(&this, sym: SymbolID) -> SourceSpan {
+        if (!sym.is_valid() || !this.is_moved(sym)) { return SourceSpan::none(); }
+        const moved_span: SourceSpan = this.moved_at_span(sym);
+        for (mut i: i64 = 0; i < this.uninitialised_keys.length(); i++) {
+            if (this.uninitialised_keys[i] == sym.key()
+                && this.uninitialised_spans[i].same_as(&moved_span)) {
+                return this.uninitialised_spans[i];
+            }
+        }
+        return SourceSpan::none();
+    }
+
+    /// E0219: `name`, declared without a value at `declared`, is used at
+    /// `span` - borrowed by a reference when `by_reference` - on a path that
+    /// has not given it one.
+    emit_uninitialised_use(mut &this, name: SymbolStr, span: SourceSpan,
+                           declared: SourceSpan, by_reference: boolean) -> void {
+        const spelled: string = this.intern.resolve(name);
+        const what: string = if (by_reference) { "reference to" } else { "use of" };
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0219_UNINITIALIZED_VAR,
+            fmt::format("%s `%s`, which is not initialised on every path here", what, spelled));
+        diag = diag.at_with_label(span, if (by_reference) { "borrowed here" } else { "used here" });
+        diag = diag.also_at(declared, "declared here without a value");
+        diag = diag.help(if (by_reference) {
+            "a reference always names a value; give the variable one on every path first, or pass a raw pointer (`T*`) to a function that fills it"
+        } else {
+            "give the variable a value on every path before this use"
+        });
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
+    /// True when `place` is a member of a binding that has not been given a
+    /// value on every path - a chain of fields and constant indices over it
+    /// (`p.a`, `xs[0]`, `xs[0].n`).  Storing to it reads nothing of the
+    /// binding.
+    fills_unset_member(&this, place: ExpressionNode*) -> boolean {
+        mut kind: [u8]  = [];
+        mut key:  [u32] = [];
+        const root: SymbolID = ExpressionNode::place_chain(place, &kind, &key);
+        return kind.length() > 0 && this.uninitialised_at(root).has_location();
+    }
+
+    /// After `place = value` where `fills_unset_member(place)`: a direct
+    /// member (`p.a`, `xs[0]`) written unconditionally is recorded, and once
+    /// every field of the binding's struct, or every slot of its array, has
+    /// been, the binding holds a whole value.
+    initialise_member(mut &this, place: ExpressionNode*) -> void {
+        if (this.branch_depth != 0) { return; }
+        mut kind: [u8]  = [];
+        mut key:  [u32] = [];
+        const root: SymbolID = ExpressionNode::place_chain(place, &kind, &key);
+        if (kind.length() != 1) { return; }
+        const member: u64 = ((kind[0] as u64) << 32) | (key[0] as u64);
+        mut assigned: i64 = 0;
+        mut recorded: boolean = false;
+        for (mut i: i64 = 0; i < this.assigned_member_keys.length(); i++) {
+            if (this.assigned_member_keys[i] != root.key()) { continue; }
+            assigned += 1;
+            if (this.assigned_members[i] == member) { recorded = true; }
+        }
+        if (!recorded) {
+            this.assigned_member_keys.push(root.key());
+            this.assigned_members.push(member);
+            assigned += 1;
+        }
+        if (assigned == this.member_count_of(this.lookup_type(root))) {
+            this.unmark_moved(root);
+        }
+    }
+
+    /// How many members a value of `ty` is made of for `initialise_member`:
+    /// a struct's fields or a fixed array's slots; -1 for any other type,
+    /// which only a whole assignment gives a value.
+    member_count_of(&this, ty: TypeRef) -> i64 {
+        const aggregate: Type* = this.aggregate_type_of(ty);
+        if (aggregate != null) { return aggregate.as_struct().fields.length(); }
+        const t: Type* = if (ty.is_valid()) { this.arena.lookup(ty) } else { null as Type* };
+        if (t != null && t.kind == TypeKind::Array) { return t.as_array().size; }
+        return -1;
     }
 
     /// A destructure consumes its right-hand side whole (sema refuses one
@@ -2008,8 +2123,12 @@ type struct MoveChecker {
             }
             // Field / index LHS: read the LHS place (its address is computed)
             // and move the RHS into it (same real=false rationale as above).
-            if (b.left  != null) { this.walk_expr_read(b.left); }
+            // A member of a binding declared without a value is written, not
+            // read (`initialise_member`).
+            const fills_member: boolean = this.fills_unset_member(b.left);
+            if (b.left != null && !fills_member) { this.walk_expr_read(b.left); }
             if (b.right != null) { this.walk_expr_move(b.right, false); }
+            if (fills_member) { this.initialise_member(b.left); }
             this.reinitialise_moved_field(b.left);
             return;
         }
@@ -2033,6 +2152,22 @@ type struct MoveChecker {
 
     read_unary(mut &this, u: UnaryExpr*) -> void {
         if (u == null) { return; }
+        if (u.op.kind == TokenType::Amp && u.desugared_call == null && u.operand != null) {
+            const id: IdentifierExpr* = ExpressionNode::identifier_of(u.operand);
+            const sym: SymbolID = if (id != null) { id.res.local_sym() } else { SymbolID::invalid() };
+            const declared: SourceSpan = this.uninitialised_at(sym);
+            if (declared.has_location()) {
+                // A pointer to storage that holds nothing yet is how a
+                // function is handed a place to fill; the binding is taken
+                // to hold a value from here, as drop insertion takes it.
+                if (u.borrowed_as_pointer) {
+                    this.unmark_moved(sym);
+                } else if (!this.suppress_emit) {
+                    this.emit_uninitialised_use(id.name, u.operand.span, declared, true);
+                }
+                return;
+            }
+        }
         if (u.operand != null) { this.walk_expr_read(u.operand); }
         return;
     }
@@ -2844,6 +2979,11 @@ type struct MoveChecker {
             // it (borrow-then-move), even when emission is suppressed.
             if (in_move_context && real) { this.mark_moved(sym, e.span, true); }
             if (this.suppress_emit) { return; }
+            const declared: SourceSpan = this.uninitialised_at(sym);
+            if (declared.has_location()) {
+                this.emit_uninitialised_use(name, e.span, declared, false);
+                return;
+            }
             if (this.is_carried(sym)) {
                 // Moved on a previous iteration of the enclosing loop.
                 this.emit_loop_carried(name, e.span);

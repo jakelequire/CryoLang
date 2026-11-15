@@ -1014,6 +1014,18 @@ mut it         = arr.iter();   // inferred: the concrete iterator type
 mut y: int;                     // declared without an initialiser; assigned later
 ```
 
+**A value before every use.** A local whose type is not `Copy` and that is declared without an initialiser holds nothing until it is given a value: by an assignment to the whole local, or by an assignment to each of its fields - each slot, for a fixed-size array - outside any branch or loop. Storing to a member is not a use. Until every path to a use has given it one, the use is refused (`E0219`) - reading it, calling a method on it, and borrowing it with `&` alike, since a reference always names a value and a store through one releases what it displaces. The one exception is `&x` taken where a raw pointer (`T*`) is wanted: a pointer may address storage that holds nothing yet, which is how a function is handed a place to fill, and the local is taken to hold a value from there on. A `Copy` local holds no resource for an unset value to corrupt, and is not checked.
+
+```cryo
+mut owned: Buffer;
+if (ready) { owned = Buffer::new(); }
+use(&owned);                    // E0219: not given a value when `ready` is false
+
+mut filled: Buffer;
+fill_into(&filled);             // fill_into(place: mut Buffer*): allowed
+use(&filled);
+```
+
 **One name per scope; `_` is no name.** Declaring a local whose name the same block already declares is a redeclaration (`E0205`); a nested block may shadow it. A local named `_` declares no name: it holds its value to the end of its block and is released there like any other local, but no expression can read it (`E0201`), so a block may declare any number of them.
 
 ```cryo
