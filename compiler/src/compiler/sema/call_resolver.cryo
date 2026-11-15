@@ -6095,26 +6095,8 @@ type struct CallResolver {
             return TypeRef::invalid();
         }
 
-        mut lookup_ref: TypeRef = obj_type;
-        mut base_t: Type* = this.arena.lookup(obj_type);
-        mut unwrap_depth: i32 = 0;
-        while (base_t != null && unwrap_depth < 5) {
-            if (base_t.kind == TypeKind::Pointer) {
-                lookup_ref = base_t.as_pointer().pointee;
-                base_t = this.arena.lookup(lookup_ref);
-            } else if (base_t.kind == TypeKind::Reference) {
-                lookup_ref = base_t.as_reference().referent;
-                base_t = this.arena.lookup(lookup_ref);
-            } else if (base_t.kind == TypeKind::InstantiatedType) {
-                const inst: InstantiatedType* = base_t.as_instantiated();
-                if (!inst.has_resolved_type()) { break; }
-                lookup_ref = inst.resolved_type;
-                base_t = this.arena.lookup(lookup_ref);
-            } else {
-                break;
-            }
-            unwrap_depth += 1;
-        }
+        const lookup_ref: TypeRef = this.method_lookup_type(obj_type);
+        const base_t: Type* = this.arena.lookup(lookup_ref);
 
         const type_sym: SymbolStr = this.types.lookup_type_sym(lookup_ref);
         if (!type_sym.is_valid()) {
@@ -6139,51 +6121,12 @@ type struct CallResolver {
             return TypeRef::invalid();
         }
 
-        // A projection-bounded trait-default method (`min`/`max` with
-        // `where This::Item: Ord`) must NOT resolve on a concrete receiver whose
-        // Item does not satisfy the bound: skip the trait-default resolution so
-        // it falls through to a clean "no method" diagnostic (E0358) instead of
-        // resolving here and failing later at codegen (E0636). False for
-        // symbolic receivers / symbolic Item types (undecidable -> allow).
-        const proj_blocked: boolean =
-            this.binding.projection_default_unavailable(obj_type, member.member);
-        // The method the selection chose: the pin on a minted receiver, the
-        // template's method on an instantiation not yet minted.
-        const lookup_t: Type* = this.arena.lookup(lookup_ref);
-        const on_template: boolean = lookup_t != null && lookup_t.kind == TypeKind::InstantiatedType;
-        const named_decl: DeclarationNode* = selected.chosen;
-        const named: MethodDecl* = DeclarationNode::method_of(named_decl);
-        const ret: TypeRef = if (on_template) { selected.ret } else { if (named != null && named.func != null) {
-            DeclarationNode::fn_of(named.func).resolved_return_type
-        } else { TypeRef::invalid() } };
-        if (ret.is_valid() && !proj_blocked) {
-            const refined: TypeRef = if (TypeAnnotation::names_every_argument(&member.generic_args)) {
-                this.binding.resolve_method_return_with_explicit_args(obj_type, member, named_decl, ret)
-            } else {
-                this.types.subst_owner_params_from_receiver(obj_type, ret)
-            };
-            // When the return is still abstract, resolve it per-call (existing).
-            // Otherwise, if the call targets a generic method whose by-name lookup
-            // handed back a CONCRETE (post-mono) return, re-derive it from THIS
-            // call's args and prefer that ONLY when it is a primitive scalar - a
-            // sibling spec of a different instantiation can otherwise leak in (a
-            // `next_range<u64>` call seeing `next_range<i64>`'s `i64`). Compound
-            // returns keep `refined` (see `generic_canonical_return`).
-            mut final_ret: TypeRef = refined;
-            if (refined.is_valid() && this.types.contains_generic_param(refined)) {
-                final_ret = this.binding.resolve_generic_method_return(obj_type, member, call, selected.chosen, refined);
-            } else if (this.generic_canonical_return(call, refined)) {
-                // Only when the by-name lookup already returned a concrete SCALAR
-                // for a generic method (a possible sibling-spec leak). Gating the
-                // genret CALL on a scalar `refined` matters: re-deriving a compound
-                // return (iterator adapters) has arena side effects that break mono.
-                const grt: TypeRef =
-                    this.binding.resolve_generic_method_return(obj_type, member, call, selected.chosen, refined);
-                if (this.generic_canonical_return(call, grt)) { final_ret = grt; }
-            }
-            final_ret = this.binding.finalize_assoc_return(obj_type, member, final_ret);
-            member_e.set_resolved_type(final_ret);
-            return final_ret;
+        mut answered: boolean = false;
+        const method_ret: TypeRef = this.method_call_return(obj_type, lookup_ref, member, call,
+                                                            &selected, &answered);
+        if (answered) {
+            member_e.set_resolved_type(method_ret);
+            return method_ret;
         }
 
         const field_ret: TypeRef = this.resolve_field_call(lookup_ref, member_e, member);
@@ -6222,8 +6165,21 @@ type struct CallResolver {
                     &member.generic_args, DeclarationNode::fn_of(unbound_method), unbound_at);
                 return TypeRef::invalid();
             }
-            member_e.set_resolved_type(coerced);
-            return coerced;
+            // A field of the pointee's that holds a function, called: the
+            // coercion typed the call by the field.
+            if (member.resolved_member.is_some()) {
+                member_e.set_resolved_type(coerced);
+                return coerced;
+            }
+            // The pointee's method returns what it returns on the pointee,
+            // its owner's parameters bound by the pointee's arguments.
+            const pointee: TypeRef = member.object.resolved_type;
+            mut pointee_answered: boolean = false;
+            const typed: TypeRef = this.method_call_return(
+                pointee, this.method_lookup_type(pointee), member, call, &on_target, &pointee_answered);
+            if (!typed.is_valid()) { return TypeRef::invalid(); }
+            member_e.set_resolved_type(typed);
+            return typed;
         }
 
         // The selection binds only an argument list whose types are all
@@ -6331,6 +6287,88 @@ type struct CallResolver {
         }
         this.ctx.emit_diagnostic(diag);
         return TypeRef::invalid();
+    }
+
+    /// The type a method call's receiver `obj_type` names its methods on:
+    /// the type behind its pointers and references, an instantiation read as
+    /// the type it was minted as.
+    method_lookup_type(&this, obj_type: TypeRef) -> TypeRef {
+        mut lookup_ref: TypeRef = obj_type;
+        mut base_t: Type* = this.arena.lookup(obj_type);
+        mut unwrap_depth: i32 = 0;
+        while (base_t != null && unwrap_depth < 5) {
+            if (base_t.kind == TypeKind::Pointer) {
+                lookup_ref = base_t.as_pointer().pointee;
+            } else if (base_t.kind == TypeKind::Reference) {
+                lookup_ref = base_t.as_reference().referent;
+            } else if (base_t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = base_t.as_instantiated();
+                if (!inst.has_resolved_type()) { break; }
+                lookup_ref = inst.resolved_type;
+            } else {
+                break;
+            }
+            base_t = this.arena.lookup(lookup_ref);
+            unwrap_depth += 1;
+        }
+        return lookup_ref;
+    }
+
+    /// What a call of the method `selected` chose returns on the receiver
+    /// `obj_type` (`lookup_ref` being what `method_lookup_type` answers for
+    /// it): the method's declared return with the owner's parameters bound by
+    /// the receiver's arguments and its own by the call's.  `answered` is
+    /// false, and the type invalid, when the selection chose no method or a
+    /// projection bound keeps a trait default off this receiver.
+    method_call_return(mut &this, obj_type: TypeRef, lookup_ref: TypeRef,
+                       member: MemberAccessExpr*, call: CallExpr*,
+                       selected: &Selection, answered: mut boolean*) -> TypeRef {
+        *answered = false;
+        // A projection-bounded trait-default method (`min`/`max` with
+        // `where This::Item: Ord`) must NOT resolve on a concrete receiver whose
+        // Item does not satisfy the bound: skip the trait-default resolution so
+        // it falls through to a clean "no method" diagnostic (E0358) instead of
+        // resolving here and failing later at codegen (E0636). False for
+        // symbolic receivers / symbolic Item types (undecidable -> allow).
+        if (this.binding.projection_default_unavailable(obj_type, member.member)) {
+            return TypeRef::invalid();
+        }
+        // The method the selection chose: the pin on a minted receiver, the
+        // template's method on an instantiation not yet minted.
+        const lookup_t: Type* = this.arena.lookup(lookup_ref);
+        const on_template: boolean = lookup_t != null && lookup_t.kind == TypeKind::InstantiatedType;
+        const named_decl: DeclarationNode* = selected.chosen;
+        const named: MethodDecl* = DeclarationNode::method_of(named_decl);
+        const ret: TypeRef = if (on_template) { selected.ret } else { if (named != null && named.func != null) {
+            DeclarationNode::fn_of(named.func).resolved_return_type
+        } else { TypeRef::invalid() } };
+        if (!ret.is_valid()) { return TypeRef::invalid(); }
+        *answered = true;
+        const refined: TypeRef = if (TypeAnnotation::names_every_argument(&member.generic_args)) {
+            this.binding.resolve_method_return_with_explicit_args(obj_type, member, named_decl, ret)
+        } else {
+            this.types.subst_owner_params_from_receiver(obj_type, ret)
+        };
+        // When the return is still abstract, resolve it per-call.  Otherwise,
+        // if the call targets a generic method whose by-name lookup handed back
+        // a CONCRETE (post-mono) return, re-derive it from THIS call's args and
+        // prefer that ONLY when it is a primitive scalar - a sibling spec of a
+        // different instantiation can otherwise leak in (a `next_range<u64>`
+        // call seeing `next_range<i64>`'s `i64`). Compound returns keep
+        // `refined` (see `generic_canonical_return`).
+        mut final_ret: TypeRef = refined;
+        if (refined.is_valid() && this.types.contains_generic_param(refined)) {
+            final_ret = this.binding.resolve_generic_method_return(obj_type, member, call, selected.chosen, refined);
+        } else if (this.generic_canonical_return(call, refined)) {
+            // Only when the by-name lookup already returned a concrete SCALAR
+            // for a generic method (a possible sibling-spec leak). Gating the
+            // genret CALL on a scalar `refined` matters: re-deriving a compound
+            // return (iterator adapters) has arena side effects that break mono.
+            const grt: TypeRef =
+                this.binding.resolve_generic_method_return(obj_type, member, call, selected.chosen, refined);
+            if (this.generic_canonical_return(call, grt)) { final_ret = grt; }
+        }
+        return this.binding.finalize_assoc_return(obj_type, member, final_ret);
     }
 
     /// E0358 at a call through a value of a function `owner` declares
