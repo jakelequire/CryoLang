@@ -195,7 +195,7 @@ type struct ModuleEntry {
 /// `names`/`keys` arrays; `lookup` answers the stored key of a namespace, none
 /// when absent (a never-before-seen module always rebuilds).
 type struct ModuleKeyTable {
-    names:      [string];
+    names:      [String];
     keys:       [u128];
 
     static empty() -> ModuleKeyTable {
@@ -204,63 +204,44 @@ type struct ModuleKeyTable {
 
     lookup(&this, name: string) -> Option<u128> {
         for (mut i: i64 = 0; i < this.names.length(); i++) {
-            if (this.names[i].eq(name)) {
+            if (this.names[i].as_str().equals(&Str::new(name))) {
                 return Option::Some(this.keys[i]);
             }
         }
         return Option::None;
     }
 
-    /// Copy `len` bytes from `data+start` into a fresh NUL-terminated string.
-    static modkeys_slice(data: i8*, start: i64, len: i64) -> string {
-        mut s: String = String::from_str(Str::from_raw((data + start) as u8*, len));
-        return s.into_raw();
-    }
-
     /// Parse the `*.modkeys` sidecar into a `ModuleKeyTable`. A missing or
     /// unreadable file yields an empty table (every module then rebuilds, which
     /// is the safe default). Lines without a TAB separator, or whose key is not
-    /// a digest `Manifest::hex128` wrote, are skipped.
-    ///
-    /// Kept a free function (not a `ModuleKeyTable` static): a static method here
-    /// resolves through the leaf-name dispatcher, where `read`/`write` collide
-    /// with the same-arity `read`/`write` intrinsics and a reference-array static
-    /// fails codegen resolution outright (E0636). The distinctly-named free
-    /// function sidesteps both.
+    /// a digest `Manifest::hex128` wrote, are skipped; anything after a second
+    /// TAB is not part of the table.
     static read_module_keys(path: Path) -> ModuleKeyTable {
         mut t: ModuleKeyTable = ModuleKeyTable::empty();
         if (!path.exists()) { return t; }
-        mut content: string = "";
-        match (File::read_text(path)) {
-            Result::Ok(s)  => { content = s.into_raw(); }
+        const content: String = match (File::read_text(path)) {
+            Result::Ok(s)  => { s }
             Result::Err(_) => { return t; }
-        }
-        const data: i8* = content as i8*;
-        const n: i64 = content.length() as i64;
-        mut i: i64 = 0;
-        while (i < n) {
-            const name_start: i64 = i;
-            while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
-            mut name: string = "";
-            mut keyh: string = "";
-            if (i < n && data[i] == 9) {
-                name = ModuleKeyTable::modkeys_slice(data, name_start, i - name_start);
-                i = i + 1;                       // skip TAB
-                const key_start: i64 = i;
-                while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
-                keyh = ModuleKeyTable::modkeys_slice(data, key_start, i - key_start);
-            }
-            // Anything after the key is not part of the table.
-            while (i < n && data[i] != 10) { i = i + 1; }
-            if (i < n && data[i] == 10) { i = i + 1; }   // skip newline
-            if (name.length() > 0) {
-                match (Manifest::parse_hex128(Str::new(keyh))) {
-                    Option::Some(key) => {
-                        t.names.push(name);
-                        t.keys.push(key);
+        };
+        const newline: Str = Str::new("\n");
+        const tab: Str = Str::new("\t");
+        for (line in content.as_str().split(&newline)) {
+            match (line.split_once(&tab)) {
+                Option::Some(fields) => {
+                    if (fields.first.is_empty()) { continue; }
+                    const key_text: Str = match (fields.second.split_once(&tab)) {
+                        Option::Some(rest) => { rest.first }
+                        Option::None       => { fields.second }
+                    };
+                    match (Manifest::parse_hex128(key_text)) {
+                        Option::Some(key) => {
+                            t.names.push(String::from_str(fields.first));
+                            t.keys.push(key);
+                        }
+                        Option::None => { }
                     }
-                    Option::None => { }
                 }
+                Option::None => { }
             }
         }
         return t;
@@ -528,9 +509,9 @@ type struct Manifest {
         // modules: namespace + source + origin + object path + size.
         mut mods: Array<JsonValue> = Array::<JsonValue>::new();
         for (mut i: i64 = 0; i < modules.length(); i++) {
-            const obj: string = this.cfg.deps_dir_for(Str::new(modules[i].origin_subdir))
-                .join(f"{Manifest::path_module(modules[i].namespace_name)}.o".as_str()).into_raw();
-            const obj_size: i64 = Manifest::file_size_bytes(obj);
+            const obj: PathBuf = this.cfg.deps_dir_for(Str::new(modules[i].origin_subdir))
+                .join(f"{Manifest::path_module(modules[i].namespace_name)}.o".as_str());
+            const obj_size: i64 = Manifest::file_size_bytes(obj.as_path());
             mut m: JsonObject = JsonObject::new();
             m.put("namespace",   JsonValue::from(modules[i].namespace_name));
             m.put("source",      JsonValue::from(modules[i].source_path));
@@ -538,7 +519,7 @@ type struct Manifest {
             m.put("kind",        JsonValue::from(modules[i].origin_kind));
             m.put("opt_level",   JsonValue::unsigned_integer_value(this.opt_level as u64));
             m.put("debug_info",  JsonValue::boolean_value(this.debug_info));
-            m.put("object",      JsonValue::from(obj));
+            m.put("object",      JsonValue::from(obj.as_path().as_str()));
             m.put("object_size", JsonValue::integer_value(obj_size));
             mods.push(JsonValue::Object(m));
         }
@@ -619,16 +600,6 @@ type struct Manifest {
         }
     }
 
-    /// Path to the running compiler binary, or "" on failure. Delegates to
-    /// `std::env::current_executable` (which handles `/proc/self/exe` on Unix and
-    /// `GetModuleFileNameW` on Windows) instead of reimplementing readlink.
-    static self_exe_path() -> string {
-        match (env::current_executable()) {
-            Option::Some(s) => { return s.into_raw(); }
-            Option::None    => { return ""; }
-        }
-    }
-
     /// Digest of the running compiler's own bytes. Changes whenever the
     /// compiler changes, invalidating every cached build it produced.  It is
     /// the digest `cryo stamp` recorded when the stamp holds one for a binary
@@ -636,14 +607,14 @@ type struct Manifest {
     /// Taken once per process: the binary does not change while it runs.
     static compiler_fingerprint() -> u128 {
         if (g_compiler_fingerprint_taken) { return g_compiler_fingerprint; }
-        const exe: string = Manifest::self_exe_path();
+        const exe: String = env::current_executable().unwrap_or(String::new());
         if (exe.length() == 0) {
             mut h: ContentHasher = ContentHasher::new();
             h.fold("<unknown-compiler>");
             g_compiler_fingerprint = h.finish128();
         } else {
             mut size: i64 = -1;
-            match (Path::from(exe).metadata()) {
+            match (Path::from(exe.as_str()).metadata()) {
                 Result::Ok(m)  => { size = m.length(); }
                 Result::Err(_) => { }
             }
@@ -653,7 +624,7 @@ type struct Manifest {
                     Log::debug(LogArea::Driver, "compiler fingerprint read from the build stamp");
                 }
                 Option::None => {
-                    g_compiler_fingerprint = Manifest::binary_fingerprint(exe);
+                    g_compiler_fingerprint = Manifest::binary_fingerprint(Path::from(exe.as_str()));
                     Log::debug(LogArea::Driver, "compiler fingerprint computed from the binary: its stamp records none for its size");
                 }
             }
@@ -666,9 +637,9 @@ type struct Manifest {
     /// `cryo stamp` rewrites the stamp in place and it changes nothing the
     /// compiler emits, so a new stamp is not a new compiler.  This is what
     /// `cryo stamp` records and what a run of that binary is identified by.
-    static binary_fingerprint(path: string) -> u128 {
+    static binary_fingerprint(path: Path) -> u128 {
         mut h: ContentHasher = ContentHasher::new();
-        Manifest::fold_file_contents(&h, Path::from(path), true);
+        Manifest::fold_file_contents(&h, path, true);
         return h.finish128();
     }
 
@@ -688,19 +659,13 @@ type struct Manifest {
     /// Read a file's content with trailing whitespace/newlines stripped, or ""
     /// when the file is absent or unreadable.
     static read_file_trimmed(path: Path) -> string {
-        mut raw: string = "";
-        match (File::read_text(path)) {
-            Result::Ok(s)  => { raw = s.into_raw(); }
+        const raw: String = match (File::read_text(path)) {
+            Result::Ok(s)  => { s }
             Result::Err(_) => { return ""; }
-        }
-        mut len: i64 = raw.length() as i64;
-        while (len > 0 && (raw[len - 1] == 10 || raw[len - 1] == 13
-                           || raw[len - 1] == 32 || raw[len - 1] == 9)) {
-            len -= 1;
-        }
-        if (len <= 0) { return ""; }
-        mut s: String = String::from_str(Str::from_raw(raw as u8*, len));
-        return s.into_raw();
+        };
+        const trimmed: Str = raw.as_str().trim_end();
+        if (trimmed.is_empty()) { return ""; }
+        return String::from_str(trimmed).into_raw();
     }
 
 
@@ -719,9 +684,8 @@ type struct Manifest {
 
     /// File size in bytes via `fs::metadata`, without reading the contents.
     /// Returns -1 when the file can't be stat'd.
-    static file_size_bytes(path_text: string) -> i64 {
-        const path: string = path_text;
-        match (Path::from(path).metadata()) {
+    static file_size_bytes(path: Path) -> i64 {
+        match (path.metadata()) {
             Result::Ok(m)  => { return m.length(); }
             Result::Err(_) => { return -1 as i64; }
         }

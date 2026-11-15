@@ -382,8 +382,9 @@ from a compile-fail file instead, which is checked without the flag.
   its run reported (`ok (12 tests)`), and `make test-census` refuses a
   passing `collect` project that ran none. The output assertions below
   (`output_contains`, `stderr_contains`, `file`, ...) read that `cryo test`
-  run, so a project can assert what reaches its stdout; `exit_code` does
-  not apply - the run passes on exit 0, or with `fails` on any other.
+  run, so a project can assert what reaches its stdout. The run's exit is
+  judged as a `build` or `run` project's is: it must be `exit_code` (0 when
+  unwritten), or with `fails` any non-zero exit.
 
   ```json
   { "outcome": "collect" }
