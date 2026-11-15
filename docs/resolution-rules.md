@@ -4295,7 +4295,11 @@ check is being deleted and the seals are what hold.  (Jake)
 
 58. **Whole-module aliases work.** `import M as N;` binds `N` to the
     module's identity, and `N::f()`, `N::Type` and the rest resolve in that
-    module.
+    module.  The alias is the module's only name there: its own leaf binds
+    nothing, so `Json::twice` below is a module the file does not import
+    (E0240), and a second module whose leaf is `Json`, imported under its
+    own name, is the only one `Json` names.  Another import of the same
+    module that is not aliased binds the leaf again.  (Jake)
 
     ```cryo
     import Json as J;
