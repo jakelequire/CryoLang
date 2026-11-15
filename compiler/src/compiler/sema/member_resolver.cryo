@@ -721,7 +721,7 @@ type struct MemberResolver {
     /// slot.
     pin_field(mut &this, member: mut MemberAccessExpr*, fa: &FieldAnswer, acc_span: SourceSpan) -> void {
         if (fa.index >= 0) { member.set_resolved_member(MemberPin::Field(fa.index)); }
-        this.enforce_field_visibility(fa, member.member, acc_span);
+        this.enforce_field_visibility(fa, member.member, acc_span, false);
     }
 
     // -- Index access (`arr[i]` / `tup[0]`) --
@@ -1082,11 +1082,15 @@ type struct MemberResolver {
     /// may not be (`member_reachable`).  A field is declared where its type
     /// is.  `fa` is the answer the caller's lookup gave (`field_of`);
     /// `field_name` is the spelling, for the diagnostic alone.  Nothing here
-    /// finds the field again.
-    enforce_field_visibility(mut &this, fa: &FieldAnswer, field_name: SymbolStr, span: SourceSpan) -> void {
-        if (fa.owner == null) { return; }
+    /// finds the field again.  `left_out` says a struct literal reached the
+    /// field by leaving it out, which no edit at the literal can repair, so
+    /// the refusal says why instead.  Answers whether the field was
+    /// reachable.
+    enforce_field_visibility(mut &this, fa: &FieldAnswer, field_name: SymbolStr, span: SourceSpan,
+                             left_out: boolean) -> boolean {
+        if (fa.owner == null) { return true; }
         const decl: ModulePath = fa.declared_in;
-        if (this.member_reachable(fa.visibility, decl, span)) { return; }
+        if (this.member_reachable(fa.visibility, decl, span)) { return true; }
 
         const declaring_name: string = fa.owner.display_name();
         const field_str: string = this.intern.resolve(field_name);
@@ -1096,7 +1100,12 @@ type struct MemberResolver {
             fmt::format("field `%s` of `%s` is %s", field_str, declaring_name, word));
         d = d.at_with_label(span, fmt::format("%s field reached outside %s", word,
             this.outside_of(fa.visibility, decl)));
+        if (left_out) {
+            d = d.help(fmt::format("a literal sets every field, the ones it leaves out included, so `%s` is built this way only where `%s` is reachable",
+                declaring_name, field_str));
+        }
         this.ctx.emit_diagnostic(d);
+        return false;
     }
 
     /// Method-call counterpart to `enforce_field_visibility` (E0353), asked
