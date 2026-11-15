@@ -18,7 +18,7 @@ namespace std::collections::array;
 import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::result::{ Result };
-import std::core::slice::{ AsMutableSlice, AsSlice, Slice, SliceIndex, SliceIter, SliceRange };
+import std::core::slice::{ AsMutableSlice, AsSlice, Slice, SliceIndex, SliceIterator, SliceRange };
 import std::core::mem;
 import std::core::pointer::{ NonNull };
 import std::core::drop::{ Drop };
@@ -185,7 +185,7 @@ public type struct Array<T, A = GlobalAllocator> where A: Allocator {
     /// iterator is invalidated by any reallocating method on the array
     /// (`push`, `reserve`, `shrink_to_fit`).
     public iter(&this) -> implement Iterator<T> where T: Copy {
-        return SliceIter::<T> { ptr: this.ptr, remaining: this.length };
+        return SliceIterator::<T> { ptr: this.ptr, remaining: this.length };
     }
 
     /// Iterate by shared borrow, yielding `T*` for each element in
@@ -195,7 +195,7 @@ public type struct Array<T, A = GlobalAllocator> where A: Allocator {
     /// `insert`, `shrink_to_fit`). This is the way to walk an
     /// `Array<String>` / `Array<Box<...>>` without cloning.
     public iterate_references(&this) -> implement Iterator<T*> {
-        return RefIter::<T> { ptr: this.ptr, index: 0, length: this.length };
+        return ReferenceIterator::<T> { ptr: this.ptr, index: 0, length: this.length };
     }
 
     /// Add `value` after the last element, growing the storage when it is
@@ -978,22 +978,22 @@ where T: Hash, A: Allocator {
 /// `private`: this cursor is an implementation detail. Callers obtain it
 /// only as the opaque `implement Iterator<T*>` returned by `iterate_references`, and
 /// never name it.
-private type struct RefIter<T> {
+private type struct ReferenceIterator<T> {
     private ptr:    T*;
     private index:  i64;
     private length: i64;
 
     /// Adapt this by-reference iterator into a by-value one that yields
     /// each pointee `T` by bitwise copy: `arr.iterate_references().copied()`. Sound
-    /// only when `T: Copy` (that bound lives on `CopiedIter`'s `Iterator`
+    /// only when `T: Copy` (that bound lives on `CopiedIterator`'s `Iterator`
     /// impl). Defined here, on the pointer-yielding cursor, rather than as
     /// an `Iterator` default - `copied` is meaningful only for iterators
     /// whose element is a pointer, and Cryo has no `where Item == T*`
     /// bound to gate a trait method on that condition.
     public copied(this) -> implement Iterator<T> where T: Copy {
         // A struct literal, so return-type inference resolves the opaque
-        // return to the literal's `CopiedIter<RefIter<T>>` directly.
-        return CopiedIter::<RefIter<T>> { inner: this };
+        // return to the literal's `CopiedIterator<ReferenceIterator<T>>` directly.
+        return CopiedIterator::<ReferenceIterator<T>> { inner: this };
     }
 
     /// Like `copied`, but clones each pointee via `Clone` into an owned
@@ -1001,11 +1001,11 @@ private type struct RefIter<T> {
     /// value, which the `Copy`-gated `iter()` can't.
     public cloned(this) -> implement Iterator<T> where T: Clone {
         // A struct literal; see `copied`.
-        return ClonedIter::<RefIter<T>> { inner: this };
+        return ClonedIterator::<ReferenceIterator<T>> { inner: this };
     }
 }
 
-implement<T> trait Iterator<T*> for struct RefIter<T> {
+implement<T> trait Iterator<T*> for struct ReferenceIterator<T> {
     next(mut &this) -> Option<T*> {
         if (this.index >= this.length) {
             return Option::None;
@@ -1017,20 +1017,20 @@ implement<T> trait Iterator<T*> for struct RefIter<T> {
 }
 
 /// Adapter dereferencing each `T*` yielded by `inner` into a `T` by bitwise
-/// copy. Bridges the by-reference `RefIter` cursor to the by-value consumers,
+/// copy. Bridges the by-reference `ReferenceIterator` cursor to the by-value consumers,
 /// so an owning collection needs no separate by-value iterator struct. The
 /// element type `T` is recovered from the inner iterator via the
 /// `where I: Iterator<T*>` bound (the monomorphizer peels the `T*`), so it is
 /// not a struct parameter. Sound only when `T: Copy`.
 ///
 /// `private`: produced only as the opaque `implement Iterator<T>` returned by
-/// `RefIter::copied`; never named outside this module. Lives here, with the
-/// `RefIter` it bridges, rather than in `core::iter`.
-private type struct CopiedIter<I> {
+/// `ReferenceIterator::copied`; never named outside this module. Lives here, with the
+/// `ReferenceIterator` it bridges, rather than in `core::iter`.
+private type struct CopiedIterator<I> {
     private inner: I;
 }
 
-implement<I, T> trait Iterator<T> for struct CopiedIter<I>
+implement<I, T> trait Iterator<T> for struct CopiedIterator<I>
 where I: Iterator<T*>, T: Copy {
     next(mut &this) -> Option<T> {
         return match (this.inner.next()) {
@@ -1041,17 +1041,17 @@ where I: Iterator<T*>, T: Copy {
 }
 
 /// Adapter cloning each `T*` yielded by `inner` into an owned `T` via `Clone`.
-/// The owning-type counterpart of `CopiedIter`: this is what lets a `loop`/`for`
+/// The owning-type counterpart of `CopiedIterator`: this is what lets a `loop`/`for`
 /// over `strings.iterate_references()` walk an `Array<String>` by value (each element an
 /// independent clone) - something the `Copy`-gated `iter()` can't express.
 ///
-/// `private`: same rationale as `CopiedIter`; produced only as the opaque
-/// `implement Iterator<T>` returned by `RefIter::cloned`.
-private type struct ClonedIter<I> {
+/// `private`: same rationale as `CopiedIterator`; produced only as the opaque
+/// `implement Iterator<T>` returned by `ReferenceIterator::cloned`.
+private type struct ClonedIterator<I> {
     private inner: I;
 }
 
-implement<I, T> trait Iterator<T> for struct ClonedIter<I>
+implement<I, T> trait Iterator<T> for struct ClonedIterator<I>
 where I: Iterator<T*>, T: Clone {
     next(mut &this) -> Option<T> {
         return match (this.inner.next()) {

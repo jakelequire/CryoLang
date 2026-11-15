@@ -758,7 +758,7 @@ yet is recorded with the change that builds it, not here.
      internal, the setters `String` and `PathBuf` keep their views in
      step with their storage through; the
      UTF-8 decoding step `decode_scalar`, its `REPLACEMENT_SCALAR` and the
-     integer parser's `I64_MIN_MAGNITUDE` are private.  `SliceIter` is
+     integer parser's `I64_MIN_MAGNITUDE` are private.  `SliceIterator` is
      internal: `Slice` and `Array` both make one and no public signature
      names it.  `Path`'s syntax constants are private and its static
      queries (`is_separator`, `root_length`, `is_absolute_str`,
@@ -1144,7 +1144,7 @@ yet is recorded with the change that builds it, not here.
      private, while `hash_str` and `hash_integer` stay public.  The iterator
      adapters are private, with `KeysReferenceIterator` internal for the set built
      on it; `copied` and `cloned`, reached through `iterate_references`'s opaque
-     result, are public.  `HashMapIter` is not marked: the compiler names
+     result, are public.  `HashMapIterator` is not marked: the compiler names
      it.  JSON reads its arrays through `get_reference` and indexing, and the
      adapters' unused constructors are gone.  (Jake; each split
      delegated)
@@ -1211,10 +1211,10 @@ yet is recorded with the change that builds it, not here.
      are private behind its accessors, and `decode_wstatus` is private
      to POSIX.  (Jake; the variant's and the parameter's names delegated)
 
-641. **`HashMapIter` is internal.**  It is reached only through
+641. **`HashMapIterator` is internal.**  It is reached only through
      `HashMap::iter`'s opaque `implement Iterator<Pair<K, V>>`, like the
      other adapters, and stays internal rather than private because
-     `HashSetIter` holds one.  The compiler holds those iterators as
+     `HashSetIterator` holds one.  The compiler holds those iterators as
      `implement Iterator<Pair<K, V>>` locals.  (Jake)
 
 642. **The intrinsics and the primitives are marked.**  Every intrinsic is
@@ -1372,7 +1372,7 @@ yet is recorded with the change that builds it, not here.
      per target, to the first trait argument its where-clause found, and
      every call ran that copy.  A parameter a method names only in its
      return, or that no method names, keeps the binding the where-clause
-     derives (`A` in `Iterator<A> for TakeIter<I> where I: Iterator<A>`).
+     derives (`A` in `Iterator<A> for TakeIterator<I> where I: Iterator<A>`).
      The trait's declaration of the method writes none of these, so the
      method still conforms.  A generic enum's static method with type
      parameters of its own is resolved through its path as a struct's
@@ -4025,8 +4025,8 @@ check is being deleted and the seals are what hold.  (Jake)
 ### 2026-10-02
 
 80. **The internal check after monomorphization names the specialization's
-    owner by its short display name** (`SliceIter<u8>`), as in "internal:
-    call to `next` in `SliceIter<u8>::for_each` reached codegen with no
+    owner by its short display name** (`SliceIterator<u8>`), as in "internal:
+    call to `next` in `SliceIterator<u8>::for_each` reached codegen with no
     resolved method (written at iter.cryo:74)". The lane gate's ARENA_READ
     count rising by one for that rendering is accepted.
 
