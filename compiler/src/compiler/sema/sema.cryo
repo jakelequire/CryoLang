@@ -180,7 +180,10 @@ implement enum PlaceAccess {
 /// the operator is not overloadable; `negate` flags `!=`, which lowers to
 /// `!a.equals(&b)`. `ord_pred` (non-empty only for the relational operators
 /// `< > <= >=`) names an `Ordering` predicate: those lower to
-/// `a.compare(&b).<ord_pred>()` (e.g. `a < b` -> `a.compare(&b).is_lt()`).
+/// `a.compare(&b).<ord_pred>()` (e.g. `a < b` -> `a.compare(&b).is_less()`).
+/// `ord_pred_superseded` is the predicate's earlier name, called instead
+/// when the standard library's `Ordering` declares no method `ord_pred`, so
+/// one compiler builds a standard library spelled either way.
 /// `deref_wrap` flags the unary `*` -> `Deref`: the built `b.deref()` call
 /// returns `Target*`, so the desugar wraps it in an outer `*` (`*(b.deref())`),
 /// a place that serves read / write / compound uniformly.
@@ -190,26 +193,28 @@ type struct OperatorTraitMap {
     lang:       LangItem;
     method:     string;
     ord_pred:   string;
+    ord_pred_superseded: string;
     negate:     boolean;
     deref_wrap: boolean;
     valid:      boolean;
 
     static none() -> OperatorTraitMap {
-        return OperatorTraitMap { lang: LangItem::Add, method: "", ord_pred: "", negate: false, deref_wrap: false, valid: false };
+        return OperatorTraitMap { lang: LangItem::Add, method: "", ord_pred: "", ord_pred_superseded: "", negate: false, deref_wrap: false, valid: false };
     }
 
     static mk(t: LangItem, m: string, neg: boolean) -> OperatorTraitMap {
-        return OperatorTraitMap { lang: t, method: m, ord_pred: "", negate: neg, deref_wrap: false, valid: true };
+        return OperatorTraitMap { lang: t, method: m, ord_pred: "", ord_pred_superseded: "", negate: neg, deref_wrap: false, valid: true };
     }
 
-    /// A relational operator: `a OP b` -> `a.compare(&b).<pred>()` via `Ord`.
-    static mk_ord(pred: string) -> OperatorTraitMap {
-        return OperatorTraitMap { lang: LangItem::Ord, method: "compare", ord_pred: pred, negate: false, deref_wrap: false, valid: true };
+    /// A relational operator: `a OP b` -> `a.compare(&b).<pred>()` via `Ord`,
+    /// or `.<superseded>()` on an `Ordering` that declares no `pred`.
+    static mk_ord(pred: string, superseded: string) -> OperatorTraitMap {
+        return OperatorTraitMap { lang: LangItem::Ord, method: "compare", ord_pred: pred, ord_pred_superseded: superseded, negate: false, deref_wrap: false, valid: true };
     }
 
     /// Unary `*` -> `Deref::deref`: `*b` desugars to `*(b.deref())`.
     static mk_deref() -> OperatorTraitMap {
-        return OperatorTraitMap { lang: LangItem::Deref, method: "deref", ord_pred: "", negate: false, deref_wrap: true, valid: true };
+        return OperatorTraitMap { lang: LangItem::Deref, method: "deref", ord_pred: "", ord_pred_superseded: "", negate: false, deref_wrap: true, valid: true };
     }
 
     /// Binary `+ - * / %` (arithmetic), `== !=` (equality via `Eq`), and
@@ -223,10 +228,10 @@ type struct OperatorTraitMap {
         if (op == TokenType::Percent)  { return OperatorTraitMap::mk(LangItem::Rem, "rem", false); }
         if (op == TokenType::EqualEqual) { return OperatorTraitMap::mk(LangItem::Eq, "equals", false); }
         if (op == TokenType::ExclaimEqual) { return OperatorTraitMap::mk(LangItem::Eq, "equals", true); }
-        if (op == TokenType::LAngle)  { return OperatorTraitMap::mk_ord("is_lt"); }
-        if (op == TokenType::RAngle)  { return OperatorTraitMap::mk_ord("is_gt"); }
-        if (op == TokenType::LessEqual) { return OperatorTraitMap::mk_ord("is_le"); }
-        if (op == TokenType::GreaterEqual) { return OperatorTraitMap::mk_ord("is_ge"); }
+        if (op == TokenType::LAngle)  { return OperatorTraitMap::mk_ord("is_less", "is_lt"); }
+        if (op == TokenType::RAngle)  { return OperatorTraitMap::mk_ord("is_greater", "is_gt"); }
+        if (op == TokenType::LessEqual) { return OperatorTraitMap::mk_ord("is_less_or_equal", "is_le"); }
+        if (op == TokenType::GreaterEqual) { return OperatorTraitMap::mk_ord("is_greater_or_equal", "is_ge"); }
         if (op == TokenType::Amp)  { return OperatorTraitMap::mk(LangItem::BitAnd, "bitand", false); }
         if (op == TokenType::Pipe)  { return OperatorTraitMap::mk(LangItem::BitOr,  "bitor",  false); }
         if (op == TokenType::Caret)  { return OperatorTraitMap::mk(LangItem::BitXor, "bitxor", false); }
@@ -2729,9 +2734,14 @@ type struct SemaVisitor {
         mut desugared: mut ExpressionNode* =
             this.build_operator_call(receiver, method_sym, trait_id, rhs, op_tok, span);
         // Relational operators: wrap the `compare` call in an `Ordering`
-        // predicate - `a < b` -> `a.compare(&b).is_lt()`.
+        // predicate - `a < b` -> `a.compare(&b).is_less()`.
         if (map.ord_pred != "") {
-            const pred_sym: SymbolStr = this.intern.intern(map.ord_pred);
+            mut pred_sym: SymbolStr = this.intern.intern(map.ord_pred);
+            const ordering: DefId = this.ctx.generic_registry.wellknown(LangItem::Ordering);
+            if (ordering.is_valid()
+                    && this.ctx.decl_index.methods_named(FamilyOwner::Def(ordering), pred_sym).length() == 0) {
+                pred_sym = this.intern.intern(map.ord_pred_superseded);
+            }
             const pred_member: mut ExpressionNode* =
                 ExpressionNode::member_access_expr(desugared, pred_sym, span, span);
             desugared = ExpressionNode::call_expr(pred_member, span);

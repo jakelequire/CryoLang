@@ -290,6 +290,12 @@ public:
     /// discovery has finished (`ModuleGraph::set_visible_modules`); the
     /// relation a written module path is judged reachable by.
     visible:              [ModulePath];
+    /// The modules an import of this module names under an alias
+    /// (`import M as A;`), and those an import names under their own
+    /// name.  A module only aliased is named by its alias alone: its own
+    /// leaf names nothing here (`ModuleGraph::imports_only_under_alias`).
+    aliased_imports:      [ModulePath];
+    named_imports:        [ModulePath];
 
     // Source origin, classified by the orchestrator after discovery from the
     // module's `file_path` (under stdlib_root => Stdlib, under a dependency
@@ -325,6 +331,8 @@ public:
             written_submodule_at: [],
             written_reexports:    [],
             visible:              [],
+            aliased_imports:      [],
+            named_imports:        [],
             origin:             ModuleOrigin::Local,
             origin_name:        String::new(),
             def:                DefId::invalid(),
@@ -729,6 +737,36 @@ public:
         return false;
     }
 
+    /// Record that an import of `use_module` names `target`, under an alias
+    /// (`aliased`) or under its own name.
+    record_import_naming(mut &this, use_module: ModulePath, target: ModulePath, aliased: boolean) -> void {
+        const idx: i64 = this.find_module_index(use_module);
+        if (idx < 0) { return; }
+        const named: mut [ModulePath]* =
+            if (aliased) { &this.modules[idx].aliased_imports } else { &this.modules[idx].named_imports };
+        for (mut k: i64 = 0; k < (*named).length(); k++) {
+            if ((*named)[k].equals(target)) { return; }
+        }
+        (*named).push(target);
+    }
+
+    /// Whether every import of `use_module` that names `target` names it
+    /// under an alias: the alias is then its only name there, and its own
+    /// leaf does not name it.
+    imports_only_under_alias(&this, use_module: ModulePath, target: ModulePath) -> boolean {
+        const idx: i64 = this.find_module_index(use_module);
+        if (idx < 0) { return false; }
+        mut aliased: boolean = false;
+        for (mut k: i64 = 0; k < this.modules[idx].aliased_imports.length(); k++) {
+            if (this.modules[idx].aliased_imports[k].equals(target)) { aliased = true; }
+        }
+        if (!aliased) { return false; }
+        for (mut k: i64 = 0; k < this.modules[idx].named_imports.length(); k++) {
+            if (this.modules[idx].named_imports[k].equals(target)) { return false; }
+        }
+        return true;
+    }
+
     /// Which modules a path written in a body names, as the file of
     /// `use_module` can see them: asked of a whole scope segment, of a
     /// segment's prefix, and by the type layer to say why a qualified
@@ -808,7 +846,10 @@ private:
                 && !(rooted && (cand_str.length() != rooted_length
                                 || !cand_path.is_within(root, intern)));
             if (!names_head && !names_spelling) { continue; }
-            const imported: boolean = this.imports(use_module, cand_path);
+            // A module imported only under an alias is named by the alias,
+            // which the scope binds, and not by its own spelling.
+            const imported: boolean = this.imports(use_module, cand_path)
+                && !this.imports_only_under_alias(use_module, cand_path);
             if (names_head && imported) {
                 heads.push(cand_path);
                 head_lengths.push(cand_str.length());
