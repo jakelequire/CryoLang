@@ -193,7 +193,7 @@ private:
     // Built by scan_all_project_files() before discovery begins.
     // Key: namespace name (e.g., "compiler::ast::node")
     // Value: file path (e.g., "src/compiler/AST/node.cryo")
-    ns_map: HashMap<string, string, GlobalAllocator, FnvHasher>;
+    ns_map: HashMap<String, string, GlobalAllocator, FnvHasher>;
 
     // Normalized file path -> `vendor::<Name>`, for each binding a
     // `vendor::<Name>` import resolved to.  The generated file declares
@@ -266,7 +266,7 @@ public:
             loading: [],
             loaded_paths:  [],
             scanned_ns:    HashMap::<String, string, GlobalAllocator, FnvHasher>::new(),
-            ns_map:        HashMap::<string, string, GlobalAllocator, FnvHasher>::new(),
+            ns_map:        HashMap::<String, string, GlobalAllocator, FnvHasher>::new(),
             vendor_modules: HashMap::<String, string, GlobalAllocator, FnvHasher>::new(),
             module_lines:   [],
             listings:       DirectoryListings::new(),
@@ -531,7 +531,7 @@ public:
         }
         if (this.index_cache_open) { this.index_cache.keep(relative, &declared, !cached); }
         if (declared.namespace_name.length() > 0) {
-            this.ns_map.insert(String::from_str(declared.namespace_name.as_str()).into_raw(), file_path);
+            this.ns_map.insert(String::from_str(declared.namespace_name.as_str()), file_path);
         }
         for (mut s: i64 = 0; s < declared.module_paths.length(); s++) {
             this.module_lines.push(ModuleLine {
@@ -549,10 +549,10 @@ public:
     /// `roots` places its file in.
     indexed_modules(mut &this, intern: mut InternTable*, roots: &PackageRoots) -> [IndexedModule] {
         mut out: [IndexedModule] = [];
-        mut names: [string] = [];
+        mut names: [Str] = [];
         mut files: [string] = [];
         for (entry in this.ns_map.entries()) {
-            names.push(*entry.first);
+            names.push(entry.first.as_str());
             files.push(*entry.second);
         }
         for (mut i: i64 = 0; i < names.length(); i++) {
@@ -662,7 +662,7 @@ public:
         // Fast path: check pre-scanned namespace map first.
         // This handles all case-insensitive resolution automatically since
         // the map was built by walking the actual filesystem.
-        const from_map: Option<string> = this.ns_map.get(&import_path);
+        const from_map: Option<string> = this.ns_map.get(&String::from_string(import_path));
         if (from_map.is_some()) {
             return from_map.unwrap();
         }
@@ -778,7 +778,7 @@ public:
                 raw.start_line, raw.start_col,
                 raw.end_line, raw.end_col);
         }
-        const suggestion: string = this.suggest_module(path);
+        const suggestion: Option<String> = this.suggest_module(path);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0500_MODULE_NOT_FOUND,
             fmt::format("cannot find module `%s`", path));
@@ -786,23 +786,23 @@ public:
             diag = diag.at_with_label(span,
                 fmt::format("no module named `%s` is in scope", path));
         }
-        if (suggestion.length() > 0) {
-            diag = diag.with_note(fmt::format("did you mean `%s`?", suggestion));
+        match (suggestion) {
+            Option::Some(name) => { diag = diag.with_note(f"did you mean `{name}`?"); }
+            Option::None => { }
         }
         return diag.help(
             "imports resolve against the project root, the entry-point directory, and the standard library; module paths are case-sensitive");
     }
 
-    suggest_module(&this, import_path: string) -> string {
-        mut candidates: [string] = [];
+    suggest_module(&this, import_path: string) -> Option<String> {
         mut views: [Str] = [];
         for (name in this.ns_map.key_references()) {
-            candidates.push(*name);
-            views.push(*name);
+            views.push(name.as_str());
         }
-        const found: Option<i64> = find_best_candidate(import_path, &views);
-        if (found.is_none()) { return ""; }
-        return candidates[found.unwrap()];
+        return match (find_best_candidate(import_path, &views)) {
+            Option::Some(at) => { Option::Some(String::from_str(views[at])) }
+            Option::None     => { Option::None }
+        };
     }
 
 
@@ -1700,7 +1700,7 @@ public:
     sub_module_file(&this, intern: InternTable*, owner_file: string, rest: SymbolStr) -> string {
         match (this.scanned_ns.get(&ModuleGraph::module_key(owner_file))) {
             Option::Some(owner_ns) => {
-                match (this.ns_map.get(&fmt::format("%s::%s", owner_ns, intern.resolve(rest)).into_raw())) {
+                match (this.ns_map.get(&f"{owner_ns}::{intern.resolve(rest)}")) {
                     Option::Some(sub_file) => { return sub_file; }
                     Option::None => { return ""; }
                 }

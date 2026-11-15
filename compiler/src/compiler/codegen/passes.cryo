@@ -659,10 +659,8 @@ type struct CodegenPasses {
     /// root.  Cross-platform via `fs::file::copy`, which creates/truncates the
     /// destination and mirrors the source's Unix mode bits (so the hoisted
     /// binary stays executable).  Returns 0 on success, 1 on failure.
-    static hoist_binary(src_text: string, dst_text: string) -> i32 {
-        const dst: string = dst_text;
-        const src: string = src_text;
-        match (File::copy(Path::from(src), Path::from(dst))) {
+    static hoist_binary(src: Path, dst: Path) -> i32 {
+        match (File::copy(src, dst)) {
             Result::Ok(_)  => { return 0; }
             Result::Err(_) => { return 1; }
         }
@@ -1381,7 +1379,7 @@ type struct CodegenPasses {
         // a windows test binary is `<name>-test.exe`.  Routed through
         // `profile_bin_path_for_target` so the same suffix logic the
         // incremental-build manifest uses applies here.
-        const exe_path: string = CodegenPasses::profile_bin_path_for_target(cfg, ctx);
+        const exe_path: PathBuf = CodegenPasses::profile_bin_path_for_target(cfg, ctx);
 
         // Build the link command.  libc's system(3) runs `sh -c`, so
         // every interpolated path must be shell-quoted; without it, a
@@ -1401,7 +1399,7 @@ type struct CodegenPasses {
         // it parses identically under `sh -c` and `cmd /c`.  Same objects,
         // same order, same libs => a byte-identical executable on every
         // host, so selfhost byte-identity is unaffected.
-        const link_rsp_path: PathBuf = PathBuf::from(f"{exe_path}.rsp".as_str());
+        const link_rsp_path: PathBuf = PathBuf::from(f"{exe_path.as_str()}.rsp".as_str());
         if (!CodegenPasses::write_rsp_file(link_rsp_path.as_path(), &ctx.artifacts.object_files)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 f"could not open linker response file for writing: {link_rsp_path.as_str()}");
@@ -1411,7 +1409,7 @@ type struct CodegenPasses {
         const link_driver: string = link_cfg.link_driver();
         mut cmd: String = String::from_string(link_driver);
         cmd.push(Str::new(" -o "));
-        cmd.push(CodegenPasses::link_quote(Str::new(exe_path)));
+        cmd.push(CodegenPasses::link_quote(exe_path.as_str()));
         cmd.push(Str::new(" @\""));
         cmd.push(link_rsp_path.as_str());
         cmd.push(Str::new("\""));
@@ -1550,7 +1548,7 @@ type struct CodegenPasses {
             cmd.push(Str::new(" -static -static-libstdc++ -static-libgcc"));
         }
 
-        Log::debug(LogArea::Link, f"linking {ctx.artifacts.object_files.length()} objects into {exe_path}");
+        Log::debug(LogArea::Link, f"linking {ctx.artifacts.object_files.length()} objects into {exe_path.as_str()}");
         Log::debug(LogArea::Link, f"startup order: {ctx.artifacts.startup_order()}");
         Log::debug(LogArea::Link, f"link command: {cmd}");
 
@@ -1571,32 +1569,28 @@ type struct CodegenPasses {
         // linger in the per-profile dir.
         CodegenPasses::remove_tool_file(link_rsp_path.as_path());
 
-        Log::debug(LogArea::Link, f"linked executable {exe_path}");
+        Log::debug(LogArea::Link, f"linked executable {exe_path.as_str()}");
 
         // Hoist the freshly-linked binary from the per-profile cache up to
         // the build root (`<output_dir>/<name>[.exe]`) so it can be run
         // as `build/<name>[.exe]` regardless of which profile produced
-        // it.  libc's system(3) runs `sh -c`, so both paths are
-        // shell-quoted.
-        const hoisted_exe: string = CodegenPasses::bin_artifact_path_for_target(cfg, ctx);
+        // it.
+        const hoisted_exe: PathBuf = CodegenPasses::bin_artifact_path_for_target(cfg, ctx);
         ProjectConfig::mkdir_p(Path::from(output_dir));
-        // `hoist_binary` is host-shell-aware: `cp -f` on a POSIX-hosted
-        // compiler, `copy /Y` (backslash paths) on a native Windows one.
-        const hrc: i32 = CodegenPasses::hoist_binary(exe_path, hoisted_exe);
+        const hrc: i32 = CodegenPasses::hoist_binary(exe_path.as_path(), hoisted_exe.as_path());
         if (hrc != 0) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("failed to hoist executable to %s (copy exited with %d)",
-                    hoisted_exe, hrc));
+                f"failed to hoist executable to {hoisted_exe.as_str()} (copy exited with {hrc})");
             return PassResult::failure(1);
         }
-        Log::debug(LogArea::Link, f"hoisted executable {hoisted_exe}");
+        Log::debug(LogArea::Link, f"hoisted executable {hoisted_exe.as_str()}");
 
         // Single-file `-o PATH` (Exe): mirror the hoisted binary to the
         // user's explicit output path.  The path is taken verbatim - no
         // `.exe` auto-append - since `-o` is explicit user intent.
         const exe_out: string = ctx.options.output.path();
         if (ctx.options.output.is_exe() && exe_out.length() > 0) {
-            const orc: i32 = CodegenPasses::hoist_binary(hoisted_exe, exe_out);
+            const orc: i32 = CodegenPasses::hoist_binary(hoisted_exe.as_path(), Path::from(exe_out));
             if (orc != 0) {
                 ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                     fmt::format("failed to copy executable to %s (copy exited with %d)",
@@ -1613,7 +1607,7 @@ type struct CodegenPasses {
         // link.  POSIX-only (a shell glob); a no-op on a Windows-hosted
         // compiler.
         if (ctx.options.emit_llvm) {
-            CodegenPasses::emit_linked_ir_dump(profile_dir.as_path(), f"{hoisted_exe}.ll".as_str());
+            CodegenPasses::emit_linked_ir_dump(profile_dir.as_path(), f"{hoisted_exe.as_str()}.ll".as_str());
         }
 
         return PassResult::ok();
@@ -1632,14 +1626,10 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
         const cfg: ProjectConfig* = ctx.project_config;
-        const archive_name: string = match (cfg.target_type) {
-            TargetType::Stdlib => { "libcryo.a" }
-            _                  => { fmt::format("lib%s.a", cfg.project_name).into_raw() }
-        };
         // Archive lands at the build root (`<output_dir>/lib<name>.a`).
         ProjectConfig::mkdir_p(Path::from(cfg.output_dir));
-        const archive_path: string = cfg.lib_archive_path(archive_name);
-        const bundled: PassResult = CodegenPasses::bundle_object_list(ctx, archive_path, &ctx.artifacts.object_files);
+        const archive_path: PathBuf = cfg.lib_archive_path(cfg.archive_name().as_str());
+        const bundled: PassResult = CodegenPasses::bundle_object_list(ctx, archive_path.as_path(), &ctx.artifacts.object_files);
         if (!bundled.success || !ctx.module_graph.builds_standard_library) {
             return bundled;
         }
@@ -1660,9 +1650,8 @@ type struct CodegenPasses {
     /// Archive an explicit object list into `archive_path`: the archiver
     /// behind `bundle_archive` (the `[lib]` / stdlib deliverable).
     static bundle_object_list(
-        ctx: mut CompilationContext*, archive_path_text: string, objs: &[string]
+        ctx: mut CompilationContext*, archive_path: Path, objs: &[string]
     ) -> PassResult {
-        const archive_path: string = archive_path_text;
         // Invoke `<ar> rcs <archive> @<response-file>`.  `r` replaces stale
         // members on re-bundle, `c` suppresses the empty-archive warning,
         // `s` writes the symbol index that `ld` consults to satisfy
@@ -1693,16 +1682,16 @@ type struct CodegenPasses {
         // `c_header_import` leaves `cc`) so a quoted-path first token can't
         // trip cmd's outer-quote-stripping rule.
         const ar: string = CodegenPasses::pick_archiver();
-        const rsp_path: PathBuf = PathBuf::from(f"{archive_path}.rsp".as_str());
+        const rsp_path: PathBuf = PathBuf::from(f"{archive_path.as_str()}.rsp".as_str());
         if (!CodegenPasses::write_rsp_file(rsp_path.as_path(), objs)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 f"could not open archiver response file for writing: {rsp_path.as_str()}");
             return PassResult::failure(1);
         }
 
-        const cmd: String = f"{ar} rcs \"{archive_path}\" @\"{rsp_path.as_str()}\"";
+        const cmd: String = f"{ar} rcs \"{archive_path.as_str()}\" @\"{rsp_path.as_str()}\"";
 
-        Log::debug(LogArea::Link, f"archiving {objs.length()} objects into {archive_path} (response file {rsp_path.as_str()})");
+        Log::debug(LogArea::Link, f"archiving {objs.length()} objects into {archive_path.as_str()} (response file {rsp_path.as_str()})");
         Log::debug(LogArea::Link, f"archive command: {cmd}");
 
         mut ar_out: string = "";
@@ -1718,7 +1707,7 @@ type struct CodegenPasses {
         // Drop the response file now the archiver has read it.
         CodegenPasses::remove_tool_file(rsp_path.as_path());
 
-        Log::debug(LogArea::Link, f"archived {archive_path} ({objs.length()} objects)");
+        Log::debug(LogArea::Link, f"archived {archive_path.as_str()} ({objs.length()} objects)");
         return PassResult::ok();
     }
 
@@ -2018,11 +2007,16 @@ type struct CodegenPasses {
     /// suffix logic lives in one place; `run_linking` writes to this path
     /// and the incremental-build manifest in instance.cryo stats it.
     static profile_bin_path_for_target(cfg: ProjectConfig*,
-                                         ctx: CompilationContext*) -> string {
-        const tri: string = ctx.options.target_triple;
-        const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
-        const path: string = cfg.profile_bin_path(ctx.options.mode.skip_user_main());
-        return if (path.ends_with(lc.exe_suffix)) { path } else { path.append(lc.exe_suffix) };
+                                         ctx: CompilationContext*) -> PathBuf {
+        return CodegenPasses::with_exe_suffix(cfg.profile_bin_path(ctx.options.mode.skip_user_main()), ctx);
+    }
+
+    /// `path` with the active target's executable suffix (`.exe` on
+    /// Windows) appended, unless it already ends with it.
+    private static with_exe_suffix(path: PathBuf, ctx: CompilationContext*) -> PathBuf {
+        const lc: LinkerConfig = LinkerConfig::linker_config_for_triple(ctx.options.target_triple);
+        if (path.as_str().ends_with(&Str::new(lc.exe_suffix))) { return path; }
+        return PathBuf::from(f"{path.as_str()}{lc.exe_suffix}".as_str());
     }
 
     /// Hoisted (build-root) executable path for the active target, with
@@ -2030,11 +2024,8 @@ type struct CodegenPasses {
     /// `profile_bin_path_for_target` but lands the file at the user-facing
     /// `<output_dir>/<name>[.exe]` instead of the per-profile cache.
     static bin_artifact_path_for_target(cfg: ProjectConfig*,
-                                          ctx: CompilationContext*) -> string {
-        const tri: string = ctx.options.target_triple;
-        const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
-        const path: string = cfg.bin_artifact_path(ctx.options.mode.skip_user_main());
-        return if (path.ends_with(lc.exe_suffix)) { path } else { path.append(lc.exe_suffix) };
+                                          ctx: CompilationContext*) -> PathBuf {
+        return CodegenPasses::with_exe_suffix(cfg.bin_artifact_path(ctx.options.mode.skip_user_main()), ctx);
     }
 }
 
