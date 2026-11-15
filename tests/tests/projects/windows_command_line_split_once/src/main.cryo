@@ -1,0 +1,130 @@
+namespace WindowsCommandLineSplitOnce;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::encoding::utf16::{ Utf16 };
+import std::env;
+import std::fmt;
+import std::sys::syscall;
+
+/// The arguments the runtime must split each case's command line tail into.
+/// Case 1 is where two splitting rules disagree: `""` inside quotes is a
+/// literal quote, so `"a""b c"` is one argument.
+function expected(case_number: i64) -> Array<String> {
+    mut out: Array<String> = Array::new();
+    match (case_number) {
+        1 => { out.push(String::from_str(Str::new("a\"b c"))); }
+        2 => {
+            out.push(String::from_str(Str::new("x")));
+            out.push(String::from_str(Str::new("")));
+            out.push(String::from_str(Str::new("y")));
+        }
+        3 => {
+            out.push(String::from_str(Str::new("a\\\"b")));
+            out.push(String::from_str(Str::new("c d\\")));
+        }
+        _ => { out.push(String::from_str(Str::new("\u{FFFD}z"))); }
+    }
+    return out;
+}
+
+/// The command line tail of each case, after the case's own number. Case 4's
+/// is not text: it is added unit by unit in `run_case`.
+function tail(case_number: i64) -> Str {
+    match (case_number) {
+        1 => { return Str::new("\"a\"\"b c\""); }
+        2 => { return Str::new("x \"\" y"); }
+        3 => { return Str::new("a\\\\\\\"b \"c d\\\\\""); }
+        _ => { return Str::new(""); }
+    }
+}
+
+/// Run this program again as case `case_number`, its command line built by
+/// hand so nothing quotes it, and return the child's exit code.
+function run_case(executable: Str, case_number: i64) -> u32 {
+    mut text: String = String::new();
+    text.push("\"");
+    text.push(executable);
+    text.push("\" case ");
+    text.push(case_number);
+    text.push(" ");
+    text.push(tail(case_number));
+    mut line: Array<u16> = Array::new();
+    Utf16::encode_into(text.as_str().as_bytes(), &line);
+    if (case_number == 4) {
+        // A high surrogate with no low surrogate after it, then `z`.
+        line.push(0xD800);
+        line.push(0x7A);
+    }
+    line.push(0);
+
+    mut startup: syscall::STARTUPINFOW = syscall::STARTUPINFOW {
+        cb: 104, lpReserved: null, lpDesktop: null, lpTitle: null,
+        dwX: 0, dwY: 0, dwXSize: 0, dwYSize: 0,
+        dwXCountChars: 0, dwYCountChars: 0, dwFillAttribute: 0,
+        dwFlags: 0, wShowWindow: 0, cbReserved2: 0, lpReserved2: null,
+        hStdInput: null, hStdOutput: null, hStdError: null
+    };
+    mut process: syscall::PROCESS_INFORMATION = syscall::PROCESS_INFORMATION {
+        hProcess: null, hThread: null, dwProcessId: 0, dwThreadId: 0
+    };
+    if (syscall::CreateProcessW(null, &line[0], null, null, 0, 0, null, null, &startup, &process) == 0) {
+        return 99;
+    }
+    syscall::WaitForSingleObject(process.hProcess, 0xFFFFFFFF);
+    mut code: u32 = 98;
+    syscall::GetExitCodeProcess(process.hProcess, &code);
+    syscall::CloseHandle(process.hThread);
+    syscall::CloseHandle(process.hProcess);
+    return code;
+}
+
+/// As a child: exit 0 when the arguments after the case number are the
+/// expected ones, 1 when their count differs, 2 when one of them does.
+function check_case(arguments: &Array<String>) -> int {
+    mut case_number: i64 = 4;
+    for (mut candidate: i64 = 1; candidate <= 3; candidate++) {
+        mut name: String = String::new();
+        name.push(candidate);
+        if (arguments[2].as_str() == name.as_str()) { case_number = candidate; }
+    }
+    const want: Array<String> = expected(case_number);
+    if (arguments.length() != want.length() + 3) { return 1; }
+    for (mut index: i64 = 0; index < want.length(); index++) {
+        if (arguments[index + 3].as_str() != want[index].as_str()) { return 2; }
+    }
+    return 0;
+}
+
+function main() -> int {
+    const arguments: Array<String> = env::args();
+    if (arguments.length() >= 3 && arguments[1].as_str() == Str::new("case")) {
+        return check_case(&arguments);
+    }
+    mut executable: String = String::new();
+    match (env::current_executable()) {
+        Option::Some(path) => { executable = path; }
+        Option::None => {
+            fmt::println(String::from_str(Str::new("no executable path")));
+            return 1;
+        }
+    }
+    mut failed: boolean = false;
+    for (mut case_number: i64 = 1; case_number <= 4; case_number++) {
+        const code: u32 = run_case(executable.as_str(), case_number);
+        if (code != 0) {
+            mut report: String = String::new();
+            report.push("case ");
+            report.push(case_number);
+            report.push(" exited ");
+            report.push(code);
+            fmt::println(report);
+            failed = true;
+        }
+    }
+    if (failed) { return 1; }
+    fmt::println(String::from_str(Str::new("every command line split once")));
+    return 0;
+}

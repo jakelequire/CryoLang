@@ -324,11 +324,13 @@ function append_utf8(buf: mut u8*, pos: mut u64*, cp: u32) -> void {
 
 /// Transcode the UTF-16 code unit at `*i` into `buf` and advance `*i` past the
 /// unit(s) consumed. A high surrogate immediately followed by a low surrogate
-/// is combined into the one code point it encodes; an unpaired surrogate is
-/// passed through as-is rather than dropped, so a malformed command line still
-/// round-trips its byte count instead of silently losing an argument.
+/// is combined into the one code point it encodes. A surrogate with no partner
+/// encodes no character, so it is written as U+FFFD: what comes out is always
+/// valid UTF-8, and the unit still yields a character rather than vanishing.
+/// U+FFFD's three bytes are within the per-unit bound the callers size for.
 ![config(windows)]
 function emit_unit(cmd: u64, n: u64, i: mut u64*, buf: mut u8*, pos: mut u64*) -> void {
+    const REPLACEMENT_CHARACTER: u32 = 0xFFFD;
     const hi: u32 = load16(cmd + (*i) * 2);
     *i = *i + 1;
     if (hi >= 0xD800 && hi < 0xDC00 && *i < n) {
@@ -339,14 +341,18 @@ function emit_unit(cmd: u64, n: u64, i: mut u64*, buf: mut u8*, pos: mut u64*) -
             return;
         }
     }
+    if (hi >= 0xD800 && hi < 0xE000) {
+        append_utf8(buf, pos, REPLACEMENT_CHARACTER);
+        return;
+    }
     append_utf8(buf, pos, hi);
 }
 
 /// Capture arguments from the PEB's `ProcessParameters.CommandLine`.
 ///
 /// The command line arrives as one UTF-16 `UNICODE_STRING`, so this owns both
-/// the split and the encoding conversion. The split follows the CRT's documented
-/// quoting rules, which `CommandLineToArgvW` also implements:
+/// the split and the encoding conversion. The split follows the current CRT's
+/// documented quoting rules:
 ///
 ///   - `2n` backslashes before a quote produce `n` backslashes and the quote
 ///     acts as a delimiter; `2n+1` produce `n` backslashes and a literal quote.
@@ -363,14 +369,17 @@ function emit_unit(cmd: u64, n: u64, i: mut u64*, buf: mut u8*, pos: mut u64*) -
 /// argument, and every argument after `argv[0]` costs at least a character and
 /// a separator, bounding the count at `n/2 + 3`.
 ///
+/// The vector ends in a null slot after the last argument, as a C `argv` does:
+/// the count bound above leaves room for it.
+///
 /// A failure to reach the PEB, or a heap allocation failure, leaves argc 0 /
 /// argv null — the same "unavailable" state callers already handle — rather
 /// than a partially built vector.
 ///
-/// Shared by both tiers, not just the freestanding one. A hosted build could
-/// have taken argv from the CRT instead, but `__getmainargs` yields codepage-
-/// mangled ANSI text; this parser yields UTF-8, which is what Cryo wants, and
-/// keeping one implementation means one set of quoting rules to be right about.
+/// Shared by both tiers, and the only parser of the command line: a hosted
+/// `main` receives this vector and the standard library's `env::args()` reads
+/// it back, so a program sees one split whichever way it asks. Taking argv
+/// from the CRT instead would yield codepage-mangled ANSI text.
 ![config(windows)]
 function capture_os_args(argc: i64, argv: mut i8**) -> void {
     const peb: u64 = current_peb();
@@ -480,6 +489,7 @@ function capture_os_args(argc: i64, argv: mut i8**) -> void {
         pos = pos + 1;
         count = count + 1;
     }
+    vec[count] = null;
 
     g_argc = count;
     g_argv = vec;

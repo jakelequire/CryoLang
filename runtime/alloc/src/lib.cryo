@@ -112,20 +112,33 @@ function align_up(x: u64, a: u64) -> u64 {
     return (x + a - 1) & ~(a - 1);
 }
 
+/// The bytes of header every allocation carries below its pointer.
+const HEADER_SIZE: u64 = 16;
+
 /// Allocate `size` bytes aligned to `align`. Weak + unmangled so a user object
-/// can override it. Returns null on OS failure. The mapping carries 16 bytes
-/// of header (base + total) below the returned pointer, plus `align` slack so
-/// the aligned user pointer always leaves room for that header above the base.
+/// can override it. The mapping carries 16 bytes of header (base + total)
+/// below the returned pointer, plus `align` slack so the aligned user pointer
+/// always leaves room for that header above the base.
+///
+/// An `align` of 0 asks for no alignment and is taken as 1. Returns null when
+/// `align` is not a power of two (rounding up to it would not align the
+/// pointer, and could put the header outside the mapping), when `size` plus
+/// the header and slack does not fit in a `u64` (the sum would wrap and map
+/// a region smaller than asked for), and when the OS has no memory to give.
 ![weak] ![no_mangle] ![config(no_runtime)]
 function __cryo_alloc(size: u64, align: u64) -> mut u8* {
     mut a: u64 = align;
     if (a < 1) { a = 1; }
-    const total: u64 = size + 16 + a;
+    if ((a & (a - 1)) != 0) { return null; }
+    // Header and slack together are below 2^64 (`a` is at most 2^63), so a
+    // sum that wraps wraps once and comes out smaller than `size`.
+    const total: u64 = size + HEADER_SIZE + a;
+    if (total < size) { return null; }
     const base: i64 = os_map(total);
     if (base < 0) { return null; }
-    const user: u64 = align_up((base as u64) + 16, a);
+    const user: u64 = align_up((base as u64) + HEADER_SIZE, a);
     // Header just below the user pointer: h[0] = base, h[1] = total.
-    const h: mut u64* = (user - 16) as mut u64*;
+    const h: mut u64* = (user - HEADER_SIZE) as mut u64*;
     h[0] = base as u64;
     h[1] = total;
     return user as mut u8*;

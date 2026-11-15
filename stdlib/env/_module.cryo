@@ -4,13 +4,14 @@
 ///! `set_var`, `remove_var` and `vars` read and write environment
 ///! variables. Ending the process with a status code is `sys::exit`.
 ///!
-///! On POSIX, argv comes from the C runtime: the generated
-///! `main(argc, argv)` calls `set_args` before user code runs, so `args()`
-///! returns the real argument vector. `current_directory`/`set_current_directory` wrap
-///! `getcwd`/`chdir`. On Windows every one of these goes through the
-///! wide-character (`W`) calls - the command line, the environment block,
-///! the working directory and the executable's path - converting UTF-16 to
-///! and from UTF-8, so non-ASCII arguments, variables and paths round-trip.
+///! argv comes from the runtime's entry: the generated `main(argc, argv)`
+///! calls `set_args` before user code runs, so `args()` returns the real
+///! argument vector (on Windows the runtime splits and transcodes the wide
+///! command line itself). `current_directory`/`set_current_directory` wrap
+///! `getcwd`/`chdir`. On Windows the rest go through the wide-character
+///! (`W`) calls - the environment block, the working directory and the
+///! executable's path - converting UTF-16 to and from UTF-8, so non-ASCII
+///! arguments, variables and paths round-trip.
 ///!
 ///! `env::arguments` reads a command line against a declaration of the
 ///! flags, options and positional arguments a program takes
@@ -69,9 +70,11 @@ internal function set_env(envp: u8**) -> void {
 }
 
 /// Program arguments as UTF-8 strings. The first element is the
-/// program name. Returns an empty array if the runtime hasn't
-/// published argv yet. Panics on allocation failure.
-![target(unix)]
+/// program name. On Windows the runtime splits the wide command line
+/// before `main` runs and transcodes it, so non-ASCII arguments arrive
+/// intact and a lone surrogate in one reads as U+FFFD. Returns an empty
+/// array if the runtime hasn't published argv yet. Panics on allocation
+/// failure.
 public function args() -> Array<String> {
     mut out: Array<String> = Array::new();
     if (argv_global == null) { return out; }
@@ -82,25 +85,6 @@ public function args() -> Array<String> {
         out.push(String::from_str(Str::from(raw as string)));
         i++;
     }
-    return out;
-}
-
-/// Program arguments as UTF-8 strings, from the wide command line split
-/// by `CommandLineToArgvW`, so non-ASCII arguments arrive intact; a
-/// lone surrogate in one reads as U+FFFD. The first element is the program
-/// name. Returns an empty array if the command line cannot be split.
-/// Panics on allocation failure.
-![target(windows)]
-public function args() -> Array<String> {
-    mut out: Array<String> = Array::new();
-    mut count: i32 = 0;
-    const vector: u16** = syscall::CommandLineToArgvW(syscall::GetCommandLineW(), &count);
-    if (vector == null) { return out; }
-    for (mut i: i32 = 0; i < count; i++) {
-        const units: u16* = vector[i as u64];
-        out.push(Utf16::decode_lossy(Slice::<u16>::from_raw(units, libc::wcslen(units) as i64)));
-    }
-    syscall::LocalFree(vector as u8*);
     return out;
 }
 

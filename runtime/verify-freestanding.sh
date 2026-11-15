@@ -198,6 +198,8 @@ function main() -> int {
     if (!streq(v[1], "one")) { return 91; }
     if (!streq(v[2], "two words")) { return 92; }
     if (!streq(v[3], "three")) { return 93; }
+    // The vector ends in a null slot, as a C argv does.
+    if (v[n] != null) { return 95; }
     return n as int;
 }
 APP
@@ -237,6 +239,15 @@ function main() -> int {
     q[63] = 99;
     if (q[0] != 42 || q[63] != 99) { return 6; }
     __cryo_dealloc(q, 64, 8);
+    // A size whose header and slack wrap the total is refused, not mapped small.
+    const most: u64 = (0 as u64) - (1 as u64);
+    if (__cryo_alloc(most - 8, 8) != null) { return 7; }
+    // An alignment that is not a power of two is refused.
+    if (__cryo_alloc(64, 24) != null) { return 8; }
+    // An alignment of 0 asks for none.
+    const z: mut u8* = __cryo_alloc(64, 0);
+    if (z == null) { return 9; }
+    __cryo_dealloc(z, 64, 0);
     return 0;
 }
 APP
@@ -330,12 +341,13 @@ run_linux() {
     linux_expect "$WORK/nomatch.cryo"  "no_match" "panicked at verify.cryo:7:3: no matching pattern" || fail=1
     linux_expect "$WORK/overflow.cryo" "overflow" "panicked at verify.cryo:7:3: arithmetic overflow (op 2): 4000000000, 4000000000" || fail=1
 
-    # alloc: exit 0 means alloc/align/write-read/free/re-alloc all held.
+    # alloc: exit 0 means alloc/align/write-read/free/re-alloc all held, and a
+    # wrapping size and a non-power-of-two alignment were refused.
     local ao; ao="$(build_app "$WORK/alloc.cryo")"
     "$CRYO_CC" -nostartfiles -nostdlib -static -Wl,--gc-sections "$ao" "$alloc_a" "$core_a" "$abort_a" -o "$WORK/exe"
     set +e; "$WORK/exe"; local ag=$?; set -e
-    if [ "$ag" -eq 0 ]; then echo "linux alloc ok: mmap alloc/free round-trip"
-    else echo "linux alloc FAIL: exit $ag (0=ok; 1-6 = failure mode)"; fail=1; fi
+    if [ "$ag" -eq 0 ]; then echo "linux alloc ok: mmap alloc/free round-trip, bad requests refused"
+    else echo "linux alloc FAIL: exit $ag (0=ok; 1-9 = failure mode)"; fail=1; fi
 
     # backtrace: "stack backtrace:" + >=3 frame addresses from the call chain.
     local bo; bo="$(build_app "$WORK/bt.cryo" --dev)"
@@ -422,8 +434,8 @@ run_windows() {
     "$mingw" -nostartfiles -nostdlib -Wl,-e,_start -Wl,--gc-sections "$ao" "$alloc_a" "$core_a" "$abort_a" \
         -lkernel32 -lntdll -o "$WORK/app.exe"
     set +e; WINEDEBUG=-all wine "$WORK/app.exe" 2>/dev/null; local ag=$?; set -e
-    if [ "$ag" -eq 0 ]; then echo "windows alloc ok: VirtualAlloc/VirtualFree round-trip (wine)"
-    else echo "windows alloc FAIL: exit $ag (0=ok; 1-6 = failure mode)"; fail=1; fi
+    if [ "$ag" -eq 0 ]; then echo "windows alloc ok: VirtualAlloc/VirtualFree round-trip, bad requests refused (wine)"
+    else echo "windows alloc FAIL: exit $ag (0=ok; 1-9 = failure mode)"; fail=1; fi
 
     # backtrace: same assertion as Linux — ">=3 frames" is what proves the walk
     # actually unwinds rather than just printing a header. Windows gets there by
