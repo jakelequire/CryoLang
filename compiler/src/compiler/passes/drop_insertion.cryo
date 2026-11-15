@@ -264,6 +264,12 @@ type struct DropInserter {
     /// `binding_syms` is the key; `binding_names` is the spelling the
     /// synthesized `<name>.drop()` is written with, and is never searched.
     scope_start_idx: [i64];
+    /// Per scope, the statement buffer of the block whose bindings it holds,
+    /// or null for a scope no block owns (a `for` statement's init).  A
+    /// binding's drop flag is declared there, so every branch that writes
+    /// the flag sees it: one declared ahead of an inner join (an `else if`)
+    /// would be out of scope in an outer join's other branch.
+    scope_outs:      [mut [Stmt*]*];
     binding_syms:    [SymbolID];
     binding_names:   [u32];
     binding_types:   [TypeRef];
@@ -541,6 +547,7 @@ type struct DropInserter {
             types_keys:      [],
             types_refs:      [],
             scope_start_idx: [],
+            scope_outs:      [],
             binding_syms:    [],
             binding_names:   [],
             binding_types:   [],
@@ -602,11 +609,13 @@ type struct DropInserter {
 
     push_scope(mut &this) -> void {
         this.scope_start_idx.push(this.binding_names.length());
+        this.scope_outs.push(null);
     }
 
     pop_scope(mut &this) -> void {
         const top: i64 = this.scope_start_idx.length();
         if (top == 0) { return; }
+        this.scope_outs.pop();
         // Read by index then truncate via pop(). Binding an Option payload
         // through a match arm into a `mut` outer variable currently fails
         // to lower (E0614: rvalue null). Read-then-truncate sidesteps the
@@ -1002,6 +1011,7 @@ type struct DropInserter {
         this.types_keys      = [];
         this.types_refs      = [];
         this.scope_start_idx = [];
+        this.scope_outs      = [];
         this.binding_syms    = [];
         this.binding_names   = [];
         this.binding_types   = [];
@@ -1143,6 +1153,8 @@ type struct DropInserter {
         const old_stmts: &[Stmt*] = &block.statements;
         mut new_stmts: [Stmt*] = [];
         mut terminated: boolean = false;
+        const scope_top: i64 = this.scope_outs.length() - 1;
+        if (scope_top >= 0) { this.scope_outs[scope_top] = &new_stmts; }
 
         // For a value block, find the index of the arm's value statement:
         // the last non-null statement, when it is an expression statement.
@@ -1207,6 +1219,7 @@ type struct DropInserter {
             }
         }
 
+        if (scope_top >= 0) { this.scope_outs[scope_top] = null; }
         block.statements = new_stmts;
         return terminated;
     }
@@ -1639,7 +1652,7 @@ type struct DropInserter {
             if (this.flag_declarations == null || !this.is_moved_id(k) || this.get_drop_flag(k).is_valid()) { continue; }
             const flag: PassLocal = this.fresh_drop_flag(k);
             const span: SourceSpan = this.binding_span_for(k, if (body != null) { body.span } else { update.span });
-            this.flag_declarations.push(this.make_drop_flag_decl(flag, span));
+            this.declare_drop_flag(k, flag, span, this.flag_declarations);
             this.flag_declarations.push(this.make_drop_flag_write(flag, true, span));
             this.register_drop_flag(k, flag);
             for (mut m: i64 = 0; m < this.moved_keys.length(); m++) {
@@ -1672,8 +1685,8 @@ type struct DropInserter {
                 mut flag: PassLocal = this.get_drop_flag(exit.key);
                 if (!flag.is_valid()) {
                     flag = this.fresh_drop_flag(exit.key);
-                    frame.declarations.push(this.make_drop_flag_decl(flag,
-                        this.binding_span_for(exit.key, exit.writes.span)));
+                    this.declare_drop_flag(exit.key, flag,
+                        this.binding_span_for(exit.key, exit.writes.span), frame.declarations);
                     this.register_drop_flag(exit.key, flag);
                 }
                 exit.writes.as_block().statements.push(this.make_drop_flag_set(flag,
@@ -2217,11 +2230,10 @@ type struct DropInserter {
         mut flag: PassLocal = this.get_drop_flag(binding);
         if (!flag.is_valid()) {
             flag = this.fresh_drop_flag(binding);
-            // Hoist `mut <flag>: boolean = false;` before the if-stmt.
             // The binding span is the best anchor for diagnostics on the
             // synthesized local; fall back to s.span if unavailable.
             const decl_span: SourceSpan = this.binding_span_for(binding, s.span);
-            out.push(this.make_drop_flag_decl(flag, decl_span));
+            this.declare_drop_flag(binding, flag, decl_span, out);
             this.register_drop_flag(binding, flag);
         }
         if (!splice) { return; }
@@ -2261,7 +2273,7 @@ type struct DropInserter {
             if (needs_writes && out != null) {
                 if (!this.get_drop_flag(key).is_valid()) {
                     const flag: PassLocal = this.fresh_drop_flag(key);
-                    out.push(this.make_drop_flag_decl(flag, this.binding_span_for(key, span)));
+                    this.declare_drop_flag(key, flag, this.binding_span_for(key, span), out);
                     this.register_drop_flag(key, flag);
                 }
                 writes.push(key);
@@ -3441,6 +3453,26 @@ type struct DropInserter {
         blk.as_block().statements.push(set_stmt);
         blk.as_block().statements.push(branch);
         return blk;
+    }
+
+    /// Declare `binding`'s new drop flag `flag` (`= false`) in the block that
+    /// declares the binding, ahead of the statement that block is walking:
+    /// every path that moves the binding is inside that statement, so the
+    /// declaration is in scope wherever a join writes the flag.  A binding
+    /// of a scope no block owns has its flag declared in the nearest
+    /// enclosing block that does, else in `out`.
+    declare_drop_flag(mut &this, binding: u64, flag: PassLocal, span: SourceSpan,
+                      out: mut [Stmt*]*) -> void {
+        const slot: i64 = this.slot_of(binding);
+        mut target: mut [Stmt*]* = out;
+        for (mut d: i64 = this.scope_start_idx.length() - 1; d >= 0 && slot >= 0; d--) {
+            if (this.scope_start_idx[d] > slot) { continue; }
+            if (this.scope_outs[d] != null) {
+                target = this.scope_outs[d];
+                break;
+            }
+        }
+        target.push(this.make_drop_flag_decl(flag, span));
     }
 
     /// Allocate a fresh drop flag for `binding`, with a binding of its own.
