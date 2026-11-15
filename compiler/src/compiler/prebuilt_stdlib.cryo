@@ -36,6 +36,7 @@ import std::core::hash::{ Hasher };
 import std::collections::hashset::{ HashSet };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
+import std::collections::pair::{ Pair };
 import std::fs::directory::{ Directory, DirectoryEntries };
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
@@ -78,7 +79,7 @@ const LOCK_REFUSALS_REPORTED: i64 = 25;
 
 /// One module of the archive, as its manifest records it.
 type struct PrebuiltModule {
-    namespace_name: string;
+    namespace_name: String;
     rank:           u32;
     startup:        boolean;
     object:         string;
@@ -88,7 +89,7 @@ type struct PrebuiltStdlib {
     directory: string;
     key:       string;
     modules:   [PrebuiltModule];
-    symbols:   HashSet<string, GlobalAllocator, FnvHasher>;
+    symbols:   HashSet<String, GlobalAllocator, FnvHasher>;
 
     /// The priority a module's startup code runs at.  In the stdlib's own
     /// build it is the module's place in that build; in any other build,
@@ -119,7 +120,7 @@ type struct PrebuiltStdlib {
         h.fold(opt_level as u64);
         h.fold(debug_info);
         h.fold(unwinds);
-        PrebuiltStdlib::fold_sources(&h, stdlib_root, "");
+        PrebuiltStdlib::fold_sources(&h, Str::new(stdlib_root), Str::new(""));
         return Manifest::hex128(h.finish128());
     }
 
@@ -128,37 +129,32 @@ type struct PrebuiltStdlib {
     /// name order, so the digest does not depend on how the directory lists.
     /// Directories whose name starts with `.` hold build outputs and are not
     /// read.
-    static fold_sources(h: mut ContentHasher*, root_text: string, relative_text: string) -> void {
-        const root: string = root_text;
-        const relative: string = relative_text;
-        const directory: string = if (relative.length() == 0) { root } else {
-            Path::from(root).join(relative).into_raw()
+    static fold_sources(h: mut ContentHasher*, root: Str, relative: Str) -> void {
+        const directory: PathBuf = if (relative.length() == 0) { PathBuf::from(root) } else {
+            Path::from(root).join(relative)
         };
-        mut entries: DirectoryEntries = match (Directory::entries(Path::from(directory))) {
+        mut entries: DirectoryEntries = match (Directory::entries(directory.as_path())) {
             Result::Ok(r)  => { r }
-            Result::Err(_) => { h.fold("<unlistable>"); h.fold(relative); return; }
+            Result::Err(_) => { h.fold("<unlistable>"); h.fold_text(relative); return; }
         };
-        mut names: [string] = [];
+        mut names: [String] = [];
         loop {
             match (entries.next()) {
-                Option::Some(entry) => {
-                    mut name: String = String::from_str(entry.name());
-                    names.push(name.into_raw());
-                }
+                Option::Some(entry) => { names.push(String::from_str(entry.name())); }
                 Option::None => { break; }
             }
         }
         names.sort();
         for (mut i: i64 = 0; i < names.length(); i++) {
-            const name: string = names[i];
-            if (name.starts_with(".")) { continue; }
-            const child: string = if (relative.length() == 0) { name } else { relative + "/" + name };
-            const full: string = Path::from(root).join(child).into_raw();
-            if (Path::from(full).is_directory()) {
-                PrebuiltStdlib::fold_sources(h, root, child);
-            } else if (name.ends_with(".cryo") || name == "cryoconfig") {
-                h.fold(child);
-                Manifest::fold_file::<ContentHasher>(h, full);
+            const name: Str = names[i].as_str();
+            if (name.starts_with(&Str::new("."))) { continue; }
+            const child: String = if (relative.length() == 0) { String::from_str(name) } else { f"{relative}/{name}" };
+            const full: PathBuf = Path::from(root).join(child.as_str());
+            if (full.as_path().is_directory()) {
+                PrebuiltStdlib::fold_sources(h, root, child.as_str());
+            } else if (name.ends_with(&Str::new(".cryo")) || name == Str::new("cryoconfig")) {
+                h.fold_text(child.as_str());
+                Manifest::fold_file::<ContentHasher>(h, full.as_path());
             }
         }
     }
@@ -173,14 +169,14 @@ type struct PrebuiltStdlib {
     }
 
     /// Whether the archive defines `name`.
-    defines(&this, name: string) -> boolean {
-        return this.symbols.contains(&name);
+    defines(&this, name: Str) -> boolean {
+        return this.symbols.contains(&String::from_str(name));
     }
 
     /// The archive's module named `namespace_name`, or -1.
-    module_index(&this, namespace_name: string) -> i64 {
+    module_index(&this, namespace_name: Str) -> i64 {
         for (mut i: i64 = 0; i < this.modules.length(); i++) {
-            if (this.modules[i].namespace_name == namespace_name) { return i; }
+            if (this.modules[i].namespace_name.as_str() == namespace_name) { return i; }
         }
         return -1;
     }
@@ -189,50 +185,48 @@ type struct PrebuiltStdlib {
     static open(directory_text: string, key_text: string) -> Option<PrebuiltStdlib> {
         const directory: string = directory_text;
         const key: string = key_text;
-        const manifest: string = Path::from(directory).join(MANIFEST_NAME).into_raw();
-        mut text: string = "";
-        match (File::read_text(Path::from(manifest))) {
-            Result::Ok(t)  => { text = t.into_raw(); }
+        const text: String = match (File::read_text(Path::from(directory).join(MANIFEST_NAME).as_path())) {
+            Result::Ok(t)  => { t }
             Result::Err(_) => { return Option::None; }
-        }
-        mut lines: [string] = [];
-        const bytes: u8* = text as u8*;
-        const length: i64 = text.length();
-        mut start: i64 = 0;
-        for (mut at: i64 = 0; at < length; at++) {
-            if (bytes[at] == 10) {
-                mut line: String = String::from_str(Str::from_raw(bytes + start, at - start));
-                lines.push(line.into_raw());
-                start = at + 1;
-            }
-        }
-        if (lines.length() < 2 || lines[0] != MANIFEST_FORMAT || lines[1] != "key " + key) {
+        };
+        mut lines: [Str] = [];
+        for (line in text.as_str().lines()) { lines.push(line); }
+        if (lines.length() < 2 || lines[0] != Str::new(MANIFEST_FORMAT)
+                || lines[1] != f"key {key}".as_str()) {
             return Option::None;
         }
         mut found: PrebuiltStdlib = PrebuiltStdlib {
             directory: directory,
             key:       key,
             modules:   [],
-            symbols:   HashSet::<string, GlobalAllocator, FnvHasher>::with_capacity(lines.length()),
+            symbols:   HashSet::<String, GlobalAllocator, FnvHasher>::with_capacity(lines.length()),
         };
         for (mut i: i64 = 2; i < lines.length(); i++) {
-            const line: string = lines[i];
-            if (line.starts_with("symbol ")) {
-                found.symbols.insert(line.substring(7, line.length() - 7));
-            } else if (line.starts_with("module ")) {
-                // module <rank> <startup> <namespace> <object>
-                const fields: [string] = line.split(" ");
-                if (fields.length() < 5) { return Option::None; }
-                const object_start: i64 = fields[0].length() + fields[1].length()
-                    + fields[2].length() + fields[3].length() + 4;
-                const object: string = line.substring(object_start, line.length() - object_start);
-                found.modules.push(PrebuiltModule {
-                    namespace_name: fields[3],
-                    rank:           fields[1].parse_int::<u32>(),
-                    startup:        fields[2] == "1",
-                    object:         Path::from(directory).join(object).into_raw(),
-                });
+            match (lines[i].strip_prefix(&Str::new("symbol "))) {
+                Option::Some(symbol) => { found.symbols.insert(String::from_str(symbol)); continue; }
+                Option::None         => { }
             }
+            // module <rank> <startup> <namespace> <object>
+            const fields: Str = match (lines[i].strip_prefix(&Str::new("module "))) {
+                Option::Some(rest) => { rest }
+                Option::None       => { continue; }
+            };
+            const space: Str = Str::new(" ");
+            const rank: Pair<Str, Str> = match (fields.split_once(&space)) { Option::Some(p) => { p } Option::None => { return Option::None; } };
+            const startup: Pair<Str, Str> = match (rank.second.split_once(&space)) { Option::Some(p) => { p } Option::None => { return Option::None; } };
+            const named: Pair<Str, Str> = match (startup.second.split_once(&space)) { Option::Some(p) => { p } Option::None => { return Option::None; } };
+            // `write_manifest` writes the rank in decimal.
+            mut rank_value: u32 = 0;
+            for (digit in rank.first.as_bytes().iter()) {
+                if (digit < ('0' as u8) || digit > ('9' as u8)) { return Option::None; }
+                rank_value = rank_value * 10 + ((digit - ('0' as u8)) as u32);
+            }
+            found.modules.push(PrebuiltModule {
+                namespace_name: String::from_str(named.first),
+                rank:           rank_value,
+                startup:        startup.first == Str::new("1"),
+                object:         Path::from(directory).join(named.second).into_raw(),
+            });
         }
         if (!Path::from(found.archive()).exists()) { return Option::None; }
         return Option::Some(found);
@@ -357,11 +351,11 @@ type struct PrebuiltStdlib {
     /// When the archive in `directory` was last used: its use record, else
     /// its manifest, else the directory itself (a build that died before
     /// writing a manifest).  0 when none of them can be read.
-    static last_use_secs(directory: string) -> i64 {
+    static last_use_secs(directory: Str) -> i64 {
         const candidates: [PathBuf] = [
             Path::from(directory).join(LAST_USE_NAME),
             Path::from(directory).join(MANIFEST_NAME),
-            PathBuf::from(Str::new(directory)),
+            PathBuf::from(directory),
         ];
         for (mut i: i64 = 0; i < candidates.length(); i++) {
             match (candidates[i].metadata()) {
@@ -434,7 +428,7 @@ type struct PrebuiltStdlib {
     /// that goes first: a removal that fails partway leaves a directory no
     /// build links, which the next build of its key clears.
     static prune(parent: string, built: string) -> void {
-        mut archives: [string] = [];
+        mut archives: [PathBuf] = [];
         mut last_uses: [i64] = [];
         match (Directory::entries(Path::from(parent))) {
             Result::Ok(listing) => {
@@ -442,12 +436,11 @@ type struct PrebuiltStdlib {
                 loop {
                     match (entries.next()) {
                         Option::Some(entry) => {
-                            mut name: String = String::from_str(entry.name());
-                            const raw_name: string = name.into_raw();
-                            const at: string = Path::from(parent).join(raw_name).into_raw();
-                            if (raw_name.contains(".") || !Path::from(at).is_directory()) { continue; }
+                            const name: Str = entry.name();
+                            const at: PathBuf = Path::from(parent).join(name);
+                            if (name.contains(&Str::new(".")) || !at.as_path().is_directory()) { continue; }
+                            last_uses.push(PrebuiltStdlib::last_use_secs(at.as_path().as_str()));
                             archives.push(at);
-                            last_uses.push(PrebuiltStdlib::last_use_secs(at));
                         }
                         Option::None => { break; }
                     }
@@ -463,19 +456,20 @@ type struct PrebuiltStdlib {
                     newer = newer + 1;
                 }
             }
-            if (newer < ARCHIVES_KEPT || archives[i] == built
+            const archive: Str = archives[i].as_path().as_str();
+            if (newer < ARCHIVES_KEPT || archive == Str::new(built)
                     || now - last_uses[i] <= ARCHIVE_IDLE_SECONDS
-                    || Path::from(archives[i] + ".lock").exists()) {
+                    || Path::from(f"{archive}.lock".as_str()).exists()) {
                 continue;
             }
-            const manifest: string = Path::from(archives[i]).join(MANIFEST_NAME).into_raw();
-            if (Path::from(manifest).exists()) {
-                match (File::remove(Path::from(manifest))) {
+            const manifest: PathBuf = archives[i].as_path().join(MANIFEST_NAME);
+            if (manifest.as_path().exists()) {
+                match (File::remove(manifest.as_path())) {
                     Result::Ok(_)  => { }
                     Result::Err(_) => { continue; }
                 }
             }
-            match (Directory::remove_all(Path::from(archives[i]))) {
+            match (Directory::remove_all(archives[i].as_path())) {
                 Result::Ok(_)  => { }
                 Result::Err(_) => { }
             }
@@ -519,12 +513,12 @@ type struct PrebuiltStdlib {
                            object_text: string) -> ArchivedModule {
         const namespace_name: string = namespace_name_text;
         const object: string = object_text;
-        mut symbols: [string] = [];
+        mut symbols: [String] = [];
         mut startup: boolean = false;
         mut f: mut void* = llvm::LLVMGetFirstFunction(unit.raw);
         while (f != null) {
             const candidate: LValue = LValue { raw: f };
-            if (candidate.is_linkable_definition()) { symbols.push(fmt::format("%s", candidate.name()).into_raw()); }
+            if (candidate.is_linkable_definition()) { symbols.push(String::from_string(candidate.name())); }
             f = llvm::LLVMGetNextFunction(f);
         }
         mut g: mut void* = llvm::LLVMGetFirstGlobal(unit.raw);
@@ -534,7 +528,7 @@ type struct PrebuiltStdlib {
             if (name == "llvm.global_ctors") {
                 startup = true;
             } else if (candidate.is_linkable_definition() && !name.starts_with("llvm.")) {
-                symbols.push(fmt::format("%s", name).into_raw());
+                symbols.push(String::from_string(name));
             }
             g = llvm::LLVMGetNextGlobal(g);
         }
@@ -548,16 +542,16 @@ type struct PrebuiltStdlib {
     }
 
     /// Write the manifest of the archive in `directory`, the stdlib's own
-    /// build's records in build order.  Answers the failure, or "".
+    /// build's records in build order.  Answers the failure, or an empty
+    /// String.
     static write_manifest(directory_text: string, key_text: string,
                           triple_text: string, opt_level: u32, debug_info: boolean,
-                          unwinds: boolean, modules: &[ArchivedModule]) -> string {
+                          unwinds: boolean, modules: &[ArchivedModule]) -> String {
         const directory: string = directory_text;
         const key: string = key_text;
         const triple: string = triple_text;
         if (modules.length() as u32 > STDLIB_STARTUP_SLOTS) {
-            return fmt::format("the stdlib has %d modules and its startup code is ordered in %u places",
-                modules.length(), STDLIB_STARTUP_SLOTS).into_raw();
+            return f"the stdlib has {modules.length()} modules and its startup code is ordered in {STDLIB_STARTUP_SLOTS} places";
         }
         mut text: String = String::new();
         text.push(Str::new(MANIFEST_FORMAT));
@@ -583,26 +577,23 @@ type struct PrebuiltStdlib {
         }
         for (mut i: i64 = 0; i < modules.length(); i++) {
             for (mut s: i64 = 0; s < modules[i].symbols.length(); s++) {
-                text.push(Str::new("symbol " + modules[i].symbols[s]));
+                text.push(Str::new("symbol "));
+                text.push(modules[i].symbols[s].as_str());
                 text.push_byte(10 as u8);
             }
         }
         // A build opens the archive as soon as the manifest is there, so it
         // appears whole, by a rename, or not at all.
-        const path: string = Path::from(directory).join(MANIFEST_NAME).into_raw();
-        const partial: string = path + ".partial";
-        match (File::write_bytes(Path::from(partial), text.as_bytes())) {
+        const path: PathBuf = Path::from(directory).join(MANIFEST_NAME);
+        const partial: String = f"{path.as_path().as_str()}.partial";
+        match (File::write_bytes(Path::from(partial.as_str()), text.as_bytes())) {
             Result::Ok(_)  => { }
-            Result::Err(error) => {
-                mut report: String = f"cannot write the stdlib manifest: {error}";
-                return report.into_raw();
-            }
+            Result::Err(error) => { return f"cannot write the stdlib manifest: {error}"; }
         }
-        match (Path::from(partial).rename_to(Path::from(path))) {
-            Result::Ok(_)  => { return ""; }
+        match (Path::from(partial.as_str()).rename_to(path.as_path())) {
+            Result::Ok(_)  => { return String::new(); }
             Result::Err(error) => {
-                mut report: String = f"cannot publish the stdlib manifest as {path}: {error}";
-                return report.into_raw();
+                return f"cannot publish the stdlib manifest as {path.as_path().as_str()}: {error}";
             }
         }
     }
