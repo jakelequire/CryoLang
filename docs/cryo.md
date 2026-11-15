@@ -3181,7 +3181,7 @@ it generates two independent types and two specialised function bodies, one for 
 
 Generic bodies are type-checked once, as templates, **before** monomorphisation: a body is checked against its parameters' bounds, never against the types it is later instantiated with, so an error in a generic body is reported whether or not anything instantiates it. That includes a path through a type parameter naming a member none of its bounds declares (`T::m()`, `T::m`, `(Tr for T)::m`): it is reported once, where the template is checked, for a body nothing instantiates as for one instantiated many times (section on calls through a bound). Monomorphisation then copies each instantiated body with its type arguments substituted and binds every call in the copy to its concrete callee; the copies are not type-checked again, so a call the template check accepts must be one every copy can bind. A method call on the body's own instantiation of a generic type (`xs.get(i)` with `xs: &Array<T>`) is therefore refused where it is written when its arguments bind to no method of the name, by the rule a call's arguments bind by - a `u64` passed for `get`'s `i64` index is refused (E0214), as is an overload set none of whose members takes the arguments. The driver lives in [`compiler/src/compiler/mono/`](../compiler/src/compiler/mono/) (`monomorphizer.cryo`), run from `instance.cryo` after the function-body type check.
 
-Every copy is analysed - its diagnostics do not depend on whether anything calls it - but an executable emits only the copies its code can reach. Once analysis is done, the compiler walks from every function that is not a copy, through every call and every function named as a value, and through what code generation calls with no call written: a trait-object table's methods, a type's `Drop` and `Allocate` implementations, an operator's, an index's and a `?`'s method, and the releases drop insertion adds. A copy the walk never reaches is left out of every object. A library, the standard library's archive, and a single object, assembly or IR file (`-o` naming one) keep every copy, since what calls them is not in the build. The walk is in [`codegen/reachable_instances.cryo`](../compiler/src/compiler/codegen/reachable_instances.cryo); a reference code generation makes to a copy the walk left out is an internal error (E0900) naming the copy.
+Every copy is analysed - its diagnostics do not depend on whether anything calls it - but an executable emits only the copies its code can reach. Once analysis is done, the compiler walks from every function that is not a copy, through every call and every function named as a value, and through what code generation calls with no call written: a trait-object table's methods, a type's `Drop` and `Allocate` implementations, an operator's, an index's and a `?`'s method, and the releases drop insertion adds. A copy the walk never reaches is left out of every object. The standard library's archive is walked the same way, from the archive's own functions: a copy its build does not reach is left out of it and not listed in its manifest, and a program linking the archive defines every copy it needs that the manifest does not list in its own objects. Any other library, and a single object, assembly or IR file (`-o` naming one), keeps every copy, since what calls them is not in the build. The walk is in [`codegen/reachable_instances.cryo`](../compiler/src/compiler/codegen/reachable_instances.cryo); a reference code generation makes to a copy the walk left out is an internal error (E0900) naming the copy.
 
 ### 11.7 `static match` — Compile-Time Type Dispatch
 
@@ -3207,20 +3207,31 @@ static match (T) {
 }
 ```
 
-**Omitting `_` makes the arm list the accepted-type list.** A `T` that matches no arm is a compile error. This is deliberate and is how the standard library expresses "this generic accepts exactly these types" without inventing a trait:
+**Omitting `_` makes the arm list the accepted-type list.** A `T` that matches no arm is a compile error, so a generic can accept exactly these types without inventing a trait:
 
 ```cryo
-// `String::try_push` accepts strings, integers, floats and boolean.
-// Any other T is rejected at compile time - there is no `_` arm.
-try_push<T>(mut &this, item: T) -> Result<(), AllocationError> {
+// Accepts the unsigned integer types and nothing else: any other T is
+// rejected at compile time, because there is no `_` arm.
+write_unsigned<T>(mut &this, value: T) -> void {
+    static match (T) {
+        u8  => { this.write_u8(value); }
+        u16 => { this.write_u16(value); }
+        u32 => { this.write_u32(value); }
+        u64 => { this.write_u64(value); }
+    }
+}
+```
+
+**With `_`, the listed arms are special cases of a general one.** `String::try_push` copies text in directly and formats every other type its `Display` bound admits:
+
+```cryo
+try_push<T>(mut &this, item: T) -> Result<(), AllocationError>
+where T: Display {
     return static match (T) {
         String  => { this.push_view_bytes(item.as_str()) }
         Str     => { this.push_view_bytes(item) }
         string  => { this.push_view_bytes(Str::from(item)) }
-        u8 | u16 | u32 | u64 |
-        i8 | i16 | i32 | i64 |
-        f32 | f64 |
-        boolean => { this.push_display(item) }
+        _       => { this.push_display(item) }
     };
 }
 ```
