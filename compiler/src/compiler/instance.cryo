@@ -235,7 +235,9 @@ type struct CompilationResult {
     success:       boolean;
     error_count:   u32;
     warning_count: u32;
-    output_path:   string;
+    /// The executable the build produced (or the `-o` path it was copied
+    /// to); empty for a target with no entry point.
+    output_path:   PathBuf;
     /// The stdlib root this build resolved (possibly relative). Surfaced
     /// so `cryo test` can export it as `$CRYO_STDLIB` for the test
     /// runtime's compile-fail helpers. Empty for `--no-std` builds.
@@ -244,8 +246,7 @@ type struct CompilationResult {
     /// build's files; 0 without the flag.
     fixes_applied: i64;
 
-    static ok(output_path_text: string) -> CompilationResult {
-        const output_path: string = output_path_text;
+    static ok(output_path: PathBuf) -> CompilationResult {
         return CompilationResult {
             success:       true,
             error_count:   0,
@@ -261,7 +262,7 @@ type struct CompilationResult {
             success:       false,
             error_count:   errors,
             warning_count: warnings,
-            output_path:   "",
+            output_path:   PathBuf::new(),
             stdlib_root:   "",
             fixes_applied: 0,
         };
@@ -422,7 +423,7 @@ type struct CompilerInstance {
         // point at the user's path, not the internal build layout.
         if (result.success
                 && this.config.output_path_override.length() > 0) {
-            result.output_path = this.config.output_path_override;
+            result.output_path = PathBuf::from(Str::new(this.config.output_path_override));
         }
         return result;
     }
@@ -657,7 +658,7 @@ type struct CompilerInstance {
         // TypeRef.id key; without resetting it, the second target gets
         // back the first target's stale LLVMTypeRef and crashes during
         // IRGen on the first generic instantiation it tries to map.
-        mut last_output: string = "";
+        mut last_output: PathBuf = PathBuf::new();
 
         // A project with `[[bin]]` targets builds its executables; its
         // `[lib]` names what a dependent compiles (a dependency is compiled
@@ -678,7 +679,7 @@ type struct CompilerInstance {
             const bin_view: ProjectConfig = CompilerInstance::make_bin_view(base.clone(), sel);
             const r: CompilationResult = this.compile_project_with_config(bin_view);
             if (!r.success) { return r; }
-            if (r.output_path.length() > 0) { last_output = r.output_path; }
+            if (!r.output_path.as_path().is_empty()) { last_output = PathBuf::from(r.output_path.as_str()); }
         }
 
         // Workspace `[[lib]]` members: build each as an independent library
@@ -695,7 +696,7 @@ type struct CompilerInstance {
             const lib_view: ProjectConfig = CompilerInstance::make_lib_member_view(base.clone(), sel);
             const r: CompilationResult = this.compile_project_with_config(lib_view);
             if (!r.success) { return r; }
-            if (r.output_path.length() > 0) { last_output = r.output_path; }
+            if (!r.output_path.as_path().is_empty()) { last_output = PathBuf::from(r.output_path.as_str()); }
         }
 
         return CompilationResult::ok(last_output);
@@ -760,13 +761,14 @@ type struct CompilerInstance {
         };
         const build: ProjectBuild = this.compile_project_to_context(config, mode, []);
         mut result: CompilationResult = build.result;
-        // Per-target teardown.  Copy the survivor strings out of any
+        // Per-target teardown.  Copy the survivor string out of any
         // context-owned (interned) storage FIRST, then reclaim this target's
         // heap so a multi-target (`[lib]` + `[[bin]]`) build does not stack
         // both contexts into peak RSS.  Ordering matters: the dup must run
         // while the interned bytes are still valid, before the teardown frees
-        // them.  The LSP keeps its context alive and never comes through here.
-        result.output_path = CompilerInstance::dup_survivor(result.output_path);
+        // them.  The output path is a PathBuf made after the target's arena
+        // was switched off, so it survives as it is.  The LSP keeps its
+        // context alive and never comes through here.
         result.stdlib_root = CompilerInstance::dup_survivor(result.stdlib_root);
         if (apply_fixes && build.ctx != null) {
             result.fixes_applied = FixApplier::apply(build.ctx.diagnostics, build.ctx.options.stdlib_root);
@@ -1406,7 +1408,7 @@ type struct CompilerInstance {
             this.config.incremental && ctx.options.mode.codegen_enabled()
             && this.config.output_path_override.length() == 0;
         mut mod_entries: [build_manifest::ModuleEntry] = [];
-        mut manifest_artifacts: [string] = [];
+        mut manifest_artifacts: [PathBuf] = [];
         mut manifest_stdlib_archive: string = "";
         mut manifest_stdlib_archive_key: string = "";
         mut build_fp_hex: string = "";
@@ -1451,11 +1453,7 @@ type struct CompilerInstance {
                 manifest_artifacts.push(
                     CodegenPasses::profile_bin_path_for_target(ctx.project_config, ctx));
             } else {
-                const archive_name: string = match (config.target_type) {
-                    TargetType::Stdlib => { "libcryo.a" }
-                    _                  => { fmt::format("lib%s.a", config.project_name).into_raw() }
-                };
-                manifest_artifacts.push(ctx.project_config.lib_archive_path(archive_name));
+                manifest_artifacts.push(ctx.project_config.lib_archive_path(config.archive_name().as_str()));
             }
             mut shape_hasher: ContentHasher = ContentHasher::new();
             ctx.options.fold_build_shape(&shape_hasher);
@@ -1470,10 +1468,10 @@ type struct CompilerInstance {
             if (manifest.is_up_to_date(build_fp_hex, &manifest_artifacts)) {
                 // Nothing changed and the artifact still exists: skip
                 // frontend, codegen, and linking entirely.
-                const up_to_date_out: string = if (config.requires_entry_point()) {
-                    manifest_artifacts[0]
+                const up_to_date_out: PathBuf = if (config.requires_entry_point()) {
+                    PathBuf::from(manifest_artifacts[0].as_str())
                 } else {
-                    ""
+                    PathBuf::new()
                 };
                 TimeTrace::span("stage", Str::new("build fingerprint"), Str::new(config.project_name), stage_start);
                 fmt::println(f"{config.project_name} is up to date ({config.profile})");
@@ -2294,11 +2292,12 @@ type struct CompilerInstance {
         // same project; `run_linking` applies the same suffix.  On Windows
         // targets the helper appends `.exe` so the reported path matches
         // what the linker actually wrote.
-        mut exe_path: string = "";
-        if (ctx.project_config != null
+        const exe_path: PathBuf = if (ctx.project_config != null
                 && ctx.project_config.requires_entry_point()) {
-            exe_path = CodegenPasses::bin_artifact_path_for_target(ctx.project_config, ctx);
-        }
+            CodegenPasses::bin_artifact_path_for_target(ctx.project_config, ctx)
+        } else {
+            PathBuf::new()
+        };
 
         // Build succeeded: record the fingerprint sidecar (consulted by the
         // next build's short-circuit) and the human/tooling-facing manifest.

@@ -219,24 +219,19 @@ type struct ProjOutcome {
 /// Rewrite a path's `/` to `\` so a `cmd`-executed command resolves it.
 /// Windows-host only; never referenced on the POSIX side.
 ![target(windows)]
-function exec_path(path_text: string) -> string {
-    const path: string = path_text;
-    const len: i64 = path.length();
-    const buf: mut i8* = libc::malloc((len + 1) as u64) as mut i8*;
-    const pb: i8* = path as i8*;
-    for (mut i: i64 = 0; i < len; i++) {
-        const ch: i8 = pb[i];
-        if (ch == '/') { buf[i] = '\\' as i8; } else { buf[i] = ch; }
+function exec_path(path: Str) -> String {
+    mut out: String = String::with_capacity(path.length());
+    for (mut i: i64 = 0; i < path.length(); i++) {
+        const byte: u8 = path.as_bytes()[i];
+        if (byte == '/' as u8) { out.push_byte('\\' as u8); } else { out.push_byte(byte); }
     }
-    buf[len] = 0;
-    return buf as string;
+    return out;
 }
 
 /// POSIX shells execute forward-slash paths fine; pass through unchanged.
 ![target(unix)]
-function exec_path(path_text: string) -> string {
-    const path: string = path_text;
-    return path;
+function exec_path(path: Str) -> String {
+    return String::from_str(path);
 }
 
 // The host OS this compiler was built for, as the name an `os:<name>`
@@ -1476,8 +1471,8 @@ type struct Executor {
         const result: instance::CompilationResult = compiler.compile_project(config_path);
 
         if (result.success) {
-            if (result.output_path.length() > 0) {
-                fmt::printf("Compiled -> %s\n", result.output_path);
+            if (!result.output_path.as_path().is_empty()) {
+                fmt::println(f"Compiled -> {result.output_path.as_str()}");
             } else {
                 fmt::printf("Project compilation succeeded.\n");
             }
@@ -1538,12 +1533,12 @@ type struct Executor {
 
         // compile_project leaves output_path empty for non-executable
         // targets (libraries, stdlib batches).  Nothing to run there.
-        if (result.output_path.length() == 0) {
+        if (result.output_path.as_path().is_empty()) {
             fmt::eprintf("Error: target produced no executable; `cryo run` only works for executable projects.\n");
             return 1;
         }
 
-        Log::debug(LogArea::Driver, f"running {result.output_path}");
+        Log::debug(LogArea::Driver, f"running {result.output_path.as_str()}");
         // Flush so the build's own output appears before the child binary's;
         // otherwise the libc buffer can interleave them.
         libc::fflush(null);
@@ -1553,9 +1548,9 @@ type struct Executor {
         // Windows.  The decoded exit code is surfaced so the caller's `$?`
         // matches what the inner binary returned; a negative value signals a
         // spawn failure.
-        const status: i32 = Command::shell(exec_path(result.output_path));
+        const status: i32 = Command::shell(exec_path(result.output_path.as_str()).as_str());
         if (status < 0) {
-            fmt::eprintf("Error: failed to spawn '%s'\n", result.output_path);
+            fmt::eprintln(f"Error: failed to spawn '{result.output_path.as_str()}'");
             return 1;
         }
         return status as int;
@@ -1601,7 +1596,7 @@ type struct Executor {
                 result.error_count, result.warning_count);
             return 1;
         }
-        if (result.output_path.length() == 0) {
+        if (result.output_path.as_path().is_empty()) {
             fmt::eprintf("Error: target produced no test executable; `cryo test` requires an executable project.\n");
             return 1;
         }
@@ -1610,7 +1605,7 @@ type struct Executor {
         // pattern (first positional) and the runner-side flags.  The leading
         // binary path is host-normalized (`/`->`\` on Windows) so `cmd` can
         // execute it; the appended flags carry no path separators.
-        mut cmd: String = String::from_string(exec_path(result.output_path));
+        mut cmd: String = exec_path(result.output_path.as_str());
         if (args.positional_count() > 0) {
             cmd.push(fmt::format(" %s", args.input_file()).as_str());
         }
@@ -1674,7 +1669,7 @@ type struct Executor {
         libc::fflush(null);
         const status: i32 = Command::shell(cmd.as_str());
         if (status < 0) {
-            fmt::eprintf("Error: failed to spawn '%s'\n", result.output_path);
+            fmt::eprintln(f"Error: failed to spawn '{result.output_path.as_str()}'");
             return 1;
         }
         mut exit_code: int = status as int;
@@ -3338,8 +3333,8 @@ type struct Executor {
         const result: instance::CompilationResult = compiler.compile_file(file_path_text);
 
         if (result.success) {
-            if (result.output_path.length() > 0) {
-                fmt::printf("Compiled -> %s\n", result.output_path);
+            if (!result.output_path.as_path().is_empty()) {
+                fmt::println(f"Compiled -> {result.output_path.as_str()}");
             } else {
                 fmt::printf("Compilation succeeded.\n");
             }
@@ -3681,10 +3676,8 @@ type struct Executor {
     /// on further rows under an empty label, broken after the last path
     /// separator that fits so each row still holds whole path segments; a
     /// single segment longer than the column breaks at the column edge.
-    static vendor_box_field(label_text: string, value_text: string) -> void {
+    static vendor_box_field(label_text: string, text: str::Str) -> void {
         const label: string = label_text;
-        const value: string = value_text;
-        const text: str::Str = str::Str::new(value);
         const n: i64 = text.length();
         mut start: i64 = 0;
         mut first: boolean = true;
@@ -3771,8 +3764,7 @@ type struct Executor {
         }
         const order: [i64] = Executor::vendor_key_order(&reg);
         fmt::printf("Registered vendor libraries (%lld)\n", reg.entries.length() as i64);
-        fmt::printf("Bindings cache: %s\n\n",
-            exec_path(registry::VendorRegistry::vendor_root()));
+        fmt::print(f"Bindings cache: {exec_path(str::Str::new(registry::VendorRegistry::vendor_root()))}\n\n");
         mut missing: i64 = 0;
         for (mut oi: i64 = 0; oi < order.length(); oi++) {
             const i: i64 = order[oi];
@@ -3791,7 +3783,7 @@ type struct Executor {
             Executor::vendor_box_field("targets",
                 Executor::vendor_cached_targets(&reg.entries[i]));
             Executor::vendor_box_field("source",
-                exec_path(reg.entries[i].source_path));
+                exec_path(str::Str::new(reg.entries[i].source_path)).as_str());
             Executor::vendor_box_gap();
         }
         Executor::vendor_box_rule("");
@@ -3850,7 +3842,7 @@ type struct Executor {
         // registry.
         for (mut d: i64 = doomed.length() - 1; d >= 0; d--) {
             fmt::printf("  %s\n", doomed[d]);
-            fmt::printf("      was %s\n", exec_path(paths[d]));
+            fmt::println(f"      was {exec_path(str::Str::new(paths[d]))}");
         }
         fmt::printf("%lld librar%s left registered.\n", reg.entries.length() as i64,
             if (reg.entries.length() == 1) { "y" } else { "ies" });
