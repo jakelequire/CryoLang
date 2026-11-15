@@ -1271,6 +1271,18 @@ type struct NameResolver {
         return best;
     }
 
+    /// `d`, a path whose prefix spells `imported` out of `use_module`'s
+    /// reach, with a note naming the alias `use_module` imports it under, if
+    /// any: such a module is reached by its alias, and its own leaf names
+    /// nothing.
+    with_import_alias_note(&this, d: Diagnostic, use_module: ModulePath, imported: ModulePath) -> Diagnostic {
+        const alias: SymbolStr = this.ctx.module_graph.import_alias_of(use_module, imported);
+        if (alias.is_empty()) { return d; }
+        return d.with_note(fmt::format(
+            "this module imports `%s` as `%s`, and a module imported under an alias is named by the alias alone",
+            this.resolver.intern_table.shown(imported.decl_name()), this.resolver.intern_table.resolve(alias)));
+    }
+
     /// `d`, a name written at `span` out of reach, with the fix `import
     /// <imported>;` as help and as an edit adding that line after the file's
     /// imports.  Every name the one import would reach is the same missing
@@ -1339,6 +1351,7 @@ type struct NameResolver {
                     fmt::format("`%s` is not reachable from this module", prefix));
                 d = d.at_with_label(span, "not reachable in this scope");
                 d = d.with_note(fmt::format("`%s` is the module it would name", owner));
+                d = this.with_import_alias_note(d, use_module, mods.any);
                 this.ctx.emit_diagnostic(this.with_import_fix(d, span, owner));
                 return true;
             }
@@ -1802,6 +1815,7 @@ type struct NameResolver {
                 // unreachable is that its first segment binds to nothing here,
                 // and only the full path fixes that.
                 d = d.with_note(fmt::format("`%s` is the module it would name", owner));
+                d = this.with_import_alias_note(d, use_module, any);
                 this.ctx.emit_diagnostic(this.with_import_fix(d, node.scope_span, owner));
                 node.set_scope_res(Res::Err);
             } else {
@@ -3113,7 +3127,7 @@ type struct NameResolver {
         // An aliased import names the module by its alias alone.
         if (imported_idx >= 0) {
             this.ctx.module_graph.record_import_naming(
-                this.resolver.current_module_path(), imported, node.has_alias());
+                this.resolver.current_module_path(), imported, node.alias);
         }
 
         const exports: [SymbolID] = this.resolver.get_exports(imported);
@@ -3344,7 +3358,7 @@ type struct NameResolver {
                     }
                     node.add_entry_def(i, this.ctx.module_graph.get_module(sub_idx).def);
                     this.ctx.module_graph.record_import_naming(
-                        this.resolver.current_module_path(), sub_module, !alias.is_empty());
+                        this.resolver.current_module_path(), sub_module, alias);
                     if (!alias.is_empty()) {
                         const sub_alias_id: SymbolID = this.resolver.alloc_symbol_id();
                         mut sub_alias: Symbol = Symbol::import_sym(

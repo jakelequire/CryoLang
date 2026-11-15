@@ -5033,6 +5033,8 @@ The lexer and grammar reserve the following forms because the language plans to 
 
 When any of these moves out of "reserved" and into "implemented," it will be added to the relevant section of this document and removed from this table.
 
+An unknown directive is a warning (E0153) that names the nearest built-in, if one is spelled close enough, as help. The rename is also offered as a machine-applicable fix only when it is certain to be accepted where it lands: the directive was written without arguments, and the built-in takes none, may be written on that declaration, and asks nothing more of it (`inline`, `noinline`, `caller_location`, `no_mangle`, `weak`, `must_use`, `thread_local`, `functions_only` and the bare OS gates).
+
 ---
 
 ## 22. Grammar Summary
