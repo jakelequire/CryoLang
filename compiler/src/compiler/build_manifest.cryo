@@ -36,7 +36,7 @@ import utils::build_stamp::{ BuildStamp, StampSlot };
 import utils::log::{ Log, LogArea };
 import std::fs::file::{ File };
 import std::fs::file;
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::fmt;
 import std::env;
 import std::core::{ hash, primitives };
@@ -227,12 +227,11 @@ type struct ModuleKeyTable {
     /// with the same-arity `read`/`write` intrinsics and a reference-array static
     /// fails codegen resolution outright (E0636). The distinctly-named free
     /// function sidesteps both.
-    static read_module_keys(path_text: string) -> ModuleKeyTable {
-        const path: string = path_text;
+    static read_module_keys(path: Path) -> ModuleKeyTable {
         mut t: ModuleKeyTable = ModuleKeyTable::empty();
-        if (!Path::from(path).exists()) { return t; }
+        if (!path.exists()) { return t; }
         mut content: string = "";
-        match (File::read_text(Path::from(path))) {
+        match (File::read_text(path)) {
             Result::Ok(s)  => { content = s.into_raw(); }
             Result::Err(_) => { return t; }
         }
@@ -271,7 +270,7 @@ type struct ModuleKeyTable {
     /// caller must have created the incremental dir (e.g. via
     /// `Manifest::write_fingerprint`, which always runs alongside this on the
     /// success path).
-    static write_module_keys(path: string, names: &[string], keys: &[u128]) -> void {
+    static write_module_keys(path: Path, names: &[string], keys: &[u128]) -> void {
         mut text: String = String::new();
         for (mut i: i64 = 0; i < names.length(); i++) {
             text.push(Str::new(names[i]));
@@ -279,10 +278,10 @@ type struct ModuleKeyTable {
             text.push(Str::new(Manifest::hex128(keys[i])));
             text.push_byte(10 as u8);    // LF
         }
-        match (File::write_bytes(Path::from(path), text.as_bytes())) {
+        match (File::write_bytes(path, text.as_bytes())) {
             Result::Ok(_)  => {}
             Result::Err(_) => {
-                fmt::eprintln(f"warning: cannot write per-module cache keys to {path}");
+                fmt::eprintln(f"warning: cannot write per-module cache keys to {path.as_str()}");
             }
         }
         mem::drop(text);
@@ -312,7 +311,7 @@ type struct ModuleObjectCache {
 
     /// The cache for a build at `opt_level` for `target_triple`, with the
     /// keys the last build wrote to `keys_path`.
-    static open(opt_level: u32, target_triple: string, keys_path: string) -> ModuleObjectCache {
+    static open(opt_level: u32, target_triple: string, keys_path: Path) -> ModuleObjectCache {
         return ModuleObjectCache {
             active: true,
             toolchain: Manifest::toolchain_fingerprint(opt_level, target_triple),
@@ -342,7 +341,7 @@ type struct ModuleObjectCache {
     }
 
     /// Write this build's keys to `keys_path` for the next build.
-    write(&this, keys_path: string) -> void {
+    write(&this, keys_path: Path) -> void {
         ModuleKeyTable::write_module_keys(keys_path, &this.names, &this.keys);
     }
 }
@@ -424,7 +423,8 @@ type struct Manifest {
     /// changes a module source anyway.  Empty when there is no sidecar.
     recorded_headers(&this) -> [string] {
         mut headers: [string] = [];
-        const lines: [string] = Manifest::read_file_trimmed(this.cfg.fingerprint_path()).split_nonempty("\n");
+        const fingerprint: PathBuf = this.cfg.fingerprint_path();
+        const lines: [string] = Manifest::read_file_trimmed(fingerprint.as_path()).split_nonempty("\n");
         for (mut i: i64 = 1; i < lines.length(); i++) { headers.push(lines[i]); }
         return headers;
     }
@@ -434,7 +434,8 @@ type struct Manifest {
     /// a build.
     is_up_to_date(&this, fp_hex_text: string, artifacts: &[string]) -> boolean {
         const fp_hex: string = fp_hex_text;
-        const lines: [string] = Manifest::read_file_trimmed(this.cfg.fingerprint_path()).split_nonempty("\n");
+        const fingerprint: PathBuf = this.cfg.fingerprint_path();
+        const lines: [string] = Manifest::read_file_trimmed(fingerprint.as_path()).split_nonempty("\n");
         if (lines.length() == 0 || !lines[0].eq(fp_hex)) { return false; }
         for (mut i: i64 = 0; i < artifacts.length(); i++) {
             if (!Path::from(artifacts[i]).exists()) { return false; }
@@ -452,14 +453,15 @@ type struct Manifest {
     /// again, and reuses every object whose bitcode is unchanged.
     write_fingerprint(&this, fp_hex_text: string, headers: &[string], reported_warnings: boolean) -> void {
         const fp_hex: string = fp_hex_text;
-        ProjectConfig::mkdir_p(Path::from(this.cfg.incremental_dir()));
-        const path: string = this.cfg.fingerprint_path();
+        const incremental: PathBuf = this.cfg.incremental_dir();
+        ProjectConfig::mkdir_p(incremental.as_path());
+        const path: PathBuf = this.cfg.fingerprint_path();
         if (reported_warnings) {
-            if (Path::from(path).exists()) {
-                match (File::remove(Path::from(path))) {
+            if (path.exists()) {
+                match (File::remove(path.as_path())) {
                     Result::Ok(_)  => {}
                     Result::Err(_) => {
-                        fmt::eprintln(f"warning: cannot remove the build fingerprint {path}; the next build may skip reporting this build's warnings");
+                        fmt::eprintln(f"warning: cannot remove the build fingerprint {path.as_str()}; the next build may skip reporting this build's warnings");
                     }
                 }
             }
@@ -472,10 +474,10 @@ type struct Manifest {
             text.push(Str::new(headers[i]));
             text.push_byte(10 as u8);
         }
-        match (File::write_bytes(Path::from(path), text.as_bytes())) {
+        match (File::write_bytes(path.as_path(), text.as_bytes())) {
             Result::Ok(_)  => {}
             Result::Err(_) => {
-                fmt::eprintln(f"warning: cannot write build fingerprint to {path}");
+                fmt::eprintln(f"warning: cannot write build fingerprint to {path.as_str()}");
             }
         }
         mem::drop(text);
@@ -486,8 +488,9 @@ type struct Manifest {
     write_manifest(&this, modules: &[ModuleEntry], fp_hex_text: string,
                    artifacts: &[string]) -> void {
         const fp_hex: string = fp_hex_text;
-        ProjectConfig::mkdir_p(Path::from(this.cfg.profile_dir()));
-        const path: string = this.cfg.manifest_path();
+        const profile: PathBuf = this.cfg.profile_dir();
+        ProjectConfig::mkdir_p(profile.as_path());
+        const path: PathBuf = this.cfg.manifest_path();
 
         const cfp: u128 = Manifest::compiler_fingerprint();
         const compiler_fp: string = Manifest::hex128(cfp);
@@ -542,10 +545,10 @@ type struct Manifest {
         mem::drop(doc);
 
         text.push_byte(10 as u8);        // trailing newline (matches prior fputs)
-        match (File::write_bytes(Path::from(path), text.as_bytes())) {
+        match (File::write_bytes(path.as_path(), text.as_bytes())) {
             Result::Ok(_)  => {}
             Result::Err(_) => {
-                fmt::eprintln(f"warning: cannot write build manifest to {path}");
+                fmt::eprintln(f"warning: cannot write build manifest to {path.as_str()}");
             }
         }
         mem::drop(text);
@@ -680,10 +683,9 @@ type struct Manifest {
 
     /// Read a file's content with trailing whitespace/newlines stripped, or ""
     /// when the file is absent or unreadable.
-    static read_file_trimmed(path_text: string) -> string {
-        const path: string = path_text;
+    static read_file_trimmed(path: Path) -> string {
         mut raw: string = "";
-        match (File::read_text(Path::from(path))) {
+        match (File::read_text(path)) {
             Result::Ok(s)  => { raw = s.into_raw(); }
             Result::Err(_) => { return ""; }
         }

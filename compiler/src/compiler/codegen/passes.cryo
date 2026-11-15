@@ -692,10 +692,10 @@ type struct CodegenPasses {
     /// normal build's output.  The shell sorts the glob's expansion, so the
     /// modules are linked in the same order on every build.
     ![target(unix)]
-    static emit_linked_ir_dump(profile_dir_text: string, ll_path_text: string) -> void {
+    static emit_linked_ir_dump(profile_dir: Path, ll_path_text: string) -> void {
         const ll_cmd: string = fmt::format(
             "llvm-link-20 -S %s/*/ir/*.ll -o %s",
-            CodegenPasses::shell_quote(profile_dir_text), CodegenPasses::shell_quote(ll_path_text)).into_raw();
+            CodegenPasses::shell_quote(profile_dir.as_str()), CodegenPasses::shell_quote(ll_path_text)).into_raw();
         const ll_rc: i32 = Command::shell(ll_cmd);
         if (ll_rc == 0) {
             Log::debug(LogArea::Codegen, f"linked ir dump {ll_path_text}");
@@ -705,7 +705,7 @@ type struct CodegenPasses {
     }
 
     ![target(windows)]
-    static emit_linked_ir_dump(profile_dir_text: string, ll_path_text: string) -> void {
+    static emit_linked_ir_dump(profile_dir: Path, ll_path_text: string) -> void {
         // cmd has no glob; the IR dump is a POSIX selfhost-check aid and is
         // not produced on a native Windows build.
     }
@@ -1357,10 +1357,10 @@ type struct CodegenPasses {
         const link_cfg: LinkerConfig = LinkerConfig::linker_config_for_triple(effective_triple);
 
         if (!link_cfg.supported) {
-            const obj_only_dir: string = cfg.profile_dir();
-            fmt::println(f"Cross-compile: produced {ctx.artifacts.object_files.length()} object file(s) for target '{ctx.options.target_triple}' in {obj_only_dir}");
+            const obj_only_dir: PathBuf = cfg.profile_dir();
+            fmt::println(f"Cross-compile: produced {ctx.artifacts.object_files.length()} object file(s) for target '{ctx.options.target_triple}' in {obj_only_dir.as_str()}");
             fmt::println(f"  (host linker skipped; link with a {ctx.options.target_triple}-aware toolchain, e.g.:");
-            fmt::println(f"     clang --target={ctx.options.target_triple} {obj_only_dir}/*/deps/*.o -o <output>)");
+            fmt::println(f"     clang --target={ctx.options.target_triple} {obj_only_dir.as_str()}/*/deps/*.o -o <output>)");
             return PassResult::ok();
         }
 
@@ -1369,8 +1369,8 @@ type struct CodegenPasses {
         // the build root afterwards; ensure the per-profile dir exists
         // for custom `--build-dir=...` paths that haven't been
         // pre-created.
-        const profile_dir: string = cfg.profile_dir();
-        ProjectConfig::mkdir_p(Path::from(profile_dir));
+        const profile_dir: PathBuf = cfg.profile_dir();
+        ProjectConfig::mkdir_p(profile_dir.as_path());
         // Test-mode builds use a `-test` suffix so the test executable
         // coexists with a normal `cryo run` build of the same project.
         // The `.exe` suffix (Windows targets) goes on top of `-test` so
@@ -1617,7 +1617,7 @@ type struct CodegenPasses {
         // link.  POSIX-only (a shell glob); a no-op on a Windows-hosted
         // compiler.
         if (ctx.options.emit_llvm) {
-            CodegenPasses::emit_linked_ir_dump(profile_dir, fmt::format("%s.ll", hoisted_exe).into_raw());
+            CodegenPasses::emit_linked_ir_dump(profile_dir.as_path(), fmt::format("%s.ll", hoisted_exe).into_raw());
         }
 
         return PassResult::ok();
@@ -1885,24 +1885,22 @@ type struct CodegenPasses {
     /// interpolated user-controlled path needs this treatment.  Without it,
     /// a working directory with a space breaks linking, and a path containing
     /// shell metacharacters is an arbitrary-command-execution hazard.
-    static shell_quote(s_text: string) -> string {
-        const s: string = s_text;
-        const len: i64 = s.length();
+    static shell_quote(text: Str) -> string {
+        const len: i64 = text.length();
         // Worst case: every byte is a single quote, expanding to 4 bytes,
         // plus two outer quotes and a NUL terminator.
         const cap: i64 = len * 4 + 3;
         mut sbuf: String = String::with_capacity(cap);
         sbuf.push_byte('\'' as u8);
-        const sb: i8* = s as i8*;
         for (mut i: i64 = 0; i < len; i++) {
-            const ch: i8 = sb[i];
-            if (ch == '\'') {
+            const ch: u8 = text.as_bytes()[i];
+            if (ch == '\'' as u8) {
                 sbuf.push_byte('\'' as u8);
                 sbuf.push_byte('\\' as u8);
                 sbuf.push_byte('\'' as u8);
                 sbuf.push_byte('\'' as u8);
             } else {
-                sbuf.push_byte(ch as u8);
+                sbuf.push_byte(ch);
             }
         }
         sbuf.push_byte('\'' as u8);
