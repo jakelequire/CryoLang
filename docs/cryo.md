@@ -3938,14 +3938,13 @@ implement trait Drop for Session {
 > along two paths, and both the field-glue rule above and the drop of a
 > partially-consumed aggregate depend on the no-op behaviour.
 
-**Do not call `drop` by hand.** An explicit `x.drop()` warns (`W0015`) and will
-become an error. To release **early**, use `mem::drop(x)`, which takes the
+**Do not call `drop` by hand.** A call that names a `Drop` implementation's
+`drop`, `x.drop()`, is refused (`E0453`): the compiler releases the value
+itself, so a destructor called through a reference runs while the owner still
+releases the value, and one called on a field runs while the owner releases
+the field again. To release **early**, use `mem::drop(x)`, which takes the
 value - so the move checker rejects any later use and the scope-exit drop is
-suppressed. On a local, `x.drop()` does the same: it is read as a move, so the
-local is released once, there, and a later use is refused (`E0452`). On a
-field, `h.a.drop()` releases the field and the owner releases it again when it
-is released itself - a second release, harmless only while every destructor
-leaves what it freed empty.
+suppressed.
 
 **Only `implement trait Drop` defines a destructor.** A method merely named `drop` - declared in a struct body or an inherent `implement` block - is an ordinary method: it is not run at scope exit, it does not make the type satisfy `where T: Drop`, and calling it releases nothing else.
 
@@ -4894,7 +4893,7 @@ The standard library follows a small set of conventions that user code is encour
 
 - **No NUL-terminated strings outside `ffi/`.** Every other module works in `Str` and `String`, and turns a C string into one at the boundary (`Str::new`, `String::with_null` / `as_c_string`).
 - **`Result` for fallible operations, `panic` for broken invariants.** A function returns `Result<T, E>` whenever failure is part of its contract; it panics only when the contract truly cannot be preserved (e.g., an out-of-bounds index on a function whose contract excludes it).
-- **Explicit resource management.** Every owning type implements `Drop` (`implement trait Drop for ...`), and its docstring identifies the ownership obligation. The compiler runs these destructors at scope exit (see [section 15.2](#152-the-drop-trait)); to release a value early, call `mem::drop(x)`, not `x.drop()` (which warns, W0015).
+- **Explicit resource management.** Every owning type implements `Drop` (`implement trait Drop for ...`), and its docstring identifies the ownership obligation. The compiler runs these destructors at scope exit (see [section 15.2](#152-the-drop-trait)); to release a value early, call `mem::drop(x)`; `x.drop()` is refused (E0453).
 - **Allocator-generic containers.** `Array<T>`, `HashMap<K, V>`, `String`, etc. accept any `Allocator` implementation, defaulting to `GlobalAllocator`.
 
 ### 19.4 Random Numbers
