@@ -108,6 +108,7 @@ import compiler::types::user_defined::{
     EnumType, EnumVariantInfo, MethodInfo, StructType, TraitType, TypeAliasType
 };
 import std::core::slice::{ Slice };
+import std::collections::str::{ Str };
 
 // Format-argument categories for the `printf`/`eprintf` directive checker.
 // A `%` conversion expects one of these; each variadic argument's resolved
@@ -1184,7 +1185,13 @@ type struct CallResolver {
             }
             if (arg != null && slot.is_valid()) {
                 const arg_node: ExpressionNode* = arg;
+                const borrowed: UnaryExpr* = ExpressionNode::unary_of(arg_node);
                 if (ExpressionNode::array_of(arg_node) != null) {
+                    push_expected = true;
+                } else if (borrowed != null && borrowed.op.kind == TokenType::Amp
+                        && ExpressionNode::array_of(borrowed.operand) != null) {
+                    // A borrowed array literal is typed by the slot's referent,
+                    // which is the only type an empty one has.
                     push_expected = true;
                 } else if (ExpressionNode::tuple_of(arg_node) != null) {
                     // Same reason as an array literal: an aggregate literal needs the
@@ -6205,15 +6212,15 @@ type struct CallResolver {
         const failed_trait: DeclName = this.trait_checker().diagnose_method_bounds_failure(lookup_ref, member.member);
         if (failed_trait.is_valid()) {
             // The identity, rendered by its leaf as the tie report does.
-            const trait_str: string = QualifiedName::leaf_of(this.intern.shown(failed_trait));
+            const trait_str: Str = QualifiedName::leaf_of(this.intern.shown(failed_trait));
             mut diag: Diagnostic = Diagnostic::error(
                 ErrorCode::E0358_UNDEFINED_METHOD_IMPL,
-                fmt::format("the trait `%s` is not implemented for `%s`", trait_str, type_display));
+                f"the trait `{trait_str}` is not implemented for `{type_display}`");
             diag = diag.at(primary_span);
-            diag = diag.with_note(fmt::format(
-                "the impl of `%s` for this type has a where-clause that this specialization does not satisfy", trait_str));
-            diag = diag.help(fmt::format(
-                "method `%s` belongs to trait `%s`; ensure the type arguments satisfy the impl's bounds", method_name, trait_str));
+            diag = diag.with_note(
+                f"the impl of `{trait_str}` for this type has a where-clause that this specialization does not satisfy");
+            diag = diag.help(
+                f"method `{method_name}` belongs to trait `{trait_str}`; ensure the type arguments satisfy the impl's bounds");
             this.ctx.emit_diagnostic(diag);
             return TypeRef::invalid();
         }
@@ -6275,8 +6282,8 @@ type struct CallResolver {
             }
         }
         if (this.arena.get_qualified_name(lookup_ref).is_valid()) {
-            const simple: string = QualifiedName::leaf_of(this.intern.shown(this.arena.get_qualified_name(lookup_ref)));
-            if (simple != "") {
+            const simple: Str = QualifiedName::leaf_of(this.intern.shown(this.arena.get_qualified_name(lookup_ref)));
+            if (!simple.is_empty()) {
                 const shadows: [ShadowCandidate] = this.diag.find_shadowed_type_candidates(SymbolStr::empty(), member.member, lookup_ref);
                 if (shadows.length() > 0) {
                     diag = this.diag.attach_shadow_import_suggestions(diag, simple, shadows);
@@ -7221,7 +7228,7 @@ type struct CallResolver {
         if (func == null) { return; }
         const tr: const TraitRef* = this.parameter_trait_bound(call, owner_ty, trait_sym, func);
         if (tr == null) {
-            const trait_leaf: string = QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(trait_sym)));
+            const trait_leaf: string = this.intern.shown(this.ctx.defs.leaf_of(trait_sym));
             const param_display: string = this.arena.format_generic_param(param);
             mut d: Diagnostic = Diagnostic::error(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
                 fmt::format("`%s` does not implement `%s`", param_display, trait_leaf));
@@ -7305,7 +7312,7 @@ type struct CallResolver {
     report_trait_qualified_unselected(mut &this, scope: ScopeResolutionExpr*, trait_sym: DefId,
                                       member_sym: SymbolStr, call_e: ExpressionNode*, call: CallExpr*) -> void {
         if (this.state.in_symbolic_check) { return; }
-        const trait_leaf: string = QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(trait_sym)));
+        const trait_leaf: string = this.intern.shown(this.ctx.defs.leaf_of(trait_sym));
         const member_str: string = this.intern.resolve(member_sym);
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
             fmt::format("`%s::%s()` selects no implementation: a call through a trait's path selects by its first argument's type, and there is none",
@@ -8415,7 +8422,7 @@ type struct CallResolver {
                                owner: TypeRef, trait_sym: DefId, member_sym: SymbolStr) -> void {
         if (this.state.in_symbolic_check) { return; }
         const owner_str: string = this.intern.resolve(owner_sym);
-        const trait_leaf: string = QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(trait_sym)));
+        const trait_leaf: string = this.intern.shown(this.ctx.defs.leaf_of(trait_sym));
         const owner_ref: TypeRef = owner;
         if (owner_ref.is_valid()
                 && !this.trait_checker().type_implements_trait(owner_ref, trait_sym, 0)) {
@@ -8434,12 +8441,11 @@ type struct CallResolver {
     /// `(Trait for Owner)::member` where the implementation has no method
     /// `member`, at the path's member segment; `owner_shown` is the owner
     /// as the message names it.
-    impl_member_miss(&this, scope: ScopeResolutionExpr*, trait_sym: DefId, owner_shown: string,
+    impl_member_miss(&this, scope: ScopeResolutionExpr*, trait_sym: DefId, owner_shown: Str,
                      member_sym: SymbolStr) -> Diagnostic {
-        const trait_leaf: string = QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(trait_sym)));
+        const trait_leaf: string = this.intern.shown(this.ctx.defs.leaf_of(trait_sym));
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0233_UNDEFINED_SYMBOL,
-            fmt::format("`%s`'s implementation for `%s` has no method `%s`",
-                trait_leaf, owner_shown, this.intern.resolve(member_sym)));
+            f"`{trait_leaf}`'s implementation for `{owner_shown}` has no method `{this.intern.resolve(member_sym)}`");
         return d.at_with_label(scope.member_span, "not a method of this implementation");
     }
 
@@ -8697,7 +8703,7 @@ type struct CallResolver {
         mut help: string = "";
         for (mut i: i64 = 0; i < traits.length(); i++) {
             const trait_str: string = this.intern.shown(this.ctx.defs.path_of(traits[i]));
-            const leaf: string = if (leaf_collides) { trait_str } else { QualifiedName::leaf_of(trait_str) };
+            const leaf: string = if (leaf_collides) { trait_str } else { this.intern.shown(this.ctx.defs.leaf_of(traits[i])) };
             const note: string = fmt::format("candidate #%d: `%s::%s`, from `implement trait %s for %s`",
                 (i as i32) + 1, leaf, member_str, trait_str, owner_display).into_raw();
             diag = if (decl_spans[i].has_location()) { diag.with_note_at(note, decl_spans[i]) } else { diag.with_note(note) };
@@ -10402,8 +10408,7 @@ type struct CallResolver {
     /// Whether two definitions print alike when each is shown by its leaf,
     /// which decides whether a message names them by their full paths.
     leaves_print_alike(&this, a: DefId, b: DefId) -> boolean {
-        return QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(a)))
-            == QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(b)));
+        return this.ctx.defs.leaf_of(a).spelling().equals(this.ctx.defs.leaf_of(b).spelling());
     }
 
     /// Whether a generic-owner static call targets one of the built-in range types

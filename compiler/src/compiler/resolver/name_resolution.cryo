@@ -15,6 +15,7 @@ import compiler::resolver::res::{ DefId, DefKind, Res, ResBase, ResSlot };
 import compiler::resolver::namespace_kind::{ Namespace };
 import std::collections::pair::{ Pair };
 import std::collections::str::{ Str };
+import std::collections::string::{ String };
 import std::core::option::{ Option };
 import compiler::const_table::{ ConstantTable };
 import compiler::diag::{ ErrorCode, snapshot, source_span, edit_distance };
@@ -1089,24 +1090,22 @@ type struct NameResolver {
             // say the owner of.
             const declarers: [string] = this.module_declarers_of_leaf(node.name);
             if (declarers.length() > 0) {
-                mut spellings: string = "";
+                mut spellings: String = String::new();
                 for (mut i: i64 = 0; i < declarers.length(); i++) {
                     const parent: string = QualifiedName::parent_of(declarers[i]);
-                    const spelled: string = QualifiedName::leaf_of(parent) + "::" + name;
                     if (i > 0) {
-                        if (i + 1 == declarers.length()) { spellings = spellings + " or "; }
-                        else                            { spellings = spellings + ", "; }
+                        if (i + 1 == declarers.length()) { spellings.push(" or "); }
+                        else                            { spellings.push(", "); }
                     }
-                    spellings = spellings + "`" + spelled + "`";
+                    spellings.push(f"`{QualifiedName::leaf_of(parent)}::{name}`");
                 }
-                mut declared_in: string = "";
+                mut declared_in: String = String::new();
                 for (mut i: i64 = 0; i < declarers.length(); i++) {
-                    if (i > 0) { declared_in = declared_in + ", "; }
-                    declared_in = declared_in + "`" + QualifiedName::parent_of(declarers[i]) + "`";
+                    if (i > 0) { declared_in.push(", "); }
+                    declared_in.push(f"`{QualifiedName::parent_of(declarers[i])}`");
                 }
-                d = d.with_note(fmt::format(
-                    "a bare name means a declaration in this module; `%s` is declared in %s - write %s, or import it",
-                    name, declared_in, spellings));
+                d = d.with_note(
+                    f"a bare name means a declaration in this module; `{name}` is declared in {declared_in} - write {spellings}, or import it");
             } else {
                 d = d.did_you_mean(name, this.visible_function_names(), "function", e.span);
             }
@@ -1457,7 +1456,7 @@ type struct NameResolver {
                             out_module: mut ModuleSpellingMatch*) -> ResSlot {
         const prefix: string = QualifiedName::parent_of(written);
         if (prefix.length() == 0) { return ResSlot::Pending; }
-        const leaf: string = QualifiedName::leaf_of(written);
+        const leaf: Str = QualifiedName::leaf_of(written);
         if (leaf.length() == 0) { return ResSlot::Pending; }
 
         // A path rooted in an `extern module` alias: the alias is a module of
@@ -1513,8 +1512,7 @@ type struct NameResolver {
             const b: Symbol = this.resolver.get_symbol(offered[1]);
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0155_AMBIGUOUS_BARE_NAME,
-                fmt::format("`%s` is offered by `%s` from more than one module, so it names nothing",
-                    leaf, prefix));
+                f"`{leaf}` is offered by `{prefix}` from more than one module, so it names nothing");
             d = d.at_with_label(span, "ambiguous through this path");
             d = d.with_note(fmt::format("`%s` and `%s` both declare it, and `%s` re-exports both",
                 this.resolver.intern_table.resolve(this.resolver.qualified_name_of(&a)),
@@ -1542,23 +1540,22 @@ type struct NameResolver {
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0503_PRIVATE_SYMBOL_ACCESS,
                 if (is_internal) {
-                    fmt::format("type `%s` is internal to the package of module `%s`", leaf, owner)
+                    f"type `{leaf}` is internal to the package of module `{owner}`"
                 } else {
-                    fmt::format("type `%s` is private to module `%s`", leaf, owner)
+                    f"type `{leaf}` is private to module `{owner}`"
                 });
             d = d.at_with_label(span,
                 if (is_internal) {
-                    fmt::format("`%s` cannot be named outside its package", leaf)
+                    f"`{leaf}` cannot be named outside its package"
                 } else {
-                    fmt::format("`%s` cannot be named outside its module `%s`", leaf, owner)
+                    f"`{leaf}` cannot be named outside its module `{owner}`"
                 });
             this.ctx.emit_diagnostic(d);
         } else {
+            const visibility: string = if (is_internal) { "internal to its package" } else { "private" };
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0353_PRIVATE_ACCESS,
-                fmt::format("`%s::%s` is %s and cannot be named from `%s`",
-                    owner, leaf, if (is_internal) { "internal to its package" } else { "private" },
-                    this.resolver.intern_table.shown(use_module.decl_name())));
+                f"`{owner}::{leaf}` is {visibility} and cannot be named from `{this.resolver.intern_table.shown(use_module.decl_name())}`");
             d = d.at_with_label(span,
                 if (is_internal) { "internal declaration named by this path" } else { "private declaration named by this path" });
             this.ctx.emit_diagnostic(d);
@@ -2128,7 +2125,7 @@ type struct NameResolver {
             // qualified spelling means what the writing file's imports say it
             // means and the cursor is on whatever module the pass is walking.
             const q_module: ModulePath = this.ctx.module_of_file(span.file);
-            const head: string = QualifiedName::head_of(written);
+            const head: Str = QualifiedName::head_of(written);
             const head_sym: SymbolID = this.resolver.type_binding(
                 this.resolver.intern_table.intern(head),
                 this.resolver.current_scope);

@@ -3890,7 +3890,7 @@ The destinations below do *not* release what they overwrite, because nothing vis
 | `xs[i] = v` with a run-time `i` | no single member for the compiler to track |
 | a module-level global | globals are never auto-dropped |
 
-A store through a reference also releases nothing when the function moved a value out from behind the same binding earlier, or the store's own right-hand side does (`this.f = wrap(this.f)` in a generic body, where such a move is not refused): the place still holds the bits of a value its new owner releases.
+A store through a reference also releases nothing when the function moved a value out from behind the same binding earlier, or the store's own right-hand side does (`this.f = wrap(this.f)` inside an `unsafe` block, where such a move is not refused): the place still holds the bits of a value its new owner releases.
 
 A local or by-value parameter of an `async function` is a local for these rules even when it is carried in a field of the generated future: reassigning it releases the displaced value, and it is released at its scope's exits, exactly as in a function that never suspends (see [section 18.4](#184-how-an-async-function-is-compiled)).
 
