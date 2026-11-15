@@ -1,0 +1,140 @@
+///! A by-value receiver (`this` / `mut this`) takes the receiver: the call
+///! moves it out of the caller, the body owns it, and whatever the body
+///! does not move out is released when it returns.  Each case counts the
+///! releases of an owning payload and asserts exactly one per value, so a
+///! receiver released by both the caller and the callee (two) or by neither
+///! (zero) fails - from a local, a temporary and a field, on a body that
+///! returns the payload, one that discards it, and one that returns the
+///! whole receiver.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ValueReceiver;
+
+import std::core::result::{ Result };
+import std::core::drop::{ Drop };
+import std::core::intrinsics;
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_equal };
+
+mut g_releases: i32 = 0;
+function reset() -> void { g_releases = 0; }
+function releases() -> i32 { return g_releases; }
+
+type struct Tracked { tag: i32; }
+implement trait Drop for struct Tracked {
+    drop(mut &this) -> void { g_releases = g_releases + 1; }
+}
+
+type enum Maybe<T> {
+    Some(T);
+    None;
+}
+
+implement enum Maybe<T> {
+    /// The payload moves out to the caller; nothing is left to release.
+    take_value(this) -> T {
+        match (this) {
+            Maybe::Some(value) => { return value; }
+            Maybe::None => { core::panic("take_value on None", intrinsics::location()); }
+        }
+    }
+
+    /// The payload is not moved out, so the body releases it.
+    discard(this) -> i32 {
+        match (this) {
+            Maybe::Some(_) => { return 1; }
+            Maybe::None => { return 0; }
+        }
+    }
+
+    /// The whole receiver moves back out to the caller.
+    give_back(mut this) -> Maybe<T> {
+        return this;
+    }
+}
+
+type struct Holder {
+    slot: Maybe<Tracked>;
+    other: Tracked;
+}
+
+function make(tag: i32) -> Maybe<Tracked> {
+    return Maybe::Some(Tracked { tag: tag });
+}
+
+![test]
+function payload_moved_out_of_a_local_is_released_once() -> Result<(), TestError> {
+    reset();
+    {
+        const m: Maybe<Tracked> = make(1);
+        const t: Tracked = m.take_value();
+        match (expect_equal(t.tag, 1)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    return expect_equal(releases(), 1);
+}
+
+![test]
+function payload_moved_out_of_a_temporary_is_released_once() -> Result<(), TestError> {
+    reset();
+    {
+        const t: Tracked = make(2).take_value();
+        match (expect_equal(t.tag, 2)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    return expect_equal(releases(), 1);
+}
+
+![test]
+function payload_moved_out_of_a_field_releases_the_rest_once() -> Result<(), TestError> {
+    reset();
+    {
+        const h: Holder = Holder { slot: make(3), other: Tracked { tag: 4 } };
+        const t: Tracked = h.slot.take_value();
+        match (expect_equal(t.tag, 3)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    return expect_equal(releases(), 2);
+}
+
+![test]
+function payload_the_body_discards_is_released_once() -> Result<(), TestError> {
+    reset();
+    {
+        const m: Maybe<Tracked> = make(5);
+        match (expect_equal(m.discard(), 1)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        match (expect_equal(releases(), 1)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    return expect_equal(releases(), 1);
+}
+
+![test]
+function receiver_given_back_is_released_once_by_the_caller() -> Result<(), TestError> {
+    reset();
+    {
+        const m: Maybe<Tracked> = make(6);
+        const back: Maybe<Tracked> = m.give_back();
+        match (expect_equal(releases(), 0)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        match (expect_equal(back.discard(), 1)) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    return expect_equal(releases(), 1);
+}
+
+![test]
+function copy_receiver_stays_usable_after_a_by_value_call() -> Result<(), TestError> {
+    const m: Maybe<i32> = Maybe::Some(9);
+    const a: i32 = m.take_value();
+    const b: i32 = m.take_value();
+    return expect_equal(a + b, 18);
+}
