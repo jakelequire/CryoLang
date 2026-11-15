@@ -175,8 +175,11 @@ private type struct CFloat {
             Option::None    => { return Option::None; }
         };
         if (!value.is_finite()) { return Option::None; }
-        const text: string = if (hexadecimal) { CFloat::literal_text(value) } else { digits };
-        return Option::Some(CFloat { value: value, text: text });
+        if (!hexadecimal) { return Option::Some(CFloat { value: value, text: digits }); }
+        return match (CFloat::literal_text(value)) {
+            Option::Some(text) => { Option::Some(CFloat { value: value, text: text }) }
+            Option::None       => { Option::None }
+        };
     }
 
     /// The value of a decimal constant: digits with at most one `.`, at
@@ -262,10 +265,14 @@ private type struct CFloat {
 
     /// `value` written as a Cryo float literal, at full double precision and
     /// with a decimal point or exponent, so it does not read as an integer.
-    static literal_text(value: f64) -> string {
+    /// `None` for an infinity or a NaN, which no float literal spells: a
+    /// constant whose value has no literal is not bound, since the C
+    /// runtime's text for it (`1.#INF`) reads back as some other number.
+    static literal_text(value: f64) -> Option<string> {
+        if (!value.is_finite()) { return Option::None; }
         mut text: string = fmt::format("%.17g", value).into_raw();
         if (!Importer::has_float_marker(text)) { text = text + ".0"; }
-        return text;
+        return Option::Some(text);
     }
 }
 
@@ -1932,11 +1939,15 @@ type struct Importer {
             this.emit_alias_const(name_sym, this.types.prim(type_name), ilit);
             this.record_macro_const(name_sym, type_name, itext, false);
         } else if (kind == clang::EVAL_FLOAT) {
-            const ftext: string = CFloat::literal_text(clang::clang_EvalResult_getAsDouble(ev));
-            mut flit: mut ExpressionNode* =
-                ExpressionNode::literal(ftext, LiteralKind::Float, SourceSpan::none());
-            this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
-            this.record_macro_const(name_sym, "f64", ftext, true);
+            match (CFloat::literal_text(clang::clang_EvalResult_getAsDouble(ev))) {
+                Option::Some(ftext) => {
+                    mut flit: mut ExpressionNode* =
+                        ExpressionNode::literal(ftext, LiteralKind::Float, SourceSpan::none());
+                    this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
+                    this.record_macro_const(name_sym, "f64", ftext, true);
+                }
+                Option::None => { bound = false; }
+            }
         } else if (kind == clang::EVAL_STRLIT) {
             const raw: u8* = clang::clang_EvalResult_getAsStr(ev);
             if (raw != null) {
@@ -2270,7 +2281,10 @@ type struct Importer {
             else { return false; }
             p = p + 2;
         }
-        const text: string = CFloat::literal_text(acc);
+        const text: string = match (CFloat::literal_text(acc)) {
+            Option::Some(t) => { t }
+            Option::None    => { return false; }
+        };
         mut flit: mut ExpressionNode* = ExpressionNode::literal(text, LiteralKind::Float, SourceSpan::none());
         this.emit_alias_const(name_sym, this.types.prim("f64"), flit);
         this.record_macro_const(name_sym, "f64", text, true);

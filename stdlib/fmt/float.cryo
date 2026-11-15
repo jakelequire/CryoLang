@@ -32,29 +32,35 @@ import std::core::primitives;
 import std::core::slice::{ Slice };
 import std::ffi::libc;
 
-/// Parse a leading `f64` from `s` using C `strtod` semantics in the C
-/// locale: skip leading whitespace, read the longest valid float prefix
-/// (decimal or scientific; no hex floats), whose decimal point is `.`
-/// whatever numeric locale the program has set. Returns `None` when `s`
-/// has no numeric prefix, or when a copy the locale needs cannot be
-/// allocated.  The single funnel every float-from-text caller routes
-/// through.  Caller-supplied strings must already be cleaned of digit
-/// separators (`_`), which `strtod` would stop at.
+/// Parse the whole of `s` as an `f64`, read with C `strtod` semantics in
+/// the C locale: leading whitespace is skipped, and what follows must be
+/// one decimal or scientific number (`1.5`, `-2e3`) and nothing else, its
+/// decimal point `.` whatever numeric locale the program has set.
+/// Returns `None` when `s` holds no number, when any byte follows the
+/// number (`"1abc"`, `"1.5 "`, `"2,5"`), for a hexadecimal float
+/// (`"0x1p4"`), or when a copy the locale needs cannot be allocated.  The
+/// single funnel every float-from-text caller routes through.
+/// Caller-supplied strings must already be cleaned of digit separators
+/// (`_`), which a number does not contain.
 public function parse_f64(s: string) -> Option<f64> {
     if (s == null) { return Option::None; }
     const text: u8* = s as u8*;
+    // `strtod` reads a hexadecimal float whole; this reader takes none.
+    mut first: u64 = 0;
+    while (text[first] == 0x20 || (text[first] >= 0x09 && text[first] <= 0x0D)) { first = first + 1; }
+    if (text[first] == 0x2B || text[first] == 0x2D) { first = first + 1; }
+    if (text[first] == 0x30 && (text[first + 1] == 0x78 || text[first + 1] == 0x58)) { return Option::None; }
     // `strtod` reads the numeric locale's decimal point. Under any locale
-    // but one whose point is `.`, it reads a copy of the text that ends
-    // where that point first appears (a C-locale read stops there) and
-    // holds the locale's point in place of the first `.`.
+    // but one whose point is `.`, text holding that point has a byte a
+    // C-locale read stops at, and any other text is read from a copy
+    // holding the locale's point in place of the first `.`.
     const point: u8* = libc::localeconv().decimal_point;
     const point_length: u64 = libc::strlen(point);
     const point_is_dot: boolean = point_length == 0 || (point_length == 1 && point[0] == 0x2E);
     mut source: mut u8* = null;
     if (!point_is_dot) {
-        mut length: u64 = libc::strlen(text);
-        const locale_point_at: u8* = libc::strstr(text, point);
-        if (locale_point_at != null) { length = length - libc::strlen(locale_point_at); }
+        if (libc::strstr(text, point) != null) { return Option::None; }
+        const length: u64 = libc::strlen(text);
         source = libc::malloc(length + point_length + 1);
         if (source == null) { return Option::None; }
         mut written: u64 = 0;
@@ -74,10 +80,11 @@ public function parse_f64(s: string) -> Option<f64> {
     const read: u8* = if (point_is_dot) { text } else { source };
     mut end: u8* = null;
     const v: f64 = libc::strtod(read, &end);
-    // `strtod` leaves `endptr == s` when it converts nothing.
-    const converted: boolean = end != read;
+    // `strtod` leaves `endptr == s` when it converts nothing, and short of
+    // the terminating NUL when bytes follow the number.
+    const whole: boolean = end != read && end[0] == 0;
     if (!point_is_dot) { libc::free(source); }
-    if (!converted) { return Option::None; }
+    if (!whole) { return Option::None; }
     return Option::Some(v);
 }
 
