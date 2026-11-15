@@ -6,22 +6,22 @@
 ///! TCP it is connectionless, so it deliberately does NOT implement the
 ///! `AsyncRead` / `AsyncWrite` / `AsyncTransport` stream traits - datagram
 ///! boundaries don't survive a byte-stream abstraction. Instead it exposes
-///! `UdpSendTo`/`UdpRecvFrom` (each datagram carries its peer address) and,
+///! `UdpSendTo`/`UdpReceiveFrom` (each datagram carries its peer address) and,
 ///! once `connect` has pinned a default peer, the address-less
-///! `UdpSend`/`UdpRecv`.
+///! `UdpSend`/`UdpReceive`.
 ///!
 ///! **Every operation that can wait is a future**, as in `net::socket::tcp`.
-///! `bind`, `unbound`, `connect`, `local_addr` and `set_broadcast` stay plain
+///! `bind`, `unbound`, `connect`, `local_address` and `set_broadcast` stay plain
 ///! calls because none of them waits - UDP `connect` is local bookkeeping and
 ///! exchanges no packets. Sending and receiving are `UdpSend` / `UdpSendTo` /
-///! `UdpRecv` / `UdpRecvFrom`. There is deliberately no blocking `send` or
-///! `recv`: a datagram source that sleeps its calling thread cannot be composed
+///! `UdpReceive` / `UdpReceiveFrom`. There is deliberately no blocking `send` or
+///! `receive`: a datagram source that sleeps its calling thread cannot be composed
 ///! with anything that suspends, and it would stall an executor worker inside
 ///! the syscall.
 ///!
 ///! Sockets from `bind` and `unbound` are put in non-blocking mode there, since
 ///! that is the only mode the futures above can use. A socket adopted through
-///! `from_fd` keeps whatever mode it arrived in; call `set_nonblocking(true)`
+///! `from_file_descriptor` keeps whatever mode it arrived in; call `set_nonblocking(true)`
 ///! on it first.
 ///!
 ///! Each future owns the socket AND the buffer for one operation and hands both
@@ -31,7 +31,7 @@
 ///! address. An array's heap block does not move with the future.
 ///!
 ///! IPv4 only for now: the underlying socket is AF_INET, so
-///! `bind`/`connect`/`UdpSendTo` reject an `IpAddr::V6` destination up front
+///! `bind`/`connect`/`UdpSendTo` reject an `IpAddress::V6` destination up front
 ///! with `IoErrorKind::Unsupported` (see `reject_ipv6`).
 
 namespace std::net::socket::udp;
@@ -43,11 +43,11 @@ import std::core::drop::{ Drop };
 import std::core::mem;
 import std::collections::array::{ Array };
 import std::io::error::{ IoError, IoErrorKind };
-import std::io::fd;
+import std::io::file_descriptor;
 import std::ffi::libc;
-import std::net::addr::ip;
-import std::net::addr::socket_addr::{ SocketAddr };
-import std::net::addr::sockaddr;
+import std::net::address::ip;
+import std::net::address::socket_address::{ SocketAddress };
+import std::net::address::socket_address_storage;
 import std::net::sys;
 import std::future::poll::{ Poll };
 import std::future::waker::{ Context };
@@ -55,17 +55,17 @@ import std::future::traits::{ Future };
 import std::future::reactor::{ INTEREST_READ, INTEREST_WRITE, Reactor };
 
 /// An IPv4 datagram socket. `bind` or `unbound` opens one in non-blocking
-/// mode; datagrams move through the `UdpSendTo`/`UdpRecvFrom` futures, or
-/// `UdpSend`/`UdpRecv` once `connect` has pinned a peer. Owns its socket and
+/// mode; datagrams move through the `UdpSendTo`/`UdpReceiveFrom` futures, or
+/// `UdpSend`/`UdpReceive` once `connect` has pinned a peer. Owns its socket and
 /// closes it on `drop`.
 ///
 /// ```cryo
 /// import std::collections::array::{ Array };
 /// import std::future::executor::{ Executor };
-/// import std::net::addr::socket_addr::{ SocketAddr };
-/// import std::net::socket::udp::{ UdpIo, UdpReceived, UdpRecvFrom, UdpSendTo, UdpSocket };
+/// import std::net::address::socket_address::{ SocketAddress };
+/// import std::net::socket::udp::{ UdpIo, UdpReceived, UdpReceiveFrom, UdpSendTo, UdpSocket };
 ///
-/// async function round_trip(receiver: UdpSocket, sender: UdpSocket, to: SocketAddr) -> i64 {
+/// async function round_trip(receiver: UdpSocket, sender: UdpSocket, to: SocketAddress) -> i64 {
 ///     mut payload: Array<u8> = Array::<u8>::new();
 ///     payload.push(0x68); payload.push(0x69);                  // "hi"
 ///     mut sent: UdpIo = await UdpSendTo::start(sender, payload, to);
@@ -73,13 +73,13 @@ import std::future::reactor::{ INTEREST_READ, INTEREST_WRITE, Reactor };
 ///
 ///     mut buffer: Array<u8> = Array::<u8>::new();
 ///     buffer.resize(64, 0);                                    // room to receive into
-///     mut got: UdpReceived = await UdpRecvFrom::start(receiver, buffer);
+///     mut got: UdpReceived = await UdpReceiveFrom::start(receiver, buffer);
 ///     mut _receiver: UdpSocket = got.take_socket();
-///     return got.take_buf().length();                          // 2
+///     return got.take_buffer().length();                          // 2
 /// }
 ///
-/// const receiver: UdpSocket = UdpSocket::bind(SocketAddr::localhost_v4(0)).unwrap();
-/// const to: SocketAddr = receiver.local_addr().unwrap();
+/// const receiver: UdpSocket = UdpSocket::bind(SocketAddress::localhost_v4(0)).unwrap();
+/// const to: SocketAddress = receiver.local_address().unwrap();
 /// const sender: UdpSocket = UdpSocket::unbound().unwrap();
 /// mut executor: Executor = Executor::new();
 /// const received: i64 = executor.block_on(round_trip(receiver, sender, to));
@@ -88,11 +88,11 @@ public type struct UdpSocket {
     private fd: i32;
 
     /// Open a datagram socket and bind it to `local`. Use
-    /// `SocketAddr::any_v4(port)` to receive on every interface or
+    /// `SocketAddress::any_v4(port)` to receive on every interface or
     /// `localhost_v4(port)` for loopback. Pass port 0 to let the
     /// kernel pick an ephemeral port, then read it back with
-    /// `local_addr`.
-    public static bind(local: SocketAddr) -> Result<UdpSocket, IoError> {
+    /// `local_address`.
+    public static bind(local: SocketAddress) -> Result<UdpSocket, IoError> {
         // The datagram socket is AF_INET (`open_dgram`), so an IPv6 address
         // cannot be used and `pack_sockaddr_in` would write a 28-byte
         // `sockaddr_in6` into the v4 buffer below. Reject it up front with
@@ -102,12 +102,12 @@ public type struct UdpSocket {
         // Buffer is 28 bytes (`sockaddr_in6`-sized) as defense in depth even
         // though only the 16-byte v4 form is packed here.
         mut sockaddr_buf: [u8; 28];
-        const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf, &local)?;
+        const len: u32 = socket_address_storage::pack_sockaddr_in(&sockaddr_buf, &local)?;
 
         const sock: i32 = open_dgram()?;
         if (sys::os_bind(sock, &sockaddr_buf[0], len) < 0) {
             const err: IoError = sys::last_io_error();
-            sys::os_close_sock(sock);
+            sys::os_close_socket(sock);
             return Result::Err(err);
         }
         return Result::Ok(UdpSocket { fd: sock });
@@ -127,24 +127,24 @@ public type struct UdpSocket {
     ///
     /// An adopted descriptor keeps whatever blocking mode it arrived in, so
     /// call `set_nonblocking(true)` before handing it to a future.
-    public static from_fd(sock: i32) -> UdpSocket {
+    public static from_file_descriptor(sock: i32) -> UdpSocket {
         return UdpSocket { fd: sock };
     }
 
     /// Borrow the underlying file descriptor without transferring ownership.
     /// The `UdpSocket` still closes it on `drop`.
-    public raw_fd(&this) -> i32 {
+    public raw_file_descriptor(&this) -> i32 {
         return this.fd;
     }
 
-    /// Pin a default peer. After this, `UdpSend`/`UdpRecv` talk to `remote`
+    /// Pin a default peer. After this, `UdpSend`/`UdpReceive` talk to `remote`
     /// and the kernel filters incoming datagrams to that source. Does
     /// not exchange packets - UDP `connect` is local bookkeeping only,
     /// so it cannot block and stays a plain call.
-    public connect(mut &this, remote: SocketAddr) -> Result<(), IoError> {
+    public connect(mut &this, remote: SocketAddress) -> Result<(), IoError> {
         reject_ipv6(&remote)?;
         mut sockaddr_buf: [u8; 28];
-        const len: u32 = sockaddr::pack_sockaddr_in(&sockaddr_buf, &remote)?;
+        const len: u32 = socket_address_storage::pack_sockaddr_in(&sockaddr_buf, &remote)?;
         if (sys::os_connect(this.fd, &sockaddr_buf[0], len) < 0) {
             return Result::Err(sys::last_io_error());
         }
@@ -154,13 +154,13 @@ public type struct UdpSocket {
     /// The local address the socket is bound to. After `bind(.., 0)`
     /// this reports the kernel-assigned ephemeral port - the only way
     /// to learn it.
-    public local_addr(&this) -> Result<SocketAddr, IoError> {
+    public local_address(&this) -> Result<SocketAddress, IoError> {
         mut sockaddr_buf: [u8; 28];
         mut addrlen: u32 = 28;
         if (sys::os_getsockname(this.fd, &sockaddr_buf[0], &addrlen) < 0) {
             return Result::Err(sys::last_io_error());
         }
-        return Result::Ok(sockaddr::unpack_sockaddr_in(&sockaddr_buf));
+        return Result::Ok(socket_address_storage::unpack_sockaddr_in(&sockaddr_buf));
     }
 
     /// Allow sending to the broadcast address. Off by default; the
@@ -175,7 +175,7 @@ public type struct UdpSocket {
     /// Put the socket in non-blocking mode, where a send or receive reports
     /// `WouldBlock` instead of sleeping the calling thread. `bind` and
     /// `unbound` already do this; it is exposed for a descriptor adopted
-    /// through `from_fd`, which arrives in an unknown mode.
+    /// through `from_file_descriptor`, which arrives in an unknown mode.
     public set_nonblocking(mut &this, on: boolean) -> Result<(), IoError> {
         if (sys::os_set_nonblocking(this.fd, on) < 0) {
             return Result::Err(sys::last_io_error());
@@ -189,7 +189,7 @@ implement trait Drop for struct UdpSocket {
     /// descriptor). Runs when the socket goes out of scope.
     drop(mut &this) -> void {
         if (this.fd >= 0) {
-            sys::os_close_sock(this.fd);
+            sys::os_close_socket(this.fd);
             this.fd = -1;
         }
     }
@@ -216,7 +216,7 @@ public type struct UdpIo {
     /// Take the socket back, so the next operation can be started on it.
     /// Calling it twice yields a closed socket the second time.
     public take_socket(mut &this) -> UdpSocket {
-        mut out: UdpSocket = UdpSocket::from_fd(-1);
+        mut out: UdpSocket = UdpSocket::from_file_descriptor(-1);
         mem::swap::<UdpSocket>(&out, &this.socket);
         return out;
     }
@@ -224,7 +224,7 @@ public type struct UdpIo {
     /// Take the buffer back. After a receive it holds exactly the bytes of the
     /// datagram that arrived; after a send it is untouched, so the caller still
     /// has what it sent. Calling it twice yields an empty buffer.
-    public take_buf(mut &this) -> Array<u8> {
+    public take_buffer(mut &this) -> Array<u8> {
         mut out: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&out, &this.buf);
         return out;
@@ -238,19 +238,19 @@ public type struct UdpIo {
     }
 }
 
-/// The outcome of a `UdpRecvFrom`: as `UdpIo`, plus the peer that sent the
+/// The outcome of a `UdpReceiveFrom`: as `UdpIo`, plus the peer that sent the
 /// datagram. A separate type rather than an optional field on `UdpIo` because a
 /// peer address is either always meaningful or never so, and a slot that is
 /// only sometimes filled is the kind of thing callers read anyway.
 public type struct UdpReceived {
     private socket: UdpSocket;
     private buf:    Array<u8>;
-    private result: Result<(i64, SocketAddr), IoError>;
+    private result: Result<(i64, SocketAddress), IoError>;
 
     /// Take the socket back, so the next operation can be started on it.
     /// Calling it twice yields a closed socket the second time.
     public take_socket(mut &this) -> UdpSocket {
-        mut out: UdpSocket = UdpSocket::from_fd(-1);
+        mut out: UdpSocket = UdpSocket::from_file_descriptor(-1);
         mem::swap::<UdpSocket>(&out, &this.socket);
         return out;
     }
@@ -258,7 +258,7 @@ public type struct UdpReceived {
     /// Take the buffer back, holding exactly the bytes of the datagram that
     /// arrived (none if the receive failed). Calling it twice yields an
     /// empty buffer the second time.
-    public take_buf(mut &this) -> Array<u8> {
+    public take_buffer(mut &this) -> Array<u8> {
         mut out: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&out, &this.buf);
         return out;
@@ -266,7 +266,7 @@ public type struct UdpReceived {
 
     /// The byte count and the sender, or why no datagram arrived. Consumes
     /// the outcome, as `UdpIo.outcome` does.
-    public outcome(mut this) -> Result<(i64, SocketAddr), IoError> {
+    public outcome(mut this) -> Result<(i64, SocketAddress), IoError> {
         return this.result;
     }
 }
@@ -282,12 +282,12 @@ public type struct UdpReceived {
 public type struct UdpSendTo {
     private socket: UdpSocket;
     private buf:    Array<u8>;
-    private dest:   SocketAddr;
+    private dest:   SocketAddress;
     private rt: mut Reactor*;   // set while parked; null once the operation is over
 
     /// Begin a send of every byte in `buf` to `dest` - socket and buffer both
     /// owned by this future until it completes.
-    public static start(socket: UdpSocket, buf: Array<u8>, dest: SocketAddr) -> UdpSendTo {
+    public static start(socket: UdpSocket, buf: Array<u8>, dest: SocketAddress) -> UdpSendTo {
         return UdpSendTo { socket: socket, buf: buf, dest: dest, rt: null };
     }
 
@@ -297,7 +297,7 @@ public type struct UdpSendTo {
     /// just handed to the caller.
     private finish(mut &this, result: Result<i64, IoError>) -> Poll<UdpIo> {
         this.rt = null;
-        mut s: UdpSocket = UdpSocket::from_fd(-1);
+        mut s: UdpSocket = UdpSocket::from_file_descriptor(-1);
         mem::swap::<UdpSocket>(&s, &this.socket);
         mut b: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&b, &this.buf);
@@ -314,13 +314,13 @@ implement trait Future for struct UdpSendTo {
         }
         mut sockaddr_buf: [u8; 28];
         mut addrlen: u32 = 0;
-        match (sockaddr::pack_sockaddr_in(&sockaddr_buf, &this.dest)) {
+        match (socket_address_storage::pack_sockaddr_in(&sockaddr_buf, &this.dest)) {
             Result::Ok(l)  => { addrlen = l; }
             Result::Err(e) => { return this.finish(Result::Err(e)); }
         }
-        const fd: i32 = this.socket.raw_fd();
+        const fd: i32 = this.socket.raw_file_descriptor();
         loop {
-            const n: i64 = sys::os_sendto(fd, this.buf.as_ptr(), this.buf.length(),
+            const n: i64 = sys::os_sendto(fd, this.buf.as_pointer(), this.buf.length(),
                                           &sockaddr_buf[0], addrlen);
             if (n >= 0) { return this.finish(Result::Ok(n)); }
             const e: IoError = sys::last_io_error();
@@ -347,7 +347,7 @@ implement trait Future for struct UdpSendTo {
 implement trait Drop for struct UdpSendTo {
     drop(mut &this) -> void {
         if (this.rt != null) {
-            this.rt.cancel(this.socket.raw_fd(), INTEREST_WRITE);
+            this.rt.cancel(this.socket.raw_file_descriptor(), INTEREST_WRITE);
             this.rt = null;
         }
     }
@@ -368,7 +368,7 @@ public type struct UdpSend {
 
     private finish(mut &this, result: Result<i64, IoError>) -> Poll<UdpIo> {
         this.rt = null;
-        mut s: UdpSocket = UdpSocket::from_fd(-1);
+        mut s: UdpSocket = UdpSocket::from_file_descriptor(-1);
         mem::swap::<UdpSocket>(&s, &this.socket);
         mut b: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&b, &this.buf);
@@ -380,9 +380,9 @@ implement trait Future for struct UdpSend {
     type Output = UdpIo;
 
     poll(mut &this, cx: Context*) -> Poll<UdpIo> {
-        const fd: i32 = this.socket.raw_fd();
+        const fd: i32 = this.socket.raw_file_descriptor();
         loop {
-            const n: i64 = sys::os_send(fd, this.buf.as_ptr(), this.buf.length());
+            const n: i64 = sys::os_send(fd, this.buf.as_pointer(), this.buf.length());
             if (n >= 0) { return this.finish(Result::Ok(n)); }
             const e: IoError = sys::last_io_error();
             match (e.kind) {
@@ -402,7 +402,7 @@ implement trait Future for struct UdpSend {
 implement trait Drop for struct UdpSend {
     drop(mut &this) -> void {
         if (this.rt != null) {
-            this.rt.cancel(this.socket.raw_fd(), INTEREST_WRITE);
+            this.rt.cancel(this.socket.raw_file_descriptor(), INTEREST_WRITE);
             this.rt = null;
         }
     }
@@ -416,25 +416,25 @@ implement trait Drop for struct UdpSend {
 /// It receives up to `buf.length()` bytes. An array exposes only `[0, length)`,
 /// so a buffer from `with_capacity` alone has nothing to receive into: size it
 /// with `resize(n, 0)`.
-public type struct UdpRecvFrom {
+public type struct UdpReceiveFrom {
     private socket: UdpSocket;
     private buf:    Array<u8>;
     private rt: mut Reactor*;
 
     /// Begin a receive on `socket`, filling `buf` - both owned by this future
     /// until it completes.
-    public static start(socket: UdpSocket, buf: Array<u8>) -> UdpRecvFrom {
-        return UdpRecvFrom { socket: socket, buf: buf, rt: null };
+    public static start(socket: UdpSocket, buf: Array<u8>) -> UdpReceiveFrom {
+        return UdpReceiveFrom { socket: socket, buf: buf, rt: null };
     }
 
     /// `kept` is how much of the buffer holds bytes that actually arrived;
     /// everything above it is whatever the buffer was filled with beforehand, so
     /// it is dropped rather than left for the caller to mistake for data.
     private finish(mut &this, kept: i64,
-                   result: Result<(i64, SocketAddr), IoError>) -> Poll<UdpReceived> {
+                   result: Result<(i64, SocketAddress), IoError>) -> Poll<UdpReceived> {
         this.rt = null;
         this.buf.truncate(kept);
-        mut s: UdpSocket = UdpSocket::from_fd(-1);
+        mut s: UdpSocket = UdpSocket::from_file_descriptor(-1);
         mem::swap::<UdpSocket>(&s, &this.socket);
         mut b: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&b, &this.buf);
@@ -442,21 +442,21 @@ public type struct UdpRecvFrom {
     }
 }
 
-implement trait Future for struct UdpRecvFrom {
+implement trait Future for struct UdpReceiveFrom {
     type Output = UdpReceived;
 
     poll(mut &this, cx: Context*) -> Poll<UdpReceived> {
-        const fd: i32 = this.socket.raw_fd();
+        const fd: i32 = this.socket.raw_file_descriptor();
         // 28-byte (`sockaddr_in6`-sized) buffer with a matching capacity so the
         // kernel can never write past it; an AF_INET socket fills only the
         // 16-byte v4 form, which `unpack_sockaddr_in` reads back.
         mut sockaddr_buf: [u8; 28];
         mut addrlen: u32 = 28;
         loop {
-            const n: i64 = sys::os_recvfrom(fd, this.buf.as_mutable_ptr(), this.buf.length(),
+            const n: i64 = sys::os_receive_from(fd, this.buf.as_mutable_pointer(), this.buf.length(),
                                             &sockaddr_buf[0], &addrlen);
             if (n >= 0) {
-                const peer: SocketAddr = sockaddr::unpack_sockaddr_in(&sockaddr_buf);
+                const peer: SocketAddress = socket_address_storage::unpack_sockaddr_in(&sockaddr_buf);
                 return this.finish(n, Result::Ok((n, peer)));
             }
             const e: IoError = sys::last_io_error();
@@ -477,10 +477,10 @@ implement trait Future for struct UdpRecvFrom {
 /// Dropping a parked receive releases its registration; a send parked on the
 /// same socket keeps waiting. The socket is closed and the buffer freed unless
 /// the operation completed and handed them back.
-implement trait Drop for struct UdpRecvFrom {
+implement trait Drop for struct UdpReceiveFrom {
     drop(mut &this) -> void {
         if (this.rt != null) {
-            this.rt.cancel(this.socket.raw_fd(), INTEREST_READ);
+            this.rt.cancel(this.socket.raw_file_descriptor(), INTEREST_READ);
             this.rt = null;
         }
     }
@@ -488,21 +488,21 @@ implement trait Drop for struct UdpRecvFrom {
 
 
 /// Receive on a `connect`ed socket, dropping the peer address - it can only be
-/// the connected peer. Truncates an oversized datagram, as `UdpRecvFrom` does.
-public type struct UdpRecv {
+/// the connected peer. Truncates an oversized datagram, as `UdpReceiveFrom` does.
+public type struct UdpReceive {
     private socket: UdpSocket;
     private buf:    Array<u8>;
     private rt: mut Reactor*;
 
     /// Begin a receive on `socket`, filling `buf`.
-    public static start(socket: UdpSocket, buf: Array<u8>) -> UdpRecv {
-        return UdpRecv { socket: socket, buf: buf, rt: null };
+    public static start(socket: UdpSocket, buf: Array<u8>) -> UdpReceive {
+        return UdpReceive { socket: socket, buf: buf, rt: null };
     }
 
     private finish(mut &this, kept: i64, result: Result<i64, IoError>) -> Poll<UdpIo> {
         this.rt = null;
         this.buf.truncate(kept);
-        mut s: UdpSocket = UdpSocket::from_fd(-1);
+        mut s: UdpSocket = UdpSocket::from_file_descriptor(-1);
         mem::swap::<UdpSocket>(&s, &this.socket);
         mut b: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&b, &this.buf);
@@ -510,13 +510,13 @@ public type struct UdpRecv {
     }
 }
 
-implement trait Future for struct UdpRecv {
+implement trait Future for struct UdpReceive {
     type Output = UdpIo;
 
     poll(mut &this, cx: Context*) -> Poll<UdpIo> {
-        const fd: i32 = this.socket.raw_fd();
+        const fd: i32 = this.socket.raw_file_descriptor();
         loop {
-            const n: i64 = sys::os_recv(fd, this.buf.as_mutable_ptr(), this.buf.length());
+            const n: i64 = sys::os_receive(fd, this.buf.as_mutable_pointer(), this.buf.length());
             if (n >= 0) { return this.finish(n, Result::Ok(n)); }
             const e: IoError = sys::last_io_error();
             match (e.kind) {
@@ -533,21 +533,21 @@ implement trait Future for struct UdpRecv {
     }
 }
 
-implement trait Drop for struct UdpRecv {
+implement trait Drop for struct UdpReceive {
     drop(mut &this) -> void {
         if (this.rt != null) {
-            this.rt.cancel(this.socket.raw_fd(), INTEREST_READ);
+            this.rt.cancel(this.socket.raw_file_descriptor(), INTEREST_READ);
             this.rt = null;
         }
     }
 }
 
 
-/// Reject an IPv6 `SocketAddr` with the documented `Unsupported` error.
+/// Reject an IPv6 `SocketAddress` with the documented `Unsupported` error.
 /// The datagram socket is AF_INET, so an IPv6 address is unusable; this
 /// also prevents `pack_sockaddr_in` from writing a 28-byte `sockaddr_in6`
 /// into a caller's v4-sized stack buffer.
-private function reject_ipv6(addr: &SocketAddr) -> Result<(), IoError> {
+private function reject_ipv6(addr: &SocketAddress) -> Result<(), IoError> {
     if (addr.ip.is_ipv6()) {
         return Result::Err(IoError::new(IoErrorKind::Unsupported, 0));
     }
@@ -566,7 +566,7 @@ private function open_dgram() -> Result<i32, IoError> {
     }
     if (sys::os_set_nonblocking(sock, true) < 0) {
         const err: IoError = sys::last_io_error();
-        sys::os_close_sock(sock);
+        sys::os_close_socket(sock);
         return Result::Err(err);
     }
     return Result::Ok(sock);

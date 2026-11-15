@@ -17,7 +17,7 @@ import compiler::types::{
     type_ref, type_base, arena, compound, user_defined, generic, checker, ownership, trait_checker, TypeKind
 };
 import compiler::resolver::{ symbol_str, intern_table };
-import compiler::ast::{ declaration, expression, MemberPin, node, TypeAnnotation, Visibility };
+import compiler::ast::{ declaration, expression, MemberPin, node, TraitRef, TypeAnnotation, Visibility };
 import compiler::lex::{ Token, TokenType };
 import compiler::diag::{ diagnostic, ErrorCode, source_span, suggestion };
 import compiler::compilation_context::{ CompilationContext };
@@ -241,7 +241,7 @@ type struct MemberResolver {
             // is a place, coerced access serves reads and writes uniformly, and
             // codegen needs nothing new.  The pointee answering with a method
             // (no field pinned) is the same misreading as above.
-            const coerced: TypeRef = this.try_deref_coercion(visitor, member_e, member);
+            const coerced: TypeRef = this.try_deref_coercion(visitor, member_e, member, false);
             if (coerced.is_valid()) {
                 if (!member.resolved_member.is_some()) {
                     this.report_method_read(member, type_name, TypeRef::invalid(), acc_span);
@@ -382,21 +382,30 @@ type struct MemberResolver {
     /// original `member.object` is left untouched and `invalid` returned.
     /// Restricted to concrete user receivers; a bounded `T: Deref` param is not
     /// coerced (its abstract pointee has no field/method to bind pre-mono).
+    /// `called` is true for the callee of a call, which names a pointee's
+    /// method before its field, as a call on the receiver itself does.
     try_deref_coercion(mut &this, visitor: mut SemaVisitor*, member_e: mut ExpressionNode*,
-                       member: mut MemberAccessExpr*) -> TypeRef {
+                       member: mut MemberAccessExpr*, called: boolean) -> TypeRef {
         if (member.object == null) { return TypeRef::invalid(); }
         mut cur_obj: mut ExpressionNode* = member.object;
         mut cur_ty:  TypeRef         = member.object.resolved_type;
         mut guard: i32 = 0;
         while (guard < 6) {
             guard += 1;
-            // Peel references to the concrete receiver; a raw pointer keeps its
-            // native field auto-deref and never needs `Deref`.
+            // Peel references and raw pointers to the concrete receiver: a
+            // member reached through `p: T*` is `T`'s, so it is `T`'s `Target`'s
+            // when `T` has none, as it is through `&T`.
             mut base_ty: TypeRef = cur_ty;
             mut t: Type* = this.arena.lookup(base_ty);
             mut rd: i32 = 0;
-            while (t != null && t.kind == TypeKind::Reference && rd < 4) {
-                base_ty = t.as_reference().referent;
+            while (t != null && rd < 4) {
+                if (t.kind == TypeKind::Reference) {
+                    base_ty = t.as_reference().referent;
+                } else if (t.kind == TypeKind::Pointer) {
+                    base_ty = t.as_pointer().pointee;
+                } else {
+                    break;
+                }
                 t = this.arena.lookup(base_ty);
                 rd += 1;
             }
@@ -408,17 +417,20 @@ type struct MemberResolver {
                 this.ctx.generic_registry.wellknown(LangItem::Deref), base_ty, 0);
             if (impl_block == null) { return TypeRef::invalid(); }
             // Build `*(cur_obj.deref())` and resolve it to the pointee `Target`.
-            const member_acc: mut ExpressionNode* = this.lang_method_callee(cur_obj, LangItem::DerefDeref, member_e.span);
+            // The place stands where the receiver is written and no further:
+            // spanning the whole member would put the desugar's `deref`
+            // under the member's own name for anything asking what is
+            // written there.
+            const at: SourceSpan = cur_obj.span;
+            const member_acc: mut ExpressionNode* = this.lang_method_callee(cur_obj, LangItem::DerefDeref, at);
             if (member_acc == null) { return TypeRef::invalid(); }
-            mut call: mut ExpressionNode* = ExpressionNode::call_expr(member_acc, member_e.span);
-            const star_tok: Token = Token::new(TokenType::Star, "*",
-                member_e.span.start_line as int, member_e.span.start_col as int);
-            const star_expr: mut ExpressionNode* =
-                ExpressionNode::synthetic_unary(star_tok, call, member_e.span);
+            mut call: mut ExpressionNode* = ExpressionNode::call_expr(member_acc, at);
+            const star_tok: Token = Token::new(TokenType::Star, "*", at.start_line as int, at.start_col as int);
+            const star_expr: mut ExpressionNode* = ExpressionNode::synthetic_unary(star_tok, call, at);
             const target_ty: TypeRef = visitor.resolve_expr(star_expr);
             if (!target_ty.is_valid()) { return TypeRef::invalid(); }
             // Re-attempt the field / method lookup on `Target`.
-            const r: TypeRef = this.member_type_on(member_e, member, target_ty);
+            const r: TypeRef = this.member_type_on(member_e, member, target_ty, called);
             if (r.is_valid()) {
                 member.object = star_expr;
                 member_e.set_resolved_type(r);
@@ -431,10 +443,10 @@ type struct MemberResolver {
         return TypeRef::invalid();
     }
 
-    /// A fresh trait checker over the shared arena + registry (a 4-pointer view).
+    /// A fresh trait checker over the shared arena + registry (a view).
     trait_checker(&this) -> TraitChecker {
         return TraitChecker::new(this.arena, this.ctx.generic_registry,
-                                 this.intern, this.ctx.diagnostics);
+                                 this.intern, this.ctx.diagnostics, this.ctx.type_resolver);
     }
 
     /// Resolve `member.member` as a field (incl. generic-template field) or
@@ -444,8 +456,13 @@ type struct MemberResolver {
     /// method call is.  Returns the member's type, or `invalid` on a
     /// genuine miss - emits no diagnostic.  Used by Deref coercion to probe each
     /// pointee in the chain without perturbing the direct-access path.
+    /// When `called`, a method answers before a field of the same name.
     member_type_on(mut &this, member_e: ExpressionNode*, member: mut MemberAccessExpr*,
-                   obj_type: TypeRef) -> TypeRef {
+                   obj_type: TypeRef, called: boolean) -> TypeRef {
+        if (called) {
+            const method_ret: TypeRef = this.method_type_on(member, obj_type);
+            if (method_ret.is_valid()) { return method_ret; }
+        }
         const acc_span: SourceSpan = if (member.member_span.has_location()) {
             member.member_span
         } else {
@@ -456,7 +473,14 @@ type struct MemberResolver {
             this.pin_field(member, &fa, acc_span);
             return fa.ty;
         }
-        // Method (from the dereferenced receiver symbol).
+        if (called) { return TypeRef::invalid(); }
+        return this.method_type_on(member, obj_type);
+    }
+
+    /// The return of the method `member` names on `obj_type`, looked up from
+    /// the type under its pointers, references and instantiation; invalid
+    /// when it names none.
+    method_type_on(&this, member: MemberAccessExpr*, obj_type: TypeRef) -> TypeRef {
         mut walk_ty: TypeRef = obj_type;
         mut walk_t: Type* = this.arena.lookup(walk_ty);
         mut depth: i32 = 0;
@@ -697,7 +721,7 @@ type struct MemberResolver {
     /// slot.
     pin_field(mut &this, member: mut MemberAccessExpr*, fa: &FieldAnswer, acc_span: SourceSpan) -> void {
         if (fa.index >= 0) { member.set_resolved_member(MemberPin::Field(fa.index)); }
-        this.enforce_field_visibility(fa, member.member, acc_span);
+        this.enforce_field_visibility(fa, member.member, acc_span, false);
     }
 
     // -- Index access (`arr[i]` / `tup[0]`) --
@@ -716,6 +740,27 @@ type struct MemberResolver {
         const element_expected: TypeRef = visitor.state.expected_type;
         visitor.state.expected_type = TypeRef::invalid();
         const array_type: TypeRef = visitor.resolve_expr(access.array);
+        // A type parameter one bound in scope gives `IndexView` at a
+        // written index type - naming it, or a trait it is a supertrait of -
+        // is indexed at that type: `0..2` under `C: IndexView<Range<i64>>`
+        // or `C: IndexViewMutable<Range<i64>>` is a `Range<i64>`.
+        const view_id: DefId = this.ctx.generic_registry.wellknown(LangItem::IndexView);
+        const viewed_base: TypeRef = this.types.peel_indirection(array_type);
+        const viewed_t: Type* = this.arena.lookup(if (viewed_base.is_valid()) { viewed_base } else { array_type });
+        if (view_id.is_valid() && viewed_t != null && viewed_t.kind == TypeKind::GenericParam) {
+            const bounds: [const TraitRef*] = visitor.binding.bounds_on(
+                if (viewed_base.is_valid()) { viewed_base } else { array_type });
+            // Bounds that give it at different index types type nothing.
+            mut index_at: TypeRef = TypeRef::invalid();
+            mut agreed: boolean = true;
+            for (mut i: i64 = 0; i < bounds.length(); i++) {
+                mut given: [TypeRef] = [];
+                if (!visitor.binding.bound_gives(bounds[i], view_id, &given)) { continue; }
+                if (given.length() != 1 || (index_at.is_valid() && !index_at.equals(given[0]))) { agreed = false; }
+                if (given.length() == 1) { index_at = given[0]; }
+            }
+            if (agreed && index_at.is_valid()) { visitor.state.expected_type = index_at; }
+        }
         const index_type: TypeRef = visitor.resolve_expr(access.index);
         visitor.state.expected_type = element_expected;
         if (!array_type.is_valid()) { return TypeRef::invalid(); }
@@ -874,8 +919,12 @@ type struct MemberResolver {
     /// its call reports: the view was what `[]` asked for.  A base that
     /// carries the walked body's parameters (`&Array<T>`) is viewed when an
     /// implementation's where-clause holds for it as written, and the
-    /// body's copies specialize the call.  A base that IS a parameter, or
-    /// an index in the body's parameters, is indexed by `Index` alone.
+    /// body's copies specialize the call.  A base that IS a parameter is
+    /// viewed when a bound in scope gives it `IndexView` at the index's
+    /// type, and the call is answered by that bound; where the parameter is
+    /// writable and a bound gives it `IndexViewMutable` there too, the
+    /// desugar is `a.view_mutable(i)`, a value of `ViewMutable`.  An index in the body's
+    /// parameters is indexed by `Index` alone.
     try_index_view(mut &this, visitor: mut SemaVisitor*, e: ExpressionNode*, access: ArrayAccessExpr*,
                    ty: TypeRef, index_ty: TypeRef) -> mut ExpressionNode* {
         const view_id: DefId = this.ctx.generic_registry.wellknown(LangItem::IndexView);
@@ -886,21 +935,38 @@ type struct MemberResolver {
             base_ty = t.as_reference().referent;
             t = this.arena.lookup(base_ty);
         }
-        if (t == null || t.kind == TypeKind::GenericParam || this.types.contains_generic_param(index_ty)) {
-            return null;
-        }
-        // No implementation can name a fixed array's length, so a `[T; N]`
-        // is viewed through the slice over its elements that the compiler
-        // builds for it, as its reference converts to one.
+        if (t == null || this.types.contains_generic_param(index_ty)) { return null; }
         mut receiver: mut ExpressionNode* = access.array;
-        if (t.kind == TypeKind::Array) {
-            receiver = visitor.slice_view(access.array);
-            if (receiver == null || !receiver.resolved_type.is_valid()) { return null; }
-            base_ty = this.arena.lookup(receiver.resolved_type).as_reference().referent;
-        }
         const index_args: [TypeRef] = [index_ty];
-        if (this.trait_checker().implementation_at(view_id, &index_args, base_ty) == null) { return null; }
-        const member: mut ExpressionNode* = this.lang_method_callee(receiver, LangItem::IndexViewView, e.span);
+        mut viewer: LangItem = LangItem::IndexViewView;
+        if (t.kind == TypeKind::GenericParam) {
+            if (!this.binding.param_bounded_by(t.as_generic_param(), view_id)
+                    || !visitor.calls.scope_gives(base_ty, view_id, &index_args, 0)) {
+                return null;
+            }
+            // A writable parameter a bound gives `IndexViewMutable` at the
+            // index's type is viewed writably wherever it is viewed: its
+            // `View` and `ViewMutable` are different projections, and only
+            // the bounds on the one `[]` names reach the view's methods and
+            // elements.
+            const writer_id: DefId = this.ctx.generic_registry.wellknown(LangItem::IndexViewMutable);
+            if (writer_id.is_valid() && this.binding.param_bounded_by(t.as_generic_param(), writer_id)
+                    && visitor.calls.scope_gives(base_ty, writer_id, &index_args, 0)
+                    && visitor.access_within(access.array).is_writable()) {
+                viewer = LangItem::IndexViewMutableViewMutable;
+            }
+        } else {
+            // No implementation can name a fixed array's length, so a `[T; N]`
+            // is viewed through the slice over its elements that the compiler
+            // builds for it, as its reference converts to one.
+            if (t.kind == TypeKind::Array) {
+                receiver = visitor.slice_view(access.array);
+                if (receiver == null || !receiver.resolved_type.is_valid()) { return null; }
+                base_ty = this.arena.lookup(receiver.resolved_type).as_reference().referent;
+            }
+            if (this.trait_checker().implementation_at(view_id, &index_args, base_ty) == null) { return null; }
+        }
+        const member: mut ExpressionNode* = this.lang_method_callee(receiver, viewer, e.span);
         if (member == null) { return null; }
         mut call: mut ExpressionNode* = ExpressionNode::call_expr(member, e.span);
         ExpressionNode::call_of(call).add_argument(access.index);
@@ -909,15 +975,13 @@ type struct MemberResolver {
     }
 
     /// The index desugar for a base that is a type parameter of the body
-    /// being walked, when a bound in scope gives the parameter
-    /// `std::core::ops::Index` - itself or as a supertrait of the trait it
-    /// names.  Null for any other base.
+    /// being walked, or an associated type of one (`C::ViewMutable`), when a
+    /// bound in scope gives it `std::core::ops::Index` - itself or as a
+    /// supertrait of the trait it names.  Null for any other base.
     try_bounded_index(mut &this, visitor: mut SemaVisitor*, e: ExpressionNode*, access: ArrayAccessExpr*,
                       ty: TypeRef) -> mut ExpressionNode* {
-        const param: GenericParamType* = this.binding.receiver_type_param(ty);
-        if (param == null) { return null; }
         const index_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Index);
-        if (!index_id.is_valid() || !this.binding.param_bounded_by(param, index_id)) { return null; }
+        if (!index_id.is_valid() || !this.binding.subject_bounded_by(ty, index_id)) { return null; }
         return this.build_index_desugar(visitor, e, access);
     }
 
@@ -1018,11 +1082,15 @@ type struct MemberResolver {
     /// may not be (`member_reachable`).  A field is declared where its type
     /// is.  `fa` is the answer the caller's lookup gave (`field_of`);
     /// `field_name` is the spelling, for the diagnostic alone.  Nothing here
-    /// finds the field again.
-    enforce_field_visibility(mut &this, fa: &FieldAnswer, field_name: SymbolStr, span: SourceSpan) -> void {
-        if (fa.owner == null) { return; }
+    /// finds the field again.  `left_out` says a struct literal reached the
+    /// field by leaving it out, which no edit at the literal can repair, so
+    /// the refusal says why instead.  Answers whether the field was
+    /// reachable.
+    enforce_field_visibility(mut &this, fa: &FieldAnswer, field_name: SymbolStr, span: SourceSpan,
+                             left_out: boolean) -> boolean {
+        if (fa.owner == null) { return true; }
         const decl: ModulePath = fa.declared_in;
-        if (this.member_reachable(fa.visibility, decl, span)) { return; }
+        if (this.member_reachable(fa.visibility, decl, span)) { return true; }
 
         const declaring_name: string = fa.owner.display_name();
         const field_str: string = this.intern.resolve(field_name);
@@ -1032,7 +1100,12 @@ type struct MemberResolver {
             fmt::format("field `%s` of `%s` is %s", field_str, declaring_name, word));
         d = d.at_with_label(span, fmt::format("%s field reached outside %s", word,
             this.outside_of(fa.visibility, decl)));
+        if (left_out) {
+            d = d.help(fmt::format("a literal sets every field, the ones it leaves out included, so `%s` is built this way only where `%s` is reachable",
+                declaring_name, field_str));
+        }
         this.ctx.emit_diagnostic(d);
+        return false;
     }
 
     /// Method-call counterpart to `enforce_field_visibility` (E0353), asked

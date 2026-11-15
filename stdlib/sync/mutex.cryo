@@ -10,8 +10,8 @@
 ///! so the handle is freely movable.
 ///!
 ///! Calling `lock()` returns a `MutexGuard<T, A>` that
-///!   1. reads the guarded value through `as_ptr()` (a `T*`) and,
-///!      held writably, writes it through `as_mutable_ptr()` (a
+///!   1. reads the guarded value through `as_pointer()` (a `T*`) and,
+///!      held writably, writes it through `as_mutable_pointer()` (a
 ///!      `mut T*`), both valid for the lifetime of the guard,
 ///!   2. releases the lock automatically when its `drop()` runs.
 ///!
@@ -36,11 +36,11 @@
 namespace std::sync::mutex;
 
 import std::core::intrinsics;
-import std::core::ptr::{ NonNull };
+import std::core::pointer::{ NonNull };
 import std::core::result::{ Result };
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ AllocError, AllocErrorKind, Allocator, GlobalAlloc };
+import std::alloc::allocator::{ AllocationError, AllocationErrorKind, Allocator, GlobalAllocator };
 import std::ffi::libc::{
     pthread_mutex_destroy, pthread_mutex_init, pthread_mutex_lock, pthread_mutex_trylock,
     pthread_mutex_unlock
@@ -107,7 +107,7 @@ private type struct MutexInner<T, A> {
 
 /// RAII guard returned by `Mutex::lock`.  Carries a raw pointer to
 /// the inner so it can release the lock on drop.  Read the guarded
-/// value through `as_ptr()`; write it through `as_mutable_ptr()`, from a
+/// value through `as_pointer()`; write it through `as_mutable_pointer()`, from a
 /// guard held writably.
 ![language("mutex_guard")]
 public type struct MutexGuard<T, A> {
@@ -115,13 +115,13 @@ public type struct MutexGuard<T, A> {
 
     /// Read-only pointer to the guarded value.  Valid for the lifetime
     /// of this guard; never `null`.
-    public as_ptr(&this) -> T* {
+    public as_pointer(&this) -> T* {
         return &this.inner.value;
     }
 
     /// Writable pointer to the guarded value, from a guard held
     /// writably.  Valid for the lifetime of this guard; never `null`.
-    public as_mutable_ptr(mut &this) -> mut T* {
+    public as_mutable_pointer(mut &this) -> mut T* {
         return &this.inner.value;
     }
 }
@@ -149,21 +149,21 @@ implement<T, A> trait Drop for struct MutexGuard<T, A> {
 ///
 /// ```cryo
 /// import std::sync::mutex::{ Mutex, MutexGuard };
-/// import std::alloc::allocator::{ GlobalAlloc };
+/// import std::alloc::allocator::{ GlobalAllocator };
 ///
 /// const counter: Mutex<i64> = Mutex::new(0);
 /// {
-///     mut guard: MutexGuard<i64, GlobalAlloc> = counter.lock();
-///     *guard.as_mutable_ptr() = *guard.as_ptr() + 1;
+///     mut guard: MutexGuard<i64, GlobalAllocator> = counter.lock();
+///     *guard.as_mutable_pointer() = *guard.as_pointer() + 1;
 /// }   // the guard drops here and releases the lock
 /// ```
-public type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
+public type struct Mutex<T, A = GlobalAllocator> where A: Allocator {
     private inner: mut MutexInner<T, A>*;
 
     /// Construct a `Mutex<T>` initialized to hold `value`, using
-    /// `GlobalAlloc` for the inner allocation.  Panics on
+    /// `GlobalAllocator` for the inner allocation.  Panics on
     /// allocation failure; use `try_new` to handle the error.
-    public static new(value: T) -> Mutex<T, GlobalAlloc> {
+    public static new(value: T) -> Mutex<T, GlobalAllocator> {
         match (Mutex::try_new(value)) {
             Result::Ok(m)  => { return m; }
             Result::Err(_) => {
@@ -187,45 +187,45 @@ public type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
 
     /// Fallible constructor.  Initializes the pthread mutex with
     /// default attributes (`PTHREAD_MUTEX_NORMAL`).  Returns
-    /// `Err(AllocError)` either when the inner buffer cannot be
+    /// `Err(AllocationError)` either when the inner buffer cannot be
     /// allocated or when `pthread_mutex_init` itself fails (ENOMEM
     /// or EAGAIN under resource pressure); in the latter case the
     /// just-allocated buffer is released before returning so the
     /// caller never leaks on the error path.
-    public static try_new(value: T) -> Result<Mutex<T, GlobalAlloc>, AllocError> {
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
-        const header: Layout = Layout::of::<MutexInner<T, GlobalAlloc>>();
+    public static try_new(value: T) -> Result<Mutex<T, GlobalAllocator>, AllocationError> {
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
+        const header: Layout = Layout::of::<MutexInner<T, GlobalAllocator>>();
         const raw: NonNull<u8> = alloc.allocate(header)?;
-        const typed: NonNull<MutexInner<T, GlobalAlloc>> =
-            raw.cast::<MutexInner<T, GlobalAlloc>>();
-        const inner_ptr: mut MutexInner<T, GlobalAlloc>* = typed.as_ptr();
+        const typed: NonNull<MutexInner<T, GlobalAllocator>> =
+            raw.cast::<MutexInner<T, GlobalAllocator>>();
+        const inner_ptr: mut MutexInner<T, GlobalAllocator>* = typed.as_pointer();
         const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
         const rc: i32 = mutex_init_raw(buf_ptr);
         if (rc != 0) {
             alloc.deallocate(raw, header);
-            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, header));
+            return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, header));
         }
         inner_ptr.value = value;
         inner_ptr.alloc = alloc;
-        return Result::Ok(Mutex::<T, GlobalAlloc> { inner: inner_ptr });
+        return Result::Ok(Mutex::<T, GlobalAllocator> { inner: inner_ptr });
     }
 
     /// Construct a `Mutex` holding `value`, its block allocated from
-    /// `alloc`. Returns the allocator's `AllocError` when the block cannot
+    /// `alloc`. Returns the allocator's `AllocationError` when the block cannot
     /// be allocated, and an `OutOfMemory` error, after freeing the block,
     /// when `pthread_mutex_init` fails (unix; the Windows initialisation
     /// cannot fail).
-    public static try_new_in(value: T, alloc: A) -> Result<Mutex<T, A>, AllocError> {
+    public static try_new_in(value: T, alloc: A) -> Result<Mutex<T, A>, AllocationError> {
         mut a: A = alloc;
         const header: Layout = Layout::of::<MutexInner<T, A>>();
         const raw: NonNull<u8> = a.allocate(header)?;
         const typed: NonNull<MutexInner<T, A>> = raw.cast::<MutexInner<T, A>>();
-        const inner_ptr: mut MutexInner<T, A>* = typed.as_ptr();
+        const inner_ptr: mut MutexInner<T, A>* = typed.as_pointer();
         const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
         const rc: i32 = mutex_init_raw(buf_ptr);
         if (rc != 0) {
             a.deallocate(raw, header);
-            return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, header));
+            return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, header));
         }
         inner_ptr.value = value;
         inner_ptr.alloc = a;
@@ -259,7 +259,7 @@ public type struct Mutex<T, A = GlobalAlloc> where A: Allocator {
         return Option::None;
     }
 
-    /// Raw pointer to the inner pthread buffer.  Used by `CondVar`
+    /// Raw pointer to the inner pthread buffer.  Used by `ConditionVariable`
     /// to pair the mutex with a condition variable in
     /// `pthread_cond_wait`; not a stable public API.
     internal raw_pthread_buf(&this) -> mut u8* {
@@ -278,7 +278,7 @@ where A: Allocator {
         const inner_ptr: mut MutexInner<T, A>* = this.inner;
         const buf_ptr: mut u8* = &inner_ptr.pthread_buf[0];
         mutex_destroy_raw(buf_ptr);
-        ptr::drop_in_place::<T>(&inner_ptr.value);
+        pointer::drop_in_place::<T>(&inner_ptr.value);
         mut alloc: A = inner_ptr.alloc;
         const header: Layout = Layout::of::<MutexInner<T, A>>();
         alloc.deallocate(NonNull::new(this.inner as mut u8*), header);

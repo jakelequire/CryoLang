@@ -18,9 +18,9 @@ namespace std::collections::array;
 import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::result::{ Result };
-import std::core::slice::{ AsMutableSlice, AsSlice, Slice, SliceIndex, SliceIter, SliceRange };
+import std::core::slice::{ AsMutableSlice, AsSlice, Slice, SliceIndex, SliceIterator, SliceRange };
 import std::core::mem;
-import std::core::ptr::{ NonNull };
+import std::core::pointer::{ NonNull };
 import std::core::drop::{ Drop };
 import std::core::clone::{ Clone };
 import std::core::cmp::{ Eq, Ord, Ordering };
@@ -30,7 +30,7 @@ import std::core::iter::{ FromIterator, Iterator };
 import std::core::ops::{ Index, IndexMutable, IndexView, IndexViewMutable };
 import std::alloc::layout::{ Layout };
 import std::alloc::allocator::{
-    AllocError, AllocErrorKind, Allocator, GlobalAlloc, next_capacity
+    AllocationError, AllocationErrorKind, Allocator, GlobalAllocator, next_capacity
 };
 import std::collections::raw_buffer::{ RawBuffer };
 import std::ffi::libc;
@@ -54,7 +54,7 @@ private const INITIAL_CAPACITY: i64 = 4;
 /// const last: Option<i32> = numbers.pop();   // Some(4)
 /// ```
 ![language("array")]
-public type struct Array<T, A = GlobalAlloc> where A: Allocator {
+public type struct Array<T, A = GlobalAllocator> where A: Allocator {
     // Layout: { ptr, length, capacity, alloc }.  ABI-compatible with
     // the legacy `[T]` fat pointer the self-hosted compiler emits.
     private ptr:      mut T*;
@@ -62,13 +62,13 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     private capacity: i64;
     private alloc:    A;
 
-    /// Empty array backed by `GlobalAlloc`.
-    public static new() -> Array<T, GlobalAlloc> {
-        return Array::<T, GlobalAlloc> {
+    /// Empty array backed by `GlobalAllocator`.
+    public static new() -> Array<T, GlobalAllocator> {
+        return Array::<T, GlobalAllocator> {
             ptr: null,
             length: 0,
             capacity: 0,
-            alloc: GlobalAlloc::new()
+            alloc: GlobalAllocator::new()
         };
     }
 
@@ -85,8 +85,8 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// Preallocate room for `capacity` elements; a `capacity` of zero or
     /// less allocates nothing. Panics on allocation failure; use
     /// `try_with_capacity_in` to recover.
-    public static with_capacity(capacity: i64) -> Array<T, GlobalAlloc> {
-        match (Array::<T, GlobalAlloc>::try_with_capacity_in(capacity, GlobalAlloc::new())) {
+    public static with_capacity(capacity: i64) -> Array<T, GlobalAllocator> {
+        match (Array::<T, GlobalAllocator>::try_with_capacity_in(capacity, GlobalAllocator::new())) {
             Result::Ok(array) => { return array; }
             Result::Err(_) => {
                 core::panic("Array::with_capacity: allocation failed", intrinsics::location());
@@ -107,9 +107,9 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     }
 
     /// An empty array with room for `capacity` elements, allocated through
-    /// `alloc`, or the `AllocError` when the storage cannot be had. A
+    /// `alloc`, or the `AllocationError` when the storage cannot be had. A
     /// `capacity` of zero or less allocates nothing.
-    public static try_with_capacity_in(capacity: i64, alloc: A) -> Result<Array<T, A>, AllocError> {
+    public static try_with_capacity_in(capacity: i64, alloc: A) -> Result<Array<T, A>, AllocationError> {
         mut array: Array<T, A> = Array::<T, A> {
             ptr: null,
             length: 0,
@@ -145,7 +145,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// result is an independent bitwise duplicate while the array retains
     /// ownership of the stored element, so handing back a copy is only
     /// sound when `T` carries no `Drop` obligation. For owning `T`, borrow
-    /// in place with `get_ref` (or move an element out with
+    /// in place with `get_reference` (or move an element out with
     /// `swap_remove`/`pop`).
     public get(&this, index: i64) -> Option<T> where T: Copy {
         if (index < 0 || index >= this.length) {
@@ -159,7 +159,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// ownership, so this is sound for every `T` (Copy or owning). The
     /// pointer is invalidated by any reallocating method (`push`,
     /// `reserve`, `shrink_to_fit`).
-    public get_ref(&this, index: i64) -> Option<T*> {
+    public get_reference(&this, index: i64) -> Option<T*> {
         if (index < 0 || index >= this.length) {
             return Option::None;
         }
@@ -168,24 +168,24 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
 
     /// Read-only raw pointer to the first element. Invalidated by any
     /// method that may reallocate (`push`, `reserve`, `shrink_to_fit`).
-    public as_ptr(&this) -> T* {
+    public as_pointer(&this) -> T* {
         return this.ptr;
     }
 
     /// Writable raw pointer to the first element, from an array held
-    /// writably. Invalidated as `as_ptr` is.
-    public as_mutable_ptr(mut &this) -> mut T* {
+    /// writably. Invalidated as `as_pointer` is.
+    public as_mutable_pointer(mut &this) -> mut T* {
         return this.ptr;
     }
 
     /// Iterate over the elements in order, yielding each by value
     /// (bitwise copy). Gated on `T: Copy` for the same reason as `get`:
     /// a yielded owning value would alias storage the array still owns.
-    /// For owning `T`, walk by index with `length()` + `get_ref`. The
+    /// For owning `T`, walk by index with `length()` + `get_reference`. The
     /// iterator is invalidated by any reallocating method on the array
     /// (`push`, `reserve`, `shrink_to_fit`).
     public iter(&this) -> implement Iterator<T> where T: Copy {
-        return SliceIter::<T> { ptr: this.ptr, remaining: this.length };
+        return SliceIterator::<T> { ptr: this.ptr, remaining: this.length };
     }
 
     /// Iterate by shared borrow, yielding `T*` for each element in
@@ -194,8 +194,8 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// are invalidated by any reallocating method (`push`, `reserve`,
     /// `insert`, `shrink_to_fit`). This is the way to walk an
     /// `Array<String>` / `Array<Box<...>>` without cloning.
-    public iter_ref(&this) -> implement Iterator<T*> {
-        return RefIter::<T> { ptr: this.ptr, index: 0, length: this.length };
+    public iterate_references(&this) -> implement Iterator<T*> {
+        return ReferenceIterator::<T> { ptr: this.ptr, index: 0, length: this.length };
     }
 
     /// Add `value` after the last element, growing the storage when it is
@@ -210,9 +210,9 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
         }
     }
 
-    /// `push` that returns `Err(AllocError)` instead of panicking when the
+    /// `push` that returns `Err(AllocationError)` instead of panicking when the
     /// storage cannot grow; the array is unchanged by a failed push.
-    public try_push(mut &this, value: T) -> Result<(), AllocError> {
+    public try_push(mut &this, value: T) -> Result<(), AllocationError> {
         if (this.length == this.capacity) {
             this.reserve_grow(1)?;
         }
@@ -241,8 +241,8 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
         if (index < 0 || index >= this.length) {
             core::panic("Array::set: index out of range", intrinsics::location());
         }
-        mut prev: T* = this.get_ref(index).unwrap();
-        ptr::drop_in_place::<T>(prev);
+        mut prev: T* = this.get_reference(index).unwrap();
+        pointer::drop_in_place::<T>(prev);
         this.ptr[index] = value;
     }
 
@@ -310,7 +310,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
             // force-emitted method body, so calling it leaves an
             // undefined symbol for `Array<T>` instantiations that never
             // call `sort`. `mem::offset` is already emitted for every
-            // `Array<T>` (used by `get_ref`), so it stays a call.
+            // `Array<T>` (used by `get_reference`), so it stays a call.
             const a: mut T* = mem::offset(this.ptr, lo);
             const b: mut T* = mem::offset(this.ptr, hi);
             // A permutation of two slots the array keeps owning: each value
@@ -389,7 +389,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
         if (new_length >= this.length) { return; }
         mut i: i64 = new_length;
         while (i < this.length) {
-            ptr::drop_in_place::<T>(&this.ptr[i]);
+            pointer::drop_in_place::<T>(&this.ptr[i]);
             i++;
         }
         this.length = new_length;
@@ -404,7 +404,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     public clear(mut &this) -> void {
         mut i: i64 = 0;
         while (i < this.length) {
-            ptr::drop_in_place::<T>(&this.ptr[i]);
+            pointer::drop_in_place::<T>(&this.ptr[i]);
             i++;
         }
         this.length = 0;
@@ -482,7 +482,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
                 }
                 kept += 1;
             } else {
-                ptr::drop_in_place::<T>(&this.ptr[index]);
+                pointer::drop_in_place::<T>(&this.ptr[index]);
             }
         }
         this.length = kept;
@@ -491,12 +491,12 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// Release every element equal to the one before it, so each run of
     /// equal neighbours keeps only its first element. On a sorted array
     /// that leaves each value once.
-    public dedup(mut &this) -> void where T: Eq {
+    public deduplicate(mut &this) -> void where T: Eq {
         if (this.length < 2) { return; }
         mut kept: i64 = 1;
         for (mut index: i64 = 1; index < this.length; index++) {
             if (this.ptr[index].equals(&this.ptr[kept - 1])) {
-                ptr::drop_in_place::<T>(&this.ptr[index]);
+                pointer::drop_in_place::<T>(&this.ptr[index]);
             } else {
                 if (kept != index) {
                     mem::copy::<T>(mem::offset(this.ptr, kept), mem::offset(this.ptr, index), 1);
@@ -528,13 +528,13 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     /// partial copies are impossible; either all elements are appended
     /// or none are. Gated on `T: Copy` (see `append`): the append is a
     /// bitwise `memcpy` out of the borrowed `source`.
-    public try_append(mut &this, source: &Slice<T>) -> Result<(), AllocError> where T: Copy {
+    public try_append(mut &this, source: &Slice<T>) -> Result<(), AllocationError> where T: Copy {
         const add: i64 = source.length();
         if (add == 0) { return Result::Ok(()); }
         this.reserve_grow(add)?;
         libc::memcpy(
             mem::offset(this.ptr, this.length),
-            source.as_ptr(),
+            source.as_pointer(),
             (add as u64) * sizeof(T)
         );
         this.length = this.length + add;
@@ -564,7 +564,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
 
     /// Fallible `resize`. Reserves the whole growth up front, so the array is
     /// either resized or left exactly as it was - never partially grown.
-    public try_resize(mut &this, new_length: i64, value: T) -> Result<(), AllocError>
+    public try_resize(mut &this, new_length: i64, value: T) -> Result<(), AllocationError>
     where T: Copy {
         if (new_length <= this.length) {
             this.truncate(new_length);
@@ -582,13 +582,13 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
 
     /// Room for at least `additional` more elements; zero or less is a
     /// no-op.
-    public reserve(mut &this, additional: i64) -> Result<(), AllocError> {
+    public reserve(mut &this, additional: i64) -> Result<(), AllocationError> {
         return this.reserve_grow(additional);
     }
 
     /// Room for exactly `additional` more elements; zero or less is a
     /// no-op.
-    public reserve_exact(mut &this, additional: i64) -> Result<(), AllocError> {
+    public reserve_exact(mut &this, additional: i64) -> Result<(), AllocationError> {
         if (additional <= 0) {
             return Result::Ok(());
         }
@@ -598,8 +598,8 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
         // otherwise see `required <= capacity`, skip the realloc, and memcpy
         // `additional` elements past the end of the buffer.
         if (required < this.length) {
-            return Result::Err(AllocError::new(
-                AllocErrorKind::OutOfMemory, Layout::array::<T>(this.length)));
+            return Result::Err(AllocationError::new(
+                AllocationErrorKind::OutOfMemory, Layout::array::<T>(this.length)));
         }
         if (required <= this.capacity) {
             return Result::Ok(());
@@ -609,7 +609,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
 
     /// Ensure at least `additional` more slots fit, doubling past
     /// `INITIAL_CAPACITY`.
-    private reserve_grow(mut &this, additional: i64) -> Result<(), AllocError> {
+    private reserve_grow(mut &this, additional: i64) -> Result<(), AllocationError> {
         if (additional <= 0) {
             return Result::Ok(());
         }
@@ -617,8 +617,8 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
         // See reserve_exact: reject a `length + additional` that does not fit
         // rather than under-allocating and overrunning the caller's memcpy.
         if (required < this.length) {
-            return Result::Err(AllocError::new(
-                AllocErrorKind::OutOfMemory, Layout::array::<T>(this.length)));
+            return Result::Err(AllocationError::new(
+                AllocationErrorKind::OutOfMemory, Layout::array::<T>(this.length)));
         }
         if (required <= this.capacity) {
             return Result::Ok(());
@@ -656,21 +656,21 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
     // `resize_array<T, A>(...)` would link as the unspecialized
     // GenericParam-named symbol from `try_with_capacity_in`'s callers.
 
-    private resize_storage(mut &this, new_capacity: i64) -> Result<(), AllocError> {
+    private resize_storage(mut &this, new_capacity: i64) -> Result<(), AllocationError> {
         if (new_capacity == this.capacity) {
             return Result::Ok(());
         }
         const new_layout: Layout = match (Layout::try_array::<T>(new_capacity)) {
             Option::Some(l) => { l }
             Option::None    => {
-                return Result::Err(AllocError::new(
-                    AllocErrorKind::OutOfMemory, Layout::of::<T>()));
+                return Result::Err(AllocationError::new(
+                    AllocationErrorKind::OutOfMemory, Layout::of::<T>()));
             }
         };
 
         if (this.ptr == null) {
             const raw: NonNull<u8> = this.alloc.allocate(new_layout)?;
-            this.ptr = raw.as_ptr() as mut T*;
+            this.ptr = raw.as_pointer() as mut T*;
             this.capacity = new_capacity;
             return Result::Ok(());
         }
@@ -680,7 +680,7 @@ public type struct Array<T, A = GlobalAlloc> where A: Allocator {
             old_layout,
             new_layout
         )?;
-        this.ptr = raw.as_ptr() as mut T*;
+        this.ptr = raw.as_pointer() as mut T*;
         this.capacity = new_capacity;
         return Result::Ok(());
     }
@@ -708,7 +708,7 @@ where A: Allocator {
     drop(mut &this) -> void {
         mut i: i64 = 0;
         while (i < this.length) {
-            ptr::drop_in_place::<T>(&this.ptr[i]);
+            pointer::drop_in_place::<T>(&this.ptr[i]);
             i++;
         }
         if (this.ptr != null) {
@@ -725,7 +725,7 @@ where A: Allocator {
 
 /// An array of every element an iterator yields, in order: what `collect`
 /// builds for `Array<T>`.
-implement<T> trait FromIterator<T> for struct Array<T, GlobalAlloc> {
+implement<T> trait FromIterator<T> for struct Array<T, GlobalAllocator> {
     static from_iterator<I>(source: I) -> Array<T> where I: Iterator<T> {
         mut out: Array<T> = Array::<T>::new();
         for (value in source) {
@@ -758,7 +758,7 @@ private function merge_sort<T, F>(items: mut T*, length: i64, compare: F) -> voi
         if (end > length) { end = length; }
         for (mut index: i64 = start + 1; index < end; index++) {
             mut at: i64 = index;
-            while (at > start && compare(&items[at - 1], &items[at]).is_gt()) {
+            while (at > start && compare(&items[at - 1], &items[at]).is_greater()) {
                 mem::swap::<T>(mem::offset(items, at - 1), mem::offset(items, at));
                 at -= 1;
             }
@@ -770,14 +770,14 @@ private function merge_sort<T, F>(items: mut T*, length: i64, compare: F) -> voi
         Result::Ok(_) => { }
         Result::Err(_) => { core::panic("Array::sort: allocation failed", intrinsics::location()); }
     }
-    const spare: mut T* = buffer.ptr();
+    const spare: mut T* = buffer.pointer();
     for (mut width: i64 = SORT_INSERTION_CUTOFF; width < length; width *= 2) {
         for (mut low: i64 = 0; low + width < length; low += 2 * width) {
             const middle: i64 = low + width;
             mut high: i64 = middle + width;
             if (high > length) { high = length; }
             // Two runs already in order need no merge.
-            if (!compare(&items[middle - 1], &items[middle]).is_gt()) { continue; }
+            if (!compare(&items[middle - 1], &items[middle]).is_greater()) { continue; }
             const left_length: i64 = middle - low;
             for (mut index: i64 = 0; index < left_length; index++) {
                 mem::copy::<T>(mem::offset(spare, index), mem::offset(items, low + index), 1);
@@ -789,7 +789,7 @@ private function merge_sort<T, F>(items: mut T*, length: i64, compare: F) -> voi
             mut right: i64 = middle;
             mut out: i64 = low;
             while (left < left_length && right < high) {
-                if (compare(&items[right], &spare[left]).is_lt()) {
+                if (compare(&items[right], &spare[left]).is_less()) {
                     mem::copy::<T>(mem::offset(items, out), mem::offset(items, right), 1);
                     right += 1;
                 } else {
@@ -830,7 +830,7 @@ private function introsort<T, F>(items: mut T*, length: i64, compare: F) -> void
         if (high - low <= SORT_INSERTION_CUTOFF) {
             for (mut index: i64 = low + 1; index < high; index++) {
                 mut at: i64 = index;
-                while (at > low && compare(&items[at - 1], &items[at]).is_gt()) {
+                while (at > low && compare(&items[at - 1], &items[at]).is_greater()) {
                     mem::swap::<T>(mem::offset(items, at - 1), mem::offset(items, at));
                     at -= 1;
                 }
@@ -856,10 +856,10 @@ private function introsort<T, F>(items: mut T*, length: i64, compare: F) -> void
                 loop {
                     mut child: i64 = 2 * root + 1;
                     if (child >= heap_end) { break; }
-                    if (child + 1 < heap_end && compare(&items[low + child], &items[low + child + 1]).is_lt()) {
+                    if (child + 1 < heap_end && compare(&items[low + child], &items[low + child + 1]).is_less()) {
                         child += 1;
                     }
-                    if (!compare(&items[low + root], &items[low + child]).is_lt()) { break; }
+                    if (!compare(&items[low + root], &items[low + child]).is_less()) { break; }
                     mem::swap::<T>(mem::offset(items, low + root), mem::offset(items, low + child));
                     root = child;
                 }
@@ -870,19 +870,19 @@ private function introsort<T, F>(items: mut T*, length: i64, compare: F) -> void
             // median at `high - 1` as the pivot and partition the rest
             // around it.
             const middle: i64 = low + (high - low) / 2;
-            if (compare(&items[middle], &items[low]).is_lt()) {
+            if (compare(&items[middle], &items[low]).is_less()) {
                 mem::swap::<T>(mem::offset(items, middle), mem::offset(items, low));
             }
-            if (compare(&items[high - 1], &items[low]).is_lt()) {
+            if (compare(&items[high - 1], &items[low]).is_less()) {
                 mem::swap::<T>(mem::offset(items, high - 1), mem::offset(items, low));
             }
-            if (compare(&items[high - 1], &items[middle]).is_lt()) {
+            if (compare(&items[high - 1], &items[middle]).is_less()) {
                 mem::swap::<T>(mem::offset(items, high - 1), mem::offset(items, middle));
             }
             mem::swap::<T>(mem::offset(items, middle), mem::offset(items, high - 1));
             mut store: i64 = low;
             for (mut index: i64 = low; index < high - 1; index++) {
-                if (compare(&items[index], &items[high - 1]).is_lt()) {
+                if (compare(&items[index], &items[high - 1]).is_less()) {
                     mem::swap::<T>(mem::offset(items, store), mem::offset(items, index));
                     store += 1;
                 }
@@ -913,7 +913,7 @@ private function introsort<T, F>(items: mut T*, length: i64, compare: F) -> void
 /// Deep copy: allocate a fresh buffer sized to `length` and clone each
 /// element into it, so the two arrays own independent storage and their
 /// elements are independent. Requires `T: Clone`.
-implement<T> trait Clone for struct Array<T, GlobalAlloc>
+implement<T> trait Clone for struct Array<T, GlobalAllocator>
 where T: Clone {
     clone(&this) -> Array<T> {
         mut out: Array<T> = Array::<T>::with_capacity(this.length);
@@ -928,7 +928,7 @@ where T: Clone {
 
 /// A fresh empty `Array` - the canonical "zero value" so `Array<T>` can be a
 /// `T: Default` field / satisfy a `Default` bound. Allocates nothing.
-implement<T> trait Default for struct Array<T, GlobalAlloc> {
+implement<T> trait Default for struct Array<T, GlobalAllocator> {
     static default() -> Array<T> {
         return Array::<T>::new();
     }
@@ -938,7 +938,7 @@ implement<T> trait Default for struct Array<T, GlobalAlloc> {
 // defaulted-allocator `<T>` form `Clone` uses: a bare-name method call
 // (`.equals()`) resolves against either, but a *trait bound* - `Array<i32>` as
 // a `HashMap` key, or `T: Eq`/`T: Hash` on a fully-applied
-// `Array<i32, GlobalAlloc>` - is only satisfied when the impl names the
+// `Array<i32, GlobalAllocator>` - is only satisfied when the impl names the
 // allocator param too.
 
 /// Element-wise equality: equal length and every element equal in order.
@@ -972,40 +972,40 @@ where T: Hash, A: Allocator {
 
 
 /// Borrowing iterator over an `Array<T>`, yielding `T*` (a pointer to
-/// each element in place). Created by `Array::iter_ref`; sound for
+/// each element in place). Created by `Array::iterate_references`; sound for
 /// owning `T`. Invalidated by any reallocating method on the array.
 ///
 /// `private`: this cursor is an implementation detail. Callers obtain it
-/// only as the opaque `implement Iterator<T*>` returned by `iter_ref`, and
+/// only as the opaque `implement Iterator<T*>` returned by `iterate_references`, and
 /// never name it.
-private type struct RefIter<T> {
+private type struct ReferenceIterator<T> {
     private ptr:    T*;
     private index:  i64;
     private length: i64;
 
     /// Adapt this by-reference iterator into a by-value one that yields
-    /// each pointee `T` by bitwise copy: `arr.iter_ref().copied()`. Sound
-    /// only when `T: Copy` (that bound lives on `CopiedIter`'s `Iterator`
+    /// each pointee `T` by bitwise copy: `arr.iterate_references().copied()`. Sound
+    /// only when `T: Copy` (that bound lives on `CopiedIterator`'s `Iterator`
     /// impl). Defined here, on the pointer-yielding cursor, rather than as
     /// an `Iterator` default - `copied` is meaningful only for iterators
     /// whose element is a pointer, and Cryo has no `where Item == T*`
     /// bound to gate a trait method on that condition.
     public copied(this) -> implement Iterator<T> where T: Copy {
         // A struct literal, so return-type inference resolves the opaque
-        // return to the literal's `CopiedIter<RefIter<T>>` directly.
-        return CopiedIter::<RefIter<T>> { inner: this };
+        // return to the literal's `CopiedIterator<ReferenceIterator<T>>` directly.
+        return CopiedIterator::<ReferenceIterator<T>> { inner: this };
     }
 
     /// Like `copied`, but clones each pointee via `Clone` into an owned
-    /// value: `strings.iter_ref().cloned()` walks an `Array<String>` by
+    /// value: `strings.iterate_references().cloned()` walks an `Array<String>` by
     /// value, which the `Copy`-gated `iter()` can't.
     public cloned(this) -> implement Iterator<T> where T: Clone {
         // A struct literal; see `copied`.
-        return ClonedIter::<RefIter<T>> { inner: this };
+        return ClonedIterator::<ReferenceIterator<T>> { inner: this };
     }
 }
 
-implement<T> trait Iterator<T*> for struct RefIter<T> {
+implement<T> trait Iterator<T*> for struct ReferenceIterator<T> {
     next(mut &this) -> Option<T*> {
         if (this.index >= this.length) {
             return Option::None;
@@ -1017,20 +1017,20 @@ implement<T> trait Iterator<T*> for struct RefIter<T> {
 }
 
 /// Adapter dereferencing each `T*` yielded by `inner` into a `T` by bitwise
-/// copy. Bridges the by-reference `RefIter` cursor to the by-value consumers,
+/// copy. Bridges the by-reference `ReferenceIterator` cursor to the by-value consumers,
 /// so an owning collection needs no separate by-value iterator struct. The
 /// element type `T` is recovered from the inner iterator via the
 /// `where I: Iterator<T*>` bound (the monomorphizer peels the `T*`), so it is
 /// not a struct parameter. Sound only when `T: Copy`.
 ///
 /// `private`: produced only as the opaque `implement Iterator<T>` returned by
-/// `RefIter::copied`; never named outside this module. Lives here, with the
-/// `RefIter` it bridges, rather than in `core::iter`.
-private type struct CopiedIter<I> {
+/// `ReferenceIterator::copied`; never named outside this module. Lives here, with the
+/// `ReferenceIterator` it bridges, rather than in `core::iter`.
+private type struct CopiedIterator<I> {
     private inner: I;
 }
 
-implement<I, T> trait Iterator<T> for struct CopiedIter<I>
+implement<I, T> trait Iterator<T> for struct CopiedIterator<I>
 where I: Iterator<T*>, T: Copy {
     next(mut &this) -> Option<T> {
         return match (this.inner.next()) {
@@ -1041,17 +1041,17 @@ where I: Iterator<T*>, T: Copy {
 }
 
 /// Adapter cloning each `T*` yielded by `inner` into an owned `T` via `Clone`.
-/// The owning-type counterpart of `CopiedIter`: this is what lets a `loop`/`for`
-/// over `strings.iter_ref()` walk an `Array<String>` by value (each element an
+/// The owning-type counterpart of `CopiedIterator`: this is what lets a `loop`/`for`
+/// over `strings.iterate_references()` walk an `Array<String>` by value (each element an
 /// independent clone) - something the `Copy`-gated `iter()` can't express.
 ///
-/// `private`: same rationale as `CopiedIter`; produced only as the opaque
-/// `implement Iterator<T>` returned by `RefIter::cloned`.
-private type struct ClonedIter<I> {
+/// `private`: same rationale as `CopiedIterator`; produced only as the opaque
+/// `implement Iterator<T>` returned by `ReferenceIterator::cloned`.
+private type struct ClonedIterator<I> {
     private inner: I;
 }
 
-implement<I, T> trait Iterator<T> for struct ClonedIter<I>
+implement<I, T> trait Iterator<T> for struct ClonedIterator<I>
 where I: Iterator<T*>, T: Clone {
     next(mut &this) -> Option<T> {
         return match (this.inner.next()) {

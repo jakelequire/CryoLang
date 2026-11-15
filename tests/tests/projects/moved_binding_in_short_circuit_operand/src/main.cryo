@@ -1,0 +1,102 @@
+namespace Main;
+
+// The right operand of `&&` or `||` runs on some paths only, so a binding it
+// moves holds its value after the operator on the paths that skipped it and
+// none on the path that ran it: it is released by a flag, exactly once
+// either way.  The left operand runs on every path, so a binding it moves is
+// moved after the operator whatever the right operand does.
+
+type struct Counted {
+    drops: mut i64*;
+    id: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { *this.drops = *this.drops + 1; }
+}
+
+function take(value: Counted) -> i64 { return value.id; }
+
+function in_and(go: boolean, drops: mut i64*) -> boolean {
+    const value: Counted = Counted { drops: drops, id: 1 };
+    return go && take(value) == 1;
+}
+
+function in_or(skip: boolean, drops: mut i64*) -> boolean {
+    const value: Counted = Counted { drops: drops, id: 2 };
+    return skip || take(value) == 2;
+}
+
+// Both operands move a binding of their own; the left one's is moved on
+// every path.
+function in_both(go: boolean, drops: mut i64*) -> boolean {
+    const first: Counted = Counted { drops: drops, id: 3 };
+    const second: Counted = Counted { drops: drops, id: 4 };
+    return (go && take(first) == 3) && take(second) == 4;
+}
+
+// The operator's value is stored and the binding outlives the statement.
+function stored(go: boolean, drops: mut i64*) -> i64 {
+    const value: Counted = Counted { drops: drops, id: 5 };
+    const ran: boolean = go && take(value) == 5;
+    if (ran) { return 1; }
+    return 0;
+}
+
+// Two levels deep: the inner right operand runs only when both conditions
+// hold.
+function nested(outer: boolean, inner: boolean, drops: mut i64*) -> boolean {
+    const value: Counted = Counted { drops: drops, id: 6 };
+    return outer && (inner || take(value) == 6);
+}
+
+// Each case returns 0 when exactly `want` values were released.
+function released(drops: mut i64*, before: i64, want: i64) -> i32 {
+    if (*drops - before == want) { return 0; }
+    return 1;
+}
+
+function main() -> i32 {
+    mut drops: i64 = 0;
+    mut failures: i32 = 0;
+    mut before: i64 = drops;
+
+    const _a: boolean = in_and(true, &drops);
+    failures += released(&drops, before, 1);
+    before = drops;
+    const _b: boolean = in_and(false, &drops);
+    failures += released(&drops, before, 1);
+
+    before = drops;
+    const _c: boolean = in_or(false, &drops);
+    failures += released(&drops, before, 1);
+    before = drops;
+    const _d: boolean = in_or(true, &drops);
+    failures += released(&drops, before, 1);
+
+    before = drops;
+    const _e: boolean = in_both(true, &drops);
+    failures += released(&drops, before, 2);
+    before = drops;
+    const _f: boolean = in_both(false, &drops);
+    failures += released(&drops, before, 2);
+
+    before = drops;
+    const _g: i64 = stored(true, &drops);
+    failures += released(&drops, before, 1);
+    before = drops;
+    const _h: i64 = stored(false, &drops);
+    failures += released(&drops, before, 1);
+
+    before = drops;
+    const _i: boolean = nested(true, false, &drops);
+    failures += released(&drops, before, 1);
+    before = drops;
+    const _j: boolean = nested(true, true, &drops);
+    failures += released(&drops, before, 1);
+    before = drops;
+    const _k: boolean = nested(false, false, &drops);
+    failures += released(&drops, before, 1);
+
+    return failures;
+}

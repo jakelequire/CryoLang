@@ -66,7 +66,7 @@ The compiler does not enforce naming, but the standard library and ecosystem use
 
 ### 1.2 Keywords
 
-Keywords are reserved identifiers. They cannot be used as variable, function, or type names — but they **can name a member**: a field or a method, declared and used.
+Keywords are reserved identifiers. They cannot be used as variable, free-function, or type names — but they **can name a member**: a field or a method, declared and used.
 
 ```cryo
 ![repr(C)]
@@ -83,11 +83,13 @@ A member position is never a declaration or an operator, so the keyword is unamb
 
 The exceptions are the keywords a member position reads *first*: `public`, `internal` and `private` open a visibility label, `static` and `async` are member modifiers, and `protected`, `virtual` and `override` are read there to be refused (`E0117`). A field with one of those eight names cannot be declared, and a C struct carrying one still needs a `![repr(C)]` shadow struct.
 
-A **binding** is the other way round. A statement that begins with a keyword opening a declaration is parsed as that declaration, so a local named by one could never be assigned or called through: `module = q;` is not an assignment. The 20 keywords that open a declaration - `function`, `const`, `mut`, `type`, `struct`, `class`, `enum`, `trait`, `import`, `module`, `extern`, `implement`, `public`, `internal`, `private`, `protected`, `namespace`, `intrinsic`, `static`, `async` - therefore cannot name a variable, a parameter, a pattern binding or a destructured local (`E0100`): a keyword is never an identifier. Keywords that open nothing (`default`, `string`) remain legal names, and a destructuring shorthand over a field named by one of the 20 needs a rename: `const { type: t }: S = s;`.
+A **binding** is the other way round. A statement that begins with a keyword opening a declaration is parsed as that declaration, so a local named by one could never be assigned or called through: `module = q;` is not an assignment. The 20 keywords that open a declaration - `function`, `const`, `mut`, `type`, `struct`, `class`, `enum`, `trait`, `import`, `module`, `extern`, `implement`, `public`, `internal`, `private`, `protected`, `namespace`, `intrinsic`, `static`, `async` - therefore cannot name a variable, a parameter, a pattern binding or a destructured local (`E0100`): a keyword is never an identifier. The same holds for the 23 keywords a statement or an expression begins with - `if`, `while`, `do`, `loop`, `for`, `match`, `return`, `break`, `continue`, `unsafe`, `asm`, `true`, `false`, `null`, `this`, `new`, `sizeof`, `alignof`, `typeof`, `delete`, `await`, `yield`, `move` - since every bare use of such a name reads as the keyword: `delete()` is the delete operator and `match;` the head of a match. A **free function** is named bare too, so neither group names one; a method, reached only after `.` or `::`, may take any of them (`Router.delete`). `this` stays a parameter name: it is the by-value receiver. Keywords that open nothing (`default`, `string`) remain legal names, and a destructuring shorthand over a field named by one of these keywords needs a rename: `const { type: t }: S = s;`.
 
 ```cryo
 const module: i32 = 42;                  // E0100: expected a variable name, found `module`, which is a reserved word
 match (r) { R::D(static) => { .. } }     // E0100: expected a binding name
+function delete() -> i32 { .. }          // E0100: expected a function name, found `delete`, which is a reserved word
+router.delete(Str::new("/items"), on_delete);   // a method: named after `.`
 ```
 
 | Control flow | Declarations    |             | Modifiers   | Operator keywords | Special values | Reserved for future use |
@@ -167,7 +169,7 @@ const b: u8 = 200 + 100;   // error: 300 does not fit `u8`, and would silently t
 const c: i8 = 0 - 128;     // -128: held
 ```
 
-A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value.
+A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value. An argument is held to its parameter the same way, including a parameter whose type the call's expected type decides: `const h: Holder<i16> = Holder::make(-3);` passes `-3` as an `i16`, while `-129` for an `i8` or `-3` for a `u16` is refused (`E0214`).
 
 A shift's amount does not type the value shifted: a literal shifted by an amount not made only of literals takes the integer type expected of the result, where one is - an initializer's, an assignment's, an argument's or a return's - so `const p: u64 = 1 << (u64::BITS - 1);` shifts at 64 bits, not at the `u32` amount's 32.  A shift's result is always the shifted value's type, and the amount's type never changes it: `b << n` with `b: u8` and `n: u64` is a `u8`.  Where no integer type is expected, a shifted literal takes the amount's type.
 
@@ -275,7 +277,7 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
   literal text are processed as in a normal string.
 - The result is a heap-backed `String` the caller owns (and drops). The
   parser desugars the whole f-string to calls of the builders in
-  `std::fmt::interp`, the language items `format_new`,
+  `std::fmt::interpolation`, the language items `format_new`,
   `format_append_literal`, `format_append_display`, `format_append_debug`
   and `format_append_spec` ([section 16.1](#161-recognised-attributes)).
   The calls name the builders themselves, so nothing is imported for them,
@@ -289,7 +291,7 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
 
   ```cryo
   mut out: String = String::new();
-  out.write(f"{name}: {code:04x}")?;   // FmtWrite.write, every sink has it
+  out.write(f"{name}: {code:04x}")?;   // FormatWrite.write, every sink has it
   f.write(f"{secs}.{millis:03}s")?;    // Formatter.write, inside a Display
   ```
 
@@ -362,7 +364,7 @@ In performance-sensitive or cross-platform code, prefer the explicit-width forms
 
 `char` and `u8` classify ASCII with methods of the same names and meaning: `is_digit`, `is_alpha`, `is_hex_digit`, `is_whitespace`, `is_uppercase` (`A`-`Z`), `is_lowercase` (`a`-`z`), and the case folds `to_ascii_lowercase` and `to_ascii_uppercase`. A `char` outside ASCII, a non-ASCII letter among them, answers false to each test and folds to itself; so does a `u8` of 0x80 or above.
 
-`string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#19-the-standard-library) (borrowed) and [`String`](#19-the-standard-library) (owned). At the FFI boundary, `Str::new` reads a `string` from C, and `String::with_null` makes a NUL-terminated copy whose `as_cstr` hands it to C.
+`string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#19-the-standard-library) (borrowed) and [`String`](#19-the-standard-library) (owned). At the FFI boundary, `Str::new` reads a `string` from C, and `String::with_null` makes a NUL-terminated copy whose `as_c_string` hands it to C.
 
 ### 2.2 Pointer Types
 
@@ -380,7 +382,7 @@ const v:  void* = malloc(64);  // type-erased
 
 A pointer converts to another pointer type without a cast only when the pointee is the same type (`mut T*` to `T*`, never back), or when either side is `void*`. A read-only level is made only at the outermost pointer: `mut (mut u8*)*` converts to `(mut u8*)*`, but not to `mut (u8*)*`, since through a `mut (u8*)*` a read-only pointer could be stored where the `mut (mut u8*)*` reads back a writable one. Below the outermost level every mark stays as written, in both directions, and only `as` converts across it. A pointer to any other type is written with `as`, including a pointee that converts to the wanted one: an `i32` converts to an `i64`, but an `i32*` addresses four bytes, so it is not an `i64*` (nor is an `i32**` an `i64**` or a `void**`). A value passed where a pointer parameter wants its address must be of the pointee type itself. The rule is the same wherever a value meets a declared type: an initializer, an assignment, a `return`, a struct field, and an argument of every kind of call - a method, a free or static function, a function reached by its path and a generic one (`E0214` at an argument, `E0200` elsewhere). It holds the same where a pointee is a type parameter: a generic body is checked once, against its own parameters, so a `T*` does not fill a `mut T*` field, variable or parameter there either. A borrow converts to a pointer to its referent: a `mut &T` to a `mut T*` or a `T*`, a `&T` to a `T*` only ([section 2.3](#23-references)).
 
-Raw pointers are unchecked. Validity, aliasing, and lifetime are the programmer's responsibility. For a pointer that is statically guaranteed non-null, see `core::ptr::NonNull<T>`. For owned heap allocations, prefer `Box<T>`. See [section 14](#14-pointers-and-memory).
+Raw pointers are unchecked. Validity, aliasing, and lifetime are the programmer's responsibility. For a pointer that is statically guaranteed non-null, see `core::pointer::NonNull<T>`. For owned heap allocations, prefer `Box<T>`. See [section 14](#14-pointers-and-memory).
 
 ### 2.3 References
 
@@ -406,7 +408,7 @@ Reading the value a reference refers to is explicit in arithmetic and comparison
 
 **A slice reference is two words.** A reference to the slice item, `&Slice<T>` or `mut &Slice<T>`, holds the slice's own two words - the address of its first element and its length - rather than the address of a slice, so no slice needs storage of its own to be referred to. It is 16 bytes (`sizeof(&Slice<i32>) == 16`), is passed and returned as a 16-byte aggregate is ([the ABI](abi.md)), and is stored that way in a field. Its elements are reached through the address it holds, so writing them through a `mut &Slice<T>` writes the storage the slice views. A `&this` or `mut &this` method of the slice is such a reference's method: its receiver is the two words, and `this` in its body addresses the copy of them it received. Holding no slice's address, a slice reference converts to no pointer and no pointer to it (`E0200`, `E0214` at an argument), `as` makes no pointer of it (`E0208`), and a slice becomes no trait object, which holds its value's address (`E0315`).
 
-**A slice's elements are as writable as the slice is held.** The slice item declares its element pointer read-only, and reading it through a writable place gives a writable pointer: in the slice's own methods, `this`'s element pointer is a `mut T*` in a `mut &this` method and a `T*` in a `&this` one, and the same holds for a `mut &Slice<T>` against a `&Slice<T>`. A slice's two words carry no mark of their own, so how it is borrowed decides whether its elements are written, and a slice is made from a read-only pointer with no cast. A container hands out its element pointer the same way: `as_ptr(&this)` on a slice or an `Array<T>` gives a read-only `T*`, and `as_mutable_ptr(mut &this)`, called on one held writably, the `mut T*` its elements are written through.
+**A slice's elements are as writable as the slice is held.** The slice item declares its element pointer read-only, and reading it through a writable place gives a writable pointer: in the slice's own methods, `this`'s element pointer is a `mut T*` in a `mut &this` method and a `T*` in a `&this` one, and the same holds for a `mut &Slice<T>` against a `&Slice<T>`. A slice's two words carry no mark of their own, so how it is borrowed decides whether its elements are written, and a slice is made from a read-only pointer with no cast. A container hands out its element pointer the same way: `as_pointer(&this)` on a slice or an `Array<T>` gives a read-only `T*`, and `as_mutable_pointer(mut &this)`, called on one held writably, the `mut T*` its elements are written through.
 
 **A container's reference converts to a slice reference.** A container that hands out its elements as a slice implements the standard library's `AsSlice<T>`, whose `as_slice(&this)` gives a `&Slice<T>`, and, when they may be written through it, `AsMutableSlice<T>`, whose `as_mutable_slice(mut &this)` gives a `mut &Slice<T>`. Where a `&Slice<T>` is wanted - an argument to a function or a method, a `return`, a declared binding's initializer, an assigned place, a field of a struct literal - a `&A` or `mut &A` of such a container is given as its `as_slice()`, and where a `mut &Slice<T>` is wanted a `mut &A` as its `as_mutable_slice()`; in a generic body a type parameter converts by a bound naming the trait. Read access never becomes write access: a `&A` where a `mut &Slice<T>` is wanted is refused (`E0251`), and `&x` there is the writable borrow of a writable `x`, as for any `mut &T`. A container's value, rather than a reference to it, does not convert, and neither does a container whose slice holds another element type (`E0214` at an argument). `Array<T>` implements both traits; `String.as_bytes()` gives a `&Slice<u8>` and no writable view, since writing its bytes could break its UTF-8.
 
@@ -438,10 +440,10 @@ An array literal written where an `Array<T>` with the default allocator is expec
 
 An array's `length()` and `capacity()` are `i64`.  The fields behind them, and those behind every collection's `length()` and `capacity()`, are private to the collection's module (`E0353`), and the accessors are inline, so reading through one costs no call.
 
-Every length, capacity, position and size in the standard library is an `i64`, whether a method returns it (`length()`, `find`, `index_of`, `Iterator::count`) or takes it (`get`, `insert`, `sub_bytes`, `truncate`, `with_capacity`, `take`), so one integer type carries a position from where it is found to where it is used, with no cast.  A negative argument is never read as a huge unsigned one; what it means is fixed by the kind of method:
+Every length, capacity, position and size in the standard library is an `i64`, whether a method returns it (`length()`, `find`, `index_of`, `Iterator::count`) or takes it (`get`, `insert`, `byte_substring`, `truncate`, `with_capacity`, `take`), so one integer type carries a position from where it is found to where it is used, with no cast.  A negative argument is never read as a huge unsigned one; what it means is fixed by the kind of method:
 
-- a lookup that answers `Option` (`get`, `get_ref`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`, as for any index past the end;
-- a method that writes or cuts at a position (`set`, `insert`, `remove`, `swap_remove`, `sub_bytes`, `subslice`) panics with "out of range";
+- a lookup that answers `Option` (`get`, `get_reference`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`, as for any index past the end;
+- a method that writes or cuts at a position (`set`, `insert`, `remove`, `swap_remove`, `byte_substring`, `subslice`) panics with "out of range";
 - `truncate` and `resize` panic with "negative length";
 - `reserve`, `reserve_exact` and `with_capacity` treat zero or less as nothing to do;
 - `take(n)` with `n` negative yields nothing, and `skip(n)` skips nothing.
@@ -547,10 +549,11 @@ consume(name);   // error[E0457]: cannot move `name` while a closure borrows it
 size();
 ```
 
-A closure's body may not move a captured value out (**E0453**): the closure
-keeps what it captures for every call - a `move` closure until it is
-released, any other closure borrowed from the value's owner - so a value
-moved out would be released again. Clone it instead (`consume(name.clone())`).
+A closure's body may not move a captured value out (**E0453**), nor a field
+of one (`consume(holder.name)`): the closure keeps what it captures for every
+call - a `move` closure until it is released, any other closure borrowed from
+the value's owner - so a value moved out would be released again. Clone it
+instead (`consume(name.clone())`).
 A closure's captures cannot be assigned to.
 
 The compiler synthesises an anonymous struct holding the captures - a
@@ -901,9 +904,9 @@ compiler infers the real type and uses it everywhere; you simply do not have
 to write it.
 
 ```cryo
-// The concrete iterator (`SliceIter<T>`) never appears in the signature.
+// The concrete iterator (`SliceIterator<T>`) never appears in the signature.
 iter(&this) -> implement Iterator<T> where T: Copy {
-    return SliceIter::<T> { ptr: this.ptr, remaining: this.length() };
+    return SliceIterator::<T> { ptr: this.ptr, remaining: this.length() };
 }
 
 // A caller binds the result without naming the concrete type either.
@@ -913,7 +916,7 @@ const n: i64 = it.count();          // trait methods are available
 
 Because Cryo monomorphises, this is a purely static, zero-cost construct: an
 `implement Iterator<i32>` value *is* the underlying concrete type (here
-`SliceIter<i32>`), method calls dispatch statically, and there is no heap
+`SliceIterator<i32>`), method calls dispatch statically, and there is no heap
 allocation, vtable, or runtime indirection. It corresponds to "return some
 single type that implements this trait", **not** to a dynamically-dispatched
 trait object. (`implement` is the same keyword used for implement blocks; in
@@ -924,19 +927,21 @@ declaration* it introduces an implement block - the two never overlap.)
 
 - **Return type** - the concrete type is inferred from the body's first
   `return` expression. That expression must currently be a *struct literal*
-  (e.g. `return SliceIter::<T> { ... }`), which is how every standard-library
+  (e.g. `return SliceIterator::<T> { ... }`), which is how every standard-library
   iterator is written.  A generic struct's literal may leave its type
   arguments out (`return Gen { f: move () -> i64 { ... } };`) in a free
-  function, generic or not, and in a method of a type that is not generic,
-  written in the type or in an `implement struct` block for it: the type is
-  then the instance the literal's field values give it, decided when the
-  function's body is checked, which happens before any other body of its
-  module.  A generic function's is decided in its own parameters
-  (`Holder<T>` for `return Holder { value: value };` with `value: T`), and
-  each specialization returns its arguments' instance.  This is the only
-  way to return a value holding a closure, whose type has no spelling.  A
-  method of a generic type, or of an instance of one, or a method with type
-  parameters of its own, still writes the literal's type arguments.
+  function, generic or not, and in a method, written in its type or in an
+  `implement struct` block for it: the type is then the instance the
+  literal's field values give it, decided when the function's body is
+  checked, which happens before any other body of its module.  A generic
+  function's is decided in its own parameters (`Holder<T>` for `return
+  Holder { value: value };` with `value: T`), a method's in its own and its
+  type's (`Hold<T>` for `return Hold { v: this.tag };` in `Maker<T>`), and
+  each call returns its arguments' instance - the receiver's and its own.
+  This is the only way to return a value holding a closure, whose type has
+  no spelling.  A trait's default method still writes the literal's type
+  arguments; its own parameters among them (`return Doubled::<This, F> {
+  ... };`) take each call's.
 - **Variable binding** - `mut it: implement Iterator<i32> = expr;`. The type
   is taken from the initialiser, which is then checked to actually implement
   the named trait; a mismatch is `E0200`:
@@ -958,8 +963,10 @@ declaration* it introduces an implement block - the two never overlap.)
   `implement Iterator<...>`), the concrete cursor is hidden behind that opaque
   return, so the local has no concrete receiver to specialise against - chain
   the combinator on the producing expression instead
-  (`arr.iter().take(2).count()`), or bind to the concrete adapter type when you
-  need a named local (`mut z: ZipIter<Range<i32>, Range<i32>> = a.zip(b);`).
+  (`arr.iter().take(2).count()`).  The standard library's adapters are
+  themselves returned as `implement Iterator<...>`, so a named local holding
+  one is typed by the trait (`mut z: implement Iterator<Pair<i32, i32>> =
+  a.zip(b);`) and driven with `next`, `for` or a consuming method.
 
 To accept *any* iterator as a **parameter**, use a generic with a trait bound
 instead - that is the tool for the input side:
@@ -984,7 +991,7 @@ iterator of `String` to `implement Iterator<i32>`) is rejected as `E0200`.
 The cross-check is category-level: it flags a structurally distinct item
 (one user struct vs another, struct vs primitive) but stays silent when the
 declared and actual items are implicitly inter-convertible (`i32` vs `i64`)
-or differ only in representation (`String` vs `String<GlobalAlloc>`).
+or differ only in representation (`String` vs `String<GlobalAllocator>`).
 
 ---
 
@@ -1006,6 +1013,25 @@ mut it         = arr.iter();   // inferred: the concrete iterator type
 
 ```cryo
 mut y: int;                     // declared without an initialiser; assigned later
+```
+
+**A value before every use.** A local whose type is not `Copy` and that is declared without an initialiser holds nothing until it is given a value: by an assignment to the whole local, or by an assignment to each of its fields - each slot, for a fixed-size array - outside any branch or loop. Storing to a member is not a use. Until every path to a use has given it one, the use is refused (`E0219`) - reading it, calling a method on it, and borrowing it with `&` alike, since a reference always names a value and a store through one releases what it displaces. The one exception is `&x` taken where a raw pointer (`T*`) is wanted: a pointer may address storage that holds nothing yet, which is how a function is handed a place to fill, and the local is taken to hold a value from there on. A `Copy` local holds no resource for an unset value to corrupt, and is not checked.
+
+```cryo
+mut owned: Buffer;
+if (ready) { owned = Buffer::new(); }
+use(&owned);                    // E0219: not given a value when `ready` is false
+
+mut filled: Buffer;
+fill_into(&filled);             // fill_into(place: mut Buffer*): allowed
+use(&filled);
+```
+
+**One name per scope; `_` is no name.** Declaring a local whose name the same block already declares is a redeclaration (`E0205`); a nested block may shadow it. A local named `_` declares no name: it holds its value to the end of its block and is released there like any other local, but no expression can read it (`E0201`), so a block may declare any number of them.
+
+```cryo
+const _ = open_log();           // kept until the block ends
+const _ = open_lock();          // a second `_` in the same block
 ```
 
 **Globals.** Module-level `const` declares an immutable global; module-level `mut` declares mutable global state. Use the latter sparingly. An initializer that is a constant expression is folded into the program: a number, a `null` or string literal, an array literal of those, and a struct literal writing every field with one of those; array and struct literals nest in each other. Any other - a call, another global's value - is computed once, before `main` runs, a module's globals after those of the modules it imports, in the order they are declared. The standard library's are computed before any of the program's, its modules in one order whichever of them a program reaches: the order of the standard library's own build. A folded integer constant's value is its initializer's wrapped to the declared type, the value the program reads at run time: with `const B: u8 = 100;`, `const A: u8 = B + 200;` is 44 wherever it is used - an array size, a `static_assert`, another constant's initializer - never 300. Read as a value, an integer of any width, boolean, `char` or float constant whose initializer folds is compiled as that value itself rather than as a read of its global; the global remains, and `&NAME` is its address. A `![thread_local]` global gets its folded initializer in every thread's copy, so its initializer must fold: one that would be computed would reach the main thread's copy only, and is refused (`E0646`).
@@ -1109,11 +1135,11 @@ extern "C" {
 }
 ```
 
-A user-defined variadic function names the bucket (`args...`). The compiler emits `va_start`/`va_end` around the body and binds `args` to the raw `va_list` pointer. Wrap it in a `VaArgs` (`std::core::varargs`, in the prelude) to read typed values without hand-rolling `va_arg`:
+A user-defined variadic function names the bucket (`args...`). The compiler emits `va_start`/`va_end` around the body and binds `args` to the raw `va_list` pointer. Wrap it in a `VariadicArguments` (`std::core::variadic_arguments`, in the prelude) to read typed values without hand-rolling `va_arg`:
 
 ```cryo
 function sum(count: i32, args...) -> i64 {
-    mut va: VaArgs = VaArgs::new(args);
+    mut va: VariadicArguments = VariadicArguments::new(args);
     mut total: i64 = 0;
     for (mut i: i32 = 0; i < count; i++) {
         const v: i64 = va.next();      // ![implicit]: T inferred from `v`'s type
@@ -1123,12 +1149,12 @@ function sum(count: i32, args...) -> i64 {
 }
 ```
 
-`va.next::<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [section 16](#16-directives-and-attributes) on `![implicit]`). `va.as_ptr()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee - equivalently, pass the original `args` identifier.
+`va.next::<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [section 16](#16-directives-and-attributes) on `![implicit]`). `va.as_pointer()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee - equivalently, pass the original `args` identifier.
 
 Two limits are inherited from C varargs and no wrapper can remove them:
 
 - **Not count-safe.** Nothing records how many arguments were passed or their types; the callee must learn that out of band (a format string, a leading count, a sentinel).
-- **Default argument promotions apply.** A variadic call promotes `i8`/`i16`/`boolean` to `i32` and `f32` to `f64`. `VaArg` is therefore implemented only for the promoted scalar set (`i32`, `u32`, `i64`, `u64`, `f64`, `string`); `va.next::<i8>()` is a compile error - read it as `i32` and narrow. Pass `i64`-typed values when reading with `next::<i64>()`.
+- **Default argument promotions apply.** A variadic call promotes `i8`/`i16`/`boolean` to `i32` and `f32` to `f64`. `VariadicArgument` is therefore implemented only for the promoted scalar set (`i32`, `u32`, `i64`, `u64`, `f64`, `string`); `va.next::<i8>()` is a compile error - read it as `i32` and narrow. Pass `i64`-typed values when reading with `next::<i64>()`.
 
 ### 4.4 Extern Functions
 
@@ -1227,7 +1253,7 @@ const d: i32 = conv(s);          // error[E0214]: no overload of `conv` accepts 
 
 An untyped literal argument takes one fixed type where the overloads differ in that parameter: an integer literal is `i32` and a float literal is `f64`, the same defaults a literal takes anywhere else. Write the type you mean with `as` (`conv(1 as i64)`). A qualified call (`Json::conv(1)`) selects among that module's overloads the same way.
 
-A non-generic overload does not win over a generic one by being non-generic. A call both accept is ambiguous (`E0154`); a generic function whose `where` clause the arguments fail does not accept them. A written type argument names the generic function:
+A non-generic overload does not win over a generic one by being non-generic, and no generic overload wins over another. A call both accept is ambiguous (`E0154`), and so is a call two generic overloads of its arity accept (with `pick<T>(a: T, b: i32)` and `pick<U>(a: i32, b: U)`, `pick(x, x)` for an `x: i32`); a call none accepts is `E0214`. A generic function whose `where` clause the arguments fail does not accept them. A call only the generic function accepts calls it, whichever of the two is declared first and whether the call is bare or through a module path. A written type argument names the generic function:
 
 ```cryo
 function same<U>(u: U) -> i32 { return 1; }
@@ -1236,6 +1262,7 @@ function same(u: i32) -> i32 { return 2; }
 const x: i32 = 7;
 const a: i32 = same(x);          // error[E0154]: `same` is ambiguous
 const b: i32 = same::<i32>(x);   // the generic function
+const c: i32 = same("seven");    // the generic function: only it accepts a `string`
 ```
 
 An overloaded name used as a value without a call is picked by its expected function type ([section 2.5](#25-function-types)).
@@ -1273,7 +1300,7 @@ This is a defined deterministic result, not undefined behavior, but it is *silen
 | `<` `>` `<=` `>=` | Ordering comparisons                                                                  |
 | `<=>`             | Three-way comparison (spaceship); yields an `Ordering` (`Less` / `Equal` / `Greater`) |
 
-Comparison operators return `boolean`. On numeric types and pointers they emit native instructions; on user-defined types that implement `Eq`/`Ord` they are **overloaded** - `a == b` becomes `a.equals(&b)` and `a < b` becomes `a.compare(&b).is_lt()` (see operator overloading, [section 10.6](#106-operator-overloading)). The two sides of `==` and `!=` are one type, so the right operand is typed with the left operand's type as its expected type, as an initializer is with its declared type: with `opt: Option<i64>`, `opt == Option::Some(4)` builds an `Option<i64>` and `r == Result::Ok(1)` infers `r`'s error type. A pointer or a reference on the left sets no expectation.
+Comparison operators return `boolean`. On numeric types and pointers they emit native instructions; on user-defined types that implement `Eq`/`Ord` they are **overloaded** - `a == b` becomes `a.equals(&b)` and `a < b` becomes `a.compare(&b).is_less()` (see operator overloading, [section 10.6](#106-operator-overloading)). The two sides of `==` and `!=` are one type, so the right operand is typed with the left operand's type as its expected type, as an initializer is with its declared type: with `opt: Option<i64>`, `opt == Option::Some(4)` builds an `Option<i64>` and `r == Result::Ok(1)` infers `r`'s error type. A pointer or a reference on the left sets no expectation.
 
 **Unrelated types are not compared.** Two values of different enum types, or two pointers neither of which converts to the other, are refused (E0200) by every comparison operator. An enum compares its discriminant, so `A::Z == B::W` would otherwise answer by variant position; two pointers to unrelated structs never hold the same address. A pointer still compares with `null`, with a `void*`, and with a pointer it converts to (`T*` with `const T*`):
 
@@ -1364,12 +1391,12 @@ A `?` written against its operand, with no space or comment between them, is thi
 When the function returns `Result<U, F>` and `F` cannot hold an `E` as it is, the error is converted on the way out: `?` returns `Err(F::from(e))`, through `F`'s implementation of `std::core::convert::From<E>`. An `E` that `F` already holds is returned unchanged. With no `From<E>` for `F`, the `?` is refused (`E0214`); convert the error with `map_err` first, or implement the conversion.
 
 ```cryo
-implement trait From<AllocError> for struct IoError {
-    static from(err: AllocError) -> IoError { return IoError::new(IoErrorKind::OutOfMemory, 0); }
+implement trait From<AllocationError> for struct IoError {
+    static from(err: AllocationError) -> IoError { return IoError::new(IoErrorKind::OutOfMemory, 0); }
 }
 
 function fill(out: mut &Array<u8>, bytes: Slice<u8>) -> Result<(), IoError> {
-    out.try_append(bytes)?;          // an AllocError leaves as an IoError
+    out.try_append(bytes)?;          // an AllocationError leaves as an IoError
     return Result::Ok(());
 }
 ```
@@ -1824,7 +1851,7 @@ public:
 }
 ```
 
-A struct literal sets every field of the struct, including the ones it leaves to their defaults, so **a literal may be written only where every field is visible**. One private field and code outside the module cannot write the literal at all; it goes through a constructor the module provides. Setting a private field is the more dangerous operation, not the less: reading one leaks information, while setting one breaks the invariant the field exists to protect, so there is no exception for construction.
+A struct literal sets every field of the struct, including the ones it leaves to their defaults, so **a literal may be written only where every field is visible**. One private field and code outside the module cannot write the literal at all; it goes through a constructor the module provides. A field the literal leaves out and may not reach is refused by `E0353` alone, never also reported missing (`E0355`): writing it in would be refused the same way. Setting a private field is the more dangerous operation, not the less: reading one leaks information, while setting one breaks the invariant the field exists to protect, so there is no exception for construction.
 
 ```cryo
 // module app::money
@@ -1909,7 +1936,7 @@ The receiver shape is part of the signature, so a caller knows whether a method 
 
 Every method that is not `static` writes its receiver: a method in a type body, an implement block or a trait with no receiver is refused where it is named (`E0118`), with a help naming the three forms. No form is assumed, since reading the receiver and changing it are different signatures.
 
-The receiver is the type the method is declared on, `This`. In a generic type's body that is the type over its own parameters, and in an `implement` block the type its head names, so a method of `type struct String<A = GlobalAlloc>` is a method of `String<NativeHeap>` as much as of `String<GlobalAlloc>`, and a method of `implement<A> trait Eq for String<A>` is one of every `String<A>`. A parameter's default never narrows it: the defaults fill a parameter a *use* of the type leaves out, and the receiver is not a use.
+The receiver is the type the method is declared on, `This`. In a generic type's body that is the type over its own parameters, and in an `implement` block the type its head names, so a method of `type struct String<A = GlobalAllocator>` is a method of `String<NativeHeap>` as much as of `String<GlobalAllocator>`, and a method of `implement<A> trait Eq for String<A>` is one of every `String<A>`. A parameter's default never narrows it: the defaults fill a parameter a *use* of the type leaves out, and the receiver is not a use.
 
 A method is reached only by calling it.  `r.area` with no call, where `area` is a method and no field has that name, names no value and is refused (E0204), with help saying to call it.
 
@@ -1918,14 +1945,14 @@ A method is reached only by calling it.  `r.area` with no call, where `area` is 
 A `const`/`mut` binding may use a **destructuring pattern** - `{ field, field, ... }` with a type annotation naming the struct - to move a struct's fields out into individually named locals. Each field is moved into a like-named local (field order need not match the declaration). This is the idiomatic companion to a consuming (`this`) receiver: binding the fields marks the receiver as *fully consumed*, so its automatic drop is suppressed and the fields can be handed off without a double free. Any bound field you don't move onward is dropped normally at the end of scope.
 
 ```cryo
-type struct Box<T, A = GlobalAlloc> {
+type struct Box<T, A = GlobalAllocator> {
     ptr:   T*;
     alloc: A;
 
     // Consume the Box and return its raw pointer, transferring ownership
     // to the caller. Destructuring `this` moves both fields out, so the
     // Box itself is not dropped (that would free `ptr`); `alloc` is dropped
-    // at function end (a no-op for GlobalAlloc).
+    // at function end (a no-op for GlobalAllocator).
     into_raw(mut this) -> T* {
         const { ptr, alloc }: Box<T, A> = this;
         return ptr;
@@ -1991,6 +2018,8 @@ const strs: Pair<string> = Pair::<string>::new("hello", "world");
 `Pair<int>` and `Pair<string>` are independent types. See [section 11.6](#116-monomorphisation).
 
 A generic struct's literal written without type arguments is one instance of it: the one its expected type names, or else the one its field values bind. Inside a generic body that instance may be over the body's own parameters, so `return Pair { first: a, second: b };` in `new` above is a `Pair<T>`, and `Holder { f: f }` returned from `function hold<F>(f: F) -> Holder<F>` is a `Holder<F>`. The owner's own literal follows the same rule: in a method of `type struct Two<A, B>` declared `-> Two<B, A>`, `return Two { a: this.b, b: this.a };` builds a `Two<B, A>`, not the `Two<A, B>` the method belongs to.
+
+Where the field values bind the instance, a value in a field written over the struct's parameters is typed on its own, as a generic function's argument is: `Holder { inner: 3, peeked: Option::Some(2) }` is a `Holder<i32>` because `3` and `Some(2)` say so, and a variant's payload binds the parameters it carries (`Result::Ok(5)` binds the `T` of a field `Result<T, E>`, leaving `E` to the other fields). A value that only its field can type - `Option::None`, an empty `[]` - takes the instance's field once the other values have bound it. Every value is then checked against the instance's field, so `Pair { a: 1, b: true }` for `type struct Pair<T> { a: T; b: T; }` is refused (E0200) at `true`.
 
 ### 8.7 Unions
 
@@ -2219,6 +2248,8 @@ type trait Read {
     }
 }
 ```
+
+A default body is written over `This`, bounded by its trait alone, and a method call in it on a value of type `This` (`this.read(...)`, or `other.compare(...)` with `other: &This`) names the trait's method. Each implementation's copy of the default calls that implementation's own: not a method of the type's own of the same name, and, for a trait implemented at several arguments (`Measure<i64>` and `Measure<i32>` for `Square`), not another of its implementations'.
 
 A trait declares each method name once: its methods are found by name alone, so a second method of a name the trait already declares is refused at its name (`E0205`: "the method `area` is declared twice in this trait"), whatever its parameters.
 
@@ -2449,10 +2480,10 @@ function halve<T>(x: T) -> T {
 | `TryFrom<T>` / `TryInto<T>`                                                                                   | Fallible conversions returning `Result`.                                                                          |
 | `Read` / `Write`                                                                                              | Byte-level I/O.                                                                                                   |
 | `Display` / `Debug`                                                                                           | Formatting.                                                                                                       |
-| `FmtWrite`                                                                                                    | Sink trait for the formatter.                                                                                     |
+| `FormatWrite`                                                                                                    | Sink trait for the formatter.                                                                                     |
 | `Allocator`                                                                                                   | Heap allocation strategy.                                                                                         |
 
-Every standard-library trait is declared in [`stdlib/core/`](../stdlib/core/) with the exception of `Read`/`Write` (in `stdlib/io/traits.cryo`), `Display`/`Debug`/`FmtWrite` (in `stdlib/fmt/`), and `Allocator` (in `stdlib/alloc/allocator.cryo`).
+Every standard-library trait is declared in [`stdlib/core/`](../stdlib/core/) with the exception of `Read`/`Write` (in `stdlib/io/traits.cryo`), `Display`/`Debug`/`FormatWrite` (in `stdlib/fmt/`), and `Allocator` (in `stdlib/alloc/allocator.cryo`).
 
 The collection iterator entry points (`Array::iter`, `HashMap::keys`/`values`, `Str::split`, ...) return [`implement Iterator<...>`](#211-opaque-types-implement-trait) rather than naming their concrete cursor structs, so you consume them through the trait and a `for-in` loop without ever spelling the underlying type.
 
@@ -2475,7 +2506,7 @@ this implementation bound". Projections also work off a generic parameter - a
 generic adapter names its source's element as `I::Item`:
 
 ```cryo
-type struct MapIter<I, Mapper, O> where I: Iterator, Mapper: (I::Item) -> O { inner: I; f: Mapper; }
+type struct MapIterator<I, Mapper, O> where I: Iterator, Mapper: (I::Item) -> O { inner: I; f: Mapper; }
 ```
 
 A projection is answered by the parameter's bounds, so `I::Item` needs a bound on `I` whose trait declares `Item`. Without one, or when no bound's trait declares the name, the projection is refused where it is written (E0203, "associated type `Item` not found for `I`"). A bound on a trait that *inherits* `Iterator` answers too: the projection resolves through the bound trait's supertraits.
@@ -2489,6 +2520,8 @@ function first<I>(it: mut &I) -> Option<I::Item> where I: DoubleEnded {   // Ite
 
 type struct Loose<I> { f: () -> I::Item; }   // error[E0203]: associated type `Item` not found for `I`
 ```
+
+A projection may be the subject of a bound itself: `where C: Source, C::Item: Put` gives a value of type `C::Item` the methods of `Put` in the body, and each copy of the body calls the implementation of `Put` for its own `Item`, which may be an implementation for every reference (`implement<T> trait Put for mut &T where T: Put`) when `Item` is one. Such a bound is checked where a call binds the parameters, as a bound on a parameter is: `store(&plain)` with `plain`'s `Item` an `i64` is refused there (E0306, "the trait bound `i64: Put` is not satisfied").
 
 **A trait with parameters.** A type may implement a trait that has generic
 parameters more than once, at different arguments, and each implementation
@@ -2538,7 +2571,7 @@ implement trait Iterator for struct Counter {
 ```
 
 The positional form scales to where-clause adapters, whose element flows from
-the source: `implement<I, A> trait Iterator<A> for struct TakeIter<I> where I:
+the source: `implement<I, A> trait Iterator<A> for struct TakeIterator<I> where I:
 Iterator<A>` binds `Item := A := I::Item`.
 
 A parameter an implementation writes in its trait's arguments and not in its
@@ -2601,7 +2634,7 @@ implement trait Seq<NotCopy> for struct Holder { ... }   // E0306: Item not Copy
   body form (`type Out = ...;`).
 
 Because Cryo monomorphises, a projection is fully resolved at compile time:
-`MapIter<Range<i32>, (i32) -> i64, i64>::Item` reduces to `i64` with no runtime cost.
+`MapIterator<Range<i32>, (i32) -> i64, i64>::Item` reduces to `i64` with no runtime cost.
 
 ### 10.6 Operator Overloading
 
@@ -2633,7 +2666,7 @@ live in
 | `&` `\|` `^` `<<` `>>` | `BitAnd` `BitOr` `BitXor` `Shl` `Shr` | `a & b` -> `a.bitand(&b)` (etc.)                             |
 | `!` `~` (unary)        | `Not` `BitNot`                        | `!a` -> `a.not()`, `~a` -> `a.bitnot()`                      |
 | `==` `!=`              | `Eq`                                  | `a == b` -> `a.equals(&b)`, `a != b` -> `!a.equals(&b)`      |
-| `<` `>` `<=` `>=`      | `Ord` (`: Eq`)                        | `a < b` -> `a.compare(&b).is_lt()` (`is_gt`/`is_le`/`is_ge`) |
+| `<` `>` `<=` `>=`      | `Ord` (`: Eq`)                        | `a < b` -> `a.compare(&b).is_less()` (`is_greater`/`is_less_or_equal`/`is_greater_or_equal`) |
 | `<=>`                  | `Ord` (`: Eq`)                        | `a <=> b` -> `a.compare(&b)`                                 |
 | `a[i]` read            | `Index<Idx>` (`type Output`)          | `a[i]` -> `*(a.index(i))`                                    |
 | `a[i]` written         | `IndexMutable<Idx>` (`: Index<Idx>`)  | `a[i]` -> `*(a.index_mutable(i))`                            |
@@ -2682,7 +2715,7 @@ implement trait Ord for struct Vec2 {
     }
 }
 const eq: boolean = a == b;   // a.equals(&b)      -> false
-const lt: boolean = a < b;    // a.compare(&b).is_lt() -> true
+const lt: boolean = a < b;    // a.compare(&b).is_less() -> true
 ```
 
 **Three-way comparison.** `a <=> b` is `Ord::compare` and yields its
@@ -2776,7 +2809,24 @@ reference converts to: `fixed[r]` is `fixed.as_slice().view(r)`, written
 written in the body's parameters (`&Array<T>`, `&[T; N]`, `&Slice<T>`) is
 viewed when an implementation applies to it as written, and each copy of
 the body calls that implementation for its own `T`.  A base that is itself
-a type parameter is indexed through `Index` alone.
+a type parameter is viewed when a bound in scope gives it `IndexView` at the
+index's type - naming it, or naming a trait it is a supertrait of, at the
+arguments that trait writes on it, so `C: IndexViewMutable<Range<i64>>` gives
+`IndexView<Range<i64>>` - and its view is the parameter's `View`; a range
+literal indexing a parameter its bounds give `IndexView<Range<i64>>` is typed
+`Range<i64>` (`function first_two<C>(c: &C) -> C::View where C:
+IndexView<Range<i64>> { return c[0..2]; }`).  Where such a parameter is
+writable (`c: mut &C`, or a `mut` binding) and a bound gives it
+`IndexViewMutable` at the index's type, `c[r]` is always `c.view_mutable(r)`,
+a value of `C::ViewMutable`, read or written: the two associated types are
+different types in the body, and the methods and elements reached through
+the view are the ones the bounds on `C::ViewMutable` give it (`where
+C::ViewMutable: Put` makes `c[r].put(v)` a call, and `where C::ViewMutable:
+IndexMutable<i64>` makes `c[r][i] = v` an assignment).  A read-only one is
+`c.view(r)`, a value of `C::View`.  An associated type of a parameter has
+the methods its bounds give it and no others (E0358), and is indexed when a
+bound on it gives it `Index`.  Any other parameter base is indexed through
+`Index` alone.
 
 The standard library slices by a range.  On an `Array<T>`, a `[T]` or a
 `Slice<T>`, `xs[r]` is a `&Slice<T>` of the elements `r` names, and written a
@@ -2807,7 +2857,14 @@ the same `Target`; E0312 otherwise), by the same rule:
 receiver lacks a field or method but implements `Deref`, `b.field` /
 `b.method()` retry on the pointee (transitively), inserting the `.deref()`
 chain for you - or the `.deref_mutable()` chain, where the member is written
-or the method takes `mut &this` - the smart-pointer pattern.
+or the method takes `mut &this` - the smart-pointer pattern.  On each
+pointee a call `b.m()` names the method `m` before a field `m`, as a call on
+the pointee itself does, so a private field never hides a public method of
+its name; a pointee with no such method has its field `m` called, when the
+field holds a function.  A receiver reached through a reference or a raw
+pointer (`b: &Boxed<Vec2>`, `b: Boxed<Vec2>*`) coerces the same way: its
+members are the referenced value's, so they are that value's `Target`'s
+where it has none.
 
 ```cryo
 type struct Boxed<T> { value: T; }
@@ -2882,7 +2939,7 @@ const n: i32 = total([&sq, &r]);                 // 10
 **Conversion.** A value becomes an object wherever it is checked against a declared object type - an initializer, an assignment, a return, a struct-literal field, an array element, and an argument, whatever the call's callee is: a function, a method, a function value held in a local or computed by an expression, or an enum variant whose payload is the object: `&c` becomes a `virtual &Shape` or a `virtual mut &Shape`, as it becomes a `&Circle` or a `mut &Circle` parameter; a pointer `c_ptr: Circle*` becomes a `virtual Shape*`. The object holds the value's address and the table of its type's implementation of the trait. An object converts to no other object, a reference to no `virtual Shape*`, and a pointer to no borrowed object (`E0200`).
 
 - The value's type must implement the trait, at the object's arguments: its implementation's trait arguments and associated types must be the ones the object writes (`E0315`: "`Square` does not implement `Shape`, so `&Square` cannot become `virtual &Shape`"; "`Square` does not implement `Conv<i32>`, ..." for a `Square` implementing only `Conv<i64>`).
-- A value whose implementation is generic converts at the instantiation it has: `&b` with `b: Tank<i64>` and `implement<T> trait Sink for struct Tank<T>` becomes a `virtual mut &Sink` whose table holds `Tank<i64>`'s copies of the methods, and a `Tank<i32>` has a table of its own. So does an implementation written for one instantiation, `implement trait Meter for struct Gauge<i64>`, and the standard library's `String` as a `virtual mut &FmtWrite`.
+- A value whose implementation is generic converts at the instantiation it has: `&b` with `b: Tank<i64>` and `implement<T> trait Sink for struct Tank<T>` becomes a `virtual mut &Sink` whose table holds `Tank<i64>`'s copies of the methods, and a `Tank<i32>` has a table of its own. So does an implementation written for one instantiation, `implement trait Meter for struct Gauge<i64>`, and the standard library's `String` as a `virtual mut &FormatWrite`.
 - In a generic body, a value whose type names a parameter converts where every copy of the body implements the trait for it: a type parameter whose own bound names the trait at the object's arguments (`s` with `s: &S` and `where S: Shape` becomes a `virtual &Shape`), `This` in a default of that trait itself (`&this` in a default of `Shape`), and the receiver of an implementation of the trait whose methods are checked over parameters - a generic implementation's, or one written for an instantiation. The body is checked once; each copy's object holds the table of the copy's own type. A parameter no bound says implements the trait, one bounded by another trait, and `This` in another trait's default do not convert (`E0315`: "`&T` cannot become `virtual &Shape`: `T` is a type parameter, and no bound in scope says it implements `Shape`", with a help naming the bound to add).
 
 **Supertraits.** The table holds the methods of every supertrait of the object's trait as well, so the value's type must implement each of them, directly or through another supertrait (`E0315`: "`Square` does not implement `Named`, which `Shape` requires, so `&Square` cannot become `virtual &Shape`"). A supertrait's arguments are the ones the subtrait writes on it, with the object's arguments put in for the subtrait's own: an object of `Sized<i64>`, with `type trait Sized<U> : Measure<U>`, needs the value's type to implement `Measure<i64>`. An associated type of a supertrait written without arguments, `type trait Twice : Pick`, is bound by no object of the subtrait, and the value's type may bind it to anything.
@@ -2936,7 +2993,7 @@ type struct Pair<T: Display>
 }
 ```
 
-Six traits can be derived. Each generated method works through the type's parts in declaration order:
+Eight traits can be derived. Each generated method works through the type's parts in declaration order:
 
 | Trait     | The generated method                                                                                                                   |
 | --------- | -------------------------------------------------------------------------------------------------------------------------------------- |
@@ -2946,12 +3003,31 @@ Six traits can be derived. Each generated method works through the type's parts 
 | `Clone`   | A new value built from each field's `clone()`; an enum rebuilds the variant from its payloads' clones.                                |
 | `Debug`   | `Point { x: 1, y: 2 }` through the formatter's `debug_struct`, a variant as `Segment(.., ..)` through `debug_tuple` and a variant without a payload as its name; `{x:#?}` writes the same members one per line. |
 | `Default` | A field with a written default takes it, every other field its type's `Default`. An enum cannot derive `Default`: which variant is the default is the type's own choice. |
+| `ToJson`  | A struct as a JSON object holding each field's `to_json()` under the field's name, in declaration order; an enum as the string naming its variant. |
+| `FromJson` | A struct from an object: each field from the member under its name through its type's `from_json`, a refusal there reported at that member (`at .limits.count: expected an i64, found a string`). Members the struct does not name are ignored. An absent member reads as whatever the field's type reads `null` as - an `Option` field is `None` - and a type that reads nothing from `null` refuses it as missing (`at .count: expected a value, found nothing`). An enum from the string naming one of its variants. |
 
-A generic type gets one implementation of each trait, which requires the trait of every type parameter and keeps the type's own bounds: `Pair<T>` above derives `Eq` as `implement<T> trait Eq for Pair<T> where T: Eq, T: Display, T: Hash`. There is no per-field control; a type that needs one field skipped or compared differently implements the trait by hand. `Copy` is never listed: whether a type is `Copy` is decided from its fields ([section 15.1](#151-the-copy-trait)). Since `f32` and `f64` have `Eq` and `Hash` but no `Ord`, a type with a float field derives `Eq` and `Hash` and is refused `Ord` at that field.
+`ToJson` and `FromJson` are derived only for an enum whose variants carry nothing: a variant's name says nothing of the values a variant carries, so such an enum implements them by hand. A field's JSON member is adjusted with the `![json(...)]` directive, written on the field, any of these options together:
+
+```cryo
+type struct Server with [ToJson, FromJson] {
+    ![json(rename = "port_number")]
+    port: u16;              // the member is `port_number`, read and written
+    ![json(skip)]
+    connections: i64;       // never written; read as `i64`'s `default()`
+    ![json(default)]
+    retries: i64;           // an absent member reads as `default()`
+    ![json(skip_none)]
+    nickname: Option<String>;  // left out of the object when it writes `null`
+}
+```
+
+`rename` names the member in both directions. `skip` leaves the field out of both: it is never written and is read as its type's `default()`. `default` reads an absent member as the type's `default()` instead of as `null`. `skip_none` leaves out of the written object a member whose value writes `null`, which `FromJson` then reads back as `null` reads. A `skip` or `default` field's type must have `Default`; a type parameter has only the `FromJson` bound the derived implementation places on it, so such a field of a parameter's type is refused.
+
+A generic type gets one implementation of each trait, which requires the trait of every type parameter and keeps the type's own bounds: `Pair<T>` above derives `Eq` as `implement<T> trait Eq for Pair<T> where T: Eq, T: Display, T: Hash`. Apart from a JSON member's options there is no per-field control; a type that needs one field skipped or compared differently implements the trait by hand. `Copy` is never listed: whether a type is `Copy` is decided from its fields ([section 15.1](#151-the-copy-trait)). Since `f32` and `f64` have `Eq` and `Hash` but no `Ord`, a type with a float field derives `Eq` and `Hash` and is refused `Ord` at that field.
 
 The entry chooses what is generated by its spelling, `Eq` or `cmp::Eq`, which must name the standard library's trait where the type is declared: a module's own trait spelled `Eq` is refused, and so is a trait imported under another name (`import std::core::hash::{ Hash as H };` then `with [H]`). Everything the generated code calls - the traits' methods, `Ordering`, `Formatter` - is the standard library's own, whatever the module declares under those names.
 
-Each refusal is `E0318`, at the entry or the field it is about: an empty list, a trait listed twice, a trait that cannot be derived, a union, `Default` on an enum, a type declared in a function body (the implementations are module items), and a field or payload whose type lacks the trait ("`Wrapper` cannot derive `Hash`: field `inner` has type `Opaque`, which does not implement `Hash`"). `with` written after `where` is refused as out of order (`E0101`), and a trait both derived and implemented by hand is a conflicting implementation (`E0308`).
+Each refusal is `E0318`, at the entry or the field it is about: an empty list, a trait listed twice, a trait that cannot be derived, a union, `Default` on an enum, `ToJson` or `FromJson` on an enum whose variants carry values, a type declared in a function body (the implementations are module items), a field or payload whose type lacks the trait ("`Wrapper` cannot derive `Hash`: field `inner` has type `Opaque`, which does not implement `Hash`"), and a `skip` or `default` field whose type lacks `Default`. An option `![json]` does not know is `E0152`, and the directive anywhere but on a field is `E0151`. `with` written after `where` is refused as out of order (`E0101`), and a trait both derived and implemented by hand is a conflicting implementation (`E0308`).
 
 ---
 
@@ -2966,7 +3042,7 @@ Type parameters are declared in angle brackets after the name. By convention the
 ### 11.2 Generic Structs
 
 ```cryo
-import std::core::ptr;
+import std::core::pointer;
 import std::core::intrinsics::{ malloc, free };
 
 type struct Box<T> {
@@ -2987,7 +3063,7 @@ type struct Box<T> {
 // merely named `drop` in the struct body would be an ordinary method.
 implement<T> trait Drop for Box<T> {
     drop(mut &this) -> void {
-        ptr::drop_in_place::<T>(this.ptr);   // release the boxed value
+        pointer::drop_in_place::<T>(this.ptr);   // release the boxed value
         free(this.ptr);                      // then its storage
     }
 }
@@ -2996,27 +3072,27 @@ implement<T> trait Drop for Box<T> {
 A struct can have multiple type parameters, and a parameter can have a default. The standard library uses defaults extensively to make the common case ergonomic:
 
 ```cryo
-type struct Array<T, A = GlobalAlloc> { /* ... */ }
-type struct HashMap<K, V, A = GlobalAlloc, H = SipHasher> { /* ... */ }
+type struct Array<T, A = GlobalAllocator> { /* ... */ }
+type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> { /* ... */ }
 ```
 
-Calling `Array::<int>::new()` uses `GlobalAlloc`; calling `Array::<int, Arena>::new_in(my_arena)` parameterises the container over a custom allocator.
+Calling `Array::<int>::new()` uses `GlobalAllocator`; calling `Array::<int, Arena>::new_in(my_arena)` parameterises the container over a custom allocator.
 
 A written type takes at most as many type arguments as its declaration has parameters, and at least as many as it has parameters without a default: with `type struct Box<T>`, `Box<i32, i64>` is refused where it is written (E0307, "`Box` has 1 type parameter, and 2 type arguments are written"), and so is `Pair<i32>` for `type struct Pair<A, B>`.  An enum and a generic alias are counted the same way.  A call writing more type arguments on a method than the method has type parameters of its own is refused the same way, `s.pick::<i32, u8>(4)` for `pick<T>`, and so is a call writing fewer, `c.map::<i64>(f)` for `map<U, F>`: a call writes every type argument, `_` for one it leaves to inference ([section 4.2](#42-generic-functions)).
 
-A default resolves **in the module where the type is declared**, not at the use site: writing `Array<int>` fills in `GlobalAlloc` as `collections::array`'s own scope sees it, so the user never imports `GlobalAlloc` to use the default. A user who writes `Array<int, GlobalAlloc>` names `GlobalAlloc` themselves and needs it in scope, because they wrote it. This is the general rule - a name resolves in the scope where it is written - and it is also why a function body, a type alias's right-hand side and an `implement` body resolve where they are written. A name that exists nowhere is an error in every position, expression and type-argument positions included: `sizeof(Nope)`, `1 as Nope` and `Array<Nope>` are refused, not silently accepted.
+A default resolves **in the module where the type is declared**, not at the use site: writing `Array<int>` fills in `GlobalAllocator` as `collections::array`'s own scope sees it, so the user never imports `GlobalAllocator` to use the default. A user who writes `Array<int, GlobalAllocator>` names `GlobalAllocator` themselves and needs it in scope, because they wrote it. This is the general rule - a name resolves in the scope where it is written - and it is also why a function body, a type alias's right-hand side and an `implement` body resolve where they are written. A name that exists nowhere is an error in every position, expression and type-argument positions included: `sizeof(Nope)`, `1 as Nope` and `Array<Nope>` are refused, not silently accepted.
 
-A use inside the type's own body is a use like any other, so a spelling means one thing wherever it is written: in `String<A>`'s methods a bare `String` in a signature is `String<GlobalAlloc>`, not the `String<A>` the method belongs to. A signature that means the owner itself names its arguments: `String<A>`.
+A use inside the type's own body is a use like any other, so a spelling means one thing wherever it is written: in `String<A>`'s methods a bare `String` in a signature is `String<GlobalAllocator>`, not the `String<A>` the method belongs to. A signature that means the owner itself names its arguments: `String<A>`.
 
-The owner of a static call written without type arguments is not such a use: its arguments are inferred at the call, and the defaults fill only the parameters nothing there decides. With `type struct Defaulted<T = i64>` and `small: i8`, `Defaulted::plain(small)` is `Defaulted<i8>` (from the argument), `const d: Defaulted<u8> = Defaulted::zero();` is `Defaulted<u8>` (from the expected type), and `Defaulted::plain(7)` and `Defaulted::zero()` with nothing expected are `Defaulted<i64>`: the default, not the literal's own type. `String::new()` is `String<GlobalAlloc>` the same way.
+The owner of a static call written without type arguments is not such a use: its arguments are inferred at the call, and the defaults fill only the parameters nothing there decides. With `type struct Defaulted<T = i64>` and `small: i8`, `Defaulted::plain(small)` is `Defaulted<i8>` (from the argument), `const d: Defaulted<u8> = Defaulted::zero();` is `Defaulted<u8>` (from the expected type), and `Defaulted::plain(7)` and `Defaulted::zero()` with nothing expected are `Defaulted<i64>`: the default, not the literal's own type. `String::new()` is `String<GlobalAllocator>` the same way. A parameter with no default that only a numeric literal argument could decide is refused (E0307) whatever the parameters after it default to: with `type struct Box<T, A = GlobalAllocator>`, `Box::new(41)` with nothing expected is refused, and the fix writes the parameters without a default, `Box::<T>::new(41)`, `T` to be replaced by the type meant. The expected type of a method call reaches a static call written as its receiver through what the method returns on it: in `const b: Box<i64> = Box::try_new(41).unwrap();`, `unwrap` on the `Result<Box<T>, AllocationError>` that `try_new` returns gives a `Box<T>`, which the expected `Box<i64>` makes `Box<i64>`, so `T` is `i64`. The same holds for any method of the receiver's type without type parameters of its own (`expect`, `unwrap_or`, `ok`); a method whose return names none of the owner's parameters (`is_ok()`) binds nothing, and the literal alone is refused as above.
 
 A struct literal written without type arguments is inferred the same way: from the expected type first, then from its field values, and the defaults fill only the parameters neither decides. `Defaulted { value: small }` is `Defaulted<i8>`, `const d: Defaulted<u8> = Defaulted { value: 200 };` is `Defaulted<u8>`, and inside `Defaulted<T>`'s own body `Defaulted { value: T::default() }` is `Defaulted<T>`. A numeric literal in a field does not decide a parameter: `Defaulted { value: 7 }` is `Defaulted<i64>`, and the `7` is then typed as that instance's field, so `Defaulted { value: 1.5 }` is refused (E0200) rather than read as `Defaulted<f64>`. A literal whose expected type and fields decide nothing is the default instance.
 
-A default fills a parameter that a *use* leaves out. An **`implement` head is not a use**: it names every parameter of the template it is written for, either as parameters of its own or as a concrete instantiation, and a head that leaves one out is an error (E0302), whether every parameter has a default or only the trailing ones do. `implement trait Display for String` would read as an impl for every `String<A>` while binding only `String<GlobalAlloc>`, so the writer says which is meant:
+A default fills a parameter that a *use* leaves out. An **`implement` head is not a use**: it names every parameter of the template it is written for, either as parameters of its own or as a concrete instantiation, and a head that leaves one out is an error (E0302), whether every parameter has a default or only the trailing ones do. `implement trait Display for String` would read as an impl for every `String<A>` while binding only `String<GlobalAllocator>`, so the writer says which is meant:
 
 ```cryo
 implement<A> trait Display for String<A> { /* ... */ }        // every String<A>
-implement trait Display for String<GlobalAlloc> { /* ... */ }  // this instantiation
+implement trait Display for String<GlobalAllocator> { /* ... */ }  // this instantiation
 implement<T, A> trait Clone for Array<T, A> { /* ... */ }      // not `Array<T>`
 ```
 
@@ -3106,7 +3182,7 @@ it generates two independent types and two specialised function bodies, one for 
 
 Generic bodies are type-checked once, as templates, **before** monomorphisation: a body is checked against its parameters' bounds, never against the types it is later instantiated with, so an error in a generic body is reported whether or not anything instantiates it. That includes a path through a type parameter naming a member none of its bounds declares (`T::m()`, `T::m`, `(Tr for T)::m`): it is reported once, where the template is checked, for a body nothing instantiates as for one instantiated many times (section on calls through a bound). Monomorphisation then copies each instantiated body with its type arguments substituted and binds every call in the copy to its concrete callee; the copies are not type-checked again, so a call the template check accepts must be one every copy can bind. A method call on the body's own instantiation of a generic type (`xs.get(i)` with `xs: &Array<T>`) is therefore refused where it is written when its arguments bind to no method of the name, by the rule a call's arguments bind by - a `u64` passed for `get`'s `i64` index is refused (E0214), as is an overload set none of whose members takes the arguments. The driver lives in [`compiler/src/compiler/mono/`](../compiler/src/compiler/mono/) (`monomorphizer.cryo`), run from `instance.cryo` after the function-body type check.
 
-Every copy is analysed - its diagnostics do not depend on whether anything calls it - but an executable emits only the copies its code can reach. Once analysis is done, the compiler walks from every function that is not a copy, through every call and every function named as a value, and through what code generation calls with no call written: a trait-object table's methods, a type's `Drop` and `Allocate` implementations, an operator's, an index's and a `?`'s method, and the releases drop insertion adds. A copy the walk never reaches is left out of every object. A library, the standard library's archive, and a single object, assembly or IR file (`-o` naming one) keep every copy, since what calls them is not in the build. The walk is in [`codegen/reachable_instances.cryo`](../compiler/src/compiler/codegen/reachable_instances.cryo); a reference code generation makes to a copy the walk left out is an internal error (E0900) naming the copy.
+Every copy is analysed - its diagnostics do not depend on whether anything calls it - but an executable emits only the copies its code can reach. Once analysis is done, the compiler walks from every function that is not a copy, through every call and every function named as a value, and through what code generation calls with no call written: a trait-object table's methods, a type's `Drop` and `Allocate` implementations, an operator's, an index's and a `?`'s method, and the releases drop insertion adds. A copy the walk never reaches is left out of every object. The standard library's archive is walked the same way, from the archive's own functions: a copy its build does not reach is left out of it and not listed in its manifest, and a program linking the archive defines every copy it needs that the manifest does not list in its own objects. Any other library, and a single object, assembly or IR file (`-o` naming one), keeps every copy, since what calls them is not in the build. The walk is in [`codegen/reachable_instances.cryo`](../compiler/src/compiler/codegen/reachable_instances.cryo); a reference code generation makes to a copy the walk left out is an internal error (E0900) naming the copy.
 
 ### 11.7 `static match` — Compile-Time Type Dispatch
 
@@ -3132,25 +3208,36 @@ static match (T) {
 }
 ```
 
-**Omitting `_` makes the arm list the accepted-type list.** A `T` that matches no arm is a compile error. This is deliberate and is how the standard library expresses "this generic accepts exactly these types" without inventing a trait:
+**Omitting `_` makes the arm list the accepted-type list.** A `T` that matches no arm is a compile error, so a generic can accept exactly these types without inventing a trait:
 
 ```cryo
-// `String::try_push` accepts strings, integers, floats and boolean.
-// Any other T is rejected at compile time - there is no `_` arm.
-try_push<T>(mut &this, item: T) -> Result<(), AllocError> {
+// Accepts the unsigned integer types and nothing else: any other T is
+// rejected at compile time, because there is no `_` arm.
+write_unsigned<T>(mut &this, value: T) -> void {
+    static match (T) {
+        u8  => { this.write_u8(value); }
+        u16 => { this.write_u16(value); }
+        u32 => { this.write_u32(value); }
+        u64 => { this.write_u64(value); }
+    }
+}
+```
+
+**With `_`, the listed arms are special cases of a general one.** `String::try_push` copies text in directly and formats every other type its `Display` bound admits:
+
+```cryo
+try_push<T>(mut &this, item: T) -> Result<(), AllocationError>
+where T: Display {
     return static match (T) {
         String  => { this.push_view_bytes(item.as_str()) }
         Str     => { this.push_view_bytes(item) }
         string  => { this.push_view_bytes(Str::from(item)) }
-        u8 | u16 | u32 | u64 |
-        i8 | i16 | i32 | i64 |
-        f32 | f64 |
-        boolean => { this.push_display(item) }
+        _       => { this.push_display(item) }
     };
 }
 ```
 
-**Statement and expression position both work.** As an expression, every arm's body yields the value of its final expression, and all arms must agree on a type — as in the `try_push` example above, where each arm yields `Result<(), AllocError>`.
+**Statement and expression position both work.** As an expression, every arm's body yields the value of its final expression, and all arms must agree on a type — as in the `try_push` example above, where each arm yields `Result<(), AllocationError>`.
 
 **Every arm is checked, each against its own type.** The arms are type-checked on the generic body, before monomorphisation, so a broken arm is an error even if no instantiation selects it:
 
@@ -3218,7 +3305,7 @@ A `_` arm takes every allowed type no arm names. An arm naming a type outside th
 
 They have no methods. The compiler decides each from the type, as it decides `Copy`, so no implementation of one is written, and an `implement` of one is refused (E0312) - for another type, which a `static match` over the trait's types would have no arm for, and for a built-in type, which has it already. A trait may name one as a supertrait (`type trait Halve : UnsignedInteger { ... }`); it can then be implemented only for a type the primitive trait admits.
 
-A bound of one says, in the signature, which types a generic accepts - a call with any other is refused where it is written (E0306 for a function, E0358 for a method) - and closes the set a `static match` over the parameter must cover ([section 11.7](#117-static-match--compile-time-type-dispatch)). The standard library writes them where its generics switch on the built-in types: `Hasher::fold` takes a `Primitive`, `RandomSource::next_range` a `Numeric`, and `Atomic<T>`'s `fetch_add` and `fetch_sub` need `T: Integer`, so on an `Atomic<boolean>` they are refused (E0358) rather than adding to its 0/1 byte.
+A bound of one says, in the signature, which types a generic accepts - a call with any other is refused where it is written (E0306 for a function, E0358 for a method) - and closes the set a `static match` over the parameter must cover ([section 11.7](#117-static-match--compile-time-type-dispatch)). The standard library writes them where its generics switch on the built-in types: `Hasher::fold` takes a `Primitive`, `RandomSource::next_range` a `Numeric`, and `Atomic<T>`'s `fetch_add` and `fetch_subtract` need `T: Integer`, so on an `Atomic<boolean>` they are refused (E0358) rather than adding to its 0/1 byte.
 
 ---
 
@@ -3253,6 +3340,24 @@ implement enum Color {
     }
 }
 ```
+
+**Methods for some instances.** An inherent block on a generic type whose head starts with its own parameter list, `implement<T>`, writes the type's arguments rather than declaring them, so they may be types: the block's methods belong to exactly the instances its head accepts. A call on any other instance does not find them (`E0358`), and a generic body calls them only on a receiver every instantiation of which the head accepts:
+
+```cryo
+type struct Wrap<T> { value: T; }
+
+implement<T> struct Wrap<Wrap<T>> {
+    inner(&this) -> T { return this.value.value; }
+}
+
+const nested: Wrap<Wrap<i32>> = Wrap { value: Wrap { value: 4 } };
+const four: i32 = nested.inner();
+// Wrap { value: 4 }.inner()        // E0358: `Wrap<i32>` is not a `Wrap<Wrap<T>>`
+```
+
+A head with no leading list, `implement struct Wrap<T>`, declares its names and is for every instance. A block for one instance whose arguments are all types writes an empty leading list, `implement<> struct Wrap<i64>`: without it the names after the type would be declared, and `i64` is no name to declare.
+
+**A block for some instances adds names.** A method of a block for some instances is refused (`E0308`) where the type's own body declares one of the same name, or where an earlier inherent block whose head accepts an instance this one accepts too declares one, and so is a method of a block for every instance written after such a block: heads overlap as trait heads do (section 12.2). `implement<T> struct Wrap<Wrap<T>>` and `implement<T> struct Wrap<Pair<T>>` accept no instance in common, so each may declare a method of one name; either overlaps `implement struct Wrap<T>`. Blocks for every instance, like the type's body, may overload a name by its parameters; two methods every instance has that share a name and take the same parameter types - in the body, in blocks for every instance, or one in each - are refused (`E0308`), since a call is selected by its arguments and could never reach one of them. The receiver's form (`&this`, `mut &this`) does not tell two methods apart, and a block's parameters are compared as the type's own: `takes(&this, x: T)` in `implement struct Wrap<T>` is the same as in the body of `Wrap<T>`.
 
 ### 12.2 Trait Implementation
 
@@ -3307,7 +3412,7 @@ A path naming a constant the primitive does not declare names no value and is re
 |---|---|
 | every integer type, `i8` to `i128`, `u8` to `u128`, `isize`, `usize` | `MIN`, `MAX`, and `BITS: u32`, the width in bits |
 | `char` | `MIN` (`'\0'`), `MAX` (`'\u{10FFFF}'`), and `BITS: u32` (32) |
-| `f32`, `f64` | `EPSILON`, `MAX`, `MIN` (the most-negative finite value), `MIN_POSITIVE` (the smallest positive normal value), `INFINITY`, `NEG_INFINITY`, `NAN` |
+| `f32`, `f64` | `EPSILON`, `MAX`, `MIN` (the most-negative finite value), `MIN_POSITIVE` (the smallest positive normal value), `INFINITY`, `NEGATIVE_INFINITY`, `NAN` |
 
 `boolean` declares none. An integer limit is a compile-time integer, so `[u8; u64::MAX >> 61]` is an array of 7 and `static_assert(i32::MAX == 2147483647)` holds.
 
@@ -3326,7 +3431,7 @@ const b: Box2 = Box2 { v: 0 };
 const n: i32 = b.put(1);    // error: both `put`s apply
 ```
 
-A static method is chosen the same way, its generic overloads by the type arguments its arguments (or its turbofish) bind. With `conv<U>(u: U)` and `conv<U>(u: U, w: U)` on `Plain`, `Plain::conv(7, 9)` calls the second. A static call two overloads accept is E0154, whether both are generic or one is not, and a call none accepts is E0214.
+A static method is chosen the same way, its generic overloads by the type arguments its arguments (or its turbofish) bind. With `conv<U>(u: U)` and `conv<U>(u: U, w: U)` on `Plain`, `Plain::conv(7, 9)` calls the second. A static call two overloads accept is E0154, whether both are generic or one is not, and a call none accepts is E0214. A generic overload whose `where` clause the arguments fail does not accept them, as for a free function: with `h<U>(u: U) where U: Shout` and `h(u: i32)` on `P`, and an `x: i32`, `P::h(x)` calls the second.
 
 **A receiver that is a reference.** A call's receiver is a `&X` - written so, or an `X` the call borrows - and the methods of `X` itself come first: when `X` is a reference, those an implementation for references ([section 10.2](#102-implementing-a-trait)) gives it. Only when `X` has no method of the name is the reference looked through, and the referent asked the same way, one step at a time. So `r.describe()` with `r: &i64` is `i64`'s `describe` (`X` is `i64`), while `rr.describe()` with `rr: & &i64` is the `describe` of `Describe for &T` (`X` is `&i64`), and with `rrr: & & &i64` the same implementation's at `X = & &i64`. A call a bound answers in a generic body names the method of the type the parameter becomes, the same way, even when that type is a reference.
 
@@ -3394,7 +3499,7 @@ namespace std::collections::array;
 
 The namespace serves as the file's identity within the project. The compiler uses it to resolve imports and to mangle symbol names so that two unrelated functions named `parse` from different modules do not collide at link time.
 
-An import finds a module's file among the `.cryo` files below the project's source root and the standard library's, by the namespace each declares. A directory whose name begins with `.` holds no sources - a build's outputs, such as `stdlib/.bin`, or a tool's state - so a file inside one declares no module an import can name (`E0500`). What each file declares is kept in a namespace-index cache, keyed by the compiler, the root, the file's path below it and a digest of its content, so a run lexes only the files whose content it has not read before; a build keeps it in `<output_dir>/namespace-index`, a single-file `cryo check`, which writes no build, in `.bin/namespace-index` beside the file, and the language server keeps none.
+An import finds a module's file among the `.cryo` files below the project's source root and the standard library's, by the namespace each declares. A path written in the standard library names only the standard library's files, and one written in a dependency or a vendored library never names a file of the program that uses it: a package does not depend on its user, so a program's `core/_module.cryo`, or a file of its declaring `namespace alloc::box;`, is never the standard library's `core` or `alloc::box`. A directory whose name begins with `.` holds no sources - a build's outputs, such as `stdlib/.bin`, or a tool's state - so a file inside one declares no module an import can name (`E0500`). What each file declares is kept in a namespace-index cache, keyed by the compiler, the root, the file's path below it and a digest of its content, so a run lexes only the files whose content it has not read before; a build keeps it in `<output_dir>/namespace-index`, a single-file `cryo check`, which writes no build, in `.bin/namespace-index` beside the file, and the language server keeps none.
 
 ### 13.2 Module Aggregators
 
@@ -3594,7 +3699,7 @@ function main() -> i32 {
 
 Two candidates are ambiguous only within one tier: two wildcards offering one name (E0154), two brace entries binding it (E0243).
 
-Nothing outside the tiers is reachable. A name declared exactly once in the whole program still does not resolve where nothing brings it into scope, and a path whose first segment no tier binds is not found, however fully it is spelled: `std::math::pow(2.0, 3.0)` in a file that imports no `std::math` is E0203.
+Nothing outside the tiers is reachable. A name declared exactly once in the whole program still does not resolve where nothing brings it into scope, and a path whose first segment no tier binds is not found, however fully it is spelled: `std::math::power(2.0, 3.0)` in a file that imports no `std::math` is E0203.
 
 A path resolves one segment at a time. Its first segment is a bare name, looked up as above; each later segment is looked up in what the segment before it named. A module is found only among those the file can see - its own and the ones it imports, spelled as [section 13.6](#136-modules-and-types-share-one-namespace) allows - never by searching the program for its spelling, so what a path means never depends on which other modules exist in the program. A path that does not resolve is an error, with a suggestion where one exists.
 
@@ -3724,10 +3829,10 @@ Dereferencing a null pointer is undefined behaviour. For "may be absent" semanti
 
 ### 14.4 NonNull
 
-`core::ptr::NonNull<T>` is a thin wrapper around `T*` that statically guarantees non-nullness. Containers and smart pointers in the standard library use `NonNull<T>` internally so they never have to defensively null-check.
+`core::pointer::NonNull<T>` is a thin wrapper around `T*` that statically guarantees non-nullness. Containers and smart pointers in the standard library use `NonNull<T>` internally so they never have to defensively null-check.
 
 ```cryo
-import core::ptr::NonNull;
+import core::pointer::NonNull;
 
 const non_null: NonNull<u8> = NonNull::new(buf).unwrap();
 ```
@@ -3744,7 +3849,7 @@ A type is `Copy` if it can be duplicated by a bitwise copy of its bytes. The com
 
 - All primitive types (integers, floats, `boolean`, `char`, `string` (the raw `u8*` view), pointers, references, function pointers).
 - Struct, enum, and tuple aggregates **iff** every field is `Copy` **and** the type does not implement `Drop`.
-- Generic parameters are conservatively non-`Copy` unless bound by `T: Copy`.
+- Generic parameters are conservatively non-`Copy` unless a bound in scope makes them `Copy`: `T: Copy`, or a bound naming a trait `Copy` is a supertrait of, written in the function's own `where` clause, in its owner's (`type struct Holder<T> where T: Copy`), or in its implementation's. A method's own `where T: Copy` on its owner's parameter makes `T` `Copy` in that method only. A type built of `Copy` parts that names such a parameter (`(T, T)`) is `Copy` there too.
 
 `Copy` is a marker trait declared in `stdlib/core/marker.cryo`; you do not implement it explicitly. Implementing `Drop` automatically makes a type non-`Copy`.
 
@@ -3785,19 +3890,25 @@ Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations, and membe
 
 #### What assignment releases
 
-Assignment releases the destination **only where the compiler can establish that it holds a live value**. That means a place carved out of a local's own storage: the local itself, or a chain of field projections and constant indices over it. The destinations below do *not* release what they overwrite, because nothing visible in the frame distinguishes a live value from reserved, never-written memory:
+Assignment releases the destination **only where the compiler can establish that it holds a live value**. That means a place carved out of a local's own storage - the local itself, or a chain of field projections and constant indices over it - or a place reached through a reference: `*r = v`, `r.f = v`, **including `this.f = v` and `*this = v`** in a `&this` / `mut &this` method, and a chain of field projections and constant indices below the reference. A reference always refers to a live value, so what it overwrites is released.
+
+Where a place is reached through several dereferences, the **nearest** one decides: `this.buffer.f = v` with `buffer` a raw pointer field is a store through the pointer, and releases nothing, though `this` is a reference.
+
+The destinations below do *not* release what they overwrite, because nothing visible in the frame distinguishes a live value from reserved, never-written memory:
 
 | destination | why not |
 | --- | --- |
-| `*p = v` | `p` may address storage that has been reserved but never written |
+| `*p = v` where `p` is a raw pointer | `p` may address storage that has been reserved but never written |
 | `p[i] = v` where `p` is a pointer | the same - this is exactly how a collection fills fresh capacity |
-| `r.f = v` where `r` is a reference or pointer, **including `this.f = v`** | the callee cannot see whether the caller initialized the pointee |
+| `p.f = v` where `p` is a raw pointer | the same: whatever `p` addresses may not have been initialised |
 | `xs[i] = v` with a run-time `i` | no single member for the compiler to track |
 | a module-level global | globals are never auto-dropped |
 
+A store through a reference also releases nothing when the function moved a value out from behind the same binding earlier, or the store's own right-hand side does (`this.f = wrap(this.f)` inside an `unsafe` block, where such a move is not refused): the place still holds the bits of a value its new owner releases.
+
 A local or by-value parameter of an `async function` is a local for these rules even when it is carried in a field of the generated future: reassigning it releases the displaced value, and it is released at its scope's exits, exactly as in a function that never suspends (see [section 18.4](#184-how-an-async-function-is-compiled)).
 
-At those destinations, release the old value yourself. `Array::set` is the canonical example: it drops the previous occupant before reusing the slot, precisely because `this.ptr[index] = value` does not.
+At those destinations, release the old value yourself. `Array::set` is the canonical example: it drops the previous occupant before reusing the slot, precisely because `this.ptr[index] = value` does not. Through a reference, do not: releasing the old value by hand and then storing over it releases it twice. To take the value out of a place behind a reference, exchange it with `core::mem::swap`.
 
 #### Members are tracked separately
 
@@ -3860,29 +3971,28 @@ implement trait Drop for Session {
 > along two paths, and both the field-glue rule above and the drop of a
 > partially-consumed aggregate depend on the no-op behaviour.
 
-**Do not call `drop` by hand.** An explicit `x.drop()` warns (`W0015`) and will
-become an error. To release **early**, use `mem::drop(x)`, which takes the
+**Do not call `drop` by hand.** A call that names a `Drop` implementation's
+`drop`, `x.drop()`, is refused (`E0453`): the compiler releases the value
+itself, so a destructor called through a reference runs while the owner still
+releases the value, and one called on a field runs while the owner releases
+the field again. To release **early**, use `mem::drop(x)`, which takes the
 value - so the move checker rejects any later use and the scope-exit drop is
-suppressed. On a local, `x.drop()` does the same: it is read as a move, so the
-local is released once, there, and a later use is refused (`E0452`). On a
-field, `h.a.drop()` releases the field and the owner releases it again when it
-is released itself - a second release, harmless only while every destructor
-leaves what it freed empty.
+suppressed.
 
 **Only `implement trait Drop` defines a destructor.** A method merely named `drop` - declared in a struct body or an inherent `implement` block - is an ordinary method: it is not run at scope exit, it does not make the type satisfy `where T: Drop`, and calling it releases nothing else.
 
-**Releasing a value behind a pointer.** Code that owns a `T` through a raw `T*` (a container's storage, a box) releases it with the `drop_in_place` intrinsic from `std::core::ptr`. After monomorphisation it runs that type's destructor and field drop-glue, or nothing for a `Copy` type, so `T` needs no bound. Calling `.drop()` on an unbounded `T` is refused, and the error says what to write:
+**Releasing a value behind a pointer.** Code that owns a `T` through a raw `T*` (a container's storage, a box) releases it with the `drop_in_place` intrinsic from `std::core::pointer`. After monomorphisation it runs that type's destructor and field drop-glue, or nothing for a `Copy` type, so `T` needs no bound. Calling `.drop()` on an unbounded `T` is refused, and the error says what to write:
 
 ```cryo
-import std::core::ptr;
+import std::core::pointer;
 
 function release<T>(p: T*) -> void {
-    ptr::drop_in_place::<T>(p);   // fine for every T
+    pointer::drop_in_place::<T>(p);   // fine for every T
 }
 
 function release_wrong<T>(p: T*) -> void {
     (*p).drop();                  // error[E0358]: no method named `drop` found on type `T`
-                                  // help: use `std::core::ptr::drop_in_place(p)`
+                                  // help: use `std::core::pointer::drop_in_place(p)`
 }
 ```
 
@@ -3894,11 +4004,11 @@ Non-`Copy` bindings are tracked by a flow-sensitive analysis ([`passes/move_chec
 - assigning a non-`Copy` value into a slot (`x = a;`),
 - placing a non-`Copy` value into an aggregate literal,
 - passing a non-`Copy` value to a function or method parameter that is **not** a reference type (`fn f(t: T)` moves; `fn f(t: &T)` borrows), and
-- calling `binding.drop()` or any method whose receiver consumes (`mut this` or `![sink]`).
+- calling `binding.drop()` or any method whose receiver is taken by value (`this` or `mut this`).
 
 A branching expression's value is the value of the branch that ran, so where an `if` expression, a `?:` or a `match` expression is itself at a move site, the value each branch yields is moved there: `const c: T = if (f) { a } else { make() };` moves `a` when `f` holds, and only then. A binding moved on some branches only, by yielding it or inside the branch (`if (f) { take(a) } else { 0 }`), is possibly moved after the expression, so a later use is refused (`E0452`) as after an `if` statement that moves it in one branch; at scope exit it is released on exactly the paths that kept it.
 
-A `break` leaves its loop with whatever was moved on the path that reached it. A binding declared outside the loop and moved before a `break` (`while (more()) { if (done()) { take(a); break; } }`) is possibly moved after the loop, and at scope exit it is released only when the loop ended some other way.
+A `break` leaves its loop with whatever was moved on the path that reached it. A binding declared outside the loop and moved before a `break` (`while (more()) { if (done()) { take(a); break; } }`) is possibly moved after the loop, and at scope exit it is released only when the loop ended some other way. A binding moved before a loop and assigned a new value only in its body is the other way round: it holds a value after the loop on the paths that ran the body and none on the path that ran it zero times. Its release at scope exit runs only where it holds one, and each value the body displaces is released when the next is stored; using it after a `while` or `for` is a use after a move (`E0452`), since such a loop may be left before its body runs, with the moves it began with. After a loop a binding is moved if it is moved on any path that leaves the loop: a `do-while` runs its body at least once and is left by its condition, and a `loop` is left by a `break` alone, so a binding either one assigns on every path to its exits holds a value after it and may be used there.
 
 References (`&T` / `mut &T`) and raw pointers borrow; passing `&x` keeps `x` usable. Reassigning a binding re-initialises it, so `consume(x); x = make();` is legal and `x` is live again after the assignment. A moved-from binding holds nothing, so that second assignment releases nothing - the callee owns what it took (see [section 15.2](#152-the-drop-trait) for what assignment does release).
 
@@ -3913,13 +4023,15 @@ Two move/ownership hazards that are unambiguous memory errors, called out as the
 - **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.  A loop's condition, and a `for`'s update, run again at every back edge, so a value or field moved in them is refused, even when the body assigns it a new one, unless the body always leaves the loop with `break` or `return`.
 - **Returning the address of a local** (`E0455`) - `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine - those are caller-backed.)
 - **A field moved out on some paths only** (`E0453`) - a field moved out of a local runs its owner's release without that field at scope exit, which is sound only when the move certainly happened.  So a field may be moved out of a local of a struct with no destructor in straight-line code, and is refused inside an `if`, `match` or loop body, on the right of `&&` or `||`, and in an arm of `?:` or of an `if` expression - each runs on some paths only.  The refusal names the local and the field ("cannot move field 'a' out of `h` on only some paths"); a field moved out of a value whose type implements `Drop` is refused as owning a destructor, and one out of any other value the partial move does not track (a tuple, a pattern binding, a field of a field) as a value that drops it at scope exit.
+- **A reference to a value with a field moved out** (`E0452`) - a reference names the whole value, and a store through it releases what it displaces, so `&p`, `p` passed where a reference is taken, and a method called on `p` are refused once a field has been moved out of `p`, until that field is given a new value.  The fields that remain may still be read and borrowed (`&p.b`).
 - **A field moved out of a value no binding owns** (`E0453` with a destructor) - `const n: String = make().name;` moves `name` out of the call's result, and the result's other fields are released, each once, when the statement ends; the same holds through fields of fields (`make().inner.name`) and for a tuple's element (`pair().1`).  Read only as a borrow (`make().name.length()`, `&make().name`), the field is released with the rest of the value then.  A value with a destructor is never taken apart: when the value, or any value the field is read out of, has a type that implements `Drop`, moving the field out is refused ("cannot move field `inner` out of a value that owns a destructor"), and borrowing it is allowed - the destructor runs over the whole value when the statement ends.
 - **An owning array read by value through a pointer or reference** (`E0453`) - `const xs: [T] = p.items;` or `xs = p.items;`, with `p` a pointer or reference, copies the array's handle while the struct `p` names still owns the same buffer, so the buffer is released twice.  `[T]` and `[T; N]` alike; borrow the field (`&p.items`) or clone it.  A take that is sound - the old value is meant to leave - swaps it out with `mem::swap`.
+- **A by-value method called through a pointer or reference** (`E0453`) - `p.unwrap()` or `p.into_id()`, where the method takes `this` by value and `p` is a pointer or reference to a value that owns a destructor, moves the value out of storage that still releases it, exactly as the written `(*p).unwrap()` does.  A value without a destructor is copied and is accepted.  Call a method that borrows its receiver, clone the value first, or empty the storage with a method that leaves a value behind (`Option::take`).
 - **A field matched by value through a pointer or reference** (`E0453`) - `match (p.slot)`, with `p` a pointer or reference (including `this` in a `&this` or `mut &this` method) and the field's type owning a destructor, gives the match's subject its own copy of the field's owning handle, released when the match ends whether or not an arm binds the payload, while the storage `p` names still holds the field.  Match on a borrow instead - `match (&p.slot)` - and the arms read the payload without owning it.  A take swaps a replacement in with `mem::swap` first.
 - **A field read by value through a pointer or reference** (`E0453`) - the same holds wherever such a field is read into a second owner: `const x: T = p.slot;`, `x = p.slot;`, `return this.slot;` from a `&this` or `mut &this` method, `take(p.slot)` for a by-value parameter, and `Other { slot: p.slot }`.  Each copies the field's owning handle while the storage `p` names still releases it.  Borrow the field (`&p.slot`), swap it out with `mem::swap`, or read it from a receiver the method owns: `outcome(mut this) -> T { return this.slot; }` consumes the value it is called on, so the field has one owner.  Inside an `unsafe` block the read is allowed, for a take whose storage is overwritten or freed without being released.  A closure reading what it captured is not such a read: its captures are fields of the closure itself.
-- **A capture moved out of a closure's body** (`E0453`) - the closure keeps what it captures for every call, and releases it once with itself (a `move` closure) or leaves it to the value's owner (any other closure), so a captured value given away by the body would be released again.  Clone it (`take(name.clone())`); `unsafe` does not change this.
+- **A capture moved out of a closure's body** (`E0453`) - the closure keeps what it captures for every call, and releases it once with itself (a `move` closure) or leaves it to the value's owner (any other closure), so a captured value, or a field of one, given away by the body would be released again.  Clone it (`take(name.clone())`); `unsafe` does not change this.
 - **A borrowed variable moved while a closure borrows it** (`E0457`) - a closure written without `move` holds a reference to each captured value that is not `Copy`, so the variable may not be moved until the end of the statement that made the closure, nor while a binding in scope holds the closure; nor may the closure, or a value holding it, be returned from the function that made it.  Write `move` before the closure to give it the value instead.
-- **A whole value read by value through a reference** (`E0453`) - `return this;` in a `&this` or `mut &this` method, with the type owning a destructor, reads the receiver by its implicit dereference and hands the caller a second owner of the storage the receiver names, so it is released twice.  Clone it, or take the receiver by value (`mut this`) when the method is meant to consume what it is called on; a method marked `![sink]` owns its receiver already, and its `return this;` is that transfer.  Inside an `unsafe` block the read is allowed, as for a field.
+- **A whole value read by value through a reference** (`E0453`) - `return this;` in a `&this` or `mut &this` method, with the type owning a destructor, reads the receiver by its implicit dereference and hands the caller a second owner of the storage the receiver names, so it is released twice.  Clone it, or take the receiver by value (`this` or `mut this`) when the method is meant to consume what it is called on; a by-value receiver is not a reference, and its `return this;` is an ordinary move.  Inside an `unsafe` block the read is allowed, as for a field.
 
 Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility (see [section 2](#2-type-system) and [section 14](#14-pointers-and-memory)). Move tracking enforces the moved-set above and nothing more: it does not prove that a reference or pointer outlives what it points to.  The one borrow it does follow is a closure's borrow of what it captures, which no written reference stands for: E0457 above.
 
@@ -3956,8 +4068,8 @@ caught by it:
 | ------------------------------------- | ------------------------------------------------------ |
 | `std::alloc::rc::Rc`                  | non-atomic refcount; use `Arc` across threads          |
 | `std::sync::mutex::MutexGuard`        | POSIX mutexes must be released by the acquiring thread |
-| `std::sync::rwlock::RwLockReadGuard`  | as above                                               |
-| `std::sync::rwlock::RwLockWriteGuard` | as above                                               |
+| `std::sync::read_write_lock::ReadWriteLockReadGuard`  | as above                                               |
+| `std::sync::read_write_lock::ReadWriteLockWriteGuard` | as above                                               |
 | `std::thread::Scope`                  | records its threads without a lock; see [scoped threads](#scoped-threads) |
 
 A value holding a closure that borrows from the frame it was made in (one
@@ -3979,8 +4091,8 @@ therefore read the caller's locals, and update shared state through a
 const words: [String] = [String::from("a"), String::from("bc")];
 const total: Mutex<i64> = Mutex::<i64>::new(0);
 thread::scope((s: mut &thread::Scope) -> void {
-    s.spawn(() -> void { mut g = total.lock(); *g.as_mutable_ptr() += words[0].length() as i64; });
-    s.spawn(() -> void { mut g = total.lock(); *g.as_mutable_ptr() += words[1].length() as i64; });
+    s.spawn(() -> void { mut g = total.lock(); *g.as_mutable_pointer() += words[0].length() as i64; });
+    s.spawn(() -> void { mut g = total.lock(); *g.as_mutable_pointer() += words[1].length() as i64; });
 });
 // both threads are joined; `total` holds 3
 
@@ -4010,7 +4122,7 @@ Bounds are genuinely enforced: `Send`/`Sync` are checked at every explicit
 `where T: Send` / `where T: Sync`, and the thread entry points carry them. A
 thread's body is a callable taking no arguments - a `move` closure, a
 non-capturing lambda or a named function - and `thread::spawn`, `try_spawn`,
-`spawn_with_attr` and `Builder`'s `spawn` / `try_spawn` take it as
+`spawn_with_attributes` and `Builder`'s `spawn` / `try_spawn` take it as
 `F: () -> T + Send` with `T: Send`; `Scope::spawn` takes `F: () -> void + Send`.
 A closure is `Send` when everything it owns is, so moving an `Rc<T>` or a lock
 guard into another thread is a compile error, and so is giving `thread::spawn`
@@ -4027,7 +4139,7 @@ What the rule does **not** do is make `Send` a safety guarantee:
 
 - **Raw pointers are unconditionally `Send + Sync`.** This is deliberate -
   Cryo has no borrow checker, and the containers built on raw pointers
-  (`Box`, `Arc`, `Array`, `String`, `mpsc::Sender`) are structurally `Send`
+  (`Box`, `Arc`, `Array`, `String`, `channel::Sender`) are structurally `Send`
   because of it. A struct that hides a `T*` and reasons about it correctly
   does not have to fight the type system; a struct that hides a `T*` and
   reasons about it *incorrectly* is `Send` all the same.
@@ -4088,14 +4200,15 @@ type struct Gauge {
 | `![section("name")]`                                      | function / method                  | Place the emitted symbol in object-file section `name`.                                                                                                                                                                                                                                                                                                                                                                         |
 | `![naked]`                                                | function                           | Emit no prologue/epilogue (sets LLVM's `naked` attribute); the body must be a single `asm { … }` block that provides its own `ret`/`jmp`/exit. For a freestanding `_start` and other raw entry points. A non-`asm` body is an error (`E0151`).                                                                                                                                                                                  |
 | `![allow(name)]` / `![warn(name)]` / `![deny(name)]`      | any decl                           | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.* Each takes at most one `reason = "..."`, a non-empty string; a lint name is not checked, so an unknown one is accepted.                                                                                                                                                                                       |
-| `![sink]`                                                 | method                             | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics.                                                                                                                                                                                                                        |
-| `![implicit]`                                             | generic function / method          | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = ...` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f::<T>(...)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
+| `![implicit]`                                             | generic function / method          | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = ...` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f::<T>(...)`) there. Used by `VariadicArguments::next` so `const n: i64 = va.next()` reads cleanly. |
 | `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]`   | any decl                           | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match.                                                                                                                                                                                            |
 | `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / union / enum              | Memory layout control. See [section 16.3](#163-memory-layout).                                                                                                                                                                                                                                                                                                                                                                  |
 | `![align(N)]`                                             | struct / union / enum / variable   | Minimum alignment in bytes; N must be a power of two. See [section 16.3](#163-memory-layout).                                                                                                                                                                                                                                                                                                                                   |
 | `![arch(<arch>, <dialect>)]`                              | asm block                          | Required directly above an `asm { ... }` block (see [section 6.12](#612-inline-assembly)). Names the target architecture - which *gates* the block, like `![config]` - and the assembly dialect (`intel` or `att`).                                                                                                                                                                                                             |
 | `![clobber(...)]`                                         | asm block                          | Lists registers, `flags`, or `memory` that an `asm` block overwrites but does not bind as operands.                                                                                                                                                                                                                                                                                                                             |
 | `![language("name")]`                                     | function / method / trait method / struct / enum / trait | Marks the declaration as the language item `name`: a declaration the compiler reasons about by identity, such as the trait an operator lowers to or a function generated code calls. Only the standard library marks items: a declaration outside it is refused (`E0151`) and claims nothing. It marks each of its items so, and the compiler finds them by the directive and by nothing else; a call the compiler generates names its item and is never refused for visibility. `name` must be one of the compiler's items (`E0152`), and an item has one declaration: a second is refused at both (`E0152`).                                                                                          |
+| `![must_use]`                                             | function / method / struct / union / enum | The value must be read. A statement that discards a value of the type, or the value the function or method returns, warns (`W0017`). A value bound to a name, assigned, returned, passed on, matched, or produced as the value of a `match` expression's arm is read. To discard one on purpose, bind it to `_` with its type: `const _: Token = make_token();`. Takes no arguments. |
+| `![json(rename = "key", skip, default, skip_none)]`       | field                              | Adjusts the field's member in a derived `ToJson` / `FromJson`: its key, left out entirely, read as `default()` when absent, left out when it writes `null`. See [section 10.8](#108-derived-implementations-with-). An unknown option is `E0152`. |
 
 A method declared in a trait body takes `![language]` and no other directive (`E0151`), and a directive written above an associated type is refused (`E0151`).
 
@@ -4204,6 +4317,8 @@ type struct CacheLine {
 - The actual alignment of the type is `max(natural_alignment, N)`.
 - The size of the type is rounded up to its alignment.
 
+On an enum it means the same, simple or not: an array of an aligned enum is strided by its size, and a member of one starts on its boundary. An aligned simple enum is passed and stored as a value of that size holding its tag, not as the bare tag, and converts with `as` to and from its tag's integer as any simple enum does.
+
 `![align(N)]` is compatible with `![repr(C)]` and `![repr(transparent)]`; it is mutually exclusive with `![repr(packed)]`.
 
 `![align(N)]` on a variable raises that variable's alignment for the lifetime of its storage; this is useful for stack buffers that must satisfy SIMD or hardware-register alignment requirements.
@@ -4227,13 +4342,13 @@ An ADT enum (variants with payloads) is laid out as a tag (`i32`) followed by a 
 `sizeof(T)` and `alignof(T)` return compile-time `u64` constants reflecting the type's chosen layout - including any `![repr]` or `![align]` directives applied to it. They are the recommended way to verify FFI struct layout against a C header in a test:
 
 ```cryo
-import std::test::assert::{ expect_eq };
+import std::test::assert::{ expect_equal };
 import std::test::error::{ TestError };
 
 ![test]
 function timespec_matches_c() -> Result<(), TestError> {
-    expect_eq(sizeof(timespec), 16 as u64)?;
-    return expect_eq(alignof(timespec), 8 as u64);
+    expect_equal(sizeof(timespec), 16 as u64)?;
+    return expect_equal(alignof(timespec), 8 as u64);
 }
 ```
 
@@ -4261,6 +4376,8 @@ extern function exit(code: int) -> void;
 ```
 
 It is the programmer's responsibility to ensure the Cryo signature matches the C signature; the compiler cannot verify this across the language boundary.
+
+C's `long` and `unsigned long` are 64 bits on Linux and 32 on Windows, so no fixed-width integer spells them on both. `std::ffi::libc` declares `CLong` and `CUnsignedLong`, a type alias per target, and writes every binding whose C header says `long` with them: `libc::lround(value: f64) -> CLong`. A result is an `i32` on Windows and an `i64` on Linux, and widens implicitly into an `i64`.
 
 A function declared in an `extern` block is a top-level declaration of the
 module that holds the block, with the top-level visibility default: it is
@@ -4335,7 +4452,7 @@ function main() -> int {
 }
 ```
 
-Each `#include` takes either an angle-bracketed name (`<stdio.h>`, resolved on the C preprocessor's system include search path) or a quoted path (`"./my_header.h"`, resolved relative to the importing file) - exactly as in C. The identifier after `extern module` (`c` here) introduces a namespace into which the imported declarations are placed; access both functions and types with `::` (`c::printf`, `c::Point`) to prevent collisions between C and Cryo names. Only declarations from the named header(s) are imported - types pulled in transitively from system headers (`size_t`, `int32_t`, ...) are resolved to their Cryo primitive directly rather than re-emitted.
+Each `#include` takes either an angle-bracketed name (`<stdio.h>`, resolved on the C preprocessor's system include search path) or a quoted path (`"./my_header.h"`, resolved relative to the importing file) - exactly as in C. The identifier after `extern module` (`c` here) introduces a namespace into which the imported declarations are placed; access both functions and types with `::` (`c::printf`, `c::Point`) to prevent collisions between C and Cryo names. Only declarations from the named header(s) are imported - types pulled in transitively from system headers (`size_t`, `int32_t`, ...) are resolved to their Cryo primitive directly rather than re-emitted. An angle-bracketed name imports the declarations written in that header itself and in each system header it includes directly, one level down, since a C library commonly declares a header's interface in such a file: `#include <math.h>` binds `c::sqrt` whether the C library declares it in `<math.h>` or in a header `<math.h>` includes. A system header included any deeper is filtered: `#include <ctype.h>` binds `c::toupper`, but not a `size_t` that `<ctype.h>` reaches only through a header two levels down.
 
 Type mapping: a C `struct` becomes a `![repr(c)]` `type struct` and a named C `union` a native `type union` (one field per member, accessed directly); a tag that the header declares but never defines - the opaque-handle idiom, and any tag completed only on another platform - becomes a zero-field opaque record, usable through a pointer exactly as in C; a named `enum` becomes a `type enum` with its explicit discriminant values; an **anonymous** `enum` (which has no nameable type - its constants are plain integers in C) contributes one alias-namespaced `const` per constant (`enum { LO = 1, HI = 2 }` -> `c::LO`, `c::HI`); a `typedef` becomes a `type alias`; function-pointer parameters/fields map to Cryo `(Args) -> Ret`. Imported types and constants are namespaced under the alias only (`c::Point`, `c::LO`), never the global namespace.
 
@@ -4345,9 +4462,9 @@ Object-like `#define` constants are imported too, each as an alias-namespaced `c
 
 A body that is not a bare literal is **constant-folded by clang** and bound to the value it computes. That covers the shape most current C APIs use for flags, where a macro's body is another macro's invocation pinning the constant's width (`#define SDL_INIT_VIDEO SDL_UINT32_C(0x20)`), as well as ordinary constant arithmetic (`#define AREA (W * H)`). The **width** the C expression has is the width bound: `SDL_UINT64_C(0x10000000)` binds as `u64` even though its value would fit `u32`, because an API that ORs it into a 64-bit field needs it to.
 
-Macros that still can't be bound - **function-like** macros (`#define SQUARE(x) ...`), valueless guards (`#define HEADER_H`), and bodies that are not constant expressions (`#define NOW time(0)`) - are reported rather than silently dropped.
+Macros that still can't be bound - **function-like** macros (`#define SQUARE(x) ...`), valueless guards (`#define HEADER_H`), and bodies that are not constant expressions (`#define NOW time(0)`) - are reported rather than silently dropped. So is a floating constant, written or folded, whose value is an infinity or a NaN (`#define BIG (1e300 * 1e300)`): no float literal spells one, so naming it is refused rather than given another value.
 
-Macros are taken from **any header the import pulled in**, not only the file named in the `#include` line: a library's entry header is typically an umbrella of `#include`s that defines nothing itself. The compiler's own predefined macros (`__STDC__` and friends) live in no header and are excluded.
+Macros are taken from **any header the import pulled in**, not only the file named in the `#include` line: a library's entry header is typically an umbrella of `#include`s that defines nothing itself. The compiler's own predefined macros (`__STDC__` and friends) live in no header and are excluded, and so are the macros of system headers, but for the ones an angle-bracketed `#include` binds.
 
 A header's `extern` **globals** bind as [imported globals](#171-extern-blocks) under the alias (`extern int errno_value;` -> `c::errno_value`), including the loader idiom of exposing each entry point as a global function pointer. A `static` global is skipped and reported: it has no symbol outside the translation unit that defines it.
 
@@ -4572,7 +4689,7 @@ type trait AsyncRead {
     async read_exact(mut &this, buf: Array<u8>) -> AsyncIo {
         mut io: AsyncIo = await this.read(buf);
         while (io.is_short()) {
-            io = await this.read(io.take_buf());
+            io = await this.read(io.take_buffer());
         }
         return io;
     }
@@ -4690,7 +4807,7 @@ const b: i64 = h2.join();
 ```cryo
 import std::time;
 
-await Sleep::new(Duration::from_millis(50));
+await Sleep::new(Duration::from_milliseconds(50));
 await Sleep::until(deadline);
 ```
 
@@ -4707,7 +4824,7 @@ The `Futures` namespace composes futures. Each takes two futures and nests for h
 The duration comes first, so the deadline reads before the work it bounds:
 
 ```cryo
-match (await Futures::timeout(Duration::from_secs(5), fetch(url))) {
+match (await Futures::timeout(Duration::from_seconds(5), fetch(url))) {
     Result::Ok(body) => { ... }
     Result::Err(_)   => { ... }   // timed out
 }
@@ -4728,7 +4845,7 @@ Async I/O futures **own the handle and the buffer** for the duration of the oper
 ```cryo
 mut io: TcpIo = await TcpRead::start(stream, buf);
 mut stream: TcpStream  = io.take_stream();
-mut buf:    Array<u8>  = io.take_buf();
+mut buf:    Array<u8>  = io.take_buffer();
 match (io.outcome()) {
     Result::Ok(n)  => { ... }      // n == 0 means the peer closed
     Result::Err(e) => { ... }
@@ -4773,7 +4890,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `core::option`       | `Option<T>` (`Some` / `None`) and its methods                                                                         |
 | `core::result`       | `Result<T, E>` (`Ok` / `Err`) and its methods                                                                         |
 | `core::primitives`   | Methods on built-in types (`(-5 as i32).abs()`, `(2.0).sqrt()`, `x.clamp(lo, hi)`, `char::is_digit`, ...)             |
-| `core::varargs`      | `VaArgs`, the compiler-assigned type of a function's `args...` bucket                                                 |
+| `core::variadic_arguments`      | `VariadicArguments`, the compiler-assigned type of a function's `args...` bucket                                                 |
 | `core::drop`, `core::marker`, `core::cmp`, `core::clone` | `Drop`, the marker traits (`Copy`, `Send`, `Sync`), `Eq` / `Ord` / `Ordering`, `Clone` |
 | `collections::array` | `Array<T>`, the type `[T]` names                                                                                       |
 | `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: [T; N]`)                 |
@@ -4787,34 +4904,34 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 
 | Module            | Highlights                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`core`**        | The language foundations. `Option<T>` and `Result<T, E>` with their combinators - beyond `map` / `and_then` / `or_else`, `filter`, `map_or`, `map_or_else`, `and`, `or`, `xor` and `zip` (a `Pair` of both values), `unwrap_or_default`, `is_some_and` / `is_none_or` (`is_ok_and` / `is_err_and`), `inspect` (`inspect_err`) and `expect_err`; a combinator that discards a value or an error releases it. `Slice<T>`, `NonNull<T>`, `Range<T>`, `RangeInclusive<T>`, `Ordering`. Traits: `Copy`, `Drop`, `Clone`, `Default`, `Eq`, `Ord`, `Hash`, `Iterator<Item>` (beyond the lazy adapters, `collect` builds any `FromIterator<T>` - an `Array`, a `HashMap` from `Pair`s, a `HashSet`, a `String` from `char`s - as the type wanted where it stands, `sum` adds into any `Sum` number, `rev` reverses a `DoubleEndedIterator` such as a range or a slice's iterator, `peekable` reads ahead with `peek`, and `flat_map` yields each element's iterator in turn), `From`/`Into`/`TryFrom`/`TryInto`, `Step`, and `error::Error` (supertraits `Display` and `Debug`; `source()` names the error this one was caused by, `None` by default), which every standard library error implements - `IoError`, `Utf8Error`, `JsonError`, `FmtError`, `AllocError`, `ConversionError`, `RandomError`, `DecodeError`, `UrlError`, `DateTimeError`, `ArgumentError`, `LogSpecificationError`, `SpawnError`, `JoinError`, `SendError<T>`, `RecvError`, `TryRecvError`, `ReceiveTimeoutError` and `TestError`; `ErrorReport::from_error(&error)` keeps the text of any `Error` and of each source - `message()`, `causes()` - and prints them joined by `: ` (through `Debug`, each cause on a line of its own). Every `Error` converts into its `ErrorReport` through `From`, so `?` in a function returning `Result<T, ErrorReport>` passes any standard error on as a report; generic `cmp::min` / `cmp::max` (`where T: Ord`). Memory utilities (`copy`, `zero`, `swap`, `transmute`). Hashing (`Hasher`; `FnvHasher`, FNV-1a, fixed and reproducible across runs, for digests and for maps whose keys are trusted; `SipHasher`, keyed SipHash - `with_keys_1_3` and `with_keys_2_4` - for a hash whose input an adversary chooses; a default `SipHasher` is SipHash-1-3 under a key drawn per hasher from a per-process random seed).                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| **`alloc`**       | `Layout`, `Allocator` trait, `GlobalAlloc`, `Box<T>`, `Arena` (bump allocator with reset), `Pool` (fixed-slot slab), `Rc<T>` (single-threaded reference counting), `Arc<T>` (atomic reference counting for cross-thread sharing).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| **`collections`** | `Array<T, A>` (growable contiguous), `Str` (borrowed length-typed UTF-8 view; `split`, `split_nonempty`, `split_whitespace` and `lines` iterate borrowed pieces, the separator `join`s an iterator of pieces - `Str::new(", ").join(words.split_whitespace())` - and `repeat`, `char_count` and `is_char_boundary` round it out), `String<A>` (owned UTF-8; `insert`, `remove` and `pop` work a scalar at a time at char boundaries), `HashMap<K, V, A, H>` (separate-chaining; keys hashed by `H`, by default a `SipHasher` keyed per map, so which keys share a bucket cannot be worked out by whoever chooses them; `HashMap<K, V, GlobalAlloc, FnvHasher>` names the faster unkeyed hasher, and `with_hasher` builds a map around a given hasher), `HashSet<T, A, H>` (the same hasher parameter), `BTreeMap<K, V, A>` and `BTreeSet<T, A>` (a B-tree kept in `Ord` order: O(log n) lookup, insert and remove, `first`/`last` and `pop_first`/`pop_last`, iterators that run in ascending order from either end, and `range`, which walks the entries whose keys a `RangeBounds` holds, `map.range(low..high)`, finding its two ends in O(log n)), `Deque<T, A>` and `BinaryHeap<T, A>`, `Pair<A, B>` (owned two-element tuple). All allocator-generic with `GlobalAlloc` default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| **`io`**          | `Read` / `Write` traits with rich defaults (`read_byte`, `read_until`, `read_to_end`, `read_to_string`, `write_all`, `write_str`, `write_line`). `Stdin`, `Stdout`, `Stderr` handles with `is_tty()`/`as_fd()`. On a Windows console, standard output and standard error - these handles and the `fmt` print family alike - are written as UTF-16 through the console's own write call, so UTF-8 text shows as written whatever the console's code page, and a character split across two writes still shows whole; a pipe or a file gets exactly the bytes written, each line feed as one byte, since a program's standard output and standard error are put in binary mode before `main` runs. `Stdin` reads a Windows console through its UTF-16 read, so typed text arrives as UTF-8 whatever the code page, each CR LF as one LF, and a Ctrl-Z ends the input there (a line that begins with one is the end of input); a piped or redirected standard input is read in binary mode, so its bytes arrive exactly as sent - a CR LF stays two bytes and a Ctrl-Z byte is data. `io::terminal` styles text: `Style::new().foreground(Color::Red).bold().paint(value)` prints `value` between the escape sequence for the style and a reset (a `Style` that sets nothing writes the value alone), and `Terminal::supports_color(StandardStream::Error)` says whether a stream takes colour - it is a terminal, `NO_COLOR` is unset or empty and `TERM` is not `dumb`; on Windows it also turns on the console's escape-sequence processing. `BufWriter<W>` / `LineWriter<W>` / `BufReader<R>` (each over a `mut` pointer to its source or sink; `BufReader.lines()` yields owned, UTF-8-checked lines without their endings). POSIX flag constants and an `IoError` / `IoErrorKind` mapping `errno` and Windows error codes; an `IoError` carries the operation that failed (`IoOperation`) and the path it named, and prints as `could not open config.toml: not found`; a kind's `label` (`not_found`) and `description` (`not found`) and an operation's `verb` (`open`) are `Str` views of static text. `IoErrorKind`, `IoOperation` and the standard library's other fieldless kind and error enums implement `Eq` and `Clone`, so `error.kind == IoErrorKind::NotFound` holds wrapped too, as an `Option<IoErrorKind>` or in a `Result`. `read_to_string` refuses bytes that are not UTF-8.                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| **`fmt`**         | `Display` and `Debug` traits (a reference displays as the value it refers to, so `f"{name}"` with `name: &String` prints the string), `Formatter` borrowing its sink as a `virtual mut &FmtWrite`, `FmtWrite`, `fmt::Arguments` (an f-string written where it goes: `sink.write(f"...")`), `print` / `println` / `eprint` / `eprintln`, `format_to_string`, `format_debug_to_string`; a `Debug` text built member by member - `f.debug_struct("Point").field("x", &this.x).field("y", &this.y).finish()` writes `Point { x: 1, y: 2 }`, `f.debug_tuple("Some").field(&value).finish()` writes `Some(1)`, and a formatter made by `Formatter::pretty` writes one member per line, indented four spaces a level; `format` / `printf` / `eprintf` for C-style `%s`/`%d` text, `format` into an owned `String`. Heap-free float writers into a caller's `mut &Slice<u8>` (`f64.to_buf`, `to_buf_with`, `to_buf_roundtrip`), each returning the bytes written or `None`, writing nothing, for a slice shorter than `F64_MAX_DIGITS` (one byte more per decimal past 13), and `parse_f64`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **`core`**        | The language foundations. `Option<T>` and `Result<T, E>` with their combinators - beyond `map` / `and_then` / `or_else`, `filter`, `map_or`, `map_or_else`, `and`, `or`, `xor` and `zip` (a `Pair` of both values), `unwrap_or_default`, `is_some_and` / `is_none_or` (`is_ok_and` / `is_err_and`), `inspect` (`inspect_err`), `expect_err`, and `flatten` on an `Option<Option<T>>` alone; a combinator that discards a value or an error releases it. `Slice<T>`, `NonNull<T>`, `Range<T>`, `RangeInclusive<T>`, `Ordering`. Traits: `Copy`, `Drop`, `Clone`, `Default`, `Eq`, `Ord`, `Hash`, `Iterator<Item>` (beyond the lazy adapters, `collect` builds any `FromIterator<T>` - an `Array`, a `HashMap` from `Pair`s, a `HashSet`, a `String` from `char`s - as the type wanted where it stands, `sum` adds into any `Sum` number, `reverse` reverses a `DoubleEndedIterator` such as a range or a slice's iterator, `peekable` returns a `Peekable<T>`, an iterator that reads ahead with `peek`, and `flat_map` yields each element's iterator in turn), `From`/`Into`/`TryFrom`/`TryInto`, `Step`, and `error::Error` (supertraits `Display` and `Debug`; `source()` names the error this one was caused by, `None` by default), which every standard library error implements - `IoError`, `Utf8Error`, `JsonError`, `FormatError`, `AllocationError`, `ConversionError`, `RandomError`, `DecodeError`, `UrlError`, `DateTimeError`, `ArgumentError`, `LogSpecificationError`, `SpawnError`, `JoinError`, `SendError<T>`, `TrySendError<T>`, `ReceiveError`, `TryReceiveError`, `ReceiveTimeoutError` and `TestError`; `ErrorReport::from_error(&error)` keeps the text of any `Error` and of each source - `message()`, `causes()` - and prints them joined by `: ` (through `Debug`, each cause on a line of its own). Every `Error` converts into its `ErrorReport` through `From`, so `?` in a function returning `Result<T, ErrorReport>` passes any standard error on as a report; generic `cmp::min` / `cmp::max` (`where T: Ord`). Memory utilities (`copy`, `zero`, `swap`, `transmute`). Hashing (`Hasher`; `FnvHasher`, FNV-1a, fixed and reproducible across runs, for digests and for maps whose keys are trusted; `SipHasher`, keyed SipHash - `with_keys_1_3` and `with_keys_2_4` - for a hash whose input an adversary chooses; a default `SipHasher` is SipHash-1-3 under a key drawn per hasher from a per-process random seed).                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **`alloc`**       | `Layout`, `Allocator` trait, `GlobalAllocator`, `Box<T>`, `Arena` (bump allocator with reset), `Pool` (fixed-slot slab), `Rc<T>` (single-threaded reference counting), `Arc<T>` (atomic reference counting for cross-thread sharing).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| **`collections`** | `Array<T, A>` (growable contiguous), `Str` (borrowed length-typed UTF-8 view; `split`, `split_nonempty`, `split_whitespace` and `lines` iterate borrowed pieces, the separator `join`s an iterator of pieces - `Str::new(", ").join(words.split_whitespace())` - and `repeat`, `char_count` and `is_char_boundary` round it out), `String<A>` (owned UTF-8; it holds a `Str` view of its text and dereferences to it, so every `Str` method reads a `String` - `s.trim()`, `s.split(...)` - and the string adds only what changes or owns text: `push` and its kin, `insert`, `remove` and `pop` working a scalar at a time at char boundaries, `truncate`, `reserve`, `as_c_string`), `HashMap<K, V, A, H>` (separate-chaining; keys hashed by `H`, by default a `SipHasher` keyed per map, so which keys share a bucket cannot be worked out by whoever chooses them; `HashMap<K, V, GlobalAllocator, FnvHasher>` names the faster unkeyed hasher, and `with_hasher` builds a map around a given hasher), `HashSet<T, A, H>` (the same hasher parameter), `BTreeMap<K, V, A>` and `BTreeSet<T, A>` (a B-tree kept in `Ord` order: O(log n) lookup, insert and remove, `first`/`last` and `pop_first`/`pop_last`, iterators that run in ascending order from either end, and `range`, which walks the entries whose keys a `RangeBounds` holds, `map.range(low..high)`, finding its two ends in O(log n)), `Deque<T, A>` and `BinaryHeap<T, A>`, `Pair<A, B>` (owned two-element tuple). All allocator-generic with `GlobalAllocator` default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **`io`**          | `Read` / `Write` traits with rich defaults (`read_byte`, `read_until`, `read_to_end`, `read_to_string`, `write_all`, `write_str`, `write_line`). `Stdin`, `Stdout`, `Stderr` handles with `is_terminal()`/`as_file_descriptor()`. On a Windows console, standard output and standard error - these handles and the `fmt` print family alike - are written as UTF-16 through the console's own write call, so UTF-8 text shows as written whatever the console's code page, and a character split across two writes still shows whole; a pipe or a file gets exactly the bytes written, each line feed as one byte, since a program's standard output and standard error are put in binary mode before `main` runs. `Stdin` reads a Windows console through its UTF-16 read, so typed text arrives as UTF-8 whatever the code page, each CR LF as one LF, and a Ctrl-Z ends the input there (a line that begins with one is the end of input); a piped or redirected standard input is read in binary mode, so its bytes arrive exactly as sent - a CR LF stays two bytes and a Ctrl-Z byte is data. `io::terminal` styles text: `Style::new().foreground(Color::Red).bold().paint(value)` prints `value` between the escape sequence for the style and a reset (a `Style` that sets nothing writes the value alone), and `Terminal::supports_color(StandardStream::Error)` says whether a stream takes colour - it is a terminal, `NO_COLOR` is unset or empty and `TERM` is not `dumb`; on Windows it also turns on the console's escape-sequence processing. `BufferedWriter<W>` / `LineWriter<W>` / `BufferedReader<R>` (each over a `mut` pointer to its source or sink; `BufferedReader.lines()` yields owned, UTF-8-checked lines without their endings). POSIX flag constants and an `IoError` / `IoErrorKind` mapping `errno` and Windows error codes; an `IoError` carries the operation that failed (`IoOperation`) and the path it named, and prints as `could not open config.toml: not found`; a kind's `label` (`not_found`) and `description` (`not found`) and an operation's `verb` (`open`) are `Str` views of static text. `IoErrorKind`, `IoOperation` and the standard library's other fieldless kind and error enums implement `Eq` and `Clone`, so `error.kind == IoErrorKind::NotFound` holds wrapped too, as an `Option<IoErrorKind>` or in a `Result`. `read_to_string` refuses bytes that are not UTF-8.                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| **`fmt`**         | `Display` and `Debug` traits (a reference displays as the value it refers to, so `f"{name}"` with `name: &String` prints the string), `Formatter` borrowing its sink as a `virtual mut &FormatWrite`, `FormatWrite`, `fmt::Arguments` (an f-string written where it goes: `sink.write(f"...")`), `print` / `println` / `eprint` / `eprintln`, `format_to_string`, `format_debug_to_string`; a `Debug` text built member by member - `f.debug_struct("Point").field("x", &this.x).field("y", &this.y).finish()` writes `Point { x: 1, y: 2 }`, `f.debug_tuple("Some").field(&value).finish()` writes `Some(1)`, and a formatter made by `Formatter::pretty` writes one member per line, indented four spaces a level; `format` / `printf` / `eprintf` for C-style `%s`/`%d` text, `format` into an owned `String`. Heap-free float writers into a caller's `mut &Slice<u8>` (`f64.to_buffer`, `to_buffer_with`, `to_buffer_roundtrip`), each returning the bytes written or `None`, writing nothing, for a slice shorter than `F64_MAX_DIGITS` (one byte more per decimal past 13), and `parse_f64`, which reads text that is one decimal or scientific number, its point `.` under any numeric locale, and answers `None` for text with any byte after the number (`"1abc"`), for a hexadecimal float (`"0x1p4"`), or for `"inf"`, `"infinity"` or `"nan"` in any case.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | **`encoding`**    | Byte-to-text codecs. `Base64` names an RFC 4648 variant - `standard`, `standard_unpadded`, `url_safe`, `url_safe_unpadded` - with `encode(&Slice<u8>) -> String`, `encode_into(bytes, mut &String)` and `decode(Str) -> Result<Array<u8>, DecodeError>`. `PercentEncoding` (RFC 3986): `encode_component` escapes every byte but the unreserved characters, `encode_path` keeps `/` as well, and `decode` turns `%XX` back into bytes and refuses a result that is not UTF-8. A `DecodeError` names its `DecodeErrorKind` and the input byte it was found at, and prints as `invalid padding at byte 2`. `hex::encode`, `sha1`, `Sha256`, and the `Utf16` codec the wide-character Windows calls take: `Utf16::encode(Str)` with a NUL after, `Utf16::encode_into(bytes, mut &Array<u16>)` for UTF-8 arriving in pieces (it answers the bytes it used, leaving a character cut short at the end for the next piece), `Utf16::decode`, which refuses a lone surrogate, and `Utf16::decode_lossy`, which reads it as U+FFFD. |
 | **`json`**        | RFC 8259 parser and serialiser. `JsonValue`, `JsonNumber`, `JsonObject` (insertion-ordered). `parse`, `stringify`, `stringify_pretty`. `json::convert`: `ToJson` writes a value as a `JsonValue` (`ports.to_json()`) and `FromJson` reads one back (`Array::<u16>::from_json(&value)`), for `boolean`, every integer width, `f32`, `f64`, `String`, `Array<T>`, and `HashMap<String, V>` / `BTreeMap<String, V>` (a JSON object), and `Option<T>` (`None` as `null`); `Str` is written only. Reading refuses a value of the wrong shape, an integer out of range or with a fraction, with a `JsonDecodeError` that says where (`at .servers[2].port: expected a u16, found a string`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| **`fs`**          | Each operation on the type it is about, all re-exported from `std::fs`. `File`: `open` / `create` / `open_with(path, &OpenOptions)` (`Read + Write + Seek`, closed on drop, `metadata`, `set_length`, `sync_all`) and whole-file statics `read_text` (UTF-8 checked) / `read_bytes` / `write_text` / `write_bytes` / `append_text` / `copy` / `remove`. `Directory`: `create` / `create_all` / `remove` / `remove_all` / `entries` (a `DirectoryEntries` iterator of `DirectoryEntry`: `name`, `path`, `file_type`, `metadata`). `Path` (borrowed; a `string` or `Str` converts to one implicitly) and `PathBuf` (owned): lexical `parent` / `file_name` / `stem` / `extension` / `with_extension` / `join`, and what is at the path: `exists`, `is_file`, `is_directory`, `metadata` / `symlink_metadata` (typed `Metadata`), `rename_to`, `canonicalize`. `TempFile` / `TempDirectory`: created exclusively under `env::temp_directory()`, removed when dropped unless `keep` is called. Every failure is an `IoError` naming its path. Windows goes through the wide-character (`*W`) calls, so any filename works. |
-| **`ffi`**         | The C ABI boundary. `libc` is the single home for every `extern "C"` the stdlib needs (POSIX I/O, sockets, math) and the named POSIX constants. A C string is a `string`; `Str::new` reads one, and `String::with_null` / `as_cstr` make one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| **`env`**         | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `temp_directory() -> PathBuf`. On Windows these, `vars`, `current_dir`, `set_current_dir` and `current_exe` go through the wide-character calls (`CommandLineToArgvW` for the arguments, the UTF-16 environment block for `vars`, which so reads the live environment and leaves out the `=C:` drive records), so non-ASCII arguments, variables and directories round-trip; a lone surrogate in an argument or variable reads as U+FFFD (`Utf16::decode_lossy`). `env::arguments` reads a command line against a declaration: `ArgumentParser::new(program)` with chained `flag(long, short, help)`, `option(long, short, value_name, help)`, `positional(name, help)` and `optional_positional(name, help)`; `parse(arguments.as_slice())` gives `ParsedArguments` - `flag(name)`, `occurrences(name)` (`-vvv` is 3), `value(name)` (the last given) and `values(name)` - or an `ArgumentError` naming the argument and its `ArgumentErrorKind`, printed as `unknown option '--colour'`. An option's value is written `--name=v`, `--name v`, `-nv` or `-n v`, short flags group (`-cv`), and `--` ends the options. `help_text()` is a usage line and an aligned list of every declaration.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| **`math`**        | `f64` functions: `cbrt`, `pow`, `powi`, `hypot`, `mul_add`, `exp` / `exp2` / `expm1`, `ln`, `log` / `log2` / `log10` / `log1p`, `sin` / `cos` / `tan` (plus the `a*` inverses, `atan2`, and the `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fract`, `copysign`, `fmod`, `signum`, classification (`is_nan`, `is_finite`, `classify`, ...), integer `gcd` / `lcm` / `is_power_of_two`, `align_up` / `align_down`, and the mathematical constants (`PI`, `TAU`, `E`, `SQRT_2`, ...); the float types' limits are constants of the types (`f64::EPSILON`, `f64::INFINITY`, [section 12.3](#123-implement-blocks-on-primitives)). `sqrt`, `abs`, `checked_abs` and `clamp` are **methods of each numeric primitive** in `core::primitives`, not `math` functions: `(16.0).sqrt()`, `(-5 as i32).abs()`, `x.clamp(lo, hi)`. A float's `abs` clears the sign bit; there is no `fabs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| **`time`**        | `Duration` (normalized seconds + sub-second nanoseconds; `from_secs`/`from_millis`/`from_micros`/`from_nanos`, `as_secs`/`as_millis`/`as_micros`/`as_nanos`/`subsec_*`, which panic when the total overflows `u64`; `checked_add`/`checked_sub`/`checked_multiply`/`checked_divide` answer `None` where `scale`/`divide` panic, and the `saturating_*` forms clamp; `try_from_secs_f64` refuses NaN, a negative and infinity, which `from_secs_f64` panics on; `is_zero`, `Eq` + `Ord`). `Instant` (monotonic `CLOCK_MONOTONIC`; `now`, `elapsed`, `duration_since`, which saturates at zero). `SystemTime` (wall `CLOCK_REALTIME`; `now`, `unix_epoch`, `duration_since_epoch`; `duration_since` is `None` when the clock was stepped back between the readings, `saturating_duration_since` zero). `sleep(Duration)` (EINTR-restarting). `DateTime`, a civil reading at a fixed `UtcOffset` (`utc`, `from_seconds` in whole minutes): `parse_rfc3339` / `format_rfc3339` (`Display` writes the same text, `1996-12-19T16:39:57-08:00`; a parse error is a `DateTimeError` naming the byte; a leap second is refused), `from_parts` checking every field, `unix_seconds`, `weekday`, `to_offset`, and `add` / `subtract` / `duration_since` with a `Duration`. Every timeout the library takes is a `Duration` (`HttpServer.with_read_timeout`, `Futures::timeout`, `Child.wait_timeout`).                                                                                                                                                                                                                                                                                                                                                                               |
+| **`fs`**          | Each operation on the type it is about, all re-exported from `std::fs`. `File`: `open` / `create` / `open_with(path, &OpenOptions)` (`Read + Write + Seek`, closed on drop, `metadata`, `set_length`, `synchronize_all`) and whole-file statics `read_text` (UTF-8 checked) / `read_bytes` / `write_text` / `write_bytes` / `append_text` / `copy` / `remove`. `Directory`: `create` / `create_all` / `remove` / `remove_all` / `entries` (a `DirectoryEntries` iterator of `DirectoryEntry`: `name`, `path`, `file_type`, `metadata`). `Path` (borrowed; a `string` or `Str` converts to one implicitly) and `PathBuf` (owned, `push` and `pop` changing it; it holds a `Path` view of its text and dereferences to it, so every `Path` method reads a `PathBuf`): lexical `parent` / `file_name` / `stem` / `extension` / `with_extension` / `join`, and what is at the path: `exists`, `is_file`, `is_directory`, `metadata` / `symlink_metadata` (typed `Metadata`), `rename_to`, `canonicalize`. `TemporaryFile` / `TemporaryDirectory`: created exclusively under `env::temporary_directory()`, removed when dropped unless `keep` is called. Every failure is an `IoError` naming its path. Windows goes through the wide-character (`*W`) calls, so any filename works. |
+| **`ffi`**         | The C ABI boundary. `libc` is the single home for every `extern "C"` the stdlib needs (POSIX I/O, sockets, math) and the named POSIX constants. A C string is a `string`; `Str::new` reads one, and `String::with_null` / `as_c_string` make one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **`env`**         | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `temporary_directory() -> PathBuf`. On Windows these, `vars`, `current_directory`, `set_current_directory` and `current_executable` go through the wide-character calls (`CommandLineToArgvW` for the arguments, the UTF-16 environment block for `vars`, which so reads the live environment and leaves out the `=C:` drive records), so non-ASCII arguments, variables and directories round-trip; a lone surrogate in an argument or variable reads as U+FFFD (`Utf16::decode_lossy`). `env::arguments` reads a command line against a declaration: `ArgumentParser::new(program)` with chained `flag(long, short, help)`, `option(long, short, value_name, help)`, `positional(name, help)` and `optional_positional(name, help)`; `parse(arguments.as_slice())` gives `ParsedArguments` - `flag(name)`, `occurrences(name)` (`-vvv` is 3), `value(name)` (the last given) and `values(name)` - or an `ArgumentError` naming the argument and its `ArgumentErrorKind`, printed as `unknown option '--colour'`. An option's value is written `--name=v`, `--name v`, `-nv` or `-n v`, short flags group (`-cv`), and `--` ends the options. `help_text()` is a usage line and an aligned list of every declaration.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **`math`**        | `f64` functions: `cbrt`, `power`, `power_integer`, `hypot`, `mul_add`, `exp` / `exp2` / `expm1`, `ln`, `log` / `log2` / `log10` / `log1p`, `sin` / `cos` / `tan` (plus the `a*` inverses, `atan2`, and the `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fract`, `copysign`, `fmod`, `signum`, classification (`is_nan`, `is_finite`, `classify`, ...), integer `gcd` / `lcm` / `is_power_of_two`, `align_up` / `align_down`, and the mathematical constants (`PI`, `TAU`, `E`, `SQRT_2`, ...); the float types' limits are constants of the types (`f64::EPSILON`, `f64::INFINITY`, [section 12.3](#123-implement-blocks-on-primitives)). `sqrt`, `abs`, `checked_abs` and `clamp` are **methods of each numeric primitive** in `core::primitives`, not `math` functions: `(16.0).sqrt()`, `(-5 as i32).abs()`, `x.clamp(lo, hi)`. A float's `abs` clears the sign bit; there is no `fabs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **`time`**        | `Duration` (normalized seconds + sub-second nanoseconds; `from_seconds`/`from_milliseconds`/`from_microseconds`/`from_nanoseconds`, `as_seconds`/`as_milliseconds`/`as_microseconds`/`as_nanoseconds`/`subsec_*`, which panic when the total overflows `u64`; `checked_add`/`checked_subtract`/`checked_multiply`/`checked_divide` answer `None` where `scale`/`divide` panic, and the `saturating_*` forms clamp; `try_from_seconds_f64` refuses NaN, a negative and infinity, which `from_seconds_f64` panics on; `is_zero`, `Eq` + `Ord`). `Instant` (monotonic `CLOCK_MONOTONIC`; `now`, `elapsed`, `duration_since`, which saturates at zero). `SystemTime` (wall `CLOCK_REALTIME`; `now`, `unix_epoch`, `duration_since_epoch`; `duration_since` is `None` when the clock was stepped back between the readings, `saturating_duration_since` zero). `sleep(Duration)` (EINTR-restarting). `DateTime`, a civil reading at a fixed `UtcOffset` (`utc`, `from_seconds` in whole minutes): `parse_rfc3339` / `format_rfc3339` (`Display` writes the same text, `1996-12-19T16:39:57-08:00`; a parse error is a `DateTimeError` naming the byte; a leap second is refused), `from_parts` checking every field, `unix_seconds`, `weekday`, `to_offset`, and `add` / `subtract` / `duration_since` with a `Duration`. Every timeout the library takes is a `Duration` (`HttpServer.with_read_timeout`, `Futures::timeout`, `Child.wait_timeout`).                                                                                                                                                                                                                                                                                                                                                                               |
 | **`log`**         | `Logger::new(area)` names an area and logs at a `LogLevel` (`Error`, `Warning`, `Information`, `Debug`, `Trace`): `log.warning(f"no route for {path}")`, `error` / `information` / `debug` / `trace`, or `log(level, message)`. The message is an f-string formatted only when a sink writes it, so a refused record costs one atomic load; the record carries the logging call's location. `Logging` holds the process-wide settings: `set_level`, `set_area_level` (an area's level covers the areas below it, `http` for `http::server`; the longest named area wins), `configure("information,http=debug")` and `configure_from_environment(variable)`, which apply nothing when an entry cannot be read (`LogSpecificationError`), and `set_sink(&sink)` for a `LogSink` of the program's own, which receives one `LogRecord` (level, area, message, location, time) at a time. Until then records at `Warning` and above go to `StandardErrorSink`: `2026-11-09T14:03:07Z warning http: ...`, the level coloured when standard error takes colour. |
-| **`random`**      | Free functions over the thread's own OS-seeded generator: `random::range(low, high)`, `float()`, `boolean()`, `value::<T>()`, `choose(&items)`, `shuffle(&items)` - see [section 19.4](#194-random-numbers). The `RandomSource` trait: `next<T>` (any integer width, `boolean`, `f32`/`f64`, `char`), unbiased `next_below(bound)` / `next_range(lo, hi)` (rejection-sampled; integers, `f32` and `f64`), `fill`, `choose`, `shuffle`. `Rng`, a fast non-cryptographic xoshiro256** source seeded via `from_seed(u64)` (reproducible: a seed's stream is the same on every version), `from_os()`, or the thread's own `for_current_thread()`. `SecureRng` draws from the kernel CSPRNG (`try_fill(&view)` reports `EntropyUnavailable` where `fill` panics); use it for keys/tokens/nonces - `Rng` is not cryptographic. Distributions (`UniformI64`, `Normal`, `Bernoulli`, `WeightedIndex`, ...) sample from any source.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| **`net`**         | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`AsyncTransport`), `TcpListener`. **Every operation that can wait is a future** driven by an `Executor` — there is no blocking socket surface. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers` (an ordered list of fields: `append` keeps a repeated name such as `Set-Cookie`, `insert` replaces every value, `get` is the first, `get_all` each in order), bodies framed by `Content-Length` or the chunked transfer coding (read by the connection, written with `chunked::ChunkedEncoder`; both framings at once, or two different lengths, are refused with 400, another transfer coding with 501, and a response with neither runs to the end of the connection), `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, and one `Client` (`net::http::client`) whose `get`/`post`/`send` take a `Url`: the scheme picks TCP or TLS, every address the host resolves to (IPv6 included) is tried in turn, HTTP/2 is offered by ALPN when it is built `with_http2()`, `with_timeout(Duration)` bounds the whole request with its redirects (`TimedOut`), and 301/302/303/307/308 are followed up to `with_redirect_limit` (20 by default), a 303 - or a 301/302 after a `POST` - as a body-less `GET`, without `Authorization`/`Cookie` when the redirect leaves the origin. `Url.join` resolves a reference such as a `Location` against a URL. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`; a `TlsConnector` trusts OpenSSL's default verify paths, on Windows the Windows ROOT certificate store as well, and any root added with `add_root_certificate(pem)`, which `Client` passes through), **UDP** (`UdpSocket`, datagram send/receive futures), **DNS** (`net::dns`; `Resolve` runs `getaddrinfo` on the executor's blocking pool rather than stalling a worker), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. A `TcpStream` connects to an IPv4 or IPv6 address. |
-| **`process`**     | Subprocess spawning: `fork + execve` on POSIX, `CreateProcessW` on Windows, with the command line, the environment block and the working directory in UTF-16, so non-ASCII arguments, variables and paths reach the child intact. `Command` builder (`arg`, `args` from an iterator of `Str`, `env`, `env_remove`, `env_clear`, `stdin`/`stdout`/`stderr`, `current_directory`; every setter returns the command, so `cmd.arg(a).arg(b).stdout(Stdio::Piped)` chains), `Command::shell(Str)` for a whole command line, `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal` (and its `SigNo`, both `Eq`: `Signal::from_i32(2).unwrap() == Signal::interrupt()`). A program that cannot be started is `spawn`'s `IoError`, naming the program (`could not start tool: not found`; `NotExecutable` for a file that is no program) or the working directory it could not enter. A piped stream is taken out of a running child with `child.stdout.take()`. `cmd.group_descendants()` starts the child as the root of its own process tree (a process group on POSIX; a job object and a console process group of its own on Windows), and `child.kill_tree()` then ends it together with everything it started. `ExitStatus.peak_memory_bytes()` is the most physical memory the child held at once; `process::memory::SystemMemory::query()` reads the machine's installed and available memory. On Windows, `send_signal` supports `Signal::kill()`, and `Signal::interrupt()` to a grouped child, delivered as Ctrl-Break; on every platform it refuses (`InvalidInput`) a child already waited for. `process::signal_handling::Signals::listen()` receives the interrupt and terminate signals for a clean shutdown (SIGINT/SIGTERM on POSIX; on Windows Ctrl-C and Ctrl-Break as interrupt, a console close, logoff or shutdown as terminate, after which Windows still ends the process at its own time limit, 5 seconds by default): while a `Signals` lives they no longer end the process, and `wait()`, `wait_timeout(d)` and `try_wait()` hand each one over once.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_sub` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`, every one taking `&this`, so a cell is updated through any shared reference to it), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`; each reads the guarded value through `as_ptr()` (a read-only `T*`), and the two exclusive guards, held writably, write it through `as_mutable_ptr()` (a `mut T*`). `Send` / `Sync` are computed structurally with call-site enforcement - see [section 15.4](#154-the-send-and-sync-traits).                                                                                                                                                                                                                                                                                                    |
-| **`thread`**      | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep` / `sleep_ms`, plus `sync::mpsc` channels (`Channel::unbounded` / `Channel::bounded`, each giving a `Pair` of its `Sender` and `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn.                                                                                                                                                                                                                                                                                                             |
-| **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [section 20](#20-testing).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **`random`**      | Free functions over the thread's own OS-seeded generator: `random::range(low, high)`, `float()`, `boolean()`, `value::<T>()`, `choose(&items)`, `shuffle(&items)` - see [section 19.4](#194-random-numbers). The `RandomSource` trait: `next<T>` (any integer width, `boolean`, `f32`/`f64`, `char`), unbiased `next_below(bound)` / `next_range(lo, hi)` (rejection-sampled; integers, `f32` and `f64`), `fill`, `choose`, `shuffle`. `Rng`, a fast non-cryptographic xoshiro256** source seeded via `from_seed(u64)` (reproducible: a seed's stream is the same on every version), `from_operating_system()`, or the thread's own `for_current_thread()`. `SecureRng` draws from the kernel CSPRNG (`try_fill(&view)` reports `EntropyUnavailable` where `fill` panics); use it for keys/tokens/nonces - `Rng` is not cryptographic. Distributions (`UniformI64`, `Normal`, `Bernoulli`, `WeightedIndex`, ...) sample from any source.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| **`net`**         | `IpV4Address`, `IpV6Address`, `IpAddress`, `SocketAddress`, `TcpStream` (`AsyncTransport`), `TcpListener`. **Every operation that can wait is a future** driven by an `Executor` — there is no blocking socket surface. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers` (an ordered list of fields: `append` keeps a repeated name such as `Set-Cookie`, `insert` replaces every value, `get` is the first, `get_all` each in order), bodies framed by `Content-Length` or the chunked transfer coding (read by the connection, written with `chunked::ChunkedEncoder`; both framings at once, or two different lengths, are refused with 400, another transfer coding with 501, and a response with neither runs to the end of the connection), `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, and one `Client` (`net::http::client`) whose `get`/`post`/`send` take a `Url`: the scheme picks TCP or TLS, every address the host resolves to (IPv6 included) is tried in turn, HTTP/2 is offered by ALPN when it is built `with_http2()`, `with_timeout(Duration)` bounds the whole request with its redirects (`TimedOut`), and 301/302/303/307/308 are followed up to `with_redirect_limit` (20 by default), a 303 - or a 301/302 after a `POST` - as a body-less `GET`, without `Authorization`/`Cookie` when the redirect leaves the origin. `Url.join` resolves a reference such as a `Location` against a URL. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`; a `TlsConnector` trusts the system's roots - OpenSSL's default verify paths on Unix; on Windows a server's chain is built and checked by Windows itself, which fetches a root the machine does not hold yet - and any root added with `add_root_certificate(pem)`, which `Client` passes through), **UDP** (`UdpSocket`, datagram send/receive futures), **DNS** (`net::dns`; `Resolve` runs `getaddrinfo` on the executor's blocking pool rather than stalling a worker), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. A `TcpStream` connects to an IPv4 or IPv6 address. |
+| **`process`**     | Subprocess spawning: `fork + execve` on POSIX, `CreateProcessW` on Windows, with the command line, the environment block and the working directory in UTF-16, so non-ASCII arguments, variables and paths reach the child intact. `Command` builder (`argument`, `arguments` from an iterator of `Str`, `env`, `env_remove`, `env_clear`, `stdin`/`stdout`/`stderr`, `current_directory`; every setter returns the command, so `cmd.argument(a).argument(b).stdout(Stdio::Piped)` chains), `Command::shell(Str)` for a whole command line, `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal` (and its `SignalNumber`, both `Eq`: `Signal::from_i32(2).unwrap() == Signal::interrupt()`). A program that cannot be started is `spawn`'s `IoError`, naming the program (`could not start tool: not found`; `NotExecutable` for a file that is no program) or the working directory it could not enter. A piped stream is taken out of a running child with `child.stdout.take()`. `cmd.group_descendants()` starts the child as the root of its own process tree (a process group on POSIX; a job object and a console process group of its own on Windows), and `child.kill_tree()` then ends it together with everything it started. `ExitStatus.peak_memory_bytes()` is the most physical memory the child held at once; `process::memory::SystemMemory::query()` reads the machine's installed and available memory. On Windows, `send_signal` supports `Signal::kill()`, and `Signal::interrupt()` to a grouped child, delivered as Ctrl-Break; on every platform it refuses (`InvalidInput`) a child already waited for. `process::signal_handling::Signals::listen()` receives the interrupt and terminate signals for a clean shutdown (SIGINT/SIGTERM on POSIX; on Windows Ctrl-C and Ctrl-Break as interrupt, a console close, logoff or shutdown as terminate, after which Windows still ends the process at its own time limit, 5 seconds by default): while a `Signals` lives they no longer end the process, and `wait()`, `wait_timeout(d)` and `try_wait()` hand each one over once.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_subtract` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`, every one taking `&this`, so a cell is updated through any shared reference to it), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `ReadWriteLock<T, A>`, `ConditionVariable`, `Once`, `Barrier`. `channel::Channel::unbounded` / `bounded` open a channel: its `Sender<T>` sends (`send` waits for room in a full bounded channel, `try_send` hands the value back instead) and its `Receiver<T>` receives (`receive`, `receive_timeout`, `try_receive`) and is an `Iterator<T>` that ends once every sender has dropped. RAII guards (`MutexGuard`, `ReadWriteLockReadGuard`, `ReadWriteLockWriteGuard`) are `!Send`; each reads the guarded value through `as_pointer()` (a read-only `T*`), and the two exclusive guards, held writably, write it through `as_mutable_pointer()` (a `mut T*`). `Send` / `Sync` are computed structurally with call-site enforcement - see [section 15.4](#154-the-send-and-sync-traits).                                                                                                                                                                                                                                                                                                    |
+| **`thread`**      | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attributes`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep(Duration)`, plus `sync::channel` channels (`Channel::unbounded` / `Channel::bounded`, each giving a `Pair` of its `Sender` and `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn.                                                                                                                                                                                                                                                                                                             |
+| **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_equal`, `expect_not_equal`, `bail`, `bail_other`. See [section 20](#20-testing).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 ### 19.3 Naming Conventions in the Standard Library
 
 The standard library follows a small set of conventions that user code is encouraged to mirror.
 
-- **No NUL-terminated strings outside `ffi/`.** Every other module works in `Str` and `String`, and turns a C string into one at the boundary (`Str::new`, `String::with_null` / `as_cstr`).
+- **No NUL-terminated strings outside `ffi/`.** Every other module works in `Str` and `String`, and turns a C string into one at the boundary (`Str::new`, `String::with_null` / `as_c_string`).
 - **`Result` for fallible operations, `panic` for broken invariants.** A function returns `Result<T, E>` whenever failure is part of its contract; it panics only when the contract truly cannot be preserved (e.g., an out-of-bounds index on a function whose contract excludes it).
-- **Explicit resource management.** Every owning type implements `Drop` (`implement trait Drop for ...`), and its docstring identifies the ownership obligation. The compiler runs these destructors at scope exit (see [section 15.2](#152-the-drop-trait)); to release a value early, call `mem::drop(x)`, not `x.drop()` (which warns, W0015).
-- **Allocator-generic containers.** `Array<T>`, `HashMap<K, V>`, `String`, etc. accept any `Allocator` implementation, defaulting to `GlobalAlloc`.
+- **Explicit resource management.** Every owning type implements `Drop` (`implement trait Drop for ...`), and its docstring identifies the ownership obligation. The compiler runs these destructors at scope exit (see [section 15.2](#152-the-drop-trait)); to release a value early, call `mem::drop(x)`; `x.drop()` is refused (E0453).
+- **Allocator-generic containers.** `Array<T>`, `HashMap<K, V>`, `String`, etc. accept any `Allocator` implementation, defaulting to `GlobalAllocator`.
 
 ### 19.4 Random Numbers
 
@@ -4842,7 +4959,7 @@ const drawn: i32 = match (random::choose(&cards)) {   // Option<T*>: None for an
 A sequence that must repeat - a test, a simulation, a replayable game - comes from an `Rng` made from a seed, which has each of these as a method (`range` is `next_range`, `value` is `next`, `float` is `next::<f64>()`):
 
 ```cryo
-import std::random::rng::{ Rng };
+import std::random::generator::{ Rng };
 import std::random::source::{ RandomSource };
 
 mut generator: Rng = Rng::from_seed(42);        // the same seed draws the same values
@@ -4862,12 +4979,12 @@ Cryo ships a built-in unit-test framework. Tests live in `<project>/tests/` file
 ![config(testing)]
 namespace MyApp::Tests;
 
-import std::test::assert::{ expect_eq, expect, bail };
+import std::test::assert::{ expect_equal, expect, bail };
 import std::test::error::{ TestError };
 
 ![test]
 function addition_is_commutative() -> Result<(), TestError> {
-    return expect_eq(1 + 2, 2 + 1);
+    return expect_equal(1 + 2, 2 + 1);
 }
 
 ![test]
@@ -4889,8 +5006,8 @@ function unwrap_none_panics() -> Result<(), TestError> {
 A test function returns `Result<(), TestError>`. `Ok(())` is success; `Err(...)` is failure with a message. The `assert` module provides:
 
 - `expect(condition, message)`: fails if the condition is false.
-- `expect_eq(a, b)`: fails if `a != b` (requires `T: Eq + Display`).
-- `expect_ne(a, b)`: fails if `a == b`.
+- `expect_equal(a, b)`: fails if `a != b` (requires `T: Eq + Display`).
+- `expect_not_equal(a, b)`: fails if `a == b`.
 - `bail(message)`: unconditional failure.
 - `bail_other(message)`: non-assertion failure (treated as an error rather than a test fail).
 
@@ -4952,6 +5069,8 @@ The lexer and grammar reserve the following forms because the language plans to 
 | `![repr(<int_type>)]` on enums                | Reserved. Use `type enum Foo : u8 { ... }` syntax for now; future versions may accept `![repr(u8)]` as an equivalent spelling.                                                                                                                                                                   |
 
 When any of these moves out of "reserved" and into "implemented," it will be added to the relevant section of this document and removed from this table.
+
+An unknown directive is a warning (E0153) that names the nearest built-in, if one is spelled close enough, as help. The rename is also offered as a machine-applicable fix only when it is certain to be accepted where it lands: the directive was written without arguments, and the built-in takes none, may be written on that declaration, and asks nothing more of it (`inline`, `noinline`, `caller_location`, `no_mangle`, `weak`, `must_use`, `thread_local`, `functions_only` and the bare OS gates).
 
 ---
 
@@ -5090,7 +5209,7 @@ takes precedence:
 
 - **`unwind`**, the default for a hosted build: the panic unwinds the stack and
   each frame's destructors run on the way out. `catch_unwind` stops it and
-  returns `Err(PanicInfo)`. A panic no `catch_unwind` stops reaches the catch
+  returns `Err(PanicInformation)`. A panic no `catch_unwind` stops reaches the catch
   the compiler wraps `main` in, which writes the report and exits with code
   101.
 - **`abort`**: the report is written and the process exits with code 101 at
@@ -5099,14 +5218,14 @@ takes precedence:
 
 Under `unwind`:
 
-- `PanicInfo.msg` is the runtime's per-thread copy of the message, so it reads
+- `PanicInformation.msg` is the runtime's per-thread copy of the message, so it reads
   back whole even when the panicking code built the message in a value the
   unwind destroyed. It stays valid until the same thread panics again. A
   message longer than 1023 bytes is cut at a character boundary and ends in
   `...`.
 - An exception that foreign code raised (a C++ `throw`, a thread-exit unwind)
   and that unwinds into Cryo frames runs their destructors like a panic.
-  `catch_unwind` catches it, with a `PanicInfo` whose message names it as a
+  `catch_unwind` catches it, with a `PanicInformation` whose message names it as a
   foreign exception and whose file is `<foreign code>`; the catch around
   `main` reports it the same way and exits 101.
 - A destructor that panics while an unwind is running it starts a new panic,
@@ -5281,6 +5400,7 @@ color  = "auto"                     # auto | always | never
 | `cryo check <file>`      | Front-end + semantic analysis only; no codegen.                                                                     |
 | `cryo init [dir]`        | Scaffold a new project (`cryoconfig` + `main.cryo`).                                                                |
 | `cryo demangle <sym>`    | Decode a mangled symbol to its source form.                                                                         |
+| `cryo api-index write\|check <root> <file>` | Write, or check that `<file>` already holds, the one-line-per-declaration index of the standard library under `<root>`. |
 | `cryo fetch`             | Fetch dependencies and write `cryoconfig.lock`.                                                                     |
 | `cryo update`            | Re-resolve every dependency, ignoring the lockfile.                                                                 |
 | `cryo vendor <sub>`      | Manage the per-machine registry of vendored C libraries: `<path>` \| `list` \| `remove <name>` \| `rebuild [name]`. |
@@ -5316,6 +5436,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--no-incremental`    | Force a full build: skip the up-to-date short-circuit and the manifest/fingerprint write.                                               |
 | `--locked`            | Verify the `cryoconfig.lock` vendor pins instead of re-resolving them; error if the lock is missing or out of date.                     |
 | `-Werror`             | Report every warning as an error and fail the build on it; a stdlib archive the build has to make is built with it too.                 |
+| `-Werror=W0017,...`   | Report the warnings named as errors and fail the build on them, in the build's own reports only (not a stdlib archive's build). A name that is not a warning code is refused. `cryo test` passes it to every test project's build; plain `-Werror` it does not, since a project may assert the warnings it reports. |
 | `--apply-fixes`       | Make every machine-applicable suggestion the build reports in the project's own files (never the stdlib's or a vendor binding's), then build again once; a suggestion overlapping one already made is left for the next build. |
 | `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable).           |
 

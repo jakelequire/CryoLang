@@ -10,7 +10,7 @@
 ///! the same `net::http` `Request` / `Response` types used by the HTTP/1.1
 ///! layer, so handlers and clients are written once.
 ///!
-///! It **OWNS** its `BufStream<S>`, as `WebSocket<S>` does and for the same
+///! It **OWNS** its `BufferedStream<S>`, as `WebSocket<S>` does and for the same
 ///! reason: the type carries per-connection protocol state (the HPACK tables,
 ///! the flow-control windows, the next stream id), and an `async` method may
 ///! only re-address its OWN receiver between polls. A borrowed transport would
@@ -45,7 +45,7 @@ import std::core::mem;
 import std::io::error::{ IoError, IoErrorKind };
 import std::io::bytes::{ ByteReader, ByteWriter };
 import std::io::traits::{ AsyncTransport };
-import std::io::buf::{ BufStream };
+import std::io::buffered::{ BufferedStream };
 import std::collections::array::{ Array };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
@@ -63,7 +63,7 @@ import std::future::waker;
 import std::future::traits;
 
 /// The 24-octet client connection preface (RFC 7540 section 3.5).
-public const PREFACE_LEN: i64 = 24;
+public const PREFACE_LENGTH: i64 = 24;
 
 /// Values we advertise in our SETTINGS frame.
 private const LOCAL_HEADER_TABLE_SIZE:   u32 = 4096;
@@ -110,9 +110,9 @@ public type struct RequestOnStream {
 /// ```cryo
 /// import std::collections::str::{ Str };
 /// import std::core::result::{ Result };
-/// import std::io::buf::{ BufStream };
+/// import std::io::buffered::{ BufferedStream };
 /// import std::io::error::{ IoError };
-/// import std::net::addr::socket_addr::{ SocketAddr };
+/// import std::net::address::socket_address::{ SocketAddress };
 /// import std::net::http::method::{ Method };
 /// import std::net::http::request::{ Request };
 /// import std::net::http::response::{ Response };
@@ -121,9 +121,9 @@ public type struct RequestOnStream {
 ///
 /// // Two requests on one cleartext connection to a local HTTP/2 server.
 /// async function two_requests(port: u16) -> Result<i64, IoError> {
-///     const socket: TcpStream = (await TcpConnect::start(SocketAddr::localhost_v4(port)))?;
+///     const socket: TcpStream = (await TcpConnect::start(SocketAddress::localhost_v4(port)))?;
 ///     mut connection: Http2Connection<TcpStream> =
-///         Http2Connection::<TcpStream>::new_client(BufStream::<TcpStream>::of(socket));
+///         Http2Connection::<TcpStream>::new_client(BufferedStream::<TcpStream>::of(socket));
 ///     (await connection.handshake_client())?;
 ///     mut total: i64 = 0;
 ///     for (mut i: i64 = 0; i < 2; i++) {
@@ -136,7 +136,7 @@ public type struct RequestOnStream {
 /// }
 /// ```
 public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
-    private conn:                  BufStream<S>;
+    private conn:                  BufferedStream<S>;
     private codec:                 C;
     private is_client:             boolean;
     private next_stream_id:        u32;
@@ -147,21 +147,29 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     // The peer's parameters, which bound what we send. Each SETTINGS frame
     // changes only the values it carries.
     private remote_settings:       Settings;
-    // Send-side flow-control windows for the single active stream.
+    // The stream whose send window `stream_send_window` is, from the
+    // moment it opens until its exchange ends; None between streams, when
+    // the window belongs to no stream and nothing may move it.
+    private send_stream:           Option<u32>;
+    // Send-side flow-control windows: the connection's, and `send_stream`'s.
     private conn_send_window:      i64;
     private stream_send_window:    i64;
 
     /// New client-side connection taking ownership of `conn`, coding its
     /// header blocks with HPACK. Call `handshake_client` before issuing
     /// requests.
-    public static new_client(conn: BufStream<S>) -> Http2Connection<S> {
+    public static new_client(conn: BufferedStream<S>) -> Http2Connection<S> {
         return Http2Connection::<S>::new_client_with_codec(
             conn, HpackCodec::new(LOCAL_HEADER_TABLE_SIZE as i64));
     }
 
     /// New client-side connection taking ownership of `conn`, coding its
     /// header blocks with `codec`.
-    public static new_client_with_codec(conn: BufStream<S>, codec: C) -> Http2Connection<S, C> {
+    public static new_client_with_codec(conn: BufferedStream<S>, codec: C) -> Http2Connection<S, C> {
+        // A server never accepts pushed streams, so its SETTINGS_ENABLE_PUSH
+        // starts at 0 and a SETTINGS frame that sets it is refused.
+        mut server_settings: Settings = Settings::defaults();
+        server_settings.enable_push = 0;
         return Http2Connection::<S, C> {
             conn:                  conn,
             codec:                 codec,
@@ -169,7 +177,8 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             next_stream_id:        1,
             goaway_received:       false,
             last_peer_stream_id:   0,
-            remote_settings:       Settings::defaults(),
+            remote_settings:       server_settings,
+            send_stream:           Option::None,
             conn_send_window:      DEFAULT_CONNECTION_WINDOW,
             stream_send_window:    65535
         };
@@ -177,14 +186,14 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
 
     /// New server-side connection over an accepted, already-buffered
     /// transport, coding its header blocks with HPACK.
-    public static new_server(conn: BufStream<S>) -> Http2Connection<S> {
+    public static new_server(conn: BufferedStream<S>) -> Http2Connection<S> {
         return Http2Connection::<S>::new_server_with_codec(
             conn, HpackCodec::new(LOCAL_HEADER_TABLE_SIZE as i64));
     }
 
     /// New server-side connection over an accepted, already-buffered
     /// transport, coding its header blocks with `codec`.
-    public static new_server_with_codec(conn: BufStream<S>, codec: C) -> Http2Connection<S, C> {
+    public static new_server_with_codec(conn: BufferedStream<S>, codec: C) -> Http2Connection<S, C> {
         return Http2Connection::<S, C> {
             conn:                  conn,
             codec:                 codec,
@@ -193,6 +202,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             goaway_received:       false,
             last_peer_stream_id:   0,
             remote_settings:       Settings::defaults(),
+            send_stream:           Option::None,
             conn_send_window:      DEFAULT_CONNECTION_WINDOW,
             stream_send_window:    65535
         };
@@ -201,7 +211,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// The buffered connection, for callers that need the transport itself
     /// (socket options, the negotiated ALPN protocol). Not for reading or
     /// writing — that would desynchronize the framing.
-    public connection(mut &this) -> mut BufStream<S>* {
+    public connection(mut &this) -> mut BufferedStream<S>* {
         return &this.conn;
     }
 
@@ -228,15 +238,16 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     /// initial SETTINGS frame has been seen.
     public async handshake_server(mut &this) -> Result<(), IoError>
     where S: AsyncTransport {
-        (await this.conn.ensure(PREFACE_LEN))?;
+        (await this.conn.ensure(PREFACE_LENGTH))?;
         // The buffer may already hold the client's SETTINGS frame behind the
         // preface, so compare exactly the preface's worth of it. Nothing
         // suspends between here and the `consume`.
-        const got: &Slice<u8> = this.conn.buffered().subslice(0, PREFACE_LEN);
+        const got: &Slice<u8> = this.conn.buffered().subslice(0, PREFACE_LENGTH);
         const good: boolean = got == preface_bytes();
-        this.conn.consume(PREFACE_LEN);
+        this.conn.consume(PREFACE_LENGTH);
         if (!good) {
-            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            const error: IoError = this.fail_connection(frame::PROTOCOL_ERROR);
+            return Result::Err(await this.flush_failure(error));
         }
         this.queue_settings()?;
         (await this.conn.flush())?;
@@ -248,7 +259,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     private async await_peer_settings(mut &this) -> Result<(), IoError>
     where S: AsyncTransport {
         loop {
-            mut fr: Frame = (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as i64))?;
+            mut fr: Frame = (await this.conn.read_http2_frame(LOCAL_MAX_FRAME_SIZE as i64))?;
             const is_settings: boolean = (fr.ftype == frame::FRAME_SETTINGS)
                                        && !fr.has_flag(frame::FLAG_ACK);
             // `process_control` only queues, so the frame is released before
@@ -273,7 +284,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         settings::push_entry(&payload, settings::SETTINGS_MAX_FRAME_SIZE, LOCAL_MAX_FRAME_SIZE);
         settings::push_entry(&payload, settings::SETTINGS_MAX_HEADER_LIST_SIZE, LOCAL_MAX_HEADER_LIST_SIZE);
         const r: Result<(), IoError> =
-            this.conn.queue_h2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice());
+            this.conn.queue_http2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice());
         mem::drop(payload);
         return r;
     }
@@ -305,20 +316,35 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
                 }
                 return Result::Ok(true);
             }
+            const previous_window: i64 = this.remote_settings.initial_window_size as i64;
             match (this.remote_settings.apply_payload(fr.payload.as_slice())) {
                 Result::Ok(_)     => { }
                 Result::Err(code) => { return Result::Err(this.fail_connection(code)); }
             }
+            if (this.is_client && this.remote_settings.enable_push != 0) {
+                return Result::Err(this.fail_connection(frame::PROTOCOL_ERROR));
+            }
+            // A new initial window moves the open stream's window by the
+            // difference, which may leave it negative; past 2^31 - 1 it is
+            // a connection error. Between streams there is no window to
+            // move: the next stream opens at the new value.
+            if (this.send_stream.is_some()) {
+                this.stream_send_window = this.stream_send_window
+                    + (this.remote_settings.initial_window_size as i64) - previous_window;
+                if (this.stream_send_window > settings::MAX_WINDOW_SIZE as i64) {
+                    return Result::Err(this.fail_connection(frame::FLOW_CONTROL_ERROR));
+                }
+            }
             // Our encoder must not exceed the peer's decoder table size.
             this.codec.limit_encoder_table(this.remote_settings.header_table_size as i64);
             // Acknowledge.
-            this.conn.queue_h2_frame(frame::FRAME_SETTINGS, frame::FLAG_ACK, 0,
+            this.conn.queue_http2_frame(frame::FRAME_SETTINGS, frame::FLAG_ACK, 0,
                                      Slice::from_raw(null as u8*, 0))?;
             return Result::Ok(true);
         }
         if (fr.ftype == frame::FRAME_PING) {
             if (fr.has_flag(frame::FLAG_ACK)) { return Result::Ok(true); }
-            this.conn.queue_h2_frame(frame::FRAME_PING, frame::FLAG_ACK, 0,
+            this.conn.queue_http2_frame(frame::FRAME_PING, frame::FLAG_ACK, 0,
                                      fr.payload.as_slice())?;
             return Result::Ok(true);
         }
@@ -338,12 +364,15 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
                 if (this.conn_send_window > window_max) {
                     return Result::Err(this.fail_connection(frame::FLOW_CONTROL_ERROR));
                 }
-            } else {
+            } else if (this.send_stream == Option::Some(fr.stream_id)) {
                 this.stream_send_window = this.stream_send_window + inc;
                 if (this.stream_send_window > window_max) {
                     return Result::Err(this.fail_connection(frame::FLOW_CONTROL_ERROR));
                 }
             }
+            // A WINDOW_UPDATE naming any other stream - one that has ended,
+            // whose update may still be in flight, or one never opened -
+            // credits nothing.
             return Result::Ok(true);
         }
         if (fr.ftype == frame::FRAME_GOAWAY) {
@@ -387,7 +416,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         mut fields: ByteWriter = ByteWriter::new(&payload);
         fields.write_u32_big_endian(last_stream_id & 0x7fffffff);
         fields.write_u32_big_endian(error_code);
-        return this.conn.queue_h2_frame(frame::FRAME_GOAWAY, 0, 0, payload.as_slice());
+        return this.conn.queue_http2_frame(frame::FRAME_GOAWAY, 0, 0, payload.as_slice());
     }
 
     // ---- sending ----------------------------------------------------------
@@ -406,12 +435,12 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         if (total <= max) {
             mut flags: u8 = frame::FLAG_END_HEADERS;
             if (end_stream) { flags = flags | frame::FLAG_END_STREAM; }
-            return this.conn.queue_h2_frame(frame::FRAME_HEADERS, flags, stream_id, block);
+            return this.conn.queue_http2_frame(frame::FRAME_HEADERS, flags, stream_id, block);
         }
         // First fragment: HEADERS without END_HEADERS.
         mut first_flags: u8 = 0;
         if (end_stream) { first_flags = first_flags | frame::FLAG_END_STREAM; }
-        this.conn.queue_h2_frame(frame::FRAME_HEADERS, first_flags, stream_id,
+        this.conn.queue_http2_frame(frame::FRAME_HEADERS, first_flags, stream_id,
                                  block.subslice(0, max))?;
         mut pos: i64 = max;
         while (pos < total) {
@@ -419,7 +448,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             if (end > total) { end = total; }
             const last: boolean = end >= total;
             const cflags: u8 = if (last) { frame::FLAG_END_HEADERS } else { 0 };
-            this.conn.queue_h2_frame(frame::FRAME_CONTINUATION, cflags, stream_id,
+            this.conn.queue_http2_frame(frame::FRAME_CONTINUATION, cflags, stream_id,
                                      block.subslice(pos, end))?;
             pos = end;
         }
@@ -444,7 +473,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         const total: i64 = b.length();
         if (total == 0) {
             if (end_stream) {
-                this.conn.queue_h2_frame(frame::FRAME_DATA, frame::FLAG_END_STREAM,
+                this.conn.queue_http2_frame(frame::FRAME_DATA, frame::FLAG_END_STREAM,
                                          stream_id, Slice::from_raw(null as u8*, 0))?;
             }
             return await this.conn.flush();
@@ -469,7 +498,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             // The slice is taken from `b` AFTER the suspension above handed the
             // array back, and consumed by a synchronous queue before the next
             // one, so no view is ever live across a fill.
-            this.conn.queue_h2_frame(frame::FRAME_DATA, flags, stream_id,
+            this.conn.queue_http2_frame(frame::FRAME_DATA, flags, stream_id,
                                      b.as_slice().subslice(pos, end))?;
             this.stream_send_window = this.stream_send_window - avail;
             this.conn_send_window = this.conn_send_window - avail;
@@ -485,7 +514,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     private async ensure_send_window(mut &this) -> Result<(), IoError>
     where S: AsyncTransport {
         while (this.stream_send_window <= 0 || this.conn_send_window <= 0) {
-            mut fr: Frame = (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as i64))?;
+            mut fr: Frame = (await this.conn.read_http2_frame(LOCAL_MAX_FRAME_SIZE as i64))?;
             const outcome: Result<boolean, IoError> = this.process_control(&fr);
             mem::drop(fr);
             match (outcome) {
@@ -506,9 +535,9 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         mut increment: Array<u8> = Array::<u8>::with_capacity(4);
         mut payload: ByteWriter = ByteWriter::new(&increment);
         payload.write_u32_big_endian((n as u32) & 0x7fffffff);
-        this.conn.queue_h2_frame(frame::FRAME_WINDOW_UPDATE, 0, 0,
+        this.conn.queue_http2_frame(frame::FRAME_WINDOW_UPDATE, 0, 0,
                                  increment.as_slice())?;
-        return this.conn.queue_h2_frame(frame::FRAME_WINDOW_UPDATE, 0, stream_id,
+        return this.conn.queue_http2_frame(frame::FRAME_WINDOW_UPDATE, 0, stream_id,
                                         increment.as_slice());
     }
 
@@ -522,7 +551,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         mut request_local: Request = req;
         const sid: u32 = this.next_stream_id;
         this.next_stream_id = this.next_stream_id + 2;
-        this.stream_send_window = this.remote_settings.initial_window_size as i64;
+        this.open_send_stream(sid);
 
         mut block: Array<u8> = Array::<u8>::new();
         this.encode_request_headers(&block, &request_local, scheme, authority);
@@ -538,13 +567,34 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         const queued: Result<(), IoError> =
             this.queue_header_block(sid, block.as_slice(), !has_body);
         mem::drop(block);
-        queued?;
+        match (queued) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => {
+                this.send_stream = Option::None;
+                return Result::Err(e);
+            }
+        }
 
         // `send_body` flushes whether or not there are DATA frames, so the
         // header block goes out either way and an empty body costs no extra
         // suspension.
-        (await this.send_body(sid, body_bytes, has_body))?;
-        return await this.read_response(sid);
+        match (await this.send_body(sid, body_bytes, has_body)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => {
+                this.send_stream = Option::None;
+                return Result::Err(e);
+            }
+        }
+        const response: Result<Response, IoError> = await this.read_response(sid);
+        this.send_stream = Option::None;
+        return response;
+    }
+
+    /// Open `stream_id` for sending: its window starts at the peer's
+    /// current initial window, and WINDOW_UPDATEs naming it credit it.
+    private open_send_stream(mut &this, stream_id: u32) -> void {
+        this.send_stream = Option::Some(stream_id);
+        this.stream_send_window = this.remote_settings.initial_window_size as i64;
     }
 
     /// Read frames until the response on `sid` completes, assembling its header
@@ -562,9 +612,12 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             // most one frame).
             if (block.length() > LOCAL_MAX_HEADER_LIST_SIZE as i64
                 || body.length() > LOCAL_MAX_BODY_SIZE) {
-                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                mem::drop(block);
+                mem::drop(body);
+                const error: IoError = this.fail_connection(frame::ENHANCE_YOUR_CALM);
+                return Result::Err(await this.flush_failure(error));
             }
-            mut fr: Frame = (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as i64))?;
+            mut fr: Frame = (await this.conn.read_http2_frame(LOCAL_MAX_FRAME_SIZE as i64))?;
             const control: Result<boolean, IoError> = this.process_control(&fr);
             mut handled: boolean = false;
             match (control) {
@@ -605,14 +658,24 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             }
         }
 
+        // A block HPACK cannot decode leaves the compression context lost
+        // (COMPRESSION_ERROR); a decoded one that is not a response is
+        // malformed (PROTOCOL_ERROR). Either ends the connection.
+        mut error_code: u32 = frame::COMPRESSION_ERROR;
         const built: Option<Response> = match (this.codec.decode(block.as_slice())) {
-            Option::Some(fields) => { build_response(fields, body) }
+            Option::Some(fields) => {
+                error_code = frame::PROTOCOL_ERROR;
+                build_response(fields, body)
+            }
             Option::None         => { mem::drop(body); Option::None }
         };
         mem::drop(block);
         match (built) {
             Option::Some(resp) => { return Result::Ok(resp); }
-            Option::None       => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+            Option::None       => {
+                const error: IoError = this.fail_connection(error_code);
+                return Result::Err(await this.flush_failure(error));
+            }
         }
     }
 
@@ -660,9 +723,12 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             // most one frame).
             if (block.length() > LOCAL_MAX_HEADER_LIST_SIZE as i64
                 || body.length() > LOCAL_MAX_BODY_SIZE) {
-                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                mem::drop(block);
+                mem::drop(body);
+                const error: IoError = this.fail_connection(frame::ENHANCE_YOUR_CALM);
+                return Result::Err(await this.flush_failure(error));
             }
-            mut fr: Frame = match (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as i64)) {
+            mut fr: Frame = match (await this.conn.read_http2_frame(LOCAL_MAX_FRAME_SIZE as i64)) {
                 Result::Ok(f)  => { f }
                 Result::Err(e) => {
                     // A peer that closes before starting a stream has simply
@@ -695,6 +761,9 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
                     sid = fr.stream_id;
                     have_stream = true;
                     this.last_peer_stream_id = sid;
+                    // The peer may grant the response window while the
+                    // request is still arriving.
+                    this.open_send_stream(sid);
                 }
                 if (fr.stream_id == sid) {
                     block.append(header_fragment(&fr));
@@ -719,8 +788,14 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             }
         }
 
+        // As in `read_response`: an undecodable block is COMPRESSION_ERROR,
+        // a malformed request PROTOCOL_ERROR, and either ends the connection.
+        mut error_code: u32 = frame::COMPRESSION_ERROR;
         const built: Option<Request> = match (this.codec.decode(block.as_slice())) {
-            Option::Some(fields) => { build_request(fields, body) }
+            Option::Some(fields) => {
+                error_code = frame::PROTOCOL_ERROR;
+                build_request(fields, body)
+            }
             Option::None         => { mem::drop(body); Option::None }
         };
         mem::drop(block);
@@ -728,7 +803,10 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
             Option::Some(req) => {
                 return Result::Ok(Option::Some(RequestOnStream { stream_id: sid, req: req }));
             }
-            Option::None => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+            Option::None => {
+                const error: IoError = this.fail_connection(error_code);
+                return Result::Err(await this.flush_failure(error));
+            }
         }
     }
 
@@ -736,7 +814,9 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     public async send_response(mut &this, sid: u32, resp: Response) -> Result<(), IoError>
     where S: AsyncTransport {
         mut response: Response = resp;
-        this.stream_send_window = this.remote_settings.initial_window_size as i64;
+        // `read_request` opened the stream it returned; a stream named
+        // here that it did not return opens now.
+        if (this.send_stream != Option::Some(sid)) { this.open_send_stream(sid); }
 
         mut block: Array<u8> = Array::<u8>::new();
         this.encode_response_headers(&block, &response);
@@ -751,9 +831,14 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
         const queued: Result<(), IoError> =
             this.queue_header_block(sid, block.as_slice(), !has_body);
         mem::drop(block);
-        queued?;
+        if (queued.is_err()) {
+            this.send_stream = Option::None;
+            return queued;
+        }
 
-        return await this.send_body(sid, body_bytes, has_body);
+        const sent: Result<(), IoError> = await this.send_body(sid, body_bytes, has_body);
+        this.send_stream = Option::None;
+        return sent;
     }
 
     /// Send a GOAWAY with the given last-stream-id and error code, then
@@ -778,7 +863,7 @@ public type struct Http2Connection<S, C = HpackCodec> where C: HeaderCodec {
     private encode_response_headers(mut &this, out: mut &Array<u8>, resp: &Response) -> void {
         mut status: Array<u8> = Array::<u8>::new();
         status.write(f"{resp.status}").expect("http2: allocation failed encoding :status");
-        this.codec.encode_field(out, Str::new(":status"), Str::from_raw(status.as_ptr(), status.length()), false);
+        this.codec.encode_field(out, Str::new(":status"), Str::from_raw(status.as_pointer(), status.length()), false);
         this.encode_regular_headers(out, &resp.headers);
     }
 
@@ -803,7 +888,7 @@ implement<S, C> trait Drop for struct Http2Connection<S, C> where C: HeaderCodec
 
 // ---- free helpers ---------------------------------------------------------
 
-/// The `PREFACE_LEN` octets of the client connection preface,
+/// The `PREFACE_LENGTH` octets of the client connection preface,
 /// `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`, as a view of static text.
 public function preface_bytes() -> &Slice<u8> {
     const magic: Str = Str::new("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
@@ -819,7 +904,7 @@ public function build_response(fields: Array<HeaderField>, body: Array<u8>) -> O
     mut have_status: boolean = false;
     mut i: i64 = 0;
     while (i < fields.length()) {
-        match (fields.get_ref(i)) {
+        match (fields.get_reference(i)) {
             Option::Some(f) => {
                 if ((*f).name.as_str().equals(&Str::new(":status"))) {
                     match (u16::try_from((*f).value.as_str())) {
@@ -837,7 +922,7 @@ public function build_response(fields: Array<HeaderField>, body: Array<u8>) -> O
     mut resp: Response = Response::new(StatusCode::from_u16(code));
     mut j: i64 = 0;
     while (j < fields.length()) {
-        match (fields.get_ref(j)) {
+        match (fields.get_reference(j)) {
             Option::Some(f) => {
                 const name: Str = (*f).name.as_str();
                 if (!name.starts_with(&Str::new(":"))) {
@@ -865,7 +950,7 @@ public function build_request(fields: Array<HeaderField>, body: Array<u8>) -> Op
 
     mut i: i64 = 0;
     while (i < fields.length()) {
-        match (fields.get_ref(i)) {
+        match (fields.get_reference(i)) {
             Option::Some(f) => {
                 const name: Str = (*f).name.as_str();
                 const value: Str = (*f).value.as_str();
@@ -918,7 +1003,7 @@ public function build_request(fields: Array<HeaderField>, body: Array<u8>) -> Op
 
     mut j: i64 = 0;
     while (j < fields.length()) {
-        match (fields.get_ref(j)) {
+        match (fields.get_reference(j)) {
             Option::Some(f) => {
                 const name: Str = (*f).name.as_str();
                 if (!name.starts_with(&Str::new(":"))) {
@@ -945,12 +1030,12 @@ private function header_fragment(fr: &Frame) -> &Slice<u8> {
         // An empty padded payload reads a pad length of 0 and yields nothing.
         const pad: i64 = p.get(0).unwrap_or(0) as i64;
         start = 1;
-        if (end >= pad) { end = end - pad; } else { return Slice::from_raw(p.as_ptr(), 0); }
+        if (end >= pad) { end = end - pad; } else { return Slice::from_raw(p.as_pointer(), 0); }
     }
     if (fr.has_flag(frame::FLAG_PRIORITY)) {
         start = start + 5;
     }
-    if (start > end) { return Slice::from_raw(p.as_ptr(), 0); }
+    if (start > end) { return Slice::from_raw(p.as_pointer(), 0); }
     return p.subslice(start, end);
 }
 
@@ -963,9 +1048,9 @@ private function data_fragment(fr: &Frame) -> &Slice<u8> {
         // An empty padded payload reads a pad length of 0 and yields nothing.
         const pad: i64 = p.get(0).unwrap_or(0) as i64;
         start = 1;
-        if (end >= pad) { end = end - pad; } else { return Slice::from_raw(p.as_ptr(), 0); }
+        if (end >= pad) { end = end - pad; } else { return Slice::from_raw(p.as_pointer(), 0); }
     }
-    if (start > end) { return Slice::from_raw(p.as_ptr(), 0); }
+    if (start > end) { return Slice::from_raw(p.as_pointer(), 0); }
     return p.subslice(start, end);
 }
 

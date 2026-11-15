@@ -20,18 +20,18 @@ import std::collections::array::{ Array };
 import std::future;
 import std::io::error::{ IoError, IoErrorKind };
 import std::io::traits;
-import std::io::buf::{ BufStream };
-import std::net::addr::url::{ Url };
-import std::net::addr::socket_addr::{ SocketAddr };
+import std::io::buffered::{ BufferedStream };
+import std::net::address::url::{ Url };
+import std::net::address::socket_address::{ SocketAddress };
 import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpListener, TcpStream };
 import std::net::http::method::{ Method };
 import std::net::http::status::{ StatusCode };
 import std::net::http::request::{ Request };
 import std::net::http::response::{ Response };
-import std::net::http::conn;
+import std::net::http::connection;
 import std::net::http::client::{ Client };
 import std::test::error::{ TestError };
-import std::test::assert::{ bail, expect_eq };
+import std::test::assert::{ bail, expect_equal };
 import std::future::combinator::{ Futures };
 import std::future::executor::{ Executor };
 import std::time::duration::{ Duration };
@@ -102,7 +102,7 @@ function answer(path: Str, port: u16) -> Response {
     } else if (path.equals(&Str::new("/away"))) {
         location.push(f"http://localhost:{port}/final".as_str());
     } else {
-        match (path.rsplit_once(&Str::new("/redirect-"))) {
+        match (path.split_once_from_end(&Str::new("/redirect-"))) {
             Option::Some(parts) => {
                 status = u16::try_from(parts.second).unwrap();
                 location.push(Str::new("final?from=redirect"));
@@ -128,7 +128,7 @@ async function serve(listener: TcpListener, connections: i64, port: u16) -> Stri
             Result::Ok(s)  => { s }
             Result::Err(_) => { log.push(Str::new("accept failed\n")); return log; }
         };
-        mut buffered: BufStream<TcpStream> = BufStream::<TcpStream>::of(stream);
+        mut buffered: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(stream);
         const request: Request = match (await buffered.read_request()) {
             Result::Ok(r)  => { r }
             Result::Err(_) => { log.push(Str::new("read failed\n")); return log; }
@@ -183,14 +183,14 @@ async function round_trip(listener: TcpListener, connections: i64, client: Clien
 /// compare the server's log plus the final status with `want`.
 function expect_exchange(client: Client, connections: i64, method: Method, path: string,
                          want: string) -> Result<(), TestError> {
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
-    listener.set_nonblocking(true);
-    const port: u16 = match (listener.local_addr()) {
+    listener.set_nonblocking(true)?;
+    const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_address failed")); }
     };
     mut ex: Executor = Executor::new();
     const got: String = ex.block_on(round_trip(listener, connections, client, port, method, Str::new(path)));
@@ -257,7 +257,7 @@ async function never_answer(listener: TcpListener) -> i64 {
         Result::Ok(s)  => { s }
         Result::Err(_) => { return -1; }
     };
-    mut buffered: BufStream<TcpStream> = BufStream::<TcpStream>::of(stream);
+    mut buffered: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(stream);
     match (await buffered.read_request()) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -2; }
@@ -270,7 +270,7 @@ async function never_answer(listener: TcpListener) -> i64 {
 
 /// 1 when the request failed with `TimedOut`, a negative step otherwise.
 async function timed_request(port: u16) -> i64 {
-    const timed: Client = client().with_timeout(Duration::from_millis(200));
+    const timed: Client = client().with_timeout(Duration::from_milliseconds(200));
     const text: String = f"http://127.0.0.1:{port}/slow";
     match (await timed.get(Url::parse(text.as_str()).unwrap())) {
         Result::Ok(_)      => { return -10; }
@@ -291,17 +291,17 @@ async function timed_round_trip(listener: TcpListener, port: u16) -> i64 {
 
 ![test]
 function client_times_out_a_server_that_never_answers() -> Result<(), TestError> {
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
-    listener.set_nonblocking(true);
-    const port: u16 = match (listener.local_addr()) {
+    listener.set_nonblocking(true)?;
+    const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_address failed")); }
     };
     mut ex: Executor = Executor::new();
-    return expect_eq(ex.block_on(timed_round_trip(listener, port)), 1 as i64);
+    return expect_equal(ex.block_on(timed_round_trip(listener, port)), 1 as i64);
 }
 
 /// 1 when an `ftp` URL is refused as `Unsupported`.
@@ -321,5 +321,5 @@ async function fetch_ftp() -> i64 {
 ![test]
 function client_refuses_a_scheme_it_does_not_speak() -> Result<(), TestError> {
     mut ex: Executor = Executor::new();
-    return expect_eq(ex.block_on(fetch_ftp()), 1 as i64);
+    return expect_equal(ex.block_on(fetch_ftp()), 1 as i64);
 }

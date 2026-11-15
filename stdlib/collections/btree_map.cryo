@@ -18,7 +18,7 @@
 ///! the root holds at least five entries.
 ///!
 ///! Iteration runs in ascending key order and from either end: every
-///! iterator here is a `DoubleEndedIterator`, so `.rev()` walks the keys in
+///! iterator here is a `DoubleEndedIterator`, so `.reverse()` walks the keys in
 ///! descending order. Like `HashMap`'s, an iterator borrows the map's
 ///! storage and is invalidated by any insert or remove.
 
@@ -34,10 +34,10 @@ import std::core::drop::{ Drop };
 import std::core::iter::{ DoubleEndedIterator, FromIterator, Iterator };
 import std::core::mem;
 import std::core::ops::{ Bound, RangeBounds };
-import std::core::ptr;
-import std::core::ptr::{ NonNull };
+import std::core::pointer;
+import std::core::pointer::{ NonNull };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ AllocError, Allocator, GlobalAlloc };
+import std::alloc::allocator::{ AllocationError, Allocator, GlobalAllocator };
 import std::collections::pair::{ Pair };
 
 /// Every node other than the root holds at least `MINIMUM_DEGREE - 1`
@@ -66,8 +66,8 @@ private type struct BTreeNode<K, V> {
     private search(&this, key: &K) -> Pair<i64, boolean> where K: Ord {
         for (mut index: i64 = 0; index < this.length; index++) {
             const order: Ordering = key.compare(&this.keys[index]);
-            if (order.is_lt()) { return Pair::new(index, false); }
-            if (!order.is_gt()) { return Pair::new(index, true); }
+            if (order.is_less()) { return Pair::new(index, false); }
+            if (!order.is_greater()) { return Pair::new(index, true); }
         }
         return Pair::new(this.length, false);
     }
@@ -184,16 +184,16 @@ private type struct KeyPosition<K, V> {
 /// scores.insert(1, Str::new("first"));
 /// // iterating visits key 1, then key 2
 /// ```
-public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
+public type struct BTreeMap<K, V, A = GlobalAllocator> where A: Allocator {
     /// Null while the map is empty.
     private root: mut BTreeNode<K, V>*;
     private length: i64;
     private alloc: A;
 
-    /// An empty map backed by `GlobalAlloc`. Allocates nothing until the
+    /// An empty map backed by `GlobalAllocator`. Allocates nothing until the
     /// first insert.
-    public static new() -> BTreeMap<K, V, GlobalAlloc> {
-        return BTreeMap::<K, V, GlobalAlloc> { root: null, length: 0, alloc: GlobalAlloc::new() };
+    public static new() -> BTreeMap<K, V, GlobalAllocator> {
+        return BTreeMap::<K, V, GlobalAllocator> { root: null, length: 0, alloc: GlobalAllocator::new() };
     }
 
     /// An empty map that allocates through `alloc`.
@@ -213,12 +213,12 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
 
     /// True when the map holds `key`.
     public contains_key(&this, key: &K) -> boolean where K: Ord {
-        return this.get_ref(key).is_some();
+        return this.get_reference(key).is_some();
     }
 
     /// A copy of the value for `key`, or `None` when the key is absent.
     public get(&this, key: &K) -> Option<V> where K: Ord, V: Copy {
-        match (this.get_ref(key)) {
+        match (this.get_reference(key)) {
             Option::Some(value) => { return Option::Some(*value); }
             Option::None => { return Option::None; }
         }
@@ -226,7 +226,7 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
 
     /// A read-only borrow of the value for `key`, or `None` when the key is
     /// absent. Valid until the next insert or remove.
-    public get_ref(&this, key: &K) -> Option<V*> where K: Ord {
+    public get_reference(&this, key: &K) -> Option<V*> where K: Ord {
         mut node: mut BTreeNode<K, V>* = this.root;
         while (node != null) {
             const position: Pair<i64, boolean> = node.search(key);
@@ -261,9 +261,9 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
         }
     }
 
-    /// `insert` that returns `Err(AllocError)` instead of panicking when a
+    /// `insert` that returns `Err(AllocationError)` instead of panicking when a
     /// node cannot be allocated. The map is unchanged by a failed insert.
-    public try_insert(mut &this, key: K, value: V) -> Result<Option<V>, AllocError> where K: Ord {
+    public try_insert(mut &this, key: K, value: V) -> Result<Option<V>, AllocationError> where K: Ord {
         const position: KeyPosition<K, V> = this.find_or_make_room(&key)?;
         if (position.found) {
             mut previous: V;
@@ -278,7 +278,7 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
     }
 
     /// Borrow the value for `key`, inserting `default` first if the key is
-    /// absent: one descent, unlike `get_ref` then `insert`. When the key is
+    /// absent: one descent, unlike `get_reference` then `insert`. When the key is
     /// present, `key` and `default` are released. Panics on allocation
     /// failure.
     public get_or_insert(mut &this, key: K, default: V) -> mut V* where K: Ord {
@@ -288,9 +288,9 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
         }
     }
 
-    /// `get_or_insert` that returns `Err(AllocError)` instead of panicking
+    /// `get_or_insert` that returns `Err(AllocationError)` instead of panicking
     /// when a node cannot be allocated.
-    public try_get_or_insert(mut &this, key: K, default: V) -> Result<mut V*, AllocError> where K: Ord {
+    public try_get_or_insert(mut &this, key: K, default: V) -> Result<mut V*, AllocationError> where K: Ord {
         const position: KeyPosition<K, V> = this.find_or_make_room(&key)?;
         if (!position.found) {
             position.node.insert_entry(position.index, key, default);
@@ -360,25 +360,25 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
     /// an owning key or value would be released twice. `entries` walks any
     /// map by borrow.
     public iter(&this) -> implement Iterator<Pair<K, V>> + DoubleEndedIterator where K: Copy, V: Copy {
-        return BTreeMapIter::<K, V> { cursor: BTreeCursor::new(this.root) };
+        return BTreeMapIterator::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Every key by value, in ascending order. Gated on `K: Copy`, as
     /// `iter` is.
     public keys(&this) -> implement Iterator<K> + DoubleEndedIterator where K: Copy {
-        return KeysIter::<K, V> { cursor: BTreeCursor::new(this.root) };
+        return KeysIterator::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Every value by value, in ascending key order. Gated on `V: Copy`, as
     /// `iter` is.
     public values(&this) -> implement Iterator<V> + DoubleEndedIterator where V: Copy {
-        return ValuesIter::<K, V> { cursor: BTreeCursor::new(this.root) };
+        return ValuesIterator::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Every entry as a borrowed key and value, in ascending key order:
     /// sound for any `K` and `V`, owning or not.
     public entries(&this) -> implement Iterator<Pair<K*, V*>> + DoubleEndedIterator {
-        return EntriesIter::<K, V> { cursor: BTreeCursor::new(this.root) };
+        return EntriesIterator::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// The entries whose keys are in `bounds`, as borrowed keys and values,
@@ -388,32 +388,32 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
     /// is O(log n).
     public range<R>(&this, bounds: R) -> implement Iterator<Pair<K*, V*>> + DoubleEndedIterator
             where K: Ord, R: RangeBounds<K> {
-        return EntriesIter::<K, V> {
+        return EntriesIterator::<K, V> {
             cursor: BTreeCursor::between(this.root, bounds.start_bound(), bounds.end_bound())
         };
     }
 
     /// Every key by borrow, in ascending order.
-    public keys_ref(&this) -> implement Iterator<K*> + DoubleEndedIterator {
-        return KeysRefIter::<K, V> { cursor: BTreeCursor::new(this.root) };
+    public key_references(&this) -> implement Iterator<K*> + DoubleEndedIterator {
+        return KeysReferenceIterator::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Every value by borrow, in ascending key order.
-    public values_ref(&this) -> implement Iterator<V*> + DoubleEndedIterator {
-        return ValuesRefIter::<K, V> { cursor: BTreeCursor::new(this.root) };
+    public value_references(&this) -> implement Iterator<V*> + DoubleEndedIterator {
+        return ValuesReferenceIterator::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Every value by writable borrow, in ascending key order: the way to
     /// change owning values in place.
     public values_mutable(mut &this) -> implement Iterator<mut V*> + DoubleEndedIterator {
-        return ValuesMutableIter::<K, V> { cursor: BTreeCursor::new(this.root) };
+        return ValuesMutableIterator::<K, V> { cursor: BTreeCursor::new(this.root) };
     }
 
     /// Descend to `key`, splitting every full node on the way so that the
     /// leaf an insert ends in has room. Answers where the key is, or the
     /// leaf slot it belongs in. A failed allocation leaves a valid tree:
     /// every split made before it is complete.
-    private find_or_make_room(mut &this, key: &K) -> Result<KeyPosition<K, V>, AllocError> where K: Ord {
+    private find_or_make_room(mut &this, key: &K) -> Result<KeyPosition<K, V>, AllocationError> where K: Ord {
         if (this.root == null) {
             this.root = this.allocate_node(true)?;
         } else if (this.root.length == NODE_CAPACITY) {
@@ -441,10 +441,10 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
                 const sibling: mut BTreeNode<K, V>* = this.allocate_node(node.children[index].leaf)?;
                 this.split_child(node, index, sibling);
                 const order: Ordering = key.compare(&node.keys[index]);
-                if (!order.is_lt() && !order.is_gt()) {
+                if (!order.is_less() && !order.is_greater()) {
                     return Result::Ok(KeyPosition::<K, V> { node: node, index: index, found: true });
                 }
-                if (order.is_gt()) { index += 1; }
+                if (order.is_greater()) { index += 1; }
             }
             node = node.children[index];
         }
@@ -596,9 +596,9 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
         this.free_node(right);
     }
 
-    private allocate_node(mut &this, leaf: boolean) -> Result<mut BTreeNode<K, V>*, AllocError> {
+    private allocate_node(mut &this, leaf: boolean) -> Result<mut BTreeNode<K, V>*, AllocationError> {
         const raw: NonNull<u8> = this.alloc.allocate(Layout::of::<BTreeNode<K, V>>())?;
-        const node: mut BTreeNode<K, V>* = raw.cast::<BTreeNode<K, V>>().as_ptr();
+        const node: mut BTreeNode<K, V>* = raw.cast::<BTreeNode<K, V>>().as_pointer();
         node.length = 0;
         node.leaf = leaf;
         return Result::Ok(node);
@@ -617,8 +617,8 @@ public type struct BTreeMap<K, V, A = GlobalAlloc> where A: Allocator {
             }
         }
         for (mut index: i64 = 0; index < node.length; index++) {
-            ptr::drop_in_place::<K>(&node.keys[index]);
-            ptr::drop_in_place::<V>(&node.values[index]);
+            pointer::drop_in_place::<K>(&node.keys[index]);
+            pointer::drop_in_place::<V>(&node.values[index]);
         }
         this.free_node(node);
     }
@@ -700,7 +700,7 @@ internal type struct BTreeCursor<K, V> {
             node = node.children[index];
         }
         cursor.mark_run();
-        if (!cursor.finished && (*cursor.first).compare(&*cursor.last).is_gt()) { cursor.finished = true; }
+        if (!cursor.finished && (*cursor.first).compare(&*cursor.last).is_greater()) { cursor.finished = true; }
         return cursor;
     }
 
@@ -716,16 +716,16 @@ internal type struct BTreeCursor<K, V> {
             match (*bound) {
                 Bound::Included(key) => {
                     if (is_start) {
-                        inside = node.keys[index].compare(key).is_lt();
+                        inside = node.keys[index].compare(key).is_less();
                     } else {
-                        inside = !node.keys[index].compare(key).is_gt();
+                        inside = !node.keys[index].compare(key).is_greater();
                     }
                 }
                 Bound::Excluded(key) => {
                     if (is_start) {
-                        inside = !node.keys[index].compare(key).is_gt();
+                        inside = !node.keys[index].compare(key).is_greater();
                     } else {
-                        inside = node.keys[index].compare(key).is_lt();
+                        inside = node.keys[index].compare(key).is_less();
                     }
                 }
                 Bound::Unbounded => { }
@@ -827,13 +827,13 @@ internal type struct BTreeCursor<K, V> {
 
 // The iterators below are produced only as the opaque iterators the map's
 // methods return. Each projects the cursor's entries to what it yields.
-// `KeysIter` and `KeysRefIter` are `internal` because `BTreeSet` wraps them.
+// `KeysIterator` and `KeysReferenceIterator` are `internal` because `BTreeSet` wraps them.
 
-private type struct BTreeMapIter<K, V> {
+private type struct BTreeMapIterator<K, V> {
     private cursor: BTreeCursor<K, V>;
 }
 
-implement<K, V> trait Iterator<Pair<K, V>> for struct BTreeMapIter<K, V> where K: Copy, V: Copy {
+implement<K, V> trait Iterator<Pair<K, V>> for struct BTreeMapIterator<K, V> where K: Copy, V: Copy {
     next(mut &this) -> Option<Pair<K, V>> {
         match (this.cursor.next_front()) {
             Option::Some(at) => { return Option::Some(Pair::new(at.first.keys[at.second], at.first.values[at.second])); }
@@ -842,7 +842,7 @@ implement<K, V> trait Iterator<Pair<K, V>> for struct BTreeMapIter<K, V> where K
     }
 }
 
-implement<K, V> trait DoubleEndedIterator for struct BTreeMapIter<K, V> where K: Copy, V: Copy {
+implement<K, V> trait DoubleEndedIterator for struct BTreeMapIterator<K, V> where K: Copy, V: Copy {
     next_back(mut &this) -> Option<Pair<K, V>> {
         match (this.cursor.next_back()) {
             Option::Some(at) => { return Option::Some(Pair::new(at.first.keys[at.second], at.first.values[at.second])); }
@@ -851,15 +851,15 @@ implement<K, V> trait DoubleEndedIterator for struct BTreeMapIter<K, V> where K:
     }
 }
 
-internal type struct KeysIter<K, V> {
+internal type struct KeysIterator<K, V> {
     private cursor: BTreeCursor<K, V>;
 
-    internal static over<A>(map: &BTreeMap<K, V, A>) -> KeysIter<K, V> where A: Allocator {
-        return KeysIter::<K, V> { cursor: BTreeCursor::new(map.root) };
+    internal static over<A>(map: &BTreeMap<K, V, A>) -> KeysIterator<K, V> where A: Allocator {
+        return KeysIterator::<K, V> { cursor: BTreeCursor::new(map.root) };
     }
 }
 
-implement<K, V> trait Iterator<K> for struct KeysIter<K, V> where K: Copy {
+implement<K, V> trait Iterator<K> for struct KeysIterator<K, V> where K: Copy {
     next(mut &this) -> Option<K> {
         match (this.cursor.next_front()) {
             Option::Some(at) => { return Option::Some(at.first.keys[at.second]); }
@@ -868,7 +868,7 @@ implement<K, V> trait Iterator<K> for struct KeysIter<K, V> where K: Copy {
     }
 }
 
-implement<K, V> trait DoubleEndedIterator for struct KeysIter<K, V> where K: Copy {
+implement<K, V> trait DoubleEndedIterator for struct KeysIterator<K, V> where K: Copy {
     next_back(mut &this) -> Option<K> {
         match (this.cursor.next_back()) {
             Option::Some(at) => { return Option::Some(at.first.keys[at.second]); }
@@ -877,11 +877,11 @@ implement<K, V> trait DoubleEndedIterator for struct KeysIter<K, V> where K: Cop
     }
 }
 
-private type struct ValuesIter<K, V> {
+private type struct ValuesIterator<K, V> {
     private cursor: BTreeCursor<K, V>;
 }
 
-implement<K, V> trait Iterator<V> for struct ValuesIter<K, V> where V: Copy {
+implement<K, V> trait Iterator<V> for struct ValuesIterator<K, V> where V: Copy {
     next(mut &this) -> Option<V> {
         match (this.cursor.next_front()) {
             Option::Some(at) => { return Option::Some(at.first.values[at.second]); }
@@ -890,7 +890,7 @@ implement<K, V> trait Iterator<V> for struct ValuesIter<K, V> where V: Copy {
     }
 }
 
-implement<K, V> trait DoubleEndedIterator for struct ValuesIter<K, V> where V: Copy {
+implement<K, V> trait DoubleEndedIterator for struct ValuesIterator<K, V> where V: Copy {
     next_back(mut &this) -> Option<V> {
         match (this.cursor.next_back()) {
             Option::Some(at) => { return Option::Some(at.first.values[at.second]); }
@@ -899,11 +899,11 @@ implement<K, V> trait DoubleEndedIterator for struct ValuesIter<K, V> where V: C
     }
 }
 
-private type struct EntriesIter<K, V> {
+private type struct EntriesIterator<K, V> {
     private cursor: BTreeCursor<K, V>;
 }
 
-implement<K, V> trait Iterator<Pair<K*, V*>> for struct EntriesIter<K, V> {
+implement<K, V> trait Iterator<Pair<K*, V*>> for struct EntriesIterator<K, V> {
     next(mut &this) -> Option<Pair<K*, V*>> {
         match (this.cursor.next_front()) {
             Option::Some(at) => { return Option::Some(Pair::<K*, V*> { first: &at.first.keys[at.second], second: &at.first.values[at.second] }); }
@@ -912,7 +912,7 @@ implement<K, V> trait Iterator<Pair<K*, V*>> for struct EntriesIter<K, V> {
     }
 }
 
-implement<K, V> trait DoubleEndedIterator for struct EntriesIter<K, V> {
+implement<K, V> trait DoubleEndedIterator for struct EntriesIterator<K, V> {
     next_back(mut &this) -> Option<Pair<K*, V*>> {
         match (this.cursor.next_back()) {
             Option::Some(at) => { return Option::Some(Pair::<K*, V*> { first: &at.first.keys[at.second], second: &at.first.values[at.second] }); }
@@ -921,21 +921,21 @@ implement<K, V> trait DoubleEndedIterator for struct EntriesIter<K, V> {
     }
 }
 
-internal type struct KeysRefIter<K, V> {
+internal type struct KeysReferenceIterator<K, V> {
     private cursor: BTreeCursor<K, V>;
 
-    internal static over<A>(map: &BTreeMap<K, V, A>) -> KeysRefIter<K, V> where A: Allocator {
-        return KeysRefIter::<K, V> { cursor: BTreeCursor::new(map.root) };
+    internal static over<A>(map: &BTreeMap<K, V, A>) -> KeysReferenceIterator<K, V> where A: Allocator {
+        return KeysReferenceIterator::<K, V> { cursor: BTreeCursor::new(map.root) };
     }
 
     /// The keys of `map` between `start` and `end`.
-    internal static between<A>(map: &BTreeMap<K, V, A>, start: Bound<&K>, end: Bound<&K>) -> KeysRefIter<K, V>
+    internal static between<A>(map: &BTreeMap<K, V, A>, start: Bound<&K>, end: Bound<&K>) -> KeysReferenceIterator<K, V>
             where K: Ord, A: Allocator {
-        return KeysRefIter::<K, V> { cursor: BTreeCursor::between(map.root, start, end) };
+        return KeysReferenceIterator::<K, V> { cursor: BTreeCursor::between(map.root, start, end) };
     }
 }
 
-implement<K, V> trait Iterator<K*> for struct KeysRefIter<K, V> {
+implement<K, V> trait Iterator<K*> for struct KeysReferenceIterator<K, V> {
     next(mut &this) -> Option<K*> {
         match (this.cursor.next_front()) {
             Option::Some(at) => { return Option::Some(&at.first.keys[at.second]); }
@@ -944,7 +944,7 @@ implement<K, V> trait Iterator<K*> for struct KeysRefIter<K, V> {
     }
 }
 
-implement<K, V> trait DoubleEndedIterator for struct KeysRefIter<K, V> {
+implement<K, V> trait DoubleEndedIterator for struct KeysReferenceIterator<K, V> {
     next_back(mut &this) -> Option<K*> {
         match (this.cursor.next_back()) {
             Option::Some(at) => { return Option::Some(&at.first.keys[at.second]); }
@@ -953,11 +953,11 @@ implement<K, V> trait DoubleEndedIterator for struct KeysRefIter<K, V> {
     }
 }
 
-private type struct ValuesRefIter<K, V> {
+private type struct ValuesReferenceIterator<K, V> {
     private cursor: BTreeCursor<K, V>;
 }
 
-implement<K, V> trait Iterator<V*> for struct ValuesRefIter<K, V> {
+implement<K, V> trait Iterator<V*> for struct ValuesReferenceIterator<K, V> {
     next(mut &this) -> Option<V*> {
         match (this.cursor.next_front()) {
             Option::Some(at) => { return Option::Some(&at.first.values[at.second]); }
@@ -966,7 +966,7 @@ implement<K, V> trait Iterator<V*> for struct ValuesRefIter<K, V> {
     }
 }
 
-implement<K, V> trait DoubleEndedIterator for struct ValuesRefIter<K, V> {
+implement<K, V> trait DoubleEndedIterator for struct ValuesReferenceIterator<K, V> {
     next_back(mut &this) -> Option<V*> {
         match (this.cursor.next_back()) {
             Option::Some(at) => { return Option::Some(&at.first.values[at.second]); }
@@ -975,11 +975,11 @@ implement<K, V> trait DoubleEndedIterator for struct ValuesRefIter<K, V> {
     }
 }
 
-private type struct ValuesMutableIter<K, V> {
+private type struct ValuesMutableIterator<K, V> {
     private cursor: BTreeCursor<K, V>;
 }
 
-implement<K, V> trait Iterator<mut V*> for struct ValuesMutableIter<K, V> {
+implement<K, V> trait Iterator<mut V*> for struct ValuesMutableIterator<K, V> {
     next(mut &this) -> Option<mut V*> {
         match (this.cursor.next_front()) {
             Option::Some(at) => { return Option::Some(&at.first.values[at.second]); }
@@ -988,7 +988,7 @@ implement<K, V> trait Iterator<mut V*> for struct ValuesMutableIter<K, V> {
     }
 }
 
-implement<K, V> trait DoubleEndedIterator for struct ValuesMutableIter<K, V> {
+implement<K, V> trait DoubleEndedIterator for struct ValuesMutableIterator<K, V> {
     next_back(mut &this) -> Option<mut V*> {
         match (this.cursor.next_back()) {
             Option::Some(at) => { return Option::Some(&at.first.values[at.second]); }
@@ -1005,9 +1005,9 @@ implement<K, V, A> trait Drop for struct BTreeMap<K, V, A> where A: Allocator {
 }
 
 /// Deep copy: a fresh map owning clones of every key and value.
-implement<K, V> trait Clone for struct BTreeMap<K, V, GlobalAlloc> where K: Ord + Clone, V: Clone {
-    clone(&this) -> BTreeMap<K, V, GlobalAlloc> {
-        mut out: BTreeMap<K, V, GlobalAlloc> = BTreeMap::<K, V, GlobalAlloc>::new();
+implement<K, V> trait Clone for struct BTreeMap<K, V, GlobalAllocator> where K: Ord + Clone, V: Clone {
+    clone(&this) -> BTreeMap<K, V, GlobalAllocator> {
+        mut out: BTreeMap<K, V, GlobalAllocator> = BTreeMap::<K, V, GlobalAllocator>::new();
         for (entry in this.entries()) {
             out.insert((*entry.first).clone(), (*entry.second).clone());
         }
@@ -1016,18 +1016,18 @@ implement<K, V> trait Clone for struct BTreeMap<K, V, GlobalAlloc> where K: Ord 
 }
 
 /// A fresh empty map, allocating nothing until the first insert.
-implement<K, V> trait Default for struct BTreeMap<K, V, GlobalAlloc> {
-    static default() -> BTreeMap<K, V, GlobalAlloc> {
-        return BTreeMap::<K, V, GlobalAlloc>::new();
+implement<K, V> trait Default for struct BTreeMap<K, V, GlobalAllocator> {
+    static default() -> BTreeMap<K, V, GlobalAllocator> {
+        return BTreeMap::<K, V, GlobalAllocator>::new();
     }
 }
 
 /// A map of every key-value pair an iterator yields: what `collect` builds
 /// for `BTreeMap`. A later pair's value replaces an earlier one's for the
 /// same key.
-implement<K, V> trait FromIterator<Pair<K, V>> for struct BTreeMap<K, V, GlobalAlloc> where K: Ord {
-    static from_iterator<I>(source: I) -> BTreeMap<K, V, GlobalAlloc> where I: Iterator<Pair<K, V>> {
-        mut out: BTreeMap<K, V, GlobalAlloc> = BTreeMap::<K, V, GlobalAlloc>::new();
+implement<K, V> trait FromIterator<Pair<K, V>> for struct BTreeMap<K, V, GlobalAllocator> where K: Ord {
+    static from_iterator<I>(source: I) -> BTreeMap<K, V, GlobalAllocator> where I: Iterator<Pair<K, V>> {
+        mut out: BTreeMap<K, V, GlobalAllocator> = BTreeMap::<K, V, GlobalAllocator>::new();
         for (pair in source) {
             out.insert(pair.first, pair.second);
         }

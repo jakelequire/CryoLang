@@ -1,0 +1,49 @@
+// E0453: a hand-written destructor call, `x.drop()`, is refused.  The
+// compiler releases every owning value itself - a local at its scope's end,
+// a field after its owner's `drop` body - so a destructor called by hand
+// releases the value a second time: through a reference (the owner still
+// releases it) and on a field (the owner's field glue releases it again).
+// `mem::drop(x)` is the one way to release a value early.  A method that is
+// merely NAMED `drop`, on a type with no `Drop`, is an ordinary call.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::ExplicitDestructorCall;
+
+import std::core::mem;
+
+type struct Noisy { id: i32; }
+implement trait Drop for struct Noisy {
+    drop(mut &this) -> void { }
+}
+
+type struct Outer { inner: Noisy; }
+implement trait Drop for struct Outer {
+    drop(mut &this) -> void {
+        this.inner.drop();
+        //~^ ERROR[E0453] explicit destructor call
+    }
+}
+
+function through_reference(v: mut &Outer) -> void {
+    v.drop();
+    //~^ ERROR[E0453] explicit destructor call
+}
+
+// Not a destructor: `Tally` has no `Drop`, and its `drop` is an ordinary
+// method that borrows.
+type struct Tally {
+    count: i32;
+    drop(&this) -> i32 { return this.count; }
+}
+
+function main() -> i32 {
+    mut local: Noisy = Noisy { id: 1 };
+    local.drop();
+    //~^ ERROR[E0453] explicit destructor call
+    mut outer: Outer = Outer { inner: Noisy { id: 2 } };
+    through_reference(&outer);
+    const early: Noisy = Noisy { id: 3 };
+    mem::drop(early);
+    const tally: Tally = Tally { count: 4 };
+    return tally.drop() + tally.drop();
+}

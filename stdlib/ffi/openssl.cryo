@@ -41,6 +41,12 @@ public const SSL_ERROR_WANT_ACCEPT:  i32 = 8;
 
 // --- certificate verification result --------------------------------
 public const X509_V_OK: i64 = 0;
+/// The verification failed for a reason no other code names.
+public const X509_V_ERR_UNSPECIFIED: i32 = 1;
+/// The certificate does not name the host asked for.
+public const X509_V_ERR_HOSTNAME_MISMATCH: i32 = 62;
+/// The certificate does not name the IP address asked for.
+public const X509_V_ERR_IP_ADDRESS_MISMATCH: i32 = 64;
 
 // --- SSL_ctrl command numbers (from openssl/ssl.h / tls1.h) ----------
 // SNI: `SSL_set_tlsext_host_name(s, name)` expands to
@@ -64,12 +70,36 @@ public extern "C" {
     function SSL_CTX_use_certificate_file(ctx: void*, file: u8*, type_: i32) -> i32;
     function SSL_CTX_use_PrivateKey_file(ctx: void*, file: u8*, type_: i32) -> i32;
     function SSL_CTX_check_private_key(ctx: void*) -> i32;
-    // Trust: add an OpenSSL store URI as a certificate source (3.0); the
-    // `org.openssl.winstore://` URI reads the Windows ROOT store (3.2).
-    function SSL_CTX_load_verify_store(ctx: void*, uri: u8*) -> i32;
     function SSL_CTX_get_cert_store(ctx: void*) -> void*;
     function X509_STORE_add_cert(store: void*, certificate: void*) -> i32;
     function X509_free(certificate: void*) -> void;
+    // Chain verification handed to the caller: `callback(store_context,
+    // argument)` replaces OpenSSL's own and returns 1 to accept the peer.
+    function SSL_CTX_set_cert_verify_callback(ctx: void*, callback: void*, argument: void*) -> void;
+    // What the callback reads: the peer's certificate, the chain it sent,
+    // and the host the connection must name; and OpenSSL's own
+    // verification, against the context's store, which the callback replaced.
+    function X509_STORE_CTX_get0_cert(store_context: void*) -> void*;
+    function X509_STORE_CTX_get0_untrusted(store_context: void*) -> void*;
+    function X509_STORE_CTX_get0_param(store_context: void*) -> void*;
+    function X509_STORE_CTX_set_error(store_context: void*, error: i32) -> void;
+    function X509_verify_cert(store_context: void*) -> i32;
+    function X509_VERIFY_PARAM_get0_host(param: void*, index: i32) -> u8*;
+    function X509_check_host(certificate: void*, name: u8*, name_length: u64, flags: u32,
+                             peer_name: void*) -> i32;
+    // The IP address the connection must name, as text the caller frees
+    // with `CRYPTO_free` (null when it names a host instead), and its check.
+    function X509_VERIFY_PARAM_get1_ip_asc(param: void*) -> mut u8*;
+    function X509_check_ip_asc(certificate: void*, address: u8*, flags: u32) -> i32;
+    // `OPENSSL_free`'s function: the file and line name the caller for
+    // OpenSSL's memory debugging, and may be null and 0.
+    function CRYPTO_free(pointer: void*, file: u8*, line: i32) -> void;
+    // A certificate's DER encoding: with `out` null, its length; else it is
+    // written at `*out`, which is advanced past it.
+    function i2d_X509(certificate: void*, out: mut (mut u8*)*) -> i32;
+    // The STACK_OF(...) accessors behind the `sk_X509_*` macros.
+    function OPENSSL_sk_num(stack: void*) -> i32;
+    function OPENSSL_sk_value(stack: void*, index: i32) -> void*;
     // A read-only memory BIO over the caller's bytes, and PEM decoding
     // from it: one certificate per call, null at the end of the data.
     function BIO_new_mem_buf(bytes: u8*, length: i32) -> void*;

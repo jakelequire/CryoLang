@@ -24,7 +24,7 @@ import std::test::*;
 
 ![test]
 function add_works() -> Result<(), TestError> {
-    expect_eq(2 + 2, 4)?;
+    expect_equal(2 + 2, 4)?;
     return Result::Ok(());
 }
 ```
@@ -59,14 +59,14 @@ A test is a `![test]` function returning `Result<(), TestError>`:
 | --- | --- |
 | `expect(cond, msg)` | `cond` is true |
 | `expect_true(cond)` / `expect_false(cond)` | boolean |
-| `expect_eq(a, b)` / `expect_ne(a, b)` | equality |
+| `expect_equal(a, b)` / `expect_not_equal(a, b)` | equality |
 | `expect_close_f64(a, b, eps)` | float within tolerance |
 | `expect_some(opt)` / `expect_none(opt)` | `Option` shape |
-| `expect_ok(res)` / `expect_err(res)` | `Result` shape |
+| `expect_ok(res)` / `expect_error(res)` | `Result` shape |
 | `bail(msg)` / `bail_other(msg)` | fail immediately |
 
 Each assertion returns a `Result<(), TestError>`; propagate failures with the
-`?` operator (`expect_eq(x, y)?;`) or by matching and returning `Err`.
+`?` operator (`expect_equal(x, y)?;`) or by matching and returning `Err`.
 
 ### Annotations
 
@@ -113,7 +113,7 @@ function prints_ready() -> Result<(), TestError> {
 function a_test_child_runs_by_name_and_exits_zero() -> Result<(), TestError> {
     const command: Command = TestChild::command(Str::new("CryoTests::Tests::TestChildren::prints_ready"))?;
     const output: Output = command.output()?;
-    return expect_eq(output.status().exit_code(), Option::Some(0));
+    return expect_equal(output.status().exit_code(), Option::Some(0));
 }
 ```
 
@@ -157,7 +157,7 @@ function writes_then_reads() -> Result<(), TestError> {
     };
     // `dir` is torn down on EVERY path below, including the failing `?`.
     write_file(dir.path.as_str(), Str::new("hi"))?;
-    return expect_eq(read_file(dir.path.as_str()), Str::new("hi"));
+    return expect_equal(read_file(dir.path.as_str()), Str::new("hi"));
 }
 ```
 
@@ -193,7 +193,7 @@ function doubling_table() -> Result<(), TestError> {
     mut i: i64 = 0;
     while (i < cases.length()) {
         const c: &Case = &cases[i];
-        match (expect_eq(c.input * 2, c.want)) {
+        match (expect_equal(c.input * 2, c.want)) {
             Result::Ok(_)  => { }
             Result::Err(e) => { return Result::Err(prefix_case(i as u64, e)); }
         }
@@ -330,6 +330,14 @@ in each place's related information, `diag-<ten hex digits>`, hashed from its
 code, headline, file name and first place, so the places of one report read
 as one; the compiler's output prints no name.
 
+A warning is pinned with `//~ WARN[<CODE>]` (`WARNING` reads the same). The
+declared code must appear at the severity the compiler reports it at, and that
+severity is chosen where the code is emitted, not by its letter: E0153 (an
+unknown directive) is a warning. So when a `//~` names the declared code, its
+severity is the one the declared code must be reported at; a file with no such
+annotation is held to the letter, `W....` as `warning[W....]` and every other
+code as `error[....]`, and an error reported as a warning fails it.
+
 ---
 
 ## 7. Multi-module test projects
@@ -367,6 +375,12 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 | `"ignore"` | `true` skips the project (reported as ignored) |
 | `"expect"` | per-outcome assertions (below) |
 
+`make test-census` runs the suite with `-Werror=W0017`, which `cryo test`
+hands to every project's build too: a unit test or a project that discards a
+`![must_use]` result fails to build there, and `make examples` holds every
+example to the same.  A project that wants to show the warning asserts it
+from a compile-fail file instead, which is checked without the flag.
+
 ### Outcomes
 
 - **`collect`** - build the package and run *its own* `![test]` functions
@@ -374,7 +388,11 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
   passes if all of them pass. This is the common case: a multi-module package
   whose tests exercise cross-module behavior. Its line reports how many tests
   its run reported (`ok (12 tests)`), and `make test-census` refuses a
-  passing `collect` project that ran none.
+  passing `collect` project that ran none. The output assertions below
+  (`output_contains`, `stderr_contains`, `file`, ...) read that `cryo test`
+  run, so a project can assert what reaches its stdout. The run's exit is
+  judged as a `build` or `run` project's is: it must be `exit_code` (0 when
+  unwritten), or with `fails` any non-zero exit.
 
   ```json
   { "outcome": "collect" }
@@ -485,6 +503,48 @@ make test ARGS="--ignored some_filter"
 `make examples` is a companion smoke gate that compiles every `examples/*/`
 project with the freshly built compiler. Both `make test` and `make examples`
 run in CI on every push and pull request to `main`.
+
+### Declaring what a change moves
+
+`make verify` runs its gates concurrently; `ARGS="--sequential"` runs them
+one after another, for a host whose memory cannot hold them all at once.
+The gates and their verdicts are the same either way.
+
+`make verify ARGS="--baseline REV --require-identical"` compares every
+compiled object against the compiler built from `REV`, and fails on any
+program whose verdict or objects differ unless the change declares it.  A
+change declares a program, one line each with its reason, in one of two files
+the comparison reads:
+
+- `tests/started-compiling` - a project the baseline refuses with a
+  diagnostic and the change builds.
+- `tests/started-passing` - a program the baseline's census fails and the
+  change corrects: a project by its directory name, a compile-fail file as
+  `negative/<file>.cryo`, an example as `examples/<name>`, a unit-test file by
+  its path under `tests/tests` (its object must move), or `archive:<path>` for
+  a unit-test file the baseline fails through the stdlib archive.
+- `moved:<project>` in `tests/started-passing` - a project both compilers
+  build and pass whose objects the change moves on purpose (a codegen
+  correction no assertion of the project observes).  The baseline's census
+  must pass it, its objects are left out of the comparison, and at least one
+  of them must have moved; a declared project whose objects are all
+  unchanged fails, and so does any object that moved in a project nothing
+  declares.
+- `moved-archive:<module>` in `tests/started-passing` - a standard-library
+  module, written by its full name (`moved-archive:std::time::clock`), whose
+  objects in the stdlib archives the change moves on purpose: a compiler
+  change that alters what the library's own source compiles to.  The
+  module's object in every archive both runs built is left out of the
+  archive comparison, and at least one of them must have moved; a declared
+  module whose archive objects are all unchanged fails, and so does a name
+  that is no module of the standard library.  A change to the library's
+  SOURCE never needs it: verify builds this tree's stdlib with both
+  compilers, so a source edit moves nothing there by construction - prove one
+  by building the library before and after at one path.
+
+A line stays once committed: against a later baseline it is inert.
+Rewriting a line into another form with its reason kept declares nothing
+again.
 
 ## 9. The language server's tests
 

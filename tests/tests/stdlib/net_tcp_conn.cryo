@@ -1,4 +1,4 @@
-///! `BufStream<TcpStream>` — the buffered `AsyncRead` + `AsyncWrite` over a real
+///! `BufferedStream<TcpStream>` — the buffered `AsyncRead` + `AsyncWrite` over a real
 ///! loopback socket, driven by a real `Executor` (worker pool + reactor).
 ///!
 ///! The in-memory trait tests (`io_async_traits`) prove the DEFAULT BODIES
@@ -31,11 +31,11 @@ import std::collections::array::{ Array };
 import std::future;
 import std::io::error::{ IoErrorKind };
 import std::io::traits;
-import std::net::addr::socket_addr::{ SocketAddr };
+import std::net::address::socket_address::{ SocketAddress };
 import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
-import std::io::buf::{ BufStream };
+import std::io::buffered::{ BufferedStream };
 import std::test::error::{ TestError };
-import std::test::assert::{ bail, expect_eq };
+import std::test::assert::{ bail, expect_equal };
 import std::future::combinator::{ Futures };
 import std::future::executor::{ Executor };
 
@@ -63,12 +63,12 @@ async function ntc_serve(listener: TcpListener) -> i64 {
     mut acc: TcpAccepted = await TcpAccept::start(listener);
     mut _lst: TcpListener = acc.take_listener();
 
-    mut stream: TcpStream = TcpStream::from_fd(-1);
+    mut stream: TcpStream = TcpStream::from_file_descriptor(-1);
     match (acc.take_result()) {
         Result::Ok(s)  => { stream = s; }
         Result::Err(_) => { return -1; }
     }
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(stream);
+    mut c: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(stream);
 
     mut head: String = match (await c.read_line(256)) {
         Result::Ok(v)  => { v }
@@ -94,11 +94,11 @@ async function ntc_serve(listener: TcpListener) -> i64 {
 }
 
 async function ntc_client(port: u16) -> i64 {
-    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -10; }
     };
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    mut c: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(sock);
 
     match (c.queue::<string>("ECHO 5\r\nHELLO")) { Result::Ok(_) => { } Result::Err(_) => { return -11; } }
     match (await c.flush())                    { Result::Ok(_) => { } Result::Err(_) => { return -12; } }
@@ -126,28 +126,28 @@ async function ntc_round_trip(port: u16, listener: TcpListener) -> i64 {
 
 ![test]
 function tcp_conn_framed_round_trip() -> Result<(), TestError> {
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
-    listener.set_nonblocking(true);
-    const port: u16 = match (listener.local_addr()) {
+    listener.set_nonblocking(true)?;
+    const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_address failed")); }
     };
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(ntc_round_trip(port, listener));
-    return expect_eq(r, 0 as i64);
+    return expect_equal(r, 0 as i64);
 }
 
 /// A peer that closes without sending the record it announced must surface as
 /// `UnexpectedEof` from `read_exact`, not as a hang and not as a short read.
 async function ntc_truncated_send(port: u16) -> i64 {
-    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -40; }
     };
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    mut c: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(sock);
     match (c.queue::<string>("REC 4\r\nab")) { Result::Ok(_) => { } Result::Err(_) => { return -41; } }
     match (await c.flush())                { Result::Ok(_) => { } Result::Err(_) => { return -42; } }
     return 1;   // dropping `c` here closes the socket mid-record
@@ -156,12 +156,12 @@ async function ntc_truncated_send(port: u16) -> i64 {
 async function ntc_truncated_recv(listener: TcpListener) -> i64 {
     mut acc: TcpAccepted = await TcpAccept::start(listener);
     mut _lst: TcpListener = acc.take_listener();
-    mut stream: TcpStream = TcpStream::from_fd(-1);
+    mut stream: TcpStream = TcpStream::from_file_descriptor(-1);
     match (acc.take_result()) {
         Result::Ok(s)  => { stream = s; }
         Result::Err(_) => { return -50; }
     }
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(stream);
+    mut c: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(stream);
     mut head: String = match (await c.read_line(64)) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -51; }
@@ -198,11 +198,11 @@ async function ntc_truncated(port: u16, listener: TcpListener) -> i64 {
 /// a `None`. The failure was originally blamed on `Futures::join`, which is only
 /// the lens it was seen through.
 async function ntc_flood_send(port: u16, n: i64) -> i64 {
-    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -60; }
     };
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    mut c: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(sock);
 
     mut i: i64 = 0;
     while (i < n) {
@@ -222,12 +222,12 @@ async function ntc_flood_send(port: u16, n: i64) -> i64 {
 async function ntc_flood_recv(listener: TcpListener, n: i64) -> i64 {
     mut acc: TcpAccepted = await TcpAccept::start(listener);
     mut _lst: TcpListener = acc.take_listener();
-    mut stream: TcpStream = TcpStream::from_fd(-1);
+    mut stream: TcpStream = TcpStream::from_file_descriptor(-1);
     match (acc.take_result()) {
         Result::Ok(s)  => { stream = s; }
         Result::Err(_) => { return -70; }
     }
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(stream);
+    mut c: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(stream);
 
     // Two suspending reads per iteration, both on the connection itself, so the
     // carrier is taken and handed back four times per record.
@@ -261,32 +261,32 @@ async function ntc_flood(port: u16, listener: TcpListener, n: i64) -> i64 {
 
 ![test]
 function tcp_conn_flood_of_records_read_one_at_a_time() -> Result<(), TestError> {
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
-    listener.set_nonblocking(true);
-    const port: u16 = match (listener.local_addr()) {
+    listener.set_nonblocking(true)?;
+    const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_address failed")); }
     };
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(ntc_flood(port, listener, 16 as i64));
-    return expect_eq(r, 0 as i64);
+    return expect_equal(r, 0 as i64);
 }
 
 ![test]
 function tcp_conn_reports_a_truncated_record_as_eof() -> Result<(), TestError> {
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
-    listener.set_nonblocking(true);
-    const port: u16 = match (listener.local_addr()) {
+    listener.set_nonblocking(true)?;
+    const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_address failed")); }
     };
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(ntc_truncated(port, listener));
-    return expect_eq(r, 0 as i64);
+    return expect_equal(r, 0 as i64);
 }

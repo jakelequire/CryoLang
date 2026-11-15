@@ -21,14 +21,14 @@
 
 namespace compiler::vendor::auto_vendor;
 
-import compiler::vendor::registry::{ VendorLock, VendorRegistry };
+import compiler::vendor::registry::{ VendorEntry, VendorLock, VendorRegistry };
 import compiler::bindgen::generator::{ VendorGenerator };
 import compiler::project_config::{ VendorPin };
-import std::fs::path::{ Path };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
 import std::fmt;
-import std::collections::string;
-import std::collections::str;
-import std::ffi::libc;
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
 
 type struct AutoVendor {
     /// Ensure every `[vendor.<Name>]` pin in `pins` has bindings cached for its
@@ -57,8 +57,7 @@ type struct AutoVendor {
             }
         }
         if (changed && !reg.save_global()) {
-            fmt::eprintf("warning: could not persist auto-vendored bindings to %s\n",
-                VendorRegistry::registry_path());
+            fmt::eprint(f"warning: could not persist auto-vendored bindings to {VendorRegistry::registry_path().as_path().as_str()}\n");
         }
         lock.release();
     }
@@ -67,29 +66,25 @@ type struct AutoVendor {
     /// has bindings for `triple` in `reg`.  Returns true only when it generated
     /// new bindings (and thus mutated `reg`).  A cache hit, an unregistered
     /// library, or a non-"headers" binding source all return false.
-    static ensure_one(reg: mut VendorRegistry*, lib: string, triple: string) -> boolean {
+    static ensure_one(reg: mut VendorRegistry*, lib: Str, triple: Str) -> boolean {
         const idx: i64 = reg.find_index(lib);
         if (idx < 0) {
-            fmt::eprintf("warning: [vendor.%s] pins a library that is not registered;\n         register it with `cryo vendor <path>` (the pin is ignored).\n",
-                lib);
+            fmt::eprint(f"warning: [vendor.{lib}] pins a library that is not registered;\n         register it with `cryo vendor <path>` (the pin is ignored).\n");
             return false;
         }
-        const norm: string = VendorRegistry::normalize_triple(triple);
-        const have_file: string = reg.entries[idx].cache_file_for(norm);
-        const have_key:  string = reg.entries[idx].cache_key_for(norm);
+        const norm: Str = VendorRegistry::normalize_triple(triple);
+        const entry: &VendorEntry = &reg.entries[idx];
+        const have_file: String = String::from_str(entry.cache_file_for(norm));
+        const have_key:  String = String::from_str(entry.cache_key_for(norm));
 
         // Only a libclang-driven "headers" (C) or "cxx-headers" (C++) source can
         // be regenerated here; a "manual" / bindings_file entry is whatever was
         // copied in at register time, so we resolve it as-is when present and
         // warn when it is not.
-        const av_is_gen: boolean =
-            reg.entries[idx].binding_source == "headers"
-            || reg.entries[idx].binding_source == "cxx-headers";
-        if (!av_is_gen || reg.entries[idx].headers.length() == 0) {
+        if (!entry.is_generated() || entry.headers.length() == 0) {
             if (have_file.length() == 0
-                    || !Path::from(have_file).exists()) {
-                fmt::eprintf("warning: [vendor.%s] has no bindings for target '%s' and cannot be\n         auto-generated (binding_source is not \"headers\"/\"cxx-headers\"); the pin is ignored.\n",
-                    lib, norm);
+                    || !Path::from(have_file.as_str()).exists()) {
+                fmt::eprint(f"warning: [vendor.{lib}] has no bindings for target '{norm}' and cannot be\n         auto-generated (binding_source is not \"headers\"/\"cxx-headers\"); the pin is ignored.\n");
             }
             return false;
         }
@@ -98,50 +93,44 @@ type struct AutoVendor {
         // current headers + triple + libclang + generator version.  Computing
         // the provenance key only reads header bytes (no libclang parse), so a
         // normal up-to-date build stays cheap.
-        const prov_key: string = VendorGenerator::provenance_key(
-            reg.entries[idx].source_path, &reg.entries[idx].headers,
-            &reg.entries[idx].include_dirs, &reg.entries[idx].defines,
-            norm, have_file, reg.entries[idx].lang_arg());
-        const hit: boolean = have_key != ""
-            && have_key == prov_key
-            && have_file != ""
-            && Path::from(have_file).exists();
+        const provenance: String = VendorGenerator::provenance_key(
+            entry.source_path.as_str(), &entry.headers, &entry.include_dirs, &entry.defines,
+            norm, have_file.as_str(), entry.lang_arg());
+        const hit: boolean = have_key.length() > 0
+            && have_key == provenance
+            && have_file.length() > 0
+            && Path::from(have_file.as_str()).exists();
         if (hit) { return false; }
 
         // Miss: (re)generate via libclang and cache the result.
-        fmt::printf("note: generating pinned bindings for '%s' (target '%s')...\n",
-            reg.entries[idx].name, norm);
-        const cache_dir: string =
-            VendorRegistry::cache_dir_for(reg.entries[idx].key, triple);
-        const dest: string = Path::from(cache_dir).join(f"{reg.entries[idx].name}.cryo".as_str()).into_raw();
-        mut inputs: [string] = [];
-        const src_text: string = VendorGenerator::generate(
-            reg.entries[idx].name, reg.entries[idx].source_path,
-            &reg.entries[idx].headers, &reg.entries[idx].include_dirs,
-            &reg.entries[idx].defines, &inputs,
-            reg.entries[idx].lang_arg(), reg.entries[idx].std);
-        if (src_text.length() == 0) {
-            fmt::eprintf("warning: auto-vendor for '%s' produced no output (no header parsed); the pin is ignored.\n",
-                reg.entries[idx].name);
+        fmt::print(f"note: generating pinned bindings for '{entry.name}' (target '{norm}')...\n");
+        const dest: PathBuf = VendorRegistry::cache_dir_for(entry.key.as_str(), triple)
+            .join(f"{entry.name}.cryo".as_str());
+        mut inputs: [String] = [];
+        const source_text: String = VendorGenerator::generate(
+            entry.name.as_str(), entry.source_path.as_str(),
+            &entry.headers, &entry.include_dirs, &entry.defines, &inputs,
+            entry.lang_arg(), entry.std.as_str());
+        if (source_text.length() == 0) {
+            fmt::eprint(f"warning: auto-vendor for '{entry.name}' produced no output (no header parsed); the pin is ignored.\n");
             return false;
         }
-        const gf: void* = libc::fopen(dest, "w");
-        if (gf == null) {
-            fmt::eprintf("warning: cannot write auto-vendored bindings to %s\n", dest);
-            return false;
+        match (File::write_text(dest.as_path(), source_text.as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => {
+                fmt::eprint(f"warning: cannot write auto-vendored bindings to {dest.as_path().as_str()}: {error}\n");
+                return false;
+            }
         }
-        libc::fputs(src_text, gf);
-        libc::fclose(gf);
         // Sidecar the include graph so the next build's provenance check folds
         // transitive headers (matches the `cryo vendor` path).
-        VendorGenerator::write_depfile(dest, &inputs);
+        VendorGenerator::write_depfile(dest.as_path().as_str(), &inputs);
         // Store the key folded FROM the just-written depfile so the next
         // unchanged build hits without a spurious one-time regeneration.
-        const store_key: string = VendorGenerator::provenance_key(
-            reg.entries[idx].source_path, &reg.entries[idx].headers,
-            &reg.entries[idx].include_dirs, &reg.entries[idx].defines,
-            norm, dest, reg.entries[idx].lang_arg());
-        reg.entries[idx].set_cache(norm, dest, store_key);
+        const store_key: String = VendorGenerator::provenance_key(
+            entry.source_path.as_str(), &entry.headers, &entry.include_dirs, &entry.defines,
+            norm, dest.as_path().as_str(), entry.lang_arg());
+        reg.entries[idx].set_cache(norm, dest.as_path().as_str(), store_key.as_str());
         return true;
     }
 }

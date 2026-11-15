@@ -11,18 +11,18 @@
 ///! Use a Pool when you have many values of the same type with
 ///! churn-heavy lifetimes (game entities, AST nodes under frequent
 ///! edit, request objects). For mixed sizes use an Arena or
-///! `GlobalAlloc`.
+///! `GlobalAllocator`.
 
 namespace std::alloc::pool;
 
 import std::ffi::libc;
 import std::core::mem;
-import std::core::ptr::{ NonNull };
+import std::core::pointer::{ NonNull };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ Allocator, AllocError, AllocErrorKind };
+import std::alloc::allocator::{ Allocator, AllocationError, AllocationErrorKind };
 import std::core::intrinsics;
 
 /// Default block size: each block carves this many slots. Chosen to
@@ -54,7 +54,7 @@ private type struct Block {
 /// ```cryo
 /// import std::alloc::pool::{ Pool };
 /// import std::alloc::layout::{ Layout };
-/// import std::core::ptr::{ NonNull };
+/// import std::core::pointer::{ NonNull };
 ///
 /// mut pool: Pool = Pool::new(Layout::of::<u64>());
 /// const slot: NonNull<u8> = pool.allocate_slot().unwrap();
@@ -95,7 +95,7 @@ public type struct Pool {
     /// Grab a free slot, carving a new block if the free list is empty.
     /// Returns `Err(OutOfMemory)` if the backing allocator refuses the
     /// block request.
-    public allocate_slot(mut &this) -> Result<NonNull<u8>, AllocError> {
+    public allocate_slot(mut &this) -> Result<NonNull<u8>, AllocationError> {
         if (this.free_list == null) {
             grow(this)?;
         }
@@ -107,7 +107,7 @@ public type struct Pool {
     /// Return a slot to the pool. `ptr` must have come from a previous
     /// `allocate_slot` on **this** pool and must not have been freed.
     public deallocate_slot(mut &this, ptr: NonNull<u8>) -> void {
-        const node: mut FreeNode* = ptr.as_ptr() as mut FreeNode*;
+        const node: mut FreeNode* = ptr.as_pointer() as mut FreeNode*;
         node.next = this.free_list;
         this.free_list = node;
     }
@@ -142,10 +142,10 @@ implement trait Allocator for struct Pool {
     /// Accepts a layout of the slot's exact size and an alignment no
     /// stricter than the slot's. Any other request returns
     /// `Err(InvalidLayout)`.
-    allocate(mut &this, block: Layout) -> Result<NonNull<u8>, AllocError> {
+    allocate(mut &this, block: Layout) -> Result<NonNull<u8>, AllocationError> {
         if (block.size() != this.slot.size()
                 || block.alignment() > this.slot.alignment()) {
-            return Result::Err(AllocError::new(AllocErrorKind::InvalidLayout, block));
+            return Result::Err(AllocationError::new(AllocationErrorKind::InvalidLayout, block));
         }
         return this.allocate_slot();
     }
@@ -158,7 +158,7 @@ implement trait Allocator for struct Pool {
 // Growth
 
 /// Allocate a new backing block and thread its slots onto the free list.
-private function grow(pool: mut &Pool) -> Result<(), AllocError> {
+private function grow(pool: mut &Pool) -> Result<(), AllocationError> {
     const stride: u64 = pool.slot.padded_size();
     // Guard `stride * slots_per_block` against u64 overflow: a wrapped product
     // would aligned_alloc a too-small block, after which threading
@@ -167,18 +167,18 @@ private function grow(pool: mut &Pool) -> Result<(), AllocError> {
     // pathological value must fail cleanly rather than corrupt the heap.
     const checked_bytes: Option<u64> = stride.checked_multiply(pool.slots_per_block);
     if (checked_bytes.is_none()) {
-        return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, pool.slot));
+        return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, pool.slot));
     }
     const bytes: u64 = checked_bytes.unwrap_or(0);
 
     const header: mut void* = libc::malloc(sizeof(Block));
     if (header == null) {
-        return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, pool.slot));
+        return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, pool.slot));
     }
     const data: mut u8* = libc::aligned_alloc(pool.slot.alignment(), bytes);
     if (data == null) {
         libc::free(header);
-        return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, pool.slot));
+        return Result::Err(AllocationError::new(AllocationErrorKind::OutOfMemory, pool.slot));
     }
 
     const block: mut Block* = header as mut Block*;

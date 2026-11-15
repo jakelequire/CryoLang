@@ -56,7 +56,6 @@ import compiler::ast::node::{ ProgramNode, StaticAssertItem };
 import compiler::ast::pattern::{ MatchArmNode, StaticMatchArmNode };
 import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
-import compiler::diag::edit_distance::{ find_best_candidate };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Applicability, Suggestion };
@@ -1985,7 +1984,7 @@ type struct TypeResolutionPasses {
             ctx.generic_registry.mark_overlap_checked(node.trait_def, decl);
         }
         if (is_source_decl && node.is_trait_impl()) {
-            TypeResolutionPasses::lend_trait_argument_params(node);
+            TypeResolutionPasses::lend_trait_argument_parameters(node);
         }
         if (blanket) { return; }
         // The head's methods under the owner the index names, their returns
@@ -2035,8 +2034,8 @@ type struct TypeResolutionPasses {
     static overlap_excused(block: mut ImplBlock*, other: mut ImplBlock*, ctx: mut CompilationContext*) -> boolean {
         mut bindings: [HeadBinding] = [];
         if (!GenericRegistry::heads_unify(other, block, &bindings)) { return false; }
-        if (!TypeResolutionPasses::head_params_named(block, &bindings)
-                || !TypeResolutionPasses::head_params_named(other, &bindings)) {
+        if (!TypeResolutionPasses::head_parameters_named(block, &bindings)
+                || !TypeResolutionPasses::head_parameters_named(other, &bindings)) {
             return false;
         }
         mut rc: ResolutionContext = ResolutionContext::new("");
@@ -2056,14 +2055,14 @@ type struct TypeResolutionPasses {
             }
         }
         const checker: TraitChecker = TraitChecker::new(ctx.type_arena, ctx.generic_registry,
-                                                        ctx.intern_table, ctx.diagnostics);
+                                                        ctx.intern_table, ctx.diagnostics, ctx.type_resolver);
         return !checker.impl_applies_at(block, block.trait_def, &trait_args, subject, 0)
             || !checker.impl_applies_at(other, other.trait_def, &trait_args, subject, 0);
     }
 
     /// Whether every parameter of `head` is bound, through `bindings`, to a
     /// named type.
-    static head_params_named(head: ImplBlock*, bindings: &[HeadBinding]) -> boolean {
+    static head_parameters_named(head: ImplBlock*, bindings: &[HeadBinding]) -> boolean {
         for (mut i: i64 = 0; i < head.generic_params.length(); i++) {
             const gp: GenericParamDecl* = DeclarationNode::generic_param_of(head.generic_params[i]);
             if (gp == null) { return false; }
@@ -2121,7 +2120,7 @@ type struct TypeResolutionPasses {
     /// The name written here is the impl's target, so the syntax this annotation
     /// now stands for was written in the impl's file; keeping the trait's span
     /// leaves a node whose name and provenance disagree, and a bare leaf then
-    /// resolves in a module that never wrote it (`HashMapIter` homed on
+    /// resolves in a module that never wrote it (`HashMapIterator` homed on
     /// `std::core::iter`).  An `implement` block may live in a third module
     /// again, so neither the trait's nor the target type's file can stand in.
     static rewrite_this_type_annotation(ann: mut TypeAnnotation*,
@@ -2324,13 +2323,16 @@ type struct TypeResolutionPasses {
     }
 
     /// True if `ann` mentions `This` anywhere (directly or nested inside a
-    /// pointer/reference/optional/array/generic/tuple/function annotation).
+    /// pointer/reference/optional/array/generic/tuple/function annotation),
+    /// or may: an opaque return (`implement Trait`) stands for the type its
+    /// body returns, which may hold `This`.
     /// Used to flag self-returning trait defaults (combinators) so the
     /// monomorphizer instantiates them lazily rather than eagerly.
     static annotation_references_this(ann: TypeAnnotation*) -> boolean {
         if (ann == null) { return false; }
         return match (*ann) {
             TypeAnnotation::ThisType(_) => { true }
+            TypeAnnotation::ImplTrait(_) => { true }
             TypeAnnotation::Reference(r) => {
                 TypeResolutionPasses::annotation_references_this(r.inner)
             }
@@ -2394,7 +2396,7 @@ type struct TypeResolutionPasses {
     /// bound it goes through gives its result.  The parameter keeps its one
     /// declaration, which every name in the block was resolved to; it is
     /// appended after the method's own, once.
-    static lend_trait_argument_params(node: ImplBlock*) -> void {
+    static lend_trait_argument_parameters(node: ImplBlock*) -> void {
         const trait_generic: GenericAnnotation* = GenericRegistry::trait_generic_of(node.trait_annotation);
         if (trait_generic == null) { return; }
         for (mut pi: i64 = 0; pi < node.generic_params.length(); pi++) {
@@ -2448,12 +2450,12 @@ type struct TypeResolutionPasses {
     /// An impl head on a template writes every parameter of the template it
     /// names - as parameters of its own (`implement<A> trait Display for
     /// String<A>`) or as a concrete instantiation (`implement trait Display
-    /// for String<GlobalAlloc>`) - whether every parameter defaults or only the
+    /// for String<GlobalAllocator>`) - whether every parameter defaults or only the
     /// trailing ones do.  A head that writes fewer is not given the default
     /// meaning: `implement trait Display for String` would be an impl for
-    /// `String<GlobalAlloc>` alone while reading as one for every `String`,
+    /// `String<GlobalAllocator>` alone while reading as one for every `String`,
     /// and `implement<T> trait Foo for Array<T>` the same for `Array<T,
-    /// GlobalAlloc>`.  Refused on the WRITTEN head only: the stamp is what a
+    /// GlobalAllocator>`.  Refused on the WRITTEN head only: the stamp is what a
     /// written head carries and a clone does not.
     static refuse_elided_template_params(decl: DeclarationNode*, node: ImplBlock*,
                                          ctx: mut CompilationContext*) -> void {
@@ -2583,16 +2585,16 @@ type struct TypeResolutionPasses {
         mut upper_next: boolean = true;
         for (mut i: i64 = 0; i < n; i++) {
             if (src[i] == '_') { upper_next = true; continue; }
-            mut piece: string = src.substring(i as u32, 1);
+            mut piece: string = src.substring(i, 1);
             if (upper_next) {
                 for (mut k: i64 = 0; k < 26; k++) {
-                    if (src[i] == lower[k]) { piece = upper.substring(k as u32, 1); break; }
+                    if (src[i] == lower[k]) { piece = upper.substring(k, 1); break; }
                 }
             }
             out = fmt::format("%s%s", out, piece).into_raw();
             upper_next = false;
         }
-        return ctx.intern(fmt::format("%sFut", out).into_raw());
+        return ctx.intern(fmt::format("%sFut", out).as_str());
     }
 
     /// Whether the trait's `slot`-th associated type is the implicit future
@@ -2733,7 +2735,7 @@ type struct TypeResolutionPasses {
     /// Ord`) is applicable to THIS impl. Returns false ONLY when the impl's
     /// concrete Item type definitively does not implement a bound trait - the
     /// case that must be filtered so the default's body is never synthesized
-    /// (and then type-checked) for it (e.g. `EnumerateIter`/`ZipIter` whose Item
+    /// (and then type-checked) for it (e.g. `EnumerateIterator`/`ZipIterator` whose Item
     /// is `Pair`, which is never `Ord`). A SYMBOLIC Item - a bare impl generic
     /// param (`A`), or an `I::Item` projection - is undecidable here and kept;
     /// its applicability is settled at the trait-level symbolic pass or per
@@ -2795,7 +2797,7 @@ type struct TypeResolutionPasses {
             owner_params.push(tmpl.param_types[i]);
         }
         const tc: TraitChecker = TraitChecker::new(arena, ctx.generic_registry,
-                                                   ctx.intern_table, ctx.diagnostics);
+                                                   ctx.intern_table, ctx.diagnostics, ctx.type_resolver);
         tc.add_head_param_bindings(node, &owner_params, &head);
         return head;
     }
@@ -3097,7 +3099,7 @@ type struct TypeResolutionPasses {
 
             // Skip cloning a projection-bounded default (`min`/`max` with
             // `where This::Item: Ord`) into an impl whose CONCRETE Item type
-            // definitively lacks the bound trait - e.g. `EnumerateIter`/`ZipIter`
+            // definitively lacks the bound trait - e.g. `EnumerateIterator`/`ZipIterator`
             // yield `Pair`, which is never `Ord`. Without this the default body
             // would be synthesized and then type-checked against a `Pair`
             // receiver (`.compare()`), a spurious E0358. Symbolic Item types
@@ -3113,7 +3115,7 @@ type struct TypeResolutionPasses {
             if (cloned == null) { continue; }
             cloned.set_synth_default(true);
             // A default whose return mentions `This` (e.g. combinators
-            // returning `MapIter<This, ...>`) is self-referential: eagerly
+            // returning `MapIterator<This, ...>`) is self-referential: eagerly
             // instantiating it for an adapter's own impl recurses forever.
             // Flag it (checked on the pre-rewrite annotation) so mono
             // instantiates it lazily, only at call sites.

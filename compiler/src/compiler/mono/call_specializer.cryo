@@ -219,7 +219,7 @@ type struct MonoCallSpecializer {
     /// A body instantiated only at a call site (a self-returning trait default,
     /// a self-growing inherent method) is never emitted from the declaration it
     /// sits in, and is not walked from there either: its calls name adapters
-    /// over the owner (`TakeIter<This>::new`), and specializing them eagerly
+    /// over the owner (`TakeIterator<This>::new`), and specializing them eagerly
     /// demands the adapter, whose impl carries the same default, without end.
     /// The lazy clone made for a call site is walked when it is made.
     static body_is_lazy(func_decl: DeclarationNode*) -> boolean {
@@ -310,7 +310,7 @@ type struct MonoCallSpecializer {
                         this.walk_expr(vd.initializer, res_ctx, subst);
                         // Sema already typed this binding to a concrete
                         // instantiation (e.g. an adapter CHAIN result
-                        // `CopiedIter<RefIter<i32>>` whose receiver is a
+                        // `CopiedIterator<ReferenceIterator<i32>>` whose receiver is a
                         // method-call temporary mono can't reconstruct).  Treat
                         // sema's binding type as the demand and enqueue it
                         // directly; enqueue_from_type_ref is a guarded no-op unless
@@ -975,13 +975,13 @@ type struct MonoCallSpecializer {
             return;
         }
         // A bare generic-template struct used directly as a receiver (`this` in
-        // `implement FmtWrite for struct String`, or `mut s: String` with all params
+        // `implement FormatWrite for struct String`, or `mut s: String` with all params
         // defaulted) is NOT a materialized spec, so a generic method on it (`try_push<T>`)
         // resolves to nothing in the lookup ladder and the call is left unpinned - 
         // codegen's name+arity fallback then picks an arbitrary sibling spec once more
         // than one exists (e.g. try_push<Str> -> try_push<i32>, corrupting all
         // formatting).  Canonicalize to the DEFAULT instantiation's emitted spec
-        // (String<GlobalAlloc>) so the call pins a symbol that is actually emitted.
+        // (String<GlobalAllocator>) so the call pins a symbol that is actually emitted.
         if (t.kind == TypeKind::Struct) {
             const canon: TypeRef = this.canonicalize_default_template_recv(recv_type);
             if (canon.is_valid() && !canon.equals(recv_type)) {
@@ -1133,7 +1133,7 @@ type struct MonoCallSpecializer {
         // by a value parameter (`chain<I>(other: I)`, `zip<U>(other: U)`,
         // `map<F>(f: F)`), so `method_generic_in_value_param` is true and this
         // branch never fires for them - their owner-spec disambiguation (a
-        // distinct `ChainIter<...>` owner per spec) is preserved.
+        // distinct `ChainIterator<...>` owner per spec) is preserved.
         mut method_generic_in_value_param: boolean = false;
         if (orig_func != null) {
             for (mut pi: i64 = 0; pi < orig_func.parameters.length(); pi++) {
@@ -1256,7 +1256,7 @@ type struct MonoCallSpecializer {
     /// The receiver's method for the definition `d`, and where it is held:
     /// the type declaration (`out_owner_ast`) or the impl block
     /// (`out_impl`) its instances are added to.  A default the receiver
-    /// instantiates per call (`take`, `map`, `Option<T>::as_ref`) is held
+    /// instantiates per call (`take`, `map`, `Option<T>::as_reference`) is held
     /// deferred in an impl block and has no index entry until a call
     /// instantiates it, so it is found where it is held, by the definition
     /// it is a copy of; every other method is the receiver's index entry for
@@ -1586,7 +1586,7 @@ type struct MonoCallSpecializer {
         // Heap-allocated: the substituter holds the pointer and attaches
         // types that outlive this call.
         const subst_ptr: mut TypeSubstitution* =
-            allocator::alloc(sizeof(TypeSubstitution), 16) as mut TypeSubstitution*;
+            allocator::allocate(sizeof(TypeSubstitution), 16) as mut TypeSubstitution*;
         *subst_ptr = head.parameter_substitution(this.arena, subject);
         mut cloner: ASTCloner = ASTCloner::for_monomorphization();
         const copy_decl: DeclarationNode* = cloner.clone_decl(head_decl);
@@ -2076,6 +2076,30 @@ type struct MonoCallSpecializer {
                         call.bind_arguments(this.arena, &vparams);
                     }
                 }
+                return;
+            }
+            CalleePin::Instance(instance) => {
+                // An instance's copy may not be registered yet; its parameters
+                // are the template's, under the instance's arguments.
+                if (this.generic_registry == null) { return; }
+                const template: const TemplateEntry* = this.generic_registry.template_of_type(
+                    this.arena.inst_generic_base(instance));
+                if (template == null) { return; }
+                const template_func: FunctionDecl* = DeclarationNode::fn_of(template.ast_node);
+                if (template_func == null) { return; }
+                mut instance_args: [TypeRef] = [];
+                for (mut i: i64 = 0; i < this.arena.inst_type_arg_count(instance); i++) {
+                    instance_args.push(this.arena.inst_type_arg_at(instance, i));
+                }
+                const instance_subst: TypeSubstitution = TypeSubstitution::from_params(
+                    &template.param_types, &instance_args);
+                mut instance_params: [TypeRef] = [];
+                for (mut i: i64 = 0; i < template_func.parameters.length(); i++) {
+                    const p: VarDecl* = DeclarationNode::var_of(template_func.parameters[i]);
+                    if (p == null) { return; }
+                    instance_params.push(instance_subst.apply(p.resolved_type, this.arena));
+                }
+                call.bind_arguments(this.arena, &instance_params);
                 return;
             }
             _ => { }
@@ -2597,7 +2621,7 @@ type struct MonoCallSpecializer {
     /// If `recv_type` is a bare generic-template struct (every type param has a
     /// default), build its DEFAULT instantiation and return the materialized spec's
     /// concrete type - so a generic-method call on the bare template pins/emits under
-    /// the same spec as in-source `String<GlobalAlloc>` receivers.  Returns
+    /// the same spec as in-source `String<GlobalAllocator>` receivers.  Returns
     /// `recv_type` unchanged when it isn't a defaultable template or no spec for the
     /// default instantiation has been materialized.
     canonicalize_default_template_recv(mut &this, recv_type: TypeRef) -> TypeRef {
@@ -2686,10 +2710,10 @@ type struct MonoCallSpecializer {
             }
         }
         // A parameter the impl's where-clause derives (`A` in `implement<I, A>
-        // Iterator<A> for TakeIter<I> where I: Iterator<A>`) is no parameter of
+        // Iterator<A> for TakeIterator<I> where I: Iterator<A>`) is no parameter of
         // the owner, so the receiver's arguments cannot bind it; the spec'd
         // impl caches it.  The signature below is resolved with the same
-        // binding, and a body stash naming it (`TakeIter<I, A>`) needs it here.
+        // binding, and a body stash naming it (`TakeIterator<I, A>`) needs it here.
         if (owner_impl != null) {
             for (mut di: i64 = 0; di < owner_impl.derived_param_names.length(); di++) {
                 if (!owner_impl.derived_param_types[di].is_valid()) { continue; }
@@ -2721,7 +2745,7 @@ type struct MonoCallSpecializer {
             }
         }
         const subst_ptr: mut TypeSubstitution* =
-            allocator::alloc(sizeof(TypeSubstitution), 16) as mut TypeSubstitution*;
+            allocator::allocate(sizeof(TypeSubstitution), 16) as mut TypeSubstitution*;
         *subst_ptr = subst_val;
         *out_subst = subst_ptr;
 
@@ -2734,7 +2758,7 @@ type struct MonoCallSpecializer {
         // cleared BEFORE the substituter runs, which skips a flagged body.
         // The skip guards the base->spec rename in a spec'd impl; there is no
         // rename here, and the body's stashes (an adapter over the owner,
-        // `TakeIter<I>`) are exactly what the owner bindings must reach.
+        // `TakeIterator<I>`) are exactly what the owner bindings must reach.
         DeclarationNode::fn_of(spec_method.func).set_self_returning_default(false);
         DeclarationNode::fn_of(spec_method.func).set_lazy_self_growing(false);
         DeclarationNode::fn_of(spec_method.func).generic_params = [];
@@ -3061,7 +3085,7 @@ type struct MonoCallSpecializer {
         if (object_t == null || object_t.kind != TypeKind::Object) { return; }
         const object: ObjectType* = object_t.as_object();
         const checker: TraitChecker = TraitChecker::new(
-            this.arena, this.generic_registry, this.intern_table, this.diagnostics);
+            this.arena, this.generic_registry, this.intern_table, this.diagnostics, this.type_resolver);
         const implementation: DeclarationNode* = checker.object_implementation(object, value);
         mut blocks: [mut ImplBlock*] = [];
         if (implementation == null
@@ -3131,7 +3155,7 @@ type struct MonoCallSpecializer {
         diag = diag.also_at_in(tref.span, tmpl_func_decl.name_span, fmt::format(
             "required by this bound in `%s`", fn_str));
         const checker: TraitChecker = TraitChecker::new(
-            this.arena, this.generic_registry, this.intern_table, this.diagnostics);
+            this.arena, this.generic_registry, this.intern_table, this.diagnostics, this.type_resolver);
         diag = diag.with_note(checker.bound_failure_note(concrete, tref.definition(), trait_str, concrete_str));
         diag = diag.help(checker.bound_failure_help(concrete, tref.definition(), trait_str, concrete_str, fmt::format(
             "implement `%s` for `%s`, or pass an argument of a type that already does",

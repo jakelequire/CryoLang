@@ -36,7 +36,7 @@ import utils::build_stamp::{ BuildStamp, StampSlot };
 import utils::log::{ Log, LogArea };
 import std::fs::file::{ File };
 import std::fs::file;
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::fmt;
 import std::env;
 import std::core::{ hash, primitives };
@@ -174,7 +174,7 @@ implement trait Hasher for struct ContentHasher {
     }
 
     write_bytes(mut &this, bytes: &Slice<u8>) -> void {
-        this.write_run(bytes.as_ptr(), bytes.length());
+        this.write_run(bytes.as_pointer(), bytes.length());
     }
 
     finish(&this) -> u64 {
@@ -186,7 +186,7 @@ implement trait Hasher for struct ContentHasher {
 type struct ModuleEntry {
     namespace_name: string;   // e.g. "std::core::primitives"
     source_path:    string;   // path on disk
-    origin_subdir:  string;   // output package subtree: "std" | "local" | <depname>
+    origin_subdir:  String;   // output package subtree: "std" | "local" | <depname>
     origin_kind:    string;   // "stdlib" | "local" | "dep"
 }
 
@@ -195,7 +195,7 @@ type struct ModuleEntry {
 /// `names`/`keys` arrays; `lookup` answers the stored key of a namespace, none
 /// when absent (a never-before-seen module always rebuilds).
 type struct ModuleKeyTable {
-    names:      [string];
+    names:      [String];
     keys:       [u128];
 
     static empty() -> ModuleKeyTable {
@@ -204,64 +204,44 @@ type struct ModuleKeyTable {
 
     lookup(&this, name: string) -> Option<u128> {
         for (mut i: i64 = 0; i < this.names.length(); i++) {
-            if (this.names[i].eq(name)) {
+            if (this.names[i].as_str().equals(&Str::new(name))) {
                 return Option::Some(this.keys[i]);
             }
         }
         return Option::None;
     }
 
-    /// Copy `len` bytes from `data+start` into a fresh NUL-terminated string.
-    static modkeys_slice(data: i8*, start: i64, len: i64) -> string {
-        mut s: String = String::from_str(Str::from_raw((data + start) as u8*, len));
-        return s.into_raw();
-    }
-
     /// Parse the `*.modkeys` sidecar into a `ModuleKeyTable`. A missing or
     /// unreadable file yields an empty table (every module then rebuilds, which
     /// is the safe default). Lines without a TAB separator, or whose key is not
-    /// a digest `Manifest::hex128` wrote, are skipped.
-    ///
-    /// Kept a free function (not a `ModuleKeyTable` static): a static method here
-    /// resolves through the leaf-name dispatcher, where `read`/`write` collide
-    /// with the same-arity `read`/`write` intrinsics and a reference-array static
-    /// fails codegen resolution outright (E0636). The distinctly-named free
-    /// function sidesteps both.
-    static read_module_keys(path_text: string) -> ModuleKeyTable {
-        const path: string = path_text;
+    /// a digest `Manifest::hex128` wrote, are skipped; anything after a second
+    /// TAB is not part of the table.
+    static read_module_keys(path: Path) -> ModuleKeyTable {
         mut t: ModuleKeyTable = ModuleKeyTable::empty();
-        if (!Path::from(path).exists()) { return t; }
-        mut content: string = "";
-        match (File::read_text(Path::from(path))) {
-            Result::Ok(s)  => { content = s.into_raw(); }
+        if (!path.exists()) { return t; }
+        const content: String = match (File::read_text(path)) {
+            Result::Ok(s)  => { s }
             Result::Err(_) => { return t; }
-        }
-        const data: i8* = content as i8*;
-        const n: i64 = content.length() as i64;
-        mut i: i64 = 0;
-        while (i < n) {
-            const name_start: i64 = i;
-            while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
-            mut name: string = "";
-            mut keyh: string = "";
-            if (i < n && data[i] == 9) {
-                name = ModuleKeyTable::modkeys_slice(data, name_start, i - name_start);
-                i = i + 1;                       // skip TAB
-                const key_start: i64 = i;
-                while (i < n && data[i] != 9 && data[i] != 10) { i = i + 1; }
-                keyh = ModuleKeyTable::modkeys_slice(data, key_start, i - key_start);
-            }
-            // Anything after the key is not part of the table.
-            while (i < n && data[i] != 10) { i = i + 1; }
-            if (i < n && data[i] == 10) { i = i + 1; }   // skip newline
-            if (name.length() > 0) {
-                match (Manifest::parse_hex128(Str::new(keyh))) {
-                    Option::Some(key) => {
-                        t.names.push(name);
-                        t.keys.push(key);
+        };
+        const newline: Str = Str::new("\n");
+        const tab: Str = Str::new("\t");
+        for (line in content.as_str().split(&newline)) {
+            match (line.split_once(&tab)) {
+                Option::Some(fields) => {
+                    if (fields.first.is_empty()) { continue; }
+                    const key_text: Str = match (fields.second.split_once(&tab)) {
+                        Option::Some(rest) => { rest.first }
+                        Option::None       => { fields.second }
+                    };
+                    match (Manifest::parse_hex128(key_text)) {
+                        Option::Some(key) => {
+                            t.names.push(String::from_str(fields.first));
+                            t.keys.push(key);
+                        }
+                        Option::None => { }
                     }
-                    Option::None => { }
                 }
+                Option::None => { }
             }
         }
         return t;
@@ -271,7 +251,7 @@ type struct ModuleKeyTable {
     /// caller must have created the incremental dir (e.g. via
     /// `Manifest::write_fingerprint`, which always runs alongside this on the
     /// success path).
-    static write_module_keys(path: string, names: &[string], keys: &[u128]) -> void {
+    static write_module_keys(path: Path, names: &[string], keys: &[u128]) -> void {
         mut text: String = String::new();
         for (mut i: i64 = 0; i < names.length(); i++) {
             text.push(Str::new(names[i]));
@@ -279,10 +259,10 @@ type struct ModuleKeyTable {
             text.push(Str::new(Manifest::hex128(keys[i])));
             text.push_byte(10 as u8);    // LF
         }
-        match (File::write_bytes(Path::from(path), text.as_bytes())) {
+        match (File::write_bytes(path, text.as_bytes())) {
             Result::Ok(_)  => {}
             Result::Err(_) => {
-                fmt::eprintln(f"warning: cannot write per-module cache keys to {path}");
+                fmt::eprintln(f"warning: cannot write per-module cache keys to {path.as_str()}");
             }
         }
         mem::drop(text);
@@ -312,7 +292,7 @@ type struct ModuleObjectCache {
 
     /// The cache for a build at `opt_level` for `target_triple`, with the
     /// keys the last build wrote to `keys_path`.
-    static open(opt_level: u32, target_triple: string, keys_path: string) -> ModuleObjectCache {
+    static open(opt_level: u32, target_triple: string, keys_path: Path) -> ModuleObjectCache {
         return ModuleObjectCache {
             active: true,
             toolchain: Manifest::toolchain_fingerprint(opt_level, target_triple),
@@ -342,7 +322,7 @@ type struct ModuleObjectCache {
     }
 
     /// Write this build's keys to `keys_path` for the next build.
-    write(&this, keys_path: string) -> void {
+    write(&this, keys_path: Path) -> void {
         ModuleKeyTable::write_module_keys(keys_path, &this.names, &this.keys);
     }
 }
@@ -386,7 +366,7 @@ type struct Manifest {
 
     /// Combined fingerprint over every build input: the module sources, and
     /// `headers`, the files the build's C imports read.
-    compute_fingerprint(&this, modules: &[ModuleEntry], headers: &[string]) -> u128 {
+    compute_fingerprint(&this, modules: &[ModuleEntry], headers: &[String]) -> u128 {
         mut h: ContentHasher = ContentHasher::new();
         h.fold(Manifest::compiler_fingerprint());
         h.fold(this.build_shape);
@@ -405,14 +385,14 @@ type struct Manifest {
         // invalidates the cache even when its source bytes are unchanged.
         for (mut i: i64 = 0; i < modules.length(); i++) {
             h.fold(modules[i].namespace_name);
-            h.fold(modules[i].origin_subdir);
-            Manifest::fold_file(&h, modules[i].source_path);
+            h.fold_text(modules[i].origin_subdir.as_str());
+            Manifest::fold_file(&h, Path::from(modules[i].source_path));
         }
         // A header no module source names: its path and its content, so an
         // edit to it, or to a file it includes, is a changed input.
         for (mut i: i64 = 0; i < headers.length(); i++) {
-            h.fold(headers[i]);
-            Manifest::fold_file(&h, headers[i]);
+            h.fold_text(headers[i].as_str());
+            Manifest::fold_file(&h, Path::from(headers[i].as_str()));
         }
         return h.finish128();
     }
@@ -422,22 +402,32 @@ type struct Manifest {
     /// reads is known only once its imports run, so the up-to-date check
     /// asks the last build's, and a source edit that names another header
     /// changes a module source anyway.  Empty when there is no sidecar.
-    recorded_headers(&this) -> [string] {
-        mut headers: [string] = [];
-        const lines: [string] = Manifest::read_file_trimmed(this.cfg.fingerprint_path()).split_nonempty("\n");
-        for (mut i: i64 = 1; i < lines.length(); i++) { headers.push(lines[i]); }
+    recorded_headers(&this) -> [String] {
+        mut headers: [String] = [];
+        const fingerprint: PathBuf = this.cfg.fingerprint_path();
+        const text: String = Manifest::read_file_trimmed(fingerprint.as_path());
+        for (line in text.as_str().split_nonempty(&Str::new("\n")).skip(1)) {
+            headers.push(String::from_str(line));
+        }
         return headers;
     }
 
     /// True when the saved fingerprint matches `fp_hex` AND every artifact
     /// still exists on disk. A missing sidecar or any missing artifact forces
     /// a build.
-    is_up_to_date(&this, fp_hex_text: string, artifacts: &[string]) -> boolean {
+    is_up_to_date(&this, fp_hex_text: string, artifacts: &[PathBuf]) -> boolean {
         const fp_hex: string = fp_hex_text;
-        const lines: [string] = Manifest::read_file_trimmed(this.cfg.fingerprint_path()).split_nonempty("\n");
-        if (lines.length() == 0 || !lines[0].eq(fp_hex)) { return false; }
+        const fingerprint: PathBuf = this.cfg.fingerprint_path();
+        const text: String = Manifest::read_file_trimmed(fingerprint.as_path());
+        mut lines = text.as_str().split_nonempty(&Str::new("\n"));
+        match (lines.next()) {
+            Option::Some(recorded) => {
+                if (recorded != Str::new(fp_hex)) { return false; }
+            }
+            Option::None => { return false; }
+        }
         for (mut i: i64 = 0; i < artifacts.length(); i++) {
-            if (!Path::from(artifacts[i]).exists()) { return false; }
+            if (!artifacts[i].as_path().exists()) { return false; }
         }
         return true;
     }
@@ -450,16 +440,17 @@ type struct Manifest {
     /// A build that reported warnings records none: skipping the next build
     /// would skip reporting them, so the next build analyses the program
     /// again, and reuses every object whose bitcode is unchanged.
-    write_fingerprint(&this, fp_hex_text: string, headers: &[string], reported_warnings: boolean) -> void {
+    write_fingerprint(&this, fp_hex_text: string, headers: &[String], reported_warnings: boolean) -> void {
         const fp_hex: string = fp_hex_text;
-        ProjectConfig::mkdir_p(this.cfg.incremental_dir());
-        const path: string = this.cfg.fingerprint_path();
+        const incremental: PathBuf = this.cfg.incremental_dir();
+        ProjectConfig::mkdir_p(incremental.as_path());
+        const path: PathBuf = this.cfg.fingerprint_path();
         if (reported_warnings) {
-            if (Path::from(path).exists()) {
-                match (File::remove(Path::from(path))) {
+            if (path.exists()) {
+                match (File::remove(path.as_path())) {
                     Result::Ok(_)  => {}
                     Result::Err(_) => {
-                        fmt::eprintln(f"warning: cannot remove the build fingerprint {path}; the next build may skip reporting this build's warnings");
+                        fmt::eprintln(f"warning: cannot remove the build fingerprint {path.as_str()}; the next build may skip reporting this build's warnings");
                     }
                 }
             }
@@ -469,13 +460,13 @@ type struct Manifest {
         text.push(Str::new(fp_hex));
         text.push_byte(10 as u8);        // LF
         for (mut i: i64 = 0; i < headers.length(); i++) {
-            text.push(Str::new(headers[i]));
+            text.push(headers[i].as_str());
             text.push_byte(10 as u8);
         }
-        match (File::write_bytes(Path::from(path), text.as_bytes())) {
+        match (File::write_bytes(path.as_path(), text.as_bytes())) {
             Result::Ok(_)  => {}
             Result::Err(_) => {
-                fmt::eprintln(f"warning: cannot write build fingerprint to {path}");
+                fmt::eprintln(f"warning: cannot write build fingerprint to {path.as_str()}");
             }
         }
         mem::drop(text);
@@ -484,32 +475,37 @@ type struct Manifest {
     /// Write the human/tooling-facing per-profile `build-manifest.json` at
     /// `<output_dir>/target/<profile>/build-manifest.json`.
     write_manifest(&this, modules: &[ModuleEntry], fp_hex_text: string,
-                   artifacts: &[string]) -> void {
+                   artifacts: &[PathBuf]) -> void {
         const fp_hex: string = fp_hex_text;
-        ProjectConfig::mkdir_p(this.cfg.profile_dir());
-        const path: string = this.cfg.manifest_path();
+        const profile: PathBuf = this.cfg.profile_dir();
+        ProjectConfig::mkdir_p(profile.as_path());
+        const path: PathBuf = this.cfg.manifest_path();
 
         const cfp: u128 = Manifest::compiler_fingerprint();
         const compiler_fp: string = Manifest::hex128(cfp);
 
         mut root: JsonObject = JsonObject::new();
-        root.put("schema_version",       JsonValue::uint_value(2));
+        root.put("schema_version",       JsonValue::unsigned_integer_value(2));
         root.put("generated_by",         JsonValue::from("cryo"));
         root.put("compiler_fingerprint", JsonValue::from(compiler_fp));
         root.put("project",              JsonValue::from(this.cfg.project_name));
         root.put("profile",              JsonValue::from(this.cfg.profile));
         root.put("target_type",          JsonValue::from(this.cfg.target_type.label()));
         root.put("target_triple",        JsonValue::from(this.target_triple));
-        root.put("opt_level",            JsonValue::uint_value(this.opt_level as u64));
-        root.put("debug_info",           JsonValue::bool_value(this.debug_info));
-        root.put("emit_llvm",            JsonValue::bool_value(this.cfg.emit_llvm));
-        root.put("no_std",               JsonValue::bool_value(this.cfg.no_std));
-        root.put("no_runtime",           JsonValue::bool_value(this.cfg.no_runtime));
+        root.put("opt_level",            JsonValue::unsigned_integer_value(this.opt_level as u64));
+        root.put("debug_info",           JsonValue::boolean_value(this.debug_info));
+        root.put("emit_llvm",            JsonValue::boolean_value(this.cfg.emit_llvm));
+        root.put("no_std",               JsonValue::boolean_value(this.cfg.no_std));
+        root.put("no_runtime",           JsonValue::boolean_value(this.cfg.no_runtime));
         root.put("stdlib_archive",       JsonValue::from(this.stdlib_archive));
         root.put("inputs_fingerprint",   JsonValue::from(fp_hex));
 
         // artifacts: absolute/cwd-relative paths, matching what `cryo run` execs.
-        root.put("artifacts", JsonValue::string_array(artifacts));
+        mut artifact_values: Array<JsonValue> = Array::<JsonValue>::new();
+        for (mut i: i64 = 0; i < artifacts.length(); i++) {
+            artifact_values.push(JsonValue::from(artifacts[i].as_str()));
+        }
+        root.put("artifacts", JsonValue::Array(artifact_values));
 
         // [link] section snapshot.
         mut link: JsonObject = JsonObject::new();
@@ -521,18 +517,18 @@ type struct Manifest {
         // modules: namespace + source + origin + object path + size.
         mut mods: Array<JsonValue> = Array::<JsonValue>::new();
         for (mut i: i64 = 0; i < modules.length(); i++) {
-            const obj: string = Path::from(this.cfg.deps_dir_for(modules[i].origin_subdir))
-                .join(f"{Manifest::path_module(modules[i].namespace_name)}.o".as_str()).into_raw();
-            const obj_size: i64 = Manifest::file_size_bytes(obj);
+            const obj: PathBuf = this.cfg.deps_dir_for(modules[i].origin_subdir.as_str())
+                .join(f"{Manifest::path_module(modules[i].namespace_name)}.o".as_str());
+            const obj_size: i64 = Manifest::file_size_bytes(obj.as_path());
             mut m: JsonObject = JsonObject::new();
             m.put("namespace",   JsonValue::from(modules[i].namespace_name));
             m.put("source",      JsonValue::from(modules[i].source_path));
-            m.put("origin",      JsonValue::from(modules[i].origin_subdir));
+            m.put("origin",      JsonValue::from(modules[i].origin_subdir.as_str()));
             m.put("kind",        JsonValue::from(modules[i].origin_kind));
-            m.put("opt_level",   JsonValue::uint_value(this.opt_level as u64));
-            m.put("debug_info",  JsonValue::bool_value(this.debug_info));
-            m.put("object",      JsonValue::from(obj));
-            m.put("object_size", JsonValue::int_value(obj_size));
+            m.put("opt_level",   JsonValue::unsigned_integer_value(this.opt_level as u64));
+            m.put("debug_info",  JsonValue::boolean_value(this.debug_info));
+            m.put("object",      JsonValue::from(obj.as_path().as_str()));
+            m.put("object_size", JsonValue::integer_value(obj_size));
             mods.push(JsonValue::Object(m));
         }
         root.put("modules", JsonValue::Array(mods));
@@ -542,10 +538,10 @@ type struct Manifest {
         mem::drop(doc);
 
         text.push_byte(10 as u8);        // trailing newline (matches prior fputs)
-        match (File::write_bytes(Path::from(path), text.as_bytes())) {
+        match (File::write_bytes(path.as_path(), text.as_bytes())) {
             Result::Ok(_)  => {}
             Result::Err(_) => {
-                fmt::eprintln(f"warning: cannot write build manifest to {path}");
+                fmt::eprintln(f"warning: cannot write build manifest to {path.as_str()}");
             }
         }
         mem::drop(text);
@@ -558,16 +554,16 @@ type struct Manifest {
     static hex128(d: u128) -> string {
         const hi: u64 = (d >> 64) as u64;
         const lo: u64 = d as u64;
-        return hi.to_hex_padded_str(16) + lo.to_hex_padded_str(16);
+        return hi.to_hex_padded_string(16) + lo.to_hex_padded_string(16);
     }
 
     /// The digest `hex128` wrote as `text`: thirty-two hex digits, the high
     /// half first.  Anything else is none.
     static parse_hex128(text: Str) -> Option<u128> {
         if (text.length() != 32) { return Option::None; }
-        match (text.sub_bytes(0, 16).try_to_hex()) {
+        match (text.byte_substring(0, 16).try_to_hex()) {
             Result::Ok(high) => {
-                match (text.sub_bytes(16, 32).try_to_hex()) {
+                match (text.byte_substring(16, 32).try_to_hex()) {
                     Result::Ok(low) => { return Option::Some(((high as u128) << 64) | (low as u128)); }
                     Result::Err(_) => { return Option::None; }
                 }
@@ -581,25 +577,24 @@ type struct Manifest {
     /// perturbs the fingerprint. The byte count is mixed in last as a length
     /// guard. File reading is compiler-specific, so this lives here and drives
     /// the canonical `Hasher::fold` for the actual byte mixing.
-    static fold_file<H>(h: mut H*, path_text: string) -> void
+    static fold_file<H>(h: mut H*, path: Path) -> void
     where H: Hasher {
-        Manifest::fold_file_contents::<H>(h, path_text, false);
+        Manifest::fold_file_contents::<H>(h, path, false);
     }
 
     /// `fold_file`, reading a binary's build stamp as zeros when
     /// `clear_stamp` is set.
-    static fold_file_contents<H>(h: mut H*, path_text: string, clear_stamp: boolean) -> void
+    static fold_file_contents<H>(h: mut H*, path: Path, clear_stamp: boolean) -> void
     where H: Hasher {
-        const path: string = path_text;
-        if (!Path::from(path).exists()) {
+        if (!path.exists()) {
             h.fold("<missing>");
             return;
         }
-        match (File::read_bytes(Path::from(path))) {
+        match (File::read_bytes(path)) {
             Result::Ok(data) => {
                 mut bytes: Array<u8> = data;
                 const n: i64 = bytes.length();
-                const d: mut u8* = bytes.as_mutable_ptr();
+                const d: mut u8* = bytes.as_mutable_pointer();
                 if (clear_stamp) {
                     StampSlot::clear_text(d, n);
                 }
@@ -613,16 +608,6 @@ type struct Manifest {
         }
     }
 
-    /// Path to the running compiler binary, or "" on failure. Delegates to
-    /// `std::env::current_exe` (which handles `/proc/self/exe` on Unix and
-    /// `GetModuleFileNameW` on Windows) instead of reimplementing readlink.
-    static self_exe_path() -> string {
-        match (env::current_exe()) {
-            Option::Some(s) => { return s.into_raw(); }
-            Option::None    => { return ""; }
-        }
-    }
-
     /// Digest of the running compiler's own bytes. Changes whenever the
     /// compiler changes, invalidating every cached build it produced.  It is
     /// the digest `cryo stamp` recorded when the stamp holds one for a binary
@@ -630,14 +615,14 @@ type struct Manifest {
     /// Taken once per process: the binary does not change while it runs.
     static compiler_fingerprint() -> u128 {
         if (g_compiler_fingerprint_taken) { return g_compiler_fingerprint; }
-        const exe: string = Manifest::self_exe_path();
+        const exe: String = env::current_executable().unwrap_or(String::new());
         if (exe.length() == 0) {
             mut h: ContentHasher = ContentHasher::new();
             h.fold("<unknown-compiler>");
             g_compiler_fingerprint = h.finish128();
         } else {
             mut size: i64 = -1;
-            match (Path::from(exe).metadata()) {
+            match (Path::from(exe.as_str()).metadata()) {
                 Result::Ok(m)  => { size = m.length(); }
                 Result::Err(_) => { }
             }
@@ -647,7 +632,7 @@ type struct Manifest {
                     Log::debug(LogArea::Driver, "compiler fingerprint read from the build stamp");
                 }
                 Option::None => {
-                    g_compiler_fingerprint = Manifest::binary_fingerprint(exe);
+                    g_compiler_fingerprint = Manifest::binary_fingerprint(Path::from(exe.as_str()));
                     Log::debug(LogArea::Driver, "compiler fingerprint computed from the binary: its stamp records none for its size");
                 }
             }
@@ -660,7 +645,7 @@ type struct Manifest {
     /// `cryo stamp` rewrites the stamp in place and it changes nothing the
     /// compiler emits, so a new stamp is not a new compiler.  This is what
     /// `cryo stamp` records and what a run of that binary is identified by.
-    static binary_fingerprint(path: string) -> u128 {
+    static binary_fingerprint(path: Path) -> u128 {
         mut h: ContentHasher = ContentHasher::new();
         Manifest::fold_file_contents(&h, path, true);
         return h.finish128();
@@ -681,21 +666,12 @@ type struct Manifest {
 
     /// Read a file's content with trailing whitespace/newlines stripped, or ""
     /// when the file is absent or unreadable.
-    static read_file_trimmed(path_text: string) -> string {
-        const path: string = path_text;
-        mut raw: string = "";
-        match (File::read_text(Path::from(path))) {
-            Result::Ok(s)  => { raw = s.into_raw(); }
-            Result::Err(_) => { return ""; }
-        }
-        mut len: i64 = raw.length() as i64;
-        while (len > 0 && (raw[len - 1] == 10 || raw[len - 1] == 13
-                           || raw[len - 1] == 32 || raw[len - 1] == 9)) {
-            len -= 1;
-        }
-        if (len <= 0) { return ""; }
-        mut s: String = String::from_str(Str::from_raw(raw as u8*, len));
-        return s.into_raw();
+    static read_file_trimmed(path: Path) -> String {
+        const raw: String = match (File::read_text(path)) {
+            Result::Ok(s)  => { s }
+            Result::Err(_) => { return String::new(); }
+        };
+        return String::from_str(raw.as_str().trim_end());
     }
 
 
@@ -714,9 +690,8 @@ type struct Manifest {
 
     /// File size in bytes via `fs::metadata`, without reading the contents.
     /// Returns -1 when the file can't be stat'd.
-    static file_size_bytes(path_text: string) -> i64 {
-        const path: string = path_text;
-        match (Path::from(path).metadata()) {
+    static file_size_bytes(path: Path) -> i64 {
+        match (path.metadata()) {
             Result::Ok(m)  => { return m.length(); }
             Result::Err(_) => { return -1 as i64; }
         }

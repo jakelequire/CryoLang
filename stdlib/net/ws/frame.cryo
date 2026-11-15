@@ -4,11 +4,11 @@
 ///! optional 4-byte masking key, then the payload. Clients MUST mask;
 ///! servers MUST NOT.
 ///!
-///! Both directions are inherent methods on `BufStream<S>`, beside HTTP/1.1's
+///! Both directions are inherent methods on `BufferedStream<S>`, beside HTTP/1.1's
 ///! `read_request` and for the same reasons:
 ///!
 ///!   - **Reading is a method** because a parser written as a static taking
-///!     `mut &BufStream<S>` cannot be called from an async caller holding the
+///!     `mut &BufferedStream<S>` cannot be called from an async caller holding the
 ///!     connection as a local — handing the address of a local to a future
 ///!     that outlives the current poll is refused (E0455), and only the
 ///!     RECEIVER is re-supplied on every poll.
@@ -18,7 +18,7 @@
 ///!     That also removes the staging `Array` a transport-driven encoder
 ///!     needed: the bytes are masked in place where they already sit.
 ///!
-///! Written once for `BufStream<S>` over any async transport, so ws:// over
+///! Written once for `BufferedStream<S>` over any async transport, so ws:// over
 ///! `TcpStream` and wss:// over `TlsStream` are served by the same code.
 ///!
 ///! No `buffered()` slice is held across an `await`: every header byte is
@@ -33,7 +33,7 @@ import std::core::slice::{ Slice };
 import std::io::error::{ IoError, IoErrorKind };
 import std::io::bytes::{ ByteReader, ByteWriter };
 import std::io::traits::{ AsyncTransport };
-import std::io::buf::{ BufStream };
+import std::io::buffered::{ BufferedStream };
 import std::collections::array::{ Array };
 import std::random::secure::{ SecureRng };
 import std::random::source::{ RandomSource };
@@ -49,7 +49,7 @@ private const MAX_PAYLOAD: u64 = 67108864;
 /// frames (`Text`, `Binary`, and `Continuation` for the later fragments of
 /// either) and control frames (`Close`, `Ping`, `Pong`). The other values
 /// are reserved, and a frame carrying one is refused.
-public type enum OpCode : u8 {
+public type enum OperationCode : u8 {
     Continuation = 0x0;
     Text         = 0x1;
     Binary       = 0x2;
@@ -65,7 +65,7 @@ public type enum OpCode : u8 {
 /// is role-agnostic).
 public type struct Frame {
     public fin:     boolean;
-    public opcode:  OpCode;
+    public opcode:  OperationCode;
     public masked:  boolean;
     public payload: Array<u8>;
 }
@@ -75,12 +75,12 @@ implement trait Drop for struct Frame {
 }
 
 /// Framing over a buffered async connection.
-implement struct BufStream<S> {
+implement struct BufferedStream<S> {
     /// Queue one frame into the outgoing buffer. `mask` selects client framing
     /// (a fresh masking key from the OS CSPRNG is generated and applied) from
     /// server framing (no mask), per RFC 6455 section 5.1. The payload is not
     /// consumed. Nothing is sent until the caller flushes.
-    public queue_frame(mut &this, fin: boolean, opcode: OpCode, payload: &Slice<u8>,
+    public queue_frame(mut &this, fin: boolean, opcode: OperationCode, payload: &Slice<u8>,
                 mask: boolean) -> Result<(), IoError> {
         const len: u64 = payload.length() as u64;
         mut out: mut &Array<u8> = this.pending();
@@ -116,7 +116,7 @@ implement struct BufStream<S> {
         const start: i64 = out.length();
         out.try_append(payload)?;
         if (mask) {
-            const p: mut u8* = out.as_mutable_ptr() + start;
+            const p: mut u8* = out.as_mutable_pointer() + start;
             mut i: i64 = 0;
             while (i < payload.length()) { p[i] = p[i] ^ key[i % 4]; i++; }
         }
@@ -145,7 +145,7 @@ implement struct BufStream<S> {
 
         const fin: boolean = (h0 & 0x80) != 0;
         const masked: boolean = (h1 & 0x80) != 0;
-        const opcode: OpCode = match (op_from_u8(h0 & 0x0F)) {
+        const opcode: OperationCode = match (op_from_u8(h0 & 0x0F)) {
             Option::Some(op) => { op }
             Option::None     => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
         };
@@ -193,7 +193,7 @@ implement struct BufStream<S> {
         const size: i64 = len as i64;
         mut payload: Array<u8> = (await this.read_exact(size))?;
         if (masked) {
-            const p: mut u8* = payload.as_mutable_ptr();
+            const p: mut u8* = payload.as_mutable_pointer();
             mut i: i64 = 0;
             while (i < size) {
                 const shift: u32 = (24 - 8 * ((i % 4) as u32));
@@ -207,39 +207,39 @@ implement struct BufStream<S> {
 }
 
 /// Numeric opcode for the wire.
-private function op_to_u8(op: OpCode) -> u8 {
+private function op_to_u8(op: OperationCode) -> u8 {
     match (op) {
-        OpCode::Continuation => { return 0x0; }
-        OpCode::Text         => { return 0x1; }
-        OpCode::Binary       => { return 0x2; }
-        OpCode::Close        => { return 0x8; }
-        OpCode::Ping         => { return 0x9; }
-        OpCode::Pong         => { return 0xA; }
+        OperationCode::Continuation => { return 0x0; }
+        OperationCode::Text         => { return 0x1; }
+        OperationCode::Binary       => { return 0x2; }
+        OperationCode::Close        => { return 0x8; }
+        OperationCode::Ping         => { return 0x9; }
+        OperationCode::Pong         => { return 0xA; }
     }
 }
 
 /// Is this one of the control opcodes (Close / Ping / Pong)? Control
 /// frames carry the section 5.4-5.5 size/fragmentation restrictions.
-private function is_control(op: OpCode) -> boolean {
+private function is_control(op: OperationCode) -> boolean {
     match (op) {
-        OpCode::Continuation => { return false; }
-        OpCode::Text         => { return false; }
-        OpCode::Binary       => { return false; }
-        OpCode::Close        => { return true; }
-        OpCode::Ping         => { return true; }
-        OpCode::Pong         => { return true; }
+        OperationCode::Continuation => { return false; }
+        OperationCode::Text         => { return false; }
+        OperationCode::Binary       => { return false; }
+        OperationCode::Close        => { return true; }
+        OperationCode::Ping         => { return true; }
+        OperationCode::Pong         => { return true; }
     }
 }
 
 /// Decode a wire opcode, rejecting the reserved values.
-private function op_from_u8(value: u8) -> Option<OpCode> {
+private function op_from_u8(value: u8) -> Option<OperationCode> {
     match (value) {
-        0x0 => { return Option::Some(OpCode::Continuation); }
-        0x1 => { return Option::Some(OpCode::Text); }
-        0x2 => { return Option::Some(OpCode::Binary); }
-        0x8 => { return Option::Some(OpCode::Close); }
-        0x9 => { return Option::Some(OpCode::Ping); }
-        0xA => { return Option::Some(OpCode::Pong); }
+        0x0 => { return Option::Some(OperationCode::Continuation); }
+        0x1 => { return Option::Some(OperationCode::Text); }
+        0x2 => { return Option::Some(OperationCode::Binary); }
+        0x8 => { return Option::Some(OperationCode::Close); }
+        0x9 => { return Option::Some(OperationCode::Ping); }
+        0xA => { return Option::Some(OperationCode::Pong); }
         _   => { return Option::None; }
     }
 }

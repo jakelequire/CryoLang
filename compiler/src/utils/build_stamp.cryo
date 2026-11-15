@@ -80,42 +80,39 @@ implement struct StampSlot {
     /// the rest of it.  Returns "" on success or the reason the binary was
     /// left as it was, phrased to follow "cannot stamp <path>: ".  An unchanged region is not rewritten, so
     /// stamping twice from one checkout leaves the file untouched.
-    static write_into(path: string, text: string) -> string {
+    static write_into(path: string, text: Str) -> String {
         const text_len: i64 = text.length();
         if (text_len >= SLOT_TEXT_LEN) {
-            return fmt::format("the stamp is %d bytes; the region holds %d",
-                text_len, SLOT_TEXT_LEN - 1).into_raw();
+            return f"the stamp is {text_len} bytes; the region holds {SLOT_TEXT_LEN - 1}";
         }
         match (File::read_bytes(Path::from(path))) {
             Result::Ok(data) => {
                 mut bytes: Array<u8> = data;
                 const n: i64 = bytes.length();
-                const d: mut u8* = bytes.as_mutable_ptr();
+                const d: mut u8* = bytes.as_mutable_pointer();
                 mut count: i64 = 0;
                 const at: i64 = StampSlot::locate(d, n, &count);
                 if (at < 0) {
-                    return fmt::format("it holds %d stamp regions; expected exactly one",
-                        count).into_raw();
+                    return f"it holds {count} stamp regions; expected exactly one";
                 }
                 mut changed: boolean = false;
                 for (mut i: i64 = 0; i < SLOT_TEXT_LEN; i++) {
-                    const want: u8 = if (i < text_len) { text[i] as u8 } else { 0 };
+                    const want: u8 = if (i < text_len) { text.byte_at(i).unwrap_or(0 as u8) } else { 0 };
                     if (d[at + i] != want) {
                         d[at + i] = want;
                         changed = true;
                     }
                 }
-                mut message: string = "";
                 if (changed) {
                     match (File::write_bytes(Path::from(path), Slice::<u8>::from_raw(d, n))) {
                         Result::Ok(_) => {}
-                        Result::Err(_) => { message = "it cannot be written"; }
+                        Result::Err(_) => { return String::from("it cannot be written"); }
                     }
                 }
-                return message;
+                return String::new();
             }
             Result::Err(_) => {
-                return "it cannot be read";
+                return String::from("it cannot be read");
             }
         }
     }
@@ -126,21 +123,22 @@ implement struct StampSlot {
 /// and `bytes` its size, both when it was stamped; they are recorded inside
 /// or outside a checkout.
 type struct BuildStamp {
-    commit:      string;
-    date:        string;
-    branch:      string;
-    describe:    string;
-    dirty:       string;
-    profile:     string;
-    fingerprint: string;
-    bytes:       string;
+    commit:      String;
+    date:        String;
+    branch:      String;
+    describe:    String;
+    dirty:       String;
+    profile:     String;
+    fingerprint: String;
+    bytes:       String;
 }
 
 implement struct BuildStamp {
     static empty() -> BuildStamp {
         return BuildStamp {
-            commit: "", date: "", branch: "", describe: "", dirty: "", profile: "",
-            fingerprint: "", bytes: "",
+            commit: String::new(), date: String::new(), branch: String::new(),
+            describe: String::new(), dirty: String::new(), profile: String::new(),
+            fingerprint: String::new(), bytes: String::new(),
         };
     }
 
@@ -152,38 +150,37 @@ implement struct BuildStamp {
     /// taken again.
     recorded_fingerprint(&this, size: i64) -> Option<u128> {
         if (this.fingerprint.length() != 32) { return Option::None; }
-        if (size < 0 || this.bytes != fmt::format("%lld", size).into_raw()) { return Option::None; }
-        return u128::parse_literal(Str::new(this.fingerprint).as_bytes(), 16);
+        if (size < 0) { return Option::None; }
+        const written: String = f"{size}";
+        if (this.bytes.as_str() != written.as_str()) { return Option::None; }
+        return u128::parse_literal(this.fingerprint.as_bytes(), 16);
     }
 
     /// The stamp of the running binary.
     static running() -> BuildStamp {
         const text: string = &BUILD_STAMP.text[0] as string;
-        return BuildStamp::parse(text);
+        return BuildStamp::parse(Str::new(text));
     }
 
     /// Read `key=value` lines.  A key it does not know is skipped, so a
     /// stamp written by a newer `cryo stamp` still reads.
-    static parse(text: string) -> BuildStamp {
+    static parse(text: Str) -> BuildStamp {
         mut stamp: BuildStamp = BuildStamp::empty();
-        if (text == null || text.length() == 0) { return stamp; }
-        const lines: [string] = text.split_char(10 as i8);
-        for (mut i: i64 = 0; i < lines.length(); i++) {
-            const line: string = lines[i];
-            const eq: i64 = line.find_char(61 as i8);
-            if (eq <= 0) { continue; }
-            const key: string = line.substr(0, eq);
-            const value: string = line.substr(eq + 1, line.length() as i64 - eq - 1);
-            match (key) {
-                "commit"   => { stamp.commit = value; }
-                "date"     => { stamp.date = value; }
-                "branch"   => { stamp.branch = value; }
-                "describe" => { stamp.describe = value; }
-                "dirty"    => { stamp.dirty = value; }
-                "profile"  => { stamp.profile = value; }
-                "fingerprint" => { stamp.fingerprint = value; }
-                "bytes"       => { stamp.bytes = value; }
-                _ => {}
+        for (line in text.split(&Str::new("\n"))) {
+            match (line.split_once(&Str::new("="))) {
+                Option::Some(field) => {
+                    const key: Str = field.first;
+                    const value: Str = field.second;
+                    if (key == Str::new("commit")) { stamp.commit = String::from_str(value); }
+                    else if (key == Str::new("date")) { stamp.date = String::from_str(value); }
+                    else if (key == Str::new("branch")) { stamp.branch = String::from_str(value); }
+                    else if (key == Str::new("describe")) { stamp.describe = String::from_str(value); }
+                    else if (key == Str::new("dirty")) { stamp.dirty = String::from_str(value); }
+                    else if (key == Str::new("profile")) { stamp.profile = String::from_str(value); }
+                    else if (key == Str::new("fingerprint")) { stamp.fingerprint = String::from_str(value); }
+                    else if (key == Str::new("bytes")) { stamp.bytes = String::from_str(value); }
+                }
+                Option::None => {}
             }
         }
         return stamp;
@@ -192,36 +189,39 @@ implement struct BuildStamp {
     /// The text `parse` reads back: the checkout's fields when there is a
     /// commit, then the fingerprint when there is one.  "" when there is
     /// neither, so writing it clears a region.
-    render(&this) -> string {
-        mut text: string = "";
-        if (this.commit.length() > 0) {
-            text = fmt::format("commit=%s\ndate=%s\nbranch=%s\ndescribe=%s\ndirty=%s\nprofile=%s\n",
-                this.commit, this.date, this.branch, this.describe, this.dirty, this.profile).into_raw();
+    render(&this) -> String {
+        mut text: String = String::new();
+        if (this.is_stamped()) {
+            text.push(f"commit={this.commit}\ndate={this.date}\nbranch={this.branch}\n");
+            text.push(f"describe={this.describe}\ndirty={this.dirty}\nprofile={this.profile}\n");
         }
-        if (this.fingerprint.length() > 0) {
-            text = text + fmt::format("fingerprint=%s\nbytes=%s\n", this.fingerprint, this.bytes).into_raw();
+        if (!this.fingerprint.is_empty()) {
+            text.push(f"fingerprint={this.fingerprint}\nbytes={this.bytes}\n");
         }
         return text;
     }
 
     is_stamped(&this) -> boolean {
-        return this.commit.length() > 0;
+        return !this.commit.is_empty();
     }
 
     /// `core`, then `-prerelease` when there is one, then the build: the
     /// commit's first eight hex digits, `-dirty` when tracked files differed
     /// from it, or `unknown` when the binary was not stamped.
-    version(&this, core: string, prerelease: string) -> string {
-        mut v: string = core;
-        if (prerelease.length() > 0) {
-            v = v + "-" + prerelease;
+    version(&this, core: Str, prerelease: Str) -> String {
+        mut v: String = String::from_str(core);
+        if (!prerelease.is_empty()) {
+            v.push("-");
+            v.push(prerelease);
         }
         if (!this.is_stamped()) {
-            return v + "+unknown";
+            v.push("+unknown");
+            return v;
         }
-        v = v + "+" + this.commit.substr(0, 8);
-        if (this.dirty == "yes") {
-            v = v + "-dirty";
+        v.push("+");
+        v.push(this.commit.as_str().byte_substring(0, 8));
+        if (this.dirty.as_str() == Str::new("yes")) {
+            v.push("-dirty");
         }
         return v;
     }
@@ -231,14 +231,14 @@ implement struct BuildStamp {
     /// one of them does not make the tree dirty: they are the files the
     /// build that asks for the stamp is itself writing.  Outside a checkout,
     /// or with no `git`, the stamp is empty.
-    static from_checkout(exclude: [string], profile: string) -> BuildStamp {
+    static from_checkout(exclude: [string], profile: Str) -> BuildStamp {
         mut stamp: BuildStamp = BuildStamp::empty();
         stamp.commit = BuildStamp::git_line(["rev-parse", "HEAD"]);
         if (stamp.commit.length() == 0) { return stamp; }
         stamp.date     = BuildStamp::git_line(["log", "-1", "--format=%cs", "HEAD"]);
         stamp.branch   = BuildStamp::git_line(["rev-parse", "--abbrev-ref", "HEAD"]);
         stamp.describe = BuildStamp::git_line(["describe", "--always", "--tags"]);
-        stamp.profile  = profile;
+        stamp.profile  = String::from_str(profile);
 
         // A build rewrites tracked files' timestamps without changing their
         // bytes, which leaves git's stat cache stale; refresh it so only a
@@ -250,20 +250,20 @@ implement struct BuildStamp {
             diff.push(":(top,exclude)" + exclude[i]);
         }
         const status: i32 = BuildStamp::git_status(diff);
-        stamp.dirty = if (status == 0) { "no" } else { "yes" };
+        stamp.dirty = String::from(if (status == 0) { "no" } else { "yes" });
         return stamp;
     }
 
     /// The first line `git <args>` prints, or "" when it fails.
-    static git_line(args: [string]) -> string {
+    static git_line(args: [string]) -> String {
         mut cmd: Command = Command::new(Str::new("git"));
         for (mut i: i64 = 0; i < args.length(); i++) {
-            cmd.arg(Str::new(args[i]));
+            cmd.argument(Str::new(args[i]));
         }
         match (cmd.output()) {
             Result::Ok(out) => {
                 mut o: Output = out;
-                if (!o.status().success()) { return ""; }
+                if (!o.status().success()) { return String::new(); }
                 const bytes: &Slice<u8> = o.stdout();
                 mut line: String = String::new();
                 for (mut i: i64 = 0; i < bytes.length(); i++) {
@@ -271,9 +271,9 @@ implement struct BuildStamp {
                     if (b == 10 as u8 || b == 13 as u8) { break; }
                     line.push_byte(b);
                 }
-                return line.into_raw();
+                return line;
             }
-            Result::Err(_) => { return ""; }
+            Result::Err(_) => { return String::new(); }
         }
     }
 
@@ -281,7 +281,7 @@ implement struct BuildStamp {
     static git_status(args: [string]) -> i32 {
         mut cmd: Command = Command::new(Str::new("git"));
         for (mut i: i64 = 0; i < args.length(); i++) {
-            cmd.arg(Str::new(args[i]));
+            cmd.argument(Str::new(args[i]));
         }
         match (cmd.output()) {
             Result::Ok(out) => {
@@ -296,9 +296,9 @@ implement struct BuildStamp {
 /// What `cryo version --verbose` prints beneath the version line.  Every
 /// field is text; one that could not be read is "".
 type struct VersionReport {
-    version: string;
-    binary:  string;
-    size:    string;
+    version: String;
+    binary:  String;
+    size:    String;
     stamp:   BuildStamp;
     llvm:    string;
     target:  string;
@@ -308,24 +308,27 @@ type struct VersionReport {
 implement struct VersionReport {
     /// The version line, a blank line, then one labelled line per field,
     /// with `unknown` for a field nobody could read.
-    render(&this) -> string {
-        mut out: string = this.version + "\n\n";
-        out = out + VersionReport::line("binary:", this.binary);
-        out = out + VersionReport::line("size:", this.size);
-        out = out + VersionReport::line("commit:", this.stamp.commit);
-        out = out + VersionReport::line("commit-date:", this.stamp.date);
-        out = out + VersionReport::line("branch:", this.stamp.branch);
-        out = out + VersionReport::line("describe:", this.stamp.describe);
-        out = out + VersionReport::line("dirty:", this.stamp.dirty);
-        out = out + VersionReport::line("llvm:", this.llvm);
-        out = out + VersionReport::line("target:", this.target);
-        out = out + VersionReport::line("stdlib:", this.stdlib);
-        out = out + VersionReport::line("profile:", this.stamp.profile);
+    render(&this) -> String {
+        mut out: String = f"{this.version}\n\n";
+        VersionReport::line(&out, "binary:", this.binary.as_str());
+        VersionReport::line(&out, "size:", this.size.as_str());
+        VersionReport::line(&out, "commit:", this.stamp.commit.as_str());
+        VersionReport::line(&out, "commit-date:", this.stamp.date.as_str());
+        VersionReport::line(&out, "branch:", this.stamp.branch.as_str());
+        VersionReport::line(&out, "describe:", this.stamp.describe.as_str());
+        VersionReport::line(&out, "dirty:", this.stamp.dirty.as_str());
+        VersionReport::line(&out, "llvm:", this.llvm);
+        VersionReport::line(&out, "target:", this.target);
+        VersionReport::line(&out, "stdlib:", this.stdlib);
+        VersionReport::line(&out, "profile:", this.stamp.profile.as_str());
         return out;
     }
 
-    static line(label: string, value: string) -> string {
-        const shown: string = if (value.length() == 0) { "unknown" } else { value };
-        return fmt::format("%-14s%s\n", label, shown).into_raw();
+    /// Append `label` padded to its column, then `value`, or `unknown` when
+    /// `value` is empty, and a newline.
+    static line(out: mut &String, label: string, value: Str) -> void {
+        out.push(fmt::format("%-14s", label));
+        if (value.is_empty()) { out.push(Str::new("unknown")); } else { out.push(value); }
+        out.push(Str::new("\n"));
     }
 }

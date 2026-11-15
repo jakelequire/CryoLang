@@ -1,6 +1,7 @@
 namespace cli;
 
 module Commands;
+module ApiIndex;
 
 import compiler;
 import compiler::lex;
@@ -13,11 +14,13 @@ import utils::log::{ Log };
 import std::core::cmp;
 import std::collections::{ hashmap, pair };
 import std::collections::str;
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
 import std::ffi::libc;
 import std::collections::hashmap;
 import std::collections::pair;
 import std::core::hash::{ FnvHasher };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 
 type struct Argument {
     name:          string;
@@ -184,18 +187,18 @@ public:
     /// Every flag and `--key=value` argument the compiler declares no flag
     /// for, written back as given (`--key`, `-k`, `--key=value`), each after
     /// a space: what `cryo test` hands the test binary unread.
-    undeclared_options(&this) -> string {
-        mut out: string = "";
+    undeclared_options(&this) -> String {
+        mut out: String = String::new();
         for (mut i: i64 = 0; i < this.flags.length(); i++) {
             const key: string = this.flags[i].first;
             if (ArgumentParser::is_known_flag(key)) { continue; }
             const dashes: string = if (key.length() == 1) { "-" } else { "--" };
-            out = fmt::format("%s %s%s", out, dashes, key).into_raw();
+            out.push(fmt::format(" %s%s", dashes, key).as_str());
         }
         for (mut i: i64 = 0; i < this.args.length(); i++) {
             const key: string = this.args[i].first;
             if (ArgumentParser::is_known_flag(key)) { continue; }
-            out = fmt::format("%s --%s=%s", out, key, this.args[i].second.default_value).into_raw();
+            out.push(fmt::format(" --%s=%s", key, this.args[i].second.default_value).as_str());
         }
         return out;
     }
@@ -354,15 +357,15 @@ type struct ArgumentParser {
 
 type struct Runner {
 private:
-    commands:       hashmap::HashMap<string, Command, GlobalAlloc, FnvHasher>;
+    commands:       hashmap::HashMap<string, Command, GlobalAllocator, FnvHasher>;
     command_order:  [string];   // insertion order for print_help
     program_name:   string;
-    version:        string;
+    version:        String;
 
 public:
-    static new(program_name: string, version: string) -> Runner {
+    static new(program_name: string, version: String) -> Runner {
         return Runner {
-            commands:       hashmap::HashMap::<string, Command, GlobalAlloc, FnvHasher>::new(),
+            commands:       hashmap::HashMap::<string, Command, GlobalAllocator, FnvHasher>::new(),
             command_order:  [],
             program_name:   program_name,
             version:        version,
@@ -454,7 +457,7 @@ public:
     }
 
     print_help(&this) -> void {
-        fmt::printf("%s %s\n", this.program_name, this.version);
+        fmt::print(f"{this.program_name} {this.version}\n");
         fmt::printf("The Cryo compiler and build tool\n\n");
         fmt::printf("Usage: %s <command> [options]\n", this.program_name);
         fmt::printf("       %s <file.cryo> [options]\n\n", this.program_name);
@@ -464,7 +467,7 @@ public:
             const cmd_name: string = this.command_order[i];
             // Borrow the stored Command; it owns an `[Argument]`, so a
             // by-value `get` would alias map storage. Read-only here.
-            match (this.commands.get_ref(&cmd_name)) {
+            match (this.commands.get_reference(&cmd_name)) {
                 Option::Some(cmd) => {
                     if (cmd.listed) {
                         fmt::printf("  %-12s %s\n", cmd_name, cmd.description);
@@ -484,13 +487,13 @@ public:
     }
 
     print_version(&this) -> void {
-        fmt::printf("%s\n", this.version_line());
+        fmt::println(this.version_line());
     }
 
     /// `cryo version 1.0.0-alpha+3f9c2a1b`: the line `-v` prints, and the
     /// first line of `version --verbose`.
-    version_line(&this) -> string {
-        return fmt::format("%s version %s", this.program_name, this.version).into_raw();
+    version_line(&this) -> String {
+        return f"{this.program_name} version {this.version}";
     }
 
     /// Per-subcommand help: usage line, one-line description, and a
@@ -498,7 +501,7 @@ public:
     /// `cryo <subcmd> --help` (or `-h`).
     print_command_help(&this, cmd_name: string) -> void {
         // Borrow rather than copy out: Command owns an `[Argument]`.
-        match (this.commands.get_ref(&cmd_name)) {
+        match (this.commands.get_reference(&cmd_name)) {
             Option::Some(cmd) => {
                 fmt::printf("%s\n\n", cmd.description);
                 fmt::printf("Usage: %s\n\n", cmd.usage);

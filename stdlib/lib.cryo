@@ -20,7 +20,7 @@
 ///!   `drop(mut &this)` method. The doc comment on each type identifies
 ///!   who is responsible for calling it.
 ///! - **Allocator-generic types.** `Array<T>`, `HashMap<K,V>`, `Box<T>`,
-///!   `Rc<T>`, `String`, `PathBuf` all default to `GlobalAlloc`
+///!   `Rc<T>`, `String`, `PathBuf` all default to `GlobalAllocator`
 ///!   but accept any type implementing `Allocator` via a second type
 ///!   parameter (`Box<T, A>`, etc.).  Use the `*_in` constructors to
 ///!   plug in an arena, pool, or other strategy.
@@ -46,8 +46,8 @@
 ///!     http        HTTP method, status, headers, request/response,
 ///!                 connection-per-request server and client
 ///!   process       subprocess spawning (POSIX fork+execve / Windows CreateProcess)
-///!   sync          synchronization primitives: atomics, Mutex, RwLock,
-///!                 CondVar, Once, Barrier, mpsc channels
+///!   sync          synchronization primitives: atomics, Mutex, ReadWriteLock,
+///!                 ConditionVariable, Once, Barrier, mpsc channels
 ///!   thread        spawn/JoinHandle, scoped threads, per-thread storage
 ///!   future        stackless async: Future/Poll/Context/Waker, Executor,
 ///!                 reactor, blocking pool, timers, combinators
@@ -74,8 +74,8 @@ module prelude;
 ///   - `option`      : `Option<T>` (`Some` / `None`)
 ///   - `result`      : `Result<T, E>` (`Ok` / `Err`)
 ///   - `error`       : `CrError { code, message }` lightweight error value
-///   - `slice`       : `Slice<T>` borrowed contiguous view; `SliceIter<T>`
-///   - `ptr`         : `NonNull<T>` guaranteed non-null pointer
+///   - `slice`       : `Slice<T>` borrowed contiguous view; `SliceIterator<T>`
+///   - `pointer`     : `NonNull<T>` guaranteed non-null pointer
 ///   - `mem`         : `copy`, `zero`, `swap`, `offset`, `transmute`, align helpers
 ///   - `marker`      : `Copy`, `Send`, `Sync`, and the primitive traits
 ///                     `Primitive`, `Numeric`, `Integer`, `SignedInteger`,
@@ -94,13 +94,13 @@ module core;
 ///
 /// Sub-modules:
 ///   - `layout`     : `Layout { size, align }`; `new<T>()`, `array<T>(n)`
-///   - `allocator`  : `Allocator` trait; `AllocError`; `AllocErrorKind`
+///   - `allocator`  : `Allocator` trait; `AllocationError`; `AllocationErrorKind`
 ///                    (`OutOfMemory`, `ZeroSized`, `Exhausted`, `InvalidLayout`);
-///                    `GlobalAlloc`
+///                    `GlobalAllocator`
 ///   - `box`        : `Box<T>` unique heap ownership
 ///   - `arena`      : bump allocator (64 KiB chunks, `reset`, `drop`)
 ///   - `pool`       : fixed-slot slab allocator; layout mismatch -> `InvalidLayout`
-///   - `heap`       : mmap-backed segment heap; `GlobalAlloc`'s backend
+///   - `heap`       : mmap-backed segment heap; `GlobalAllocator`'s backend
 ///                    under `[low_level] native_alloc` (Stage 3)
 ///   - `rc`         : `Rc<T>` single-threaded reference-counted pointer
 ///   - `arc`        : `Arc<T>` atomically reference-counted pointer for
@@ -109,14 +109,14 @@ module alloc;
 
 /// Growable containers built on `alloc`. Every container owns heap
 /// storage and exposes a manual `drop`. Allocator choice is a type
-/// parameter with a `GlobalAlloc` default.
+/// parameter with a `GlobalAllocator` default.
 ///
 /// Sub-modules:
 ///   - `raw_buffer` : `RawBuffer<T, A>` untyped backing store (internal)
 ///   - `array`      : `Array<T, A>` contiguous growable sequence;
 ///                    `push`, `pop`, `append`, `try_append`, ...
 ///   - `str`        : `Str` borrowed length-typed UTF-8 slice;
-///                    `length`, `is_empty`, `byte_at`, `sub_bytes`,
+///                    `length`, `is_empty`, `byte_at`, `byte_substring`,
 ///                    `equals`, `to_ascii_lowercase`;
 ///                    implements `Eq + Hash`
 ///   - `string`     : `String` owned growable UTF-8; implements `Eq + Hash`
@@ -136,27 +136,27 @@ module collections;
 ///               named (`path()`, `with_path`); `IoErrorKind` enum;
 ///               `from_errno(code)` / `from_windows_error(code)` map the
 ///               OS's codes
-///   - `fd`     : `read_fd`, `write_fd`, `close_fd` retry-on-EINTR
+///   - `file_descriptor` : `read_file_descriptor`, `write_file_descriptor`, `close_file_descriptor` retry-on-EINTR
 ///               wrappers (POSIX flag constants and `errno()` live
 ///               in `ffi::libc`)
 ///   - `traits` : `Read` and `Write` traits; defaults for `read_byte`,
 ///               `read_char` (UTF-8 decode), `read_until`, `read_line`,
 ///               `read_exact`, `read_all`, `read_to_end`,
 ///               `read_to_string`; `write_some`, generic `write`
-///   - `stdio`  : `Stdin`/`Stdout`/`Stderr` handles; `is_tty()`,
-///               `as_fd()` on each; `Stdin::line()` owning-read +
+///   - `stdio`  : `Stdin`/`Stdout`/`Stderr` handles; `is_terminal()`,
+///               `as_file_descriptor()` on each; `Stdin::line()` owning-read +
 ///               newline-strip; `Stdin::prompt(msg)` (prompt to
-///               stderr, read one line); `isatty(fd)` / `is_tty(fd)`
+///               stderr, read one line); `isatty(fd)` / `is_terminal(fd)`
 ///               free fn; `NEWLINE` / `LINE_FEED` constants
-///   - `buf`    : `BufWriter<W>`, `LineWriter<W>`, `BufReader<R>`
+///   - `buffered` : `BufferedWriter<W>`, `LineWriter<W>`, `BufferedReader<R>`
 ///               (coalesce small reads/writes into one syscall each)
 module io;
 
 /// Human- and developer-readable text formatting.
 ///
 /// Sub-modules:
-///   - `error`    : `FmtError { Io(IoError) | Alloc(AllocError) }`
-///   - `write`    : `FmtWrite` trait; impls for `Stdout`, `Stderr`, `String`
+///   - `error`    : `FormatError { Io(IoError) | Allocation(AllocationError) }`
+///   - `write`    : `FormatWrite` trait; impls for `Stdout`, `Stderr`, `String`
 ///   - `integer`  : `write_u64_decimal/_hex/_oct/_bin` (no heap);
 ///                  padded variants; `parse_u64/_u32/_u16/_u8/_hex`
 ///   - `float`    : `write_f64` decimal + scientific-notation writer
@@ -205,7 +205,7 @@ module encoding;
 ///                   `with_extension`, `join`; `exists`, `is_file`,
 ///                   `is_directory`, `metadata`, `rename_to`, `canonicalize`
 ///   - `metadata`  : `Metadata`, `FileType`
-///   - `temporary` : `TempFile`, `TempDirectory` - removed when dropped
+///   - `temporary` : `TemporaryFile`, `TemporaryDirectory` - removed when dropped
 module fs;
 
 /// The C ABI boundary. The only place in the stdlib where NUL-terminated
@@ -243,7 +243,7 @@ module sys;
 module env;
 
 /// Thin wrappers over libm, using C-style names: `cbrt`,
-/// `pow` / `powi`, `exp` / `exp2` / `expm1`, `ln` / `log2` /
+/// `power` / `power_integer`, `exp` / `exp2` / `expm1`, `ln` / `log2` /
 /// `log10` / `log1p`, `log(value, base)`, `sin` / `cos` / `tan`
 /// (+ `asin` / `acos` / `atan` / `atan2`), `sinh` / `cosh` / `tanh`,
 /// `hypot`, `min` / `max`,
@@ -275,7 +275,7 @@ module time;
 module log;
 
 /// Randomness. `Rng` is a fast non-cryptographic generator (xoshiro256**)
-/// seeded deterministically (`from_seed`) or from the OS (`from_os`):
+/// seeded deterministically (`from_seed`) or from the OS (`from_operating_system`):
 /// `next<T>()` (any primitive), unbiased `next_below(bound)` /
 /// `next_range(lo, hi)`, and `fill`. For keys/tokens/nonces, `SecureRng`
 /// pulls straight from the kernel CSPRNG (`getrandom`): `SecureRng::fill`
@@ -286,18 +286,18 @@ module random;
 /// HTTP/2, and WebSocket layers on top.
 ///
 /// Sub-modules:
-///   - `ip`          : `IpV4Addr`, `IpV6Addr`, `IpAddr`
-///   - `socket_addr` : `SocketAddr { ip, port }`; `parse_v4`
+///   - `ip`          : `IpV4Address`, `IpV6Address`, `IpAddress`
+///   - `socket_address` : `SocketAddress { ip, port }`; `parse_v4`
 ///   - `tcp`         : `TcpStream` (`AsyncTransport`), `TcpListener`
 ///   - `udp`         : `UdpSocket` datagram send/receive futures
-///   - `dns`         : hostname resolution to `IpAddr`; `Resolve` for
+///   - `dns`         : hostname resolution to `IpAddress`; `Resolve` for
 ///                     async callers, which runs it off the executor
 ///   - `tls`         : `tls::context` + `tls::stream` (`Read + Write`)
 ///                     over OpenSSL
 ///   - `http`        : HTTP/1.1 layer (see below)
 ///   - `http2`       : HTTP/2 - framing, HPACK + Huffman, settings,
 ///                     `connection`, `client`, `server`
-///   - `ws`          : WebSocket - `handshake`, `frame`, `conn`
+///   - `ws`          : WebSocket - `handshake`, `frame`, `connection`
 ///
 /// `http` sub-modules:
 ///   - `http::method`   : `Method` enum (`Get`, `Post`, `Put`, ...)
@@ -321,7 +321,7 @@ module net;
 ///   - `signal`  : `Signal { number }`; `hup`, `int`, `quit`, `kill`, `term`
 ///   - `child`   : `ExitStatus`, `Child`; `wait`, `try_wait`, `kill`;
 ///                `ChildStdin` (`Write`), `ChildStdout`/`ChildStderr` (`Read`)
-///   - `command` : `Command` builder (`arg`, `env`, `stdin`, `stdout`, ...);
+///   - `command` : `Command` builder (`argument`, `env`, `stdin`, `stdout`, ...);
 ///                `spawn`, `output`, `status`;
 ///                `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`);
 ///                `Output { status, stdout, stderr }`
@@ -359,13 +359,13 @@ module thread;
 ///                 `std::core::cmp::Ordering` (Less/Equal/Greater).
 ///   - `mutex`   : `Mutex<T, A>` exclusive lock; `lock` / `try_lock`;
 ///                 RAII `MutexGuard` (`!Send`).
-///   - `rwlock`  : `RwLock<T, A>` multi-reader / single-writer lock;
-///                 RAII `RwLockReadGuard` / `RwLockWriteGuard` (`!Send`).
-///   - `condvar` : `CondVar` condition variable; `wait`, `notify_one`,
+///   - `read_write_lock` : `ReadWriteLock<T, A>` multi-reader / single-writer lock;
+///                 RAII `ReadWriteLockReadGuard` / `ReadWriteLockWriteGuard` (`!Send`).
+///   - `condition_variable` : `ConditionVariable` condition variable; `wait`, `notify_one`,
 ///                 `notify_all`.
 ///   - `once`    : `Once` one-shot initializer; `call_once(init)`.
 ///   - `barrier` : `Barrier` N-thread rendezvous.
-///   - `mpsc`    : multi-producer / single-consumer channel;
+///   - `channel` : multi-producer / single-consumer channel;
 ///                 `Sender` / `Receiver`.
 module sync;
 
@@ -387,7 +387,7 @@ module future;
 ///                   `Display` impl
 ///   - `descriptor` : `TestDescriptor { name, func, ignored, should_panic }`
 ///                   (layout matched by the compiler-synthesized test main)
-///   - `assert`     : `expect(cond, msg)`, `expect_eq`, `expect_ne`,
+///   - `assert`     : `expect(cond, msg)`, `expect_equal`, `expect_not_equal`,
 ///                   `bail`, `bail_other`
 ///   - `runner`     : `run_all(argc, argv, descriptors, count) -> i32`,
 ///                   the entry the synthesized test main calls

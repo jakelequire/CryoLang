@@ -1,0 +1,58 @@
+///! A method that takes its receiver by value, called through `Deref` on a
+///! value whose pointee owns a destructor, moves the pointee out of storage
+///! the box still releases: refused, as the written `(*p).method()` is.  A
+///! pointee without a destructor is copied, and is accepted.
+
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::E0453ConsumingCallThroughDeref;
+
+import std::alloc::box::{ Box };
+
+type struct Tracked {
+    id: i32;
+    into_id(this) -> i32 { return this.id; }
+}
+
+implement trait Drop for struct Tracked {
+    drop(mut &this) -> void { }
+}
+
+type enum Either<T> {
+    Left(T);
+    Right(i32);
+}
+
+implement enum Either<T> {
+    into_left(this, fallback: T) -> T {
+        match (this) {
+            Either::Left(v) => { return v; }
+            Either::Right(_) => { return fallback; }
+        }
+    }
+}
+
+function generic_enum_payload(b: Box<Option<Tracked>>) -> i32 {
+    const t: Tracked = b.unwrap();
+    //~^ ERROR[E0453] cannot move a value that owns a destructor out of a pointer
+    return t.id;
+}
+
+function user_generic_enum(b: Box<Either<Tracked>>) -> i32 {
+    const t: Tracked = b.into_left(Tracked { id: 0 });
+    //~^ ERROR[E0453] cannot move a value that owns a destructor out of a pointer
+    return t.id;
+}
+
+function struct_pointee(b: Box<Tracked>) -> i32 {
+    return b.into_id();
+    //~^ ERROR[E0453] cannot move a value that owns a destructor out of a pointer
+}
+
+function copied_through_deref(b: Box<Option<i32>>) -> i32 {
+    return b.unwrap();
+}
+
+function main() -> i32 {
+    return 0;
+}

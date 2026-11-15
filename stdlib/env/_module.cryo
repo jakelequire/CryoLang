@@ -6,7 +6,7 @@
 ///!
 ///! On POSIX, argv comes from the C runtime: the generated
 ///! `main(argc, argv)` calls `set_args` before user code runs, so `args()`
-///! returns the real argument vector. `current_dir`/`set_current_dir` wrap
+///! returns the real argument vector. `current_directory`/`set_current_directory` wrap
 ///! `getcwd`/`chdir`. On Windows every one of these goes through the
 ///! wide-character (`W`) calls - the command line, the environment block,
 ///! the working directory and the executable's path - converting UTF-16 to
@@ -109,7 +109,7 @@ public function args() -> Array<String> {
 ![target(unix)]
 public function var(name: Str) -> Option<String> {
     mut c_name: String = String::with_null(name);
-    const raw: u8* = libc::getenv(c_name.as_ptr());
+    const raw: u8* = libc::getenv(c_name.as_pointer());
     if (raw == null) { return Option::None; }
     return Option::Some(String::from_str(Str::from(raw as string)));
 }
@@ -125,7 +125,7 @@ public function var(name: Str) -> Option<String> {
     units.resize(256, 0);
     loop {
         syscall::SetLastError(syscall::ERROR_SUCCESS);
-        const count: u32 = syscall::GetEnvironmentVariableW(wide_name.as_ptr(), &units[0], units.length() as u32);
+        const count: u32 = syscall::GetEnvironmentVariableW(wide_name.as_pointer(), &units[0], units.length() as u32);
         if (count == 0 && syscall::GetLastError() == syscall::ERROR_ENVVAR_NOT_FOUND) {
             return Option::None;
         }
@@ -152,7 +152,7 @@ public function var(name: Str) -> Option<String> {
 /// runtime will not appear here. Use `var(name)` for a live single-value
 /// read that goes through `getenv`.
 ///
-/// Walk the result by shared borrow (`env::vars().iter_ref()`) to read
+/// Walk the result by shared borrow (`env::vars().iterate_references()`) to read
 /// the pairs without cloning, since `Pair<String, String>` is not `Copy`.
 ///
 /// A malformed entry with no `=` keeps the whole entry as the key with an
@@ -172,8 +172,8 @@ public function vars() -> Array<Pair<String, String>> {
         mut val: Str = Str::new("");
         match (entry.find(&sep)) {
             Option::Some(eq) => {
-                key = entry.sub_bytes(0, eq);
-                val = entry.sub_bytes(eq + 1, entry.length());
+                key = entry.byte_substring(0, eq);
+                val = entry.byte_substring(eq + 1, entry.length());
             }
             Option::None => { }
         }
@@ -206,8 +206,8 @@ public function vars() -> Array<Pair<String, String>> {
         if (text.starts_with(&separator)) { continue; }
         match (text.find(&separator)) {
             Option::Some(at) => {
-                out.push(Pair::<String, String>::new(String::from_str(text.sub_bytes(0, at)),
-                                                     String::from_str(text.sub_bytes(at + 1, text.length()))));
+                out.push(Pair::<String, String>::new(String::from_str(text.byte_substring(0, at)),
+                                                     String::from_str(text.byte_substring(at + 1, text.length()))));
             }
             Option::None => {
                 out.push(Pair::<String, String>::new(String::from_str(text), String::new()));
@@ -229,7 +229,7 @@ public function vars() -> Array<Pair<String, String>> {
 public function set_var(name: Str, value: Str) -> boolean {
     mut n: String = String::with_null(name);
     mut v: String = String::with_null(value);
-    const rc: i32 = libc::setenv(n.as_ptr(), v.as_ptr(), 1);
+    const rc: i32 = libc::setenv(n.as_pointer(), v.as_pointer(), 1);
     return rc == 0;
 }
 
@@ -241,7 +241,7 @@ public function set_var(name: Str, value: Str) -> boolean {
 public function set_var(name: Str, value: Str) -> boolean {
     const wide_name: Array<u16> = Utf16::encode(name);
     const wide_value: Array<u16> = Utf16::encode(value);
-    return syscall::SetEnvironmentVariableW(wide_name.as_ptr(), wide_value.as_ptr()) != 0;
+    return syscall::SetEnvironmentVariableW(wide_name.as_pointer(), wide_value.as_pointer()) != 0;
 }
 
 /// Remove the binding for `name`.  Returns `true` if the underlying
@@ -249,7 +249,7 @@ public function set_var(name: Str, value: Str) -> boolean {
 ![target(unix)]
 public function remove_var(name: Str) -> boolean {
     mut n: String = String::with_null(name);
-    const rc: i32 = libc::unsetenv(n.as_ptr());
+    const rc: i32 = libc::unsetenv(n.as_pointer());
     return rc == 0;
 }
 
@@ -259,14 +259,14 @@ public function remove_var(name: Str) -> boolean {
 ![target(windows)]
 public function remove_var(name: Str) -> boolean {
     const wide_name: Array<u16> = Utf16::encode(name);
-    if (syscall::SetEnvironmentVariableW(wide_name.as_ptr(), null) != 0) { return true; }
+    if (syscall::SetEnvironmentVariableW(wide_name.as_pointer(), null) != 0) { return true; }
     return syscall::GetLastError() == syscall::ERROR_ENVVAR_NOT_FOUND;
 }
 
 /// The directory for temporary files: `TMPDIR` if it is set and not
 /// empty, else `/tmp`.
 ![target(unix)]
-public function temp_directory() -> PathBuf {
+public function temporary_directory() -> PathBuf {
     match (var(Str::new("TMPDIR"))) {
         Option::Some(directory) => {
             if (!directory.is_empty()) { return PathBuf::from(directory.as_str()); }
@@ -281,7 +281,7 @@ public function temp_directory() -> PathBuf {
 /// directory), with `/` separators and no trailing separator; the
 /// Windows directory's `Temp` if that call fails.
 ![target(windows)]
-public function temp_directory() -> PathBuf {
+public function temporary_directory() -> PathBuf {
     mut units: [u16; 1024];
     const count: u32 = syscall::GetTempPathW(1024, &units[0]);
     if (count > 0 && count < 1024) {
@@ -302,7 +302,7 @@ public function temp_directory() -> PathBuf {
 /// Returns `None` if the path could not be read (e.g. it exceeds the
 /// 4096-byte buffer, or a parent component was removed/unreadable).
 ![target(unix)]
-public function current_dir() -> Option<String> {
+public function current_directory() -> Option<String> {
     mut buf: [u8; 4096];
     const rc: u8* = libc::getcwd(&buf[0], 4096);
     if (rc == null) { return Option::None; }
@@ -314,7 +314,7 @@ public function current_dir() -> Option<String> {
 /// separators). Returns `None` if it could not be read, or holds a lone
 /// surrogate no `String` can.
 ![target(windows)]
-public function current_dir() -> Option<String> {
+public function current_directory() -> Option<String> {
     mut units: Array<u16> = Array::new();
     units.resize(260, 0);
     loop {
@@ -337,7 +337,7 @@ public function current_dir() -> Option<String> {
 /// rather than behind a uniform-looking libc wrapper: Unix reads the
 /// `/proc/self/exe` symlink, Windows asks kernel32 for the module path.
 ![target(unix)]
-public function current_exe() -> Option<String> {
+public function current_executable() -> Option<String> {
     mut buf: [u8; 4096];
     const n: i64 = libc::readlink("/proc/self/exe", &buf[0], 4096);
     if (n <= 0 || n >= 4096) { return Option::None; }
@@ -350,7 +350,7 @@ public function current_exe() -> Option<String> {
 /// kernel32 through the wide-character call; `None` if it could not be
 /// read, or holds a lone surrogate no `String` can.
 ![target(windows)]
-public function current_exe() -> Option<String> {
+public function current_executable() -> Option<String> {
     mut units: Array<u16> = Array::new();
     units.resize(260, 0);
     loop {
@@ -370,16 +370,16 @@ public function current_exe() -> Option<String> {
 /// `true` on success. This affects the whole process, not just the
 /// calling thread.
 ![target(unix)]
-public function set_current_dir(path: Str) -> boolean {
+public function set_current_directory(path: Str) -> boolean {
     mut p: String = String::with_null(path);
-    return libc::chdir(p.as_ptr()) == 0;
+    return libc::chdir(p.as_pointer()) == 0;
 }
 
 /// Change the process's current working directory to `path`, named
 /// through the wide-character call. Returns `true` on success. This
 /// affects the whole process, not just the calling thread.
 ![target(windows)]
-public function set_current_dir(path: Str) -> boolean {
+public function set_current_directory(path: Str) -> boolean {
     const wide: Array<u16> = Utf16::encode(path);
-    return syscall::SetCurrentDirectoryW(wide.as_ptr()) != 0;
+    return syscall::SetCurrentDirectoryW(wide.as_pointer()) != 0;
 }

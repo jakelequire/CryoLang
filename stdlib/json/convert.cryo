@@ -26,7 +26,7 @@ import std::core::result::{ Result };
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 import std::core::default::{ Default };
 import std::core::hash::{ Hasher };
 import std::collections::hashmap::{ HashMap };
@@ -34,12 +34,14 @@ import std::collections::btree_map::{ BTreeMap };
 import std::json::value::{ JsonNumber, JsonObject, JsonValue };
 
 /// A value that can be written as JSON.
+![language("to_json")]
 public type trait ToJson {
     /// This value as a JSON value the caller owns.
     to_json(&this) -> JsonValue;
 }
 
 /// A value that can be read from JSON.
+![language("from_json")]
 public type trait FromJson {
     /// Read a value of this type from `value`, or say where in it and why
     /// it could not be read.
@@ -50,6 +52,7 @@ public type trait FromJson {
 /// (`path`, from the value read: `.servers[2].port`, empty for the value
 /// itself), what was expected there and what was found. It prints as
 /// `at .servers[2].port: expected a u16, found a string`.
+![language("json_decode_error")]
 public type struct JsonDecodeError {
     private path: String;
     private expected: Str;
@@ -145,8 +148,8 @@ private function unsigned_from_json(value: &JsonValue, maximum: u64, expected: s
 // An unsigned value is written as `Int` when it fits, as the parser reads
 // it, so a value written and parsed again is the same `JsonNumber`.
 private function unsigned_to_json(value: u64) -> JsonValue {
-    if (value <= i64::MAX as u64) { return JsonValue::int_value(value as i64); }
-    return JsonValue::uint_value(value);
+    if (value <= i64::MAX as u64) { return JsonValue::integer_value(value as i64); }
+    return JsonValue::unsigned_integer_value(value);
 }
 
 implement trait ToJson for boolean {
@@ -163,7 +166,7 @@ implement trait FromJson for boolean {
 }
 
 implement trait ToJson for i8 {
-    to_json(&this) -> JsonValue { return JsonValue::int_value(this); }
+    to_json(&this) -> JsonValue { return JsonValue::integer_value(this); }
 }
 
 implement trait FromJson for i8 {
@@ -173,7 +176,7 @@ implement trait FromJson for i8 {
 }
 
 implement trait ToJson for i16 {
-    to_json(&this) -> JsonValue { return JsonValue::int_value(this); }
+    to_json(&this) -> JsonValue { return JsonValue::integer_value(this); }
 }
 
 implement trait FromJson for i16 {
@@ -183,7 +186,7 @@ implement trait FromJson for i16 {
 }
 
 implement trait ToJson for i32 {
-    to_json(&this) -> JsonValue { return JsonValue::int_value(this); }
+    to_json(&this) -> JsonValue { return JsonValue::integer_value(this); }
 }
 
 implement trait FromJson for i32 {
@@ -193,7 +196,7 @@ implement trait FromJson for i32 {
 }
 
 implement trait ToJson for i64 {
-    to_json(&this) -> JsonValue { return JsonValue::int_value(this); }
+    to_json(&this) -> JsonValue { return JsonValue::integer_value(this); }
 }
 
 implement trait FromJson for i64 {
@@ -276,7 +279,7 @@ implement<A> trait ToJson for struct String<A> {
     to_json(&this) -> JsonValue { return JsonValue::from(this.as_str()); }
 }
 
-implement trait FromJson for struct String<GlobalAlloc> {
+implement trait FromJson for struct String<GlobalAllocator> {
     static from_json(value: &JsonValue) -> Result<String, JsonDecodeError> {
         return match (value) {
             JsonValue::String(text) => { Result::Ok(String::from_str(text.as_str())) }
@@ -312,7 +315,7 @@ implement<T> trait ToJson for enum Option<T> where T: ToJson {
 implement<T, A> trait ToJson for struct Array<T, A> where T: ToJson {
     to_json(&this) -> JsonValue {
         mut items: Array<JsonValue> = Array::with_capacity(this.length());
-        for (item in this.iter_ref()) {
+        for (item in this.iterate_references()) {
             items.push(item.to_json());
         }
         return JsonValue::Array(items);
@@ -321,8 +324,8 @@ implement<T, A> trait ToJson for struct Array<T, A> where T: ToJson {
 
 /// A JSON array, each element read as `T`; an element that cannot be is
 /// named by its index in the error.
-implement<T> trait FromJson for struct Array<T, GlobalAlloc> where T: FromJson {
-    static from_json(value: &JsonValue) -> Result<Array<T, GlobalAlloc>, JsonDecodeError> {
+implement<T> trait FromJson for struct Array<T, GlobalAllocator> where T: FromJson {
+    static from_json(value: &JsonValue) -> Result<Array<T, GlobalAllocator>, JsonDecodeError> {
         match (value) {
             JsonValue::Array(elements) => {
                 mut items: Array<T> = Array::with_capacity(elements.length());
@@ -340,7 +343,7 @@ implement<T> trait FromJson for struct Array<T, GlobalAlloc> where T: FromJson {
 }
 
 /// A JSON object, one member per entry, in the map's iteration order.
-implement<V, H> trait ToJson for struct HashMap<String<GlobalAlloc>, V, GlobalAlloc, H> where V: ToJson {
+implement<V, H> trait ToJson for struct HashMap<String<GlobalAllocator>, V, GlobalAllocator, H> where V: ToJson {
     to_json(&this) -> JsonValue {
         mut object: JsonObject = JsonObject::with_capacity(this.length());
         for (entry in this.entries()) {
@@ -352,11 +355,11 @@ implement<V, H> trait ToJson for struct HashMap<String<GlobalAlloc>, V, GlobalAl
 
 /// A JSON object, each member's value read as `V`; one that cannot be is
 /// named by its key in the error. A key written twice keeps its last value.
-implement<V, H> trait FromJson for struct HashMap<String<GlobalAlloc>, V, GlobalAlloc, H> where V: FromJson, H: Hasher + Copy + Default {
-    static from_json(value: &JsonValue) -> Result<HashMap<String<GlobalAlloc>, V, GlobalAlloc, H>, JsonDecodeError> {
+implement<V, H> trait FromJson for struct HashMap<String<GlobalAllocator>, V, GlobalAllocator, H> where V: FromJson, H: Hasher + Copy + Default {
+    static from_json(value: &JsonValue) -> Result<HashMap<String<GlobalAllocator>, V, GlobalAllocator, H>, JsonDecodeError> {
         match (value) {
             JsonValue::Object(members) => {
-                mut map: HashMap<String<GlobalAlloc>, V, GlobalAlloc, H> = HashMap::new();
+                mut map: HashMap<String<GlobalAllocator>, V, GlobalAllocator, H> = HashMap::new();
                 for (mut index: i64 = 0; index < members.length(); index++) {
                     const key: Str = members.key_at(index).unwrap();
                     match (V::from_json(members.value_at(index).unwrap())) {
@@ -372,7 +375,7 @@ implement<V, H> trait FromJson for struct HashMap<String<GlobalAlloc>, V, Global
 }
 
 /// A JSON object, one member per entry, in key order.
-implement<V> trait ToJson for struct BTreeMap<String<GlobalAlloc>, V, GlobalAlloc> where V: ToJson {
+implement<V> trait ToJson for struct BTreeMap<String<GlobalAllocator>, V, GlobalAllocator> where V: ToJson {
     to_json(&this) -> JsonValue {
         mut object: JsonObject = JsonObject::with_capacity(this.length());
         for (entry in this.entries()) {
@@ -384,11 +387,11 @@ implement<V> trait ToJson for struct BTreeMap<String<GlobalAlloc>, V, GlobalAllo
 
 /// A JSON object, each member's value read as `V`; one that cannot be is
 /// named by its key in the error. A key written twice keeps its last value.
-implement<V> trait FromJson for struct BTreeMap<String<GlobalAlloc>, V, GlobalAlloc> where V: FromJson {
-    static from_json(value: &JsonValue) -> Result<BTreeMap<String<GlobalAlloc>, V, GlobalAlloc>, JsonDecodeError> {
+implement<V> trait FromJson for struct BTreeMap<String<GlobalAllocator>, V, GlobalAllocator> where V: FromJson {
+    static from_json(value: &JsonValue) -> Result<BTreeMap<String<GlobalAllocator>, V, GlobalAllocator>, JsonDecodeError> {
         match (value) {
             JsonValue::Object(members) => {
-                mut map: BTreeMap<String<GlobalAlloc>, V> = BTreeMap::new();
+                mut map: BTreeMap<String<GlobalAllocator>, V> = BTreeMap::new();
                 for (mut index: i64 = 0; index < members.length(); index++) {
                     const key: Str = members.key_at(index).unwrap();
                     match (V::from_json(members.value_at(index).unwrap())) {

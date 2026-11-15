@@ -1,12 +1,14 @@
-///! The instances an executable calls.
+///! The instances an executable, or the stdlib's archive, calls.
 ///!
 ///! Monomorphization copies every method of every instantiated type, but an
 ///! executable calls only some of them.  An executable's functions are all
 ///! known when code generation starts, so the instances none of them can
-///! reach are left out of every module: neither defined nor declared.  A
-///! library is linked by programs this build does not see, so it keeps every
-///! instance, as does a build whose output is a single object, assembly or
-///! IR file.
+///! reach are left out of every module: neither defined nor declared.  The
+///! stdlib's own build leaves out the instances its archive does not reach
+///! the same way: a program linking the archive defines every instance the
+///! archive's manifest does not list.  Another library is linked by programs
+///! this build does not see, so it keeps every instance, as does a build
+///! whose output is a single object, assembly or IR file.
 ///!
 ///! Reachability follows exactly what code generation resolves a function
 ///! through: an expression's callee pin, a string `+`'s `append`, the call an
@@ -46,7 +48,7 @@ import std::collections::hashmap::{ HashMap };
 import std::collections::hashset::{ HashSet };
 import utils::log::{ Log, LogArea, LogLevel };
 import std::core::hash::{ FnvHasher };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 
 type struct ReachableInstances {
     di: mut DeclarationIndex*;
@@ -58,11 +60,11 @@ type struct ReachableInstances {
     /// position's predecessor under the same symbol (-1 for none).
     definitions: [DeclarationNode*];
     earlier_definition: [i64];
-    last_definition: HashMap<u32, i64, GlobalAlloc, FnvHasher>;
+    last_definition: HashMap<u32, i64, GlobalAllocator, FnvHasher>;
     /// Every instance symbol, by id, in the order first defined.
     instance_symbols: [u32];
     /// The symbols a root reaches, by id.
-    reached: HashSet<u32, GlobalAlloc, FnvHasher>;
+    reached: HashSet<u32, GlobalAllocator, FnvHasher>;
     /// Function declarations whose bodies are still to be walked.
     pending: [DeclarationNode*];
 
@@ -77,9 +79,9 @@ type struct ReachableInstances {
             ],
             definitions: [],
             earlier_definition: [],
-            last_definition: HashMap::<u32, i64, GlobalAlloc, FnvHasher>::new(),
+            last_definition: HashMap::<u32, i64, GlobalAllocator, FnvHasher>::new(),
             instance_symbols: [],
-            reached: HashSet::<u32, GlobalAlloc, FnvHasher>::new(),
+            reached: HashSet::<u32, GlobalAllocator, FnvHasher>::new(),
             pending: [],
         };
         for (mut i: i64 = 0; i < programs.length(); i++) {
@@ -255,6 +257,7 @@ implement trait Walk for struct ReachableInstances {
         BinaryExpr::walk_children(n, this);
         this.walk_expr(n.desugared_call);
         this.walk_cleanup(&n.unwind_cleanup);
+        this.walk_cleanup(&n.right_flag_writes);
     }
 
     walk_unary(mut &this, e: mut ExpressionNode*, n: UnaryExpr*) -> void {

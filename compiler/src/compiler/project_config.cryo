@@ -11,6 +11,7 @@ import std::fs::file::{ File };
 import std::fs::file;
 import std::fs::path::{ Path, PathBuf };
 import std::collections::str;
+import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::ffi::libc;
 import std::core::mem;
@@ -124,7 +125,7 @@ type struct BinTarget {
 // Dependency: entries under [dependencies]
 
 /// What kind of source a `[dependencies]` entry points at.
-type enum DepKind {
+type enum DepKind with [Clone] {
     /// Local filesystem path (relative to the consumer's project root).
     Path;
     /// Remote git repository fetched into the global cryo cache and
@@ -138,7 +139,7 @@ type enum DepKind {
 /// Which kind of ref selects a git dep's commit.  At most one of
 /// `version`, `tag`, `branch`, `rev` may appear in the inline table.
 /// `None` is only valid for non-git deps.
-type enum GitRefKind {
+type enum GitRefKind with [Clone] {
     None;
     /// `version = "0.1.0"` or `version = "^0.1.0"`.  Resolves to the
     /// highest matching tag at fetch time.
@@ -168,41 +169,40 @@ type enum GitRefKind {
 /// `alias` is the top-level namespace the consumer expects, currently
 /// informational; a future warning fires if the dep's source declares
 /// a different one.
-type struct Dependency {
-    name:  string;
+type struct Dependency with [Clone] {
+    name:  String;
     kind:  DepKind;
-    alias: string;
+    alias: String;
 
     // ---- Path deps ----
     /// Filesystem path relative to the consumer's project root.
     /// Empty for git deps.
-    path:  string;
+    path:  String;
 
     // ---- Git deps ----
     /// `https://...`, `git@...:...`, etc.  Empty for path deps.
-    git_url:  string;
+    git_url:  String;
     /// Which of `version`/`tag`/`branch`/`rev` was supplied.
     /// `None` for path deps.
     ref_kind: GitRefKind;
     /// The literal value of whichever ref-key was supplied.
-    ref_val:  string;
+    ref_val:  String;
     /// Subpath into the repo where the dep's `cryoconfig` lives.
     /// Empty <=> repo root.
-    subdir:   string;
+    subdir:   String;
 
-    static empty() -> Dependency {
+    static named(name: str::Str) -> Dependency {
         return Dependency {
-            name:     "",
+            name:     String::from_str(name),
             kind:     DepKind::Path,  // overwritten by parse_inline_table_into_dep
-            alias:    "",
-            path:     "",
-            git_url:  "",
+            alias:    String::new(),
+            path:     String::new(),
+            git_url:  String::new(),
             ref_kind: GitRefKind::None,
-            ref_val:  "",
-            subdir:   "",
+            ref_val:  String::new(),
+            subdir:   String::new(),
         };
     }
-
 }
 
 /// One `[vendor.<Name>]` project pin.  Locks `import vendor::<Name>` for this
@@ -222,7 +222,7 @@ type struct Dependency {
 /// (`[vendor.RayLib]` -> "RayLib"); an empty `triple` means "use the build's
 /// own `target_triple`", which makes the pin a no-op.  Both fields are
 /// non-owning `string`s, so `VendorPin` is Copy and safe to pass/return by
-/// value (mirrors `BinTarget` / `Dependency`).
+/// value (mirrors `BinTarget`).
 type struct VendorPin {
     name:   string;
     triple: string;
@@ -528,7 +528,7 @@ type struct ProjectConfig {
         }
 
         // Extract project root from the config file path
-        const project_root: string = path.parent_dir();
+        const project_root: string = path.parent_directory();
 
         mut config: ProjectConfig = ProjectConfig::default();
         config.project_root = project_root;
@@ -561,7 +561,7 @@ type struct ProjectConfig {
             while (pos < len && content[pos] != 10) {  // 10 = '\n'
                 pos += 1;
             }
-            const line: string = content.substr(line_start, pos - line_start);
+            const line: string = content.substring(line_start, pos - line_start);
             if (pos < len) { pos += 1; }  // skip '\n'
 
             // Skip empty lines and comments
@@ -580,7 +580,7 @@ type struct ProjectConfig {
                     // [[bin]] -> section "bin", push a fresh BinTarget;
                     // [[lib]] -> section "lib", push a fresh LibTarget (the
                     // workspace form, distinct from the singular `[lib]`).
-                    current_section = trimmed.substr(2, t_len - 4);
+                    current_section = trimmed.substring(2, t_len - 4);
                     current_vendor_idx = -1;
                     if (current_section.eq("bin")) {
                         config.bins.push(BinTarget::empty());
@@ -597,7 +597,7 @@ type struct ProjectConfig {
                 } else {
                     const close: i64 = trimmed.find_char(93 as i8);  // 93 = ']'
                     if (close > 1) {
-                        current_section = trimmed.substr(1, close - 1);
+                        current_section = trimmed.substring(1, close - 1);
                     }
                     current_bin_idx = -1;
                     current_lib_idx = -1;
@@ -605,7 +605,7 @@ type struct ProjectConfig {
                     // `[vendor.<Name>]` -> push a fresh pin and track its index,
                     // so the dotted-section keys below land on the right pin.
                     if (current_section.starts_with("vendor.")) {
-                        const vname: string = current_section.substr(
+                        const vname: string = current_section.substring(
                             7, current_section.length() as i64 - 7);
                         config.vendor_pins.push(VendorPin::empty(vname));
                         current_vendor_idx = config.vendor_pins.length() as i64 - 1;
@@ -618,14 +618,14 @@ type struct ProjectConfig {
             const eq_pos: i64 = trimmed.find_char(61 as i8);  // 61 = '='
             if (eq_pos < 0) { continue; }
 
-            const key_slice: string = trimmed.substr(0, eq_pos);
+            const key_slice: string = trimmed.substring(0, eq_pos);
             const key: string   = key_slice.trim();
-            const val_slice: string = trimmed.substr(eq_pos + 1, trimmed.length() as i64 - eq_pos - 1);
+            const val_slice: string = trimmed.substring(eq_pos + 1, trimmed.length() as i64 - eq_pos - 1);
             const raw_val: string = val_slice.trim();
             // A quoted value is the text between its quotes.
             const quoted: boolean = raw_val.length() >= 2
                                  && raw_val.starts_with("\"") && raw_val.ends_with("\"");
-            const val: string = if (quoted) { raw_val.substr(1, raw_val.length() as i64 - 2) }
+            const val: string = if (quoted) { raw_val.substring(1, raw_val.length() as i64 - 2) }
                                 else        { raw_val };
 
             // `[vendor.<Name>]` pins use a dynamic section name, so they can't
@@ -765,9 +765,8 @@ type struct ProjectConfig {
                 "dependencies" => {
                     // KEY = { path = "...", alias = "..." }   (path dep)
                     // KEY = { git = "...", version = "..." }  (git dep)
-                    config.dependencies.push(Dependency::empty());
+                    config.dependencies.push(Dependency::named(str::Str::from(key)));
                     const idx: i64 = config.dependencies.length() as i64 - 1;
-                    config.dependencies[idx].name = key;
                     config.error_count = config.error_count
                         + ProjectConfig::parse_inline_table_into_dep(raw_val, &config.dependencies[idx]);
                 }
@@ -851,9 +850,9 @@ type struct ProjectConfig {
     /// remain at the build root - the `.exe` suffix already
     /// distinguishes them for Windows targets, and ordinary users only
     /// build one target at a time.
-    profile_dir(&this) -> string {
+    profile_dir(&this) -> PathBuf {
         return Path::from(this.output_dir).join("target").join(this.profile)
-            .join(this.target_subdir()).into_raw();
+            .join(this.target_subdir());
     }
 
     /// Returns the active cross-compile triple if set, otherwise the native
@@ -878,15 +877,13 @@ type struct ProjectConfig {
 
     /// Per-origin object output dir: `<profile_dir>/<origin_subdir>/deps`.
     /// `origin_subdir` is `"std"`, `"local"`, or a dependency name.
-    deps_dir_for(&this, origin_subdir_text: string) -> string {
-        const origin_subdir: string = origin_subdir_text;
-        return Path::from(this.profile_dir()).join(origin_subdir).join("deps").into_raw();
+    deps_dir_for(&this, origin_subdir: Str) -> PathBuf {
+        return this.profile_dir().join(origin_subdir).join(Str::new("deps"));
     }
 
     /// Per-origin LLVM IR (`.ll`) output dir: `<profile_dir>/<origin_subdir>/ir`.
-    ir_dir_for(&this, origin_subdir_text: string) -> string {
-        const origin_subdir: string = origin_subdir_text;
-        return Path::from(this.profile_dir()).join(origin_subdir).join("ir").into_raw();
+    ir_dir_for(&this, origin_subdir: Str) -> PathBuf {
+        return this.profile_dir().join(origin_subdir).join(Str::new("ir"));
     }
 
     /// Umbrella directory for vendored-library build artifacts:
@@ -897,8 +894,8 @@ type struct ProjectConfig {
     /// (`<cache_root>/vendor/...`) remains the regeneration cache; the build
     /// folder holds the resolved copy actually compiled into this build, so
     /// what's visible here is exactly what was built.
-    vendor_dir(&this) -> string {
-        return Path::from(this.profile_dir()).join("vendor").into_raw();
+    vendor_dir(&this) -> PathBuf {
+        return this.profile_dir().join(Str::new("vendor"));
     }
 
     /// Where discovery keeps its namespace-index caches
@@ -906,62 +903,71 @@ type struct ProjectConfig {
     /// every profile and target, since what a file declares depends on
     /// neither.  A run that writes no build - a single-file `check` - keeps
     /// them in `.bin/namespace-index` beside the file instead.
-    namespace_index_dir(&this, writes_build: boolean) -> string {
+    namespace_index_dir(&this, writes_build: boolean) -> PathBuf {
         if (!writes_build) {
-            return Path::from(this.project_root).join(".bin").join("namespace-index").into_raw();
+            return Path::from(this.project_root).join(".bin").join("namespace-index");
         }
-        return Path::from(this.output_dir).join("namespace-index").into_raw();
+        return Path::from(this.output_dir).join("namespace-index");
     }
 
     /// Incremental-build state dir (whole-build, owned by the local project):
     /// `<profile_dir>/local/incremental`.
-    incremental_dir(&this) -> string {
-        return Path::from(this.profile_dir()).join("local/incremental").into_raw();
+    incremental_dir(&this) -> PathBuf {
+        return this.profile_dir().join("local/incremental");
     }
 
     /// Per-profile executable, the link target BEFORE hoisting:
     /// `<profile_dir>/<name>[-test]`.
-    profile_bin_path(&this, test_suffix: boolean) -> string {
+    profile_bin_path(&this, test_suffix: boolean) -> PathBuf {
         if (test_suffix) {
-            return Path::from(this.profile_dir()).join(f"{this.project_name}-test".as_str()).into_raw();
+            return this.profile_dir().join(f"{this.project_name}-test".as_str());
         }
-        return Path::from(this.profile_dir()).join(this.project_name).into_raw();
+        return this.profile_dir().join(this.project_name);
     }
 
 
     /// Hoisted final executable at the build root.  `test_suffix` appends
     /// `-test` so a `cryo test` binary coexists with a `cryo run` build.
     /// This is the stable, profile-agnostic path `cryo run` execs.
-    bin_artifact_path(&this, test_suffix: boolean) -> string {
+    bin_artifact_path(&this, test_suffix: boolean) -> PathBuf {
         if (test_suffix) {
-            return Path::from(this.output_dir).join(f"{this.project_name}-test".as_str()).into_raw();
+            return Path::from(this.output_dir).join(f"{this.project_name}-test".as_str());
         }
-        return Path::from(this.output_dir).join(this.project_name).into_raw();
+        return Path::from(this.output_dir).join(this.project_name);
     }
 
-    /// Hoisted final library-archive at the build root: `<output_dir>/lib<name>.a`.
-    lib_archive_path(&this, archive_name_text: string) -> string {
-        return Path::from(this.output_dir).join(archive_name_text).into_raw();
+    /// Hoisted final library-archive at the build root: `<output_dir>/<archive_name>`.
+    lib_archive_path(&this, archive_name: Str) -> PathBuf {
+        return Path::from(this.output_dir).join(archive_name);
+    }
+
+    /// The file name of the library archive this target bundles:
+    /// `libcryo.a` for the standard library, `lib<name>.a` otherwise.
+    archive_name(&this) -> String {
+        return match (this.target_type) {
+            TargetType::Stdlib => { String::from_str(Str::new("libcryo.a")) }
+            _                  => { f"lib{this.project_name}.a" }
+        };
     }
 
     /// JSON build manifest path (per-profile): `<profile_dir>/build-manifest.json`.
-    manifest_path(&this) -> string {
-        return Path::from(this.profile_dir()).join("build-manifest.json").into_raw();
+    manifest_path(&this) -> PathBuf {
+        return this.profile_dir().join("build-manifest.json");
     }
 
     /// Incremental fingerprint sidecar, keyed by target name so a
     /// multi-target project's `[lib]` and each `[[bin]]` track their inputs
     /// independently: `<profile_dir>/local/incremental/<project_name>.fp`.
-    fingerprint_path(&this) -> string {
-        return Path::from(this.incremental_dir()).join(f"{this.project_name}.fp".as_str()).into_raw();
+    fingerprint_path(&this) -> PathBuf {
+        return this.incremental_dir().join(f"{this.project_name}.fp".as_str());
     }
 
     /// Per-module cache-key sidecar (one `namespace<TAB>keyhex` line per
     /// module), keyed by target name alongside the whole-build fingerprint:
     /// `<profile_dir>/local/incremental/<project_name>.modkeys`. Read by the
     /// next build to decide which modules' objects can be reused.
-    module_keys_path(&this) -> string {
-        return Path::from(this.incremental_dir()).join(f"{this.project_name}.modkeys".as_str()).into_raw();
+    module_keys_path(&this) -> PathBuf {
+        return this.incremental_dir().join(f"{this.project_name}.modkeys".as_str());
     }
 
     /// Recursively create `path` and any missing parent directories, like
@@ -971,21 +977,21 @@ type struct ProjectConfig {
     /// EEXIST for an existing prefix is harmless and ignored.  Static so the
     /// codegen / manifest passes can reach it without a free-function symbol
     /// that could collide with another module's leaf-name.
-    static mkdir_p(path_text: string) -> void {
-        const path: string = path_text;
-        const len: i64 = path.length();
+    static mkdir_p(path: Path) -> void {
+        const text: Str = path.as_str();
+        const len: i64 = text.length();
         if (len == 0) { return; }
-        const src: i8* = path as i8*;
+        const src: u8* = text.as_pointer();
         mut s: String = String::with_capacity(len + 1);
         for (mut i: i64 = 0; i < len; i++) {
             // At each interior '/', the prefix built so far (src[0..i]) is the
             // parent directory to create before descending into it.
-            if (i > 0 && src[i] == '/') {
-                libc::mkdir(s.as_cstr() as string, 493);  // 0755
+            if (i > 0 && src[i] == 0x2F) {  // '/'
+                libc::mkdir(s.as_c_string() as string, 493);  // 0755
             }
-            s.push_byte(src[i] as u8);
+            s.push_byte(src[i]);
         }
-        libc::mkdir(s.as_cstr() as string, 493);  // 0755
+        libc::mkdir(s.as_c_string() as string, 493);  // 0755
         mem::drop(s);
     }
 
@@ -1015,7 +1021,7 @@ type struct ProjectConfig {
         }
 
         // Walk upward by stripping the last path component
-        const parent: string = start_dir.parent_dir();
+        const parent: string = start_dir.parent_directory();
         if (parent.length() == 0 || parent.eq(start_dir)) {
             return "";  // reached root, not found
         }
@@ -1093,7 +1099,7 @@ type struct ProjectConfig {
                 const start: i64 = i;
                 while (i < len && raw[i] != quote) { i += 1; }
                 if (i > start) {
-                    result.push(raw.substr(start, i - start));
+                    result.push(raw.substring(start, i - start));
                 }
                 if (i < len) { i += 1; }  // skip closing quote
                 continue;
@@ -1107,7 +1113,7 @@ type struct ProjectConfig {
                 end -= 1;
             }
             if (end > t_start) {
-                result.push(raw.substr(t_start, end - t_start));
+                result.push(raw.substring(t_start, end - t_start));
             }
         }
         return result;
@@ -1177,7 +1183,7 @@ type struct ProjectConfig {
             while (i < len && raw[i] != '=' && raw[i] != ' ' && raw[i] != '\t') {
                 i += 1;
             }
-            const key: string = raw.substr(k_start, i - k_start);
+            const key: string = raw.substring(k_start, i - k_start);
 
             // Skip to '='.
             while (i < len && raw[i] != '=') { i += 1; }
@@ -1195,7 +1201,7 @@ type struct ProjectConfig {
                 i += 1;
                 const v_start: i64 = i;
                 while (i < len && raw[i] != quote) { i += 1; }
-                value = raw.substr(v_start, i - v_start);
+                value = raw.substring(v_start, i - v_start);
                 if (i < len) { i += 1; }  // past closing quote
             } else {
                 const v_start: i64 = i;
@@ -1204,36 +1210,36 @@ type struct ProjectConfig {
                 while (end > v_start && (raw[end - 1] == ' ' || raw[end - 1] == '\t')) {
                     end -= 1;
                 }
-                value = raw.substr(v_start, end - v_start);
+                value = raw.substring(v_start, end - v_start);
             }
 
             if (key.eq("path")) {
-                dep.path = value;
+                dep.path = String::from_string(value);
                 saw_path = true;
             } else if (key.eq("git")) {
-                dep.git_url = value;
+                dep.git_url = String::from_string(value);
                 saw_git = true;
             } else if (key.eq("version")) {
                 dep.ref_kind = GitRefKind::Version;
-                dep.ref_val  = value;
+                dep.ref_val  = String::from_string(value);
                 saw_version  = true;
             } else if (key.eq("tag")) {
                 dep.ref_kind = GitRefKind::Tag;
-                dep.ref_val  = value;
+                dep.ref_val  = String::from_string(value);
                 saw_tag      = true;
             } else if (key.eq("branch")) {
                 dep.ref_kind = GitRefKind::Branch;
-                dep.ref_val  = value;
+                dep.ref_val  = String::from_string(value);
                 saw_branch   = true;
             } else if (key.eq("rev")) {
                 dep.ref_kind = GitRefKind::Rev;
-                dep.ref_val  = value;
+                dep.ref_val  = String::from_string(value);
                 saw_rev      = true;
             } else if (key.eq("subdir")) {
-                dep.subdir = value;
+                dep.subdir = String::from_string(value);
                 saw_subdir = true;
             } else if (key.eq("alias")) {
-                dep.alias = value;
+                dep.alias = String::from_string(value);
             } else {
                 fmt::eprintln(f"error: dependency '{dep.name}' uses unknown key '{key}'");
                 fmt::eprintf("  recognized keys: path, git, version, tag, branch, rev, subdir, alias\n");
@@ -1255,10 +1261,9 @@ type struct ProjectConfig {
 
         // Catch the most common authoring mistake: someone pasted a URL
         // into the `path` field instead of using `git`.
-        if (saw_path && ProjectConfig::looks_like_url(dep.path)) {
+        if (saw_path && ProjectConfig::looks_like_url(dep.path.as_str())) {
             fmt::eprintln(f"error: dependency '{dep.name}' has a URL in `path`; use `git = \"...\"` for remote sources");
-            fmt::eprintf("  e.g. `%s = { git = \"%s\", version = \"0.1.0\" }`\n",
-                dep.name, dep.path);
+            fmt::eprintln(f"  e.g. `{dep.name} = {{ git = \"{dep.path}\", version = \"0.1.0\" }}`");
             errors += 1;
         }
 
@@ -1301,21 +1306,21 @@ type struct ProjectConfig {
     /// Heuristic: does this look like a URL the user accidentally put in
     /// `path`?  Catches `https://`, `http://`, `git://`, `ssh://`, the
     /// `git@host:path` SCP-ish form, and bare `*.git` paths.
-    static looks_like_url(s_text: string) -> boolean {
-        const s: string = s_text;
-        if (s.starts_with("http://"))  { return true; }
-        if (s.starts_with("https://")) { return true; }
-        if (s.starts_with("git://"))   { return true; }
-        if (s.starts_with("ssh://"))   { return true; }
-        if (s.starts_with("git@"))     { return true; }
-        return s.ends_with(".git");
+    static looks_like_url(s: str::Str) -> boolean {
+        if (s.starts_with(&str::Str::from("http://")))  { return true; }
+        if (s.starts_with(&str::Str::from("https://"))) { return true; }
+        if (s.starts_with(&str::Str::from("git://")))   { return true; }
+        if (s.starts_with(&str::Str::from("ssh://")))   { return true; }
+        if (s.starts_with(&str::Str::from("git@")))     { return true; }
+        return s.ends_with(&str::Str::from(".git"));
     }
 }
 
 /// Deep copy.  All scalar fields are Copy; the owning arrays
 /// (`link_system`/`link_search`/`link_static`/`source_paths`/`bins`/
-/// `dependencies`) hold Copy elements (strings / BinTarget / Dependency),
-/// so each is rebuilt element-wise into an independent buffer.  Used by
+/// `vendor_pins`) hold Copy elements (strings / BinTarget / VendorPin), so
+/// each is rebuilt element-wise into an independent buffer; a `Dependency`
+/// owns its text and is cloned.  Used by
 /// multi-target builds to derive a per-target view without consuming the
 /// shared base config.
 implement trait Clone for struct ProjectConfig {
@@ -1346,7 +1351,7 @@ implement trait Clone for struct ProjectConfig {
         for (mut i: i64 = 0; i < this.source_paths.length(); i++)  { source_paths_c.push(this.source_paths[i]); }
         for (mut i: i64 = 0; i < this.bins.length(); i++)          { bins_c.push(this.bins[i]); }
         for (mut i: i64 = 0; i < this.libs.length(); i++)          { libs_c.push(this.libs[i]); }
-        for (mut i: i64 = 0; i < this.dependencies.length(); i++)  { deps_c.push(this.dependencies[i]); }
+        for (mut i: i64 = 0; i < this.dependencies.length(); i++)  { deps_c.push(this.dependencies[i].clone()); }
         for (mut i: i64 = 0; i < this.vendor_pins.length(); i++)   { vendor_pins_c.push(this.vendor_pins[i]); }
         return ProjectConfig {
             project_name:  this.project_name,

@@ -4,11 +4,11 @@
 ///! type, an 8-bit flags field, and a 31-bit stream identifier (the top
 ///! reserved bit is cleared) - followed by `length` octets of payload.
 ///!
-///! Both directions are inherent methods on `BufStream<S>`, beside HTTP/1.1's
+///! Both directions are inherent methods on `BufferedStream<S>`, beside HTTP/1.1's
 ///! `read_request` and WebSocket's `read_frame`, and for the same reasons:
 ///!
 ///!   - **Reading is a method** because a parser written as a static taking
-///!     `mut &BufStream<S>` cannot be called from an async caller holding the
+///!     `mut &BufferedStream<S>` cannot be called from an async caller holding the
 ///!     connection as a local — handing the address of a local to a future
 ///!     that outlives the current poll is refused (E0455), and only the
 ///!     RECEIVER is re-supplied on every poll.
@@ -18,11 +18,11 @@
 ///!     block and its CONTINUATION fragments, or a DATA frame and the
 ///!     WINDOW_UPDATE that follows it, go out in one transport operation.
 ///!
-///! The names carry the `h2_` prefix because `BufStream<S>` hosts the framing
+///! The names carry the `h2_` prefix because `BufferedStream<S>` hosts the framing
 ///! for three protocols and each name has to be its own: `ws::frame` already
 ///! owns `read_frame` / `queue_frame` on this type.
 ///!
-///! Written once for `BufStream<S>` over any async transport, so h2c over
+///! Written once for `BufferedStream<S>` over any async transport, so h2c over
 ///! `TcpStream` and h2 over `TlsStream` are served by the same code.
 ///!
 ///! No `buffered()` slice is held across an `await`: every header byte is
@@ -37,14 +37,14 @@ import std::core::slice::{ Slice };
 import std::io::error::{ IoError, IoErrorKind };
 import std::io::bytes::{ ByteReader, ByteWriter };
 import std::io::traits::{ AsyncTransport };
-import std::io::buf::{ BufStream };
+import std::io::buffered::{ BufferedStream };
 import std::collections::array::{ Array };
 import std::future::poll;
 import std::future::waker;
 import std::future::traits;
 
 /// Length of the fixed frame header.
-public const FRAME_HEADER_LEN: i64 = 9;
+public const FRAME_HEADER_LENGTH: i64 = 9;
 
 // Frame types (RFC 7540 section 6).
 /// Frame type 0x0, DATA: a slice of a stream's body.
@@ -127,7 +127,7 @@ public const HTTP_1_1_REQUIRED:   u32 = 0xd;
 /// Absolute ceiling on a payload length we will buffer for a single
 /// frame, independent of the negotiated SETTINGS_MAX_FRAME_SIZE. A
 /// frame claiming more is rejected rather than risking an unbounded
-/// allocation. Callers pass the negotiated limit to `read_h2_frame`;
+/// allocation. Callers pass the negotiated limit to `read_http2_frame`;
 /// this is only the hard backstop.
 private const MAX_FRAME_PAYLOAD: i64 = 1048576;   // 1 MiB
 
@@ -151,12 +151,12 @@ implement trait Drop for struct Frame {
 }
 
 /// HTTP/2 framing over a buffered async connection.
-implement struct BufStream<S> {
+implement struct BufferedStream<S> {
     /// Queue one frame into the outgoing buffer: the 9-byte header, then the
     /// payload. The reserved high bit of the stream identifier is always sent
     /// as 0. The payload is not consumed. Nothing is sent until the caller
     /// flushes.
-    public queue_h2_frame(mut &this, ftype: u8, flags: u8, stream_id: u32,
+    public queue_http2_frame(mut &this, ftype: u8, flags: u8, stream_id: u32,
                           payload: &Slice<u8>) -> Result<(), IoError> {
         const len: i64 = payload.length();
         mut out: mut &Array<u8> = this.pending();
@@ -182,16 +182,16 @@ implement struct BufStream<S> {
     /// The nine header bytes are copied into scalars and consumed before the
     /// payload's suspension, so no view into the connection's buffer is live
     /// when a fill can move it.
-    public async read_h2_frame(mut &this, max_payload: i64) -> Result<Frame, IoError>
+    public async read_http2_frame(mut &this, max_payload: i64) -> Result<Frame, IoError>
     where S: AsyncTransport {
-        (await this.ensure(FRAME_HEADER_LEN))?;
+        (await this.ensure(FRAME_HEADER_LENGTH))?;
         mut header: ByteReader = ByteReader::new(this.buffered());
         const length_high: u8 = header.read_u8()?;
         const length_low: u16 = header.read_u16_big_endian()?;
         const ftype: u8 = header.read_u8()?;
         const flags: u8 = header.read_u8()?;
         const stream_id: u32 = (header.read_u32_big_endian()?) & 0x7fffffff;
-        this.consume(FRAME_HEADER_LEN);
+        this.consume(FRAME_HEADER_LENGTH);
 
         const len: i64 = ((length_high as i64) << 16) | (length_low as i64);
 

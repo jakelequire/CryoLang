@@ -25,13 +25,13 @@ import std::core::result::{ Result };
 import std::core::drop;
 import std::collections::str::{ Str };
 import std::future;
-import std::net::addr::socket_addr::{ SocketAddr };
+import std::net::address::socket_address::{ SocketAddress };
 import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
 import std::net::tls::context::{ TlsAcceptor, TlsConnector };
 import std::net::tls::stream::{ TlsStream };
 import std::net::tls::future::{ TlsHandshake, TlsIo, TlsRead, TlsWrite };
 import std::test::error::{ TestError };
-import std::test::assert::{ bail, expect_eq };
+import std::test::assert::{ bail, expect_equal };
 import std::future::combinator::{ Futures };
 import std::future::executor::{ Executor };
 
@@ -43,7 +43,7 @@ async function tls_serve_echo(listener: TcpListener, acceptor: TlsAcceptor) -> i
     mut acc: TcpAccepted = await TcpAccept::start(listener);
     mut _lst: TcpListener = acc.take_listener();
 
-    mut sock: TcpStream = TcpStream::from_fd(-1);
+    mut sock: TcpStream = TcpStream::from_file_descriptor(-1);
     match (acc.take_result()) {
         Result::Ok(s)  => { sock = s; }
         Result::Err(_) => { return -1; }
@@ -64,7 +64,7 @@ async function tls_serve_echo(listener: TcpListener, acceptor: TlsAcceptor) -> i
     rbuf.resize(64, 0);
     mut rio: TlsIo = await TlsRead::start(tls, rbuf);
     mut t2:  TlsStream = rio.take_stream();
-    mut got: Array<u8> = rio.take_buf();
+    mut got: Array<u8> = rio.take_buffer();
     match (rio.outcome()) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -4; }
@@ -72,7 +72,7 @@ async function tls_serve_echo(listener: TcpListener, acceptor: TlsAcceptor) -> i
 
     mut wio: TlsIo = await TlsWrite::start(t2, got);
     mut _t3:   TlsStream = wio.take_stream();
-    mut _back: Array<u8> = wio.take_buf();
+    mut _back: Array<u8> = wio.take_buffer();
     match (wio.outcome()) {
         Result::Ok(k)  => { return k as i64; }
         Result::Err(_) => { return -5; }
@@ -82,8 +82,8 @@ async function tls_serve_echo(listener: TcpListener, acceptor: TlsAcceptor) -> i
 /// Client: connect, complete the TLS handshake, send five bytes, read the echo
 /// and check it survived the encrypted round trip.
 async function tls_echo_client(port: u16, connector: TlsConnector) -> i64 {
-    mut sock: TcpStream = TcpStream::from_fd(-1);
-    match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = TcpStream::from_file_descriptor(-1);
+    match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(s)  => { sock = s; }
         Result::Err(_) => { return -10; }
     }
@@ -103,7 +103,7 @@ async function tls_echo_client(port: u16, connector: TlsConnector) -> i64 {
     out.push(72); out.push(69); out.push(76); out.push(76); out.push(79);
     mut wio: TlsIo = await TlsWrite::start(tls, out);
     mut t2:   TlsStream = wio.take_stream();
-    mut _sent: Array<u8> = wio.take_buf();
+    mut _sent: Array<u8> = wio.take_buffer();
     match (wio.outcome()) {
         Result::Ok(k)  => { if (k != 5) { return -13; } }
         Result::Err(_) => { return -14; }
@@ -113,7 +113,7 @@ async function tls_echo_client(port: u16, connector: TlsConnector) -> i64 {
     rbuf.resize(64, 0);
     mut rio: TlsIo = await TlsRead::start(t2, rbuf);
     mut _t3: TlsStream = rio.take_stream();
-    mut echoed: Array<u8> = rio.take_buf();
+    mut echoed: Array<u8> = rio.take_buffer();
     const len: u64 = echoed.length() as u64;
     mut first: u8 = 0;
     match (echoed.get(0)) {
@@ -145,25 +145,25 @@ function async_tls_loopback_round_trip() -> Result<(), TestError> {
     };
     // The fixture certificate is self-signed, so the client cannot verify it.
     mut connector: TlsConnector = match (TlsConnector::new()) {
-        Result::Ok(c)  => { c.danger_accept_invalid_certs() }
+        Result::Ok(c)  => { c.danger_accept_invalid_certificates() }
         Result::Err(_) => { return bail(Str::new("TlsConnector::new failed")); }
     };
 
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => {
             return bail(Str::new("bind 127.0.0.1:0 failed"));
         }
     };
-    listener.set_nonblocking(true);
-    const port: u16 = match (listener.local_addr()) {
+    listener.set_nonblocking(true)?;
+    const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
         Result::Err(_) => {
-            return bail(Str::new("local_addr failed"));
+            return bail(Str::new("local_address failed"));
         }
     };
 
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(tls_round_trip(port, listener, acceptor, connector));
-    return expect_eq(r, 0 as i64);
+    return expect_equal(r, 0 as i64);
 }

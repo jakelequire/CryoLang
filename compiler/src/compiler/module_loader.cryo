@@ -11,7 +11,7 @@ import compiler::diag::{
     sink, diagnostic, source_span, edit_distance, ErrorCode
 };
 import compiler::resolver::{ symbol_str, intern_table };
-import compiler::module_graph::{ IndexedModule, LexedSource, ModuleGraph, ModuleInfo, PackageRoots };
+import compiler::module_graph::{ IndexedModule, LexedSource, ModuleGraph, ModuleInfo, ModulePackage, PackageRoots };
 import compiler::diag::config::{ DiagConfig };
 import compiler::lex::{ Token, TokenType };
 import compiler::lex::lexer::{ Lexer };
@@ -41,7 +41,7 @@ import std::collections::pair::{ Pair };
 import std::core::mem;
 import compiler::namespace_index_cache::{ IndexedFile, NamespaceIndexCache };
 import std::core::hash::{ FnvHasher };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 
 /// The entries of one directory, in the order the directory listed them,
 /// each with the kind the listing reported for it.  `listed` is false for a
@@ -70,12 +70,12 @@ type struct DirectoryListing {
 /// all answered "no" - and the directories do not change while discovery
 /// runs.
 type struct DirectoryListings {
-    at:       HashMap<String, i64, GlobalAlloc, FnvHasher>;
+    at:       HashMap<String, i64, GlobalAllocator, FnvHasher>;
     listings: [DirectoryListing];
 
     static new() -> DirectoryListings {
         return DirectoryListings {
-            at:       HashMap::<String, i64, GlobalAlloc, FnvHasher>::new(),
+            at:       HashMap::<String, i64, GlobalAllocator, FnvHasher>::new(),
             listings: [],
         };
     }
@@ -122,10 +122,10 @@ type struct DirectoryListings {
     /// holds no entry the next component names under any spelling; such a
     /// path exists on no filesystem.  True otherwise, including when a
     /// directory on the way cannot be listed.
-    may_hold(mut &this, base: string, relative: string) -> boolean {
+    may_hold(mut &this, base: string, relative: Str) -> boolean {
         mut directory: PathBuf = PathBuf::from(base);
         const separator: Str = Str::new("/");
-        for (component in Str::new(relative).split(&separator)) {
+        for (component in relative.split(&separator)) {
             if (component.is_empty()) { continue; }
             const listing: DirectoryListing* = this.listing_of(directory.as_path().as_str());
             if (!listing.listed) { return true; }
@@ -171,10 +171,10 @@ type struct ModuleLoader {
 
     // Circular dependency detection.
     // loading[i].first is the path; loading[i].second is true while it is being loaded.
-    loading: [Pair<string, boolean>];
+    loading: [Pair<String, boolean>];
 
     // Already-loaded file paths (dedup)
-    loaded_paths: [string];
+    loaded_paths: [String];
 
 private:
     // Normalized file path -> declared namespace, recorded as soon as a
@@ -187,19 +187,19 @@ private:
     // and the module's import list would not reach a module it plainly
     // imports.  This map is what makes the edge resolvable while
     // the target is still on the loading stack.
-    scanned_ns: HashMap<string, string, GlobalAlloc, FnvHasher>;
+    scanned_ns: HashMap<String, string, GlobalAllocator, FnvHasher>;
 
     // Pre-scanned namespace -> file_path map.
     // Built by scan_all_project_files() before discovery begins.
     // Key: namespace name (e.g., "compiler::ast::node")
     // Value: file path (e.g., "src/compiler/AST/node.cryo")
-    ns_map: HashMap<string, string, GlobalAlloc, FnvHasher>;
+    ns_map: HashMap<String, string, GlobalAllocator, FnvHasher>;
 
     // Normalized file path -> `vendor::<Name>`, for each binding a
     // `vendor::<Name>` import resolved to.  The generated file declares
     // `namespace <Name>;`, but the module is registered under the path the
     // import writes, because an import names a module whole.
-    vendor_modules: HashMap<string, string, GlobalAlloc, FnvHasher>;
+    vendor_modules: HashMap<String, String, GlobalAllocator, FnvHasher>;
 
     // Every `module` line of every pre-scanned file, whether or not this
     // build loads that file.  A module's reach is declared by its package's
@@ -217,7 +217,7 @@ private:
 
     // Where the roots' index caches live (`set_namespace_index_directory`);
     // empty when this discovery keeps none.
-    index_cache_directory: string;
+    index_cache_directory: PathBuf;
 
 public:
     /// The language server's open buffers.  A file one of them names is
@@ -239,7 +239,7 @@ public:
     /// never call `set_vendor_context` (single-file, raw, LSP for now).
     vendor_registry:  VendorRegistry;
     vendor_triple:    string;
-    used_vendor_keys: [string];
+    used_vendor_keys: [String];
     /// `[vendor.<Name>]` project pins from cryoconfig.  When a pin names the
     /// library being resolved, its triple overrides `vendor_triple` for that
     /// one library (project pin -> global), so a project can lock a lib to a
@@ -252,35 +252,53 @@ public:
     /// compiled, so the bindings (and their `deps/*.o`, `ir/*.ll`) are visible
     /// in the project's build tree.  Empty with no project configuration,
     /// where resolution answers the cache path.
-    vendor_build_root: string;
+    vendor_build_root: PathBuf;
+    /// The roots that tell which package a file is in.  A module path
+    /// written in a file names only a file of a package the writer's may
+    /// name (`ModulePackage::may_name`).  Holds only the standard library's
+    /// root until `set_package_roots`.
+    package_roots: PackageRoots;
 
     static new(project_root: string, entry_point: string,
                stdlib_root: string, no_std: boolean,
                extra_roots: [string]) -> ModuleLoader {
         return ModuleLoader {
             project_root:  project_root,
-            entry_dir:     entry_point.parent_dir(),
+            entry_dir:     entry_point.parent_directory(),
             stdlib_root:   stdlib_root,
             no_std:        no_std,
             extra_roots:   extra_roots,
             loading: [],
             loaded_paths:  [],
-            scanned_ns:    HashMap::<string, string, GlobalAlloc, FnvHasher>::new(),
-            ns_map:        HashMap::<string, string, GlobalAlloc, FnvHasher>::new(),
-            vendor_modules: HashMap::<string, string, GlobalAlloc, FnvHasher>::new(),
+            scanned_ns:    HashMap::<String, string, GlobalAllocator, FnvHasher>::new(),
+            ns_map:        HashMap::<String, string, GlobalAllocator, FnvHasher>::new(),
+            vendor_modules: HashMap::<String, String, GlobalAllocator, FnvHasher>::new(),
             module_lines:   [],
             listings:       DirectoryListings::new(),
             index_cache:    NamespaceIndexCache::closed(),
             index_cache_open: false,
-            index_cache_directory: "",
+            index_cache_directory: PathBuf::new(),
             lsp_overrides:    [],
             options:          null,
             vendor_registry:  VendorRegistry::empty(),
             vendor_triple:    "",
             used_vendor_keys: [],
             vendor_pins:      [],
-            vendor_build_root: "",
+            vendor_build_root: PathBuf::new(),
+            package_roots: PackageRoots {
+                vendor_root: PathBuf::new(),
+                stdlib_root: if (no_std) { PathBuf::new() } else { PathBuf::from(Str::new(stdlib_root)) },
+                dep_roots:   [],
+                dep_names:   [],
+            },
         };
+    }
+
+    /// Classify files by `roots`, the build's vendored libraries,
+    /// standard library and dependencies.  Called once, before
+    /// `discover_project`.
+    set_package_roots(mut &this, roots: PackageRoots) -> void {
+        this.package_roots = roots;
     }
 
     /// Enable `vendor::` import resolution.  Loads the global vendor registry
@@ -290,7 +308,7 @@ public:
     /// `discover_project`, on the project-build path - after the AutoVendor
     /// hook has generated any pinned bindings, so the load sees them.
     set_vendor_context(mut &this, triple: string, pins: &[VendorPin],
-                       build_root: string) -> void {
+                       build_root: PathBuf) -> void {
         this.vendor_triple     = triple;
         this.vendor_registry   = VendorRegistry::load_global();
         this.vendor_build_root = build_root;
@@ -305,14 +323,14 @@ public:
     /// shadows the build triple for that library), otherwise the build's
     /// `vendor_triple`.  `lib` is the namespace after `vendor::` (e.g. the
     /// "RayLib" in `vendor::RayLib`), matched against the pin name verbatim.
-    triple_for_lib(&this, lib: string) -> string {
+    triple_for_lib(&this, lib: Str) -> Str {
         for (mut i: i64 = 0; i < this.vendor_pins.length(); i++) {
-            if (this.vendor_pins[i].name == lib
+            if (Str::new(this.vendor_pins[i].name) == lib
                     && this.vendor_pins[i].triple != "") {
-                return this.vendor_pins[i].triple;
+                return Str::new(this.vendor_pins[i].triple);
             }
         }
-        return this.vendor_triple;
+        return Str::new(this.vendor_triple);
     }
 
     /// Wire the language server's open buffers.  Called once, before
@@ -324,7 +342,7 @@ public:
     /// Keep each root's namespace-index cache in `directory`
     /// (`NamespaceIndexCache`).  Called once, before `discover_project`;
     /// without it discovery lexes every file it indexes.
-    set_namespace_index_directory(mut &this, directory: string) -> void {
+    set_namespace_index_directory(mut &this, directory: PathBuf) -> void {
         this.index_cache_directory = directory;
     }
 
@@ -410,7 +428,7 @@ public:
             match (rd.next()) {
                 Option::Some(entry) => {
                     mut name_s: String = String::with_null(entry.name());
-                    const name: string = name_s.as_ptr() as string;
+                    const name: string = name_s.as_pointer() as string;
                     const full_path: string = Path::from(dir).join(name).into_raw();
                     if (Path::from(full_path).is_directory()) {
                         // `tests/negative/` holds compile-fail cases (files that
@@ -456,9 +474,9 @@ public:
     /// used while any is open, nor when this discovery keeps none.
     scan_all_project_files(mut &this, intern: mut InternTable*, dir: string) -> void {
         const use_cache: boolean = this.lsp_overrides.length() == 0
-            && this.index_cache_directory.length() > 0;
+            && !this.index_cache_directory.is_empty();
         if (use_cache) {
-            this.index_cache = NamespaceIndexCache::open(this.index_cache_directory, dir);
+            this.index_cache = NamespaceIndexCache::open(this.index_cache_directory.as_path(), dir);
         }
         this.index_cache_open = use_cache;
         this.scan_directory(intern, dir, "");
@@ -531,36 +549,36 @@ public:
         }
         if (this.index_cache_open) { this.index_cache.keep(relative, &declared, !cached); }
         if (declared.namespace_name.length() > 0) {
-            this.ns_map.insert(String::from_str(declared.namespace_name.as_str()).into_raw(), file_path);
+            this.ns_map.insert(String::from_str(declared.namespace_name.as_str()), file_path);
         }
         for (mut s: i64 = 0; s < declared.module_paths.length(); s++) {
             this.module_lines.push(ModuleLine {
-                written:     intern.intern(String::from_str(declared.module_paths[s].as_str()).into_raw()),
-                from_dir:    file_path.parent_dir(),
+                written:     intern.intern(declared.module_paths[s].as_str()),
+                writer:      file_path,
                 declarer:    ModuleGraph::module_key(file_path),
                 is_internal: declared.module_internal[s],
-                target:      "",
+                target:      String::new(),
                 resolved:    false,
             });
         }
     }
 
     /// Every module the pre-scan indexed, loaded or not, each in the package
-    /// `roots` places its file in.
-    indexed_modules(mut &this, intern: mut InternTable*, roots: &PackageRoots) -> [IndexedModule] {
+    /// its file is in.
+    indexed_modules(mut &this, intern: mut InternTable*) -> [IndexedModule] {
         mut out: [IndexedModule] = [];
-        mut names: [string] = [];
+        mut names: [Str] = [];
         mut files: [string] = [];
         for (entry in this.ns_map.entries()) {
-            names.push(*entry.first);
+            names.push(entry.first.as_str());
             files.push(*entry.second);
         }
         for (mut i: i64 = 0; i < names.length(); i++) {
             out.push(IndexedModule {
                 name:              intern.intern(names[i]),
                 file_path:         files[i],
-                package:           roots.package_of(files[i]),
-                declared_internal: this.declared_internal(intern, ModuleGraph::module_key(files[i])),
+                package:           this.package_roots.package_of(files[i]),
+                declared_internal: this.declared_internal(intern, ModuleGraph::module_key(files[i]).as_str()),
             });
         }
         return out;
@@ -572,20 +590,20 @@ public:
     /// answer does not depend on which files this build loads.  A line's
     /// path resolves as discovery resolves it, once the pre-scan has
     /// indexed every namespace it can name.
-    declared_internal(mut &this, intern: InternTable*, norm_path: string) -> boolean {
+    declared_internal(mut &this, intern: InternTable*, norm_path: Str) -> boolean {
         for (mut k: i64 = 0; k < this.module_lines.length(); k++) {
             if (this.module_lines[k].resolved) { continue; }
             this.module_lines[k].target = ModuleGraph::module_key(this.resolve_import_path(
-                intern, this.module_lines[k].written, this.module_lines[k].from_dir));
+                intern, this.module_lines[k].written, this.module_lines[k].writer));
             this.module_lines[k].resolved = true;
         }
-        mut chain: [string] = [norm_path];
+        mut chain: [String] = [String::from_str(norm_path)];
         for (mut c: i64 = 0; c < chain.length(); c++) {
             for (mut k: i64 = 0; k < this.module_lines.length(); k++) {
-                if (!this.module_lines[k].target.eq(chain[c])) { continue; }
+                if (this.module_lines[k].target != chain[c]) { continue; }
                 if (this.module_lines[k].is_internal) { return true; }
                 if (!chain.contains(&this.module_lines[k].declarer)) {
-                    chain.push(this.module_lines[k].declarer);
+                    chain.push(this.module_lines[k].declarer.clone());
                 }
             }
         }
@@ -602,17 +620,27 @@ public:
     /// The file the written module path `written` names (e.g. "BattleTest"
     /// or "compiler::ast"): a vendored library's bindings, a file declaring
     /// that namespace, or a file at that path under the project root, the
-    /// entry point's directory, the standard library, and last `from_dir`,
-    /// the directory of the file that wrote it ("" asks none).  "" when
-    /// none is found.
-    resolve_import_path(mut &this, intern: InternTable*, written: SymbolStr, from_dir: string) -> string {
-        const found: string = this.resolve_written_path(intern.resolve(written));
-        if (found.length() > 0 || from_dir.length() == 0) { return found; }
-        return this.search_location(from_dir, intern.resolve(written).replace("::", "/"));
+    /// entry point's directory, the standard library, and last the
+    /// directory of `writer`, the file that wrote it ("" asks none).  A
+    /// file of a package `writer`'s may not name is passed over, so a
+    /// program's `core/_module.cryo` is never the standard library's
+    /// `core::_module`.  "" when none is found.
+    resolve_import_path(mut &this, intern: InternTable*, written: SymbolStr, writer: string) -> string {
+        const writer_package: ModulePackage = this.package_roots.package_of(Path::from(writer));
+        const found: string = this.resolve_written_path(intern.resolve(written), &writer_package);
+        if (found.length() > 0 || writer.length() == 0) { return found; }
+        // A path found here names a module for the rest of the build.
+        return this.search_location(writer.parent_directory(), intern.resolve(written).replace("::", "/")).into_raw();
+    }
+
+    /// Whether a module path written in `writer`'s package may name `file`.
+    names_reachable_file(&this, writer: &ModulePackage, file: Str) -> boolean {
+        const target: ModulePackage = this.package_roots.package_of(Path::from(file));
+        return writer.may_name(&target);
     }
 
     /// `resolve_import_path`'s search before the writing file's directory.
-    resolve_written_path(mut &this, import_path: string) -> string {
+    resolve_written_path(mut &this, import_path: string, writer: &ModulePackage) -> string {
         // Vendor libraries: `import vendor::Name` resolves through the vendor
         // registry to the bindings generated for the active target triple,
         // never the project tree or stdlib.  Handled before any filesystem
@@ -625,10 +653,10 @@ public:
             const idx: i64 = this.vendor_registry.find_index(lib);
             if (idx < 0) { return ""; }
             // A `[vendor.<lib>]` pin overrides the build triple for this lib.
-            const triple: string =
+            const triple: Str =
                 VendorRegistry::normalize_triple(this.triple_for_lib(lib));
-            const f: string = this.vendor_registry.entries[idx].cache_file_for(triple);
-            if (f.length() > 0 && Path::from(f).exists()) {
+            const cached: Str = this.vendor_registry.entries[idx].cache_file_for(triple);
+            if (cached.length() > 0 && Path::from(cached).exists()) {
                 // Surface the binding in the project build tree: copy the
                 // cache file into `<vendor_build_root>/<Name>/<Name>.cryo` and
                 // compile THAT, so the generated `.cryo` sits alongside its
@@ -637,46 +665,58 @@ public:
                 // resolved copy for this build.  Copy every resolve so a cache
                 // regeneration this build is reflected; falls back to the
                 // cache path if there's no build folder or the copy fails.
-                if (this.vendor_build_root.length() > 0) {
-                    const name: string = this.vendor_registry.entries[idx].name;
-                    const dest: string = Path::from(this.vendor_build_root).join(name)
-                        .join(f"{name}.cryo".as_str()).into_raw();
-                    ProjectConfig::mkdir_p(dest.parent_dir());
-                    match (File::copy(Path::from(f), Path::from(dest))) {
-                        Result::Ok(_)  => { return dest; }
-                        Result::Err(_) => { return f; }
+                mut chosen: PathBuf = PathBuf::from(cached);
+                if (!this.vendor_build_root.is_empty()) {
+                    const name: Str = this.vendor_registry.entries[idx].name.as_str();
+                    const dest: PathBuf = this.vendor_build_root.join(name)
+                        .join(f"{name}.cryo".as_str());
+                    match (dest.as_path().parent()) {
+                        Option::Some(directory) => { ProjectConfig::mkdir_p(directory); }
+                        Option::None            => { }
+                    }
+                    match (File::copy(Path::from(cached), dest.as_path())) {
+                        Result::Ok(_)  => { chosen = dest; }
+                        Result::Err(_) => { }
                     }
                 }
-                return f;
+                // The module graph keeps the path a module was found at, as a
+                // `string`, for the whole build.
+                return chosen.into_raw();
             }
             // Registered, but nothing generated for THIS triple (a cross-compile
             // against a host-only registration is the common case).  Point the
             // user at the regeneration command rather than leaving them with the
             // generic "cannot find module" diagnostic.
-            fmt::eprintf("note: vendor library '%s' is registered but has no bindings for target '%s'.\n      Generate them with: cryo vendor --target=%s <path>\n",
-                lib, triple, triple);
+            fmt::eprint(f"note: vendor library '{lib}' is registered but has no bindings for target '{triple}'.\n      Generate them with: cryo vendor --target={triple} <path>\n");
             return "";
         }
 
         // Fast path: check pre-scanned namespace map first.
         // This handles all case-insensitive resolution automatically since
         // the map was built by walking the actual filesystem.
-        const from_map: Option<string> = this.ns_map.get(&import_path);
-        if (from_map.is_some()) {
-            return from_map.unwrap();
+        match (this.ns_map.get(&String::from_string(import_path))) {
+            Option::Some(file) => {
+                if (this.names_reachable_file(writer, Str::new(file))) { return file; }
+            }
+            Option::None => { }
         }
 
         const fs_path: string = import_path.replace("::", "/");
 
-        // Search locations in priority order
+        // Search locations in priority order.  A path found names a module
+        // for the rest of the build.
         // 1. Project root
-        const from_root: string = this.search_location(this.project_root, fs_path);
-        if (from_root.length() > 0) { return from_root; }
+        mut from_root: String = this.search_location(this.project_root, fs_path);
+        if (from_root.length() > 0 && this.names_reachable_file(writer, from_root.as_str())) {
+            return from_root.into_raw();
+        }
 
         // 2. Entry point directory (if different from root)
         if (!this.entry_dir.eq(this.project_root) && this.entry_dir.length() > 0) {
-            const from_entry: string = this.search_location(this.entry_dir, fs_path);
-            if (from_entry.length() > 0) { return from_entry; }
+            mut from_entry: String = this.search_location(this.entry_dir, fs_path);
+            if (from_entry.length() > 0 && this.names_reachable_file(writer, from_entry.as_str())) {
+                return from_entry.into_raw();
+            }
         }
 
         // 3. Stdlib (unless no_std)
@@ -690,8 +730,8 @@ public:
                 fs_path[2] == 'd' && fs_path[3] == '/') {
                 stdlib_fs_path = fs_path + 4;  // skip "std/"
             }
-            const from_stdlib: string = this.search_location(this.stdlib_root, stdlib_fs_path);
-            if (from_stdlib.length() > 0) { return from_stdlib; }
+            mut from_stdlib: String = this.search_location(this.stdlib_root, stdlib_fs_path);
+            if (from_stdlib.length() > 0) { return from_stdlib.into_raw(); }
         }
 
         return "";
@@ -715,12 +755,12 @@ public:
         const idx: i64 = this.vendor_registry.find_index(lib);
         if (idx < 0) { return; }
         this.vendor_modules.insert(ModuleGraph::module_key(resolved),
-            "vendor::" + this.vendor_registry.entries[idx].name);
-        const key: string = this.vendor_registry.entries[idx].key;
+            f"vendor::{this.vendor_registry.entries[idx].name}");
+        const key: Str = this.vendor_registry.entries[idx].key.as_str();
         for (mut i: i64 = 0; i < this.used_vendor_keys.length(); i++) {
-            if (this.used_vendor_keys[i] == key) { return; }
+            if (this.used_vendor_keys[i].as_str() == key) { return; }
         }
-        this.used_vendor_keys.push(key);
+        this.used_vendor_keys.push(String::from_str(key));
     }
 
     /// Merge every used vendor library's link metadata into `cfg`'s link
@@ -728,7 +768,7 @@ public:
     /// Called after discovery, before linking.
     merge_vendor_links(&this, cfg: mut ProjectConfig*) -> void {
         for (mut i: i64 = 0; i < this.used_vendor_keys.length(); i++) {
-            const idx: i64 = this.vendor_registry.find_index(this.used_vendor_keys[i]);
+            const idx: i64 = this.vendor_registry.find_index(this.used_vendor_keys[i].as_str());
             if (idx < 0) { continue; }
             VendorRegistry::merge_entry_link(cfg, &this.vendor_registry.entries[idx]);
         }
@@ -742,16 +782,16 @@ public:
     collect_vendor_locks(&this) -> [LockedVendor] {
         mut out: [LockedVendor] = [];
         for (mut i: i64 = 0; i < this.used_vendor_keys.length(); i++) {
-            const idx: i64 = this.vendor_registry.find_index(this.used_vendor_keys[i]);
+            const idx: i64 = this.vendor_registry.find_index(this.used_vendor_keys[i].as_str());
             if (idx < 0) { continue; }
-            const name: string = this.vendor_registry.entries[idx].name;
-            const triple: string =
+            const name: Str = this.vendor_registry.entries[idx].name.as_str();
+            const triple: Str =
                 VendorRegistry::normalize_triple(this.triple_for_lib(name));
-            const file: string = this.vendor_registry.entries[idx].cache_file_for(triple);
+            const file: Str = this.vendor_registry.entries[idx].cache_file_for(triple);
             if (file.length() == 0) { continue; }
-            const sha: string = LockedVendor::file_sha(file);
+            const sha: String = LockedVendor::file_sha(Path::from(file));
             if (sha.length() == 0) { continue; }
-            out.push(LockedVendor { name: name, triple: triple, binding_sha: sha });
+            out.push(LockedVendor { name: String::from_str(name), triple: String::from_str(triple), binding_sha: sha });
         }
         return out;
     }
@@ -776,7 +816,7 @@ public:
                 raw.start_line, raw.start_col,
                 raw.end_line, raw.end_col);
         }
-        const suggestion: string = this.suggest_module(path);
+        const suggestion: Option<String> = this.suggest_module(path);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0500_MODULE_NOT_FOUND,
             fmt::format("cannot find module `%s`", path));
@@ -784,19 +824,23 @@ public:
             diag = diag.at_with_label(span,
                 fmt::format("no module named `%s` is in scope", path));
         }
-        if (suggestion.length() > 0) {
-            diag = diag.with_note(fmt::format("did you mean `%s`?", suggestion));
+        match (suggestion) {
+            Option::Some(name) => { diag = diag.with_note(f"did you mean `{name}`?"); }
+            Option::None => { }
         }
         return diag.help(
             "imports resolve against the project root, the entry-point directory, and the standard library; module paths are case-sensitive");
     }
 
-    suggest_module(&this, import_path: string) -> string {
-        mut candidates: [string] = [];
-        for (name in this.ns_map.keys_ref()) {
-            candidates.push(*name);
+    suggest_module(&this, import_path: string) -> Option<String> {
+        mut views: [Str] = [];
+        for (name in this.ns_map.key_references()) {
+            views.push(name.as_str());
         }
-        return find_best_candidate(import_path, candidates);
+        return match (find_best_candidate(import_path, &views)) {
+            Option::Some(at) => { Option::Some(String::from_str(views[at])) }
+            Option::None     => { Option::None }
+        };
     }
 
 
@@ -813,17 +857,17 @@ public:
         // (`<root>/./core/x.cryo` from a `source_dir` of `.`).  The key
         // ensures we only load and register each physical file once, and
         // the module keeps the one spelling.
-        const file_path: string = ModuleGraph::module_spelling(written_path);
-        const norm_path: string = ModuleGraph::module_key(file_path);
+        const file_path: string = ModuleGraph::module_spelling(written_path).into_raw();
+        const norm_path: String = ModuleGraph::module_key(file_path);
 
-        if (this.is_loaded(norm_path)) { return true; }
+        if (this.is_loaded(&norm_path)) { return true; }
 
         // Circular dependency: this module is already being loaded
         // (i.e., we are inside its own import subtree).  This is expected
         // for mutually-referencing modules (e.g., ast::Node <-> ast::Expression).
         // During *discovery* we only need to know that the file exists and
         // will be registered; the topological sort handles actual ordering.
-        if (this.is_loading(norm_path)) {
+        if (this.is_loading(&norm_path)) {
             return true;
         }
 
@@ -834,13 +878,13 @@ public:
         const is_override: boolean =
             SourceOverride::content_for(&this.lsp_overrides, file_path).is_some();
         if (!is_override && !Path::from(file_path).exists()) {
-            const msg: string = fmt::format("module file not found: `%s`", file_path).into_raw();
+            const msg: String = fmt::format("module file not found: `%s`", file_path);
             sink.emit(Diagnostic::error(ErrorCode::E0500_MODULE_NOT_FOUND, msg));
             return false;
         }
 
         // Mark as loading (use normalized path for dedup)
-        this.push_loading(norm_path);
+        this.push_loading(&norm_path);
 
         if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
             Log::trace(LogArea::Loader, f"discovering {file_path}");
@@ -870,7 +914,7 @@ public:
         mem::swap(&lexed.diagnostics, &scan_sink.diagnostics);
 
         // Note if this module uses an f-string so the orchestrator can
-        // force-discover the f-string runtime (std::fmt::interp) on demand.
+        // force-discover the f-string runtime (std::fmt::interpolation) on demand.
         if (scan.uses_fstring) {
             graph.uses_fstring = true;
         }
@@ -880,9 +924,9 @@ public:
         }
 
         // Create ModuleInfo (store original path so the lexer can open the file)
-        const vendor_name: Option<string> = this.vendor_modules.get(&norm_path);
+        const vendor_name: Option<String*> = this.vendor_modules.get_reference(&norm_path);
         const mod_name: SymbolStr = if (vendor_name.is_some()) {
-            intern.intern(vendor_name.unwrap())
+            intern.intern(vendor_name.unwrap().as_str())
         } else {
             if (scan.namespace_name.is_valid()) {
                 scan.namespace_name
@@ -893,19 +937,14 @@ public:
         const mod_name_str: string = intern.resolve(mod_name);
         mut info: ModuleInfo = ModuleInfo::with_namespace(
             mod_name, file_path, mod_name);
-        info.declared_internal = this.declared_internal(intern, norm_path);
+        info.declared_internal = this.declared_internal(intern, norm_path.as_str());
         info.lexed = lexed;
 
         // Publish this module's namespace BEFORE recursing into its imports.
         // Inside a cycle the recursion comes back around and asks for this
         // module's namespace while it is still mid-load; without this the
         // dependency edge degrades to the raw import path.  See `scanned_ns`.
-        this.scanned_ns.insert(norm_path, mod_name_str);
-
-        // Directory of the current file, used to resolve bare sub-module
-        // names (e.g., `module Commands;` in src/CLI/_module.cryo
-        // should find src/CLI/Commands.cryo).
-        const file_dir: string = file_path.parent_dir();
+        this.scanned_ns.insert(norm_path.clone(), mod_name_str);
 
         // Process imports: discover dependencies recursively
         mut success: boolean = true;
@@ -928,7 +967,7 @@ public:
             // Resolve to filesystem path, last relative to the declaring
             // file's directory (bare `module X;` declarations in
             // _module.cryo).
-            mut resolved: string = this.resolve_import_path(intern, import_sym, file_dir);
+            mut resolved: string = this.resolve_import_path(intern, import_sym, file_path);
             if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
                 Log::trace(LogArea::Loader, f"import '{import_path}' resolved to '{resolved}'");
             }
@@ -1024,7 +1063,7 @@ public:
         for (mut ii: i64 = 0; ii < scan.import_item_count; ii++) {
             const item_sym: SymbolStr = scan.import_items[ii];
             const item_path: string = intern.resolve(item_sym);
-            const item_resolved: string = this.resolve_import_path(intern, item_sym, file_dir);
+            const item_resolved: string = this.resolve_import_path(intern, item_sym, file_path);
             if (item_resolved.length() > 0) {
                 if (!this.discover_module(intern, graph, sink, item_resolved)) {
                     success = false;
@@ -1103,7 +1142,7 @@ public:
             const braced: boolean = scan.export_braced[ei];
             const exp_sym: SymbolStr = scan.export_paths[ei];
             const exp_path: string = intern.resolve(exp_sym);
-            const exp_resolved: string = this.resolve_import_path(intern, exp_sym, file_dir);
+            const exp_resolved: string = this.resolve_import_path(intern, exp_sym, file_path);
             if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
                 Log::trace(LogArea::Loader, f"export '{exp_path}' resolved to '{exp_resolved}'");
             }
@@ -1162,7 +1201,7 @@ public:
         // inside the path, mirroring the import-item loop above.
         for (mut eii: i64 = 0; eii < scan.export_item_count; eii++) {
             const eitem_sym: SymbolStr = scan.export_items[eii];
-            const eitem_resolved: string = this.resolve_import_path(intern, eitem_sym, file_dir);
+            const eitem_resolved: string = this.resolve_import_path(intern, eitem_sym, file_path);
             if (eitem_resolved.length() > 0) {
                 if (!this.discover_module(intern, graph, sink, eitem_resolved)) {
                     success = false;
@@ -1199,7 +1238,7 @@ public:
         // creates false cycles (e.g., AST -> Specializer -> Types -> AST).
         for (mut s: i64 = 0; s < scan.submodule_count; s++) {
             const sub_sym: SymbolStr = scan.submodule_paths[s];
-            const sub_resolved: string = this.resolve_import_path(intern, sub_sym, file_dir);
+            const sub_resolved: string = this.resolve_import_path(intern, sub_sym, file_path);
             if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
                 Log::trace(LogArea::Loader, f"submodule '{intern.resolve(sub_sym)}' resolved to '{sub_resolved}'");
             }
@@ -1236,8 +1275,8 @@ public:
         graph.add_module(info, intern);
 
         // Mark as loaded, remove from loading set (use normalized path)
+        this.pop_loading(&norm_path);
         this.mark_loaded(norm_path);
-        this.pop_loading(norm_path);
 
         return success;
     }
@@ -1250,38 +1289,38 @@ public:
     /// variation found it: a filesystem that ignores case answers the
     /// first variation, and the path's spelling becomes the file name of
     /// every span in the module.
-    search_location(mut &this, base_dir: string, fs_path: string) -> string {
+    search_location(mut &this, base_dir: string, fs_path: string) -> String {
         // 1. Directory module: base_dir/fs_path/_module.cryo
-        const dir_module: string = Path::from(fs_path).join("_module.cryo").into_raw();
-        if (this.exists_under(base_dir, dir_module)) {
-            return this.spelled_as_on_disk(base_dir, dir_module);
+        const dir_module: PathBuf = Path::from(fs_path).join("_module.cryo");
+        if (this.exists_under(base_dir, dir_module.as_path().as_str())) {
+            return this.spelled_as_on_disk(base_dir, dir_module.as_path().as_str());
         }
 
         // 2. Exact case: base_dir/fs_path.cryo
-        const exact: string = fmt::format("%s.cryo", fs_path).into_raw();
-        if (this.exists_under(base_dir, exact)) {
-            return this.spelled_as_on_disk(base_dir, exact);
+        const exact: String = f"{fs_path}.cryo";
+        if (this.exists_under(base_dir, exact.as_str())) {
+            return this.spelled_as_on_disk(base_dir, exact.as_str());
         }
 
         // 3. Lowercase: base_dir/lowercase.cryo
-        const lower: string = fmt::format("%s.cryo", fs_path.to_ascii_lower()).into_raw();
-        if (this.exists_under(base_dir, lower)) {
-            return this.spelled_as_on_disk(base_dir, lower);
+        const lower: String = f"{fs_path.to_ascii_lower()}.cryo";
+        if (this.exists_under(base_dir, lower.as_str())) {
+            return this.spelled_as_on_disk(base_dir, lower.as_str());
         }
 
         // 4. Snake case: base_dir/snake_case.cryo
-        const snake: string = fmt::format("%s.cryo", ModuleLoader::to_snake_case(fs_path)).into_raw();
-        if (this.exists_under(base_dir, snake)) {
-            return this.spelled_as_on_disk(base_dir, snake);
+        const snake: String = f"{ModuleLoader::to_snake_case(fs_path)}.cryo";
+        if (this.exists_under(base_dir, snake.as_str())) {
+            return this.spelled_as_on_disk(base_dir, snake.as_str());
         }
 
         // 5. Lowercase directory module
-        const lower_dir: string = Path::from(fs_path.to_ascii_lower()).join("_module.cryo").into_raw();
-        if (this.exists_under(base_dir, lower_dir)) {
-            return this.spelled_as_on_disk(base_dir, lower_dir);
+        const lower_dir: PathBuf = Path::from(fs_path.to_ascii_lower()).join("_module.cryo");
+        if (this.exists_under(base_dir, lower_dir.as_path().as_str())) {
+            return this.spelled_as_on_disk(base_dir, lower_dir.as_path().as_str());
         }
 
-        return "";
+        return String::new();
     }
 
     /// Whether `base_dir/relative` exists.  A path one of whose directories
@@ -1289,7 +1328,7 @@ public:
     /// filesystem, which the listings answer; any other is the operating
     /// system's to answer, since whether a spelling differing only in case
     /// names an entry is the filesystem's rule.
-    exists_under(mut &this, base_dir: string, relative: string) -> boolean {
+    exists_under(mut &this, base_dir: string, relative: Str) -> boolean {
         if (!this.listings.may_hold(base_dir, relative)) { return false; }
         const candidate: PathBuf = Path::from(base_dir).join(relative);
         return candidate.as_path().exists();
@@ -1297,51 +1336,46 @@ public:
 
     /// `base_dir/relative`, each component of `relative` replaced by the
     /// entry of its directory that it names.
-    spelled_as_on_disk(mut &this, base_dir: string, relative: string) -> string {
+    spelled_as_on_disk(mut &this, base_dir: string, relative: Str) -> String {
         mut spelled: PathBuf = PathBuf::from(base_dir);
         const separator: Str = Str::new("/");
-        for (component in Str::new(relative).split(&separator)) {
+        for (component in relative.split(&separator)) {
             const entry: String = this.listings.entry_named(spelled.as_path().as_str(), component);
             spelled.push(entry.as_str());
         }
-        return spelled.into_raw();
+        return String::from_str(spelled.as_path().as_str());
     }
 
 
     // Loading set management
 
-    is_loading(&this, path: string) -> boolean {
+    is_loading(&this, path: &String) -> boolean {
         for (mut i: i64 = 0; i < this.loading.length(); i++) {
-            if (this.loading[i].second && this.loading[i].first.eq(path)) {
+            if (this.loading[i].second && this.loading[i].first == *path) {
                 return true;
             }
         }
         return false;
     }
 
-    push_loading(mut &this, path: string) -> void {
-        this.loading.push(Pair::new(path, true));
+    push_loading(mut &this, path: &String) -> void {
+        this.loading.push(Pair::new(path.clone(), true));
     }
 
-    pop_loading(mut &this, path: string) -> void {
+    pop_loading(mut &this, path: &String) -> void {
         for (mut i: i64 = 0; i < this.loading.length(); i++) {
-            if (this.loading[i].second && this.loading[i].first.eq(path)) {
+            if (this.loading[i].second && this.loading[i].first == *path) {
                 this.loading[i].second = false;
                 return;
             }
         }
     }
 
-    is_loaded(&this, path: string) -> boolean {
-        for (mut i: i64 = 0; i < this.loaded_paths.length(); i++) {
-            if (this.loaded_paths[i].eq(path)) {
-                return true;
-            }
-        }
-        return false;
+    is_loaded(&this, path: &String) -> boolean {
+        return this.loaded_paths.contains(path);
     }
 
-    mark_loaded(mut &this, path: string) -> void {
+    mark_loaded(mut &this, path: String) -> void {
         this.loaded_paths.push(path);
     }
 
@@ -1354,8 +1388,8 @@ public:
         mut import_spans: [SourceSpan] = [];
         mut import_entry_items: [i64] = [];
         mut import_items: [string] = [];
-        mut import_binds: [string] = [];
-        mut import_item_binds: [string] = [];
+        mut import_binds: [Str] = [];
+        mut import_item_binds: [Str] = [];
         mut exports: [string] = [];
         mut export_spans: [SourceSpan] = [];
         mut export_braced: [boolean] = [];
@@ -1457,7 +1491,7 @@ public:
                                         import_items.push(item_path);
                                         import_item_binds.push(
                                             if ((i + 1) < len && tokens[i].kind == TokenType::KwAs) {
-                                                tokens[i + 1].lexeme
+                                                Str::from(tokens[i + 1].lexeme)
                                             } else {
                                                 QualifiedName::leaf_of(item)
                                             });
@@ -1504,11 +1538,11 @@ public:
                             if (!is_exp && owner.length() > 0) {
                                 imports[imports.length() - 1] = owner;
                                 import_entry_items[import_entry_items.length() - 1] = import_items.length();
-                                import_binds[import_binds.length() - 1] = "";
+                                import_binds[import_binds.length() - 1] = Str::from("");
                                 import_items.push(path);
                                 import_item_binds.push(alias);
                             } else if (!is_exp) {
-                                import_binds[import_binds.length() - 1] = alias;
+                                import_binds[import_binds.length() - 1] = Str::from(alias);
                             }
                         }
                     }
@@ -1575,7 +1609,7 @@ public:
         // `J::Inner` when there is one, and no import discovers it.  Each
         // proper prefix past the head is recorded - the last segment is the
         // member the path ends at, never a module it passes through.
-        mut binds: [string] = [];
+        mut binds: [Str] = [];
         mut bind_imports: [i64] = [];
         mut bind_items: [i64] = [];
         for (mut k: i64 = 0; k < import_binds.length(); k++) {
@@ -1625,7 +1659,7 @@ public:
         // The import/namespace scan above stops at the first declaration, but
         // f-strings live in function bodies, so do a separate full-stream pass
         // to detect whether this module uses one (drives discovery of the
-        // f-string runtime, std::fmt::interp).
+        // f-string runtime, std::fmt::interpolation).
         mut uses_fstring_val: boolean = false;
         for (mut fi: i64 = 0; fi < len; fi++) {
             if (tokens[fi].kind == TokenType::FStringLiteral) {
@@ -1678,9 +1712,9 @@ public:
     ///
     /// The position in `binds`, the names a file's imports bind, of the
     /// first that is `name`; -1 when none is.
-    static binding_of(binds: &[string], name: string) -> i64 {
+    static binding_of(binds: &[Str], name: Str) -> i64 {
         for (mut k: i64 = 0; k < binds.length(); k++) {
-            if (binds[k].eq(name)) { return k; }
+            if (binds[k] == name) { return k; }
         }
         return -1;
     }
@@ -1699,7 +1733,7 @@ public:
     sub_module_file(&this, intern: InternTable*, owner_file: string, rest: SymbolStr) -> string {
         match (this.scanned_ns.get(&ModuleGraph::module_key(owner_file))) {
             Option::Some(owner_ns) => {
-                match (this.ns_map.get(&fmt::format("%s::%s", owner_ns, intern.resolve(rest)).into_raw())) {
+                match (this.ns_map.get(&f"{owner_ns}::{intern.resolve(rest)}")) {
                     Option::Some(sub_file) => { return sub_file; }
                     Option::None => { return ""; }
                 }
@@ -1753,7 +1787,7 @@ public:
     /// is lowercase (a word after a lowercase run) or the one after it is
     /// (the last capital of an acronym, the `V` in "ASTValidation") - never
     /// at the start, and never after a `/` or `_`.
-    static to_snake_case(s: string) -> string {
+    static to_snake_case(s: string) -> String {
         const length: i64 = s.length() as i64;
         mut out: String = String::with_capacity(length);
         for (mut i: i64 = 0; i < length; i++) {
@@ -1767,7 +1801,7 @@ public:
             }
             out.push_byte(ch.to_ascii_lowercase() as u8);
         }
-        return out.into_raw();
+        return out;
     }
 
     /// Extract a module name from a file path (filename without extension).
@@ -1858,15 +1892,15 @@ type struct ModuleScanResult {
     uses_fstring:    boolean;     // file contains at least one f-string (`f"..."`)
 }
 
-/// A `module` line the pre-scan read: the path as written, the directory
-/// of the file writing it (which resolves it as an import's path is), that
-/// file lower-cased, and whether it is `internal module`.  `target` is the
-/// file the path names, lower-cased, once `resolved`.
+/// A `module` line the pre-scan read: the path as written, the file
+/// writing it (which resolves it as an import's path is), that file
+/// lower-cased, and whether it is `internal module`.  `target` is the file
+/// the path names, lower-cased, once `resolved`.
 type struct ModuleLine {
     written:     SymbolStr;
-    from_dir:    string;
-    declarer:    string;
+    writer:      string;
+    declarer:    String;
     is_internal: boolean;
-    target:      string;
+    target:      String;
     resolved:    boolean;
 }

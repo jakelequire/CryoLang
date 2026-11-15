@@ -15,13 +15,13 @@ import std::collections::string::{ String };
 import std::env;
 import std::core::error::{ Error };
 import std::fmt::display::{ Debug, Display, Formatter };
-import std::fmt::error::{ FmtError };
-import std::fmt::interp::{ Arguments };
+import std::fmt::error::{ FormatError };
+import std::fmt::interpolation::{ Arguments };
 import std::log::record::{ LogLevel, LogRecord };
 import std::log::sink::{ LogSink, StandardErrorSink };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::sync::mutex::{ Mutex, MutexGuard };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 import std::time::clock::{ SystemTime };
 
 /// A named area of a program, `Logger::new("http")`, that logs records at a
@@ -123,7 +123,7 @@ implement trait Error for struct LogSpecificationError { }
 
 /// `unrecognized logging entry 'http=loud'`.
 implement trait Display for struct LogSpecificationError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         const entry: Str = this.entry.as_str();
         return f.write(f"unrecognized logging entry '{entry}'");
     }
@@ -159,7 +159,7 @@ internal type struct LoggingSettings {
             if (name.length() <= best_length || !area.starts_with(&name)) {
                 continue;
             }
-            const rest: Str = area.sub_bytes(name.length(), area.length());
+            const rest: Str = area.byte_substring(name.length(), area.length());
             if (rest.length() == 0 || rest.starts_with(&Str::new("::"))) {
                 best = entry.second.clone();
                 best_length = name.length();
@@ -192,15 +192,15 @@ public type struct Logging {
     /// Let records at `level` and above through, from every area no area
     /// setting names.
     public static set_level(level: LogLevel) -> void {
-        mut settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
-        settings.as_mutable_ptr().level = level;
+        mut settings: MutexGuard<LoggingSettings, GlobalAllocator> = g_settings.lock();
+        settings.as_mutable_pointer().level = level;
         Logging::publish(&settings);
     }
 
     /// Let records at `level` and above through from `area` and every area
     /// below it, replacing an earlier setting for the same area.
     public static set_area_level(area: Str, level: LogLevel) -> void {
-        mut settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
+        mut settings: MutexGuard<LoggingSettings, GlobalAllocator> = g_settings.lock();
         Logging::store_area_level(&settings, area, level);
         Logging::publish(&settings);
     }
@@ -243,9 +243,9 @@ public type struct Logging {
                 }
             }
         }
-        mut settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
+        mut settings: MutexGuard<LoggingSettings, GlobalAllocator> = g_settings.lock();
         match (default_level) {
-            Option::Some(level) => { settings.as_mutable_ptr().level = level; }
+            Option::Some(level) => { settings.as_mutable_pointer().level = level; }
             Option::None => { }
         }
         for (mut i: i64 = 0; i < area_levels.length(); i++) {
@@ -270,14 +270,14 @@ public type struct Logging {
     /// logging, as a global or a value `main` holds does. Any thread may log,
     /// so the sink's type must be `Sync`.
     public static set_sink<S>(sink: &S) -> void where S: LogSink, S: Sync {
-        mut settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
-        settings.as_mutable_ptr().sink = Option::Some(sink);
+        mut settings: MutexGuard<LoggingSettings, GlobalAllocator> = g_settings.lock();
+        settings.as_mutable_pointer().sink = Option::Some(sink);
     }
 
     /// Send records to standard error again, as before any `set_sink`.
     public static reset_sink() -> void {
-        mut settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
-        settings.as_mutable_ptr().sink = Option::None;
+        mut settings: MutexGuard<LoggingSettings, GlobalAllocator> = g_settings.lock();
+        settings.as_mutable_pointer().sink = Option::None;
     }
 
     /// True when the settings let a record at `level` from `area` through:
@@ -290,15 +290,15 @@ public type struct Logging {
         if (!g_has_area_levels.load(MemoryOrder::Acquire)) {
             return true;
         }
-        const settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
-        return settings.as_ptr().level_for(area).allows(level);
+        const settings: MutexGuard<LoggingSettings, GlobalAllocator> = g_settings.lock();
+        return settings.as_pointer().level_for(area).allows(level);
     }
 
     /// Hand `record` to the sink, under the lock, so records from different
     /// threads reach it one at a time.
     internal static write(record: &LogRecord) -> void {
-        mut settings: MutexGuard<LoggingSettings, GlobalAlloc> = g_settings.lock();
-        const held: mut LoggingSettings* = settings.as_mutable_ptr();
+        mut settings: MutexGuard<LoggingSettings, GlobalAllocator> = g_settings.lock();
+        const held: mut LoggingSettings* = settings.as_mutable_pointer();
         match (held.sink) {
             Option::Some(sink) => {
                 sink.write(record);
@@ -309,11 +309,11 @@ public type struct Logging {
         if (held.standard_error.is_none()) {
             held.standard_error = Option::Some(StandardErrorSink::new());
         }
-        held.standard_error.unwrap_ptr().write(record);
+        held.standard_error.unwrap_pointer().write(record);
     }
 
-    private static store_area_level(settings: mut &MutexGuard<LoggingSettings, GlobalAlloc>, area: Str, level: LogLevel) -> void {
-        const held: mut LoggingSettings* = settings.as_mutable_ptr();
+    private static store_area_level(settings: mut &MutexGuard<LoggingSettings, GlobalAllocator>, area: Str, level: LogLevel) -> void {
+        const held: mut LoggingSettings* = settings.as_mutable_pointer();
         for (mut i: i64 = 0; i < held.area_levels.length(); i++) {
             if (held.area_levels[i].first.as_str().equals(&area)) {
                 held.area_levels[i].second = level;
@@ -325,8 +325,8 @@ public type struct Logging {
 
     /// Store the threshold and whether any area has a level of its own, for
     /// `allows` to read without the lock.
-    private static publish(settings: &MutexGuard<LoggingSettings, GlobalAlloc>) -> void {
-        const held: LoggingSettings* = settings.as_ptr();
+    private static publish(settings: &MutexGuard<LoggingSettings, GlobalAllocator>) -> void {
+        const held: LoggingSettings* = settings.as_pointer();
         g_threshold.store(held.most_verbose(), MemoryOrder::Release);
         g_has_area_levels.store(held.area_levels.length() > 0, MemoryOrder::Release);
     }

@@ -4,14 +4,14 @@
 ///! What these pin that a hand-inspection cannot:
 ///!
 ///!   - **The handshake and the first frame may arrive in ONE write.** Because
-///!     `WebSocket<S>` OWNS its `BufStream<S>`, the read buffer outlives the
+///!     `WebSocket<S>` OWNS its `BufferedStream<S>`, the read buffer outlives the
 ///!     handshake, so frame bytes that landed in the same fill as the
-///!     terminating blank line survive into the first `recv`. The borrowed,
+///!     terminating blank line survive into the first `receive`. The borrowed,
 ///!     byte-at-a-time version could only avoid over-reading by never
 ///!     buffering; this one has to KEEP what it over-read.
 ///!     `pipelined_upgrade_and_frame_round_trip` sends the upgrade request and
 ///!     the first frame in a single flush and still expects the message.
-///!   - **The connection survives several frames.** `recv` carries its
+///!   - **The connection survives several frames.** `receive` carries its
 ///!     accumulator, and `read_frame` carries a masking key and a length,
 ///!     across suspension points inside a loop. A desynchronized carrier shows
 ///!     up as a wrong count, so every test asserts numbers.
@@ -33,14 +33,14 @@ import std::collections::array::{ Array };
 import std::future;
 import std::io::error::{ IoError };
 import std::io::traits;
-import std::io::buf::{ BufStream };
-import std::net::addr::socket_addr::{ SocketAddr };
+import std::io::buffered::{ BufferedStream };
+import std::net::address::socket_address::{ SocketAddress };
 import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
-import std::net::ws::frame::{ Frame, OpCode };
-import std::net::ws::conn::{ accept, connect, Message, WebSocket };
+import std::net::ws::frame::{ Frame, OperationCode };
+import std::net::ws::connection::{ accept, connect, Message, WebSocket };
 import std::net::ws::handshake::{ compute_accept, generate_key };
 import std::test::error::{ TestError };
-import std::test::assert::{ bail, expect, expect_eq };
+import std::test::assert::{ bail, expect, expect_equal };
 import std::future::combinator::{ Futures };
 import std::future::executor::{ Executor };
 
@@ -62,8 +62,8 @@ function accept_key_rfc6455_vector() -> Result<(), TestError> {
 function generated_keys_are_sixteen_fresh_bytes() -> Result<(), TestError> {
     const first: String = generate_key();
     const second: String = generate_key();
-    expect_eq(first.length(), 24)?;
-    expect_eq(second.length(), 24)?;
+    expect_equal(first.length(), 24)?;
+    expect_equal(second.length(), 24)?;
     return expect(!first.as_str().equals(&second.as_str()), Str::new("two generated keys differ"));
 }
 
@@ -76,14 +76,14 @@ function generated_keys_are_sixteen_fresh_bytes() -> Result<(), TestError> {
 /// port: moving one field out of a tuple that owns a destructor would leave
 /// the other to be dropped twice.
 function ws_bind() -> Result<TcpListener, IoError> {
-    mut l: TcpListener = TcpListener::bind(SocketAddr::localhost_v4(0))?;
-    l.set_nonblocking(true);
+    mut l: TcpListener = TcpListener::bind(SocketAddress::localhost_v4(0))?;
+    l.set_nonblocking(true)?;
     return Result::Ok(l);
 }
 
 /// The port the kernel assigned, or 0 if it cannot be read.
 function ws_port(l: &TcpListener) -> u16 {
-    return match (l.local_addr()) {
+    return match (l.local_address()) {
         Result::Ok(a)  => { a.port }
         Result::Err(_) => { 0 }
     };
@@ -118,7 +118,7 @@ function ws_message_is(msg: Message, expect_text: string) -> boolean {
 /// Client: connect, upgrade, send `n` distinct text messages, then read the
 /// server's echo of each. Returns `n`, or a negative step code.
 async function ws_client_n(port: u16, n: i64) -> i64 {
-    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -10; }
     };
@@ -136,7 +136,7 @@ async function ws_client_n(port: u16, n: i64) -> i64 {
             Result::Ok(_)  => { }
             Result::Err(_) => { return -12; }
         }
-        mut back: Message = match (await ws.recv()) {
+        mut back: Message = match (await ws.receive()) {
             Result::Ok(v)  => { v }
             Result::Err(_) => { return -13; }
         };
@@ -174,7 +174,7 @@ async function ws_server_n(listener: TcpListener, n: i64) -> i64 {
 
     mut seen: i64 = 0;
     while (seen < n) {
-        mut msg: Message = match (await ws.recv()) {
+        mut msg: Message = match (await ws.receive()) {
             Result::Ok(v)  => { v }
             Result::Err(_) => { return -102; }
         };
@@ -204,7 +204,7 @@ async function ws_pair(listener: TcpListener, port: u16, n: i64) -> i64 {
 
 /// One message each way: the control for the loop below. If this passes and
 /// the three-message test does not, the fault is in carrying the connection
-/// round the recv loop rather than in the upgrade or the framing.
+/// round the receive loop rather than in the upgrade or the framing.
 ![test]
 function upgrade_and_one_text_frame_round_trip() -> Result<(), TestError> {
     mut l: TcpListener = match (ws_bind()) {
@@ -212,10 +212,10 @@ function upgrade_and_one_text_frame_round_trip() -> Result<(), TestError> {
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
     const port: u16 = ws_port(&l);
-    if (port == 0) { return bail(Str::new("local_addr failed")); }
+    if (port == 0) { return bail(Str::new("local_address failed")); }
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(ws_pair(l, port, 1 as i64));
-    return expect_eq(r, 1 as i64);
+    return expect_equal(r, 1 as i64);
 }
 
 /// Three messages each way down ONE connection, each body distinct. A
@@ -228,10 +228,10 @@ function three_text_frames_on_one_connection() -> Result<(), TestError> {
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
     const port: u16 = ws_port(&l);
-    if (port == 0) { return bail(Str::new("local_addr failed")); }
+    if (port == 0) { return bail(Str::new("local_address failed")); }
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(ws_pair(l, port, 3 as i64));
-    return expect_eq(r, 3 as i64);
+    return expect_equal(r, 3 as i64);
 }
 
 // ============================================================================
@@ -244,16 +244,16 @@ function three_text_frames_on_one_connection() -> Result<(), TestError> {
 /// same fill as the blank line, so they only survive if the connection - not
 /// the handshake - owns the buffer.
 async function ws_pipelined_client(port: u16) -> i64 {
-    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -10; }
     };
     // The handshake is driven on the CONNECTION, which is only wrapped in a
-    // `WebSocket` once the upgrade is complete. Holding a `BufStream<S>*` into
+    // `WebSocket` once the upgrade is complete. Holding a `BufferedStream<S>*` into
     // the wrapper instead would not survive: an owning local is carried across
     // each suspend, so a pointer taken before the first `await` addresses a
     // copy the later states have stopped using.
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    mut c: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(sock);
 
     // Hand-built request so the frame can be appended to the SAME buffer
     // before anything is sent. The key is the RFC's worked example, so the
@@ -269,7 +269,7 @@ async function ws_pipelined_client(port: u16) -> i64 {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -11; }
     }
-    match (c.queue_frame(true, OpCode::Text, Str::new("pipelined").as_bytes(), true)) {
+    match (c.queue_frame(true, OperationCode::Text, Str::new("pipelined").as_bytes(), true)) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -12; }
     }
@@ -300,9 +300,9 @@ async function ws_pipelined_client(port: u16) -> i64 {
 
     // The upgrade is done and the frame the server echoes may already be
     // sitting in `c`'s buffer -- wrapping it now is what carries those bytes
-    // into `recv` instead of discarding them with a handshake-owned buffer.
+    // into `receive` instead of discarding them with a handshake-owned buffer.
     mut ws: WebSocket<TcpStream> = WebSocket::<TcpStream>::of(c, true);
-    mut echoed: Message = match (await ws.recv()) {
+    mut echoed: Message = match (await ws.receive()) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -18; }
     };
@@ -324,10 +324,10 @@ function pipelined_upgrade_and_frame_round_trip() -> Result<(), TestError> {
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
     const port: u16 = ws_port(&l);
-    if (port == 0) { return bail(Str::new("local_addr failed")); }
+    if (port == 0) { return bail(Str::new("local_address failed")); }
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(ws_pipelined_pair(l, port));
-    return expect_eq(r, 1 as i64);
+    return expect_equal(r, 1 as i64);
 }
 
 // ============================================================================
@@ -335,10 +335,10 @@ function pipelined_upgrade_and_frame_round_trip() -> Result<(), TestError> {
 // ============================================================================
 
 /// Client that sends a Ping BEFORE its text message. The server must answer
-/// the Ping with a Pong from inside `recv` and still deliver the text, so the
+/// the Ping with a Pong from inside `receive` and still deliver the text, so the
 /// client sees its echo AND a Pong-free message stream.
 async function ws_ping_client(port: u16) -> i64 {
-    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -10; }
     };
@@ -355,9 +355,9 @@ async function ws_ping_client(port: u16) -> i64 {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -13; }
     }
-    // The server's Pong is a control frame; `recv` skips it and yields the
-    // echo, so one `recv` is enough.
-    mut back: Message = match (await ws.recv()) {
+    // The server's Pong is a control frame; `receive` skips it and yields the
+    // echo, so one `receive` is enough.
+    mut back: Message = match (await ws.receive()) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -14; }
     };
@@ -379,10 +379,10 @@ function ping_is_answered_inline_without_losing_the_message() -> Result<(), Test
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
     const port: u16 = ws_port(&l);
-    if (port == 0) { return bail(Str::new("local_addr failed")); }
+    if (port == 0) { return bail(Str::new("local_address failed")); }
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(ws_ping_pair(l, port));
-    return expect_eq(r, 1 as i64);
+    return expect_equal(r, 1 as i64);
 }
 
 // ============================================================================
@@ -393,15 +393,18 @@ function ping_is_answered_inline_without_losing_the_message() -> Result<(), Test
 ///   0 - Close 1000 with the reason "bye", which the server echoes;
 ///   1 - text that is not UTF-8 (0xC3 0x28), answered with 1007;
 ///   2 - a Close of one byte, answered with 1002;
-///   3 - Close 1005, a code no peer may send, answered with 1002.
+///   3 - Close 1005, a code no peer may send, answered with 1002;
+///   4 - an unmasked text frame, which a client may not send, answered
+///       with 1002;
+///   5 - a Close with no status code, answered with 1000.
 /// Returns the status code of the Close the server sends back, or a
 /// negative step code.
 async function ws_raw_client(port: u16, case: i64) -> i64 {
-    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -10; }
     };
-    mut c: BufStream<TcpStream> = BufStream::<TcpStream>::of(sock);
+    mut c: BufferedStream<TcpStream> = BufferedStream::<TcpStream>::of(sock);
     mut req: String = String::with_capacity(200);
     req.push(Str::new("GET /chat HTTP/1.1\r\n"));
     req.push(Str::new("Host: 127.0.0.1\r\n"));
@@ -419,16 +422,21 @@ async function ws_raw_client(port: u16, case: i64) -> i64 {
         if (case == 0) {
             body.push(0x03); body.push(0xE8);
             body.append(Str::new("bye").as_bytes());
-            queued = c.queue_frame(true, OpCode::Close, body.as_slice(), true).is_ok();
+            queued = c.queue_frame(true, OperationCode::Close, body.as_slice(), true).is_ok();
         } else if (case == 1) {
             body.push(0xC3); body.push(0x28);
-            queued = c.queue_frame(true, OpCode::Text, body.as_slice(), true).is_ok();
+            queued = c.queue_frame(true, OperationCode::Text, body.as_slice(), true).is_ok();
         } else if (case == 2) {
             body.push(0x03);
-            queued = c.queue_frame(true, OpCode::Close, body.as_slice(), true).is_ok();
+            queued = c.queue_frame(true, OperationCode::Close, body.as_slice(), true).is_ok();
+        } else if (case == 4) {
+            body.append(Str::new("hi").as_bytes());
+            queued = c.queue_frame(true, OperationCode::Text, body.as_slice(), false).is_ok();
+        } else if (case == 5) {
+            queued = c.queue_frame(true, OperationCode::Close, body.as_slice(), true).is_ok();
         } else {
             body.push(0x03); body.push(0xED);
-            queued = c.queue_frame(true, OpCode::Close, body.as_slice(), true).is_ok();
+            queued = c.queue_frame(true, OperationCode::Close, body.as_slice(), true).is_ok();
         }
     }
     if (!queued) { return -12; }
@@ -448,7 +456,7 @@ async function ws_raw_client(port: u16, case: i64) -> i64 {
         Result::Err(_) => { return -15; }
     };
     const is_close: boolean = match (answer.opcode) {
-        OpCode::Close => { true }
+        OperationCode::Close => { true }
         _             => { false }
     };
     if (!is_close) { return -16; }
@@ -457,9 +465,23 @@ async function ws_raw_client(port: u16, case: i64) -> i64 {
     return (((status[0] as i64) << 8) | (status[1] as i64));
 }
 
-/// Accept, upgrade and read one message. Returns 1 when `recv` answered as
-/// the case requires - `Message::Close` for case 0, an error otherwise -
-/// and a negative step code when it did not.
+/// 1 when `ws` reports the peer's Close as `code` and `reason`, else a
+/// negative step code.
+function close_status_is(ws: &WebSocket<TcpStream>, code: u16, reason: Str) -> i64 {
+    match (ws.close_status()) {
+        option::Option::Some(status) => {
+            if (status.code != code) { return -104; }
+            if (status.reason != reason) { return -105; }
+            return 1;
+        }
+        option::Option::None => { return -106; }
+    }
+}
+
+/// Accept, upgrade and read one message. Returns 1 when `receive` answered as
+/// the case requires - `Message::Close` carrying the sent status for cases
+/// 0 and 5, an error and no status otherwise - and a negative step code
+/// when it did not.
 async function ws_raw_server(listener: TcpListener, case: i64) -> i64 {
     mut sock: TcpStream = match (await ws_accept_one(listener)) {
         Result::Ok(v)  => { v }
@@ -469,18 +491,20 @@ async function ws_raw_server(listener: TcpListener, case: i64) -> i64 {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -101; }
     };
-    match (await ws.recv()) {
+    match (await ws.receive()) {
         Result::Ok(msg) => {
             const closed: boolean = match (msg) {
                 Message::Close     => { true }
                 Message::Text(s)   => { mut _owned: String = s; false }
                 Message::Binary(b) => { mut _bytes: Array<u8> = b; false }
             };
-            if (closed && case == 0) { return 1; }
+            if (closed && case == 0) { return close_status_is(&ws, 1000, Str::new("bye")); }
+            if (closed && case == 5) { return close_status_is(&ws, 1005, Str::new("")); }
             return -102;
         }
         Result::Err(_) => {
-            if (case == 0) { return -103; }
+            if (case == 0 || case == 5) { return -103; }
+            if (ws.close_status().is_some()) { return -107; }
             return 1;
         }
     }
@@ -504,23 +528,37 @@ function ws_raw_case(case: i64) -> (i64, i64) {
 ![test]
 function close_is_answered_with_its_own_status() -> Result<(), TestError> {
     const r: (i64, i64) = ws_raw_case(0);
-    expect_eq(r.0, 1 as i64)?;
-    return expect_eq(r.1, 1000 as i64);
+    expect_equal(r.0, 1 as i64)?;
+    return expect_equal(r.1, 1000 as i64);
 }
 
 ![test]
 function text_that_is_not_utf8_fails_the_connection_with_1007() -> Result<(), TestError> {
     const r: (i64, i64) = ws_raw_case(1);
-    expect_eq(r.0, 1 as i64)?;
-    return expect_eq(r.1, 1007 as i64);
+    expect_equal(r.0, 1 as i64)?;
+    return expect_equal(r.1, 1007 as i64);
 }
 
 ![test]
 function malformed_close_is_answered_with_1002() -> Result<(), TestError> {
     const short: (i64, i64) = ws_raw_case(2);
-    expect_eq(short.0, 1 as i64)?;
-    expect_eq(short.1, 1002 as i64)?;
+    expect_equal(short.0, 1 as i64)?;
+    expect_equal(short.1, 1002 as i64)?;
     const reserved: (i64, i64) = ws_raw_case(3);
-    expect_eq(reserved.0, 1 as i64)?;
-    return expect_eq(reserved.1, 1002 as i64);
+    expect_equal(reserved.0, 1 as i64)?;
+    return expect_equal(reserved.1, 1002 as i64);
+}
+
+![test]
+function a_frame_masked_the_wrong_way_is_answered_with_1002() -> Result<(), TestError> {
+    const r: (i64, i64) = ws_raw_case(4);
+    expect_equal(r.0, 1 as i64)?;
+    return expect_equal(r.1, 1002 as i64);
+}
+
+![test]
+function a_close_without_a_status_reports_1005() -> Result<(), TestError> {
+    const r: (i64, i64) = ws_raw_case(5);
+    expect_equal(r.0, 1 as i64)?;
+    return expect_equal(r.1, 1000 as i64);
 }

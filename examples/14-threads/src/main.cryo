@@ -12,7 +12,7 @@
 namespace Main;
 
 import std::thread;
-import std::sync::mpsc;
+import std::sync::channel;
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::collections::string::{ String };
 import std::collections::pair::{ Pair };
@@ -34,16 +34,21 @@ function decorate(s: &String) -> String {
     return out;
 }
 
-/// A producer: send five numbers down a channel. The thread's closure owns
-/// the sender, so it is released when the thread ends, and the receiver
-/// then observes disconnection.
-function produce(tx: &mpsc::Sender<i32>) -> i32 {
-    mut i: i32 = 1;
-    while (i <= 5) {
-        tx.send(i * i);   // 1, 4, 9, 16, 25
-        i = i + 1;
+/// A producer: send the squares of 1..5 down a channel and report how many
+/// were sent. A send fails only once the receiver is gone, when nothing more
+/// can arrive, so the producer stops there. The thread's closure owns the
+/// sender, so it is released when the thread ends, and the receiver then
+/// observes disconnection.
+function produce(tx: &channel::Sender<i32>) -> i32 {
+    mut sent: i32 = 0;
+    while (sent < 5) {
+        const i: i32 = sent + 1;
+        match (tx.send(i * i)) {   // 1, 4, 9, 16, 25
+            Result::Ok(_)  => { sent = sent + 1; }
+            Result::Err(_) => { return sent; }
+        }
     }
-    return 0;
+    return sent;
 }
 
 function main() -> int {
@@ -59,17 +64,17 @@ function main() -> int {
         thread::spawn(move () -> String { return decorate(&greeting); });
     mut result: String = sh.join();
     fmt::printf("move String:  %.*s\n",
-        result.length() as i32, result.as_str().as_ptr());
+        result.length() as i32, result.as_str().as_pointer());
 
     // 3. Message passing: a producer thread feeds a channel, main drains
     //    it until every sender has dropped (disconnection).
-    const { first: tx, second: rx }: Pair<mpsc::Sender<i32>, mpsc::Receiver<i32>> =
-        mpsc::Channel::unbounded::<i32>();
+    const { first: tx, second: rx }: Pair<channel::Sender<i32>, channel::Receiver<i32>> =
+        channel::Channel::unbounded::<i32>();
     const ph: thread::JoinHandle<i32> = thread::spawn(move () -> i32 { return produce(&tx); });
     mut sum: i32 = 0;
     mut draining: boolean = true;
     while (draining) {
-        match (rx.recv()) {
+        match (rx.receive()) {
             Result::Ok(v)  => { sum = sum + v; }
             Result::Err(_) => { draining = false; }   // all senders dropped
         }

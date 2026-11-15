@@ -1,0 +1,166 @@
+namespace Main;
+
+import std::core::option::{ Option };
+
+// A store through a reference overwrites a place that always holds a value,
+// so the value it displaces is released, once.  A store through a raw
+// pointer releases nothing: the pointer may address storage that holds
+// nothing yet.  A value moved out of the place first belongs to whoever took
+// it, and the store that follows releases nothing either.
+
+type struct Counted {
+    drops: mut i64*;
+    id: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { *this.drops = *this.drops + 1; }
+}
+
+type struct Holder {
+    held: Counted;
+    maybe: Option<Counted>;
+    target: mut Holder*;
+
+    // The member is replaced through `mut &this`.
+    replace_held(mut &this, value: Counted) -> void {
+        this.held = value;
+    }
+
+    // The whole receiver is replaced.
+    replace_whole(mut &this, value: Holder) -> void {
+        *this = value;
+    }
+
+    // An `Option` member is emptied through `mut &this`.
+    empty(mut &this) -> void {
+        this.maybe = Option::None;
+    }
+
+    // The nearest dereference is the raw pointer `target`, not `this`.
+    replace_through_pointer_member(mut &this, value: Counted) -> void {
+        this.target.held = value;
+    }
+}
+
+// A move out from behind a reference is refused outside an `unsafe` block;
+// inside one it is the programmer's, and the store reaches the release with
+// the move still in it.
+type struct Slot<T> {
+    value: T;
+
+    // The right-hand side moves the value the store displaces.
+    store_what_it_moved(mut &this) -> void {
+        unsafe { this.value = pass_through::<T>(this.value); }
+    }
+}
+
+type struct Outer {
+    inner: Holder;
+}
+
+function pass_through<T>(value: T) -> T { return value; }
+
+function counted(drops: mut i64*, id: i64) -> Counted {
+    return Counted { drops: drops, id: id };
+}
+
+function holder(drops: mut i64*, id: i64) -> Holder {
+    return Holder {
+        held: counted(drops, id),
+        maybe: Option::Some(counted(drops, id + 100)),
+        target: null as mut Holder*,
+    };
+}
+
+// A member two levels below the reference.
+function replace_nested(outer: mut &Outer, value: Counted) -> void {
+    outer.inner.held = value;
+}
+
+// The whole referent.
+function replace_referent(place: mut &Counted, value: Counted) -> void {
+    *place = value;
+}
+
+// The whole pointee of a raw pointer.
+function replace_pointee(place: mut Counted*, value: Counted) -> void {
+    *place = value;
+}
+
+// The case's bit when the release count since `before` is not `want`.
+function released(drops: mut i64*, before: i64, want: i64, bit: i32) -> i32 {
+    if (*drops - before == want) { return 0; }
+    return bit;
+}
+
+function main() -> i32 {
+    mut drops: i64 = 0;
+    mut failures: i32 = 0;
+
+    // Each holder is released at the end of its block: `held` and `maybe`.
+    mut before: i64 = drops;
+    {
+        mut h: Holder = holder(&drops, 1);
+        h.replace_held(counted(&drops, 2));
+        failures = failures | released(&drops, before, 1, 1);
+    }
+    failures = failures | released(&drops, before, 3, 1);
+
+    before = drops;
+    {
+        mut h: Holder = holder(&drops, 3);
+        h.empty();
+        failures = failures | released(&drops, before, 1, 2);
+    }
+    failures = failures | released(&drops, before, 2, 2);
+
+    before = drops;
+    {
+        mut outer: Outer = Outer { inner: holder(&drops, 4) };
+        replace_nested(&outer, counted(&drops, 5));
+        failures = failures | released(&drops, before, 1, 4);
+    }
+    failures = failures | released(&drops, before, 3, 4);
+
+    before = drops;
+    {
+        mut value: Counted = counted(&drops, 6);
+        replace_referent(&value, counted(&drops, 7));
+        failures = failures | released(&drops, before, 1, 8);
+    }
+    failures = failures | released(&drops, before, 2, 8);
+
+    // Raw pointer stores: the displaced values are not released (leaked by
+    // design), so only the values stored are, at the end of the block.
+    before = drops;
+    {
+        mut value: Counted = counted(&drops, 8);
+        replace_pointee(&value, counted(&drops, 9));
+        failures = failures | released(&drops, before, 0, 16);
+        mut pointee: Holder = holder(&drops, 10);
+        mut h: Holder = holder(&drops, 11);
+        h.target = &pointee;
+        h.replace_through_pointer_member(counted(&drops, 12));
+        failures = failures | released(&drops, before, 0, 16);
+    }
+    failures = failures | released(&drops, before, 5, 16);
+
+    before = drops;
+    {
+        mut slot: Slot<Counted> = Slot::<Counted> { value: counted(&drops, 13) };
+        slot.store_what_it_moved();
+        failures = failures | released(&drops, before, 0, 32);
+    }
+    failures = failures | released(&drops, before, 1, 32);
+
+    before = drops;
+    {
+        mut h: Holder = holder(&drops, 15);
+        h.replace_whole(holder(&drops, 16));
+        failures = failures | released(&drops, before, 2, 64);
+    }
+    failures = failures | released(&drops, before, 4, 64);
+
+    return failures;
+}

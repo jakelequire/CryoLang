@@ -42,7 +42,7 @@ import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::core::drop::{ Drop };
-import std::core::ptr::{ NonNull };
+import std::core::pointer::{ NonNull };
 import std::core::mem;
 import std::core::cmp::{ min };
 import std::collections::array::{ Array };
@@ -50,10 +50,10 @@ import std::time::duration::{ Duration };
 import std::time::clock;
 import std::time::clock::{ Instant };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 import std::io::error::{ IoError, IoErrorKind };
-import std::io::fd;
-import std::io::fd::{ BorrowedFileDescriptor };
+import std::io::file_descriptor;
+import std::io::file_descriptor::{ BorrowedFileDescriptor };
 import std::io::traits::{ Read, Write };
 import std::ffi::libc;
 import std::sys::syscall;
@@ -74,11 +74,11 @@ import std::future::blocking::{ BlockingJob, BlockingPool, JOB_PENDING };
 //
 // Windows has no signals and no zombie table: there is nothing to "reap", but
 // the process HANDLE must be closed exactly once - done in `Child::drop` via
-// `os_proc_reap`, regardless of whether `wait` already read the exit code.
+// `os_process_reap`, regardless of whether `wait` already read the exit code.
 // ---------------------------------------------------------------------------
 
 ![target(unix)]
-private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoError> {
+private function os_process_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoError> {
     mut status: i32 = 0;
     mut usage: libc::rusage;
     loop {
@@ -97,19 +97,19 @@ private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoErr
     }
 }
 ![target(windows)]
-private function os_proc_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoError> {
+private function os_process_wait(pid: i32, handle: u64) -> Result<ExitStatus, IoError> {
     const h: u8* = handle as u8*;
     if (syscall::WaitForSingleObject(h, 0xFFFFFFFF) == 0xFFFFFFFF) {   // INFINITE; WAIT_FAILED
         return Result::Err(IoError::last_os_error());
     }
-    return os_proc_exit_status(h);
+    return os_process_exit_status(h);
 }
 
 /// The status of the exited process `h`: its exit code, and the largest
 /// working set it reached, which the system keeps for as long as a HANDLE
 /// to the process is open.
 ![target(windows)]
-private function os_proc_exit_status(h: u8*) -> Result<ExitStatus, IoError> {
+private function os_process_exit_status(h: u8*) -> Result<ExitStatus, IoError> {
     mut code: u32 = 0;
     if (syscall::GetExitCodeProcess(h, &code) == 0) {
         return Result::Err(IoError::last_os_error());
@@ -136,7 +136,7 @@ private function wstatus_is_alive(wstatus: i32) -> boolean {
 }
 
 ![target(unix)]
-private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitStatus>, IoError> {
+private function os_process_try_wait(pid: i32, handle: u64) -> Result<Option<ExitStatus>, IoError> {
     mut status: i32 = 0;
     mut usage: libc::rusage;
     loop {
@@ -154,7 +154,7 @@ private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitSt
     }
 }
 ![target(windows)]
-private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitStatus>, IoError> {
+private function os_process_try_wait(pid: i32, handle: u64) -> Result<Option<ExitStatus>, IoError> {
     const h: u8* = handle as u8*;
     const waited: u32 = syscall::WaitForSingleObject(h, 0);
     if (waited == 0x102) {   // WAIT_TIMEOUT
@@ -163,33 +163,33 @@ private function os_proc_try_wait(pid: i32, handle: u64) -> Result<Option<ExitSt
     if (waited == 0xFFFFFFFF) {   // WAIT_FAILED
         return Result::Err(IoError::last_os_error());
     }
-    return Result::Ok(Option::Some(os_proc_exit_status(h)?));
+    return Result::Ok(Option::Some(os_process_exit_status(h)?));
 }
 
 // POSIX has no timed waitpid, so the wait polls `WNOHANG`, pausing between
 // tries for 1 ms at first and doubling up to 50 ms: a short-lived child is
 // seen promptly and a long-lived one costs few wakeups.
 ![target(unix)]
-private function os_proc_wait_timeout(pid: i32, handle: u64, timeout: Duration) -> Result<Option<ExitStatus>, IoError> {
+private function os_process_wait_timeout(pid: i32, handle: u64, timeout: Duration) -> Result<Option<ExitStatus>, IoError> {
     const started: Instant = Instant::now();
-    const longest_pause: Duration = Duration::from_millis(50);
-    mut pause: Duration = Duration::from_millis(1);
+    const longest_pause: Duration = Duration::from_milliseconds(50);
+    mut pause: Duration = Duration::from_milliseconds(1);
     loop {
-        match (os_proc_try_wait(pid, handle)?) {
+        match (os_process_try_wait(pid, handle)?) {
             Option::Some(status) => { return Result::Ok(Option::Some(status)); }
             Option::None         => { }
         }
-        const remaining: Duration = timeout.saturating_sub(&started.elapsed());
+        const remaining: Duration = timeout.saturating_subtract(&started.elapsed());
         if (remaining.is_zero()) { return Result::Ok(Option::None); }
         clock::sleep(min(pause, remaining));
         pause = min(pause.scale(2), longest_pause);
     }
 }
 ![target(windows)]
-private function os_proc_wait_timeout(pid: i32, handle: u64, timeout: Duration) -> Result<Option<ExitStatus>, IoError> {
+private function os_process_wait_timeout(pid: i32, handle: u64, timeout: Duration) -> Result<Option<ExitStatus>, IoError> {
     const h: u8* = handle as u8*;
     // INFINITE is 0xFFFFFFFF, so the longest finite wait is one below it.
-    const milliseconds: u32 = min(timeout.as_millis_ceil(), 0xFFFFFFFE) as u32;
+    const milliseconds: u32 = min(timeout.as_milliseconds_ceiling(), 0xFFFFFFFE) as u32;
     const waited: u32 = syscall::WaitForSingleObject(h, milliseconds);
     if (waited == 0x102) {   // WAIT_TIMEOUT
         return Result::Ok(Option::None);
@@ -197,18 +197,18 @@ private function os_proc_wait_timeout(pid: i32, handle: u64, timeout: Duration) 
     if (waited == 0xFFFFFFFF) {   // WAIT_FAILED
         return Result::Err(IoError::last_os_error());
     }
-    return Result::Ok(Option::Some(os_proc_exit_status(h)?));
+    return Result::Ok(Option::Some(os_process_exit_status(h)?));
 }
 
 ![target(unix)]
-private function os_proc_signal(pid: i32, handle: u64, tree: u64, sig: i32) -> Result<(), IoError> {
+private function os_process_signal(pid: i32, handle: u64, tree: u64, sig: i32) -> Result<(), IoError> {
     if (libc::kill(pid, sig) < 0) {
         return Result::Err(IoError::last_os_error());
     }
     return Result::Ok(());
 }
 ![target(windows)]
-private function os_proc_signal(pid: i32, handle: u64, tree: u64, sig: i32) -> Result<(), IoError> {
+private function os_process_signal(pid: i32, handle: u64, tree: u64, sig: i32) -> Result<(), IoError> {
     // No POSIX signals on Windows. Termination is delivered as itself, and
     // the interrupt as Ctrl-Break to a child rooting a console process group
     // of its own - the one event that reaches that child's group alone. Any
@@ -230,7 +230,7 @@ private function os_proc_signal(pid: i32, handle: u64, tree: u64, sig: i32) -> R
 }
 
 ![target(unix)]
-private function os_proc_kill_tree(tree: u64) -> Result<(), IoError> {
+private function os_process_kill_tree(tree: u64) -> Result<(), IoError> {
     // A negative pid names the process group.
     if (libc::kill(-(tree as i32), Signal::kill().as_i32()) < 0) {
         return Result::Err(IoError::last_os_error());
@@ -238,7 +238,7 @@ private function os_proc_kill_tree(tree: u64) -> Result<(), IoError> {
     return Result::Ok(());
 }
 ![target(windows)]
-private function os_proc_kill_tree(tree: u64) -> Result<(), IoError> {
+private function os_process_kill_tree(tree: u64) -> Result<(), IoError> {
     if (syscall::TerminateJobObject(tree as u8*, 1) == 0) {
         return Result::Err(IoError::last_os_error());
     }
@@ -248,9 +248,9 @@ private function os_proc_kill_tree(tree: u64) -> Result<(), IoError> {
 // A tree's job object is a HANDLE the `Child` owns; closing it leaves the
 // processes in the job running. A process group needs no release.
 ![target(unix)]
-private function os_proc_release_tree(tree: u64) -> void { }
+private function os_process_release_tree(tree: u64) -> void { }
 ![target(windows)]
-private function os_proc_release_tree(tree: u64) -> void {
+private function os_process_release_tree(tree: u64) -> void {
     if (tree != 0) { syscall::CloseHandle(tree as u8*); }
 }
 
@@ -258,7 +258,7 @@ private function os_proc_release_tree(tree: u64) -> void {
 // already-exited child's zombie is released.  Windows: close the process
 // HANDLE (nothing to reap).
 ![target(unix)]
-private function os_proc_reap(pid: i32, handle: u64, waited: boolean) -> void {
+private function os_process_reap(pid: i32, handle: u64, waited: boolean) -> void {
     if (waited) { return; }
     mut status: i32 = 0;
     loop {
@@ -275,7 +275,7 @@ private function os_proc_reap(pid: i32, handle: u64, waited: boolean) -> void {
     }
 }
 ![target(windows)]
-private function os_proc_reap(pid: i32, handle: u64, waited: boolean) -> void {
+private function os_process_reap(pid: i32, handle: u64, waited: boolean) -> void {
     if (handle != 0) { syscall::CloseHandle(handle as u8*); }
 }
 
@@ -287,7 +287,7 @@ private function os_proc_reap(pid: i32, handle: u64, waited: boolean) -> void {
 /// an older kernel it returns `-ENOSYS` and this reports "no descriptor" — the
 /// same answer every other platform gives, and the same route out.
 ![target(linux)]
-private function os_proc_exit_fd(pid: i32) -> i32 {
+private function os_process_exit_fd(pid: i32) -> i32 {
     const fd: i32 = syscall::sys_pidfd_open(pid, 0);
     if (fd < 0) { return -1; }
     return fd;
@@ -296,16 +296,16 @@ private function os_proc_exit_fd(pid: i32) -> i32 {
 /// be armed on the AFD-based reactor, and macOS has no readiness backend here at
 /// all. Both wait on a thread.
 ![not(linux)]
-private function os_proc_exit_fd(pid: i32) -> i32 {
+private function os_process_exit_fd(pid: i32) -> i32 {
     return -1;
 }
 
 ![target(linux)]
-private function os_proc_close_exit_fd(fd: i32) -> void {
+private function os_process_close_exit_fd(fd: i32) -> void {
     libc::close(fd);
 }
 ![not(linux)]
-private function os_proc_close_exit_fd(fd: i32) -> void { }
+private function os_process_close_exit_fd(fd: i32) -> void { }
 
 /// A process reference the caller owns outright, for handing to a thread that
 /// may still be using it after the `Child` is gone. `None` means the OS refused
@@ -318,11 +318,11 @@ private function os_proc_close_exit_fd(fd: i32) -> void { }
 /// HANDLE would be waiting on a closed object. The job gets a duplicate whose
 /// lifetime it controls instead.
 ![target(unix)]
-private function os_proc_dup(handle: u64) -> Option<u64> {
+private function os_process_dup(handle: u64) -> Option<u64> {
     return Option::Some(handle);
 }
 ![target(windows)]
-private function os_proc_dup(handle: u64) -> Option<u64> {
+private function os_process_dup(handle: u64) -> Option<u64> {
     mut dup: u8* = null;
     const me: u8* = syscall::GetCurrentProcess();
     if (syscall::DuplicateHandle(me, handle as u8*, me, &dup, 0, 0,
@@ -332,12 +332,12 @@ private function os_proc_dup(handle: u64) -> Option<u64> {
     return Option::Some(dup as u64);
 }
 
-/// Release what `os_proc_dup` handed out. A no-op on POSIX, where the duplicate
+/// Release what `os_process_dup` handed out. A no-op on POSIX, where the duplicate
 /// is the pid itself and reaping is `Child`'s job, not the borrower's.
 ![target(unix)]
-private function os_proc_close_dup(handle: u64) -> void { }
+private function os_process_close_dup(handle: u64) -> void { }
 ![target(windows)]
-private function os_proc_close_dup(handle: u64) -> void {
+private function os_process_close_dup(handle: u64) -> void {
     if (handle != 0) { syscall::CloseHandle(handle as u8*); }
 }
 
@@ -421,11 +421,11 @@ private const MAXRSS_UNIT: u64 = 1;
 public type struct ChildStdin {
     private fd: i32;
 
-    /// Wrap `raw_fd`, a pipe descriptor this handle now owns and closes when
+    /// Wrap `raw_file_descriptor`, a pipe descriptor this handle now owns and closes when
     /// it drops. `Command::spawn` builds these; a descriptor of -1 makes an
     /// empty handle whose drop closes nothing.
-    public static from_fd(raw_fd: i32) -> ChildStdin {
-        return ChildStdin { fd: raw_fd };
+    public static from_file_descriptor(raw_file_descriptor: i32) -> ChildStdin {
+        return ChildStdin { fd: raw_file_descriptor };
     }
 
     /// Hand the pipe's descriptor over to the caller, who must close it, and
@@ -439,7 +439,7 @@ public type struct ChildStdin {
 
 implement trait Write for struct ChildStdin {
     write_some(mut &this, bytes: &Slice<u8>) -> Result<i64, IoError> {
-        return fd::write_fd(this.fd, bytes);
+        return file_descriptor::write_file_descriptor(this.fd, bytes);
     }
 
     flush(mut &this) -> Result<(), IoError> {
@@ -451,11 +451,11 @@ implement trait Write for struct ChildStdin {
 public type struct ChildStdout {
     private fd: i32;
 
-    /// Wrap `raw_fd`, a pipe descriptor this handle now owns and closes when
+    /// Wrap `raw_file_descriptor`, a pipe descriptor this handle now owns and closes when
     /// it drops. `Command::spawn` builds these; a descriptor of -1 makes an
     /// empty handle whose drop closes nothing.
-    public static from_fd(raw_fd: i32) -> ChildStdout {
-        return ChildStdout { fd: raw_fd };
+    public static from_file_descriptor(raw_file_descriptor: i32) -> ChildStdout {
+        return ChildStdout { fd: raw_file_descriptor };
     }
 
     /// Hand the pipe's descriptor over to the caller, who must close it, and
@@ -469,7 +469,7 @@ public type struct ChildStdout {
 
 implement trait Read for struct ChildStdout {
     read(mut &this, buffer: mut u8*, length: i64) -> Result<i64, IoError> {
-        return fd::read_fd(this.fd, buffer, length);
+        return file_descriptor::read_file_descriptor(this.fd, buffer, length);
     }
 }
 
@@ -477,11 +477,11 @@ implement trait Read for struct ChildStdout {
 public type struct ChildStderr {
     private fd: i32;
 
-    /// Wrap `raw_fd`, a pipe descriptor this handle now owns and closes when
+    /// Wrap `raw_file_descriptor`, a pipe descriptor this handle now owns and closes when
     /// it drops. `Command::spawn` builds these; a descriptor of -1 makes an
     /// empty handle whose drop closes nothing.
-    public static from_fd(raw_fd: i32) -> ChildStderr {
-        return ChildStderr { fd: raw_fd };
+    public static from_file_descriptor(raw_file_descriptor: i32) -> ChildStderr {
+        return ChildStderr { fd: raw_file_descriptor };
     }
 
     /// Hand the pipe's descriptor over to the caller, who must close it, and
@@ -495,7 +495,7 @@ public type struct ChildStderr {
 
 implement trait Read for struct ChildStderr {
     read(mut &this, buffer: mut u8*, length: i64) -> Result<i64, IoError> {
-        return fd::read_fd(this.fd, buffer, length);
+        return file_descriptor::read_file_descriptor(this.fd, buffer, length);
     }
 }
 
@@ -553,7 +553,7 @@ public:
     /// stdin before writing to stdout.
     wait(mut &this) -> Result<ExitStatus, IoError> {
         this.close_stdin();
-        const r: Result<ExitStatus, IoError> = os_proc_wait(this.pid, this.handle);
+        const r: Result<ExitStatus, IoError> = os_process_wait(this.pid, this.handle);
         match (r) {
             Result::Ok(_)  => { this.waited = true; }
             Result::Err(_) => { }
@@ -590,7 +590,7 @@ public:
     /// Non-blocking check. `Ok(Some(status))` means the child has
     /// exited; `Ok(None)` means it's still running.
     try_wait(mut &this) -> Result<Option<ExitStatus>, IoError> {
-        const r: Result<Option<ExitStatus>, IoError> = os_proc_try_wait(this.pid, this.handle);
+        const r: Result<Option<ExitStatus>, IoError> = os_process_try_wait(this.pid, this.handle);
         match (r) {
             Result::Ok(opt) => {
                 match (opt) {
@@ -608,7 +608,7 @@ public:
     /// is up, and is left running.  Like `wait`, it closes stdin first.
     wait_timeout(mut &this, timeout: Duration) -> Result<Option<ExitStatus>, IoError> {
         this.close_stdin();
-        const r: Result<Option<ExitStatus>, IoError> = os_proc_wait_timeout(this.pid, this.handle, timeout);
+        const r: Result<Option<ExitStatus>, IoError> = os_process_wait_timeout(this.pid, this.handle, timeout);
         match (r) {
             Result::Ok(opt) => {
                 match (opt) {
@@ -640,7 +640,7 @@ public:
         if (this.waited) {
             return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
         }
-        return os_proc_signal(this.pid, this.handle, this.tree, sig.as_i32());
+        return os_process_signal(this.pid, this.handle, this.tree, sig.as_i32());
     }
 
     /// End the child and every process in its tree at once: SIGKILL to
@@ -654,7 +654,7 @@ public:
         if (this.tree == 0 || this.waited) {
             return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
         }
-        return os_proc_kill_tree(this.tree);
+        return os_process_kill_tree(this.tree);
     }
 
     /// Close the child's stdin now, if it is still held, so the child sees
@@ -673,7 +673,7 @@ public:
 /// `job` must be the first field — the pool is given its address and casts it
 /// back to this type, which is only sound at offset 0. The block is owned by
 /// whichever of {the pool, the future} lets go of it last, so it holds its own
-/// process reference (`os_proc_dup`) rather than borrowing the `Child`'s: the
+/// process reference (`os_process_dup`) rather than borrowing the `Child`'s: the
 /// `Child` may be gone, and on Windows its HANDLE closed, long before a pool
 /// thread stops waiting on it.
 ///
@@ -698,7 +698,7 @@ private type struct ChildWaitJob {
 /// after this returns, which is what orders the two.
 private function child_wait_job_run(raw: mut u8*) -> void {
     mut j: mut ChildWaitJob* = raw as mut ChildWaitJob*;
-    match (os_proc_wait(j.pid, j.handle)) {
+    match (os_process_wait(j.pid, j.handle)) {
         Result::Ok(s)  => { j.status = s; j.ok = true;  }
         Result::Err(e) => { j.err    = e; j.ok = false; }
     }
@@ -710,8 +710,8 @@ private function child_wait_job_run(raw: mut u8*) -> void {
 /// are plain scalars, so an answer nobody collected needs no teardown.
 private function child_wait_job_free(raw: mut u8*) -> void {
     mut j: ChildWaitJob* = raw as ChildWaitJob*;
-    os_proc_close_dup(j.handle);
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    os_process_close_dup(j.handle);
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(raw), Layout::of::<ChildWaitJob>());
 }
 
@@ -740,7 +740,7 @@ private function child_wait_job_free(raw: mut u8*) -> void {
 ///
 /// A pidfd going ready says only that the child has become waitable. The status
 /// still comes from `waitpid`, which is also what releases the zombie, so every
-/// poll reaps first via `os_proc_try_wait` — that decoder already handles the
+/// poll reaps first via `os_process_try_wait` — that decoder already handles the
 /// stop/continue statuses a naive read of the exit code gets wrong.
 ///
 /// ## Cancellation
@@ -792,7 +792,7 @@ private type struct ChildWait {
             this.rt = null;
         }
         if (this.exit_fd >= 0) {
-            os_proc_close_exit_fd(this.exit_fd);
+            os_process_close_exit_fd(this.exit_fd);
             this.exit_fd = -1;
         }
     }
@@ -818,7 +818,7 @@ implement trait Future for struct ChildWait {
             // `waitpid` regardless. On the first poll this also short-circuits a
             // child that had already exited, which then needs no route at all.
             const early: Result<Option<ExitStatus>, IoError> =
-                os_proc_try_wait(this.pid, this.handle);
+                os_process_try_wait(this.pid, this.handle);
             match (early) {
                 Result::Ok(opt) => {
                     match (opt) {
@@ -842,7 +842,7 @@ implement trait Future for struct ChildWait {
                 this.routed = true;
                 mut rt0: Reactor* = Reactor::current();
                 if (rt0 != null) {
-                    this.exit_fd = os_proc_exit_fd(this.pid);
+                    this.exit_fd = os_process_exit_fd(this.pid);
                 }
             }
             if (this.exit_fd >= 0) {
@@ -860,29 +860,29 @@ implement trait Future for struct ChildWait {
             // Route 2: a pool thread.
             mut pool: mut BlockingPool* = BlockingPool::current();
             if (pool == null) {
-                return Poll::Ready(os_proc_wait(this.pid, this.handle));
+                return Poll::Ready(os_process_wait(this.pid, this.handle));
             }
             mut owned: u64 = 0;
-            const dup: Option<u64> = os_proc_dup(this.handle);
+            const dup: Option<u64> = os_process_dup(this.handle);
             match (dup) {
                 Option::Some(h) => { owned = h; }
                 Option::None    => {
                     // No reference the job could safely hold, so it cannot be
                     // handed to a thread. Wait here instead - slow, but an
                     // answer rather than a hang.
-                    return Poll::Ready(os_proc_wait(this.pid, this.handle));
+                    return Poll::Ready(os_process_wait(this.pid, this.handle));
                 }
             }
-            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            mut alloc: GlobalAllocator = GlobalAllocator::new();
             mut j: mut ChildWaitJob* = null;
             match (alloc.allocate(Layout::of::<ChildWaitJob>())) {
-                Result::Ok(raw) => { j = raw.cast::<ChildWaitJob>().as_ptr(); }
+                Result::Ok(raw) => { j = raw.cast::<ChildWaitJob>().as_pointer(); }
                 Result::Err(_)  => {
-                    os_proc_close_dup(owned);
+                    os_process_close_dup(owned);
                     return Poll::Ready(Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)));
                 }
             }
-            BlockingJob::init(&j.job, child_wait_job_run, child_wait_job_free);
+            BlockingJob::initialize(&j.job, child_wait_job_run, child_wait_job_free);
             j.pid      = this.pid;
             j.handle   = owned;
             j.status   = ExitStatus { code: 0, signal: 0, signaled: false, peak_memory: 0 };
@@ -894,7 +894,7 @@ implement trait Future for struct ChildWait {
                 // nothing would ever run this job. Release the block (which
                 // closes the reference it took) and wait here instead.
                 j.job.release();
-                return Poll::Ready(os_proc_wait(this.pid, this.handle));
+                return Poll::Ready(os_process_wait(this.pid, this.handle));
             }
             this.job = j;
         }
@@ -995,11 +995,11 @@ private function pipe_drain_job_run(raw: mut u8*) -> void {
 private function pipe_drain_job_free(raw: mut u8*) -> void {
     mut j: mut PipeDrainJob* = raw as mut PipeDrainJob*;
     if (j.fd >= 0) {
-        fd::close_fd(j.fd);
+        file_descriptor::close_file_descriptor(j.fd);
         j.fd = -1;
     }
-    ptr::drop_in_place::<Array<u8>>(&j.buf);
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    pointer::drop_in_place::<Array<u8>>(&j.buf);
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(raw), Layout::of::<PipeDrainJob>());
 }
 
@@ -1038,12 +1038,12 @@ internal type struct PipeDrain {
     private routed:     boolean;        // true once the first poll chose a route
     private on_reactor: boolean;        // which route that was
 
-    /// Begin draining `raw_fd`, which this future now owns. Nothing is read or
+    /// Begin draining `raw_file_descriptor`, which this future now owns. Nothing is read or
     /// submitted until the first poll, so a `PipeDrain` that is never awaited
     /// costs nothing beyond closing the descriptor.
-    internal static start(raw_fd: i32) -> PipeDrain {
+    internal static start(raw_file_descriptor: i32) -> PipeDrain {
         return PipeDrain {
-            fd: raw_fd,
+            fd: raw_file_descriptor,
             buf: Array::new(),
             rt: null,
             job: null,
@@ -1080,7 +1080,7 @@ internal type struct PipeDrain {
     private finish(mut &this, result: Result<i64, IoError>) -> Poll<Result<Array<u8>, IoError>> {
         this.disarm();
         if (this.fd >= 0) {
-            fd::close_fd(this.fd);
+            file_descriptor::close_file_descriptor(this.fd);
             this.fd = -1;
         }
         mut b: Array<u8> = Array::<u8>::new();
@@ -1105,7 +1105,7 @@ implement trait Future for struct PipeDrain {
                 this.on_reactor = pipe_fits_reactor() && (Reactor::current() != null);
                 // Best-effort: a descriptor the kernel will not take the flag
                 // on still works, it just blocks in `read` once per park.
-                if (this.on_reactor) { mem::drop(fd::set_nonblocking(this.fd, true)); }
+                if (this.on_reactor) { mem::drop(file_descriptor::set_nonblocking(this.fd, true)); }
             }
 
             if (this.on_reactor) {
@@ -1139,15 +1139,15 @@ implement trait Future for struct PipeDrain {
                 mut inline_r: Result<i64, IoError> = inline_pipe.read_to_end(&this.buf);
                 return this.finish(inline_r);
             }
-            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            mut alloc: GlobalAllocator = GlobalAllocator::new();
             mut j: mut PipeDrainJob* = null;
             match (alloc.allocate(Layout::of::<PipeDrainJob>())) {
-                Result::Ok(raw) => { j = raw.cast::<PipeDrainJob>().as_ptr(); }
+                Result::Ok(raw) => { j = raw.cast::<PipeDrainJob>().as_pointer(); }
                 Result::Err(_)  => {
                     return this.finish(Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)));
                 }
             }
-            BlockingJob::init(&j.job, pipe_drain_job_run, pipe_drain_job_free);
+            BlockingJob::initialize(&j.job, pipe_drain_job_run, pipe_drain_job_free);
             j.fd       = this.fd;
             j.buf      = Array::<u8>::new();
             j.err      = IoError::new(IoErrorKind::Other, 0);
@@ -1208,7 +1208,7 @@ implement trait Drop for struct PipeDrain {
     drop(mut &this) -> void {
         this.disarm();
         if (this.fd >= 0) {
-            fd::close_fd(this.fd);
+            file_descriptor::close_file_descriptor(this.fd);
             this.fd = -1;
         }
         this.let_go();
@@ -1221,7 +1221,7 @@ implement trait Drop for struct PipeDrain {
 implement trait Drop for struct ChildStdin {
     drop(mut &this) -> void {
         if (this.fd >= 0) {
-            fd::close_fd(this.fd);
+            file_descriptor::close_file_descriptor(this.fd);
             this.fd = -1;
         }
     }
@@ -1230,7 +1230,7 @@ implement trait Drop for struct ChildStdin {
 implement trait Drop for struct ChildStdout {
     drop(mut &this) -> void {
         if (this.fd >= 0) {
-            fd::close_fd(this.fd);
+            file_descriptor::close_file_descriptor(this.fd);
             this.fd = -1;
         }
     }
@@ -1239,7 +1239,7 @@ implement trait Drop for struct ChildStdout {
 implement trait Drop for struct ChildStderr {
     drop(mut &this) -> void {
         if (this.fd >= 0) {
-            fd::close_fd(this.fd);
+            file_descriptor::close_file_descriptor(this.fd);
             this.fd = -1;
         }
     }
@@ -1258,11 +1258,11 @@ implement trait Drop for struct Child {
         // POSIX: non-blocking reap of an already-exited child (skipped if
         // `wait`/`try_wait` already reaped it). Windows: close the process
         // HANDLE exactly once (always, even after `wait`, which does not
-        // close it). `os_proc_reap` encapsulates both; null the handle after
+        // close it). `os_process_reap` encapsulates both; null the handle after
         // so a second drop is a no-op.
-        os_proc_reap(this.pid, this.handle, this.waited);
+        os_process_reap(this.pid, this.handle, this.waited);
         this.handle = 0;
-        os_proc_release_tree(this.tree);
+        os_process_release_tree(this.tree);
         this.tree = 0;
     }
 }

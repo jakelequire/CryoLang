@@ -10,14 +10,13 @@
 ///! its path in full; every candidate is resolved through the doors and
 ///! compared by identity before it is used, and nothing is cut from a name's
 ///! text.  By its own name, the text a hover shows: a definition's declared
-///! name, under its owner's when it is a member (`Str::as_ptr`), whatever the
+///! name, under its owner's when it is a member (`Str::as_pointer`), whatever the
 ///! cursor's scope binds.  In full, the expanded hover's: every path as
 ///! declared.  A type argument equal to the default its template declares is
 ///! left out in each style.
 namespace lsp::handlers::names;
 
 import std::collections::str;
-import std::collections::string::{ String };
 
 import compiler::compilation_context::{ CompilationContext };
 import compiler::module_graph::{ ModulePath, ModuleSpellingMatch };
@@ -142,7 +141,7 @@ type struct Names {
             return this.place_of(&s);
         }
         const m: ModuleSpellingMatch = this.ctx.modules_written_as(
-            this.cstr(seg), this.module, ModulePath::none());
+            seg, this.module, ModulePath::none());
         if (m.visible == 1) { return Place::Module(m.found); }
         return Place::Nothing;
     }
@@ -161,7 +160,7 @@ type struct Names {
                         _              => { return p; }
                     }
                 }
-                const sub: ModuleSpellingMatch = this.ctx.modules_written_as(this.cstr(seg), this.module, m);
+                const sub: ModuleSpellingMatch = this.ctx.modules_written_as(seg, this.module, m);
                 if (sub.visible == 1) { return Place::Module(sub.found); }
                 return Place::Nothing;
             }
@@ -257,22 +256,27 @@ type struct Names {
     }
 
     /// The shortest spelling of module `m`'s path, its last segments, that
-    /// the cursor's scope resolves to `m`; "" when none does.
+    /// the cursor's scope resolves to `m`; "" when none does.  A spelling is
+    /// a tail of the interned path, so it is returned as that tail.
     module_text(&this, m: ModulePath) -> string {
         if (!m.is_valid()) { return ""; }
         const whole: string = this.ctx.intern_table.shown(m.decl_name());
+        const whole_text: str::Str = str::Str::from(whole);
         const separator: str::Str = str::Str::from("::");
-        const segs: [str::Str] = str::Str::from(whole).split(&separator).collect();
+        const segs: [str::Str] = whole_text.split(&separator).collect();
+        // `starts[j]`: the byte where segment j begins in `whole`.
+        mut starts: [i64] = [];
+        mut start: i64 = 0;
+        for (mut k: i64 = 0; k < segs.length(); k++) {
+            starts.push(start);
+            start = start + segs[k].length() + separator.length();
+        }
         for (mut j: i64 = segs.length() - 1; j >= 0; j--) {
-            mut spelled: String = String::new();
-            for (mut k: i64 = j; k < segs.length(); k++) {
-                if (k > j) { spelled.push(str::Str::from("::")); }
-                spelled.push(segs[k]);
-            }
-            const p: Place = this.place_of_path(spelled.as_str());
+            const spelled: str::Str = whole_text.byte_substring(starts[j], whole_text.length());
+            const p: Place = this.place_of_path(spelled);
             match (p) {
                 Place::Module(found) => {
-                    if (found.equals(m)) { return spelled.into_raw(); }
+                    if (found.equals(m)) { return whole + starts[j]; }
                 }
                 _ => { }
             }
@@ -435,14 +439,6 @@ type struct Names {
     /// becomes a `SymbolStr` through; a name the analysis never saw is added
     /// to its table and binds nothing.
     intern(&this, s: str::Str) -> SymbolStr {
-        return this.ctx.intern_table.intern(this.cstr(s));
-    }
-
-    /// `s` as a NUL-terminated copy.
-    cstr(&this, s: str::Str) -> string {
-        mut buf: String = String::with_capacity(s.length() + 1);
-        buf.push(s);
-        buf.push_byte(0 as u8);
-        return buf.into_raw();
+        return this.ctx.intern_table.intern(s);
     }
 }

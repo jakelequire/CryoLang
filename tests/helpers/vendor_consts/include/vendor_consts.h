@@ -51,3 +51,13 @@ int vc_touch(int x);
 const char* vc_name(void);
 int vc_count_lines(const char* const* lines, int count);
 int vc_fill(char* const* slots, int count);
+
+/* Records and enums by name: a record passed or returned by value, a record
+ * field of record type and a pointer to a record each bind as the named type
+ * the binding declares, never as `void*` - a by-value record is a different
+ * type and a different calling convention from a pointer.  An enum parameter
+ * binds as its enum. */
+typedef struct VcColor { unsigned char r, g, b, a; } VcColor;
+typedef struct VcBox { VcColor fill; int width; } VcBox;
+VcColor vc_tint(VcColor color, enum VcKind kind);
+void vc_paint(VcBox* target, VcColor color);

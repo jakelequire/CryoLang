@@ -63,7 +63,7 @@ public type struct TlsIo {
     /// Take the stream back. Calling it twice yields a closed placeholder the
     /// second time — the outcome holds the stream exactly once.
     public take_stream(mut &this) -> TlsStream {
-        mut out: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
+        mut out: TlsStream = TlsStream::from_parts(null, TcpStream::from_file_descriptor(-1));
         mem::swap::<TlsStream>(&out, &this.tls);
         return out;
     }
@@ -71,7 +71,7 @@ public type struct TlsIo {
     /// Take the buffer back. After a read it holds exactly the bytes that
     /// arrived; after a write it is untouched, so a caller with a short write
     /// still has the bytes it has not sent yet.
-    public take_buf(mut &this) -> Array<u8> {
+    public take_buffer(mut &this) -> Array<u8> {
         mut out: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&out, &this.buf);
         return out;
@@ -107,7 +107,7 @@ public type struct TlsHandshake {
     /// future's `Drop` does not tear down what it has just handed over.
     private release(mut &this) -> TlsStream {
         this.rt = null;
-        mut out: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
+        mut out: TlsStream = TlsStream::from_parts(null, TcpStream::from_file_descriptor(-1));
         mem::swap::<TlsStream>(&out, &this.tls);
         return out;
     }
@@ -117,12 +117,12 @@ implement trait Future for struct TlsHandshake {
     type Output = Result<TlsStream, IoError>;
 
     poll(mut &this, cx: Context*) -> Poll<Result<TlsStream, IoError>> {
-        const fd: i32 = this.tls.raw_fd();
+        const fd: i32 = this.tls.raw_file_descriptor();
         openssl::ERR_clear_error();
         const rc: i32 = if (this.is_client) {
-            openssl::SSL_connect(this.tls.ssl_ptr())
+            openssl::SSL_connect(this.tls.ssl_pointer())
         } else {
-            openssl::SSL_accept(this.tls.ssl_ptr())
+            openssl::SSL_accept(this.tls.ssl_pointer())
         };
         if (rc == 1) {
             // Belt-and-suspenders verification gate, mirroring the blocking
@@ -131,14 +131,14 @@ implement trait Future for struct TlsHandshake {
             // keeps a future change from silently handing back an unverified
             // peer.
             if (this.verify
-                    && openssl::SSL_get_verify_result(this.tls.ssl_ptr()) != openssl::X509_V_OK) {
+                    && openssl::SSL_get_verify_result(this.tls.ssl_pointer()) != openssl::X509_V_OK) {
                 mut bad: TlsStream = this.release();
                 mem::drop(bad);
                 return Poll::Ready(Result::Err(IoError::new(IoErrorKind::Other, 0)));
             }
             return Poll::Ready(Result::Ok(this.release()));
         }
-        const code: i32 = openssl::SSL_get_error(this.tls.ssl_ptr(), rc);
+        const code: i32 = openssl::SSL_get_error(this.tls.ssl_pointer(), rc);
         const want: u32 = interest_for(code);
         if (want != 0) {
             mut rt: mut Reactor* = Reactor::require();
@@ -159,7 +159,7 @@ implement trait Future for struct TlsHandshake {
 implement trait Drop for struct TlsHandshake {
     drop(mut &this) -> void {
         if (this.rt != null) {
-            this.rt.cancel(this.tls.raw_fd(), this.armed);
+            this.rt.cancel(this.tls.raw_file_descriptor(), this.armed);
             this.rt = null;
             this.armed = 0;
         }
@@ -191,7 +191,7 @@ public type struct TlsRead {
     private finish(mut &this, kept: i64, result: Result<i64, IoError>) -> Poll<TlsIo> {
         this.rt = null;
         this.buf.truncate(kept);
-        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
+        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_file_descriptor(-1));
         mem::swap::<TlsStream>(&s, &this.tls);
         mut b: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&b, &this.buf);
@@ -203,13 +203,13 @@ implement trait Future for struct TlsRead {
     type Output = TlsIo;
 
     poll(mut &this, cx: Context*) -> Poll<TlsIo> {
-        const fd: i32 = this.tls.raw_fd();
+        const fd: i32 = this.tls.raw_file_descriptor();
         const want_len: i64 = this.buf.length();
         openssl::ERR_clear_error();
-        const n: i32 = openssl::SSL_read(this.tls.ssl_ptr(), this.buf.as_mutable_ptr(),
+        const n: i32 = openssl::SSL_read(this.tls.ssl_pointer(), this.buf.as_mutable_pointer(),
                                          clamp_io(want_len));
         if (n > 0) { return this.finish(n as i64, Result::Ok(n as i64)); }
-        const code: i32 = openssl::SSL_get_error(this.tls.ssl_ptr(), n);
+        const code: i32 = openssl::SSL_get_error(this.tls.ssl_pointer(), n);
         if (code == openssl::SSL_ERROR_ZERO_RETURN) {
             return this.finish(0, Result::Ok(0));   // clean TLS close -> EOF
         }
@@ -228,7 +228,7 @@ implement trait Future for struct TlsRead {
 implement trait Drop for struct TlsRead {
     drop(mut &this) -> void {
         if (this.rt != null) {
-            this.rt.cancel(this.tls.raw_fd(), this.armed);
+            this.rt.cancel(this.tls.raw_file_descriptor(), this.armed);
             this.rt = null;
             this.armed = 0;
         }
@@ -253,7 +253,7 @@ public type struct TlsWrite {
 
     private finish(mut &this, result: Result<i64, IoError>) -> Poll<TlsIo> {
         this.rt = null;
-        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
+        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_file_descriptor(-1));
         mem::swap::<TlsStream>(&s, &this.tls);
         mut b: Array<u8> = Array::<u8>::new();
         mem::swap::<Array<u8>>(&b, &this.buf);
@@ -265,14 +265,14 @@ implement trait Future for struct TlsWrite {
     type Output = TlsIo;
 
     poll(mut &this, cx: Context*) -> Poll<TlsIo> {
-        const fd: i32 = this.tls.raw_fd();
+        const fd: i32 = this.tls.raw_file_descriptor();
         const want_len: i64 = this.buf.length();
         if (want_len == 0) { return this.finish(Result::Ok(0)); }
         openssl::ERR_clear_error();
-        const n: i32 = openssl::SSL_write(this.tls.ssl_ptr(), this.buf.as_ptr(),
+        const n: i32 = openssl::SSL_write(this.tls.ssl_pointer(), this.buf.as_pointer(),
                                           clamp_io(want_len));
         if (n > 0) { return this.finish(Result::Ok(n as i64)); }
-        const code: i32 = openssl::SSL_get_error(this.tls.ssl_ptr(), n);
+        const code: i32 = openssl::SSL_get_error(this.tls.ssl_pointer(), n);
         const interest: u32 = interest_for(code);
         if (interest != 0) {
             mut rt: mut Reactor* = Reactor::require();
@@ -288,7 +288,7 @@ implement trait Future for struct TlsWrite {
 implement trait Drop for struct TlsWrite {
     drop(mut &this) -> void {
         if (this.rt != null) {
-            this.rt.cancel(this.tls.raw_fd(), this.armed);
+            this.rt.cancel(this.tls.raw_file_descriptor(), this.armed);
             this.rt = null;
             this.armed = 0;
         }
@@ -303,7 +303,7 @@ private function clamp_io(n: i64) -> i32 {
 }
 
 
-/// The raw async byte channel, so `BufStream<TlsStream>` is buffered by exactly
+/// The raw async byte channel, so `BufferedStream<TlsStream>` is buffered by exactly
 /// the same code as a plaintext socket — the difference between the two is how
 /// bytes move, not how they are buffered.
 ///
@@ -312,7 +312,7 @@ private function clamp_io(n: i64) -> i32 {
 /// socket, which only this layer should have to know how to spell.
 implement trait AsyncTransport for struct TlsStream {
     async read_into(mut &this, buf: Array<u8>) -> Transfer {
-        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
+        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_file_descriptor(-1));
         mem::swap::<TlsStream>(&s, this);
 
         mut io: TlsIo = await TlsRead::start(s, buf);
@@ -322,11 +322,11 @@ implement trait AsyncTransport for struct TlsStream {
         mut spare: TlsStream = io.take_stream();
         mem::swap::<TlsStream>(&spare, this);
 
-        return Transfer { buf: io.take_buf(), result: io.outcome() };
+        return Transfer { buf: io.take_buffer(), result: io.outcome() };
     }
 
     async write_from(mut &this, buf: Array<u8>) -> Transfer {
-        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
+        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_file_descriptor(-1));
         mem::swap::<TlsStream>(&s, this);
 
         mut io: TlsIo = await TlsWrite::start(s, buf);
@@ -334,7 +334,7 @@ implement trait AsyncTransport for struct TlsStream {
         mut spare: TlsStream = io.take_stream();
         mem::swap::<TlsStream>(&spare, this);
 
-        return Transfer { buf: io.take_buf(), result: io.outcome() };
+        return Transfer { buf: io.take_buffer(), result: io.outcome() };
     }
 }
 

@@ -16,6 +16,7 @@ import std::core::default::{ Default };
 import std::core::option::{ Option };
 import std::core::slice::{ Slice };
 import std::core::mem;
+import std::collections::str::{ Str };
 
 /// A running hash state that values feed their bytes into, one `write_*`
 /// call at a time; `finish` reads the digest of everything fed so far.
@@ -42,7 +43,7 @@ public type trait Hasher {
     /// for hashing any fixed-width integer: `write_u8` is the 1-byte special
     /// case; this covers 2/4/8/16-byte values. The default loops `write_u8`;
     /// implementations may override with a faster path.
-    write_uint(mut &this, value: u128, byte_count: u32) -> void {
+    write_unsigned_integer(mut &this, value: u128, byte_count: u32) -> void {
         mut x: u128 = value;
         mut i: u32 = 0;
         while (i < byte_count) {
@@ -68,10 +69,11 @@ public type trait Hasher {
     ///                   adjacent concatenations can't collide ("ab"+"c" vs
     ///                   "a"+"bc").
     /// Fixed-width values need no separator; only the variable-length `string`
-    /// arm appends one. Any other type is refused where it is given.
+    /// arm appends one. Any other type is refused where it is given; a `Str`
+    /// folds through `fold_text`.
     ///
     /// Lives on the trait rather than on one hasher because it is pure
-    /// composition over `write_u8` / `write_uint`: every implementation folds
+    /// composition over `write_u8` / `write_unsigned_integer`: every implementation folds
     /// values identically, and a digest of the same parts differs only by the
     /// mixing function underneath.
     fold<T>(mut &this, value: T) -> void where T: Primitive {
@@ -81,22 +83,22 @@ public type trait Hasher {
             i8      => { this.write_u8(value as u8); }
             boolean => { this.write_u8(if (value) { 1 as u8 } else { 0 as u8 }); }
             // 2-byte
-            u16 => { this.write_uint(value as u128, 2); }
-            i16 => { this.write_uint((value as u16) as u128, 2); }
+            u16 => { this.write_unsigned_integer(value as u128, 2); }
+            i16 => { this.write_unsigned_integer((value as u16) as u128, 2); }
             // 4-byte
-            u32  => { this.write_uint(value as u128, 4); }
-            i32  => { this.write_uint((value as u32) as u128, 4); }
-            char => { this.write_uint((value as u32) as u128, 4); }
-            f32  => { this.write_uint(mem::transmute::<f32, u32>(value) as u128, 4); }
+            u32  => { this.write_unsigned_integer(value as u128, 4); }
+            i32  => { this.write_unsigned_integer((value as u32) as u128, 4); }
+            char => { this.write_unsigned_integer((value as u32) as u128, 4); }
+            f32  => { this.write_unsigned_integer(mem::transmute::<f32, u32>(value) as u128, 4); }
             // 8-byte
-            u64   => { this.write_uint(value as u128, 8); }
-            i64   => { this.write_uint((value as u64) as u128, 8); }
-            usize => { this.write_uint(value as u128, 8); }
-            isize => { this.write_uint((value as u64) as u128, 8); }
-            f64   => { this.write_uint(mem::transmute::<f64, u64>(value) as u128, 8); }
+            u64   => { this.write_unsigned_integer(value as u128, 8); }
+            i64   => { this.write_unsigned_integer((value as u64) as u128, 8); }
+            usize => { this.write_unsigned_integer(value as u128, 8); }
+            isize => { this.write_unsigned_integer((value as u64) as u128, 8); }
+            f64   => { this.write_unsigned_integer(mem::transmute::<f64, u64>(value) as u128, 8); }
             // 16-byte
-            u128 => { this.write_uint(value, 16); }
-            i128 => { this.write_uint(value as u128, 16); }
+            u128 => { this.write_unsigned_integer(value, 16); }
+            i128 => { this.write_unsigned_integer(value as u128, 16); }
             // variable-length + separator
             string => {
                 const bytes: u8* = value as u8*;
@@ -108,6 +110,17 @@ public type trait Hasher {
                 this.write_u8(0 as u8);
             }
         }
+    }
+
+    /// Fold the text of `text` into the running digest: its bytes, then the
+    /// separator NUL `fold` writes after a `string`, so a part folds the same
+    /// whether it is held as a `Str` or as the `string` of the same text, and
+    /// a digest does not change when its parts move from one to the other.
+    /// A NUL inside the view is folded as a byte, where a `string` would end
+    /// at it.
+    fold_text(mut &this, text: Str) -> void {
+        this.write_bytes(text.as_bytes());
+        this.write_u8(0 as u8);
     }
 
     /// Finalize the hash and return the digest. After calling `finish`
@@ -209,10 +222,8 @@ public type struct Fnv128Hasher {
     }
 
     /// The digest's two halves, high first, for callers rendering it as text.
-    /// Returned rather than formatted here so `core::hash` keeps depending on
-    /// nothing but `core` - hex formatting lives on `u64`, and pulling
-    /// `String` in for it would put the collections module underneath every
-    /// HashMap that uses this file.
+    /// Returned rather than formatted here: hex formatting lives on `u64`,
+    /// and the caller decides where the text goes.
     public high64(&this) -> u64 {
         return (this.state >> 64) as u64;
     }
@@ -328,7 +339,7 @@ implement trait Hasher for struct SipHasher {
 
     /// Up to eight bytes at a time join the pending bytes in one step; a word
     /// they complete is absorbed, and what is left over starts the next.
-    write_uint(mut &this, value: u128, byte_count: u32) -> void {
+    write_unsigned_integer(mut &this, value: u128, byte_count: u32) -> void {
         mut rest: u128 = value;
         mut remaining: u64 = byte_count;
         while (remaining > 0) {
@@ -352,7 +363,7 @@ implement trait Hasher for struct SipHasher {
     /// Bytes up to a word boundary go one at a time, then whole eight-byte
     /// words, then the rest one at a time.
     write_bytes(mut &this, bytes: &Slice<u8>) -> void {
-        const data: u8* = bytes.as_ptr();
+        const data: u8* = bytes.as_pointer();
         const count: i64 = bytes.length();
         mut at: i64 = 0;
         while (at < count && this.pending_length != 0) {
@@ -434,21 +445,21 @@ implement trait Hash for u8 {
 implement trait Hash for u16 {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hasher.write_uint(this as u128, 2);
+        hasher.write_unsigned_integer(this as u128, 2);
     }
 }
 
 implement trait Hash for u32 {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hasher.write_uint(this as u128, 4);
+        hasher.write_unsigned_integer(this as u128, 4);
     }
 }
 
 implement trait Hash for u64 {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hasher.write_uint(this as u128, 8);
+        hasher.write_unsigned_integer(this as u128, 8);
     }
 }
 
@@ -462,49 +473,49 @@ implement trait Hash for i8 {
 implement trait Hash for i16 {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hasher.write_uint((this as u16) as u128, 2);
+        hasher.write_unsigned_integer((this as u16) as u128, 2);
     }
 }
 
 implement trait Hash for i32 {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hasher.write_uint((this as u32) as u128, 4);
+        hasher.write_unsigned_integer((this as u32) as u128, 4);
     }
 }
 
 implement trait Hash for i64 {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hasher.write_uint((this as u64) as u128, 8);
+        hasher.write_unsigned_integer((this as u64) as u128, 8);
     }
 }
 
 implement trait Hash for u128 {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hasher.write_uint(this, 16);
+        hasher.write_unsigned_integer(this, 16);
     }
 }
 
 implement trait Hash for i128 {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hasher.write_uint(this as u128, 16);
+        hasher.write_unsigned_integer(this as u128, 16);
     }
 }
 
 implement trait Hash for usize {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hasher.write_uint(this as u128, 8);
+        hasher.write_unsigned_integer(this as u128, 8);
     }
 }
 
 implement trait Hash for isize {
     hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hasher.write_uint((this as u64) as u128, 8);
+        hasher.write_unsigned_integer((this as u64) as u128, 8);
     }
 }
 
@@ -517,7 +528,7 @@ implement trait Hash for f32 {
         mut bits: u32 = mem::transmute::<f32, u32>(this);
         if (this == 0.0) { bits = 0; }
         if (this != this) { bits = 0x7FC00000; }
-        hasher.write_uint(bits as u128, 4);
+        hasher.write_unsigned_integer(bits as u128, 4);
     }
 }
 
@@ -527,7 +538,7 @@ implement trait Hash for f64 {
         mut bits: u64 = mem::transmute::<f64, u64>(this);
         if (this == 0.0) { bits = 0; }
         if (this != this) { bits = 0x7FF8000000000000; }
-        hasher.write_uint(bits as u128, 8);
+        hasher.write_unsigned_integer(bits as u128, 8);
     }
 }
 
@@ -550,7 +561,7 @@ implement trait Hash for char {
         // low byte (e.g. 'A' 0x41 vs U+0141 vs U+1041) into one bucket,
         // degrading `HashMap<char, V>` / `HashSet<char>` to near-linear for
         // non-ASCII keys. Mirrors the `u32` impl.
-        hasher.write_uint((this as u32) as u128, 4);
+        hasher.write_unsigned_integer((this as u32) as u128, 4);
     }
 }
 

@@ -16,21 +16,21 @@ import std::core::clone::{ Clone };
 import std::core::default::{ Default };
 import std::core::drop::{ Drop };
 import std::core::iter::{ FromIterator, Iterator };
-import std::alloc::allocator::{ AllocError, Allocator, GlobalAlloc };
-import std::collections::hashmap::{ HashMap, HashMapIter, KeysRefIter };
+import std::alloc::allocator::{ AllocationError, Allocator, GlobalAllocator };
+import std::collections::hashmap::{ HashMap, HashMapIterator, KeysReferenceIterator };
 import std::collections::pair;
 
 /// A set of distinct values, found by their hash: a `HashMap` whose
 /// values are `()`. Values need `Hash` and `Eq`; `H` is the hasher, as for
 /// `HashMap`. Iteration order is unspecified; `BTreeSet` keeps values
 /// sorted.
-public type struct HashSet<T, A = GlobalAlloc, H = SipHasher> {
+public type struct HashSet<T, A = GlobalAllocator, H = SipHasher> {
     private map: HashMap<T, (), A, H>;
 
-    /// An empty set backed by `GlobalAlloc`, hashing with `H`'s default.
-    public static new() -> HashSet<T, GlobalAlloc, H>
+    /// An empty set backed by `GlobalAllocator`, hashing with `H`'s default.
+    public static new() -> HashSet<T, GlobalAllocator, H>
     where H: Default {
-        return HashSet::<T, GlobalAlloc, H> { map: HashMap::<T, (), GlobalAlloc, H>::new() };
+        return HashSet::<T, GlobalAllocator, H> { map: HashMap::<T, (), GlobalAllocator, H>::new() };
     }
 
     /// An empty set that allocates through `alloc`, hashing with `H`'s
@@ -40,17 +40,17 @@ public type struct HashSet<T, A = GlobalAlloc, H = SipHasher> {
         return HashSet::<T, A, H> { map: HashMap::<T, (), A, H>::new_in(alloc) };
     }
 
-    /// An empty set backed by `GlobalAlloc`, sized for `capacity` values
+    /// An empty set backed by `GlobalAllocator`, sized for `capacity` values
     /// before it grows, as `HashMap::with_capacity` is.
-    public static with_capacity(capacity: i64) -> HashSet<T, GlobalAlloc, H>
+    public static with_capacity(capacity: i64) -> HashSet<T, GlobalAllocator, H>
     where H: Default {
-        return HashSet::<T, GlobalAlloc, H> { map: HashMap::<T, (), GlobalAlloc, H>::with_capacity(capacity) };
+        return HashSet::<T, GlobalAllocator, H> { map: HashMap::<T, (), GlobalAllocator, H>::with_capacity(capacity) };
     }
 
     /// An empty set whose values are hashed starting from `hasher` (see
     /// `HashMap::with_hasher`).
-    public static with_hasher(hasher: H) -> HashSet<T, GlobalAlloc, H> {
-        return HashSet::<T, GlobalAlloc, H> { map: HashMap::<T, (), GlobalAlloc, H>::with_hasher(hasher) };
+    public static with_hasher(hasher: H) -> HashSet<T, GlobalAllocator, H> {
+        return HashSet::<T, GlobalAllocator, H> { map: HashMap::<T, (), GlobalAllocator, H>::with_hasher(hasher) };
     }
 
     /// The hasher every value's hash starts from (see `HashMap.hasher`).
@@ -86,10 +86,10 @@ public type struct HashSet<T, A = GlobalAlloc, H = SipHasher> {
         }
     }
 
-    /// `insert` that returns `Err(AllocError)` instead of panicking when
+    /// `insert` that returns `Err(AllocationError)` instead of panicking when
     /// the set cannot grow. `Ok(true)` when `value` was not already a
     /// member.
-    public try_insert(mut &this, value: T) -> Result<boolean, AllocError>
+    public try_insert(mut &this, value: T) -> Result<boolean, AllocationError>
     where T: Hash + Eq, H: Hasher + Copy {
         const previous: Option<()> = this.map.try_insert(value, ())?;
         match (previous) {
@@ -118,33 +118,33 @@ public type struct HashSet<T, A = GlobalAlloc, H = SipHasher> {
     /// Same mutation-invalidation contract as `HashMap::iter`.
     public iter(&this) -> implement Iterator<T>
     where T: Copy {
-        return HashSetIter::<T> { inner: this.map.iter() };
+        return HashSetIterator::<T> { inner: this.map.iter() };
     }
 
     /// Iterate over every element by shared borrow, yielding `T*`. Unlike
     /// `iter`, this is sound for **any** `T` (owning or Copy) because it hands
     /// out borrows, never bitcopies - so it is the way to walk a
-    /// `HashSet<String>` without cloning. Mirrors `Array::iter_ref` and
-    /// `HashMap::keys_ref`. Same mutation-invalidation contract as `iter`.
-    public iter_ref(&this) -> implement Iterator<T*> {
-        return HashSetRefIter::<T> { inner: this.map.keys_ref() };
+    /// `HashSet<String>` without cloning. Mirrors `Array::iterate_references` and
+    /// `HashMap::key_references`. Same mutation-invalidation contract as `iter`.
+    public iterate_references(&this) -> implement Iterator<T*> {
+        return HashSetReferenceIterator::<T> { inner: this.map.key_references() };
     }
 }
 
-// HashSetIter: projects HashMapIter<T, ()> onto its keys.
+// HashSetIterator: projects HashMapIterator<T, ()> onto its keys.
 //
 // `private`: produced only as the opaque `implement Iterator<T>` returned by
 // `HashSet::iter`; never named outside this module. Wraps the internal
-// `HashMapIter`.
+// `HashMapIterator`.
 
-private type struct HashSetIter<T> {
-    private inner: HashMapIter<T, ()>;
+private type struct HashSetIterator<T> {
+    private inner: HashMapIterator<T, ()>;
 }
 
-// `where T: Copy`: the inner `HashMapIter<T, ()>::next` is now Copy-gated, so
-// this body can only resolve it when `T: Copy`. `HashSetIter` is produced only
+// `where T: Copy`: the inner `HashMapIterator<T, ()>::next` is now Copy-gated, so
+// this body can only resolve it when `T: Copy`. `HashSetIterator` is produced only
 // by `HashSet::iter` (itself `where T: Copy`), so the bound is always met.
-implement<T> trait Iterator<T> for struct HashSetIter<T>
+implement<T> trait Iterator<T> for struct HashSetIterator<T>
 where T: Copy {
     next(mut &this) -> Option<T> {
         match (this.inner.next()) {
@@ -154,18 +154,18 @@ where T: Copy {
     }
 }
 
-// HashSetRefIter: the borrow-yielding analog of HashSetIter. Wraps the map's
-// `KeysRefIter<T, ()>` (which yields `T*` and is itself ungated) and forwards
-// its borrows unchanged, so `HashSet::iter_ref` is sound for any `T`.
+// HashSetReferenceIterator: the borrow-yielding analog of HashSetIterator. Wraps the map's
+// `KeysReferenceIterator<T, ()>` (which yields `T*` and is itself ungated) and forwards
+// its borrows unchanged, so `HashSet::iterate_references` is sound for any `T`.
 //
 // `private`: produced only as the opaque `implement Iterator<T*>` returned by
-// `HashSet::iter_ref`; never named outside this module.
+// `HashSet::iterate_references`; never named outside this module.
 
-private type struct HashSetRefIter<T> {
-    private inner: KeysRefIter<T, ()>;
+private type struct HashSetReferenceIterator<T> {
+    private inner: KeysReferenceIterator<T, ()>;
 }
 
-implement<T> trait Iterator<T*> for struct HashSetRefIter<T> {
+implement<T> trait Iterator<T*> for struct HashSetReferenceIterator<T> {
     next(mut &this) -> Option<T*> {
         return this.inner.next();
     }
@@ -180,19 +180,19 @@ where A: Allocator {
 
 /// A fresh empty set is `HashSet`'s canonical "zero value", so it can satisfy
 /// a `Default` bound. Allocates nothing until the first insert.
-implement<T, H> trait Default for struct HashSet<T, GlobalAlloc, H>
+implement<T, H> trait Default for struct HashSet<T, GlobalAllocator, H>
 where H: Default {
-    static default() -> HashSet<T, GlobalAlloc, H> {
-        return HashSet::<T, GlobalAlloc, H>::new();
+    static default() -> HashSet<T, GlobalAllocator, H> {
+        return HashSet::<T, GlobalAllocator, H>::new();
     }
 }
 
 /// A set of every value an iterator yields: what `collect` builds for
 /// `HashSet`.
-implement<T, H> trait FromIterator<T> for struct HashSet<T, GlobalAlloc, H>
+implement<T, H> trait FromIterator<T> for struct HashSet<T, GlobalAllocator, H>
 where T: Hash + Eq, H: Hasher + Copy + Default {
-    static from_iterator<I>(source: I) -> HashSet<T, GlobalAlloc, H> where I: Iterator<T> {
-        mut out: HashSet<T, GlobalAlloc, H> = HashSet::<T, GlobalAlloc, H>::new();
+    static from_iterator<I>(source: I) -> HashSet<T, GlobalAllocator, H> where I: Iterator<T> {
+        mut out: HashSet<T, GlobalAllocator, H> = HashSet::<T, GlobalAllocator, H>::new();
         for (value in source) {
             out.insert(value);
         }
@@ -201,14 +201,14 @@ where T: Hash + Eq, H: Hasher + Copy + Default {
 }
 
 /// Deep copy: a fresh set that owns independent clones of every element,
-/// mirroring `HashMap::Clone`. Walks by borrow (`iter_ref`) and clones each
+/// mirroring `HashMap::Clone`. Walks by borrow (`iterate_references`) and clones each
 /// element in, so it is sound for owning `T` (`HashSet<String>`); the copy
 /// hashes with the original's hasher.
-implement<T, H> trait Clone for struct HashSet<T, GlobalAlloc, H>
+implement<T, H> trait Clone for struct HashSet<T, GlobalAllocator, H>
 where T: Hash + Eq + Clone, H: Hasher + Copy {
-    clone(&this) -> HashSet<T, GlobalAlloc, H> {
-        mut out: HashSet<T, GlobalAlloc, H> = HashSet::<T, GlobalAlloc, H>::with_hasher(this.hasher());
-        mut it: implement Iterator<T*> = this.iter_ref();
+    clone(&this) -> HashSet<T, GlobalAllocator, H> {
+        mut out: HashSet<T, GlobalAllocator, H> = HashSet::<T, GlobalAllocator, H>::with_hasher(this.hasher());
+        mut it: implement Iterator<T*> = this.iterate_references();
         loop {
             match (it.next()) {
                 Option::Some(e) => { out.insert((*e).clone()); }

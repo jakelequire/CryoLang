@@ -105,7 +105,7 @@ or reads the store by identity.  Locked so far:
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
 | `module-by-path` | `ModuleGraph::module_path_over` | `compiler/src/compiler/module_graph.cryo` | an import's written path to itself as a path to list modules within, when the graph holds a module at it or under it, whether or not it names a module (`import std::`) |
 | `module-by-path` | `ModuleGraph::modules_in_view` | `compiler/src/compiler/module_graph.cryo` | a path written in a body to the modules it names, among those the writing file can see: its own, the ones it imports, the prelude, or a package root written whole |
-| `loader-path` | `ModuleLoader::resolve_import_path` | `compiler/src/compiler/module_loader.cryo` | a module path written in an `import`, an `export` or a `module` line to the file of the module it names: a vendored library, a file declaring the namespace, or a file at the path on disk |
+| `loader-path` | `ModuleLoader::resolve_import_path` | `compiler/src/compiler/module_loader.cryo` | a module path written in an `import`, an `export` or a `module` line to the file of the module it names: a vendored library, a file declaring the namespace, or a file at the path on disk, only ever in a package the writing file's package may name (`ModulePackage::may_name`) |
 | `loader-path` | `ModuleLoader::binding_of` | `compiler/src/compiler/module_loader.cryo` | a body path's head to the import of the file that binds it |
 | `loader-path` | `ModuleLoader::sub_module_file` | `compiler/src/compiler/module_loader.cryo` | a path's continuation past an import binding to the file of the sub-module it names |
 | `primitive` | `ResBase::is_primitive_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table |
@@ -133,12 +133,47 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-14
+
+707. **An angle-bracketed import also binds the headers its header
+     includes directly.**  `extern module m := "C" { #include <math.h> }`
+     binds the declarations and macros written in `<math.h>` and in each
+     system header `<math.h>` itself includes, one level down, since a C
+     library commonly declares a header's interface in such a file.  A
+     system header included any deeper stays filtered.  Supersedes the
+     part of 704 that filtered every header the named one includes.
+     (Jake)
+
+708. **`net::sys::set_timeout` is internal**, as every other item of
+     `net::sys` is; a socket's timeouts are set through `net::socket`.
+     Supersedes the part of 705 that left it public.  (Jake)
+
+### 2026-11-13
+
+704. **An inline import of an angle-bracketed header binds that header.**
+     `extern module c := "C" { #include <ctype.h> }` binds the
+     declarations and macros written in `<ctype.h>` itself under the
+     alias, and keeps filtering the system headers it includes, as a
+     quoted header's are.  (Jake)
+
+705. **`net::sys` is internal.**  The per-OS socket, resolver and error
+     calls (`os_*`, `sock_*`, `network_initialize`, `last_io_error`), the
+     `addrinfo` layout and hint readings and `ConnectStatus` are the
+     standard library's plumbing for `net::socket` and `net::dns`, and the
+     module is declared `internal module net::sys;`.  `set_timeout` is
+     still written `public`.  Supersedes the part of 597 that made
+     `net::sys` a public low-level API.  (Jake)
+
+706. **`thread::sleep` takes a `Duration`**, as `time::clock::sleep`
+     does, and there is no `sleep_ms`: a length of time is written as a
+     `Duration` wherever the library takes one.  (Jake)
+
 ### 2026-11-12
 
 703. **A hash map's bucket layer is internal.**  `Entry`, the node of a
      bucket's chain, and `HashMap::get_bucket`, which hands one out, are
      internal: a caller outside the standard library walks a map through
-     `entries`, `keys_ref`, `values_ref` and `values_mutable`, which
+     `entries`, `key_references`, `value_references` and `values_mutable`, which
      borrow in place for any key and value type.  `bucket_count` stays
      public.  Supersedes the part of 636 that kept `Entry` public for
      callers walking a map in place.  (Jake)
@@ -329,11 +364,11 @@ yet is recorded with the change that builds it, not here.
 683. **A lookup that hands out a pointer has a read-only form and a
      writable one, and code that writes takes the writable one.**
      `Slice::as_const_ptr(&this)` returns the read-only `const T*` where
-     `as_ptr` returns `mut T*`, and `mem::const_offset<T>(ptr: const T*,
+     `as_pointer` returns `mut T*`, and `mem::const_offset<T>(ptr: const T*,
      count) -> const T*` is `mem::offset`'s read-only counterpart.
      `HashMap::get_mutable(mut &this, key: &K) -> Option<mut V*>` and
      `HashMap::values_mutable(mut &this)`, yielding `mut V*`, are the
-     writable counterparts of `get_ref` and `values_ref`, and
+     writable counterparts of `get_reference` and `value_references`, and
      `JsonObject::get_mutable(mut &this, key: Str) -> Option<mut
      JsonValue*>` that of `JsonObject::get`.  (Jake)
 
@@ -358,9 +393,9 @@ yet is recorded with the change that builds it, not here.
 
 686. **A bare struct literal takes the type's defaults inside the type's
      own body too.**  In the methods of a generic type whose parameters
-     all have defaults, `String { .. }` is a `String<GlobalAlloc>`, as a
+     all have defaults, `String { .. }` is a `String<GlobalAllocator>`, as a
      bare `String` in a return type is, and its fields are judged as
-     `String<GlobalAlloc>`'s; one spelling has one meaning wherever it is
+     `String<GlobalAllocator>`'s; one spelling has one meaning wherever it is
      written.  A literal of the owner itself is written with its
      arguments, `String::<A> { .. }`.  (Jake)
 
@@ -444,12 +479,12 @@ yet is recorded with the change that builds it, not here.
      which borrow is wanted, and a read-only place never gives a writable
      one.  (Jake)
 
-669. **`as_ref` borrows read-only; `as_mutable_ref` borrows writable.**
-     `Option::as_ref(&this)` returns `Option<const T*>` and
-     `Result::as_ref(&this)` returns `Result<const T*, const E*>`; the
-     writable forms are `as_mutable_ref(mut &this)`, returning
+669. **`as_reference` borrows read-only; `as_mutable_reference` borrows writable.**
+     `Option::as_reference(&this)` returns `Option<const T*>` and
+     `Result::as_reference(&this)` returns `Result<const T*, const E*>`; the
+     writable forms are `as_mutable_reference(mut &this)`, returning
      `Option<T*>` and `Result<T*, E*>`.  A caller that writes through the
-     borrow calls `as_mutable_ref`.  (Jake)
+     borrow calls `as_mutable_reference`.  (Jake)
 
 670. **E0217 is reserved.**  It named a const violation and was never
      reported; a write through a read-only place is E0250.  Like every
@@ -558,7 +593,7 @@ yet is recorded with the change that builds it, not here.
 599. **The rest of `net` is marked item by item.**  `Headers` keeps its
      map private and hands out its entries through a public `entries()`
      iterator, which HTTP/2 walks.  An allocation failure converts to an
-     I/O error, `OutOfMemory`, through a public `From<AllocError>` for
+     I/O error, `OutOfMemory`, through a public `From<AllocationError>` for
      `IoError`.  In HTTP/2 the protocol's constants (frame types, flags,
      the frame header length, settings identifiers, the preface's length
      and bytes, the default connection window) are public and the limits
@@ -611,7 +646,7 @@ yet is recorded with the change that builds it, not here.
      `push` and `try_push` take any `T: Display`: text is copied in, every
      other type is formatted.  `push_char(c)` appends one scalar and
      `push_repeated(c, count)` appends `count` copies.  Every `char` is
-     encoded by the one private encoder behind `FmtWrite.write_char`, which
+     encoded by the one private encoder behind `FormatWrite.write_char`, which
      writes a surrogate or an out-of-range value as U+FFFD; `char`'s
      `Display` writes through `write_char`.  The format spec's fill, the
      JSON escape decoder and serializer, the HTTP client's decimal writers
@@ -634,16 +669,16 @@ yet is recorded with the change that builds it, not here.
      type Jake)
 
 605. **Addresses, URLs, methods and status codes are `Display`.**  An
-     `IpV4Addr` writes dotted decimal; an `IpV6Addr` its canonical text
+     `IpV4Address` writes dotted decimal; an `IpV6Address` its canonical text
      (RFC 5952): lowercase hex groups without leading zeros, the longest
      run of two or more zero groups written `::`, the first of equally
-     long runs, and no dotted tail; an `IpAddr` writes its address.  A
-     `SocketAddr` writes `ip:port`, an IPv6 address in brackets.  A `Url`
+     long runs, and no dotted tail; an `IpAddress` writes its address.  A
+     `SocketAddress` writes `ip:port`, an IPv6 address in brackets.  A `Url`
      writes `scheme://host[:port]path[?query][#fragment]`: an IPv6 host
      in brackets, the port only when it is not the scheme's default, and
      no userinfo, which the parser does not keep.  A `Method` writes its
      wire form and a `StatusCode` its code in decimal.  The HTTP client
-     writes its `Host` header through `SocketAddr`'s, so an IPv6 host is
+     writes its `Host` header through `SocketAddress`'s, so an IPv6 host is
      sent compressed, and its own address writers are deleted.  (Jake for
      the types and the compressed form; the URL's port and userinfo and
      the bare status code delegated)
@@ -652,7 +687,7 @@ yet is recorded with the change that builds it, not here.
      generic body, a value whose type names a parameter becomes a trait
      object where every copy of the body has an implementation of the
      trait for it: a type parameter whose own bound names the trait at
-     the object's arguments (`where W: FmtWrite`), `This` in a default
+     the object's arguments (`where W: FormatWrite`), `This` in a default
      of that trait itself, and the receiver of an implementation of the
      trait whose methods are checked over parameters - a generic
      implementation, or one written for an instantiation.  The template
@@ -662,7 +697,7 @@ yet is recorded with the change that builds it, not here.
      default - is E0315, and for a parameter the help names the bound to
      add.  A supertrait's object, and an instantiation over a parameter
      whose implementation holds for every argument, are not converted
-     yet.  (delegated; needed for `FmtWrite.write`, a default that makes
+     yet.  (delegated; needed for `FormatWrite.write`, a default that makes
      a `Formatter` over its receiver)
 
 607. **An f-string passed as `fmt::Arguments` is written where it goes.**
@@ -674,16 +709,16 @@ yet is recorded with the change that builds it, not here.
      initializer, a return, a field, an argument whose parameter is
      anything else, a generic `T` included - an f-string is a `String`,
      so no stored value keeps a borrow of a hole past the call.
-     `FmtWrite.write(arguments)` is a default every sink gets, and
+     `FormatWrite.write(arguments)` is a default every sink gets, and
      `Formatter.write(arguments)` writes through a formatter;
      `String.push(f"...")` still builds the text first.  A number in a
      hole with a spec is rendered on the stack.  `Stdout` and `Stderr`
-     are no longer `FmtWrite` sinks: they write text through
+     are no longer `FormatWrite` sinks: they write text through
      `io::Write.write`, whose name the default made ambiguous on them.
      The duration and date-time `Display`s and the JSON control escape
      write through `write`; their own decimal, padding and hex writers
-     are deleted.  (Jake for `write` on `FmtWrite`, the name
-     `fmt::Arguments` and the argument position; dropping `FmtWrite`
+     are deleted.  (Jake for `write` on `FormatWrite`, the name
+     `fmt::Arguments` and the argument position; dropping `FormatWrite`
      from `Stdout`/`Stderr` and `Formatter.write` delegated)
 
 608. **A byte classifies itself, by `char`'s rules.**  `u8` has
@@ -698,8 +733,8 @@ yet is recorded with the change that builds it, not here.
      these.  (Jake for the names and the whitespace set)
 
 609. **`Str` searches from either end; a `Slice` indexes and compares.**
-     `Str` has `rfind`, `find_byte`, `rfind_byte`, `split_once`,
-     `rsplit_once` (the text before and after the first or last
+     `Str` has `find_last`, `find_byte`, `find_last_byte`, `split_once`,
+     `split_once_from_end` (the text before and after the first or last
      separator, neither half including it) and `equals_case_insensitive`
      (ASCII letters folded, every other byte exact).  `Slice<T>`
      implements `Index` for every integer type, as `Array` does - an
@@ -715,14 +750,18 @@ yet is recorded with the change that builds it, not here.
 
 610. **`Str`, `Slice` and `Path` are marked item by item.**  `Str`,
      `Slice<T>`, `Path` and `PathBuf` and all their methods are public,
-     their storage private behind `as_ptr`, `as_bytes`, `as_str` and
-     `as_path`.  `Str`'s `SplitIter`, `Chars` and `CharIndices` are
-     public, since `String`'s methods name them, with private fields; the
+     their storage private behind `as_pointer`, `as_bytes`, `as_str` and
+     `as_path`.  `Str`'s `SplitIterator`, `Chars` and `CharIndices` are
+     internal: `Str`'s methods return them as `implement Iterator<...>`,
+     and `String` reads them through `Str` by `Deref`, so no public
+     signature names them.  `Str`'s `set_bytes` and `set_length` are
+     internal, the setters `String` and `PathBuf` keep their views in
+     step with their storage through; the
      UTF-8 decoding step `decode_scalar`, its `REPLACEMENT_SCALAR` and the
-     integer parser's `I64_MIN_MAGNITUDE` are private.  `SliceIter` is
+     integer parser's `I64_MIN_MAGNITUDE` are private.  `SliceIterator` is
      internal: `Slice` and `Array` both make one and no public signature
      names it.  `Path`'s syntax constants are private and its static
-     queries (`is_separator`, `root_len`, `is_absolute_str`,
+     queries (`is_separator`, `root_length`, `is_absolute_str`,
      `last_separator`) public.  Base64 looks its alphabet up by indexing
      a `Slice`, its own byte readers deleted.  (delegated)
 
@@ -798,13 +837,13 @@ yet is recorded with the change that builds it, not here.
      maps a Winsock code on every target, as `from_windows_error` maps a
      system code, so the `WSAE*` codes it reads are declared on every
      target; the network layer's own mapper is deleted.  `Array<u8>`
-     implements `FmtWrite`, appending the text's bytes, and `IoError`
-     converts from `FmtError` (its I/O error, or the allocation failure),
+     implements `FormatWrite`, appending the text's bytes, and `IoError`
+     converts from `FormatError` (its I/O error, or the allocation failure),
      so the HTTP status line is written with `write(f"...")` and `?`, and
      HTTP/2's `:status` and both `set_body`s' Content-Length are formatted
      into a byte array, panicking where the array cannot grow.  (Jake for
-     `over`, `from_wsa` and the `FmtWrite` impl; `position`, the
-     `From<FmtError>` conversion and the ungated codes delegated)
+     `over`, `from_wsa` and the `FormatWrite` impl; `position`, the
+     `From<FormatError>` conversion and the ungated codes delegated)
 
 616. **A `where` bound may be written on any type.**  A bound's subject is
      a written type, stamped and resolved like every annotation: a
@@ -904,7 +943,7 @@ yet is recorded with the change that builds it, not here.
 
 622. **One mutex, one condition variable, one thread creator.**  The
      executor, the reactor, the blocking pool and `mpsc` hold their
-     locks as `sync::Mutex` and `sync::CondVar` and start their threads
+     locks as `sync::Mutex` and `sync::ConditionVariable` and start their threads
      through `std::thread` (`Scope`, or `try_spawn` where a refused
      thread is not fatal), with no per-OS copy of their own; a module
      whose own type shares a name with one of `thread`'s imports it
@@ -939,12 +978,12 @@ yet is recorded with the change that builds it, not here.
      `Mutex<()>`.  Behaviour is unchanged.  (Jake)
 
 625. **One non-blocking switch, one borrowed reader.**
-     `io::fd::set_nonblocking(fd, on)` turns a descriptor's
+     `io::file_descriptor::set_nonblocking(fd, on)` turns a descriptor's
      non-blocking mode on or off, keeping its other file-status flags,
      and returns the OS error on failure; on Windows a C runtime
      descriptor has no such mode and the call fails with `Unsupported`.
      `net::sys`'s POSIX switch delegates to it, and the process module's
-     two copies are gone.  `io::fd::BorrowedFileDescriptor` reads a
+     two copies are gone.  `io::file_descriptor::BorrowedFileDescriptor` reads a
      descriptor it does not own - dropping it closes nothing - through
      `Read`, so a drain is `read_to_end`: to EOF for a blocking pipe, and
      to `WouldBlock` for a non-blocking one, with every byte read before
@@ -953,15 +992,15 @@ yet is recorded with the change that builds it, not here.
      drain whose buffer cannot grow now reports `OutOfMemory` rather
      than stopping the process.  (Jake)
 
-626. **Time converts one way.**  `Duration.as_millis_ceil()` is the
+626. **Time converts one way.**  `Duration.as_milliseconds_ceiling()` is the
      whole milliseconds a span takes, a partial one rounded up so a wait
      never ends early, saturating at `u64::MAX`; Windows' `Sleep` and the
      reactor's wait timeout both round through it.
      `Instant.saturating_add(dur)` is `checked_add` that answers the
-     latest reading instead of `None`, and `Instant.as_nanos()` saturates
+     latest reading instead of `None`, and `Instant.as_nanoseconds()` saturates
      at `i64::MAX`, so a timer's deadline for an over-long sleep lies in
      the far future instead of wrapping into the past.
-     `thread::sleep(nanos)` is `time::clock::sleep` and has no copy of
+     `thread::sleep(duration)` is `time::clock::sleep` and has no copy of
      its own, which also leaves `clock`'s POSIX sleep the only
      `Duration`-to-`timespec` conversion, so it needs none named.
      `SystemTime::from_filetime` (internal) is the one `FILETIME`
@@ -1019,24 +1058,24 @@ yet is recorded with the change that builds it, not here.
      type is written `private`.  (Jake; each split delegated)
 
 631. **`thread` and `fmt` are marked.**  Spawning (`spawn`,
-     `spawn_with_attr`, `try_spawn`, `Builder`, `Scope`), `JoinHandle`,
+     `spawn_with_attributes`, `try_spawn`, `Builder`, `Scope`), `JoinHandle`,
      `ThreadId`, `Thread`, `ThreadLocal`, the scheduling calls and
      `MAX_THREAD_NAME`, the cap `Builder.name` truncates to, are public;
      every handle's OS id and shared block, `ThreadId`'s word (it is
      opaque, compared through `equals`), the result block, the start
      payloads, their trampolines and the detached-thread reaper are
      private.  `fmt`'s print calls, `Formatter` (its writer private behind
-     `get_writer`), `Display`, `Debug`, `FmtWrite`, `FmtError`,
+     `get_writer`), `Display`, `Debug`, `FormatWrite`, `FormatError`,
      `Arguments`, `parse_f64` and the to-string calls are public.  The
      f-string `String` builders are internal language items, as the pieces
-     builders are.  `fmt::spec` is the f-string spec's plumbing: what the
+     builders are.  `fmt::specification` is the f-string spec's plumbing: what the
      spec piece calls is internal, the rest private.  (Jake; each split
      delegated)
 
 632. **`io` and `fs` are marked.**  The I/O traits, `SeekFrom`, the
      buffered readers and writers, `Cursor`, the standard streams with
-     their locks, `is_tty`, the descriptor numbers and calls of
-     `io::fd`, the newline constants, `read_dir`, the directory and file
+     their locks, `is_terminal`, the descriptor numbers and calls of
+     `io::file_descriptor`, the newline constants, `read_dir`, the directory and file
      calls, `DirEntry`, `ReadDir`, `OpenOptions` and `File` are public,
      and so are the default buffer size, file mode and directory mode.
      `Transfer` keeps public fields, since every `AsyncTransport`
@@ -1064,7 +1103,7 @@ yet is recorded with the change that builds it, not here.
      delegated)
 
 634. **`process` is marked.**  `Command`, `Stdio`, `Output`, `Child`,
-     its pipe handles with `from_fd`, `ExitStatus`'s methods, `SigNo`,
+     its pipe handles with `from_file_descriptor`, `ExitStatus`'s methods, `SignalNumber`,
      `Signal` and `id` are public.  A command's settings, an output's
      captures and a signal's number are private behind their methods.
      The spawn, pipe, environment and command-line steps, the Windows
@@ -1102,17 +1141,17 @@ yet is recorded with the change that builds it, not here.
      `get_bucket` hands to a caller walking a map in place.  The sizes an
      array, a string and a map start with, the sort steps, the per-process
      seed generator, a map's seeded hashing and its node allocation are
-     private, while `hash_str` and `hash_int` stay public.  The iterator
-     adapters are private, with `KeysRefIter` internal for the set built
-     on it; `copied` and `cloned`, reached through `iter_ref`'s opaque
-     result, are public.  `HashMapIter` is not marked: the compiler names
-     it.  JSON reads its arrays through `get_ref` and indexing, and the
+     private, while `hash_str` and `hash_integer` stay public.  The iterator
+     adapters are private, with `KeysReferenceIterator` internal for the set built
+     on it; `copied` and `cloned`, reached through `iterate_references`'s opaque
+     result, are public.  `HashMapIterator` is not marked: the compiler names
+     it.  JSON reads its arrays through `get_reference` and indexing, and the
      adapters' unused constructors are gone.  (Jake; each split
      delegated)
 
 637. **`test` is marked.**  The assertions, `TestError` with its
      constructors and `message_str`, `Fixture` and the table-case
-     prefixes are public; the step `expect_eq` and `expect_ne` share to
+     prefixes are public; the step `expect_equal` and `expect_not_equal` share to
      build their message is private.  `TestDescriptor`, whose layout the
      generated test main fills, and `run_all`, the entry it calls, are
      internal language items, as the entry point's are.  Everything else
@@ -1125,17 +1164,17 @@ yet is recorded with the change that builds it, not here.
      `Ordering`, `min`, `max`, `clamp`, the conversion traits,
      `ConversionError`, the hashers, the FNV parameters and `digest`,
      `Iterator` with its adapters, `mem`'s calls, the operator traits,
-     `Range` and `RangeInclusive`, `Option`, `Result`, `PanicInfo`,
-     `catch_unwind`, `drop_in_place`, `NonNull`, `VaArg` and `VaArgs` are
+     `Range` and `RangeInclusive`, `Option`, `Result`, `PanicInformation`,
+     `catch_unwind`, `drop_in_place`, `NonNull`, `VariadicArgument` and `VariadicArguments` are
      public with their methods.  An adapter is named by the `Iterator`
      method that builds it, so it stays public, with its state private
      and its constructor public, since the trait's default bodies call it
-     from the implementing type's module.  `PanicInfo` and a range's
+     from the implementing type's module.  `PanicInformation` and a range's
      bounds stay public fields, as plain data.  A hasher's running state,
      a conversion error's reason, a pointer's address in `NonNull` and
-     `VaArgs`, and an inclusive range's exhaustion flag are private behind
+     `VariadicArguments`, and an inclusive range's exhaustion flag are private behind
      accessors, and the unwinding catch's trampoline and its context are
-     private.  `taken_panic_info`, the executor's read of a panic its
+     private.  `taken_panic_information`, the executor's read of a panic its
      `try_catch` caught, is left with `intrinsics`.  (Jake; each split
      delegated)
 
@@ -1172,16 +1211,16 @@ yet is recorded with the change that builds it, not here.
      are private behind its accessors, and `decode_wstatus` is private
      to POSIX.  (Jake; the variant's and the parameter's names delegated)
 
-641. **`HashMapIter` is internal.**  It is reached only through
+641. **`HashMapIterator` is internal.**  It is reached only through
      `HashMap::iter`'s opaque `implement Iterator<Pair<K, V>>`, like the
      other adapters, and stays internal rather than private because
-     `HashSetIter` holds one.  The compiler holds those iterators as
+     `HashSetIterator` holds one.  The compiler holds those iterators as
      `implement Iterator<Pair<K, V>>` locals.  (Jake)
 
 642. **The intrinsics and the primitives are marked.**  Every intrinsic is
      public: they are the language's primitive operations, the
      allocation, bit, atomic, float, trap, unwinding, directory-entry and
-     variadic ones alike.  `taken_panic_info` is public beside
+     variadic ones alike.  `taken_panic_information` is public beside
      `try_catch`, as the way a caller catching through it reads the
      payload.  The primitives' constants and methods are public, but for
      the digit-table step behind the integers' hex writers
@@ -1191,7 +1230,7 @@ yet is recorded with the change that builds it, not here.
 
 643. **`hash_str` is gone.**  A string's hash is `core::hash::digest`,
      which `hash_str` only delegated to; the compiler's resolution map and
-     the LSP's diagnostic ids call `digest` directly.  `hash_int` stays
+     the LSP's diagnostic ids call `digest` directly.  `hash_integer` stays
      public.  (Jake)
 
 644. **The compiler and the LSP classify bytes and read numbers through the
@@ -1215,7 +1254,7 @@ yet is recorded with the change that builds it, not here.
 
 645. **The compiler and the LSP split names and join paths through the
      standard library.**  A qualified name's head, leaf, parent and segment
-     count are `string.find`, `rfind`, `substr` and `Str.split`;
+     count are `string.find`, `find_last`, `substring` and `Str.split`;
      `QualifiedName::leaf_of` is the one leaf operation, which bindgen and
      completion use too.  `::` becomes `/` by `string.replace`, a name's
      segments are `string.split_nonempty` or `Str.split`, and a module's
@@ -1333,7 +1372,7 @@ yet is recorded with the change that builds it, not here.
      per target, to the first trait argument its where-clause found, and
      every call ran that copy.  A parameter a method names only in its
      return, or that no method names, keeps the binding the where-clause
-     derives (`A` in `Iterator<A> for TakeIter<I> where I: Iterator<A>`).
+     derives (`A` in `Iterator<A> for TakeIterator<I> where I: Iterator<A>`).
      The trait's declaration of the method writes none of these, so the
      method still conforms.  A generic enum's static method with type
      parameters of its own is resolved through its path as a struct's
@@ -1388,7 +1427,7 @@ yet is recorded with the change that builds it, not here.
      arguments, and any trait on an object, is still asked of the type
      alone.  Head arguments are compared as the types they denote: one a
      head leaves to its parameter's default is that default (`Array<u8>`
-     unifies with `[u8]`, `Array<u8, GlobalAlloc>`), and a name the
+     unifies with `[u8]`, `Array<u8, GlobalAllocator>`), and a name the
      compiler wrote with its type already attached is compared as that
      type.  An implementation's where-clause is checked the same way
      (660).  (the regression fix delegated)
@@ -1438,7 +1477,7 @@ yet is recorded with the change that builds it, not here.
 
 662. **No `ffi::cstr`; a chunked request is 501.**  The standard library
      has no `CStr`/`CString`/`NulError`: a C string is a `string`, read
-     with `Str::new` and made with `String::with_null` / `as_cstr`, and
+     with `Str::new` and made with `String::with_null` / `as_c_string`, and
      the specification no longer promises the module.  The HTTP/1 server
      answers a first request framed by `Transfer-Encoding`, which it reads
      but does not implement, with 501 Not Implemented; any other first
@@ -1452,8 +1491,8 @@ yet is recorded with the change that builds it, not here.
      private to `alloc::arc`, and the executor holds its tasks through
      `Arc`'s raw API alone.  `Rc` has no raw API, so nothing changes
      there.  `datetime`'s seconds per day, hour and minute are private to
-     it, and `Duration` has public `SECS_PER_MINUTE`, `SECS_PER_HOUR` and
-     `SECS_PER_DAY` beside `NANOS_PER_SEC`.  The `public`, `internal` and
+     it, and `Duration` has public `SECONDS_PER_MINUTE`, `SECONDS_PER_HOUR` and
+     `SECONDS_PER_DAY` beside `NANOSECONDS_PER_SECOND`.  The `public`, `internal` and
      `private` keywords on an `extern` block stay the block's default, as
      593 built.  (Jake)
 
@@ -1462,13 +1501,13 @@ yet is recorded with the change that builds it, not here.
      few functions that exist only to implement another one there (the
      Winsock error normaliser, the connect-status probe behind
      `os_connect_status`, the timeout packer) are private.  In
-     `net::addr`, `dns` and `http`, plain records keep public fields
-     (`IpV4Addr`, `SocketAddr`, `Url`, `Request`, `Response`); a type
+     `net::address`, `dns` and `http`, plain records keep public fields
+     (`IpV4Address`, `SocketAddress`, `Url`, `Request`, `Response`); a type
      that guards state keeps it private behind its methods
-     (`ResolvedAddrs`, `Resolve`, `Router`, `HttpServer`, `StatusCode`);
+     (`ResolvedAddresses`, `Resolve`, `Router`, `HttpServer`, `StatusCode`);
      parse steps, formatting steps and the URL parser's byte constants
      are private; the limits and defaults a program may name
-     (`HTTP_VERSION`, `MAX_BODY`, `DEFAULT_READ_TIMEOUT_SECS`, ...) are
+     (`HTTP_VERSION`, `MAX_BODY`, `DEFAULT_READ_TIMEOUT_SECONDS`, ...) are
      public.  (Jake for `net::sys`; the rest delegated under 587)
 
 ### 2026-10-25
@@ -1488,7 +1527,7 @@ yet is recorded with the change that builds it, not here.
      arena's routing calls are internal.**  `arena::DEFAULT_CHUNK_SIZE`
      and `pool::DEFAULT_SLOTS_PER_BLOCK` are the sizes `Arena::new` and
      `Pool::new` choose, and a program may name them.  `GlobalArena`'s
-     `routing`, `take`, `holds` and `grow` are how `GlobalAlloc` serves
+     `routing`, `take`, `holds` and `grow` are how `GlobalAllocator` serves
      and releases a block from the published arena, and reach the
      standard library alone; `publish` and `set_active` stay public.
      The C bindings of `libc`, `syscall` and `openssl` are each a
@@ -1498,7 +1537,7 @@ yet is recorded with the change that builds it, not here.
 
 595. **A `Duration`, an `Instant` and a `SystemTime` are read through
      their accessors.**  Their seconds and nanoseconds are private fields
-     behind `as_secs`, `subsec_nanos`, `as_nanos` and `unix_secs`, so the
+     behind `as_seconds`, `subsecond_nanoseconds`, `as_nanoseconds` and `unix_seconds`, so the
      library's own clocks and timers call those; `Duration`'s unit
      constants stay public, and the clocks' conversion constants and the
      calendar algorithm's are private.  A `DateTime`'s fields are its
@@ -1572,9 +1611,9 @@ yet is recorded with the change that builds it, not here.
      allocator `NativeHeap`;** this replaces 587 for both.  The reactor
      and everything in it reach the standard library alone, as before
      587.  `alloc::heap` is a public module whose public item is
-     `NativeHeap`, a type implementing `Allocator` like `GlobalAlloc`, so
+     `NativeHeap`, a type implementing `Allocator` like `GlobalAllocator`, so
      `Array<T, NativeHeap>` keeps its storage on the mmap-backed heap
-     whatever `GlobalAlloc` is backed by; the raw `alloc`, `free` and
+     whatever `GlobalAllocator` is backed by; the raw `alloc`, `free` and
      `realloc` stay internal and the segment and lock machinery private.
      (Jake; the name `NativeHeap`, delegated)
 
@@ -1590,15 +1629,15 @@ yet is recorded with the change that builds it, not here.
      generic type over its own parameters, an `implement` block's target
      as its head writes it.  The owner's bare name denoted the defaults'
      instantiation when every parameter of the owner has a default, so
-     each method of `String<A = GlobalAlloc>` and of `implement<A> trait
-     Eq for String<A>` was a method of `String<GlobalAlloc>` alone, and
+     each method of `String<A = GlobalAllocator>` and of `implement<A> trait
+     Eq for String<A>` was a method of `String<GlobalAllocator>` alone, and
      `String<NativeHeap>` had none.  (Jake asked for the fix; the rule
      follows from 98's `This` naming the enclosing type)
 
 592. **A `Box` is made only by its constructors, and gives its pointer up
      only through `into_raw`.**  Its pointer and allocator are private
      fields; `Box::from_raw_in(ptr, alloc)` re-wraps a pointer from a box
-     on any allocator, as `from_raw` does for `GlobalAlloc`'s, and `leak`,
+     on any allocator, as `from_raw` does for `GlobalAllocator`'s, and `leak`,
      which did what `into_raw` does, is gone.  `next_capacity`, the growth
      curve `Array` and `RawBuffer` share, is internal; the allocator's
      platform calls are private to it; `Rc`, `Arc`, `Weak`, `Arena` and
@@ -1610,7 +1649,7 @@ yet is recorded with the change that builds it, not here.
 575. **Every length, position and size in the standard library is an
      `i64`.**  `length()`, `capacity()`, `find`, `index_of` and
      `Iterator::count` answer one, and `get`, `set`, `insert`, `remove`,
-     `sub_bytes`, `subslice`, `truncate`, `reserve`, `with_capacity`,
+     `byte_substring`, `subslice`, `truncate`, `reserve`, `with_capacity`,
      `take`, `skip` and their kind take one, so a position found by one
      call is passed to the next with no cast.  This answers the question
      ruling 574 left open.  The checking cost of reaching a length through
@@ -1619,9 +1658,9 @@ yet is recorded with the change that builds it, not here.
 
 576. **A negative length or position means what the method's kind says,
      never a huge unsigned one.**  A lookup that answers `Option` (`get`,
-     `get_ref`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`; a
+     `get_reference`, `byte_at`, `at`, `key_at`, `value_at`) answers `None`; a
      method that writes or cuts at a position (`set`, `insert`, `remove`,
-     `swap_remove`, `sub_bytes`, `subslice`) panics "out of range";
+     `swap_remove`, `byte_substring`, `subslice`) panics "out of range";
      `truncate` and `resize` panic "negative length"; `reserve`,
      `reserve_exact` and `with_capacity` treat zero or less as nothing to
      do; `take` of a negative count yields nothing and `skip` of one skips
@@ -1881,7 +1920,7 @@ yet is recorded with the change that builds it, not here.
      address.  (Jake)
 
 512. **The float types' limits are constants** - `EPSILON`, `MAX`, `MIN`,
-     `MIN_POSITIVE`, `INFINITY`, `NEG_INFINITY` and `NAN` on `f32` and
+     `MIN_POSITIVE`, `INFINITY`, `NEGATIVE_INFINITY` and `NAN` on `f32` and
      `f64`.  `math::F64_*` and `math::F32_*`, and `math::infinity()`,
      `math::neg_infinity()` and `math::nan()`, are removed and their
      callers moved to the constants.  `math::PI` and the other
@@ -2453,7 +2492,7 @@ yet is recorded with the change that builds it, not here.
      &Iterator<i32>`.  (Jake, on the trait-object audit)
 
 423. **Printing goes through objects by a non-generic formatting method**
-     taking a `virtual mut &FmtWrite` formatter, added in the standard
+     taking a `virtual mut &FormatWrite` formatter, added in the standard
      library's visibility pass.  (Jake, on the trait-object audit)
 
 424. **A trait that declares two methods with the same name is refused**
@@ -2530,7 +2569,7 @@ yet is recorded with the change that builds it, not here.
 
 380. **The demangler prints the full `Array<...>` type a `[T]` symbol
      names** - `std::collections::array::Array<i64,
-     std::alloc::allocator::GlobalAlloc>` - rather than sugaring it back to
+     std::alloc::allocator::GlobalAllocator>` - rather than sugaring it back to
      `[i64]`.  (Dispatch, delegated)
 
 381. **A call-site argument error spells a dynamic array `[T]`;** only
@@ -3640,7 +3679,7 @@ check is being deleted and the seals are what hold.  (Jake)
      counted.
 
 156. **Ruling 73's help names the pointer as written**: `(*q).drop()` gets
-     "use `std::core::ptr::drop_in_place(q)`", not a literal `p`.
+     "use `std::core::pointer::drop_in_place(q)`", not a literal `p`.
 
 157. **Store #2's leftover name-keyed instance registration is finished
      together with store #4.**
@@ -3986,8 +4025,8 @@ check is being deleted and the seals are what hold.  (Jake)
 ### 2026-10-02
 
 80. **The internal check after monomorphization names the specialization's
-    owner by its short display name** (`SliceIter<u8>`), as in "internal:
-    call to `next` in `SliceIter<u8>::for_each` reached codegen with no
+    owner by its short display name** (`SliceIterator<u8>`), as in "internal:
+    call to `next` in `SliceIterator<u8>::for_each` reached codegen with no
     resolved method (written at iter.cryo:74)". The lane gate's ARENA_READ
     count rising by one for that rendering is accepted.
 
@@ -4073,7 +4112,7 @@ check is being deleted and the seals are what hold.  (Jake)
     (ruling 18). The test's expected output changes in the same commit.
 
 94. **The help on a `Copy`-gated method's bound error is correct for the
-    method it names.** "borrow the element in place with `get_ref` instead
+    method it names.** "borrow the element in place with `get_reference` instead
     of copying it out with `append`" is wrong advice for `append`.
 
 ### 2026-10-01
@@ -4084,7 +4123,7 @@ check is being deleted and the seals are what hold.  (Jake)
 
 71. **The internal check after monomorphization uses plain wording** that
     names the method, the specialization and the template call site:
-    "internal: call to `push` in `String<GlobalAlloc>::from_str` reached
+    "internal: call to `push` in `String<GlobalAllocator>::from_str` reached
     codegen with no resolved method (written at string.cryo:120)".
 
 72. **The temporary identity-first, by-name fallback for the calls whose
@@ -4092,7 +4131,7 @@ check is being deleted and the seals are what hold.  (Jake)
     fix**, which must remove it before the by-name finders are deleted.
 
 73. **E0358 on `(*p).drop()` gets a help of its own**: "use
-    `std::core::ptr::drop_in_place(p)`".
+    `std::core::pointer::drop_in_place(p)`".
 
 74. **The spelling-flow entry for `IntrinsicKind::from_name` is accepted.**
 
@@ -4256,7 +4295,13 @@ check is being deleted and the seals are what hold.  (Jake)
 
 58. **Whole-module aliases work.** `import M as N;` binds `N` to the
     module's identity, and `N::f()`, `N::Type` and the rest resolve in that
-    module.
+    module.  The alias is the module's only name there: its own leaf binds
+    nothing, so `Json::twice` below is a module the file does not import
+    (E0240), and a second module whose leaf is `Json`, imported under its
+    own name, is the only one `Json` names.  Another import of the same
+    module that is not aliased binds the leaf again.  The E0240 a path
+    through the leaf gets carries a note naming the alias the file imports
+    the module under.  (Jake)
 
     ```cryo
     import Json as J;
@@ -4447,23 +4492,23 @@ check is being deleted and the seals are what hold.  (Jake)
     ```
 
 14. **The drop-in-place intrinsic is `drop_in_place<T>(p: T*)` in a new
-    module `std::core::ptr`**, beside the pointer operations. It does not go in
+    module `std::core::pointer`**, beside the pointer operations. It does not go in
     `std::core::intrinsics`. This names the intrinsic ruling 7 left
     unnamed.
 
     ```cryo
-    import std::core::ptr;
+    import std::core::pointer;
     function release<T>(p: T*) -> void {
-        ptr::drop_in_place::<T>(p);
+        pointer::drop_in_place::<T>(p);
     }
     ```
 
-15. **`BufStream::drop`'s explicit `this.inner.drop()` is deleted**; the
+15. **`BufferedStream::drop`'s explicit `this.inner.drop()` is deleted**; the
     field glue releases `inner` after the body. Explicit drop calls already
     warn, and they become an error at the v1.0 freeze.
 
     ```cryo
-    implement<S> Drop for BufStream<S> {
+    implement<S> Drop for BufferedStream<S> {
         drop(mut &this) -> void {
             this.inner.drop();   // deleted: `inner` is released by field glue
         }
@@ -4500,7 +4545,7 @@ check is being deleted and the seals are what hold.  (Jake)
     is accepted**: both of its runs compile against the working tree's
     standard library. A library change that alters behaviour is proven by a
     test project of its own, the way a counting transport proves that a
-    `BufStream` releases what it wraps once. verify is not extended.
+    `BufferedStream` releases what it wraps once. verify is not extended.
 
 21. *Superseded by ruling 22 the same day.* **A generic inherent method and
     a non-generic trait method of the same name that both apply to a call
@@ -4601,8 +4646,8 @@ check is being deleted and the seals are what hold.  (Jake)
     wins" rule; the call names the trait it means.
 
     ```cryo
-    implement trait Debug for struct String<GlobalAlloc> {
-        fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError> where W: FmtWrite {
+    implement trait Debug for struct String<GlobalAllocator> {
+        fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FormatError> where W: FormatWrite {
             const view: Str = this.as_str();
             return view.fmt(f);                    // error[E0156]: Display::fmt and Debug::fmt
             return (Debug for Str)::fmt(&view, f); // the one meant
@@ -4709,7 +4754,7 @@ dropped or deferred says so; a deferred one is listed in
 - **D16.** An `implement` head writes every parameter of the template it
   names, as its own parameters or as a concrete instantiation; one left
   out is E0302.  `implement<A> trait Display for String<A>`, or `for
-  String<GlobalAlloc>`.  The concrete spelling is honoured by selection:
+  String<GlobalAllocator>`.  The concrete spelling is honoured by selection:
   `for Wrap<T, Alpha>` is not selected for `Wrap<i32, Beta>`.
 - **D17.** An `extern "C"` function is public unless written `private`.
 - **D18.** The primitive type names stop being keywords, and the alias
@@ -4724,7 +4769,7 @@ dropped or deferred says so; a deferred one is listed in
 - **D21.** An unknown type in expression or type-argument position
   (`sizeof(Nope)`, `1 as Nope`, `String<Nope>`) is an error.  A defaulted
   type parameter resolves in the module where the type is declared, so
-  `String` fills in `GlobalAlloc` without the user importing it; a user who
+  `String` fills in `GlobalAllocator` without the user importing it; a user who
   writes the argument needs it in scope.
 - **D22.** A trait head's trailing type list declares nothing: a name there
   declared nowhere is E0302, and the head is written `implement<T> trait

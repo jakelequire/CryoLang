@@ -22,7 +22,7 @@ namespace compiler::passes::move_check;
 
 import compiler::diag::{ diagnostic, ErrorCode, sink, snapshot, source_span };
 import compiler::ast::{
-    ArgBinding, declaration, expression, node, pattern, PatternBinding, statement
+    ArgBinding, declaration, expression, node, pattern, PatternBinding, statement, TraitBound
 };
 import compiler::lex::{ TokenType };
 import compiler::passes::pass_id::{ PassResult };
@@ -39,6 +39,8 @@ import std::collections::hashmap::{ HashMap };
 import compiler::types::generic::{ InstantiatedType };
 import compiler::types::user_defined::{ StructType };
 import std::fmt;
+import std::fmt::display::{ Display };
+import std::collections::string::{ String };
 import compiler::ast::declaration::{
     DeclarationNode, DestructureBinding, DestructureDecl, FunctionDecl,
     DeclKind, ImplBlock, MethodDecl, StructDecl, UnionDecl,
@@ -59,14 +61,14 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::generic_registry::{ GenericRegistry };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::trait_checker::{ TraitChecker };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import std::core::hash::{ FnvHasher };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 
 
 /// How the value a branching construct yields is used, which decides how
@@ -110,6 +112,21 @@ type enum FieldReadSite {
     MatchSubject;
 }
 
+/// Where a loop is left other than by a `break`, which decides the moved-set
+/// after it: a loop holds what is moved on every path that leaves it.
+type enum LoopExits {
+    /// `while` and `for`: the condition is tested before the body, so the
+    /// loop may be left before the body runs at all, with the moved-set it
+    /// began with.
+    BeforeBody;
+    /// `do-while`: the condition is tested after the body, which therefore
+    /// runs at least once; the loop is left with the moved-set its condition
+    /// ends with.
+    AfterBody;
+    /// `loop`: left by a `break` alone.
+    BreakOnly;
+}
+
 /// A binding declared outside a loop that was moved on a path leaving the
 /// loop's body through a `break` or a `continue`.
 type struct LoopExitMove {
@@ -124,6 +141,15 @@ type struct MoveChecker {
     registry: GenericRegistry*;
     intern:   mut InternTable*;
 
+    /// The type parameters the bounds of the declaration whose methods are
+    /// walked make `Copy` (the owner's `where` clause, an implementation's).
+    owner_copy_params: [SymbolID];
+
+    /// The type parameters the bounds in scope of the function being
+    /// walked make `Copy`: the owner's, and the function's own `where`
+    /// clause, which may bound the owner's parameters too.
+    copy_params: [SymbolID];
+
     /// Per-binding type info: the binding's identity -> resolved TypeRef.
     /// Reset on enter_function. Identifier-uses whose binding is absent from
     /// this map are skipped; that's how globals, function names and other
@@ -133,7 +159,7 @@ type struct MoveChecker {
     /// one function may share a spelling - an inner block's declaration
     /// shadows an outer one - and a spelling key gives them one slot, so a
     /// move recorded against either is read back against both.
-    types: HashMap<SymbolKey, TypeRef, GlobalAlloc, FnvHasher>;
+    types: HashMap<SymbolKey, TypeRef, GlobalAllocator, FnvHasher>;
 
     /// Set of bindings currently in the Moved state, encoded as a
     /// (key, span) parallel-array stack rather than a HashMap so
@@ -225,6 +251,21 @@ type struct MoveChecker {
     pm_field:   [u32];
     pm_site:    [SourceSpan];
 
+    /// The bindings of the function being walked that were declared without
+    /// a value, and where.  Each enters the moved-set at its declaration, so
+    /// the joins that answer "moved on some path" answer "not initialised on
+    /// some path" for it, and a use that finds the declaration's own entry
+    /// there is a use before initialisation (E0219).
+    uninitialised_keys:  [u64];
+    uninitialised_spans: [SourceSpan];
+    /// The direct members - fields and constant-index slots - assigned
+    /// unconditionally to a binding declared without a value, as parallel
+    /// arrays: the binding, and the member as `kind << 32 | key` of its
+    /// `ExpressionNode::place_chain`.  Once every member has been, the
+    /// binding holds a whole value.
+    assigned_member_keys: [u64];
+    assigned_members:     [u64];
+
     /// Depth of enclosing `unsafe` blocks.
     ///
     /// `unsafe` does NOT turn the pass off - a use-after-move is a
@@ -284,12 +325,6 @@ type struct MoveChecker {
     /// releases it twice (`check_destructor_field_move_out`).
     drop_receiver: SymbolID;
 
-    /// The receiver of the function being walked when that function is a
-    /// method marked `![sink]`, invalid otherwise: such a method owns its
-    /// receiver although it is written `&this` or `mut &this`, so reading it
-    /// whole is a transfer (`check_reference_binding_move_out`).
-    consumed_receiver: SymbolID;
-
     /// The bindings of the function being walked that name a closure's
     /// captures inside its `__call__`.  The closure keeps - or borrows - each
     /// for every call, so none may be moved out (`emit_capture_move_out`).
@@ -338,7 +373,9 @@ type struct MoveChecker {
             arena:    ctx.type_arena,
             registry: ctx.generic_registry,
             intern:   ctx.get_intern_table(),
-            types:       HashMap::<SymbolKey, TypeRef, GlobalAlloc, FnvHasher>::new(),
+            owner_copy_params: [],
+            copy_params:       [],
+            types:       HashMap::<SymbolKey, TypeRef, GlobalAllocator, FnvHasher>::new(),
             moved_keys:  [],
             moved_spans: [],
             polled_keys:  [],
@@ -355,12 +392,15 @@ type struct MoveChecker {
             pm_binding:         [],
             pm_field:           [],
             pm_site:            [],
+            uninitialised_keys:  [],
+            uninitialised_spans: [],
+            assigned_member_keys: [],
+            assigned_members:     [],
             branch_depth:       0,
             loop_repeat:        false,
             unsafe_depth:        0,
             arg_binding_unknown: false,
             drop_receiver:       SymbolID::invalid(),
-            consumed_receiver:   SymbolID::invalid(),
             capture_alias_keys:    [],
             borrow_closures:       [],
             borrow_keys:           [],
@@ -377,9 +417,17 @@ type struct MoveChecker {
         };
     }
 
-    enter_function(mut &this, func_decl: DeclarationNode*, receiver_consumed: boolean) -> void {
+    enter_function(mut &this, func_decl: DeclarationNode*) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
-        this.types       = HashMap::<SymbolKey, TypeRef, GlobalAlloc, FnvHasher>::new();
+        this.copy_params = [];
+        for (mut i: i64 = 0; i < this.owner_copy_params.length(); i++) {
+            this.copy_params.push(this.owner_copy_params[i]);
+        }
+        if (func != null) {
+            const own: [SymbolID] = this.copy_params_of(&func.trait_bounds);
+            for (mut i: i64 = 0; i < own.length(); i++) { this.copy_params.push(own[i]); }
+        }
+        this.types       = HashMap::<SymbolKey, TypeRef, GlobalAllocator, FnvHasher>::new();
         this.moved_keys  = [];
         this.moved_spans = [];
         this.polled_keys  = [];
@@ -396,12 +444,15 @@ type struct MoveChecker {
         this.pm_binding         = [];
         this.pm_field           = [];
         this.pm_site            = [];
+        this.uninitialised_keys  = [];
+        this.uninitialised_spans = [];
+        this.assigned_member_keys = [];
+        this.assigned_members     = [];
         this.branch_depth       = 0;
         this.loop_repeat        = false;
         this.unsafe_depth       = 0;
         this.arg_binding_unknown = false;
         this.drop_receiver       = SymbolID::invalid();
-        this.consumed_receiver   = SymbolID::invalid();
         this.capture_alias_keys    = [];
         this.borrow_closures       = [];
         this.borrow_keys           = [];
@@ -420,7 +471,6 @@ type struct MoveChecker {
             if (param == null) { continue; }
             this.register_binding(param.sym_id, param.resolved_type, param.name, param_decl.span);
             if (is_destructor && param.is_receiver()) { this.drop_receiver = param.sym_id; }
-            if (receiver_consumed && param.is_receiver()) { this.consumed_receiver = param.sym_id; }
         }
     }
 
@@ -562,7 +612,35 @@ type struct MoveChecker {
     }
 
     is_copy(&this, ty: TypeRef) -> boolean {
-        return OwnershipQuery::is_copy(this.arena, this.registry, this.intern, ty);
+        return OwnershipQuery::is_copy_given(this.arena, this.registry, this.intern, ty, &this.copy_params);
+    }
+
+    /// The type parameters `bounds`, written on the declaration whose
+    /// methods are about to be walked, make `Copy`, added to the owner's.
+    push_owner_copy_params(mut &this, bounds: &[TraitBound]) -> void {
+        const own: [SymbolID] = this.copy_params_of(bounds);
+        for (mut i: i64 = 0; i < own.length(); i++) { this.owner_copy_params.push(own[i]); }
+    }
+
+    /// The type parameters `bounds` make `Copy`, each one a bound names with
+    /// `Copy` or with a trait `Copy` is a supertrait of.
+    copy_params_of(&this, bounds: &[TraitBound]) -> [SymbolID] {
+        mut out: [SymbolID] = [];
+        const copy_id: DefId = this.registry.wellknown(LangItem::Copy);
+        if (!copy_id.is_valid()) { return out; }
+        for (mut i: i64 = 0; i < bounds.length(); i++) {
+            const b: const TraitBound* = &bounds[i];
+            if (b.has_projection_subject() || !b.subject_param().is_valid()) { continue; }
+            for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
+                const chain: [DefId] = this.registry.trait_and_supertraits(b.trait_refs[ti].definition());
+                mut gives: boolean = false;
+                for (mut k: i64 = 0; k < chain.length(); k++) {
+                    if (chain[k].equals(copy_id)) { gives = true; }
+                }
+                if (gives) { out.push(b.subject_param()); }
+            }
+        }
+        return out;
     }
 
     /// Whether a value of this type owns a resource that the callee's
@@ -614,7 +692,7 @@ type struct MoveChecker {
         if (t == null) { return false; }
         if (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference) { return false; }
         mut checker: TraitChecker = TraitChecker::new(
-            this.arena, this.registry, this.intern, this.ctx.diagnostics);
+            this.arena, this.registry, this.intern, this.ctx.diagnostics, this.ctx.type_resolver);
         return checker.type_implements_trait(
             ty, this.ctx.generic_registry.wellknown(LangItem::Future), 0);
     }
@@ -638,9 +716,9 @@ type struct MoveChecker {
     /// storage, so moving it now leaves that pointer naming the old bytes.
     emit_moved_after_poll(mut &this, name: SymbolStr, sym: SymbolID,
                           move_span: SourceSpan) -> void {
-        const headline: string = fmt::format(
+        const headline: String = fmt::format(
             "future `%s` is moved after it has been polled",
-            this.intern.resolve(name)).into_raw();
+            this.intern.resolve(name));
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0459_MOVED_AFTER_POLL, headline);
         diag = diag.at_with_label(move_span, "moved here");
@@ -1051,9 +1129,9 @@ type struct MoveChecker {
     /// the same allocation - a double free.  The pass is fatal_on_failure,
     /// so a non-zero `fatal` aborts the pipeline before codegen and the
     /// unsound binary is never emitted.
-    emit_use_after_move(mut &this, code: ErrorCode, headline_text: string,
-                        use_span: SourceSpan, move_span: SourceSpan, value_type: TypeRef) -> void {
-        mut diag: Diagnostic = Diagnostic::error(code, headline_text);
+    emit_use_after_move<T>(mut &this, code: ErrorCode, headline: T,
+                        use_span: SourceSpan, move_span: SourceSpan, value_type: TypeRef) -> void where T: Display {
+        mut diag: Diagnostic = Diagnostic::error(code, headline);
         diag = diag.at_with_label(use_span, "value used here after move");
         if (move_span.has_location()) {
             diag = diag.also_at(move_span, "value moved here");
@@ -1079,9 +1157,9 @@ type struct MoveChecker {
         if (!clone_trait.is_valid() || !ty.is_valid() || !moved_at.has_location()) { return diag; }
         const shown: string = this.arena.resolve_display_name_short(ty);
         mut checker: TraitChecker = TraitChecker::new(
-            this.arena, this.registry, this.intern, this.ctx.diagnostics);
+            this.arena, this.registry, this.intern, this.ctx.diagnostics, this.ctx.type_resolver);
         if (checker.type_implements_trait(ty, clone_trait, 0)) {
-            const message: string = fmt::format("`%s` implements `Clone`: move a copy where the value is first moved", shown).into_raw();
+            const message: String = fmt::format("`%s` implements `Clone`: move a copy where the value is first moved", shown);
             if (moved == null || moved.takes_postfix_directly()) {
                 return diag.suggest(Suggestion::machine_applicable(moved_at.end_point(), ".clone()", message));
             }
@@ -1092,9 +1170,65 @@ type struct MoveChecker {
         }
         const is_enum: boolean = this.is_enum(ty);
         if (this.aggregate_type_of(ty) == null && !is_enum) { return diag; }
+        const kind: string = if (is_enum) { "enum" } else { "struct" };
+        const base: TypeRef = this.arena.inst_generic_base(ty);
+        if (!base.is_valid()) {
+            return diag.help_with_example(fmt::format(
+                "`%s` does not implement `Clone`; derive it on its declaration, or implement it, to move a copy and keep the original",
+                shown), fmt::format("type %s %s with [Clone] { ... }", kind, shown));
+        }
+        // An implementation of `Clone` written for the generic type that is
+        // for this instance and does not apply is one its bounds refuse: the
+        // instance is `Clone` where the type arguments that lack it are.
+        const heads: [DeclarationNode*] = this.registry.heads_under(clone_trait, base);
+        mut matching: boolean = false;
+        for (mut i: i64 = 0; i < heads.length(); i++) {
+            if (this.registry.head_matches(DeclarationNode::impl_of(heads[i]), ty, this.intern)) { matching = true; }
+        }
+        if (matching) {
+            mut lacking: [TypeRef] = [];
+            for (mut i: i64 = 0; i < this.arena.inst_type_arg_count(ty); i++) {
+                const argument_ty: TypeRef = this.arena.inst_type_arg_at(ty, i);
+                if (!checker.type_implements_trait(argument_ty, clone_trait, 0)) {
+                    lacking.push(argument_ty);
+                }
+            }
+            if (lacking.length() == 0) { return diag; }
+            mut names: String = String::new();
+            for (mut i: i64 = 0; i < lacking.length(); i++) {
+                if (i > 0) { names.push(", "); }
+                names.push("`");
+                names.push(this.arena.resolve_display_name_short(lacking[i]));
+                names.push("`");
+            }
+            const one: boolean = lacking.length() == 1;
+            const verb: string = if (one) { "does" } else { "do" };
+            const declarations: string = if (one) { "its declaration" } else { "their declarations" };
+            const message: String = f"`{shown}` implements `Clone` only where its type arguments do, and {names} {verb} not; derive `Clone` on {declarations}, or implement it, to move a copy and keep the original";
+            const plain_argument: boolean = one
+                && !this.arena.inst_generic_base(lacking[0]).is_valid()
+                && (this.aggregate_type_of(lacking[0]) != null || this.is_enum(lacking[0]));
+            if (!plain_argument) { return diag.help(message); }
+            return diag.help_with_example(message, fmt::format("type %s %s with [Clone] { ... }",
+                if (this.is_enum(lacking[0])) { "enum" } else { "struct" },
+                this.arena.resolve_display_name_short(lacking[0])));
+        }
+        // No implementation at all: the declaration to derive it on is the
+        // generic type's own, written with its parameters.
+        const template: const TemplateEntry* = this.registry.template_of_type(base);
+        if (template == null) { return diag; }
+        const leaf: string = this.intern.resolve(template.leaf_name().spelling());
+        mut declaration: String = String::new();
+        declaration.push(leaf);
+        declaration.push("<");
+        for (mut i: i64 = 0; i < template.param_names.length(); i++) {
+            if (i > 0) { declaration.push(", "); }
+            declaration.push(this.intern.resolve(template.param_names[i]));
+        }
+        declaration.push(">");
         return diag.help_with_example(fmt::format(
-            "`%s` does not implement `Clone`; derive it on its declaration, or implement it, to move a copy and keep the original",
-            shown), fmt::format("type %s %s with [Clone] { ... }", if (is_enum) { "enum" } else { "struct" }, shown).into_raw());
+            "`%s` does not implement `Clone`; derive it on the declaration of `%s`, or implement it, to move a copy and keep the original",
+            shown, leaf), f"type {kind} {declaration} with [Clone] {{ ... }}");
     }
 
     /// Whether `ty`, its instantiations seen through, is an enum.
@@ -1124,9 +1258,8 @@ type struct MoveChecker {
 
     /// As `emit_loop_carried`, for a value named by written text: a field
     /// path such as `h.items`.
-    emit_loop_carried_text(mut &this, name: string, use_span: SourceSpan) -> void {
-        const headline: string = fmt::format(
-            "value `%s` moved inside a loop is used again on the next iteration", name).into_raw();
+    emit_loop_carried_text<T>(mut &this, name: T, use_span: SourceSpan) -> void where T: Display {
+        const headline: String = f"value `{name}` moved inside a loop is used again on the next iteration";
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0452_USE_AFTER_MOVE, headline);
         diag = diag.at_with_label(use_span,
@@ -1149,27 +1282,40 @@ type struct MoveChecker {
     }
 
     walk_top_level(mut &this, stmt: DeclarationNode*) -> void {
+        this.owner_copy_params = [];
         match (stmt.kind) {
             DeclKind::Function(_) => {
-                this.walk_function(stmt, false);
+                this.walk_function(stmt);
             }
             DeclKind::Trait(td) => {
                 for (mut i: i64 = 0; i < td.methods.length(); i++) {
                     const m_decl: DeclarationNode* = td.methods[i];
                     const m: FunctionDecl* = DeclarationNode::fn_of(m_decl);
-                    if (m != null) { this.walk_function(m_decl, false); }
+                    if (m != null) { this.walk_function(m_decl); }
                 }
             }
-            DeclKind::Union(ud) => { this.walk_methods(ud.methods); }
+            DeclKind::Union(ud) => {
+                this.push_owner_copy_params(&ud.where_bounds);
+                this.walk_methods(ud.methods);
+            }
             DeclKind::Struct(sd) => {
                 // The closure of a lambda written in a generic body is a
                 // template whose `__call__` is that lambda's body: part of a
                 // generic body, which is checked in each copy of it, where
                 // its type parameters say what is `Copy`.
                 if (stmt.generated && sd.generic_params.length() > 0) { return; }
+                this.push_owner_copy_params(&sd.where_bounds);
                 this.walk_methods(sd.methods);
             }
-            DeclKind::Impl(ib) => { this.walk_methods(ib.methods); }
+            DeclKind::Impl(ib) => {
+                this.push_owner_copy_params(&ib.where_bounds);
+                const target: const TemplateEntry* = this.registry.template_of(ib.target_def());
+                if (target != null) {
+                    const declared: [TraitBound]* = target.declared_where_bounds();
+                    if (declared != null) { this.push_owner_copy_params(declared); }
+                }
+                this.walk_methods(ib.methods);
+            }
             DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
             | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
             | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
@@ -1182,18 +1328,18 @@ type struct MoveChecker {
             const m_decl: DeclarationNode* = methods[i];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
-            this.walk_function(m.func, m.is_sink);
+            this.walk_function(m.func);
         }
     }
 
-    walk_function(mut &this, func_decl: DeclarationNode*, receiver_consumed: boolean) -> void {
+    walk_function(mut &this, func_decl: DeclarationNode*) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         if (func.is_generic()) { return; }
         if (Log::enabled(LogArea::Drop, LogLevel::Trace)) {
             Log::trace(LogArea::Drop, f"move checking function '{this.intern.resolve(func.name)}'");
         }
-        this.enter_function(func_decl, receiver_consumed);
+        this.enter_function(func_decl);
         this.walk_stmt(func.body);
     }
 
@@ -1319,20 +1465,19 @@ type struct MoveChecker {
             // re-walks it, and a `for`'s update, at the back edge.
             StmtKind::While(w) => {
                 this.walk_condition(w.condition);
-                this.walk_loop_body(w.body, null, w.condition);
+                this.walk_loop_body(w.body, null, w.condition, LoopExits::BeforeBody);
             }
             StmtKind::For(f) => {
                 this.walk_condition(f.condition);
-                this.walk_loop_body(f.body, f.update, f.condition);
+                this.walk_loop_body(f.body, f.update, f.condition, LoopExits::BeforeBody);
             }
             StmtKind::DoWhile(d) => {
                 // The condition is tested after the body, so it runs at
                 // least once and is part of every iteration's back edge.
-                this.walk_loop_body(d.body, null, d.condition);
-                this.walk_condition(d.condition);
+                this.walk_loop_body(d.body, null, d.condition, LoopExits::AfterBody);
             }
             StmtKind::Loop(lp) => {
-                this.walk_loop_body(lp.body, null, null);
+                this.walk_loop_body(lp.body, null, null, LoopExits::BreakOnly);
             }
             StmtKind::Break    => { this.record_loop_exit(true); }
             StmtKind::Continue => { this.record_loop_exit(false); }
@@ -1348,7 +1493,11 @@ type struct MoveChecker {
     record_loop_exit(mut &this, is_break: boolean) -> void {
         if (this.loop_walks.length() == 0) { return; }
         const walk: LoopWalk = this.loop_walks[this.loop_walks.length() - 1];
-        for (mut i: i64 = walk.moves_start; i < this.moved_keys.length(); i++) {
+        // A `continue` reaches the back edge, where only the body's own
+        // moves matter; a `break` leaves the loop, after which everything
+        // moved here, before the loop or in it, is still moved.
+        const first: i64 = if (is_break) { 0 } else { walk.moves_start };
+        for (mut i: i64 = first; i < this.moved_keys.length(); i++) {
             const key: u64 = this.moved_keys[i];
             if (!this.moved_real[i]) { continue; }
             if (this.is_body_local(key, walk.declarations_start)) { continue; }
@@ -1387,7 +1536,7 @@ type struct MoveChecker {
     /// null), so both walks walk them after the body, unless the body always
     /// leaves the loop; any move made there is refused (`walk_back_edge`).
     walk_loop_body(mut &this, body: Stmt*, update: Stmt*,
-                   condition: ExpressionNode*) -> void {
+                   condition: ExpressionNode*, exits: LoopExits) -> void {
         if (body == null) { return; }
         const loops_back: boolean = !this.leaves_loop(body);
         // A loop body is conditional (0+ iterations): a field-move-out inside
@@ -1399,6 +1548,18 @@ type struct MoveChecker {
         const snap:       i64 = this.snapshot_moves();
         const cap_snap:   i64 = this.captured_decl_keys.length();
         const carry_snap: i64 = this.carried_keys.length();
+        // The whole pre-loop moved-set, element-wise: an assignment in the
+        // body revives its binding by deleting an entry that may sit below
+        // `snap`, which a length rewind cannot put back, and a binding the
+        // body revives is still moved on the path that runs it zero times.
+        mut pre_keys:  [u64]        = [];
+        mut pre_spans: [SourceSpan] = [];
+        mut pre_real:  [boolean]    = [];
+        for (mut i: i64 = 0; i < this.moved_keys.length(); i++) {
+            pre_keys.push(this.moved_keys[i]);
+            pre_spans.push(this.moved_spans[i]);
+            pre_real.push(this.moved_real[i]);
+        }
         const walk: LoopWalk = LoopWalk {
             moves_start:        snap,
             declarations_start: cap_snap,
@@ -1441,7 +1602,7 @@ type struct MoveChecker {
             if (!staged) { this.carried_keys.push(k); }
         }
         this.truncate_loop_exits(walk);
-        this.restore_moves(snap);
+        this.restore_full(pre_keys, pre_spans, pre_real);
 
         // real walk: carried bindings are moved-on-entry, so the
         // re-move at the top of the body reports use-after-move.
@@ -1455,12 +1616,24 @@ type struct MoveChecker {
         this.walk_stmt(body);
         if (loops_back) { this.walk_back_edge(update, condition); }
 
-        // The loop's own exit holds the moved-set it began with: a loop may
-        // run zero times, and a move reaching the back edge was refused
-        // above.  A `break` leaves with its own moves, so they hold after
-        // the loop too.
+        // After the loop a binding is moved if it is moved on any path that
+        // leaves it.  A `while` or `for` may be left before its body runs,
+        // with the moved-set it began with; a move reaching the back edge
+        // was refused above, so that set is also what its condition leaves
+        // with.  A `do-while` is left by its condition with the moved-set
+        // the body's last pass ends with, and a `loop` by a `break` alone.
+        // Each `break` leaves with the moved-set it has.
         this.truncate_carried(carry_snap);
-        this.restore_moves(snap);
+        match (exits) {
+            LoopExits::BeforeBody => { this.restore_full(pre_keys, pre_spans, pre_real); }
+            LoopExits::AfterBody  => { }
+            LoopExits::BreakOnly  => {
+                const no_keys:  [u64]        = [];
+                const no_spans: [SourceSpan] = [];
+                const no_real:  [boolean]    = [];
+                this.restore_full(no_keys, no_spans, no_real);
+            }
+        }
         for (mut i: i64 = walk.breaks_start; i < this.break_moves.length(); i++) {
             const exit: LoopExitMove = this.break_moves[i];
             this.mark_moved_key(exit.key, exit.span, true);
@@ -1502,6 +1675,98 @@ type struct MoveChecker {
         if (!vd.is_global) {
             this.register_binding(vd.sym_id, vd.resolved_type, vd.name, d.span);
         }
+        if (vd.initializer == null && !vd.is_global && vd.sym_id.is_valid()
+            && !this.is_copy(vd.resolved_type)) {
+            this.mark_moved(vd.sym_id, d.span, false);
+            this.uninitialised_keys.push(vd.sym_id.key());
+            this.uninitialised_spans.push(d.span);
+        }
+    }
+
+    /// Where `sym` was declared without a value, when the moved-set still
+    /// holds that declaration's own entry for it - it has not been given a
+    /// value on every path to here.  None otherwise.
+    uninitialised_at(&this, sym: SymbolID) -> SourceSpan {
+        if (!sym.is_valid() || !this.is_moved(sym)) { return SourceSpan::none(); }
+        const moved_span: SourceSpan = this.moved_at_span(sym);
+        for (mut i: i64 = 0; i < this.uninitialised_keys.length(); i++) {
+            if (this.uninitialised_keys[i] == sym.key()
+                && this.uninitialised_spans[i].same_as(&moved_span)) {
+                return this.uninitialised_spans[i];
+            }
+        }
+        return SourceSpan::none();
+    }
+
+    /// E0219: `name`, declared without a value at `declared`, is used at
+    /// `span` - borrowed by a reference when `by_reference` - on a path that
+    /// has not given it one.
+    emit_uninitialised_use(mut &this, name: SymbolStr, span: SourceSpan,
+                           declared: SourceSpan, by_reference: boolean) -> void {
+        const spelled: string = this.intern.resolve(name);
+        const what: string = if (by_reference) { "reference to" } else { "use of" };
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0219_UNINITIALIZED_VAR,
+            fmt::format("%s `%s`, which is not initialised on every path here", what, spelled));
+        diag = diag.at_with_label(span, if (by_reference) { "borrowed here" } else { "used here" });
+        diag = diag.also_at(declared, "declared here without a value");
+        diag = diag.help(if (by_reference) {
+            "a reference always names a value; give the variable one on every path first, or pass a raw pointer (`T*`) to a function that fills it"
+        } else {
+            "give the variable a value on every path before this use"
+        });
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
+    /// True when `place` is a member of a binding that has not been given a
+    /// value on every path - a chain of fields and constant indices over it
+    /// (`p.a`, `xs[0]`, `xs[0].n`).  Storing to it reads nothing of the
+    /// binding.
+    fills_unset_member(&this, place: ExpressionNode*) -> boolean {
+        mut kind: [u8]  = [];
+        mut key:  [u32] = [];
+        const root: SymbolID = ExpressionNode::place_chain(place, &kind, &key);
+        return kind.length() > 0 && this.uninitialised_at(root).has_location();
+    }
+
+    /// After `place = value` where `fills_unset_member(place)`: a direct
+    /// member (`p.a`, `xs[0]`) written unconditionally is recorded, and once
+    /// every field of the binding's struct, or every slot of its array, has
+    /// been, the binding holds a whole value.
+    initialise_member(mut &this, place: ExpressionNode*) -> void {
+        if (this.branch_depth != 0) { return; }
+        mut kind: [u8]  = [];
+        mut key:  [u32] = [];
+        const root: SymbolID = ExpressionNode::place_chain(place, &kind, &key);
+        if (kind.length() != 1) { return; }
+        const member: u64 = ((kind[0] as u64) << 32) | (key[0] as u64);
+        mut assigned: i64 = 0;
+        mut recorded: boolean = false;
+        for (mut i: i64 = 0; i < this.assigned_member_keys.length(); i++) {
+            if (this.assigned_member_keys[i] != root.key()) { continue; }
+            assigned += 1;
+            if (this.assigned_members[i] == member) { recorded = true; }
+        }
+        if (!recorded) {
+            this.assigned_member_keys.push(root.key());
+            this.assigned_members.push(member);
+            assigned += 1;
+        }
+        if (assigned == this.member_count_of(this.lookup_type(root))) {
+            this.unmark_moved(root);
+        }
+    }
+
+    /// How many members a value of `ty` is made of for `initialise_member`:
+    /// a struct's fields or a fixed array's slots; -1 for any other type,
+    /// which only a whole assignment gives a value.
+    member_count_of(&this, ty: TypeRef) -> i64 {
+        const aggregate: Type* = this.aggregate_type_of(ty);
+        if (aggregate != null) { return aggregate.as_struct().fields.length(); }
+        const t: Type* = if (ty.is_valid()) { this.arena.lookup(ty) } else { null as Type* };
+        if (t != null && t.kind == TypeKind::Array) { return t.as_array().size; }
+        return -1;
     }
 
     /// A destructure consumes its right-hand side whole (sema refuses one
@@ -1555,6 +1820,7 @@ type struct MoveChecker {
     walk_argument(mut &this, arg: ExpressionNode*) -> void {
         if (arg == null) { return; }
         if (!this.arg_transfers_value(arg)) {
+            if (arg.autoref && this.refuse_reference_to_partially_moved(arg, arg.span)) { return; }
             this.walk_expr_read(arg);
             return;
         }
@@ -1780,12 +2046,28 @@ type struct MoveChecker {
     /// the value is released again after the move.
     emit_capture_move_out(mut &this, name: SymbolStr, span: SourceSpan, ty: TypeRef) -> void {
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
-            fmt::format("cannot move captured `%s` out of a closure", this.intern.resolve(name)).into_raw());
+            fmt::format("cannot move captured `%s` out of a closure", this.intern.resolve(name)));
         diag = diag.at_with_label(span,
             "moving the capture out here leaves the closure's owner of it to release it again (double free)");
         diag = diag.with_note(
             "a closure keeps what it captures for every call: a `move` closure releases it when the closure is released, and any other closure borrows it from its owner");
         diag = this.with_clone_hint(diag, ty, span, null);
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
+    /// E0453 for field `ma` moved out of a closure's capture at `expr`: the
+    /// closure's owner of the capture releases the field again.
+    emit_capture_field_move_out(mut &this, expr: ExpressionNode*, ma: MemberAccessExpr*) -> void {
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
+            fmt::format("cannot move field `%s` out of a closure's capture",
+                this.intern.resolve(ma.member)));
+        diag = diag.at_with_label(expr.span,
+            "moving the field out here leaves the closure's owner of the capture to release it again (double free)");
+        diag = diag.with_note(
+            "a closure keeps what it captures for every call: a `move` closure releases it when the closure is released, and any other closure borrows it from its owner");
+        diag = diag.help("borrow the field, or move a clone of it");
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1797,13 +2079,13 @@ type struct MoveChecker {
         const shown: string = this.intern.resolve(name);
         const site: SourceSpan = this.borrow_sites[entry];
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0457_NON_COPY_CAPTURE,
-            fmt::format("cannot move `%s` while a closure borrows it", shown).into_raw());
-        diag = diag.at_with_label(span, fmt::format("`%s` is moved here", shown).into_raw());
-        diag = diag.also_at(site, fmt::format("this closure borrows `%s` and can still run", shown).into_raw());
+            fmt::format("cannot move `%s` while a closure borrows it", shown));
+        diag = diag.at_with_label(span, fmt::format("`%s` is moved here", shown));
+        diag = diag.also_at(site, fmt::format("this closure borrows `%s` and can still run", shown));
         diag = diag.with_note(
             "a closure written without `move` borrows each captured value that is not `Copy`, so the value has to stay where it is while the closure can run");
         diag = diag.help(fmt::format(
-            "to keep the move, make the closure own `%s`: a `move` closure takes what it captures where it is made", shown).into_raw());
+            "to keep the move, make the closure own `%s`: a `move` closure takes what it captures where it is made", shown));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1814,12 +2096,12 @@ type struct MoveChecker {
     emit_use_after_closure_move(mut &this, name: SymbolStr, use_span: SourceSpan, closure: SourceSpan) -> void {
         const shown: string = this.intern.resolve(name);
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0452_USE_AFTER_MOVE,
-            fmt::format("use of moved value `%s`", shown).into_raw());
+            fmt::format("use of moved value `%s`", shown));
         diag = diag.at_with_label(use_span, "value used here after move");
-        diag = diag.also_at(closure, fmt::format("`%s` was moved into this `move` closure", shown).into_raw());
+        diag = diag.also_at(closure, fmt::format("`%s` was moved into this `move` closure", shown));
         diag = diag.help(fmt::format(
             "a `move` closure owns what it captures; to keep `%s`, capture a clone made before the closure, or leave out `move` so the closure borrows it",
-            shown).into_raw());
+            shown));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -1827,36 +2109,9 @@ type struct MoveChecker {
 
     read_call(mut &this, e: ExpressionNode*, c: CallExpr*) -> void {
         if (c == null) { return; }
-        // Special case: `<ident>.drop()` is the user's "release this
-        // binding now" mark.  `Drop::drop` is signed `drop(mut &this)`,
-        // so `method_consumes_receiver` says false (a reference
-        // receiver isn't a by-value consume), and without this arm
-        // the move-checker would treat `x.drop()` as a borrow.  But
-        // drop_insertion already treats `.drop()` as a move so it
-        // doesn't synthesise a second drop at scope exit
-        // (drop_insertion.cryo:1899-1924), and the two passes must
-        // agree on the move-set.  Mirror that classification here so
-        // `x.drop(); x.drop();` (or `x.drop(); use(x);`) surfaces as
-        // E0452 at compile time instead of a silent double-free at
-        // runtime.  Identifier-only receivers and zero arguments keep
-        // the special case syntactic (no false positives on method
-        // chains or .drop()-with-args overloads).
-        if (c.callee != null && c.arguments.length() == 0 &&
-            ExpressionNode::member_access_of(c.callee) != null) {
-            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
-            if (this.intern != null &&
-                ma.member.id == this.intern.intern("drop").id &&
-                ExpressionNode::identifier_of(ma.object) != null) {
-                // walk_expr_move's Copy guard short-circuits for
-                // primitives and POD types, so this is a no-op for
-                // bindings that don't actually own anything.
-                this.walk_expr_move(ma.object, true);
-                return;
-            }
-        }
         // Method call to a consuming method: treat the receiver
         // (`x` in `x.method(...)`) as moved.  Without this, a method
-        // declared `mut this` or marked `![sink]` would still
+        // declared `this` or `mut this` would still
         // appear as a borrow at the call site, since the LHS of a
         // member-access defaults to `walk_expr_read`.  Resolved-method
         // is null for free functions, scope-resolution calls, and
@@ -1870,15 +2125,22 @@ type struct MoveChecker {
         if (OwnershipQuery::call_consumes_receiver(this.arena, this.intern, this.ctx.decl_index, c)) {
             const ma: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
             if (ma.object != null) {
-                // A consuming receiver (`mut this` / `![sink]`) is a
+                // A consuming receiver (`this` / `mut this`) is a
                 // real move: the value is taken and dropped by the
                 // callee, so a loop-carried receiver double-frees.
+                this.check_consumed_through_indirection(ma.object);
                 this.walk_expr_move(ma.object, true);
                 receiver_moved = true;
             }
         }
         if (!receiver_moved && c.callee != null) {
-            this.walk_expr_read(c.callee);
+            const method: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
+            const borrows_receiver: boolean = method != null
+                && c.method_named(this.ctx.decl_index) != null;
+            if (!borrows_receiver
+                || !this.refuse_reference_to_partially_moved(method.object, c.callee.span)) {
+                this.walk_expr_read(c.callee);
+            }
         }
         // An argument's ownership effect depends on the parameter it binds to,
         // which sema records as `arg_binding` (see `arg_transfers_value`):
@@ -1940,8 +2202,12 @@ type struct MoveChecker {
             }
             // Field / index LHS: read the LHS place (its address is computed)
             // and move the RHS into it (same real=false rationale as above).
-            if (b.left  != null) { this.walk_expr_read(b.left); }
+            // A member of a binding declared without a value is written, not
+            // read (`initialise_member`).
+            const fills_member: boolean = this.fills_unset_member(b.left);
+            if (b.left != null && !fills_member) { this.walk_expr_read(b.left); }
             if (b.right != null) { this.walk_expr_move(b.right, false); }
+            if (fills_member) { this.initialise_member(b.left); }
             this.reinitialise_moved_field(b.left);
             return;
         }
@@ -1965,6 +2231,24 @@ type struct MoveChecker {
 
     read_unary(mut &this, u: UnaryExpr*) -> void {
         if (u == null) { return; }
+        if (u.op.kind == TokenType::Amp && u.desugared_call == null && u.operand != null) {
+            const id: IdentifierExpr* = ExpressionNode::identifier_of(u.operand);
+            const sym: SymbolID = if (id != null) { id.res.local_sym() } else { SymbolID::invalid() };
+            const declared: SourceSpan = this.uninitialised_at(sym);
+            if (declared.has_location()) {
+                // A pointer to storage that holds nothing yet is how a
+                // function is handed a place to fill; the binding is taken
+                // to hold a value from here, as drop insertion takes it.
+                if (u.borrowed_as_pointer) {
+                    this.unmark_moved(sym);
+                } else if (!this.suppress_emit) {
+                    this.emit_uninitialised_use(id.name, u.operand.span, declared, true);
+                }
+                return;
+            }
+            if (!u.borrowed_as_pointer
+                && this.refuse_reference_to_partially_moved(u.operand, u.operand.span)) { return; }
+        }
         if (u.operand != null) { this.walk_expr_read(u.operand); }
         return;
     }
@@ -2140,6 +2424,32 @@ type struct MoveChecker {
         this.pm_site.remove(moved);
     }
 
+    /// E0452 when `object` is a bare binding a field has been moved out of
+    /// and the use at `span` makes a reference to it - `&p`, an argument
+    /// taken by reference, a method's receiver.  A reference names the whole
+    /// value, and a store through one releases what it displaces, the moved
+    /// field's stale bits among them.  True when it reported.
+    refuse_reference_to_partially_moved(mut &this, object: ExpressionNode*, span: SourceSpan) -> boolean {
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(object);
+        if (id == null) { return false; }
+        const sym: SymbolID = id.res.local_sym();
+        if (!sym.is_valid() || !this.pm_has_binding(sym.key())) { return false; }
+        if (this.suppress_emit) { return true; }
+        mut moved_at: SourceSpan = SourceSpan::none();
+        for (mut i: i64 = 0; i < this.pm_binding.length(); i++) {
+            if (this.pm_binding[i] == sym.key()) { moved_at = this.pm_site[i]; }
+        }
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0452_USE_AFTER_MOVE,
+            fmt::format("reference to partially-moved value `%s`", this.intern.resolve(id.name)));
+        diag = diag.at_with_label(span, "borrowed here after one of its fields was moved out");
+        if (moved_at.has_location()) { diag = diag.also_at(moved_at, "field moved out here"); }
+        diag = diag.help("a reference names the whole value; give the moved field a new value first, or borrow the fields that remain");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+        return true;
+    }
+
     pm_has_binding(&this, binding_id: u64) -> boolean {
         for (mut i: i64 = 0; i < this.pm_binding.length(); i++) {
             if (this.pm_binding[i] == binding_id) { return true; }
@@ -2218,8 +2528,8 @@ type struct MoveChecker {
     emit_double_field_move(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*,
                            moved_at: SourceSpan) -> void {
         const field: string = this.intern.resolve(ma.member);
-        const headline: string = fmt::format(
-            "field `%s` moved out of a value more than once", field).into_raw();
+        const headline: String = fmt::format(
+            "field `%s` moved out of a value more than once", field);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0452_USE_AFTER_MOVE, headline);
         diag = diag.at_with_label(e.span,
@@ -2312,7 +2622,7 @@ type struct MoveChecker {
             if (this.suppress_emit) { return; }
             const field: string = this.intern.resolve(ma.member);
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
-                fmt::format("cannot move field `%s` out of a value that owns a destructor", field).into_raw());
+                fmt::format("cannot move field `%s` out of a value that owns a destructor", field));
             diag = diag.at_with_label(expr.span,
                 "the destructor is run over the whole value when the statement ends, this field with it");
             diag = diag.help(
@@ -2320,6 +2630,16 @@ type struct MoveChecker {
             this.ctx.emit_diagnostic(this.with_clone_hint(diag, field_ty, expr.span, expr));
             this.fired += 1;
             this.fatal += 1;
+            return;
+        }
+        // A closure keeps what it captures for every call - a `move`
+        // closure releases it with the closure, any other borrows it from
+        // its owner - so no field of a capture is the call's to give away.
+        mut chain_kind: [u8]  = [];
+        mut chain_key:  [u32] = [];
+        const root: SymbolID = ExpressionNode::place_chain(expr, &chain_kind, &chain_key);
+        if (root.is_valid() && this.is_capture_alias(root.key())) {
+            if (!this.suppress_emit) { this.emit_capture_field_move_out(expr, ma); }
             return;
         }
         // The source must be an owned, glue-dropped value place.
@@ -2340,7 +2660,7 @@ type struct MoveChecker {
             if (!this.suppress_emit) {
                 const owner: string = this.intern.resolve(ExpressionNode::identifier_of(ma.object).name);
                 this.emit_loop_carried_text(
-                    fmt::format("%s.%s", owner, this.intern.resolve(ma.member)).into_raw(), expr.span);
+                    fmt::format("%s.%s", owner, this.intern.resolve(ma.member)), expr.span);
             }
             return;
         }
@@ -2376,8 +2696,8 @@ type struct MoveChecker {
         if (!this.is_receiver_value_place(ma.object)) { return; }
         if (!this.type_needs_drop(field_ty)) { return; }
         const field: string = this.intern.resolve(ma.member);
-        const headline: string = fmt::format(
-            "cannot move field `%s` out of `this` in a destructor", field).into_raw();
+        const headline: String = fmt::format(
+            "cannot move field `%s` out of `this` in a destructor", field);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0453_DOUBLE_FREE, headline);
         diag = diag.at_with_label(e.span,
@@ -2557,14 +2877,13 @@ type struct MoveChecker {
     /// by its implicit dereference: the caller gets a second owner of the
     /// storage the receiver names, and both are released.  It is the read
     /// `check_deref_move_out` refuses for a written `*p`, with the same
-    /// `unsafe` escape for a deliberate take.  A method marked `![sink]` owns
-    /// its receiver, so its `return this;` is the transfer it declares.
+    /// `unsafe` escape for a deliberate take.  A by-value `this` is not a
+    /// reference, so its `return this;` is an ordinary move.
     check_reference_binding_move_out(mut &this, expr: ExpressionNode*) -> void {
         if (this.unsafe_depth > 0 || this.arg_binding_unknown) { return; }
         const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
         if (id == null) { return; }
         const sym: SymbolID = id.res.local_sym();
-        if (this.consumed_receiver.is_valid() && sym.equals(this.consumed_receiver)) { return; }
         const declared: TypeRef = this.lookup_type(sym);
         if (!declared.is_valid() || !this.is_ptr_or_ref(declared)) { return; }
         const value_ty: TypeRef = expr.resolved_type;
@@ -2573,12 +2892,41 @@ type struct MoveChecker {
         if (this.suppress_emit) { return; }
         const name: string = this.intern.resolve(id.name);
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
-            fmt::format("cannot move `%s` out through a reference", name).into_raw());
+            fmt::format("cannot move `%s` out through a reference", name));
         diag = diag.at_with_label(expr.span,
             "this copies the value's owning handle into a second owner; the storage it refers to still drops it too (double free)");
         diag = diag.help(
             "clone it, or take it by value (`mut this` for a receiver) when the method is meant to consume it");
         this.ctx.emit_diagnostic(this.with_clone_hint(diag, value_ty, expr.span, expr));
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
+    /// Reject a method that takes its receiver by value, called on a
+    /// receiver reached through a reference or pointer whose pointee owns a
+    /// destructor: the call dereferences the receiver implicitly and moves
+    /// the pointee into the method, which releases it, while the storage it
+    /// was read from still releases it too.  It is the move `check_deref_move_out`
+    /// refuses for a written `(*p).method()`, with the same `unsafe` escape.
+    check_consumed_through_indirection(mut &this, receiver: ExpressionNode*) -> void {
+        if (this.unsafe_depth > 0 || this.arg_binding_unknown) { return; }
+        if (receiver == null) { return; }
+        const written: TypeRef = receiver.resolved_type;
+        if (!written.is_valid() || !this.is_ptr_or_ref(written)) { return; }
+        const t: Type* = this.arena.lookup(written);
+        if (t == null) { return; }
+        const pointee: TypeRef =
+            if (t.kind == TypeKind::Pointer) { t.as_pointer().pointee } else { t.as_reference().referent };
+        if (!pointee.is_valid() || this.is_ptr_or_ref(pointee) || this.is_copy(pointee)) { return; }
+        if (!this.type_needs_drop(pointee)) { return; }
+        if (this.suppress_emit) { return; }
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
+            "cannot move a value that owns a destructor out of a pointer");
+        diag = diag.at_with_label(receiver.span,
+            "the method takes its receiver by value, so the call reads the pointee out by value; the storage this points at is still dropped by its owner (double free)");
+        diag = diag.help(
+            "call a method that borrows its receiver (`&this`) instead, or clone the value first; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");
+        this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
     }
@@ -2589,7 +2937,7 @@ type struct MoveChecker {
         diag = diag.at_with_label(expr.span,
             "reading the pointee by value copies its owning handle; the storage this points at is still dropped by its owner (double free)");
         diag = diag.help(
-            "borrow it instead (`p.field`, `p.method()`), or clone it; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");
+            "borrow it instead (read a field, or call a method that borrows its receiver with `&this`), or clone it; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");
         this.ctx.emit_diagnostic(this.with_clone_hint(diag, expr.resolved_type, expr.span, expr));
         this.fired += 1;
         this.fatal += 1;
@@ -2602,21 +2950,21 @@ type struct MoveChecker {
     /// not tracked one by one.
     emit_move_out_error(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*) -> void {
         const field: string = this.intern.resolve(ma.member);
-        mut headline: string = fmt::format("cannot move field `%s` out of a value that drops it at scope exit", field).into_raw();
-        mut label: string = "moving this field out leaves the source to drop it again at scope exit (double free)";
+        mut headline: String = fmt::format("cannot move field `%s` out of a value that drops it at scope exit", field);
+        mut label: String = String::from("moving this field out leaves the source to drop it again at scope exit (double free)");
         if (this.has_user_drop(ma.object.resolved_type)) {
-            headline = fmt::format("cannot move field `%s` out of a value that owns a destructor", field).into_raw();
+            headline = fmt::format("cannot move field `%s` out of a value that owns a destructor", field);
         } else if (this.branch_depth != 0 && this.partial_move_shape(ma)) {
             const owner: string = this.intern.resolve(ExpressionNode::identifier_of(ma.object).name);
-            headline = fmt::format("cannot move field `%s` out of `%s` on only some paths", field, owner).into_raw();
+            headline = fmt::format("cannot move field `%s` out of `%s` on only some paths", field, owner);
             label = fmt::format("moved only when this runs, so `%s` cannot tell at scope exit whether to drop `%s` (double free)",
-                owner, field).into_raw();
+                owner, field);
         }
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE, headline);
         diag = diag.at_with_label(e.span, label);
         diag = diag.help_with_example(
             "swap the field out with `core::mem::swap`, leaving a valid value to be dropped in place; or use a `Copy` field type",
-            fmt::format("mut taken = <a value to leave behind>;\ncore::mem::swap(&taken, &owner.%s);", field).into_raw());
+            fmt::format("mut taken = <a value to leave behind>;\ncore::mem::swap(&taken, &owner.%s);", field));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -2728,8 +3076,8 @@ type struct MoveChecker {
         // stay fine; only a real move (`real`) is rejected.
         if (in_move_context && real && this.pm_has_binding(sym.key())) {
             if (!this.suppress_emit) {
-                const headline: string = fmt::format(
-                    "use of partially-moved value `%s`", this.intern.resolve(name)).into_raw();
+                const headline: String = fmt::format(
+                    "use of partially-moved value `%s`", this.intern.resolve(name));
                 mut diag: Diagnostic = Diagnostic::error(
                     ErrorCode::E0452_USE_AFTER_MOVE, headline);
                 diag = diag.at_with_label(e.span,
@@ -2748,6 +3096,11 @@ type struct MoveChecker {
             // it (borrow-then-move), even when emission is suppressed.
             if (in_move_context && real) { this.mark_moved(sym, e.span, true); }
             if (this.suppress_emit) { return; }
+            const declared: SourceSpan = this.uninitialised_at(sym);
+            if (declared.has_location()) {
+                this.emit_uninitialised_use(name, e.span, declared, false);
+                return;
+            }
             if (this.is_carried(sym)) {
                 // Moved on a previous iteration of the enclosing loop.
                 this.emit_loop_carried(name, e.span);
@@ -2759,8 +3112,8 @@ type struct MoveChecker {
                 this.emit_use_after_closure_move(name, e.span, into_closure);
                 return;
             }
-            const headline: string = fmt::format("use of moved value `%s`",
-                this.intern.resolve(name)).into_raw();
+            const headline: String = fmt::format("use of moved value `%s`",
+                this.intern.resolve(name));
             this.emit_use_after_move(ErrorCode::E0452_USE_AFTER_MOVE,
                 headline, e.span, move_span, ty);
             return;

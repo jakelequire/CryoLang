@@ -17,7 +17,7 @@ import std::core::result::{ Result };
 import std::core::drop::{ Drop };
 import std::core::mem;
 import std::test::error::{ TestError };
-import std::test::assert::{ expect_eq };
+import std::test::assert::{ expect_equal };
 
 mut g_drop_count: i32 = 0;
 function reset() -> void { g_drop_count = 0; }
@@ -69,7 +69,7 @@ function colliding_leaf_name_is_not_drop() -> Result<(), TestError> {
         sink(pr.a);   // a moved out (count -> 1); pr is a NON-Drop owner
         // pr.b still live -> dropped once by per-field glue (count -> 2)
     }
-    return expect_eq(count(), 2);
+    return expect_equal(count(), 2);
 }
 
 // ---- partial move out of a non-`Drop` owner: move one field --------------
@@ -83,7 +83,7 @@ function partial_move_nondrop_owner_one_field() -> Result<(), TestError> {
         // pr.a is skipped at scope exit; pr.b is still live and dropped by
         // per-field glue exactly once (count -> 2).
     }
-    return expect_eq(count(), 2);
+    return expect_equal(count(), 2);
 }
 
 // ---- partial move out of a non-`Drop` owner: move ALL fields -------------
@@ -99,7 +99,47 @@ function partial_move_nondrop_owner_all_fields() -> Result<(), TestError> {
         // (skipping both), so the total stays 2 - a double free would push
         // it to 4 (and trip valgrind under `make valgrind-check`).
     }
-    return expect_eq(count(), 2);
+    return expect_equal(count(), 2);
+}
+
+// ---- borrowing a partially-moved owner -----------------------------------
+// The field that remains may be borrowed; the whole owner may be borrowed
+// again once the moved field has a new value.
+
+function tag_sum(pair: &ProbePair) -> i32 { return pair.a.tag + pair.b.tag; }
+function tag_of(probe: &Probe) -> i32 { return probe.tag; }
+
+![test]
+function remaining_field_borrowed_after_partial_move() -> Result<(), TestError> {
+    reset();
+    mut kept: i32 = 0;
+    {
+        mut pr: ProbePair = ProbePair { a: Probe { tag: 1 }, b: Probe { tag: 2 } };
+        sink(pr.a);
+        kept = tag_of(&pr.b);
+    }
+    match (expect_equal(kept, 2)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_equal(count(), 2);
+}
+
+![test]
+function owner_borrowed_after_moved_field_is_refilled() -> Result<(), TestError> {
+    reset();
+    mut kept: i32 = 0;
+    {
+        mut pr: ProbePair = ProbePair { a: Probe { tag: 1 }, b: Probe { tag: 2 } };
+        sink(pr.a);
+        pr.a = Probe { tag: 5 };
+        kept = tag_sum(&pr);
+    }
+    match (expect_equal(kept, 7)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_equal(count(), 3);
 }
 
 // ---- replace idiom through a borrowed receiver ---------------------------
@@ -112,7 +152,7 @@ function replace_idiom_drops_old_once() -> Result<(), TestError> {
         const _old: Probe = c.replace(Probe { tag: 2 });
         // _old (tag 1) and c.p (tag 2, by glue) each dropped once at scope exit
     }
-    return expect_eq(count(), 2);
+    return expect_equal(count(), 2);
 }
 
 // ---- Copy field move-out is bitwise-independent (no double free) ---------
@@ -126,9 +166,9 @@ function copy_field_move_out_is_fine() -> Result<(), TestError> {
         kept = m.id;          // Copy field: allowed, no drop, no aliasing
         // m.p dropped by glue exactly once at scope exit
     }
-    match (expect_eq(kept, 42)) {
+    match (expect_equal(kept, 42)) {
         Result::Ok(_)  => { }
         Result::Err(e) => { return Result::Err(e); }
     }
-    return expect_eq(count(), 1);
+    return expect_equal(count(), 1);
 }

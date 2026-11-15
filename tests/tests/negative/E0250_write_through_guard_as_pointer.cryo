@@ -1,0 +1,50 @@
+// E0250: a lock guard's `as_pointer()` is a read-only `T*`, so the guarded value
+// is not written through it - not by a store, a compound assignment or a
+// `mut &this` method.  Writes go through `as_mutable_pointer()`, from a guard
+// held writably; the controls compile: those writes, and reads through
+// `as_pointer()` of all three guards.
+![config(testing)]
+![config(negative, E0250)]
+namespace CryoTests::Negative::WriteThroughGuardAsPointer;
+
+import std::sync::mutex::{ Mutex, MutexGuard };
+import std::sync::read_write_lock::{ ReadWriteLock, ReadWriteLockReadGuard, ReadWriteLockWriteGuard };
+import std::alloc::allocator::{ GlobalAllocator };
+import std::collections::array::{ Array };
+
+function store_through_mutex_guard(m: mut &Mutex<i32>) -> void {
+    const g: MutexGuard<i32, GlobalAllocator> = m.lock();
+    *g.as_pointer() = 1;
+    //~^ ERROR[E0250] cannot assign to a place reached through `i32*`, which is read-only
+}
+
+function method_through_mutex_guard(m: mut &Mutex<Array<i32>>) -> void {
+    const g: MutexGuard<Array<i32>, GlobalAllocator> = m.lock();
+    g.as_pointer().push(1);
+    //~^ ERROR[E0250] cannot call a `mut &this` method on a place reached through
+}
+
+function store_through_write_guard(l: mut &ReadWriteLock<i32>) -> void {
+    const g: ReadWriteLockWriteGuard<i32, GlobalAllocator> = l.write();
+    *g.as_pointer() = 2;
+    //~^ ERROR[E0250] cannot assign to a place reached through `i32*`, which is read-only
+}
+
+function writes_control(m: mut &Mutex<i32>, l: mut &ReadWriteLock<i32>) -> i32 {
+    mut g: MutexGuard<i32, GlobalAllocator> = m.lock();
+    *g.as_mutable_pointer() = 3;
+    const p: mut i32* = g.as_mutable_pointer();
+    *p = *p + 1;
+    mut w: ReadWriteLockWriteGuard<i32, GlobalAllocator> = l.write();
+    *w.as_mutable_pointer() = 5;
+    return *g.as_pointer() + *w.as_pointer();
+}
+
+function reads_control(l: mut &ReadWriteLock<i32>) -> i32 {
+    const r: ReadWriteLockReadGuard<i32, GlobalAllocator> = l.read();
+    return *r.as_pointer();
+}
+
+function main() -> int {
+    return 0;
+}

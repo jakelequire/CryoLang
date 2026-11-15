@@ -1,0 +1,698 @@
+///! Buffered readers and writers.
+///!
+///! `Stdout`, `File`, and `TcpStream` go through a syscall on every
+///! `write` call, which is expensive when callers emit bytes in small
+///! increments (every digit of an integer, every field of a struct).
+///! Wrapping the sink in a `BufferedWriter` coalesces those writes into
+///! one syscall per buffer-full.
+///!
+///! These types borrow the inner reader/writer via pointer; the
+///! caller retains ownership of the underlying sink and is responsible
+///! for eventually dropping it. Wrapping and unwrapping is free.
+///!
+///! `BufferedStream<S>` at the end of this module is the non-blocking
+///! counterpart: it OWNS its transport rather than borrowing it, because
+///! a borrowed transport cannot be held across a suspension point.
+///!
+///! Ownership protocol: every type in this module exposes
+///! `drop(mut &this)` that releases the heap buffer. `BufferedWriter::drop`
+///! also flushes any pending bytes; call it before the wrapped sink
+///! goes away, or buffered writes are lost.
+
+namespace std::io::buffered;
+
+import std::core::intrinsics;
+import std::core::mem;
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::core::pointer::{ NonNull };
+import std::core::drop::{ Drop };
+import std::core::iter::{ Iterator };
+import std::alloc::layout::{ Layout };
+import std::alloc::allocator::{ GlobalAllocator };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::traits::{ AsyncRead, AsyncTransport, AsyncWrite, Read, Transfer, Write };
+import std::collections::array::{ Array };
+import std::future::poll;
+import std::future::waker;
+import std::future::traits;
+import std::ffi::libc;
+
+/// Default buffer size. Matches stdio's block-buffered default on
+/// most Unixes. Large enough that a typical line of output fits in
+/// one flush; small enough that many concurrent BufWriters don't eat
+/// the heap.
+public const DEFAULT_BUFFER_SIZE: i64 = 8192;
+
+/// ASCII line feed. `LineWriter` flushes after any chunk that
+/// contains this byte.
+private const BYTE_LF: u8 = 0x0A;
+
+/// Coalesces writes destined for `W` into larger flushes. The inner
+/// writer is borrowed via pointer; the caller owns it and drops it.
+public type struct BufferedWriter<W> where W: Write {
+    private writer: mut W*;
+    private buffer: mut u8*;
+    private capacity: i64;
+    private length: i64;
+
+    /// Wrap `writer` with a `DEFAULT_BUFFER_SIZE`-byte buffer. Panics
+    /// on allocation failure.
+    ///
+    /// The `W: Write` bound lives on construction; instance methods
+    /// don't restate it since no `BufferedWriter<W>` can exist without
+    /// having gone through here first.
+    public static new(writer: mut W*) -> BufferedWriter<W>
+    where W: Write {
+        return BufferedWriter::with_capacity(writer, DEFAULT_BUFFER_SIZE);
+    }
+
+    /// Wrap with an explicit buffer size. A `capacity` of zero or less is
+    /// permitted but degenerate: no buffer is allocated and every write
+    /// hits the sink directly. Panics on allocation failure.
+    public static with_capacity(writer: mut W*, capacity: i64) -> BufferedWriter<W>
+    where W: Write {
+        mut buffer: mut u8* = null;
+        mut size: i64 = 0;
+        if (capacity > 0) {
+            mut alloc: GlobalAllocator = GlobalAllocator::new();
+            match (alloc.allocate(Layout::array::<u8>(capacity))) {
+                Result::Ok(raw) => { buffer = raw.as_pointer(); }
+                Result::Err(_) => {
+                    core::panic("BufferedWriter::with_capacity: allocation failed", intrinsics::location());
+                }
+            }
+            size = capacity;
+        }
+        return BufferedWriter::<W> {
+            writer: writer,
+            buffer: buffer,
+            capacity: size,
+            length: 0
+        };
+    }
+
+    /// Borrow the inner writer. Useful for operations that bypass
+    /// buffering (e.g., a direct `flush` on the underlying fd).
+    /// Callers mutating through this must call `BufferedWriter::flush`
+    /// first, or buffered bytes will land out of order.
+    public get_reference(&this) -> W* {
+        return this.writer;
+    }
+
+    /// Number of bytes currently buffered but not yet flushed.
+    public buffered(&this) -> i64 {
+        return this.length;
+    }
+
+    /// The size of the write buffer in bytes.
+    ![inline]
+    public capacity(&this) -> i64 {
+        return this.capacity;
+    }
+
+    /// Discard buffered bytes without writing them. Useful on error
+    /// paths where the caller knows the output is garbage.
+    public clear(mut &this) -> void {
+        this.length = 0;
+    }
+
+    /// Write buffered bytes to the sink and reset. Retries are
+    /// delegated to the sink's `write_all`.
+    private flush_buffer(mut &this) -> Result<(), IoError> {
+        if (this.length == 0) {
+            return Result::Ok(());
+        }
+        // Drive the low-level `write_some` directly, looping over short
+        // writes and retrying `Interrupted` - a buffered writer IS this
+        // loop.  (We don't call the generic `write` on the inner sink:
+        // it's only known through the `W: Write` bound, and the buffered
+        // writer already owns the all-or-nothing responsibility.)
+        // On error `length` is left intact so a retry still has the bytes;
+        // callers that want to give up call `clear`.
+        mut remaining: &Slice<u8> = Slice::from_raw(this.buffer, this.length);
+        while (!remaining.is_empty()) {
+            match (this.writer.write_some(remaining)) {
+                Result::Ok(n) => {
+                    if (n == 0) {
+                        return Result::Err(IoError::new(IoErrorKind::WriteZero, 0));
+                    }
+                    remaining = remaining.subslice(n, remaining.length());
+                }
+                Result::Err(err) => {
+                    match (err.kind) {
+                        IoErrorKind::Interrupted => { }
+                        _ => { return Result::Err(err); }
+                    }
+                }
+            }
+        }
+        this.length = 0;
+        return Result::Ok(());
+    }
+
+}
+
+implement<W> trait Write for struct BufferedWriter<W>
+where W: Write {
+    write_some(mut &this, bytes: &Slice<u8>) -> Result<i64, IoError> {
+        const incoming: i64 = bytes.length();
+        // Buffer would overflow; flush what we have.
+        if (this.length + incoming > this.capacity) {
+            this.flush_buffer()?;
+        }
+        // After flushing, if the incoming chunk is itself larger than
+        // the buffer there's no point double-copying; send straight
+        // to the sink.
+        if (incoming >= this.capacity) {
+            return this.writer.write_some(bytes);
+        }
+        libc::memcpy(
+            this.buffer + this.length,
+            bytes.as_pointer(),
+            incoming as u64
+        );
+        this.length = this.length + incoming;
+        return Result::Ok(incoming);
+    }
+
+    flush(mut &this) -> Result<(), IoError> {
+        this.flush_buffer()?;
+        return this.writer.flush();
+    }
+}
+
+/// A `BufferedWriter` that flushes after any write containing a `\n`.
+/// Appropriate for interactive stdout on a TTY, where "the user saw
+/// the line as soon as it was emitted" matters more than coalescing.
+///
+/// Internally a thin layer over `BufferedWriter`; holds one, delegates
+/// to it. Caller drops this; the inner `BufferedWriter::drop` (driven by
+/// our `drop`) flushes the remainder.
+public type struct LineWriter<W> {
+    private inner: BufferedWriter<W>;
+
+    /// A writer over `writer` that flushes at the end of every line, with
+    /// a buffer of the default size. `writer` must outlive it.
+    public static new(writer: mut W*) -> LineWriter<W>
+    where W: Write {
+        return LineWriter::with_capacity(writer, DEFAULT_BUFFER_SIZE);
+    }
+
+    /// As `new`, with a buffer of `capacity` bytes.
+    public static with_capacity(writer: mut W*, capacity: i64) -> LineWriter<W>
+    where W: Write {
+        return LineWriter::<W> {
+            inner: BufferedWriter::with_capacity(writer, capacity)
+        };
+    }
+
+    /// The writer underneath; flush this one first before writing to it,
+    /// or buffered bytes land out of order.
+    public get_reference(&this) -> W* {
+        return this.inner.get_reference();
+    }
+
+}
+
+implement<W> trait Write for struct LineWriter<W>
+where W: Write {
+    write_some(mut &this, bytes: &Slice<u8>) -> Result<i64, IoError> {
+        // Find the last newline in the incoming chunk. Everything up
+        // to and including that newline is flushed immediately; the
+        // tail goes through the normal buffer path. This gives the
+        // "lines appear as they are completed" behaviour without
+        // paying a flush per byte.
+        mut last_nl: i64 = -1;
+        mut i: i64 = 0;
+        while (i < bytes.length()) {
+            match (bytes.get(i)) {
+                Option::Some(byte) => {
+                    if (byte == BYTE_LF) {
+                        last_nl = i;
+                    }
+                }
+                Option::None => { break; }
+            }
+            i++;
+        }
+
+        if (last_nl < 0) {
+            return this.inner.write_some(bytes);
+        }
+
+        const head_len: i64 = last_nl + 1;
+        const head: &Slice<u8> = bytes.subslice(0, head_len);
+        // Deliver the head IN FULL (`write`, not `write_some`): we report
+        // `head_len` bytes consumed below, so a short write here would
+        // silently drop the unwritten remainder. The large-chunk bypass in
+        // BufferedWriter::write_some forwards straight to the raw sink, which
+        // may legitimately short-write.
+        this.inner.write(head)?;
+        this.inner.flush_buffer()?;
+        if (head_len == bytes.length()) {
+            return Result::Ok(head_len);
+        }
+        const tail: &Slice<u8> = bytes.subslice(head_len, bytes.length());
+        const n: i64 = this.inner.write_some(tail)?;
+        return Result::Ok(head_len + n);
+    }
+
+    flush(mut &this) -> Result<(), IoError> {
+        return this.inner.flush();
+    }
+}
+
+/// Release the buffer. Flushes first so no bytes are dropped silently.
+/// The inner writer is **not** closed; the caller owns and drops it.
+implement<W> trait Drop for struct BufferedWriter<W> {
+    drop(mut &this) -> void {
+        match (this.flush_buffer()) {
+            Result::Ok(_) => { }
+            Result::Err(_) => { }
+        }
+        if (this.buffer != null) {
+            mut alloc: GlobalAllocator = GlobalAllocator::new();
+            alloc.deallocate(
+                NonNull::new(this.buffer),
+                Layout::array::<u8>(this.capacity)
+            );
+            this.buffer = null;
+            this.capacity = 0;
+            this.length = 0;
+        }
+    }
+}
+
+implement<W> trait Drop for struct LineWriter<W> {
+    drop(mut &this) -> void { }
+}
+
+/// Pulls from `R` in buffer-sized chunks and serves reads from the
+/// buffer. Transforms a stream of small reads into a few large ones
+/// and makes `read_line` fast: no per-byte syscall.
+///
+/// Borrows the inner reader via pointer. Caller owns it.
+public type struct BufferedReader<R> where R: Read {
+    private reader: mut R*;
+    private buffer: mut u8*;
+    private capacity: i64;
+    /// First unread byte in the buffer.
+    private position: i64;
+    /// One past the last filled byte.
+    private filled: i64;
+
+    /// A reader that fills a buffer of the default size from `reader`,
+    /// which must outlive it.
+    ///
+    /// ```cryo
+    /// mut file: File = File::open("notes.txt")?;
+    /// for (line in BufferedReader::new(&file).lines()) {
+    ///     const text: String = line?;
+    ///     println(f"{text.as_str()}");
+    /// }
+    /// ```
+    public static new(reader: mut R*) -> BufferedReader<R>
+    where R: Read {
+        return BufferedReader::with_capacity(reader, DEFAULT_BUFFER_SIZE);
+    }
+
+    /// A reader with a buffer of `capacity` bytes. Panics when `capacity`
+    /// is not positive.
+    public static with_capacity(reader: mut R*, capacity: i64) -> BufferedReader<R>
+    where R: Read {
+        if (capacity <= 0) {
+            core::panic("BufferedReader::with_capacity: capacity must be > 0", intrinsics::location());
+        }
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
+        mut buffer: mut u8* = null;
+        match (alloc.allocate(Layout::array::<u8>(capacity))) {
+            Result::Ok(raw) => { buffer = raw.as_pointer(); }
+            Result::Err(_) => {
+                core::panic("BufferedReader::with_capacity: allocation failed", intrinsics::location());
+            }
+        }
+        return BufferedReader::<R> {
+            reader: reader,
+            buffer: buffer,
+            capacity: capacity,
+            position: 0,
+            filled: 0
+        };
+    }
+
+    /// The reader underneath. Reading from it directly skips the bytes
+    /// this `BufferedReader` has already buffered.
+    public get_reference(&this) -> R* {
+        return this.reader;
+    }
+
+    /// The size of the read buffer in bytes.
+    ![inline]
+    public capacity(&this) -> i64 {
+        return this.capacity;
+    }
+
+    /// Bytes currently buffered and unread.
+    public available(&this) -> i64 {
+        return this.filled - this.position;
+    }
+
+    /// Advance the buffer cursor past `amount` bytes. `amount` must
+    /// not exceed `available()`; a larger value is a caller bug, and a
+    /// negative one panics "out of range".
+    public consume(mut &this, amount: i64) -> void {
+        if (amount < 0) {
+            core::panic("BufferedReader::consume: out of range", intrinsics::location());
+        }
+        if (amount > this.filled - this.position) {
+            core::panic("BufferedReader::consume: overran filled region", intrinsics::location());
+        }
+        this.position = this.position + amount;
+    }
+
+    /// Fill the buffer from the source if empty, then surface the
+    /// filled region. Returns an empty slice at EOF. Paired with
+    /// `consume` for zero-copy parsing: read a prefix, decide how
+    /// many bytes are actually wanted, consume that many.
+    public fill_buffer(mut &this) -> Result<&Slice<u8>, IoError> {
+        if (this.position >= this.filled) {
+            const n: i64 = this.reader.read(this.buffer, this.capacity)?;
+            this.position = 0;
+            this.filled = n;
+        }
+        return Result::Ok(Slice::from_raw(
+            this.buffer + this.position,
+            this.filled - this.position
+        ));
+    }
+
+    /// The rest of the source, one line at a time: each item is an owned
+    /// `String` without its `\n` or `\r\n`, or the error that stopped the
+    /// reading. A last line with no line ending is still a line.
+    ///
+    ///     mut file: File = File::open("data.txt")?;
+    ///     for (line in BufferedReader::new(&file).lines()) {
+    ///         const text: String = line?;
+    ///     }
+    public lines(this) -> Lines<R> {
+        return Lines::<R> { reader: this };
+    }
+}
+
+/// The lines of a `BufferedReader`; see `BufferedReader.lines`.
+public type struct Lines<R> where R: Read {
+    private reader: BufferedReader<R>;
+}
+
+/// A line that is not UTF-8 is an `InvalidData` error, after which the
+/// next line is read as usual.
+implement<R> trait Iterator<Result<String, IoError>> for struct Lines<R>
+where R: Read {
+    next(mut &this) -> Option<Result<String, IoError>> {
+        mut line: String = String::new();
+        match (this.reader.read_line(&line)) {
+            Result::Err(error) => { return Option::Some(Result::Err(error)); }
+            Result::Ok(count) => {
+                if (count == 0) { return Option::None; }
+            }
+        }
+        if (line.as_str().ends_with(&Str::new("\n"))) { line.truncate(line.length() - 1); }
+        if (line.as_str().ends_with(&Str::new("\r"))) { line.truncate(line.length() - 1); }
+        if (Str::from_utf8(line.as_str().as_bytes()).is_err()) {
+            return Option::Some(Result::Err(IoError::new(IoErrorKind::InvalidData, 0)));
+        }
+        return Option::Some(Result::Ok(line));
+    }
+}
+
+implement<R> trait Read for struct BufferedReader<R>
+where R: Read {
+    read(mut &this, buffer: mut u8*, length: i64) -> Result<i64, IoError> {
+        if (length < 0) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+        }
+        // Buffer empty and caller wants more than we'd hold anyway;
+        // bypass the buffer to avoid the copy.
+        if (this.position >= this.filled && length >= this.capacity) {
+            return this.reader.read(buffer, length);
+        }
+        const filled: &Slice<u8> = this.fill_buffer()?;
+        mut n: i64 = filled.length();
+        if (n > length) { n = length; }
+        if (n > 0) {
+            libc::memcpy(
+                buffer,
+                filled.as_pointer(),
+                n as u64
+            );
+            this.consume(n);
+        }
+        return Result::Ok(n);
+    }
+
+    /// Override the trait default; line-reading is the whole point
+    /// of `BufferedReader`, so we do it the fast way: scan the filled
+    /// region for `\n`, copy the prefix wholesale, consume, refill
+    /// only if we didn't hit the newline.
+    read_line(mut &this, out: mut &String) -> Result<i64, IoError> {
+        const start: i64 = out.length();
+        loop {
+            const filled: &Slice<u8> = this.fill_buffer()?;
+            if (filled.is_empty()) {
+                return Result::Ok(out.length() - start);
+            }
+            mut scan: i64 = 0;
+            mut hit_nl: boolean = false;
+            while (scan < filled.length()) {
+                match (filled.get(scan)) {
+                    Option::Some(byte) => {
+                        scan++;
+                        if (byte == BYTE_LF) {
+                            hit_nl = true;
+                            break;
+                        }
+                    }
+                    Option::None => { break; }
+                }
+            }
+            const prefix: &Slice<u8> = filled.subslice(0, scan);
+            out.try_push(Str::from(prefix))?;
+            this.consume(scan);
+            if (hit_nl) {
+                return Result::Ok(out.length() - start);
+            }
+        }
+    }
+}
+
+implement<R> trait Drop for struct BufferedReader<R> {
+    drop(mut &this) -> void {
+        // Mirrors the inherent BufferedReader::drop: release the heap buffer.
+        // The wrapped reader is borrowed; caller drops it.
+        if (this.buffer != null) {
+            mut alloc: GlobalAllocator = GlobalAllocator::new();
+            alloc.deallocate(
+                NonNull::new(this.buffer),
+                Layout::array::<u8>(this.capacity)
+            );
+            this.buffer = null;
+            this.capacity = 0;
+            this.position = 0;
+            this.filled = 0;
+        }
+    }
+}
+
+
+// ============================================================================
+// `BufferedStream<S>` — the buffered connection for the non-blocking family.
+//
+// The wrappers above borrow their inner reader/writer by pointer. That is
+// exactly what cannot cross a suspension point (E0455), so a connection driving
+// `AsyncRead` / `AsyncWrite` OWNS its transport instead. Everything else is the
+// same idea: coalesce many small transport operations into few large ones.
+//
+// There is exactly one of these for every transport. A plaintext socket and a
+// TLS session differ in how bytes move, not in how they are buffered, so the
+// buffering, the compaction, the short-write requeue and both trait contracts
+// are written once here and the transport supplies only `read_into` /
+// `write_from`.
+//
+// The read buffer is compacted (the consumed prefix dropped) at the START of a
+// fill, never at the end, so `buffered()`'s view never shifts underneath a
+// caller part-way through parsing a record. An `rpos` cursor is what keeps
+// `consume` O(1) between those compactions.
+//
+// Cancellation is inherited from the transport: while an operation is in flight
+// the transport holds a closed placeholder and the future owns the real handle,
+// so dropping that future closes the connection. Nothing else holds the handle,
+// so this is coherent — but a caller that wants to keep the connection must not
+// cancel an operation on it.
+// ============================================================================
+
+/// Bytes requested per `fill`. One page: large enough that a header block or a
+/// small frame arrives in a single transport operation, small enough that many
+/// idle connections do not each pin a large buffer.
+private const FILL_CHUNK: i64 = 4096;
+
+/// A buffered connection for asynchronous code: it owns its transport `S`
+/// (a socket or a TLS session) and buffers both directions, so many small
+/// reads and writes become few large ones. It implements `AsyncRead` and
+/// `AsyncWrite`; make one with `of`.
+public type struct BufferedStream<S> {
+    private inner:   S;
+    private rbuf:    Array<u8>;
+    private rpos:    i64;      // start of the unconsumed region within `rbuf`
+    private scratch: Array<u8>;  // reused fill buffer; empty while a fill is in flight
+    private wbuf:    Array<u8>;
+
+    /// Wrap an already-connected transport.
+    public static of(inner: S) -> BufferedStream<S> {
+        return BufferedStream::<S> {
+            inner:   inner,
+            rbuf:    Array::<u8>::new(),
+            rpos:    0,
+            scratch: Array::<u8>::new(),
+            wbuf:    Array::<u8>::new()
+        };
+    }
+
+    /// Drop the consumed prefix so a long-lived connection's buffer tracks what
+    /// is live rather than everything ever read. Called only at the start of a
+    /// fill: moving bytes at any other time would shift `buffered()` under a
+    /// caller mid-parse.
+    private compact(mut &this) -> void {
+        if (this.rpos == 0) { return; }
+        const live: i64 = this.rbuf.length() - this.rpos;
+        if (live == 0) {
+            this.rbuf.clear();
+            this.rpos = 0;
+            return;
+        }
+        const p: mut u8* = this.rbuf.as_mutable_pointer();
+        mut i: i64 = 0;
+        while (i < live) {
+            p[i] = p[this.rpos + i];
+            i = i + 1;
+        }
+        this.rbuf.truncate(live);
+        this.rpos = 0;
+    }
+
+    /// The transport, for callers that need it directly (socket options, the
+    /// negotiated ALPN protocol). Not for reading or writing — that would
+    /// desynchronize the buffers.
+    public transport(mut &this) -> mut S* {
+        return &this.inner;
+    }
+}
+
+implement<S> trait AsyncRead for struct BufferedStream<S> {
+    async fill(mut &this) -> Result<i64, IoError> where S: AsyncTransport {
+        this.compact();
+
+        // An array exposes only `[0, length)`, so a capacity-only buffer has
+        // nothing to read into: size it with `resize`.
+        mut sc: Array<u8> = Array::<u8>::new();
+        mem::swap::<Array<u8>>(&sc, &this.scratch);
+        sc.resize(FILL_CHUNK, 0);
+
+        mut t: Transfer = await this.inner.read_into(sc);
+
+        mut got: Array<u8> = t.take_buffer();
+        const n: i64 = got.length();
+        mut failed: boolean = false;
+        mut err: IoError = IoError::new(IoErrorKind::Other, 0);
+        match (t.outcome()) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { failed = true; err = e; }
+        }
+        if (!failed && n > 0) {
+            match (this.rbuf.try_append(got.as_slice())) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => {
+                    failed = true;
+                    err = IoError::new(IoErrorKind::OutOfMemory, 0);
+                }
+            }
+        }
+        // Keep the block for the next fill; `got` is left holding the old empty
+        // scratch and released with the frame.
+        got.clear();
+        mem::swap::<Array<u8>>(&got, &this.scratch);
+
+        if (failed) { return Result::Err(err); }
+        return Result::Ok(n);
+    }
+
+    buffered(&this) -> &Slice<u8> {
+        return Slice::<u8>::from_raw(this.rbuf.as_pointer() + this.rpos,
+                                   this.rbuf.length() - this.rpos);
+    }
+
+    consume(mut &this, count: i64) -> void {
+        if (count < 0) {
+            core::panic("BufferedStream::consume: out of range", intrinsics::location());
+        }
+        this.rpos = this.rpos + count;
+    }
+}
+
+implement<S> trait AsyncWrite for struct BufferedStream<S> {
+    pending(mut &this) -> mut &Array<u8> {
+        return &this.wbuf;
+    }
+
+    async flush(mut &this) -> Result<(), IoError> where S: AsyncTransport {
+        while (this.wbuf.length() > 0) {
+            mut out: Array<u8> = Array::<u8>::new();
+            mem::swap::<Array<u8>>(&out, &this.wbuf);
+
+            mut t: Transfer = await this.inner.write_from(out);
+
+            // The transport hands the buffer back UNTOUCHED, so a short write
+            // still has every byte it has not sent yet; requeue the tail.
+            mut sent_buf: Array<u8> = t.take_buffer();
+            mut moved: i64 = 0;
+            mut failed: boolean = false;
+            mut err: IoError = IoError::new(IoErrorKind::Other, 0);
+            match (t.outcome()) {
+                Result::Ok(k)  => { moved = k; }
+                Result::Err(e) => { failed = true; err = e; }
+            }
+            // A sink that repeatedly refuses progress is reported rather than
+            // spun on.
+            if (!failed && moved == 0) {
+                failed = true;
+                err = IoError::new(IoErrorKind::WriteZero, 0);
+            }
+
+            mut rest: Array<u8> = Array::<u8>::new();
+            const total: i64 = sent_buf.length();
+            const keep_from: i64 = if (failed) { 0 } else { moved };
+            if (keep_from < total) {
+                match (rest.try_append(sent_buf.as_slice().subslice(keep_from, total))) {
+                    Result::Ok(_)  => { }
+                    Result::Err(_) => {
+                        failed = true;
+                        err = IoError::new(IoErrorKind::OutOfMemory, 0);
+                    }
+                }
+            }
+            mem::swap::<Array<u8>>(&rest, &this.wbuf);
+
+            // On failure the unsent bytes are back in `wbuf`, so a caller that
+            // can retry still has them.
+            if (failed) { return Result::Err(err); }
+        }
+        return Result::Ok(());
+    }
+}
+
+implement<S> trait Drop for struct BufferedStream<S> {
+    drop(mut &this) -> void { }
+}

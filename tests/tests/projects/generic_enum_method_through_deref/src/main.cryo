@@ -1,0 +1,61 @@
+namespace Main;
+
+import std::core::option::{ Option };
+import std::alloc::box::{ Box };
+
+// A method of a generic enum called through `Box`'s `Deref` returns what it
+// returns on the pointee: the enum's type parameter is the pointee's
+// argument.  A borrowing or writing method leaves the pointee where it is,
+// so every value is released once.
+
+type struct Counted {
+    drops: mut i64*;
+    id: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { *this.drops = *this.drops + 1; }
+}
+
+type enum Either<T> {
+    Left(T);
+    Right(i64);
+}
+
+implement enum Either<T> {
+    // Returns the type parameter by value.
+    or_fallback(&this, fallback: T) -> T { return fallback; }
+    is_left(&this) -> boolean {
+        match (this) {
+            Either::Left(_) => { return true; }
+            Either::Right(_) => { return false; }
+        }
+    }
+}
+
+function main() -> i32 {
+    mut drops: i64 = 0;
+    mut failures: i32 = 0;
+
+    // A consuming method with a `Copy` payload: nothing is released twice.
+    const copied: Box<Option<i32>> = Box::new(Option::Some(9));
+    if (copied.unwrap() != 9) { failures = failures | 1; }
+    if (!copied.is_some()) { failures = failures | 1; }
+
+    // The parameter comes back as the pointee's argument.
+    const either: Box<Either<i32>> = Box::new(Either::Left(4));
+    if (either.or_fallback(3) != 3) { failures = failures | 2; }
+    if (!either.is_left()) { failures = failures | 2; }
+
+    // A writing method through the mutable dereference hands the payload
+    // out typed as the argument; the box is left holding nothing.
+    {
+        mut boxed: Box<Option<Counted>> = Box::new(Option::Some(Counted { drops: &drops, id: 5 }));
+        const taken: Option<Counted> = boxed.take();
+        if (!taken.is_some() || boxed.is_some()) { failures = failures | 4; }
+        if (drops != 0) { failures = failures | 4; }
+    }
+    if (drops != 1) { failures = failures | 8; }
+
+    return failures;
+}

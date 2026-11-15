@@ -9,7 +9,6 @@ import std::core::intrinsics;
 import std::core::clone::{ Clone };
 import std::core::cmp::{ Eq };
 import std::core::default::{ Default };
-import std::core::mem;
 import std::core::option::{ Option };
 import std::core::convert::{ From };
 import std::core::ops::{ ControlFlow, FromResidual, Try };
@@ -31,6 +30,10 @@ import std::fmt::display::{ Debug };
 ///     return Result::Ok(text.length());
 /// }
 /// ```
+///
+/// A statement that discards a `Result` warns (`W0017`): a failure dropped
+/// that way is one nobody sees.
+![must_use]
 ![language("result")]
 public type enum Result<T, E> with [Eq, Clone, Debug] {
     Ok(T);
@@ -56,16 +59,16 @@ implement enum Result<T, E> {
 
     /// Borrow both payloads in place, read-only: `Ok(v)` -> `Ok(&v)`,
     /// `Err(e)` -> `Err(&e)`. The pointers alias the receiver's payload
-    /// (no copy), so unlike the consuming accessors this is NOT `![sink]`
-    /// - the receiver stays live and keeps ownership of `T`/`E`. The
+    /// (no copy), so unlike the consuming accessors this borrows the
+    /// receiver, which stays live and keeps ownership of `T`/`E`. The
     /// pointers are valid only while the receiver outlives them.
-    /// `as_mutable_ref` is the writable form.
+    /// `as_mutable_reference` is the writable form.
     ///
     /// Returns `Result<const T*, const E*>`, a structurally larger `Result`
     /// than the receiver, so the compiler instantiates it lazily at call
-    /// sites (see `Option::as_ref` for why eager monomorphization would not
+    /// sites (see `Option::as_reference` for why eager monomorphization would not
     /// terminate).
-    public as_ref(&this) -> Result<const T*, const E*> {
+    public as_reference(&this) -> Result<const T*, const E*> {
         match (&this) {
             Result::Ok(value) => { return Result::Ok(&value); }
             Result::Err(err) => { return Result::Err(&err); }
@@ -75,21 +78,18 @@ implement enum Result<T, E> {
     /// Borrow both payloads in place, writable: `Ok(v)` -> `Ok(&v)`,
     /// `Err(e)` -> `Err(&e)`. A write through either pointer changes the
     /// receiver's payload. Lazily instantiated for the same reason as
-    /// `as_ref`.
-    public as_mutable_ref(mut &this) -> Result<mut T*, mut E*> {
+    /// `as_reference`.
+    public as_mutable_reference(mut &this) -> Result<mut T*, mut E*> {
         match (&this) {
             Result::Ok(value) => { return Result::Ok(&value); }
             Result::Err(err) => { return Result::Err(&err); }
         }
     }
 
-    /// `![sink]`: the match-arm binding copies the payload out of
-    /// the receiver, so the receiver must be treated as moved at the call
-    /// site - otherwise both the returned value and the still-live receiver
-    /// would be dropped, double-freeing an owning `T`/`E`.
-    ![sink]
-    public unwrap(&this) -> T {
-        match (&this) {
+    /// The `Ok` value, aborting on `Err`. Consumes the result: the value
+    /// moves out to the caller and the error, if any, is released.
+    public unwrap(this) -> T {
+        match (this) {
             Result::Ok(value) => { return value; }
             Result::Err(_) => {
                 core::panic("called Result::unwrap() on an Err value", intrinsics::location());
@@ -100,9 +100,8 @@ implement enum Result<T, E> {
     /// The `Ok` value. Panics with `message` when the result is `Err`, so
     /// write the message as the invariant the caller believed held:
     /// `config.expect("the defaults always parse")`. Consumes the result.
-    ![sink]
-    public expect(&this, message: string) -> T {
-        match (&this) {
+    public expect(this, message: string) -> T {
+        match (this) {
             Result::Ok(value) => { return value; }
             Result::Err(_) => {
                 core::panic(message, intrinsics::location());
@@ -112,9 +111,8 @@ implement enum Result<T, E> {
 
     /// Mirror of `unwrap` for error paths. Useful in tests that assert an
     /// operation fails.
-    ![sink]
-    public unwrap_err(&this) -> E {
-        match (&this) {
+    public unwrap_err(this) -> E {
+        match (this) {
             Result::Ok(_) => {
                 core::panic("called Result::unwrap_err() on an Ok value", intrinsics::location());
             }
@@ -124,22 +122,17 @@ implement enum Result<T, E> {
 
     /// The `Ok` value, or `default_value` when the result is `Err`,
     /// releasing the error. Consumes the result.
-    ![sink]
-    public unwrap_or(&this, default_value: T) -> T {
-        match (&this) {
+    public unwrap_or(this, default_value: T) -> T {
+        match (this) {
             Result::Ok(value) => { return value; }
-            Result::Err(error) => {
-                mem::drop(error);
-                return default_value;
-            }
+            Result::Err(_) => { return default_value; }
         }
     }
 
     /// The `Ok` value, or the value `op` computes from the error when the
     /// result is `Err`. `op` is called only for `Err`. Consumes the result.
-    ![sink]
-    public unwrap_or_else<O>(&this, op: O) -> T where O: (E) -> T {
-        match (&this) {
+    public unwrap_or_else<O>(this, op: O) -> T where O: (E) -> T {
+        match (this) {
             Result::Ok(value) => { return value; }
             Result::Err(err) => { return op(err); }
         }
@@ -147,18 +140,16 @@ implement enum Result<T, E> {
 
     /// `Ok(op(value))`, or the same error when the result is `Err` (`op`
     /// is not called). Consumes the result.
-    ![sink]
-    public map<U, O>(&this, op: O) -> Result<U, E> where O: (T) -> U {
-        match (&this) {
+    public map<U, O>(this, op: O) -> Result<U, E> where O: (T) -> U {
+        match (this) {
             Result::Ok(value) => { return Result::Ok(op(value)); }
             Result::Err(err) => { return Result::Err(err); }
         }
     }
 
     /// Adapt an inner error to a caller's outer error type.
-    ![sink]
-    public map_err<F, O>(&this, op: O) -> Result<T, F> where O: (E) -> F {
-        match (&this) {
+    public map_err<F, O>(this, op: O) -> Result<T, F> where O: (E) -> F {
+        match (this) {
             Result::Ok(value) => { return Result::Ok(value); }
             Result::Err(err) => { return Result::Err(op(err)); }
         }
@@ -167,9 +158,8 @@ implement enum Result<T, E> {
     /// The result `op` returns for the `Ok` value, or the same error when
     /// this result is `Err` (`op` is not called). Chains steps that can
     /// each fail with the same error type. Consumes the result.
-    ![sink]
-    public and_then<U, O>(&this, op: O) -> Result<U, E> where O: (T) -> Result<U, E> {
-        match (&this) {
+    public and_then<U, O>(this, op: O) -> Result<U, E> where O: (T) -> Result<U, E> {
+        match (this) {
             Result::Ok(value) => { return op(value); }
             Result::Err(err) => { return Result::Err(err); }
         }
@@ -178,34 +168,25 @@ implement enum Result<T, E> {
     /// This result when it is `Ok`; otherwise the result `op` returns for
     /// the error, which may recover or fail with a different error type.
     /// `op` is called only for `Err`. Consumes the result.
-    ![sink]
-    public or_else<F, O>(&this, op: O) -> Result<T, F> where O: (E) -> Result<T, F> {
-        match (&this) {
+    public or_else<F, O>(this, op: O) -> Result<T, F> where O: (E) -> Result<T, F> {
+        match (this) {
             Result::Ok(value) => { return Result::Ok(value); }
             Result::Err(err) => { return op(err); }
         }
     }
 
     /// Project the success side to an `Option`, releasing the error.
-    ![sink]
-    public ok(&this) -> Option<T> {
-        match (&this) {
+    public ok(this) -> Option<T> {
+        match (this) {
             Result::Ok(value) => { return Option::Some(value); }
-            Result::Err(error) => {
-                mem::drop(error);
-                return Option::None;
-            }
+            Result::Err(_) => { return Option::None; }
         }
     }
 
     /// Project the error side to an `Option`, releasing the value.
-    ![sink]
-    public err(&this) -> Option<E> {
-        match (&this) {
-            Result::Ok(value) => {
-                mem::drop(value);
-                return Option::None;
-            }
+    public err(this) -> Option<E> {
+        match (this) {
+            Result::Ok(_) => { return Option::None; }
             Result::Err(err) => { return Option::Some(err); }
         }
     }
@@ -247,22 +228,17 @@ implement enum Result<T, E> {
 
     /// The function applied to the value, or `default_value` for `Err`,
     /// releasing the error.
-    ![sink]
-    public map_or<U, O>(&this, default_value: U, op: O) -> U where O: (T) -> U {
-        match (&this) {
+    public map_or<U, O>(this, default_value: U, op: O) -> U where O: (T) -> U {
+        match (this) {
             Result::Ok(value) => { return op(value); }
-            Result::Err(error) => {
-                mem::drop(error);
-                return default_value;
-            }
+            Result::Err(_) => { return default_value; }
         }
     }
 
     /// The function applied to the value, or `default_op` applied to the
     /// error.
-    ![sink]
-    public map_or_else<U, D, O>(&this, default_op: D, op: O) -> U where D: (E) -> U, O: (T) -> U {
-        match (&this) {
+    public map_or_else<U, D, O>(this, default_op: D, op: O) -> U where D: (E) -> U, O: (T) -> U {
+        match (this) {
             Result::Ok(value) => { return op(value); }
             Result::Err(error) => { return default_op(error); }
         }
@@ -270,46 +246,33 @@ implement enum Result<T, E> {
 
     /// `other` when this result is `Ok`, releasing the value; this result's
     /// error otherwise, releasing `other`.
-    ![sink]
-    public and<U>(&this, other: Result<U, E>) -> Result<U, E> {
-        match (&this) {
-            Result::Ok(value) => {
-                mem::drop(value);
-                return other;
-            }
+    public and<U>(this, other: Result<U, E>) -> Result<U, E> {
+        match (this) {
+            Result::Ok(_) => { return other; }
             Result::Err(error) => { return Result::Err(error); }
         }
     }
 
     /// This result when it is `Ok`, releasing `other`; `other` otherwise,
     /// releasing this result's error.
-    ![sink]
-    public or<F>(&this, other: Result<T, F>) -> Result<T, F> {
-        match (&this) {
+    public or<F>(this, other: Result<T, F>) -> Result<T, F> {
+        match (this) {
             Result::Ok(value) => { return Result::Ok(value); }
-            Result::Err(error) => {
-                mem::drop(error);
-                return other;
-            }
+            Result::Err(_) => { return other; }
         }
     }
 
     /// The value, or `T::default()` for `Err`, releasing the error.
-    ![sink]
-    public unwrap_or_default(&this) -> T where T: Default {
-        match (&this) {
+    public unwrap_or_default(this) -> T where T: Default {
+        match (this) {
             Result::Ok(value) => { return value; }
-            Result::Err(error) => {
-                mem::drop(error);
-                return T::default();
-            }
+            Result::Err(_) => { return T::default(); }
         }
     }
 
     /// Like `unwrap_err`, with a caller-supplied message for the `Ok` case.
-    ![sink]
-    public expect_err(&this, message: string) -> E {
-        match (&this) {
+    public expect_err(this, message: string) -> E {
+        match (this) {
             Result::Ok(_) => {
                 core::panic(message, intrinsics::location());
             }
@@ -319,8 +282,7 @@ implement enum Result<T, E> {
 
     /// Lend the value to `f` when the result is `Ok`, then give the result
     /// back unchanged.
-    ![sink]
-    public inspect<F>(&this, f: F) -> Result<T, E> where F: (&T) -> void {
+    public inspect<F>(this, f: F) -> Result<T, E> where F: (&T) -> void {
         match (&this) {
             Result::Ok(value) => { f(&value); }
             Result::Err(_) => { }
@@ -330,8 +292,7 @@ implement enum Result<T, E> {
 
     /// Lend the error to `f` when the result is `Err`, then give the result
     /// back unchanged.
-    ![sink]
-    public inspect_err<F>(&this, f: F) -> Result<T, E> where F: (&E) -> void {
+    public inspect_err<F>(this, f: F) -> Result<T, E> where F: (&E) -> void {
         match (&this) {
             Result::Ok(_) => { }
             Result::Err(error) => { f(&error); }

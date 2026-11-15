@@ -1,0 +1,82 @@
+// A trait's default method returning `implement Counter` from a generic
+// struct's literal written without type arguments: each implementation's
+// copy decides the literal's instance from its own `This`.
+
+type trait Counter {
+    type Item;
+    next_value(mut &this) -> Option<This::Item>;
+
+    doubled<F>(this, f: F) -> implement Counter where F: (This::Item) -> i64 {
+        return Doubled { inner: this, f: f };
+    }
+
+    wrapped(this) -> implement Counter {
+        return Wrapped { inner: this };
+    }
+}
+
+type struct Doubled<I, F> {
+    inner: I;
+    f: F;
+}
+
+implement<I, F> trait Counter for Doubled<I, F> where I: Counter, F: (I::Item) -> i64 {
+    type Item = i64;
+    next_value(mut &this) -> Option<i64> {
+        return match (this.inner.next_value()) {
+            Option::Some(v) => { Option::Some((this.f)(v) * 2) }
+            Option::None    => { Option::None }
+        };
+    }
+}
+
+type struct Wrapped<I> {
+    inner: I;
+}
+
+implement<I> trait Counter for Wrapped<I> where I: Counter {
+    type Item = I::Item;
+    next_value(mut &this) -> Option<I::Item> {
+        return this.inner.next_value();
+    }
+}
+
+type struct Upto {
+    at: i64;
+    end: i64;
+}
+
+implement trait Counter for Upto {
+    type Item = i64;
+    next_value(mut &this) -> Option<i64> {
+        if (this.at >= this.end) { return Option::None; }
+        this.at = this.at + 1;
+        return Option::Some(this.at);
+    }
+}
+
+function plus_one(x: i64) -> i64 { return x + 1; }
+
+function total_of<C>(c: C) -> i64 where C: Counter<i64> {
+    mut counter: C = c;
+    mut total: i64 = 0;
+    while (true) {
+        match (counter.next_value()) {
+            Option::Some(v) => { total = total + v; }
+            Option::None    => { break; }
+        }
+    }
+    return total;
+}
+
+function main() -> i32 {
+    // (1+1 + 2+1 + 3+1) * 2
+    if (total_of(Upto { at: 0, end: 3 }.doubled(plus_one)) != 18) { return 1; }
+    // The default copied into a generic implementation: ((v+1)*2 + 1) * 2
+    // over 1..3 gives 10 + 14 + 18.
+    if (total_of(Upto { at: 0, end: 3 }.doubled(plus_one).doubled(plus_one)) != 42) { return 2; }
+    // A default with no type parameters of its own.
+    if (total_of(Upto { at: 0, end: 4 }.wrapped()) != 10) { return 3; }
+    if (total_of(Upto { at: 0, end: 2 }.wrapped().doubled(plus_one)) != 10) { return 4; }
+    return 0;
+}

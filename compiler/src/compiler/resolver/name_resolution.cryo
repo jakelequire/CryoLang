@@ -14,6 +14,9 @@ import compiler::resolver::{ symbol_id, symbol_str, symbol, scope, resolver, qua
 import compiler::resolver::res::{ DefId, DefKind, Res, ResBase, ResSlot };
 import compiler::resolver::namespace_kind::{ Namespace };
 import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
 import compiler::const_table::{ ConstantTable };
 import compiler::diag::{ ErrorCode, snapshot, source_span, edit_distance };
 import compiler::diag::edit_distance::{ find_best_candidate };
@@ -207,7 +210,7 @@ type struct NameResolver {
             gp.sym_id = this.resolver.declare_generic_param(gp.name, gp_decl.span);
         }
 
-        // A parameter's default (`struct Array<T, A = GlobalAlloc>`) is written
+        // A parameter's default (`struct Array<T, A = GlobalAllocator>`) is written
         // type syntax with a span, in the template's own file, and it is
         // resolved like any other annotation - so it needs an answer like any
         // other annotation.  Unstamped, the only thing a reader has is the
@@ -887,9 +890,9 @@ type struct NameResolver {
     /// hold: the same defect as an elided parameter, spelled from the other
     /// side, and refused as E0302 with the head spelled the way it must be,
     /// its undeclared names moved to the leading list.  An inherent impl's
-    /// list declares its names (the parser makes each a parameter), so
-    /// nothing in it is unbound; anything nested, or written as more than a
-    /// name, is stamped as every annotation is.
+    /// list either declares its names (no leading list: the parser makes
+    /// each a parameter) or writes arguments in the leading list's names, so
+    /// it is stamped as every annotation is.
     stamp_impl_target_args(mut &this, decl: DeclarationNode*, node: ImplBlock*) -> void {
         mut undeclared: [string] = [];
         for (mut i: i64 = 0; i < node.target_args.length(); i++) {
@@ -1087,24 +1090,22 @@ type struct NameResolver {
             // say the owner of.
             const declarers: [string] = this.module_declarers_of_leaf(node.name);
             if (declarers.length() > 0) {
-                mut spellings: string = "";
+                mut spellings: String = String::new();
                 for (mut i: i64 = 0; i < declarers.length(); i++) {
                     const parent: string = QualifiedName::parent_of(declarers[i]);
-                    const spelled: string = QualifiedName::leaf_of(parent) + "::" + name;
                     if (i > 0) {
-                        if (i + 1 == declarers.length()) { spellings = spellings + " or "; }
-                        else                            { spellings = spellings + ", "; }
+                        if (i + 1 == declarers.length()) { spellings.push(" or "); }
+                        else                            { spellings.push(", "); }
                     }
-                    spellings = spellings + "`" + spelled + "`";
+                    spellings.push(f"`{QualifiedName::leaf_of(parent)}::{name}`");
                 }
-                mut declared_in: string = "";
+                mut declared_in: String = String::new();
                 for (mut i: i64 = 0; i < declarers.length(); i++) {
-                    if (i > 0) { declared_in = declared_in + ", "; }
-                    declared_in = declared_in + "`" + QualifiedName::parent_of(declarers[i]) + "`";
+                    if (i > 0) { declared_in.push(", "); }
+                    declared_in.push(f"`{QualifiedName::parent_of(declarers[i])}`");
                 }
-                d = d.with_note(fmt::format(
-                    "a bare name means a declaration in this module; `%s` is declared in %s - write %s, or import it",
-                    name, declared_in, spellings));
+                d = d.with_note(
+                    f"a bare name means a declaration in this module; `{name}` is declared in {declared_in} - write {spellings}, or import it");
             } else {
                 d = d.did_you_mean(name, this.visible_function_names(), "function", e.span);
             }
@@ -1269,6 +1270,18 @@ type struct NameResolver {
         return best;
     }
 
+    /// `d`, a path whose prefix spells `imported` out of `use_module`'s
+    /// reach, with a note naming the alias `use_module` imports it under, if
+    /// any: such a module is reached by its alias, and its own leaf names
+    /// nothing.
+    with_import_alias_note(&this, d: Diagnostic, use_module: ModulePath, imported: ModulePath) -> Diagnostic {
+        const alias: SymbolStr = this.ctx.module_graph.import_alias_of(use_module, imported);
+        if (alias.is_empty()) { return d; }
+        return d.with_note(fmt::format(
+            "this module imports `%s` as `%s`, and a module imported under an alias is named by the alias alone",
+            this.resolver.intern_table.shown(imported.decl_name()), this.resolver.intern_table.resolve(alias)));
+    }
+
     /// `d`, a name written at `span` out of reach, with the fix `import
     /// <imported>;` as help and as an edit adding that line after the file's
     /// imports.  Every name the one import would reach is the same missing
@@ -1337,6 +1350,7 @@ type struct NameResolver {
                     fmt::format("`%s` is not reachable from this module", prefix));
                 d = d.at_with_label(span, "not reachable in this scope");
                 d = d.with_note(fmt::format("`%s` is the module it would name", owner));
+                d = this.with_import_alias_note(d, use_module, mods.any);
                 this.ctx.emit_diagnostic(this.with_import_fix(d, span, owner));
                 return true;
             }
@@ -1442,7 +1456,7 @@ type struct NameResolver {
                             out_module: mut ModuleSpellingMatch*) -> ResSlot {
         const prefix: string = QualifiedName::parent_of(written);
         if (prefix.length() == 0) { return ResSlot::Pending; }
-        const leaf: string = QualifiedName::leaf_of(written);
+        const leaf: Str = QualifiedName::leaf_of(written);
         if (leaf.length() == 0) { return ResSlot::Pending; }
 
         // A path rooted in an `extern module` alias: the alias is a module of
@@ -1498,8 +1512,7 @@ type struct NameResolver {
             const b: Symbol = this.resolver.get_symbol(offered[1]);
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0155_AMBIGUOUS_BARE_NAME,
-                fmt::format("`%s` is offered by `%s` from more than one module, so it names nothing",
-                    leaf, prefix));
+                f"`{leaf}` is offered by `{prefix}` from more than one module, so it names nothing");
             d = d.at_with_label(span, "ambiguous through this path");
             d = d.with_note(fmt::format("`%s` and `%s` both declare it, and `%s` re-exports both",
                 this.resolver.intern_table.resolve(this.resolver.qualified_name_of(&a)),
@@ -1527,23 +1540,22 @@ type struct NameResolver {
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0503_PRIVATE_SYMBOL_ACCESS,
                 if (is_internal) {
-                    fmt::format("type `%s` is internal to the package of module `%s`", leaf, owner)
+                    f"type `{leaf}` is internal to the package of module `{owner}`"
                 } else {
-                    fmt::format("type `%s` is private to module `%s`", leaf, owner)
+                    f"type `{leaf}` is private to module `{owner}`"
                 });
             d = d.at_with_label(span,
                 if (is_internal) {
-                    fmt::format("`%s` cannot be named outside its package", leaf)
+                    f"`{leaf}` cannot be named outside its package"
                 } else {
-                    fmt::format("`%s` cannot be named outside its module `%s`", leaf, owner)
+                    f"`{leaf}` cannot be named outside its module `{owner}`"
                 });
             this.ctx.emit_diagnostic(d);
         } else {
+            const visibility: string = if (is_internal) { "internal to its package" } else { "private" };
             mut d: Diagnostic = Diagnostic::error(
                 ErrorCode::E0353_PRIVATE_ACCESS,
-                fmt::format("`%s::%s` is %s and cannot be named from `%s`",
-                    owner, leaf, if (is_internal) { "internal to its package" } else { "private" },
-                    this.resolver.intern_table.shown(use_module.decl_name())));
+                f"`{owner}::{leaf}` is {visibility} and cannot be named from `{this.resolver.intern_table.shown(use_module.decl_name())}`");
             d = d.at_with_label(span,
                 if (is_internal) { "internal declaration named by this path" } else { "private declaration named by this path" });
             this.ctx.emit_diagnostic(d);
@@ -1726,7 +1738,7 @@ type struct NameResolver {
             // module that DECLARES the member, because that is the namespace
             // the member is registered under and the one every consumer of
             // this stamp appends the member to; recording the facade would
-            // make `test::expect_eq` name a function `std::test` never
+            // make `test::expect_equal` name a function `std::test` never
             // declared.  A member two of the facade's children declare is
             // refused, as it is everywhere else.
             mut owner: DefId = m.found_def;
@@ -1800,6 +1812,7 @@ type struct NameResolver {
                 // unreachable is that its first segment binds to nothing here,
                 // and only the full path fixes that.
                 d = d.with_note(fmt::format("`%s` is the module it would name", owner));
+                d = this.with_import_alias_note(d, use_module, any);
                 this.ctx.emit_diagnostic(this.with_import_fix(d, node.scope_span, owner));
                 node.set_scope_res(Res::Err);
             } else {
@@ -1914,7 +1927,7 @@ type struct NameResolver {
     /// Stamp a written list of type arguments.
     ///
     /// An expression carries the same written type syntax a declaration does -
-    /// `Array<T, GlobalAlloc> { }` and `Layout::of<Entry<K, V>>()` spell a type
+    /// `Array<T, GlobalAllocator> { }` and `Layout::of<Entry<K, V>>()` spell a type
     /// the way an annotation spells one - and the position a spelling is
     /// written in does not change what it names.  A list left unwalked is a
     /// node with a span and a slot that no consumer can read an answer from.
@@ -2112,7 +2125,7 @@ type struct NameResolver {
             // qualified spelling means what the writing file's imports say it
             // means and the cursor is on whatever module the pass is walking.
             const q_module: ModulePath = this.ctx.module_of_file(span.file);
-            const head: string = QualifiedName::head_of(written);
+            const head: Str = QualifiedName::head_of(written);
             const head_sym: SymbolID = this.resolver.type_binding(
                 this.resolver.intern_table.intern(head),
                 this.resolver.current_scope);
@@ -2600,7 +2613,7 @@ type struct NameResolver {
 
     /// Refuse each projection on a type parameter that no bound of the
     /// parameter answers: none of its bounds declares the associated type
-    /// (E0203), or two different bounds do (E0221's case, E0203 here too).
+    /// (E0203), or two different bounds do (E0203 too).
     /// A refused annotation is stamped `Err`, so no later pass resolves it
     /// as a projection keyed by its written leaf.
     check_param_projections(mut &this) -> void {
@@ -2949,7 +2962,7 @@ type struct NameResolver {
         for (mut mi: u32 = 0; mi < graph.module_count(); mi++) {
             const cand: string = this.resolver.intern_table.shown(graph.modules[mi].path().decl_name());
             if (!cand.starts_with(prefix)) { continue; }
-            const rest: string = cand.substring(prefix.length() as u32, (cand.length() - prefix.length()) as u32);
+            const rest: string = cand.substring(prefix.length(), cand.length() - prefix.length());
             if (rest.contains("::")) { continue; }
             out.push(rest);
         }
@@ -2977,9 +2990,11 @@ type struct NameResolver {
         if (count > cap) {
             listed = listed + fmt::format(" and %lld more", count - cap).into_raw();
         }
-        // Last: the candidate search consumes the list.
-        const best: string = find_best_candidate(name_str, offered);
-        if (best != "") {
+        mut views: [Str] = [];
+        for (mut i: i64 = 0; i < count; i++) { views.push(offered[i]); }
+        const found: Option<i64> = find_best_candidate(name_str, &views);
+        if (found.is_some()) {
+            const best: string = offered[found.unwrap()];
             d = d.help(fmt::format("a name with a similar spelling is offered: `%s`", best));
             // A spelling another entry already writes would import it twice.
             mut written: boolean = false;
@@ -3106,6 +3121,11 @@ type struct NameResolver {
         }
         if (imported_idx >= 0) { node.resolved_module = imported; }
         if (imported_idx >= 0 && this.refuse_internal_module(decl, imported)) { return; }
+        // An aliased import names the module by its alias alone.
+        if (imported_idx >= 0) {
+            this.ctx.module_graph.record_import_naming(
+                this.resolver.current_module_path(), imported, node.alias);
+        }
 
         const exports: [SymbolID] = this.resolver.get_exports(imported);
 
@@ -3334,6 +3354,8 @@ type struct NameResolver {
                         continue;
                     }
                     node.add_entry_def(i, this.ctx.module_graph.get_module(sub_idx).def);
+                    this.ctx.module_graph.record_import_naming(
+                        this.resolver.current_module_path(), sub_module, alias);
                     if (!alias.is_empty()) {
                         const sub_alias_id: SymbolID = this.resolver.alloc_symbol_id();
                         mut sub_alias: Symbol = Symbol::import_sym(
@@ -3720,7 +3742,7 @@ implement trait Walk for struct NameResolver {
         const outer_trait: DefId = this.this_trait;
         this.this_trait = TypeAnnotation::trait_def(node.trait_annotation);
         // What the head writes AFTER the target: a parameter of its own, or
-        // a declaration (`Array<T, GlobalAlloc>`), and only a stamp can say
+        // a declaration (`Array<T, GlobalAllocator>`), and only a stamp can say
         // which.  Read after `declare_generics` for the reason the trait
         // side is.
         this.stamp_impl_target_args(decl, node);

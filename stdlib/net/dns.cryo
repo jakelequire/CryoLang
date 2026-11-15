@@ -5,7 +5,7 @@
 ///! doesn't model the C struct layout), copies out the addresses, and
 ///! calls `freeaddrinfo` before returning - the borrowed C memory never
 ///! escapes. Both IPv4 (`AF_INET`) and IPv6 (`AF_INET6`) results are
-///! surfaced as `IpAddr`; the TCP socket layer (`net::socket::tcp`) dials both
+///! surfaced as `IpAddress`; the TCP socket layer (`net::socket::tcp`) dials both
 ///! families, so a v6 result is directly connectable.
 ///!
 ///! `struct addrinfo` offsets (Linux x86_64, from `man getaddrinfo`):
@@ -32,10 +32,10 @@ namespace std::net::dns;
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::mem;
-import std::core::ptr::{ NonNull };
+import std::core::pointer::{ NonNull };
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::collections::array::{ Array };
@@ -43,8 +43,8 @@ import std::core::slice::{ Slice };
 import std::io::error::{ IoError, IoErrorKind };
 import std::io::bytes::{ ByteReader, ByteWriter };
 import std::ffi::libc;
-import std::net::addr::ip::{ IpAddr, IpV4Addr, IpV6Addr };
-import std::net::addr::socket_addr::{ SocketAddr };
+import std::net::address::ip::{ IpAddress, IpV4Address, IpV6Address };
+import std::net::address::socket_address::{ SocketAddress };
 import std::net::sys;
 import std::future::poll::{ Poll };
 import std::future::waker::{ Context };
@@ -62,8 +62,8 @@ private const AF_INET6: u32 = 23;
 
 /// The addresses a hostname resolved to. Owns the backing `Array`,
 /// released when the value goes out of scope.
-public type struct ResolvedAddrs {
-    private addrs: Array<IpAddr>;
+public type struct ResolvedAddresses {
+    private addrs: Array<IpAddress>;
 
     /// Number of resolved addresses (>= 1 on a successful `resolve`).
     ![inline]
@@ -72,7 +72,7 @@ public type struct ResolvedAddrs {
     }
 
     /// The i-th resolved address, or `None` if out of range.
-    public get(&this, index: i64) -> Option<IpAddr> {
+    public get(&this, index: i64) -> Option<IpAddress> {
         return this.addrs.get(index);
     }
 
@@ -80,12 +80,12 @@ public type struct ResolvedAddrs {
     /// the name resolved only to AAAA records. Callers that can dial a v6
     /// address should walk `get` instead; this exists for the layers that
     /// cannot yet.
-    public first_ipv4(&this, port: u16) -> Option<SocketAddr> {
+    public first_ipv4(&this, port: u16) -> Option<SocketAddress> {
         mut i: i64 = 0;
         while (i < this.addrs.length()) {
             match (this.addrs.get(i)) {
                 Option::Some(ip) => {
-                    if (ip.is_ipv4()) { return Option::Some(SocketAddr::new(ip, port)); }
+                    if (ip.is_ipv4()) { return Option::Some(SocketAddress::new(ip, port)); }
                 }
                 Option::None => { }
             }
@@ -95,7 +95,7 @@ public type struct ResolvedAddrs {
     }
 }
 
-implement trait Drop for struct ResolvedAddrs {
+implement trait Drop for struct ResolvedAddresses {
     drop(mut &this) -> void { }
 }
 
@@ -104,7 +104,7 @@ implement trait Drop for struct ResolvedAddrs {
 /// RFC 3484 rules). `host` may be a name or a numeric literal - a
 /// numeric address resolves to itself. Fails with `NotFound` for an
 /// unknown name, `WouldBlock` for a temporary resolver failure.
-public function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
+public function resolve(host: Str) -> Result<ResolvedAddresses, IoError> {
     // getaddrinfo needs a NUL-terminated node string.
     mut host_c: String = String::with_null(host);
 
@@ -123,14 +123,14 @@ public function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
     while (slot < 4) { fields.write_u64_little_endian(0); slot++; }
 
     mut res: mut u8* = null;
-    const rc: i32 = sys::os_getaddrinfo(host_c.as_ptr(), null, hints.as_ptr(), &res);
+    const rc: i32 = sys::os_getaddrinfo(host_c.as_pointer(), null, hints.as_pointer(), &res);
     if (rc != 0) {
         const err: IoError = eai_to_io(rc);
         mem::drop(host_c);
         return Result::Err(err);
     }
 
-    mut addrs: Array<IpAddr> = Array::<IpAddr>::new();
+    mut addrs: Array<IpAddress> = Array::<IpAddress>::new();
     mut cur: u8* = res;
     while (cur != null) {
         // The entry is a whole `struct addrinfo`, so none of these reads
@@ -145,14 +145,14 @@ public function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
         if (sa != null) {
             if (family == AF_INET) {
                 // sockaddr_in: sin_addr at offset 4, network order.
-                addrs.push(IpAddr::V4(IpV4Addr::new(sa[4], sa[5], sa[6], sa[7])));
+                addrs.push(IpAddress::V4(IpV4Address::new(sa[4], sa[5], sa[6], sa[7])));
             }
             if (family == AF_INET6) {
                 // sockaddr_in6: sin6_addr (16 bytes) at offset 8.
                 mut seg: [u8; 16];
                 mut j: u64 = 0;
                 while (j < 16) { seg[j] = sa[8 + j]; j++; }
-                addrs.push(IpAddr::V6(IpV6Addr { segments: seg }));
+                addrs.push(IpAddress::V6(IpV6Address { segments: seg }));
             }
         }
         entry.set_position(40);   // ai_next
@@ -166,19 +166,19 @@ public function resolve(host: Str) -> Result<ResolvedAddrs, IoError> {
         mem::drop(addrs);
         return Result::Err(IoError::new(IoErrorKind::NotFound, 0));
     }
-    return Result::Ok(ResolvedAddrs { addrs: addrs });
+    return Result::Ok(ResolvedAddresses { addrs: addrs });
 }
 
 /// Resolve `host` and pair every address with `port`, ready to hand to
 /// `TcpConnect::start` / `UdpSocket::connect`. The returned `Array`
 /// must be dropped by the caller.
-public function lookup(host: Str, port: u16) -> Result<Array<SocketAddr>, IoError> {
-    mut resolved: ResolvedAddrs = resolve(host)?;
-    mut out: Array<SocketAddr> = Array::<SocketAddr>::new();
+public function lookup(host: Str, port: u16) -> Result<Array<SocketAddress>, IoError> {
+    mut resolved: ResolvedAddresses = resolve(host)?;
+    mut out: Array<SocketAddress> = Array::<SocketAddress>::new();
     mut i: i64 = 0;
     while (i < resolved.length()) {
         match (resolved.get(i)) {
-            Option::Some(ip) => { out.push(SocketAddr::new(ip, port)); }
+            Option::Some(ip) => { out.push(SocketAddress::new(ip, port)); }
             Option::None     => { }
         }
         i++;
@@ -189,9 +189,9 @@ public function lookup(host: Str, port: u16) -> Result<Array<SocketAddr>, IoErro
 
 /// Resolve `host` to a single address - the first (most-preferred)
 /// record. The common case for "connect to this name".
-public function resolve_one(host: Str) -> Result<IpAddr, IoError> {
-    mut resolved: ResolvedAddrs = resolve(host)?;
-    const first: Option<IpAddr> = resolved.get(0);
+public function resolve_one(host: Str) -> Result<IpAddress, IoError> {
+    mut resolved: ResolvedAddresses = resolve(host)?;
+    const first: Option<IpAddress> = resolved.get(0);
     mem::drop(resolved);
     match (first) {
         Option::Some(ip) => { return Result::Ok(ip); }
@@ -216,7 +216,7 @@ public function resolve_one(host: Str) -> Result<IpAddr, IoError> {
 private type struct ResolveJob {
     private job:      BlockingJob;
     private host:     String;
-    private addrs:    ResolvedAddrs;   // valid when `produced && ok`
+    private addrs:    ResolvedAddresses;   // valid when `produced && ok`
     private err:      IoError;         // valid when `produced && !ok`
     private produced: boolean;
     private ok:       boolean;
@@ -239,15 +239,15 @@ private function resolve_job_run(raw: mut u8*) -> void {
 
 /// `drop_fn` for a `ResolveJob`: release the request, release an answer nobody
 /// collected, and free the block. Runs on whichever side let go of the block
-/// last. A collected answer leaves an empty `ResolvedAddrs` behind, so this
+/// last. A collected answer leaves an empty `ResolvedAddresses` behind, so this
 /// stays correct whether or not anyone was still waiting.
 private function resolve_job_free(raw: mut u8*) -> void {
     mut j: ResolveJob* = raw as ResolveJob*;
-    ptr::drop_in_place::<String>(&j.host);
+    pointer::drop_in_place::<String>(&j.host);
     if (j.produced && j.ok) {
-        ptr::drop_in_place::<ResolvedAddrs>(&j.addrs);
+        pointer::drop_in_place::<ResolvedAddresses>(&j.addrs);
     }
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     alloc.deallocate(NonNull::new(raw), Layout::of::<ResolveJob>());
 }
 
@@ -292,23 +292,23 @@ public type struct Resolve {
 }
 
 implement trait Future for struct Resolve {
-    type Output = Result<ResolvedAddrs, IoError>;
+    type Output = Result<ResolvedAddresses, IoError>;
 
-    poll(mut &this, cx: Context*) -> Poll<Result<ResolvedAddrs, IoError>> {
+    poll(mut &this, cx: Context*) -> Poll<Result<ResolvedAddresses, IoError>> {
         if (this.job == null) {
             mut pool: mut BlockingPool* = BlockingPool::current();
             if (pool == null) {
                 return Poll::Ready(resolve(this.host));
             }
-            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            mut alloc: GlobalAllocator = GlobalAllocator::new();
             mut j: mut ResolveJob* = null;
             match (alloc.allocate(Layout::of::<ResolveJob>())) {
-                Result::Ok(raw) => { j = raw.cast::<ResolveJob>().as_ptr(); }
+                Result::Ok(raw) => { j = raw.cast::<ResolveJob>().as_pointer(); }
                 Result::Err(_)  => {
                     return Poll::Ready(Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)));
                 }
             }
-            BlockingJob::init(&j.job, resolve_job_run, resolve_job_free);
+            BlockingJob::initialize(&j.job, resolve_job_run, resolve_job_free);
             j.host     = String::from_str(this.host);
             j.produced = false;
             j.ok       = false;
@@ -332,16 +332,16 @@ implement trait Future for struct Resolve {
         }
         // Finished. `Interrupted` stands for "the pool shut down before reaching
         // this job", the one terminal state that produces no answer at all.
-        mut out: Result<ResolvedAddrs, IoError> =
+        mut out: Result<ResolvedAddresses, IoError> =
             Result::Err(IoError::new(IoErrorKind::Interrupted, 0));
         if (j.produced) {
             if (j.ok) {
                 // Swap rather than read: the block may outlive this future (a
                 // pool thread could still be releasing it), and leaving an empty
-                // `ResolvedAddrs` behind is what stops its teardown from
+                // `ResolvedAddresses` behind is what stops its teardown from
                 // freeing the array twice.
-                mut taken: ResolvedAddrs = ResolvedAddrs { addrs: Array::<IpAddr>::new() };
-                mem::swap::<ResolvedAddrs>(&taken, &j.addrs);
+                mut taken: ResolvedAddresses = ResolvedAddresses { addrs: Array::<IpAddress>::new() };
+                mem::swap::<ResolvedAddresses>(&taken, &j.addrs);
                 out = Result::Ok(taken);
             } else {
                 mut err: IoError = IoError::new(IoErrorKind::Other, 0);

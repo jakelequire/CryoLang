@@ -1,0 +1,99 @@
+// A value with a destructor moved in an `if` branch and again in its
+// `else if` branch: the `else if` is an `if` nested in the else branch, and
+// the flag that records whether the value was moved is written by the outer
+// and the inner branches alike.  Each case checks where the value went and
+// that it is released exactly once, on every path.
+//
+// The exit code names the first case that went wrong.
+namespace MoveInIfAndElseIfBranches::Main;
+
+import std::core::drop::{ Drop };
+
+mut released: i32 = 0;
+
+type struct Held {
+    id: i32;
+}
+
+implement trait Drop for struct Held {
+    drop(mut &this) -> void {
+        released = released + 1;
+    }
+}
+
+type struct Slots {
+    a: i32;
+    b: i32;
+    c: i32;
+}
+
+function take_into(slot: mut &i32, h: Held) -> void {
+    *slot = h.id;
+}
+
+/// Two branches move the value; the third path keeps it to the end.
+function two_branches(k: i32, s: mut &Slots) -> void {
+    const value: Held = Held { id: 7 };
+    if (k == 1) { take_into(&s.a, value); } else if (k == 2) { take_into(&s.b, value); }
+}
+
+/// A longer chain ending in `else`: every path moves the value.
+function chain_with_else(k: i32, s: mut &Slots) -> void {
+    const value: Held = Held { id: 9 };
+    if (k == 1) {
+        take_into(&s.a, value);
+    } else if (k == 2) {
+        take_into(&s.b, value);
+    } else {
+        take_into(&s.c, value);
+    }
+}
+
+/// A longer chain with no `else`: the last path keeps the value.
+function chain_without_else(k: i32, s: mut &Slots) -> void {
+    const value: Held = Held { id: 5 };
+    if (k == 1) {
+        take_into(&s.a, value);
+    } else if (k == 2) {
+        take_into(&s.b, value);
+    } else if (k == 3) {
+        take_into(&s.c, value);
+    }
+}
+
+function check(case_code: i32, expect_a: i32, expect_b: i32, expect_c: i32,
+               s: &Slots, released_before: i32) -> i32 {
+    if (s.a != expect_a || s.b != expect_b || s.c != expect_c) { return case_code; }
+    if (released != released_before + 1) { return case_code + 1; }
+    return 0;
+}
+
+function main() -> i32 {
+    for (mut k: i32 = 1; k <= 3; k++) {
+        mut s: Slots = Slots { a: 0, b: 0, c: 0 };
+        const before: i32 = released;
+        two_branches(k, &s);
+        const r: i32 = check(10 + k * 2,
+            if (k == 1) { 7 } else { 0 }, if (k == 2) { 7 } else { 0 }, 0, &s, before);
+        if (r != 0) { return r; }
+    }
+    for (mut k: i32 = 1; k <= 3; k++) {
+        mut s: Slots = Slots { a: 0, b: 0, c: 0 };
+        const before: i32 = released;
+        chain_with_else(k, &s);
+        const r: i32 = check(20 + k * 2,
+            if (k == 1) { 9 } else { 0 }, if (k == 2) { 9 } else { 0 }, if (k == 3) { 9 } else { 0 },
+            &s, before);
+        if (r != 0) { return r; }
+    }
+    for (mut k: i32 = 1; k <= 4; k++) {
+        mut s: Slots = Slots { a: 0, b: 0, c: 0 };
+        const before: i32 = released;
+        chain_without_else(k, &s);
+        const r: i32 = check(30 + k * 2,
+            if (k == 1) { 5 } else { 0 }, if (k == 2) { 5 } else { 0 }, if (k == 3) { 5 } else { 0 },
+            &s, before);
+        if (r != 0) { return r; }
+    }
+    return 0;
+}

@@ -2,9 +2,10 @@
 ///!
 ///! Standalone trait-satisfaction query engine. Answers read-only questions of
 ///! the form "does this concrete type implement this trait?" and the diagnostics
-///! that hang off them. It depends on nothing but the four shared read-only
-///! components - the TypeArena, the GenericRegistry, the InternTable, and the
-///! DiagnosticSink - and holds no mutable analysis state (no worklist, no
+///! that hang off them. It depends on nothing but the shared components - the
+///! TypeArena, the GenericRegistry, the InternTable, the DiagnosticSink, and
+///! the TypeResolver, which reduces the projections an implementation's head
+///! writes - and holds no mutable analysis state (no worklist, no
 ///! instantiation cache, no inference scratch buffers).
 ///!
 ///! This is deliberately severable from the Monomorphizer: semantic analysis
@@ -44,6 +45,7 @@ import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
+import compiler::types::resolver::{ TypeResolver };
 
 
 /// Read-only trait-satisfaction query engine. See file header.
@@ -52,14 +54,19 @@ type struct TraitChecker {
     generic_registry:  GenericRegistry*;
     intern_table:      mut InternTable*;
     diagnostics:       mut DiagnosticSink*;
+    /// Reduces a projection an implementation's head writes, once the head
+    /// is bound, to the type it names.
+    type_resolver:     TypeResolver*;
 
     static new(arena: mut TypeArena*, generic_registry: GenericRegistry*,
-               intern_table: mut InternTable*, diagnostics: mut DiagnosticSink*) -> TraitChecker {
+               intern_table: mut InternTable*, diagnostics: mut DiagnosticSink*,
+               type_resolver: TypeResolver*) -> TraitChecker {
         return TraitChecker {
             arena:            arena,
             generic_registry: generic_registry,
             intern_table:     intern_table,
             diagnostics:      diagnostics,
+            type_resolver:    type_resolver,
         };
     }
 
@@ -413,7 +420,12 @@ type struct TraitChecker {
         this.add_head_param_bindings(block, &value_args, &head);
         for (mut i: i64 = 0; i < args.length() && i < block.trait_arg_types.length(); i++) {
             if (!args[i].is_valid() || this.arena.contains_generic_param(args[i])) { continue; }
-            const written: TypeRef = head.apply(block.trait_arg_types[i], this.arena);
+            // A head writing the argument as a projection of its own
+            // parameter (`Peekable<I::Item>`) leaves `Range<i64>::Item`
+            // once the head is bound; only its reduction compares with
+            // an argument.
+            const written: TypeRef = this.type_resolver.reduce_projections(
+                head.apply(block.trait_arg_types[i], this.arena), false);
             if (!written.is_valid() || this.arena.contains_generic_param(written)) { continue; }
             if (!this.generic_registry.type_unifies(written, args[i], this.intern_table)) { return false; }
         }
@@ -777,10 +789,10 @@ type struct TraitChecker {
             bindings = impl_block.parameter_substitution(this.arena, subject);
         }
         // The impl's TARGET arguments - the names the type itself is
-        // parameterized by (`I` in `for TakeIter<I>`) - bound to the
+        // parameterized by (`I` in `for TakeIterator<I>`) - bound to the
         // instantiation's.  A where-clause can introduce parameters the type
         // does not carry (`A` in `implement<I, A> Iterator<A> for
-        // TakeIter<I> where I: Iterator<A>`), so the head is matched by its
+        // TakeIterator<I> where I: Iterator<A>`), so the head is matched by its
         // target arguments, never by its whole parameter list.
         const subject_arg_count: i64 = this.arena.inst_type_arg_count(subject);
         if (!target.is_valid() && subject_arg_count > 0) {
@@ -829,14 +841,16 @@ type struct TraitChecker {
         if (arg_t == null) { return; }
         match (*ann) {
             TypeAnnotation::Named(n) => {
+                // The name as the head writes it is the parameter the body
+                // reads; the block's declared list only places it.
                 const sym: SymbolID = n.param_sym();
                 if (!sym.is_valid() || this.lookup_subst_for_param(sym, subst).is_valid()) { return; }
+                mut index: u64 = 0;
                 for (mut gi: i64 = 0; gi < impl_block.generic_params.length(); gi++) {
                     const gp: GenericParamDecl* = DeclarationNode::generic_param_of(impl_block.generic_params[gi]);
-                    if (gp == null || !gp.sym_id.equals(sym)) { continue; }
-                    subst.add(this.arena.create_generic_param(gp.sym_id, gp.name, gi as u64), arg);
-                    return;
+                    if (gp != null && gp.sym_id.equals(sym)) { index = gi as u64; }
                 }
+                subst.add(this.arena.create_generic_param(sym, n.name, index), arg);
             }
             TypeAnnotation::Generic(g) => {
                 const count: i64 = this.arena.inst_type_arg_count(arg);
@@ -864,14 +878,16 @@ type struct TraitChecker {
     /// relate to the type's only through the head, so a bound the impl
     /// writes (`where U: Show`) is checked against these bindings and never
     /// against the type's parameters, which may be spelled differently.  A
-    /// head whose argument count differs from `args` binds nothing.
+    /// parameter written inside an argument is bound to the part of the
+    /// instantiation's argument in its place: `T` in `implement<T> enum
+    /// Option<Option<T>>`, for `Option<Option<i32>>`, to `i32`.  A head whose
+    /// argument count differs from `args` binds nothing.
     add_head_param_bindings(&this, impl_block: ImplBlock*, args: &[TypeRef],
                             subst: mut TypeSubstitution*) -> void {
         if (impl_block == null || subst == null) { return; }
         if (impl_block.target_args.length() != args.length()) { return; }
         for (mut gi: i64 = 0; gi < impl_block.target_args.length(); gi++) {
-            const gp_ref: TypeRef = this.head_param_type(impl_block, gi);
-            if (gp_ref.is_valid()) { subst.add(gp_ref, args[gi]); }
+            this.add_annotation_param_bindings(impl_block, impl_block.target_args[gi], args[gi], subst);
         }
     }
 
@@ -900,7 +916,7 @@ type struct TraitChecker {
     ///
     /// `type_implements_trait` confirms a head's where-bounds, and cannot
     /// bind a where-clause-ONLY generic - the `T` in `implement<I, T>
-    /// Iterator<T> for CopiedIter<I> where I: Iterator<T*>` is recovered by
+    /// Iterator<T> for CopiedIterator<I> where I: Iterator<T*>` is recovered by
     /// pointer-peeling at instantiation, which the bound checker does not
     /// replay - so a written head with such a bound reads as unsatisfied
     /// until its clone is placed.  For an opaque-binding sanity check the

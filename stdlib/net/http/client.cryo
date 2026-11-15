@@ -23,13 +23,13 @@
 ///!
 ///! ```cryo
 ///! import std::collections::str::{ Str };
-///! import std::net::addr::url::{ Url };
+///! import std::net::address::url::{ Url };
 ///! import std::net::http::client::{ Client };
 ///! import std::net::http::response::{ Response };
 ///! import std::time::duration::{ Duration };
 ///!
 ///! async function fetch() -> i64 {
-///!     const client: Client = Client::new().unwrap().with_timeout(Duration::from_secs(10));
+///!     const client: Client = Client::new().unwrap().with_timeout(Duration::from_seconds(10));
 ///!     const url: Url = Url::parse(Str::new("https://example.com/")).unwrap();
 ///!     const response: Response = (await client.get(url)).unwrap();
 ///!     return response.body.length();
@@ -44,14 +44,14 @@ import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::io::error::{ IoError, IoErrorKind };
 import std::io::traits::{ AsyncTransport };
-import std::io::buf::{ BufStream };
+import std::io::buffered::{ BufferedStream };
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
-import std::net::addr::url::{ Url };
-import std::net::addr::ip::{ IpAddr };
-import std::net::addr::socket_addr::{ SocketAddr };
-import std::net::dns::{ Resolve, ResolvedAddrs };
+import std::net::address::url::{ Url };
+import std::net::address::ip::{ IpAddress };
+import std::net::address::socket_address::{ SocketAddress };
+import std::net::dns::{ Resolve, ResolvedAddresses };
 import std::net::socket::tcp::{ TcpConnect, TcpStream };
 import std::net::tls::context::{ TlsConnector };
 import std::net::tls::stream::{ TlsStream, AlpnProtocol };
@@ -59,7 +59,7 @@ import std::net::tls::future::{ TlsHandshake };
 import std::net::http::method::{ Method };
 import std::net::http::request::{ Request };
 import std::net::http::response::{ Response };
-import std::net::http::conn;
+import std::net::http::connection;
 import std::net::http2::connection::{ Http2Connection };
 import std::net::http2::client::{ connect };
 import std::future::poll;
@@ -102,7 +102,7 @@ public type struct Client {
     /// `http`. Fluent.
     public with_http2(this) -> Client {
         return Client {
-            connector: this.connector.with_alpn_h2(),
+            connector: this.connector.with_alpn_http2(),
             http2: true,
             timeout: this.timeout,
             redirect_limit: this.redirect_limit
@@ -127,9 +127,9 @@ public type struct Client {
 
     /// Skip certificate and hostname verification. For self-signed or
     /// out-of-band-pinned servers only - never for the open web. Fluent.
-    public danger_accept_invalid_certs(this) -> Client {
+    public danger_accept_invalid_certificates(this) -> Client {
         return Client {
-            connector: this.connector.danger_accept_invalid_certs(),
+            connector: this.connector.danger_accept_invalid_certificates(),
             http2: this.http2,
             timeout: this.timeout,
             redirect_limit: this.redirect_limit
@@ -265,14 +265,14 @@ where F: Future<Result<T, IoError>> {
 /// Connect to `host` on `port`, trying each address it resolves to in the
 /// resolver's order; the last address's error when none connects.
 private async function dial(host: Str, port: u16) -> Result<TcpStream, IoError> {
-    const resolved: ResolvedAddrs = (await Resolve::start(host))?;
+    const resolved: ResolvedAddresses = (await Resolve::start(host))?;
     mut index: i64 = 0;
     loop {
-        const ip: IpAddr = match (resolved.get(index)) {
+        const ip: IpAddress = match (resolved.get(index)) {
             Option::Some(address) => { address }
             Option::None          => { return Result::Err(IoError::new(IoErrorKind::NotFound, 0)); }
         };
-        const attempt: Result<TcpStream, IoError> = await TcpConnect::start(SocketAddr::new(ip, port));
+        const attempt: Result<TcpStream, IoError> = await TcpConnect::start(SocketAddress::new(ip, port));
         if (attempt.is_ok() || index + 1 >= resolved.length()) { return attempt; }
         index = index + 1;
     }
@@ -288,7 +288,7 @@ private async function exchange_http1<S>(transport: S, request: Request) -> Resu
 where S: AsyncTransport {
     mut outgoing: Request = request;
     outgoing.headers.insert(Str::new("Connection"), Str::new("close"));
-    mut buffered: BufStream<S> = BufStream::<S>::of(transport);
+    mut buffered: BufferedStream<S> = BufferedStream::<S>::of(transport);
     outgoing.encode_into(buffered.pending())?;
     (await buffered.flush())?;
     return await buffered.read_response();
@@ -299,6 +299,6 @@ where S: AsyncTransport {
 private async function exchange_http2<S>(transport: S, request: Request, scheme: Str, authority: Str)
     -> Result<Response, IoError>
 where S: AsyncTransport {
-    mut connection: Http2Connection<S> = (await connect(BufStream::<S>::of(transport)))?;
+    mut connection: Http2Connection<S> = (await connect(BufferedStream::<S>::of(transport)))?;
     return await connection.request(request, scheme, authority);
 }

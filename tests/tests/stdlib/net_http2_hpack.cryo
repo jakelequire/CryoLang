@@ -24,13 +24,13 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::future;
 import std::io::traits::{ AsyncTransport, Transfer };
-import std::io::buf::{ BufStream };
+import std::io::buffered::{ BufferedStream };
 import std::net::http::method::{ Method };
 import std::net::http::request::{ Request };
 import std::net::http::response::{ Response };
 import std::net::http2::connection::{ Http2Connection, RequestOnStream };
 import std::test::error::{ TestError };
-import std::test::assert::{ expect_eq };
+import std::test::assert::{ expect_equal };
 
 /// An in-memory transport: a read hands over what is left of `inbox`, a
 /// write appends to `outbox`, and an exhausted inbox reads as the peer
@@ -77,7 +77,7 @@ const FRAME_HEADERS: u8 = 0x1;
 const FRAME_SETTINGS: u8 = 0x4;
 /// END_STREAM | END_HEADERS: a whole request or response in one frame.
 const COMPLETE: u8 = 0x5;
-const FRAME_HEADER_LEN: i64 = 9;
+const FRAME_HEADER_LENGTH: i64 = 9;
 const PREFACE: string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 function hex_digit(c: u8) -> u8 {
@@ -179,7 +179,7 @@ const C62: string = "4883640effc1c0bf";
 /// A server connection over `wire`, already through its handshake.
 async function server_over(wire: Array<u8>) -> Option<Http2Connection<MemTransport>> {
     mut connection: Http2Connection<MemTransport> =
-        Http2Connection::<MemTransport>::new_server(BufStream::<MemTransport>::of(MemTransport::of(wire)));
+        Http2Connection::<MemTransport>::new_server(BufferedStream::<MemTransport>::of(MemTransport::of(wire)));
     match (await connection.handshake_server()) {
         Result::Ok(_)  => { return Option::Some(connection); }
         Result::Err(_) => { return Option::None; }
@@ -229,7 +229,7 @@ async function decode_c4_requests() -> i64 {
 
 ![test]
 function hpack_server_decodes_the_c4_requests() -> Result<(), TestError> {
-    return expect_eq(future::block_on(decode_c4_requests()), 3 as i64);
+    return expect_equal(future::block_on(decode_c4_requests()), 3 as i64);
 }
 
 /// Each HEADERS block the client wrote, in order, after its preface.
@@ -237,14 +237,14 @@ function written_blocks(out: &Array<u8>) -> Array<Array<u8>> {
     mut blocks: Array<Array<u8>> = Array::<Array<u8>>::new();
     const all: &Slice<u8> = out.as_slice();
     mut at: i64 = Str::new(PREFACE).length();
-    while (at + FRAME_HEADER_LEN <= all.length()) {
+    while (at + FRAME_HEADER_LENGTH <= all.length()) {
         mut n: i64 = 0;
         mut kind: u8 = 0;
         match (all.get(at))     { Option::Some(b) => { n = (b as i64) << 16; } Option::None => { } }
         match (all.get(at + 1)) { Option::Some(b) => { n = n | ((b as i64) << 8); } Option::None => { } }
         match (all.get(at + 2)) { Option::Some(b) => { n = n | (b as i64); } Option::None => { } }
         match (all.get(at + 3)) { Option::Some(b) => { kind = b; } Option::None => { } }
-        const start: i64 = at + FRAME_HEADER_LEN;
+        const start: i64 = at + FRAME_HEADER_LENGTH;
         if (start + n > all.length()) { break; }
         if (kind == FRAME_HEADERS) {
             mut block: Array<u8> = Array::<u8>::new();
@@ -266,7 +266,7 @@ async function encode_c4_requests() -> i64 {
     push_headers(&wire, 3, C62);
     push_headers(&wire, 5, "88");
     mut connection: Http2Connection<MemTransport> =
-        Http2Connection::<MemTransport>::new_client(BufStream::<MemTransport>::of(MemTransport::of(wire)));
+        Http2Connection::<MemTransport>::new_client(BufferedStream::<MemTransport>::of(MemTransport::of(wire)));
     match (await connection.handshake_client()) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -1; }
@@ -307,7 +307,7 @@ async function encode_c4_requests() -> i64 {
     mut i: i64 = 0;
     while (i < 3) {
         mut want: Array<u8> = from_hex(expected[i]);
-        match (blocks.get_ref(i)) {
+        match (blocks.get_reference(i)) {
             Option::Some(got) => { if (bytes_equal(got.as_slice(), want.as_slice())) { matched = matched + 1; } }
             Option::None      => { }
         }
@@ -318,7 +318,7 @@ async function encode_c4_requests() -> i64 {
 
 ![test]
 function hpack_client_writes_the_c4_requests_byte_for_byte() -> Result<(), TestError> {
-    return expect_eq(future::block_on(encode_c4_requests()), 3 as i64);
+    return expect_equal(future::block_on(encode_c4_requests()), 3 as i64);
 }
 
 // ---- what the vectors leave out ----------------------------------------------
@@ -357,14 +357,14 @@ async function second_names_index_62(first_field: string) -> i64 {
 /// block's index 62 names nothing and the block is refused.
 ![test]
 function hpack_never_indexed_field_is_not_stored() -> Result<(), TestError> {
-    return expect_eq(future::block_on(second_names_index_62("100870617373776f726406736563726574")), 0 as i64);
+    return expect_equal(future::block_on(second_names_index_62("100870617373776f726406736563726574")), 0 as i64);
 }
 
 /// The control: the same field with incremental indexing is stored, and index
 /// 62 then names it.
 ![test]
 function hpack_incrementally_indexed_field_is_stored() -> Result<(), TestError> {
-    return expect_eq(future::block_on(second_names_index_62("400870617373776f726406736563726574")), 1 as i64);
+    return expect_equal(future::block_on(second_names_index_62("400870617373776f726406736563726574")), 1 as i64);
 }
 
 /// Whether `block` holds the two octets `first`, `second` in a row.
@@ -390,7 +390,7 @@ async function credential_headers_sent_never_indexed() -> i64 {
     push_headers(&wire, 1, "88");
     push_headers(&wire, 3, "88");
     mut connection: Http2Connection<MemTransport> =
-        Http2Connection::<MemTransport>::new_client(BufStream::<MemTransport>::of(MemTransport::of(wire)));
+        Http2Connection::<MemTransport>::new_client(BufferedStream::<MemTransport>::of(MemTransport::of(wire)));
     match (await connection.handshake_client()) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -1; }
@@ -411,7 +411,7 @@ async function credential_headers_sent_never_indexed() -> i64 {
     mut sensitive: i64 = 0;
     mut b: i64 = 0;
     while (b < 2) {
-        match (blocks.get_ref(b)) {
+        match (blocks.get_reference(b)) {
             Option::Some(block) => {
                 if (holds_pair(block, 0x1f, 0x08) && holds_pair(block, 0x1f, 0x11)) { sensitive = sensitive + 1; }
             }
@@ -424,7 +424,7 @@ async function credential_headers_sent_never_indexed() -> i64 {
 
 ![test]
 function hpack_client_sends_credential_headers_never_indexed() -> Result<(), TestError> {
-    return expect_eq(future::block_on(credential_headers_sent_never_indexed()), 2 as i64);
+    return expect_equal(future::block_on(credential_headers_sent_never_indexed()), 2 as i64);
 }
 
 /// A block opening with the table size update `update` (hex) whose `:path`
@@ -456,12 +456,12 @@ async function after_size_update(update: string) -> i64 {
 /// prefix, as the path's length is in a 7-bit one.
 ![test]
 function hpack_integers_continue_past_their_prefix() -> Result<(), TestError> {
-    return expect_eq(future::block_on(after_size_update("3fe11f")), 1337 as i64);
+    return expect_equal(future::block_on(after_size_update("3fe11f")), 1337 as i64);
 }
 
 /// A size update one octet past the 4096 the connection advertises refuses
 /// the block: the peer may not grow the table beyond what was offered.
 ![test]
 function hpack_size_update_past_the_advertised_limit_is_refused() -> Result<(), TestError> {
-    return expect_eq(future::block_on(after_size_update("3fe21f")), -1 as i64);
+    return expect_equal(future::block_on(after_size_update("3fe21f")), -1 as i64);
 }

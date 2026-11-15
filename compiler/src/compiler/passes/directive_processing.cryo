@@ -62,10 +62,11 @@ import compiler::resolver::lang_item::{ LangItem };
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::pattern::{ DirectiveArg, DirectiveArgKind, DirectiveNode };
 import compiler::diag::diagnostic::{ Diagnostic };
-import compiler::diag::edit_distance::{ find_best_candidate };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Suggestion };
+import compiler::diag::edit_distance::{ find_best_candidate };
+import std::collections::str::{ Str };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
@@ -209,12 +210,6 @@ type struct DirectiveProcessingPasses {
             "inline" | "noinline" | "caller_location" | "entry" | "test" | "ignore"
             | "should_panic" | "test_child" | "config" | "deprecated" | "align"
             | "repr" | "link" | "symbol" | "target" | "allow" | "warn" | "deny"
-            // `![sink]`: marks a method as consuming its receiver.
-            // Tells move-check / drop-insertion to treat the call as moving
-            // the receiver, even when the receiver is syntactically `&this`
-            // or `mut &this`.  Used for methods that semantically take
-            // ownership but want the borrow-style call ergonomics.
-            | "sink"
             // `![implicit]`: lets the inference engine recover omitted generic
             // type args at a call site by unifying the callee's return type
             // against the call's expected type (return-type-driven inference).
@@ -254,8 +249,33 @@ type struct DirectiveProcessingPasses {
             | "not"
             // `![language("name")]`: the declaration is the language item
             // `name`, which the compiler reasons about by identity.
-            | "language" => { true }
+            | "language"
+            // `![must_use]`: a value of the type, or the value the function
+            // returns, warns when a statement discards it.
+            | "must_use" => { true }
             _       => { false }
+        };
+    }
+
+    /// Whether `![name]`, written with no arguments on `target`, is a
+    /// well-formed directive that asks nothing more of the declaration: one
+    /// that takes no arguments, may be written there, and has no condition a
+    /// later pass checks (a companion directive, a body shape, a signature).
+    /// The placement checks of these directives are this predicate, so a
+    /// name suggested through it is certain to be accepted where it stands.
+    static applies_unconditionally(name: string, target: DirectiveTarget) -> boolean {
+        const function_or_method: boolean =
+            target == DirectiveTarget::Function || target == DirectiveTarget::Method;
+        return match (name) {
+            "inline" | "noinline" | "caller_location" | "no_mangle" | "weak" => { function_or_method }
+            "must_use" => {
+                function_or_method || target == DirectiveTarget::Struct
+                    || target == DirectiveTarget::Enum || target == DirectiveTarget::Union
+            }
+            "thread_local"   => { target == DirectiveTarget::Variable }
+            "functions_only" => { target == DirectiveTarget::Extern }
+            "windows" | "linux" | "macos" | "unix" => { true }
+            _ => { false }
         };
     }
 
@@ -295,7 +315,7 @@ type struct DirectiveProcessingPasses {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
-                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                if (!DirectiveProcessingPasses::applies_unconditionally(name, target)) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "function or method", target);
                 }
             }
@@ -309,16 +329,17 @@ type struct DirectiveProcessingPasses {
                 }
             }
 
-            // `![sink]`: zero args; method-target only.  Static-method
-            // and missing-receiver checks need the MethodDecl and its
-            // FunctionDecl, so they live in the per-decl loop in
-            // run_directive_processing where we already have the decl pointer.
-            "sink" => {
+            // `![must_use]`: zero args; on a type whose values must be read,
+            // or on a function or method whose result must be.  A trait
+            // method is not a target: a call reaches the implementing
+            // method, which does not carry the trait's directives.
+            "must_use" => {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
-                if (target != DirectiveTarget::Method) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "method", target);
+                if (!DirectiveProcessingPasses::applies_unconditionally(name, target)) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind,
+                        "a function, a method, a struct, a union or an enum", target);
                 }
             }
 
@@ -417,7 +438,7 @@ type struct DirectiveProcessingPasses {
                 // Low-level migration switch: `config(native_alloc)` gates a
                 // decl on the `[low_level] native_alloc` build flag (Low-Level
                 // Plan Stage 3: the native mmap-backed heap behind
-                // `GlobalAlloc`).  No placement restriction; evaluated by
+                // `GlobalAllocator`).  No placement restriction; evaluated by
                 // ConfigGating against `ctx.options.native_heap()`.  Migration
                 // switches are temporary: deleted once the native subsystem
                 // is proven (as `native_syscalls` was in Stage 2).
@@ -584,6 +605,36 @@ type struct DirectiveProcessingPasses {
                 }
             }
 
+            // `![json(...)]`: a field's options for a derived `ToJson` and
+            // `FromJson` - `rename = "key"`, `skip`, `default`, `skip_none`, any
+            // of them.  Read where the implementations are generated; an option
+            // not listed would otherwise be ignored there, so it is refused.
+            "json" => {
+                if (argc < 1) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 1, argc);
+                    return;
+                }
+                if (target != DirectiveTarget::Field) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "field", target);
+                    return;
+                }
+                for (mut i: i64 = 0; i < argc; i++) {
+                    const a: DirectiveArg = dir.args[i];
+                    const known: boolean = if (a.kind == DirectiveArgKind::Ident) {
+                        a.name == "skip" || a.name == "default" || a.name == "skip_none"
+                    } else {
+                        a.kind == DirectiveArgKind::KeyValue && a.name == "rename"
+                            && a.value_kind == DirectiveArgKind::StringLit
+                    };
+                    if (!known) {
+                        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0152_DIRECTIVE_BAD_ARG,
+                            "directive `![json]`: unknown option (expected `rename = \"key\"`, `skip`, `default` or `skip_none`)");
+                        diag = diag.at(a.span);
+                        ctx.emit_diagnostic(diag);
+                    }
+                }
+            }
+
             // `![link("lib")]` names a library to link (block-level); `![symbol("sym")]`
             // overrides a function/method's linker symbol name (the C++ binding
             // generator pins an Itanium mangled symbol this way).  Both take a single
@@ -609,7 +660,7 @@ type struct DirectiveProcessingPasses {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
-                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                if (!DirectiveProcessingPasses::applies_unconditionally(name, target)) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "function or method", target);
                 }
             }
@@ -620,7 +671,7 @@ type struct DirectiveProcessingPasses {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
-                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                if (!DirectiveProcessingPasses::applies_unconditionally(name, target)) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "function or method", target);
                 }
             }
@@ -631,7 +682,7 @@ type struct DirectiveProcessingPasses {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
-                if (target != DirectiveTarget::Variable) {
+                if (!DirectiveProcessingPasses::applies_unconditionally(name, target)) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "global variable", target);
                 }
             }
@@ -753,7 +804,7 @@ type struct DirectiveProcessingPasses {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
-                if (target != DirectiveTarget::Extern) {
+                if (!DirectiveProcessingPasses::applies_unconditionally(name, target)) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "extern module", target);
                 }
             }
@@ -857,31 +908,36 @@ type struct DirectiveProcessingPasses {
                 // distance.  The full directive list is short and stable
                 // enough to embed inline here; updating it tracks
                 // `is_known_builtin` above.
-                mut cands: [string] = [
+                const cands: [string] = [
                     "inline", "noinline", "caller_location", "entry", "test", "ignore",
                     "should_panic", "test_child", "config", "deprecated", "align",
                     "repr", "link", "symbol", "no_mangle", "weak", "naked", "section",
                     "target", "allow", "warn", "deny",
-                    "sink", "implicit", "functions_only",
-                    "windows", "linux", "macos", "unix", "not", "language"
+                    "implicit", "functions_only",
+                    "windows", "linux", "macos", "unix", "not", "language", "must_use"
                 ];
-                const best: string = find_best_candidate(name, cands);
-                if (best != "") {
-                    diag = diag.help(fmt::format(
-                        "a directive with a similar name exists: `%s`", best));
-                    // The parser stamps `dir.span` over the whole `![name(args)]`
-                    // slice with `![` at start_col.  The directive name starts
-                    // exactly 2 bytes later and has the length of `name`.  No
-                    // whitespace is allowed between `![` and the identifier,
-                    // so this byte arithmetic is safe.
-                    const name_len: u32 = name.length() as u32;
-                    const ns: SourceSpan = SourceSpan::new(
-                        dir.span.file,
-                        dir.span.start_line, dir.span.start_col + 2,
-                        dir.span.start_line, dir.span.start_col + 2 + name_len);
-                    diag = diag.suggest(Suggestion::machine_applicable(
-                        ns, best,
-                        fmt::format("did you mean `%s`?", best)));
+                // The parser stamps `dir.span` over the whole `![name(args)]`
+                // slice with `![` at start_col.  The directive name starts
+                // exactly 2 bytes later and has the length of `name`.  No
+                // whitespace is allowed between `![` and the identifier,
+                // so this byte arithmetic is safe.
+                const name_len: u32 = name.length() as u32;
+                const ns: SourceSpan = SourceSpan::new(
+                    dir.span.file,
+                    dir.span.start_line, dir.span.start_col + 2,
+                    dir.span.start_line, dir.span.start_col + 2 + name_len);
+                // The edit renames the directive and keeps what follows the
+                // name, so it is offered only for a directive written with no
+                // arguments whose suggestion takes none and stands here
+                // unconditionally; any other gets the help alone.
+                mut views: [Str] = [];
+                for (mut i: i64 = 0; i < cands.length(); i++) { views.push(cands[i]); }
+                const found: Option<i64> = find_best_candidate(name, &views);
+                if (found.is_some()) {
+                    const best: string = cands[found.unwrap()];
+                    const applicable: boolean = dir.args.length() == 0
+                        && DirectiveProcessingPasses::applies_unconditionally(best, target);
+                    diag = diag.similar_name(best, "directive", ns, applicable);
                 }
                 ctx.emit_diagnostic(diag);
             }
@@ -1040,7 +1096,6 @@ type struct DirectiveProcessingPasses {
     /// Currently:
     ///   ![inline]         -> sets FunctionDecl.is_inline = true
     ///   ![noinline]       -> sets FunctionDecl.is_noinline = true
-    ///   ![sink]           -> sets MethodDecl.is_sink = true
     ///   ![repr(C|packed|transparent)] -> sets repr_* flags on struct/enum decl
     ///   ![align(N)]       -> sets min_alignment on struct/enum decl
     static apply_effects(ctx: mut CompilationContext*, dir: DirectiveNode*,
@@ -1201,40 +1256,6 @@ type struct DirectiveProcessingPasses {
         if (DeclarationNode::method_of(decl) != null) {
             const m_decl: DeclarationNode* = decl;
             const m: mut MethodDecl* = DeclarationNode::method_of(m_decl);
-            if (name.eq("sink")) {
-                // Reject placement on a static method: static methods have
-                // no receiver, so "consumes the receiver" is meaningless.
-                if (m.is_static) {
-                    const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
-                    const msg: string =
-                        "directive `![sink]` cannot be applied to a static method (no receiver)";
-                    mut diag: Diagnostic = Diagnostic::error(code, msg);
-                    diag = diag.at(dir.span);
-                    diag = diag.suggest(Suggestion::machine_applicable(
-                        dir.span, "",
-                        "remove the `![sink]` directive"));
-                    ctx.emit_diagnostic(diag);
-                    return;
-                }
-                // Reject placement on a method with zero parameters.  Sema
-                // enforces that the first parameter is named `this` for
-                // non-static methods, so a zero-parameter method is missing
-                // its receiver entirely.
-                if (m.func == null || DeclarationNode::fn_of(m.func).parameters.length() == 0) {
-                    const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
-                    const msg: string =
-                        "directive `![sink]` requires a method with a `this` receiver";
-                    mut diag: Diagnostic = Diagnostic::error(code, msg);
-                    diag = diag.at(dir.span);
-                    diag = diag.suggest(Suggestion::machine_applicable(
-                        dir.span, "",
-                        "remove the `![sink]` directive"));
-                    ctx.emit_diagnostic(diag);
-                    return;
-                }
-                m.is_sink = true;
-                return;
-            }
             if (name.eq("implicit")) {
                 if (m.func != null) { DeclarationNode::fn_of(m.func).is_implicit = true; }
                 return;
@@ -1435,7 +1456,7 @@ type struct DirectiveProcessingPasses {
             // Note: do NOT `continue` when ad_count == 0; the method
             // descent below still needs to run for struct/impl decls
             // whose own attached_directives are empty but whose method
-            // members carry their own (e.g. `![sink]`).
+            // members carry their own (e.g. `![inline]`).
 
             for (mut j: i64 = 0; j < ad_count; j++) {
                 const d: DirectiveNode* = decl.attached_directives[j];
@@ -1492,7 +1513,7 @@ type struct DirectiveProcessingPasses {
 
             // Descend into method lists on structs/impls.  The
             // top-level loop above only sees the container; per-method
-            // directives like `![sink]` live on each MethodDecl
+            // directives like `![inline]` live on each MethodDecl
             // and must be validated + applied here.  Methods on traits
             // are [DeclarationNode*] (no MethodDecl wrapper) and don't
             // currently carry directives; if that changes, fold them in.

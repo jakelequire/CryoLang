@@ -39,10 +39,11 @@ import utils;
 import utils::log::{ Log, LogArea, LogLevel };
 import utils::time_trace::{ TimeTrace };
 import std::fmt;
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::env;
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::thread;
+import std::time::duration::{ Duration };
 import std::time::clock::{ Instant };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
@@ -194,6 +195,9 @@ type struct CompilerConfig {
     /// already built is linked as it is: its key holds no diagnostic option,
     /// because a warning changes no byte of it.
     warnings_as_errors:  boolean;
+    /// `-Werror=W0017,...`: the warnings this build reports as errors.  The
+    /// stdlib archive's build does not take them: `-Werror` alone reaches it.
+    promoted_warnings:   [u32];
     /// `--apply-fixes`: make every machine-applicable suggestion the build
     /// reports in the project's own files, then build again.
     apply_fixes:         boolean;
@@ -220,6 +224,7 @@ type struct CompilerConfig {
             codegen_threads_override: -1,
             plant_unanswered_name: "",
             warnings_as_errors:  false,
+            promoted_warnings:   [],
             apply_fixes:         false,
         };
     }
@@ -230,7 +235,9 @@ type struct CompilationResult {
     success:       boolean;
     error_count:   u32;
     warning_count: u32;
-    output_path:   string;
+    /// The executable the build produced (or the `-o` path it was copied
+    /// to); empty for a target with no entry point.
+    output_path:   PathBuf;
     /// The stdlib root this build resolved (possibly relative). Surfaced
     /// so `cryo test` can export it as `$CRYO_STDLIB` for the test
     /// runtime's compile-fail helpers. Empty for `--no-std` builds.
@@ -239,8 +246,7 @@ type struct CompilationResult {
     /// build's files; 0 without the flag.
     fixes_applied: i64;
 
-    static ok(output_path_text: string) -> CompilationResult {
-        const output_path: string = output_path_text;
+    static ok(output_path: PathBuf) -> CompilationResult {
         return CompilationResult {
             success:       true,
             error_count:   0,
@@ -256,7 +262,7 @@ type struct CompilationResult {
             success:       false,
             error_count:   errors,
             warning_count: warnings,
-            output_path:   "",
+            output_path:   PathBuf::new(),
             stdlib_root:   "",
             fixes_applied: 0,
         };
@@ -290,7 +296,7 @@ type struct ProjectBuild {
 // (4)/(5) resolve the running binary's own location so an in-tree or
 // symlink install (`/usr/local/bin/cryo` -> `<repo>/bin/cryo`, or a
 // `bin/cryo.exe` sitting beside `stdlib/`) finds the repo's stdlib with
-// no env var.  `env::current_exe()` reads `/proc/self/exe` on Unix and
+// no env var.  `env::current_executable()` reads `/proc/self/exe` on Unix and
 // `GetModuleFileNameW` on Windows, so the dirname scan must accept BOTH
 // `/` and `\` separators (the Windows path is backslash-delimited).
 // (6) is for projects that vendor a custom stdlib or pin a version.
@@ -417,7 +423,7 @@ type struct CompilerInstance {
         // point at the user's path, not the internal build layout.
         if (result.success
                 && this.config.output_path_override.length() > 0) {
-            result.output_path = this.config.output_path_override;
+            result.output_path = PathBuf::from(Str::new(this.config.output_path_override));
         }
         return result;
     }
@@ -463,7 +469,7 @@ type struct CompilerInstance {
     /// the language server's file outside any project all build this view.
     single_file_config(&this, source: string) -> ProjectConfig {
         mut config: ProjectConfig = ProjectConfig::default();
-        config.project_root = source.parent_dir();
+        config.project_root = source.parent_directory();
         config.entry_point  = source.basename();
         config.project_name = source.stem();
         config.no_std       = this.config.no_std;
@@ -652,7 +658,7 @@ type struct CompilerInstance {
         // TypeRef.id key; without resetting it, the second target gets
         // back the first target's stale LLVMTypeRef and crashes during
         // IRGen on the first generic instantiation it tries to map.
-        mut last_output: string = "";
+        mut last_output: PathBuf = PathBuf::new();
 
         // A project with `[[bin]]` targets builds its executables; its
         // `[lib]` names what a dependent compiles (a dependency is compiled
@@ -673,7 +679,7 @@ type struct CompilerInstance {
             const bin_view: ProjectConfig = CompilerInstance::make_bin_view(base.clone(), sel);
             const r: CompilationResult = this.compile_project_with_config(bin_view);
             if (!r.success) { return r; }
-            if (r.output_path.length() > 0) { last_output = r.output_path; }
+            if (!r.output_path.as_path().is_empty()) { last_output = PathBuf::from(r.output_path.as_str()); }
         }
 
         // Workspace `[[lib]]` members: build each as an independent library
@@ -690,7 +696,7 @@ type struct CompilerInstance {
             const lib_view: ProjectConfig = CompilerInstance::make_lib_member_view(base.clone(), sel);
             const r: CompilationResult = this.compile_project_with_config(lib_view);
             if (!r.success) { return r; }
-            if (r.output_path.length() > 0) { last_output = r.output_path; }
+            if (!r.output_path.as_path().is_empty()) { last_output = PathBuf::from(r.output_path.as_str()); }
         }
 
         return CompilationResult::ok(last_output);
@@ -755,13 +761,14 @@ type struct CompilerInstance {
         };
         const build: ProjectBuild = this.compile_project_to_context(config, mode, []);
         mut result: CompilationResult = build.result;
-        // Per-target teardown.  Copy the survivor strings out of any
+        // Per-target teardown.  Copy the survivor string out of any
         // context-owned (interned) storage FIRST, then reclaim this target's
         // heap so a multi-target (`[lib]` + `[[bin]]`) build does not stack
         // both contexts into peak RSS.  Ordering matters: the dup must run
         // while the interned bytes are still valid, before the teardown frees
-        // them.  The LSP keeps its context alive and never comes through here.
-        result.output_path = CompilerInstance::dup_survivor(result.output_path);
+        // them.  The output path is a PathBuf made after the target's arena
+        // was switched off, so it survives as it is.  The LSP keeps its
+        // context alive and never comes through here.
         result.stdlib_root = CompilerInstance::dup_survivor(result.stdlib_root);
         if (apply_fixes && build.ctx != null) {
             result.fixes_applied = FixApplier::apply(build.ctx.diagnostics, build.ctx.options.stdlib_root);
@@ -798,7 +805,7 @@ type struct CompilerInstance {
         // cryoconfig stdlib_root -> legacy fallbacks.
         mut stdlib_root: string = "";
         if (!config.no_std) {
-            mut tried: [string] = [];
+            mut tried: [String] = [];
             stdlib_root = CompilerInstance::resolve_stdlib_root(
                 this.config.stdlib_path_override,
                 config.stdlib_root,
@@ -814,7 +821,7 @@ type struct CompilerInstance {
                 fmt::eprintf("error: cannot locate the Cryo standard library\n");
                 fmt::eprintf("  none of the candidate paths contained a 'lib.cryo':\n");
                 for (mut ti: i64 = 0; ti < tried.length(); ti++) {
-                    fmt::eprintln(f"    {tried[ti]}");
+                    fmt::eprintln(f"    {tried[ti].as_str()}");
                 }
                 fmt::eprintf("  fix one of:\n");
                 fmt::eprintf("    --stdlib=PATH                            (one-off override)\n");
@@ -834,16 +841,16 @@ type struct CompilerInstance {
         // but not over one the command line names: `--dev` is a fast debug
         // build whatever the project pins.  `--opt-level=N` wins over all.
         options.opt_level = ProjectConfig::profile_base_opt_level(config.profile);
-        mut opt_level_source: string = fmt::format("the `%s` profile", config.profile).into_raw();
+        mut opt_level_source: String = f"the `{config.profile}` profile";
         if (config.opt_level_explicit && this.config.profile_override.length() == 0) {
             options.opt_level = config.opt_level;
-            opt_level_source = "`[compiler] optimize`";
+            opt_level_source = String::from_str(Str::new("`[compiler] optimize`"));
         }
         if (this.config.opt_level_override >= 0) {
             mut lvl: i32 = this.config.opt_level_override;
             if (lvl > 3) { lvl = 3; }
             options.opt_level = lvl as u32;
-            opt_level_source = "`--opt-level`";
+            opt_level_source = String::from_str(Str::new("`--opt-level`"));
         }
         Log::debug(LogArea::Driver, f"optimization level O{options.opt_level}, from {opt_level_source}");
         options.debug_info = ProjectConfig::profile_base_debug_info(config.profile)
@@ -858,6 +865,7 @@ type struct CompilerInstance {
         options.static_link = this.config.release_static;
         options.emit_llvm = this.config.emit_llvm || config.emit_llvm;
         options.warnings_as_errors = this.config.warnings_as_errors;
+        options.promoted_warnings = this.config.promoted_warnings.clone();
         options.source_overrides = overlays;
         options.yield_hook = this.yield_hook;
 
@@ -914,7 +922,7 @@ type struct CompilerInstance {
         // prints (success path) when the `time` area logs at info, so the
         // overhead on a normal build is a handful of `clock_gettime`s.
         const tm_on: boolean = Log::enabled(LogArea::Time, LogLevel::Info);
-        const tm_entry:        i64 = Instant::now().as_nanos();
+        const tm_entry:        i64 = Instant::now().as_nanoseconds();
         mut tm_discovery_end:  i64 = 0;
         mut tm_frontend_end:   i64 = 0;
         mut tm_mono_end:       i64 = 0;
@@ -954,9 +962,9 @@ type struct CompilerInstance {
         // dep roots and reporting confusing "namespace not found"
         // diagnostics later.
         mut stage_start: i64 = TimeTrace::now();
-        const lock_path: string = CompilerInstance::lock_path_for(config.project_root);
+        const lock_path: PathBuf = CompilerInstance::lock_path_for(config.project_root);
         const dep_outcome: ResolveOutcome = DepResolver::resolve(
-            &config, ResolveMode::Build, lock_path);
+            &config, ResolveMode::Build, lock_path.as_path());
         if (dep_outcome.failed) {
             return CompilationResult::failed(1, 0);
         }
@@ -969,6 +977,27 @@ type struct CompilerInstance {
         mut loader: ModuleLoader = ModuleLoader::new(
             config.project_root, root_path, stdlib_root, config.no_std,
             effective_roots);
+        // Vendored bindings are the loader's copies in `<profile_dir>/vendor/
+        // <Name>/<Name>.cryo`, checked first as the most specific root; their
+        // output routes to `vendor/<Name>/{deps,ir}`.  The dep-root prefix
+        // mirrors the loader's scan-root form: relative dep roots are
+        // prefixed with project_root before scanning.
+        mut roots: PackageRoots = PackageRoots {
+            vendor_root: if (ctx.project_config != null) { ctx.project_config.vendor_dir() } else { PathBuf::new() },
+            stdlib_root: if (config.no_std) { PathBuf::new() } else { PathBuf::from(Str::new(stdlib_root)) },
+            dep_roots:   [],
+            dep_names:   [],
+        };
+        for (mut drc: i64 = 0; drc < dep_outcome.roots.length(); drc++) {
+            const dr_path: Str = Str::new(dep_outcome.roots[drc].path);
+            roots.dep_roots.push(if (config.project_root.length() == 0 || config.project_root.eq(".")) {
+                PathBuf::from(dr_path)
+            } else {
+                Path::from(config.project_root).join(dr_path)
+            });
+            roots.dep_names.push(String::from_string(dep_outcome.roots[drc].name));
+        }
+        loader.set_package_roots(roots);
 
         // Vendor libraries: honor any cryoconfig `[vendor.<Name>]` pins first,
         // generating bindings for each pinned triple on a cache miss (this is
@@ -982,11 +1011,11 @@ type struct CompilerInstance {
         // `<profile_dir>/vendor/<Name>/` so the generated `.cryo` (and its
         // object/IR output) is visible alongside std/local; empty when there's
         // no project configuration, where the loader answers the cache path.
-        const vendor_build_root: string =
+        const vendor_build_root: PathBuf =
             if (ctx.project_config != null) {
                 ctx.project_config.vendor_dir()
             } else {
-                ""
+                PathBuf::new()
             };
         loader.set_vendor_context(
             config.target_triple, &config.vendor_pins, vendor_build_root);
@@ -1063,7 +1092,7 @@ type struct CompilerInstance {
         // system header or libclang upgrade silently changed the bound API).
         const used_locks: [LockedVendor] = loader.collect_vendor_locks();
         if (used_locks.length() > 0) {
-            if (!CompilerInstance::sync_vendor_lock(lock_path, &used_locks, this.config.locked)) {
+            if (!CompilerInstance::sync_vendor_lock(lock_path.as_path(), &used_locks, this.config.locked)) {
                 // Only `--locked` returns false (a drift/missing-entry gate
                 // failure); the diagnostic was already printed.
                 return CompilationResult::failed(1, 0);
@@ -1118,7 +1147,7 @@ type struct CompilerInstance {
             }
         }
 
-        // Force-discover the f-string runtime (std::fmt::interp), but ONLY
+        // Force-discover the f-string runtime (`LangModule::Interp`), but ONLY
         // when some discovered module (entry graph, prelude, OR a test file)
         // actually uses an f-string.  Done after ALL discovery so the
         // `uses_fstring` flag reflects test files too.  It is deliberately
@@ -1133,7 +1162,7 @@ type struct CompilerInstance {
         if (ctx.options.mode.auto_imports_enabled() && !config.no_std
                 && stdlib_root.length() > 0
                 && ctx.module_graph.uses_fstring) {
-            const interp_path: string = stdlib_root + "/fmt/interp.cryo";
+            const interp_path: string = LangModule::Interp.file_below(stdlib_root);
             if (Path::from(interp_path).exists()) {
                 loader.discover_module(
                     ctx.intern_table, ctx.module_graph, ctx.diagnostics,
@@ -1149,9 +1178,7 @@ type struct CompilerInstance {
         // codegen and the build manifest route object/IR output into the
         // matching per-package subtree (`std/`, `local/`, `<depname>/`).
         // Done after ALL discovery so late-discovered stdlib modules
-        // (prelude, test runner, fmt::interp) are tagged Stdlib too.  The
-        // dep-root prefix mirrors ModuleLoader's scan-root form: relative
-        // dep roots are prefixed with project_root before scanning.
+        // (prelude, test runner, fmt::interpolation) are tagged Stdlib too.
         ctx.module_graph.builds_standard_library = config.target_type == TargetType::Stdlib;
         // The stdlib's own build is rooted at the stdlib; any other build
         // finds it at the root it resolved.
@@ -1161,36 +1188,18 @@ type struct CompilerInstance {
             } else {
                 if (config.no_std) { "" } else { stdlib_root }
             });
-        // Vendored bindings are the loader's copies in `<profile_dir>/vendor/
-        // <Name>/<Name>.cryo`, checked first as the most specific root; their
-        // output routes to `vendor/<Name>/{deps,ir}`.
-        mut roots: PackageRoots = PackageRoots {
-            vendor_root: if (ctx.project_config != null) { ctx.project_config.vendor_dir() } else { "" },
-            stdlib_root: if (config.no_std) { "" } else { stdlib_root },
-            dep_roots:   [],
-            dep_names:   [],
-        };
-        for (mut drc: i64 = 0; drc < dep_outcome.roots.length(); drc++) {
-            const dr_path: string = dep_outcome.roots[drc].path;
-            roots.dep_roots.push(if (config.project_root.length() == 0 || config.project_root.eq(".")) {
-                dr_path
-            } else {
-                Path::from(config.project_root).join(dr_path).into_raw()
-            });
-            roots.dep_names.push(dep_outcome.roots[drc].name);
-        }
         for (mut mci: u32 = 0; mci < ctx.module_graph.module_count(); mci++) {
             const mci_info: mut ModuleInfo* = &ctx.module_graph.modules[mci];
-            const package: ModulePackage = roots.package_of(mci_info.file_path);
+            const package: ModulePackage = loader.package_roots.package_of(Path::from(mci_info.file_path));
             mci_info.origin = package.origin;
-            mci_info.origin_name = package.origin_name;
+            mci_info.origin_name = package.origin_name.clone();
             // Warnings pointing into a generated binding are not the
             // consuming author's to act on; the sink drops them from here on.
             if (package.origin == ModuleOrigin::Vendor) { ctx.diagnostics.mark_vendor_file(mci_info.file_path); }
         }
         // Only the language server asks which modules exist unloaded.
         if (ctx.options.mode == CompileMode::Lsp) {
-            ctx.module_graph.indexed = loader.indexed_modules(ctx.intern_table, &roots);
+            ctx.module_graph.indexed = loader.indexed_modules(ctx.intern_table);
         }
 
         // Give each module the list of modules it can see through its imports,
@@ -1286,12 +1295,11 @@ type struct CompilerInstance {
                 };
                 if (!is_vendor) { continue; }
                 const vidx: i64 =
-                    loader.vendor_registry.find_index(ginfo.origin_name);
+                    loader.vendor_registry.find_index(ginfo.origin_name.as_str());
                 if (vidx < 0) { continue; }
                 if (!loader.vendor_registry.entries[vidx].is_cxx()) { continue; }
                 ctx.emit_error(ErrorCode::E0505_EXPERIMENTAL_FEATURE,
-                    fmt::format("`import vendor::%s` uses the experimental C++ binding generator",
-                        ginfo.origin_name));
+                    f"`import vendor::{ginfo.origin_name}` uses the experimental C++ binding generator");
                 cxx_gated = true;
             }
             if (cxx_gated) {
@@ -1316,21 +1324,16 @@ type struct CompilerInstance {
             // user saw only "Project compilation failed (1 errors, ...)" with
             // no diagnostic at all: the cycle listing went to the debug
             // channel, and the E0501 below was buffered but never flushed.
-            mut cyc: string = "";
+            mut cyc_msg: String = String::from_str(Str::new(
+                "circular module dependency detected; cannot determine compilation order"));
             const unplaced: &[u32] = &ctx.module_graph.topo_unplaced;
             for (mut ui: i64 = 0; ui < unplaced.length(); ui++) {
                 const uinfo: ModuleInfo* =
                     &ctx.module_graph.modules[unplaced[ui]];
                 const uname: string = ctx.intern_table.shown(uinfo.path().decl_name());
-                if (cyc.length() > 0) { cyc = cyc + ", "; }
-                cyc = cyc + uname;
+                cyc_msg.push(if (ui == 0) { Str::new(". Modules in the cycle: ") } else { Str::new(", ") });
+                cyc_msg.push(uname);
             }
-            const cyc_msg: string = if (cyc.length() > 0) {
-                fmt::format("circular module dependency detected; cannot determine "
-                       "compilation order. Modules in the cycle: %s", cyc).into_raw()
-            } else {
-                "circular module dependency detected; cannot determine compilation order"
-            };
             ctx.emit_error(ErrorCode::E0501_CIRCULAR_IMPORT, cyc_msg);
             // Diagnostics are buffered until flush(); an early return that
             // skips it silently discards the error (same defect the E0505
@@ -1341,7 +1344,7 @@ type struct CompilerInstance {
 
         const order: &[u32] = &ctx.module_graph.topo_order;
         const n: u32 = order.length() as u32;
-        tm_discovery_end = Instant::now().as_nanos();
+        tm_discovery_end = Instant::now().as_nanoseconds();
 
         if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
             for (mut i: u32 = 0; i < n; i++) {
@@ -1374,7 +1377,7 @@ type struct CompilerInstance {
                 }
                 Result::Err(reason) => {
                     mut text: String = reason;
-                    ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR, text.as_cstr() as string);
+                    ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR, text.as_c_string() as string);
                     ctx.diagnostics.flush();
                     return CompilationResult::failed(ctx.diagnostics.error_count, 0);
                 }
@@ -1401,7 +1404,7 @@ type struct CompilerInstance {
             this.config.incremental && ctx.options.mode.codegen_enabled()
             && this.config.output_path_override.length() == 0;
         mut mod_entries: [build_manifest::ModuleEntry] = [];
-        mut manifest_artifacts: [string] = [];
+        mut manifest_artifacts: [PathBuf] = [];
         mut manifest_stdlib_archive: string = "";
         mut manifest_stdlib_archive_key: string = "";
         mut build_fp_hex: string = "";
@@ -1417,7 +1420,7 @@ type struct CompilerInstance {
                 mod_entries.push(build_manifest::ModuleEntry {
                     namespace_name: ctx.intern_table.shown(minfo.path().decl_name()),
                     source_path:    minfo.file_path,
-                    origin_subdir:  ModuleInfo::origin_subdir(minfo.origin, minfo.origin_name),
+                    origin_subdir:  ModuleInfo::origin_subdir(minfo.origin, minfo.origin_name.as_str()),
                     origin_kind:    ModuleInfo::origin_kind_label(minfo.origin),
                 });
             }
@@ -1445,11 +1448,7 @@ type struct CompilerInstance {
                 manifest_artifacts.push(
                     CodegenPasses::profile_bin_path_for_target(ctx.project_config, ctx));
             } else {
-                const archive_name: string = match (config.target_type) {
-                    TargetType::Stdlib => { "libcryo.a" }
-                    _                  => { fmt::format("lib%s.a", config.project_name).into_raw() }
-                };
-                manifest_artifacts.push(ctx.project_config.lib_archive_path(archive_name));
+                manifest_artifacts.push(ctx.project_config.lib_archive_path(config.archive_name().as_str()));
             }
             mut shape_hasher: ContentHasher = ContentHasher::new();
             ctx.options.fold_build_shape(&shape_hasher);
@@ -1457,17 +1456,17 @@ type struct CompilerInstance {
             const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
                 ctx.project_config, build_shape, ctx.options.opt_level, ctx.options.debug_info,
                 ctx.options.target_triple, manifest_stdlib_archive, manifest_stdlib_archive_key);
-            const recorded_headers: [string] = manifest.recorded_headers();
+            const recorded_headers: [String] = manifest.recorded_headers();
             const build_fp: u128 = manifest.compute_fingerprint(&mod_entries, &recorded_headers);
             build_fp_hex = compiler::build_manifest::Manifest::hex128(build_fp);
 
             if (manifest.is_up_to_date(build_fp_hex, &manifest_artifacts)) {
                 // Nothing changed and the artifact still exists: skip
                 // frontend, codegen, and linking entirely.
-                const up_to_date_out: string = if (config.requires_entry_point()) {
-                    manifest_artifacts[0]
+                const up_to_date_out: PathBuf = if (config.requires_entry_point()) {
+                    PathBuf::from(manifest_artifacts[0].as_str())
                 } else {
-                    ""
+                    PathBuf::new()
                 };
                 TimeTrace::span("stage", Str::new("build fingerprint"), Str::new(config.project_name), stage_start);
                 fmt::println(f"{config.project_name} is up to date ({config.profile})");
@@ -1550,7 +1549,7 @@ type struct CompilerInstance {
         }
         TimeTrace::span("stage", Str::new("declare and resolve types"), Str::new(config.project_name), stage_start);
 
-        tm_frontend_end = Instant::now().as_nanos();
+        tm_frontend_end = Instant::now().as_nanoseconds();
 
         // Specialization runs as three ordered stages across all modules:
         // directives (layout flags) -> body typecheck (mono-after-sema) ->
@@ -1613,7 +1612,7 @@ type struct CompilerInstance {
             return this.project_failure_release(ctx, ast_buf);
         }
 
-        tm_mono_end = Instant::now().as_nanos();
+        tm_mono_end = Instant::now().as_nanoseconds();
         TimeTrace::span("stage", Str::new("monomorphize"), Str::new(config.project_name), stage_start);
 
         // Per-module incremental cache.  Every module is analysed and has its
@@ -1628,9 +1627,9 @@ type struct CompilerInstance {
         // give, so it reuses no module's object.
         if (do_incremental && ctx.project_config != null
                 && !ctx.module_graph.builds_standard_library) {
+            const keys_path: PathBuf = ctx.project_config.module_keys_path();
             module_cache = compiler::build_manifest::ModuleObjectCache::open(
-                ctx.options.opt_level, ctx.options.target_triple,
-                ctx.project_config.module_keys_path());
+                ctx.options.opt_level, ctx.options.target_triple, keys_path.as_path());
         }
 
         // Semantic analysis: GenericValidation + MoveCheck + DropInsertion +
@@ -1685,7 +1684,7 @@ type struct CompilerInstance {
             pipeline.reset();
         }
 
-        tm_sema_end = Instant::now().as_nanos();
+        tm_sema_end = Instant::now().as_nanoseconds();
         TimeTrace::span("stage", Str::new("validate, move-check and lower"), Str::new(config.project_name), stage_start);
 
         // Dump ASTs if requested (even on errors, for debugging)
@@ -1744,16 +1743,20 @@ type struct CompilerInstance {
             ctx.decl_index.settle_method_symbols();
 
             // An executable's every caller is in this build, so an instance
-            // none of its functions reaches is left out of every module.  A
-            // library's callers are not, nor are those of a single object,
+            // none of its functions reaches is left out of every module.  So
+            // is one the stdlib's own build does not reach: a program linking
+            // its archive defines every instance the archive's manifest does
+            // not list (`PrebuiltStdlib.strip`).  Another library's callers
+            // are not in this build, nor are those of a single object,
             // assembly or IR file.
-            const emits_whole_program: boolean = config.target_type == TargetType::Executable
+            const omits_unreached_instances: boolean =
+                (config.target_type == TargetType::Executable || ctx.module_graph.builds_standard_library)
                 && match (ctx.options.output) {
                     OutputOverride::Default => { true }
                     OutputOverride::Exe(_)  => { true }
                     _                       => { false }
                 };
-            if (emits_whole_program) {
+            if (omits_unreached_instances) {
                 const reach_start: i64 = TimeTrace::now();
                 mut programs: [ProgramNode*] = [];
                 for (mut r: u32 = 0; r < n; r++) {
@@ -1889,7 +1892,7 @@ type struct CompilerInstance {
                 for (mut r: u32 = 0; r < n; r++) {
                     cg_final_slot.push(-1);
                 }
-                cg_pool.start(cg_jobs.as_mutable_ptr(), cg_done.as_ptr(), cg_threads,
+                cg_pool.start(cg_jobs.as_mutable_pointer(), cg_done.as_pointer(), cg_threads,
                               codegen_emit_job);
             }
 
@@ -1946,9 +1949,9 @@ type struct CompilerInstance {
                 ctx.provisions.mark(Provision::BodiesTypeChecked);
                 ctx.provisions.mark(Provision::TypesLowered);
 
-                const tm_ir_start: i64 = Instant::now().as_nanos();
+                const tm_ir_start: i64 = Instant::now().as_nanoseconds();
                 const _gen_ok: boolean = pipeline.run_all(ctx);
-                tm_ir_generation = tm_ir_generation + (Instant::now().as_nanos() - tm_ir_start);
+                tm_ir_generation = tm_ir_generation + (Instant::now().as_nanoseconds() - tm_ir_start);
 
                 const mod_info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
                 const mod_name: string = ctx.intern_table.shown(mod_info.path().decl_name());
@@ -2122,7 +2125,7 @@ type struct CompilerInstance {
                     cg_live = cg_live - CompilerInstance::retire_finished_jobs(
                         &cg_jobs, &cg_done, &cg_filled, &cg_final_slot, &cg_pool, &cg_emit_failed);
                     if (cg_live < cg_live_cap) { break; }
-                    thread::sleep_ms(1);
+                    thread::sleep(Duration::from_milliseconds(1));
                 }
             }
 
@@ -2133,7 +2136,7 @@ type struct CompilerInstance {
                 while (cg_live > 0) {
                     cg_live = cg_live - CompilerInstance::retire_finished_jobs(
                         &cg_jobs, &cg_done, &cg_filled, &cg_final_slot, &cg_pool, &cg_emit_failed);
-                    if (cg_live > 0) { thread::sleep_ms(1); }
+                    if (cg_live > 0) { thread::sleep(Duration::from_milliseconds(1)); }
                 }
                 cg_pool.close();
                 for (mut p: i64 = 0; p < cg_final_slot.length(); p++) {
@@ -2159,7 +2162,7 @@ type struct CompilerInstance {
                 }
             }
 
-            tm_codegen_end = Instant::now().as_nanos();
+            tm_codegen_end = Instant::now().as_nanoseconds();
             TimeTrace::span("stage", Str::new("generate and emit code"), Str::new(config.project_name), tm_sema_end);
 
             // test-main synthesis: synthesize the test-runner main when in test mode.
@@ -2194,7 +2197,7 @@ type struct CompilerInstance {
                 }
             }
 
-            tm_link_end = Instant::now().as_nanos();
+            tm_link_end = Instant::now().as_nanoseconds();
             TimeTrace::span("stage", Str::new("link"), Str::new(config.project_name), tm_codegen_end);
         }
 
@@ -2284,11 +2287,12 @@ type struct CompilerInstance {
         // same project; `run_linking` applies the same suffix.  On Windows
         // targets the helper appends `.exe` so the reported path matches
         // what the linker actually wrote.
-        mut exe_path: string = "";
-        if (ctx.project_config != null
+        const exe_path: PathBuf = if (ctx.project_config != null
                 && ctx.project_config.requires_entry_point()) {
-            exe_path = CodegenPasses::bin_artifact_path_for_target(ctx.project_config, ctx);
-        }
+            CodegenPasses::bin_artifact_path_for_target(ctx.project_config, ctx)
+        } else {
+            PathBuf::new()
+        };
 
         // Build succeeded: record the fingerprint sidecar (consulted by the
         // next build's short-circuit) and the human/tooling-facing manifest.
@@ -2307,7 +2311,8 @@ type struct CompilerInstance {
             // module with an object, emitted or reused, under the key of the
             // bitcode that object was emitted from.
             if (module_cache.active) {
-                module_cache.write(ctx.project_config.module_keys_path());
+                const keys_path: PathBuf = ctx.project_config.module_keys_path();
+                module_cache.write(keys_path.as_path());
             }
         }
 
@@ -2906,7 +2911,7 @@ type struct CompilerInstance {
     static resolve_stdlib_root(cli_override_text: string,
                                  cryoconfig_override_text: string,
                                  project_root_text: string,
-                                 tried_out: mut [string]*) -> string {
+                                 tried_out: mut [String]*) -> string {
         const found: string = CompilerInstance::search_stdlib_root(
             cli_override_text, cryoconfig_override_text, project_root_text, tried_out);
         if (found.length() == 0) { return found; }
@@ -2922,7 +2927,7 @@ type struct CompilerInstance {
     private static search_stdlib_root(cli_override_text: string,
                                       cryoconfig_override_text: string,
                                       project_root_text: string,
-                                      tried_out: mut [string]*) -> string {
+                                      tried_out: mut [String]*) -> string {
         const cli_override: string = cli_override_text;
         const cryoconfig_override: string = cryoconfig_override_text;
         const project_root: string = project_root_text;
@@ -2932,7 +2937,7 @@ type struct CompilerInstance {
                 return cli_override;
             }
             if (tried_out != null) {
-                tried_out.push(fmt::format("%s  (--stdlib)", cli_override).into_raw());
+                tried_out.push(fmt::format("%s  (--stdlib)", cli_override));
             }
         }
 
@@ -2947,7 +2952,7 @@ type struct CompilerInstance {
                     return env_path;
                 }
                 if (tried_out != null) {
-                    tried_out.push(fmt::format("%s  ($CRYO_STDLIB)", env_path).into_raw());
+                    tried_out.push(fmt::format("%s  ($CRYO_STDLIB)", env_path));
                 }
             }
             Option::None => {}
@@ -2964,20 +2969,20 @@ type struct CompilerInstance {
                 // exit; a borrowed cstr view builds the (independently
                 // allocated) candidate paths, which outlive the drop.
                 mut s: String = v;
-                const home_path: string = s.as_cstr() as string;
+                const home_path: string = s.as_c_string() as string;
                 const cand_home_simple: string = home_path + "/stdlib";
                 if (Path::from(cand_home_simple + "/lib.cryo").exists()) {
                     return cand_home_simple;
                 }
                 if (tried_out != null) {
-                    tried_out.push(fmt::format("%s  ($CRYO_HOME/stdlib)", cand_home_simple).into_raw());
+                    tried_out.push(fmt::format("%s  ($CRYO_HOME/stdlib)", cand_home_simple));
                 }
                 const cand_home_share: string = home_path + "/share/cryo/stdlib";
                 if (Path::from(cand_home_share + "/lib.cryo").exists()) {
                     return cand_home_share;
                 }
                 if (tried_out != null) {
-                    tried_out.push(fmt::format("%s  ($CRYO_HOME/share/cryo/stdlib)", cand_home_share).into_raw());
+                    tried_out.push(fmt::format("%s  ($CRYO_HOME/share/cryo/stdlib)", cand_home_share));
                 }
             }
             Option::None => {}
@@ -2987,7 +2992,7 @@ type struct CompilerInstance {
         // buffer is leaked once per compile; same pattern as the path
         // concatenations below, and only happens once per `cryo build`.
         mut self_exe: string = "";
-        match (env::current_exe()) {
+        match (env::current_executable()) {
             Option::Some(s) => { self_exe = s.into_raw(); }
             Option::None    => {}
         }
@@ -2995,7 +3000,7 @@ type struct CompilerInstance {
         if (exe_len > 0) {
             mut exe_buf: mut i8* = self_exe as mut i8*;
             const exe_path: string = self_exe;
-            // dirname: walk back to the final path separator.  `current_exe()`
+            // dirname: walk back to the final path separator.  `current_executable()`
             // yields a forward-slash path on Unix (`/proc/self/exe`) but a
             // BACKSLASH path on Windows (`GetModuleFileNameW` returns
             // `C:\...\bin\cryo.exe`), so both separators must terminate the
@@ -3015,14 +3020,14 @@ type struct CompilerInstance {
                     return cand_repo;
                 }
                 if (tried_out != null) {
-                    tried_out.push(fmt::format("%s  (binary-relative)", cand_repo).into_raw());
+                    tried_out.push(fmt::format("%s  (binary-relative)", cand_repo));
                 }
                 const cand_sys: string = bindir + "/../share/cryo/stdlib";
                 if (Path::from(cand_sys + "/lib.cryo").exists()) {
                     return cand_sys;
                 }
                 if (tried_out != null) {
-                    tried_out.push(fmt::format("%s  (binary-relative share)", cand_sys).into_raw());
+                    tried_out.push(fmt::format("%s  (binary-relative share)", cand_sys));
                 }
             }
         }
@@ -3040,7 +3045,7 @@ type struct CompilerInstance {
                 return cand_cfg;
             }
             if (tried_out != null) {
-                tried_out.push(fmt::format("%s  ([project] stdlib_root)", cand_cfg).into_raw());
+                tried_out.push(fmt::format("%s  ([project] stdlib_root)", cand_cfg));
             }
         }
 
@@ -3050,25 +3055,24 @@ type struct CompilerInstance {
             return cand_proj;
         }
         if (tried_out != null) {
-            tried_out.push(fmt::format("%s  (project-relative)", cand_proj).into_raw());
+            tried_out.push(fmt::format("%s  (project-relative)", cand_proj));
         }
         // 8. ../stdlib (cwd-relative)
         if (Path::from("../stdlib/lib.cryo").exists()) {
             return "../stdlib";
         }
         if (tried_out != null) {
-            tried_out.push("../stdlib  (cwd-relative)");
+            tried_out.push(String::from_string("../stdlib  (cwd-relative)"));
         }
         return "";
     }
 
     /// Path to the lockfile next to a given cryoconfig.
-    static lock_path_for(consumer_root_text: string) -> string {
-        const consumer_root: string = consumer_root_text;
-        if (consumer_root.length() == 0 || consumer_root.eq(".")) {
-            return "cryoconfig.lock";
+    static lock_path_for(consumer_root: Str) -> PathBuf {
+        if (consumer_root.is_empty() || consumer_root == Str::new(".")) {
+            return PathBuf::from(Str::new("cryoconfig.lock"));
         }
-        return Path::from(consumer_root).join("cryoconfig.lock").into_raw();
+        return Path::from(consumer_root).join(Str::new("cryoconfig.lock"));
     }
 
     /// Reconcile `used` (the vendor bindings this build resolved) with the
@@ -3080,44 +3084,33 @@ type struct CompilerInstance {
     ///     content hash drifted.  Returns true when every binding matches.
     /// The packages section is preserved because `read` loads it and `write`
     /// emits it back untouched.
-    static sync_vendor_lock(lock_path_text: string, used: &[LockedVendor], locked: boolean) -> boolean {
-        const lock_path: string = lock_path_text;
-        mut lock: Lockfile = Lockfile::read(lock_path_text);
+    static sync_vendor_lock(lock_path: Path, used: &[LockedVendor], locked: boolean) -> boolean {
+        mut lock: Lockfile = Lockfile::read(lock_path);
         mut changed: boolean = false;
         mut drift:   boolean = false;
         for (mut i: i64 = 0; i < used.length(); i++) {
             mut found: i64 = -1;
             for (mut j: i64 = 0; j < lock.vendor.length(); j++) {
-                if (lock.vendor[j].name.eq(used[i].name)
-                        && lock.vendor[j].triple.eq(used[i].triple)) {
+                if (lock.vendor[j].name == used[i].name && lock.vendor[j].triple == used[i].triple) {
                     found = j;
                     break;
                 }
             }
             if (found < 0) {
                 if (locked) {
-                    fmt::eprintf("error: --locked: vendor '%s' (triple '%s') has no entry in %s.\n        Run a normal build to record it, then commit the lockfile.\n",
-                        used[i].name, used[i].triple, lock_path);
+                    fmt::eprintln(f"error: --locked: vendor '{used[i].name}' (triple '{used[i].triple}') has no entry in {lock_path.as_str()}.\n        Run a normal build to record it, then commit the lockfile.");
                     drift = true;
                 } else {
-                    lock.vendor.push(LockedVendor {
-                        name:        used[i].name,
-                        triple:      used[i].triple,
-                        binding_sha: used[i].binding_sha,
-                    });
+                    lock.vendor.push(used[i].clone());
                     changed = true;
                 }
-            } else if (!lock.vendor[found].binding_sha.eq(used[i].binding_sha)) {
+            } else if (lock.vendor[found].binding_sha != used[i].binding_sha) {
                 if (locked) {
-                    fmt::eprintf("error: --locked: vendor '%s' (triple '%s') bindings drifted from %s.\n        locked %s, built %s. Run `cryo vendor rebuild %s` and re-lock, or restore the toolchain.\n",
-                        used[i].name, used[i].triple, lock_path,
-                        lock.vendor[found].binding_sha, used[i].binding_sha, used[i].name);
+                    fmt::eprintln(f"error: --locked: vendor '{used[i].name}' (triple '{used[i].triple}') bindings drifted from {lock_path.as_str()}.\n        locked {lock.vendor[found].binding_sha}, built {used[i].binding_sha}. Run `cryo vendor rebuild {used[i].name}` and re-lock, or restore the toolchain.");
                     drift = true;
                 } else {
-                    fmt::eprintf("note: vendor '%s' (triple '%s') bindings changed; updating %s (%s -> %s).\n",
-                        used[i].name, used[i].triple, lock_path,
-                        lock.vendor[found].binding_sha, used[i].binding_sha);
-                    lock.vendor[found].binding_sha = used[i].binding_sha;
+                    fmt::eprintln(f"note: vendor '{used[i].name}' (triple '{used[i].triple}') bindings changed; updating {lock_path.as_str()} ({lock.vendor[found].binding_sha} -> {used[i].binding_sha}).");
+                    lock.vendor[found].binding_sha = used[i].binding_sha.clone();
                     changed = true;
                 }
             }
@@ -3125,8 +3118,8 @@ type struct CompilerInstance {
         if (locked) {
             return !drift;
         }
-        if (changed && !Lockfile::write(lock_path_text, &lock)) {
-            fmt::eprintf("warning: could not write vendor pins to %s\n", lock_path);
+        if (changed && !Lockfile::write(lock_path, &lock)) {
+            fmt::eprintln(f"warning: could not write vendor pins to {lock_path.as_str()}");
         }
         return true;
     }
@@ -3183,7 +3176,7 @@ type struct CompilerInstance {
             Option::Some(v) => {
                 // The owned String drops at the arm's end, after the compare.
                 mut s: String = v;
-                const view: string = s.as_cstr() as string;
+                const view: string = s.as_c_string() as string;
                 return view == "serial";
             }
             Option::None => { return false; }
@@ -3258,14 +3251,15 @@ type struct CompilerInstance {
     /// IR tree mirrors the source tree.
     static write_module_ir(ctx: CompilationContext*, mod_info: ModuleInfo*,
                            mod_name: string, llvm_module: mut void*) -> void {
-        mut ir_dir: string = "build/target/release/local/ir";
-        if (ctx.project_config != null) {
-            ir_dir = ctx.project_config.ir_dir_for(
-                ModuleInfo::origin_subdir(mod_info.origin, mod_info.origin_name));
-        }
+        const ir_dir: PathBuf = if (ctx.project_config != null) {
+            ctx.project_config.ir_dir_for(
+                ModuleInfo::origin_subdir(mod_info.origin, mod_info.origin_name.as_str()).as_str())
+        } else {
+            PathBuf::from(Str::new("build/target/release/local/ir"))
+        };
         const ll_rel: string = compiler::build_manifest::Manifest::path_module(mod_name);
-        const ll_path: string = Path::from(ir_dir).join(f"{ll_rel}.ll".as_str()).into_raw();
-        ProjectConfig::mkdir_p(ll_path.parent_dir());
+        const ll_path: string = ir_dir.join(f"{ll_rel}.ll".as_str()).into_raw();
+        ProjectConfig::mkdir_p(Path::from(ll_path.parent_directory()));
         mut ll_err: i8* = null;
         const ll_rc: i32 = llvm::LLVMPrintModuleToFile(llvm_module, ll_path, &ll_err as mut void*);
         if (ll_rc != 0 && ll_err != null) {

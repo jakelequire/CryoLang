@@ -25,7 +25,8 @@ make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS and unit/project NAMES asserted
 make verify              # build once; census, examples, lsp, cross, incr, abi, check-fast
-                         # CONCURRENTLY, objects hashed (tests, examples, stdlib archives,
+                         # CONCURRENTLY (ARGS="--sequential": one at a time, for a host short
+                         # of memory), objects hashed (tests, examples, stdlib archives,
                          # runtime archive members); ARGS="--baseline HEAD --require-identical"
                          # proves a change moved no compiled output (baseline = REV's
                          # compiler/src AND runtime/, the rest from the tree; built in .verify/, cached;
@@ -117,10 +118,11 @@ not done. The remaining limits are here so nobody rediscovers them:
   OS-gated entries - it keeps a golden entry whose test is still
   `![target]`-gated elsewhere in the SOURCE, and drops one whose test is
   actually gone.
-- **`outcome: "collect"` ignores every `expect` field.** `project_outcome`
-  (`compiler/src/CLI/commands.cryo`) passes a `collect` project on the
-  child's exit code and nothing else, so writing assertions into such a
-  `test.json` does not make them run. What it does add is the child's own
+- **`outcome: "collect"` passes on its exit code alone.** `project_outcome`
+  (`compiler/src/CLI/commands.cryo`) judges a `collect` project's `cryo test`
+  exit as it judges a build's: `expect.exit_code` (default 0), or with
+  `fails` any non-zero exit; its output and file assertions run against
+  that `cryo test` output. What it does add is the child's own
   unit-test count on the verdict (`ok (12 tests)`), and `make test-census`
   refuses a passing `collect` project that ran none - a broken `![test]`
   discovery exits 0 too. `make test` does not check the count. The roster

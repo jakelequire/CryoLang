@@ -1,0 +1,83 @@
+namespace Main;
+
+// Where a container that is a type parameter is writable and a bound gives
+// it `IndexViewMutable` at the index's type, `container[r]` is its writable
+// view, a value of `C::ViewMutable`: the methods and elements the bounds on
+// `C::ViewMutable` give are reached through it, and a function returning
+// it returns `container[r]`.  A read-only container is viewed through
+// `IndexView`, a value of `C::View`.
+
+import std::core::ops::{ Index, IndexMutable, IndexView, IndexViewMutable, Range };
+
+type trait Put {
+    put(mut &this, at: i64, value: i64) -> void;
+}
+
+type struct Store {
+    values: [i64; 4];
+}
+
+// The read view: the first value the range selects.
+type struct Reading {
+    first: i64;
+}
+
+// The writable view: the values the range selects, in place.
+type struct Window {
+    values: mut i64*;
+}
+
+implement trait Put for struct Window {
+    put(mut &this, at: i64, value: i64) -> void { this.values[at] = value; }
+}
+
+implement trait Index<i64> for struct Window {
+    type Output = i64;
+    index(&this, at: i64) -> const i64* { return &this.values[at]; }
+}
+
+implement trait IndexMutable<i64> for struct Window {
+    index_mutable(mut &this, at: i64) -> mut i64* { return &this.values[at]; }
+}
+
+implement trait IndexView<Range<i64>> for struct Store {
+    type View = Reading;
+    view(&this, range: Range<i64>) -> Reading { return Reading { first: this.values[range.start] }; }
+}
+
+implement trait IndexViewMutable<Range<i64>> for struct Store {
+    type ViewMutable = Window;
+    view_mutable(mut &this, range: Range<i64>) -> Window { return Window { values: &this.values[range.start] }; }
+}
+
+function put_through<C>(container: mut &C, value: i64) -> void
+        where C: IndexViewMutable<Range<i64>>, C::ViewMutable: Put {
+    container[1..3].put(1, value);
+}
+
+function assign_through<C>(container: mut &C, value: i64) -> void
+        where C: IndexViewMutable<Range<i64>>, C::ViewMutable: IndexMutable<i64> {
+    container[1..3][0] = value;
+}
+
+function writable_view<C>(container: mut &C) -> C::ViewMutable where C: IndexViewMutable<Range<i64>> {
+    return container[0..2];
+}
+
+function read_view<C>(container: &C) -> C::View where C: IndexViewMutable<Range<i64>> {
+    return container[2..4];
+}
+
+function main() -> i32 {
+    mut store = Store { values: [1, 2, 3, 4] };
+    put_through(&store, 9);
+    if (store.values[2] != 9) { return 1; }
+    assign_through(&store, 7);
+    if (store.values[1] != 7) { return 2; }
+    mut window: Window = writable_view(&store);
+    window.put(0, 5);
+    if (store.values[0] != 5) { return 3; }
+    const reading: Reading = read_view(&store);
+    if (reading.first != 9) { return 4; }
+    return 0;
+}

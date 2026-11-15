@@ -43,4 +43,6 @@ The point of the feature is that **no one hand-writes raylib bindings** - they
 are generated from `raylib.h` per machine/triple and cached under the cryo
 cache (`<cache>/vendor/raylib/<triple>/RayLib.cryo`), not committed here. This
 project contains only the *consumer* (`src/main.cryo`) and the manifest
-*template*.
+*template*. For the same reason its `cryoconfig.lock` is not committed: the
+lock records the hash of the bindings this machine generated, so the build
+writes it.

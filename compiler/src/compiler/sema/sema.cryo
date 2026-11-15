@@ -41,6 +41,7 @@ import compiler::types::{
 import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name, resolver };
 import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResBase, ResSlot };
 import compiler::decl_index::{ DeclarationIndex, GlobalEntry, OverloadId };
+import utils::keyword::{ Keyword };
 import compiler::sema::{
     state, helpers, scope_manager, type_utils, literal_resolver, diagnostics,
     symbolic_checker, method_binding, pattern_resolver,
@@ -49,6 +50,7 @@ import compiler::sema::{
 import std::core::{ option, mem };
 import std::collections::hashmap::{ HashMap };
 import std::collections::string::{ String };
+import std::collections::str::{ Str };
 import std::collections::pair::{ Pair };
 import std::core::iter::{ Iterator };
 import std::fmt;
@@ -58,7 +60,7 @@ import compiler::passes::type_resolution::{ TypeResolutionPasses, TypeResolution
 import compiler::ast::cloner::{ ASTCloner };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, DeclarationNode, DeclKind, DestructureBinding, DestructureDecl,
-    EnumVariant, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock, MethodDecl,
+    EnumVariant, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock, JsonFieldOptions, MethodDecl,
     StructDecl, TraitDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -179,7 +181,7 @@ implement enum PlaceAccess {
 /// the operator is not overloadable; `negate` flags `!=`, which lowers to
 /// `!a.equals(&b)`. `ord_pred` (non-empty only for the relational operators
 /// `< > <= >=`) names an `Ordering` predicate: those lower to
-/// `a.compare(&b).<ord_pred>()` (e.g. `a < b` -> `a.compare(&b).is_lt()`).
+/// `a.compare(&b).<ord_pred>()` (e.g. `a < b` -> `a.compare(&b).is_less()`).
 /// `deref_wrap` flags the unary `*` -> `Deref`: the built `b.deref()` call
 /// returns `Target*`, so the desugar wraps it in an outer `*` (`*(b.deref())`),
 /// a place that serves read / write / compound uniformly.
@@ -222,10 +224,10 @@ type struct OperatorTraitMap {
         if (op == TokenType::Percent)  { return OperatorTraitMap::mk(LangItem::Rem, "rem", false); }
         if (op == TokenType::EqualEqual) { return OperatorTraitMap::mk(LangItem::Eq, "equals", false); }
         if (op == TokenType::ExclaimEqual) { return OperatorTraitMap::mk(LangItem::Eq, "equals", true); }
-        if (op == TokenType::LAngle)  { return OperatorTraitMap::mk_ord("is_lt"); }
-        if (op == TokenType::RAngle)  { return OperatorTraitMap::mk_ord("is_gt"); }
-        if (op == TokenType::LessEqual) { return OperatorTraitMap::mk_ord("is_le"); }
-        if (op == TokenType::GreaterEqual) { return OperatorTraitMap::mk_ord("is_ge"); }
+        if (op == TokenType::LAngle)  { return OperatorTraitMap::mk_ord("is_less"); }
+        if (op == TokenType::RAngle)  { return OperatorTraitMap::mk_ord("is_greater"); }
+        if (op == TokenType::LessEqual) { return OperatorTraitMap::mk_ord("is_less_or_equal"); }
+        if (op == TokenType::GreaterEqual) { return OperatorTraitMap::mk_ord("is_greater_or_equal"); }
         if (op == TokenType::Amp)  { return OperatorTraitMap::mk(LangItem::BitAnd, "bitand", false); }
         if (op == TokenType::Pipe)  { return OperatorTraitMap::mk(LangItem::BitOr,  "bitor",  false); }
         if (op == TokenType::Caret)  { return OperatorTraitMap::mk(LangItem::BitXor, "bitxor", false); }
@@ -352,10 +354,10 @@ type struct SemaVisitor {
         this.calls.bind_destructor(this as mut SemaVisitor*, call, member.object.resolved_type);
     }
 
-    /// A fresh trait checker over the shared arena + registry (a 4-pointer view).
+    /// A fresh trait checker over the shared arena + registry (a view).
     trait_checker(&this) -> TraitChecker {
         return TraitChecker::new(this.arena, this.ctx.generic_registry,
-                                 this.intern, this.ctx.diagnostics);
+                                 this.intern, this.ctx.diagnostics, this.ctx.type_resolver);
     }
 
     // -- Top-level + statement recursion seams --
@@ -382,9 +384,10 @@ type struct SemaVisitor {
     /// function whose opaque return (`-> implement Trait`) its signature left
     /// undecided: the first value it returns decides the type
     /// (`visit_return`), and a caller checked earlier would find the
-    /// function with no return type.  Such a method of a type that is not
-    /// generic, or of an inherent implementation for one, is checked the
-    /// same way.
+    /// function with no return type.  Such a method of a type, or of an
+    /// implementation (inherent or of a trait, whose copies of the trait's
+    /// defaults it holds), is checked the same way; a generic owner's
+    /// symbolically, in its parameters.
     /// Returns
     /// the statement positions of the free functions checked, which the
     /// module's walk then passes over; it passes over such methods by their
@@ -399,15 +402,34 @@ type struct SemaVisitor {
                 this.check_undecided_opaque_methods(st.methods,
                     this.ctx.decl_index.type_of_decl(st.def, "sema/undecided opaque methods"));
             }
+            if (st != null && st.is_generic()) {
+                this.check_undecided_opaque_template_methods(st.methods,
+                    this.ctx.decl_index.type_of_decl(st.def, "sema/undecided opaque methods"),
+                    &st.generic_params, st.def, null);
+            }
             const un: UnionDecl* = DeclarationNode::union_of(decl);
             if (un != null && !un.is_generic()) {
                 this.check_undecided_opaque_methods(un.methods,
                     this.ctx.decl_index.type_of_decl(un.def, "sema/undecided opaque methods"));
             }
-            const block: ImplBlock* = DeclarationNode::impl_of(decl);
-            if (block != null && !block.is_trait_impl() && !block.is_template() && !block.is_generic()) {
+            if (un != null && un.is_generic()) {
+                this.check_undecided_opaque_template_methods(un.methods,
+                    this.ctx.decl_index.type_of_decl(un.def, "sema/undecided opaque methods"),
+                    &un.generic_params, un.def, null);
+            }
+            const block: mut ImplBlock* = DeclarationNode::impl_of(decl);
+            if (block != null && !block.is_template() && !block.is_generic()) {
                 this.check_undecided_opaque_methods(block.methods,
                     this.ctx.decl_index.impl_owner(block, "sema/undecided opaque methods"));
+            }
+            if (block != null && block.is_template()) {
+                const template: DefId = match (block.res) {
+                    ResSlot::Answered(r) => { r.def_id() }
+                    _                    => { DefId::invalid() }
+                };
+                this.check_undecided_opaque_template_methods(block.methods,
+                    this.ctx.decl_index.impl_owner(block, "sema/undecided opaque methods"),
+                    &block.generic_params, template, block);
             }
             const func: FunctionDecl* = DeclarationNode::fn_of(decl);
             if (func == null || func.body == null || !SemaVisitor::opaque_return_decided_by_body(func)) {
@@ -423,8 +445,9 @@ type struct SemaVisitor {
     /// Check each of `methods`, of `owner`, whose opaque return its
     /// signature left undecided, and register it again under `owner` with
     /// the type its body decided: a method's callers read its registration.
-    /// A trait's method declares no opaque return, so no implementation's
-    /// method has one to decide.
+    /// A trait implementation's copy of a default declaring an opaque return
+    /// is decided here too, in the implementing type: the default's literal
+    /// names its instance only once `This` is known.
     check_undecided_opaque_methods(mut &this, methods: &[DeclarationNode*], owner: TypeRef) -> void {
         const owner_type: Type* = this.arena.lookup(owner);
         if (owner_type == null || owner_type.kind == TypeKind::InstantiatedType) { return; }
@@ -432,7 +455,7 @@ type struct SemaVisitor {
             const method: MethodDecl* = DeclarationNode::method_of(methods[i]);
             if (method == null || method.func == null) { continue; }
             const func: FunctionDecl* = DeclarationNode::fn_of(method.func);
-            if (func.body == null || func.is_generic() || !SemaVisitor::opaque_return_decided_by_body(func)) {
+            if (func.body == null || !SemaVisitor::opaque_return_decided_by_body(func)) {
                 continue;
             }
             this.state.current_func = null;
@@ -445,6 +468,42 @@ type struct SemaVisitor {
             this.ctx.decl_index.register_methods(owner, &decided, this.ctx.intern_table, this.arena,
                 "sema/undecided opaque methods");
         }
+    }
+
+    /// Walk symbolically each of `methods`, of the generic `owner`, whose
+    /// opaque return its signature left undecided, and register it again on
+    /// the template `template` with the type its body decided, in the
+    /// owner's parameters: a caller reads the template's entry and
+    /// substitutes its receiver's arguments, and an instance's copy of the
+    /// method carries its literal typed.  `impl_node` is the implementation
+    /// the methods are written in, null for a type's own body.
+    check_undecided_opaque_template_methods(mut &this, methods: &[DeclarationNode*], owner: TypeRef,
+                                            owner_params: &[DeclarationNode*], template: DefId,
+                                            impl_node: mut ImplBlock*) -> void {
+        mut undecided: [DeclarationNode*] = [];
+        for (mut i: i64 = 0; i < methods.length(); i++) {
+            const method: MethodDecl* = DeclarationNode::method_of(methods[i]);
+            if (method == null || method.func == null) { continue; }
+            const func: FunctionDecl* = DeclarationNode::fn_of(method.func);
+            if (func.body == null || !SemaVisitor::opaque_return_decided_by_body(func)) { continue; }
+            undecided.push(methods[i]);
+        }
+        if (undecided.length() == 0) { return; }
+        const saved_impl: mut ImplBlock* = this.state.symbolic_impl_node;
+        if (impl_node != null) { this.state.symbolic_impl_node = impl_node; }
+        this.state.current_func = null;
+        this.symbolic_check_owner_methods(&undecided, owner, owner_params);
+        this.state.symbolic_impl_node = saved_impl;
+        for (mut i: i64 = 0; i < undecided.length(); i++) {
+            const func: FunctionDecl* = DeclarationNode::fn_of(DeclarationNode::method_of(undecided[i]).func);
+            match (*func.return_type_annotation) {
+                TypeAnnotation::ImplTrait(opaque) => { opaque.body_checked_first = true; }
+                _ => { }
+            }
+        }
+        this.ctx.decl_index.register_template_methods(template, &undecided, this.arena);
+        this.ctx.decl_index.register_methods(owner, &undecided, this.ctx.intern_table, this.arena,
+            "sema/undecided opaque template methods");
     }
 
     /// Whether `func`'s signature left its opaque return (`-> implement
@@ -605,7 +664,7 @@ type struct SemaVisitor {
         const greg: GenericRegistry* = this.ctx.generic_registry;
         if (greg == null) { return []; }
         // The template the head's stamp names.  The target is written bare
-        // (`BufStream`), and a spelling qualified by the module the impl sits
+        // (`BufferedStream`), and a spelling qualified by the module the impl sits
         // in names the template only when that module declares the type; an
         // impl written anywhere else missed, handed back no parameters, and
         // left the future non-generic in `S` while the body still mentioned
@@ -722,7 +781,11 @@ type struct SemaVisitor {
         // The declaration's own registration, by the id it stamped - for an
         // injected specialization the one its injector wrote, whichever
         // module the clone was placed in.
-        const st_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:StructDecl");        if (node.is_generic()) {
+        const st_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:StructDecl");
+        mut in_body: [ImplBlock*] = [];
+        for (mut k: i64 = 0; k < node.methods.length(); k++) { in_body.push(null); }
+        this.refuse_identical_methods(&node.methods, &in_body, 0);
+        if (node.is_generic()) {
             this.symbolic_check_owner_methods(node.methods, st_type, node.generic_params);
             return;
         }
@@ -731,6 +794,9 @@ type struct SemaVisitor {
 
     visit_union(mut &this, node: UnionDecl*) -> void {
         const un_type: TypeRef = this.ctx.decl_index.type_of_decl(node.def, "sema/visit:UnionDecl");
+        mut in_body: [ImplBlock*] = [];
+        for (mut k: i64 = 0; k < node.methods.length(); k++) { in_body.push(null); }
+        this.refuse_identical_methods(&node.methods, &in_body, 0);
         if (node.is_generic()) {
             this.symbolic_check_owner_methods(node.methods, un_type, node.generic_params);
             return;
@@ -764,6 +830,7 @@ type struct SemaVisitor {
         if (!this.check_derivation(node)) { return; }
         if (this.refuse_primitive_trait_implementation(decl, node)) { return; }
         this.check_supertraits_implemented(decl, node);
+        this.refuse_overlapping_inherent_methods(node);
         if (node.is_template()) {
             // A head whose target is a parameter of its own has no owner;
             // its methods' receiver is the type it is written for.
@@ -780,7 +847,7 @@ type struct SemaVisitor {
             // The template the head is written for, off the head's stamp.  A
             // head with no parameters of its own whose target is a template
             // names a concrete instantiation (`implement trait Clone for
-            // String<GlobalAlloc>`; the elided form is refused where the head
+            // String<GlobalAllocator>`; the elided form is refused where the head
             // is attached to its template).  Its methods are walked
             // symbolically over the TEMPLATE's parameters, as a generic head's
             // are over its own: that is what produces the method-spec demand
@@ -861,8 +928,8 @@ type struct SemaVisitor {
             }
             return;
         }
-        // A self-returning trait default (`take -> TakeIter<This>`) and a
-        // method whose return grows its owner (`as_ref -> Option<T*>`)
+        // A self-returning trait default (`take -> TakeIterator<This>`) and a
+        // method whose return grows its owner (`as_reference -> Option<T*>`)
         // are instantiated lazily, per call site, so the body is typed the
         // way a generic body is: symbolically, demanding no instantiation.
         // An eager walk would demand the adapter over this owner, whose
@@ -1047,6 +1114,7 @@ type struct SemaVisitor {
             const method_decl: DeclarationNode* = methods[i];
             const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null || DeclarationNode::fn_of(method.func).body == null) { continue; }
+            if (SemaVisitor::opaque_return_checked_first(DeclarationNode::fn_of(method.func))) { continue; }
             const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
             // A method on a GENERIC owner reaches sema only here, whether or not
             // it has generic parameters of its own — so this is where an `async`
@@ -1137,7 +1205,57 @@ type struct SemaVisitor {
     }
 
     visit_expr_stmt(mut &this, stmt: Stmt*, node: ExprStmt*) -> void {
-        this.resolve_expr(node.expression);
+        const value_type: TypeRef = this.resolve_expr(node.expression);
+        this.warn_discarded_must_use(node.expression, value_type);
+    }
+
+    /// Warn when a statement discards a value that must be read: a value of
+    /// a type marked `![must_use]`, or the value a function or method marked
+    /// `![must_use]` returns.  A `Result` dropped this way is a failure
+    /// nobody sees.  Asked once the expression is typed, so the type is the
+    /// value's own and a call's callee is the one sema selected.
+    warn_discarded_must_use(mut &this, expression: ExpressionNode*, value_type: TypeRef) -> void {
+        if (expression == null || expression.generated || !value_type.is_valid()) { return; }
+        // An assignment's statement stores the value: the place holds it.
+        const binary: BinaryExpr* = ExpressionNode::binary_of(expression);
+        if (binary != null && binary.op.kind.is_assignment_op()) { return; }
+        const marker: Keyword = Keyword::new("must_use");
+        const index: DeclarationIndex* = this.ctx.decl_index;
+        const type_declaration: DeclarationNode* =
+            index.declaration_of(index.def_of(value_type, this.ctx.type_arena));
+        const marked_type: boolean = type_declaration != null && type_declaration.has_directive(marker);
+        const shown: string = this.arena.resolve_display_name_short(value_type);
+        mut warning: Diagnostic = Diagnostic::warning(ErrorCode::W0017_MUST_USE_DISCARDED,
+            fmt::format("this statement discards a value of type `%s`, which must be used", shown));
+        if (!marked_type) {
+            const call: CallExpr* = ExpressionNode::call_of(expression);
+            if (call == null) { return; }
+            // A generic free function's call records its template, whose
+            // instance has no entry until monomorphization; a call pinned
+            // to an entry is answered by it; a method call monomorphization
+            // has not pinned yet names its definition.
+            mut callee: DeclarationNode* = null;
+            if (call.resolved_template.is_valid()) {
+                const template: const TemplateEntry* =
+                    this.ctx.generic_registry.template_of_type(call.resolved_template);
+                if (template != null) { callee = template.ast_node; }
+            } else if (call.resolved_callee.is_some()) {
+                callee = index.entry_decl(call.resolved_callee.entry(index));
+            } else {
+                callee = call.method_named(index);
+            }
+            if (callee == null || !callee.has_directive(marker)) { return; }
+            const method: MethodDecl* = DeclarationNode::method_of(callee);
+            const callee_function: FunctionDecl* =
+                DeclarationNode::fn_of(if (method != null) { method.func } else { callee });
+            warning = Diagnostic::warning(ErrorCode::W0017_MUST_USE_DISCARDED,
+                fmt::format("this statement discards the value `%s` returns, which must be used",
+                    this.intern.resolve(callee_function.name)));
+        }
+        warning = warning.at_with_label(expression.span, "never read");
+        warning = warning.help(fmt::format(
+            "read the value, or bind it to `_` to discard it on purpose: `const _: %s = ...;`", shown));
+        this.ctx.emit_diagnostic(warning);
     }
 
     visit_return(mut &this, stmt: Stmt*, node: mut ReturnStmt*) -> void {
@@ -1396,6 +1514,168 @@ type struct SemaVisitor {
         if (node.owner != null) { this.refuse_constant_member_clash(decl, node); }
         if (this.typed_before_bodies(node)) { return; }
         this.check_var_decl(decl, node);
+    }
+
+    /// A method of an inherent block whose head is for some instances
+    /// (`implement<T> struct Wrap<Wrap<T>>`) shares its name with no method
+    /// the type's body declares, nor with one an earlier inherent block
+    /// whose head overlaps this one's declares, and neither does a method of
+    /// a block for every instance beside an earlier block for some (E0308):
+    /// an instance both heads accept would have two methods of one name,
+    /// and which one a call means would depend on the order the blocks were
+    /// written in.  Heads overlap as trait heads do
+    /// (`GenericRegistry::heads_overlap`): `Wrap<Wrap<T>>` and
+    /// `Wrap<Pair<T>>` are for disjoint instances and may each declare a
+    /// method of one name.  Blocks for every instance overload a name by
+    /// their parameters, as the type's body does, and are not asked here.
+    refuse_overlapping_inherent_methods(mut &this, node: ImplBlock*) -> void {
+        if (node.is_trait_impl() || node.template != null || node.spec_owner.is_valid()) { return; }
+        const node_for_every: boolean = node.accepts_every_instance();
+        mut body: DeclarationNode* = null;
+        mut earlier: [DeclarationNode*] = [];
+        const tmpl: const TemplateEntry* = this.ctx.generic_registry.template_of(node.target_def());
+        if (tmpl != null) {
+            body = tmpl.ast_node;
+            for (mut i: i64 = 0; i < tmpl.impl_blocks.length(); i++) {
+                const block: ImplBlock* = DeclarationNode::impl_of(tmpl.impl_blocks[i]);
+                if (block == node) { break; }
+                if (block != null && !block.is_trait_impl()) { earlier.push(tmpl.impl_blocks[i]); }
+            }
+        } else {
+            const owner: TypeRef = this.ctx.decl_index.impl_owner(node, "sema/inherent overlap");
+            body = this.ctx.generic_registry.lookup_inherent_owner(owner);
+            const blocks: [DeclarationNode*] = this.ctx.generic_registry.inherent_impl_blocks(owner);
+            for (mut i: i64 = 0; i < blocks.length(); i++) {
+                if (DeclarationNode::impl_of(blocks[i]) == node) { break; }
+                earlier.push(blocks[i]);
+            }
+        }
+        if (node_for_every) {
+            mut declared: [DeclarationNode*] = [];
+            mut blocks_of: [ImplBlock*] = [];
+            const body_methods: [DeclarationNode*]* = MethodDecl::methods_in(body);
+            if (body_methods != null) {
+                for (mut k: i64 = 0; k < (*body_methods).length(); k++) {
+                    declared.push((*body_methods)[k]);
+                    blocks_of.push(null);
+                }
+            }
+            for (mut ei: i64 = 0; ei < earlier.length(); ei++) {
+                const block: ImplBlock* = DeclarationNode::impl_of(earlier[ei]);
+                if (!block.accepts_every_instance()) { continue; }
+                for (mut k: i64 = 0; k < block.methods.length(); k++) {
+                    declared.push(block.methods[k]);
+                    blocks_of.push(block);
+                }
+            }
+            const first_checked: i64 = declared.length();
+            for (mut k: i64 = 0; k < node.methods.length(); k++) {
+                declared.push(node.methods[k]);
+                blocks_of.push(node);
+            }
+            this.refuse_identical_methods(&declared, &blocks_of, first_checked);
+        }
+        const target: string = this.intern.resolve(node.target_type);
+        for (mut mi: i64 = 0; mi < node.methods.length(); mi++) {
+            const m: MethodDecl* = DeclarationNode::method_of(node.methods[mi]);
+            if (m == null || m.func == null) { continue; }
+            const name: SymbolStr = DeclarationNode::fn_of(m.func).name;
+            const spelt: string = this.intern.resolve(name);
+            const in_body: DeclarationNode* = if (node_for_every) { null } else { MethodDecl::method_named(body, name) };
+            if (in_body != null) {
+                mut d: Diagnostic = Diagnostic::error(ErrorCode::E0308_CONFLICTING_TRAIT_IMPL,
+                    fmt::format("conflicting definitions of method `%s`: `%s` declares it in its own body, which every instance has",
+                        spelt, target));
+                d = d.at_with_label(m.func.name_span, "defined again here");
+                d = d.also_at(DeclarationNode::method_of(in_body).func.name_span, "first defined here");
+                d = d.with_note("a block for some instances declares no method of a name its instances already have; rename one, or keep one definition");
+                this.ctx.emit_diagnostic(d);
+                continue;
+            }
+            for (mut ei: i64 = 0; ei < earlier.length(); ei++) {
+                const other_method: DeclarationNode* = MethodDecl::method_named(earlier[ei], name);
+                const other: ImplBlock* = DeclarationNode::impl_of(earlier[ei]);
+                if (other_method == null || (node_for_every && other.accepts_every_instance())
+                        || !GenericRegistry::heads_overlap(other, node)) {
+                    continue;
+                }
+                const this_head: string = node.spell_head(this.intern);
+                const that_head: string = other.spell_head(this.intern);
+                const msg: string = if (this_head == that_head) {
+                    fmt::format("conflicting definitions of method `%s`: two `%s` blocks declare it",
+                        spelt, this_head).into_raw()
+                } else {
+                    fmt::format("conflicting definitions of method `%s`: `%s` overlaps `%s`, so an instance both heads accept would have two",
+                        spelt, this_head, that_head).into_raw()
+                };
+                mut d: Diagnostic = Diagnostic::error(ErrorCode::E0308_CONFLICTING_TRAIT_IMPL, msg);
+                d = d.at_with_label(m.func.name_span, "defined again here");
+                d = d.also_at(DeclarationNode::method_of(other_method).func.name_span, "first defined here");
+                d = d.with_note("a block for some instances may declare a method of a name another inherent block declares only when their heads accept no instance in common; rename one, or keep one definition");
+                this.ctx.emit_diagnostic(d);
+                break;
+            }
+        }
+    }
+
+    /// No two of the methods every instance of a type has - those its body
+    /// declares and those of its blocks for every instance - share a name
+    /// and take the same parameters (E0308).  A call is selected among the
+    /// methods of its name by its arguments, so of two such declarations
+    /// one could never be called, and which one would depend on the order
+    /// they were written in.  `declared` are the methods in the order they
+    /// were written, each beside the block declaring it (`blocks_of`, null
+    /// for the type's body); those from `first_checked` on are checked
+    /// against every one before them.  Static methods and methods taking a
+    /// receiver are told apart, and so are methods with different numbers
+    /// of type parameters of their own.
+    refuse_identical_methods(mut &this, declared: &[DeclarationNode*], blocks_of: &[ImplBlock*],
+                             first_checked: i64) -> void {
+        for (mut mi: i64 = first_checked; mi < declared.length(); mi++) {
+            const m: MethodDecl* = DeclarationNode::method_of(declared[mi]);
+            if (m == null || m.func == null) { continue; }
+            const name: SymbolStr = DeclarationNode::fn_of(m.func).name;
+            const own_count: i64 = DeclarationNode::fn_of(m.func).generic_params.length();
+            const own_types: [TypeRef] = this.parameters_in_owner(m, blocks_of[mi]);
+            mut first: MethodDecl* = null;
+            for (mut k: i64 = 0; k < mi && first == null; k++) {
+                const candidate: MethodDecl* = DeclarationNode::method_of(declared[k]);
+                if (candidate == null || candidate.func == null || candidate.is_static != m.is_static
+                        || !DeclarationNode::fn_of(candidate.func).name.equals(name)
+                        || DeclarationNode::fn_of(candidate.func).generic_params.length() != own_count) {
+                    continue;
+                }
+                const their_types: [TypeRef] = this.parameters_in_owner(candidate, blocks_of[k]);
+                mut same: boolean = own_types.length() == their_types.length();
+                for (mut i: i64 = 0; i < own_types.length() && same; i++) {
+                    same = own_types[i].is_valid() && own_types[i].equals(their_types[i]);
+                }
+                if (same) { first = candidate; }
+            }
+            if (first == null) { continue; }
+            mut d: Diagnostic = Diagnostic::error(ErrorCode::E0308_CONFLICTING_TRAIT_IMPL,
+                fmt::format("conflicting definitions of method `%s`: both take the same parameters",
+                    this.intern.resolve(name)));
+            d = d.at_with_label(m.func.name_span, "defined again here");
+            d = d.also_at(first.func.name_span, "first defined here");
+            d = d.with_note("a call is selected among the methods of its name by its arguments, so only one of these could ever be called; rename one, or keep one definition");
+            this.ctx.emit_diagnostic(d);
+        }
+    }
+
+    /// The types `method`'s call parameters take, written in the type's own
+    /// parameters: a block's are bound to them through its head
+    /// (`implement<U> struct Wrap<U>`'s `U` is `Wrap`'s `T`), the body's are
+    /// already.  `block` is null for a method of the body.
+    parameters_in_owner(mut &this, method: MethodDecl*, block: ImplBlock*) -> [TypeRef] {
+        const types: [TypeRef] = method.call_parameter_types();
+        if (block == null) { return types; }
+        mut head: TypeSubstitution = TypeResolutionPasses::impl_params_to_owner(block, this.ctx, this.arena);
+        mut in_owner: [TypeRef] = [];
+        for (mut i: i64 = 0; i < types.length(); i++) {
+            in_owner.push(if (types[i].is_valid()) { head.apply(types[i], this.arena) } else { types[i] });
+        }
+        return in_owner;
     }
 
     /// A type's constant shares its name with no other member of the type -
@@ -1715,7 +1995,7 @@ type struct SemaVisitor {
             // `this.field` is; the template records it and every copy
             // substitutes it.
             const bound: FieldAnswer = this.member.field_of(node.resolved_type, b.source_field);
-            this.member.enforce_field_visibility(&bound, b.source_field, b.span);
+            this.member.enforce_field_visibility(&bound, b.source_field, b.span, false);
             if (bound.ty.is_valid()) { b.resolved_type = bound.ty; }
             b.field_index = positions[i];
             node.bindings[i] = b;
@@ -1981,12 +2261,32 @@ type struct SemaVisitor {
     /// reports nothing - and its spelling is refused at the `<` (E0111); the
     /// fix inserting the `::` is offered only when the call is accepted, the
     /// one case where writing it is certain to give a call that compiles.
+    ///
+    /// A method call's expected type reaches its receiver through the method
+    /// (`state.receiver_of`): a static call there binds its owner from what
+    /// the method returns on it.
     resolve_written_call(mut &this, expr: mut ExpressionNode*, call: mut CallExpr*) -> TypeRef {
-        if (!call.turbofish_left_out.has_location()) { return this.calls.resolve_call(this, expr, call); }
         const angle: SourceSpan = call.turbofish_left_out;
         call.turbofish_left_out = SourceSpan::none();
         const errors_before: u32 = this.ctx.diagnostics.error_count;
+        const saved_receiver_of: ExpressionNode* = this.state.receiver_of;
+        const saved_receiver_method: SymbolStr = this.state.receiver_method;
+        const saved_receiver_expected: TypeRef = this.state.receiver_expected;
+        const method: MemberAccessExpr* = ExpressionNode::member_access_of(call.callee);
+        if (method != null && this.state.expected_type.is_valid()) {
+            this.state.receiver_of = method.object;
+            this.state.receiver_method = method.member;
+            this.state.receiver_expected = this.state.expected_type;
+        } else if (this.state.receiver_of != expr) {
+            // Only the receiver itself is typed under the expectation, not
+            // a call inside it.
+            this.state.receiver_of = null;
+        }
         const typed: TypeRef = this.calls.resolve_call(this, expr, call);
+        this.state.receiver_of = saved_receiver_of;
+        this.state.receiver_method = saved_receiver_method;
+        this.state.receiver_expected = saved_receiver_expected;
+        if (!angle.has_location()) { return typed; }
         const accepted: boolean = typed.is_valid() && this.ctx.diagnostics.error_count == errors_before;
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0111_INVALID_SYNTAX,
             "type arguments in an expression are written with `::<`");
@@ -2304,7 +2604,7 @@ type struct SemaVisitor {
     /// scrutinee the language's `Iterator`, `a <=> b`'s `a` its `Ord`): its
     /// subject does - a parameter by a bound naming it, a concrete type by an
     /// impl of it.  An impl whose where-clause binds a generic the target
-    /// does not carry (`CopiedIter<I>`, `where I: Iterator<T*>`) is confirmed
+    /// does not carry (`CopiedIterator<I>`, `where I: Iterator<T*>`) is confirmed
     /// when its clone is placed, so a head that unifies answers here, as for
     /// an `implement Iterator` binding.  An unclaimed trait is implemented
     /// by nothing.
@@ -2430,7 +2730,7 @@ type struct SemaVisitor {
         mut desugared: mut ExpressionNode* =
             this.build_operator_call(receiver, method_sym, trait_id, rhs, op_tok, span);
         // Relational operators: wrap the `compare` call in an `Ordering`
-        // predicate - `a < b` -> `a.compare(&b).is_lt()`.
+        // predicate - `a < b` -> `a.compare(&b).is_less()`.
         if (map.ord_pred != "") {
             const pred_sym: SymbolStr = this.intern.intern(map.ord_pred);
             const pred_member: mut ExpressionNode* =
@@ -3189,10 +3489,13 @@ type struct SemaVisitor {
         }
         if (!registry.wellknown(writer).is_valid()) { return star; }
         if (!this.access_within(member.object).is_writable()) { return star; }
-        // A type parameter has the trait by a bound in scope, as its read did.
-        const param: GenericParamType* = this.binding.receiver_type_param(member.object.resolved_type);
-        const writes: boolean = if (param != null) {
-            this.binding.param_bounded_by(param, registry.wellknown(writer_trait))
+        // A type parameter, or an associated type of one, has the trait by a
+        // bound in scope, as its read did.
+        const receiver_type: TypeRef = member.object.resolved_type;
+        const bounded: boolean = this.binding.receiver_type_param(receiver_type) != null
+            || this.binding.receiver_type_projection(receiver_type) != null;
+        const writes: boolean = if (bounded) {
+            this.binding.subject_bounded_by(receiver_type, registry.wellknown(writer_trait))
         } else {
             this.receiver_implements(member.object.resolved_type, registry.wellknown(writer_trait))
         };
@@ -3564,6 +3867,7 @@ type struct SemaVisitor {
             const wanted: Type* = this.arena.lookup(saved_expected);
             this.state.expected_type = TypeRef::invalid();
             if (wanted != null && wanted.kind == TypeKind::Pointer) {
+                unary.borrowed_as_pointer = true;
                 this.state.expected_type = wanted.as_pointer().pointee;
             } else if (wanted != null && wanted.kind == TypeKind::Reference) {
                 this.state.expected_type = wanted.as_reference().referent;
@@ -4099,6 +4403,19 @@ type struct SemaVisitor {
                     const field: FieldDecl* = DeclarationNode::field_of(s.fields[i]);
                     if (field == null) { continue; }
                     const field_name: string = this.intern.resolve(field.name);
+                    const json: boolean = item == LangItem::ToJson || item == LangItem::FromJson;
+                    const options: JsonFieldOptions = JsonFieldOptions::of(s.fields[i], field_name);
+                    // A field read as its type's `default()` - always when
+                    // skipped, when its member is absent with `default` - needs
+                    // that type to have `Default`, which the implementation's
+                    // bounds do not give a parameter.
+                    if (item == LangItem::FromJson && (options.skip || options.defaulted)
+                            && !this.json_field_default_holds(field.resolved_type, owner_name, field_name,
+                                   if (options.skip) { "skip" } else { "default" }, annotation_span(field.type_annotation))) {
+                        holds = false;
+                    }
+                    // A skipped field is neither written nor read.
+                    if (json && options.skip) { continue; }
                     if (!this.derived_part_holds(field.resolved_type, standard, item, &f"field `{field_name}`",
                             owner_name, annotation_span(field.type_annotation), node.derived_removal)) {
                         holds = false;
@@ -4157,6 +4474,39 @@ type struct SemaVisitor {
             d = d.help(f"give `{shown_part}` `{trait_name}` - `with [{trait_name}]` on its declaration, or an implementation by hand - or remove `{trait_name}` from `{owner_name}`'s `with` clause");
         } else {
             d = d.help(f"implement `{trait_name}` for `{owner_name}` by hand, or remove it from the `with` clause");
+        }
+        this.ctx.emit_diagnostic(d);
+        return false;
+    }
+
+    /// Whether a field a derived `FromJson` reads as its type's `default()`
+    /// - `![json(skip)]` or `![json(default)]`, `option` naming which - has a
+    /// type with `Default`; refused at `span` when it has not.  A parameter
+    /// of the type has no `Default`: the implementation bounds each by
+    /// `FromJson` alone.
+    json_field_default_holds(mut &this, part: TypeRef, owner_name: string, field_name: string, option: string,
+                             span: SourceSpan) -> boolean {
+        const t: Type* = this.arena.lookup(part);
+        const default_trait: DefId = this.ctx.generic_registry.wellknown(LangItem::Default);
+        if (t == null || !default_trait.is_valid()) { return true; }
+        const holds: boolean = if (t.kind == TypeKind::GenericParam) {
+            false
+        } else {
+            if (this.arena.contains_generic_param(part)) {
+                this.ctx.generic_registry.heads_for(default_trait, part, this.intern).length() > 0
+            } else {
+                this.trait_checker().type_implements_trait(part, default_trait, 0)
+            }
+        };
+        if (holds) { return true; }
+        const shown_part: string = this.arena.format_display(t);
+        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0318_CANNOT_DERIVE,
+            f"`{owner_name}` cannot derive `FromJson`: field `{field_name}` is `![json({option})]`, so it is read as its type's `default()`, and `{shown_part}` does not implement `Default`");
+        d = d.at(span);
+        if (t.kind == TypeKind::GenericParam) {
+            d = d.help(f"a derived `FromJson` bounds `{shown_part}` by `FromJson` only: implement `FromJson` for `{owner_name}` by hand, or remove `{option}` from the field's `![json]`");
+        } else {
+            d = d.help(f"give `{shown_part}` `Default` - `with [Default]` on its declaration, or an implementation by hand - or remove `{option}` from the field's `![json]`");
         }
         this.ctx.emit_diagnostic(d);
         return false;
@@ -4459,28 +4809,16 @@ type struct SemaVisitor {
             if (arm.guard != null) { this.resolve_condition(arm.guard); }
             match (arm.body.kind) {
                 StmtKind::Block(block) => {
-                    const last_idx: i64 = block.statements.length() - 1;
-                    for (mut j: i64 = 0; j < block.statements.length(); j++) {
-                        if (j == last_idx && outer_expected.is_valid()) { this.state.expected_type = outer_expected; }
-                        this.dispatch_stmt(block.statements[j]);
-                        if (j == last_idx) { this.state.expected_type = outer_expected; }
-                    }
-                    if (block.statements.length() > 0) {
-                        match (block.statements[block.statements.length() - 1].kind) {
-                            StmtKind::Expr(es) => {
-                                if (es.expression != null && es.expression.has_resolved_type()) {
-                                    const arm_type: TypeRef = es.expression.resolved_type;
-                                    if (!result_type.is_valid()) {
-                                        result_type = arm_type;
-                                        result_span = es.expression.span;
-                                    } else {
-                                        this.check_branch_agreement(result_type, result_span,
-                                            arm_type, es.expression.span,
-                                            "every arm of a `match` expression must produce the same type");
-                                    }
-                                }
-                            }
-                            _ => {}
+                    const value: ExpressionNode* = this.resolve_value_block(block, outer_expected);
+                    if (value != null && value.has_resolved_type()) {
+                        const arm_type: TypeRef = value.resolved_type;
+                        if (!result_type.is_valid()) {
+                            result_type = arm_type;
+                            result_span = value.span;
+                        } else {
+                            this.check_branch_agreement(result_type, result_span,
+                                arm_type, value.span,
+                                "every arm of a `match` expression must produce the same type");
                         }
                     }
                 }
@@ -4493,6 +4831,32 @@ type struct SemaVisitor {
         this.patterns.check_literal_patterns(match_expr.arms, subject_type);
         if (outer_expected.is_valid()) { return outer_expected; }
         return result_type;
+    }
+
+    /// Type the statements of a block that produces a value, an arm of a
+    /// `match` or `static match` expression, and return its value: the last
+    /// statement when it is an expression, typed against `expected`.  That
+    /// expression is read by whatever holds the block, so it is typed as a
+    /// value rather than visited as a statement, which would report it
+    /// discarded.
+    resolve_value_block(mut &this, block: BlockStmt*, expected: TypeRef) -> ExpressionNode* {
+        const last_index: i64 = block.statements.length() - 1;
+        for (mut j: i64 = 0; j < last_index; j++) {
+            this.dispatch_stmt(block.statements[j]);
+        }
+        if (last_index < 0) { return null; }
+        if (expected.is_valid()) { this.state.expected_type = expected; }
+        const last: Stmt* = block.statements[last_index];
+        mut value: ExpressionNode* = null;
+        match (last.kind) {
+            StmtKind::Expr(statement) => {
+                value = statement.expression;
+                this.resolve_expr(statement.expression);
+            }
+            _ => { this.dispatch_stmt(last); }
+        }
+        this.state.expected_type = expected;
+        return value;
     }
 
     resolve_static_match_expr(mut &this, e: ExpressionNode*, sm: mut StaticMatchExpr*) -> TypeRef {
@@ -4616,20 +4980,8 @@ type struct SemaVisitor {
             null
         };
         if (value_block != null) {
-            const last_idx: i64 = value_block.statements.length() - 1;
-            for (mut j: i64 = 0; j < value_block.statements.length(); j++) {
-                if (j == last_idx && outer_expected.is_valid()) { this.state.expected_type = outer_expected; }
-                this.dispatch_stmt(value_block.statements[j]);
-                if (j == last_idx) { this.state.expected_type = outer_expected; }
-            }
-            if (value_block.statements.length() > 0) {
-                match (value_block.statements[last_idx].kind) {
-                    StmtKind::Expr(es) => {
-                        if (es.expression != null && es.expression.has_resolved_type()) { arm_result = es.expression.resolved_type; }
-                    }
-                    _ => {}
-                }
-            }
+            const value: ExpressionNode* = this.resolve_value_block(value_block, outer_expected);
+            if (value != null && value.has_resolved_type()) { arm_result = value.resolved_type; }
         } else {
             this.dispatch_stmt(body);
         }
@@ -4832,7 +5184,7 @@ type struct SemaVisitor {
         const enum_name: SymbolStr = this.ctx.defs.leaf_of(flow).spelling();
         const ok_variant: SymbolStr = this.intern.intern("Continue");
         const err_variant: SymbolStr = this.intern.intern("Break");
-        const ok_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_%u", this.state.try_counter).into_raw());
+        const ok_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_%u", this.state.try_counter).as_str());
 
         const branch: mut ExpressionNode* = ExpressionNode::member_access_expr(node.operand,
             this.ctx.defs.leaf_of(registry.wellknown(LangItem::TryBranch)).spelling(), span, span);
@@ -4863,7 +5215,7 @@ type struct SemaVisitor {
         const err_node: mut Pattern* = Pattern::enum_variant(enum_name, err_variant, span);
         mut err_pat: mut EnumPattern* = err_node.enum_payload();
         err_pat.set_res(Res::Def(flow));
-        const err_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_residual_%u", this.state.try_counter).into_raw());
+        const err_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_residual_%u", this.state.try_counter).as_str());
         const err_sym: SymbolID = this.resolver.alloc_synthetic_binding();
         const err_pb: PatternBinding* = new PatternBinding {
             name: err_bind, span: span, sym_id: err_sym,
@@ -5155,6 +5507,29 @@ type struct SemaVisitor {
                                                      e.span);
     }
 
+    /// A struct literal's field `i`, given a value of `value_type` where the
+    /// field is `field_type`: a value the field does not accept converts
+    /// through a trait or is refused (E0200).  A pair either side of which
+    /// names no one type is not checked here, and since a generic body is
+    /// checked once and its copies are not, it is never checked.
+    check_field_value(mut &this, lit: mut StructExpr*, i: i64, value_type: TypeRef, field_type: TypeRef) -> void {
+        const value_expr: mut ExpressionNode* = lit.field_inits[i].value;
+        if (!this.symbolic.symbolic_names_one_type(value_type) || !this.symbolic.symbolic_names_one_type(field_type)) {
+            return;
+        }
+        if (this.checker.can_assign(value_type, field_type)) { return; }
+        match (this.convert_through_trait(value_expr, value_type, field_type)) {
+            TraitConversionOutcome::Converted(c) => { lit.field_inits[i].value = c; }
+            TraitConversionOutcome::Refused => { }
+            TraitConversionOutcome::Mismatch => {
+                const field_name_str: string = this.intern.resolve(lit.field_inits[i].field_name);
+                this.diag.emit_type_mismatch_with_value(
+                    ErrorCode::E0200_TYPE_MISMATCH, value_expr.span, field_type, value_type,
+                    fmt::format("field `%s` expects this type", field_name_str).into_raw(), SourceSpan::none(), value_expr);
+            }
+        }
+    }
+
     resolve_struct_literal(mut &this, e: ExpressionNode*, lit: mut StructExpr*) -> TypeRef {
         mut struct_ref: TypeRef = TypeRef::invalid();
         // Monomorphization records a specialized literal's instantiation as the
@@ -5239,27 +5614,49 @@ type struct SemaVisitor {
         }
         mut infer_fields: [TypeRef] = [];
         mut infer_values: [TypeRef] = [];
+        mut infer_expressions: [ExpressionNode*] = [];
         const defaults_fill: boolean = infer_from != null && defaults.length() > 0;
         mut typed_last: [i64] = [];
+        mut retyped_last: [i64] = [];
+        mut checked_last: [i64] = [];
 
         const saved_expected: TypeRef = this.state.expected_type;
-        // Pass 0 types every field but the literals a default outranks; pass 1
-        // knows the instance and types those as its fields.
+        // Pass 0 types every field but the literals a default outranks, and
+        // the empty array literals only a field types; pass 1 knows the
+        // instance and types those as its fields.
         for (mut pass: i64 = 0; pass < 2; pass++) {
             if (pass == 1 && infer_from != null) {
                 const bound: TypeRef = this.calls.instance_from_fields(infer_from, &infer_fields, &infer_values,
-                    &written, &defaults);
+                    &infer_expressions, &written, &defaults);
                 lit_type = if (bound.is_valid()) { bound }
                     else { this.ctx.type_resolver.canonicalize_default_generic_type(struct_ref) };
                 field_owner = lit_type;
+                // A value pass 0 typed on its own is checked against the
+                // instance's field, and a variant its own payload left at its
+                // generic enum (`peeked: Option::None`) is that field.
+                for (mut n: i64 = 0; n < retyped_last.length(); n++) {
+                    const field_init: FieldInit = lit.field_inits[retyped_last[n]];
+                    const fa: FieldAnswer = this.member.field_of(field_owner, field_init.field_name);
+                    this.calls.retype_generic_variant(field_init.value, fa.ty);
+                }
+                for (mut n: i64 = 0; n < checked_last.length(); n++) {
+                    const field_init: FieldInit = lit.field_inits[checked_last[n]];
+                    const fa: FieldAnswer = this.member.field_of(field_owner, field_init.field_name);
+                    if (fa.ty.is_valid()) {
+                        this.check_field_value(lit, checked_last[n], field_init.value.resolved_type, fa.ty);
+                    }
+                }
             }
             const count: i64 = if (pass == 0) { lit.field_inits.length() } else { typed_last.length() };
             for (mut n: i64 = 0; n < count; n++) {
                 const i: i64 = if (pass == 0) { n } else { typed_last[n] };
                 const field_init: FieldInit = lit.field_inits[i];
                 const value_expr: mut ExpressionNode* = field_init.value;
-                if (pass == 0 && defaults_fill && value_expr != null
-                        && this.calls.sema_arg_is_polymorphic_literal(value_expr)) {
+                const empty_array: ArrayExpr* = if (value_expr != null) { ExpressionNode::array_of(value_expr) } else { null };
+                if (pass == 0 && value_expr != null
+                        && ((defaults_fill && this.calls.sema_arg_is_polymorphic_literal(value_expr))
+                            || (infer_from != null && empty_array != null && empty_array.elements.length() == 0
+                                && empty_array.repeat_count == 0 && empty_array.repeat_count_expr == null))) {
                     typed_last.push(i);
                     continue;
                 }
@@ -5270,7 +5667,7 @@ type struct SemaVisitor {
                 // field directly, so it obeys the same module-scoped visibility
                 // as a `.field` access (E0353), asked of the entry the door found.
                 // Asked of a struct, of an instantiation not minted yet
-                // (`RefIter::<T> { index: 0, .. }`, `Pair::<u32, u64> { .. }`), whose
+                // (`ReferenceIterator::<T> { index: 0, .. }`, `Pair::<u32, u64> { .. }`), whose
                 // fields are the template's read through its arguments, and of the
                 // generic OWNER inside its own body (`Pair { a: a, b: b }` in a
                 // `Pair<A, B>` method).  The field types give
@@ -5287,36 +5684,39 @@ type struct SemaVisitor {
                         lit.field_inits[i].pin = MemberPin::Field(fa.index);
                         lit.field_inits[i].pin_carried = false;
                     }
-                    this.member.enforce_field_visibility(&fa, field_init.field_name, field_init.span);
+                    this.member.enforce_field_visibility(&fa, field_init.field_name, field_init.span, false);
                 }
                 if (value_expr == null) { field_type = TypeRef::invalid(); }
-                if (field_type.is_valid()) { this.state.expected_type = field_type; }
+                // Before the instance is known a field's type is the template's,
+                // over the template's parameters, which are types only in the
+                // struct's own body.  Anywhere else the value types itself, as
+                // a generic call's argument does against a parameter over the
+                // callee's own, and its type is what binds the instance; its
+                // array kind still holds, since only the field says an
+                // `[T]` literal is an `Array`.
+                const over_parameters: boolean = pass == 0 && infer_from != null && field_type.is_valid()
+                    && this.symbolic.names_param_out_of_scope(field_type);
+                if (field_type.is_valid() && !over_parameters) { this.state.expected_type = field_type; }
                 else { this.state.expected_type = TypeRef::invalid(); }
-                const value_type: TypeRef = this.resolve_expr(value_expr);
+                mut value_type: TypeRef = this.resolve_expr(value_expr);
+                if (over_parameters && value_type.is_valid()) {
+                    if (this.arena.default_array_element(field_type).is_valid()) {
+                        this.calls.adopt_dynamic_array_kind(value_expr);
+                        value_type = value_expr.resolved_type;
+                    }
+                    if (this.calls.is_generic_variant(value_expr)) { retyped_last.push(i); }
+                    checked_last.push(i);
+                }
                 if (pass == 0 && infer_from != null && field_type.is_valid() && value_type.is_valid()) {
                     infer_fields.push(field_type);
                     infer_values.push(value_type);
+                    infer_expressions.push(value_expr);
                 }
                 if (field_type.is_valid() && value_type.is_valid() && value_expr != null) {
-                    // A generic body is checked once and its copies are not, so a
-                    // pair skipped here is never checked.
-                    const skip: boolean = !this.symbolic.symbolic_names_one_type(value_type)
-                        || !this.symbolic.symbolic_names_one_type(field_type);
                     this.lambda.refuse_stored_closure(value_type, field_type, value_expr.span, "a field",
                         SourceSpan::none());
                     this.lambda.refuse_held_scope_handle(value_type, value_expr.span, "a field", false);
-                    if (!skip && !this.checker.can_assign(value_type, field_type)) {
-                        match (this.convert_through_trait(value_expr, value_type, field_type)) {
-                            TraitConversionOutcome::Converted(c) => { lit.field_inits[i].value = c; }
-                            TraitConversionOutcome::Refused => { }
-                            TraitConversionOutcome::Mismatch => {
-                                const field_name_str: string = this.intern.resolve(field_init.field_name);
-                                this.diag.emit_type_mismatch_with_value(
-                                    ErrorCode::E0200_TYPE_MISMATCH, value_expr.span, field_type, value_type,
-                                    fmt::format("field `%s` expects this type", field_name_str).into_raw(), SourceSpan::none(), value_expr);
-                            }
-                        }
-                    }
+                    if (!over_parameters) { this.check_field_value(lit, i, value_type, field_type); }
                 }
             }
         }
@@ -5364,8 +5764,12 @@ type struct SemaVisitor {
                 if (covered) { continue; }
                 // A literal sets every field, the ones it leaves to their
                 // defaults included, so one the writer may not reach
-                // refuses the literal whether it is named or not.
-                this.member.enforce_field_visibility(&fields[k], fields[k].name, e.span);
+                // refuses the literal whether it is named or not.  That
+                // refusal is the whole report for the field: writing it
+                // into the literal is refused the same way.
+                if (!this.member.enforce_field_visibility(&fields[k], fields[k].name, e.span, true)) {
+                    continue;
+                }
                 // An omitted field carrying a `= default` is filled in: clone the
                 // default, resolve + type-check it, and append it as a synthetic
                 // field-init so codegen materializes it.  Only an omitted field
@@ -5784,8 +6188,10 @@ type struct SemaVisitor {
         if (scope.member_span.has_location() && !scope.member_span.same_as(&e.span)) {
             d = d.did_you_mean(member, cands, "variant", scope.member_span);
         } else {
-            const best: string = find_best_candidate(member, cands);
-            if (best.length() > 0) { d = d.help(fmt::format("did you mean `%s::%s`?", enum_name, best)); }
+            mut views: [Str] = [];
+            for (mut i: i64 = 0; i < cands.length(); i++) { views.push(cands[i]); }
+            const found: Option<i64> = find_best_candidate(member, &views);
+            if (found.is_some()) { d = d.help(fmt::format("did you mean `%s::%s`?", enum_name, cands[found.unwrap()])); }
         }
         this.ctx.diagnostics.emit(d);
     }
@@ -5835,12 +6241,16 @@ type struct SemaVisitor {
                     const enum_name: string = this.intern.resolve(new_expr.type_name);
                     const member: string = this.intern.resolve(new_expr.variant_name);
                     mut cands: [string] = [];
-                    for (mut i: i64 = 0; i < et.variants.length(); i++) { cands.push(et.variants[i].display_name(this.intern)); }
-                    const best: string = find_best_candidate(member, cands);
+                    mut views: [Str] = [];
+                    for (mut i: i64 = 0; i < et.variants.length(); i++) {
+                        cands.push(et.variants[i].display_name(this.intern));
+                        views.push(cands[i]);
+                    }
+                    const found: Option<i64> = find_best_candidate(member, &views);
                     mut d: Diagnostic = Diagnostic::error(ErrorCode::E0640_INVALID_ENUM_VARIANT_ACCESS,
                         fmt::format("enum `%s` has no variant `%s`", enum_name, member));
                     d = d.at_with_label(expr.span, "unknown variant");
-                    if (best.length() > 0) { d = d.help(fmt::format("did you mean `%s::%s`?", enum_name, best)); }
+                    if (found.is_some()) { d = d.help(fmt::format("did you mean `%s::%s`?", enum_name, cands[found.unwrap()])); }
                     this.ctx.diagnostics.emit(d);
                     return TypeRef::invalid();
                 }

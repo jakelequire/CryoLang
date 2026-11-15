@@ -55,6 +55,12 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS_DIR = os.path.join(ROOT, "tests")
 GOLDEN = os.path.join(TESTS_DIR, "test-roster.txt")
+# A discarded result fails the unit suite's build and every project's (the
+# runner hands `-Werror=` to each project's own build): the corpus is held to
+# handling what it is given.  The compile-fail files are checked without it,
+# since one of them asserts the warning itself.  verify's baseline census runs
+# with the same flags.
+RUN_FLAGS = ["--format=plain", "-Werror=W0017"]
 
 # `    passed        2113` - the rows every suite summary block prints.
 ROW = re.compile(r"^\s*(passed|failed|ignored|filtered)\s+(\d+)\s*$")
@@ -214,7 +220,7 @@ def main():
                          "checks for; run the census unfiltered\n")
         return 1
 
-    cmd = [os.path.abspath(args.cryo), "test", "--format=plain"] + extra
+    cmd = [os.path.abspath(args.cryo), "test"] + RUN_FLAGS + extra
     proc = subprocess.Popen(cmd, cwd=TESTS_DIR, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT)
     captured = []

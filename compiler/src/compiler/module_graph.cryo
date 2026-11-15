@@ -15,8 +15,9 @@ import utils::log::{ Log, LogArea, LogLevel };
 import std::collections::hashmap::{ HashMap };
 import std::ffi::libc;
 import std::fmt;
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::collections::string::{ String };
+import std::collections::str::{ Str };
 import std::core::hash::{ Hash, Hasher };
 import std::core::cmp::{ Eq };
 import compiler::resolver::intern_table::{ InternTable };
@@ -30,7 +31,7 @@ import std::core::mem;
 import compiler::resolver::res::{ DeclVisibility, DefId, DefTable, DefKind };
 import compiler::resolver::lang_item::{ LangModule };
 import std::core::hash::{ FnvHasher };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 
 /// Where a module's source originates, driving which per-package subtree
 /// (`std/`, `local/`, or `<depname>/`) its object/IR output lands in.
@@ -121,7 +122,7 @@ public:
                 const flen: i64 = out.length() as i64;
                 if (flen > 0 && out[flen - 1] != '_') { out += "_"; }
             } else {
-                out += path.substr(ci, 1);
+                out += path.substring(ci, 1);
             }
         }
         return intern.intern(out + "_" + intern.resolve(leaf));
@@ -216,6 +217,13 @@ type struct LexedSource {
     }
 }
 
+/// An import that names a module under an alias (`import M as A;`): the
+/// module, and the alias it is named by in the importing module.
+type struct AliasedImport {
+    imported: ModulePath;
+    alias:    SymbolStr;
+}
+
 type struct ModuleInfo {
 private:
     /// The module's path, its identity: `path()`.
@@ -289,12 +297,19 @@ public:
     /// discovery has finished (`ModuleGraph::set_visible_modules`); the
     /// relation a written module path is judged reachable by.
     visible:              [ModulePath];
+    /// The modules an import of this module names under an alias
+    /// (`import M as A;`), and those an import names under their own
+    /// name.  A module only aliased is named by its alias alone: its own
+    /// leaf names nothing here (`ModuleGraph::imports_only_under_alias`).
+    aliased_imports:      [AliasedImport];
+    named_imports:        [ModulePath];
 
     // Source origin, classified by the orchestrator after discovery from the
     // module's `file_path` (under stdlib_root => Stdlib, under a dependency
     // root => Dep, else Local).  Defaults to Local at construction.
     origin:         ModuleOrigin;
-    origin_name:    string;       // dependency name when origin == Dep, else ""
+    /// The dependency's or vendored library's name; empty for the others.
+    origin_name:    String;
 
 
     /// The module as a definition, registered when the graph adds it
@@ -323,8 +338,10 @@ public:
             written_submodule_at: [],
             written_reexports:    [],
             visible:              [],
+            aliased_imports:      [],
+            named_imports:        [],
             origin:             ModuleOrigin::Local,
-            origin_name:        "",
+            origin_name:        String::new(),
             def:                DefId::invalid(),
             lexed:              LexedSource::empty(),
         };
@@ -359,15 +376,15 @@ public:
     /// can never drift.  Static (not an instance method) so callers holding
     /// only the enum + name can reach it, and to side-step the "unsized enum
     /// return in impl block" codegen wart that bites instance methods.
-    static origin_subdir(origin: ModuleOrigin, origin_name: string) -> string {
+    static origin_subdir(origin: ModuleOrigin, origin_name: Str) -> String {
         return match (origin) {
-            ModuleOrigin::Stdlib => { "std" }
-            ModuleOrigin::Dep    => { origin_name }
-            ModuleOrigin::Local  => { "local" }
+            ModuleOrigin::Stdlib => { String::from_str(Str::new("std")) }
+            ModuleOrigin::Dep    => { String::from_str(origin_name) }
+            ModuleOrigin::Local  => { String::from_str(Str::new("local")) }
             // Each vendored library gets its own subtree beneath `vendor/`
             // (e.g. `vendor/RayLib/deps/*.o`), keyed by the library name in
             // `origin_name`, so multiple vendored libs stay isolated.
-            ModuleOrigin::Vendor => { fmt::format("vendor/%s", origin_name).into_raw() }
+            ModuleOrigin::Vendor => { f"vendor/{origin_name}" }
         };
     }
 
@@ -414,11 +431,20 @@ public:
 /// vendored library, its name.
 type struct ModulePackage {
     origin:      ModuleOrigin;
-    origin_name: string;
+    origin_name: String;
 
-    /// Whether this is the same package as `other`.
-    same_as(&this, other: &ModulePackage) -> boolean {
-        return this.origin == other.origin && this.origin_name.eq(other.origin_name);
+    /// Whether a module path written in this package may name a file in
+    /// `other`: the program's own files may name any package's, a
+    /// dependency's or a vendored library's any but the program's, and the
+    /// standard library's only its own.  A package never depends on the
+    /// program that uses it, so a program's file of the same path or
+    /// namespace cannot stand in for one of the package's own.
+    may_name(&this, other: &ModulePackage) -> boolean {
+        return match (this.origin) {
+            ModuleOrigin::Local  => { true }
+            ModuleOrigin::Stdlib => { other.origin == ModuleOrigin::Stdlib }
+            _                    => { other.origin != ModuleOrigin::Local }
+        };
     }
 }
 
@@ -428,28 +454,31 @@ type struct ModulePackage {
 /// dependency's; otherwise the program's own.
 type struct PackageRoots {
     /// `<profile_dir>/vendor`; empty when the build has no project.
-    vendor_root: string;
+    vendor_root: PathBuf;
     /// Empty when the build uses no standard library.
-    stdlib_root: string;
-    dep_roots:   [string];
-    dep_names:   [string];
+    stdlib_root: PathBuf;
+    dep_roots:   [PathBuf];
+    dep_names:   [String];
 
-    /// The package file `file_path` is in.
-    package_of(&this, file_path: string) -> ModulePackage {
-        const file: Path = Path::from(file_path);
-        if (this.vendor_root.length() > 0 && file.starts_with(Path::from(this.vendor_root))) {
+    /// The package `file` is in.
+    package_of(&this, file: Path) -> ModulePackage {
+        if (!this.vendor_root.is_empty() && file.starts_with(this.vendor_root.as_path())) {
             // The library name is the bindings file's directory.
-            return ModulePackage { origin: ModuleOrigin::Vendor, origin_name: file_path.parent_dir().basename() };
+            const library: Str = match (file.parent()) {
+                Option::Some(directory) => { directory.file_name().unwrap_or(Str::new("")) }
+                Option::None            => { Str::new("") }
+            };
+            return ModulePackage { origin: ModuleOrigin::Vendor, origin_name: String::from_str(library) };
         }
-        if (this.stdlib_root.length() > 0 && file.starts_with(Path::from(this.stdlib_root))) {
-            return ModulePackage { origin: ModuleOrigin::Stdlib, origin_name: "" };
+        if (!this.stdlib_root.is_empty() && file.starts_with(this.stdlib_root.as_path())) {
+            return ModulePackage { origin: ModuleOrigin::Stdlib, origin_name: String::new() };
         }
         for (mut i: i64 = 0; i < this.dep_roots.length(); i++) {
-            if (file.starts_with(Path::from(this.dep_roots[i]))) {
-                return ModulePackage { origin: ModuleOrigin::Dep, origin_name: this.dep_names[i] };
+            if (file.starts_with(this.dep_roots[i].as_path())) {
+                return ModulePackage { origin: ModuleOrigin::Dep, origin_name: this.dep_names[i].clone() };
             }
         }
-        return ModulePackage { origin: ModuleOrigin::Local, origin_name: "" };
+        return ModulePackage { origin: ModuleOrigin::Local, origin_name: String::new() };
     }
 }
 
@@ -487,26 +516,26 @@ type struct ModuleGraph {
     // Per-module AST storage: raw pointer array to avoid array[i]=x codegen bug
     module_ast_buf: mut void*;   // malloc'd buffer of ProgramNode* pointers
     module_ast_cap: u32;         // capacity (== modules.length())
-    module_sources: [string];
 
 private:
     // Module name -> index lookup (SymbolStr.id -> module index)
-    name_index: HashMap<ModuleKey, u32, GlobalAlloc, FnvHasher>;
+    name_index: HashMap<ModuleKey, u32, GlobalAllocator, FnvHasher>;
     /// Each module's position by its file path as `paths_equal_ignore_case`
     /// compares paths (`path_key`); the first module registered under it.
-    path_index: HashMap<string, u32, GlobalAlloc, FnvHasher>;
+    path_index: HashMap<String, u32, GlobalAllocator, FnvHasher>;
     /// The positions of the modules declaring a namespace, by the
     /// namespace's last segment, in the graph's order.  A written path names
     /// only a namespace that ends with the path's own last segment
-    /// (`ns_written_as`), so these are the only candidates for it.
-    leaf_index: HashMap<string, [u32], GlobalAlloc, FnvHasher>;
+    /// (`ns_written_as`), so these are the only candidates for it.  Each key
+    /// views the interned namespace it is the last segment of.
+    leaf_index: HashMap<Str, [u32], GlobalAllocator, FnvHasher>;
 
     /// Every module's definition, by the module's path:
     /// each module of this graph as it is added, and each module a C import
     /// declares (`extern module cit := "C" { .. }`), which is a module the
     /// name layer makes and no file holds.  The one table a declaration's
     /// parent module is asked of.
-    module_defs: HashMap<ModuleKey, DefId, GlobalAlloc, FnvHasher>;
+    module_defs: HashMap<ModuleKey, DefId, GlobalAllocator, FnvHasher>;
     /// The same entries in the order they were made, for the reverse
     /// question - which module a definition is (`declaring_module`).  A
     /// list, because a `DefId` cannot key a map.
@@ -519,7 +548,7 @@ public:
 
     // Set during discovery when any discovered module contains an f-string
     // (`f"..."`).  The orchestrator reads it to force-discover the f-string
-    // runtime (std::fmt::interp) only when it's actually needed, keeping its
+    // runtime (std::fmt::interpolation) only when it's actually needed, keeping its
     // transitive deps (ffi::libc etc.) out of programs that don't use one.
     uses_fstring: boolean;
 
@@ -549,11 +578,10 @@ public:
             topo_unplaced:    [],
             module_ast_buf:   ast_buf,
             module_ast_cap:   initial_cap,
-            module_sources:   [],
-            name_index:       HashMap::<ModuleKey, u32, GlobalAlloc, FnvHasher>::new(),
-            path_index:       HashMap::<string, u32, GlobalAlloc, FnvHasher>::new(),
-            leaf_index:       HashMap::<string, [u32], GlobalAlloc, FnvHasher>::new(),
-            module_defs:      HashMap::<ModuleKey, DefId, GlobalAlloc, FnvHasher>::new(),
+            name_index:       HashMap::<ModuleKey, u32, GlobalAllocator, FnvHasher>::new(),
+            path_index:       HashMap::<String, u32, GlobalAllocator, FnvHasher>::new(),
+            leaf_index:       HashMap::<Str, [u32], GlobalAllocator, FnvHasher>::new(),
+            module_defs:      HashMap::<ModuleKey, DefId, GlobalAllocator, FnvHasher>::new(),
             def_list:         [],
             def_paths:        [],
             uses_fstring:     false,
@@ -566,15 +594,13 @@ public:
     add_module(mut &this, info: ModuleInfo, intern: InternTable*) -> void {
         const idx: u32 = this.modules.length() as u32;
         this.name_index.insert(ModulePath::of(info.name).table_key(), idx);
-        const path_key: string = ModuleGraph::path_key(info.file_path);
+        const path_key: String = ModuleGraph::path_key(info.file_path);
         if (!this.path_index.contains_key(&path_key)) { this.path_index.insert(path_key, idx); }
         if (info.namespace_name.is_valid()) {
             const positions: mut [u32]* = this.leaf_index.get_or_insert(
                 QualifiedName::leaf_of(intern.resolve(info.namespace_name)), []);
             positions.push(idx);
         }
-        // Read the (Copy) file_path before `info` is moved into `this.modules`.
-        this.module_sources.push(info.file_path);
         this.modules.push(info);
         // A module's identity is made here, where the graph first holds it:
         // a root of the definition tree, named by the path its namespace
@@ -733,13 +759,56 @@ public:
         return false;
     }
 
+    /// Record that an import of `use_module` names `target`, under `alias`,
+    /// or under its own name when `alias` is empty.
+    record_import_naming(mut &this, use_module: ModulePath, target: ModulePath, alias: SymbolStr) -> void {
+        const idx: i64 = this.find_module_index(use_module);
+        if (idx < 0) { return; }
+        if (alias.is_empty()) {
+            for (mut k: i64 = 0; k < this.modules[idx].named_imports.length(); k++) {
+                if (this.modules[idx].named_imports[k].equals(target)) { return; }
+            }
+            this.modules[idx].named_imports.push(target);
+            return;
+        }
+        for (mut k: i64 = 0; k < this.modules[idx].aliased_imports.length(); k++) {
+            const known: AliasedImport = this.modules[idx].aliased_imports[k];
+            if (known.imported.equals(target) && known.alias.equals(alias)) { return; }
+        }
+        this.modules[idx].aliased_imports.push(AliasedImport { imported: target, alias: alias });
+    }
+
+    /// The first alias an import of `use_module` gives `target`, or an empty
+    /// name when no import there aliases it.
+    import_alias_of(&this, use_module: ModulePath, target: ModulePath) -> SymbolStr {
+        const idx: i64 = this.find_module_index(use_module);
+        if (idx < 0) { return SymbolStr::empty(); }
+        for (mut k: i64 = 0; k < this.modules[idx].aliased_imports.length(); k++) {
+            const known: AliasedImport = this.modules[idx].aliased_imports[k];
+            if (known.imported.equals(target)) { return known.alias; }
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Whether every import of `use_module` that names `target` names it
+    /// under an alias: the alias is then its only name there, and its own
+    /// leaf does not name it.
+    imports_only_under_alias(&this, use_module: ModulePath, target: ModulePath) -> boolean {
+        if (this.import_alias_of(use_module, target).is_empty()) { return false; }
+        const idx: i64 = this.find_module_index(use_module);
+        for (mut k: i64 = 0; k < this.modules[idx].named_imports.length(); k++) {
+            if (this.modules[idx].named_imports[k].equals(target)) { return false; }
+        }
+        return true;
+    }
+
     /// Which modules a path written in a body names, as the file of
     /// `use_module` can see them: asked of a whole scope segment, of a
     /// segment's prefix, and by the type layer to say why a qualified
     /// annotation named nothing.  With a `root`, the spelling continues a
     /// path that already named that module (`J::Inner` once `J` named
     /// `Json`).
-    modules_written_as(&this, spelling: string, use_module: ModulePath, root: ModulePath,
+    modules_written_as(&this, spelling: Str, use_module: ModulePath, root: ModulePath,
                        intern: mut InternTable*) -> ModuleSpellingMatch {
         return this.modules_in_view(spelling, use_module, root, intern);
     }
@@ -747,7 +816,7 @@ public:
     /// Every module, in the graph's order, whose declared namespace the
     /// written path `written` abbreviates: for a diagnostic's help naming
     /// the module an unknown import path was meant to be.
-    modules_abbreviated_by(&this, written: string, intern: InternTable*) -> [ModulePath] {
+    modules_abbreviated_by(&this, written: Str, intern: InternTable*) -> [ModulePath] {
         mut out: [ModulePath] = [];
         if (intern == null) { return out; }
         for (mut i: i64 = 0; i < this.modules.length(); i++) {
@@ -777,7 +846,7 @@ private:
     /// package root is addressable as written.  Only the whole one - an
     /// abbreviation like `core::option` is a proper suffix whose first
     /// segment binds nothing, and stays unreachable.
-    modules_in_view(&this, spelling: string, use_module: ModulePath, root: ModulePath,
+    modules_in_view(&this, spelling: Str, use_module: ModulePath, root: ModulePath,
                     intern: mut InternTable*) -> ModuleSpellingMatch {
         mut r: ModuleSpellingMatch = ModuleSpellingMatch {
             found:   ModulePath::none(),
@@ -792,7 +861,7 @@ private:
         const rooted: boolean = root.is_valid();
         const rooted_length: i64 =
             if (rooted) { intern.resolve(root.sym).length() + 2 + spelling.length() } else { 0 };
-        const head: string = QualifiedName::head_of(spelling);
+        const head: Str = QualifiedName::head_of(spelling);
         const continues: boolean = !rooted && head.length() < spelling.length();
         const tail_length: i64 = spelling.length() - head.length();
         mut heads: [ModulePath] = [];
@@ -801,18 +870,21 @@ private:
         mut cand_defs: [DefId] = [];
         mut cand_lengths: [i64] = [];
         mut cand_reach: [boolean] = [];
-        const in_reach: [u32] = this.modules_ending_in(spelling, if (continues) { head } else { "" });
+        const in_reach: [u32] = this.modules_ending_in(spelling, if (continues) { head } else { Str::from("") });
         for (mut at: i64 = 0; at < in_reach.length(); at++) {
             const i: i64 = in_reach[at] as i64;
             const cand_ns: SymbolStr = this.modules[i].namespace_name;
             const cand_path: ModulePath = this.modules[i].path();
-            const cand_str: string = intern.resolve(cand_ns);
+            const cand_str: Str = Str::from(intern.resolve(cand_ns));
             const names_head: boolean = continues && ModuleGraph::ns_written_as(cand_str, head);
             const names_spelling: boolean = ModuleGraph::ns_written_as(cand_str, spelling)
                 && !(rooted && (cand_str.length() != rooted_length
                                 || !cand_path.is_within(root, intern)));
             if (!names_head && !names_spelling) { continue; }
-            const imported: boolean = this.imports(use_module, cand_path);
+            // A module imported only under an alias is named by the alias,
+            // which the scope binds, and not by its own spelling.
+            const imported: boolean = this.imports(use_module, cand_path)
+                && !this.imports_only_under_alias(use_module, cand_path);
             if (names_head && imported) {
                 heads.push(cand_path);
                 head_lengths.push(cand_str.length());
@@ -826,7 +898,7 @@ private:
             }
             const reachable: boolean = rooted
                 || cand_path.equals(use_module)
-                || cand_str.eq(spelling)
+                || cand_str == spelling
                 || in_prelude
                 || imported;
             cands.push(cand_path);
@@ -854,34 +926,34 @@ private:
     /// segments may be left off: whether `future` names `std::future` from
     /// here is a scope question, while a path that drops trailing segments
     /// would name a module that declares nothing it names.
-    static ns_written_as(mod_str: string, written: string) -> boolean {
-        const ml: i64 = mod_str.length() as i64;
-        const pl: i64 = written.length() as i64;
+    static ns_written_as(mod_str: Str, written: Str) -> boolean {
+        const ml: i64 = mod_str.length();
+        const pl: i64 = written.length();
         if (pl == 0 || pl > ml) { return false; }
         // Only one alignment can be a suffix, so this is a single check rather
         // than a scan.
         const i: i64 = ml - pl;
-        if (!mod_str.ends_with(written)) { return false; }
-        return i == 0 || (i >= 2 && mod_str[i - 1] == ':' && mod_str[i - 2] == ':');
+        if (!mod_str.ends_with(&written)) { return false; }
+        return i == 0 || (i >= 2 && mod_str.byte_substring(i - 2, i) == Str::from("::"));
     }
 
     /// The positions, in the graph's order, of the modules whose namespace
     /// ends in the same segment as `first` or as `second` ("" asks for
     /// none): every module either can name (`ns_written_as`), and others.
-    modules_ending_in(&this, first: string, second: string) -> [u32] {
+    modules_ending_in(&this, first: Str, second: Str) -> [u32] {
         mut out: [u32] = [];
-        const first_leaf: string = QualifiedName::leaf_of(first);
-        const second_leaf: string = QualifiedName::leaf_of(second);
+        const first_leaf: Str = QualifiedName::leaf_of(first);
+        const second_leaf: Str = QualifiedName::leaf_of(second);
         mut a: [u32]* = null;
         mut a_length: i64 = 0;
-        match (this.leaf_index.get_ref(&first_leaf)) {
+        match (this.leaf_index.get_reference(&first_leaf)) {
             Option::Some(positions) => { a = positions; a_length = (*positions).length(); }
             Option::None => { }
         }
         mut b: [u32]* = null;
         mut b_length: i64 = 0;
-        if (second_leaf.length() > 0 && !second_leaf.eq(first_leaf)) {
-            match (this.leaf_index.get_ref(&second_leaf)) {
+        if (second_leaf.length() > 0 && second_leaf != first_leaf) {
+            match (this.leaf_index.get_reference(&second_leaf)) {
                 Option::Some(positions) => { b = positions; b_length = (*positions).length(); }
                 Option::None => { }
             }
@@ -1017,7 +1089,7 @@ public:
         if (ia < 0 || ib < 0) { return false; }
         const ma: const ModuleInfo* = &this.modules[ia];
         const mb: const ModuleInfo* = &this.modules[ib];
-        return ma.origin == mb.origin && ma.origin_name.eq(mb.origin_name);
+        return ma.origin == mb.origin && ma.origin_name == mb.origin_name;
     }
 
     /// Whether the indexed module `m` may be named from module `from`: it
@@ -1026,9 +1098,8 @@ public:
         if (!m.declared_internal) { return true; }
         const index: i64 = this.find_module_index(from);
         if (index < 0) { return false; }
-        const own: ModulePackage = ModulePackage {
-            origin: this.modules[index].origin, origin_name: this.modules[index].origin_name };
-        return own.same_as(&m.package);
+        return this.modules[index].origin == m.package.origin
+            && this.modules[index].origin_name == m.package.origin_name;
     }
 
     /// Whether the module at path `m` is the standard library's: one a
@@ -1161,8 +1232,8 @@ public:
 
     /// Find a module's index by its file path (case-insensitive), however
     /// its `.` segments are written.  Returns -1 if not found.
-    find_module_by_path(&this, path: string) -> i64 {
-        const key: string = ModuleGraph::path_key(ModuleGraph::module_spelling(path));
+    find_module_by_path(&this, path: Str) -> i64 {
+        const key: String = ModuleGraph::path_key(ModuleGraph::module_spelling(path).as_str());
         return match (this.path_index.get(&key)) {
             Option::Some(at) => { at as i64 }
             Option::None     => { -1 }
@@ -1172,15 +1243,15 @@ public:
     /// `path` as `paths_equal_ignore_case` compares it: ASCII letters
     /// lower-cased and `\` written `/`, so two paths are equal under that
     /// comparison exactly when their keys are the same text.
-    static path_key(path: string) -> string {
-        const n: i64 = path.length() as i64;
-        mut out: String = String::with_capacity(n);
-        for (mut i: i64 = 0; i < n; i++) {
-            mut c: u8 = (path[i] as u8).to_ascii_lowercase();
+    static path_key(path: Str) -> String {
+        const bytes: &Slice<u8> = path.as_bytes();
+        mut out: String = String::with_capacity(path.length());
+        for (mut i: i64 = 0; i < path.length(); i++) {
+            mut c: u8 = bytes[i].to_ascii_lowercase();
             if (c == 92) { c = 47; }
             out.push_byte(c);
         }
-        return out.into_raw();
+        return out;
     }
 
     /// A module file's path with every `.` segment after the first dropped,
@@ -1188,36 +1259,28 @@ public:
     /// written one way.  A leading `.` stays: it is how a relative path
     /// starts.  Every module is registered under this spelling, so its
     /// spans name the file as an editor does.
-    static module_spelling(path: string) -> string {
-        const n: i64 = path.length() as i64;
-        mut has_dot_segment: boolean = false;
-        for (mut i: i64 = 1; i < n; i++) {
-            if ((path[i] as u8) == 46 && Path::is_separator(path[i - 1] as u8)
-                    && (i + 1 == n || Path::is_separator(path[i + 1] as u8))) {
-                has_dot_segment = true;
-                break;
-            }
-        }
-        if (!has_dot_segment) { return path; }
+    static module_spelling(path: Str) -> String {
+        const n: i64 = path.length();
+        const bytes: &Slice<u8> = path.as_bytes();
         mut out: String = String::with_capacity(n);
         mut start: i64 = 0;
         while (start <= n) {
             mut end: i64 = start;
-            while (end < n && !Path::is_separator(path[end] as u8)) { end++; }
-            const dot: boolean = end - start == 1 && (path[start] as u8) == 46;
+            while (end < n && !Path::is_separator(bytes[end])) { end++; }
+            const dot: boolean = end - start == 1 && bytes[start] == 46;
             if (!dot || start == 0) {
-                for (mut i: i64 = start; i < end; i++) { out.push_byte(path[i] as u8); }
-                if (end < n) { out.push_byte(path[end] as u8); }
+                for (mut i: i64 = start; i < end; i++) { out.push_byte(bytes[i]); }
+                if (end < n) { out.push_byte(bytes[end]); }
             }
             start = end + 1;
         }
-        return out.into_raw();
+        return out;
     }
 
     /// The loader's key for a module file: its spelling, lower-cased, as
     /// paths compare on a case-insensitive filesystem.
-    static module_key(path: string) -> string {
-        return ModuleGraph::module_spelling(path).to_ascii_lower();
+    static module_key(path: Str) -> String {
+        return ModuleGraph::module_spelling(path).to_ascii_lowercase();
     }
 
     /// Get the parsed AST for a module by index.

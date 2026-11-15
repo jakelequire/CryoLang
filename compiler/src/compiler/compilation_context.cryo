@@ -48,6 +48,8 @@ import compiler::resolver::mangled_name::{ MangledName };
 import compiler::resolver::qualified_name::{ QualifiedName };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
 import compiler::module_graph::{ ModulePath };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::generic_registry::{ GenericRegistry };
@@ -135,7 +137,7 @@ type enum Runtime {
     Freestanding;
 }
 
-/// Where `GlobalAlloc` gets its memory.
+/// Where `GlobalAllocator` gets its memory.
 type enum HeapBackend {
     Libc;
     Native;
@@ -264,6 +266,9 @@ public:
     /// `-Werror`: every warning is reported, counted and failed as an error,
     /// the stdlib archive's own build included when this build makes it.
     warnings_as_errors: boolean;
+    /// `-Werror=W0017,...`: the warnings this build reports as errors, each
+    /// as `ErrorCode::to_u32` answers it.
+    promoted_warnings: [u32];
     output:        OutputOverride;
     /// The language server's open buffers, each replacing its file on disk.
     source_overrides: [SourceOverride];
@@ -284,6 +289,7 @@ public:
             static_link:     false,
             emit_llvm:       false,
             warnings_as_errors: false,
+            promoted_warnings: [],
             output:          OutputOverride::Default,
             source_overrides: [],
             yield_hook:      null,
@@ -352,7 +358,7 @@ public:
     /// header it names and each file that header includes in turn, as
     /// libclang reports them.  Inputs no module source names, so the
     /// whole-build fingerprint folds them in.
-    imported_headers:  [string];
+    imported_headers:  [String];
     /// The program's entry point: the entry file's module-level `main`,
     /// recorded once by the name layer when that module is declared;
     /// invalid when it declares none.
@@ -543,6 +549,7 @@ public:
         diag_ptr.set_renderer(renderer);
         mut diag_config: DiagConfig = DiagConfig::default();
         diag_config.warnings_as_errors = ctx.options.warnings_as_errors;
+        diag_config.promoted_codes = ctx.options.promoted_warnings.clone();
         diag_ptr.set_config(diag_config);
         return ctx;
     }
@@ -551,7 +558,7 @@ public:
 
     /// Intern a string, returning a SymbolStr handle.
     /// Shorthand for this.intern_table.intern(text).
-    intern(mut &this, text: string) -> SymbolStr {
+    intern(mut &this, text: Str) -> SymbolStr {
         return this.intern_table.intern(text);
     }
 
@@ -576,11 +583,11 @@ public:
 
     /// Record `path` among the files a C import read, once however many
     /// imports read it.
-    note_imported_header(mut &this, path: string) -> void {
+    note_imported_header(mut &this, path: Str) -> void {
         for (mut i: i64 = 0; i < this.imported_headers.length(); i++) {
-            if (this.imported_headers[i].eq(path)) { return; }
+            if (this.imported_headers[i].as_str() == path) { return; }
         }
-        this.imported_headers.push(path);
+        this.imported_headers.push(String::from_str(path));
     }
 
     note_lang_ref(mut &this, node: Node, item: LangItem) -> void {
@@ -797,7 +804,7 @@ public:
     /// graph's answer (`ModuleGraph::modules_written_as`), the one relation
     /// a scope segment, a segment's prefix and the type layer's account of
     /// a qualified annotation that named nothing all ask.
-    modules_written_as(&this, spelling: string,
+    modules_written_as(&this, spelling: Str,
                        use_module: ModulePath, root: ModulePath) -> ModuleSpellingMatch {
         if (this.module_graph == null) {
             return ModuleSpellingMatch {

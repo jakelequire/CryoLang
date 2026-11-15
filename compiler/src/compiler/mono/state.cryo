@@ -45,7 +45,7 @@ import compiler::resolver::res::{ DefKey };
 import std::core::hash::{ Hash, Hasher };
 import std::core::cmp::{ Eq };
 import std::core::hash::{ FnvHasher };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 
 
 /// The key of an owner's instances of a method definition: the owner type
@@ -166,11 +166,11 @@ type struct MonoState {
     // Each entry's position under its `specialized_type`, in the order the
     // entries were added (`add_spec_entry`), so the entries for one type are
     // found without visiting every specialization in the program.
-    spec_entries_by_type: HashMap<TypeKey, [i64], GlobalAlloc, FnvHasher>;
+    spec_entries_by_type: HashMap<TypeKey, [i64], GlobalAllocator, FnvHasher>;
 
     // The types request_nested_instantiations has visited in the current
     // traversal; the caller clears it before each top-level one.
-    nested_visited:   HashSet<TypeKey, GlobalAlloc, FnvHasher>;
+    nested_visited:   HashSet<TypeKey, GlobalAllocator, FnvHasher>;
 
     // Error tracking (shared: the orchestrator's spine and the collaborators that
     // emit diagnostics both bump this; process_all returns error_count == 0).
@@ -186,7 +186,7 @@ type struct MonoState {
     // cleared by `reset_worklist`): an instance, once emitted, is shared by
     // every module.
     method_instances: [MethodInstance];
-    instance_keys:    HashMap<InstanceKey, [i64], GlobalAlloc, FnvHasher>;
+    instance_keys:    HashMap<InstanceKey, [i64], GlobalAllocator, FnvHasher>;
 
     // Arena ids of InstantiatedTypes that have a REGISTERED spec entry.
     //
@@ -196,13 +196,13 @@ type struct MonoState {
     // NOT answerable from the type alone is whether the spec has been registered
     // YET, because `materialize` registers the entry BEFORE it swaps the wrapper
     // slot to the concrete (the nested-call walk in between must be able to see the
-    // spec it is currently inside - the `String<GlobalAlloc>` self-reference case).
+    // spec it is currently inside - the `String<GlobalAllocator>` self-reference case).
     // During that window the slot still reads as an unresolved wrapper even though
     // the spec exists, so the slot kind cannot answer it and this set must.
     // Keyed by the instantiation itself, so membership costs no allocation
     // or string hash, and "same instantiation" is decided by the arena's
     // interner rather than independently here.
-    materialized_insts: HashMap<TypeKey, boolean, GlobalAlloc, FnvHasher>;
+    materialized_insts: HashMap<TypeKey, boolean, GlobalAllocator, FnvHasher>;
 
     // Owner modules of generic-METHOD specs (those attached to an impl block or a
     // fixed receiver's decl, NOT the `spec_entries` type/free-function specs).
@@ -233,12 +233,12 @@ type struct MonoState {
             pending:          [],
             pending_cursor:   0,
             spec_entries:     [],
-            spec_entries_by_type: HashMap::<TypeKey, [i64], GlobalAlloc, FnvHasher>::new(),
-            nested_visited:   HashSet::<TypeKey, GlobalAlloc, FnvHasher>::new(),
+            spec_entries_by_type: HashMap::<TypeKey, [i64], GlobalAllocator, FnvHasher>::new(),
+            nested_visited:   HashSet::<TypeKey, GlobalAllocator, FnvHasher>::new(),
             error_count:      0,
             method_instances: [],
-            instance_keys:    HashMap::<InstanceKey, [i64], GlobalAlloc, FnvHasher>::new(),
-            materialized_insts: HashMap::<TypeKey, boolean, GlobalAlloc, FnvHasher>::new(),
+            instance_keys:    HashMap::<InstanceKey, [i64], GlobalAllocator, FnvHasher>::new(),
+            materialized_insts: HashMap::<TypeKey, boolean, GlobalAllocator, FnvHasher>::new(),
             spec_owner_files: [],
             settled_objects:  [],
         };
@@ -257,7 +257,7 @@ type struct MonoState {
     /// the order they were added.
     entries_specializing(&this, ty: TypeRef) -> [i64] {
         mut out: [i64] = [];
-        match (this.spec_entries_by_type.get_ref(&ty.table_key())) {
+        match (this.spec_entries_by_type.get_reference(&ty.table_key())) {
             Option::Some(positions) => {
                 for (mut k: i64 = 0; k < (*positions).length(); k++) {
                     const at: i64 = (*positions)[k];
@@ -273,7 +273,7 @@ type struct MonoState {
     /// the type arguments `args`; invalid when none was minted.
     method_instance(&this, owner: TypeRef, def: DefKey, args: &[TypeRef]) -> OverloadId {
         const key: InstanceKey = MonoState::instance_key(owner, def);
-        match (this.instance_keys.get_ref(&key)) {
+        match (this.instance_keys.get_reference(&key)) {
             Option::Some(positions) => {
                 for (mut k: i64 = 0; k < (*positions).length(); k++) {
                     const inst: const MethodInstance* = &this.method_instances[(*positions)[k]];
@@ -417,7 +417,7 @@ type struct MonoState {
         // `implement<T> ... for struct Wrapper<T>` where `Wrapper<T, A = ...>`:
         // the receiver substitutes to the 1-arg `Wrapper<Concrete>` while the
         // template has 2 params, and a method call on `this` (e.g. `HashSet::clone`
-        // calling `this.iter_ref()`) re-instantiates and enqueues that receiver
+        // calling `this.iterate_references()`) re-instantiates and enqueues that receiver
         // here - a field-access-only body (`Array::clone` reading `this.ptr`) never
         // did, so the non-wrapper `Array<T>` slipped by.  `generic_type` stays the
         // ORIGINAL (lower-arity) `ty`, so the later `set_resolved_type` still lands

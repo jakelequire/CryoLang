@@ -1,6 +1,6 @@
 ///! HTTP request parsing through a persistent connection buffer.
 ///!
-///! The server wraps each accepted socket in ONE `BufStream` that lives across
+///! The server wraps each accepted socket in ONE `BufferedStream` that lives across
 ///! the keep-alive loop, so `read_request` reads the request line, the headers
 ///! and the Content-Length body through a shared buffer. The correctness risk in
 ///! that design is FRAMING: after the first request's body is consumed, any
@@ -31,12 +31,12 @@ import std::future;
 import std::io::error;
 import std::io::error::{ IoErrorKind };
 import std::io::traits::{ AsyncTransport, Transfer };
-import std::io::buf::{ BufStream };
+import std::io::buffered::{ BufferedStream };
 import std::net::http::method;
 import std::net::http::request::{ Request };
-import std::net::http::conn;
+import std::net::http::connection;
 import std::test::error::{ TestError };
-import std::test::assert::{ expect_eq };
+import std::test::assert::{ expect_equal };
 
 /// In-memory async transport. `chunk == 0` hands over everything available in
 /// one operation; a positive `chunk` caps each one, which is how a message is
@@ -123,7 +123,7 @@ const TWO_REQUESTS: string =
 
 /// One request with a body. Returns 5 (its body length) on a verified parse.
 async function hbp_single_request(chunk: i64) -> i64 {
-    mut c: BufStream<MemTransport> = BufStream::<MemTransport>::of(MemTransport::of(
+    mut c: BufferedStream<MemTransport> = BufferedStream::<MemTransport>::of(MemTransport::of(
         "POST /submit HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", chunk));
     mut r: Request = match (await c.read_request()) {
         Result::Ok(v)  => { v }
@@ -139,8 +139,8 @@ async function hbp_single_request(chunk: i64) -> i64 {
 /// took. Value assertions fold in as negative returns, so a wrong path or body
 /// can never be mistaken for a fill count.
 async function hbp_two_requests(chunk: i64) -> i64 {
-    mut c: BufStream<MemTransport> =
-        BufStream::<MemTransport>::of(MemTransport::of(TWO_REQUESTS, chunk));
+    mut c: BufferedStream<MemTransport> =
+        BufferedStream::<MemTransport>::of(MemTransport::of(TWO_REQUESTS, chunk));
 
     mut first: Request = match (await c.read_request()) {
         Result::Ok(v)  => { v }
@@ -164,14 +164,14 @@ async function hbp_two_requests(chunk: i64) -> i64 {
 
 ![test]
 function parses_single_request_with_body() -> Result<(), TestError> {
-    return expect_eq(future::block_on(hbp_single_request(0)), 5 as i64);
+    return expect_equal(future::block_on(hbp_single_request(0)), 5 as i64);
 }
 
 /// Both requests arrive together, so the second is read entirely out of the
 /// buffer: exactly ONE transport read for the pair.
 ![test]
 function keep_alive_two_requests_one_buffer() -> Result<(), TestError> {
-    return expect_eq(future::block_on(hbp_two_requests(0)), 1 as i64);
+    return expect_equal(future::block_on(hbp_two_requests(0)), 1 as i64);
 }
 
 /// The control that gives the `1` above its meaning: the same two requests
@@ -180,7 +180,7 @@ function keep_alive_two_requests_one_buffer() -> Result<(), TestError> {
 ![test]
 function tiny_chunks_still_frame_correctly() -> Result<(), TestError> {
     const fills: i64 = future::block_on(hbp_two_requests(1));
-    return expect_eq(fills, Str::new(TWO_REQUESTS).length() as i64);
+    return expect_equal(fills, Str::new(TWO_REQUESTS).length() as i64);
 }
 
 /// A chunked request whose one chunk (0x17 = 23 bytes) is itself a request
@@ -193,8 +193,8 @@ const CHUNKED_REQUEST: string =
 /// 0 when the chunk is the body and the next read finds the end of the
 /// connection rather than a request.
 async function hbp_chunked_request() -> i64 {
-    mut c: BufStream<MemTransport> =
-        BufStream::<MemTransport>::of(MemTransport::of(CHUNKED_REQUEST, 0));
+    mut c: BufferedStream<MemTransport> =
+        BufferedStream::<MemTransport>::of(MemTransport::of(CHUNKED_REQUEST, 0));
     match (await c.read_request()) {
         Result::Ok(first) => {
             if (!hbp_bytes_eq(&first.body, "GET /admin HTTP/1.1\r\n\r\n")) { return 1; }
@@ -212,5 +212,5 @@ async function hbp_chunked_request() -> i64 {
 
 ![test]
 function a_chunk_holding_a_request_line_stays_the_body() -> Result<(), TestError> {
-    return expect_eq(future::block_on(hbp_chunked_request()), 0 as i64);
+    return expect_equal(future::block_on(hbp_chunked_request()), 0 as i64);
 }

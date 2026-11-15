@@ -28,14 +28,11 @@
 ///! declaration order.  Move-checked bindings are skipped, as are
 ///! types without a `Drop` impl (inherent or trait).
 ///!
-///! Consumption tracking covers three patterns:
-///!   - explicit `.drop()` calls,
-///!   - by-value receivers (`mut this` / `this`),
-///!   - `![sink]`-tagged `&this` methods (e.g. `Box::into_raw`).
-///!
-///! All three mark the receiver as moved so synthesis skips it at the
+///! A call whose receiver is taken by value (`this` / `mut this`, e.g.
+///! `Box::into_raw`) marks the receiver moved, so synthesis skips it at the
 ///! enclosing scope's exit.  See `types/ownership.cryo`'s
-///! `method_consumes_receiver` for the directive plumbing.
+///! `method_consumes_receiver`.  A hand-written `x.drop()` never reaches
+///! here: sema refuses it.
 
 namespace compiler::passes::drop_insertion;
 
@@ -51,7 +48,6 @@ import compiler::resolver::{ symbol_str, intern_table };
 import compiler::resolver::res::{ Res };
 import compiler::resolver::resolver::{ Resolver };
 import compiler::resolver::symbol_id::{ SymbolID };
-import compiler::lex::lexer::{ Lexer };
 import utils::log::{ Log, LogArea, LogLevel };
 import std::core::option;
 import std::collections::hashmap;
@@ -68,7 +64,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::expression::{
     ArrayAccessExpr, ArrayExpr, BinaryExpr, CallExpr, CalleePin, CastExpr,
-    ExprKind, ExpressionNode, IdentifierExpr, IfExpr, LambdaExpr, LiteralExpr,
+    ExprKind, ExpressionNode, IdentifierExpr, IfExpr, LambdaExpr,
     MemberAccessExpr, NewExpr, StructExpr, TernaryExpr,
     TupleExpr, UnaryExpr
 };
@@ -88,6 +84,7 @@ import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::sema::sema::{ SemaVisitor };
+import compiler::ast::walk::{ Walk };
 
 
 /// A local this pass writes a reference to: the binding it denotes and the
@@ -196,6 +193,26 @@ type struct LoopExitMove {
     writes: Stmt*;
 }
 
+/// The bindings a body assigns whole (`x = ...`), at any depth outside the
+/// lambdas written in it, whose bodies run where they are called.
+type struct WholeAssignments {
+    keys: [u64];
+}
+
+implement trait Walk for struct WholeAssignments {
+    walk_binary(mut &this, e: mut ExpressionNode*, n: BinaryExpr*) -> void {
+        if (n.op.kind == TokenType::Equal) {
+            const target: IdentifierExpr* = ExpressionNode::identifier_of(n.left);
+            if (target != null && target.res.local_sym().is_valid()) {
+                this.keys.push(target.res.local_sym().key());
+            }
+        }
+        BinaryExpr::walk_children(n, this);
+    }
+
+    walk_lambda(mut &this, e: mut ExpressionNode*, n: LambdaExpr*) -> void { }
+}
+
 
 type struct DropInserter {
     ctx:      mut CompilationContext*;
@@ -247,6 +264,12 @@ type struct DropInserter {
     /// `binding_syms` is the key; `binding_names` is the spelling the
     /// synthesized `<name>.drop()` is written with, and is never searched.
     scope_start_idx: [i64];
+    /// Per scope, the statement buffer of the block whose bindings it holds,
+    /// or null for a scope no block owns (a `for` statement's init).  A
+    /// binding's drop flag is declared there, so every branch that writes
+    /// the flag sees it: one declared ahead of an inner join (an `else if`)
+    /// would be out of scope in an outer join's other branch.
+    scope_outs:      [mut [Stmt*]*];
     binding_syms:    [SymbolID];
     binding_names:   [u32];
     binding_types:   [TypeRef];
@@ -454,6 +477,12 @@ type struct DropInserter {
     pend_assign_kind:    [u8];
     pend_assign_key:     [u32];
 
+    /// Bindings a value was moved out of from behind a reference earlier in
+    /// the function (`const old: T = this.f;`): the place still holds the
+    /// moved value's bits, so a store through the same binding must not
+    /// release them (see `record_reference_store`).
+    reference_moved_roots: [u64];
+
     /// Monotonic counter for naming the hidden locals that hold a displaced
     /// value between the store and its release (see `emit_assign_drop`).
     assign_seq:   i64;
@@ -518,6 +547,7 @@ type struct DropInserter {
             types_keys:      [],
             types_refs:      [],
             scope_start_idx: [],
+            scope_outs:      [],
             binding_syms:    [],
             binding_names:   [],
             binding_types:   [],
@@ -546,6 +576,7 @@ type struct DropInserter {
             pend_assign_base_ty: TypeRef::invalid(),
             pend_assign_kind:    [],
             pend_assign_key:     [],
+            reference_moved_roots: [],
             assign_seq:      0,
             stmt_move_snap:  0,
             stmt_writes_flags: false,
@@ -578,11 +609,13 @@ type struct DropInserter {
 
     push_scope(mut &this) -> void {
         this.scope_start_idx.push(this.binding_names.length());
+        this.scope_outs.push(null);
     }
 
     pop_scope(mut &this) -> void {
         const top: i64 = this.scope_start_idx.length();
         if (top == 0) { return; }
+        this.scope_outs.pop();
         // Read by index then truncate via pop(). Binding an Option payload
         // through a match arm into a `mut` outer variable currently fails
         // to lower (E0614: rvalue null). Read-then-truncate sidesteps the
@@ -978,6 +1011,7 @@ type struct DropInserter {
         this.types_keys      = [];
         this.types_refs      = [];
         this.scope_start_idx = [];
+        this.scope_outs      = [];
         this.binding_syms    = [];
         this.binding_names   = [];
         this.binding_types   = [];
@@ -985,6 +1019,7 @@ type struct DropInserter {
         this.binding_initflags = [];
         this.binding_definit = [];
         this.pend_assign_node = null;
+        this.reference_moved_roots = [];
         this.assign_seq      = 0;
         this.loops           = [];
         this.loop_exit_moves = [];
@@ -1118,6 +1153,8 @@ type struct DropInserter {
         const old_stmts: &[Stmt*] = &block.statements;
         mut new_stmts: [Stmt*] = [];
         mut terminated: boolean = false;
+        const scope_top: i64 = this.scope_outs.length() - 1;
+        if (scope_top >= 0) { this.scope_outs[scope_top] = &new_stmts; }
 
         // For a value block, find the index of the arm's value statement:
         // the last non-null statement, when it is an expression statement.
@@ -1182,6 +1219,7 @@ type struct DropInserter {
             }
         }
 
+        if (scope_top >= 0) { this.scope_outs[scope_top] = null; }
         block.statements = new_stmts;
         return terminated;
     }
@@ -1532,7 +1570,7 @@ type struct DropInserter {
         // back edge is refused by MoveCheck (fatal_on_failure) before this
         // pass runs, so the loop's own exit sees the pre-loop moved-set;
         // only a `break` carries body moves past the loop (`leave_loop`).
-        this.enter_loop();
+        this.enter_loop(w.body, null);
         this.branch_depth += 1;
         if (w.body != null) {
             w.body = this.as_child_block(w.body);
@@ -1544,7 +1582,7 @@ type struct DropInserter {
 
     walk_do_while(mut &this, w: mut DoWhileStmt*) -> void {
         if (w == null) { return; }
-        this.enter_loop();
+        this.enter_loop(w.body, null);
         this.branch_depth += 1;
         if (w.body != null) {
             w.body = this.as_child_block(w.body);
@@ -1565,7 +1603,7 @@ type struct DropInserter {
             this.walk_var_decl(f.init.as_decl());
         }
         if (f.condition != null) { this.walk_expr_read(f.condition); }
-        this.enter_loop();
+        this.enter_loop(f.body, f.update);
         this.branch_depth += 1;
         if (f.body != null) {
             f.body = this.as_child_block(f.body);
@@ -1585,7 +1623,7 @@ type struct DropInserter {
 
     walk_loop(mut &this, l: mut LoopStmt*) -> void {
         if (l == null) { return; }
-        this.enter_loop();
+        this.enter_loop(l.body, null);
         this.branch_depth += 1;
         if (l.body != null) {
             l.body = this.as_child_block(l.body);
@@ -1595,9 +1633,32 @@ type struct DropInserter {
         this.leave_loop(null);
     }
 
-    /// Begin walking a loop statement's body.  Its flags are declared where
-    /// the loop statement's own are, ahead of it.
-    enter_loop(mut &this) -> void {
+    /// Begin walking a loop statement's body (and a `for`'s `update`).  Its
+    /// flags are declared where the loop statement's own are, ahead of it.
+    ///
+    /// A binding moved when the loop starts and assigned whole in the body
+    /// holds a value after the loop on the paths that ran the body and none
+    /// on the path that did not, so it is given its move flag here, set
+    /// moved ahead of the loop: the body's assignment clears it, the value
+    /// an assignment displaces is released where it is clear (none on the
+    /// first iteration, the previous iteration's after), and the scope-exit
+    /// drop runs where it is clear.
+    enter_loop(mut &this, body: Stmt*, update: Stmt*) -> void {
+        mut assigned: WholeAssignments = WholeAssignments { keys: [] };
+        if (body != null) { assigned.walk_stmt(body); }
+        if (update != null) { assigned.walk_stmt(update); }
+        for (mut i: i64 = 0; i < assigned.keys.length(); i++) {
+            const k: u64 = assigned.keys[i];
+            if (this.flag_declarations == null || !this.is_moved_id(k) || this.get_drop_flag(k).is_valid()) { continue; }
+            const flag: PassLocal = this.fresh_drop_flag(k);
+            const span: SourceSpan = this.binding_span_for(k, if (body != null) { body.span } else { update.span });
+            this.declare_drop_flag(k, flag, span, this.flag_declarations);
+            this.flag_declarations.push(this.make_drop_flag_write(flag, true, span));
+            this.register_drop_flag(k, flag);
+            for (mut m: i64 = 0; m < this.moved_keys.length(); m++) {
+                if (this.moved_keys[m] == k) { this.moved_gov[m] = true; }
+            }
+        }
         this.loops.push(LoopFrame {
             scope_boundary: this.scope_start_idx.length(),
             move_snapshot:  this.snapshot_moves(),
@@ -1624,8 +1685,8 @@ type struct DropInserter {
                 mut flag: PassLocal = this.get_drop_flag(exit.key);
                 if (!flag.is_valid()) {
                     flag = this.fresh_drop_flag(exit.key);
-                    frame.declarations.push(this.make_drop_flag_decl(flag,
-                        this.binding_span_for(exit.key, exit.writes.span)));
+                    this.declare_drop_flag(exit.key, flag,
+                        this.binding_span_for(exit.key, exit.writes.span), frame.declarations);
                     this.register_drop_flag(exit.key, flag);
                 }
                 exit.writes.as_block().statements.push(this.make_drop_flag_set(flag,
@@ -2169,11 +2230,10 @@ type struct DropInserter {
         mut flag: PassLocal = this.get_drop_flag(binding);
         if (!flag.is_valid()) {
             flag = this.fresh_drop_flag(binding);
-            // Hoist `mut <flag>: boolean = false;` before the if-stmt.
             // The binding span is the best anchor for diagnostics on the
             // synthesized local; fall back to s.span if unavailable.
             const decl_span: SourceSpan = this.binding_span_for(binding, s.span);
-            out.push(this.make_drop_flag_decl(flag, decl_span));
+            this.declare_drop_flag(binding, flag, decl_span, out);
             this.register_drop_flag(binding, flag);
         }
         if (!splice) { return; }
@@ -2213,7 +2273,7 @@ type struct DropInserter {
             if (needs_writes && out != null) {
                 if (!this.get_drop_flag(key).is_valid()) {
                     const flag: PassLocal = this.fresh_drop_flag(key);
-                    out.push(this.make_drop_flag_decl(flag, this.binding_span_for(key, span)));
+                    this.declare_drop_flag(key, flag, this.binding_span_for(key, span), out);
                     this.register_drop_flag(key, flag);
                 }
                 writes.push(key);
@@ -2487,10 +2547,10 @@ type struct DropInserter {
     /// Guards param auto-drop against a type whose drop method would mangle
     /// to a name that isn't emitted. A by-value param can receive a generic
     /// type with unfilled default args via mono substitution (e.g. `T` bound
-    /// to bare `Box` from `Option<Box>`, where `Box<T, A=GlobalAlloc>`
+    /// to bare `Box` from `Option<Box>`, where `Box<T, A=GlobalAllocator>`
     /// is what's actually emitted). Such a *base* template type is registered
     /// in the generic registry by its own type id; a fully concrete type or a
-    /// canonical `InstantiatedType` (`String<GlobalAlloc>`) is not, so its drop
+    /// canonical `InstantiatedType` (`String<GlobalAllocator>`) is not, so its drop
     /// mangles to the emitted symbol. Dropping a bare-template param would
     /// reference an unmangled `Type::drop` that nothing defines, so skip it
     /// (it leaks, as before this pass dropped any param - no regression). The
@@ -2571,6 +2631,25 @@ type struct DropInserter {
         const t: Type* = this.arena.lookup(ty);
         if (t == null) { return false; }
         return t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference;
+    }
+
+    /// True when `ty` is a reference (`&T` / `mut &T`), whose referent is
+    /// always initialised; a raw pointer may address storage holding nothing.
+    is_reference(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid() || this.arena == null) { return false; }
+        const t: Type* = this.arena.lookup(ty);
+        return t != null && t.kind == TypeKind::Reference;
+    }
+
+    /// What dereferencing `ty` reaches: a pointer's pointee or a reference's
+    /// referent; invalid for any other type.
+    dereferenced_type(&this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid() || this.arena == null) { return TypeRef::invalid(); }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind == TypeKind::Pointer) { return t.as_pointer().pointee; }
+        if (t.kind == TypeKind::Reference) { return t.as_reference().referent; }
+        return TypeRef::invalid();
     }
 
     /// True when `ty` has a destructor (a `Drop` implementation): partial
@@ -2809,15 +2888,17 @@ type struct DropInserter {
         // never from the place node's own `resolved_type`: async lowering
         // rebuilds the bodies this pass sees and leaves those annotations
         // invalid, which silently answered "nothing to release" for every
-        // assignment inside a lowered `poll`.  A hop through a pointer or
-        // reference, or a run-time index, fails to type here - a raw slot store
-        // fills reserved capacity that holds nothing yet, and releasing its
-        // previous occupant frees whatever the allocator last left there.
+        // assignment inside a lowered `poll`.  A place reached through a
+        // dereference is decided by `record_reference_store`; a run-time index
+        // fails to type here.
         mut kind: [u8]  = [];
         mut key:  [u32] = [];
-        const root: SymbolID = this.collect_place_chain(b.left, &kind, &key);
+        const root: SymbolID = ExpressionNode::place_chain(b.left, &kind, &key);
         if (!root.is_valid()) { return; }
         const slot: i64 = this.innermost_binding_slot(root);
+        mut root_ty: TypeRef = this.lookup_type(root);
+        if (slot >= 0) { root_ty = this.binding_types[slot]; }
+        if (this.record_reference_store(e, b.left, root, root_ty, &kind, &key)) { return; }
         if (slot < 0) { return; }
         const place_ty: TypeRef = this.place_type_of(
             this.binding_types[slot], &kind, &key, 0, kind.length());
@@ -2876,6 +2957,127 @@ type struct DropInserter {
             }
         }
         this.pend_assign(e, slot, guard, place_ty, kind, key);
+    }
+
+    /// Decide the release for a store whose place is reached through a
+    /// dereference - written (`*r = x`) or implied by a member or index of a
+    /// pointer or reference (`this.f = x`) - and answer whether it was one;
+    /// false leaves a place in the binding's own storage to the caller.
+    ///
+    /// The NEAREST dereference decides.  Through a reference the place is
+    /// always initialised, so the displaced value is released with no guard.
+    /// Through a raw pointer nothing is released: a pointer store may fill
+    /// storage that holds nothing yet (reserved capacity, a fresh
+    /// allocation), and releasing its previous bytes frees whatever the
+    /// allocator last left there.  `this.state.x` with `state` a pointer
+    /// field is a pointer store, though `this` is a reference.
+    ///
+    /// A binding something was moved out of from behind a reference earlier
+    /// in the function, or by this store's own right-hand side
+    /// (`this.f = wrap(this.f)`), declines: the place still holds the bits
+    /// of the value whoever took it now owns.
+    record_reference_store(mut &this, e: ExpressionNode*, place: ExpressionNode*,
+                           root: SymbolID, root_ty: TypeRef,
+                           kind: &[u8], key: &[u32]) -> boolean {
+        mut steps_kind: [u8]  = [];
+        mut steps_key:  [u32] = [];
+        mut hop: u8 = 0;
+        const cur: TypeRef = this.dereferencing_place_type(
+            root_ty, kind, key, &steps_kind, &steps_key, &hop);
+        // Untypeable: declined here and by the caller alike.
+        if (!cur.is_valid()) { return true; }
+        if (hop == (0 as u8)) { return false; }
+        if (hop != (1 as u8) || !this.type_needs_drop(cur)) { return true; }
+        for (mut i: i64 = 0; i < this.reference_moved_roots.length(); i++) {
+            if (this.reference_moved_roots[i] == root.key()) { return true; }
+        }
+        mut base_node: ExpressionNode* = place;
+        while (ExpressionNode::identifier_of(base_node) == null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(base_node);
+            const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(base_node);
+            const ue: UnaryExpr* = ExpressionNode::unary_of(base_node);
+            if (ma != null) {
+                base_node = ma.object;
+            } else if (aa != null) {
+                base_node = aa.array;
+            } else {
+                base_node = ue.operand;
+            }
+        }
+        // A by-reference receiver is typed as the value it refers to: its
+        // identifier already names the referent's place, so the place is
+        // built from it with that dereference done.
+        mut base_ty: TypeRef = root_ty;
+        const referent_ty: TypeRef = this.dereferenced_type(root_ty);
+        if (steps_kind.length() != 0 && steps_kind[0] == (2 as u8)
+                && referent_ty.is_valid() && base_node.resolved_type.equals(referent_ty)) {
+            base_ty = referent_ty;
+            steps_kind.remove(0);
+            steps_key.remove(0);
+        }
+        this.pend_assign_node  = e;
+        this.pend_assign_guard = PassLocal::none();
+        this.pend_assign_ty    = cur;
+        this.pend_assign_base    = PassLocal {
+            name:    ExpressionNode::identifier_of(base_node).name,
+            binding: root,
+        };
+        this.pend_assign_base_ty = base_ty;
+        this.pend_assign_kind    = steps_kind;
+        this.pend_assign_key     = steps_key;
+        return true;
+    }
+
+    /// Note a move out of a place reached through a dereference: the
+    /// binding it is rooted at no longer owns what the place holds (see
+    /// `record_reference_store`).  Read syntactically and typed from the
+    /// binding, as every place here is.
+    note_reference_move(mut &this, expr: ExpressionNode*) -> void {
+        mut kind: [u8]  = [];
+        mut key:  [u32] = [];
+        const root: SymbolID = ExpressionNode::place_chain(expr, &kind, &key);
+        if (!root.is_valid() || kind.length() == 0) { return; }
+        mut steps_kind: [u8]  = [];
+        mut steps_key:  [u32] = [];
+        mut hop: u8 = 0;
+        const moved_ty: TypeRef = this.dereferencing_place_type(
+            this.lookup_type(root), kind, key, &steps_kind, &steps_key, &hop);
+        // Untypeable, it may be behind one; a value with nothing to release
+        // leaves nothing to release twice.
+        if (moved_ty.is_valid() && (hop == (0 as u8) || !this.type_needs_drop(moved_ty))) { return; }
+        this.reference_moved_roots.push(root.key());
+    }
+
+    /// The type of the place `root_ty` + the chain, stepping through every
+    /// pointer or reference the chain dereferences, written or implied by a
+    /// member or index of one.  The chain with every dereference written out
+    /// (kind 2) is appended to `out_kind`/`out_key`; `out_hop` says what the
+    /// NEAREST dereference went through: 0 none, 1 a reference, 2 a raw
+    /// pointer.  Invalid when a step does not type.
+    dereferencing_place_type(&this, root_ty: TypeRef, kind: &[u8], key: &[u32],
+                             out_kind: mut [u8]*, out_key: mut [u32]*,
+                             out_hop: mut u8*) -> TypeRef {
+        *out_hop = 0;
+        mut cur: TypeRef = root_ty;
+        for (mut k: i64 = 0; k < kind.length(); k++) {
+            if (kind[k] != (2 as u8) && this.is_ptr_or_ref(cur)) {
+                *out_hop = if (this.is_reference(cur)) { 1 as u8 } else { 2 as u8 };
+                cur = this.dereferenced_type(cur);
+                out_kind.push(2 as u8);
+                out_key.push(0);
+            }
+            if (kind[k] == (2 as u8)) {
+                *out_hop = if (this.is_reference(cur)) { 1 as u8 } else { 2 as u8 };
+                cur = this.dereferenced_type(cur);
+            } else {
+                mut unused_index: i64 = -1;
+                cur = this.project_type(cur, kind[k], key[k], &unused_index);
+            }
+            if (!cur.is_valid()) { return TypeRef::invalid(); }
+            out_kind.push(kind[k]);
+            out_key.push(key[k]);
+        }
+        return cur;
     }
 
     /// Stash the release `record_assign_drop` decided on for the enclosing
@@ -2970,7 +3172,7 @@ type struct DropInserter {
             0, this.pend_assign_kind.length(), span);
         if (place == null) { out.push(stmt); return; }
         const old: PassLocal = this.mint_local(this.intern.intern(
-            fmt::format("__assign_old%lld", this.assign_seq).into_raw()));
+            fmt::format("__assign_old%lld", this.assign_seq).as_str()));
         this.assign_seq = this.assign_seq + 1;
 
         const vd: mut VarDecl* = VarDecl::new(old.name);
@@ -3033,7 +3235,7 @@ type struct DropInserter {
                               out: mut [Stmt*]*, span: SourceSpan) -> void {
         const ty: TypeRef = expr.resolved_type;
         const tmp: PassLocal = this.mint_local(this.intern.intern(
-            fmt::format("__drop_tmp%d", this.discard_seq).into_raw()));
+            fmt::format("__drop_tmp%d", this.discard_seq).as_str()));
         this.discard_seq = this.discard_seq + 1;
         const vd: mut VarDecl* = VarDecl::new(tmp.name);
         const vd_decl: mut DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vd), span);
@@ -3064,7 +3266,7 @@ type struct DropInserter {
         const span: SourceSpan = m.subject.span;
         const ty: TypeRef = m.subject.resolved_type;
         const name: SymbolStr = this.intern.intern(
-            fmt::format("__match_subj%d", this.discard_seq).into_raw());
+            fmt::format("__match_subj%d", this.discard_seq).as_str());
         this.discard_seq = this.discard_seq + 1;
         // Walk the subject in move context FIRST (it's the rvalue init).
         this.walk_expr_move(m.subject);
@@ -3253,6 +3455,26 @@ type struct DropInserter {
         return blk;
     }
 
+    /// Declare `binding`'s new drop flag `flag` (`= false`) in the block that
+    /// declares the binding, ahead of the statement that block is walking:
+    /// every path that moves the binding is inside that statement, so the
+    /// declaration is in scope wherever a join writes the flag.  A binding
+    /// of a scope no block owns has its flag declared in the nearest
+    /// enclosing block that does, else in `out`.
+    declare_drop_flag(mut &this, binding: u64, flag: PassLocal, span: SourceSpan,
+                      out: mut [Stmt*]*) -> void {
+        const slot: i64 = this.slot_of(binding);
+        mut target: mut [Stmt*]* = out;
+        for (mut d: i64 = this.scope_start_idx.length() - 1; d >= 0 && slot >= 0; d--) {
+            if (this.scope_start_idx[d] > slot) { continue; }
+            if (this.scope_outs[d] != null) {
+                target = this.scope_outs[d];
+                break;
+            }
+        }
+        target.push(this.make_drop_flag_decl(flag, span));
+    }
+
     /// Allocate a fresh drop flag for `binding`, with a binding of its own.
     /// The name `<name>__dropflag<seq>` keeps the binding visible in IR
     /// dumps; the seq keeps two flags of one spelling apart there.
@@ -3393,7 +3615,7 @@ type struct DropInserter {
         if (this.mem_slot.length() == 0) { return -1; }
         mut kind: [u8]  = [];
         mut key:  [u32] = [];
-        const root: SymbolID = this.collect_place_chain(expr, &kind, &key);
+        const root: SymbolID = ExpressionNode::place_chain(expr, &kind, &key);
         if (!root.is_valid() || kind.length() == 0) { return -1; }
         const slot: i64 = this.innermost_binding_slot(root);
         if (slot < 0) { return -1; }
@@ -3421,7 +3643,8 @@ type struct DropInserter {
     }
 
     /// Build a place expression as fresh nodes: `<base>` followed by the chain
-    /// slice.  Every node gets its type from `project_type` rather than from
+    /// slice, a dereference step written as `*`.  Every node gets its type
+    /// from `project_type` (or `dereferenced_type`) rather than from
     /// whatever the source node carried, because codegen runs after this pass
     /// and will not re-resolve one - and because async lowering leaves many
     /// `resolved_type` annotations invalid.  Null when the chain does not
@@ -3438,6 +3661,18 @@ type struct DropInserter {
         for (mut k: i64 = 0; k < len; k++) {
             const pkind: u8  = kind[start + k];
             const pkey:  u32 = key[start + k];
+            if (pkind == (2 as u8)) {
+                const target_ty: TypeRef = this.dereferenced_type(cur_ty);
+                if (!target_ty.is_valid()) { return null as mut ExpressionNode*; }
+                const star: Token = Token::new(TokenType::Star, "*",
+                    span.start_line as int, span.start_col as int);
+                const deref: mut ExpressionNode* = ExpressionNode::synthetic_unary(star, cur, span);
+                deref.set_resolved_type(target_ty);
+                deref.generated = true;
+                cur = deref;
+                cur_ty = target_ty;
+                continue;
+            }
             mut next_index: i64 = -1;
             const next_ty: TypeRef = this.project_type(cur_ty, pkind, pkey, &next_index);
             if (!next_ty.is_valid()) { return null as mut ExpressionNode*; }
@@ -3780,67 +4015,6 @@ type struct DropInserter {
         return t != null && t.kind == TypeKind::Array;
     }
 
-    /// The constant value of an index expression, or -1 when it is not a plain
-    /// integer literal.  A member flag names one slot, so an index decided at
-    /// run time has no member for it to govern.
-    const_index_of(&this, expr: ExpressionNode*) -> i64 {
-        const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
-        if (lit == null || lit.literal_kind != LiteralKind::Integer) { return -1; }
-        const parsed: Option<u128> = Lexer::integer_literal_value(lit.value, lit.suffix);
-        if (parsed.is_none()) { return -1; }
-        const v: u128 = parsed.unwrap();
-        // The key is stored as a u32 alongside field name ids; an index that
-        // does not fit is not a member this table can name.
-        if (v > u32::MAX as u128) { return -1; }
-        return v as i64;
-    }
-
-    /// Decompose a place into the local it is rooted at plus its projection
-    /// chain, appended root-first to `out_kind`/`out_key`.  Returns the root
-    /// binding's identity, or an invalid one when the shape is not a
-    /// projection chain over a local.
-    ///
-    /// Purely SYNTACTIC: whether the chain stays inside the local's own
-    /// storage is decided by `place_type_of`, walking types down from the
-    /// binding rather than reading each node's `resolved_type`.  Async
-    /// lowering rebuilds the bodies this pass sees and leaves many of those
-    /// annotations invalid, so a type test here silently answers "no" for
-    /// every assignment in a lowered `poll`.
-    ///
-    /// A failure never leaves a partial chain behind: every push happens after
-    /// the recursive call has already succeeded.
-    collect_place_chain(&this, expr: ExpressionNode*,
-                        out_kind: mut [u8]*, out_key: mut [u32]*) -> SymbolID {
-        if (expr == null) { return SymbolID::invalid(); }
-        const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
-        if (id != null) {
-            return id.res.local_sym();
-        }
-        if (ExpressionNode::member_access_of(expr) != null) {
-            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(expr);
-            if (ma.object == null) { return SymbolID::invalid(); }
-            const root: SymbolID =
-                this.collect_place_chain(ma.object, out_kind, out_key);
-            if (!root.is_valid()) { return SymbolID::invalid(); }
-            out_kind.push(0 as u8);
-            out_key.push(ma.member.id);
-            return root;
-        }
-        const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(expr);
-        if (aa != null) {
-            if (aa.array == null || aa.index == null) { return SymbolID::invalid(); }
-            const idx: i64 = this.const_index_of(aa.index);
-            if (idx < 0) { return SymbolID::invalid(); }
-            const root: SymbolID =
-                this.collect_place_chain(aa.array, out_kind, out_key);
-            if (!root.is_valid()) { return SymbolID::invalid(); }
-            out_kind.push(1 as u8);
-            out_key.push(idx as u32);
-            return root;
-        }
-        return SymbolID::invalid();
-    }
-
     /// The type of the place `base_ty` + the chain slice, or an invalid
     /// TypeRef when the chain leaves the local's own storage.  This is the
     /// single authority on "is this place part of the local": `project_type`
@@ -3865,7 +4039,7 @@ type struct DropInserter {
     project_type(&this, ty: TypeRef, kind: u8, key: u32, out_index: mut i64*) -> TypeRef {
         *out_index = -1;
         if (!ty.is_valid() || this.arena == null) { return TypeRef::invalid(); }
-        if (this.is_ptr_or_ref(ty)) { return TypeRef::invalid(); }
+        if (this.is_ptr_or_ref(ty) || kind == (2 as u8)) { return TypeRef::invalid(); }
         if (kind == (1 as u8)) {
             if (!this.is_fixed_array(ty)) { return TypeRef::invalid(); }
             mut cur: TypeRef = ty;
@@ -3933,9 +4107,14 @@ type struct DropInserter {
     /// fall back to disqualifying the local entirely.
     record_init_place(mut &this, expr: ExpressionNode*) -> boolean {
         const mark: i64 = this.pw_proj_kind.length();
-        const root: SymbolID = this.collect_place_chain(
+        const root: SymbolID = ExpressionNode::place_chain(
             expr, &this.pw_proj_kind, &this.pw_proj_key);
-        if (!root.is_valid() || this.pw_proj_kind.length() == mark) {
+        // A place behind a dereference is not storage of the local's own.
+        mut through_dereference: boolean = false;
+        for (mut k: i64 = mark; k < this.pw_proj_kind.length(); k++) {
+            if (this.pw_proj_kind[k] == (2 as u8)) { through_dereference = true; }
+        }
+        if (!root.is_valid() || this.pw_proj_kind.length() == mark || through_dereference) {
             while (this.pw_proj_kind.length() > mark) {
                 this.pw_proj_kind.pop();
                 this.pw_proj_key.pop();
@@ -4093,11 +4272,7 @@ type struct DropInserter {
         if (c.arguments.length() != 1 || c.arguments[0] == null) { return; }
         const p: mut ExpressionNode* = c.arguments[0];
         // `p` is the `T*` parameter's argument: a pointer, or `&place`.
-        const pt: Type* = this.arena.lookup(p.resolved_type);
-        if (pt == null) { return; }
-        mut target_ty: TypeRef = TypeRef::invalid();
-        if (pt.kind == TypeKind::Pointer) { target_ty = pt.as_pointer().pointee; }
-        if (pt.kind == TypeKind::Reference) { target_ty = pt.as_reference().referent; }
+        const target_ty: TypeRef = this.dereferenced_type(p.resolved_type);
         if (!target_ty.is_valid()) { return; }
         const deref_tok: Token = Token::new(TokenType::Star, "*",
             e.span.start_line as int, e.span.start_col as int);
@@ -4145,6 +4320,7 @@ type struct DropInserter {
         if (moved_field != null) {
             this.classify_field_move_out(expr, moved_field);
         }
+        this.note_reference_move(expr);
         const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
         if (id != null) {
             this.handle_ident(expr, id, true);
@@ -4298,32 +4474,6 @@ type struct DropInserter {
     read_call(mut &this, e: ExpressionNode*, c: mut CallExpr*) -> void {
         if (c == null) { return; }
         this.lower_drop_in_place(e, c);
-        // Recognise `<ident>.drop()` and treat it as a move: the user
-        // is explicitly releasing the binding here, so auto-drop must
-        // not emit a second `.drop()` at scope exit.  Without this, any
-        // file that hand-writes `b.drop();` would double-drop.  Same
-        // applies post-stdlib-migration for user code that opts out of
-        // auto-drop with an explicit consume.
-        if (c.callee != null && c.arguments.length() == 0 &&
-            ExpressionNode::member_access_of(c.callee) != null) {
-            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
-            const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
-            if (this.registry.names_lang_method(ma.member, LangItem::DropDrop) && id != null) {
-                // Only treat as a move when the identifier is a binding
-                // we're tracking (in the types map).  Pattern bindings
-                // introduced by `match` arms aren't currently registered,
-                // and treating their `.drop()` as a move would inflate
-                // the per-arm moved-set and cascade into spurious
-                // conditional-move errors at the match join.
-                const sym: SymbolID = id.res.local_sym();
-                if (this.lookup_type(sym).is_valid()) {
-                    if (!this.is_moved(sym)) {
-                        this.mark_moved(sym, ma.object.span);
-                    }
-                    return;
-                }
-            }
-        }
         // `--panic=unwind`: open a pending-arg frame for this call. Each
         // bare-identifier owning argument moved below is recorded on it; a panic
         // origin nested in a LATER argument drops them (the callee never ran).
@@ -4331,8 +4481,7 @@ type struct DropInserter {
         // unwind_cleanup (snapshotted after) correctly excludes them.
         if (this.ctx.options.unwinds()) { this.open_pending_arg_frame(); }
         // General consuming-method case: any method whose receiver is
-        // by-value (`mut this` / `this`) or that carries
-        // `![sink]` consumes the LHS at the call site.
+        // by-value (`this` / `mut this`) consumes the LHS at the call site.
         // Walk the receiver in move context; that mirrors what the
         // explicit `.drop()` arm above does, but for any consuming
         // method (e.g. `Box::into_raw`).  This tells the synthesiser
@@ -4402,9 +4551,15 @@ type struct DropInserter {
                 } else {
                     this.reinitialise_moved_field(b.left);
                 }
+            } else if (b.op.kind == TokenType::AmpAmp || b.op.kind == TokenType::PipePipe) {
+                // The right operand runs on some paths only, so it joins
+                // against the path that skips it, as an `if` expression's
+                // arm joins against a missing `else`.
+                mut skipped: [Stmt*] = [];
+                this.walk_conditional(e.span, null, b.right, null,
+                    &b.right_flag_writes, &skipped, false);
             } else {
-                this.walk_conditional_operand(b.right,
-                    b.op.kind == TokenType::AmpAmp || b.op.kind == TokenType::PipePipe);
+                this.walk_expr_read(b.right);
             }
         }
         // `--panic=unwind`: raw integer `/`, `%` and their compound-assign forms
@@ -4469,16 +4624,6 @@ type struct DropInserter {
         for (mut i: i64 = 0; i < al.elements.length(); i++) {
             this.walk_expr_move(al.elements[i]);
         }
-    }
-
-    /// The right operand of `&&` or `||` (`conditional`) runs on some paths
-    /// only, so it is walked as a branch body is: a field moved out of it is
-    /// not recorded as an unconditional partial move.  Mirrors move_check,
-    /// which refuses that move (E0453).
-    walk_conditional_operand(mut &this, operand: ExpressionNode*, conditional: boolean) -> void {
-        if (conditional) { this.branch_depth += 1; }
-        this.walk_expr_read(operand);
-        if (conditional) { this.branch_depth -= 1; }
     }
 
     read_new(mut &this, n: mut NewExpr*) -> void {

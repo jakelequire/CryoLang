@@ -31,16 +31,17 @@ import std::process;
 import std::sys::syscall;
 import compiler::deps::cache::{ Cache };
 import compiler::project_config::{ ProjectConfig };
-import std::fs::directory::{ Directory };
 import std::fs::file::{ File, OpenOptions };
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::fmt;
 import std::thread;
+import std::time::duration::{ Duration };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import std::core::option::{ Option };
 import std::json::{ value, parser, serializer };
 import std::json::value::{ JsonObject, JsonValue };
+import std::json::convert::{ ToJson };
 import std::core::mem;
 
 const VENDOR_SCHEMA_VERSION: i64 = 1;
@@ -49,6 +50,8 @@ const VENDOR_SCHEMA_VERSION: i64 = 1;
 /// intent-named roles of `ProjectConfig`'s `[link]` section (system -> `-l`,
 /// search -> `-L`, static -> verbatim archive path) plus the per-OS overlays,
 /// so merging into a project's link command is a field-for-field append.
+/// The elements are `string`s because they are appended to the project
+/// config's own link arrays, which hold `string`s for the whole build.
 type struct VendorLink {
     system:          [string];
     search:          [string];
@@ -70,77 +73,87 @@ type struct VendorLink {
 }
 
 /// One (triple -> generated bindings file) cache slot, with the provenance
-/// `key` the cache is validated against ("" for now).
+/// `key` the cache is validated against.
 type struct VendorCacheItem {
-    triple: string;
-    file:   string;
-    key:    string;
+    triple: String;
+    file:   String;
+    key:    String;
 }
 
 /// One registered library.
 type struct VendorEntry {
-    key:            string;   // registry key (the source dir basename, lowercased)
-    name:           string;   // import namespace, e.g. "RayLib"
-    source_path:    string;   // absolute path to the vendored C project
-    binding_source: string;   // "headers" (C/libclang) | "cxx-headers" (C++/libclang, direct mangled) | "manual" (pre-written) | "cxx-shim" (reserved, unimplemented)
-    headers:        [string];
-    include_dirs:   [string];
-    defines:        [string];
+    key:            String;   // registry key (the source dir basename, lowercased)
+    name:           String;   // import namespace, e.g. "RayLib"
+    source_path:    String;   // absolute path to the vendored C project
+    binding_source: String;   // "headers" (C/libclang) | "cxx-headers" (C++/libclang, direct mangled) | "manual" (pre-written) | "cxx-shim" (reserved, unimplemented)
+    headers:        [String];
+    include_dirs:   [String];
+    defines:        [String];
     /// Source language for libclang: "c" (default) or "c++".  Empty means "c".
     /// `binding_source: "cxx-headers"` implies "c++".  Selects `-x c++`.
-    language:       string;
+    language:       String;
     /// C++ standard for `-std=` (e.g. "c++17"); empty defaults to "c++17".
     /// Ignored for C bindings.
-    std:            string;
+    std:            String;
     link:           VendorLink;
     cache:          [VendorCacheItem];
 
     /// True when this entry binds C++ headers (direct mangled-symbol binding).
     is_cxx(&this) -> boolean {
-        return this.binding_source == "cxx-headers"
-            || this.language == "c++";
+        return this.binding_source.as_str() == Str::new("cxx-headers")
+            || this.language.as_str() == Str::new("c++");
+    }
+
+    /// True when the bindings are generated from the manifest's headers by
+    /// libclang (C or C++), rather than copied from a pre-written file.
+    is_generated(&this) -> boolean {
+        return this.binding_source.as_str() == Str::new("headers")
+            || this.binding_source.as_str() == Str::new("cxx-headers");
     }
 
     /// The libclang source language for this entry: "c++" for a C++ binding,
     /// else "c".
-    lang_arg(&this) -> string {
-        if (this.is_cxx()) { return "c++"; }
-        return "c";
+    lang_arg(&this) -> Str {
+        if (this.is_cxx()) { return Str::new("c++"); }
+        return Str::new("c");
     }
 
     /// The generated bindings path for `triple`, or "" if not yet cached.
-    cache_file_for(&this, triple_text: string) -> string {
-        const triple: string = triple_text;
+    cache_file_for(&this, triple: Str) -> Str {
         for (mut i: i64 = 0; i < this.cache.length(); i++) {
-            if (this.cache[i].triple == triple) {
-                return this.cache[i].file;
+            if (this.cache[i].triple.as_str() == triple) {
+                return this.cache[i].file.as_str();
             }
         }
-        return "";
+        return Str::new("");
     }
 
     /// The stored provenance key for `triple`, or "" if not cached.  Compared
     /// against a freshly computed key (`VendorGenerator::provenance_key`) to
     /// decide a cache hit vs. a regeneration.
-    cache_key_for(&this, triple: string) -> string {
+    cache_key_for(&this, triple: Str) -> Str {
         for (mut i: i64 = 0; i < this.cache.length(); i++) {
-            if (this.cache[i].triple == triple) {
-                return this.cache[i].key;
+            if (this.cache[i].triple.as_str() == triple) {
+                return this.cache[i].key.as_str();
             }
         }
-        return "";
+        return Str::new("");
     }
 
     /// Record (or replace) the bindings file for `triple`.
-    set_cache(mut &this, triple: string, file_path: string, prov_key: string) -> void {
+    set_cache(mut &this, triple: Str, file_path: Str, provenance_key: Str) -> void {
         for (mut i: i64 = 0; i < this.cache.length(); i++) {
-            if (this.cache[i].triple == triple) {
-                this.cache[i].file = file_path;
-                this.cache[i].key  = prov_key;
+            if (this.cache[i].triple.as_str() == triple) {
+                this.cache[i].file = String::from_str(file_path);
+                this.cache[i].key  = String::from_str(provenance_key);
                 return;
             }
         }
-        this.cache.push(VendorCacheItem { triple: triple, file: file_path, key: prov_key });
+        this.cache.push(VendorCacheItem {
+            triple: String::from_str(triple),
+            file:   String::from_str(file_path),
+            key:    String::from_str(provenance_key),
+        });
     }
 }
 
@@ -156,30 +169,29 @@ type struct VendorRegistry {
     // Paths
 
     /// `<cache_root>/vendor`: the vendor subtree of the shared cache.
-    static vendor_root() -> string {
-        const root: string = Path::from(Cache::cache_root()).join("vendor").into_raw();
-        Directory::create_all(Path::from(root));
+    static vendor_root() -> PathBuf {
+        const root: PathBuf = Cache::cache_root().join("vendor");
+        Cache::create_directory(root.as_path());
         return root;
     }
 
     /// `<vendor_root>/registry.json`.
-    static registry_path() -> string {
-        return Path::from(VendorRegistry::vendor_root()).join("registry.json").into_raw();
+    static registry_path() -> PathBuf {
+        return VendorRegistry::vendor_root().join("registry.json");
     }
 
     /// `<vendor_root>/<key>/<triple>`: per-(library, triple) cache dir.
-    static cache_dir_for(key: string, triple: string) -> string {
-        const d: string = Path::from(VendorRegistry::vendor_root()).join(key)
-            .join(VendorRegistry::normalize_triple(triple)).into_raw();
-        Directory::create_all(Path::from(d));
-        return d;
+    static cache_dir_for(key: Str, triple: Str) -> PathBuf {
+        const directory: PathBuf = VendorRegistry::vendor_root().join(key)
+            .join(VendorRegistry::normalize_triple(triple));
+        Cache::create_directory(directory.as_path());
+        return directory;
     }
 
     /// A host build carries an empty target triple; map it to "host" so it
     /// survives as a path component and matches on the resolve side.
-    static normalize_triple(triple_text: string) -> string {
-        const triple: string = triple_text;
-        if (triple.length() == 0) { return "host"; }
+    static normalize_triple(triple: Str) -> Str {
+        if (triple.length() == 0) { return Str::new("host"); }
         return triple;
     }
 
@@ -188,12 +200,12 @@ type struct VendorRegistry {
     /// Index of the entry matching `lib` by import namespace (exact) or by
     /// registry key (case-insensitive), or -1.  The import side uses the
     /// namespace (`vendor::RayLib`); the CLI uses the key (`raylib`).
-    find_index(&this, lib: string) -> i64 {
+    find_index(&this, lib: Str) -> i64 {
         for (mut i: i64 = 0; i < this.entries.length(); i++) {
-            if (this.entries[i].name == lib) { return i; }
+            if (this.entries[i].name.as_str() == lib) { return i; }
         }
         for (mut i: i64 = 0; i < this.entries.length(); i++) {
-            if (Str::from(this.entries[i].key).equals_case_insensitive(&Str::from(lib))) { return i; }
+            if (this.entries[i].key.as_str().equals_case_insensitive(&lib)) { return i; }
         }
         return -1;
     }
@@ -213,7 +225,7 @@ type struct VendorRegistry {
 
     /// Remove the entry matching `lib` (by name or key).  Returns true if one
     /// was removed.
-    remove(mut &this, lib: string) -> boolean {
+    remove(mut &this, lib: Str) -> boolean {
         const idx: i64 = this.find_index(lib);
         if (idx < 0) { return false; }
         return this.remove_at(idx);
@@ -239,16 +251,15 @@ type struct VendorRegistry {
     /// malformed (a malformed registry must not wedge every build; `cryo
     /// vendor` rewrites it cleanly).
     static load_global() -> VendorRegistry {
-        const path: string = VendorRegistry::registry_path();
-        if (!Path::from(path).exists()) {
+        const path: PathBuf = VendorRegistry::registry_path();
+        if (!path.as_path().exists()) {
             return VendorRegistry::empty();
         }
-        mut content: string = "";
-        match (File::read_text(Path::from(path))) {
-            Result::Ok(s)  => { content = s.into_raw(); }
+        const content: String = match (File::read_text(path.as_path())) {
+            Result::Ok(s)  => { s }
             Result::Err(_) => { return VendorRegistry::empty(); }
-        }
-        mut root: JsonValue = match (parser::parse(Str::from(content))) {
+        };
+        mut root: JsonValue = match (parser::parse(content.as_str())) {
             Result::Ok(v)      => { v }
             Result::Err(e)     => { mem::drop(e); return VendorRegistry::empty(); }
         };
@@ -283,9 +294,9 @@ type struct VendorRegistry {
     /// empty" fallback from being triggered by an interrupted writer, which
     /// would otherwise silently drop every registered library.
     save_global(&this) -> boolean {
-        const path: string = VendorRegistry::registry_path();
+        const path: PathBuf = VendorRegistry::registry_path();
         mut root: JsonObject = JsonObject::new();
-        root.put("schema_version", JsonValue::int_value(VENDOR_SCHEMA_VERSION));
+        root.put("schema_version", JsonValue::integer_value(VENDOR_SCHEMA_VERSION));
 
         mut libs: Array<JsonValue> = Array::<JsonValue>::new();
         for (mut i: i64 = 0; i < this.entries.length(); i++) {
@@ -297,17 +308,22 @@ type struct VendorRegistry {
         mut text: String = serializer::stringify_pretty(&doc);
         mem::drop(doc);
 
-        const tmp: string = fmt::format("%s.tmp.%d", path, process::id()).into_raw();
-        text.push_byte(10 as u8);        // trailing newline (matches prior fputs)
-        match (File::write_bytes(Path::from(tmp), text.as_bytes())) {
+        const temporary: String = f"{path.as_path().as_str()}.tmp.{process::id()}";
+        text.push_byte(10 as u8);        // trailing newline
+        match (File::write_bytes(Path::from(temporary.as_str()), text.as_bytes())) {
             Result::Ok(_)  => {}
             Result::Err(_) => { mem::drop(text); return false; }
         }
         mem::drop(text);
         // `rename_to` replaces an existing registry in one step, so a reader
         // never sees it half written.
-        if (Path::from(tmp).rename_to(path).is_err()) {
-            File::remove(tmp);   // leave no stray temp file on a failed swap
+        if (Path::from(temporary.as_str()).rename_to(path.as_path()).is_err()) {
+            match (File::remove(Path::from(temporary.as_str()))) {
+                Result::Ok(_)  => { }
+                // A temporary file left behind is never read: its name
+                // carries this process's id, and nothing looks for it.
+                Result::Err(_) => { }
+            }
             return false;
         }
         return true;
@@ -361,38 +377,34 @@ type struct VendorRegistry {
 
     // JSON helpers
 
-    /// Copy a borrowed `Str` into an owned NUL-terminated C string that
-    /// outlives the `JsonValue` it was read from.
-    static dup_cstr(s: Str) -> string {
-        mut owned: String = String::from_str(s);
-        return owned.into_raw();
-    }
-
-    /// Read a string field off a JSON object, or `def` when absent/non-string.
-    static jstr(parent: JsonValue*, key: string, def: string) -> string {
-        match (parent.get(Str::from(key))) {
-            Option::Some(vp) => {
-                match (vp.as::<Str>()) {
-                    Option::Some(vs) => { return VendorRegistry::dup_cstr(vs); }
-                    Option::None     => { return def; }
+    /// A string field of a JSON object as an owned String, or `fallback`
+    /// when it is absent or not a string.
+    static text_field(parent: JsonValue*, key: Str, fallback: Str) -> String {
+        match (parent.get(key)) {
+            Option::Some(field) => {
+                match (field.as::<Str>()) {
+                    Option::Some(text) => { return String::from_str(text); }
+                    Option::None       => { }
                 }
             }
-            Option::None => { return def; }
+            Option::None => { }
         }
+        return String::from_str(fallback);
     }
 
-    /// Read a `[string]` field off a JSON object (empty when absent).
-    static jstrs(parent: JsonValue*, key: string) -> [string] {
-        mut out: [string] = [];
-        match (parent.get(Str::from(key))) {
-            Option::Some(arrp) => {
-                const n: i64 = arrp.length();
+    /// The string elements of an array field of a JSON object, each owned
+    /// (empty when the field is absent; a non-string element is skipped).
+    static text_list_field(parent: JsonValue*, key: Str) -> [String] {
+        mut out: [String] = [];
+        match (parent.get(key)) {
+            Option::Some(list) => {
+                const n: i64 = list.length();
                 for (mut i: i64 = 0; i < n; i++) {
-                    match (arrp.at(i)) {
-                        Option::Some(ep) => {
-                            match (ep.as::<Str>()) {
-                                Option::Some(es) => { out.push(VendorRegistry::dup_cstr(es)); }
-                                Option::None     => { }
+                    match (list.at(i)) {
+                        Option::Some(element) => {
+                            match (element.as::<Str>()) {
+                                Option::Some(text) => { out.push(String::from_str(text)); }
+                                Option::None       => { }
                             }
                         }
                         Option::None => { }
@@ -404,18 +416,30 @@ type struct VendorRegistry {
         return out;
     }
 
+    /// `text_list_field` as `string`s for a `VendorLink` array, which the
+    /// build's link command reads after the registry is gone (see
+    /// `VendorLink`).
+    static link_list_field(parent: JsonValue*, key: Str) -> [string] {
+        mut owned: [String] = VendorRegistry::text_list_field(parent, key);
+        mut out: [string] = [];
+        while (owned.length() > 0) {
+            out.push(owned.remove(0).into_raw());
+        }
+        return out;
+    }
+
     /// Parse one library entry object.
     static read_entry(ep: JsonValue*) -> VendorEntry {
         mut entry: VendorEntry = VendorEntry {
-            key:            VendorRegistry::jstr(ep, "key", ""),
-            name:           VendorRegistry::jstr(ep, "name", ""),
-            source_path:    VendorRegistry::jstr(ep, "source_path", ""),
-            binding_source: VendorRegistry::jstr(ep, "binding_source", "headers"),
-            headers:        VendorRegistry::jstrs(ep, "headers"),
-            include_dirs:   VendorRegistry::jstrs(ep, "include_dirs"),
-            defines:        VendorRegistry::jstrs(ep, "defines"),
-            language:       VendorRegistry::jstr(ep, "language", ""),
-            std:            VendorRegistry::jstr(ep, "std", ""),
+            key:            VendorRegistry::text_field(ep, Str::new("key"), Str::new("")),
+            name:           VendorRegistry::text_field(ep, Str::new("name"), Str::new("")),
+            source_path:    VendorRegistry::text_field(ep, Str::new("source_path"), Str::new("")),
+            binding_source: VendorRegistry::text_field(ep, Str::new("binding_source"), Str::new("headers")),
+            headers:        VendorRegistry::text_list_field(ep, Str::new("headers")),
+            include_dirs:   VendorRegistry::text_list_field(ep, Str::new("include_dirs")),
+            defines:        VendorRegistry::text_list_field(ep, Str::new("defines")),
+            language:       VendorRegistry::text_field(ep, Str::new("language"), Str::new("")),
+            std:            VendorRegistry::text_field(ep, Str::new("std"), Str::new("")),
             link:           VendorLink::empty(),
             cache:          [],
         };
@@ -430,9 +454,9 @@ type struct VendorRegistry {
                     match (cp.at(i)) {
                         Option::Some(itp) => {
                             entry.cache.push(VendorCacheItem {
-                                triple: VendorRegistry::jstr(itp, "triple", ""),
-                                file:   VendorRegistry::jstr(itp, "file", ""),
-                                key:    VendorRegistry::jstr(itp, "key", ""),
+                                triple: VendorRegistry::text_field(itp, Str::new("triple"), Str::new("")),
+                                file:   VendorRegistry::text_field(itp, Str::new("file"), Str::new("")),
+                                key:    VendorRegistry::text_field(itp, Str::new("key"), Str::new("")),
                             });
                         }
                         Option::None => { }
@@ -447,30 +471,30 @@ type struct VendorRegistry {
     /// Parse the `link` sub-object.
     static read_link(lp: JsonValue*) -> VendorLink {
         return VendorLink {
-            system:          VendorRegistry::jstrs(lp, "system"),
-            search:          VendorRegistry::jstrs(lp, "search"),
-            static_libs:     VendorRegistry::jstrs(lp, "static"),
-            system_windows:  VendorRegistry::jstrs(lp, "system_windows"),
-            search_windows:  VendorRegistry::jstrs(lp, "search_windows"),
-            static_windows:  VendorRegistry::jstrs(lp, "static_windows"),
-            system_unix:     VendorRegistry::jstrs(lp, "system_unix"),
-            search_unix:     VendorRegistry::jstrs(lp, "search_unix"),
-            static_unix:     VendorRegistry::jstrs(lp, "static_unix"),
+            system:          VendorRegistry::link_list_field(lp, Str::new("system")),
+            search:          VendorRegistry::link_list_field(lp, Str::new("search")),
+            static_libs:     VendorRegistry::link_list_field(lp, Str::new("static")),
+            system_windows:  VendorRegistry::link_list_field(lp, Str::new("system_windows")),
+            search_windows:  VendorRegistry::link_list_field(lp, Str::new("search_windows")),
+            static_windows:  VendorRegistry::link_list_field(lp, Str::new("static_windows")),
+            system_unix:     VendorRegistry::link_list_field(lp, Str::new("system_unix")),
+            search_unix:     VendorRegistry::link_list_field(lp, Str::new("search_unix")),
+            static_unix:     VendorRegistry::link_list_field(lp, Str::new("static_unix")),
         };
     }
 
     /// Serialize one entry to a JSON value.
     static entry_to_json(entry: &VendorEntry) -> JsonValue {
         mut obj: JsonObject = JsonObject::new();
-        obj.put("key",            JsonValue::from(entry.key));
-        obj.put("name",           JsonValue::from(entry.name));
-        obj.put("source_path",    JsonValue::from(entry.source_path));
-        obj.put("binding_source", JsonValue::from(entry.binding_source));
-        obj.put("headers",        JsonValue::string_array(&entry.headers));
-        obj.put("include_dirs",   JsonValue::string_array(&entry.include_dirs));
-        obj.put("defines",        JsonValue::string_array(&entry.defines));
-        obj.put("language",       JsonValue::from(entry.language));
-        obj.put("std",            JsonValue::from(entry.std));
+        obj.put("key",            entry.key.to_json());
+        obj.put("name",           entry.name.to_json());
+        obj.put("source_path",    entry.source_path.to_json());
+        obj.put("binding_source", entry.binding_source.to_json());
+        obj.put("headers",        entry.headers.to_json());
+        obj.put("include_dirs",   entry.include_dirs.to_json());
+        obj.put("defines",        entry.defines.to_json());
+        obj.put("language",       entry.language.to_json());
+        obj.put("std",            entry.std.to_json());
 
         mut link: JsonObject = JsonObject::new();
         link.put("system",         JsonValue::string_array(&entry.link.system));
@@ -487,9 +511,9 @@ type struct VendorRegistry {
         mut cache: Array<JsonValue> = Array::<JsonValue>::new();
         for (mut i: i64 = 0; i < entry.cache.length(); i++) {
             mut c: JsonObject = JsonObject::new();
-            c.put("triple", JsonValue::from(entry.cache[i].triple));
-            c.put("file",   JsonValue::from(entry.cache[i].file));
-            c.put("key",    JsonValue::from(entry.cache[i].key));
+            c.put("triple", entry.cache[i].triple.to_json());
+            c.put("file",   entry.cache[i].file.to_json());
+            c.put("key",    entry.cache[i].key.to_json());
             cache.push(JsonValue::Object(c));
         }
         obj.put("cache", JsonValue::Array(cache));
@@ -516,14 +540,14 @@ type struct VendorRegistry {
 /// exactly the move-checker hazard to avoid): callers `acquire` then `release`
 /// explicitly, and `release` is idempotent / a no-op on a non-holding handle.
 type struct VendorLock {
-    path: string;
+    path: PathBuf;
     held: boolean;
 
     /// Take the registry lock, spinning up to ~5s (50 * 100ms).  Always returns
     /// a handle; the caller does not branch on success - it just calls `release`
     /// when the critical section ends (a no-op if the lock was not acquired).
     static acquire() -> VendorLock {
-        const lpath: string = Path::from(VendorRegistry::vendor_root()).join("registry.lock").into_raw();
+        const lock_path: PathBuf = VendorRegistry::vendor_root().join("registry.lock");
         // `create_new` => O_CREAT|O_EXCL: the open succeeds for exactly one
         // racer (the file's creator) and fails with EEXIST for the rest.  Going
         // through `std::fs::file` keeps the flag values correct on Windows too
@@ -531,30 +555,34 @@ type struct VendorLock {
         mut opts: OpenOptions = OpenOptions::new();
         opts = opts.write(true).create_new(true);
         for (mut tries: i32 = 0; tries < 50; tries++) {
-            match (File::open_with(Path::from(lpath), &opts)) {
+            match (File::open_with(lock_path.as_path(), &opts)) {
                 Result::Ok(fh) => {
                     // The lock token is the file's existence; we don't write to
                     // it.  Close the fd now (the file stays until `release`).
                     mem::drop(fh);
-                    return VendorLock { path: lpath, held: true };
+                    return VendorLock { path: lock_path, held: true };
                 }
                 Result::Err(_) => {
                     // EEXIST (held by another racer) or a transient error: back
                     // off and retry.
                 }
             }
-            thread::sleep_ms(100);      // 100ms
+            thread::sleep(Duration::from_milliseconds(100));
         }
-        fmt::eprintf("warning: vendor registry lock is held (%s); proceeding without it.\n         If no other `cryo` is running, this is a stale lock - delete that file.\n",
-            lpath);
-        return VendorLock { path: lpath, held: false };
+        fmt::eprint(f"warning: vendor registry lock is held ({lock_path.as_path().as_str()}); proceeding without it.\n         If no other `cryo` is running, this is a stale lock - delete that file.\n");
+        return VendorLock { path: lock_path, held: false };
     }
 
     /// Release the lock if this handle holds it.  Idempotent and safe to call
     /// on a handle returned from a timed-out `acquire`.
     release(mut &this) -> void {
         if (this.held) {
-            File::remove(Path::from(this.path));
+            match (File::remove(this.path.as_path())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => {
+                    fmt::eprintln(f"warning: cannot remove the vendor registry lock {this.path.as_path().as_str()}: {error}; delete that file before the next `cryo` run waits on it");
+                }
+            }
             this.held = false;
         }
     }

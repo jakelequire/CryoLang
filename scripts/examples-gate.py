@@ -78,8 +78,10 @@ def main():
     env = dict(os.environ)
     env["CRYO_STDLIB"] = args.stdlib
 
+    # An example that discards a result does not build: what the examples
+    # teach is held to handling what it is given.
     def build(d):
-        return subprocess.run([args.cryo, "build", "."], cwd=d, env=env,
+        return subprocess.run([args.cryo, "build", ".", "-Werror=W0017"], cwd=d, env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
     with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:

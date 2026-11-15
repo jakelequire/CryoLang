@@ -1,0 +1,498 @@
+///! WebSocket connection: handshake + message send/receive over a buffered
+///! async connection.
+///!
+///! `WebSocket<S>` OWNS its `BufferedStream<S>`. Ownership is forced rather than
+///! stylistic: the type carries per-connection protocol state (`is_client`
+///! selects the RFC 6455 section 5.1 mask direction, `closed` records that a
+///! Close frame went out), and an `async` method may only re-address its OWN
+///! receiver between polls — a borrowed transport would be a second address
+///! the state machine has no way to refresh. Stateless framing stays where it
+///! has no state to keep: an inherent impl on `BufferedStream<S>` in `ws::frame`.
+///!
+///! Owning the connection is also what removes the byte-at-a-time handshake
+///! read the borrowed version needed. The buffer outlives the handshake, so
+///! frame bytes that arrived in the same fill as the terminating blank line
+///! survive into the first `receive` instead of being consumed and lost, and the
+///! head can be read a line at a time.
+///!
+///! Messages are reassembled from frames (continuations joined, control frames
+///! handled inline — Ping is auto-answered with Pong). A received
+///! `Message::Text` / `Binary` owns its payload — drop it (or match it out)
+///! when done.
+
+namespace std::net::ws::connection;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::bytes::{ ByteWriter };
+import std::io::traits::{ AsyncTransport };
+import std::io::buffered::{ BufferedStream };
+import std::collections::array::{ Array };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::net::socket::tcp::{ TcpStream };
+import std::net::ws::frame::{ Frame, OperationCode };
+import std::net::ws::handshake;
+import std::future::poll;
+import std::future::waker;
+import std::future::traits;
+import std::core::mem;
+
+/// Cap on one line of the opening handshake's head, and on how many such
+/// lines are read. A peer that never sends the terminating blank line cannot
+/// drive the buffer to exhaust memory.
+private const MAX_HEAD_LINE: i64 = 8192;
+private const MAX_HEAD_LINES: u64 = 100;
+
+/// Cap on a single reassembled message. Fragmentation lets a peer stream an
+/// unbounded number of continuation frames into one message; without a ceiling
+/// that is an OOM DoS. 64 MiB matches the single-frame cap in `ws::frame`.
+private const MAX_MESSAGE: i64 = 67108864;          // 64 MiB
+
+/// Cap on control frames (Ping/Pong) serviced within a single `receive` before a
+/// data frame arrives. A peer that streams only Pings would otherwise pin the
+/// connection in unbounded auto-Pong work and never yield a message.
+private const MAX_CONTROL_PER_RECV: u64 = 256;
+
+// Close status codes (RFC 6455 section 7.4.1), for `close` and for what
+// `receive` answers a Close frame with.
+/// Status 1000: the connection did what it was for.
+public const CLOSE_NORMAL:              u16 = 1000;
+/// Status 1001: the endpoint is going away, as a server shutting down.
+public const CLOSE_GOING_AWAY:          u16 = 1001;
+/// Status 1002: the peer broke the protocol.
+public const CLOSE_PROTOCOL_ERROR:      u16 = 1002;
+/// Status 1003: a message of a type the endpoint cannot take.
+public const CLOSE_UNSUPPORTED_DATA:    u16 = 1003;
+/// Status 1007: a message's data does not fit its type, as text that is
+/// not UTF-8.
+public const CLOSE_INVALID_PAYLOAD:     u16 = 1007;
+/// Status 1008: a message broke the endpoint's policy.
+public const CLOSE_POLICY_VIOLATION:    u16 = 1008;
+/// Status 1009: a message too big to process.
+public const CLOSE_MESSAGE_TOO_BIG:     u16 = 1009;
+/// Status 1010: the server did not agree to an extension the client
+/// requires.
+public const CLOSE_MANDATORY_EXTENSION: u16 = 1010;
+/// Status 1011: the server met a condition it could not handle.
+public const CLOSE_INTERNAL_ERROR:      u16 = 1011;
+/// Status 1005: the peer's Close frame carried no status code. Never sent;
+/// `WebSocket.close_status` reports it for such a Close.
+public const CLOSE_NO_STATUS_RECEIVED:  u16 = 1005;
+
+/// The status code and reason of the Close frame a peer sent, as
+/// `WebSocket.close_status` reports them.
+public type struct CloseStatus {
+    /// The peer's status code; `CLOSE_NO_STATUS_RECEIVED` when its Close
+    /// carried none.
+    public code:   u16;
+    /// The peer's reason, UTF-8 and possibly empty. A view of the
+    /// connection's copy, valid while the `WebSocket` is.
+    public reason: Str;
+}
+
+/// A complete application message. Owns its payload.
+public type enum Message {
+    Text(String);
+    Binary(Array<u8>);
+    Close;
+}
+
+/// A WebSocket connection over the buffered async transport `S` -
+/// `TcpStream` for ws://, `TlsStream` for wss://. Owns the connection and
+/// records which side it is, which decides the frame masking: a client
+/// masks what it sends and refuses masked frames, a server the reverse.
+/// `connect` and `accept` build one over a `TcpStream` and run the opening
+/// handshake; `of` adopts any other transport. The handshakes and `receive`
+/// report a protocol violation by the peer as `InvalidData`.
+///
+/// ```cryo
+/// import std::core::result::{ Result };
+/// import std::collections::str::{ Str };
+/// import std::io::error::{ IoError };
+/// import std::net::socket::tcp::{ TcpStream };
+/// import std::net::ws::connection::{ Message, WebSocket };
+/// import std::net::ws::connection;
+///
+/// // `socket` is already connected to the server (see `TcpConnect`).
+/// async function hello(socket: TcpStream) -> Result<Message, IoError> {
+///     mut ws: WebSocket<TcpStream> = (await connection::connect(socket, Str::new("localhost"), Str::new("/")))?;
+///     (await ws.send_text(Str::new("hello")))?;
+///     return await ws.receive();
+/// }
+/// ```
+public type struct WebSocket<S> {
+    private conn:      BufferedStream<S>;
+    private is_client: boolean;
+    private closed:    boolean;
+    // The status code of the peer's Close frame, 0 until `receive` has taken
+    // a valid one, and its reason.
+    private peer_close_code:   u16;
+    private peer_close_reason: String;
+
+    /// Take ownership of an already-upgraded connection. `is_client` selects
+    /// masked (client) vs unmasked (server) framing per RFC 6455. Use
+    /// `client_handshake` / `server_handshake` to run the upgrade first.
+    public static of(conn: BufferedStream<S>, is_client: boolean) -> WebSocket<S> {
+        return WebSocket::<S> {
+            conn: conn, is_client: is_client, closed: false,
+            peer_close_code: 0, peer_close_reason: String::new()
+        };
+    }
+
+    /// The buffered connection, for callers that need the transport itself
+    /// (socket options, the negotiated ALPN protocol). Not for reading or
+    /// writing — that would desynchronize the framing.
+    public connection(mut &this) -> mut BufferedStream<S>* {
+        return &this.conn;
+    }
+
+    /// Has a Close frame been sent or received on this connection?
+    public is_closed(&this) -> boolean {
+        return this.closed;
+    }
+
+    /// The status code and reason of the Close frame the peer sent, once
+    /// `receive` has returned `Message::Close` for it; `None` before that, and
+    /// for a Close that broke the protocol, which `receive` reports as an error.
+    public close_status(&this) -> Option<CloseStatus> {
+        if (this.peer_close_code == 0) { return Option::None; }
+        return Option::Some(CloseStatus {
+            code: this.peer_close_code, reason: this.peer_close_reason.as_str()
+        });
+    }
+
+    /// Client handshake: send the GET upgrade, then verify the `101` and the
+    /// `Sec-WebSocket-Accept` echo. Bytes that arrived after the blank line
+    /// stay buffered for `receive`.
+    public async client_handshake(mut &this, host: Str, path: Str) -> Result<(), IoError>
+    where S: AsyncTransport {
+        mut key: String = handshake::generate_key();
+        mut expected: String = handshake::compute_accept(key.as_str());
+
+        mut req: String = String::with_capacity(160);
+        req.push(Str::new("GET ")); req.push(path); req.push(Str::new(" HTTP/1.1\r\n"));
+        req.push(Str::new("Host: ")); req.push(host); req.push(Str::new("\r\n"));
+        req.push(Str::new("Upgrade: websocket\r\n"));
+        req.push(Str::new("Connection: Upgrade\r\n"));
+        req.push(Str::new("Sec-WebSocket-Key: ")); req.push(key.as_str()); req.push(Str::new("\r\n"));
+        req.push(Str::new("Sec-WebSocket-Version: 13\r\n\r\n"));
+        this.conn.pending().try_append(req.as_str().as_bytes())?;
+        (await this.conn.flush())?;
+
+        mut status: String = (await this.conn.read_line(MAX_HEAD_LINE))?;
+        const code: u64 = status_code(status.as_str());
+
+        mut accept_ok: boolean = false;
+        mut lines: u64 = 0;
+        loop {
+            mut header: String = (await this.conn.read_line(MAX_HEAD_LINE))?;
+            if (header.is_empty()) { break; }
+            match (header_line_value(header.as_str(), Str::new("sec-websocket-accept"))) {
+                Option::Some(got) => {
+                    if (got == expected.as_str()) { accept_ok = true; }
+                }
+                Option::None => { }
+            }
+            lines = lines + 1;
+            if (lines > MAX_HEAD_LINES) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+        }
+
+        if (code != 101)  { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+        if (!accept_ok)   { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+        return Result::Ok(());
+    }
+
+    /// Server handshake: read the client GET, reply `101` with the computed
+    /// accept value. Bytes that arrived after the blank line — a client that
+    /// pipelined its first frame into the same write — stay buffered.
+    public async server_handshake(mut &this) -> Result<(), IoError>
+    where S: AsyncTransport {
+        // The request line is read for its framing only: the resource this
+        // handshake upgrades is the caller's concern, not the protocol's.
+        mut _request_line: String = (await this.conn.read_line(MAX_HEAD_LINE))?;
+
+        mut key: String = String::new();
+        mut lines: u64 = 0;
+        loop {
+            mut header: String = (await this.conn.read_line(MAX_HEAD_LINE))?;
+            if (header.is_empty()) { break; }
+            match (header_line_value(header.as_str(), Str::new("sec-websocket-key"))) {
+                // First one wins; a duplicate key header is malformed, and
+                // appending it would build a nonce neither value produces.
+                Option::Some(got) => { if (key.is_empty()) { key.push(got); } }
+                Option::None      => { }
+            }
+            lines = lines + 1;
+            if (lines > MAX_HEAD_LINES) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+        }
+        if (key.is_empty()) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+
+        mut accept_val: String = handshake::compute_accept(key.as_str());
+        mut resp: String = String::with_capacity(130);
+        resp.push(Str::new("HTTP/1.1 101 Switching Protocols\r\n"));
+        resp.push(Str::new("Upgrade: websocket\r\n"));
+        resp.push(Str::new("Connection: Upgrade\r\n"));
+        resp.push(Str::new("Sec-WebSocket-Accept: ")); resp.push(accept_val.as_str());
+        resp.push(Str::new("\r\n\r\n"));
+        this.conn.pending().try_append(resp.as_str().as_bytes())?;
+        return await this.conn.flush();
+    }
+
+    /// Send a text message in a single frame.
+    public async send_text(mut &this, text: Str) -> Result<(), IoError>
+    where S: AsyncTransport {
+        this.conn.queue_frame(true, OperationCode::Text, text.as_bytes(), this.is_client)?;
+        return await this.conn.flush();
+    }
+
+    /// Send a binary message in a single frame.
+    public async send_binary(mut &this, data: &Slice<u8>) -> Result<(), IoError>
+    where S: AsyncTransport {
+        this.conn.queue_frame(true, OperationCode::Binary, data, this.is_client)?;
+        return await this.conn.flush();
+    }
+
+    /// Send a Ping with optional application data.
+    public async ping(mut &this, data: &Slice<u8>) -> Result<(), IoError>
+    where S: AsyncTransport {
+        this.conn.queue_frame(true, OperationCode::Ping, data, this.is_client)?;
+        return await this.conn.flush();
+    }
+
+    /// Send a Close frame with a status code and reason. The transport itself
+    /// is closed when the `WebSocket` is dropped.
+    public async close(mut &this, code: u16, reason: Str) -> Result<(), IoError>
+    where S: AsyncTransport {
+        mut payload: Array<u8> = Array::<u8>::with_capacity(2 + reason.length());
+        mut status: ByteWriter = ByteWriter::new(&payload);
+        status.write_u16_big_endian(code);
+        payload.append(reason.as_bytes());
+        const queued: Result<(), IoError> = this.conn.queue_frame(
+            true, OperationCode::Close, payload.as_slice(), this.is_client);
+        mem::drop(payload);
+        this.closed = true;
+        queued?;
+        return await this.conn.flush();
+    }
+
+    /// Receive the next application message, reassembling fragments and
+    /// transparently answering Pings with Pongs and skipping Pongs. A Close
+    /// frame surfaces as `Message::Close`, after being answered with a Close
+    /// echoing its status code unless this side already sent one; its code
+    /// and reason are then `close_status`. A Close whose status code or
+    /// reason breaks the protocol is answered with `CLOSE_PROTOCOL_ERROR` or
+    /// `CLOSE_INVALID_PAYLOAD` instead and reported as `InvalidData`, as is
+    /// a text message that is not UTF-8, which is answered with
+    /// `CLOSE_INVALID_PAYLOAD`, and a frame masked the wrong way for this
+    /// side, which is answered with `CLOSE_PROTOCOL_ERROR`.
+    public async receive(mut &this) -> Result<Message, IoError>
+    where S: AsyncTransport {
+        mut acc: Array<u8> = Array::<u8>::new();
+        mut binary: boolean = false;
+        mut control_count: u64 = 0;
+        loop {
+            mut fr: Frame = (await this.conn.read_frame())?;
+
+            // RFC 6455 section 5.1 mask direction: a server (is_client ==
+            // false) requires masked client frames; a client requires unmasked
+            // server frames. A violation (masked == is_client) is a protocol
+            // error - the proxy cache-poisoning vector.
+            const bad: boolean = (fr.masked == this.is_client);
+            mut pong: boolean = false;
+            mut done: boolean = false;
+            mut closing: boolean = false;
+            // The status code a Close frame is answered with: the peer's own
+            // when it sent a valid one with a valid reason.
+            mut close_answer: u16 = CLOSE_NORMAL;
+            // The Close frame broke the protocol, which fails the connection.
+            mut close_broken: boolean = false;
+            if (!bad) {
+                match (fr.opcode) {
+                    OperationCode::Ping => {
+                        // Best-effort Pong echoing the ping payload. It is
+                        // queued, not sent: the frame it echoes is released
+                        // below, before the one suspension this arm adds.
+                        match (this.conn.queue_frame(true, OperationCode::Pong,
+                                                    fr.payload.as_slice(), this.is_client)) {
+                            Result::Ok(_)  => { pong = true; }
+                            Result::Err(_) => { }
+                        }
+                        control_count = control_count + 1;
+                    }
+                    OperationCode::Pong => {
+                        control_count = control_count + 1;
+                    }
+                    OperationCode::Close => {
+                        closing = true;
+                        const body: &Slice<u8> = fr.payload.as_slice();
+                        if (body.length() == 0) {
+                            this.peer_close_code = CLOSE_NO_STATUS_RECEIVED;
+                        } else if (body.length() == 1) {
+                            // A status code is two bytes or absent.
+                            close_answer = CLOSE_PROTOCOL_ERROR;
+                            close_broken = true;
+                        } else if (body.length() >= 2) {
+                            const code: u16 = ((body[0] as u16) << 8) | (body[1] as u16);
+                            // The codes a peer may send: the protocol's own
+                            // (1004 is reserved, and 1005, 1006 and 1015
+                            // only stand for a missing code locally), and
+                            // the registered and private ranges.
+                            const receivable: boolean = (code >= 1000 && code <= 1003)
+                                || (code >= 1007 && code <= 1014)
+                                || (code >= 3000 && code <= 4999);
+                            if (!receivable) {
+                                close_answer = CLOSE_PROTOCOL_ERROR;
+                                close_broken = true;
+                            } else {
+                                match (Str::from_utf8(body.subslice(2, body.length()))) {
+                                    Result::Ok(reason) => {
+                                        close_answer = code;
+                                        this.peer_close_code = code;
+                                        this.peer_close_reason.clear();
+                                        this.peer_close_reason.push(reason);
+                                    }
+                                    Result::Err(_) => {
+                                        close_answer = CLOSE_INVALID_PAYLOAD;
+                                        close_broken = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    OperationCode::Text => {
+                        binary = false;
+                        acc.append(fr.payload.as_slice());
+                        done = fr.fin;
+                    }
+                    OperationCode::Binary => {
+                        binary = true;
+                        acc.append(fr.payload.as_slice());
+                        done = fr.fin;
+                    }
+                    OperationCode::Continuation => {
+                        acc.append(fr.payload.as_slice());
+                        done = fr.fin;
+                    }
+                }
+            }
+            // Nothing suspends between the frame's arrival and here, so the
+            // frame never crosses a suspension point and is released as soon
+            // as its bytes have been copied out.
+            mem::drop(fr);
+
+            if (bad) {
+                // A frame masked the wrong way fails the connection.
+                if (!this.closed) {
+                    match (await this.close(CLOSE_PROTOCOL_ERROR, Str::new(""))) {
+                        Result::Ok(_)  => { }
+                        Result::Err(_) => { }
+                    }
+                }
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            if (closing) {
+                // A Close that does not answer ours is answered, so the peer
+                // need not wait out a timeout; one that breaks the protocol
+                // is answered with the error and fails the connection.
+                if (!this.closed) {
+                    match (await this.close(close_answer, Str::new(""))) {
+                        Result::Ok(_)  => { }
+                        Result::Err(_) => { }
+                    }
+                }
+                this.closed = true;
+                if (close_broken) {
+                    return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                }
+                return Result::Ok(Message::Close);
+            }
+            if (acc.length() > MAX_MESSAGE) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            if (control_count > MAX_CONTROL_PER_RECV) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            if (done) {
+                if (binary) { return Result::Ok(Message::Binary(acc)); }
+                match (String::from_utf8(acc)) {
+                    Result::Ok(text) => { return Result::Ok(Message::Text(text)); }
+                    Result::Err(_)   => {
+                        // Text that is not UTF-8 fails the connection.
+                        match (await this.close(CLOSE_INVALID_PAYLOAD, Str::new(""))) {
+                            Result::Ok(_)  => { }
+                            Result::Err(_) => { }
+                        }
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
+                }
+            }
+            if (pong) {
+                (await this.conn.flush())?;
+            }
+        }
+    }
+}
+
+implement<S> trait Drop for struct WebSocket<S> {
+    drop(mut &this) -> void { }
+}
+
+/// Connect a WebSocket over an already-connected TCP socket: wrap it, run the
+/// client handshake, and hand back the upgraded connection. The socket is
+/// consumed — the `WebSocket` owns it from here.
+public async function connect(sock: TcpStream, host: Str, path: Str)
+        -> Result<WebSocket<TcpStream>, IoError> {
+    mut ws: WebSocket<TcpStream> =
+        WebSocket::<TcpStream>::of(BufferedStream::<TcpStream>::of(sock), true);
+    (await ws.client_handshake(host, path))?;
+    return Result::Ok(ws);
+}
+
+/// Accept a WebSocket over an accepted TCP socket: wrap it, run the server
+/// handshake, and hand back the upgraded connection.
+public async function accept(sock: TcpStream) -> Result<WebSocket<TcpStream>, IoError> {
+    mut ws: WebSocket<TcpStream> =
+        WebSocket::<TcpStream>::of(BufferedStream::<TcpStream>::of(sock), false);
+    (await ws.server_handshake())?;
+    return Result::Ok(ws);
+}
+
+/// Status code from a response's first line (`HTTP/1.1 <code> ...`).
+private function status_code(head: Str) -> u64 {
+    const bytes: &Slice<u8> = head.as_bytes();
+    const len: i64 = bytes.length();
+    mut i: i64 = 0;
+    while (i < len && bytes[i] != 0x20) { i++; }   // skip "HTTP/1.1"
+    while (i < len && bytes[i] == 0x20) { i++; }   // skip spaces
+    mut code: u64 = 0;
+    while (i < len && bytes[i].is_digit()) {
+        code = code * 10 + ((bytes[i] - 0x30) as u64);
+        i++;
+    }
+    return code;
+}
+
+/// The value of ONE header line when its name matches `name`
+/// case-insensitively, as a view into that line. `read_line` has already
+/// stripped the terminator, so the value runs to the end of the line.
+private function header_line_value(line: Str, name: Str) -> Option<Str> {
+    match (line.split_once(&Str::new(":"))) {
+        Option::Some(parts) => {
+            if (!parts.first.equals_case_insensitive(&name)) { return Option::None; }
+            const value: &Slice<u8> = parts.second.as_bytes();
+            mut start: i64 = 0;
+            while (start < value.length() && value[start] == 0x20) { start++; }   // strip leading SP
+            return Option::Some(parts.second.byte_substring(start, value.length()));
+        }
+        Option::None => { return Option::None; }
+    }
+}

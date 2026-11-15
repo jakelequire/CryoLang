@@ -63,13 +63,13 @@
 namespace std::future::blocking;
 
 import std::core::result::{ Result };
-import std::core::ptr::{ NonNull };
+import std::core::pointer::{ NonNull };
 import std::core::drop;
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::sync::mutex::{ Mutex, MutexGuard };
-import std::sync::condvar::{ CondVar };
+import std::sync::condition_variable::{ ConditionVariable };
 import std::thread;
 import std::thread::{ JoinHandle as ThreadJoinHandle };
 import std::future::waker::{ Waker };
@@ -124,7 +124,7 @@ public type struct BlockingJob {
     /// A static taking the block by pointer rather than a `mut &this` method:
     /// the memory is raw at this point, and `waker` is assigned (not swapped)
     /// exactly once here, before anything could be holding a waker in it.
-    public static init(job: mut BlockingJob*, run_fn: (mut u8*) -> void, drop_fn: (mut u8*) -> void) -> void {
+    public static initialize(job: mut BlockingJob*, run_fn: (mut u8*) -> void, drop_fn: (mut u8*) -> void) -> void {
         job.rc      = Atomic::<u32>::new(1);
         job.status  = Atomic::<u8>::new(JOB_PENDING);
         job.run_fn  = run_fn;
@@ -145,7 +145,7 @@ public type struct BlockingJob {
     /// takes it back out.
     public arm(mut &this, w: Waker) -> u8 {
         const pool: BlockingPool* = this.pool;
-        const held: MutexGuard<PoolState, GlobalAlloc> = pool.state.lock();
+        const held: MutexGuard<PoolState, GlobalAllocator> = pool.state.lock();
         const st: u8 = this.status.load(MemoryOrder::Acquire);
         mut replaced: Waker = Waker::replace(&this.waker, w);
         mem::drop(held);
@@ -162,7 +162,7 @@ public type struct BlockingJob {
     /// may free it.
     private finish(mut &this, status: u8) -> void {
         const pool: BlockingPool* = this.pool;
-        const held: MutexGuard<PoolState, GlobalAlloc> = pool.state.lock();
+        const held: MutexGuard<PoolState, GlobalAllocator> = pool.state.lock();
         mut w: Waker = Waker::take(&this.waker);
         this.status.store(status, MemoryOrder::Release);
         mem::drop(held);
@@ -173,7 +173,7 @@ public type struct BlockingJob {
     }
 
     /// Acquire one reference to this block, so it cannot be freed while the
-    /// acquirer still names it. `init` hands out the first; `submit` takes the
+    /// acquirer still names it. `initialize` hands out the first; `submit` takes the
     /// pool's. Pairs one-for-one with `release`.
     public retain(mut &this) -> void {
         this.rc.fetch_add(1, MemoryOrder::Relaxed);
@@ -186,7 +186,7 @@ public type struct BlockingJob {
     /// after the job had already finished stores it into a slot nobody will read
     /// again. Taking it out here is the only thing that releases it.
     public release(mut &this) -> void {
-        if (this.rc.fetch_sub(1, MemoryOrder::AcqRel) != 1) { return; }
+        if (this.rc.fetch_subtract(1, MemoryOrder::AcqRel) != 1) { return; }
         mut _waker: Waker = Waker::take(&this.waker);
         const df: (mut u8*) -> void = this.drop_fn;
         df(&this as mut u8*);
@@ -234,12 +234,12 @@ private type struct PoolState {
 /// it must not move.
 public type struct BlockingPool {
     private state: Mutex<PoolState>;   // also guards every job's waker slot
-    private work_ready: CondVar;            // threads wait here for work
+    private work_ready: ConditionVariable;            // threads wait here for work
     private max:        u32;                // ceiling on the number of threads; fixed at creation
 
     /// Create an empty pool with the default thread ceiling.
     public static start() -> mut BlockingPool* {
-        return BlockingPool::with_max(BLOCKING_DEFAULT_THREADS);
+        return BlockingPool::with_maximum(BLOCKING_DEFAULT_THREADS);
     }
 
     /// Create an empty pool that will grow to at most `max` threads (clamped to
@@ -248,19 +248,19 @@ public type struct BlockingPool {
     /// so a program that never offloads anything never pays for a thread, and
     /// `max` costs nothing until it is reached. Panics only if the allocator
     /// refuses the pool block or its lock.
-    public static with_max(max: u32) -> mut BlockingPool* {
+    public static with_maximum(max: u32) -> mut BlockingPool* {
         mut count: u32 = max;
         if (count == 0) { count = 1; }
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         mut p: mut BlockingPool* = null;
         match (alloc.allocate(Layout::of::<BlockingPool>())) {
-            Result::Ok(raw) => { p = raw.cast::<BlockingPool>().as_ptr(); }
-            Result::Err(_)  => { panic("BlockingPool::with_max: allocation failed", intrinsics::location()); }
+            Result::Ok(raw) => { p = raw.cast::<BlockingPool>().as_pointer(); }
+            Result::Err(_)  => { panic("BlockingPool::with_maximum: allocation failed", intrinsics::location()); }
         }
         p.state = Mutex::new(PoolState {
             head: null, tail: null, shutdown: false, idle: 0, threads: []
         });
-        p.work_ready = CondVar::new();
+        p.work_ready = ConditionVariable::new();
         p.max        = count;
         return p;
     }
@@ -280,16 +280,16 @@ public type struct BlockingPool {
     /// writing into a pool block that is about to be freed.
     public static stop(p: BlockingPool*) -> void {
         if (p == null) { return; }
-        mut held: MutexGuard<PoolState, GlobalAlloc> = p.state.lock();
-        held.as_mutable_ptr().shutdown = true;
+        mut held: MutexGuard<PoolState, GlobalAllocator> = p.state.lock();
+        held.as_mutable_pointer().shutdown = true;
         mem::drop(held);
         p.work_ready.notify_all();
         // No thread is created once shutdown is set, so each pop below leaves
         // one fewer. A thread is joined outside the lock: it needs the lock to
         // see shutdown and leave.
         loop {
-            mut listed: MutexGuard<PoolState, GlobalAlloc> = p.state.lock();
-            const next: Option<ThreadJoinHandle<()>> = listed.as_mutable_ptr().threads.pop();
+            mut listed: MutexGuard<PoolState, GlobalAllocator> = p.state.lock();
+            const next: Option<ThreadJoinHandle<()>> = listed.as_mutable_pointer().threads.pop();
             mem::drop(listed);
             match (next) {
                 Option::Some(worker) => { worker.join(); }
@@ -299,8 +299,8 @@ public type struct BlockingPool {
         // `finish` takes the lock itself, which is why the jobs are unlinked
         // one at a time rather than under a lock held across the loop.
         loop {
-            mut queued: MutexGuard<PoolState, GlobalAlloc> = p.state.lock();
-            const job: mut BlockingJob* = queued.as_mutable_ptr().pop();
+            mut queued: MutexGuard<PoolState, GlobalAllocator> = p.state.lock();
+            const job: mut BlockingJob* = queued.as_mutable_pointer().pop();
             mem::drop(queued);
             if (job == null) { return; }
             job.finish(JOB_CANCELLED);
@@ -311,8 +311,8 @@ public type struct BlockingPool {
     /// let go of a job has been dropped — see `stop`.
     public static free(p: mut BlockingPool*) -> void {
         if (p == null) { return; }
-        ptr::drop_in_place::<BlockingPool>(p);
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        pointer::drop_in_place::<BlockingPool>(p);
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         alloc.deallocate(NonNull::new(p as mut u8*), Layout::of::<BlockingPool>());
     }
 
@@ -339,8 +339,8 @@ public type struct BlockingPool {
     /// life, and in exchange `threads` is never observed half-updated by
     /// `stop`, its only other reader.
     public submit(mut &this, job: mut BlockingJob*) -> boolean {
-        mut held: MutexGuard<PoolState, GlobalAlloc> = this.state.lock();
-        const state: mut PoolState* = held.as_mutable_ptr();
+        mut held: MutexGuard<PoolState, GlobalAllocator> = this.state.lock();
+        const state: mut PoolState* = held.as_mutable_pointer();
         if (state.shutdown) { return false; }
         // Grow only when nothing is idle: an idle thread takes this job the
         // moment the lock is released.
@@ -375,8 +375,8 @@ public type struct BlockingPool {
     /// job, or null once shutdown is set — leaving anything still queued for
     /// `stop` to cancel.
     private take(mut &this) -> mut BlockingJob* {
-        mut held: MutexGuard<PoolState, GlobalAlloc> = this.state.lock();
-        const state: mut PoolState* = held.as_mutable_ptr();
+        mut held: MutexGuard<PoolState, GlobalAllocator> = this.state.lock();
+        const state: mut PoolState* = held.as_mutable_pointer();
         while (state.head == null && !state.shutdown) {
             // `idle` is what `submit` reads to decide whether growing the pool
             // would buy anything, so it must count exactly the threads parked

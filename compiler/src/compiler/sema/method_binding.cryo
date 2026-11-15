@@ -147,17 +147,17 @@ type struct MethodBinding {
         this.symbolic = symbolic;
     }
 
-    /// A fresh trait checker over the shared arena + registry (a 4-pointer view).
+    /// A fresh trait checker over the shared arena + registry (a view).
     trait_checker(&this) -> TraitChecker {
         return TraitChecker::new(this.arena, this.ctx.generic_registry,
-                                 this.intern, this.ctx.diagnostics);
+                                 this.intern, this.ctx.diagnostics, this.ctx.type_resolver);
     }
 
 
     // -- Receiver/return substitution --
 
     /// Substitute the receiver's bare nominal type for the `This` placeholder in
-    /// `ty` (used for trait-default returns like `take -> TakeIter<This>`).
+    /// `ty` (used for trait-default returns like `take -> TakeIterator<This>`).
     subst_this_in_type(mut &this, ty: TypeRef, receiver: TypeRef) -> TypeRef {
         if (!ty.is_valid() || !this.types.contains_generic_param(ty)) { return ty; }
         mut recv: TypeRef = receiver;
@@ -519,6 +519,25 @@ type struct MethodBinding {
     /// copy of a trait default, an `async` lowering's `poll` - is skipped:
     /// its source is walked, with its own bounds, where it is written.
     receiver_type_param(&this, recv_type: TypeRef) -> GenericParamType* {
+        const t: Type* = this.receiver_written_type(recv_type);
+        if (t == null || t.kind != TypeKind::GenericParam) { return null; }
+        const param: GenericParamType* = t.as_generic_param();
+        if (this.arena.is_this_placeholder(param)) { return null; }
+        return param;
+    }
+
+    /// The associated type of a type parameter a receiver is
+    /// (`C::ViewMutable`), or null for any other receiver; skipped where
+    /// `receiver_type_param` skips a body.
+    receiver_type_projection(&this, recv_type: TypeRef) -> AssocProjectionType* {
+        const t: Type* = this.receiver_written_type(recv_type);
+        if (t == null || t.kind != TypeKind::AssocProjection) { return null; }
+        return t.as_assoc_projection();
+    }
+
+    /// `recv_type` behind its pointers and references, in a body the user
+    /// wrote where it stands; null in any other body.
+    receiver_written_type(&this, recv_type: TypeRef) -> Type* {
         const func_decl: DeclarationNode* = this.state.symbolic_current_func;
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.is_synth_default || func.is_synthesized_body) { return null; }
@@ -534,10 +553,21 @@ type struct MethodBinding {
             }
             depth += 1;
         }
-        if (t == null || t.kind != TypeKind::GenericParam) { return null; }
-        const param: GenericParamType* = t.as_generic_param();
-        if (this.arena.is_this_placeholder(param)) { return null; }
-        return param;
+        return t;
+    }
+
+    /// Whether a bound in scope of the body being walked gives a receiver
+    /// that is a type parameter, or an associated type of one, the trait
+    /// `trait_def`: names it, or names a trait it is a supertrait of.
+    subject_bounded_by(&this, recv_type: TypeRef, trait_def: DefId) -> boolean {
+        const param: GenericParamType* = this.receiver_type_param(recv_type);
+        if (param != null) { return this.param_bounded_by(param, trait_def); }
+        const projection: AssocProjectionType* = this.receiver_type_projection(recv_type);
+        if (projection == null) { return false; }
+        const func: FunctionDecl* = DeclarationNode::fn_of(this.state.symbolic_current_func);
+        if (func != null && this.projection_bounds_give(&func.trait_bounds, projection, trait_def)) { return true; }
+        return this.state.symbolic_impl_node != null
+            && this.projection_bounds_give(&this.state.symbolic_impl_node.where_bounds, projection, trait_def);
     }
 
     /// Whether a bound in scope of the body being walked names `param`: the
@@ -628,11 +658,28 @@ type struct MethodBinding {
     bounds_give(&this, bounds: &[TraitBound], param: GenericParamType*, trait_def: DefId) -> boolean {
         for (mut i: i64 = 0; i < bounds.length(); i++) {
             if (!MethodBinding::bound_names_param(&bounds[i], param)) { continue; }
-            for (mut ti: i64 = 0; ti < bounds[i].trait_refs.length(); ti++) {
-                const chain: [DefId] = this.trait_chain(bounds[i].trait_refs[ti].definition());
-                for (mut k: i64 = 0; k < chain.length(); k++) {
-                    if (chain[k].equals(trait_def)) { return true; }
-                }
+            if (this.bound_gives_trait(&bounds[i], trait_def)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether one of `bounds` on the associated type `proj` names
+    /// `trait_def` or a trait `trait_def` is a supertrait of.
+    projection_bounds_give(&this, bounds: &[TraitBound], proj: AssocProjectionType*, trait_def: DefId) -> boolean {
+        for (mut i: i64 = 0; i < bounds.length(); i++) {
+            if (!bounds[i].has_projection_subject() || !this.bound_subject_is(bounds[i].subject, proj)) { continue; }
+            if (this.bound_gives_trait(&bounds[i], trait_def)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether a trait the bound `b` writes is `trait_def` or has it as a
+    /// supertrait.
+    bound_gives_trait(&this, b: const TraitBound*, trait_def: DefId) -> boolean {
+        for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
+            const chain: [DefId] = this.trait_chain(b.trait_refs[ti].definition());
+            for (mut k: i64 = 0; k < chain.length(); k++) {
+                if (chain[k].equals(trait_def)) { return true; }
             }
         }
         return false;
@@ -782,6 +829,25 @@ type struct MethodBinding {
             }
         }
         return out;
+    }
+
+    /// The trait a call of `method_name` on `recv_type` names in an
+    /// implement block's copy of that trait's default, through the bound
+    /// `This: Trait` the default is written under: the copy's trait, when
+    /// the receiver is the implementing type and the trait declares the
+    /// method.  The copy then names the method of the implementation that
+    /// copied it, as the default names its bound's, whatever other
+    /// implementations of the trait at other arguments, or methods of the
+    /// type's own, share the name.  Invalid outside such a copy.
+    default_copy_own_trait(&this, recv_type: TypeRef, method_name: SymbolStr) -> DefId {
+        const func: FunctionDecl* = DeclarationNode::fn_of(this.state.current_func);
+        if (func == null || !func.is_synth_default || !func.origin_trait.is_valid()) { return DefId::invalid(); }
+        if (!this.state.this_type.is_valid()) { return DefId::invalid(); }
+        if (!this.peel_all_indirection(recv_type).equals(this.peel_all_indirection(this.state.this_type))) {
+            return DefId::invalid();
+        }
+        if (this.ctx.generic_registry.trait_item_slot(func.origin_trait, method_name) < 0) { return DefId::invalid(); }
+        return func.origin_trait;
     }
 
     /// `t` with every pointer and reference around it peeled, as a method
@@ -986,6 +1052,29 @@ type struct MethodBinding {
             return ret;
         }
         return this.ctx.type_resolver.substitute_trait_arguments(ret, declaring, &along);
+    }
+
+    /// Whether the bound `tr` gives its subject the trait `trait_def`, and
+    /// at which arguments, into `out`: the ones it writes when it names
+    /// `trait_def` itself (none when it writes none), and when `trait_def`
+    /// is a supertrait of the trait it names, what that trait writes on it
+    /// with the bound's arguments put in, one per parameter of `trait_def`
+    /// (`C: IndexViewMutable<Range<i64>>` gives `IndexView<Range<i64>>`).
+    bound_gives(mut &this, tr: const TraitRef*, trait_def: DefId, out: mut &[TypeRef]) -> boolean {
+        if (tr.definition().equals(trait_def)) {
+            for (mut i: i64 = 0; i < tr.argument_types.length(); i++) { out.push(tr.argument_types[i]); }
+            return true;
+        }
+        const target: TraitDecl* = this.ctx.generic_registry.get_trait_decl(trait_def);
+        if (target == null) { return false; }
+        const own: [TypeRef] = this.bound_argument_positions(tr);
+        mut open: [DefId] = [];
+        mut along: [TypeRef] = [];
+        if (!this.ctx.type_resolver.trait_arguments_along(tr.definition(), &own, trait_def, &open, &along)) {
+            return false;
+        }
+        for (mut i: i64 = 0; i < target.generic_params.length() && i < along.length(); i++) { out.push(along[i]); }
+        return true;
     }
 
     /// What the bound `tr` writes for each position of its trait: the
@@ -1665,8 +1754,8 @@ type struct MethodBinding {
         mut owner_impl: ImplBlock* = null;
         // Template key: an instantiation (`Array<i32>`) keys off its generic base; a
         // BARE template struct used directly as a receiver (`this` in `implement
-        // FmtWrite for struct String`, where `this` is the un-parameterized `String`,
-        // not `String<GlobalAlloc>`) keys off its own type id.  Without the bare case
+        // FormatWrite for struct String`, where `this` is the un-parameterized `String`,
+        // not `String<GlobalAllocator>`) keys off its own type id.  Without the bare case
         // the call's method-arg bindings are never stashed, so mono can't pin the
         // generic call and codegen's name+arity fallback picks a wrong sibling spec.
         const tmpl_base: TypeRef = if (recv_base.is_valid()) { recv_base } else { recv_type };
@@ -2115,10 +2204,33 @@ type struct MethodBinding {
         }
         ret_ctx.set_this_type(recv_type);
         mut refined: TypeRef = this.ctx.type_resolver.resolve(ret_ann, &ret_ctx);
+        // An opaque return its body decided is cached on the annotation in
+        // the method's parameters and its owner's, and resolving the
+        // annotation hands it back as it is: the call's bindings, by each
+        // parameter's symbol, are put into it here.
+        match (*ret_ann) {
+            TypeAnnotation::ImplTrait(_) => {
+                mut params: [TypeRef] = [];
+                this.arena.generic_params_in(refined, &params);
+                mut replacements: [TypeRef] = [];
+                for (mut p: i64 = 0; p < params.length(); p++) {
+                    const sym: SymbolID = this.arena.lookup(params[p]).as_generic_param().param_sym;
+                    mut bound: TypeRef = params[p];
+                    for (mut b: i64 = 0; b < ret_ctx.generic_bindings.length(); b++) {
+                        if (ret_ctx.generic_bindings[b].sym.equals(sym)) { bound = ret_ctx.generic_bindings[b].ty; }
+                    }
+                    replacements.push(bound);
+                }
+                if (params.length() > 0) {
+                    refined = TypeSubstitution::from_params(&params, &replacements).apply(refined, this.arena);
+                }
+            }
+            _ => { }
+        }
         refined = this.reduce_assoc_projections(refined);
         if (!refined.is_valid()) { return fallback; }
         // In a generic body's walk the return is in the body's parameters
-        // (`MapIter<FilterIter<I>, i32>`), which each copy substitutes.
+        // (`MapIterator<FilterIterator<I>, i32>`), which each copy substitutes.
         if (this.state.in_symbolic_check) { return refined; }
         if (this.types.contains_generic_param(refined) || this.types.contains_unresolved_projection(refined)) {
             return fallback;
@@ -2130,7 +2242,7 @@ type struct MethodBinding {
     // -- Associated-type projection reduction --
 
     /// Bind impl-introduced generic params the Self type doesn't determine
-    /// (`A`/`O` in `ZipIter<I,J> where I: Iterator<A>, J: Iterator<O>`) into `res_ctx`.
+    /// (`A`/`O` in `ZipIterator<I,J> where I: Iterator<A>, J: Iterator<O>`) into `res_ctx`.
     proj_derive_impl_where_generics(mut &this, impl_node: ImplBlock*,
                                     subst: TypeSubstitution*, res_ctx: mut ResolutionContext*) -> void {
         if (impl_node == null || subst == null) { return; }

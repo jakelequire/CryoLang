@@ -1,0 +1,107 @@
+///! File-descriptor primitives.
+///!
+///! This module is the canonical home for the libc calls every
+///! fd-owning type needs: `read`, `write`, `close`, and the
+///! `__errno_location` machinery behind `errno()`. Modules that
+///! wrap a fd (`Stdin`, `File`, `TcpStream`, `ChildStdin`, ...)
+///! should import from here rather than re-declare the same
+///! externs.
+///!
+///! The `read_file_descriptor` / `write_file_descriptor` wrappers handle the "retry on
+///! `Interrupted`, map everything else through `IoError::from_errno`"
+///! dance so Read/Write implementations collapse to a single line.
+
+namespace std::io::file_descriptor;
+
+import std::core::option;
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::io::error::{ IoError, IoErrorKind };
+import std::io::traits::{ Read };
+import std::ffi::libc;
+
+/// `read(2)` wrapper: retries on `EINTR`, maps every other failure
+/// through `IoError::from_errno`. Returns the number of bytes
+/// actually read; zero means EOF.  A negative `length` fails with
+/// `InvalidInput` before reaching `read(2)`, which would take it as a
+/// huge unsigned size.
+public function read_file_descriptor(fd: i32, buffer: mut u8*, length: i64) -> Result<i64, IoError> {
+    if (length < 0) {
+        return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+    }
+    loop {
+        const n: i64 = libc::read(fd, buffer, length as u64);
+        if (n >= 0) { return Result::Ok(n); }
+        const err: IoError = IoError::from_errno(libc::errno());
+        match (err.kind) {
+            IoErrorKind::Interrupted => { }
+            _ => { return Result::Err(err); }
+        }
+    }
+}
+
+/// `write(2)` wrapper with the same retry semantics as `read_file_descriptor`.
+/// Returns the number of bytes actually written; short writes are
+/// normal on slow sinks; callers who need all bytes written use
+/// `Write::write_all`.
+public function write_file_descriptor(fd: i32, bytes: &Slice<u8>) -> Result<i64, IoError> {
+    loop {
+        const n: i64 = libc::write(fd, bytes.as_pointer(), bytes.length() as u64);
+        if (n >= 0) { return Result::Ok(n); }
+        const err: IoError = IoError::from_errno(libc::errno());
+        match (err.kind) {
+            IoErrorKind::Interrupted => { }
+            _ => { return Result::Err(err); }
+        }
+    }
+}
+
+/// `close(2)` wrapper. Swallows the return value because nothing
+/// sensible can be done with a close failure; the fd is gone from
+/// the process's perspective either way.
+public function close_file_descriptor(fd: i32) -> void {
+    libc::close(fd);
+}
+
+/// Turn `fd`'s non-blocking mode on or off, keeping its other
+/// file-status flags.  In non-blocking mode a read with nothing
+/// available fails with `WouldBlock` instead of sleeping the thread.
+![target(unix)]
+public function set_nonblocking(fd: i32, on: boolean) -> Result<(), IoError> {
+    const flags: i32 = libc::fcntl(fd, libc::F_GETFL, 0 as i64);
+    if (flags < 0) { return Result::Err(IoError::last_os_error()); }
+    const next: i32 = if (on) { flags | libc::O_NONBLOCK } else { flags & ~libc::O_NONBLOCK };
+    if (libc::fcntl(fd, libc::F_SETFL, next as i64) < 0) {
+        return Result::Err(IoError::last_os_error());
+    }
+    return Result::Ok(());
+}
+
+/// A C runtime descriptor on Windows has no non-blocking mode: the
+/// request fails with `Unsupported`, and the descriptor keeps blocking.
+![target(windows)]
+public function set_nonblocking(fd: i32, on: boolean) -> Result<(), IoError> {
+    return Result::Err(IoError::new(IoErrorKind::Unsupported, 0));
+}
+
+/// A descriptor read through without being owned: dropping it closes
+/// nothing, so it reads a descriptor whose owner closes it, and `Read`'s
+/// own methods (`read_to_end`, `read_exact`, ...) work over any open
+/// descriptor.
+public type struct BorrowedFileDescriptor {
+private:
+    fd: i32;
+
+public:
+    /// Read `fd` without taking it over.  The caller keeps `fd` open for
+    /// as long as this value reads it.
+    static new(fd: i32) -> BorrowedFileDescriptor {
+        return BorrowedFileDescriptor { fd: fd };
+    }
+}
+
+implement trait Read for struct BorrowedFileDescriptor {
+    read(mut &this, buffer: mut u8*, length: i64) -> Result<i64, IoError> {
+        return read_file_descriptor(this.fd, buffer, length);
+    }
+}

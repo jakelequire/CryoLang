@@ -51,8 +51,8 @@
 ///!   const words: [String] = [String::from("a"), String::from("bc")];
 ///!   const total: Mutex<i64> = Mutex::<i64>::new(0);
 ///!   thread::scope((s: mut &thread::Scope) -> void {
-///!       s.spawn(() -> void { mut g = total.lock(); *g.as_mutable_ptr() += words[0].length() as i64; });
-///!       s.spawn(() -> void { mut g = total.lock(); *g.as_mutable_ptr() += words[1].length() as i64; });
+///!       s.spawn(() -> void { mut g = total.lock(); *g.as_mutable_pointer() += words[0].length() as i64; });
+///!       s.spawn(() -> void { mut g = total.lock(); *g.as_mutable_pointer() += words[1].length() as i64; });
 ///!   });
 ///!   // both threads are joined here; `total` holds 3
 ///!   ```
@@ -67,16 +67,16 @@
 namespace std::thread;
 
 import std::core::intrinsics;
-import std::core::ptr::{ NonNull };
+import std::core::pointer::{ NonNull };
 import std::core::result::{ Result };
 import std::core::drop::{ Drop };
 import std::alloc::layout::{ Layout };
-import std::alloc::allocator::{ GlobalAlloc };
+import std::alloc::allocator::{ GlobalAllocator };
 import std::collections::array;
 import std::collections::str::{ Str };
 import std::core::error::{ Error };
 import std::fmt::display::{ Debug, Display, Formatter };
-import std::fmt::error::{ FmtError };
+import std::fmt::error::{ FormatError };
 import std::ffi::libc::{
     pthread_attr_destroy, pthread_attr_init, pthread_attr_setstacksize,
     pthread_create, pthread_detach, pthread_equal, pthread_join, pthread_self,
@@ -204,7 +204,7 @@ private function thread_body<F, T>(arg: mut u8*) -> void where F: () -> T {
     // Writing the result through a raw `T*` avoids drop-synthesis on the
     // (uninitialized) destination.
     const rptr: mut T* = &(*shared).result;
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
     // A take: the body is read out of the payload, and the payload box is
     // released raw right after, without dropping what it held, so `body` is
     // the only owner of what it captured from here on; it is released when
@@ -219,7 +219,7 @@ private function thread_body<F, T>(arg: mut u8*) -> void where F: () -> T {
     // one will ever read the result, so we own teardown here.
     const prev: u8 = (*shared).state.swap(STATE_THREAD_DONE, MemoryOrder::AcqRel);
     if (prev == STATE_DETACHED) {
-        ptr::drop_in_place::<T>(rptr);
+        pointer::drop_in_place::<T>(rptr);
         alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
     }
 }
@@ -290,8 +290,8 @@ private function reap_detached<T>(tid: u64, shared: mut Shared<T>*) -> void {
     if (prev == STATE_THREAD_DONE) {
         // Thread already finished and left the result for us; drop it.
         const rptr: T* = &(*shared).result;
-        ptr::drop_in_place::<T>(rptr);
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        pointer::drop_in_place::<T>(rptr);
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
     }
     // Otherwise the thread is still running and will reclaim the block
@@ -320,7 +320,7 @@ public type struct JoinHandle<T> {
         // exactly one owner.  The read and the free are a single sequence.
         unsafe {
             const out: T = *rptr;
-            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            mut alloc: GlobalAllocator = GlobalAllocator::new();
             alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
             return out;
         }
@@ -371,13 +371,13 @@ implement<T> trait Drop for struct JoinHandle<T> {
 /// owns) and `T: Send` (the result handed back through
 /// `JoinHandle::join`). Both are computed structurally - primitives, raw
 /// pointers, references, and the standard containers built on them
-/// (`Box`, `Arc`, `Array`, `String`, `mpsc::Sender`, ...) are `Send`. The
+/// (`Box`, `Arc`, `Array`, `String`, `channel::Sender`, ...) are `Send`. The
 /// bound rejects a closure written without `move`, which borrows from the
 /// spawning function, and the types on the thread-safety deny-list
 /// (`Rc<T>` and the lock guards).
 public function spawn<F, T>(body: F) -> JoinHandle<T>
 where F: () -> T + Send, T: Send {
-    match (spawn_with_attr::<F, T>(body, 0)) {
+    match (spawn_with_attributes::<F, T>(body, 0)) {
         Result::Ok(h)  => { return h; }
         Result::Err(_) => {
             core::panic("thread::spawn: failed to create thread", intrinsics::location());
@@ -388,20 +388,20 @@ where F: () -> T + Send, T: Send {
 /// Fallible spawn with an optional stack size (`0` == OS default). The
 /// per-OS thread creator (`os_create_thread`) applies it - via a
 /// `pthread_attr_t` on POSIX, or `CreateThread`'s `dwStackSize` on Windows.
-public function spawn_with_attr<F, T>(body: F, stack_bytes: u64) -> Result<JoinHandle<T>, SpawnError>
+public function spawn_with_attributes<F, T>(body: F, stack_bytes: u64) -> Result<JoinHandle<T>, SpawnError>
 where F: () -> T + Send, T: Send {
-    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
 
     mut shared: mut Shared<T>* = null;
     match (alloc.allocate(Layout::of::<Shared<T>>())) {
-        Result::Ok(raw) => { shared = raw.cast::<Shared<T>>().as_ptr(); }
+        Result::Ok(raw) => { shared = raw.cast::<Shared<T>>().as_pointer(); }
         Result::Err(_)  => { return Result::Err(SpawnError::OutOfMemory); }
     }
     (*shared).state = Atomic::<u8>::new(STATE_LIVE);
 
     mut p: mut Payload<F, T>* = null;
     match (alloc.allocate(Layout::of::<Payload<F, T>>())) {
-        Result::Ok(raw) => { p = raw.cast::<Payload<F, T>>().as_ptr(); }
+        Result::Ok(raw) => { p = raw.cast::<Payload<F, T>>().as_pointer(); }
         Result::Err(_)  => {
             alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
             return Result::Err(SpawnError::OutOfMemory);
@@ -416,7 +416,7 @@ where F: () -> T + Send, T: Send {
             // The thread never started, so we still own both boxes. The
             // body was moved in; release it in place so what it owns is not
             // leaked, then free both boxes.
-            ptr::drop_in_place::<F>(&(*p).body);
+            pointer::drop_in_place::<F>(&(*p).body);
             alloc.deallocate(NonNull::new(p as mut u8*), Layout::of::<Payload<F, T>>());
             alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
             return Result::Err(e);
@@ -447,7 +447,7 @@ implement enum SpawnError {
 
 /// `could not start a thread: out of memory`, and so on for each reason.
 implement trait Display for enum SpawnError {
-    fmt(&this, f: mut &Formatter) -> Result<(), FmtError> {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         f.write_str(Str::new("could not start a thread"))?;
         match (&this) {
             SpawnError::OutOfMemory      => { return f.write_str(Str::new(": out of memory")); }
@@ -474,7 +474,7 @@ implement trait Error for enum SpawnError { }
 ///   ```
 public function try_spawn<F, T>(body: F) -> Result<JoinHandle<T>, SpawnError>
 where F: () -> T + Send, T: Send {
-    return spawn_with_attr::<F, T>(body, 0);
+    return spawn_with_attributes::<F, T>(body, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +535,7 @@ public type struct Builder {
     public name(mut this, n: Str) -> Builder {
         mut len: u64 = n.length() as u64;
         if (len > MAX_THREAD_NAME) { len = MAX_THREAD_NAME; }
-        const src: u8* = n.as_ptr();
+        const src: u8* = n.as_pointer();
         mut i: u64 = 0;
         while (i < len) {
             this.name_buf[i] = src[i];
@@ -567,7 +567,7 @@ public type struct Builder {
         // `pthread_attr_t` on POSIX, `dwStackSize` on Windows), so the
         // builder just forwards the configured size.
         mut result: Result<JoinHandle<T>, SpawnError> =
-            spawn_with_attr::<F, T>(body, this.stack_bytes);
+            spawn_with_attributes::<F, T>(body, this.stack_bytes);
 
         match (result) {
             Result::Ok(h) => {
@@ -623,15 +623,10 @@ public function yield_now() -> void {
     os_yield();
 }
 
-/// Sleep the current thread for at least `nanos` nanoseconds, as
+/// Sleep the current thread for at least `duration`, as
 /// `time::clock::sleep` does.
-public function sleep(nanos: u64) -> void {
-    clock::sleep(Duration::from_nanos(nanos));
-}
-
-/// Sleep for at least `millis` milliseconds.
-public function sleep_ms(millis: u64) -> void {
-    sleep(millis * 1000000);
+public function sleep(duration: Duration) -> void {
+    clock::sleep(duration);
 }
 
 
@@ -647,7 +642,7 @@ private function scope_body<F>(arg: mut u8*) -> void where F: () -> void {
     // `body` is the only owner of what it captured.
     unsafe {
         const body: F = *(arg as F*);
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         alloc.deallocate(NonNull::new(arg), Layout::of::<F>());
         body();
     }
@@ -689,10 +684,10 @@ public type struct Scope {
     /// a deny-listed type (`Rc`, a lock guard, the scope itself) is not.
     public spawn<F>(mut &this, body: F) -> void
     where F: () -> void + Send {
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut alloc: GlobalAllocator = GlobalAllocator::new();
         mut p: mut F* = null;
         match (alloc.allocate(Layout::of::<F>())) {
-            Result::Ok(raw) => { p = raw.cast::<F>().as_ptr(); }
+            Result::Ok(raw) => { p = raw.cast::<F>().as_pointer(); }
             Result::Err(_)  => { core::panic("Scope::spawn: alloc failed", intrinsics::location()); }
         }
         *p = body;

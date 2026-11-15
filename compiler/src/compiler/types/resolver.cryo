@@ -265,7 +265,7 @@ type struct TypeResolver {
                     this.diagnostics.emit(Diagnostic::error(
                         ErrorCode::E0239_NON_CONST_ARRAY_SIZE,
                         fmt::format("array size must not be negative (folded to %s)",
-                               folded.to_decimal_str())).at(a.span));
+                               folded.to_decimal_string())).at(a.span));
                 }
                 return 0;
             }
@@ -274,7 +274,7 @@ type struct TypeResolver {
                     this.diagnostics.emit(Diagnostic::error(
                         ErrorCode::E0010_NUMBER_TOO_LARGE,
                         fmt::format("array size %s is too large: an array's length is at most `i64::MAX`",
-                               folded.to_decimal_str())).at(a.span));
+                               folded.to_decimal_string())).at(a.span));
                 }
                 return 0;
             }
@@ -381,7 +381,7 @@ type struct TypeResolver {
         const registry: GenericRegistry* = this.generic_registry;
         const traits: [DefId] = registry.object_table_traits(object.trait_def);
         const checker: TraitChecker = TraitChecker::new(
-            this.arena, this.generic_registry, this.intern_table, this.diagnostics);
+            this.arena, this.generic_registry, this.intern_table, this.diagnostics, this);
         for (mut k: i64 = 0; k < traits.length(); k++) {
             if (traits[k].equals(object.trait_def)) { blocks.push(own); continue; }
             const args: [TypeRef] = this.object_trait_arguments(object, traits[k]);
@@ -394,14 +394,15 @@ type struct TypeResolver {
 
     /// The trait of `bound` that its subject does not implement once the
     /// declaring template's parameters `param_syms` are bound to `bindings`:
-    /// a parameter's binding (`TraitChecker::unmet_parameter_trait`), or a
-    /// type that is not a parameter (`where HighError: From<E>`, `where
-    /// Array<T>: Display`; `TraitChecker::unmet_written_trait`).
-    /// `*out_subject` is the subject so resolved and `*out_trait` the trait
-    /// as it is required, with its arguments (`From<OtherError>`).  Null
-    /// when every trait has one, for a projection subject, and when the
-    /// subject or an argument still names a parameter, which the copy that
-    /// binds it decides.  `outer` binds the parameters of the type a method
+    /// a parameter's binding (`TraitChecker::unmet_parameter_trait`), the
+    /// type an associated type of the parameters names once they are bound
+    /// (`where C::Item: Put`; `unmet_projection_trait`), or a type that is
+    /// not a parameter (`where HighError: From<E>`, `where Array<T>:
+    /// Display`; `TraitChecker::unmet_written_trait`).  `*out_subject` is
+    /// the subject so resolved and `*out_trait` the trait as it is
+    /// required, with its arguments (`From<OtherError>`).  Null when every
+    /// trait has one, and when the subject or an argument still names a
+    /// parameter, which the copy that binds it decides.  `outer` binds the parameters of the type a method
     /// belongs to, which its bounds' arguments may name (`R: RangeBounds<K>`
     /// on a method of `BTreeMap<K, V>`); empty for a free function.
     unmet_written_bound(&this, bound: TraitBound*, param_syms: &[SymbolID], bindings: &[TypeRef],
@@ -416,9 +417,11 @@ type struct TypeResolver {
             }
         }
         const checker: TraitChecker = TraitChecker::new(
-            this.arena, this.generic_registry, this.intern_table, this.diagnostics);
+            this.arena, this.generic_registry, this.intern_table, this.diagnostics, this);
         mut tr: const TraitRef* = null;
-        if (bound.subject_param().is_valid()) {
+        if (bound.has_projection_subject()) {
+            tr = this.unmet_projection_trait(&checker, bound, param_syms, bindings, &subst, out_subject);
+        } else if (bound.subject_param().is_valid()) {
             if (!subject.is_valid() || this.arena.contains_generic_param(subject)) { return null; }
             tr = checker.unmet_parameter_trait(bound, subject, &subst, 0);
             if (tr != null) { *out_subject = subject; }
@@ -428,6 +431,61 @@ type struct TypeResolver {
         if (tr == null) { return null; }
         *out_trait = this.intern_table.intern(checker.trait_as_required(tr, &subst));
         return tr;
+    }
+
+    /// The trait of `bound`, written on an associated type of the declaring
+    /// template's parameters (`where C::Item: Put`), that the type the
+    /// projection names once `subst` binds them does not implement:
+    /// `C::Item` with `C` bound to a type whose `Item` is `i64` is `i64`.
+    /// `*out_subject` is that type.  Null when every trait has an
+    /// implementation for it, and while the subject or an argument still
+    /// names a parameter, which the copy that binds it decides.
+    unmet_projection_trait(&this, checker: &TraitChecker, bound: TraitBound*, param_syms: &[SymbolID],
+                           bindings: &[TypeRef], subst: &TypeSubstitution,
+                           out_subject: mut TypeRef*) -> const TraitRef* {
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        for (mut i: i64 = 0; i < param_syms.length() && i < bindings.length(); i++) {
+            if (bindings[i].is_valid()) { rc.add_binding(param_syms[i], SymbolStr::empty(), bindings[i]); }
+        }
+        const written: TypeRef = this.resolve(bound.subject, &rc);
+        if (!written.is_valid()) { return null; }
+        const subject: TypeRef = this.apply_reduced(subst, written);
+        const subject_t: Type* = this.arena.lookup(subject);
+        if (subject_t == null || subject_t.kind == TypeKind::AssocProjection
+                || this.arena.contains_generic_param(subject)) {
+            return null;
+        }
+        for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
+            const tr: const TraitRef* = &bound.trait_refs[ri];
+            // A bound refused where it is written is reported there.
+            if (tr.path.length() == 0 || tr.refused || !tr.definition().is_valid()) { continue; }
+            if (tr.argument_types.length() != tr.type_args.length()) { return null; }
+            mut args: [TypeRef] = [];
+            for (mut ai: i64 = 0; ai < tr.argument_types.length(); ai++) {
+                const arg: TypeRef = this.apply_reduced(subst, tr.argument_types[ai]);
+                if (!arg.is_valid() || this.arena.contains_generic_param(arg)) { return null; }
+                args.push(arg);
+            }
+            if (checker.implementation_at(tr.definition(), &args, subject) == null) {
+                *out_subject = subject;
+                return tr;
+            }
+        }
+        return null;
+    }
+
+    /// `ty` under `subst`, each projection the substitution made concrete
+    /// reduced to the type its implementation binds: with `I` bound to
+    /// `Range<i64>`, `Option<I::Item>` is `Option<i64>`.  The unreduced form
+    /// is built without demanding it - nothing monomorphizes an
+    /// instantiation holding a projection, so a demanded one is left
+    /// unresolved.
+    apply_reduced(&this, subst: &TypeSubstitution, ty: TypeRef) -> TypeRef {
+        const was: boolean = this.arena.symbolic_no_demand_active;
+        this.arena.set_symbolic_no_demand(true);
+        const applied: TypeRef = subst.apply(ty, this.arena);
+        this.arena.set_symbolic_no_demand(was);
+        return this.reduce_projections(applied, false);
     }
 
     trait_arguments_along(&this, trait_def: DefId, args: &[TypeRef], declaring: DefId,
@@ -502,13 +560,13 @@ type struct TypeResolver {
             TypeAnnotation::Named(n) => {
                 if (n.pre_resolved.is_valid()) { return n.pre_resolved; }
                 // Canonicalize a BARE all-default generic name to its default
-                // instantiation (`String` -> `String<GlobalAlloc>`) so a bare
+                // instantiation (`String` -> `String<GlobalAllocator>`) so a bare
                 // reference shares ONE TypeID with the explicit form - the single
                 // authority for default-arg identity (no-op for non-templates,
                 // partially-defaulted templates, and generic-parameter bindings).
                 // The base of an explicit `String<...>` is resolved directly in
                 // resolve_generic and deliberately bypasses this, so it is NOT
-                // canonicalized here (which would nest as `String<GlobalAlloc><...>`).
+                // canonicalized here (which would nest as `String<GlobalAllocator><...>`).
                 this.canonicalize_default_generic_type(
                     this.resolve_named(n.name, ctx, n.res, n.span))
             }
@@ -661,7 +719,8 @@ type struct TypeResolver {
         mut out: [TypeRef] = [];
         if (proj == null || !trait_ty.is_valid() || this.decl_index == null || this.generic_registry == null) { return out; }
         const declaring: DefId = this.decl_index.def_of(trait_ty, this.arena);
-        if (proj.rooted_at.is_valid()) { return this.bound_trait_arguments(proj.rooted_at, declaring, ctx); }
+        const parameter: SymbolID = proj.written_on();
+        if (parameter.is_valid()) { return this.bound_trait_arguments(parameter, declaring, ctx); }
         if (!proj.owner_trait.is_valid()) { return out; }
         const owner: TraitDecl* = this.generic_registry.get_trait_decl(proj.owner_trait);
         if (owner == null) { return out; }
@@ -748,7 +807,8 @@ type struct TypeResolver {
     /// a projection written on a type, or `This` in an inherent impl.
     projection_trait(&this, proj: ProjectionAnnotation*) -> TypeRef {
         if (proj == null) { return TypeRef::invalid(); }
-        if (proj.rooted_at.is_valid()) { return this.bound_declaring(proj.rooted_at, proj.member); }
+        const parameter: SymbolID = proj.written_on();
+        if (parameter.is_valid()) { return this.bound_declaring(parameter, proj.member); }
         if (proj.owner_trait.is_valid()) { return this.trait_declaring(proj.owner_trait, proj.member); }
         return TypeRef::invalid();
     }
@@ -1018,7 +1078,7 @@ type struct TypeResolver {
             }
             this.bind_trait_argument_params(impl_node, tdecl, trait_args, &bctx);
             // An adapter whose item is carried only by a where-bound
-            // (`implement<I,A> Iterator<A> for TakeIter<I> where I: Iterator<A>`)
+            // (`implement<I,A> Iterator<A> for TakeIterator<I> where I: Iterator<A>`)
             // names `A` in its `Item` binding, but `A` is not a target param -
             // it is determined by `I: Iterator<A>` once `I` is concrete. Derive
             // those where-clause generics into `bctx` so the binding resolves.
@@ -1031,7 +1091,7 @@ type struct TypeResolver {
                 }
                 // A projection on one of the base's own arguments is the
                 // answer while that argument is still abstract:
-                // `FilterIter<I>::Item` is `I::Item`, which the caller reduces
+                // `FilterIterator<I>::Item` is `I::Item`, which the caller reduces
                 // through `I`'s bound.  Any other projection names a parameter
                 // of the implementation that nothing bound.
                 if (rt != null) {
@@ -1158,7 +1218,7 @@ type struct TypeResolver {
 
     /// Bind impl where-clause-derived generics into `bctx` for projection
     /// resolution. An adapter can carry its associated item only through a
-    /// where-bound - `implement<I,A> Iterator<A> for TakeIter<I>
+    /// where-bound - `implement<I,A> Iterator<A> for TakeIterator<I>
     /// where I: Iterator<A>` binds `Item` to `A`, but `A` is not a target
     /// parameter; it is determined by `I: Iterator<A>` once `I` is concrete.
     /// For each bound whose subject is already bound to a concrete type in
@@ -1224,7 +1284,7 @@ type struct TypeResolver {
     /// Bind the generic param(s) named in a where-bound trait arg against the
     /// concrete member type derived from the subject, peeling pointer/reference
     /// wrappers so `where I: Iterator<T*>` binds `T` to the pointee of the
-    /// subject's `Item` (the `CopiedIter`/`ClonedIter` by-ref->by-value bridge).
+    /// subject's `Item` (the `CopiedIterator`/`ClonedIterator` by-ref->by-value bridge).
     /// Mirrors the monomorphizer's `bind_where_arg_param`. Existing bindings are
     /// kept (the Self-type substitution already fixed any struct params).
     bind_where_arg_into_ctx(&this, ta: TypeAnnotation*, concrete: TypeRef,
@@ -1656,19 +1716,20 @@ type struct TypeResolver {
     }
 
     /// Resolve, in the declaration's context `res_ctx`, each bound of
-    /// `bounds` written on a type that is not a projection: its traits'
-    /// arguments, and a subject that is not a parameter, in the
-    /// declaration's own parameters.  A bound already resolved keeps its
-    /// answer - a copy carries its template's - and one that does not
-    /// resolve yet is asked again on the next pass over the declaration.
+    /// `bounds`: its traits' arguments, and a subject that is neither a
+    /// parameter nor a projection, in the declaration's own parameters.  A
+    /// projection subject (`C::Item`) is resolved where a call binds the
+    /// parameters it names (`unmet_written_bound`).  A bound already
+    /// resolved keeps its answer - a copy carries its template's - and one
+    /// that does not resolve yet is asked again on the next pass over the
+    /// declaration.
     resolve_written_bounds(&this, bounds: mut &[TraitBound], res_ctx: ResolutionContext*) -> void {
         for (mut b: i64 = 0; b < bounds.length(); b++) {
             const bound: mut TraitBound* = &bounds[b];
-            if (bound.has_projection_subject()) { continue; }
             if (bound.signature != null && !bound.signature_type.is_valid()) {
                 bound.signature_type = this.resolve(bound.signature, res_ctx);
             }
-            if (bound.subject_param().is_valid()) {
+            if (bound.subject_param().is_valid() || bound.has_projection_subject()) {
                 for (mut r: i64 = 0; r < bound.trait_refs.length(); r++) {
                     const tr: mut TraitRef* = &bound.trait_refs[r];
                     if (tr.argument_types.length() == tr.type_args.length()) { continue; }
@@ -1732,22 +1793,19 @@ type struct TypeResolver {
         // A generic struct's literal written without type arguments names no
         // instance until its field values are typed, so the type is the one
         // the body's check gives the value returned.  A copy of a checked
-        // body - a generic function's specialization - carries its literal
-        // typed, substituted to the copy's arguments; any other body is
-        // checked later, and its signature leaves the type for that check
-        // to decide (`SemaVisitor.visit_return`), a generic function's in
-        // its own parameters.  A method's of a generic type, of an instance
-        // of one, or of a trait is not checked at a type its callers can
-        // substitute.
-        const owner: Type* = this.arena.lookup(res_ctx.this_type);
-        const concrete_owner: boolean = !res_ctx.this_type.is_valid()
-            || (owner != null && owner.kind != TypeKind::InstantiatedType
-                && !this.arena.contains_generic_param(res_ctx.this_type));
-        if (ExpressionNode::struct_of(ret_expr).generic_args.length() == 0 && concrete_owner) {
+        // body - a generic function's specialization, a method's copy in an
+        // instance of its generic owner or at its own type arguments -
+        // carries its literal typed, substituted to the copy's arguments;
+        // any other body is checked later, and its signature leaves the type
+        // for that check to decide (`SemaVisitor.visit_return`), a generic
+        // body's in its own parameters and its owner's, which its callers
+        // substitute.  A generic method's copy in an instance keeps the
+        // method's own parameters, so its literal is typed in them.
+        if (ExpressionNode::struct_of(ret_expr).generic_args.length() == 0) {
             const template: const TemplateEntry* = this.generic_registry.template_of_type(concrete);
             if (template != null && template.kind == TemplateKind::Struct && template.param_types.length() > 0) {
                 const typed: TypeRef = ret_expr.resolved_type;
-                if (typed.is_valid() && !this.arena.contains_generic_param(typed)) {
+                if (typed.is_valid() && (func.copy_of.is_valid() || !this.arena.contains_generic_param(typed))) {
                     imp.resolved = typed;
                     func.resolved_return_type = typed;
                     return;
@@ -1886,7 +1944,7 @@ type struct TypeResolver {
 
             // Anti-tower: flag a non-generic method, static or instance, whose
             // resolved return type (or a non-receiver param) is a strict
-            // structural superterm of the owner - e.g. `Option<T>::as_ref ->
+            // structural superterm of the owner - e.g. `Option<T>::as_reference ->
             // Option<T*>` - or names the owner inside another generic type
             // (`static decode() -> Result<Option<T>, E>`).  Eagerly
             // materializing such a method recurses forever (each level grows
@@ -1980,7 +2038,7 @@ type struct TypeResolver {
             const gp_decl: DeclarationNode* = params[i];
             const gp: GenericParamDecl* = DeclarationNode::generic_param_of(gp_decl);
             if (gp == null || !gp.has_default_annotation()) { return filled; }
-            // A default annotation (`struct String<A = GlobalAlloc>`) is syntax
+            // A default annotation (`struct String<A = GlobalAllocator>`) is syntax
             // written in the TEMPLATE'S module and carries that module's answer
             // as its stamp; the caller's context contributes only the bindings
             // of the arguments resolved so far.
@@ -2102,13 +2160,13 @@ type struct TypeResolver {
     }
 
     /// Fold an already-resolved BARE reference to a generic whose parameters
-    /// are ALL defaulted (`String` for `String<A = GlobalAlloc>`) into its
-    /// fully-defaulted instantiation (`String<GlobalAlloc>`).
+    /// are ALL defaulted (`String` for `String<A = GlobalAllocator>`) into its
+    /// fully-defaulted instantiation (`String<GlobalAllocator>`).
     ///
     /// A bare `String` and a `-> String` return must denote the SAME concrete
     /// type, but a method's return annotation resolved during bootstrap keeps
     /// the raw template base while annotation / inference paths land on
-    /// `String<GlobalAlloc>`.  The divergence mints two manglings of one type -
+    /// `String<GlobalAllocator>`.  The divergence mints two manglings of one type -
     /// surfacing as a spurious `Box<String/*bare*/>::clone` that calls a
     /// never-emitted bare `String::clone` (link error).  Read sites (e.g. a
     /// method's stored return type) call this so every path agrees.
@@ -2262,7 +2320,7 @@ private:
                 const prefix_ty: TypeRef = ctx.lookup_binding(slot.relative_param_sym());
                 if (prefix_ty.is_valid()) {
                     const member_str: string =
-                        name_str.substring((sep + 2) as u32, (name_len - sep - 2) as u32);
+                        name_str.substring(sep + 2, name_len - sep - 2);
                     const member_sym: SymbolStr = this.intern_table.intern(member_str);
                     // `I::Item` is `Item` of the trait `I` is bounded by, not of
                     // any trait that declares something spelled `Item`.
@@ -2400,7 +2458,7 @@ private:
         for (mut i: i64 = 0; i < args.length(); i++) { arg_copy.push(args[i]); }
         mut subst: TypeSubstitution = TypeSubstitution::from_params(&entry.param_types, &arg_copy);
         const checker: TraitChecker = TraitChecker::new(
-            this.arena, this.generic_registry, this.intern_table, this.diagnostics);
+            this.arena, this.generic_registry, this.intern_table, this.diagnostics, this);
         mut concrete: TypeRef = TypeRef::invalid();
         // A bound written on a type is checked where every instantiation
         // is, by the monomorphizer.
@@ -2436,7 +2494,7 @@ private:
     resolve_generic(&this, g: GenericAnnotation*, ctx: ResolutionContext*) -> TypeRef {
         // Resolve the base template WITHOUT default-canonicalization: an explicit
         // `String<...>` must instantiate the String TEMPLATE, not the canonical
-        // `String<GlobalAlloc>` (which would nest as `String<GlobalAlloc><...>`).
+        // `String<GlobalAllocator>` (which would nest as `String<GlobalAllocator><...>`).
         // A bare Named base goes straight through resolve_named, bypassing the
         // canonicalization the `resolve()` Named arm applies to bare uses.
         mut base: TypeRef = match (*g.base) {
@@ -2475,7 +2533,7 @@ private:
         if (entry != null) {
             // Default-type-parameter substitution: when the annotation
             // omits trailing args (e.g. `Array<i32>` on a template defined
-            // as `Array<T, A = GlobalAlloc>`), fill the tail by resolving
+            // as `Array<T, A = GlobalAllocator>`), fill the tail by resolving
             // each missing param's default annotation. Defaults can
             // reference earlier params, so re-bind on every iteration.
             if (args.length() < entry.param_count) {

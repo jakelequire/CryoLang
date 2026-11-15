@@ -1,4 +1,4 @@
-///! `BufStream<TlsStream>` — the SAME buffered connection as `BufStream<TcpStream>`,
+///! `BufferedStream<TlsStream>` — the SAME buffered connection as `BufferedStream<TcpStream>`,
 ///! over an encrypted transport instead of a plaintext one.
 ///!
 ///! That is the claim under test, and it is the whole point of the
@@ -31,14 +31,14 @@ import std::collections::array::{ Array };
 import std::future;
 import std::io::error;
 import std::io::traits;
-import std::io::buf::{ BufStream };
-import std::net::addr::socket_addr::{ SocketAddr };
+import std::io::buffered::{ BufferedStream };
+import std::net::address::socket_address::{ SocketAddress };
 import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
 import std::net::tls::context::{ TlsAcceptor, TlsConnector };
 import std::net::tls::stream::{ TlsStream };
 import std::net::tls::future::{ TlsHandshake };
 import std::test::error::{ TestError };
-import std::test::assert::{ bail, expect_eq };
+import std::test::assert::{ bail, expect_equal };
 import std::future::combinator::{ Futures };
 import std::future::executor::{ Executor };
 
@@ -66,7 +66,7 @@ async function ntls_serve(listener: TcpListener, acceptor: TlsAcceptor) -> i64 {
     mut acc: TcpAccepted = await TcpAccept::start(listener);
     mut _lst: TcpListener = acc.take_listener();
 
-    mut sock: TcpStream = TcpStream::from_fd(-1);
+    mut sock: TcpStream = TcpStream::from_file_descriptor(-1);
     match (acc.take_result()) {
         Result::Ok(s)  => { sock = s; }
         Result::Err(_) => { return -1; }
@@ -82,7 +82,7 @@ async function ntls_serve(listener: TcpListener, acceptor: TlsAcceptor) -> i64 {
         Result::Ok(t)  => { t }
         Result::Err(_) => { return -3; }
     };
-    mut c: BufStream<TlsStream> = BufStream::<TlsStream>::of(tls);
+    mut c: BufferedStream<TlsStream> = BufferedStream::<TlsStream>::of(tls);
 
     mut head: String = match (await c.read_line(256)) {
         Result::Ok(v)  => { v }
@@ -106,8 +106,8 @@ async function ntls_serve(listener: TcpListener, acceptor: TlsAcceptor) -> i64 {
 }
 
 async function ntls_client(port: u16, connector: TlsConnector) -> i64 {
-    mut sock: TcpStream = TcpStream::from_fd(-1);
-    match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = TcpStream::from_file_descriptor(-1);
+    match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(s)  => { sock = s; }
         Result::Err(_) => { return -20; }
     }
@@ -122,7 +122,7 @@ async function ntls_client(port: u16, connector: TlsConnector) -> i64 {
         Result::Ok(t)  => { t }
         Result::Err(_) => { return -22; }
     };
-    mut c: BufStream<TlsStream> = BufStream::<TlsStream>::of(tls);
+    mut c: BufferedStream<TlsStream> = BufferedStream::<TlsStream>::of(tls);
 
     match (c.queue::<string>("ECHO 5\r\nHELLO")) { Result::Ok(_) => { } Result::Err(_) => { return -23; } }
     match (await c.flush())                    { Result::Ok(_) => { } Result::Err(_) => { return -24; } }
@@ -159,34 +159,34 @@ function tls_conn_framed_round_trip() -> Result<(), TestError> {
     };
     // The fixture certificate is self-signed, so the client cannot verify it.
     mut connector: TlsConnector = match (TlsConnector::new()) {
-        Result::Ok(c)  => { c.danger_accept_invalid_certs() }
+        Result::Ok(c)  => { c.danger_accept_invalid_certificates() }
         Result::Err(_) => { return bail(Str::new("TlsConnector::new failed")); }
     };
 
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => {
             return bail(Str::new("bind 127.0.0.1:0 failed"));
         }
     };
-    listener.set_nonblocking(true);
-    const port: u16 = match (listener.local_addr()) {
+    listener.set_nonblocking(true)?;
+    const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
         Result::Err(_) => {
-            return bail(Str::new("local_addr failed"));
+            return bail(Str::new("local_address failed"));
         }
     };
 
     mut ex: Executor = Executor::new();
     const r: i64 = ex.block_on(ntls_round_trip(port, listener, acceptor, connector));
-    return expect_eq(r, 0 as i64);
+    return expect_equal(r, 0 as i64);
 }
 
 /// Connect to `port` and set up the client side for `hostname`, without a
 /// handshake: 1 when `start_connect` accepts the name, 0 when it refuses.
 async function ntls_start_for(port: u16, connector: TlsConnector, hostname: String) -> i64 {
-    mut sock: TcpStream = TcpStream::from_fd(-1);
-    match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+    mut sock: TcpStream = TcpStream::from_file_descriptor(-1);
+    match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
         Result::Ok(s)  => { sock = s; }
         Result::Err(_) => { return -1; }
     }
@@ -201,14 +201,14 @@ async function ntls_start_for(port: u16, connector: TlsConnector, hostname: Stri
 function tls_connect_refuses_a_name_it_cannot_set() -> Result<(), TestError> {
     // OpenSSL takes no server name longer than 255 bytes. Connecting anyway
     // would send none, and would verify the chain but not the name.
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
-    listener.set_nonblocking(true);
-    const port: u16 = match (listener.local_addr()) {
+    listener.set_nonblocking(true)?;
+    const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
-        Result::Err(_) => { return bail(Str::new("local_addr failed")); }
+        Result::Err(_) => { return bail(Str::new("local_address failed")); }
     };
     mut ex: Executor = Executor::new();
 
@@ -218,11 +218,11 @@ function tls_connect_refuses_a_name_it_cannot_set() -> Result<(), TestError> {
         Result::Ok(c)  => { ex.block_on(ntls_start_for(port, c, long_name)) }
         Result::Err(_) => { return bail(Str::new("TlsConnector::new failed")); }
     };
-    expect_eq(refused, 0 as i64)?;
+    expect_equal(refused, 0 as i64)?;
 
     const accepted: i64 = match (TlsConnector::new()) {
         Result::Ok(c)  => { ex.block_on(ntls_start_for(port, c, String::from_str(Str::new("localhost")))) }
         Result::Err(_) => { return bail(Str::new("TlsConnector::new failed")); }
     };
-    return expect_eq(accepted, 1 as i64);
+    return expect_equal(accepted, 1 as i64);
 }

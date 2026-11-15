@@ -24,21 +24,23 @@ language server".  From there, in order, to the v1.0 freeze:
    Left for trait objects: owning boxes and upcasting; see "Trait objects"
    below.
 4. **Associated constants on concrete types.**  Built, on
-   `associated-constants`: `i32::MAX`, `f64::NAN`, `Duration::NANOS_PER_SEC`,
+   `associated-constants`: `i32::MAX`, `f64::NAN`, `Duration::NANOSECONDS_PER_SECOND`,
    with `max_value()` removed (ruling 510).  Trait constants used as
    values come after v1.0; trait constants as array lengths are not in
    v1.0; see "Associated constants" below.
 5. **An internal compiler logger.**  Built: `utils::log`, with areas, levels, `CRYO_LOG` / `--log` and a file
    sink, in place of `LOG_DEBUG`, `cdebug` and `CRYO_TIMINGS`; see
    "An internal compiler logger" below.
-6. **The standard library's visibility pass.**  Everything in it is public
-   today, so internals such as `Array`'s grower are public API.  The pass
-   decides what stays public, and which standard-library APIs want trait
-   objects.
+6. **The standard library's visibility pass.**  Built: every item of the
+   library is written `public`, `private` or `internal`, so internals such
+   as `Array`'s grower are no longer public API; what is left is listed
+   under "The standard library's visibility pass" below.
 7. **The slice and API pass**, after the visibility pass:
    - first, the fix for a by-value struct parameter accepting
      `&OtherStruct` (bug 0063);
-   - `&this` enforced as read-only (D37), with const pointers following;
+   - `&this` enforced as read-only (D37) is built: a write through a
+     read-only place is E0250, and a read-only place given where a
+     writable one is wanted is E0251; const pointers follow;
    - `Read` taking a `Slice`;
    - `Slice` finished: `s[i]`, `Eq`, borrowed-only `&Slice<T>` and
      `mut &Slice<T>` with `AsSlice`/`AsMutableSlice`, the container
@@ -78,9 +80,9 @@ implementations, each one a candidate for its trait.  Not started.
 - The HTTP status line, HTTP/2's `:status` and `set_body`'s Content-Length
   still write their decimals through a stack buffer by hand: they write
   into an `Array<u8>` and a header map's `Str`, neither of which is an
-  `FmtWrite` sink.  Open: whether `Array<u8>` (a byte buffer that would
-  only ever be given UTF-8 through `FmtWrite`) should implement
-  `FmtWrite`, so they become `out.write(f"...")`.
+  `FormatWrite` sink.  Open: whether `Array<u8>` (a byte buffer that would
+  only ever be given UTF-8 through `FormatWrite`) should implement
+  `FormatWrite`, so they become `out.write(f"...")`.
 - A spec on a non-numeric hole (`{name:>8}`) still formats the value into
   a `String` to measure it before padding.
 - The object conversion it needed (ruling 606) does not yet cover an
@@ -99,7 +101,7 @@ sweep.  Counted (`grep -E '^\s*implement(<[^>]*>)? (struct|union) '`):
   `cursor.cryo`, the struct's own file, goes inline.  The others are
   `AsmPiece`, `InlineBodies`, `DirectiveRegistry`, and `StampSlot`,
   `BuildStamp`, `VersionReport` in `utils/build_stamp.cryo`.
-- standard library: 4.  Three are `BufStream<S>` extended from the
+- standard library: 4.  Three are `BufferedStream<S>` extended from the
   HTTP/1.1, HTTP/2 and WebSocket modules, the split-type exception; one is
   `Array<T, A>`'s second block in its own file, to fold inline (its bound
   becomes a `where` on the methods that need it, or stays on the type).
@@ -319,8 +321,9 @@ normalised before the comparison.
 - **The language server reports the stamped version** (`serverInfo`) that
   `cryo version` prints, with the matching change in the VS Code extension
   (ruling 343).
-- **`cryo version --verbose` shows the binary's sha256,** once the standard
-  library has a sha256; it has sha1 only today.
+- **`cryo version --verbose` shows the binary's sha256.**  The standard
+  library computes one (`std::encoding::sha256`); the report does not use
+  it yet.
 - **`make verify ARGS="--baseline REV"` works for a revision from before
   the version stamp,** `main` included (ruling 298: fixed after the merge).
   verify builds every baseline with the working tree's Makefile, which runs
@@ -375,10 +378,9 @@ Open:
 
 ## The standard library's visibility pass
 
-Everything in the standard library is public today, so its internals -
-`Array`'s grower among them - are public API, and would be frozen with
-v1.0.  Cryo stays public by default and nothing is linted; the library
-itself writes `public`, `private` or `internal` on every item, so each
+A standard library whose every item was public would freeze its internals -
+`Array`'s grower among them - as public API with v1.0.  Cryo stays public
+by default and nothing is linted; the library itself writes `public`, `private` or `internal` on every item, so each
 exposure is a decision.  Built: `private` holds on every member and item
 (rulings 562, 563); `internal` reaches the declaring package (567); and a
 signature may not name a type seen by fewer modules than it is, a trait's
@@ -409,20 +411,18 @@ Left over from that: the async entry point calls `Executor::new` and
    and MIR pipeline lands.
 2. **`Display` and `Debug` over a trait object.**  Built: one
    non-generic `fmt(&this, f: mut &Formatter)` writing through the
-   `virtual mut &FmtWrite` a `Formatter` holds (423).  Since that `fmt`
-   is no longer generic, the implementation for an instantiation of a
-   generic type (`Pair<i64, Str>`, `Option<T>`) is emitted with every
-   instantiation whose bound holds, as each of its other methods is,
-   where `fmt<W>` was instantiated only when called: the compiler's code
-   grew by about a thirtieth and the library archive by about a
-   twentieth, accepted for now (delegated).  "A generic type's methods
-   emitted only when called" below would take it back.
+   `virtual mut &FormatWrite` a `Formatter` holds (423).  The
+   implementation for an instantiation of a generic type (`Pair<i64,
+   Str>`, `Option<T>`) is analysed with every instantiation whose bound
+   holds and emitted only where something reaches it, as each of its
+   other methods is; see "A generic type's methods emitted only when
+   called" below.
 3. **Every item marked.**  About 650 helpers used only in their own
    module become `private`; about 215 used across the library become
    `internal`; implementation modules become `internal module`.
    `internal` is for plumbing only the library uses; an API a program
    could build on stays public, and an item nothing calls yet is not
-   hidden for that (587).  `net::addr::sockaddr` stays public: low-level
+   hidden for that (587).  `net::address::socket_address_storage` stays public: low-level
    programming is not hidden.  The C bindings (`libc`, `syscall`, `openssl`) stay public,
    outside the 1.0 stability promise.  Tests that reach internals are
    rewritten through the public API, or deleted where they pinned only
@@ -446,8 +446,8 @@ Left over from that: the async entry point calls `Executor::new` and
    hooks are a `private extern` block.  `time`'s clocks and `Duration`
    keep their seconds and nanoseconds private behind accessors (595).
    `encoding`'s base64 and SHA-1 internals are
-   private, behind `Base64`'s methods and `sha1`.  `net::sys` is public
-   but for its own helpers, and `net::addr`, `dns` and `http` are marked
+   private, behind `Base64`'s methods and `sha1`.  `net::sys` is an
+   internal module (705), and `net::address`, `dns` and `http` are marked
    item by item (597), and the rest of `net` (599) - HTTP/2, HTTPS,
    sockets, TLS and WebSocket - so all of `net` is marked: its three
    private `push_all` copies are gone, the encoders writing
@@ -457,7 +457,7 @@ Left over from that: the async entry point calls `Executor::new` and
    attributed accessors (`length`, `capacity`, `Str::new`,
    `String::from_string`, `Location`'s four) are public.  HPACK
    is tested through `Http2Connection` against RFC 7541's examples, and
-   the heap through `GlobalAlloc` with `native_alloc` on and as the
+   the heap through `GlobalAllocator` with `native_alloc` on and as the
    allocator of an array, a hash map and a string without it.  An `internal module` line now hides its
    module from other packages whichever files a build loads, so the
    standard library's internal modules are refused at the import as a
@@ -470,11 +470,11 @@ Left over from that: the async entry point calls `Executor::new` and
    `io::error`, which is marked (612).  A float classifies itself and an
    integer rotates itself (613).  The executor, the reactor, the
    blocking pool and the channels lock with `sync`'s `Mutex` and
-   `CondVar` and start their threads through `thread`, which creates
+   `ConditionVariable` and start their threads through `thread`, which creates
    every thread one way (622), and each lock holds the state it guards
    (624).  A descriptor's non-blocking mode has one switch, and a drain
    reads through a borrowed descriptor's `read_to_end` (625).  A
-   millisecond wait rounds through `Duration.as_millis_ceil`, a deadline
+   millisecond wait rounds through `Duration.as_milliseconds_ceiling`, a deadline
    saturates through `Instant.saturating_add`, `thread::sleep` is
    `time::clock::sleep`, and a `FILETIME` becomes a `SystemTime` one way
    (626).  A process exits through `sys::exit` and shells out through
@@ -495,15 +495,17 @@ Left over from that: the async entry point calls `Executor::new` and
 
 ## A generic type's methods emitted only when called
 
-Every method of every specialization of a generic type is emitted, called
-or not, wherever its bound holds: `Array`'s unused indexing methods, and
-since `Display` and `Debug` stopped being generic, a `fmt` for every
-instantiation of `Option`, `Result`, `Pair` and the rest.  Emitting only
-the methods something reaches takes that code back for every
-specialization, not only formatting's.  It needs reachability over every
-reference to a specialization's method - codegen's own synthesized calls,
-trait-object tables and drop glue among them - where a missed one is a
-link failure.
+Built.  Every method of every specialization of a generic type is analysed
+wherever its bound holds, but an executable and the standard library's
+archive emit only the copies their code reaches: the walk runs over every
+call, every function named as a value, and every reference code
+generation makes with no call written - trait-object tables, `Drop` and
+`Allocate` implementations, operators, indexing, `?` and the releases drop
+insertion adds (`codegen/reachable_instances.cryo`).  A program linking
+the archive defines in its own objects every copy the archive's manifest
+does not list.  Any other library, and a single object, assembly or IR
+file, keeps every copy, since its callers are not in the build;
+`docs/cryo.md` states the rule.
 
 ## One dynamic array type
 
@@ -523,15 +525,11 @@ alike first.  What stays open:
 - **Operators on a generic container in a generic body** (`a + b` with
   `a: Vec<T>`) have the gap indexing had: only a bare bounded parameter is
   desugared there.
-- **Every method of an instantiated generic is emitted**, `Array`'s
-  eleven `index` and `element_at` among them, used or not: about 1% of a
-  stripped binary (373: accepted); see "A generic type's methods emitted
-  only when called".
 - **The written spelling reaches declaration mismatches only.**  An
   argument mismatch shows the parameter as `[T]` even where the parameter
   was written `Array<T>`: the check holds the types, not the annotations.
 - **The demangler prints `[T]` as the instance it is**,
-  `std::collections::array::Array<i64, std::alloc::allocator::GlobalAlloc>`.
+  `std::collections::array::Array<i64, std::alloc::allocator::GlobalAllocator>`.
 
 ## Build the compiler with LLVM optimisation, then derive `TypeKind`
 
@@ -566,8 +564,7 @@ A pointer or reference to a trait, dispatched through a table of the
 implementation's methods.  **Borrowed trait objects are built** (ruling
 360 brought them forward from ruling 286's "possibly after v1.0"; ruling
 415 placed them after the class removal); `docs/cryo.md` section 10.7
-describes them.  Left: owning boxes, upcasting, and generic
-implementations as objects.
+describes them.  Left: owning boxes and upcasting.
 
 - **Spelling:** `virtual &Shape`, `virtual mut &Shape` and
   `virtual Shape*`, a prefix as in `mut &this`; there is no `dyn` (ruling
@@ -642,10 +639,6 @@ language's features; each is a branch of its own after the merge.
 - **Primitive type names stop being keywords** (D18), and with them a cast
   followed by a comparison without parentheses, `x as u32 < y`, is refused
   and the parentheses asked for (D66).
-- **Explicit receivers** on every non-static method (D36, D65).
-- **A reference-mutability check**, run before the async lowering (D37).
-- **The `raw` subcommand builds a module graph** as `check` and `build` do
-  (D60).
 - **A checked conversion from an integer to an enum.**  `op as u8` reads an
   enum's discriminant; nothing turns a `u8` back into a variant without a
   hand-written `match`, so every wire format with an enum (WebSocket's
@@ -686,26 +679,16 @@ function keeps its single-pointer form across the C boundary.
 
 ## Moving a value out from behind a reference
 
-A field moved out of a place reached through a reference or a pointer -
-`mut old: Body = this.body;`, `match (this.opt)` by value, a generic getter
-returning a `T` field, an array field read through `node.fields` - copies an
-owning handle the place still holds, and the move checker lets it through:
-the borrowed storage is someone else's to release, and nothing records
-whether they will.  Only the destructor's own receiver is refused today
-(`E0453`; ruling 309: moving a field of `this` out inside `drop` is refused,
-full move checking waits for after the merge), because field glue certainly
-releases it again.
+A field that owns a resource, moved by value out of a place reached through
+a reference or a pointer, is refused (`E0453`) in every body, each copy of
+a generic body included, and in a closure's or an `async` function's;
+inside an `unsafe` block it is the programmer's.  The legitimate takes are
+written with `mem::swap` or `Option::take`, and a store through a reference
+releases the value it displaces.
 
-Full move checking refuses every such move, and needs a way to write the
-legitimate ones: a take that leaves a replacement behind (`mem::swap` does it
-today, in two statements) and a release of what an assignment through a
-reference overwrites, which today is not released at all.  The take-and-
-replace idiom in the standard library's `set_body`, the editor's
-`take_pending`, and `tests/tests/lang/move_field_out_ok.cryo`, which asserts
-the idiom, are the first sites it reaches.
-
-Open: whether a raw-pointer root is in scope (the compiler's own AST cloner
-moves array fields through node pointers), and the spelling of a take.
+Open: whether a raw-pointer root should stay refused outside `unsafe` (the
+compiler's own AST cloner moves array fields through node pointers), and the
+spelling of a take for an owning type that is no `Option` (below).
 
 ## `mem::replace` and `Option::take`
 
@@ -720,25 +703,16 @@ callers.
 Open: whether `Option::take` is enough on its own, or every owning type
 needs a take with a default left behind.
 
-## W0015 becomes an error
 
-An explicit destructor call, `x.drop()`, is a warning today, and the
-compiler, the standard library, the editor, the examples and the tests
-have none left outside the tests of the diagnostic itself.  The
-warning's own text says it will become an error; then `mem::drop(x)` is
-the only way to release a value early.  An ordinary method that happens to
-be named `drop` on a type with no `Drop` is not a destructor call, and is
-told apart before the warning becomes an error.
-
-Open: whether `ptr::drop_in_place` stays the spelling for releasing a
+Open: whether `pointer::drop_in_place` stays the spelling for releasing a
 value through a raw pointer.
 
 ## Typed JSON through the derive list
 
-`std::json::convert` has `ToJson` and `FromJson`, implemented for the
-primitives, `String`, `Str` (writing only), `Array<T>` and `Option<T>`
-(writing only).  A struct of its own is converted by writing both
-implementations by hand; the derive list writes them instead.
+Built.  `std::json::convert` has `ToJson` and `FromJson`, implemented for
+the primitives, `String`, `Str` (writing only), `Array<T>`, `Option<T>`,
+and a `HashMap` or `BTreeMap` keyed by `String`; the derive list writes
+both for a struct or a field-less enum, as follows.
 
 - **Spelling.**  `type struct Server with [ToJson, FromJson] { ... }`, the
   derive list that exists.  A field's options are a field directive:
@@ -766,14 +740,7 @@ implementations by hand; the derive list writes them instead.
   variant's name, `"Red"`, and read back from that string; another string
   is refused with `unexpected(Str::new("a Color"), value)`.  An enum whose
   variants carry values is out of scope for the first version, and a
-  derive on one is refused.
-
-It waits on reading an `Option` through `FromJson`, which the compiler
-refuses today (the specialization of `Option<X>`'s static `from_json`
-grows without end through `Result<Option<X>, E>`), and on the map
-implementations, `ToJson` and `FromJson` for a `HashMap` or `BTreeMap`
-keyed by `String`, which need a pin built with the fix to a trait
-implementation's head being checked before it is cloned for an instance.
+  derive on one is refused (E0318).
 
 ## libc bindings spelled as their C headers
 
@@ -782,6 +749,115 @@ Low priority.  Most of the standard library's libc bindings spell C's
 `void*` as C does.  Every binding is aligned with the C header it binds, so
 a call passes the pointer type C declares and a generic copy does not need
 a cast to reach it.
+
+## Decisions for the standard library's v1.0 shape
+
+Jake's answers to the standard library plan.  Each is binding on the work
+it names, built or not.
+
+| # | decision |
+|---|---|
+| 1 | An `Error` trait plus a concrete `ErrorReport` carrier. |
+| 2 | `IoError` holds an optional owned path; it drops and moves. |
+| 3 | Capturing closures are allowed in method position, and `move` moves locals into a closure. |
+| 4 | No `MutableSlice`: one `Slice<T>` whose mutability comes from the borrow, `&Slice<T>` reading and `mut &Slice<T>` writing; `&` is enforced read-only, `&this` included, with const pointers following. |
+| 5 | A sorted map is named by its structure: `BTreeMap`/`BTreeSet` when it is a B-tree, `SortedMap`/`SortedSet` otherwise. |
+| 6 | Logging is per-area `Logger` values plus a process-wide `Logging` configuration. |
+| 7 | Fixed and local UTC offsets are in the standard library; the time zone database is a package. |
+| 8 | Regular expressions are a package, after v1.0. |
+| 9 | `Duration` stays `u64`. |
+| 10 | The plan's new and renamed names are approved as written, `Signal.resume` included. |
+| 11 | A documentation-coverage gate, with its mutation pair. |
+| 12 | The API index is generated by a `cryo` subcommand rather than a script. |
+| 13 | `Result` is `must_use`. |
+| 14 | `Str` and `String` are in the prelude. |
+| 15 | A callable bound is written as a function type, `F: (T) -> U`; an adapter that stores a callable is generic over it. |
+| 16 | E0458 stays the code for what remains refused of closures (a function-pointer local, `virtual` dispatch, `extern "C"`, function-typed slots), its wording naming each reason. |
+| 17 | By-reference, non-escaping captures: a borrowing closure may only be passed straight to a function-typed parameter, never stored, returned or used as a type argument, and an escaping one has an error code of its own. |
+| 18 | `move` means "take ownership".  A closure without `move` borrows its captures and does not escape; a non-`Copy` capture is never moved implicitly.  Stored adapters (`map`, `filter`) take `move` closures; call-only callbacks (`for_each`, `sort_by_key`) take borrowing ones. |
+| 19 | `&x` takes its mutability from what is expected and what `x` is; there is no `mut &x` expression. |
+| 20 | `IndexMutable`/`index_mutable` and `DerefMutable`/`deref_mutable`. |
+| 21 | Three codes: a write through a read-only place, a read-only borrow where a writable one is wanted, and `Slice<T>` used as a value. |
+| 22 | `as_slice`/`as_mutable_slice`, plus the implicit conversion of an array to a slice reference through a language-item trait. |
+| 23 | `Str` stays a `Copy` read-only view value; `as_bytes()` returns `&Slice<u8>`. |
+| 24 | `Scope::spawn` accepts borrowing closures, under a rule tied to the scope. |
+| 25 | HTTPS connects by trying every resolved address in turn, IPv4 first. |
+| 26 | `SocketAddr::parse` accepts `a.b.c.d:port` and `[v6]:port`, beside `parse_v4`. |
+| 27 | An opaque `implement Trait` value is `Copy` only when the return type says `+ Copy`; the concrete type's `Copy` does not show through. |
+| 28 | Any trait method, not only a default, may return `implement Trait`, and an implementation may write its own body with its own concrete type, as a hidden associated type per implementation.  Such a method is not callable through `virtual &Trait`, and the refusal says so. |
+| 29 | One trait over every iterator yielding `T*`, implemented once for every such iterator, carries `copied` and `cloned`. |
+| 30 | The hidden associated type may carry the trait method's own type parameters, with no writable syntax.  Writable associated types with parameters (`type Name<T>;` in a trait) are a possible additive feature, perhaps after v1.0. |
+| 31 | Which cheap opaque iterators promise `+ Copy` is decided per method and reported to Jake. |
+
+The slice and API pass (item 7 under "Order to v1.0") is absorbed into this
+work: read-only `&` and const pointers, `Read` on slices, `Slice`
+finished, the `![implicit]` docs and `implement Trait` in type position.
+
+### Left to packages, or to after v1.0
+
+| domain | decision | reason |
+|---|---|---|
+| Regular expressions | package, after v1.0 | A correct linear-time engine is large, and nothing in the tree needs one. |
+| Compression (deflate, gzip, zstd) | package | Nothing in the standard library needs it; CRC32 is the piece it would share. |
+| Cryptography beyond SHA-1, SHA-256 and HMAC | package | Ciphers and signatures belong behind OpenSSL or a dedicated package.  Secure random exists (`SecureRng`). |
+| Big integers | package | Arbitrary precision is its own library. |
+| Memory-mapped files | package | Only raw `sys::mmap` exists, with no Windows arm; an owning `MappedFile` for both OSes is additive. |
+| Time zone database | package | Fixed and local offsets are in the standard library. |
+| Unicode normalization, graphemes, collation | package | |
+| Glob | package | The standard library has the recursive walk. |
+| A libc-free `core` tier for `runtime/` | after v1.0 | `runtime/` stays free of the standard library; `core::mem::copy`, `zero` and `swap` keep their names when moved. |
+| A Windows reactor for pipes (IOCP on named pipes) | after v1.0 | Async child I/O works through the blocking pool. |
+| Linked list, small vector, bit set, interner, slab | package | |
+
+## Decisions for the test infrastructure
+
+Jake's answers to the test-infrastructure plan.
+
+1. **The fuzz farm runs on both WSL and Windows**, at a quarter of the
+   cores, under a 6 GB farm-wide memory cap, between 01:00 and 07:00, and
+   pauses while `soloapps-train` runs in WSL or a full-screen application
+   is in front on Windows.  WSL runs the coverage, AddressSanitizer and
+   fork-server lanes; Windows runs the OS differential's Windows half and
+   the Windows language server.
+2. **The interpreter runs before specialisation,** with its own
+   implementation selection and layout written from the specs.
+3. **The program generator's prelude is measured first,** leaning towards
+   a minimal fuzz core.
+4. **The fuzz corpus is stored outside the repository,** with a small
+   curated seed set in `tools/CryoFuzz/seeds/`.
+5. **The fixed-seed fuzz smoke blocks verify; the farm never does.**  At
+   most 5 automatically filed bugs a night.
+6. **Integer overflow: decided as trapping in debug builds and wrapping in
+   release, NOT built.**  The compiler wraps in every profile, and
+   `docs/cryo.md` (Arithmetic Operators, "Overflow") states that rule; that
+   is the rule in force.  The decided rule would replace it, with
+   `overflow_checks` a profile key (true in `debug`, false in `release`,
+   settable in a custom profile, unchanged by `--opt-level`), and division
+   by zero and `MIN / -1` panicking in both profiles instead of faulting;
+   shifts by the width or more are decided separately.  Building it is a
+   language change that comes with its spec change.
+7. **"The last release" means the pin until 1.0, then the tags.**
+8. **The edit-fuzz gate is written in Cryo**, as the first `cryofuzz`
+   subcommand in `tools/CryoFuzz`.
+9. **The language server is a 1.0 deliverable,** so fuzzing it is
+   required.
+10. **The property framework** is `std::test::property`, with the
+    `Property` trait, `run`, and `CRYO_PROPERTY_SEED`.
+11. **A recursive directory walk and a child's peak memory are public
+    standard-library API.**  Job objects and shared memory stay private to
+    `tools/CryoFuzz`.
+12. **The Python gates stay for now; the goal is to drop Python
+    altogether** once the new infrastructure can replace them, possibly
+    after 1.0.
+13. **A bug found while building is filed and building continues,** unless
+    its fix is genuinely very easy.
+14. **The interpreter is internal to `tools/CryoFuzz` for 1.0;** there is no
+    public `cryo interp`.
+15. **Ported gates live in a second binary, `cryogate`,** in the
+    `tools/CryoFuzz` project, sharing its library.
+16. **`legacy/` is frozen:** not ported, not deleted, not edited.
+17. **The wrapping arithmetic names** are `wrapping_add`,
+    `wrapping_subtract`, `wrapping_multiply` and `wrapping_negate`.
 
 ## Open questions
 
