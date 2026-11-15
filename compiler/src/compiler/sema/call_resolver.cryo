@@ -3835,15 +3835,7 @@ type struct CallResolver {
             const t: const TemplateEntry* = this.ctx.generic_registry.template_of(f.def);
             if (t == null || t.kind != TemplateKind::Function) { continue; }
             if (!this.template_fits(t, call, null, arg_types)) { continue; }
-            // A generic whose where-clause the arguments fail does not
-            // accept them.
-            const binds: [TypeRef] = this.template_call_bindings(call, null, t, f_decl);
-            mut unmet_arg: TypeRef = TypeRef::invalid();
-            mut unmet_trait: SymbolStr = SymbolStr::empty();
-            const no_owner: TypeSubstitution = TypeSubstitution::empty();
-            if (this.unmet_call_bound(f_decl, &t.param_syms, &binds, &no_owner, &unmet_arg, &unmet_trait) != null) {
-                continue;
-            }
+            if (this.where_bound_refuses(call, null, t)) { continue; }
             generics.push(entries[i]);
         }
         if (!plain.is_valid() || generics.length() == 0) { return false; }
@@ -3862,6 +3854,19 @@ type struct CallResolver {
             leaf));
         this.ctx.emit_diagnostic(d);
         return true;
+    }
+
+    /// Whether a where-clause bound of the generic function `t`, called
+    /// through `scope` (null for a free function), is unmet by the types
+    /// `call` binds its parameters to: a generic so refused does not accept
+    /// the call, so it ties with no other candidate.  A bound still abstract
+    /// in the arguments refuses nothing.
+    where_bound_refuses(mut &this, call: CallExpr*, scope: ScopeResolutionExpr*, t: const TemplateEntry*) -> boolean {
+        const binds: [TypeRef] = this.template_call_bindings(call, scope, t, t.ast_node);
+        mut unmet_arg: TypeRef = TypeRef::invalid();
+        mut unmet_trait: SymbolStr = SymbolStr::empty();
+        const no_owner: TypeSubstitution = TypeSubstitution::empty();
+        return this.unmet_call_bound(t.ast_node, &t.param_syms, &binds, &no_owner, &unmet_arg, &unmet_trait) != null;
     }
 
     /// E0214 for a call to an overloaded family that no signature of the
@@ -8591,18 +8596,35 @@ type struct CallResolver {
     /// not outrank a generic one for being non-generic, and no generic
     /// method outranks another.  The non-generic entry, when there is one,
     /// is answered so the tie is the one error the call reports; invalid
-    /// otherwise.
+    /// otherwise.  A generic method whose where-clause the arguments fail
+    /// does not accept them (`where_bound_refuses`): when that leaves one
+    /// inherent entry, it is answered and there is no tie.
     report_static_generic_tie(mut &this, fits: &[OverloadId], path_e: ExpressionNode*,
                               path: ScopeResolutionExpr*, call_e: ExpressionNode*, call: CallExpr*,
                               owner: FamilyOwner) -> OverloadId {
         mut plain: OverloadId = OverloadId::invalid();
+        mut plains: i64 = 0;
+        mut refused: i64 = 0;
         mut generics: [OverloadId] = [];
         for (mut i: i64 = 0; i < fits.length(); i++) {
             if (this.ctx.decl_index.entry_trait(fits[i]).is_valid()) { continue; }
             const m_decl: DeclarationNode* = this.ctx.decl_index.entry_method(fits[i]);
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
-            if (DeclarationNode::fn_of(m.func).generic_params.length() > 0) { generics.push(fits[i]); } else { plain = fits[i]; }
+            if (DeclarationNode::fn_of(m.func).generic_params.length() == 0) {
+                plain = fits[i];
+                plains = plains + 1;
+                continue;
+            }
+            const t: const TemplateEntry* = this.static_entry_template(fits[i]);
+            if (call != null && t != null && this.where_bound_refuses(call, path, t)) {
+                refused = refused + 1;
+                continue;
+            }
+            generics.push(fits[i]);
+        }
+        if (refused > 0 && plains + generics.length() == 1) {
+            return if (plain.is_valid()) { plain } else { generics[0] };
         }
         if (generics.length() == 0 || (!plain.is_valid() && generics.length() < 2)) { return OverloadId::invalid(); }
         const leaf: string = if (path != null) { this.intern.resolve(path.member_name) } else { "" };

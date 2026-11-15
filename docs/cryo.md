@@ -3430,7 +3430,7 @@ const b: Box2 = Box2 { v: 0 };
 const n: i32 = b.put(1);    // error: both `put`s apply
 ```
 
-A static method is chosen the same way, its generic overloads by the type arguments its arguments (or its turbofish) bind. With `conv<U>(u: U)` and `conv<U>(u: U, w: U)` on `Plain`, `Plain::conv(7, 9)` calls the second. A static call two overloads accept is E0154, whether both are generic or one is not, and a call none accepts is E0214.
+A static method is chosen the same way, its generic overloads by the type arguments its arguments (or its turbofish) bind. With `conv<U>(u: U)` and `conv<U>(u: U, w: U)` on `Plain`, `Plain::conv(7, 9)` calls the second. A static call two overloads accept is E0154, whether both are generic or one is not, and a call none accepts is E0214. A generic overload whose `where` clause the arguments fail does not accept them, as for a free function: with `h<U>(u: U) where U: Shout` and `h(u: i32)` on `P`, and an `x: i32`, `P::h(x)` calls the second.
 
 **A receiver that is a reference.** A call's receiver is a `&X` - written so, or an `X` the call borrows - and the methods of `X` itself come first: when `X` is a reference, those an implementation for references ([section 10.2](#102-implementing-a-trait)) gives it. Only when `X` has no method of the name is the reference looked through, and the referent asked the same way, one step at a time. So `r.describe()` with `r: &i64` is `i64`'s `describe` (`X` is `i64`), while `rr.describe()` with `rr: & &i64` is the `describe` of `Describe for &T` (`X` is `&i64`), and with `rrr: & & &i64` the same implementation's at `X = & &i64`. A call a bound answers in a generic body names the method of the type the parameter becomes, the same way, even when that type is a reference.
 
