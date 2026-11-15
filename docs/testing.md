@@ -498,6 +498,10 @@ run in CI on every push and pull request to `main`.
 
 ### Declaring what a change moves
 
+`make verify` runs its gates concurrently; `ARGS="--sequential"` runs them
+one after another, for a host whose memory cannot hold them all at once.
+The gates and their verdicts are the same either way.
+
 `make verify ARGS="--baseline REV --require-identical"` compares every
 compiled object against the compiler built from `REV`, and fails on any
 program whose verdict or objects differ unless the change declares it.  A
