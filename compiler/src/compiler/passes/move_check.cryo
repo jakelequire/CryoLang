@@ -295,12 +295,6 @@ type struct MoveChecker {
     /// releases it twice (`check_destructor_field_move_out`).
     drop_receiver: SymbolID;
 
-    /// The receiver of the function being walked when that function is a
-    /// method marked `![sink]`, invalid otherwise: such a method owns its
-    /// receiver although it is written `&this` or `mut &this`, so reading it
-    /// whole is a transfer (`check_reference_binding_move_out`).
-    consumed_receiver: SymbolID;
-
     /// The bindings of the function being walked that name a closure's
     /// captures inside its `__call__`.  The closure keeps - or borrows - each
     /// for every call, so none may be moved out (`emit_capture_move_out`).
@@ -373,7 +367,6 @@ type struct MoveChecker {
             unsafe_depth:        0,
             arg_binding_unknown: false,
             drop_receiver:       SymbolID::invalid(),
-            consumed_receiver:   SymbolID::invalid(),
             capture_alias_keys:    [],
             borrow_closures:       [],
             borrow_keys:           [],
@@ -390,7 +383,7 @@ type struct MoveChecker {
         };
     }
 
-    enter_function(mut &this, func_decl: DeclarationNode*, receiver_consumed: boolean) -> void {
+    enter_function(mut &this, func_decl: DeclarationNode*) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         this.copy_params = [];
         for (mut i: i64 = 0; i < this.owner_copy_params.length(); i++) {
@@ -422,7 +415,6 @@ type struct MoveChecker {
         this.unsafe_depth       = 0;
         this.arg_binding_unknown = false;
         this.drop_receiver       = SymbolID::invalid();
-        this.consumed_receiver   = SymbolID::invalid();
         this.capture_alias_keys    = [];
         this.borrow_closures       = [];
         this.borrow_keys           = [];
@@ -441,7 +433,6 @@ type struct MoveChecker {
             if (param == null) { continue; }
             this.register_binding(param.sym_id, param.resolved_type, param.name, param_decl.span);
             if (is_destructor && param.is_receiver()) { this.drop_receiver = param.sym_id; }
-            if (receiver_consumed && param.is_receiver()) { this.consumed_receiver = param.sym_id; }
         }
     }
 
@@ -1200,13 +1191,13 @@ type struct MoveChecker {
         this.owner_copy_params = [];
         match (stmt.kind) {
             DeclKind::Function(_) => {
-                this.walk_function(stmt, false);
+                this.walk_function(stmt);
             }
             DeclKind::Trait(td) => {
                 for (mut i: i64 = 0; i < td.methods.length(); i++) {
                     const m_decl: DeclarationNode* = td.methods[i];
                     const m: FunctionDecl* = DeclarationNode::fn_of(m_decl);
-                    if (m != null) { this.walk_function(m_decl, false); }
+                    if (m != null) { this.walk_function(m_decl); }
                 }
             }
             DeclKind::Union(ud) => {
@@ -1243,18 +1234,18 @@ type struct MoveChecker {
             const m_decl: DeclarationNode* = methods[i];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
-            this.walk_function(m.func, m.is_sink);
+            this.walk_function(m.func);
         }
     }
 
-    walk_function(mut &this, func_decl: DeclarationNode*, receiver_consumed: boolean) -> void {
+    walk_function(mut &this, func_decl: DeclarationNode*) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
         if (func.is_generic()) { return; }
         if (Log::enabled(LogArea::Drop, LogLevel::Trace)) {
             Log::trace(LogArea::Drop, f"move checking function '{this.intern.resolve(func.name)}'");
         }
-        this.enter_function(func_decl, receiver_consumed);
+        this.enter_function(func_decl);
         this.walk_stmt(func.body);
     }
 
@@ -1929,7 +1920,7 @@ type struct MoveChecker {
         }
         // Method call to a consuming method: treat the receiver
         // (`x` in `x.method(...)`) as moved.  Without this, a method
-        // declared `mut this` or marked `![sink]` would still
+        // declared `this` or `mut this` would still
         // appear as a borrow at the call site, since the LHS of a
         // member-access defaults to `walk_expr_read`.  Resolved-method
         // is null for free functions, scope-resolution calls, and
@@ -1943,7 +1934,7 @@ type struct MoveChecker {
         if (OwnershipQuery::call_consumes_receiver(this.arena, this.intern, this.ctx.decl_index, c)) {
             const ma: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
             if (ma.object != null) {
-                // A consuming receiver (`mut this` / `![sink]`) is a
+                // A consuming receiver (`this` / `mut this`) is a
                 // real move: the value is taken and dropped by the
                 // callee, so a loop-carried receiver double-frees.
                 this.walk_expr_move(ma.object, true);
@@ -2630,14 +2621,13 @@ type struct MoveChecker {
     /// by its implicit dereference: the caller gets a second owner of the
     /// storage the receiver names, and both are released.  It is the read
     /// `check_deref_move_out` refuses for a written `*p`, with the same
-    /// `unsafe` escape for a deliberate take.  A method marked `![sink]` owns
-    /// its receiver, so its `return this;` is the transfer it declares.
+    /// `unsafe` escape for a deliberate take.  A by-value `this` is not a
+    /// reference, so its `return this;` is an ordinary move.
     check_reference_binding_move_out(mut &this, expr: ExpressionNode*) -> void {
         if (this.unsafe_depth > 0 || this.arg_binding_unknown) { return; }
         const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
         if (id == null) { return; }
         const sym: SymbolID = id.res.local_sym();
-        if (this.consumed_receiver.is_valid() && sym.equals(this.consumed_receiver)) { return; }
         const declared: TypeRef = this.lookup_type(sym);
         if (!declared.is_valid() || !this.is_ptr_or_ref(declared)) { return; }
         const value_ty: TypeRef = expr.resolved_type;

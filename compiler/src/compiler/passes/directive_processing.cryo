@@ -208,12 +208,6 @@ type struct DirectiveProcessingPasses {
             "inline" | "noinline" | "caller_location" | "entry" | "test" | "ignore"
             | "should_panic" | "test_child" | "config" | "deprecated" | "align"
             | "repr" | "link" | "symbol" | "target" | "allow" | "warn" | "deny"
-            // `![sink]`: marks a method as consuming its receiver.
-            // Tells move-check / drop-insertion to treat the call as moving
-            // the receiver, even when the receiver is syntactically `&this`
-            // or `mut &this`.  Used for methods that semantically take
-            // ownership but want the borrow-style call ergonomics.
-            | "sink"
             // `![implicit]`: lets the inference engine recover omitted generic
             // type args at a call site by unifying the callee's return type
             // against the call's expected type (return-type-driven inference).
@@ -308,19 +302,6 @@ type struct DirectiveProcessingPasses {
                 }
                 if (target != DirectiveTarget::Function) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "function", target);
-                }
-            }
-
-            // `![sink]`: zero args; method-target only.  Static-method
-            // and missing-receiver checks need the MethodDecl and its
-            // FunctionDecl, so they live in the per-decl loop in
-            // run_directive_processing where we already have the decl pointer.
-            "sink" => {
-                if (argc != 0) {
-                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
-                }
-                if (target != DirectiveTarget::Method) {
-                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "method", target);
                 }
             }
 
@@ -910,7 +891,7 @@ type struct DirectiveProcessingPasses {
                     "should_panic", "test_child", "config", "deprecated", "align",
                     "repr", "link", "symbol", "no_mangle", "weak", "naked", "section",
                     "target", "allow", "warn", "deny",
-                    "sink", "implicit", "functions_only",
+                    "implicit", "functions_only",
                     "windows", "linux", "macos", "unix", "not", "language", "must_use"
                 ];
                 // The parser stamps `dir.span` over the whole `![name(args)]`
@@ -1081,7 +1062,6 @@ type struct DirectiveProcessingPasses {
     /// Currently:
     ///   ![inline]         -> sets FunctionDecl.is_inline = true
     ///   ![noinline]       -> sets FunctionDecl.is_noinline = true
-    ///   ![sink]           -> sets MethodDecl.is_sink = true
     ///   ![repr(C|packed|transparent)] -> sets repr_* flags on struct/enum decl
     ///   ![align(N)]       -> sets min_alignment on struct/enum decl
     static apply_effects(ctx: mut CompilationContext*, dir: DirectiveNode*,
@@ -1242,40 +1222,6 @@ type struct DirectiveProcessingPasses {
         if (DeclarationNode::method_of(decl) != null) {
             const m_decl: DeclarationNode* = decl;
             const m: mut MethodDecl* = DeclarationNode::method_of(m_decl);
-            if (name.eq("sink")) {
-                // Reject placement on a static method: static methods have
-                // no receiver, so "consumes the receiver" is meaningless.
-                if (m.is_static) {
-                    const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
-                    const msg: string =
-                        "directive `![sink]` cannot be applied to a static method (no receiver)";
-                    mut diag: Diagnostic = Diagnostic::error(code, msg);
-                    diag = diag.at(dir.span);
-                    diag = diag.suggest(Suggestion::machine_applicable(
-                        dir.span, "",
-                        "remove the `![sink]` directive"));
-                    ctx.emit_diagnostic(diag);
-                    return;
-                }
-                // Reject placement on a method with zero parameters.  Sema
-                // enforces that the first parameter is named `this` for
-                // non-static methods, so a zero-parameter method is missing
-                // its receiver entirely.
-                if (m.func == null || DeclarationNode::fn_of(m.func).parameters.length() == 0) {
-                    const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
-                    const msg: string =
-                        "directive `![sink]` requires a method with a `this` receiver";
-                    mut diag: Diagnostic = Diagnostic::error(code, msg);
-                    diag = diag.at(dir.span);
-                    diag = diag.suggest(Suggestion::machine_applicable(
-                        dir.span, "",
-                        "remove the `![sink]` directive"));
-                    ctx.emit_diagnostic(diag);
-                    return;
-                }
-                m.is_sink = true;
-                return;
-            }
             if (name.eq("implicit")) {
                 if (m.func != null) { DeclarationNode::fn_of(m.func).is_implicit = true; }
                 return;
@@ -1476,7 +1422,7 @@ type struct DirectiveProcessingPasses {
             // Note: do NOT `continue` when ad_count == 0; the method
             // descent below still needs to run for struct/impl decls
             // whose own attached_directives are empty but whose method
-            // members carry their own (e.g. `![sink]`).
+            // members carry their own (e.g. `![inline]`).
 
             for (mut j: i64 = 0; j < ad_count; j++) {
                 const d: DirectiveNode* = decl.attached_directives[j];
@@ -1533,7 +1479,7 @@ type struct DirectiveProcessingPasses {
 
             // Descend into method lists on structs/impls.  The
             // top-level loop above only sees the container; per-method
-            // directives like `![sink]` live on each MethodDecl
+            // directives like `![inline]` live on each MethodDecl
             // and must be validated + applied here.  Methods on traits
             // are [DeclarationNode*] (no MethodDecl wrapper) and don't
             // currently carry directives; if that changes, fold them in.

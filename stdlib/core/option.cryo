@@ -9,7 +9,6 @@ import std::core::intrinsics;
 import std::core::clone::{ Clone };
 import std::core::cmp::{ Eq };
 import std::core::default::{ Default };
-import std::core::mem;
 import std::core::result::{ Result };
 import std::collections::pair::{ Pair };
 import std::core::ops::{ ControlFlow, FromResidual, Try };
@@ -57,8 +56,8 @@ implement enum Option<T> {
 
     /// Borrow the contained value in place, read-only: `Some(v)` ->
     /// `Some(&v)`, `None` -> `None`. The pointer aliases the receiver's
-    /// payload (no copy is made), so unlike the consuming accessors this is
-    /// NOT `![sink]` - the receiver stays live and keeps ownership of `T`.
+    /// payload (no copy is made), so unlike the consuming accessors this
+    /// borrows the receiver, which stays live and keeps ownership of `T`.
     /// The pointer is valid only while the receiver outlives it and is
     /// invalidated by anything that moves or overwrites the receiver.
     /// `as_mutable_reference` is the writable form.
@@ -88,8 +87,7 @@ implement enum Option<T> {
 
     /// Borrow the contained value in place, aborting on `None`. Like `as_reference`
     /// the pointer aliases the receiver's payload rather than copying it, so
-    /// the receiver keeps ownership of `T` and this is NOT `![sink]`; the
-    /// pointer is invalidated by anything that moves or overwrites the
+    /// the receiver keeps ownership of `T`; the pointer is invalidated by anything that moves or overwrites the
     /// receiver.
     ///
     /// Returns a bare `T*` where `as_mutable_reference` returns `Option<T*>`. Beyond
@@ -109,16 +107,11 @@ implement enum Option<T> {
     }
 
     /// Return the inner value, aborting on `None`. Prefer `unwrap_or` or
-    /// a `match` in code that must not panic.
-    ///
-    /// `![sink]`: the match-arm binding copies the payload out of
-    /// the receiver, so the receiver must be treated as moved at the call
-    /// site - otherwise both the returned value and the still-live receiver
-    /// would be dropped, double-freeing an owning `T` (`String`, `Box`, ...).
-    ![sink]
+    /// a `match` in code that must not panic. Consumes the option: the
+    /// value moves out to the caller.
     ![language("option_unwrap")]
-    public unwrap(&this) -> T {
-        match (&this) {
+    public unwrap(this) -> T {
+        match (this) {
             Option::Some(value) => { return value; }
             Option::None => {
                 core::panic("called Option::unwrap() on a None value", intrinsics::location());
@@ -128,9 +121,8 @@ implement enum Option<T> {
 
     /// Like `unwrap`, but with a caller-supplied message describing the
     /// invariant the caller believed held.
-    ![sink]
-    public expect(&this, message: string) -> T {
-        match (&this) {
+    public expect(this, message: string) -> T {
+        match (this) {
             Option::Some(value) => { return value; }
             Option::None => {
                 core::panic(message, intrinsics::location());
@@ -141,9 +133,8 @@ implement enum Option<T> {
     /// The value, or `default_value` when the option is `None`. Consumes
     /// the option; `default_value` is evaluated whether it is used or not
     /// (see `unwrap_or_else` to compute it only when needed).
-    ![sink]
-    public unwrap_or(&this, default_value: T) -> T {
-        match (&this) {
+    public unwrap_or(this, default_value: T) -> T {
+        match (this) {
             Option::Some(value) => { return value; }
             Option::None => { return default_value; }
         }
@@ -151,9 +142,8 @@ implement enum Option<T> {
 
     /// Use this when the default is expensive and shouldn't be computed
     /// in the `Some` case.
-    ![sink]
-    public unwrap_or_else<F>(&this, default_fn: F) -> T where F: () -> T {
-        match (&this) {
+    public unwrap_or_else<F>(this, default_fn: F) -> T where F: () -> T {
+        match (this) {
             Option::Some(value) => { return value; }
             Option::None => { return default_fn(); }
         }
@@ -165,18 +155,16 @@ implement enum Option<T> {
     /// ```cryo
     /// const wide: Option<i64> = half(10).map((h: i32) -> i64 { return h as i64; });
     /// ```
-    ![sink]
-    public map<U, F>(&this, f: F) -> Option<U> where F: (T) -> U {
-        match (&this) {
+    public map<U, F>(this, f: F) -> Option<U> where F: (T) -> U {
+        match (this) {
             Option::Some(value) => { return Option::Some(f(value)); }
             Option::None => { return Option::None; }
         }
     }
 
     /// Monadic bind: chain operations each of which may be absent.
-    ![sink]
-    public and_then<U, F>(&this, f: F) -> Option<U> where F: (T) -> Option<U> {
-        match (&this) {
+    public and_then<U, F>(this, f: F) -> Option<U> where F: (T) -> Option<U> {
+        match (this) {
             Option::Some(value) => { return f(value); }
             Option::None => { return Option::None; }
         }
@@ -184,8 +172,7 @@ implement enum Option<T> {
 
     /// This option when it is `Some`; otherwise the option `f` returns.
     /// `f` is called only for `None`. Consumes the option.
-    ![sink]
-    public or_else<F>(&this, f: F) -> Option<T> where F: () -> Option<T> {
+    public or_else<F>(this, f: F) -> Option<T> where F: () -> Option<T> {
         match (&this) {
             Option::Some(_) => { return this; }
             Option::None => { return f(); }
@@ -220,9 +207,8 @@ implement enum Option<T> {
     }
 
     /// `Some(v)` -> `Ok(v)`; `None` -> `Err(err)`.
-    ![sink]
-    public ok_or<E>(&this, err: E) -> Result<T, E> {
-        match (&this) {
+    public ok_or<E>(this, err: E) -> Result<T, E> {
+        match (this) {
             Option::Some(value) => { return Result::Ok(value); }
             Option::None => { return Result::Err(err); }
         }
@@ -235,9 +221,8 @@ implement enum Option<T> {
     /// ```cryo
     /// const h: i32 = half(n).ok_or_else(() -> Str { return Str::new("an odd number"); })?;
     /// ```
-    ![sink]
-    public ok_or_else<E, F>(&this, err_fn: F) -> Result<T, E> where F: () -> E {
-        match (&this) {
+    public ok_or_else<E, F>(this, err_fn: F) -> Result<T, E> where F: () -> E {
+        match (this) {
             Option::Some(value) => { return Result::Ok(value); }
             Option::None => { return Result::Err(err_fn()); }
         }
@@ -271,14 +256,12 @@ implement enum Option<T> {
 
     /// The option itself when it is `Some` and the predicate holds for the
     /// value; `None` otherwise, releasing a refused value.
-    ![sink]
-    public filter<P>(&this, predicate: P) -> Option<T> where P: (&T) -> boolean {
-        match (&this) {
+    public filter<P>(this, predicate: P) -> Option<T> where P: (&T) -> boolean {
+        match (this) {
             Option::Some(value) => {
                 if (predicate(&value)) {
                     return Option::Some(value);
                 }
-                mem::drop(value);
                 return Option::None;
             }
             Option::None => { return Option::None; }
@@ -286,9 +269,8 @@ implement enum Option<T> {
     }
 
     /// The function applied to the value, or `default_value` for `None`.
-    ![sink]
-    public map_or<U, F>(&this, default_value: U, f: F) -> U where F: (T) -> U {
-        match (&this) {
+    public map_or<U, F>(this, default_value: U, f: F) -> U where F: (T) -> U {
+        match (this) {
             Option::Some(value) => { return f(value); }
             Option::None => { return default_value; }
         }
@@ -296,9 +278,8 @@ implement enum Option<T> {
 
     /// The function applied to the value, or `default_function`'s result for
     /// `None`; the default is computed only when it is needed.
-    ![sink]
-    public map_or_else<U, D, F>(&this, default_function: D, f: F) -> U where D: () -> U, F: (T) -> U {
-        match (&this) {
+    public map_or_else<U, D, F>(this, default_function: D, f: F) -> U where D: () -> U, F: (T) -> U {
+        match (this) {
             Option::Some(value) => { return f(value); }
             Option::None => { return default_function(); }
         }
@@ -306,21 +287,16 @@ implement enum Option<T> {
 
     /// `other` when this option is `Some`, `None` otherwise. This option's
     /// value is released either way.
-    ![sink]
-    public and<U>(&this, other: Option<U>) -> Option<U> {
-        match (&this) {
-            Option::Some(value) => {
-                mem::drop(value);
-                return other;
-            }
+    public and<U>(this, other: Option<U>) -> Option<U> {
+        match (this) {
+            Option::Some(_) => { return other; }
             Option::None => { return Option::None; }
         }
     }
 
     /// This option when it is `Some`, `other` otherwise.
-    ![sink]
-    public or(&this, other: Option<T>) -> Option<T> {
-        match (&this) {
+    public or(this, other: Option<T>) -> Option<T> {
+        match (this) {
             Option::Some(value) => { return Option::Some(value); }
             Option::None => { return other; }
         }
@@ -328,14 +304,12 @@ implement enum Option<T> {
 
     /// The one of the two options that is `Some`, when exactly one is;
     /// `None` when both or neither are, releasing both values.
-    ![sink]
-    public xor(&this, other: Option<T>) -> Option<T> {
-        match (&this) {
+    public xor(this, other: Option<T>) -> Option<T> {
+        match (this) {
             Option::Some(value) => {
                 if (other.is_none()) {
                     return Option::Some(value);
                 }
-                mem::drop(value);
                 return Option::None;
             }
             Option::None => { return other; }
@@ -344,16 +318,12 @@ implement enum Option<T> {
 
     /// Both values as a `Pair` when both options are `Some`; `None`
     /// otherwise, releasing whichever value there was.
-    ![sink]
-    public zip<U>(&this, other: Option<U>) -> Option<Pair<T, U>> {
-        match (&this) {
+    public zip<U>(this, other: Option<U>) -> Option<Pair<T, U>> {
+        match (this) {
             Option::Some(value) => {
                 match (other) {
                     Option::Some(other_value) => { return Option::Some(Pair::new(value, other_value)); }
-                    Option::None => {
-                        mem::drop(value);
-                        return Option::None;
-                    }
+                    Option::None => { return Option::None; }
                 }
             }
             Option::None => { return Option::None; }
@@ -361,9 +331,8 @@ implement enum Option<T> {
     }
 
     /// The value, or `T::default()` for `None`.
-    ![sink]
-    public unwrap_or_default(&this) -> T where T: Default {
-        match (&this) {
+    public unwrap_or_default(this) -> T where T: Default {
+        match (this) {
             Option::Some(value) => { return value; }
             Option::None => { return T::default(); }
         }
@@ -371,8 +340,7 @@ implement enum Option<T> {
 
     /// Lend the value to `f` when there is one, then give the option back
     /// unchanged.
-    ![sink]
-    public inspect<F>(&this, f: F) -> Option<T> where F: (&T) -> void {
+    public inspect<F>(this, f: F) -> Option<T> where F: (&T) -> void {
         match (&this) {
             Option::Some(value) => { f(&value); }
             Option::None => { }
@@ -385,9 +353,8 @@ implement<T> enum Option<Option<T>> {
     /// The option a `Some` holds, or `None`: `Some(Some(4))` flattens to
     /// `Some(4)`, and `Some(None)` and `None` both to `None`. Consumes the
     /// option.
-    ![sink]
-    public flatten(&this) -> Option<T> {
-        match (&this) {
+    public flatten(this) -> Option<T> {
+        match (this) {
             Option::Some(inner) => { return inner; }
             Option::None => { return Option::None; }
         }
