@@ -174,6 +174,7 @@ type struct TypeMapper {
             const arr: ArrayType* = t.as_array();
             return this.natural_align(arr.element, depth + 1);
         }
+        if (t.kind == TypeKind::Enum) { return this.enum_natural_align(t.as_enum()); }
         if (t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t.as_instantiated();
             if (inst.has_resolved_type()) { return this.natural_align(inst.resolved_type, depth + 1); }
@@ -641,7 +642,7 @@ type struct TypeMapper {
     }
 
     map_enum(mut &this, t: EnumType*) -> LType {
-        if (t.is_simple_enum()) {
+        if (t.lowers_to_its_tag()) {
             return this.enum_tag_ltype(t);
         }
 
@@ -702,20 +703,48 @@ type struct TypeMapper {
         }
         const elem_count: u32 = (padded_payload / elem_align) as u32;
 
-        // { i32 tag, [elem_count x elem_ty] payload }.  ADT enums ALWAYS
+        // { tag, [elem_count x elem_ty] payload }.  ADT enums ALWAYS
         // lower to a struct so `build_enum_variant` can struct-gep the
         // tag field at index 0 and the payload at index 1.  When every
         // variant's payload is zero-sized, elem_count=0 keeps the layout
-        // as a 2-field struct rather than collapsing to a raw i32.
-        const i32_ty: LType = LType::i32();
-        const buf: mut void* = libc::malloc(16);
+        // as a 2-field struct rather than collapsing to a raw tag.  An
+        // `![align(N)]` rounds the enum's size up to N, and an LLVM struct
+        // has no alignment of its own: a `[pad x i8]` filler at index 2
+        // gives the body the size the front end reports.
+        const buf: mut void* = libc::malloc(24);
         const slots: mut (mut void*)* = buf as mut (mut void*)*;
-        slots[0] = i32_ty.raw;
+        slots[0] = this.enum_tag_ltype(t).raw;
         const payload_ty: LType = LType::array_of(elem_ty, elem_count);
         slots[1] = payload_ty.raw;
-        const result: LType = LType::literal_struct(buf, 2, false);
+        const pad: u64 = this.tail_padding_for(t.computed_size, buf, 2, false);
+        mut count: u32 = 2;
+        if (pad > 0) {
+            slots[2] = LType::array_of(LType::i8(), pad as u32).raw;
+            count = 3;
+        }
+        const result: LType = LType::literal_struct(buf, count, false);
         libc::free(buf);
         return result;
+    }
+
+    /// The alignment LLVM gives an enum's lowered value, as `natural_align`
+    /// answers it for a struct: the tag's and the payload elements', never
+    /// the `![align(N)]` the filler carries.
+    enum_natural_align(&this, t: EnumType*) -> u64 {
+        mut a: u64 = 4;
+        if (t.is_simple_enum() && t.discriminant_type.is_valid()) {
+            const dt: Type* = this.arena.lookup(t.discriminant_type);
+            if (dt != null && dt.alignment() > 0) { a = dt.alignment(); }
+        }
+        for (mut i: i64 = 0; i < t.variants.length(); i++) {
+            const v: &EnumVariantInfo = &t.variants[i];
+            if (!v.has_payload()) { continue; }
+            mut v_total: u64 = 0;
+            mut v_align: u64 = 1;
+            this.arena.variant_payload_layout(v, &v_total, &v_align);
+            if (v_align > a) { a = v_align; }
+        }
+        return a;
     }
 
 

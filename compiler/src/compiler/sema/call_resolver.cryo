@@ -4321,6 +4321,10 @@ type struct CallResolver {
             this.binding.default_copy_bound_return(obj_type, member.member, &copied);
             if (copied.named().is_valid()) { this.stamp_trait_item(member, copied.named()); }
         }
+        if (!member.resolved_trait.is_valid()) {
+            const own: DefId = this.binding.default_copy_own_trait(obj_type, member.member);
+            if (own.is_valid()) { this.stamp_trait_item(member, own); }
+        }
 
         if (base_t == null) { return Selection::none(); }
         mut methods_ref: &Slice<MethodInfo> = Slice::<MethodInfo>::from_raw(null, 0);
@@ -4603,13 +4607,23 @@ type struct CallResolver {
     /// each implementation selected by (trait, type), in registration order,
     /// then its method at the position the call recorded.  A trait
     /// implemented at several arguments (`Mul<f32, V>` and `Mul<V, V>` for
-    /// `V`) has an implementation, and an answer, for each.  Empty when the
-    /// call recorded no position or no implementation is selected.
+    /// `V`) has an implementation, and an answer, for each - except in a
+    /// method one of them holds, its own or a default it copies, where the
+    /// trait's `This` is that implementation's at its arguments and the
+    /// answer is its method alone.  Empty when the call recorded no
+    /// position or no implementation is selected.
     trait_item_answers(&this, member: MemberAccessExpr*, recv: TypeRef) -> [DeclarationNode*] {
         mut out: [DeclarationNode*] = [];
         if (member.resolved_trait_slot < 0) { return out; }
-        const heads: [DeclarationNode*] = this.ctx.generic_registry.heads_for(
+        mut heads: [DeclarationNode*] = this.ctx.generic_registry.heads_for(
             member.resolved_trait, recv, this.intern);
+        for (mut i: i64 = 0; i < heads.length(); i++) {
+            if (MethodDecl::holds_function(heads[i], this.state.current_func)) {
+                const own: DeclarationNode* = heads[i];
+                heads = [own];
+                break;
+            }
+        }
         for (mut i: i64 = 0; i < heads.length(); i++) {
             const m: DeclarationNode* = this.ctx.generic_registry.trait_item_method(
                 DeclarationNode::impl_of(heads[i]), member.resolved_trait_slot);
@@ -8197,10 +8211,11 @@ type struct CallResolver {
     /// as the method form `r.next()` does.  Reported only when an entry
     /// accepts every argument once the mutability of a reference is set
     /// aside; a wrong count or type is the argument checks' to report.
-    /// Silent during a symbolic generic-body walk.
+    /// Reported in a generic body's template walk too: a shared reference
+    /// is shared in every copy, and the copies are not checked again, so a
+    /// call left unpinned there reaches code generation unbound.
     report_shared_for_exclusive(mut &this, call: CallExpr*, scope: ScopeResolutionExpr*,
                                 entries: &[OverloadId], arg_types: &[TypeRef]) -> void {
-        if (this.state.in_symbolic_check) { return; }
         for (mut ei: i64 = 0; ei < entries.length(); ei++) {
             const et: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entries[ei]));
             if (et == null || et.kind != TypeKind::Function) { continue; }

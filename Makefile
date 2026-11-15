@@ -235,7 +235,8 @@ Tests and gates
   make verify            Build once; census, examples, lsp-check, cross-check,
                          incremental-instance-check and check-fast run
                          concurrently and their objects are hashed
-                         (ARGS="--baseline HEAD --require-identical").
+                         (ARGS="--baseline HEAD --require-identical";
+                         --sequential runs them one at a time).
   make check-fast        verify's self-test and verify-pin; builds nothing.
   make verify-selftest   verify's judges and verify-pin's checks, driven
                          through fixtures they must accept and refuse.

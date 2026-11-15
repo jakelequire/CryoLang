@@ -24,7 +24,8 @@ api-index-check` fails if it is stale.
 make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS and unit/project NAMES asserted
-make verify              # build once; census, examples, lsp, cross, incr, check-fast CONCURRENTLY,
+make verify              # build once; census, examples, lsp, cross, incr, check-fast CONCURRENTLY
+                         # (ARGS="--sequential": one at a time, for a host short of memory),
                          # objects hashed; ARGS="--baseline HEAD --require-identical" proves
                          # a change moved no compiled output (baseline built in .verify/, cached;
                          # its results recorded per program, so a new test re-runs only itself);

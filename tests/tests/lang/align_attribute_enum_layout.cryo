@@ -1,0 +1,89 @@
+///! `![align(N)]` on an enum: the emitted object is as wide as `sizeof`
+///! says, as an aligned struct's is.  An aligned enum, simple or not, is
+///! lowered as a tag, a payload and a tail filler, so an array's stride, a
+///! member's offset and a by-value copy all agree with the front end's
+///! layout, and the value still matches, compares and converts as a value
+///! of the enum.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::AlignAttributeEnumLayout;
+
+import std::core::result::{ Result };
+
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_equal };
+
+![align(64)]
+type enum WideTag { Small(i32); Nothing; }
+
+![align(32)]
+type enum PlainTag { First; Second; Third; }
+
+![align(16)]
+type enum ByteTag : u8 { Low = 1; High = 200; }
+
+type struct AfterByte { flag: u8; tag: PlainTag; }
+
+function wide_value(w: WideTag) -> i32 {
+    match (w) {
+        WideTag::Small(n) => { return n; }
+        WideTag::Nothing  => { return -1; }
+    }
+}
+
+function plain_rank(p: PlainTag) -> i32 {
+    match (p) {
+        PlainTag::First  => { return 1; }
+        PlainTag::Second => { return 2; }
+        PlainTag::Third  => { return 3; }
+    }
+}
+
+function plain_next(p: PlainTag) -> PlainTag {
+    match (p) {
+        PlainTag::First  => { return PlainTag::Second; }
+        PlainTag::Second => { return PlainTag::Third; }
+        PlainTag::Third  => { return PlainTag::First; }
+    }
+}
+
+![test]
+function an_aligned_enum_is_as_wide_as_sizeof_says() -> Result<(), TestError> {
+    expect_equal(sizeof(WideTag) as i64, 64)?;
+    mut wides: [WideTag; 2] = [WideTag::Small(7), WideTag::Nothing];
+    const stride: u64 = (&wides[1] as u64) - (&wides[0] as u64);
+    expect_equal(stride as i64, 64)?;
+    expect_equal(wide_value(wides[0]), 7)?;
+    return expect_equal(wide_value(wides[1]), -1);
+}
+
+![test]
+function an_aligned_simple_enum_is_as_wide_as_sizeof_says() -> Result<(), TestError> {
+    expect_equal(sizeof(PlainTag) as i64, 32)?;
+    mut plains: [PlainTag; 3] = [PlainTag::First, PlainTag::Second, PlainTag::Third];
+    const stride: u64 = (&plains[1] as u64) - (&plains[0] as u64);
+    expect_equal(stride as i64, 32)?;
+    expect_equal(plain_rank(plains[0]) * 100 + plain_rank(plains[1]) * 10 + plain_rank(plains[2]), 123)?;
+    return expect_equal(plain_rank(plain_next(plains[2])), 1);
+}
+
+![test]
+function an_aligned_simple_enum_member_starts_on_its_boundary() -> Result<(), TestError> {
+    mut a: AfterByte = AfterByte { flag: 9, tag: PlainTag::Third };
+    const off: u64 = (&a.tag as u64) - (&a as u64);
+    expect_equal(off as i64, 32)?;
+    expect_equal(sizeof(AfterByte) as i64, 64)?;
+    expect_equal(a.flag as i32, 9)?;
+    return expect_equal(plain_rank(a.tag), 3);
+}
+
+![test]
+function an_aligned_simple_enum_converts_through_its_tag() -> Result<(), TestError> {
+    expect_equal(PlainTag::Second as i32, 1)?;
+    expect_equal(ByteTag::High as i32, 200)?;
+    expect_equal(sizeof(ByteTag) as i64, 16)?;
+    mut bytes: [ByteTag; 2] = [ByteTag::Low, ByteTag::High];
+    const stride: u64 = (&bytes[1] as u64) - (&bytes[0] as u64);
+    expect_equal(stride as i64, 16)?;
+    return expect_equal(bytes[0] as i32, 1);
+}

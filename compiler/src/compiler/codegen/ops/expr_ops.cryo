@@ -172,6 +172,15 @@ type struct ExprOps {
         return a.lookup(ty);
     }
 
+    /// The integer type an enum's tag is: its discriminant base
+    /// (`type enum E : u8`), else `i32`.
+    enum_tag_type(&this, et: EnumType*) -> TypeRef {
+        if (et.discriminant_type.is_valid()) { return et.discriminant_type; }
+        const c: CompilationContext* = this.ctx;
+        const a: TypeArena* = c.type_arena;
+        return a.get_i32();
+    }
+
     /// Lowered byte size of the aggregate an argument feeds into
     /// register-shaped parameter slot(s), or 0 when the argument is not
     /// such an aggregate.  Used by the call-argument marshallers to
@@ -348,6 +357,17 @@ type struct ExprOps {
                                 to_kind == TypeKind::Function;
 
         if (from_int && to_int) {
+            // An aligned simple enum is lowered as a struct whose field 0 is
+            // the tag: the cast reads the tag out of it, or writes the
+            // converted integer into a value of it.
+            if (from_enum && !src_type.as_enum().lowers_to_its_tag() && val.is_valid()) {
+                return this.codegen_cast(this.builder.build_extract_value(val, 0, "enum.tag"),
+                    this.enum_tag_type(src_type.as_enum()), to_type);
+            }
+            if (to_enum && !dst_type.as_enum().lowers_to_its_tag() && val.is_valid()) {
+                const tag: LValue = this.codegen_cast(val, from_type, this.enum_tag_type(dst_type.as_enum()));
+                return this.builder.build_insert_value(LType::const_null(dest_ty), tag, 0, "enum.tag");
+            }
             mut from_bits: u32 = 0;
             mut signed_src: boolean = false;
             if (from_kind == TypeKind::Int) {

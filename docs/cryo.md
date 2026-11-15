@@ -2248,6 +2248,8 @@ type trait Read {
 }
 ```
 
+A default body is written over `This`, bounded by its trait alone, and a method call in it on a value of type `This` (`this.read(...)`, or `other.compare(...)` with `other: &This`) names the trait's method. Each implementation's copy of the default calls that implementation's own: not a method of the type's own of the same name, and, for a trait implemented at several arguments (`Measure<i64>` and `Measure<i32>` for `Square`), not another of its implementations'.
+
 A trait declares each method name once: its methods are found by name alone, so a second method of a name the trait already declares is refused at its name (`E0205`: "the method `area` is declared twice in this trait"), whatever its parameters.
 
 A trait may inherit from a base trait; implementations of the derived trait must also implement the base:
@@ -4302,6 +4304,8 @@ type struct CacheLine {
 - `N` must be a power of two between 1 and 65536.
 - The actual alignment of the type is `max(natural_alignment, N)`.
 - The size of the type is rounded up to its alignment.
+
+On an enum it means the same, simple or not: an array of an aligned enum is strided by its size, and a member of one starts on its boundary. An aligned simple enum is passed and stored as a value of that size holding its tag, not as the bare tag, and converts with `as` to and from its tag's integer as any simple enum does.
 
 `![align(N)]` is compatible with `![repr(C)]` and `![repr(transparent)]`; it is mutually exclusive with `![repr(packed)]`.
 

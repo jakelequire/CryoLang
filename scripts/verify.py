@@ -282,7 +282,11 @@ def run_gate(name, cryo, logdir, env):
     return {"name": name, "rc": rc, "secs": secs, "line": line, "ok": ok, "log": log}
 
 
-def run_gates(names, cryo, logdir, env):
+def run_gates(names, cryo, logdir, env, sequential):
+    """Run `names`, concurrently unless `sequential`: one gate at a time
+    holds one gate's memory, where all of them at once can exhaust a host."""
+    if sequential:
+        return [run_gate(n, cryo, logdir, env) for n in names]
     with ThreadPoolExecutor(max_workers=len(names)) as pool:
         return list(pool.map(lambda n: run_gate(n, cryo, logdir, env), names))
 
@@ -293,10 +297,10 @@ def report_gates(results):
                                           r["secs"], r["line"] or "<no verdict line; see %s>" % rel(r["log"])))
 
 
-def population(cryo, tag, logdir, env, names):
+def population(cryo, tag, logdir, env, names, sequential):
     """Wipe, run `names` (which include the population gates), hash."""
     wipe_population()
-    results = run_gates(names, cryo, logdir, env)
+    results = run_gates(names, cryo, logdir, env, sequential)
     counts = {}
     for base in POPULATIONS:
         counts[base] = hash_objects(base, os.path.join(logdir, "%s.%s.sha256" % (tag, base)))
@@ -1292,6 +1296,9 @@ def main():
                     help="comma-separated gates to run (default all: %s)"
                          % ",".join(GATES))
     ap.add_argument("--list-limit", type=int, default=40)
+    ap.add_argument("--sequential", action="store_true",
+                    help="run the gates one after another instead of concurrently, "
+                         "on a host short of memory")
     args = ap.parse_args()
     if args.selftest:
         return selftest()
@@ -1371,8 +1378,9 @@ def main():
             return 1
         base_counts = bdir
 
-    print("verify: gates over %s: %s" % (rel(cryo), ", ".join(names)))
-    results, counts = population(cryo, "tree", logdir, env, names)
+    print("verify: gates over %s: %s%s" % (rel(cryo), ", ".join(names),
+                                            " (one at a time)" if args.sequential else ""))
+    results, counts = population(cryo, "tree", logdir, env, names, args.sequential)
     report_gates(results)
     ok = all(r["ok"] for r in results)
     hashed = [b for b, g in (("tests", "census"), ("examples", "examples")) if g in names]
