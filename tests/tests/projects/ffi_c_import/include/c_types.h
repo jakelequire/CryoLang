@@ -43,6 +43,13 @@ enum { FLAG_A = 1, FLAG_B = 2, FLAG_NEG = -3 };
 #define CIT_HEX_E     0xE           /* in hex an `e` is a digit: 14              */
 #define CIT_WIDE      L"w"          /* an encoding prefix still makes a string   */
 
+/* Hexadecimal floating constants: hex digits, a binary exponent, a suffix. */
+#define CIT_HEX_FLOAT    0x1p4          /* 16.0                                   */
+#define CIT_HEX_FRACTION 0x1.8p1        /* 3.0: the digits after the point count  */
+#define CIT_HEX_SMALL    0x3p-2F        /* 0.75: a negative exponent and a suffix */
+#define CIT_HEX_NEGATIVE -0xA.4p0       /* -10.25                                 */
+#define CIT_HEX_SUM      (CIT_HEX_FLOAT + 0x1p-1) /* 16.5, folded from both forms */
+
 /* Bitfields share a storage unit: a per-field map would inflate the layout, so
  * the run collapses to one opaque storage blob.  sizeof must stay 8 (two `unsigned`
  * bitfields packed into the first 4-byte unit, then `c`). */
