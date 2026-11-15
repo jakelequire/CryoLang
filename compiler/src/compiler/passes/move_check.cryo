@@ -1170,9 +1170,65 @@ type struct MoveChecker {
         }
         const is_enum: boolean = this.is_enum(ty);
         if (this.aggregate_type_of(ty) == null && !is_enum) { return diag; }
+        const kind: string = if (is_enum) { "enum" } else { "struct" };
+        const base: TypeRef = this.arena.inst_generic_base(ty);
+        if (!base.is_valid()) {
+            return diag.help_with_example(fmt::format(
+                "`%s` does not implement `Clone`; derive it on its declaration, or implement it, to move a copy and keep the original",
+                shown), fmt::format("type %s %s with [Clone] { ... }", kind, shown));
+        }
+        // An implementation of `Clone` written for the generic type that is
+        // for this instance and does not apply is one its bounds refuse: the
+        // instance is `Clone` where the type arguments that lack it are.
+        const heads: [DeclarationNode*] = this.registry.heads_under(clone_trait, base);
+        mut matching: boolean = false;
+        for (mut i: i64 = 0; i < heads.length(); i++) {
+            if (this.registry.head_matches(DeclarationNode::impl_of(heads[i]), ty, this.intern)) { matching = true; }
+        }
+        if (matching) {
+            mut lacking: [TypeRef] = [];
+            for (mut i: i64 = 0; i < this.arena.inst_type_arg_count(ty); i++) {
+                const argument_ty: TypeRef = this.arena.inst_type_arg_at(ty, i);
+                if (!checker.type_implements_trait(argument_ty, clone_trait, 0)) {
+                    lacking.push(argument_ty);
+                }
+            }
+            if (lacking.length() == 0) { return diag; }
+            mut names: String = String::new();
+            for (mut i: i64 = 0; i < lacking.length(); i++) {
+                if (i > 0) { names.push(", "); }
+                names.push("`");
+                names.push(this.arena.resolve_display_name_short(lacking[i]));
+                names.push("`");
+            }
+            const one: boolean = lacking.length() == 1;
+            const verb: string = if (one) { "does" } else { "do" };
+            const declarations: string = if (one) { "its declaration" } else { "their declarations" };
+            const message: String = f"`{shown}` implements `Clone` only where its type arguments do, and {names} {verb} not; derive `Clone` on {declarations}, or implement it, to move a copy and keep the original";
+            const plain_argument: boolean = one
+                && !this.arena.inst_generic_base(lacking[0]).is_valid()
+                && (this.aggregate_type_of(lacking[0]) != null || this.is_enum(lacking[0]));
+            if (!plain_argument) { return diag.help(message); }
+            return diag.help_with_example(message, fmt::format("type %s %s with [Clone] { ... }",
+                if (this.is_enum(lacking[0])) { "enum" } else { "struct" },
+                this.arena.resolve_display_name_short(lacking[0])));
+        }
+        // No implementation at all: the declaration to derive it on is the
+        // generic type's own, written with its parameters.
+        const template: const TemplateEntry* = this.registry.template_of_type(base);
+        if (template == null) { return diag; }
+        const leaf: string = this.intern.resolve(template.leaf_name().spelling());
+        mut declaration: String = String::new();
+        declaration.push(leaf);
+        declaration.push("<");
+        for (mut i: i64 = 0; i < template.param_names.length(); i++) {
+            if (i > 0) { declaration.push(", "); }
+            declaration.push(this.intern.resolve(template.param_names[i]));
+        }
+        declaration.push(">");
         return diag.help_with_example(fmt::format(
-            "`%s` does not implement `Clone`; derive it on its declaration, or implement it, to move a copy and keep the original",
-            shown), fmt::format("type %s %s with [Clone] { ... }", if (is_enum) { "enum" } else { "struct" }, shown));
+            "`%s` does not implement `Clone`; derive it on the declaration of `%s`, or implement it, to move a copy and keep the original",
+            shown, leaf), f"type {kind} {declaration} with [Clone] {{ ... }}");
     }
 
     /// Whether `ty`, its instantiations seen through, is an enum.
@@ -2001,6 +2057,22 @@ type struct MoveChecker {
         this.fatal += 1;
     }
 
+    /// E0453 for field `ma` moved out of a closure's capture at `expr`: the
+    /// closure's owner of the capture releases the field again.
+    emit_capture_field_move_out(mut &this, expr: ExpressionNode*, ma: MemberAccessExpr*) -> void {
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
+            fmt::format("cannot move field `%s` out of a closure's capture",
+                this.intern.resolve(ma.member)));
+        diag = diag.at_with_label(expr.span,
+            "moving the field out here leaves the closure's owner of the capture to release it again (double free)");
+        diag = diag.with_note(
+            "a closure keeps what it captures for every call: a `move` closure releases it when the closure is released, and any other closure borrows it from its owner");
+        diag = diag.help("borrow the field, or move a clone of it");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
     /// E0457: the binding `name` moved at `span` while the closure of borrow
     /// entry `entry` can still run.
     emit_borrowed_move(mut &this, name: SymbolStr, span: SourceSpan, entry: i64) -> void {
@@ -2558,6 +2630,16 @@ type struct MoveChecker {
             this.ctx.emit_diagnostic(this.with_clone_hint(diag, field_ty, expr.span, expr));
             this.fired += 1;
             this.fatal += 1;
+            return;
+        }
+        // A closure keeps what it captures for every call - a `move`
+        // closure releases it with the closure, any other borrows it from
+        // its owner - so no field of a capture is the call's to give away.
+        mut chain_kind: [u8]  = [];
+        mut chain_key:  [u32] = [];
+        const root: SymbolID = ExpressionNode::place_chain(expr, &chain_kind, &chain_key);
+        if (root.is_valid() && this.is_capture_alias(root.key())) {
+            if (!this.suppress_emit) { this.emit_capture_field_move_out(expr, ma); }
             return;
         }
         // The source must be an owned, glue-dropped value place.

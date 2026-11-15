@@ -549,10 +549,11 @@ consume(name);   // error[E0457]: cannot move `name` while a closure borrows it
 size();
 ```
 
-A closure's body may not move a captured value out (**E0453**): the closure
-keeps what it captures for every call - a `move` closure until it is
-released, any other closure borrowed from the value's owner - so a value
-moved out would be released again. Clone it instead (`consume(name.clone())`).
+A closure's body may not move a captured value out (**E0453**), nor a field
+of one (`consume(holder.name)`): the closure keeps what it captures for every
+call - a `move` closure until it is released, any other closure borrowed from
+the value's owner - so a value moved out would be released again. Clone it
+instead (`consume(name.clone())`).
 A closure's captures cannot be assigned to.
 
 The compiler synthesises an anonymous struct holding the captures - a
@@ -4014,7 +4015,7 @@ Two move/ownership hazards that are unambiguous memory errors, called out as the
 - **A by-value method called through a pointer or reference** (`E0453`) - `p.unwrap()` or `p.into_id()`, where the method takes `this` by value and `p` is a pointer or reference to a value that owns a destructor, moves the value out of storage that still releases it, exactly as the written `(*p).unwrap()` does.  A value without a destructor is copied and is accepted.  Call a method that borrows its receiver, clone the value first, or empty the storage with a method that leaves a value behind (`Option::take`).
 - **A field matched by value through a pointer or reference** (`E0453`) - `match (p.slot)`, with `p` a pointer or reference (including `this` in a `&this` or `mut &this` method) and the field's type owning a destructor, gives the match's subject its own copy of the field's owning handle, released when the match ends whether or not an arm binds the payload, while the storage `p` names still holds the field.  Match on a borrow instead - `match (&p.slot)` - and the arms read the payload without owning it.  A take swaps a replacement in with `mem::swap` first.
 - **A field read by value through a pointer or reference** (`E0453`) - the same holds wherever such a field is read into a second owner: `const x: T = p.slot;`, `x = p.slot;`, `return this.slot;` from a `&this` or `mut &this` method, `take(p.slot)` for a by-value parameter, and `Other { slot: p.slot }`.  Each copies the field's owning handle while the storage `p` names still releases it.  Borrow the field (`&p.slot`), swap it out with `mem::swap`, or read it from a receiver the method owns: `outcome(mut this) -> T { return this.slot; }` consumes the value it is called on, so the field has one owner.  Inside an `unsafe` block the read is allowed, for a take whose storage is overwritten or freed without being released.  A closure reading what it captured is not such a read: its captures are fields of the closure itself.
-- **A capture moved out of a closure's body** (`E0453`) - the closure keeps what it captures for every call, and releases it once with itself (a `move` closure) or leaves it to the value's owner (any other closure), so a captured value given away by the body would be released again.  Clone it (`take(name.clone())`); `unsafe` does not change this.
+- **A capture moved out of a closure's body** (`E0453`) - the closure keeps what it captures for every call, and releases it once with itself (a `move` closure) or leaves it to the value's owner (any other closure), so a captured value, or a field of one, given away by the body would be released again.  Clone it (`take(name.clone())`); `unsafe` does not change this.
 - **A borrowed variable moved while a closure borrows it** (`E0457`) - a closure written without `move` holds a reference to each captured value that is not `Copy`, so the variable may not be moved until the end of the statement that made the closure, nor while a binding in scope holds the closure; nor may the closure, or a value holding it, be returned from the function that made it.  Write `move` before the closure to give it the value instead.
 - **A whole value read by value through a reference** (`E0453`) - `return this;` in a `&this` or `mut &this` method, with the type owning a destructor, reads the receiver by its implicit dereference and hands the caller a second owner of the storage the receiver names, so it is released twice.  Clone it, or take the receiver by value (`this` or `mut this`) when the method is meant to consume what it is called on; a by-value receiver is not a reference, and its `return this;` is an ordinary move.  Inside an `unsafe` block the read is allowed, as for a field.
 
