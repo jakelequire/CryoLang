@@ -2001,6 +2001,22 @@ type struct MoveChecker {
         this.fatal += 1;
     }
 
+    /// E0453 for field `ma` moved out of a closure's capture at `expr`: the
+    /// closure's owner of the capture releases the field again.
+    emit_capture_field_move_out(mut &this, expr: ExpressionNode*, ma: MemberAccessExpr*) -> void {
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
+            fmt::format("cannot move field `%s` out of a closure's capture",
+                this.intern.resolve(ma.member)));
+        diag = diag.at_with_label(expr.span,
+            "moving the field out here leaves the closure's owner of the capture to release it again (double free)");
+        diag = diag.with_note(
+            "a closure keeps what it captures for every call: a `move` closure releases it when the closure is released, and any other closure borrows it from its owner");
+        diag = diag.help("borrow the field, or move a clone of it");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
     /// E0457: the binding `name` moved at `span` while the closure of borrow
     /// entry `entry` can still run.
     emit_borrowed_move(mut &this, name: SymbolStr, span: SourceSpan, entry: i64) -> void {
@@ -2558,6 +2574,16 @@ type struct MoveChecker {
             this.ctx.emit_diagnostic(this.with_clone_hint(diag, field_ty, expr.span, expr));
             this.fired += 1;
             this.fatal += 1;
+            return;
+        }
+        // A closure keeps what it captures for every call - a `move`
+        // closure releases it with the closure, any other borrows it from
+        // its owner - so no field of a capture is the call's to give away.
+        mut chain_kind: [u8]  = [];
+        mut chain_key:  [u32] = [];
+        const root: SymbolID = ExpressionNode::place_chain(expr, &chain_kind, &chain_key);
+        if (root.is_valid() && this.is_capture_alias(root.key())) {
+            if (!this.suppress_emit) { this.emit_capture_field_move_out(expr, ma); }
             return;
         }
         // The source must be an owned, glue-dropped value place.
