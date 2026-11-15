@@ -1170,9 +1170,65 @@ type struct MoveChecker {
         }
         const is_enum: boolean = this.is_enum(ty);
         if (this.aggregate_type_of(ty) == null && !is_enum) { return diag; }
+        const kind: string = if (is_enum) { "enum" } else { "struct" };
+        const base: TypeRef = this.arena.inst_generic_base(ty);
+        if (!base.is_valid()) {
+            return diag.help_with_example(fmt::format(
+                "`%s` does not implement `Clone`; derive it on its declaration, or implement it, to move a copy and keep the original",
+                shown), fmt::format("type %s %s with [Clone] { ... }", kind, shown));
+        }
+        // An implementation of `Clone` written for the generic type that is
+        // for this instance and does not apply is one its bounds refuse: the
+        // instance is `Clone` where the type arguments that lack it are.
+        const heads: [DeclarationNode*] = this.registry.heads_under(clone_trait, base);
+        mut matching: boolean = false;
+        for (mut i: i64 = 0; i < heads.length(); i++) {
+            if (this.registry.head_matches(DeclarationNode::impl_of(heads[i]), ty, this.intern)) { matching = true; }
+        }
+        if (matching) {
+            mut lacking: [TypeRef] = [];
+            for (mut i: i64 = 0; i < this.arena.inst_type_arg_count(ty); i++) {
+                const argument_ty: TypeRef = this.arena.inst_type_arg_at(ty, i);
+                if (!checker.type_implements_trait(argument_ty, clone_trait, 0)) {
+                    lacking.push(argument_ty);
+                }
+            }
+            if (lacking.length() == 0) { return diag; }
+            mut names: String = String::new();
+            for (mut i: i64 = 0; i < lacking.length(); i++) {
+                if (i > 0) { names.push(", "); }
+                names.push("`");
+                names.push(this.arena.resolve_display_name_short(lacking[i]));
+                names.push("`");
+            }
+            const one: boolean = lacking.length() == 1;
+            const verb: string = if (one) { "does" } else { "do" };
+            const declarations: string = if (one) { "its declaration" } else { "their declarations" };
+            const message: String = f"`{shown}` implements `Clone` only where its type arguments do, and {names} {verb} not; derive `Clone` on {declarations}, or implement it, to move a copy and keep the original";
+            const plain_argument: boolean = one
+                && !this.arena.inst_generic_base(lacking[0]).is_valid()
+                && (this.aggregate_type_of(lacking[0]) != null || this.is_enum(lacking[0]));
+            if (!plain_argument) { return diag.help(message); }
+            return diag.help_with_example(message, fmt::format("type %s %s with [Clone] { ... }",
+                if (this.is_enum(lacking[0])) { "enum" } else { "struct" },
+                this.arena.resolve_display_name_short(lacking[0])));
+        }
+        // No implementation at all: the declaration to derive it on is the
+        // generic type's own, written with its parameters.
+        const template: const TemplateEntry* = this.registry.template_of_type(base);
+        if (template == null) { return diag; }
+        const leaf: string = this.intern.resolve(template.leaf_name().spelling());
+        mut declaration: String = String::new();
+        declaration.push(leaf);
+        declaration.push("<");
+        for (mut i: i64 = 0; i < template.param_names.length(); i++) {
+            if (i > 0) { declaration.push(", "); }
+            declaration.push(this.intern.resolve(template.param_names[i]));
+        }
+        declaration.push(">");
         return diag.help_with_example(fmt::format(
-            "`%s` does not implement `Clone`; derive it on its declaration, or implement it, to move a copy and keep the original",
-            shown), fmt::format("type %s %s with [Clone] { ... }", if (is_enum) { "enum" } else { "struct" }, shown));
+            "`%s` does not implement `Clone`; derive it on the declaration of `%s`, or implement it, to move a copy and keep the original",
+            shown, leaf), f"type {kind} {declaration} with [Clone] {{ ... }}");
     }
 
     /// Whether `ty`, its instantiations seen through, is an enum.
