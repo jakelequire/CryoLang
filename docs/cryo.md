@@ -2505,7 +2505,7 @@ function first<I>(it: mut &I) -> Option<I::Item> where I: DoubleEnded {   // Ite
 type struct Loose<I> { f: () -> I::Item; }   // error[E0203]: associated type `Item` not found for `I`
 ```
 
-A projection may be the subject of a bound itself: `where C: Source, C::Item: Put` gives a value of type `C::Item` the methods of `Put` in the body, and each copy of the body calls the implementation of `Put` for its own `Item`, which may be an implementation for every reference (`implement<T> trait Put for mut &T where T: Put`) when `Item` is one.
+A projection may be the subject of a bound itself: `where C: Source, C::Item: Put` gives a value of type `C::Item` the methods of `Put` in the body, and each copy of the body calls the implementation of `Put` for its own `Item`, which may be an implementation for every reference (`implement<T> trait Put for mut &T where T: Put`) when `Item` is one. Such a bound is checked where a call binds the parameters, as a bound on a parameter is: `store(&plain)` with `plain`'s `Item` an `i64` is refused there (E0306, "the trait bound `i64: Put` is not satisfied").
 
 **A trait with parameters.** A type may implement a trait that has generic
 parameters more than once, at different arguments, and each implementation
@@ -3822,7 +3822,7 @@ A type is `Copy` if it can be duplicated by a bitwise copy of its bytes. The com
 
 - All primitive types (integers, floats, `boolean`, `char`, `string` (the raw `u8*` view), pointers, references, function pointers).
 - Struct, enum, and tuple aggregates **iff** every field is `Copy` **and** the type does not implement `Drop`.
-- Generic parameters are conservatively non-`Copy` unless bound by `T: Copy`.
+- Generic parameters are conservatively non-`Copy` unless a bound in scope makes them `Copy`: `T: Copy`, or a bound naming a trait `Copy` is a supertrait of, written in the function's own `where` clause, in its owner's (`type struct Holder<T> where T: Copy`), or in its implementation's. A method's own `where T: Copy` on its owner's parameter makes `T` `Copy` in that method only. A type built of `Copy` parts that names such a parameter (`(T, T)`) is `Copy` there too.
 
 `Copy` is a marker trait declared in `stdlib/core/marker.cryo`; you do not implement it explicitly. Implementing `Drop` automatically makes a type non-`Copy`.
 
@@ -3976,7 +3976,7 @@ Non-`Copy` bindings are tracked by a flow-sensitive analysis ([`passes/move_chec
 
 A branching expression's value is the value of the branch that ran, so where an `if` expression, a `?:` or a `match` expression is itself at a move site, the value each branch yields is moved there: `const c: T = if (f) { a } else { make() };` moves `a` when `f` holds, and only then. A binding moved on some branches only, by yielding it or inside the branch (`if (f) { take(a) } else { 0 }`), is possibly moved after the expression, so a later use is refused (`E0452`) as after an `if` statement that moves it in one branch; at scope exit it is released on exactly the paths that kept it.
 
-A `break` leaves its loop with whatever was moved on the path that reached it. A binding declared outside the loop and moved before a `break` (`while (more()) { if (done()) { take(a); break; } }`) is possibly moved after the loop, and at scope exit it is released only when the loop ended some other way.
+A `break` leaves its loop with whatever was moved on the path that reached it. A binding declared outside the loop and moved before a `break` (`while (more()) { if (done()) { take(a); break; } }`) is possibly moved after the loop, and at scope exit it is released only when the loop ended some other way. A binding moved before a loop and assigned a new value only in its body is the other way round: it holds a value after the loop on the paths that ran the body and none on the path that ran it zero times. Its release at scope exit runs only where it holds one, and each value the body displaces is released when the next is stored; using it after the loop is a use after a move (`E0452`), since the loop's exit holds the moves it began with.
 
 References (`&T` / `mut &T`) and raw pointers borrow; passing `&x` keeps `x` usable. Reassigning a binding re-initialises it, so `consume(x); x = make();` is legal and `x` is live again after the assignment. A moved-from binding holds nothing, so that second assignment releases nothing - the callee owns what it took (see [section 15.2](#152-the-drop-trait) for what assignment does release).
 

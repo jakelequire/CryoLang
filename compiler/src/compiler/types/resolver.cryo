@@ -394,14 +394,15 @@ type struct TypeResolver {
 
     /// The trait of `bound` that its subject does not implement once the
     /// declaring template's parameters `param_syms` are bound to `bindings`:
-    /// a parameter's binding (`TraitChecker::unmet_parameter_trait`), or a
-    /// type that is not a parameter (`where HighError: From<E>`, `where
-    /// Array<T>: Display`; `TraitChecker::unmet_written_trait`).
-    /// `*out_subject` is the subject so resolved and `*out_trait` the trait
-    /// as it is required, with its arguments (`From<OtherError>`).  Null
-    /// when every trait has one, for a projection subject, and when the
-    /// subject or an argument still names a parameter, which the copy that
-    /// binds it decides.  `outer` binds the parameters of the type a method
+    /// a parameter's binding (`TraitChecker::unmet_parameter_trait`), the
+    /// type an associated type of the parameters names once they are bound
+    /// (`where C::Item: Put`; `unmet_projection_trait`), or a type that is
+    /// not a parameter (`where HighError: From<E>`, `where Array<T>:
+    /// Display`; `TraitChecker::unmet_written_trait`).  `*out_subject` is
+    /// the subject so resolved and `*out_trait` the trait as it is
+    /// required, with its arguments (`From<OtherError>`).  Null when every
+    /// trait has one, and when the subject or an argument still names a
+    /// parameter, which the copy that binds it decides.  `outer` binds the parameters of the type a method
     /// belongs to, which its bounds' arguments may name (`R: RangeBounds<K>`
     /// on a method of `BTreeMap<K, V>`); empty for a free function.
     unmet_written_bound(&this, bound: TraitBound*, param_syms: &[SymbolID], bindings: &[TypeRef],
@@ -418,7 +419,9 @@ type struct TypeResolver {
         const checker: TraitChecker = TraitChecker::new(
             this.arena, this.generic_registry, this.intern_table, this.diagnostics, this);
         mut tr: const TraitRef* = null;
-        if (bound.subject_param().is_valid()) {
+        if (bound.has_projection_subject()) {
+            tr = this.unmet_projection_trait(&checker, bound, param_syms, bindings, &subst, out_subject);
+        } else if (bound.subject_param().is_valid()) {
             if (!subject.is_valid() || this.arena.contains_generic_param(subject)) { return null; }
             tr = checker.unmet_parameter_trait(bound, subject, &subst, 0);
             if (tr != null) { *out_subject = subject; }
@@ -428,6 +431,61 @@ type struct TypeResolver {
         if (tr == null) { return null; }
         *out_trait = this.intern_table.intern(checker.trait_as_required(tr, &subst));
         return tr;
+    }
+
+    /// The trait of `bound`, written on an associated type of the declaring
+    /// template's parameters (`where C::Item: Put`), that the type the
+    /// projection names once `subst` binds them does not implement:
+    /// `C::Item` with `C` bound to a type whose `Item` is `i64` is `i64`.
+    /// `*out_subject` is that type.  Null when every trait has an
+    /// implementation for it, and while the subject or an argument still
+    /// names a parameter, which the copy that binds it decides.
+    unmet_projection_trait(&this, checker: &TraitChecker, bound: TraitBound*, param_syms: &[SymbolID],
+                           bindings: &[TypeRef], subst: &TypeSubstitution,
+                           out_subject: mut TypeRef*) -> const TraitRef* {
+        mut rc: ResolutionContext = ResolutionContext::new("");
+        for (mut i: i64 = 0; i < param_syms.length() && i < bindings.length(); i++) {
+            if (bindings[i].is_valid()) { rc.add_binding(param_syms[i], SymbolStr::empty(), bindings[i]); }
+        }
+        const written: TypeRef = this.resolve(bound.subject, &rc);
+        if (!written.is_valid()) { return null; }
+        const subject: TypeRef = this.apply_reduced(subst, written);
+        const subject_t: Type* = this.arena.lookup(subject);
+        if (subject_t == null || subject_t.kind == TypeKind::AssocProjection
+                || this.arena.contains_generic_param(subject)) {
+            return null;
+        }
+        for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
+            const tr: const TraitRef* = &bound.trait_refs[ri];
+            // A bound refused where it is written is reported there.
+            if (tr.path.length() == 0 || tr.refused || !tr.definition().is_valid()) { continue; }
+            if (tr.argument_types.length() != tr.type_args.length()) { return null; }
+            mut args: [TypeRef] = [];
+            for (mut ai: i64 = 0; ai < tr.argument_types.length(); ai++) {
+                const arg: TypeRef = this.apply_reduced(subst, tr.argument_types[ai]);
+                if (!arg.is_valid() || this.arena.contains_generic_param(arg)) { return null; }
+                args.push(arg);
+            }
+            if (checker.implementation_at(tr.definition(), &args, subject) == null) {
+                *out_subject = subject;
+                return tr;
+            }
+        }
+        return null;
+    }
+
+    /// `ty` under `subst`, each projection the substitution made concrete
+    /// reduced to the type its implementation binds: with `I` bound to
+    /// `Range<i64>`, `Option<I::Item>` is `Option<i64>`.  The unreduced form
+    /// is built without demanding it - nothing monomorphizes an
+    /// instantiation holding a projection, so a demanded one is left
+    /// unresolved.
+    apply_reduced(&this, subst: &TypeSubstitution, ty: TypeRef) -> TypeRef {
+        const was: boolean = this.arena.symbolic_no_demand_active;
+        this.arena.set_symbolic_no_demand(true);
+        const applied: TypeRef = subst.apply(ty, this.arena);
+        this.arena.set_symbolic_no_demand(was);
+        return this.reduce_projections(applied, false);
     }
 
     trait_arguments_along(&this, trait_def: DefId, args: &[TypeRef], declaring: DefId,
@@ -1658,19 +1716,20 @@ type struct TypeResolver {
     }
 
     /// Resolve, in the declaration's context `res_ctx`, each bound of
-    /// `bounds` written on a type that is not a projection: its traits'
-    /// arguments, and a subject that is not a parameter, in the
-    /// declaration's own parameters.  A bound already resolved keeps its
-    /// answer - a copy carries its template's - and one that does not
-    /// resolve yet is asked again on the next pass over the declaration.
+    /// `bounds`: its traits' arguments, and a subject that is neither a
+    /// parameter nor a projection, in the declaration's own parameters.  A
+    /// projection subject (`C::Item`) is resolved where a call binds the
+    /// parameters it names (`unmet_written_bound`).  A bound already
+    /// resolved keeps its answer - a copy carries its template's - and one
+    /// that does not resolve yet is asked again on the next pass over the
+    /// declaration.
     resolve_written_bounds(&this, bounds: mut &[TraitBound], res_ctx: ResolutionContext*) -> void {
         for (mut b: i64 = 0; b < bounds.length(); b++) {
             const bound: mut TraitBound* = &bounds[b];
-            if (bound.has_projection_subject()) { continue; }
             if (bound.signature != null && !bound.signature_type.is_valid()) {
                 bound.signature_type = this.resolve(bound.signature, res_ctx);
             }
-            if (bound.subject_param().is_valid()) {
+            if (bound.subject_param().is_valid() || bound.has_projection_subject()) {
                 for (mut r: i64 = 0; r < bound.trait_refs.length(); r++) {
                     const tr: mut TraitRef* = &bound.trait_refs[r];
                     if (tr.argument_types.length() == tr.type_args.length()) { continue; }

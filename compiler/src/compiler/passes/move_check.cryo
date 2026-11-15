@@ -22,7 +22,7 @@ namespace compiler::passes::move_check;
 
 import compiler::diag::{ diagnostic, ErrorCode, sink, snapshot, source_span };
 import compiler::ast::{
-    ArgBinding, declaration, expression, node, pattern, PatternBinding, statement
+    ArgBinding, declaration, expression, node, pattern, PatternBinding, statement, TraitBound
 };
 import compiler::lex::{ TokenType };
 import compiler::passes::pass_id::{ PassResult };
@@ -61,7 +61,7 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::types::arena::{ TypeArena };
-import compiler::types::generic_registry::{ GenericRegistry };
+import compiler::types::generic_registry::{ GenericRegistry, TemplateEntry };
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::trait_checker::{ TraitChecker };
@@ -125,6 +125,15 @@ type struct MoveChecker {
     arena:    mut TypeArena*;
     registry: GenericRegistry*;
     intern:   mut InternTable*;
+
+    /// The type parameters the bounds of the declaration whose methods are
+    /// walked make `Copy` (the owner's `where` clause, an implementation's).
+    owner_copy_params: [SymbolID];
+
+    /// The type parameters the bounds in scope of the function being
+    /// walked make `Copy`: the owner's, and the function's own `where`
+    /// clause, which may bound the owner's parameters too.
+    copy_params: [SymbolID];
 
     /// Per-binding type info: the binding's identity -> resolved TypeRef.
     /// Reset on enter_function. Identifier-uses whose binding is absent from
@@ -340,6 +349,8 @@ type struct MoveChecker {
             arena:    ctx.type_arena,
             registry: ctx.generic_registry,
             intern:   ctx.get_intern_table(),
+            owner_copy_params: [],
+            copy_params:       [],
             types:       HashMap::<SymbolKey, TypeRef, GlobalAllocator, FnvHasher>::new(),
             moved_keys:  [],
             moved_spans: [],
@@ -381,6 +392,14 @@ type struct MoveChecker {
 
     enter_function(mut &this, func_decl: DeclarationNode*, receiver_consumed: boolean) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+        this.copy_params = [];
+        for (mut i: i64 = 0; i < this.owner_copy_params.length(); i++) {
+            this.copy_params.push(this.owner_copy_params[i]);
+        }
+        if (func != null) {
+            const own: [SymbolID] = this.copy_params_of(&func.trait_bounds);
+            for (mut i: i64 = 0; i < own.length(); i++) { this.copy_params.push(own[i]); }
+        }
         this.types       = HashMap::<SymbolKey, TypeRef, GlobalAllocator, FnvHasher>::new();
         this.moved_keys  = [];
         this.moved_spans = [];
@@ -564,7 +583,35 @@ type struct MoveChecker {
     }
 
     is_copy(&this, ty: TypeRef) -> boolean {
-        return OwnershipQuery::is_copy(this.arena, this.registry, this.intern, ty);
+        return OwnershipQuery::is_copy_given(this.arena, this.registry, this.intern, ty, &this.copy_params);
+    }
+
+    /// The type parameters `bounds`, written on the declaration whose
+    /// methods are about to be walked, make `Copy`, added to the owner's.
+    push_owner_copy_params(mut &this, bounds: &[TraitBound]) -> void {
+        const own: [SymbolID] = this.copy_params_of(bounds);
+        for (mut i: i64 = 0; i < own.length(); i++) { this.owner_copy_params.push(own[i]); }
+    }
+
+    /// The type parameters `bounds` make `Copy`, each one a bound names with
+    /// `Copy` or with a trait `Copy` is a supertrait of.
+    copy_params_of(&this, bounds: &[TraitBound]) -> [SymbolID] {
+        mut out: [SymbolID] = [];
+        const copy_id: DefId = this.registry.wellknown(LangItem::Copy);
+        if (!copy_id.is_valid()) { return out; }
+        for (mut i: i64 = 0; i < bounds.length(); i++) {
+            const b: const TraitBound* = &bounds[i];
+            if (b.has_projection_subject() || !b.subject_param().is_valid()) { continue; }
+            for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
+                const chain: [DefId] = this.registry.trait_and_supertraits(b.trait_refs[ti].definition());
+                mut gives: boolean = false;
+                for (mut k: i64 = 0; k < chain.length(); k++) {
+                    if (chain[k].equals(copy_id)) { gives = true; }
+                }
+                if (gives) { out.push(b.subject_param()); }
+            }
+        }
+        return out;
     }
 
     /// Whether a value of this type owns a resource that the callee's
@@ -1150,6 +1197,7 @@ type struct MoveChecker {
     }
 
     walk_top_level(mut &this, stmt: DeclarationNode*) -> void {
+        this.owner_copy_params = [];
         match (stmt.kind) {
             DeclKind::Function(_) => {
                 this.walk_function(stmt, false);
@@ -1161,16 +1209,28 @@ type struct MoveChecker {
                     if (m != null) { this.walk_function(m_decl, false); }
                 }
             }
-            DeclKind::Union(ud) => { this.walk_methods(ud.methods); }
+            DeclKind::Union(ud) => {
+                this.push_owner_copy_params(&ud.where_bounds);
+                this.walk_methods(ud.methods);
+            }
             DeclKind::Struct(sd) => {
                 // The closure of a lambda written in a generic body is a
                 // template whose `__call__` is that lambda's body: part of a
                 // generic body, which is checked in each copy of it, where
                 // its type parameters say what is `Copy`.
                 if (stmt.generated && sd.generic_params.length() > 0) { return; }
+                this.push_owner_copy_params(&sd.where_bounds);
                 this.walk_methods(sd.methods);
             }
-            DeclKind::Impl(ib) => { this.walk_methods(ib.methods); }
+            DeclKind::Impl(ib) => {
+                this.push_owner_copy_params(&ib.where_bounds);
+                const target: const TemplateEntry* = this.registry.template_of(ib.target_def());
+                if (target != null) {
+                    const declared: [TraitBound]* = target.declared_where_bounds();
+                    if (declared != null) { this.push_owner_copy_params(declared); }
+                }
+                this.walk_methods(ib.methods);
+            }
             DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
             | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
             | DeclKind::Intrinsic(_) | DeclKind::Module(_) | DeclKind::TypeAlias(_)
@@ -1400,6 +1460,18 @@ type struct MoveChecker {
         const snap:       i64 = this.snapshot_moves();
         const cap_snap:   i64 = this.captured_decl_keys.length();
         const carry_snap: i64 = this.carried_keys.length();
+        // The whole pre-loop moved-set, element-wise: an assignment in the
+        // body revives its binding by deleting an entry that may sit below
+        // `snap`, which a length rewind cannot put back, and a binding the
+        // body revives is still moved on the path that runs it zero times.
+        mut pre_keys:  [u64]        = [];
+        mut pre_spans: [SourceSpan] = [];
+        mut pre_real:  [boolean]    = [];
+        for (mut i: i64 = 0; i < this.moved_keys.length(); i++) {
+            pre_keys.push(this.moved_keys[i]);
+            pre_spans.push(this.moved_spans[i]);
+            pre_real.push(this.moved_real[i]);
+        }
         const walk: LoopWalk = LoopWalk {
             moves_start:        snap,
             declarations_start: cap_snap,
@@ -1442,7 +1514,7 @@ type struct MoveChecker {
             if (!staged) { this.carried_keys.push(k); }
         }
         this.truncate_loop_exits(walk);
-        this.restore_moves(snap);
+        this.restore_full(pre_keys, pre_spans, pre_real);
 
         // real walk: carried bindings are moved-on-entry, so the
         // re-move at the top of the body reports use-after-move.
@@ -1461,7 +1533,7 @@ type struct MoveChecker {
         // above.  A `break` leaves with its own moves, so they hold after
         // the loop too.
         this.truncate_carried(carry_snap);
-        this.restore_moves(snap);
+        this.restore_full(pre_keys, pre_spans, pre_real);
         for (mut i: i64 = walk.breaks_start; i < this.break_moves.length(); i++) {
             const exit: LoopExitMove = this.break_moves[i];
             this.mark_moved_key(exit.key, exit.span, true);
