@@ -277,7 +277,7 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
   literal text are processed as in a normal string.
 - The result is a heap-backed `String` the caller owns (and drops). The
   parser desugars the whole f-string to calls of the builders in
-  `std::fmt::interp`, the language items `format_new`,
+  `std::fmt::interpolation`, the language items `format_new`,
   `format_append_literal`, `format_append_display`, `format_append_debug`
   and `format_append_spec` ([section 16.1](#161-recognised-attributes)).
   The calls name the builders themselves, so nothing is imported for them,
@@ -1286,7 +1286,7 @@ This is a defined deterministic result, not undefined behavior, but it is *silen
 | `<` `>` `<=` `>=` | Ordering comparisons                                                                  |
 | `<=>`             | Three-way comparison (spaceship); yields an `Ordering` (`Less` / `Equal` / `Greater`) |
 
-Comparison operators return `boolean`. On numeric types and pointers they emit native instructions; on user-defined types that implement `Eq`/`Ord` they are **overloaded** - `a == b` becomes `a.equals(&b)` and `a < b` becomes `a.compare(&b).is_lt()` (see operator overloading, [section 10.6](#106-operator-overloading)). The two sides of `==` and `!=` are one type, so the right operand is typed with the left operand's type as its expected type, as an initializer is with its declared type: with `opt: Option<i64>`, `opt == Option::Some(4)` builds an `Option<i64>` and `r == Result::Ok(1)` infers `r`'s error type. A pointer or a reference on the left sets no expectation.
+Comparison operators return `boolean`. On numeric types and pointers they emit native instructions; on user-defined types that implement `Eq`/`Ord` they are **overloaded** - `a == b` becomes `a.equals(&b)` and `a < b` becomes `a.compare(&b).is_less()` (see operator overloading, [section 10.6](#106-operator-overloading)). The two sides of `==` and `!=` are one type, so the right operand is typed with the left operand's type as its expected type, as an initializer is with its declared type: with `opt: Option<i64>`, `opt == Option::Some(4)` builds an `Option<i64>` and `r == Result::Ok(1)` infers `r`'s error type. A pointer or a reference on the left sets no expectation.
 
 **Unrelated types are not compared.** Two values of different enum types, or two pointers neither of which converts to the other, are refused (E0200) by every comparison operator. An enum compares its discriminant, so `A::Z == B::W` would otherwise answer by variant position; two pointers to unrelated structs never hold the same address. A pointer still compares with `null`, with a `void*`, and with a pointer it converts to (`T*` with `const T*`):
 
@@ -2650,7 +2650,7 @@ live in
 | `&` `\|` `^` `<<` `>>` | `BitAnd` `BitOr` `BitXor` `Shl` `Shr` | `a & b` -> `a.bitand(&b)` (etc.)                             |
 | `!` `~` (unary)        | `Not` `BitNot`                        | `!a` -> `a.not()`, `~a` -> `a.bitnot()`                      |
 | `==` `!=`              | `Eq`                                  | `a == b` -> `a.equals(&b)`, `a != b` -> `!a.equals(&b)`      |
-| `<` `>` `<=` `>=`      | `Ord` (`: Eq`)                        | `a < b` -> `a.compare(&b).is_lt()` (`is_gt`/`is_le`/`is_ge`) |
+| `<` `>` `<=` `>=`      | `Ord` (`: Eq`)                        | `a < b` -> `a.compare(&b).is_less()` (`is_greater`/`is_less_or_equal`/`is_greater_or_equal`) |
 | `<=>`                  | `Ord` (`: Eq`)                        | `a <=> b` -> `a.compare(&b)`                                 |
 | `a[i]` read            | `Index<Idx>` (`type Output`)          | `a[i]` -> `*(a.index(i))`                                    |
 | `a[i]` written         | `IndexMutable<Idx>` (`: Index<Idx>`)  | `a[i]` -> `*(a.index_mutable(i))`                            |
@@ -2699,7 +2699,7 @@ implement trait Ord for struct Vec2 {
     }
 }
 const eq: boolean = a == b;   // a.equals(&b)      -> false
-const lt: boolean = a < b;    // a.compare(&b).is_lt() -> true
+const lt: boolean = a < b;    // a.compare(&b).is_less() -> true
 ```
 
 **Three-way comparison.** `a <=> b` is `Ord::compare` and yields its
