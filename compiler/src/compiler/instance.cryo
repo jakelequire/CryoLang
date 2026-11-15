@@ -977,6 +977,27 @@ type struct CompilerInstance {
         mut loader: ModuleLoader = ModuleLoader::new(
             config.project_root, root_path, stdlib_root, config.no_std,
             effective_roots);
+        // Vendored bindings are the loader's copies in `<profile_dir>/vendor/
+        // <Name>/<Name>.cryo`, checked first as the most specific root; their
+        // output routes to `vendor/<Name>/{deps,ir}`.  The dep-root prefix
+        // mirrors the loader's scan-root form: relative dep roots are
+        // prefixed with project_root before scanning.
+        mut roots: PackageRoots = PackageRoots {
+            vendor_root: if (ctx.project_config != null) { ctx.project_config.vendor_dir() } else { PathBuf::new() },
+            stdlib_root: if (config.no_std) { PathBuf::new() } else { PathBuf::from(Str::new(stdlib_root)) },
+            dep_roots:   [],
+            dep_names:   [],
+        };
+        for (mut drc: i64 = 0; drc < dep_outcome.roots.length(); drc++) {
+            const dr_path: Str = Str::new(dep_outcome.roots[drc].path);
+            roots.dep_roots.push(if (config.project_root.length() == 0 || config.project_root.eq(".")) {
+                PathBuf::from(dr_path)
+            } else {
+                Path::from(config.project_root).join(dr_path)
+            });
+            roots.dep_names.push(String::from_string(dep_outcome.roots[drc].name));
+        }
+        loader.set_package_roots(roots);
 
         // Vendor libraries: honor any cryoconfig `[vendor.<Name>]` pins first,
         // generating bindings for each pinned triple on a cache miss (this is
@@ -1157,9 +1178,7 @@ type struct CompilerInstance {
         // codegen and the build manifest route object/IR output into the
         // matching per-package subtree (`std/`, `local/`, `<depname>/`).
         // Done after ALL discovery so late-discovered stdlib modules
-        // (prelude, test runner, fmt::interpolation) are tagged Stdlib too.  The
-        // dep-root prefix mirrors ModuleLoader's scan-root form: relative
-        // dep roots are prefixed with project_root before scanning.
+        // (prelude, test runner, fmt::interpolation) are tagged Stdlib too.
         ctx.module_graph.builds_standard_library = config.target_type == TargetType::Stdlib;
         // The stdlib's own build is rooted at the stdlib; any other build
         // finds it at the root it resolved.
@@ -1169,27 +1188,9 @@ type struct CompilerInstance {
             } else {
                 if (config.no_std) { "" } else { stdlib_root }
             });
-        // Vendored bindings are the loader's copies in `<profile_dir>/vendor/
-        // <Name>/<Name>.cryo`, checked first as the most specific root; their
-        // output routes to `vendor/<Name>/{deps,ir}`.
-        mut roots: PackageRoots = PackageRoots {
-            vendor_root: if (ctx.project_config != null) { ctx.project_config.vendor_dir() } else { PathBuf::new() },
-            stdlib_root: if (config.no_std) { PathBuf::new() } else { PathBuf::from(Str::new(stdlib_root)) },
-            dep_roots:   [],
-            dep_names:   [],
-        };
-        for (mut drc: i64 = 0; drc < dep_outcome.roots.length(); drc++) {
-            const dr_path: Str = Str::new(dep_outcome.roots[drc].path);
-            roots.dep_roots.push(if (config.project_root.length() == 0 || config.project_root.eq(".")) {
-                PathBuf::from(dr_path)
-            } else {
-                Path::from(config.project_root).join(dr_path)
-            });
-            roots.dep_names.push(String::from_string(dep_outcome.roots[drc].name));
-        }
         for (mut mci: u32 = 0; mci < ctx.module_graph.module_count(); mci++) {
             const mci_info: mut ModuleInfo* = &ctx.module_graph.modules[mci];
-            const package: ModulePackage = roots.package_of(Path::from(mci_info.file_path));
+            const package: ModulePackage = loader.package_roots.package_of(Path::from(mci_info.file_path));
             mci_info.origin = package.origin;
             mci_info.origin_name = package.origin_name.clone();
             // Warnings pointing into a generated binding are not the
@@ -1198,7 +1199,7 @@ type struct CompilerInstance {
         }
         // Only the language server asks which modules exist unloaded.
         if (ctx.options.mode == CompileMode::Lsp) {
-            ctx.module_graph.indexed = loader.indexed_modules(ctx.intern_table, &roots);
+            ctx.module_graph.indexed = loader.indexed_modules(ctx.intern_table);
         }
 
         // Give each module the list of modules it can see through its imports,

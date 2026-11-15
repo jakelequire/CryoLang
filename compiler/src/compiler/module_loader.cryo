@@ -11,7 +11,7 @@ import compiler::diag::{
     sink, diagnostic, source_span, edit_distance, ErrorCode
 };
 import compiler::resolver::{ symbol_str, intern_table };
-import compiler::module_graph::{ IndexedModule, LexedSource, ModuleGraph, ModuleInfo, PackageRoots };
+import compiler::module_graph::{ IndexedModule, LexedSource, ModuleGraph, ModuleInfo, ModulePackage, PackageRoots };
 import compiler::diag::config::{ DiagConfig };
 import compiler::lex::{ Token, TokenType };
 import compiler::lex::lexer::{ Lexer };
@@ -253,6 +253,11 @@ public:
     /// in the project's build tree.  Empty with no project configuration,
     /// where resolution answers the cache path.
     vendor_build_root: PathBuf;
+    /// The roots that tell which package a file is in.  A module path
+    /// written in a file names only a file of a package the writer's may
+    /// name (`ModulePackage::may_name`).  Holds only the standard library's
+    /// root until `set_package_roots`.
+    package_roots: PackageRoots;
 
     static new(project_root: string, entry_point: string,
                stdlib_root: string, no_std: boolean,
@@ -280,7 +285,20 @@ public:
             used_vendor_keys: [],
             vendor_pins:      [],
             vendor_build_root: PathBuf::new(),
+            package_roots: PackageRoots {
+                vendor_root: PathBuf::new(),
+                stdlib_root: if (no_std) { PathBuf::new() } else { PathBuf::from(Str::new(stdlib_root)) },
+                dep_roots:   [],
+                dep_names:   [],
+            },
         };
+    }
+
+    /// Classify files by `roots`, the build's vendored libraries,
+    /// standard library and dependencies.  Called once, before
+    /// `discover_project`.
+    set_package_roots(mut &this, roots: PackageRoots) -> void {
+        this.package_roots = roots;
     }
 
     /// Enable `vendor::` import resolution.  Loads the global vendor registry
@@ -536,7 +554,7 @@ public:
         for (mut s: i64 = 0; s < declared.module_paths.length(); s++) {
             this.module_lines.push(ModuleLine {
                 written:     intern.intern(declared.module_paths[s].as_str()),
-                from_dir:    file_path.parent_directory(),
+                writer:      file_path,
                 declarer:    ModuleGraph::module_key(file_path),
                 is_internal: declared.module_internal[s],
                 target:      String::new(),
@@ -546,8 +564,8 @@ public:
     }
 
     /// Every module the pre-scan indexed, loaded or not, each in the package
-    /// `roots` places its file in.
-    indexed_modules(mut &this, intern: mut InternTable*, roots: &PackageRoots) -> [IndexedModule] {
+    /// its file is in.
+    indexed_modules(mut &this, intern: mut InternTable*) -> [IndexedModule] {
         mut out: [IndexedModule] = [];
         mut names: [Str] = [];
         mut files: [string] = [];
@@ -559,7 +577,7 @@ public:
             out.push(IndexedModule {
                 name:              intern.intern(names[i]),
                 file_path:         files[i],
-                package:           roots.package_of(files[i]),
+                package:           this.package_roots.package_of(files[i]),
                 declared_internal: this.declared_internal(intern, ModuleGraph::module_key(files[i]).as_str()),
             });
         }
@@ -576,7 +594,7 @@ public:
         for (mut k: i64 = 0; k < this.module_lines.length(); k++) {
             if (this.module_lines[k].resolved) { continue; }
             this.module_lines[k].target = ModuleGraph::module_key(this.resolve_import_path(
-                intern, this.module_lines[k].written, this.module_lines[k].from_dir));
+                intern, this.module_lines[k].written, this.module_lines[k].writer));
             this.module_lines[k].resolved = true;
         }
         mut chain: [String] = [String::from_str(norm_path)];
@@ -602,18 +620,27 @@ public:
     /// The file the written module path `written` names (e.g. "BattleTest"
     /// or "compiler::ast"): a vendored library's bindings, a file declaring
     /// that namespace, or a file at that path under the project root, the
-    /// entry point's directory, the standard library, and last `from_dir`,
-    /// the directory of the file that wrote it ("" asks none).  "" when
-    /// none is found.
-    resolve_import_path(mut &this, intern: InternTable*, written: SymbolStr, from_dir: string) -> string {
-        const found: string = this.resolve_written_path(intern.resolve(written));
-        if (found.length() > 0 || from_dir.length() == 0) { return found; }
+    /// entry point's directory, the standard library, and last the
+    /// directory of `writer`, the file that wrote it ("" asks none).  A
+    /// file of a package `writer`'s may not name is passed over, so a
+    /// program's `core/_module.cryo` is never the standard library's
+    /// `core::_module`.  "" when none is found.
+    resolve_import_path(mut &this, intern: InternTable*, written: SymbolStr, writer: string) -> string {
+        const writer_package: ModulePackage = this.package_roots.package_of(Path::from(writer));
+        const found: string = this.resolve_written_path(intern.resolve(written), &writer_package);
+        if (found.length() > 0 || writer.length() == 0) { return found; }
         // A path found here names a module for the rest of the build.
-        return this.search_location(from_dir, intern.resolve(written).replace("::", "/")).into_raw();
+        return this.search_location(writer.parent_directory(), intern.resolve(written).replace("::", "/")).into_raw();
+    }
+
+    /// Whether a module path written in `writer`'s package may name `file`.
+    names_reachable_file(&this, writer: &ModulePackage, file: Str) -> boolean {
+        const target: ModulePackage = this.package_roots.package_of(Path::from(file));
+        return writer.may_name(&target);
     }
 
     /// `resolve_import_path`'s search before the writing file's directory.
-    resolve_written_path(mut &this, import_path: string) -> string {
+    resolve_written_path(mut &this, import_path: string, writer: &ModulePackage) -> string {
         // Vendor libraries: `import vendor::Name` resolves through the vendor
         // registry to the bindings generated for the active target triple,
         // never the project tree or stdlib.  Handled before any filesystem
@@ -662,9 +689,11 @@ public:
         // Fast path: check pre-scanned namespace map first.
         // This handles all case-insensitive resolution automatically since
         // the map was built by walking the actual filesystem.
-        const from_map: Option<string> = this.ns_map.get(&String::from_string(import_path));
-        if (from_map.is_some()) {
-            return from_map.unwrap();
+        match (this.ns_map.get(&String::from_string(import_path))) {
+            Option::Some(file) => {
+                if (this.names_reachable_file(writer, Str::new(file))) { return file; }
+            }
+            Option::None => { }
         }
 
         const fs_path: string = import_path.replace("::", "/");
@@ -673,12 +702,16 @@ public:
         // for the rest of the build.
         // 1. Project root
         mut from_root: String = this.search_location(this.project_root, fs_path);
-        if (from_root.length() > 0) { return from_root.into_raw(); }
+        if (from_root.length() > 0 && this.names_reachable_file(writer, from_root.as_str())) {
+            return from_root.into_raw();
+        }
 
         // 2. Entry point directory (if different from root)
         if (!this.entry_dir.eq(this.project_root) && this.entry_dir.length() > 0) {
             mut from_entry: String = this.search_location(this.entry_dir, fs_path);
-            if (from_entry.length() > 0) { return from_entry.into_raw(); }
+            if (from_entry.length() > 0 && this.names_reachable_file(writer, from_entry.as_str())) {
+                return from_entry.into_raw();
+            }
         }
 
         // 3. Stdlib (unless no_std)
@@ -908,11 +941,6 @@ public:
         // dependency edge degrades to the raw import path.  See `scanned_ns`.
         this.scanned_ns.insert(norm_path.clone(), mod_name_str);
 
-        // Directory of the current file, used to resolve bare sub-module
-        // names (e.g., `module Commands;` in src/CLI/_module.cryo
-        // should find src/CLI/Commands.cryo).
-        const file_dir: string = file_path.parent_directory();
-
         // Process imports: discover dependencies recursively
         mut success: boolean = true;
         // Per brace item: the import whose path could not be found and whose
@@ -934,7 +962,7 @@ public:
             // Resolve to filesystem path, last relative to the declaring
             // file's directory (bare `module X;` declarations in
             // _module.cryo).
-            mut resolved: string = this.resolve_import_path(intern, import_sym, file_dir);
+            mut resolved: string = this.resolve_import_path(intern, import_sym, file_path);
             if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
                 Log::trace(LogArea::Loader, f"import '{import_path}' resolved to '{resolved}'");
             }
@@ -1030,7 +1058,7 @@ public:
         for (mut ii: i64 = 0; ii < scan.import_item_count; ii++) {
             const item_sym: SymbolStr = scan.import_items[ii];
             const item_path: string = intern.resolve(item_sym);
-            const item_resolved: string = this.resolve_import_path(intern, item_sym, file_dir);
+            const item_resolved: string = this.resolve_import_path(intern, item_sym, file_path);
             if (item_resolved.length() > 0) {
                 if (!this.discover_module(intern, graph, sink, item_resolved)) {
                     success = false;
@@ -1109,7 +1137,7 @@ public:
             const braced: boolean = scan.export_braced[ei];
             const exp_sym: SymbolStr = scan.export_paths[ei];
             const exp_path: string = intern.resolve(exp_sym);
-            const exp_resolved: string = this.resolve_import_path(intern, exp_sym, file_dir);
+            const exp_resolved: string = this.resolve_import_path(intern, exp_sym, file_path);
             if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
                 Log::trace(LogArea::Loader, f"export '{exp_path}' resolved to '{exp_resolved}'");
             }
@@ -1168,7 +1196,7 @@ public:
         // inside the path, mirroring the import-item loop above.
         for (mut eii: i64 = 0; eii < scan.export_item_count; eii++) {
             const eitem_sym: SymbolStr = scan.export_items[eii];
-            const eitem_resolved: string = this.resolve_import_path(intern, eitem_sym, file_dir);
+            const eitem_resolved: string = this.resolve_import_path(intern, eitem_sym, file_path);
             if (eitem_resolved.length() > 0) {
                 if (!this.discover_module(intern, graph, sink, eitem_resolved)) {
                     success = false;
@@ -1205,7 +1233,7 @@ public:
         // creates false cycles (e.g., AST -> Specializer -> Types -> AST).
         for (mut s: i64 = 0; s < scan.submodule_count; s++) {
             const sub_sym: SymbolStr = scan.submodule_paths[s];
-            const sub_resolved: string = this.resolve_import_path(intern, sub_sym, file_dir);
+            const sub_resolved: string = this.resolve_import_path(intern, sub_sym, file_path);
             if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
                 Log::trace(LogArea::Loader, f"submodule '{intern.resolve(sub_sym)}' resolved to '{sub_resolved}'");
             }
@@ -1859,13 +1887,13 @@ type struct ModuleScanResult {
     uses_fstring:    boolean;     // file contains at least one f-string (`f"..."`)
 }
 
-/// A `module` line the pre-scan read: the path as written, the directory
-/// of the file writing it (which resolves it as an import's path is), that
-/// file lower-cased, and whether it is `internal module`.  `target` is the
-/// file the path names, lower-cased, once `resolved`.
+/// A `module` line the pre-scan read: the path as written, the file
+/// writing it (which resolves it as an import's path is), that file
+/// lower-cased, and whether it is `internal module`.  `target` is the file
+/// the path names, lower-cased, once `resolved`.
 type struct ModuleLine {
     written:     SymbolStr;
-    from_dir:    string;
+    writer:      string;
     declarer:    String;
     is_internal: boolean;
     target:      String;
