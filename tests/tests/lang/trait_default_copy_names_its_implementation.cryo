@@ -1,0 +1,96 @@
+///! A trait's default body calls, on `This`, the method of the
+///! implementation its copy belongs to: with the trait implemented at two
+///! arguments, each copy calls its own implementation's method, and a
+///! method of the type's own with the trait method's name is not the one
+///! the default means.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::TraitDefaultCopyNamesItsImplementation;
+
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_equal };
+
+type trait TdcTag<T> {
+    tag(&this) -> i32;
+    tag_twice(&this) -> i32 { return this.tag() * 2; }
+    tag_sum(&this, other: &This) -> i32 { return this.tag() + other.tag(); }
+}
+
+type struct TdcSquare { side: i64; }
+
+implement trait TdcTag<i64> for TdcSquare {
+    tag(&this) -> i32 { return 1; }
+}
+
+implement trait TdcTag<i32> for TdcSquare {
+    tag(&this) -> i32 { return 5; }
+}
+
+function tdc_twice_at_i64<S>(s: &S) -> i32 where S: TdcTag<i64> { return s.tag_twice(); }
+function tdc_twice_at_i32<S>(s: &S) -> i32 where S: TdcTag<i32> { return s.tag_twice(); }
+function tdc_sum_at_i32<S>(s: &S, t: &S) -> i32 where S: TdcTag<i32> { return s.tag_sum(t); }
+
+/// Typed by the implementation's argument: the copy for `TdcMeasure<i32>`
+/// is checked against `i32`, which the first implementation's methods
+/// would refuse.
+type trait TdcMeasure<T> {
+    measure(&this) -> T;
+    scale(&this, by: T) -> T;
+    scaled_measure(&this) -> T { return this.scale(this.measure()); }
+}
+
+implement trait TdcMeasure<i64> for TdcSquare {
+    measure(&this) -> i64 { return this.side * this.side; }
+    scale(&this, by: i64) -> i64 { return this.side * by; }
+}
+
+implement trait TdcMeasure<i32> for TdcSquare {
+    measure(&this) -> i32 { return 7; }
+    scale(&this, by: i32) -> i32 { return by + 1; }
+}
+
+function tdc_scaled_at_i32<S>(s: &S) -> i32 where S: TdcMeasure<i32> { return s.scaled_measure(); }
+function tdc_scaled_at_i64<S>(s: &S) -> i64 where S: TdcMeasure<i64> { return s.scaled_measure(); }
+
+type trait TdcLabel {
+    label(&this) -> i32;
+    label_twice(&this) -> i32 { return this.label() * 2; }
+}
+
+type struct TdcDot {
+    n: i32;
+    label(&this) -> i32 { return 99; }
+}
+
+implement trait TdcLabel for TdcDot {
+    label(&this) -> i32 { return 4; }
+}
+
+![test]
+function each_copy_calls_its_own_implementation() -> Result<(), TestError> {
+    const s: TdcSquare = TdcSquare { side: 3 };
+    expect_equal(tdc_twice_at_i64(&s), 2)?;
+    return expect_equal(tdc_twice_at_i32(&s), 10);
+}
+
+![test]
+function another_value_of_this_type_calls_the_same_implementation() -> Result<(), TestError> {
+    const s: TdcSquare = TdcSquare { side: 3 };
+    const t: TdcSquare = TdcSquare { side: 4 };
+    return expect_equal(tdc_sum_at_i32(&s, &t), 10);
+}
+
+![test]
+function copy_is_typed_by_its_implementations_argument() -> Result<(), TestError> {
+    const s: TdcSquare = TdcSquare { side: 3 };
+    expect_equal(tdc_scaled_at_i64(&s), 27)?;
+    return expect_equal(tdc_scaled_at_i32(&s), 8);
+}
+
+![test]
+function default_calls_the_trait_method_not_the_types_own() -> Result<(), TestError> {
+    const d: TdcDot = TdcDot { n: 1 };
+    expect_equal(d.label(), 99)?;
+    return expect_equal(d.label_twice(), 8);
+}
