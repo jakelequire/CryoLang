@@ -706,15 +706,22 @@ EXAMPLE_FAILED = re.compile(r"^\s*FAIL\s+(examples/\S+)")
 # is compared as any other, and an archive object must have moved.  A project
 # written `moved:<project>` passes on both compilers and the change moves its
 # objects on purpose: the baseline's census must pass it, its objects are left
-# out of the comparison, and one of them must have moved.
+# out of the comparison, and one of them must have moved.  A standard-library
+# module written `moved-archive:<module>` (`moved-archive:std::time::clock`)
+# names no program: the change moves the module's objects in the stdlib
+# archives on purpose, so they are left out of the archive comparison, and one
+# of them must have moved.
 NEGATIVE = "negative/"
 EXAMPLE = "examples/"
 ARCHIVE = "archive:"
 MOVED = "moved:"
+MOVED_ARCHIVE = "moved-archive:"
 UNIT_DIR = "tests/tests"
 
 
 def declared_kind(name):
+    if name.startswith(MOVED_ARCHIVE):
+        return "moved-archive"
     if name.startswith(ARCHIVE):
         return "archive"
     if name.startswith(MOVED):
@@ -730,8 +737,9 @@ def declared_kind(name):
 
 def program_of(name):
     """The program a declaration line names, without the form it is written
-    in: `archive:stdlib/x.cryo` names `stdlib/x.cryo`, `moved:p` names `p`."""
-    for form in (ARCHIVE, MOVED):
+    in: `archive:stdlib/x.cryo` names `stdlib/x.cryo`, `moved:p` names `p`,
+    `moved-archive:std::m` names `std::m`."""
+    for form in (MOVED_ARCHIVE, ARCHIVE, MOVED):
         if name.startswith(form):
             return name[len(form):]
     return name
@@ -756,6 +764,26 @@ def unit_object_suffix(name):
     `namespace A::B::C;` is `.../deps/A/B/C.o`."""
     ns = unit_namespace(name)
     return None if ns is None else "/deps/" + "/".join(ns.split("::")) + ".o"
+
+
+def archive_module_source(name):
+    """The source file of the standard-library module a `moved-archive:` line
+    names, `std::a::b` -> `stdlib/a/b.cryo` (or `stdlib/a/b/_module.cryo`);
+    None when the name is not below `std::` or no such file exists."""
+    module = program_of(name)
+    if not module.startswith("std::"):
+        return None
+    below = os.path.join(ROOT, "stdlib", *module.split("::")[1:])
+    for path in (below + ".cryo", os.path.join(below, "_module.cryo")):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def archive_module_suffix(name):
+    """The object path tail a standard-library module compiles to in every
+    stdlib archive: `std::time::clock` is `.../deps/std/time/clock.o`."""
+    return "/deps/" + "/".join(program_of(name).split("::")) + ".o"
 
 
 def parse_declared(text):
@@ -835,7 +863,8 @@ def judge_baseline_census(declared, accounted, unit_failed, neg_failed, failed, 
             continue
         problems.append("the baseline fails %s, which neither %s nor %s declares"
                         % (p, DECLARED, FIXED))
-    judged = set(declared) | {p for p in fixed if declared_kind(p) not in ("unit", "archive", "moved")}
+    judged = set(declared) | {p for p in fixed if declared_kind(p) not in
+                              ("unit", "archive", "moved", "moved-archive")}
     for p in sorted(judged - set(failed)):
         problems.append("%s is declared as changed by this change, but the baseline census "
                         "passes it; a program this change makes compile or corrects fails "
@@ -898,6 +927,14 @@ def check_declared(declared, base_exe, cryo, logdir, env, fixed=()):
             if unit_object_suffix(name) is None:
                 problems.append("%s: declared in %s but %s/%s is not a unit-test file "
                                 "with a namespace" % (name, rel, UNIT_DIR, name))
+            continue
+        if kind == "moved-archive":
+            if not is_fixed:
+                problems.append("%s: a standard-library module's moved objects are declared "
+                                "in %s, not %s" % (name, FIXED, DECLARED))
+            elif archive_module_source(name) is None:
+                problems.append("%s: declared in %s but %s is no standard-library module"
+                                % (name, rel, program_of(name)))
             continue
         if not os.path.isfile(os.path.join(ROOT, PROJECTS, program_of(name), "test.json")):
             problems.append("%s: declared in %s but %s/%s is not a test project"
@@ -1039,6 +1076,37 @@ def selftest():
          == ({PROJECTS + "/q/a.o": "1"}, {PROJECTS + "/q/a.o": "2"}) else ["bad"], 0),
         ("declarations: a line rewritten into the moved form, reason kept",
          [] if declarations_between("moved:p a\n", "p a\n") == {} else ["bad"], 0),
+        ("moved-archive: the form is its own kind, naming the module",
+         [] if declared_kind("moved-archive:std::a::b") == "moved-archive"
+         and program_of("moved-archive:std::a::b") == "std::a::b"
+         and archive_module_suffix("moved-archive:std::a::b") == "/deps/std/a/b.o" else ["bad"], 0),
+        ("census: a module declared moved in the archive asks nothing of the baseline",
+         judge_baseline_census({}, True, 0, 0, [], {"moved-archive:std::m"}), 0),
+        ("moved-archive: a declared module whose archive object moved",
+         judge_archive_module_moves(["moved-archive:std::m"],
+                                    {"stdlib-archive/t/O0/x/deps/std/m.o": "1",
+                                     "stdlib-archive/t/O2/x/deps/std/m.o": "1"},
+                                    {"stdlib-archive/t/O0/x/deps/std/m.o": "1",
+                                     "stdlib-archive/t/O2/x/deps/std/m.o": "2"}), 0),
+        ("moved-archive: a declared module whose archive objects did not move",
+         judge_archive_module_moves(["moved-archive:std::m"],
+                                    {"stdlib-archive/t/O0/x/deps/std/m.o": "1"},
+                                    {"stdlib-archive/t/O0/x/deps/std/m.o": "1"}), 1),
+        ("moved-archive: a declared module no archive holds",
+         judge_archive_module_moves(["moved-archive:std::m"], {}, {}), 1),
+        ("moved-archive: a module's name is matched whole, not as a tail",
+         judge_archive_module_moves(["moved-archive:std::m"],
+                                    {"stdlib-archive/t/O0/x/deps/std/am.o": "1"},
+                                    {"stdlib-archive/t/O0/x/deps/std/am.o": "2"}), 1),
+        ("moved-archive: another module's moved object is still compared",
+         [] if (lambda a, b: (judge_archive_module_moves(["moved-archive:std::m"], a, b), a, b))(
+             {"s/x/deps/std/m.o": "1", "s/x/deps/std/n.o": "1"},
+             {"s/x/deps/std/m.o": "2", "s/x/deps/std/n.o": "2"})[1:]
+         == ({"s/x/deps/std/n.o": "1"}, {"s/x/deps/std/n.o": "2"}) else ["bad"], 0),
+        ("moved-archive: a module below std:: whose source is missing is refused",
+         [] if archive_module_source("moved-archive:std::no_such_module_here") is None
+         and archive_module_source("moved-archive:fmt::display") is None
+         and archive_module_source("moved-archive:std::time::clock") is not None else ["bad"], 0),
         ("declarations: parse skips comments and blanks",
          [] if parse_declared("# c\n\np why\nq\n") == {"p": "why", "q": ""} else ["bad"], 0),
         ("declarations: a new line applies",
@@ -1109,6 +1177,30 @@ def judge_project_moves(names, a, b):
     return problems
 
 
+def judge_archive_module_moves(names, a, b):
+    """Problems with the standard-library modules `names` declared
+    `moved-archive:` over the archive hash maps `a` and `b`: each must have
+    objects in both - one per archive built - and one of them must differ
+    (moved, or in one run only).  Their objects are removed from both."""
+    problems = []
+    for name in sorted(names):
+        suffix = archive_module_suffix(name)
+        ka = {p for p in a if p.endswith(suffix)}
+        kb = {p for p in b if p.endswith(suffix)}
+        if not ka or not kb:
+            problems.append("%s: %d baseline and %d tree archive objects end in %s; a module "
+                            "declared as moving its objects is in both runs' archives"
+                            % (name, len(ka), len(kb), suffix))
+        elif ka == kb and all(a[p] == b[p] for p in ka):
+            problems.append("%s is declared as moving its archive objects, but none of its %d "
+                            "moved" % (name, len(ka)))
+        for p in ka:
+            del a[p]
+        for p in kb:
+            del b[p]
+    return problems
+
+
 def judge_archive_moves(names, archive_changed):
     """Problems with the unit-test files `names` declared as failing on the
     baseline through the stdlib archive: the archive is their cause, so some
@@ -1130,7 +1222,7 @@ def split_replaced(only_baseline, replaced_by_archive):
 
 
 def compare(tag_a, a_path, b_path, limit, excluded=(), units=None, problems=None,
-            replaced_by_archive=False, moved_projects=()):
+            replaced_by_archive=False, moved_projects=(), moved_modules=()):
     a, b = read_hashes(a_path), read_hashes(b_path)
     if units:
         found = judge_unit_moves(units, a, b)
@@ -1165,6 +1257,11 @@ def compare(tag_a, a_path, b_path, limit, excluded=(), units=None, problems=None
         if unpaired:
             print("  %-9s archive objects of a stdlib root only one run used, left out: %d"
                   % (tag_a, len(unpaired)))
+        if moved_modules:
+            found = judge_archive_module_moves(moved_modules, a, b)
+            print("  %-9s declared moved modules left out: %d, %d problem(s)"
+                  % (tag_a, len(moved_modules), len(found)))
+            problems.extend(found)
     moved = sorted(p for p in a.keys() & b.keys() if a[p] != b[p])
     only_a = sorted(a.keys() - b.keys())
     only_b = sorted(b.keys() - a.keys())
@@ -1304,7 +1401,9 @@ def main():
                               problems=unit_problems,
                               replaced_by_archive=counts["stdlib"] > 0,
                               moved_projects=[n for n in fixed if declared_kind(n) == "moved"]
-                              if base == "tests" else ())
+                              if base == "tests" else (),
+                              moved_modules=[n for n in fixed if declared_kind(n) == "moved-archive"]
+                              if base == "stdlib" else ())
             diff += changed
             if base == "stdlib":
                 archive_changed = changed
