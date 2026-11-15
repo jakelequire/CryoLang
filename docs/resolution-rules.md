@@ -4299,7 +4299,9 @@ check is being deleted and the seals are what hold.  (Jake)
     nothing, so `Json::twice` below is a module the file does not import
     (E0240), and a second module whose leaf is `Json`, imported under its
     own name, is the only one `Json` names.  Another import of the same
-    module that is not aliased binds the leaf again.  (Jake)
+    module that is not aliased binds the leaf again.  The E0240 a path
+    through the leaf gets carries a note naming the alias the file imports
+    the module under.  (Jake)
 
     ```cryo
     import Json as J;

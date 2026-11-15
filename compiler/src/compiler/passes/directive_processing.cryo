@@ -65,6 +65,8 @@ import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Suggestion };
+import compiler::diag::edit_distance::{ find_best_candidate };
+import std::collections::str::{ Str };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
@@ -255,6 +257,28 @@ type struct DirectiveProcessingPasses {
         };
     }
 
+    /// Whether `![name]`, written with no arguments on `target`, is a
+    /// well-formed directive that asks nothing more of the declaration: one
+    /// that takes no arguments, may be written there, and has no condition a
+    /// later pass checks (a companion directive, a body shape, a signature).
+    /// The placement checks of these directives are this predicate, so a
+    /// name suggested through it is certain to be accepted where it stands.
+    static applies_unconditionally(name: string, target: DirectiveTarget) -> boolean {
+        const function_or_method: boolean =
+            target == DirectiveTarget::Function || target == DirectiveTarget::Method;
+        return match (name) {
+            "inline" | "noinline" | "caller_location" | "no_mangle" | "weak" => { function_or_method }
+            "must_use" => {
+                function_or_method || target == DirectiveTarget::Struct
+                    || target == DirectiveTarget::Enum || target == DirectiveTarget::Union
+            }
+            "thread_local"   => { target == DirectiveTarget::Variable }
+            "functions_only" => { target == DirectiveTarget::Extern }
+            "windows" | "linux" | "macos" | "unix" => { true }
+            _ => { false }
+        };
+    }
+
     /// Local copy of the OS-atom predicate so the validator can extend
     /// `config(...)` arg-shape checking without cross-importing the
     /// ConfigGating pass.  Kept in sync with config_gating.cryo's atom set.
@@ -291,7 +315,7 @@ type struct DirectiveProcessingPasses {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
-                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                if (!DirectiveProcessingPasses::applies_unconditionally(name, target)) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "function or method", target);
                 }
             }
@@ -313,9 +337,7 @@ type struct DirectiveProcessingPasses {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
-                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method
-                        && target != DirectiveTarget::Struct && target != DirectiveTarget::Enum
-                        && target != DirectiveTarget::Union) {
+                if (!DirectiveProcessingPasses::applies_unconditionally(name, target)) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind,
                         "a function, a method, a struct, a union or an enum", target);
                 }
@@ -638,7 +660,7 @@ type struct DirectiveProcessingPasses {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
-                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                if (!DirectiveProcessingPasses::applies_unconditionally(name, target)) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "function or method", target);
                 }
             }
@@ -649,7 +671,7 @@ type struct DirectiveProcessingPasses {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
-                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                if (!DirectiveProcessingPasses::applies_unconditionally(name, target)) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "function or method", target);
                 }
             }
@@ -660,7 +682,7 @@ type struct DirectiveProcessingPasses {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
-                if (target != DirectiveTarget::Variable) {
+                if (!DirectiveProcessingPasses::applies_unconditionally(name, target)) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "global variable", target);
                 }
             }
@@ -782,7 +804,7 @@ type struct DirectiveProcessingPasses {
                 if (argc != 0) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, dir.directive_kind, 0, argc);
                 }
-                if (target != DirectiveTarget::Extern) {
+                if (!DirectiveProcessingPasses::applies_unconditionally(name, target)) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, dir.directive_kind, "extern module", target);
                 }
             }
@@ -886,7 +908,7 @@ type struct DirectiveProcessingPasses {
                 // distance.  The full directive list is short and stable
                 // enough to embed inline here; updating it tracks
                 // `is_known_builtin` above.
-                mut cands: [string] = [
+                const cands: [string] = [
                     "inline", "noinline", "caller_location", "entry", "test", "ignore",
                     "should_panic", "test_child", "config", "deprecated", "align",
                     "repr", "link", "symbol", "no_mangle", "weak", "naked", "section",
@@ -904,7 +926,19 @@ type struct DirectiveProcessingPasses {
                     dir.span.file,
                     dir.span.start_line, dir.span.start_col + 2,
                     dir.span.start_line, dir.span.start_col + 2 + name_len);
-                diag = diag.did_you_mean(name, cands, "directive", ns);
+                // The edit renames the directive and keeps what follows the
+                // name, so it is offered only for a directive written with no
+                // arguments whose suggestion takes none and stands here
+                // unconditionally; any other gets the help alone.
+                mut views: [Str] = [];
+                for (mut i: i64 = 0; i < cands.length(); i++) { views.push(cands[i]); }
+                const found: Option<i64> = find_best_candidate(name, &views);
+                if (found.is_some()) {
+                    const best: string = cands[found.unwrap()];
+                    const applicable: boolean = dir.args.length() == 0
+                        && DirectiveProcessingPasses::applies_unconditionally(best, target);
+                    diag = diag.similar_name(best, "directive", ns, applicable);
+                }
                 ctx.emit_diagnostic(diag);
             }
         }

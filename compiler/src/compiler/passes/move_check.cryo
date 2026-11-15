@@ -112,6 +112,21 @@ type enum FieldReadSite {
     MatchSubject;
 }
 
+/// Where a loop is left other than by a `break`, which decides the moved-set
+/// after it: a loop holds what is moved on every path that leaves it.
+type enum LoopExits {
+    /// `while` and `for`: the condition is tested before the body, so the
+    /// loop may be left before the body runs at all, with the moved-set it
+    /// began with.
+    BeforeBody;
+    /// `do-while`: the condition is tested after the body, which therefore
+    /// runs at least once; the loop is left with the moved-set its condition
+    /// ends with.
+    AfterBody;
+    /// `loop`: left by a `break` alone.
+    BreakOnly;
+}
+
 /// A binding declared outside a loop that was moved on a path leaving the
 /// loop's body through a `break` or a `continue`.
 type struct LoopExitMove {
@@ -1371,20 +1386,19 @@ type struct MoveChecker {
             // re-walks it, and a `for`'s update, at the back edge.
             StmtKind::While(w) => {
                 this.walk_condition(w.condition);
-                this.walk_loop_body(w.body, null, w.condition);
+                this.walk_loop_body(w.body, null, w.condition, LoopExits::BeforeBody);
             }
             StmtKind::For(f) => {
                 this.walk_condition(f.condition);
-                this.walk_loop_body(f.body, f.update, f.condition);
+                this.walk_loop_body(f.body, f.update, f.condition, LoopExits::BeforeBody);
             }
             StmtKind::DoWhile(d) => {
                 // The condition is tested after the body, so it runs at
                 // least once and is part of every iteration's back edge.
-                this.walk_loop_body(d.body, null, d.condition);
-                this.walk_condition(d.condition);
+                this.walk_loop_body(d.body, null, d.condition, LoopExits::AfterBody);
             }
             StmtKind::Loop(lp) => {
-                this.walk_loop_body(lp.body, null, null);
+                this.walk_loop_body(lp.body, null, null, LoopExits::BreakOnly);
             }
             StmtKind::Break    => { this.record_loop_exit(true); }
             StmtKind::Continue => { this.record_loop_exit(false); }
@@ -1400,7 +1414,11 @@ type struct MoveChecker {
     record_loop_exit(mut &this, is_break: boolean) -> void {
         if (this.loop_walks.length() == 0) { return; }
         const walk: LoopWalk = this.loop_walks[this.loop_walks.length() - 1];
-        for (mut i: i64 = walk.moves_start; i < this.moved_keys.length(); i++) {
+        // A `continue` reaches the back edge, where only the body's own
+        // moves matter; a `break` leaves the loop, after which everything
+        // moved here, before the loop or in it, is still moved.
+        const first: i64 = if (is_break) { 0 } else { walk.moves_start };
+        for (mut i: i64 = first; i < this.moved_keys.length(); i++) {
             const key: u64 = this.moved_keys[i];
             if (!this.moved_real[i]) { continue; }
             if (this.is_body_local(key, walk.declarations_start)) { continue; }
@@ -1439,7 +1457,7 @@ type struct MoveChecker {
     /// null), so both walks walk them after the body, unless the body always
     /// leaves the loop; any move made there is refused (`walk_back_edge`).
     walk_loop_body(mut &this, body: Stmt*, update: Stmt*,
-                   condition: ExpressionNode*) -> void {
+                   condition: ExpressionNode*, exits: LoopExits) -> void {
         if (body == null) { return; }
         const loops_back: boolean = !this.leaves_loop(body);
         // A loop body is conditional (0+ iterations): a field-move-out inside
@@ -1519,12 +1537,24 @@ type struct MoveChecker {
         this.walk_stmt(body);
         if (loops_back) { this.walk_back_edge(update, condition); }
 
-        // The loop's own exit holds the moved-set it began with: a loop may
-        // run zero times, and a move reaching the back edge was refused
-        // above.  A `break` leaves with its own moves, so they hold after
-        // the loop too.
+        // After the loop a binding is moved if it is moved on any path that
+        // leaves it.  A `while` or `for` may be left before its body runs,
+        // with the moved-set it began with; a move reaching the back edge
+        // was refused above, so that set is also what its condition leaves
+        // with.  A `do-while` is left by its condition with the moved-set
+        // the body's last pass ends with, and a `loop` by a `break` alone.
+        // Each `break` leaves with the moved-set it has.
         this.truncate_carried(carry_snap);
-        this.restore_full(pre_keys, pre_spans, pre_real);
+        match (exits) {
+            LoopExits::BeforeBody => { this.restore_full(pre_keys, pre_spans, pre_real); }
+            LoopExits::AfterBody  => { }
+            LoopExits::BreakOnly  => {
+                const no_keys:  [u64]        = [];
+                const no_spans: [SourceSpan] = [];
+                const no_real:  [boolean]    = [];
+                this.restore_full(no_keys, no_spans, no_real);
+            }
+        }
         for (mut i: i64 = walk.breaks_start; i < this.break_moves.length(); i++) {
             const exit: LoopExitMove = this.break_moves[i];
             this.mark_moved_key(exit.key, exit.span, true);
@@ -1910,6 +1940,7 @@ type struct MoveChecker {
                 // A consuming receiver (`this` / `mut this`) is a
                 // real move: the value is taken and dropped by the
                 // callee, so a loop-carried receiver double-frees.
+                this.check_consumed_through_indirection(ma.object);
                 this.walk_expr_move(ma.object, true);
                 receiver_moved = true;
             }
@@ -2619,13 +2650,42 @@ type struct MoveChecker {
         this.fatal += 1;
     }
 
+    /// Reject a method that takes its receiver by value, called on a
+    /// receiver reached through a reference or pointer whose pointee owns a
+    /// destructor: the call dereferences the receiver implicitly and moves
+    /// the pointee into the method, which releases it, while the storage it
+    /// was read from still releases it too.  It is the move `check_deref_move_out`
+    /// refuses for a written `(*p).method()`, with the same `unsafe` escape.
+    check_consumed_through_indirection(mut &this, receiver: ExpressionNode*) -> void {
+        if (this.unsafe_depth > 0 || this.arg_binding_unknown) { return; }
+        if (receiver == null) { return; }
+        const written: TypeRef = receiver.resolved_type;
+        if (!written.is_valid() || !this.is_ptr_or_ref(written)) { return; }
+        const t: Type* = this.arena.lookup(written);
+        if (t == null) { return; }
+        const pointee: TypeRef =
+            if (t.kind == TypeKind::Pointer) { t.as_pointer().pointee } else { t.as_reference().referent };
+        if (!pointee.is_valid() || this.is_ptr_or_ref(pointee) || this.is_copy(pointee)) { return; }
+        if (!this.type_needs_drop(pointee)) { return; }
+        if (this.suppress_emit) { return; }
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
+            "cannot move a value that owns a destructor out of a pointer");
+        diag = diag.at_with_label(receiver.span,
+            "the method takes its receiver by value, so the call reads the pointee out by value; the storage this points at is still dropped by its owner (double free)");
+        diag = diag.help(
+            "call a method that borrows its receiver (`&this`) instead, or clone the value first; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
     emit_deref_move_out_error(mut &this, expr: ExpressionNode*) -> void {
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
             "cannot move a value that owns a destructor out of a pointer");
         diag = diag.at_with_label(expr.span,
             "reading the pointee by value copies its owning handle; the storage this points at is still dropped by its owner (double free)");
         diag = diag.help(
-            "borrow it instead (`p.field`, `p.method()`), or clone it; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");
+            "borrow it instead (read a field, or call a method that borrows its receiver with `&this`), or clone it; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");
         this.ctx.emit_diagnostic(this.with_clone_hint(diag, expr.resolved_type, expr.span, expr));
         this.fired += 1;
         this.fatal += 1;

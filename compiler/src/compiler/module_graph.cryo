@@ -217,6 +217,13 @@ type struct LexedSource {
     }
 }
 
+/// An import that names a module under an alias (`import M as A;`): the
+/// module, and the alias it is named by in the importing module.
+type struct AliasedImport {
+    imported: ModulePath;
+    alias:    SymbolStr;
+}
+
 type struct ModuleInfo {
 private:
     /// The module's path, its identity: `path()`.
@@ -294,7 +301,7 @@ public:
     /// (`import M as A;`), and those an import names under their own
     /// name.  A module only aliased is named by its alias alone: its own
     /// leaf names nothing here (`ModuleGraph::imports_only_under_alias`).
-    aliased_imports:      [ModulePath];
+    aliased_imports:      [AliasedImport];
     named_imports:        [ModulePath];
 
     // Source origin, classified by the orchestrator after discovery from the
@@ -751,30 +758,43 @@ public:
         return false;
     }
 
-    /// Record that an import of `use_module` names `target`, under an alias
-    /// (`aliased`) or under its own name.
-    record_import_naming(mut &this, use_module: ModulePath, target: ModulePath, aliased: boolean) -> void {
+    /// Record that an import of `use_module` names `target`, under `alias`,
+    /// or under its own name when `alias` is empty.
+    record_import_naming(mut &this, use_module: ModulePath, target: ModulePath, alias: SymbolStr) -> void {
         const idx: i64 = this.find_module_index(use_module);
         if (idx < 0) { return; }
-        const named: mut [ModulePath]* =
-            if (aliased) { &this.modules[idx].aliased_imports } else { &this.modules[idx].named_imports };
-        for (mut k: i64 = 0; k < (*named).length(); k++) {
-            if ((*named)[k].equals(target)) { return; }
+        if (alias.is_empty()) {
+            for (mut k: i64 = 0; k < this.modules[idx].named_imports.length(); k++) {
+                if (this.modules[idx].named_imports[k].equals(target)) { return; }
+            }
+            this.modules[idx].named_imports.push(target);
+            return;
         }
-        (*named).push(target);
+        for (mut k: i64 = 0; k < this.modules[idx].aliased_imports.length(); k++) {
+            const known: AliasedImport = this.modules[idx].aliased_imports[k];
+            if (known.imported.equals(target) && known.alias.equals(alias)) { return; }
+        }
+        this.modules[idx].aliased_imports.push(AliasedImport { imported: target, alias: alias });
+    }
+
+    /// The first alias an import of `use_module` gives `target`, or an empty
+    /// name when no import there aliases it.
+    import_alias_of(&this, use_module: ModulePath, target: ModulePath) -> SymbolStr {
+        const idx: i64 = this.find_module_index(use_module);
+        if (idx < 0) { return SymbolStr::empty(); }
+        for (mut k: i64 = 0; k < this.modules[idx].aliased_imports.length(); k++) {
+            const known: AliasedImport = this.modules[idx].aliased_imports[k];
+            if (known.imported.equals(target)) { return known.alias; }
+        }
+        return SymbolStr::empty();
     }
 
     /// Whether every import of `use_module` that names `target` names it
     /// under an alias: the alias is then its only name there, and its own
     /// leaf does not name it.
     imports_only_under_alias(&this, use_module: ModulePath, target: ModulePath) -> boolean {
+        if (this.import_alias_of(use_module, target).is_empty()) { return false; }
         const idx: i64 = this.find_module_index(use_module);
-        if (idx < 0) { return false; }
-        mut aliased: boolean = false;
-        for (mut k: i64 = 0; k < this.modules[idx].aliased_imports.length(); k++) {
-            if (this.modules[idx].aliased_imports[k].equals(target)) { aliased = true; }
-        }
-        if (!aliased) { return false; }
         for (mut k: i64 = 0; k < this.modules[idx].named_imports.length(); k++) {
             if (this.modules[idx].named_imports[k].equals(target)) { return false; }
         }
