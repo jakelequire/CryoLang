@@ -37,7 +37,7 @@ import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import std::fs::directory::{ Directory, DirectoryEntries };
 import std::fs::file::{ File };
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::io::error::{ IoErrorKind };
 import std::process::command::{ Command, Output };
 import std::time::clock::{ SystemTime };
@@ -330,9 +330,9 @@ type struct PrebuiltStdlib {
             }
             Option::None => { }
         }
-        return Result::Err(String::from_str(Str::new(fmt::format(
+        return Result::Err(fmt::format(
             "the stdlib archive built in %s does not record the key %s this build asked for",
-            directory, key).into_raw())));
+            directory, key));
     }
 
     static release(lock: string) -> void {
@@ -346,8 +346,8 @@ type struct PrebuiltStdlib {
     /// A tree this build cannot write to is one it never prunes either, so a
     /// use that cannot be recorded costs nothing.
     record_use(&this) -> void {
-        const record: string = Path::from(this.directory).join(LAST_USE_NAME).into_raw();
-        match (File::write_text(Path::from(record), Str::new(""))) {
+        const record: PathBuf = Path::from(this.directory).join(LAST_USE_NAME);
+        match (File::write_text(record.as_path(), Str::new(""))) {
             Result::Ok(_)  => { }
             Result::Err(_) => { }
         }
@@ -357,13 +357,13 @@ type struct PrebuiltStdlib {
     /// its manifest, else the directory itself (a build that died before
     /// writing a manifest).  0 when none of them can be read.
     static last_use_secs(directory: string) -> i64 {
-        const candidates: [string] = [
-            Path::from(directory).join(LAST_USE_NAME).into_raw(),
-            Path::from(directory).join(MANIFEST_NAME).into_raw(),
-            directory,
+        const candidates: [PathBuf] = [
+            Path::from(directory).join(LAST_USE_NAME),
+            Path::from(directory).join(MANIFEST_NAME),
+            PathBuf::from(Str::new(directory)),
         ];
         for (mut i: i64 = 0; i < candidates.length(); i++) {
-            match (Path::from(candidates[i]).metadata()) {
+            match (candidates[i].metadata()) {
                 Result::Ok(m)  => { return m.modified_seconds(); }
                 Result::Err(_) => { }
             }
@@ -393,11 +393,11 @@ type struct PrebuiltStdlib {
         mut command: Command = Command::new(Str::new(exe));
         command.argument(Str::new("build"));
         command.argument(Str::new(stdlib_root));
-        command.argument(Str::new(fmt::format("--build-dir=%s", directory).into_raw()));
+        command.argument(fmt::format("--build-dir=%s", directory).as_str());
         command.argument(Str::new("--no-incremental"));
-        command.argument(Str::new(fmt::format("--opt-level=%u", opt_level).into_raw()));
+        command.argument(fmt::format("--opt-level=%u", opt_level).as_str());
         command.argument(Str::new(if (unwinds) { "--panic=unwind" } else { "--panic=abort" }));
-        command.argument(Str::new(fmt::format("--target=%s", triple).into_raw()));
+        command.argument(fmt::format("--target=%s", triple).as_str());
         if (debug_info) { command.argument(Str::new("-g")); }
         if (warnings_as_errors) { command.argument(Str::new("-Werror")); }
         Log::debug(LogArea::Driver, f"building the stdlib archive in {directory}");
@@ -405,8 +405,8 @@ type struct PrebuiltStdlib {
             Result::Ok(result) => {
                 mut output: Output = result;
                 if (!output.status().success()) {
-                    mut report: String = String::from_str(Str::new(fmt::format(
-                        "building the stdlib archive in %s failed:\n", directory).into_raw()));
+                    mut report: String = fmt::format(
+                        "building the stdlib archive in %s failed:\n", directory);
                     report.push(Str::from_raw(output.stdout().as_pointer(), output.stdout().length()));
                     report.push(Str::from_raw(output.stderr().as_pointer(), output.stderr().length()));
                     return report;
@@ -418,7 +418,7 @@ type struct PrebuiltStdlib {
                 // build inherits, they fail it above.
             }
             Result::Err(_) => {
-                return String::from_str(Str::new(fmt::format("could not run %s to build the stdlib archive", exe).into_raw()));
+                return fmt::format("could not run %s to build the stdlib archive", exe);
             }
         }
         return String::new();
@@ -564,9 +564,9 @@ type struct PrebuiltStdlib {
         text.push(Str::new("key " + key));
         text.push_byte(10 as u8);
         // What the key folds besides the compiler and the sources, readable.
-        text.push(Str::new(fmt::format("options %s O%u %s %s", triple, opt_level,
+        text.push(fmt::format("options %s O%u %s %s", triple, opt_level,
             if (debug_info) { "debug-info" } else { "no-debug-info" },
-            if (unwinds) { "unwind" } else { "abort" }).into_raw()));
+            if (unwinds) { "unwind" } else { "abort" }).as_str());
         text.push_byte(10 as u8);
         const prefix: string = directory + "/";
         for (mut i: i64 = 0; i < modules.length(); i++) {
@@ -576,8 +576,8 @@ type struct PrebuiltStdlib {
             } else {
                 object
             };
-            text.push(Str::new(fmt::format("module %u %s %s %s", modules[i].rank,
-                if (modules[i].startup) { "1" } else { "0" }, modules[i].namespace_name, relative).into_raw()));
+            text.push(fmt::format("module %u %s %s %s", modules[i].rank,
+                if (modules[i].startup) { "1" } else { "0" }, modules[i].namespace_name, relative).as_str());
             text.push_byte(10 as u8);
         }
         for (mut i: i64 = 0; i < modules.length(); i++) {
