@@ -117,16 +117,16 @@ type struct ProjSpec {
     /// then not checked.
     fails:      boolean;
     /// Single substring that must appear in the combined stdout+stderr.
-    stdout_sub: string;
+    stdout_sub: String;
     /// Every entry must appear in the combined output; no entry of
     /// `output_excludes` may.  `expect.diagnostic: "E0200"` is sugar: it sets
     /// `fails` and appends `error[E0200]` to `output_contains`.
-    output_contains: [string];
-    output_excludes: [string];
+    output_contains: [String];
+    output_excludes: [String];
     /// Every entry must appear in the combined output after the previous
     /// entry: the order of what is printed, which `output_contains` cannot
     /// say.
-    output_in_order: [string];
+    output_in_order: [String];
     /// Environment prerequisites (test.json `requires`): the project runs only
     /// where every token holds, and is otherwise SKIPPED with a reason (not a
     /// failure).  Recognized tokens: `"display"` (an X11/Wayland display is
@@ -136,29 +136,29 @@ type struct ProjSpec {
     /// hard-use one platform's surface).  Lets a real integration test (e.g.
     /// the raylib window demo) stay live without turning a portable
     /// `make test` red.  Empty = no prerequisites (the common case).
-    requires:   [string];
+    requires:   [String];
     /// `NAME=value` entries (test.json `environment`) set in the compiler's
     /// environment for this project's command only.
-    environment: [string];
+    environment: [String];
     /// Extra arguments (test.json `arguments`) given to the compiler after
     /// the fixture's own verb and flags.
-    arguments:  [string];
+    arguments:  [String];
     /// Every entry must appear in the compiler's stderr alone; no entry of
     /// `stderr_excludes` may.
-    stderr_contains: [string];
-    stderr_excludes: [string];
+    stderr_contains: [String];
+    stderr_excludes: [String];
     /// When non-empty, every non-empty line of that stream must start with
     /// one of these prefixes, so a line nobody expected fails the project
     /// whatever it says.
-    stdout_line_prefixes: [string];
-    stderr_line_prefixes: [string];
+    stdout_line_prefixes: [String];
+    stderr_line_prefixes: [String];
     /// A file the command writes, relative to the project (test.json
     /// `expect.file`): removed before the command runs, so what is read
     /// afterwards is this run's, then checked against `file_contains` and
     /// `file_excludes` and removed again.  Empty = no file is checked.
-    file: string;
-    file_contains: [string];
-    file_excludes: [string];
+    file: String;
+    file_contains: [String];
+    file_excludes: [String];
     /// test.json `applied`: the project's machine-applicable fixes are
     /// proven too.  A copy of the project is run with `cryo run
     /// --apply-fixes`, which must make at least one fix, build the fixed
@@ -168,11 +168,11 @@ type struct ProjSpec {
 
     static empty() -> ProjSpec {
         return ProjSpec {
-            outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: "",
+            outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: String::new(),
             output_contains: [], output_excludes: [], output_in_order: [], requires: [],
             environment: [], arguments: [], stderr_contains: [], stderr_excludes: [],
             stdout_line_prefixes: [], stderr_line_prefixes: [],
-            file: "", file_contains: [], file_excludes: [],
+            file: String::new(), file_contains: [], file_excludes: [],
             applied: false, applied_exit_code: 0
         };
     }
@@ -185,10 +185,10 @@ type struct ProjSpec {
         run.outcome = 2;
         run.exit_code = this.applied_exit_code;
         for (mut i: i64 = 0; i < this.environment.length(); i++) {
-            run.environment.push(this.environment[i]);
+            run.environment.push(this.environment[i].clone());
         }
-        run.arguments.push("--apply-fixes");
-        run.output_contains.push("building again");
+        run.arguments.push(String::from_str(Str::new("--apply-fixes")));
+        run.output_contains.push(String::from_str(Str::new("building again")));
         return run;
     }
 }
@@ -822,7 +822,7 @@ type struct Executor {
         if (args.has_arg("Werror")) {
             const comma: str::Str = str::Str::new(",");
             for (piece in str::Str::new(args.get_value("Werror")).split(&comma)) {
-                const name: string = Executor::dup_cstr(piece.trim());
+                const name: string = String::from_str(piece.trim()).into_raw();
                 match (ErrorCode::warning_named(name)) {
                     Option::Some(code) => { config.promoted_warnings.push(code.to_u32()); }
                     Option::None => {
@@ -2213,14 +2213,6 @@ type struct Executor {
         return NegSuiteResult { ran: ran, failures: failures };
     }
 
-    /// Copy a borrowed `Str` into an owned NUL-terminated C string. The copy
-    /// outlives the `JsonValue` it was read from (which we drop right after
-    /// parsing), so the dispatch logic can keep using it.
-    static dup_cstr(s: str::Str) -> string {
-        mut owned: String = String::from_str(s);
-        return owned.into_raw();
-    }
-
     /// The first `requires` token NOT satisfied in this environment, or "" when
     /// every prerequisite holds (so the project should run).  Recognized:
     ///   - `"display"`        an X11 (`DISPLAY`) or Wayland (`WAYLAND_DISPLAY`)
@@ -2231,31 +2223,31 @@ type struct Executor {
     ///   - `"cxx"`            a C++ toolchain is available.
     /// Unrecognized tokens never reach here: `proj_first_unknown_requirement`
     /// rejects them as a hard test failure first.
-    static proj_first_unmet_requirement(reqs: &[string]) -> string {
+    static proj_first_unmet_requirement(reqs: &[String]) -> Str {
         for (mut i: i64 = 0; i < reqs.length(); i++) {
-            if (!Executor::proj_requirement_met(reqs[i])) { return reqs[i]; }
+            if (!Executor::proj_requirement_met(reqs[i].as_str())) { return reqs[i].as_str(); }
         }
-        return "";
+        return Str::new("");
     }
 
-    /// The first `requires` token this harness does not recognize, or ""
-    /// when every token is known.  An unknown token is a hard test failure,
-    /// not a skip and not "satisfied": a typo'd requirement must not
-    /// silently change semantics from "gated" to "always-run" (or park the
-    /// project as permanently skipped).
-    static proj_first_unknown_requirement(reqs: &[string]) -> string {
+    /// The first `requires` token this harness does not recognize, or an
+    /// empty view when every token is known.  An unknown token is a hard
+    /// test failure, not a skip and not "satisfied": a typo'd requirement
+    /// must not silently change semantics from "gated" to "always-run" (or
+    /// park the project as permanently skipped).
+    static proj_first_unknown_requirement(reqs: &[String]) -> Str {
         for (mut i: i64 = 0; i < reqs.length(); i++) {
-            const r: string = reqs[i];
-            const known: boolean = r == "display" || r == "cxx"
-                || r.starts_with("vendor:") || r.starts_with("os:");
+            const r: Str = reqs[i].as_str();
+            const known: boolean = r.equals(&Str::new("display")) || r.equals(&Str::new("cxx"))
+                || r.starts_with(&Str::new("vendor:")) || r.starts_with(&Str::new("os:"));
             if (!known) { return r; }
         }
-        return "";
+        return Str::new("");
     }
 
     /// True when a single `requires` token holds (see `proj_first_unmet_requirement`).
-    static proj_requirement_met(req: string) -> boolean {
-        if (req == "display") {
+    static proj_requirement_met(req: Str) -> boolean {
+        if (req.equals(&Str::new("display"))) {
             match (env::var(str::Str::new("DISPLAY"))) {
                 Option::Some(v) => { mut s: String = v; if (s.length() > 0) { return true; } }
                 Option::None => {}
@@ -2266,8 +2258,10 @@ type struct Executor {
             }
             return false;
         }
-        if (req.starts_with("vendor:")) {
-            const lib: string = req + 7;   // strip "vendor:"
+        const vendor_prefix: Str = Str::new("vendor:");
+        const os_prefix: Str = Str::new("os:");
+        if (req.starts_with(&vendor_prefix)) {
+            const lib: Str = req.byte_substring(vendor_prefix.length(), req.length());
             const reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
             const idx: i64 = reg.find_index(lib);
             if (idx < 0) { return false; }
@@ -2275,15 +2269,15 @@ type struct Executor {
                 registry::VendorRegistry::normalize_triple(""));
             return f.length() > 0 && path::Path::from(f).exists();
         }
-        if (req.starts_with("os:")) {
+        if (req.starts_with(&os_prefix)) {
             // The project's sources hard-use one platform's surface (e.g.
             // native_syscalls_gate's Linux `syscall`-instruction asm), so it
             // can only compile and run on that host.  Matched against the
             // COMPILER's OWN target - the projects suite builds and runs on
             // the host, so compiler target == project host.
-            return (req + 3) == host_os_name();
+            return req.byte_substring(os_prefix.length(), req.length()).equals(&Str::new(host_os_name()));
         }
-        if (req == "cxx") {
+        if (req.equals(&Str::new("cxx"))) {
             // A C++ toolchain is available.  The C++ direct-mangled-binding test
             // links a `c++`-compiled helper by its Itanium-mangled symbols, so it
             // is meaningless without a C++ compiler (and the Itanium ABI) - skip
@@ -2380,9 +2374,8 @@ type struct Executor {
                     Option::Some(dp) => {
                         match (dp.as::<str::Str>()) {
                             Option::Some(ds) => {
-                                const dcode: string = Executor::dup_cstr(ds);
                                 spec.fails = true;
-                                spec.output_contains.push(fmt::format("error[%s]", dcode).into_raw());
+                                spec.output_contains.push(f"error[{ds}]");
                             }
                             Option::None     => { }
                         }
@@ -2392,7 +2385,7 @@ type struct Executor {
                 match (ep.get(str::Str::new("stdout_contains"))) {
                     Option::Some(sp) => {
                         match (sp.as::<str::Str>()) {
-                            Option::Some(ss) => { spec.stdout_sub = Executor::dup_cstr(ss); }
+                            Option::Some(ss) => { spec.stdout_sub = String::from_str(ss); }
                             Option::None     => { }
                         }
                     }
@@ -2408,7 +2401,7 @@ type struct Executor {
                 match (ep.get(str::Str::new("file"))) {
                     Option::Some(fp) => {
                         match (fp.as::<str::Str>()) {
-                            Option::Some(fs) => { spec.file = Executor::dup_cstr(fs); }
+                            Option::Some(fs) => { spec.file = String::from_str(fs); }
                             Option::None     => { }
                         }
                     }
@@ -2425,7 +2418,7 @@ type struct Executor {
 
     /// Append each string of the array `object.key` to `into`; a missing key
     /// or a non-string element adds nothing.
-    static read_strings(object: &value::JsonValue, key: string, into: mut &[string]) -> void {
+    static read_strings(object: &value::JsonValue, key: string, into: mut &[String]) -> void {
         match (object.get(str::Str::new(key))) {
             Option::Some(ap) => {
                 const n: i64 = ap.length();
@@ -2433,7 +2426,7 @@ type struct Executor {
                     match (ap.at(i)) {
                         Option::Some(iv) => {
                             match (iv.as::<str::Str>()) {
-                                Option::Some(is) => { into.push(Executor::dup_cstr(is)); }
+                                Option::Some(is) => { into.push(String::from_str(is)); }
                                 Option::None     => { }
                             }
                         }
@@ -2507,21 +2500,21 @@ type struct Executor {
                 // A `requires` token the harness doesn't recognize is a hard
                 // FAILURE, not a skip: a typo'd requirement would otherwise
                 // silently change semantics from "gated" to "always-run".
-                const unknown_req: string = Executor::proj_first_unknown_requirement(&spec.requires);
+                const unknown_req: Str = Executor::proj_first_unknown_requirement(&spec.requires);
                 // Environment-gated skip: a project declaring `requires` runs
                 // only where every prerequisite holds (a display, a registered
                 // vendor lib, ...); elsewhere it is skipped WITH A REASON, never
                 // counted as a failure, so a portable `make test` stays green.
                 if (unknown_req.length() > 0) {
-                    verdict = 3; reason = String::from_string(unknown_req);
+                    verdict = 3; reason = String::from_str(unknown_req);
                 } else {
-                    const unmet: string = Executor::proj_first_unmet_requirement(&spec.requires);
+                    const unmet: Str = Executor::proj_first_unmet_requirement(&spec.requires);
                     if (unmet.length() > 0) {
-                        verdict = 4; reason = String::from_string(unmet);
+                        verdict = 4; reason = String::from_str(unmet);
                     } else if (!proj_dir.as_path().exists()) {
                         verdict = 5; reason = String::from_str(proj_dir.as_path().as_str());
                     } else if (!Executor::remove_project_file(proj_dir.as_path(), &spec)) {
-                        verdict = 6; reason = String::from_string(spec.file);
+                        verdict = 6; reason = spec.file.clone();
                     }
                 }
             }
@@ -2655,7 +2648,7 @@ type struct Executor {
                 mut res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path.as_str(), proj_dir.as_path());
                 if (!Executor::remove_project_file(proj_dir.as_path(), &specs[i]) && res.passed) {
                     res = ProjOutcome { passed: false,
-                        detail: fmt::format("cannot remove the %s it wrote", specs[i].file) };
+                        detail: f"cannot remove the {specs[i].file} it wrote" };
                 }
                 // The run of the copy with its fixes applied is judged on its
                 // own, and fails the project when the project itself passed.
@@ -2779,7 +2772,7 @@ type struct Executor {
             else { if (spec.outcome == 2) { "run" } else { "test --format=plain" } };
         mut command: String = String::new();
         for (mut i: i64 = 0; i < spec.environment.length(); i++) {
-            command.push(shell_set_environment(spec.environment[i]));
+            command.push(shell_set_environment(spec.environment[i].as_str()));
         }
         command.push(f"{self_exe} {verb}");
         if (stdlib_abs.length() > 0) { command.push(f" --stdlib={stdlib_abs}"); }
@@ -2797,7 +2790,7 @@ type struct Executor {
     /// that could not be removed.
     static remove_project_file(proj_dir: path::Path, spec: &ProjSpec) -> boolean {
         if (spec.file.length() == 0) { return true; }
-        const file_path: path::PathBuf = proj_dir.join(spec.file);
+        const file_path: path::PathBuf = proj_dir.join(spec.file.as_str());
         return !file_path.as_path().exists() || File::remove(file_path.as_path()).is_ok();
     }
 
@@ -2808,14 +2801,14 @@ type struct Executor {
 
     /// The stream's first line that starts with none of `prefixes`, or an
     /// empty view when every non-empty line starts with one of them.
-    static first_unexpected_line(stream: Str, prefixes: &[string]) -> Str {
+    static first_unexpected_line(stream: Str, prefixes: &[String]) -> Str {
         const newline: str::Str = str::Str::new("\n");
         for (raw in stream.split(&newline)) {
             const line: str::Str = raw.trim();
             if (line.is_empty()) { continue; }
             mut expected: boolean = false;
             for (mut i: i64 = 0; !expected && i < prefixes.length(); i++) {
-                expected = line.starts_with(&str::Str::new(prefixes[i]));
+                expected = line.starts_with(&prefixes[i].as_str());
             }
             if (!expected) { return line; }
         }
@@ -2859,24 +2852,24 @@ type struct Executor {
         // stdout is its `cryo test` run, which is what a runner option that
         // reaches the test binary changes.
         if (passed && spec.stdout_sub.length() > 0) {
-            passed = out.contains(&str::Str::new(spec.stdout_sub));
-            if (!passed) { detail = fmt::format("output missing \"%s\"", spec.stdout_sub); }
+            passed = out.contains(&spec.stdout_sub.as_str());
+            if (!passed) { detail = f"output missing \"{spec.stdout_sub}\""; }
         }
         for (mut i: i64 = 0; passed && i < spec.output_contains.length(); i++) {
-            if (!out.contains(&str::Str::new(spec.output_contains[i]))) {
+            if (!out.contains(&spec.output_contains[i].as_str())) {
                 passed = false;
-                detail = fmt::format("output missing \"%s\"", spec.output_contains[i]);
+                detail = f"output missing \"{spec.output_contains[i]}\"";
             }
         }
         for (mut i: i64 = 0; passed && i < spec.output_excludes.length(); i++) {
-            if (out.contains(&str::Str::new(spec.output_excludes[i]))) {
+            if (out.contains(&spec.output_excludes[i].as_str())) {
                 passed = false;
-                detail = fmt::format("output must not contain \"%s\"", spec.output_excludes[i]);
+                detail = f"output must not contain \"{spec.output_excludes[i]}\"";
             }
         }
         mut rest: str::Str = out;
         for (mut i: i64 = 0; passed && i < spec.output_in_order.length(); i++) {
-            const entry: str::Str = str::Str::new(spec.output_in_order[i]);
+            const entry: str::Str = spec.output_in_order[i].as_str();
             match (rest.find(&entry)) {
                 Option::Some(at) => {
                     rest = rest.byte_substring(at + entry.length(), rest.length());
@@ -2884,23 +2877,23 @@ type struct Executor {
                 Option::None => {
                     passed = false;
                     detail = if (i == 0) {
-                        fmt::format("output missing \"%s\"", spec.output_in_order[i])
+                        f"output missing \"{entry}\""
                     } else {
-                        fmt::format("output missing \"%s\" after \"%s\"", spec.output_in_order[i], spec.output_in_order[i - 1])
+                        f"output missing \"{entry}\" after \"{spec.output_in_order[i - 1]}\""
                     };
                 }
             }
         }
         for (mut i: i64 = 0; passed && i < spec.stderr_contains.length(); i++) {
-            if (!standard_error.contains(&str::Str::new(spec.stderr_contains[i]))) {
+            if (!standard_error.contains(&spec.stderr_contains[i].as_str())) {
                 passed = false;
-                detail = fmt::format("stderr missing \"%s\"", spec.stderr_contains[i]);
+                detail = f"stderr missing \"{spec.stderr_contains[i]}\"";
             }
         }
         for (mut i: i64 = 0; passed && i < spec.stderr_excludes.length(); i++) {
-            if (standard_error.contains(&str::Str::new(spec.stderr_excludes[i]))) {
+            if (standard_error.contains(&spec.stderr_excludes[i].as_str())) {
                 passed = false;
-                detail = fmt::format("stderr must not contain \"%s\"", spec.stderr_excludes[i]);
+                detail = f"stderr must not contain \"{spec.stderr_excludes[i]}\"";
             }
         }
         if (passed && spec.stdout_line_prefixes.length() > 0) {
@@ -2918,22 +2911,22 @@ type struct Executor {
             }
         }
         if (passed && spec.file.length() > 0) {
-            const file_path: path::PathBuf = proj_dir.join(spec.file);
+            const file_path: path::PathBuf = proj_dir.join(spec.file.as_str());
             if (!file_path.as_path().exists()) {
                 passed = false;
-                detail = fmt::format("no file %s", spec.file);
+                detail = f"no file {spec.file}";
             }
             const written: String = Executor::read_file_or_empty(file_path.as_path());
             for (mut i: i64 = 0; passed && i < spec.file_contains.length(); i++) {
-                if (!written.contains(&str::Str::new(spec.file_contains[i]))) {
+                if (!written.contains(&spec.file_contains[i].as_str())) {
                     passed = false;
-                    detail = fmt::format("%s missing \"%s\"", spec.file, spec.file_contains[i]);
+                    detail = f"{spec.file} missing \"{spec.file_contains[i]}\"";
                 }
             }
             for (mut i: i64 = 0; passed && i < spec.file_excludes.length(); i++) {
-                if (written.contains(&str::Str::new(spec.file_excludes[i]))) {
+                if (written.contains(&spec.file_excludes[i].as_str())) {
                     passed = false;
-                    detail = fmt::format("%s must not contain \"%s\"", spec.file, spec.file_excludes[i]);
+                    detail = f"{spec.file} must not contain \"{spec.file_excludes[i]}\"";
                 }
             }
         }
