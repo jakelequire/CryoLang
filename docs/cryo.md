@@ -4305,6 +4305,8 @@ type struct CacheLine {
 - The actual alignment of the type is `max(natural_alignment, N)`.
 - The size of the type is rounded up to its alignment.
 
+On an enum it means the same, simple or not: an array of an aligned enum is strided by its size, and a member of one starts on its boundary. An aligned simple enum is passed and stored as a value of that size holding its tag, not as the bare tag, and converts with `as` to and from its tag's integer as any simple enum does.
+
 `![align(N)]` is compatible with `![repr(C)]` and `![repr(transparent)]`; it is mutually exclusive with `![repr(packed)]`.
 
 `![align(N)]` on a variable raises that variable's alignment for the lifetime of its storage; this is useful for stack buffers that must satisfy SIMD or hardware-register alignment requirements.
