@@ -2940,6 +2940,9 @@ type struct Executor {
     static project_outcome(spec: &ProjSpec, st: i32, tmp_text: string, proj_dir: string) -> ProjOutcome {
         mut passed: boolean = false;
         mut detail: string = "";
+        const standard_output: string = Executor::read_file_or_empty(tmp_text);
+        const standard_error: string = Executor::read_file_or_empty(Executor::stderr_path(tmp_text));
+        const out: string = fmt::format("%s%s", standard_output, standard_error).into_raw();
 
         if (spec.outcome == 1 || spec.outcome == 2) {
             // The fixture and the checks are orthogonal: a failing build is
@@ -2947,94 +2950,12 @@ type struct Executor {
             // `output_contains` marker (both folded in at parse time).
             const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
             const ec: i64 = st as i64;
-            const standard_output: string = Executor::read_file_or_empty(tmp_text);
-            const standard_error: string = Executor::read_file_or_empty(Executor::stderr_path(tmp_text));
-            const out: string = fmt::format("%s%s", standard_output, standard_error).into_raw();
-
             if (spec.fails) {
                 passed = ec != 0;
                 if (!passed) { detail = fmt::format("expected %s to fail (exit non-zero)", verb).into_raw(); }
             } else {
                 passed = ec == spec.exit_code;
                 if (!passed) { detail = fmt::format("exit %lld, expected %lld", ec, spec.exit_code).into_raw(); }
-            }
-            if (passed && spec.stdout_sub.length() > 0) {
-                passed = out.contains(spec.stdout_sub);
-                if (!passed) { detail = fmt::format("output missing \"%s\"", spec.stdout_sub).into_raw(); }
-            }
-            for (mut i: i64 = 0; passed && i < spec.output_contains.length(); i++) {
-                if (!out.contains(spec.output_contains[i])) {
-                    passed = false;
-                    detail = fmt::format("output missing \"%s\"", spec.output_contains[i]).into_raw();
-                }
-            }
-            for (mut i: i64 = 0; passed && i < spec.output_excludes.length(); i++) {
-                if (out.contains(spec.output_excludes[i])) {
-                    passed = false;
-                    detail = fmt::format("output must not contain \"%s\"", spec.output_excludes[i]).into_raw();
-                }
-            }
-            mut rest: string = out;
-            for (mut i: i64 = 0; passed && i < spec.output_in_order.length(); i++) {
-                const entry: string = spec.output_in_order[i];
-                const at: i64 = rest.find(entry);
-                if (at < 0) {
-                    passed = false;
-                    detail = if (i == 0) {
-                        fmt::format("output missing \"%s\"", entry).into_raw()
-                    } else {
-                        fmt::format("output missing \"%s\" after \"%s\"", entry, spec.output_in_order[i - 1]).into_raw()
-                    };
-                } else {
-                    const past: i64 = at + (entry.length() as i64);
-                    rest = rest.substring(past, rest.length() - past);
-                }
-            }
-            for (mut i: i64 = 0; passed && i < spec.stderr_contains.length(); i++) {
-                if (!standard_error.contains(spec.stderr_contains[i])) {
-                    passed = false;
-                    detail = fmt::format("stderr missing \"%s\"", spec.stderr_contains[i]).into_raw();
-                }
-            }
-            for (mut i: i64 = 0; passed && i < spec.stderr_excludes.length(); i++) {
-                if (standard_error.contains(spec.stderr_excludes[i])) {
-                    passed = false;
-                    detail = fmt::format("stderr must not contain \"%s\"", spec.stderr_excludes[i]).into_raw();
-                }
-            }
-            if (passed && spec.stdout_line_prefixes.length() > 0) {
-                const line: string = Executor::first_unexpected_line(standard_output, &spec.stdout_line_prefixes);
-                if (line.length() > 0) {
-                    passed = false;
-                    detail = fmt::format("unexpected stdout line \"%s\"", line).into_raw();
-                }
-            }
-            if (passed && spec.stderr_line_prefixes.length() > 0) {
-                const line: string = Executor::first_unexpected_line(standard_error, &spec.stderr_line_prefixes);
-                if (line.length() > 0) {
-                    passed = false;
-                    detail = fmt::format("unexpected stderr line \"%s\"", line).into_raw();
-                }
-            }
-            if (passed && spec.file.length() > 0) {
-                const file_path: string = path::Path::from(proj_dir).join(spec.file).into_raw();
-                if (!path::Path::from(file_path).exists()) {
-                    passed = false;
-                    detail = fmt::format("no file %s", spec.file).into_raw();
-                }
-                const written: string = Executor::read_file_or_empty(file_path);
-                for (mut i: i64 = 0; passed && i < spec.file_contains.length(); i++) {
-                    if (!written.contains(spec.file_contains[i])) {
-                        passed = false;
-                        detail = fmt::format("%s missing \"%s\"", spec.file, spec.file_contains[i]).into_raw();
-                    }
-                }
-                for (mut i: i64 = 0; passed && i < spec.file_excludes.length(); i++) {
-                    if (written.contains(spec.file_excludes[i])) {
-                        passed = false;
-                        detail = fmt::format("%s must not contain \"%s\"", spec.file, spec.file_excludes[i]).into_raw();
-                    }
-                }
             }
         } else {
             // collect: run the project's own `cryo test`; exit 0 = all passed.
@@ -3051,6 +2972,89 @@ type struct Executor {
                 passed = st == 0;
                 if (!passed) { detail = "project tests failed"; }
             }
+        }
+        // The output assertions hold for every fixture: a collect project's
+        // stdout is its `cryo test` run, which is what a runner option that
+        // reaches the test binary changes.
+        if (passed && spec.stdout_sub.length() > 0) {
+            passed = out.contains(spec.stdout_sub);
+            if (!passed) { detail = fmt::format("output missing \"%s\"", spec.stdout_sub).into_raw(); }
+        }
+        for (mut i: i64 = 0; passed && i < spec.output_contains.length(); i++) {
+            if (!out.contains(spec.output_contains[i])) {
+                passed = false;
+                detail = fmt::format("output missing \"%s\"", spec.output_contains[i]).into_raw();
+            }
+        }
+        for (mut i: i64 = 0; passed && i < spec.output_excludes.length(); i++) {
+            if (out.contains(spec.output_excludes[i])) {
+                passed = false;
+                detail = fmt::format("output must not contain \"%s\"", spec.output_excludes[i]).into_raw();
+            }
+        }
+        mut rest: string = out;
+        for (mut i: i64 = 0; passed && i < spec.output_in_order.length(); i++) {
+            const entry: string = spec.output_in_order[i];
+            const at: i64 = rest.find(entry);
+            if (at < 0) {
+                passed = false;
+                detail = if (i == 0) {
+                    fmt::format("output missing \"%s\"", entry).into_raw()
+                } else {
+                    fmt::format("output missing \"%s\" after \"%s\"", entry, spec.output_in_order[i - 1]).into_raw()
+                };
+            } else {
+                const past: i64 = at + (entry.length() as i64);
+                rest = rest.substring(past, rest.length() - past);
+            }
+        }
+        for (mut i: i64 = 0; passed && i < spec.stderr_contains.length(); i++) {
+            if (!standard_error.contains(spec.stderr_contains[i])) {
+                passed = false;
+                detail = fmt::format("stderr missing \"%s\"", spec.stderr_contains[i]).into_raw();
+            }
+        }
+        for (mut i: i64 = 0; passed && i < spec.stderr_excludes.length(); i++) {
+            if (standard_error.contains(spec.stderr_excludes[i])) {
+                passed = false;
+                detail = fmt::format("stderr must not contain \"%s\"", spec.stderr_excludes[i]).into_raw();
+            }
+        }
+        if (passed && spec.stdout_line_prefixes.length() > 0) {
+            const line: string = Executor::first_unexpected_line(standard_output, &spec.stdout_line_prefixes);
+            if (line.length() > 0) {
+                passed = false;
+                detail = fmt::format("unexpected stdout line \"%s\"", line).into_raw();
+            }
+        }
+        if (passed && spec.stderr_line_prefixes.length() > 0) {
+            const line: string = Executor::first_unexpected_line(standard_error, &spec.stderr_line_prefixes);
+            if (line.length() > 0) {
+                passed = false;
+                detail = fmt::format("unexpected stderr line \"%s\"", line).into_raw();
+            }
+        }
+        if (passed && spec.file.length() > 0) {
+            const file_path: string = path::Path::from(proj_dir).join(spec.file).into_raw();
+            if (!path::Path::from(file_path).exists()) {
+                passed = false;
+                detail = fmt::format("no file %s", spec.file).into_raw();
+            }
+            const written: string = Executor::read_file_or_empty(file_path);
+            for (mut i: i64 = 0; passed && i < spec.file_contains.length(); i++) {
+                if (!written.contains(spec.file_contains[i])) {
+                    passed = false;
+                    detail = fmt::format("%s missing \"%s\"", spec.file, spec.file_contains[i]).into_raw();
+                }
+            }
+            for (mut i: i64 = 0; passed && i < spec.file_excludes.length(); i++) {
+                if (written.contains(spec.file_excludes[i])) {
+                    passed = false;
+                    detail = fmt::format("%s must not contain \"%s\"", spec.file, spec.file_excludes[i]).into_raw();
+                }
+            }
+        }
+        if (spec.outcome == 0) {
             // A run whose test discovery found nothing exits 0 as well, so the
             // run's own count goes on the project's line: the exit code alone
             // cannot tell the two apart.
