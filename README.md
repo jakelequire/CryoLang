@@ -321,11 +321,11 @@ The `c := extern "C" { #include ... }` form imports a real C header. The compile
 ![config(testing)]
 namespace MyApp::Tests;
 
-import std::test::assert::{ expect_eq };
+import std::test::assert::{ expect_equal };
 
 ![test]
 function addition_is_commutative() -> Result<(), TestError> {
-    return expect_eq(1 + 2, 2 + 1);
+    return expect_equal(1 + 2, 2 + 1);
 }
 ```
 

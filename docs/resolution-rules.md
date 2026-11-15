@@ -1151,7 +1151,7 @@ yet is recorded with the change that builds it, not here.
 
 637. **`test` is marked.**  The assertions, `TestError` with its
      constructors and `message_str`, `Fixture` and the table-case
-     prefixes are public; the step `expect_eq` and `expect_ne` share to
+     prefixes are public; the step `expect_equal` and `expect_not_equal` share to
      build their message is private.  `TestDescriptor`, whose layout the
      generated test main fills, and `run_all`, the entry it calls, are
      internal language items, as the entry point's are.  Everything else
