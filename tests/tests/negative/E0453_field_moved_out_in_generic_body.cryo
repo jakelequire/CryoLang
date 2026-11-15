@@ -1,0 +1,50 @@
+// E0453: a generic body that passes a field reached through a reference to
+// a generic function by value moves it out from behind the reference, in
+// every copy whose field type owns a resource.  The copy for `Tracked` is
+// refused where the body writes the move; a borrow of the field is not a
+// move and passes.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::E0453FieldMovedOutInGenericBody;
+
+type struct Tracked { id: i32; }
+implement trait Drop for struct Tracked {
+    drop(mut &this) -> void { }
+}
+
+type struct Holder<T> {
+    n: T;
+
+    // The store would refill the field, but the move out of it is refused
+    // first, as it is in a body that is not generic.
+    cf_rewrap(mut &this) -> void {
+        this.n = keep_value(this.n);   //~ ERROR[E0453] cannot move field `n` out through a pointer or reference
+    }
+}
+type struct Outer<T> { inner: Holder<T>; }
+
+function keep<T>(t: T) -> i32 { return 1; }
+function keep_value<T>(t: T) -> T { return t; }
+function peek<T>(t: &T) -> i32 { return 2; }
+
+function cf_field<T>(h: &Holder<T>) -> i32 {
+    return keep(h.n);   //~ ERROR[E0453] cannot move field `n` out through a pointer or reference
+}
+
+function cf_nested_field<T>(o: &Outer<T>) -> i32 {
+    return keep(o.inner.n);   //~ ERROR[E0453] cannot move field `n` out through a pointer or reference
+}
+
+function cf_borrowed<T>(h: &Holder<T>) -> i32 {
+    return peek(&h.n);
+}
+
+function main() -> int {
+    mut h: Holder<Tracked> = Holder { n: Tracked { id: 1 } };
+    h.cf_rewrap();
+    const o: Outer<Tracked> = Outer { inner: Holder { n: Tracked { id: 2 } } };
+    cf_field(&h);
+    cf_nested_field(&o);
+    cf_borrowed(&h);
+    return 0;
+}

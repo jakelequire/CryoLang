@@ -686,26 +686,16 @@ function keeps its single-pointer form across the C boundary.
 
 ## Moving a value out from behind a reference
 
-A field moved out of a place reached through a reference or a pointer -
-`mut old: Body = this.body;`, `match (this.opt)` by value, a generic getter
-returning a `T` field, an array field read through `node.fields` - copies an
-owning handle the place still holds, and the move checker lets it through:
-the borrowed storage is someone else's to release, and nothing records
-whether they will.  Only the destructor's own receiver is refused today
-(`E0453`; ruling 309: moving a field of `this` out inside `drop` is refused,
-full move checking waits for after the merge), because field glue certainly
-releases it again.
+A field that owns a resource, moved by value out of a place reached through
+a reference or a pointer, is refused (`E0453`) in every body, each copy of
+a generic body included, and in a closure's or an `async` function's;
+inside an `unsafe` block it is the programmer's.  The legitimate takes are
+written with `mem::swap` or `Option::take`, and a store through a reference
+releases the value it displaces.
 
-Full move checking refuses every such move, and needs a way to write the
-legitimate ones: a take that leaves a replacement behind (`mem::swap` does it
-today, in two statements) and a release of what an assignment through a
-reference overwrites, which today is not released at all.  The take-and-
-replace idiom in the standard library's `set_body`, the editor's
-`take_pending`, and `tests/tests/lang/move_field_out_ok.cryo`, which asserts
-the idiom, are the first sites it reaches.
-
-Open: whether a raw-pointer root is in scope (the compiler's own AST cloner
-moves array fields through node pointers), and the spelling of a take.
+Open: whether a raw-pointer root should stay refused outside `unsafe` (the
+compiler's own AST cloner moves array fields through node pointers), and the
+spelling of a take for an owning type that is no `Option` (below).
 
 ## `mem::replace` and `Option::take`
 
