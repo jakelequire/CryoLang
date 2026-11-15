@@ -903,9 +903,9 @@ compiler infers the real type and uses it everywhere; you simply do not have
 to write it.
 
 ```cryo
-// The concrete iterator (`SliceIter<T>`) never appears in the signature.
+// The concrete iterator (`SliceIterator<T>`) never appears in the signature.
 iter(&this) -> implement Iterator<T> where T: Copy {
-    return SliceIter::<T> { ptr: this.ptr, remaining: this.length() };
+    return SliceIterator::<T> { ptr: this.ptr, remaining: this.length() };
 }
 
 // A caller binds the result without naming the concrete type either.
@@ -915,7 +915,7 @@ const n: i64 = it.count();          // trait methods are available
 
 Because Cryo monomorphises, this is a purely static, zero-cost construct: an
 `implement Iterator<i32>` value *is* the underlying concrete type (here
-`SliceIter<i32>`), method calls dispatch statically, and there is no heap
+`SliceIterator<i32>`), method calls dispatch statically, and there is no heap
 allocation, vtable, or runtime indirection. It corresponds to "return some
 single type that implements this trait", **not** to a dynamically-dispatched
 trait object. (`implement` is the same keyword used for implement blocks; in
@@ -926,7 +926,7 @@ declaration* it introduces an implement block - the two never overlap.)
 
 - **Return type** - the concrete type is inferred from the body's first
   `return` expression. That expression must currently be a *struct literal*
-  (e.g. `return SliceIter::<T> { ... }`), which is how every standard-library
+  (e.g. `return SliceIterator::<T> { ... }`), which is how every standard-library
   iterator is written.  A generic struct's literal may leave its type
   arguments out (`return Gen { f: move () -> i64 { ... } };`) in a free
   function, generic or not, and in a method, written in its type or in an
@@ -2490,7 +2490,7 @@ this implementation bound". Projections also work off a generic parameter - a
 generic adapter names its source's element as `I::Item`:
 
 ```cryo
-type struct MapIter<I, Mapper, O> where I: Iterator, Mapper: (I::Item) -> O { inner: I; f: Mapper; }
+type struct MapIterator<I, Mapper, O> where I: Iterator, Mapper: (I::Item) -> O { inner: I; f: Mapper; }
 ```
 
 A projection is answered by the parameter's bounds, so `I::Item` needs a bound on `I` whose trait declares `Item`. Without one, or when no bound's trait declares the name, the projection is refused where it is written (E0203, "associated type `Item` not found for `I`"). A bound on a trait that *inherits* `Iterator` answers too: the projection resolves through the bound trait's supertraits.
@@ -2555,7 +2555,7 @@ implement trait Iterator for struct Counter {
 ```
 
 The positional form scales to where-clause adapters, whose element flows from
-the source: `implement<I, A> trait Iterator<A> for struct TakeIter<I> where I:
+the source: `implement<I, A> trait Iterator<A> for struct TakeIterator<I> where I:
 Iterator<A>` binds `Item := A := I::Item`.
 
 A parameter an implementation writes in its trait's arguments and not in its
@@ -2618,7 +2618,7 @@ implement trait Seq<NotCopy> for struct Holder { ... }   // E0306: Item not Copy
   body form (`type Out = ...;`).
 
 Because Cryo monomorphises, a projection is fully resolved at compile time:
-`MapIter<Range<i32>, (i32) -> i64, i64>::Item` reduces to `i64` with no runtime cost.
+`MapIterator<Range<i32>, (i32) -> i64, i64>::Item` reduces to `i64` with no runtime cost.
 
 ### 10.6 Operator Overloading
 

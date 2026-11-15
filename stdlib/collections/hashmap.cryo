@@ -201,7 +201,7 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
     /// or resizes; same contract as `as_pointer` / `get_reference`.
     public iter(&this) -> implement Iterator<Pair<K, V>>
     where K: Copy, V: Copy {
-        return HashMapIter::<K, V> {
+        return HashMapIterator::<K, V> {
             buckets: this.buckets,
             bucket_count: this.bucket_count,
             bucket_index: 0,
@@ -214,7 +214,7 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
     /// bucket-major and unstable across resizes.
     public keys(&this) -> implement Iterator<K>
     where K: Copy {
-        return KeysIter::<K, V> {
+        return KeysIterator::<K, V> {
             buckets: this.buckets,
             bucket_count: this.bucket_count,
             bucket_index: 0,
@@ -226,7 +226,7 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
     /// Gated on `V: Copy`. Order is bucket-major and unstable.
     public values(&this) -> implement Iterator<V>
     where V: Copy {
-        return ValuesIter::<K, V> {
+        return ValuesIterator::<K, V> {
             buckets: this.buckets,
             bucket_count: this.bucket_count,
             bucket_index: 0,
@@ -242,7 +242,7 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
     /// removes, or resizes; same contract as `get_reference`. Order is bucket-major
     /// and unstable across resizes.
     public entries(&this) -> implement Iterator<Pair<K*, V*>> {
-        return EntriesRefIter::<K, V> {
+        return EntriesReferenceIterator::<K, V> {
             buckets: this.buckets,
             bucket_count: this.bucket_count,
             bucket_index: 0,
@@ -280,7 +280,7 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
     /// way to change owning values in place. Same invalidation contract as
     /// `entries`, and the same order as `value_references`.
     public values_mutable(mut &this) -> implement Iterator<mut V*> {
-        return ValuesMutableIter::<K, V> {
+        return ValuesMutableIterator::<K, V> {
             buckets: this.buckets,
             bucket_count: this.bucket_count,
             bucket_index: 0,
@@ -592,7 +592,7 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
     }
 }
 
-// HashMapIter: bucket-major forward iterator over a HashMap
+// HashMapIterator: bucket-major forward iterator over a HashMap
 //
 // State machine: `current` walks the active chain; when it reaches null
 // the iterator advances `bucket_index` until it finds a non-empty
@@ -600,23 +600,23 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
 // storage, so any mutation that resizes or removes invalidates it.
 //
 // Produced as the opaque `implement Iterator<Pair<K, V>>` that `HashMap::iter`
-// returns.  `internal` rather than `private` because `HashSetIter`, in the
+// returns.  `internal` rather than `private` because `HashSetIterator`, in the
 // `collections::hashset` module, holds one as a field.
 //
 // The `Iterator` impl is Copy-gated directly, not only through
 // `HashMap::iter`'s bound: `next()` bit-copies keys and values out, which for
 // an owning `K`/`V` would alias map-owned storage (double-free), so for such
-// types it does not exist.  `HashSetIter` over `HashMapIter<T, ()>` meets the
+// types it does not exist.  `HashSetIterator` over `HashMapIterator<T, ()>` meets the
 // gate, `()` being trivially `Copy`.
 
-internal type struct HashMapIter<K, V> {
+internal type struct HashMapIterator<K, V> {
     private buckets: (mut Entry<K, V>*)*;
     private bucket_count: u64;
     private bucket_index: u64;
     private current: Entry<K, V>*;
 }
 
-implement<K, V> trait Iterator<Pair<K, V>> for struct HashMapIter<K, V>
+implement<K, V> trait Iterator<Pair<K, V>> for struct HashMapIterator<K, V>
 where K: Copy, V: Copy {
     next(mut &this) -> Option<Pair<K, V>> {
         loop {
@@ -637,21 +637,21 @@ where K: Copy, V: Copy {
     }
 }
 
-// KeysIter / ValuesIter: bucket-major projections of HashMapIter that
+// KeysIterator / ValuesIterator: bucket-major projections of HashMapIterator that
 // yield only the key (resp. value) of each entry. Same state machine
-// and invalidation contract as HashMapIter.
+// and invalidation contract as HashMapIterator.
 //
 // `private`: produced only as the opaque `implement Iterator<K>` / `<V>`
 // returned by `HashMap::keys` / `values`; never named outside this module.
 
-private type struct KeysIter<K, V> {
+private type struct KeysIterator<K, V> {
     private buckets: (mut Entry<K, V>*)*;
     private bucket_count: u64;
     private bucket_index: u64;
     private current: Entry<K, V>*;
 }
 
-implement<K, V> trait Iterator<K> for struct KeysIter<K, V> {
+implement<K, V> trait Iterator<K> for struct KeysIterator<K, V> {
     next(mut &this) -> Option<K> {
         loop {
             if (this.current != null) {
@@ -668,14 +668,14 @@ implement<K, V> trait Iterator<K> for struct KeysIter<K, V> {
     }
 }
 
-private type struct ValuesIter<K, V> {
+private type struct ValuesIterator<K, V> {
     private buckets: (mut Entry<K, V>*)*;
     private bucket_count: u64;
     private bucket_index: u64;
     private current: Entry<K, V>*;
 }
 
-implement<K, V> trait Iterator<V> for struct ValuesIter<K, V> {
+implement<K, V> trait Iterator<V> for struct ValuesIterator<K, V> {
     next(mut &this) -> Option<V> {
         loop {
             if (this.current != null) {
@@ -692,30 +692,30 @@ implement<K, V> trait Iterator<V> for struct ValuesIter<K, V> {
     }
 }
 
-// Borrow-yielding iterators: EntriesRefIter / KeysReferenceIterator / ValuesReferenceIterator /
-// ValuesMutableIter.
+// Borrow-yielding iterators: EntriesReferenceIterator / KeysReferenceIterator / ValuesReferenceIterator /
+// ValuesMutableIterator.
 //
 // Same bucket-major state machine and invalidation contract as the by-value
 // iterators above, but each `next()` hands out a borrow (`K*` / `V*` /
-// `Pair<K*, V*>`, or `mut V*` for ValuesMutableIter) into the live entry
+// `Pair<K*, V*>`, or `mut V*` for ValuesMutableIterator) into the live entry
 // rather than a bitcopy. That makes them UNGATED - no `K: Copy` /
 // `V: Copy` - so they walk maps of owning types (`HashMap<String, Foo>`)
 // that the Copy-gated `iter`/`keys`/`values` reject. The yielded pointers
 // alias map-owned storage, so they are views, not values to move out of.
 //
-// `EntriesRefIter` mirrors `HashMapIter`; the projections mirror
-// `KeysIter`/`ValuesIter`. `KeysReferenceIterator` is `internal` because
+// `EntriesReferenceIterator` mirrors `HashMapIterator`; the projections mirror
+// `KeysIterator`/`ValuesIterator`. `KeysReferenceIterator` is `internal` because
 // `HashSet::iterate_references` wraps it; the others are only produced as opaque
 // `implement Iterator<...>` and stay private.
 
-private type struct EntriesRefIter<K, V> {
+private type struct EntriesReferenceIterator<K, V> {
     private buckets: (mut Entry<K, V>*)*;
     private bucket_count: u64;
     private bucket_index: u64;
     private current: Entry<K, V>*;
 }
 
-implement<K, V> trait Iterator<Pair<K*, V*>> for struct EntriesRefIter<K, V> {
+implement<K, V> trait Iterator<Pair<K*, V*>> for struct EntriesReferenceIterator<K, V> {
     next(mut &this) -> Option<Pair<K*, V*>> {
         loop {
             if (this.current != null) {
@@ -783,14 +783,14 @@ implement<K, V> trait Iterator<V*> for struct ValuesReferenceIterator<K, V> {
     }
 }
 
-private type struct ValuesMutableIter<K, V> {
+private type struct ValuesMutableIterator<K, V> {
     private buckets: (mut Entry<K, V>*)*;
     private bucket_count: u64;
     private bucket_index: u64;
     private current: mut Entry<K, V>*;
 }
 
-implement<K, V> trait Iterator<mut V*> for struct ValuesMutableIter<K, V> {
+implement<K, V> trait Iterator<mut V*> for struct ValuesMutableIterator<K, V> {
     next(mut &this) -> Option<mut V*> {
         loop {
             if (this.current != null) {
