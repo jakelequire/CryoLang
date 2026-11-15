@@ -186,7 +186,7 @@ implement trait Hasher for struct ContentHasher {
 type struct ModuleEntry {
     namespace_name: string;   // e.g. "std::core::primitives"
     source_path:    string;   // path on disk
-    origin_subdir:  string;   // output package subtree: "std" | "local" | <depname>
+    origin_subdir:  String;   // output package subtree: "std" | "local" | <depname>
     origin_kind:    string;   // "stdlib" | "local" | "dep"
 }
 
@@ -366,7 +366,7 @@ type struct Manifest {
 
     /// Combined fingerprint over every build input: the module sources, and
     /// `headers`, the files the build's C imports read.
-    compute_fingerprint(&this, modules: &[ModuleEntry], headers: &[string]) -> u128 {
+    compute_fingerprint(&this, modules: &[ModuleEntry], headers: &[String]) -> u128 {
         mut h: ContentHasher = ContentHasher::new();
         h.fold(Manifest::compiler_fingerprint());
         h.fold(this.build_shape);
@@ -385,14 +385,14 @@ type struct Manifest {
         // invalidates the cache even when its source bytes are unchanged.
         for (mut i: i64 = 0; i < modules.length(); i++) {
             h.fold(modules[i].namespace_name);
-            h.fold(modules[i].origin_subdir);
+            h.fold_text(modules[i].origin_subdir.as_str());
             Manifest::fold_file(&h, Path::from(modules[i].source_path));
         }
         // A header no module source names: its path and its content, so an
         // edit to it, or to a file it includes, is a changed input.
         for (mut i: i64 = 0; i < headers.length(); i++) {
-            h.fold(headers[i]);
-            Manifest::fold_file(&h, Path::from(headers[i]));
+            h.fold_text(headers[i].as_str());
+            Manifest::fold_file(&h, Path::from(headers[i].as_str()));
         }
         return h.finish128();
     }
@@ -402,11 +402,13 @@ type struct Manifest {
     /// reads is known only once its imports run, so the up-to-date check
     /// asks the last build's, and a source edit that names another header
     /// changes a module source anyway.  Empty when there is no sidecar.
-    recorded_headers(&this) -> [string] {
-        mut headers: [string] = [];
+    recorded_headers(&this) -> [String] {
+        mut headers: [String] = [];
         const fingerprint: PathBuf = this.cfg.fingerprint_path();
-        const lines: [string] = Manifest::read_file_trimmed(fingerprint.as_path()).split_nonempty("\n");
-        for (mut i: i64 = 1; i < lines.length(); i++) { headers.push(lines[i]); }
+        const text: String = Manifest::read_file_trimmed(fingerprint.as_path());
+        for (line in text.as_str().split_nonempty(&Str::new("\n")).skip(1)) {
+            headers.push(String::from_str(line));
+        }
         return headers;
     }
 
@@ -416,8 +418,14 @@ type struct Manifest {
     is_up_to_date(&this, fp_hex_text: string, artifacts: &[PathBuf]) -> boolean {
         const fp_hex: string = fp_hex_text;
         const fingerprint: PathBuf = this.cfg.fingerprint_path();
-        const lines: [string] = Manifest::read_file_trimmed(fingerprint.as_path()).split_nonempty("\n");
-        if (lines.length() == 0 || !lines[0].eq(fp_hex)) { return false; }
+        const text: String = Manifest::read_file_trimmed(fingerprint.as_path());
+        mut lines = text.as_str().split_nonempty(&Str::new("\n"));
+        match (lines.next()) {
+            Option::Some(recorded) => {
+                if (recorded != Str::new(fp_hex)) { return false; }
+            }
+            Option::None => { return false; }
+        }
         for (mut i: i64 = 0; i < artifacts.length(); i++) {
             if (!artifacts[i].as_path().exists()) { return false; }
         }
@@ -432,7 +440,7 @@ type struct Manifest {
     /// A build that reported warnings records none: skipping the next build
     /// would skip reporting them, so the next build analyses the program
     /// again, and reuses every object whose bitcode is unchanged.
-    write_fingerprint(&this, fp_hex_text: string, headers: &[string], reported_warnings: boolean) -> void {
+    write_fingerprint(&this, fp_hex_text: string, headers: &[String], reported_warnings: boolean) -> void {
         const fp_hex: string = fp_hex_text;
         const incremental: PathBuf = this.cfg.incremental_dir();
         ProjectConfig::mkdir_p(incremental.as_path());
@@ -452,7 +460,7 @@ type struct Manifest {
         text.push(Str::new(fp_hex));
         text.push_byte(10 as u8);        // LF
         for (mut i: i64 = 0; i < headers.length(); i++) {
-            text.push(Str::new(headers[i]));
+            text.push(headers[i].as_str());
             text.push_byte(10 as u8);
         }
         match (File::write_bytes(path.as_path(), text.as_bytes())) {
@@ -509,13 +517,13 @@ type struct Manifest {
         // modules: namespace + source + origin + object path + size.
         mut mods: Array<JsonValue> = Array::<JsonValue>::new();
         for (mut i: i64 = 0; i < modules.length(); i++) {
-            const obj: PathBuf = this.cfg.deps_dir_for(Str::new(modules[i].origin_subdir))
+            const obj: PathBuf = this.cfg.deps_dir_for(modules[i].origin_subdir.as_str())
                 .join(f"{Manifest::path_module(modules[i].namespace_name)}.o".as_str());
             const obj_size: i64 = Manifest::file_size_bytes(obj.as_path());
             mut m: JsonObject = JsonObject::new();
             m.put("namespace",   JsonValue::from(modules[i].namespace_name));
             m.put("source",      JsonValue::from(modules[i].source_path));
-            m.put("origin",      JsonValue::from(modules[i].origin_subdir));
+            m.put("origin",      JsonValue::from(modules[i].origin_subdir.as_str()));
             m.put("kind",        JsonValue::from(modules[i].origin_kind));
             m.put("opt_level",   JsonValue::unsigned_integer_value(this.opt_level as u64));
             m.put("debug_info",  JsonValue::boolean_value(this.debug_info));
@@ -658,14 +666,12 @@ type struct Manifest {
 
     /// Read a file's content with trailing whitespace/newlines stripped, or ""
     /// when the file is absent or unreadable.
-    static read_file_trimmed(path: Path) -> string {
+    static read_file_trimmed(path: Path) -> String {
         const raw: String = match (File::read_text(path)) {
             Result::Ok(s)  => { s }
-            Result::Err(_) => { return ""; }
+            Result::Err(_) => { return String::new(); }
         };
-        const trimmed: Str = raw.as_str().trim_end();
-        if (trimmed.is_empty()) { return ""; }
-        return String::from_str(trimmed).into_raw();
+        return String::from_str(raw.as_str().trim_end());
     }
 
 

@@ -890,26 +890,26 @@ type struct Executor {
             exclude = args.get_value("exclude").split_nonempty(",");
         }
         const profile: string = if (args.has_arg("profile")) { args.get_value("profile") } else { "" };
-        mut stamp: BuildStamp = BuildStamp::from_checkout(exclude, profile);
+        mut stamp: BuildStamp = BuildStamp::from_checkout(exclude, Str::new(profile));
         match (path::Path::from(target).metadata()) {
             Result::Ok(m) => {
-                stamp.fingerprint = build_manifest::Manifest::hex128(
-                    build_manifest::Manifest::binary_fingerprint(path::Path::from(target)));
-                stamp.bytes = fmt::format("%lld", m.length()).into_raw();
+                stamp.fingerprint = String::from(build_manifest::Manifest::hex128(
+                    build_manifest::Manifest::binary_fingerprint(path::Path::from(target))));
+                stamp.bytes = f"{m.length()}";
             }
             Result::Err(_) => { }
         }
-        const failure: string = StampSlot::write_into(target, stamp.render());
-        if (failure.length() > 0) {
-            fmt::eprintf("error: cannot stamp %s: %s\n", target, failure);
+        const failure: String = StampSlot::write_into(target, stamp.render().as_str());
+        if (!failure.is_empty()) {
+            fmt::eprintln(f"error: cannot stamp {target}: {failure}");
             return 1;
         }
         if (!stamp.is_stamped()) {
             fmt::printf("==> %s: not in a git checkout; only its fingerprint recorded\n", target);
             return 0;
         }
-        fmt::printf("==> %s stamped: %s %s, dirty: %s, profile: %s\n", target,
-            stamp.commit.substring(0, 8), stamp.date, stamp.dirty, stamp.profile);
+        const short_commit: Str = stamp.commit.as_str().byte_substring(0, 8);
+        fmt::print(f"==> {target} stamped: {short_commit} {stamp.date}, dirty: {stamp.dirty}, profile: {stamp.profile}\n");
         return 0;
     }
 
@@ -1147,47 +1147,54 @@ type struct Executor {
         // When the user passed `cryo init <dir>`, offer the directory name
         // as the default project name; `cryo init hello` + Enter at every
         // prompt is the documented shortcut path.
-        const name: string = if (has_positional) {
-            Executor::prompt_default(&input, "Project name", target_dir)
+        const name: String = if (has_positional) {
+            Executor::prompt_default(&input, "Project name", Str::new(target_dir))
         } else {
             Executor::prompt_required(&input, "Project name")
         };
-        if (name == "") {
+        if (name.is_empty()) {
             fmt::eprintf("Error: project name is required\n");
             return 1;
         }
-        const src_dir: string  = Executor::prompt_default(&input, "Source directory", "src");
-        const out_dir: string  = Executor::prompt_default(&input, "Output directory", "build");
-        const ttype:   string  = Executor::prompt_default(&input, "Target type (executable/library/stdlib)", "executable");
+        const src_dir: String = Executor::prompt_default(&input, "Source directory", Str::new("src"));
+        const out_dir: String = Executor::prompt_default(&input, "Output directory", Str::new("build"));
+        const ttype:   String = Executor::prompt_default(&input, "Target type (executable/library/stdlib)", Str::new("executable"));
 
         // Validate target_type; silently accepting "exe" or typos would
         // produce a cryoconfig the parser can't load.
-        if (ttype != "executable"
-                && ttype != "library"
-                && ttype != "stdlib") {
-            fmt::eprintf("Error: target type must be one of: executable, library, stdlib (got '%s')\n", ttype);
+        if (ttype.as_str() != Str::new("executable")
+                && ttype.as_str() != Str::new("library")
+                && ttype.as_str() != Str::new("stdlib")) {
+            fmt::eprintln(f"Error: target type must be one of: executable, library, stdlib (got '{ttype.as_str()}')");
             return 1;
         }
 
-        // Create the source directory.  When src_dir is "." we skip the
-        // mkdir (target_dir already exists).
-        mut src_path: string = "";
-        if (src_dir == "." || src_dir == "") {
-            src_path = target_dir;
+        // Create the source directory.  When src_dir is "." the target
+        // directory is the source directory, and already exists.  A
+        // directory that cannot be made is reported by the file writes below.
+        const in_place: boolean = src_dir.is_empty() || src_dir.as_str() == Str::new(".");
+        const src_path: path::PathBuf = if (in_place) {
+            path::PathBuf::from(Str::new(target_dir))
         } else {
-            src_path = path::Path::from(target_dir).join(src_dir).into_raw();
-            libc::mkdir(src_path, 493);
+            path::Path::from(Str::new(target_dir)).join(src_dir.as_str())
+        };
+        if (!in_place) {
+            match (Directory::create(src_path.as_path())) {
+                Result::Ok(_)  => {}
+                Result::Err(_) => {}
+            }
         }
 
-        const main_path: string = path::Path::from(src_path).join("main.cryo").into_raw();
-        const ns_name: string = Executor::derive_namespace(name);
-        if (!Executor::write_main_cryo(main_path, ns_name)) { return 1; }
+        const main_path: path::PathBuf = src_path.join("main.cryo");
+        const ns_name: string = Executor::derive_namespace(name.as_str());
+        if (!Executor::write_main_cryo(main_path.as_path(), ns_name)) { return 1; }
 
-        const config_path: string = path::Path::from(target_dir).join("cryoconfig").into_raw();
-        if (!Executor::write_cryoconfig(config_path, name, src_dir, out_dir, ttype)) { return 1; }
+        const config_path: path::PathBuf = path::Path::from(Str::new(target_dir)).join("cryoconfig");
+        if (!Executor::write_cryoconfig(config_path.as_path(), name.as_str(), src_dir.as_str(),
+                                        out_dir.as_str(), ttype.as_str())) { return 1; }
 
-        fmt::printf("\n  Created %s\n", config_path);
-        fmt::printf("  Created %s\n", main_path);
+        fmt::print(f"\n  Created {config_path.as_str()}\n");
+        fmt::print(f"  Created {main_path.as_str()}\n");
         fmt::printf("\nNext steps:\n");
         if (target_dir != ".") {
             fmt::printf("  cd %s\n", target_dir);
@@ -1198,40 +1205,31 @@ type struct Executor {
 
     /// Read a line from `input`, returning `def` when the user
     /// presses Enter (empty input) or stdin closes.
-    static prompt_default(input: mut &stdio::Stdin, label_text: string, def_text: string) -> string {
-        const def: string = def_text;
-        const label: string = label_text;
-        fmt::printf("%s [%s]: ", label, def);
+    static prompt_default(input: mut &stdio::Stdin, label: string, def: Str) -> String {
+        fmt::print(f"{label} [{def}]: ");
         libc::fflush(null);
-        return Executor::read_line_or(input, def_text);
+        return Executor::read_line_or(input, def);
     }
 
     /// Like `prompt_default` but with no default: returns the empty
     /// string on EOF / blank input so the caller can reject it.
-    static prompt_required(input: mut &stdio::Stdin, label_text: string) -> string {
-        const label: string = label_text;
-        fmt::printf("%s: ", label);
+    static prompt_required(input: mut &stdio::Stdin, label: string) -> String {
+        fmt::print(f"{label}: ");
         libc::fflush(null);
-        return Executor::read_line_or(input, "");
+        return Executor::read_line_or(input, Str::new(""));
     }
 
-    static read_line_or(input: mut &stdio::Stdin, def_text: string) -> string {
-        const def: string = def_text;
-        // Read one line into a local buffer.  Keeping it out of the `match`
-        // binding lets it drop as an ordinary local on the `def` paths and
-        // be consumed by `into_raw` on the success path.
+    static read_line_or(input: mut &stdio::Stdin, def: Str) -> String {
         mut line: String = String::new();
         match (input.read_line(&line)) {
             Result::Ok(n) => {
-                if (n == 0) { return def; }        // EOF before any bytes
+                if (n == 0) { return String::from_str(def); }        // EOF before any bytes
                 const len: i64 = Executor::strip_eol(&line);
-                if (len == 0) { return def; }       // blank line -> default
+                if (len == 0) { return String::from_str(def); }       // blank line -> default
                 line.truncate(len);
-                // Hand off ownership as a NUL-terminated C string; the
-                // caller keeps it for the lifetime of `cryo init`.
-                return line.into_raw();
+                return line;
             }
-            Result::Err(_) => { return def; }
+            Result::Err(_) => { return String::from_str(def); }
         }
     }
 
@@ -1252,21 +1250,28 @@ type struct Executor {
         return n;
     }
 
-    static write_main_cryo(path_text: string, ns_name: string) -> boolean {
-        const path: string = path_text;
-        const f: void* = libc::fopen(path, "w");
-        if (f == null) {
-            fmt::eprintf("Error: cannot open %s for writing\n", path);
-            return false;
+    static write_main_cryo(path: path::Path, ns_name: string) -> boolean {
+        mut text: String = String::new();
+        text.push("namespace ");
+        text.push(ns_name);
+        text.push(";\n\nimport std::fmt;\n\n");
+        text.push("function main() -> int {\n");
+        text.push("    fmt::printf(\"Hello, world!\\n\");\n");
+        text.push("    return 0;\n");
+        text.push("}\n");
+        return Executor::write_scaffold_file(path, text.as_str());
+    }
+
+    /// Write one file of a new project, reporting a failure the way every
+    /// file `cryo init` writes reports it.
+    static write_scaffold_file(path: path::Path, text: Str) -> boolean {
+        match (File::write_text(path, text)) {
+            Result::Ok(_)  => { return true; }
+            Result::Err(_) => {
+                fmt::eprintln(f"Error: cannot open {path.as_str()} for writing");
+                return false;
+            }
         }
-        const header: string = fmt::format("namespace %s;\n\nimport std::fmt;\n\n", ns_name).into_raw();
-        libc::fputs(header, f);
-        libc::fputs("function main() -> int {\n", f);
-        libc::fputs("    fmt::printf(\"Hello, world!\\n\");\n", f);
-        libc::fputs("    return 0;\n", f);
-        libc::fputs("}\n", f);
-        libc::fclose(f);
-        return true;
     }
 
     /// Derive a PascalCase namespace identifier from a project name.
@@ -1280,11 +1285,10 @@ type struct Executor {
     /// Anything else is dropped.  The output compiles as-is even when the
     /// input contains characters the Cryo parser would reject in an
     /// identifier.
-    static derive_namespace(name: string) -> string {
-        const n: i64 = name.length();
-        mut out: String = String::with_capacity(n);
-        for (mut i: i64 = 0; i < n; i++) {
-            const ch: char = name[i];
+    static derive_namespace(name: Str) -> string {
+        mut out: String = String::with_capacity(name.length());
+        for (byte in name.as_bytes().iter()) {
+            const ch: char = byte as char;
             if (out.is_empty()) {
                 // First byte: only letters allowed; lowercase gets upcased.
                 // Digits, symbols and hyphens at the start are skipped.
@@ -1299,36 +1303,28 @@ type struct Executor {
         return out.into_raw();
     }
 
-    static write_cryoconfig(path_text: string, name: string, src_dir_text: string,
-                            out_dir_text: string, target_type: string) -> boolean {
-        const out_dir: string = out_dir_text;
-        const path: string = path_text;
-        const src_dir: string = src_dir_text;
-        const f: void* = libc::fopen(path, "w");
-        if (f == null) {
-            fmt::eprintf("Error: cannot open %s for writing\n", path);
-            return false;
-        }
+    static write_cryoconfig(path: path::Path, name: Str, src_dir: Str,
+                            out_dir: Str, target_type: Str) -> boolean {
         // Build the entry_point as "<src_dir>/main.cryo" (or just
         // "main.cryo" when source_dir is "." / empty).  Only emit the
         // entry_point key for executables; libraries discover via
         // <source_dir>/lib.cryo instead.
-        libc::fputs("[project]\n", f);
-        libc::fprintf(f, "project_name = \"%s\"\n", name);
-        libc::fprintf(f, "output_dir = \"%s\"\n", out_dir);
-        libc::fprintf(f, "target_type = \"%s\"\n", target_type);
-        libc::fprintf(f, "source_dir = \"%s\"\n", src_dir);
-        if (target_type == "executable") {
-            if (src_dir == "." || src_dir == "") {
-                libc::fputs("entry_point = \"main.cryo\"\n", f);
+        mut text: String = String::new();
+        text.push("[project]\n");
+        text.push(f"project_name = \"{name}\"\n");
+        text.push(f"output_dir = \"{out_dir}\"\n");
+        text.push(f"target_type = \"{target_type}\"\n");
+        text.push(f"source_dir = \"{src_dir}\"\n");
+        if (target_type == Str::new("executable")) {
+            if (src_dir.is_empty() || src_dir == Str::new(".")) {
+                text.push("entry_point = \"main.cryo\"\n");
             } else {
-                libc::fprintf(f, "entry_point = \"%s/main.cryo\"\n", src_dir);
+                text.push(f"entry_point = \"{src_dir}/main.cryo\"\n");
             }
         }
-        libc::fputs("\n[compiler]\n", f);
-        libc::fputs("\n[dependencies]\n", f);
-        libc::fclose(f);
-        return true;
+        text.push("\n[compiler]\n");
+        text.push("\n[dependencies]\n");
+        return Executor::write_scaffold_file(path, text.as_str());
     }
 
     /// `cryo build [file|dir]`: single-file or project compilation.
@@ -3354,7 +3350,7 @@ type struct Executor {
         };
 
         const key: string = Executor::path_basename(abs).to_ascii_lower();
-        const name: string = registry::VendorRegistry::jstr(&root, "name", Executor::derive_namespace(key));
+        const name: string = registry::VendorRegistry::jstr(&root, "name", Executor::derive_namespace(Str::new(key)));
 
         mut entry: registry::VendorEntry = registry::VendorEntry {
             key:            key,
@@ -3456,7 +3452,7 @@ type struct Executor {
             } else {
                 fmt::printf("Generating bindings for '%s' from %lld header(s) via libclang...\n",
                     name, entry.headers.length() as i64);
-                mut inputs: [string] = [];
+                mut inputs: [String] = [];
                 const src_text: String = generator::VendorGenerator::generate(
                     name, abs, &entry.headers, &entry.include_dirs, &entry.defines, &inputs,
                     entry.lang_arg(), entry.std);
