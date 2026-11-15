@@ -1926,36 +1926,69 @@ type struct CallResolver {
     /// import visibility, both of which the stamp already accounts for.
     ///
     /// The stamp names one definition of the callee's family, and an
-    /// overloaded name has several: the call's is the one its arity admits,
-    /// read off the family (the member-function door, by the definition's
-    /// owner and leaf).  A template whose parameter count differs from the
-    /// call's is not this call's template: generic inference would otherwise
-    /// proceed on a mismatched count and return a type, and the arity
-    /// diagnostic that the non-generic path reports would never run.  Two
-    /// declarations of the call's arity are for the overload selection to
-    /// tell apart, and name no template here.
-    find_fn_template_for_call(&this, ident: IdentifierExpr*, argc: i64) -> const TemplateEntry* {
+    /// overloaded name has several: which of them the call calls is
+    /// `family_template_for_call`'s answer, the one a module-qualified call
+    /// gets too.
+    find_fn_template_for_call(mut &this, ident: IdentifierExpr*, call: CallExpr*) -> const TemplateEntry* {
         // The name layer answers every bare callee - a binding, or `Err`
         // for one it refused - so a slot with no answer is a defect the door
         // records; measured at 0 over the corpus before the door went in.
         const r: Res = ident.res.require("call_resolver:free-call template");
-        const t: const TemplateEntry* = this.lookup_scope_template(r);
-        if (t == null || t.kind != TemplateKind::Function) { return null; }
-        const entries: [OverloadId] = this.family_entries(r.def_id());
-        mut fits: DeclarationNode* = null;
-        mut count: i64 = 0;
+        return this.family_template_for_call(r.def_id(), call);
+    }
+
+    /// The generic function of `callee`'s family that `call` calls, or null
+    /// when it calls none.  The candidates are the family's functions of
+    /// the call's arity: a template whose parameter count differs is not
+    /// the call's, since generic inference would otherwise proceed on a
+    /// mismatched count and the arity diagnostic would never run.  The only
+    /// candidate is the call's whatever its arguments are, so a generic
+    /// one's mismatches are reported against it.  Among several, a type
+    /// argument written on the call or on its path names the one generic
+    /// candidate; otherwise the arguments choose, typed: none when a
+    /// non-generic candidate accepts them, since that one is the call's
+    /// (and a generic that fits too ties with it), else the one generic
+    /// whose type parameters bind to them and whose where-clause they meet.
+    /// A bare call and a module-qualified one ask this alike, so every path
+    /// to a family agrees on which generic a call is.
+    family_template_for_call(mut &this, callee: DefId, call: CallExpr*) -> const TemplateEntry* {
+        if (call == null) { return null; }
+        const entries: [OverloadId] = this.family_entries(callee);
+        mut plain: [OverloadId] = [];
+        mut generic: [const TemplateEntry*] = [];
         for (mut i: i64 = 0; i < entries.length(); i++) {
             const d: DeclarationNode* = this.ctx.decl_index.entry_decl(entries[i]);
             if (d == null || DeclarationNode::fn_of(d) == null) { continue; }
-            const f_decl: DeclarationNode* = d;
-            const f: FunctionDecl* = DeclarationNode::fn_of(f_decl);
-            if (f.parameters.length() != argc) { continue; }
-            fits = f_decl;
-            count = count + 1;
+            const f: FunctionDecl* = DeclarationNode::fn_of(d);
+            if (f.parameters.length() != call.arguments.length()) { continue; }
+            const t: const TemplateEntry* = this.ctx.generic_registry.template_of(f.def);
+            if (t != null && t.kind == TemplateKind::Function) { generic.push(t); } else { plain.push(entries[i]); }
         }
-        if (count != 1) { return null; }
-        const chosen: const TemplateEntry* = this.ctx.generic_registry.template_of(DeclarationNode::fn_of(fits).def);
-        if (chosen == null || chosen.kind != TemplateKind::Function) { return null; }
+        if (generic.length() == 0) { return null; }
+        if (generic.length() == 1 && plain.length() == 0) { return generic[0]; }
+        mut written: boolean = call.generic_args.length() > 0;
+        const path: ScopeResolutionExpr* = ExpressionNode::scope_resolution_of(call.callee);
+        if (path != null && path.generic_args.length() > 0) { written = true; }
+        if (written) {
+            if (generic.length() == 1) { return generic[0]; }
+            return null;
+        }
+        mut arg_types: [TypeRef] = [];
+        for (mut ai: i64 = 0; ai < call.arguments.length(); ai++) {
+            const arg: ExpressionNode* = call.arguments[ai];
+            if (arg == null || !arg.resolved_type.is_valid()) { return null; }
+            arg_types.push(arg.resolved_type);
+        }
+        for (mut pi: i64 = 0; pi < plain.length(); pi++) {
+            if (this.signature_accepts(this.ctx.decl_index.entry_signature(plain[pi]), &arg_types)) { return null; }
+        }
+        mut chosen: const TemplateEntry* = null;
+        for (mut gi: i64 = 0; gi < generic.length(); gi++) {
+            if (!this.template_fits(generic[gi], call, null, &arg_types)) { continue; }
+            if (this.where_bound_refuses(call, null, generic[gi])) { continue; }
+            if (chosen != null) { return null; }
+            chosen = generic[gi];
+        }
         return chosen;
     }
 
@@ -2108,7 +2141,7 @@ type struct CallResolver {
     /// to be checked by.
     check_generic_free_call(mut &this, call_e: ExpressionNode*, call: mut CallExpr*, ident: IdentifierExpr*,
                             refused: mut &boolean) -> TypeRef {
-        const entry: const TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length());
+        const entry: const TemplateEntry* = this.find_fn_template_for_call(ident, call);
         if (entry == null) { return TypeRef::invalid(); }
         const tmpl_decl: DeclarationNode* = entry.ast_node;
         const tmpl: FunctionDecl* = DeclarationNode::fn_of(tmpl_decl);
@@ -2316,8 +2349,7 @@ type struct CallResolver {
         if (call.generic_args.length() == 0) { return out; }
         const ident: IdentifierExpr* = ExpressionNode::identifier_of(callee_node);
         if (ident == null) { return out; }
-        const entry: const TemplateEntry* = this.find_fn_template_for_call(
-            ident, call.arguments.length());
+        const entry: const TemplateEntry* = this.find_fn_template_for_call(ident, call);
         if (entry == null || entry.param_types.length() == 0) { return out; }
 
         mut bindings: [TypeRef] = [];
@@ -3755,7 +3787,7 @@ type struct CallResolver {
         if (call.resolved_callee.is_some()) { return TypeRef::invalid(); }
         // GATED: a generic function template has no concrete spec pre-mono; leave
         // unpinned so mono specializes.
-        const gen_tmpl: const TemplateEntry* = this.find_fn_template_for_call(ident, call.arguments.length());
+        const gen_tmpl: const TemplateEntry* = this.find_fn_template_for_call(ident, call);
         if (gen_tmpl != null && gen_tmpl.param_types.length() > 0) { return TypeRef::invalid(); }
         return this.pin_family_signature(call_e, call, this.callee_def(ident), null);
     }
@@ -4908,7 +4940,7 @@ type struct CallResolver {
     check_generic_free_call_args(mut &this, visitor: mut SemaVisitor*, call: mut CallExpr*,
                                  ident: IdentifierExpr*) -> void {
         this.check_function_template_args(visitor, call,
-            this.find_fn_template_for_call(ident, call.arguments.length()));
+            this.find_fn_template_for_call(ident, call));
     }
 
     /// The arguments of `call` to the function template `entry`, checked
@@ -10824,7 +10856,20 @@ type struct CallResolver {
                                       claimed: mut boolean*) -> TypeRef {
         const callee: DefId = this.resolve_module_qualified_def(scope);
         if (!callee.is_valid()) { return TypeRef::invalid(); }
-        const ret: TypeRef = this.overload_return_type(this.ctx.decl_index.func_type_of_def(callee));
+        // A generic function is a template: a member with one declaration
+        // is its own, and an overloaded member's is the one of its family
+        // the call chooses (`family_template_for_call`), as a bare call's
+        // is.  The call records it, so the monomorphizer specializes that
+        // template and never looks the member up again.
+        mut tmpl: const TemplateEntry* = null;
+        if (call != null && this.family_entries(callee).length() > 1) {
+            tmpl = this.family_template_for_call(callee, call);
+        } else {
+            tmpl = this.ctx.generic_registry.template_of(callee);
+        }
+        const is_fn_template: boolean = tmpl != null && tmpl.kind == TemplateKind::Function;
+        const declared: DefId = if (is_fn_template) { DeclarationNode::fn_of(tmpl.ast_node).def } else { callee };
+        const ret: TypeRef = this.overload_return_type(this.ctx.decl_index.func_type_of_def(declared));
         if (!ret.is_valid()) { return TypeRef::invalid(); }
         // A WRITTEN qualified path resolves straight to a symbol here and
         // never meets the bare binder's scope classifier, so visibility is
@@ -10834,14 +10879,6 @@ type struct CallResolver {
         const q_span: SourceSpan = if (call != null) { call_e.span } else { SourceSpan::none() };
         this.enforce_callee_visibility(callee, this.call_use_site_module(q_span), q_span);
 
-        // A generic function is the template its definition is: the one the
-        // name layer bound the member to, asked by identity.  The call records
-        // it, so the monomorphizer specializes that template and never looks
-        // the member up again.
-        mut is_fn_template: boolean = false;
-        mut tmpl: const TemplateEntry* = null;
-        tmpl = this.ctx.generic_registry.template_of(callee);
-        if (tmpl != null && tmpl.kind == TemplateKind::Function) { is_fn_template = true; }
         if (is_fn_template && call != null) {
             call.set_resolved_template(tmpl.base_type);
             // The instance the call is pinned to, else the one its turbofish

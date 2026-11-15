@@ -1253,7 +1253,7 @@ const d: i32 = conv(s);          // error[E0214]: no overload of `conv` accepts 
 
 An untyped literal argument takes one fixed type where the overloads differ in that parameter: an integer literal is `i32` and a float literal is `f64`, the same defaults a literal takes anywhere else. Write the type you mean with `as` (`conv(1 as i64)`). A qualified call (`Json::conv(1)`) selects among that module's overloads the same way.
 
-A non-generic overload does not win over a generic one by being non-generic. A call both accept is ambiguous (`E0154`); a generic function whose `where` clause the arguments fail does not accept them. A written type argument names the generic function:
+A non-generic overload does not win over a generic one by being non-generic. A call both accept is ambiguous (`E0154`); a generic function whose `where` clause the arguments fail does not accept them. A call only the generic function accepts calls it, whichever of the two is declared first and whether the call is bare or through a module path. A written type argument names the generic function:
 
 ```cryo
 function same<U>(u: U) -> i32 { return 1; }
@@ -1262,6 +1262,7 @@ function same(u: i32) -> i32 { return 2; }
 const x: i32 = 7;
 const a: i32 = same(x);          // error[E0154]: `same` is ambiguous
 const b: i32 = same::<i32>(x);   // the generic function
+const c: i32 = same("seven");    // the generic function: only it accepts a `string`
 ```
 
 An overloaded name used as a value without a call is picked by its expected function type ([section 2.5](#25-function-types)).
