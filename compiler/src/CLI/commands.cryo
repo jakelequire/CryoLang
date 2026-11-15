@@ -1816,6 +1816,24 @@ type struct Executor {
         return out;
     }
 
+    /// The rendered marker a negative test's expected code must appear as.
+    /// The severity a code is reported at is chosen where it is emitted, not by
+    /// its letter (E0153 is a warning), so a `//~` annotation naming the
+    /// expected code gives the marker its severity.  A file with no such
+    /// annotation is held to the letter: `W....` as `warning[W....]`,
+    /// everything else as `error[....]`, so an error demoted to a warning
+    /// still fails an unannotated file.
+    static neg_expected_marker(expected: Str, anns: &[NegExpect]) -> String {
+        for (mut a: i64 = 0; a < anns.length(); a++) {
+            if (anns[a].code.as_str() == expected) {
+                const severity: string = anns[a].severity;
+                return f"{severity}[{expected}]";
+            }
+        }
+        if (expected.starts_with(&str::Str::new("W"))) { return f"warning[{expected}]"; }
+        return f"error[{expected}]";
+    }
+
     /// Enumerate the diagnostics `cryo check` rendered into `out` that are
     /// anchored in the test file `fname` (its basename must appear in the `-->`
     /// arrow line).  Scoping to the file keeps `//~` exhaustiveness from tripping
@@ -2136,24 +2154,19 @@ type struct Executor {
                 const out_path: String = Executor::job_tmp_path(tmp.as_path(), k);
                 const out: String = Executor::read_file_or_empty(path::Path::from(out_path.as_str()));
                 Executor::remove_capture(path::Path::from(out_path.as_str()));
-                // Warning codes (`W....`) render as `warning[Wxxxx]`; everything else
-                // as `error[Exxxx]`.  A warning-only file still exits 0, but the suite
-                // asserts on the rendered marker, not the exit status.
-                const want: String = if (expected.starts_with(&str::Str::new("W"))) {
-                    f"warning[{expected}]"
-                } else { f"error[{expected}]" };
+                // A warning-only file still exits 0, so the suite asserts on the
+                // rendered marker, not the exit status.
+                const anns: [NegExpect] = Executor::parse_neg_expectations(content);
+                const want: String = Executor::neg_expected_marker(expected, &anns);
                 mut passed: boolean = out.contains(&want.as_str());
                 // When the file carries `//~` annotations, ALSO assert each one's
                 // message text and source line, and that every diagnostic anchored in
                 // the file is annotated (so an unexpected cascade fails).  Files with
                 // no annotations keep the code-presence-only behavior.
-                mut detail: String = String::new();
-                if (passed) {
-                    const anns: [NegExpect] = Executor::parse_neg_expectations(content);
-                    if (anns.length() > 0) {
-                        detail = Executor::check_annotations(&anns, out.as_str(), name);
-                        if (detail.length() > 0) { passed = false; }
-                    }
+                mut detail: String = if (passed) { String::new() } else { f"expected {want}" };
+                if (passed && anns.length() > 0) {
+                    detail = Executor::check_annotations(&anns, out.as_str(), name);
+                    if (detail.length() > 0) { passed = false; }
                 }
                 if (passed) {
                     if (is_compact) {
@@ -2165,14 +2178,13 @@ type struct Executor {
                         fmt::printf("ok\n");
                     }
                 } else {
-                    const reason: String = if (detail.length() > 0) { detail } else { f"expected {expected}" };
                     if (is_compact) {
                         fmt::printf("F");
                     } else if (is_pretty) {
                         Executor::neg_chip_fail(color_on);
-                        fmt::printf("  (%.*s)\n", reason.length() as i32, reason.as_str().as_pointer());
+                        fmt::printf("  (%.*s)\n", detail.length() as i32, detail.as_str().as_pointer());
                     } else {
-                        fmt::printf("FAILED (%.*s)\n", reason.length() as i32, reason.as_str().as_pointer());
+                        fmt::printf("FAILED (%.*s)\n", detail.length() as i32, detail.as_str().as_pointer());
                     }
                     failures += 1;
                 }

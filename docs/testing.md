@@ -330,6 +330,14 @@ in each place's related information, `diag-<ten hex digits>`, hashed from its
 code, headline, file name and first place, so the places of one report read
 as one; the compiler's output prints no name.
 
+A warning is pinned with `//~ WARN[<CODE>]` (`WARNING` reads the same). The
+declared code must appear at the severity the compiler reports it at, and that
+severity is chosen where the code is emitted, not by its letter: E0153 (an
+unknown directive) is a warning. So when a `//~` names the declared code, its
+severity is the one the declared code must be reported at; a file with no such
+annotation is held to the letter, `W....` as `warning[W....]` and every other
+code as `error[....]`, and an error reported as a warning fails it.
+
 ---
 
 ## 7. Multi-module test projects
