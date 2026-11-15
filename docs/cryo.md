@@ -3875,19 +3875,25 @@ Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations, and membe
 
 #### What assignment releases
 
-Assignment releases the destination **only where the compiler can establish that it holds a live value**. That means a place carved out of a local's own storage: the local itself, or a chain of field projections and constant indices over it. The destinations below do *not* release what they overwrite, because nothing visible in the frame distinguishes a live value from reserved, never-written memory:
+Assignment releases the destination **only where the compiler can establish that it holds a live value**. That means a place carved out of a local's own storage - the local itself, or a chain of field projections and constant indices over it - or a place reached through a reference: `*r = v`, `r.f = v`, **including `this.f = v` and `*this = v`** in a `&this` / `mut &this` method, and a chain of field projections and constant indices below the reference. A reference always refers to a live value, so what it overwrites is released.
+
+Where a place is reached through several dereferences, the **nearest** one decides: `this.buffer.f = v` with `buffer` a raw pointer field is a store through the pointer, and releases nothing, though `this` is a reference.
+
+The destinations below do *not* release what they overwrite, because nothing visible in the frame distinguishes a live value from reserved, never-written memory:
 
 | destination | why not |
 | --- | --- |
-| `*p = v` | `p` may address storage that has been reserved but never written |
+| `*p = v` where `p` is a raw pointer | `p` may address storage that has been reserved but never written |
 | `p[i] = v` where `p` is a pointer | the same - this is exactly how a collection fills fresh capacity |
-| `r.f = v` where `r` is a reference or pointer, **including `this.f = v`** | the callee cannot see whether the caller initialized the pointee |
+| `p.f = v` where `p` is a raw pointer | the same: whatever `p` addresses may not have been initialised |
 | `xs[i] = v` with a run-time `i` | no single member for the compiler to track |
 | a module-level global | globals are never auto-dropped |
 
+A store through a reference also releases nothing when the function moved a value out from behind the same binding earlier, or the store's own right-hand side does (`this.f = wrap(this.f)` in a generic body, where such a move is not refused): the place still holds the bits of a value its new owner releases.
+
 A local or by-value parameter of an `async function` is a local for these rules even when it is carried in a field of the generated future: reassigning it releases the displaced value, and it is released at its scope's exits, exactly as in a function that never suspends (see [section 18.4](#184-how-an-async-function-is-compiled)).
 
-At those destinations, release the old value yourself. `Array::set` is the canonical example: it drops the previous occupant before reusing the slot, precisely because `this.ptr[index] = value` does not.
+At those destinations, release the old value yourself. `Array::set` is the canonical example: it drops the previous occupant before reusing the slot, precisely because `this.ptr[index] = value` does not. Through a reference, do not: releasing the old value by hand and then storing over it releases it twice. To take the value out of a place behind a reference, exchange it with `core::mem::swap`.
 
 #### Members are tracked separately
 
@@ -4002,6 +4008,7 @@ Two move/ownership hazards that are unambiguous memory errors, called out as the
 - **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.  A loop's condition, and a `for`'s update, run again at every back edge, so a value or field moved in them is refused, even when the body assigns it a new one, unless the body always leaves the loop with `break` or `return`.
 - **Returning the address of a local** (`E0455`) - `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine - those are caller-backed.)
 - **A field moved out on some paths only** (`E0453`) - a field moved out of a local runs its owner's release without that field at scope exit, which is sound only when the move certainly happened.  So a field may be moved out of a local of a struct with no destructor in straight-line code, and is refused inside an `if`, `match` or loop body, on the right of `&&` or `||`, and in an arm of `?:` or of an `if` expression - each runs on some paths only.  The refusal names the local and the field ("cannot move field 'a' out of `h` on only some paths"); a field moved out of a value whose type implements `Drop` is refused as owning a destructor, and one out of any other value the partial move does not track (a tuple, a pattern binding, a field of a field) as a value that drops it at scope exit.
+- **A reference to a value with a field moved out** (`E0452`) - a reference names the whole value, and a store through it releases what it displaces, so `&p`, `p` passed where a reference is taken, and a method called on `p` are refused once a field has been moved out of `p`, until that field is given a new value.  The fields that remain may still be read and borrowed (`&p.b`).
 - **A field moved out of a value no binding owns** (`E0453` with a destructor) - `const n: String = make().name;` moves `name` out of the call's result, and the result's other fields are released, each once, when the statement ends; the same holds through fields of fields (`make().inner.name`) and for a tuple's element (`pair().1`).  Read only as a borrow (`make().name.length()`, `&make().name`), the field is released with the rest of the value then.  A value with a destructor is never taken apart: when the value, or any value the field is read out of, has a type that implements `Drop`, moving the field out is refused ("cannot move field `inner` out of a value that owns a destructor"), and borrowing it is allowed - the destructor runs over the whole value when the statement ends.
 - **An owning array read by value through a pointer or reference** (`E0453`) - `const xs: [T] = p.items;` or `xs = p.items;`, with `p` a pointer or reference, copies the array's handle while the struct `p` names still owns the same buffer, so the buffer is released twice.  `[T]` and `[T; N]` alike; borrow the field (`&p.items`) or clone it.  A take that is sound - the old value is meant to leave - swaps it out with `mem::swap`.
 - **A by-value method called through a pointer or reference** (`E0453`) - `p.unwrap()` or `p.into_id()`, where the method takes `this` by value and `p` is a pointer or reference to a value that owns a destructor, moves the value out of storage that still releases it, exactly as the written `(*p).unwrap()` does.  A value without a destructor is copied and is accepted.  Call a method that borrows its receiver, clone the value first, or empty the storage with a method that leaves a value behind (`Option::take`).

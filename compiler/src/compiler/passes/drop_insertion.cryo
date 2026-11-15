@@ -471,6 +471,12 @@ type struct DropInserter {
     pend_assign_kind:    [u8];
     pend_assign_key:     [u32];
 
+    /// Bindings a value was moved out of from behind a reference earlier in
+    /// the function (`const old: T = this.f;`): the place still holds the
+    /// moved value's bits, so a store through the same binding must not
+    /// release them (see `record_reference_store`).
+    reference_moved_roots: [u64];
+
     /// Monotonic counter for naming the hidden locals that hold a displaced
     /// value between the store and its release (see `emit_assign_drop`).
     assign_seq:   i64;
@@ -563,6 +569,7 @@ type struct DropInserter {
             pend_assign_base_ty: TypeRef::invalid(),
             pend_assign_kind:    [],
             pend_assign_key:     [],
+            reference_moved_roots: [],
             assign_seq:      0,
             stmt_move_snap:  0,
             stmt_writes_flags: false,
@@ -1002,6 +1009,7 @@ type struct DropInserter {
         this.binding_initflags = [];
         this.binding_definit = [];
         this.pend_assign_node = null;
+        this.reference_moved_roots = [];
         this.assign_seq      = 0;
         this.loops           = [];
         this.loop_exit_moves = [];
@@ -2613,6 +2621,25 @@ type struct DropInserter {
         return t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference;
     }
 
+    /// True when `ty` is a reference (`&T` / `mut &T`), whose referent is
+    /// always initialised; a raw pointer may address storage holding nothing.
+    is_reference(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid() || this.arena == null) { return false; }
+        const t: Type* = this.arena.lookup(ty);
+        return t != null && t.kind == TypeKind::Reference;
+    }
+
+    /// What dereferencing `ty` reaches: a pointer's pointee or a reference's
+    /// referent; invalid for any other type.
+    dereferenced_type(&this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid() || this.arena == null) { return TypeRef::invalid(); }
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind == TypeKind::Pointer) { return t.as_pointer().pointee; }
+        if (t.kind == TypeKind::Reference) { return t.as_reference().referent; }
+        return TypeRef::invalid();
+    }
+
     /// True when `ty` has a destructor (a `Drop` implementation): partial
     /// moves out of it stay forbidden.  Mirrors move_check::has_user_drop.
     has_user_drop(&this, ty: TypeRef) -> boolean {
@@ -2849,15 +2876,17 @@ type struct DropInserter {
         // never from the place node's own `resolved_type`: async lowering
         // rebuilds the bodies this pass sees and leaves those annotations
         // invalid, which silently answered "nothing to release" for every
-        // assignment inside a lowered `poll`.  A hop through a pointer or
-        // reference, or a run-time index, fails to type here - a raw slot store
-        // fills reserved capacity that holds nothing yet, and releasing its
-        // previous occupant frees whatever the allocator last left there.
+        // assignment inside a lowered `poll`.  A place reached through a
+        // dereference is decided by `record_reference_store`; a run-time index
+        // fails to type here.
         mut kind: [u8]  = [];
         mut key:  [u32] = [];
         const root: SymbolID = ExpressionNode::place_chain(b.left, &kind, &key);
         if (!root.is_valid()) { return; }
         const slot: i64 = this.innermost_binding_slot(root);
+        mut root_ty: TypeRef = this.lookup_type(root);
+        if (slot >= 0) { root_ty = this.binding_types[slot]; }
+        if (this.record_reference_store(e, b.left, root, root_ty, &kind, &key)) { return; }
         if (slot < 0) { return; }
         const place_ty: TypeRef = this.place_type_of(
             this.binding_types[slot], &kind, &key, 0, kind.length());
@@ -2916,6 +2945,127 @@ type struct DropInserter {
             }
         }
         this.pend_assign(e, slot, guard, place_ty, kind, key);
+    }
+
+    /// Decide the release for a store whose place is reached through a
+    /// dereference - written (`*r = x`) or implied by a member or index of a
+    /// pointer or reference (`this.f = x`) - and answer whether it was one;
+    /// false leaves a place in the binding's own storage to the caller.
+    ///
+    /// The NEAREST dereference decides.  Through a reference the place is
+    /// always initialised, so the displaced value is released with no guard.
+    /// Through a raw pointer nothing is released: a pointer store may fill
+    /// storage that holds nothing yet (reserved capacity, a fresh
+    /// allocation), and releasing its previous bytes frees whatever the
+    /// allocator last left there.  `this.state.x` with `state` a pointer
+    /// field is a pointer store, though `this` is a reference.
+    ///
+    /// A binding something was moved out of from behind a reference earlier
+    /// in the function, or by this store's own right-hand side
+    /// (`this.f = wrap(this.f)`), declines: the place still holds the bits
+    /// of the value whoever took it now owns.
+    record_reference_store(mut &this, e: ExpressionNode*, place: ExpressionNode*,
+                           root: SymbolID, root_ty: TypeRef,
+                           kind: &[u8], key: &[u32]) -> boolean {
+        mut steps_kind: [u8]  = [];
+        mut steps_key:  [u32] = [];
+        mut hop: u8 = 0;
+        const cur: TypeRef = this.dereferencing_place_type(
+            root_ty, kind, key, &steps_kind, &steps_key, &hop);
+        // Untypeable: declined here and by the caller alike.
+        if (!cur.is_valid()) { return true; }
+        if (hop == (0 as u8)) { return false; }
+        if (hop != (1 as u8) || !this.type_needs_drop(cur)) { return true; }
+        for (mut i: i64 = 0; i < this.reference_moved_roots.length(); i++) {
+            if (this.reference_moved_roots[i] == root.key()) { return true; }
+        }
+        mut base_node: ExpressionNode* = place;
+        while (ExpressionNode::identifier_of(base_node) == null) {
+            const ma: MemberAccessExpr* = ExpressionNode::member_access_of(base_node);
+            const aa: ArrayAccessExpr* = ExpressionNode::array_access_of(base_node);
+            const ue: UnaryExpr* = ExpressionNode::unary_of(base_node);
+            if (ma != null) {
+                base_node = ma.object;
+            } else if (aa != null) {
+                base_node = aa.array;
+            } else {
+                base_node = ue.operand;
+            }
+        }
+        // A by-reference receiver is typed as the value it refers to: its
+        // identifier already names the referent's place, so the place is
+        // built from it with that dereference done.
+        mut base_ty: TypeRef = root_ty;
+        const referent_ty: TypeRef = this.dereferenced_type(root_ty);
+        if (steps_kind.length() != 0 && steps_kind[0] == (2 as u8)
+                && referent_ty.is_valid() && base_node.resolved_type.equals(referent_ty)) {
+            base_ty = referent_ty;
+            steps_kind.remove(0);
+            steps_key.remove(0);
+        }
+        this.pend_assign_node  = e;
+        this.pend_assign_guard = PassLocal::none();
+        this.pend_assign_ty    = cur;
+        this.pend_assign_base    = PassLocal {
+            name:    ExpressionNode::identifier_of(base_node).name,
+            binding: root,
+        };
+        this.pend_assign_base_ty = base_ty;
+        this.pend_assign_kind    = steps_kind;
+        this.pend_assign_key     = steps_key;
+        return true;
+    }
+
+    /// Note a move out of a place reached through a dereference: the
+    /// binding it is rooted at no longer owns what the place holds (see
+    /// `record_reference_store`).  Read syntactically and typed from the
+    /// binding, as every place here is.
+    note_reference_move(mut &this, expr: ExpressionNode*) -> void {
+        mut kind: [u8]  = [];
+        mut key:  [u32] = [];
+        const root: SymbolID = ExpressionNode::place_chain(expr, &kind, &key);
+        if (!root.is_valid() || kind.length() == 0) { return; }
+        mut steps_kind: [u8]  = [];
+        mut steps_key:  [u32] = [];
+        mut hop: u8 = 0;
+        const moved_ty: TypeRef = this.dereferencing_place_type(
+            this.lookup_type(root), kind, key, &steps_kind, &steps_key, &hop);
+        // Untypeable, it may be behind one; a value with nothing to release
+        // leaves nothing to release twice.
+        if (moved_ty.is_valid() && (hop == (0 as u8) || !this.type_needs_drop(moved_ty))) { return; }
+        this.reference_moved_roots.push(root.key());
+    }
+
+    /// The type of the place `root_ty` + the chain, stepping through every
+    /// pointer or reference the chain dereferences, written or implied by a
+    /// member or index of one.  The chain with every dereference written out
+    /// (kind 2) is appended to `out_kind`/`out_key`; `out_hop` says what the
+    /// NEAREST dereference went through: 0 none, 1 a reference, 2 a raw
+    /// pointer.  Invalid when a step does not type.
+    dereferencing_place_type(&this, root_ty: TypeRef, kind: &[u8], key: &[u32],
+                             out_kind: mut [u8]*, out_key: mut [u32]*,
+                             out_hop: mut u8*) -> TypeRef {
+        *out_hop = 0;
+        mut cur: TypeRef = root_ty;
+        for (mut k: i64 = 0; k < kind.length(); k++) {
+            if (kind[k] != (2 as u8) && this.is_ptr_or_ref(cur)) {
+                *out_hop = if (this.is_reference(cur)) { 1 as u8 } else { 2 as u8 };
+                cur = this.dereferenced_type(cur);
+                out_kind.push(2 as u8);
+                out_key.push(0);
+            }
+            if (kind[k] == (2 as u8)) {
+                *out_hop = if (this.is_reference(cur)) { 1 as u8 } else { 2 as u8 };
+                cur = this.dereferenced_type(cur);
+            } else {
+                mut unused_index: i64 = -1;
+                cur = this.project_type(cur, kind[k], key[k], &unused_index);
+            }
+            if (!cur.is_valid()) { return TypeRef::invalid(); }
+            out_kind.push(kind[k]);
+            out_key.push(key[k]);
+        }
+        return cur;
     }
 
     /// Stash the release `record_assign_drop` decided on for the enclosing
@@ -3461,7 +3611,8 @@ type struct DropInserter {
     }
 
     /// Build a place expression as fresh nodes: `<base>` followed by the chain
-    /// slice.  Every node gets its type from `project_type` rather than from
+    /// slice, a dereference step written as `*`.  Every node gets its type
+    /// from `project_type` (or `dereferenced_type`) rather than from
     /// whatever the source node carried, because codegen runs after this pass
     /// and will not re-resolve one - and because async lowering leaves many
     /// `resolved_type` annotations invalid.  Null when the chain does not
@@ -3478,6 +3629,18 @@ type struct DropInserter {
         for (mut k: i64 = 0; k < len; k++) {
             const pkind: u8  = kind[start + k];
             const pkey:  u32 = key[start + k];
+            if (pkind == (2 as u8)) {
+                const target_ty: TypeRef = this.dereferenced_type(cur_ty);
+                if (!target_ty.is_valid()) { return null as mut ExpressionNode*; }
+                const star: Token = Token::new(TokenType::Star, "*",
+                    span.start_line as int, span.start_col as int);
+                const deref: mut ExpressionNode* = ExpressionNode::synthetic_unary(star, cur, span);
+                deref.set_resolved_type(target_ty);
+                deref.generated = true;
+                cur = deref;
+                cur_ty = target_ty;
+                continue;
+            }
             mut next_index: i64 = -1;
             const next_ty: TypeRef = this.project_type(cur_ty, pkind, pkey, &next_index);
             if (!next_ty.is_valid()) { return null as mut ExpressionNode*; }
@@ -3844,7 +4007,7 @@ type struct DropInserter {
     project_type(&this, ty: TypeRef, kind: u8, key: u32, out_index: mut i64*) -> TypeRef {
         *out_index = -1;
         if (!ty.is_valid() || this.arena == null) { return TypeRef::invalid(); }
-        if (this.is_ptr_or_ref(ty)) { return TypeRef::invalid(); }
+        if (this.is_ptr_or_ref(ty) || kind == (2 as u8)) { return TypeRef::invalid(); }
         if (kind == (1 as u8)) {
             if (!this.is_fixed_array(ty)) { return TypeRef::invalid(); }
             mut cur: TypeRef = ty;
@@ -3914,7 +4077,12 @@ type struct DropInserter {
         const mark: i64 = this.pw_proj_kind.length();
         const root: SymbolID = ExpressionNode::place_chain(
             expr, &this.pw_proj_kind, &this.pw_proj_key);
-        if (!root.is_valid() || this.pw_proj_kind.length() == mark) {
+        // A place behind a dereference is not storage of the local's own.
+        mut through_dereference: boolean = false;
+        for (mut k: i64 = mark; k < this.pw_proj_kind.length(); k++) {
+            if (this.pw_proj_kind[k] == (2 as u8)) { through_dereference = true; }
+        }
+        if (!root.is_valid() || this.pw_proj_kind.length() == mark || through_dereference) {
             while (this.pw_proj_kind.length() > mark) {
                 this.pw_proj_kind.pop();
                 this.pw_proj_key.pop();
@@ -4072,11 +4240,7 @@ type struct DropInserter {
         if (c.arguments.length() != 1 || c.arguments[0] == null) { return; }
         const p: mut ExpressionNode* = c.arguments[0];
         // `p` is the `T*` parameter's argument: a pointer, or `&place`.
-        const pt: Type* = this.arena.lookup(p.resolved_type);
-        if (pt == null) { return; }
-        mut target_ty: TypeRef = TypeRef::invalid();
-        if (pt.kind == TypeKind::Pointer) { target_ty = pt.as_pointer().pointee; }
-        if (pt.kind == TypeKind::Reference) { target_ty = pt.as_reference().referent; }
+        const target_ty: TypeRef = this.dereferenced_type(p.resolved_type);
         if (!target_ty.is_valid()) { return; }
         const deref_tok: Token = Token::new(TokenType::Star, "*",
             e.span.start_line as int, e.span.start_col as int);
@@ -4124,6 +4288,7 @@ type struct DropInserter {
         if (moved_field != null) {
             this.classify_field_move_out(expr, moved_field);
         }
+        this.note_reference_move(expr);
         const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
         if (id != null) {
             this.handle_ident(expr, id, true);

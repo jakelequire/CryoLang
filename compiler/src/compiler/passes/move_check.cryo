@@ -1764,6 +1764,7 @@ type struct MoveChecker {
     walk_argument(mut &this, arg: ExpressionNode*) -> void {
         if (arg == null) { return; }
         if (!this.arg_transfers_value(arg)) {
+            if (arg.autoref && this.refuse_reference_to_partially_moved(arg, arg.span)) { return; }
             this.walk_expr_read(arg);
             return;
         }
@@ -2061,7 +2062,13 @@ type struct MoveChecker {
             }
         }
         if (!receiver_moved && c.callee != null) {
-            this.walk_expr_read(c.callee);
+            const method: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
+            const borrows_receiver: boolean = method != null
+                && c.method_named(this.ctx.decl_index) != null;
+            if (!borrows_receiver
+                || !this.refuse_reference_to_partially_moved(method.object, c.callee.span)) {
+                this.walk_expr_read(c.callee);
+            }
         }
         // An argument's ownership effect depends on the parameter it binds to,
         // which sema records as `arg_binding` (see `arg_transfers_value`):
@@ -2167,6 +2174,8 @@ type struct MoveChecker {
                 }
                 return;
             }
+            if (!u.borrowed_as_pointer
+                && this.refuse_reference_to_partially_moved(u.operand, u.operand.span)) { return; }
         }
         if (u.operand != null) { this.walk_expr_read(u.operand); }
         return;
@@ -2341,6 +2350,32 @@ type struct MoveChecker {
         this.pm_binding.remove(moved);
         this.pm_field.remove(moved);
         this.pm_site.remove(moved);
+    }
+
+    /// E0452 when `object` is a bare binding a field has been moved out of
+    /// and the use at `span` makes a reference to it - `&p`, an argument
+    /// taken by reference, a method's receiver.  A reference names the whole
+    /// value, and a store through one releases what it displaces, the moved
+    /// field's stale bits among them.  True when it reported.
+    refuse_reference_to_partially_moved(mut &this, object: ExpressionNode*, span: SourceSpan) -> boolean {
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(object);
+        if (id == null) { return false; }
+        const sym: SymbolID = id.res.local_sym();
+        if (!sym.is_valid() || !this.pm_has_binding(sym.key())) { return false; }
+        if (this.suppress_emit) { return true; }
+        mut moved_at: SourceSpan = SourceSpan::none();
+        for (mut i: i64 = 0; i < this.pm_binding.length(); i++) {
+            if (this.pm_binding[i] == sym.key()) { moved_at = this.pm_site[i]; }
+        }
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0452_USE_AFTER_MOVE,
+            fmt::format("reference to partially-moved value `%s`", this.intern.resolve(id.name)));
+        diag = diag.at_with_label(span, "borrowed here after one of its fields was moved out");
+        if (moved_at.has_location()) { diag = diag.also_at(moved_at, "field moved out here"); }
+        diag = diag.help("a reference names the whole value; give the moved field a new value first, or borrow the fields that remain");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+        return true;
     }
 
     pm_has_binding(&this, binding_id: u64) -> boolean {
