@@ -36,7 +36,7 @@ import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::diag::{ source_span };
 import std::fs::file::{ File };
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::fs::file;
 import std::fmt;
 import std::core::primitives;
@@ -128,7 +128,7 @@ type struct BindingSerializer {
 
     /// Render the full binding file for `root` (top-level type decls) plus
     /// `extern_node` (the C functions) under `namespace ns`.
-    static render(ctx: CompilationContext*, ns: string,
+    static render(ctx: CompilationContext*, ns: Str,
                   root: ProgramNode*, extern_node: ExternBlock*,
                   report: mut ImportReport*) -> String {
         mut text: String = String::new();
@@ -716,9 +716,9 @@ type struct VendorGenerator {
     /// file reached transitively via `#include` - so the caller can write a
     /// `<bindings>.cryo.deps` sidecar that `provenance_key` folds on the next
     /// cache check (catching edits to transitively-included headers).
-    static generate(ns: string, source_path: string, headers: &[string],
-                    include_dirs: &[string], defines: &[string],
-                    out_inputs: mut [String]*, language: string, cpp_std: string) -> String {
+    static generate(ns: Str, source_path: Str, headers: &[String],
+                    include_dirs: &[String], defines: &[String],
+                    out_inputs: mut [String]*, language: Str, cpp_std: Str) -> String {
         mut ctx: CompilationContext = CompilationContext::new(
             BuildOptions::defaults(CompileMode::SingleFile), "<vendor-bindgen>", null);
         // The importer pushes top-level type decls into the AST root; give it a
@@ -742,7 +742,7 @@ type struct VendorGenerator {
         // once the list is complete.
         mut arguments: [String] = [];
         for (mut i: i64 = 0; i < include_dirs.length(); i++) {
-            arguments.push(f"-I{Path::from(source_path).join(include_dirs[i]).as_path().as_str()}");
+            arguments.push(f"-I{Path::from(source_path).join(include_dirs[i].as_str()).as_path().as_str()}");
         }
         for (mut i: i64 = 0; i < defines.length(); i++) {
             arguments.push(f"-D{defines[i]}");
@@ -757,16 +757,17 @@ type struct VendorGenerator {
         mut report: ImportReport = ImportReport::new();
         mut parsed: i32 = 0;
         for (mut i: i64 = 0; i < headers.length(); i++) {
-            const hp: string = VendorGenerator::resolve_header(
-                source_path, include_dirs, headers[i]);
-            if (hp.length() == 0) {
-                fmt::eprintf("warning: vendor header '%s' not found under %s\n",
-                    headers[i], source_path);
-                continue;
-            }
+            mut header_path: String = match (VendorGenerator::resolve_header(
+                    source_path, include_dirs, headers[i].as_str())) {
+                Option::Some(found) => { String::from_str(found.as_path().as_str()) }
+                Option::None        => {
+                    fmt::eprint(f"warning: vendor header '{headers[i]}' not found under {source_path}\n");
+                    continue;
+                }
+            };
             // `collect_from_tu` records the entry header and its transitive
             // non-system includes on `ctx`, each once.
-            Importer::collect_from_tu(hp as u8*, null, 0, &extra, hp,
+            Importer::collect_from_tu(header_path.as_c_string(), null, 0, &extra, header_path.as_str(),
                                       extern_node, false, &ctx, &report,
                                       language, cpp_std);
             parsed = parsed + 1;
@@ -786,13 +787,13 @@ type struct VendorGenerator {
 
     /// The libclang version banner (e.g. "clang version 20.1.0"), or "" when
     /// unavailable.  Folded into the provenance key so a toolchain upgrade
-    /// invalidates the cache.  The CXString's C buffer is interned (copied) so
-    /// the returned `string` outlives the disposed CXString.
-    static clang_version() -> string {
+    /// invalidates the cache.  The CXString's C buffer is copied, so the
+    /// String outlives the disposed CXString.
+    static clang_version() -> String {
         const s: CXString = clang::clang_getClangVersion();
         const cstr: u8* = clang::clang_getCString(s);
-        mut out: string = "";
-        if (cstr != null) { out = String::from_string(cstr as string).into_raw(); }
+        mut out: String = String::new();
+        if (cstr != null) { out = String::from_string(cstr as string); }
         clang::clang_disposeString(s);
         return out;
     }
@@ -815,12 +816,9 @@ type struct VendorGenerator {
     /// upgrading does not spuriously invalidate a cache whose `GENERATOR_VERSION`
     /// already matched (the version bump to 6 is what forces the one-time
     /// regeneration that installs the sidecar).
-    static provenance_key(source_path_text: string, headers: &[string],
-                          include_dirs: &[string], defines: &[string],
-                          triple_text: string, cache_file_text: string, lang_text: string) -> string {
-        const cache_file: string = cache_file_text;
-        const lang: string = lang_text;
-        const triple: string = triple_text;
+    static provenance_key(source_path: Str, headers: &[String],
+                          include_dirs: &[String], defines: &[String],
+                          triple: Str, cache_file: Str, lang: Str) -> String {
         mut h: Fnv128Hasher = Fnv128Hasher::new();
         const depfile: String = if (cache_file.length() > 0) {
             f"{cache_file}.deps"
@@ -833,15 +831,15 @@ type struct VendorGenerator {
         } else {
             // Fallback (fresh register / pre-sidecar cache): entry headers only.
             for (mut i: i64 = 0; i < headers.length(); i++) {
-                const hp: string = VendorGenerator::resolve_header(
-                    source_path_text, include_dirs, headers[i]);
-                if (hp.length() == 0) {
-                    // A missing header still perturbs the key (distinct marker +
-                    // the requested name) so it can't masquerade as unchanged.
-                    h.fold("<missing-header>");
-                    h.fold(headers[i]);
-                } else {
-                    Manifest::fold_file(&h, Path::from(hp));
+                match (VendorGenerator::resolve_header(source_path, include_dirs, headers[i].as_str())) {
+                    Option::Some(found) => { Manifest::fold_file(&h, found.as_path()); }
+                    Option::None        => {
+                        // A missing header still perturbs the key (distinct
+                        // marker + the requested name) so it can't masquerade
+                        // as unchanged.
+                        h.fold("<missing-header>");
+                        h.fold_text(headers[i].as_str());
+                    }
                 }
             }
         }
@@ -862,26 +860,26 @@ type struct VendorGenerator {
         h.fold("<headers>");
         h.fold(headers.length() as u64);
         for (mut i: i64 = 0; i < headers.length(); i++) {
-            h.fold(headers[i]);
+            h.fold_text(headers[i].as_str());
         }
         h.fold("<include_dirs>");
         for (mut i: i64 = 0; i < include_dirs.length(); i++) {
-            h.fold(include_dirs[i]);
+            h.fold_text(include_dirs[i].as_str());
         }
         h.fold("<defines>");
         for (mut i: i64 = 0; i < defines.length(); i++) {
-            h.fold(defines[i]);
+            h.fold_text(defines[i].as_str());
         }
         // The source language ("c" vs "c++") changes what libclang parses and
         // what the generator emits, so flipping it (without touching headers)
         // MUST invalidate the cache.  An empty/"c" lang folds the same marker so
         // existing C entries keep a stable key relative to each other.
         h.fold("<lang>");
-        h.fold(if ((lang as string) == "c++") { "c++" } else { "c" });
-        h.fold(triple);
-        h.fold(VendorGenerator::clang_version());
+        h.fold(if (lang == Str::new("c++")) { "c++" } else { "c" });
+        h.fold_text(triple);
+        h.fold_text(VendorGenerator::clang_version().as_str());
         h.fold(GENERATOR_VERSION as u64);
-        return Manifest::hex128(h.finish128());
+        return String::from_string(Manifest::hex128(h.finish128()));
     }
 
     /// Fold the bytes of every file listed in an include-graph depfile (one path
@@ -911,8 +909,8 @@ type struct VendorGenerator {
     /// per line, in the order `generate` accumulated them.  Best-effort - a
     /// write failure just means the next cache check falls back to the
     /// entry-header key (a possible spurious regeneration, never a stale cache).
-    static write_depfile(cryo_path_text: string, inputs: &[String]) -> void {
-        const depfile: String = f"{cryo_path_text}.deps";
+    static write_depfile(cryo_path: Str, inputs: &[String]) -> void {
+        const depfile: String = f"{cryo_path}.deps";
         mut text: String = String::new();
         for (mut i: i64 = 0; i < inputs.length(); i++) {
             text.push(inputs[i].as_str());
@@ -929,17 +927,16 @@ type struct VendorGenerator {
 
     /// Resolve a manifest header name to an existing file: try each include dir
     /// under source_path, then source_path itself, then the name verbatim.
-    static resolve_header(source_path_text: string, include_dirs: &[string],
-                          header_text: string) -> string {
-        const header: string = header_text;
-        const source_path: string = source_path_text;
+    /// `None` when none of them exists.
+    static resolve_header(source_path: Str, include_dirs: &[String],
+                          header: Str) -> Option<PathBuf> {
         for (mut i: i64 = 0; i < include_dirs.length(); i++) {
-            const cand: string = Path::from(source_path).join(include_dirs[i]).join(header).into_raw();
-            if (Path::from(cand).exists()) { return cand; }
+            const candidate: PathBuf = Path::from(source_path).join(include_dirs[i].as_str()).join(header);
+            if (candidate.as_path().exists()) { return Option::Some(candidate); }
         }
-        const direct: string = Path::from(source_path).join(header).into_raw();
-        if (Path::from(direct).exists()) { return direct; }
-        if (Path::from(header).exists()) { return header; }
-        return "";
+        const direct: PathBuf = Path::from(source_path).join(header);
+        if (direct.as_path().exists()) { return Option::Some(direct); }
+        if (Path::from(header).exists()) { return Option::Some(PathBuf::from(header)); }
+        return Option::None;
     }
 }

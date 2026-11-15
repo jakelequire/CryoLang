@@ -1186,8 +1186,8 @@ type struct Executor {
         }
 
         const main_path: path::PathBuf = src_path.join("main.cryo");
-        const ns_name: string = Executor::derive_namespace(name.as_str());
-        if (!Executor::write_main_cryo(main_path.as_path(), ns_name)) { return 1; }
+        const ns_name: String = Executor::derive_namespace(name.as_str());
+        if (!Executor::write_main_cryo(main_path.as_path(), ns_name.as_str())) { return 1; }
 
         const config_path: path::PathBuf = path::Path::from(Str::new(target_dir)).join("cryoconfig");
         if (!Executor::write_cryoconfig(config_path.as_path(), name.as_str(), src_dir.as_str(),
@@ -1250,7 +1250,7 @@ type struct Executor {
         return n;
     }
 
-    static write_main_cryo(path: path::Path, ns_name: string) -> boolean {
+    static write_main_cryo(path: path::Path, ns_name: Str) -> boolean {
         mut text: String = String::new();
         text.push("namespace ");
         text.push(ns_name);
@@ -1285,7 +1285,7 @@ type struct Executor {
     /// Anything else is dropped.  The output compiles as-is even when the
     /// input contains characters the Cryo parser would reject in an
     /// identifier.
-    static derive_namespace(name: Str) -> string {
+    static derive_namespace(name: Str) -> String {
         mut out: String = String::with_capacity(name.length());
         for (byte in name.as_bytes().iter()) {
             const ch: char = byte as char;
@@ -1299,8 +1299,8 @@ type struct Executor {
                 out.push_byte('_' as u8);
             }
         }
-        if (out.is_empty()) { return "Main"; }
-        return out.into_raw();
+        if (out.is_empty()) { return String::from_string("Main"); }
+        return out;
     }
 
     static write_cryoconfig(path: path::Path, name: Str, src_dir: Str,
@@ -2262,8 +2262,8 @@ type struct Executor {
             const reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
             const idx: i64 = reg.find_index(lib);
             if (idx < 0) { return false; }
-            const f: string = reg.entries[idx].cache_file_for(
-                registry::VendorRegistry::normalize_triple(""));
+            const f: Str = reg.entries[idx].cache_file_for(
+                registry::VendorRegistry::normalize_triple(Str::new("")));
             return f.length() > 0 && path::Path::from(f).exists();
         }
         if (req.starts_with(&os_prefix)) {
@@ -3312,56 +3312,58 @@ type struct Executor {
     /// always regenerates; a bare `cryo vendor <path>` passes `false`, so an
     /// unchanged (headers + triple + libclang + generator) provenance is a
     /// cache hit and libclang is not re-run.
-    static vendor_register(path_text: string, args: &cli::ParsedArgs, force: boolean) -> int {
-        const path: string = path_text;
+    static vendor_register(path: Str, args: &cli::ParsedArgs, force: boolean) -> int {
         // Resolve to an absolute path (the registry stores absolute roots so
         // `import vendor::Name` works from any project directory).
-        mut abs: string = "";
-        match (path::Path::from(path).canonicalize()) {
-            Result::Ok(pb)  => { abs = pb.into_raw(); }
-            Result::Err(_)  => {
-                fmt::eprintf("Error: cannot resolve vendor path '%s' (does it exist?).\n", path);
+        const abs: path::PathBuf = match (path::Path::from(path).canonicalize()) {
+            Result::Ok(resolved) => { resolved }
+            Result::Err(_)       => {
+                fmt::eprint(f"Error: cannot resolve vendor path '{path}' (does it exist?).\n");
                 return 1;
             }
-        }
+        };
+        const source_path: Str = abs.as_path().as_str();
 
-        const manifest_path: string = path::Path::from(abs).join("cryo-vendor.json").into_raw();
-        if (!path::Path::from(manifest_path).exists()) {
-            fmt::eprintf("Error: no cryo-vendor.json manifest found at %s\n", manifest_path);
+        const manifest_path: path::PathBuf = abs.as_path().join("cryo-vendor.json");
+        if (!manifest_path.as_path().exists()) {
+            fmt::eprint(f"Error: no cryo-vendor.json manifest found at {manifest_path.as_path().as_str()}\n");
             fmt::eprintf("       a vendored library needs a manifest declaring its name,\n");
             fmt::eprintf("       headers, link libraries, and (Stage 1) a bindings_file.\n");
             return 1;
         }
-        mut content: string = "";
-        match (File::read_text(path::Path::from(manifest_path))) {
-            Result::Ok(s)  => { content = s.into_raw(); }
+        const content: String = match (File::read_text(manifest_path.as_path())) {
+            Result::Ok(s)  => { s }
             Result::Err(_) => {
-                fmt::eprintf("Error: cannot read %s\n", manifest_path);
+                fmt::eprint(f"Error: cannot read {manifest_path.as_path().as_str()}\n");
                 return 1;
             }
-        }
-        mut root: value::JsonValue = match (parser::parse(str::Str::from(content))) {
+        };
+        mut root: value::JsonValue = match (parser::parse(content.as_str())) {
             Result::Ok(v)      => { v }
             Result::Err(e)     => {
                 mem::drop(e);
-                fmt::eprintf("Error: %s is not valid JSON.\n", manifest_path);
+                fmt::eprint(f"Error: {manifest_path.as_path().as_str()} is not valid JSON.\n");
                 return 1;
             }
         };
 
-        const key: string = Executor::path_basename(abs).to_ascii_lower();
-        const name: string = registry::VendorRegistry::jstr(&root, "name", Executor::derive_namespace(Str::new(key)));
+        const key: String = match (abs.as_path().file_name()) {
+            Option::Some(base) => { base.to_ascii_lowercase() }
+            Option::None       => { String::new() }
+        };
+        const name: String = registry::VendorRegistry::text_field(&root, Str::new("name"),
+            Executor::derive_namespace(key.as_str()).as_str());
 
         mut entry: registry::VendorEntry = registry::VendorEntry {
-            key:            key,
-            name:           name,
-            source_path:    abs,
-            binding_source: registry::VendorRegistry::jstr(&root, "binding_source", "manual"),
-            headers:        registry::VendorRegistry::jstrs(&root, "headers"),
-            include_dirs:   registry::VendorRegistry::jstrs(&root, "include_dirs"),
-            defines:        registry::VendorRegistry::jstrs(&root, "defines"),
-            language:       registry::VendorRegistry::jstr(&root, "language", ""),
-            std:            registry::VendorRegistry::jstr(&root, "std", ""),
+            key:            key.clone(),
+            name:           name.clone(),
+            source_path:    String::from_str(source_path),
+            binding_source: registry::VendorRegistry::text_field(&root, Str::new("binding_source"), Str::new("manual")),
+            headers:        registry::VendorRegistry::text_list_field(&root, Str::new("headers")),
+            include_dirs:   registry::VendorRegistry::text_list_field(&root, Str::new("include_dirs")),
+            defines:        registry::VendorRegistry::text_list_field(&root, Str::new("defines")),
+            language:       registry::VendorRegistry::text_field(&root, Str::new("language"), Str::new("")),
+            std:            registry::VendorRegistry::text_field(&root, Str::new("std"), Str::new("")),
             link:           registry::VendorLink::empty(),
             cache:          [],
         };
@@ -3370,13 +3372,13 @@ type struct Executor {
             Option::None     => { }
         }
 
-        const triple: string = if (args.has_arg("target")) { args.get_value("target") } else { "" };
-        const norm_triple: string = registry::VendorRegistry::normalize_triple(triple);
-        const bindings_file: string = registry::VendorRegistry::jstr(&root, "bindings_file", "");
+        const triple: Str = if (args.has_arg("target")) { Str::new(args.get_value("target")) } else { Str::new("") };
+        const norm_triple: Str = registry::VendorRegistry::normalize_triple(triple);
+        const bindings_file: String = registry::VendorRegistry::text_field(&root, Str::new("bindings_file"), Str::new(""));
         mem::drop(root);
 
-        const cache_dir: string = registry::VendorRegistry::cache_dir_for(key, triple);
-        const dest: string = path::Path::from(cache_dir).join(f"{name}.cryo".as_str()).into_raw();
+        const dest: path::PathBuf = registry::VendorRegistry::cache_dir_for(key.as_str(), triple)
+            .join(f"{name}.cryo".as_str());
         mut produced: boolean = false;
 
         // Serialize the load -> (maybe generate) -> save against any other
@@ -3388,46 +3390,47 @@ type struct Executor {
 
         // Load the on-disk registry up front: it carries any cache entries for
         // OTHER triples (so they coexist after this re-register) and the prior
-        // provenance key for THIS triple (for the cache-hit check).
-        // `string` fields are non-owning pointers into leaked buffers, so the
-        // carried-over items stay valid after the old entry is replaced.
+        // provenance key for THIS triple (for the cache-hit check).  The
+        // carried-over items are copies, owned by the new entry.
         mut reg: registry::VendorRegistry = registry::VendorRegistry::load_global();
-        mut prev_key:  string = "";
-        mut prev_file: string = "";
-        const prev_idx: i64 = reg.find_index(key);
+        mut prev_key:  String = String::new();
+        mut prev_file: String = String::new();
+        const prev_idx: i64 = reg.find_index(key.as_str());
         if (prev_idx >= 0) {
             for (mut c: i64 = 0; c < reg.entries[prev_idx].cache.length(); c++) {
-                const ct: string = reg.entries[prev_idx].cache[c].triple;
+                const item: &registry::VendorCacheItem = &reg.entries[prev_idx].cache[c];
                 entry.cache.push(registry::VendorCacheItem {
-                    triple: ct,
-                    file:   reg.entries[prev_idx].cache[c].file,
-                    key:    reg.entries[prev_idx].cache[c].key,
+                    triple: item.triple.clone(),
+                    file:   item.file.clone(),
+                    key:    item.key.clone(),
                 });
-                if (ct == norm_triple) {
-                    prev_key  = reg.entries[prev_idx].cache[c].key;
-                    prev_file = reg.entries[prev_idx].cache[c].file;
+                if (item.triple.as_str() == norm_triple) {
+                    prev_key  = item.key.clone();
+                    prev_file = item.file.clone();
                 }
             }
         }
 
-        if (bindings_file != "") {
+        if (bindings_file.length() > 0) {
             // Escape hatch: copy pre-written bindings verbatim into the cache.
             // (No provenance key: a hand-supplied file is always re-copied.)
-            const src: string = path::Path::from(abs).join(bindings_file).into_raw();
-            if (!path::Path::from(src).exists()) {
+            const src: path::PathBuf = abs.as_path().join(bindings_file.as_str());
+            if (!src.as_path().exists()) {
                 lock.release();
-                fmt::eprintf("Error: bindings_file '%s' not found at %s\n", bindings_file, src);
+                fmt::eprint(f"Error: bindings_file '{bindings_file}' not found at {src.as_path().as_str()}\n");
                 return 1;
             }
-            if (!Executor::copy_text_file(src, dest)) {
-                lock.release();
-                fmt::eprintf("Error: failed to copy bindings into the cache (%s -> %s).\n", src, dest);
-                return 1;
+            match (File::copy(src.as_path(), dest.as_path())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => {
+                    lock.release();
+                    fmt::eprint(f"Error: failed to copy bindings into the cache ({src.as_path().as_str()} -> {dest.as_path().as_str()}): {error}\n");
+                    return 1;
+                }
             }
-            entry.set_cache(norm_triple, dest, "");
+            entry.set_cache(norm_triple, dest.as_path().as_str(), Str::new(""));
             produced = true;
-        } else if (entry.binding_source == "headers"
-                || entry.binding_source == "cxx-headers") {
+        } else if (entry.is_generated()) {
             // Generate bindings from the manifest's headers via libclang, unless
             // an unchanged provenance key makes this a cache hit.  "headers" =
             // C; "cxx-headers" = C++ (direct mangled-symbol binding, Strategy A).
@@ -3436,54 +3439,52 @@ type struct Executor {
                 fmt::eprintf("Error: manifest declares no \"headers\" to generate bindings from.\n");
                 return 1;
             }
-            const prov_key: string = generator::VendorGenerator::provenance_key(
-                abs, &entry.headers, &entry.include_dirs, &entry.defines,
-                norm_triple, prev_file, entry.lang_arg());
+            const provenance: String = generator::VendorGenerator::provenance_key(
+                source_path, &entry.headers, &entry.include_dirs, &entry.defines,
+                norm_triple, prev_file.as_str(), entry.lang_arg());
             const hit: boolean = !force
-                && prev_key != "" && prev_key == prov_key
-                && prev_file != "" && path::Path::from(prev_file).exists();
+                && prev_key.length() > 0 && prev_key == provenance
+                && prev_file.length() > 0 && path::Path::from(prev_file.as_str()).exists();
             if (hit) {
-                fmt::printf("Bindings for '%s' are up to date for triple '%s' (cache hit).\n",
-                    name, norm_triple);
+                fmt::print(f"Bindings for '{name}' are up to date for triple '{norm_triple}' (cache hit).\n");
                 // Keep the file we just confirmed exists (its path, not the
                 // recomputed `dest`, in case the manifest's name changed).
-                entry.set_cache(norm_triple, prev_file, prov_key);
+                entry.set_cache(norm_triple, prev_file.as_str(), provenance.as_str());
                 produced = true;
             } else {
-                fmt::printf("Generating bindings for '%s' from %lld header(s) via libclang...\n",
-                    name, entry.headers.length() as i64);
+                fmt::print(f"Generating bindings for '{name}' from {entry.headers.length()} header(s) via libclang...\n");
                 mut inputs: [String] = [];
-                const src_text: String = generator::VendorGenerator::generate(
-                    name, abs, &entry.headers, &entry.include_dirs, &entry.defines, &inputs,
-                    entry.lang_arg(), entry.std);
-                if (src_text.length() == 0) {
+                const source_text: String = generator::VendorGenerator::generate(
+                    name.as_str(), source_path, &entry.headers, &entry.include_dirs, &entry.defines, &inputs,
+                    entry.lang_arg(), entry.std.as_str());
+                if (source_text.length() == 0) {
                     lock.release();
                     fmt::eprintf("Error: binding generation produced no output (no header parsed).\n");
                     return 1;
                 }
-                const gf: void* = libc::fopen(dest, "w");
-                if (gf == null) {
-                    lock.release();
-                    fmt::eprintf("Error: cannot write generated bindings to %s\n", dest);
-                    return 1;
+                match (File::write_text(dest.as_path(), source_text.as_str())) {
+                    Result::Ok(_)      => { }
+                    Result::Err(error) => {
+                        lock.release();
+                        fmt::eprint(f"Error: cannot write generated bindings to {dest.as_path().as_str()}: {error}\n");
+                        return 1;
+                    }
                 }
-                libc::fwrite(src_text.as_pointer(), 1, src_text.length() as u64, gf);
-                libc::fclose(gf);
                 // Record the include graph next to the bindings so a later cache
                 // check folds every transitively-included header, not just the
                 // entry header (see VendorGenerator::provenance_key).
-                generator::VendorGenerator::write_depfile(dest, &inputs);
+                generator::VendorGenerator::write_depfile(dest.as_path().as_str(), &inputs);
                 // Store the key computed FROM the just-written depfile (not the
-                // pre-generation `prov_key`, which folded the previous graph), so
+                // pre-generation `provenance`, which folded the previous graph), so
                 // the next unchanged check folds the same `dest.deps` and hits
                 // without a spurious one-time regeneration.
-                const store_key: string = generator::VendorGenerator::provenance_key(
-                    abs, &entry.headers, &entry.include_dirs, &entry.defines,
-                    norm_triple, dest, entry.lang_arg());
-                entry.set_cache(norm_triple, dest, store_key);
+                const store_key: String = generator::VendorGenerator::provenance_key(
+                    source_path, &entry.headers, &entry.include_dirs, &entry.defines,
+                    norm_triple, dest.as_path().as_str(), entry.lang_arg());
+                entry.set_cache(norm_triple, dest.as_path().as_str(), store_key.as_str());
                 produced = true;
             }
-        } else if (entry.binding_source == "cxx-shim") {
+        } else if (entry.binding_source.as_str() == Str::new("cxx-shim")) {
             // Reserved forward-compat seam: C++
             // libraries would be bound through a generated extern-C shim keyed
             // off `clang_Cursor_getMangling`.  That generator does not exist
@@ -3500,16 +3501,15 @@ type struct Executor {
         const saved: boolean = reg.save_global();
         lock.release();
         if (!saved) {
-            fmt::eprintf("Error: failed to write the vendor registry at %s\n",
-                registry::VendorRegistry::registry_path());
+            fmt::eprint(f"Error: failed to write the vendor registry at {registry::VendorRegistry::registry_path().as_path().as_str()}\n");
             return 1;
         }
 
-        fmt::printf("Registered vendor library '%s' -> import vendor::%s\n", key, name);
-        fmt::printf("  source: %s\n", abs);
+        fmt::print(f"Registered vendor library '{key}' -> import vendor::{name}\n");
+        fmt::print(f"  source: {source_path}\n");
         if (produced) {
-            fmt::printf("  bindings: %s\n", dest);
-            fmt::printf("  cached for triple '%s'\n", norm_triple);
+            fmt::print(f"  bindings: {dest.as_path().as_str()}\n");
+            fmt::print(f"  cached for triple '{norm_triple}'\n");
             if (is_cxx_lib) {
                 // The C++ bindgen (Strategy A) is experimental; consuming these
                 // bindings requires the project to opt in. Registration itself
@@ -3526,20 +3526,19 @@ type struct Executor {
 
     /// A `+- label ------+` rule opening one library's block.  Passing "" gives
     /// the plain rule that closes the last block.
-    static vendor_box_rule(label_text: string) -> void {
-        const label: string = label_text;
+    static vendor_box_rule(label: Str) -> void {
         mut rule: String = String::new();
-        if (label == "") {
+        if (label.is_empty()) {
             rule.push_repeated('-', VENDOR_BOX_WIDTH - 2);
-            fmt::printf("+%s+\n", rule.as_c_string() as string);
+            fmt::print(f"+{rule}+\n");
             return;
         }
         // "+- " + label + " " + dashes + "+" spans the box width; a label wider
         // than the box keeps a stub of rule rather than a negative count.
-        mut dashes: i64 = VENDOR_BOX_WIDTH - 5 - (label.length() as i64);
+        mut dashes: i64 = VENDOR_BOX_WIDTH - 5 - label.length();
         if (dashes < 3) { dashes = 3; }
         rule.push_repeated('-', dashes);
-        fmt::printf("+- %s %s+\n", label, rule.as_c_string() as string);
+        fmt::print(f"+- {label} {rule}+\n");
     }
 
     /// A bordered but empty row, closing one library's block off from the rule
@@ -3587,27 +3586,26 @@ type struct Executor {
     }
 
     /// How an entry's bindings were produced, for its `bindings` row.
-    static vendor_binding_kind(entry: &registry::VendorEntry) -> string {
-        if (entry.binding_source == "manual") { return "pre-written"; }
-        if (entry.binding_source == "headers"
-                || entry.binding_source == "cxx-headers") {
-            if (entry.is_cxx()) { return "generated from C++ headers"; }
-            return "generated from C headers";
+    static vendor_binding_kind(entry: &registry::VendorEntry) -> Str {
+        if (entry.binding_source.as_str() == Str::new("manual")) { return Str::new("pre-written"); }
+        if (entry.is_generated()) {
+            if (entry.is_cxx()) { return Str::new("generated from C++ headers"); }
+            return Str::new("generated from C headers");
         }
-        return entry.binding_source;
+        return entry.binding_source.as_str();
     }
 
     /// The target triples an entry has cached bindings for.  The files sit at
     /// `<cache>/<key>/<triple>/<Name>.cryo`, so the listing prints the cache
     /// root once and names only the triples here.
-    static vendor_cached_targets(entry: &registry::VendorEntry) -> string {
-        if (entry.cache.length() == 0) { return "none cached"; }
+    static vendor_cached_targets(entry: &registry::VendorEntry) -> String {
+        if (entry.cache.length() == 0) { return String::from_string("none cached"); }
         mut out: String = String::new();
         for (mut c: i64 = 0; c < entry.cache.length(); c++) {
             if (c > 0) { out.push(", "); }
-            out.push(entry.cache[c].triple);
+            out.push(entry.cache[c].triple.as_str());
         }
-        return out.into_raw();
+        return out;
     }
 
     /// Registry indices ordered by library key.  Insertion order is whatever
@@ -3619,8 +3617,8 @@ type struct Executor {
         for (mut a: i64 = 0; a + 1 < order.length(); a++) {
             mut low: i64 = a;
             for (mut b: i64 = a + 1; b < order.length(); b++) {
-                const cand: str::Str = str::Str::new(reg.entries[order[b]].key);
-                const best: str::Str = str::Str::new(reg.entries[order[low]].key);
+                const cand: str::Str = reg.entries[order[b]].key.as_str();
+                const best: str::Str = reg.entries[order[low]].key.as_str();
                 if (cand < best) { low = b; }
             }
             if (low != a) {
@@ -3642,29 +3640,25 @@ type struct Executor {
         }
         const order: [i64] = Executor::vendor_key_order(&reg);
         fmt::printf("Registered vendor libraries (%lld)\n", reg.entries.length() as i64);
-        fmt::print(f"Bindings cache: {exec_path(str::Str::new(registry::VendorRegistry::vendor_root()))}\n\n");
+        fmt::print(f"Bindings cache: {exec_path(registry::VendorRegistry::vendor_root().as_path().as_str())}\n\n");
         mut missing: i64 = 0;
         for (mut oi: i64 = 0; oi < order.length(); oi++) {
             const i: i64 = order[oi];
-            const gone: boolean =
-                !path::Path::from(reg.entries[i].source_path).exists();
-            mut title: string = reg.entries[i].key;
+            const entry: &registry::VendorEntry = &reg.entries[i];
+            const gone: boolean = !path::Path::from(entry.source_path.as_str()).exists();
+            mut title: String = entry.key.clone();
             if (gone) {
                 missing++;
-                title = fmt::format("%s  (source missing)", reg.entries[i].key).into_raw();
+                title.push("  (source missing)");
             }
-            Executor::vendor_box_rule(title);
-            Executor::vendor_box_field("import as",
-                fmt::format("vendor::%s", reg.entries[i].name).into_raw());
-            Executor::vendor_box_field("bindings",
-                Executor::vendor_binding_kind(&reg.entries[i]));
-            Executor::vendor_box_field("targets",
-                Executor::vendor_cached_targets(&reg.entries[i]));
-            Executor::vendor_box_field("source",
-                exec_path(str::Str::new(reg.entries[i].source_path)).as_str());
+            Executor::vendor_box_rule(title.as_str());
+            Executor::vendor_box_field("import as", f"vendor::{entry.name}".as_str());
+            Executor::vendor_box_field("bindings", Executor::vendor_binding_kind(entry));
+            Executor::vendor_box_field("targets", Executor::vendor_cached_targets(entry).as_str());
+            Executor::vendor_box_field("source", exec_path(entry.source_path.as_str()).as_str());
             Executor::vendor_box_gap();
         }
-        Executor::vendor_box_rule("");
+        Executor::vendor_box_rule(Str::new(""));
         if (missing > 0) {
             fmt::printf("\n%lld of %lld libraries no longer have their source; unregister them\n",
                 missing, reg.entries.length() as i64);
@@ -3689,15 +3683,14 @@ type struct Executor {
         // down, so descending indices leave the entries not yet examined where
         // they were.  Deleting by index (not by key) is what keeps a library
         // whose namespace collides with a doomed entry's key from being the one
-        // that goes.  The recorded key and path outlive their entry - a
-        // `string` field is a borrowed pointer its owner's drop does not free.
+        // that goes.  The key and path are copied out before their entry goes.
         const total: i64 = reg.entries.length();
-        mut doomed: [string] = [];
-        mut paths:  [string] = [];
+        mut doomed: [String] = [];
+        mut paths:  [String] = [];
         for (mut i: i64 = total - 1; i >= 0; i--) {
-            if (!path::Path::from(reg.entries[i].source_path).exists()) {
-                doomed.push(reg.entries[i].key);
-                paths.push(reg.entries[i].source_path);
+            if (!path::Path::from(reg.entries[i].source_path.as_str()).exists()) {
+                doomed.push(reg.entries[i].key.clone());
+                paths.push(reg.entries[i].source_path.clone());
                 reg.remove_at(i);
             }
         }
@@ -3719,8 +3712,8 @@ type struct Executor {
         // Collection ran downwards; report upwards so the order matches the
         // registry.
         for (mut d: i64 = doomed.length() - 1; d >= 0; d--) {
-            fmt::printf("  %s\n", doomed[d]);
-            fmt::println(f"      was {exec_path(str::Str::new(paths[d]))}");
+            fmt::println(f"  {doomed[d]}");
+            fmt::println(f"      was {exec_path(paths[d].as_str())}");
         }
         fmt::printf("%lld librar%s left registered.\n", reg.entries.length() as i64,
             if (reg.entries.length() == 1) { "y" } else { "ies" });
@@ -3761,14 +3754,13 @@ type struct Executor {
         mut failures: i32 = 0;
         for (mut i: i64 = 0; i < reg.entries.length(); i++) {
             if (name != ""
-                    && reg.entries[i].key != name
-                    && !str::Str::from(reg.entries[i].name).equals_case_insensitive(&str::Str::from(name))) {
+                    && reg.entries[i].key.as_str() != str::Str::new(name)
+                    && !reg.entries[i].name.as_str().equals_case_insensitive(&str::Str::new(name))) {
                 continue;
             }
-            const src: string = reg.entries[i].source_path;
+            const src: Str = reg.entries[i].source_path.as_str();
             if (!path::Path::from(src).exists()) {
-                fmt::eprintf("Error: source path for '%s' is gone: %s\n",
-                    reg.entries[i].key, src);
+                fmt::eprint(f"Error: source path for '{reg.entries[i].key}' is gone: {src}\n");
                 failures += 1;
                 continue;
             }
@@ -3780,33 +3772,4 @@ type struct Executor {
         return 0;
     }
 
-    /// The final path component of `p` (handles both `/` and `\` separators).
-    /// Returns a pointer into `p`.
-    static path_basename(p_text: string) -> string {
-        const p: string = p_text;
-        const n: i64 = p.length() as i64;
-        mut start: i64 = 0;
-        for (mut i: i64 = 0; i < n; i++) {
-            if (p[i] == '/' || p[i] == '\\') { start = i + 1; }
-        }
-        return p + start;
-    }
-
-
-    /// Copy a text file `src` -> `dest` (truncating dest).  Used to seed the
-    /// vendor cache with hand-written bindings.
-    static copy_text_file(src_text: string, dest_text: string) -> boolean {
-        const dest: string = dest_text;
-        const src: string = src_text;
-        mut text: string = "";
-        match (File::read_text(path::Path::from(src))) {
-            Result::Ok(s)  => { text = s.into_raw(); }
-            Result::Err(_) => { return false; }
-        }
-        const f: void* = libc::fopen(dest, "w");
-        if (f == null) { return false; }
-        libc::fputs(text, f);
-        libc::fclose(f);
-        return true;
-    }
 }

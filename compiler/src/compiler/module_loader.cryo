@@ -199,7 +199,7 @@ private:
     // `vendor::<Name>` import resolved to.  The generated file declares
     // `namespace <Name>;`, but the module is registered under the path the
     // import writes, because an import names a module whole.
-    vendor_modules: HashMap<String, string, GlobalAllocator, FnvHasher>;
+    vendor_modules: HashMap<String, String, GlobalAllocator, FnvHasher>;
 
     // Every `module` line of every pre-scanned file, whether or not this
     // build loads that file.  A module's reach is declared by its package's
@@ -239,7 +239,7 @@ public:
     /// never call `set_vendor_context` (single-file, raw, LSP for now).
     vendor_registry:  VendorRegistry;
     vendor_triple:    string;
-    used_vendor_keys: [string];
+    used_vendor_keys: [String];
     /// `[vendor.<Name>]` project pins from cryoconfig.  When a pin names the
     /// library being resolved, its triple overrides `vendor_triple` for that
     /// one library (project pin -> global), so a project can lock a lib to a
@@ -272,7 +272,7 @@ public:
             loaded_paths:  [],
             scanned_ns:    HashMap::<String, string, GlobalAllocator, FnvHasher>::new(),
             ns_map:        HashMap::<String, string, GlobalAllocator, FnvHasher>::new(),
-            vendor_modules: HashMap::<String, string, GlobalAllocator, FnvHasher>::new(),
+            vendor_modules: HashMap::<String, String, GlobalAllocator, FnvHasher>::new(),
             module_lines:   [],
             listings:       DirectoryListings::new(),
             index_cache:    NamespaceIndexCache::closed(),
@@ -323,14 +323,14 @@ public:
     /// shadows the build triple for that library), otherwise the build's
     /// `vendor_triple`.  `lib` is the namespace after `vendor::` (e.g. the
     /// "RayLib" in `vendor::RayLib`), matched against the pin name verbatim.
-    triple_for_lib(&this, lib: string) -> string {
+    triple_for_lib(&this, lib: Str) -> Str {
         for (mut i: i64 = 0; i < this.vendor_pins.length(); i++) {
-            if (this.vendor_pins[i].name == lib
+            if (Str::new(this.vendor_pins[i].name) == lib
                     && this.vendor_pins[i].triple != "") {
-                return this.vendor_pins[i].triple;
+                return Str::new(this.vendor_pins[i].triple);
             }
         }
-        return this.vendor_triple;
+        return Str::new(this.vendor_triple);
     }
 
     /// Wire the language server's open buffers.  Called once, before
@@ -653,10 +653,10 @@ public:
             const idx: i64 = this.vendor_registry.find_index(lib);
             if (idx < 0) { return ""; }
             // A `[vendor.<lib>]` pin overrides the build triple for this lib.
-            const triple: string =
+            const triple: Str =
                 VendorRegistry::normalize_triple(this.triple_for_lib(lib));
-            const f: string = this.vendor_registry.entries[idx].cache_file_for(triple);
-            if (f.length() > 0 && Path::from(f).exists()) {
+            const cached: Str = this.vendor_registry.entries[idx].cache_file_for(triple);
+            if (cached.length() > 0 && Path::from(cached).exists()) {
                 // Surface the binding in the project build tree: copy the
                 // cache file into `<vendor_build_root>/<Name>/<Name>.cryo` and
                 // compile THAT, so the generated `.cryo` sits alongside its
@@ -665,24 +665,29 @@ public:
                 // resolved copy for this build.  Copy every resolve so a cache
                 // regeneration this build is reflected; falls back to the
                 // cache path if there's no build folder or the copy fails.
+                mut chosen: PathBuf = PathBuf::from(cached);
                 if (!this.vendor_build_root.is_empty()) {
-                    const name: string = this.vendor_registry.entries[idx].name;
-                    const dest: string = this.vendor_build_root.join(Str::new(name))
-                        .join(f"{name}.cryo".as_str()).into_raw();
-                    ProjectConfig::mkdir_p(Path::from(dest.parent_directory()));
-                    match (File::copy(Path::from(f), Path::from(dest))) {
-                        Result::Ok(_)  => { return dest; }
-                        Result::Err(_) => { return f; }
+                    const name: Str = this.vendor_registry.entries[idx].name.as_str();
+                    const dest: PathBuf = this.vendor_build_root.join(name)
+                        .join(f"{name}.cryo".as_str());
+                    match (dest.as_path().parent()) {
+                        Option::Some(directory) => { ProjectConfig::mkdir_p(directory); }
+                        Option::None            => { }
+                    }
+                    match (File::copy(Path::from(cached), dest.as_path())) {
+                        Result::Ok(_)  => { chosen = dest; }
+                        Result::Err(_) => { }
                     }
                 }
-                return f;
+                // The module graph keeps the path a module was found at, as a
+                // `string`, for the whole build.
+                return chosen.into_raw();
             }
             // Registered, but nothing generated for THIS triple (a cross-compile
             // against a host-only registration is the common case).  Point the
             // user at the regeneration command rather than leaving them with the
             // generic "cannot find module" diagnostic.
-            fmt::eprintf("note: vendor library '%s' is registered but has no bindings for target '%s'.\n      Generate them with: cryo vendor --target=%s <path>\n",
-                lib, triple, triple);
+            fmt::eprint(f"note: vendor library '{lib}' is registered but has no bindings for target '{triple}'.\n      Generate them with: cryo vendor --target={triple} <path>\n");
             return "";
         }
 
@@ -750,12 +755,12 @@ public:
         const idx: i64 = this.vendor_registry.find_index(lib);
         if (idx < 0) { return; }
         this.vendor_modules.insert(ModuleGraph::module_key(resolved),
-            "vendor::" + this.vendor_registry.entries[idx].name);
-        const key: string = this.vendor_registry.entries[idx].key;
+            f"vendor::{this.vendor_registry.entries[idx].name}");
+        const key: Str = this.vendor_registry.entries[idx].key.as_str();
         for (mut i: i64 = 0; i < this.used_vendor_keys.length(); i++) {
-            if (this.used_vendor_keys[i] == key) { return; }
+            if (this.used_vendor_keys[i].as_str() == key) { return; }
         }
-        this.used_vendor_keys.push(key);
+        this.used_vendor_keys.push(String::from_str(key));
     }
 
     /// Merge every used vendor library's link metadata into `cfg`'s link
@@ -763,7 +768,7 @@ public:
     /// Called after discovery, before linking.
     merge_vendor_links(&this, cfg: mut ProjectConfig*) -> void {
         for (mut i: i64 = 0; i < this.used_vendor_keys.length(); i++) {
-            const idx: i64 = this.vendor_registry.find_index(this.used_vendor_keys[i]);
+            const idx: i64 = this.vendor_registry.find_index(this.used_vendor_keys[i].as_str());
             if (idx < 0) { continue; }
             VendorRegistry::merge_entry_link(cfg, &this.vendor_registry.entries[idx]);
         }
@@ -777,16 +782,16 @@ public:
     collect_vendor_locks(&this) -> [LockedVendor] {
         mut out: [LockedVendor] = [];
         for (mut i: i64 = 0; i < this.used_vendor_keys.length(); i++) {
-            const idx: i64 = this.vendor_registry.find_index(this.used_vendor_keys[i]);
+            const idx: i64 = this.vendor_registry.find_index(this.used_vendor_keys[i].as_str());
             if (idx < 0) { continue; }
-            const name: string = this.vendor_registry.entries[idx].name;
-            const triple: string =
+            const name: Str = this.vendor_registry.entries[idx].name.as_str();
+            const triple: Str =
                 VendorRegistry::normalize_triple(this.triple_for_lib(name));
-            const file: string = this.vendor_registry.entries[idx].cache_file_for(triple);
+            const file: Str = this.vendor_registry.entries[idx].cache_file_for(triple);
             if (file.length() == 0) { continue; }
             const sha: String = LockedVendor::file_sha(Path::from(file));
             if (sha.length() == 0) { continue; }
-            out.push(LockedVendor { name: String::from_string(name), triple: String::from_string(triple), binding_sha: sha });
+            out.push(LockedVendor { name: String::from_str(name), triple: String::from_str(triple), binding_sha: sha });
         }
         return out;
     }
@@ -919,9 +924,9 @@ public:
         }
 
         // Create ModuleInfo (store original path so the lexer can open the file)
-        const vendor_name: Option<string> = this.vendor_modules.get(&norm_path);
+        const vendor_name: Option<String*> = this.vendor_modules.get_reference(&norm_path);
         const mod_name: SymbolStr = if (vendor_name.is_some()) {
-            intern.intern(vendor_name.unwrap())
+            intern.intern(vendor_name.unwrap().as_str())
         } else {
             if (scan.namespace_name.is_valid()) {
                 scan.namespace_name
