@@ -3796,7 +3796,8 @@ type struct CallResolver {
     /// and answer that signature's return.  The family's entries come through
     /// the member-function door, by the declaration's owner and leaf; which
     /// entry is the selection (`select_family_overload`).  Invalid, pinning
-    /// nothing, when an argument is untyped or no signature accepts them.
+    /// nothing, when an argument is untyped, when no signature accepts them,
+    /// or when generic functions of the family tie for them.
     /// Shared by a bare call and a module-qualified one, whose path is
     /// `scope` (null for a bare call): both name a declaration, and which of
     /// its signatures a call means is one question.
@@ -3816,12 +3817,16 @@ type struct CallResolver {
             overloads.push(this.ctx.decl_index.entry_signature(entries[ei]));
         }
         const oi: i64 = this.select_family_overload(&overloads, &arg_types);
+        // Generic functions accept the arguments without any signature
+        // matching them exactly, so a tie among them is not "no overload".
+        const tied: boolean = this.report_free_generic_tie(call_e, call, callee, scope, &arg_types);
         if (oi < 0) {
-            this.refuse_unmatched_family_call(call_e, call, this.intern.shown(this.ctx.defs.leaf_of(callee)),
-                &overloads, &arg_types);
+            if (!tied) {
+                this.refuse_unmatched_family_call(call_e, call, this.intern.shown(this.ctx.defs.leaf_of(callee)),
+                    &overloads, &arg_types);
+            }
             return TypeRef::invalid();
         }
-        this.report_free_generic_tie(call_e, call, callee, scope, &arg_types);
         // The pin is the selected entry: the declaration and the one of its
         // signatures the arguments chose, carrying its own symbol.
         call.set_resolved_callee(CalleePin::Decl(entries[oi]));
@@ -3837,9 +3842,10 @@ type struct CallResolver {
     }
 
     /// E0154 when a non-generic signature of `callee`'s family and one of its
-    /// generic functions both accept the arguments of `call`, and true then.
-    /// A function is not preferred for being non-generic, as a method is
-    /// not, so the call is ambiguous.  Asked by a bare call and a
+    /// generic functions both accept the arguments of `call`, or two of its
+    /// generic functions do, and true then.  A function is not preferred
+    /// for being non-generic, as a method is not, and no generic function
+    /// outranks another, so the call is ambiguous.  Asked by a bare call and a
     /// module-qualified one alike, whichever declaration the name layer
     /// stamped; the caller keeps whatever it pinned, so the tie is the one
     /// error the call reports.  A type argument, on the call or on the path
@@ -3870,8 +3876,20 @@ type struct CallResolver {
             if (this.where_bound_refuses(call, null, t)) { continue; }
             generics.push(entries[i]);
         }
-        if (!plain.is_valid() || generics.length() == 0) { return false; }
+        if (generics.length() == 0 || (!plain.is_valid() && generics.length() < 2)) { return false; }
         const leaf: string = this.intern.shown(this.ctx.defs.leaf_of(callee));
+        if (!plain.is_valid()) {
+            mut tie: Diagnostic = Diagnostic::error(ErrorCode::E0154_AMBIGUOUS_CALL,
+                fmt::format("`%s` is ambiguous: more than one generic function accepts these arguments", leaf));
+            tie = tie.at_with_label(call_e.span, "these functions all apply here");
+            for (mut i: i64 = 0; i < generics.length(); i++) {
+                tie = tie.with_note_at(fmt::format("candidate #%d: `%s`, generic", (i + 1) as i32, leaf),
+                    this.ctx.decl_index.entry_span(generics[i]));
+            }
+            tie = tie.help("no generic function is preferred over another; rename one of them");
+            this.ctx.emit_diagnostic(tie);
+            return true;
+        }
         mut d: Diagnostic = Diagnostic::error(ErrorCode::E0154_AMBIGUOUS_CALL,
             fmt::format("`%s` is ambiguous: a non-generic and a generic function both accept these arguments", leaf));
         d = d.at_with_label(call_e.span, "both functions apply here");
