@@ -16,6 +16,7 @@ import std::core::default::{ Default };
 import std::core::option::{ Option };
 import std::core::slice::{ Slice };
 import std::core::mem;
+import std::collections::str::{ Str };
 
 /// A running hash state that values feed their bytes into, one `write_*`
 /// call at a time; `finish` reads the digest of everything fed so far.
@@ -68,7 +69,8 @@ public type trait Hasher {
     ///                   adjacent concatenations can't collide ("ab"+"c" vs
     ///                   "a"+"bc").
     /// Fixed-width values need no separator; only the variable-length `string`
-    /// arm appends one. Any other type is refused where it is given.
+    /// arm appends one. Any other type is refused where it is given; a `Str`
+    /// folds through `fold_text`.
     ///
     /// Lives on the trait rather than on one hasher because it is pure
     /// composition over `write_u8` / `write_unsigned_integer`: every implementation folds
@@ -108,6 +110,17 @@ public type trait Hasher {
                 this.write_u8(0 as u8);
             }
         }
+    }
+
+    /// Fold the text of `text` into the running digest: its bytes, then the
+    /// separator NUL `fold` writes after a `string`, so a part folds the same
+    /// whether it is held as a `Str` or as the `string` of the same text, and
+    /// a digest does not change when its parts move from one to the other.
+    /// A NUL inside the view is folded as a byte, where a `string` would end
+    /// at it.
+    fold_text(mut &this, text: Str) -> void {
+        this.write_bytes(text.as_bytes());
+        this.write_u8(0 as u8);
     }
 
     /// Finalize the hash and return the digest. After calling `finish`
@@ -209,10 +222,8 @@ public type struct Fnv128Hasher {
     }
 
     /// The digest's two halves, high first, for callers rendering it as text.
-    /// Returned rather than formatted here so `core::hash` keeps depending on
-    /// nothing but `core` - hex formatting lives on `u64`, and pulling
-    /// `String` in for it would put the collections module underneath every
-    /// HashMap that uses this file.
+    /// Returned rather than formatted here: hex formatting lives on `u64`,
+    /// and the caller decides where the text goes.
     public high64(&this) -> u64 {
         return (this.state >> 64) as u64;
     }

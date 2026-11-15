@@ -1,0 +1,65 @@
+///! `Hasher.fold_text` of a `Str` feeds the same bytes as `fold` of the
+///! `string` with the same text, under every hasher: a digest does not change
+///! when its parts are held as views. Only the view's own bytes are folded.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::HashFoldText;
+
+import std::core::hash::{ Hasher, FnvHasher, Fnv128Hasher, SipHasher };
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_equal };
+
+const KEY0: u64 = 0x0706050403020100;
+const KEY1: u64 = 0x0f0e0d0c0b0a0908;
+
+![test]
+function a_view_folds_as_the_string_of_its_text_under_fnv() -> Result<(), TestError> {
+    mut from_strings: FnvHasher = FnvHasher::new();
+    from_strings.fold("");
+    from_strings.fold("main.cryo");
+    from_strings.fold("x86_64-pc-windows-gnu");
+    mut from_views: FnvHasher = FnvHasher::new();
+    from_views.fold_text(Str::new(""));
+    from_views.fold_text(Str::new("main.cryo"));
+    from_views.fold_text(Str::new("x86_64-pc-windows-gnu"));
+    return expect_equal(from_views.finish(), from_strings.finish());
+}
+
+![test]
+function a_view_folds_as_the_string_of_its_text_under_fnv128_and_sip() -> Result<(), TestError> {
+    mut wide_strings: Fnv128Hasher = Fnv128Hasher::new();
+    wide_strings.fold("compiler/src/main.cryo");
+    wide_strings.fold(7 as u64);
+    mut wide_views: Fnv128Hasher = Fnv128Hasher::new();
+    wide_views.fold_text(Str::new("compiler/src/main.cryo"));
+    wide_views.fold(7 as u64);
+    expect(wide_views.finish128() == wide_strings.finish128(), Str::new("128-bit digests agree"))?;
+    mut keyed_strings: SipHasher = SipHasher::with_keys_1_3(KEY0, KEY1);
+    keyed_strings.fold("a header longer than one eight-byte word");
+    mut keyed_views: SipHasher = SipHasher::with_keys_1_3(KEY0, KEY1);
+    keyed_views.fold_text(Str::new("a header longer than one eight-byte word"));
+    return expect_equal(keyed_views.finish(), keyed_strings.finish());
+}
+
+![test]
+function only_the_views_bytes_are_folded() -> Result<(), TestError> {
+    const whole: Str = Str::new("abcdef");
+    mut prefix: FnvHasher = FnvHasher::new();
+    prefix.fold_text(whole.byte_substring(0, 3));
+    mut text: FnvHasher = FnvHasher::new();
+    text.fold("abc");
+    return expect_equal(prefix.finish(), text.finish());
+}
+
+![test]
+function the_separator_keeps_adjacent_views_apart() -> Result<(), TestError> {
+    mut first: FnvHasher = FnvHasher::new();
+    first.fold_text(Str::new("ab"));
+    first.fold_text(Str::new("c"));
+    mut second: FnvHasher = FnvHasher::new();
+    second.fold_text(Str::new("a"));
+    second.fold_text(Str::new("bc"));
+    return expect(first.finish() != second.finish(), Str::new("\"ab\"+\"c\" is not \"a\"+\"bc\""));
+}
