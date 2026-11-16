@@ -281,7 +281,7 @@ type struct SpecializationPasses {
         if (root != null) {
             loop {
                 const before_specs: i64 = mono_ptr.spec_count();
-                const before_methods: i64 = mono_ptr.spec_owner_file_count();
+                const before_methods: i64 = mono_ptr.method_instance_count();
                 mono_ptr.specialize_calls_in_module(root);
                 // Drain the pending worklist for any new instantiations queued
                 // by the walk.  We deliberately don't re-enter `process_all`
@@ -291,16 +291,16 @@ type struct SpecializationPasses {
                 const post_success: boolean = mono_ptr.drain_pending_worklist();
                 if (success) { success = post_success; }
                 // Fixpoint on BOTH progress metrics.  A pass whose only progress
-                // is materializing a generic-METHOD spec (pinning a static
-                // generic-owner call whose owner instantiation drained on the
-                // previous pass, or an adapter-chain receiver) grows
-                // `spec_owner_file_count` but leaves `spec_count` unchanged;
+                // is a method instance (pinning a static generic-owner call
+                // whose owner instantiation drained on the previous pass, or an
+                // adapter-chain receiver's default) grows
+                // `method_instance_count` but may leave `spec_count` unchanged;
                 // breaking on `spec_count` alone stops before the call that
-                // method spec unblocks gets re-walked.  Both metrics are
-                // monotonic and bounded - each spec is recorded exactly once,
+                // instance unblocks gets re-walked.  Both metrics are
+                // monotonic and bounded - each instance is made exactly once,
                 // behind the `method_instance` guard - so this terminates.
                 if (mono_ptr.spec_count() == before_specs
-                        && mono_ptr.spec_owner_file_count() == before_methods) {
+                        && mono_ptr.method_instance_count() == before_methods) {
                     break;
                 }
             }
@@ -356,10 +356,10 @@ type struct SpecializationPasses {
                 SpecializationPasses::register_spec(ctx, mono, entry);
             }
             mono.advance_injection_cursor();
-            const before_methods: i64 = mono.spec_owner_file_count();
+            const before_methods: i64 = mono.method_instance_count();
             mono.bind_queued_calls();
             if (!mono.drain_pending_worklist()) { break; }
-            if (mono.spec_count() == reg_end && mono.spec_owner_file_count() == before_methods) { break; }
+            if (mono.spec_count() == reg_end && mono.method_instance_count() == before_methods) { break; }
         }
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
@@ -385,11 +385,21 @@ type struct SpecializationPasses {
     /// monomorphizer materializes its whole worklist while `ctx` is loaded
     /// to the first module, so the asking module is not known here.
     ///
+    /// An instance of a method with type parameters of its own is placed by
+    /// the same rule, its own type arguments considered first, then its
+    /// receiver as a type argument, then the module declaring the method.
+    ///
     /// Invalid when no candidate is a module of the build.
     static owner_module_for_spec(ctx: CompilationContext*,
                                  entry: SpecializationEntry*) -> ModulePath {
         mut owner: InstanceOwner = InstanceOwner::new();
         if (ctx.module_graph == null) { return ModulePath::none(); }
+        for (mut i: i64 = 0; i < entry.method_arguments.length(); i++) {
+            owner.consider_type(ctx, entry.method_arguments[i], 0);
+        }
+        if (entry.is_method_instance()) {
+            owner.consider_type(ctx, entry.specialized_type, 0);
+        }
         if (entry.instantiated_type.is_valid()) {
             const arena: TypeArena* = ctx.type_arena;
             // `inst_*` answers for a pre-mono wrapper AND a post-mono concrete
@@ -414,6 +424,12 @@ type struct SpecializationPasses {
                          entry: mut SpecializationEntry*) -> void {
         const arena: TypeArena* = ctx.type_arena;
         const module_sym: SymbolStr = ctx.intern(ctx.source_file);
+
+        // A method instance's template is the method, whose module is the
+        // one its file declares; only the module graph knows which that is.
+        if (entry.is_method_instance()) {
+            entry.template_module = ctx.module_of_file(entry.impl_nodes[0].source_file);
+        }
 
         // Resolve this spec's OWNER module (`owner_module_for_spec`).  Both DI
         // ownership (here) and AST placement key off `owner_source`, so they
@@ -493,6 +509,9 @@ type struct SpecializationPasses {
                     ctx.decl_index.registered_def(entry.specialized_type), entry.instantiated_type);
             }
         }
+        // A method instance's block was made for its receiver, and its one
+        // method registered under the receiver, when the instance was made.
+        if (entry.is_method_instance()) { return; }
         // Each cloned impl block is rewritten to target the specialization
         // by its qualified name and recorded as a head under the
         // specialization's type; its methods were registered under the type
@@ -576,6 +595,29 @@ type struct SpecializationPasses {
         }
     }
 
+    /// How the placement trace names `entry`'s instance: its instantiation,
+    /// or for a method instance its receiver, method and type arguments
+    /// (`Array<i64>::sort_by_key<i64, ...>`).
+    static instance_shown(ctx: CompilationContext*, entry: SpecializationEntry*) -> string {
+        const arena: TypeArena* = ctx.type_arena;
+        if (!entry.is_method_instance()) {
+            const shown: TypeRef = if (entry.instantiated_type.is_valid()) {
+                entry.instantiated_type
+            } else {
+                entry.specialized_type
+            };
+            return arena.resolve_display_name(shown);
+        }
+        const method: MethodDecl* = DeclarationNode::method_of(DeclarationNode::impl_of(entry.impl_nodes[0]).methods[0]);
+        mut shown: string = arena.resolve_display_name(entry.specialized_type).append("::")
+            .append(ctx.intern_table.resolve(DeclarationNode::fn_of(method.func).name)).append("<");
+        for (mut i: i64 = 0; i < entry.method_arguments.length(); i++) {
+            if (i > 0) { shown = shown.append(", "); }
+            shown = shown.append(arena.resolve_display_name(entry.method_arguments[i]));
+        }
+        return shown.append(">");
+    }
+
     static route_specializations_to_owners(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
@@ -596,12 +638,7 @@ type struct SpecializationPasses {
             if (!entry.owner_source.equals(my_src)) { continue; }
             entry.injected = true;
             if (Log::enabled(LogArea::Mono, LogLevel::Trace)) {
-                const shown: TypeRef = if (entry.instantiated_type.is_valid()) {
-                    entry.instantiated_type
-                } else {
-                    entry.specialized_type
-                };
-                Log::trace(LogArea::Mono, f"instance {ctx.type_arena.resolve_display_name(shown)} placed in {ctx.intern_table.shown(ctx.unit_module.decl_name())}");
+                Log::trace(LogArea::Mono, f"instance {SpecializationPasses::instance_shown(ctx, entry)} placed in {ctx.intern_table.shown(ctx.unit_module.decl_name())}");
             }
             if (entry.ast_node != null) {
                 SpecializationPasses::mark_specialized(entry.ast_node);

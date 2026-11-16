@@ -1162,42 +1162,10 @@ type struct MonoCallSpecializer {
         }
 
 
-        // Route the spec'd sibling onto the right AST array.
-        if (inherent_owner_ast != null) {
-            mut target_ast: DeclarationNode* = inherent_owner_ast;
-            mut from_template: boolean = false;
-            if (this.generic_registry != null) {
-                const recv_t: Type* = this.arena.lookup(recv_type);
-                if (recv_t != null && recv_t.kind == TypeKind::InstantiatedType) {
-                    const inst_recv: InstantiatedType* = recv_t.as_instantiated();
-                    const tmpl_recv: const TemplateEntry* =
-                        this.generic_registry.template_of_type(inst_recv.generic_base);
-                    if (tmpl_recv != null && tmpl_recv.ast_node == inherent_owner_ast) {
-                        from_template = true;
-                    }
-                }
-            }
-            if (from_template) {
-                // The method is placed on the template AST; route to the
-                // receiver's spec entry instead so the sibling doesn't leak across
-                // every instantiation.
-                const specializing: [i64] = this.state.entries_specializing(recv_type);
-                for (mut si: i64 = 0; si < specializing.length(); si++) {
-                    const e: SpecializationEntry* = &this.state.spec_entries[specializing[si]];
-                    if (e.ast_node != null) {
-                        target_ast = e.ast_node;
-                        break;
-                    }
-                }
-            }
-            if (DeclarationNode::struct_of(target_ast) != null) {
-                (DeclarationNode::struct_of(target_ast)).methods.push(spec_method_decl);
-            } else if (DeclarationNode::union_of(target_ast) != null) {
-                (DeclarationNode::union_of(target_ast)).methods.push(spec_method_decl);
-            }
-        } else {
-            DeclarationNode::impl_of(impl_node).methods.push(spec_method_decl);
-        }
+        // The instance is held by a block of its own, whatever declares the
+        // method: its symbol is its registered entry's, so what holds it
+        // decides only the object it is defined in.
+        this.hold_method_instance(spec_method_decl, recv_type, &bindings);
 
         // DI registration + symbol pin.  Inherent generic methods on a fixed
         // receiver get the precise mangle pinned (disambiguates Inner::relay<A> vs
@@ -1251,6 +1219,38 @@ type struct MonoCallSpecializer {
             this.walk_body(spec_method.func, &rw_ctx, copy_subst);
         }
         return DeclarationNode::fn_of(spec_method.func).overload_entry;
+    }
+
+    /// Hold `spec_method_decl`, an instance on `recv_type` of a method at
+    /// its own type arguments `arguments`, in an implementation block of its
+    /// own for the receiver, carrying the file the method is written in
+    /// (the copy's span keeps its template's).  The block is an entry of its
+    /// own, placed by the instance's type arguments before its receiver's,
+    /// then by the method's module (`SpecializationPasses::
+    /// owner_module_for_spec`): an instance over a program's type - a
+    /// closure passed to a standard-library method - is defined in the
+    /// program, wherever its receiver's own instance is.
+    hold_method_instance(mut &this, spec_method_decl: DeclarationNode*, recv_type: TypeRef,
+                         arguments: &[TypeRef]) -> void {
+        const block: mut ImplBlock* = ImplBlock::new(this.arena.get_qualified_name(recv_type).spelling());
+        block.spec_owner = recv_type;
+        block.methods.push(spec_method_decl);
+        const block_decl: mut DeclarationNode* = DeclarationNode::of(DeclKind::Impl(block), SourceSpan::none());
+        block_decl.set_source_file(spec_method_decl.span.file);
+        mut impls: [DeclarationNode*] = [];
+        impls.push(block_decl);
+        mut held_arguments: [TypeRef] = [];
+        for (mut i: i64 = 0; i < arguments.length(); i++) { held_arguments.push(arguments[i]); }
+        this.state.add_spec_entry(SpecializationEntry {
+            specialized_type:  recv_type,
+            ast_node:          null,
+            impl_nodes:        impls,
+            template_module:   ModulePath::none(),
+            instantiated_type: TypeRef::invalid(),
+            injected:          false,
+            owner_source:      SymbolStr::empty(),
+            method_arguments:  held_arguments,
+        });
     }
 
     /// The receiver's method for the definition `d`, and where it is held:
@@ -1443,6 +1443,7 @@ type struct MonoCallSpecializer {
             instantiated_type: TypeRef::invalid(),
             injected:          false,
             owner_source:      SymbolStr::empty(),
+            method_arguments:  [],
         });
         return block_decl;
     }
@@ -1629,6 +1630,7 @@ type struct MonoCallSpecializer {
             instantiated_type: TypeRef::invalid(),
             injected:          false,
             owner_source:      SymbolStr::empty(),
+            method_arguments:  [],
         });
         this.specialize_calls_in_spec_decl(copy_decl, &binding);
         return copy_decl;
@@ -2993,16 +2995,7 @@ type struct MonoCallSpecializer {
         const spec_method: MethodDecl* = DeclarationNode::method_of(spec_method_decl);
         if (this.decl_index == null) { return; }
         if (spec_method == null || impl_node == null) { return; }
-        mut owning_file: SymbolStr = SymbolStr::empty();
-        if (impl_node.source_file != "") {
-            owning_file = this.intern_table.intern(impl_node.source_file);
-        } else {
-            owning_file = this.current_source_file;
-        }
-        // The spec's definition is emitted into the unit of `owning_file`; flag
-        // it as a spec owner so the per-module incremental cache does not reuse
-        // a stale object (see MonoState::record_spec_owner_file).
-        this.state.record_spec_owner_file(owning_file);
+        this.state.note_method_instance();
         if (this.receiver_unmaterialized(recv_type)) { return; }
         mut spec_methods: [DeclarationNode*] = [];
         spec_methods.push(spec_method_decl);
@@ -3010,22 +3003,15 @@ type struct MonoCallSpecializer {
             recv_type, spec_methods, this.intern_table, this.arena, "mono/spec impl method");
     }
 
-    /// Register a spec method whose owner is a non-generic struct (no impl
-    /// block) under the receiver's type.  The spec's definition is emitted with
-    /// the owner's declaration, so the module that owns it is the one whose
-    /// file declares the owner - not the module whose call asked for it: a
-    /// `scope.spawn(body)` written in `main` defines `Scope::spawn<F>` for the
-    /// body's type in `std::thread`'s object.
+    /// Register a spec method declared in a type's own body (no impl
+    /// block) under the receiver's type.
     register_spec_method_in_di_inherent(mut &this, spec_method_decl: DeclarationNode*,
                                         recv_type: TypeRef, owner_ast: DeclarationNode*) -> void {
         const spec_method: MethodDecl* = DeclarationNode::method_of(spec_method_decl);
         if (this.decl_index == null) { return; }
         if (spec_method == null || owner_ast == null) { return; }
         if (this.receiver_unmaterialized(recv_type)) { return; }
-        // Flag the emitting module as a spec owner for the incremental cache
-        // (see MonoState::record_spec_owner_file): an owner not flagged is
-        // served from its cached object, which predates the spec.
-        this.state.record_spec_owner_file(this.intern_table.intern(owner_ast.span.file));
+        this.state.note_method_instance();
         mut spec_methods: [DeclarationNode*] = [];
         spec_methods.push(spec_method_decl);
         this.decl_index.register_methods(
