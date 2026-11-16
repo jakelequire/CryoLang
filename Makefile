@@ -607,20 +607,28 @@ endif
 # would otherwise land among the archives verify hashes.
 cryogate: $(CRYOGATE) $(CRYOGATE_TESTS)
 
+# Each binary is touched last, as the compiler is: a build the pin finds up
+# to date leaves it as it was, older than the input that made the rule run,
+# and the rule would then run the pin on every later make - inside verify,
+# too, where the pin's stdlib archive lands among the archives it hashes.
 ifeq ($(HOST_OS),windows)
 $(CRYOGATE): $(CRYOGATE_INPUTS)
 	@echo "==> Building cryogate via bin/cryo.exe"
 	@cd tools/CryoGate && "$(subst /,\,$(PIN_EXE))" build
+	@copy /b "$(subst /,\,$(CRYOGATE))" +,, "$(subst /,\,$(CRYOGATE))" >NUL
 $(CRYOGATE_TESTS): $(CRYOGATE_INPUTS) $(call rwildcard,$(CRYOGATE_DIR)/tests,*.cryo)
 	@echo "==> Building cryogate's unit tests via bin/cryo.exe"
 	@cd tools/CryoGate && "$(subst /,\,$(PIN_EXE))" test --list
+	@copy /b "$(subst /,\,$(CRYOGATE_TESTS))" +,, "$(subst /,\,$(CRYOGATE_TESTS))" >NUL
 else
 $(CRYOGATE): $(CRYOGATE_INPUTS)
 	@echo "==> Building cryogate via bin/cryo"
 	@cd tools/CryoGate && "$(PIN)" build
+	@touch "$(CRYOGATE)"
 $(CRYOGATE_TESTS): $(CRYOGATE_INPUTS) $(call rwildcard,$(CRYOGATE_DIR)/tests,*.cryo)
 	@echo "==> Building cryogate's unit tests via bin/cryo"
 	@cd tools/CryoGate && "$(PIN)" test --list
+	@touch "$(CRYOGATE_TESTS)"
 endif
 
 # ---- cryosmith ----------------------------------------------------------
@@ -628,17 +636,20 @@ endif
 # tree's stdlib and linked against the stdlib only: it writes program text
 # and needs nothing from the compiler it helps to test.  Rebuilt when its
 # sources, the stdlib, the runtime's sources or the pin are newer than the
-# binary.  `cryosmith selftest` builds nothing, so check-fast runs it.
+# binary.  `cryosmith selftest` builds nothing, so check-fast runs it.  The
+# binary is touched last, as cryogate's is.
 cryosmith: $(CRYOSMITH)
 
 ifeq ($(HOST_OS),windows)
 $(CRYOSMITH): $(CRYOSMITH_INPUTS)
 	@echo "==> Building cryosmith via bin/cryo.exe"
 	@cd tools/CryoSmith && "$(subst /,\,$(PIN_EXE))" build
+	@copy /b "$(subst /,\,$(CRYOSMITH))" +,, "$(subst /,\,$(CRYOSMITH))" >NUL
 else
 $(CRYOSMITH): $(CRYOSMITH_INPUTS)
 	@echo "==> Building cryosmith via bin/cryo"
 	@cd tools/CryoSmith && "$(PIN)" build
+	@touch "$(CRYOSMITH)"
 endif
 
 cryosmith-selftest: $(CRYOSMITH)

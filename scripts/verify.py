@@ -657,12 +657,14 @@ def shared_inputs():
 def runtime_home_files(runtime_home):
     """Every file the baseline's runtime home holds, relative to it, except
     the archives its compiler builds there: REV's runtime sources, which with
-    the compiler decide those archives, or a tiered runtime's archives."""
+    the compiler decide those archives, or a tiered runtime's archives.  Each
+    is a `/`-separated path, and the list is sorted as whole paths, so the
+    key it feeds is the same whichever host or walk produced it."""
     out = []
     for dirpath, dirs, files in os.walk(runtime_home):
-        dirs[:] = sorted(d for d in dirs if d != ".bin")
-        out += [os.path.relpath(os.path.join(dirpath, f), runtime_home) for f in sorted(files)]
-    return out
+        dirs[:] = [d for d in dirs if d != ".bin"]
+        out += [os.path.relpath(os.path.join(dirpath, f), runtime_home).replace(os.sep, "/") for f in files]
+    return sorted(out)
 
 
 def program_keys(exe, owned, runtime_home):

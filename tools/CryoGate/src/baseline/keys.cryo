@@ -1,0 +1,258 @@
+///! The programs verify records the baseline's verdicts and objects for,
+///! the key each record is stored under, and the key of the baseline
+///! compiler built from a commit.
+///!
+///! A record is keyed by the baseline compiler's bytes, the runtime its
+///! programs link, the inputs every program reads, and the program's own
+///! files with the ones its cryoconfig reaches outside its directory, so a
+///! change that adds or edits a test runs the baseline over that test alone.
+///! A record whose inputs changed has another key and is never read.
+
+namespace cryogate::baseline::keys;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::encoding::sha256::{ Sha256 };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::baseline::listing::{ Listing };
+import cryogate::core::child::{ Completion };
+import cryogate::core::git::{ Git };
+import cryogate::core::tree::{ Tree };
+
+/// One program the baseline's verdict and objects are recorded for, and
+/// the files of the working tree that are its own.
+public type struct Program {
+    /// The program as the declaration files name it.
+    public name: String;
+    /// Its files, `/`-separated paths from the checkout's root.
+    public files: Array<String>;
+}
+
+/// The programs the census and the examples sweep build or check.
+public type struct Programs {
+    /// The unit suite's name: every unit-test file builds into one binary.
+    public static unit_suite() -> Str { return Str::new("unit suite"); }
+
+    /// The record of the stdlib archives the census's programs link.
+    public static census_archives() -> Str { return Str::new("archives/census"); }
+
+    /// The record of the stdlib archives the examples sweep's programs link.
+    public static example_archives() -> Str { return Str::new("archives/examples"); }
+
+    /// Every program, named as the declaration files name it: the unit
+    /// suite (every file under tests/tests outside the projects and the
+    /// compile-fail files), each compile-fail file as `negative/<file>`,
+    /// each test project (a directory of tests/tests/projects holding a
+    /// `test.json`) by its directory's name, and each example (a directory
+    /// of examples/ holding a cryoconfig) as `examples/<name>`.  A project's
+    /// and an example's files are its directory's and what its cryoconfig
+    /// reaches outside it.
+    public static discover(repository: Path, git: &Git) -> Result<Array<Program>, String> {
+        mut programs: Array<Program> = Array::<Program>::new();
+        mut tests_path: Array<Str> = Array::<Str>::new();
+        tests_path.push(Str::new("tests/tests"));
+        const tests: Array<String> = Listing::of(git, &tests_path)?;
+        const projects: Str = Str::new("tests/tests/projects/");
+        const negatives: Str = Str::new("tests/tests/negative/");
+        mut unit: Array<String> = Array::<String>::new();
+        for (file in tests.iterate_references()) {
+            if (!file.as_str().starts_with(&projects) && !file.as_str().starts_with(&negatives)) { unit.push(file.clone()); }
+        }
+        programs.push(Program { name: String::from_str(Programs::unit_suite()), files: unit });
+        for (file in tests.iterate_references()) {
+            if (!file.as_str().starts_with(&negatives) || !file.as_str().ends_with(&Str::new(".cryo"))) { continue; }
+            const base: Str = match (file.as_str().split_once_from_end(&Str::new("/"))) {
+                Option::Some(parts) => { parts.second }
+                Option::None        => { file.as_str() }
+            };
+            mut own: Array<String> = Array::<String>::new();
+            own.push(file.clone());
+            programs.push(Program { name: f"negative/{base}", files: own });
+        }
+        Programs::homes(repository, git, Str::new("tests/tests/projects"), Str::new("test.json"), Str::new(""), &programs)?;
+        Programs::homes(repository, git, Str::new("examples"), Str::new("cryoconfig"), Str::new("examples/"), &programs)?;
+        return Result::Ok(programs);
+    }
+
+    /// One program per directory of `parent` that holds `marker`, named
+    /// `<prefix><directory>`.
+    static homes(repository: Path, git: &Git, parent: Str, marker: Str, prefix: Str, programs: mut &Array<Program>) -> Result<(), String> {
+        const names: Array<String> = Tree::names(repository.join(parent).as_path(), &Array::<String>::new())?;
+        for (directory in names.iterate_references()) {
+            const home: String = f"{parent}/{directory.as_str()}";
+            if (!repository.join(home.as_str()).join(marker).as_path().is_file()) { continue; }
+            mut one: Array<Str> = Array::<Str>::new();
+            one.push(home.as_str());
+            mut files: Array<String> = Listing::of(git, &one)?;
+            mut seen: Array<String> = Array::<String>::new();
+            for (file in Listing::reached_outside(repository, git, home.as_str(), &seen)?.iterate_references()) {
+                files.push(file.clone());
+            }
+            programs.push(Program { name: f"{prefix}{directory.as_str()}", files: files });
+        }
+        return Result::Ok(());
+    }
+}
+
+/// The keys the baseline's records are stored under.
+public type struct ProgramKeys {
+    /// Each program's key, and the two archive records' keys, as
+    /// `(name, key)` pairs: 32 hex digits of a sha256 seeded with the hex
+    /// digest of the baseline compiler `compiler`, fed the files of the
+    /// runtime home `runtime` (all but its build outputs, under `.bin`), then
+    /// the inputs every program reads, then the program's name and files.
+    public static of(repository: Path, git: &Git, compiler: Path, runtime: Path, programs: &Array<Program>) -> Result<Array<Pair<String, String>>, String> {
+        const compiler_bytes: Array<u8> = match (File::read_bytes(compiler)) {
+            Result::Ok(bytes)  => { bytes }
+            Result::Err(error) => { return Result::Err(f"cannot read {compiler.as_str()}: {error.describe()}"); }
+        };
+        mut linked: Sha256 = Sha256::new();
+        linked.update(Sha256::digest(compiler_bytes.as_slice()).to_hex().as_str().as_bytes());
+        mut excluded: Array<String> = Array::<String>::new();
+        excluded.push(String::from_str(Str::new(".bin")));
+        mut runtime_files: Array<String> = Tree::files(runtime, &excluded)?;
+        runtime_files.sort();
+        Inputs::feed(&linked, runtime, &runtime_files)?;
+        Inputs::feed(&linked, repository, &ProgramKeys::shared(git)?)?;
+        const shared: String = linked.finish().to_hex();
+
+        mut keys: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        for (program in programs.iterate_references()) {
+            mut hasher: Sha256 = ProgramKeys::seeded(shared.as_str(), program.name.as_str());
+            Inputs::feed(&hasher, repository, &program.files)?;
+            keys.push(Pair::new(program.name.clone(), ProgramKeys::shortened(hasher.finish().to_hex())));
+        }
+        mut archives: Array<Str> = Array::<Str>::new();
+        archives.push(Programs::census_archives());
+        archives.push(Programs::example_archives());
+        for (name in archives.iterate_references()) {
+            const hasher: Sha256 = ProgramKeys::seeded(shared.as_str(), *name);
+            keys.push(Pair::new(String::from_str(*name), ProgramKeys::shortened(hasher.finish().to_hex())));
+        }
+        return Result::Ok(keys);
+    }
+
+    /// The files of the working tree every program's build reads: the
+    /// stdlib, the pins, the procedure that runs and hashes the builds (how
+    /// the stdlib is spelled to each run, which flags a build gets), and
+    /// what tests/ holds outside the test sources, less the files the census
+    /// reads to judge a run rather than to build one.
+    public static shared(git: &Git) -> Result<Array<String>, String> {
+        mut roots: Array<Str> = Array::<Str>::new();
+        roots.push(Str::new("stdlib"));
+        roots.push(Str::new("bin"));
+        mut shared: Array<String> = Listing::of(git, &roots)?;
+        for (path in ProgramKeys::procedure().iterate_references()) { shared.push(String::from_str(*path)); }
+        mut tests: Array<Str> = Array::<Str>::new();
+        tests.push(Str::new("tests"));
+        mut bookkeeping: Array<String> = Array::<String>::new();
+        bookkeeping.push(String::from_str(Str::new("tests/test-roster.txt")));
+        bookkeeping.push(String::from_str(Str::new("tests/started-compiling")));
+        bookkeeping.push(String::from_str(Str::new("tests/started-passing")));
+        for (file in Listing::of(git, &tests)?.iterate_references()) {
+            if (file.as_str().starts_with(&Str::new("tests/tests/")) || bookkeeping.contains(file)) { continue; }
+            shared.push(file.clone());
+        }
+        return Result::Ok(shared);
+    }
+
+    /// The files of the procedure, in the order they are fed.
+    public static procedure() -> Array<Str> {
+        mut files: Array<Str> = Array::<Str>::new();
+        files.push(Str::new("scripts/verify.py"));
+        files.push(Str::new("tools/CryoGate/src/gates/census.cryo"));
+        files.push(Str::new("tools/CryoGate/src/gates/roster.cryo"));
+        files.push(Str::new("tools/CryoGate/src/gates/examples.cryo"));
+        files.push(Str::new("tools/CryoGate/src/core/host.cryo"));
+        return files;
+    }
+
+    /// A sha256 fed `shared`, a NUL and `name`.
+    static seeded(shared: Str, name: Str) -> Sha256 {
+        mut hasher: Sha256 = Sha256::new();
+        mut seed: String = String::from_str(shared);
+        seed.push_byte(0);
+        seed.push(name);
+        hasher.update(seed.as_str().as_bytes());
+        return hasher;
+    }
+
+    static shortened(hex: String) -> String { return String::from_str(hex.as_str().byte_substring(0, 32)); }
+}
+
+/// The key of the baseline compiler built from a commit.
+public type struct BaselineKey {
+    /// 16 hex digits of the sha256 of the commit's compiler/src tree, its
+    /// runtime tree and the hex digest of the working tree's build inputs:
+    /// what a compiler build reads besides compiler/src and runtime/, which
+    /// come from the commit.  `git` runs in the checkout at `repository`.
+    /// Fails when `revision` names no commit.
+    public static of(repository: Path, git: &Git, revision: Str) -> Result<String, String> {
+        mut commit_of: String = String::from_str(revision);
+        commit_of.push(Str::new("^{commit}"));
+        const commit: String = BaselineKey::parsed(git, commit_of.as_str())?;
+        const sources: String = BaselineKey::parsed(git, f"{commit.as_str()}:compiler/src".as_str())?;
+        const runtime: String = BaselineKey::parsed(git, f"{commit.as_str()}:runtime".as_str())?;
+        mut inputs: Sha256 = Sha256::new();
+        Inputs::feed(&inputs, repository, &BaselineKey::build_inputs(git)?)?;
+        mut key: Sha256 = Sha256::new();
+        const text: String = f"{sources.as_str()}{runtime.as_str()}{inputs.finish().to_hex().as_str()}";
+        key.update(text.as_str().as_bytes());
+        return Result::Ok(String::from_str(key.finish().to_hex().as_str().byte_substring(0, 16)));
+    }
+
+    /// The working tree's files a compiler build reads besides compiler/src
+    /// and runtime/: the stdlib, the pins, compiler/ outside its sources and
+    /// the Makefile.  The clone a baseline is built in is given exactly
+    /// these, so the key names the files the baseline was built from.
+    public static build_inputs(git: &Git) -> Result<Array<String>, String> {
+        mut roots: Array<Str> = Array::<Str>::new();
+        roots.push(Str::new("stdlib"));
+        roots.push(Str::new("bin"));
+        roots.push(Str::new("compiler"));
+        roots.push(Str::new("Makefile"));
+        mut inputs: Array<String> = Array::<String>::new();
+        for (file in Listing::of(git, &roots)?.iterate_references()) {
+            if (!file.as_str().starts_with(&Str::new("compiler/src/"))) { inputs.push(file.clone()); }
+        }
+        return Result::Ok(inputs);
+    }
+
+    static parsed(git: &Git, specification: Str) -> Result<String, String> {
+        mut arguments: Array<Str> = Array::<Str>::new();
+        arguments.push(Str::new("rev-parse"));
+        arguments.push(Str::new("--verify"));
+        arguments.push(specification);
+        const done: Completion = git.run(&arguments);
+        if (!done.outcome.succeeded()) { return Result::Err(f"git rev-parse --verify {specification}: {done.outcome.describe().as_str()}"); }
+        return Result::Ok(String::from_str(done.output().as_str().trim()));
+    }
+}
+
+/// Files fed to a digest, each as a NUL, its path, a NUL and its bytes.
+type struct Inputs {
+    /// Feed `hasher` each of `files` below `root` that is a file; a listed
+    /// path that is not on disk is left out.
+    static feed(hasher: mut &Sha256, root: Path, files: &Array<String>) -> Result<(), String> {
+        for (file in files.iterate_references()) {
+            const path: PathBuf = root.join(file.as_str());
+            if (!path.as_path().is_file()) { continue; }
+            mut header: String = String::new();
+            header.push_byte(0);
+            header.push(file.as_str());
+            header.push_byte(0);
+            hasher.update(header.as_str().as_bytes());
+            match (File::read_bytes(path.as_path())) {
+                Result::Ok(bytes)  => { hasher.update(bytes.as_slice()); }
+                Result::Err(error) => { return Result::Err(f"cannot read {path.as_path().as_str()}: {error.describe()}"); }
+            }
+        }
+        return Result::Ok(());
+    }
+}

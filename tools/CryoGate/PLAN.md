@@ -116,6 +116,9 @@ tools/CryoGate/
                       sandbox limits, governor, verdicts, digests, tree walk,
                       git, WSL
     store/            the store outside the repo, records, corpus, pruning
+    baseline/         verify's baseline: what git lists, each recorded
+                      program's files and record key, the baseline compiler's
+                      key; later the clone's sync and the bounded cache
     gates/            one file per gate (census, roster, examples, lsp, cross,
                       incr, vendor, selfhost, freestanding, pin, verify, ...)
     judges/           the pure decisions each gate's verdict rests on
