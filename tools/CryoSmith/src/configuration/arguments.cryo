@@ -1,0 +1,67 @@
+///! `GenerationArguments`: the generation options as a command line spells
+///! them, declared and read the same way by every command that generates.
+
+namespace cryosmith::configuration::arguments;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::convert::{ TryFrom };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env::arguments::{ ArgumentParser, ParsedArguments };
+
+import cryosmith::configuration::features::{ FeatureSet };
+import cryosmith::configuration::options::{ GenerationOptions, Plant };
+
+/// The options every generating command takes.
+public type struct GenerationArguments {
+    /// Declare the generation options on `parser`.
+    public static declare(parser: mut &ArgumentParser) -> void {
+        parser.option(Str::new("features"), Option::None, Str::new("LIST"), Str::new("enabled features, comma-separated"))
+            .option(Str::new("functions"), Option::None, Str::new("N"), Str::new("helper functions (default: from the seed)"))
+            .option(Str::new("size"), Option::None, Str::new("N"), Str::new("statements per function"))
+            .option(Str::new("plant"), Option::None, Str::new("NAME"), Str::new("a deliberate defect, for a check's control"))
+            .flag(Str::new("no-header"), Option::None, Str::new("leave the header comment out"));
+    }
+
+    /// The generation options `parsed` gives, for `seed`.
+    public static read(parsed: &ParsedArguments, seed: u64) -> Result<GenerationOptions, String> {
+        mut options: GenerationOptions = GenerationOptions::new(seed);
+        match (parsed.value(Str::new("features"))) {
+            Option::Some(list) => { options.features = FeatureSet::parse(list)?; }
+            Option::None       => { }
+        }
+        match (GenerationArguments::number(parsed, Str::new("functions"))?) {
+            Option::Some(count) => { options.functions = count as i64; }
+            Option::None        => { }
+        }
+        match (GenerationArguments::number(parsed, Str::new("size"))?) {
+            Option::Some(size) => { options.size = size as i64; }
+            Option::None       => { }
+        }
+        match (parsed.value(Str::new("plant"))) {
+            Option::Some(name) => {
+                match (Plant::named(name)) {
+                    Option::Some(plant) => { options.plant = plant; }
+                    Option::None        => { return Result::Err(f"unknown plant `{name}`; the plants are `none` and `unguarded-division`"); }
+                }
+            }
+            Option::None => { }
+        }
+        options.header = !parsed.flag(Str::new("no-header"));
+        return Result::Ok(options);
+    }
+
+    /// The decimal value of option `name`, if it was given.
+    public static number(parsed: &ParsedArguments, name: Str) -> Result<Option<u64>, String> {
+        match (parsed.value(name)) {
+            Option::Some(text) => {
+                return match (u64::try_from(text)) {
+                    Result::Ok(value) => { Result::Ok(Option::Some(value)) }
+                    Result::Err(_)    => { Result::Err(f"--{name} takes a decimal number, not `{text}`") }
+                };
+            }
+            Option::None => { return Result::Ok(Option::None); }
+        }
+    }
+}

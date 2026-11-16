@@ -1,0 +1,74 @@
+///! `RandomStream`: the draws generation makes, over the standard library's
+///! `Rng::from_seed`, whose sequence is fixed for every version of the
+///! library.
+///!
+///! Each part of a program has its own stream: the structs, every method
+///! and every free function.  A part's stream is seeded from the program's
+///! seed and the part's place, so a change in how one part spends draws does
+///! not reshuffle the next part's choices.
+
+namespace cryosmith::random::stream;
+
+import std::collections::array::{ Array };
+import std::random::generator::{ Rng };
+import std::random::source::{ RandomSource };
+
+/// The spacing between the seeds of two functions' streams.
+const STREAM_SPACING: u64 = 0x9E3779B97F4A7C15;
+
+/// Mixed into the seed of the stream the structs are declared from.
+const STRUCTURE_STREAM: u64 = 0xD1B54A32D192ED03;
+
+/// Mixed into the seed of every method's stream, so no method shares a
+/// stream with a free function.
+const METHOD_STREAM: u64 = 0x94D049BB133111EB;
+
+/// One seeded sequence of draws.
+public type struct RandomStream {
+    private source: Rng;
+
+    /// The stream of the program's own choices, made before any part's:
+    /// how many helper functions it has.
+    public static for_program(seed: u64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed) };
+    }
+
+    /// The stream the program's structs and their fields are declared from.
+    public static for_structures(seed: u64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ STRUCTURE_STREAM) };
+    }
+
+    /// The stream of free function `number` (`main` is the one after the
+    /// last helper).
+    public static for_function(seed: u64, number: i64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ ((number as u64) + 1).wrapping_multiply(STREAM_SPACING)) };
+    }
+
+    /// The stream of the method generated at `ordinal` among the methods.
+    public static for_method(seed: u64, ordinal: i64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ METHOD_STREAM ^ ((ordinal as u64) + 1).wrapping_multiply(STREAM_SPACING)) };
+    }
+
+    /// 64 random bits.
+    public bits(mut &this) -> u64 { return this.source.next_64(); }
+
+    /// A number in `[0, bound)`.
+    public below(mut &this, bound: i64) -> i64 { return this.source.next_below(bound); }
+
+    /// True `percent` times in a hundred.
+    public chance(mut &this, percent: i64) -> boolean { return this.below(100) < percent; }
+
+    /// An index into `weights`, chosen in proportion to its weight.
+    public pick(mut &this, weights: &Array<i64>) -> i64 {
+        const total: i64 = weights.iter().sum();
+        mut roll: i64 = this.below(total);
+        mut index: i64 = 0;
+        while (index < weights.length()) {
+            const weight: i64 = weights.get(index).unwrap();
+            if (roll < weight) { return index; }
+            roll = roll - weight;
+            index = index + 1;
+        }
+        return weights.length() - 1;
+    }
+}

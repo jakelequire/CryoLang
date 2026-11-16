@@ -1,0 +1,120 @@
+///! `Generator`: the state of one program's generation, its entry point,
+///! and what every stage builds with.
+///!
+///! An expression is generated for a wanted type, with a depth budget, from
+///! the forms the enabled features allow.  Structs are declared first, then
+///! their methods, then the free functions and `main`, each function from
+///! its own random stream; a function calls only functions generated before
+///! it.  Every node is charged to the function's `CostBudget`.
+
+namespace cryosmith::generate::generator;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature, GenerationOptions };
+import cryosmith::guarantees::{ CostBudget };
+import cryosmith::model::{ ExpressionKind, Program, Receiver, ValueType };
+import cryosmith::random::{ RandomStream };
+import cryosmith::typing::{ Environment, TypeChoice };
+
+/// Builds one program.
+public type struct Generator {
+    /// The program built so far.
+    internal program: Program;
+    /// What it is generated from.
+    internal options: GenerationOptions;
+    /// The stream of the part being generated.
+    internal random: RandomStream;
+    /// The names in scope in the function being generated.
+    internal environment: Environment;
+    /// The function's work so far, and its limit.
+    internal budget: CostBudget;
+    /// How many loops enclose the statement being generated.
+    internal loop_depth: i64;
+    /// How many blocks enclose it.
+    internal block_depth: i64;
+    /// The function's statements still to generate.
+    internal statements_left: i64;
+    /// Whether the function is `main`, which never returns early.
+    internal in_main: boolean;
+    /// What the function returns.
+    internal returns: ValueType;
+
+    /// The program `options` describe.
+    public static generate(options: GenerationOptions) -> Program {
+        mut generator: Generator = Generator {
+            program: Program::new(), options: options, random: RandomStream::for_program(options.seed),
+            environment: Environment::new(), budget: CostBudget::for_function(false), loop_depth: 0, block_depth: 0,
+            statements_left: 0, in_main: false, returns: ValueType::I32,
+        };
+        if (options.features.has(Feature::Structs)) { generator.declare_structures(); }
+        const count: i64 = options.function_count();
+        mut number: i64 = 0;
+        while (number < count) {
+            generator.define(number, -1, Receiver::Free);
+            number = number + 1;
+        }
+        generator.define(count, -1, Receiver::Free);
+        return generator.program;
+    }
+
+    /// An expression of `wanted`: a bare literal, or one that reads a name
+    /// (a variable, a field, a call, a named limit), never only literals
+    /// combined.  A literal combined with a name takes the name's type, but
+    /// literals combined with each other are typed by where the whole
+    /// stands, and an operand gives them none.  With `reads_name`, not even
+    /// a bare literal: a method's receiver, a cast's operand and an `if`
+    /// expression's arms give a literal no type either.
+    internal expression(mut &this, wanted: ValueType, depth: i64, reads_name: boolean) -> i64 {
+        match (wanted) {
+            ValueType::Boolean   => { return this.boolean_expression(depth, reads_name); }
+            ValueType::Record(_) => { return this.record_expression(wanted, depth); }
+            _                    => { return this.integer_expression(wanted, depth, reads_name); }
+        }
+    }
+
+    /// An expression of `wanted` where the language converts implicitly:
+    /// an initializer, an assignment, an argument, a return value or a
+    /// struct literal's field.  It may be a narrower value, widened.
+    internal typed_place(mut &this, wanted: ValueType, depth: i64) -> i64 {
+        if (this.options.features.has(Feature::Widening) && wanted.is_integer() && this.random.chance(15)) {
+            const narrower: Array<ValueType> = TypeChoice::narrower(wanted);
+            if (narrower.length() > 0) {
+                const source: ValueType = narrower.get(this.random.below(narrower.length())).unwrap();
+                const operand: i64 = this.expression(source, depth, true);
+                return this.node(ExpressionKind::Widen(operand), wanted);
+            }
+        }
+        return this.expression(wanted, depth, false);
+    }
+
+    /// An expression node, charged as one unit of work.
+    internal node(mut &this, kind: ExpressionKind, value_type: ValueType) -> i64 {
+        this.budget.charge(1);
+        return this.program.expression(kind, value_type);
+    }
+
+    /// A read of `variable`.
+    internal read(mut &this, variable: i64) -> i64 {
+        return this.node(ExpressionKind::Variable(variable), this.program.variable_at(variable).value_type);
+    }
+
+    /// A store's target, `variable` named: a place written is not a value
+    /// read, so it is not charged as work.
+    internal target(mut &this, variable: i64) -> i64 {
+        return this.program.expression(ExpressionKind::Variable(variable), this.program.variable_at(variable).value_type);
+    }
+
+    /// A non-negative literal of `value_type` whose value the caller chose.
+    internal integer(mut &this, value: u64, value_type: ValueType) -> i64 {
+        return this.node(ExpressionKind::IntegerLiteral(value, false), value_type);
+    }
+
+    /// An expression depth for a statement: 1 to 4.
+    internal depth(mut &this) -> i64 { return 1 + this.random.below(4); }
+
+    /// A type for a value: a scalar, or sometimes a declared struct.
+    internal any_type(mut &this) -> ValueType {
+        return TypeChoice::any(&this.random, this.options.features, this.program.structures.length());
+    }
+}

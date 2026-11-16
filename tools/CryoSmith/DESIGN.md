@@ -219,6 +219,17 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   decides a struct's value. (`observed` is the exception the stage-1 forms
   already make: a call inside `mix(observed, ...)` may observe, and so
   change `observed`, while the same statement reads it.)
+- **Open guarantee: operand evaluation order.** That exception's hash
+  depends on the order a call's arguments and an operator's operands are
+  evaluated in: `observed = mix(observed, (h1(v0) as u64))` reads
+  `observed` before `h1` changes it only when the arguments are evaluated
+  left to right. The pin and the current compiler both evaluate left to
+  right, but the spec does not yet promise an order; the question is open.
+  Until it is answered CryoSmith keeps generating these statements, and a
+  compiler that changed the order would print a different hash at every
+  optimisation level alike, so the corpus check (which compares -O0 with
+  -O2) would not see it. If the spec leaves the order unspecified, every
+  call is bound to a local before the statement that observes it.
 
 ### 3.5 Reproducible from the seed
 
@@ -334,3 +345,74 @@ statement budget of one function, default 24), `--no-header`, and
   generates `(a / (b & M))`, without the `| 1`. The static audit must refuse
   every planted program that divides, and the corpus check must report the
   plant as a failure. A plant is never on by default and the header names it.
+
+## 8. Architecture
+
+The source is one directory per concern under `src/`, each with a
+`_module.cryo` that declares its files and exports the layer's surface. The
+layers, lowest first:
+
+| layer | owns |
+|---|---|
+| `model/` | the program tree: `ValueType`, the operators, expression and statement nodes, variables, fields, structs, functions, and `Program`'s arenas |
+| `random/` | `RandomStream`: every draw, and the seed of each part's stream (section 3.5) |
+| `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
+| `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
+| `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4) |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants` |
+| `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
+| `selftest/` | `SelfTest` and the static audit (section 7) |
+| `corpus/` | `CorpusCheck`: building and running programs with a named compiler |
+| `cli/` | `Cli`: the commands, the usage text, the exit codes |
+
+`main.cryo` only hands the command line to `Cli`.
+
+**Dependency rules.**
+
+- A layer imports only layers above it in the table, and the rank is strict
+  where it matters: `model` and `random` import only the standard library;
+  `configuration` imports `random`; `typing` imports `model`, `random` and
+  `configuration`; `guarantees` imports `model` alone; `generate` imports
+  the five layers above it; `emit` imports `model`, `configuration` and
+  `guarantees`, and never reads a random stream; `selftest` and `corpus`
+  import `generate`, `emit` and what those export; `cli` imports any layer,
+  and no layer imports `cli`.
+- Another layer is imported through its aggregator
+  (`import cryosmith::model::{ Program };`), never by one of its files'
+  paths, so a layer may move a declaration between its files without its
+  users noticing. Files of one layer import each other by path.
+- What an aggregator exports is the layer's surface and is `public`. A
+  member that only other files of its layer use is `internal` - the
+  `Generator`'s and `Printer`'s methods, split across files with
+  `implement struct` blocks, are - and one that only its own file uses is
+  `private`. Every public item carries a doc comment.
+- A rule stated in section 3 has one home in `guarantees/`. The static
+  audit is the exception on purpose: it spells the guards out itself, so a
+  wrong mask in `guarantees/` is refused rather than shared.
+
+**Adding a stage or a feature.**
+
+1. Name the feature in `configuration/features.cryo`: its variant, name,
+   stage and bit; `default` takes it from there.
+2. Give the model what it needs: a new `ExpressionKind` or `StatementKind`
+   variant, a new item. The printer must then print it (`emit/`), or the
+   build stops at the non-exhaustive `match`.
+3. Write the forms in a new `generate/<stage>.cryo`, an `implement struct
+   Generator` block listed in `generate/_module.cryo`. A form is a weight in
+   the dispatch of the type it produces (`scalars`, `structs`,
+   `control_flow`) that is 0, and so takes no draw, where the feature is off
+   or nothing it needs exists - which is what keeps every old seed's text
+   (section 3.5).
+4. A new safety rule goes in `guarantees/`, and section 3 says why it holds.
+5. `selftest/features.cryo` gets the feature's switch check: some program
+   spells it with the feature on, none with it off. Raise
+   `GENERATOR_VERSION` when an existing seed's text changes.
+
+**Proving a change preserves output.** A change meant to move no text is
+checked by generating the same seeds before and after and comparing the
+files' bytes: the binary before the change is copied aside, `cryosmith
+batch` writes 500 seeds under several feature lists (`default`, `default,
+no-structs,no-constants`, every feature named, and smaller ones), and the
+two corpora must be byte-identical. A one-character change to the printer
+must make that comparison fail, or the comparison is not reading what it
+claims to.

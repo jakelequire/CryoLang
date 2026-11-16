@@ -1,0 +1,67 @@
+///! `SelfTest`: runs every check, counts them and reports the failures.
+
+namespace cryosmith::selftest::runner;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::fmt;
+
+import cryosmith::configuration::{ GenerationOptions };
+import cryosmith::emit::{ Printer };
+import cryosmith::generate::{ Generator };
+
+/// The self-test's checks and their failures.
+public type struct SelfTest {
+    private checks: i64;
+    private failures: Array<String>;
+
+    /// Run every check; 0 when all passed, 1 otherwise.
+    public static run() -> i32 {
+        mut test: SelfTest = SelfTest { checks: 0, failures: Array::<String>::new() };
+        test.determinism();
+        test.function_prefix();
+        test.feature_lists();
+        test.feature_switches();
+        test.audit();
+        for (failure in test.failures.iterate_references()) { fmt::eprintln(f"cryosmith selftest: FAIL {failure.as_str()}"); }
+        if (test.checks == 0) {
+            fmt::eprintln(String::from_str(Str::new("cryosmith selftest: FAIL no check ran")));
+            return 1;
+        }
+        if (test.failures.length() > 0) {
+            fmt::eprintln(f"cryosmith selftest: FAIL ({test.failures.length()} of {test.checks} checks)");
+            return 1;
+        }
+        fmt::println(f"cryosmith selftest: OK ({test.checks} checks)");
+        return 0;
+    }
+
+    /// Count one check, and record `description` when it does not hold.
+    internal expect(mut &this, holds: boolean, description: String) -> void {
+        this.checks = this.checks + 1;
+        if (!holds) { this.failures.push(description); }
+    }
+
+    /// The text of the program `options` describe.
+    internal static program(options: GenerationOptions) -> String {
+        return Printer::print(&Generator::generate(options), &options);
+    }
+
+    /// The program after its prelude: everything past `mix`'s closing brace.
+    internal static body(text: Str) -> Str {
+        return match (text.split_once(&Str::new("\n}\n"))) {
+            Option::Some(parts) => { parts.second }
+            Option::None        => { text }
+        };
+    }
+
+    /// The text from `start` up to `end`, if both are there in that order.
+    internal static between(text: Str, start: Str, end: Str) -> Option<Str> {
+        const from: i64 = text.find(&start)?;
+        const rest: Str = text.byte_substring(from, text.length());
+        const length: i64 = rest.find(&end)?;
+        return Option::Some(rest.byte_substring(0, length));
+    }
+}

@@ -1,0 +1,141 @@
+///! Functions: a function's signature, body and cost, and calls of free
+///! functions and static methods.
+///!
+///! A function draws from its own stream, so the function count shapes
+///! nothing before `main`.  Its body ends by observing its parameters (and
+///! a method's receiver) and returning a value of its type; `main` ends by
+///! observing one call of each helper the cost model allows, then prints the
+///! hash.
+
+namespace cryosmith::generate::functions;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::guarantees::{ CostBudget };
+import cryosmith::model::{
+    ExpressionKind, Function, Receiver, StatementKind, ValueType, Variable, VariableRole
+};
+import cryosmith::random::{ RandomStream };
+
+implement struct Generator {
+    /// Generate one function from its own random stream: free function
+    /// `number` (or `main` after the last), or method `number` of struct
+    /// `owner`.
+    internal define(mut &this, number: i64, owner: i64, receiver: Receiver) -> void {
+        const is_main: boolean = owner < 0 && number == this.options.function_count();
+        this.random = if (owner < 0) {
+            RandomStream::for_function(this.options.seed, number)
+        } else {
+            RandomStream::for_method(this.options.seed, this.program.functions.length())
+        };
+        this.environment.enter_function();
+        this.loop_depth = 0;
+        this.block_depth = 0;
+        this.budget = CostBudget::for_function(is_main);
+        this.statements_left = if (owner < 0) { this.options.size } else { (this.options.size + 1) / 2 };
+        this.in_main = is_main;
+        mut receiver_variable: i64 = -1;
+        if (!receiver.is_called_by_name()) {
+            receiver_variable = this.program.variable(Variable {
+                role: VariableRole::Receiver, number: 0, value_type: ValueType::Record(owner), mutable: receiver.writes_receiver(),
+            });
+            this.environment.bind(receiver_variable);
+        }
+        const first_parameter: i64 = this.program.lists.length();
+        mut parameter_count: i64 = 0;
+        if (!is_main) {
+            parameter_count = if (owner < 0) { 1 + this.random.below(4) } else { this.random.below(4) };
+            mut index: i64 = 0;
+            while (index < parameter_count) {
+                const value_type: ValueType = this.any_type();
+                const parameter: i64 = this.program.variable(Variable { role: VariableRole::Parameter, number: index, value_type: value_type, mutable: false });
+                this.program.lists.push(parameter);
+                this.environment.bind(parameter);
+                index = index + 1;
+            }
+        }
+        this.returns = match (receiver) {
+            Receiver::Exclusive => { ValueType::Void }
+            Receiver::Static    => { (if (this.random.chance(50)) { ValueType::Record(owner) } else { this.any_type() }) }
+            _                   => { (if (is_main) { ValueType::I32 } else { this.any_type() }) }
+        };
+        mut statements: Array<i64> = Array::<i64>::new();
+        const body_start: i64 = this.environment.mark();
+        this.fill(&statements, true);
+        this.observe_declared(body_start, &statements);
+        if (is_main) {
+            mut helper: i64 = 0;
+            while (helper < this.program.functions.length()) {
+                const called: Function = this.program.function_at(helper);
+                if (called.owner < 0 && this.callees(called.returns).contains(&helper)) {
+                    this.observe_value(this.call(helper, 2), &statements);
+                }
+                helper = helper + 1;
+            }
+            statements.push(this.program.statement(StatementKind::Finish));
+        } else {
+            mut index: i64 = 0;
+            while (index < parameter_count) {
+                const parameter: i64 = this.program.list_at(first_parameter + index);
+                this.observe_place(this.read(parameter), &statements);
+                index = index + 1;
+            }
+            if (receiver_variable >= 0) { this.observe_place(this.read(receiver_variable), &statements); }
+            if (!this.returns.same(ValueType::Void)) {
+                const value: i64 = this.typed_place(this.returns, this.depth());
+                statements.push(this.program.statement(StatementKind::Return(value)));
+            }
+        }
+        const body: i64 = this.program.block(&statements);
+        this.program.functions.push(Function {
+            number: number, is_main: is_main, owner: owner, receiver: receiver, first_parameter: first_parameter,
+            parameter_count: parameter_count, returns: this.returns, body: body, cost: this.budget.spent(),
+        });
+    }
+
+    /// A call of the free function or static method `callee`, with
+    /// arguments for its parameters.
+    internal call(mut &this, callee: i64, depth: i64) -> i64 {
+        const called: Function = this.program.function_at(callee);
+        const first: i64 = this.arguments(called, depth);
+        return this.node(ExpressionKind::Call(callee, first, called.parameter_count), called.returns);
+    }
+
+    /// Charge a call of `called` and generate its arguments; the first
+    /// argument's place in the index lists.
+    internal arguments(mut &this, called: Function, depth: i64) -> i64 {
+        this.budget.charge(called.cost);
+        mut arguments: Array<i64> = Array::<i64>::new();
+        mut index: i64 = 0;
+        while (index < called.parameter_count) {
+            const parameter: Variable = this.program.variable_at(this.program.list_at(called.first_parameter + index));
+            if (this.constant_wanted(parameter.value_type)) {
+                arguments.push(this.constant(parameter.value_type));
+            } else {
+                arguments.push(this.typed_place(parameter.value_type, if (depth < 0) { 0 } else { depth }));
+            }
+            index = index + 1;
+        }
+        const first: i64 = this.program.lists.length();
+        for (argument in arguments.iter()) { this.program.lists.push(argument); }
+        return first;
+    }
+
+    /// The earlier free functions and static methods returning `wanted`
+    /// that one more call of keeps this function's work under its limit.
+    internal callees(&this, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        if (!this.options.features.has(Feature::Calls)) { return found; }
+        mut index: i64 = 0;
+        while (index < this.program.functions.length()) {
+            const candidate: Function = this.program.function_at(index);
+            if (candidate.receiver.is_called_by_name() && candidate.returns.same(wanted) && this.budget.affordable(candidate.cost)) {
+                found.push(index);
+            }
+            index = index + 1;
+        }
+        return found;
+    }
+}
