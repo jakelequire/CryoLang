@@ -30,7 +30,7 @@ import cryosmith::program::{
 
 /// The generator's version: raised whenever one seed and one set of
 /// options may generate different text.
-public const GENERATOR_VERSION: i64 = 2;
+public const GENERATOR_VERSION: i64 = 3;
 
 /// The spacing between the seeds of two functions' random streams.
 const STREAM_SPACING: u64 = 0x9E3779B97F4A7C15;
@@ -633,7 +633,7 @@ public type struct Generator {
                 _ => { WrappingOperator::Multiply }
             };
             const receiver: i64 = this.expression(wanted, next, true);
-            const argument: i64 = this.expression(wanted, next, false);
+            const argument: i64 = if (this.constant_wanted(wanted)) { this.constant(wanted) } else { this.expression(wanted, next, false) };
             return this.node(ExpressionKind::Wrapping(operator, receiver, argument), wanted);
         }
         if (form == 5) { return this.guarded(wanted, next); }
@@ -812,12 +812,45 @@ public type struct Generator {
         mut index: i64 = 0;
         while (index < called.parameter_count) {
             const parameter: Variable = this.program.variable_at(this.program.list_at(called.first_parameter + index));
-            arguments.push(this.typed_place(parameter.value_type, if (depth < 0) { 0 } else { depth }));
+            if (this.constant_wanted(parameter.value_type)) {
+                arguments.push(this.constant(parameter.value_type));
+            } else {
+                arguments.push(this.typed_place(parameter.value_type, if (depth < 0) { 0 } else { depth }));
+            }
             index = index + 1;
         }
         const first: i64 = this.program.lists.length();
         for (argument in arguments.iter()) { this.program.lists.push(argument); }
         return first;
+    }
+
+    /// Whether an argument for a parameter of `wanted` is a constant: now
+    /// and then, for an integer, with `constants` and the bitwise operators
+    /// it combines literals with enabled.
+    constant_wanted(mut &this, wanted: ValueType) -> boolean {
+        const features: FeatureSet = this.options.features;
+        return features.has(Feature::Constants) && features.has(Feature::Bitwise) && wanted.is_integer() && this.chance(15);
+    }
+
+    /// An argument made only of literals: `(a & b)`, `(a | b)` or `(a ^ b)`
+    /// of two literals in `[0, M]`, `M` the largest literal of `wanted`,
+    /// and for a signed type, with `guarded`, sometimes its negation.  Every value it
+    /// computes on the way is one `wanted` holds, so the parameter it is
+    /// passed to types it.
+    constant(mut &this, wanted: ValueType) -> i64 {
+        const maximum: u64 = if (wanted.maximum() > LARGEST_LITERAL) { LARGEST_LITERAL } else { wanted.maximum() };
+        const left: i64 = this.integer(this.random.next_64() & maximum, wanted);
+        const right: i64 = this.integer(this.random.next_64() & maximum, wanted);
+        const operator: BinaryOperator = match (this.below(3)) {
+            0 => { BinaryOperator::BitAnd }
+            1 => { BinaryOperator::BitOr }
+            _ => { BinaryOperator::BitXor }
+        };
+        const combined: i64 = this.node(ExpressionKind::Binary(operator, left, right), wanted);
+        if (wanted.is_signed() && this.options.features.has(Feature::Guarded) && this.chance(50)) {
+            return this.node(ExpressionKind::Unary(UnaryOperator::Negate, combined), wanted);
+        }
+        return combined;
     }
 
     /// Whether `called` takes `mut &this`.

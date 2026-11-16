@@ -114,6 +114,15 @@ expression reads a name too. Every scope has one: `observed`, the program's
 global hash state, is always readable, a named limit (`u8::MAX`) is a typed
 constant, and a function has at least one parameter.
 
+**Constants.** A parameter does type literals combined with each other: an
+argument made only of literals takes its parameter's type when every value
+it computes on the way is one the parameter holds. With `constants`, an
+integer argument - of a call, a method call or a wrapping method - is now
+and then such an expression: `(a & b)`, `(a | b)` or `(a ^ b)` of two
+literals in `[0, M]` (`M` the type's largest literal), and for a signed type
+sometimes its negation, `(-(a & b))`. Every intermediate is in the type's
+range, so the argument is typed by the parameter and never refused.
+
 ## 3. Guarantees, and how each is enforced
 
 ### 3.1 Valid under either overflow rule
@@ -228,8 +237,8 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   helpers of the same seed's program with more, plus its own `main`.
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
-  so with `--features default,no-structs` a seed generates the text the
-  version-1 generator did, header aside.
+  so with `--features default,no-structs,no-constants` a seed generates the
+  text the version-1 generator did, header aside.
 - The header records the **generator version**, raised whenever one seed may
   produce different text, so a seed filed in a bug report names the
   generator that reproduces it.
@@ -242,7 +251,7 @@ every feature of the current stage; `no-<name>` removes one.
 | stage | features |
 |---|---|
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
-| 2 (this one) | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`) |
+| 2 (this one) | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
 | 3 | `generics`: generic functions and structs, `where` bounds, overload sets |
 | 4 | `references`, `moves`: `&` / `mut &`, receivers, move-checked bindings |
 | 5 | `drop`: a drop log folded into the hash, the expected drop order |
@@ -281,7 +290,7 @@ statement budget of one function, default 24), `--no-header`, and
   seed and options wherever the file goes:
 
   ```
-  // cryosmith 2 seed 42 features booleans,wrapping,... functions 4 size 24
+  // cryosmith 3 seed 42 features booleans,wrapping,... functions 4 size 24
   ```
 
   Generating again from the header's fields reproduces the file.

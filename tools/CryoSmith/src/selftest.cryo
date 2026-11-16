@@ -129,6 +129,47 @@ public type struct SelfTest {
         this.switch(Feature::IfExpressions, [Str::new("(if ("), Str::new("(if (")]);
         this.switch(Feature::Booleans, [Str::new(" && "), Str::new(" || ")]);
         this.switch(Feature::Structs, [Str::new("type struct "), Str::new("this.")]);
+        this.constants_switch();
+    }
+
+    /// `constants`: with it on, some program passes an argument made only of
+    /// literals; with it off, none does.  Such an argument is the one place
+    /// a literal opens a parenthesised operation (`(19371 & 32767)`).
+    constants_switch(mut &this) -> void {
+        mut seen: boolean = false;
+        mut leaked: boolean = false;
+        mut seed: u64 = 1;
+        while (seed <= SWITCH_PROGRAMS) {
+            const on: String = SelfTest::program(GenerationOptions::new(seed));
+            mut off_options: GenerationOptions = GenerationOptions::new(seed);
+            off_options.features = FeatureSet::parse(Str::new("default,no-constants")).unwrap();
+            const off: String = SelfTest::program(off_options);
+            if (SelfTest::combines_literals(SelfTest::body(on.as_str()))) { seen = true; }
+            if (SelfTest::combines_literals(SelfTest::body(off.as_str()))) { leaked = true; }
+            seed = seed + 1;
+        }
+        this.expect(seen, String::from_str(Str::new("`constants` on: no program passes an argument made only of literals")));
+        this.expect(!leaked, String::from_str(Str::new("`constants` off: a program still passes an argument made only of literals")));
+    }
+
+    /// Whether a parenthesis in `text` opens on a literal that an operator
+    /// then combines: `(` and digits, then ` & `, ` | ` or ` ^ `.
+    static combines_literals(text: Str) -> boolean {
+        mut index: i64 = 0;
+        while (index < text.length()) {
+            if (text.byte_at(index) == Option::Some('(' as u8)) {
+                mut end: i64 = index + 1;
+                while (end < text.length() && text.byte_at(end).unwrap() >= '0' as u8 && text.byte_at(end).unwrap() <= '9' as u8) {
+                    end = end + 1;
+                }
+                if (end > index + 1) {
+                    const rest: Str = text.byte_substring(end, text.length());
+                    if (rest.starts_with(&Str::new(" & ")) || rest.starts_with(&Str::new(" | ")) || rest.starts_with(&Str::new(" ^ "))) { return true; }
+                }
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     switch(mut &this, feature: Feature, spellings: [Str; 2]) -> void {
