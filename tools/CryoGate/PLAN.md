@@ -427,6 +427,59 @@ Additions the port makes because it is the natural place:
   builds its archive once, keyed by its own bytes); the stage table is the
   landed one.
 
+**Implementation (G10).**  One module, `gates/selfhost.cryo`, beside verify's:
+
+- **Pure parts, tested as `![test]`s first.**
+  - `Stage { source, via, output, directory, arguments, environment }` and
+    `StageTable::linux(pin, triple)` / `StageTable::windows(pin, triple)`:
+    the runtime rounds, then pin -> stage 2 -> stage 3 -> stage 4.  The
+    Windows table carries what the script does by hand today: the
+    cryoconfig written without its `bin` line, the LLVM DLL dropped beside
+    each stage compiler, and the `llvm-link` of each stage's module IR.
+  - `ModuleTrees::compare(a, b, below, suffix)` returns
+    `Same(modules, bytes) | Differs(first module) | NotComparable(reason)`.
+    Files are keyed by their path below `below`, never by basename,
+    because `core/error.ll` and `io/error.ll` share one.
+  - `StageArchives::{record, compare}` ports the archive comparison,
+    including a stage 3 that is byte-identical to stage 2: it shares
+    stage 2's key and archive and builds none.  The script's five
+    self-test cases become tests over a scratch tree made with `Tree`.
+  - `TreeDigest::of(root)` is the sha256 of the concatenated
+    `<path>\0<sha256 of file>` over the mirrored set (`bin/cryo`,
+    `compiler`, `runtime`, `stdlib`, `scripts`, less the build outputs and
+    `__pycache__`), in path order.  That equals the script's running
+    update, so no incremental hasher is needed (`PinIntegrity::digest_of`
+    is the primitive).  Tests: the skip list is honoured, the walk order
+    does not move the digest, and one changed byte does.
+- **The two arms.**  Both start from one `Scheduler`:
+  - The Windows arm runs its stages in order in-process, each a `Job`
+    logged to `RunLogs`.
+  - The Linux arm is one `wsl.exe` job.  It starts WSL (`-e true`), runs
+    `rsync` into `~/.cache/cryo-selfhost/<checkout digest>` with the
+    script's exclusions, builds the ELF cryogate there with `bin/cryo`,
+    and runs `cryogate selfhost --arm=linux`.  That arm prints its
+    `TreeDigest`, and the Windows side refuses the arm unless the digest
+    equals its own over the working tree.  Its log is copied to
+    `build-logs/selfhost-check/linux-arm.log`.
+  - Each stage prints one line with its time.  Each arm ends with
+    `FIXED POINT OK` and `STDLIB ARCHIVES OK` spelled exactly as today,
+    since a run is accepted on those counts.
+- **Staging.**
+  1. The pure parts and their tests.  check-fast drops
+     `selfhost-check.py --selftest`.  Side by side, `cryogate selfhost
+     --digest` prints the working tree's digest, which must equal the
+     script's.
+  2. The Windows arm, run beside the `.cmd` on one tree: the same stage
+     list and the same verdicts.
+  3. The Linux arm through WSL.
+  4. The `.py` and `.cmd` deleted, and the Makefile calls `cryogate
+     selfhost` on both hosts.
+
+  Each stage proves itself with the G10 row's mutation pairs.
+- **Zombie cost.**  A full run starts about a dozen top-level children per
+  arm, plus each compiler's own.  It is a heavy run: it waits for the
+  commit-charge check, like verify.
+
 ### 4g. The LSP gate
 
 `cryogate lsp` builds `tools/CryoLSP` with the compiler under test into its own

@@ -487,12 +487,15 @@ pin: $(CRYOGATE)
 
 pin-impl: pin-linux-impl pin-windows-impl
 
-# cryogate is an order-only prerequisite: the refresh rewrites bin/cryo,
-# one of cryogate's inputs, and must not rebuild it halfway through.
+# The Linux half builds cryogate before it rewrites bin/cryo, one of
+# cryogate's inputs; the Windows half runs after it and names no cryogate
+# prerequisite at all.  make remakes an out-of-date prerequisite even when
+# it is order-only, so naming cryogate there rebuilds it halfway through,
+# over the running `cryogate heavy` that holds the lock.
 pin-linux-impl: cryo | $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) pin --source "$(STAGE2)" --pin "$(PIN)" --stamp-profile=$(CRYO_PROFILE)
 
-pin-windows-impl:
+pin-windows-impl: pin-linux-impl
 	@if command -v $(MINGW_GCC) >/dev/null 2>&1 && [ -f "$(WIN_LLVM_LIB)" ] && [ -f "$(WIN_CLANG_LIB)" ]; then \
 		$(MAKE) --no-print-directory _pin-windows-do; \
 	else \
@@ -504,7 +507,7 @@ pin-windows-impl:
 			     echo "         run: scripts/fetch-windows-llvm.sh"; }; \
 	fi
 
-_pin-windows-do: cryo-exe | $(CRYOGATE)
+_pin-windows-do: cryo-exe
 	@$(CRYOGATE_COMMAND) pin --source "$(STAGE2_EXE)" --pin "$(PIN_EXE)" --strip-tool $(MINGW_STRIP) \
 		--stamper "$(STAGE2)" --stamp-profile=$(CRYO_PROFILE)
 	@cp -f "$(WIN_LLVM_DLL)" "$(ROOT)/bin/LLVM-C.dll" 2>/dev/null \
