@@ -17,13 +17,6 @@ one; the history keeps it.
 | `selfhost-check.py` | Byte-identity fixed point of the compiler and of the stdlib archives its stages build: the Linux chain, the Windows chain natively or under wine; on a Windows host both at once, the Linux one from a digest-checked copy of its sources on WSL's own filesystem (`--mirror`) | `make selfhost-check`, `selfhost-check-windows.cmd`, CI |
 | `selfhost-check-windows.cmd` | Windows host: checks for Python and WSL, then runs `selfhost-check.py` | `make selfhost-check` (Windows) |
 
-## Pins
-
-| script | what it does | called by |
-|---|---|---|
-| `cryo-pin.py` | Copies (and strips) a built compiler into `bin/` and writes its `.pin.txt` sidecar | `make pin` (Linux) |
-| `pin-windows.cmd` | Windows host: re-enters this Makefile inside WSL to run `make pin` | `make pin` (Windows) |
-
 ## Release
 
 | script | what it does | called by |

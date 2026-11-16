@@ -7,17 +7,23 @@
 namespace cryogate::tests::pin;
 
 import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::core::option::{ Option };
 import std::core::result::{ Result };
+import std::fs::directory::{ Directory };
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
 import std::fs::temporary::{ TemporaryDirectory };
+import std::io::error::{ IoError };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect, expect_false };
 
+import cryogate::core::git::{ Git };
+import cryogate::core::log::{ RunLogs };
 import cryogate::core::text::{ Text };
-import cryogate::gates::pin::{ PinIntegrity, PinVerdict };
+import cryogate::gates::pin::{ PinIntegrity, PinRefresh, PinVerdict };
 
 /// Fixture pins: stamp regions, PE32+ images and sidecars.
 type struct PinFixture {
@@ -295,4 +301,111 @@ function a_pair_built_from_two_commits_is_refused() -> Result<(), TestError> {
     expect_false(verdict.ok, Str::new("refused"))?;
     expect(PinFixture::said(&verdict).as_str().contains(&Str::new("           cryo         6b2997d649dbbbce6adf1c509ddb1dd082347086")), PinFixture::said(&verdict).as_str())?;
     return expect(PinFixture::said(&verdict).as_str().contains(&Str::new("           cryo.exe     975faa5d49dbbbce6adf1c509ddb1dd082347086")), PinFixture::said(&verdict).as_str());
+}
+
+/// A git checkout holding one committed source file and one committed pin,
+/// and the sidecar `pin` writes for that pin.
+type struct PinCheckout {
+    directory: TemporaryDirectory;
+    logs: RunLogs;
+    git: Git;
+
+    static create() -> Result<PinCheckout, TestError> {
+        const directory: TemporaryDirectory = scratch()?;
+        const logs: RunLogs = match (RunLogs::open(directory.path())) {
+            Result::Ok(logs)    => { logs }
+            Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+        };
+        const git: Git = Git::new(directory.path(), &logs);
+        // The logs the commands write are ignored, as the repository's are.
+        PinCheckout::write(directory.path(), Str::new(".gitignore"), Str::new("build-logs/\n"))?;
+        PinCheckout::write(directory.path(), Str::new("source.txt"), Str::new("one\n"))?;
+        PinCheckout::write(directory.path(), Str::new("bin/cryo"), Str::new("pin\n"))?;
+        PinCheckout::git_must(&git, Str::new("init -q"))?;
+        PinCheckout::git_must(&git, Str::new("add -A"))?;
+        PinCheckout::git_must(&git, Str::new("-c user.name=pin -c user.email=pin@localhost commit -q -m start"))?;
+        return Result::Ok(PinCheckout { directory: directory, logs: logs, git: git });
+    }
+
+    static write(root: Path, name: Str, text: Str) -> Result<(), TestError> {
+        const path: PathBuf = root.join(name);
+        match (path.as_path().parent()) {
+            Option::Some(parent) => { const _: Result<(), IoError> = Directory::create_all(parent); }
+            Option::None         => { }
+        }
+        return match (File::write_text(path.as_path(), text)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(TestError::other(error.describe())) }
+        };
+    }
+
+    /// Run git with the space-separated `words`, refusing a failure.
+    static git_must(git: &Git, words: Str) -> Result<(), TestError> {
+        mut arguments: Array<Str> = Array::<Str>::new();
+        for (word in words.split(&Str::new(" "))) { arguments.push(word); }
+        if (!git.run(&arguments).outcome.succeeded()) { return Result::Err(TestError::other(f"git {words} failed".as_str())); }
+        return Result::Ok(());
+    }
+
+    /// The sidecar's fields for a pin holding `data`.
+    fields(&this, data: &Array<u8>) -> Array<Pair<String, String>> {
+        const text: String = PinRefresh::sidecar_text(&this.git, &this.logs, Str::new("bin/cryo"), Str::new("compiler/build/bin/cryo"), data, true);
+        return PinIntegrity::sidecar_fields(text.as_str());
+    }
+
+    static value(fields: &Array<Pair<String, String>>, key: Str) -> String {
+        mut found: String = String::new();
+        for (entry in fields.iterate_references()) {
+            if (entry.first.as_str() == key) { found = entry.second.clone(); }
+        }
+        return found;
+    }
+}
+
+![test]
+function a_pin_made_in_a_clean_checkout_records_its_commit_and_digest() -> Result<(), TestError> {
+    const checkout: PinCheckout = PinCheckout::create()?;
+    mut data: Array<u8> = Array::<u8>::new();
+    PinFixture::append(&data, Str::new("pinned bytes"));
+    const fields: Array<Pair<String, String>> = checkout.fields(&data);
+    mut head: Array<Str> = Array::<Str>::new();
+    head.push(Str::new("rev-parse"));
+    head.push(Str::new("HEAD"));
+    const commit: String = checkout.git.answer(&head);
+    expect(commit.as_str().length() == 40, commit.as_str())?;
+    expect(PinCheckout::value(&fields, Str::new("git-commit")).as_str() == commit.as_str(), Str::new("git-commit is HEAD"))?;
+    expect(PinCheckout::value(&fields, Str::new("sha256")).as_str() == PinIntegrity::digest_of(&data).as_str(), Str::new("sha256 of the pin's bytes"))?;
+    expect(PinCheckout::value(&fields, Str::new("size")).as_str() == Str::new("12 bytes"), Str::new("size"))?;
+    expect(PinCheckout::value(&fields, Str::new("stripped")).as_str() == Str::new("yes"), Str::new("stripped"))?;
+    expect(PinCheckout::value(&fields, Str::new("worktree")).as_str() == Str::new("clean"), Str::new("worktree clean"))?;
+    return expect_false(PinCheckout::value(&fields, Str::new("git-describe")).as_str().ends_with(&Str::new("-dirty")), Str::new("describe not dirty"));
+}
+
+![test]
+function rewriting_the_pins_leaves_the_checkout_clean() -> Result<(), TestError> {
+    // A refresh rewrites the pin before it writes the sidecar; that must not
+    // read as a change to the checkout.
+    const checkout: PinCheckout = PinCheckout::create()?;
+    PinCheckout::write(checkout.directory.path(), Str::new("bin/cryo"), Str::new("a new pin\n"))?;
+    PinCheckout::write(checkout.directory.path(), Str::new("bin/cryo.pin.txt"), Str::new("a new sidecar\n"))?;
+    const fields: Array<Pair<String, String>> = checkout.fields(&Array::<u8>::new());
+    return expect(PinCheckout::value(&fields, Str::new("worktree")).as_str() == Str::new("clean"), Str::new("worktree clean"));
+}
+
+![test]
+function a_pin_made_from_a_changed_checkout_is_recorded_dirty() -> Result<(), TestError> {
+    const checkout: PinCheckout = PinCheckout::create()?;
+    PinCheckout::write(checkout.directory.path(), Str::new("source.txt"), Str::new("two\n"))?;
+    const fields: Array<Pair<String, String>> = checkout.fields(&Array::<u8>::new());
+    expect(PinCheckout::value(&fields, Str::new("worktree")).as_str() == Str::new("dirty"), Str::new("worktree dirty"))?;
+    return expect(PinCheckout::value(&fields, Str::new("git-describe")).as_str().ends_with(&Str::new("-dirty")), Str::new("describe dirty"));
+}
+
+![test]
+function a_sidecar_records_when_it_was_made_in_whole_seconds() -> Result<(), TestError> {
+    const checkout: PinCheckout = PinCheckout::create()?;
+    const at: String = PinCheckout::value(&checkout.fields(&Array::<u8>::new()), Str::new("built-at"));
+    // `YYYY-MM-DDTHH:MM:SSZ`
+    expect(at.as_str().length() == 20, at.as_str())?;
+    return expect(at.as_str().ends_with(&Str::new("Z")) && at.as_str().byte_substring(10, 11) == Str::new("T"), at.as_str());
 }

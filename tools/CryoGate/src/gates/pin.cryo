@@ -29,6 +29,14 @@
 ///! A pin whose binary and sidecar are both absent is skipped with a note (a
 ///! Linux-only checkout may not carry `bin/cryo.exe`); one without the other
 ///! is a failure, and so is finding no pin at all.
+///!
+///! `cryogate pin --source <compiler> --pin <binary> [--no-strip]
+///! [--strip-tool <tool>] [--stamper <compiler>] [--stamp-profile <name>]`
+///! makes a pin: the source copied to the pin's path, stripped, stamped again
+///! (stripping rewrites the bytes the stamp's digest covers), and its sidecar
+///! written from the result and from git.  `cryogate pin --through-wsl` runs
+///! `make pin-impl` in this checkout inside WSL, which makes both pins on a
+///! Windows host.
 
 namespace cryogate::gates::pin;
 
@@ -41,9 +49,16 @@ import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::encoding::sha256::{ Sha256 };
 import std::fmt;
+import std::fs::directory::{ Directory };
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
+import std::time::clock::{ SystemTime };
+import std::time::datetime::{ DateTime };
 
+import cryogate::core::child::{ Completion, Job, Outcome };
+import cryogate::core::git::{ Git };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::text::{ Text };
 
@@ -423,4 +438,229 @@ public type struct PinIntegrity {
     public const HIGHLOW: u64 = 3;
     /// The base relocation table's index among the data directories.
     public const BASE_RELOCATION_DIRECTORY: u64 = 5;
+}
+
+/// Making a pin and its sidecar.
+public type struct PinRefresh {
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new(
+            "cryogate pin [--source <compiler>] [--pin <binary>] [--no-strip] [--strip-tool <tool>] [--stamper <compiler>] [--stamp-profile <name>] | --through-wsl"));
+        options.flag(Str::new("--through-wsl"));
+        options.flag(Str::new("--no-strip"));
+        options.valued(Str::new("--source"));
+        options.valued(Str::new("--pin"));
+        options.valued(Str::new("--strip-tool"));
+        options.valued(Str::new("--stamper"));
+        options.valued(Str::new("--stamp-profile"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate pin: {reason.as_str()}"); return 2; }
+        };
+        if (parsed.has(Str::new("--through-wsl"))) { return PinRefresh::through_wsl(repository, logs); }
+
+        const default_source: PathBuf = repository.join(Str::new("compiler")).as_path().join(Str::new("build")).as_path()
+            .join(Str::new("bin")).as_path().join(Str::new("cryo"));
+        const default_pin: PathBuf = repository.join(Str::new("bin")).as_path().join(Str::new("cryo"));
+        const source: Str = parsed.value(Str::new("--source")).unwrap_or(default_source.as_path().as_str());
+        const pin: Str = parsed.value(Str::new("--pin")).unwrap_or(default_pin.as_path().as_str());
+        const strip_tool: Str = parsed.value(Str::new("--strip-tool")).unwrap_or(Str::new("strip"));
+        const stamper: Str = parsed.value(Str::new("--stamper")).unwrap_or(source);
+        const profile: Str = parsed.value(Str::new("--stamp-profile")).unwrap_or(Str::new("release"));
+        const git: Git = Git::new(repository, logs);
+
+        if (!PinRefresh::is_executable(Path::from(source))) {
+            fmt::eprintln(f"ERROR: {source} does not exist or is not executable. Run 'make cryo' first.");
+            return 1;
+        }
+        fmt::println(f"==> Refreshing pinned binary at {pin}");
+        match (Path::from(pin).parent()) {
+            Option::Some(parent) => {
+                if (!parent.as_str().is_empty()) {
+                    match (Directory::create_all(parent)) {
+                        Result::Ok(_)      => { }
+                        Result::Err(error) => { fmt::eprintln(f"ERROR: cannot create {parent.as_str()}: {error.describe()}"); return 1; }
+                    }
+                }
+            }
+            Option::None => { }
+        }
+        match (File::copy(Path::from(source), Path::from(pin))) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { fmt::eprintln(f"ERROR: cannot copy {source} to {pin}: {error.describe()}"); return 1; }
+        }
+
+        mut stripped: boolean = false;
+        if (!parsed.has(Str::new("--no-strip"))) {
+            mut strip: Job = Job::new(strip_tool);
+            strip.argument(pin);
+            strip.log_to(logs.file(Str::new("strip")).as_str());
+            stripped = strip.run().outcome.succeeded();
+            if (!stripped) {
+                fmt::eprintln(f"    (warning: '{strip_tool}' unavailable or failed; binary not stripped)");
+            }
+        }
+        if (stripped) {
+            mut stamp: Job = Job::new(stamper);
+            stamp.argument(Str::new("stamp"));
+            stamp.argument(pin);
+            stamp.argument(f"--profile={profile}".as_str());
+            // The pin outputs, which the refresh rewrites between stamping
+            // its two halves, are left out of the stamp's dirty check.
+            stamp.argument(Str::new("--exclude=bin/cryo,bin/cryo.pin.txt,bin/cryo.exe,bin/cryo.exe.pin.txt"));
+            stamp.directory(repository.as_str());
+            if (!stamp.run().outcome.succeeded()) {
+                fmt::eprintln(f"ERROR: {stamper} could not stamp the stripped {pin}");
+                return 1;
+            }
+        }
+
+        const data: Array<u8> = match (File::read_bytes(Path::from(pin))) {
+            Result::Ok(bytes)  => { bytes }
+            Result::Err(error) => { fmt::eprintln(f"ERROR: cannot read {pin}: {error.describe()}"); return 1; }
+        };
+        const sidecar: PathBuf = PinIntegrity::sidecar_of(Path::from(pin));
+        const text: String = PinRefresh::sidecar_text(&git, logs, pin, source, &data, stripped);
+        match (File::write_text(sidecar.as_path(), text.as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { fmt::eprintln(f"ERROR: cannot write {sidecar.as_path().as_str()}: {error.describe()}"); return 1; }
+        }
+        const suffix: Str = if (stripped) { Str::new(", stripped") } else { Str::new("") };
+        fmt::println(f"==> Pinned: {pin} ({data.length()} bytes{suffix})");
+        fmt::println(f"==> Wrote:  {sidecar.as_path().as_str()}");
+
+        // A pin built from a dirty tree is not reproducible from any commit:
+        // fine while developing, never for a release, so it is said loudly.
+        if (git.changed_outside(&PinRefresh::excluded_paths())) {
+            fmt::eprintln(String::from_str(Str::new("    WARNING: worktree is dirty - this pin is not reproducible from a commit.")));
+            fmt::eprintln(String::from_str(Str::new("             For a release pin, commit first and re-pin from a clean tree")));
+            fmt::eprintln(String::from_str(Str::new("             (verify with: make verify-pin-clean).")));
+        }
+        return 0;
+    }
+
+    /// The sidecar for the pin at `pin` holding `data`, made from `source`.
+    public static sidecar_text(git: &Git, logs: &RunLogs, pin: Str, source: Str, data: &Array<u8>, stripped: boolean) -> String {
+        const dirty: boolean = git.changed_outside(&PinRefresh::excluded_paths());
+        const stripped_word: Str = if (stripped) { Str::new("yes") } else { Str::new("no") };
+        const worktree_word: Str = if (dirty) { Str::new("dirty") } else { Str::new("clean") };
+        const built_at: String = DateTime::from_unix_seconds(SystemTime::now().unix_seconds()).format_rfc3339();
+        const describe: String = PinRefresh::ask(git, Str::new("describe"), Str::new("--always"), Str::new("--tags"));
+        const shown_describe: String = if (dirty) { f"{describe.as_str()}-dirty" } else { describe };
+        mut lines: Array<String> = Array::<String>::new();
+        lines.push(String::from_str(Str::new("Cryo pinned compiler")));
+        lines.push(String::from_str(Str::new("====================")));
+        lines.push(String::new());
+        lines.push(f"binary:       {pin}");
+        lines.push(f"source:       {source}");
+        lines.push(f"size:         {data.length()} bytes");
+        lines.push(f"sha256:       {PinIntegrity::digest_of(data).as_str()}");
+        const built_by: String = PinRefresh::ask(git, Str::new("config"), Str::new("user.name"), Str::new(""));
+        const host: String = PinRefresh::host(logs);
+        const commit: String = PinRefresh::ask(git, Str::new("rev-parse"), Str::new("HEAD"), Str::new(""));
+        const short: String = PinRefresh::ask(git, Str::new("rev-parse"), Str::new("--short"), Str::new("HEAD"));
+        const branch: String = PinRefresh::ask(git, Str::new("rev-parse"), Str::new("--abbrev-ref"), Str::new("HEAD"));
+        lines.push(f"stripped:     {stripped_word}");
+        lines.push(String::new());
+        lines.push(f"built-at:     {built_at.as_str()}");
+        lines.push(f"built-by:     {built_by.as_str()}");
+        lines.push(f"host:         {host.as_str()}");
+        lines.push(String::new());
+        lines.push(f"git-commit:   {commit.as_str()}");
+        lines.push(f"git-short:    {short.as_str()}");
+        lines.push(f"git-branch:   {branch.as_str()}");
+        lines.push(f"git-describe: {shown_describe.as_str()}");
+        lines.push(f"worktree:     {worktree_word}");
+        lines.push(String::new());
+        return Text::joined(&lines, Str::new("\n"));
+    }
+
+    /// git's answer to a command of up to three words (an empty word is
+    /// left out).
+    static ask(git: &Git, first: Str, second: Str, third: Str) -> String {
+        mut words: Array<Str> = Array::<Str>::new();
+        words.push(first);
+        if (!second.is_empty()) { words.push(second); }
+        if (!third.is_empty()) { words.push(third); }
+        return git.answer(&words);
+    }
+
+    /// The system, kernel release and machine the pin was made on, as
+    /// `uname -srm` prints them; `unknown` where there is no `uname`.
+    static host(logs: &RunLogs) -> String {
+        mut uname: Job = Job::new(Str::new("uname"));
+        uname.argument(Str::new("-srm"));
+        uname.log_to(logs.file(Str::new("uname")).as_str());
+        uname.errors_to(logs.file(Str::new("uname-errors")).as_str());
+        const done: Completion = uname.run();
+        if (!done.outcome.succeeded()) { return String::from_str(Str::new("unknown")); }
+        return String::from_str(done.output().as_str().trim());
+    }
+
+    /// Whether `path` is a file this host can run.
+    ![target(windows)]
+    static is_executable(path: Path) -> boolean { return path.is_file(); }
+    ![target(unix)]
+    static is_executable(path: Path) -> boolean {
+        return match (path.metadata()) {
+            Result::Ok(info) => { path.is_file() && (info.permissions() & PinRefresh::ANY_EXECUTE) != 0 }
+            Result::Err(_)   => { false }
+        };
+    }
+
+    /// The pathspecs that leave the pins and sidecars out of the dirty
+    /// check: a refresh rewrites them, and must not read itself as a change.
+    static excluded_paths() -> Array<Str> {
+        mut paths: Array<Str> = Array::<Str>::new();
+        paths.push(Str::new(":!bin/cryo"));
+        paths.push(Str::new(":!bin/cryo.pin.txt"));
+        paths.push(Str::new(":!bin/cryo.exe"));
+        paths.push(Str::new(":!bin/cryo.exe.pin.txt"));
+        return paths;
+    }
+
+    /// Run `make pin-impl` in this checkout inside WSL, where both pins are
+    /// built: a Windows host has no Linux toolchain for `bin/cryo`.
+    static through_wsl(repository: Path, logs: &RunLogs) -> i32 {
+        mut resolve: Job = Job::new(Str::new("wsl.exe"));
+        resolve.argument(Str::new("--"));
+        resolve.argument(Str::new("wslpath"));
+        resolve.argument(Str::new("-a"));
+        resolve.argument(repository.as_str());
+        resolve.log_to(logs.file(Str::new("wslpath")).as_str());
+        resolve.errors_to(logs.file(Str::new("wslpath-errors")).as_str());
+        const resolved: Completion = resolve.run();
+        match (&resolved.outcome) {
+            Outcome::CouldNotStart(_) => {
+                fmt::eprintln(String::from_str(Str::new(
+                    "ERROR: wsl.exe not found on PATH\n"
+                    "       'make pin' on a Windows host needs WSL to drive both the\n"
+                    "       Linux self-host build (bin/cryo) and the mingw cross-link\n"
+                    "       for bin/cryo.exe.  Install WSL with 'wsl --install' and a\n"
+                    "       Linux distro that has cryo's cross-build toolchain\n"
+                    "       (clang-20, x86_64-w64-mingw32-gcc), then retry.")));
+                return 1;
+            }
+            _ => { }
+        }
+        const root: String = String::from_str(resolved.output().as_str().trim());
+        if (!resolved.outcome.succeeded() || root.as_str().is_empty()) {
+            fmt::eprintln(f"ERROR: could not resolve a WSL path for {repository.as_str()}\n       Is the repo visible inside your WSL distro?");
+            return 1;
+        }
+        fmt::println(f"==> [windows host] refreshing both pins via WSL ({root.as_str()})");
+        // `pin-impl`, not `pin`: this host's `make pin` holds the heavy-run
+        // lock for the whole refresh, and `pin` would wait for it.
+        mut make: Job = Job::new(Str::new("wsl.exe"));
+        make.argument(Str::new("--"));
+        make.argument(Str::new("bash"));
+        make.argument(Str::new("-lc"));
+        make.argument(f"cd '{root.as_str()}' && make pin-impl".as_str());
+        return match (make.run().outcome) {
+            Outcome::Exited(code) => { code }
+            _                     => { 1 }
+        };
+    }
+
+    /// Any of a POSIX mode's three execute bits.
+    const ANY_EXECUTE: u32 = 0x49;
 }

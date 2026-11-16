@@ -364,7 +364,7 @@ $(PIN):
 # The linked compiler is then stamped (`cryo stamp`) with the checkout it was
 # built from, which is what `cryo version` reports.  The stamp is a region of
 # the binary rewritten in place, so no object changes.  The pin outputs are
-# excluded from the dirty check, as cryo-pin.py excludes them from its own:
+# excluded from the dirty check, as `cryogate pin` excludes them from its own:
 # a pin refresh rewrites bin/ between stamping its two halves.
 #
 # `cryo` names the binary, and the binary's rule runs only when a prerequisite
@@ -472,13 +472,11 @@ ifeq ($(HOST_OS),windows)
 # Windows host: refresh both pins by delegating to WSL.  The Linux
 # branch of this Makefile runs there and does the real work.
 #
-# The recipe is a single command (`scripts\pin-windows.cmd`) so it works
-# unchanged whether you invoked `make` from cmd / PowerShell (recipe shell
-# is cmd) or from MSYS2 / Git Bash (recipe shell is bash).  The wrapper
-# checks for wsl.exe, resolves the WSL path, and re-enters this Makefile
-# inside WSL at `pin-impl`, which takes no lock: this host's run holds it.
+# `cryogate pin --through-wsl` checks for wsl.exe, resolves the checkout's
+# WSL path, and re-enters this Makefile inside WSL at `pin-impl`, which
+# takes no lock: this host's run holds it.
 pin: $(CRYOGATE)
-	@$(CRYOGATE_HEAVY) cmd /c scripts\pin-windows.cmd
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) pin --through-wsl
 else
 # Linux/macOS host: native build for bin/cryo, cross-build for bin/cryo.exe.
 # The Windows half is skipped (not failed) when the mingw toolchain or
@@ -489,8 +487,10 @@ pin: $(CRYOGATE)
 
 pin-impl: pin-linux-impl pin-windows-impl
 
-pin-linux-impl: cryo
-	@$(PYTHON) scripts/cryo-pin.py --source "$(STAGE2)" --pin "$(PIN)" --stamp-profile=$(CRYO_PROFILE)
+# cryogate is an order-only prerequisite: the refresh rewrites bin/cryo,
+# one of cryogate's inputs, and must not rebuild it halfway through.
+pin-linux-impl: cryo | $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) pin --source "$(STAGE2)" --pin "$(PIN)" --stamp-profile=$(CRYO_PROFILE)
 
 pin-windows-impl:
 	@if command -v $(MINGW_GCC) >/dev/null 2>&1 && [ -f "$(WIN_LLVM_LIB)" ] && [ -f "$(WIN_CLANG_LIB)" ]; then \
@@ -504,8 +504,8 @@ pin-windows-impl:
 			     echo "         run: scripts/fetch-windows-llvm.sh"; }; \
 	fi
 
-_pin-windows-do: cryo-exe
-	@$(PYTHON) scripts/cryo-pin.py --source "$(STAGE2_EXE)" --pin "$(PIN_EXE)" --strip-tool $(MINGW_STRIP) \
+_pin-windows-do: cryo-exe | $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) pin --source "$(STAGE2_EXE)" --pin "$(PIN_EXE)" --strip-tool $(MINGW_STRIP) \
 		--stamper "$(STAGE2)" --stamp-profile=$(CRYO_PROFILE)
 	@cp -f "$(WIN_LLVM_DLL)" "$(ROOT)/bin/LLVM-C.dll" 2>/dev/null \
 		&& echo "==> Runtime LLVM-C.dll copied to bin/ (gitignored)" || true
