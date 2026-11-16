@@ -1,8 +1,9 @@
 ///! Printing a `Program` as Cryo source.
 ///!
 ///! Every binary, unary, cast and `if` expression is parenthesised, so
-///! precedence never decides a meaning, and every statement has a line of
-///! its own, so a line-based reducer can delete one.
+///! precedence never decides a meaning, and every statement and every
+///! field has a line of its own, so a line-based reducer can delete one.
+///! A struct's methods are printed inside its body.
 
 namespace cryosmith::printer;
 
@@ -11,8 +12,8 @@ import std::collections::string::{ String };
 
 import cryosmith::generator::{ GENERATOR_VERSION, GenerationOptions };
 import cryosmith::program::{
-    ExpressionKind, ExpressionNode, Function, LoopShape, Program, ScalarType, StatementKind, StatementNode,
-    Variable, VariableRole
+    ExpressionKind, ExpressionNode, Field, Function, LoopShape, Program, Receiver, StatementKind, StatementNode,
+    Structure, ValueType, Variable, VariableRole
 };
 
 /// Writes one program's text.
@@ -35,31 +36,72 @@ public type struct Printer {
             "    return (state ^ value).wrapping_multiply(1099511628211).wrapping_add(2654435769);\n"
             "}\n"));
         mut index: i64 = 0;
+        while (index < program.structures.length()) {
+            printer.structure(program, program.structure_at(index));
+            index = index + 1;
+        }
+        index = 0;
         while (index < program.functions.length()) {
-            printer.definition(program, program.function_at(index));
+            const defined: Function = program.function_at(index);
+            if (defined.owner < 0) { printer.definition(program, defined, 0); }
             index = index + 1;
         }
         return printer.text;
     }
 
-    definition(mut &this, program: &Program, defined: Function) -> void {
+    /// A struct's declaration: its fields, then its methods.
+    structure(mut &this, program: &Program, declared: Structure) -> void {
+        this.text.push(f"\ntype struct S{declared.number} ");
+        this.text.push(Str::new("{\n"));
+        mut index: i64 = declared.first_field;
+        while (index < declared.first_field + declared.field_count) {
+            const field: Field = program.field_at(index);
+            this.indent(1);
+            this.text.push(f"f{field.number}: {field.value_type.name().as_str()}");
+            if (field.default_value >= 0) {
+                this.text.push(Str::new(" = "));
+                this.expression(program, field.default_value);
+            }
+            this.text.push(Str::new(";\n"));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.functions.length()) {
+            const defined: Function = program.function_at(index);
+            if (defined.owner == declared.number) { this.definition(program, defined, 1); }
+            index = index + 1;
+        }
+        this.text.push(Str::new("}\n"));
+    }
+
+    /// A function or method's signature and body, at `indent`.
+    definition(mut &this, program: &Program, defined: Function, indent: i64) -> void {
         this.text.push(Str::new("\n"));
+        this.indent(indent);
         if (defined.is_main) {
             this.text.push(Str::new("function main() -> i32 {\n"));
         } else {
-            this.text.push(f"function h{defined.number}(");
+            mut separate: boolean = false;
+            match (defined.receiver) {
+                Receiver::Free      => { this.text.push(f"function h{defined.number}("); }
+                Receiver::Static    => { this.text.push(f"static m{defined.number}("); }
+                Receiver::Shared    => { this.text.push(f"m{defined.number}(&this"); separate = true; }
+                Receiver::Exclusive => { this.text.push(f"m{defined.number}(mut &this"); separate = true; }
+            }
             mut index: i64 = 0;
             while (index < defined.parameter_count) {
-                if (index > 0) { this.text.push(Str::new(", ")); }
+                if (separate) { this.text.push(Str::new(", ")); }
+                separate = true;
                 const parameter: i64 = program.list_at(defined.first_parameter + index);
                 this.name(program, parameter);
-                this.text.push(f": {program.variable_at(parameter).scalar.name()}");
+                this.text.push(f": {program.variable_at(parameter).value_type.name().as_str()}");
                 index = index + 1;
             }
-            this.text.push(f") -> {defined.returns.name()} ");
+            this.text.push(f") -> {defined.returns.name().as_str()} ");
             this.text.push(Str::new("{\n"));
         }
-        this.block(program, defined.body, 1);
+        this.block(program, defined.body, indent + 1);
+        this.indent(indent);
         this.text.push(Str::new("}\n"));
     }
 
@@ -87,18 +129,18 @@ public type struct Printer {
                 const declared: Variable = program.variable_at(variable);
                 this.text.push(if (declared.mutable) { Str::new("mut ") } else { Str::new("const ") });
                 this.name(program, variable);
-                this.text.push(f": {declared.scalar.name()} = ");
+                this.text.push(f": {declared.value_type.name().as_str()} = ");
                 this.expression(program, value);
                 this.text.push(Str::new(";\n"));
             }
-            StatementKind::Assign(variable, value) => {
-                this.name(program, variable);
+            StatementKind::Assign(place, value) => {
+                this.expression(program, place);
                 this.text.push(Str::new(" = "));
                 this.expression(program, value);
                 this.text.push(Str::new(";\n"));
             }
-            StatementKind::Compound(operator, variable, value) => {
-                this.name(program, variable);
+            StatementKind::Compound(operator, place, value) => {
+                this.expression(program, place);
                 this.text.push(f" {operator.symbol()}= ");
                 this.expression(program, value);
                 this.text.push(Str::new(";\n"));
@@ -107,6 +149,10 @@ public type struct Printer {
                 this.text.push(Str::new("observed = mix(observed, "));
                 this.as_hash_input(program, value);
                 this.text.push(Str::new(");\n"));
+            }
+            StatementKind::Evaluate(value) => {
+                this.expression(program, value);
+                this.text.push(Str::new(";\n"));
             }
             StatementKind::Branch(condition, then_block, else_block) => {
                 this.text.push(Str::new("if ("));
@@ -120,12 +166,12 @@ public type struct Printer {
                 this.text.push(Str::new("\n"));
             }
             StatementKind::Loop(shape, counter, trips, body) => {
-                const scalar: Str = program.variable_at(counter).scalar.name();
+                const counter_type: String = program.variable_at(counter).value_type.name();
                 match (shape) {
                     LoopShape::Counted => {
                         this.text.push(Str::new("for (mut "));
                         this.name(program, counter);
-                        this.text.push(f": {scalar} = 0; ");
+                        this.text.push(f": {counter_type.as_str()} = 0; ");
                         this.name(program, counter);
                         this.text.push(f" < {trips}; ");
                         this.name(program, counter);
@@ -137,7 +183,7 @@ public type struct Printer {
                     LoopShape::Conditioned => {
                         this.text.push(Str::new("mut "));
                         this.name(program, counter);
-                        this.text.push(f": {scalar} = 0;\n");
+                        this.text.push(f": {counter_type.as_str()} = 0;\n");
                         this.indent(indent);
                         this.text.push(Str::new("while ("));
                         this.name(program, counter);
@@ -169,9 +215,13 @@ public type struct Printer {
             StatementKind::ReturnIf(condition, value) => {
                 this.text.push(Str::new("if ("));
                 this.expression(program, condition);
-                this.text.push(Str::new(") { return "));
-                this.expression(program, value);
-                this.text.push(Str::new("; }\n"));
+                if (value < 0) {
+                    this.text.push(Str::new(") { return; }\n"));
+                } else {
+                    this.text.push(Str::new(") { return "));
+                    this.expression(program, value);
+                    this.text.push(Str::new("; }\n"));
+                }
             }
             StatementKind::Return(value) => {
                 this.text.push(Str::new("return "));
@@ -189,8 +239,8 @@ public type struct Printer {
     /// A value as `mix` takes it: an integer converted to `u64`, a boolean
     /// as 1 or 2.
     as_hash_input(mut &this, program: &Program, value: i64) -> void {
-        match (program.expression_at(value).scalar) {
-            ScalarType::Boolean => {
+        match (program.expression_at(value).value_type) {
+            ValueType::Boolean => {
                 this.text.push(Str::new("if ("));
                 this.expression(program, value);
                 this.text.push(Str::new(") { 1 } else { 2 }"));
@@ -213,7 +263,7 @@ public type struct Printer {
                 this.text.push(if (value) { Str::new("true") } else { Str::new("false") });
             }
             ExpressionKind::Limit(is_maximum) => {
-                this.text.push(f"{node.scalar.name()}::");
+                this.text.push(f"{node.value_type.name().as_str()}::");
                 this.text.push(if (is_maximum) { Str::new("MAX") } else { Str::new("MIN") });
             }
             ExpressionKind::Variable(variable) => { this.name(program, variable); }
@@ -238,7 +288,7 @@ public type struct Printer {
             ExpressionKind::Cast(operand) => {
                 this.text.push(Str::new("("));
                 this.expression(program, operand);
-                this.text.push(f" as {node.scalar.name()})");
+                this.text.push(f" as {node.value_type.name().as_str()})");
             }
             ExpressionKind::Widen(operand) => { this.expression(program, operand); }
             ExpressionKind::Conditional(condition, then_value, else_value) => {
@@ -251,23 +301,55 @@ public type struct Printer {
                 this.text.push(Str::new(" })"));
             }
             ExpressionKind::Call(callee, first, count) => {
-                this.text.push(f"h{program.function_at(callee).number}(");
-                mut index: i64 = 0;
-                while (index < count) {
-                    if (index > 0) { this.text.push(Str::new(", ")); }
-                    this.expression(program, program.list_at(first + index));
-                    index = index + 1;
+                const called: Function = program.function_at(callee);
+                if (called.owner < 0) {
+                    this.text.push(f"h{called.number}(");
+                } else {
+                    this.text.push(f"S{called.owner}::m{called.number}(");
                 }
-                this.text.push(Str::new(")"));
+                this.arguments(program, first, count);
+            }
+            ExpressionKind::MethodCall(receiver, callee, first, count) => {
+                this.expression(program, receiver);
+                this.text.push(f".m{program.function_at(callee).number}(");
+                this.arguments(program, first, count);
+            }
+            ExpressionKind::Field(base, field) => {
+                this.expression(program, base);
+                this.text.push(f".f{program.field_at(field).number}");
+            }
+            ExpressionKind::StructureLiteral(structure, first, count) => {
+                this.text.push(f"S{structure} ");
+                this.text.push(Str::new("{"));
+                mut entry: i64 = 0;
+                while (entry < count) {
+                    this.text.push(if (entry > 0) { Str::new(", ") } else { Str::new(" ") });
+                    this.text.push(f"f{program.field_at(program.list_at(first + 2 * entry)).number}: ");
+                    this.expression(program, program.list_at(first + 2 * entry + 1));
+                    entry = entry + 1;
+                }
+                this.text.push(if (count > 0) { Str::new(" }") } else { Str::new("}") });
             }
         }
     }
 
-    /// A method's receiver: a name or a parenthesised expression as it
-    /// prints, anything else in parentheses.
+    /// A call's arguments and its closing parenthesis.
+    arguments(mut &this, program: &Program, first: i64, count: i64) -> void {
+        mut index: i64 = 0;
+        while (index < count) {
+            if (index > 0) { this.text.push(Str::new(", ")); }
+            this.expression(program, program.list_at(first + index));
+            index = index + 1;
+        }
+        this.text.push(Str::new(")"));
+    }
+
+    /// A method's receiver: a name, a field or a parenthesised expression
+    /// as it prints, anything else in parentheses.
     receiver(mut &this, program: &Program, index: i64) -> void {
         match (program.expression_at(index).kind) {
             ExpressionKind::Variable(_) => { this.expression(program, index); }
+            ExpressionKind::Field(_, _) => { this.expression(program, index); }
             ExpressionKind::Unary(_, _) => { this.expression(program, index); }
             ExpressionKind::Binary(_, _, _) => { this.expression(program, index); }
             ExpressionKind::Cast(_) => { this.expression(program, index); }
@@ -287,6 +369,7 @@ public type struct Printer {
             VariableRole::Parameter => { this.text.push(f"p{named.number}"); }
             VariableRole::Local     => { this.text.push(f"v{named.number}"); }
             VariableRole::Counter   => { this.text.push(f"n{named.number}"); }
+            VariableRole::Receiver  => { this.text.push(Str::new("this")); }
         }
     }
 

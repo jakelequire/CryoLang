@@ -22,26 +22,39 @@ deterministic by construction.
 CryoSmith builds a program as a tree first and prints it last. Nothing is
 generated as text.
 
-- **Arenas, not pointers.** A `Program` holds three arenas: expression nodes,
-  statement nodes and functions. A node names its children by index. A block
-  is a chain of statements, each naming the next (`-1` ends the chain), so no
-  node owns another and the whole model is plain data.
-- **Expression nodes** carry their scalar type and one of: an integer or
-  boolean literal; a type's named limit (`i8::MIN`, `u32::MAX`); a variable
-  read; a unary operator; a binary operator; a wrapping method call
+- **Arenas, not pointers.** A `Program` holds arenas of structs, fields,
+  variables, expression nodes, statement nodes and functions, and one of
+  index runs (a call's arguments, a function's parameters, a struct
+  literal's entries). A node names its children by index. A block is a chain
+  of statements, each naming the next (`-1` ends the chain), so no node owns
+  another and the whole model is plain data.
+- **Types** are the eight integer types, `boolean`, `void` (what a method
+  that writes its receiver returns) and a generated struct, named by its
+  index.
+- **Expression nodes** carry their type and one of: an integer or boolean
+  literal; a type's named limit (`i8::MIN`, `u32::MAX`); a variable read; a
+  unary operator; a binary operator; a wrapping method call
   (`a.wrapping_add(b)`); a cast (`a as T`); an implicit widening (a narrower
   value where its wider type is expected, printed bare); an `if` expression;
-  a call (its arguments are a run of a fourth arena, argument indices).
+  a call of a free function or a static method; a method call on a place
+  (`v2.f1.m0(a)`); a field (`v2.f1`); a struct literal (`S1 { f2: a, f0: b }`).
 - **Statement nodes:** a declaration (`const` / `mut`), an assignment (plain
-  or compound), an observation (`observed = mix(observed, ...)`), `if` /
+  or compound) to a place - a `mut` local, or a field reached from one or
+  from a `mut &this` - an observation (`observed = mix(observed, ...)`), a
+  call evaluated for its effect (a method that writes its receiver), `if` /
   `else`, a loop (three shapes, below), a loop exit (`if (c) { break; }`,
   `if (c) { continue; }`) and a return, early (`if (c) { return e; }`) or
   final.
-- **Functions** have numbered parameters, a return type, a body and a
-  **cost**: the most work one call can do (section 3.3).
+- **Structs** `S<N>` have fields `f<N>` of an integer type, `boolean` or an
+  earlier struct (so none contains itself), some with a literal default.
+- **Functions** are free functions `h<N>`, `main`, and a struct's methods
+  `m<N>`: static, or taking `&this` or `mut &this`. Each has numbered
+  parameters, a return type, a body and a **cost**: the most work one call
+  can do (section 3.3).
 - **The printer** walks the model once. Every binary expression is
   parenthesised, so precedence never decides a meaning, and every statement
-  has its own line.
+  and field has its own line. A struct's methods are printed inside its
+  body, and every struct before the free functions.
 
 The model is a structure an evaluator can walk later: the plan's expected
 output (a value model) and the reference interpreter both start from it.
@@ -69,15 +82,25 @@ enabled features allow:
 | division | `(a / ((b & M) \| 1))`, `%` | the divisor is in `[1, M]` |
 | negation (signed) | `(-(a & MAX))` | the operand is not `MIN` |
 | `if` expression | `if (c) { a } else { b }` | both arms are `T` |
-| call | `h2(a, b)` | a function returning `T` (section 3.3) |
+| call | `h2(a, b)`, `S1::m0(a)` | a function or static method returning `T` (section 3.3) |
+| field | `v3.f1`, `this.f0.f2` | a field of type `T`, reached from a struct in scope |
+| method call | `v3.m1(a)`, `this.f0.m2()` | a `&this` method returning `T`, on a place of its struct |
 
 A boolean is a literal, a variable, a comparison of two integers of one
 type, a comparison of two integers of **different** types (they compare by
-their true values), `&&`, `||`, `!`, or `==` / `!=` of two booleans.
+their true values), `&&`, `||`, `!`, `==` / `!=` of two booleans, or a field,
+call or method call returning one.
 
-At depth 0 only leaves are chosen. **Widening** (`v` of type `u8` where a
-`u32` is wanted) is generated only where the language converts implicitly: an
-initializer, an assignment, a call's argument and a return value.
+A struct value of `S` is a struct literal (`S { f1: a, f0: b }`: its fields
+in a shuffled order, a field with a default left out half the time), a
+variable, a field of type `S`, a call or `&this` method call returning `S`,
+or an `if` expression over two of these. A literal names its type, so a
+struct expression always reads a name.
+
+At depth 0 only leaves are chosen (a field is a leaf, and so is a struct
+literal of leaves). **Widening** (`v` of type `u8` where a `u32` is wanted)
+is generated only where the language converts implicitly: an initializer, an
+assignment, a call's argument, a return value and a struct literal's field.
 
 **Literal-only expressions.** A bare literal beside a typed operand takes
 that operand's type, but literals combined with each other (`(12 & 63)`) are
@@ -130,12 +153,20 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   exactly that type: operands are of `T`, a different type is converted with
   `as`, and widening appears only at the implicit-conversion places.
 - Names are declared before use, in scope, unique per function (`v<N>`,
-  `p<N>`, counters `n<N>`, functions `h<N>`); only `mut` names are assigned,
-  and no loop counter is. No name is spelled like a type: a local `i8` would
-  stand in front of the type in `i8::MIN`, and a function `f32` in front of
-  `f32`.
-- A function's body ends with a `return` of its type; `main` never returns
-  early, so its final print always runs.
+  `p<N>`, counters `n<N>`, functions `h<N>`, structs `S<N>`, fields `f<N>`,
+  methods `m<N>`); only `mut` names are assigned, and no loop counter is. No
+  name is spelled like a type: a local `i8` would stand in front of the type
+  in `i8::MIN`, and a function `f32` in front of `f32`. A struct has at most
+  four fields, so no field is `f32` either.
+- **Receivers.** A field is written only through a `mut` local or a
+  `mut &this`; a method taking `mut &this` is called only on such a place.
+  A parameter, a `const` local and a `&this` are read and never written. A
+  static method is called through its struct (`S1::m0()`), never on a value.
+  `this` is never assigned whole.
+- A struct literal writes every field that has no default.
+- A function's body ends with a `return` of its type, or with nothing when
+  it returns `void`; `main` never returns early, so its final print always
+  runs.
 - The corpus check (section 7) is the proof that this list is complete:
   every refusal is either a generator defect or a compiler finding.
 
@@ -146,10 +177,12 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   `for (mut n0: u16 = 0; n0 < 4; n0 = n0 + 1)`, `while (n1 < 3) { n1 = n1 + 1; ... }`
   (the increment comes first, so a `continue` cannot skip it) and
   `for (n2 in 0..5)`. Loops nest at most three deep.
-- **No recursion.** Function `h<k>` calls only `h<j>` with `j < k`, and `main`
-  is last: the call graph is acyclic.
-- **A cost model.** A statement costs its expressions' nodes; a loop costs its
-  trip count times its body; an `if` the dearer arm; a call the callee's cost.
+- **No recursion.** Functions are generated in one order - every struct's
+  methods, then `h0`, `h1`, ..., then `main` - and each calls only functions
+  generated before it: the call graph is acyclic.
+- **A cost model.** A statement costs its expressions' nodes (a store's
+  target is written, not read, and costs nothing); a loop costs its trip
+  count times its body; an `if` the dearer arm; a call the callee's cost.
   A call is generated only while the caller's cost stays under its limit, so
   every program does a bounded amount of work, known at generation time.
 
@@ -163,11 +196,20 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   so folding the state into itself does not stick at zero. An integer is
   folded as `(e as u64)`; a boolean as `1` or `2`. `observed` is read as a
   value only where no other name of the wanted type is in scope.
+- A struct is observed field by field, nested structs through their own
+  fields (`v2.f1.f0`); a struct a call returns is bound to a local first, so
+  the call runs once.
 - Each block ends by observing every name it declared, a function body ends
-  by observing its parameters, and `main` ends by observing one call of each
-  helper the cost model allows, so every value a program computes reaches the
-  hash. A nested block spends at most half the statements left, so no
-  function is one untaken branch.
+  by observing its parameters (and a method's, its receiver), and `main` ends
+  by observing one call of each helper the cost model allows, so every value
+  a program computes reaches the hash. A nested block spends at most half the
+  statements left, so no function is one untaken branch.
+- **No expression both writes a struct and reads it.** A method taking
+  `mut &this` returns `void` and is called only as a statement of its own,
+  so the order in which an expression's operands are evaluated never
+  decides a struct's value. (`observed` is the exception the stage-1 forms
+  already make: a call inside `mix(observed, ...)` may observe, and so
+  change `observed`, while the same statement reads it.)
 
 ### 3.5 Reproducible from the seed
 
@@ -178,10 +220,16 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **Each function has its own stream**, seeded from the program seed and the
   function's index, so a change in how one function spends random draws does
   not reshuffle the next function's choices (it still sees the earlier
-  functions' signatures and costs, which its calls use).
+  functions' signatures and costs, which its calls use). The structs and
+  their fields come from a stream of their own, and each method from one
+  seeded with its place among the methods.
 - **The function count shapes nothing before `main`**: a program generated
-  with `--functions 3` is the first three helpers of the same seed's program
-  with more, plus its own `main`.
+  with `--functions 3` is the same structs and methods and the first three
+  helpers of the same seed's program with more, plus its own `main`.
+- **A new stage leaves the old forms' draws alone.** A form a stage adds
+  takes no random draw where its feature is off or nothing it needs exists,
+  so with `--features default,no-structs` a seed generates the text the
+  version-1 generator did, header aside.
 - The header records the **generator version**, raised whenever one seed may
   produce different text, so a seed filed in a bug report names the
   generator that reproduces it.
@@ -193,8 +241,8 @@ every feature of the current stage; `no-<name>` removes one.
 
 | stage | features |
 |---|---|
-| 1 (this one) | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
-| 2 | `structs`: fields, defaults, inline methods, struct literals |
+| 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
+| 2 (this one) | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`) |
 | 3 | `generics`: generic functions and structs, `where` bounds, overload sets |
 | 4 | `references`, `moves`: `&` / `mut &`, receivers, move-checked bindings |
 | 5 | `drop`: a drop log folded into the hash, the expected drop order |
@@ -205,7 +253,7 @@ every feature of the current stage; `no-<name>` removes one.
 A new stage adds features; it never changes what an existing seed and
 feature list generate without raising the generator version.
 
-## 5. Command line (proposed; awaiting approval)
+## 5. Command line
 
 ```
 cryosmith generate --seed N [options] [--out FILE]
@@ -233,7 +281,7 @@ statement budget of one function, default 24), `--no-header`, and
   seed and options wherever the file goes:
 
   ```
-  // cryosmith 1 seed 42 features booleans,wrapping,... functions 4 size 24
+  // cryosmith 2 seed 42 features booleans,wrapping,... functions 4 size 24
   ```
 
   Generating again from the header's fields reproduces the file.
@@ -268,9 +316,11 @@ statement budget of one function, default 24), `--no-header`, and
 - **The corpus check**, `cryosmith corpus-check`: K seeds are generated,
   each built at `--opt-level=0` and `--opt-level=2` with the compiler named,
   and both run. A program passes when both builds succeed, both exit 0 and
-  both print the same single hash line. It is CryoSmith's acceptance test,
-  not CryoGate's differential lane, and it is the one place CryoSmith runs a
-  compiler.
+  both print the same single hash line; the summary counts the distinct
+  hashes, since a hash every program shares is a stuck one. It is
+  CryoSmith's acceptance test, not CryoGate's differential lane, and it is
+  the one place CryoSmith runs a compiler; it moves into CryoGate once
+  CryoGate's differential driver exists.
 - **Plants prove the checks can refuse.** `--plant unguarded-division`
   generates `(a / (b & M))`, without the `| 1`. The static audit must refuse
   every planted program that divides, and the corpus check must report the
