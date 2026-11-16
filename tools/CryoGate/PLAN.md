@@ -107,20 +107,27 @@ tools/CryoGate/
                       (a [lib] is added when the harness first needs the
                       worker protocol's code)
   PLAN.md             this file (deleted with the last Python gate)
+  DESIGN.md           the layers, what each owns, the dependency rules, and
+                      how a gate plugs in (stays)
   src/
     main.cryo         argv -> subcommand
     selftest.cryo     `cryogate selftest`; probe.cryo, the child it runs
     heavy.cryo        `cryogate heavy`
     core/             child runner, scheduler, heavy-run lock, logs, the
-                      unit-suite judge, host (OS, pin, repository); later the
-                      sandbox limits, governor, verdicts, digests, tree walk,
-                      git, WSL
+                      unit-suite judge, host (OS, pin, repository), tree
+                      walk, git; later the sandbox limits, governor,
+                      verdicts, digests, WSL
+    corpus/           the test corpus as read: the roster golden, discovery
+                      and merging, a census run's reading
     store/            the store outside the repo, records, corpus, pruning
     baseline/         verify's baseline: what git lists, each recorded
                       program's files and record key, the baseline compiler's
-                      key; later the clone's sync and the bounded cache
+                      key, the clone's sync and the bounded cache
+    verify/           verify's decisions: declarations, object populations,
+                      runtime archive members, records, judges, comparison
     gates/            one file per gate (census, roster, examples, lsp, cross,
-                      incr, vendor, selfhost, freestanding, pin, verify, ...)
+                      incr, vendor, selfhost, freestanding, pin, verify, ...);
+                      no gate imports another
     judges/           the pure decisions each gate's verdict rests on
     lsp/              JSON-RPC stdio driver, checks.json reader, LSP state fuzzing
     smith/            CryoSmith: model, generator, expected-output and drop log

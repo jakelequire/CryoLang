@@ -1,0 +1,222 @@
+///! One program's record of a baseline run, as verify stores it under the
+///! program's record key: written from a baseline census and read back.
+
+namespace cryogate::verify::record;
+
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+
+import cryogate::core::text::{ Text };
+import cryogate::corpus::census::{ CensusReading };
+import cryogate::verify::objects::{ ObjectOwner };
+
+/// One program's record of a baseline run: its verdict; the unit suite's
+/// failed tests, counts and build warnings when it is the unit suite; a
+/// project's build warnings, when the runner listed them; and its objects,
+/// as `<sha256 digest>  <path>` rows.
+public type struct BaselineRecord {
+    /// The program, by its declaration name (`unit suite` for the unit suite).
+    public name: String;
+    /// `ok` or `FAILED`.
+    public verdict: String;
+    /// The unit tests the baseline failed, by full name, sorted.
+    public unit_failed: Array<String>;
+    /// passed, failed, ignored and filtered, when the record has them.
+    public unit_counts: Option<Array<i64>>;
+    /// The build warnings, `<code> <file>:<line>`, sorted.
+    public warnings: Array<String>;
+    /// Whether the runner listed this project's build warnings, so that
+    /// none recorded means none and not a runner that never said.
+    public warnings_listed: boolean;
+    /// The program's objects, `<sha256 digest>  <path>`.
+    public rows: Array<String>;
+
+    /// A record of `name` with `verdict` and nothing else.
+    public static new(name: Str, verdict: Str) -> BaselineRecord {
+        return BaselineRecord {
+            name: String::from_str(name), verdict: String::from_str(verdict), unit_failed: Array::<String>::new(),
+            unit_counts: Option::None, warnings: Array::<String>::new(), warnings_listed: false,
+            rows: Array::<String>::new(),
+        };
+    }
+
+    /// A record file's text read back: a tag and its value per line,
+    /// `name`, `verdict`, `unit-failed`, `unit-counts` (four numbers),
+    /// `warnings-listed` (no value), `warning` and `row`.
+    public static read(text: Str) -> BaselineRecord {
+        mut record: BaselineRecord = BaselineRecord::new(Str::new(""), Str::new(""));
+        for (line in Text::lines(text).iterate_references()) {
+            const tag: Str = match (line.as_str().split_once(&Str::new(" "))) {
+                Option::Some(parts) => { parts.first }
+                Option::None        => { line.as_str() }
+            };
+            const value: Str = match (line.as_str().split_once(&Str::new(" "))) {
+                Option::Some(parts) => { parts.second }
+                Option::None        => { Str::new("") }
+            };
+            if (tag == Str::new("name")) { record.name = String::from_str(value); }
+            if (tag == Str::new("verdict")) { record.verdict = String::from_str(value); }
+            if (tag == Str::new("unit-failed")) { record.unit_failed.push(String::from_str(value)); }
+            if (tag == Str::new("warning")) { record.warnings.push(String::from_str(value)); }
+            if (tag == Str::new("warnings-listed")) { record.warnings_listed = true; }
+            if (tag == Str::new("row")) { record.rows.push(String::from_str(value)); }
+            if (tag == Str::new("unit-counts")) {
+                mut counts: Array<i64> = Array::<i64>::new();
+                for (number in value.split_whitespace()) { counts.push(i64::try_from(number).unwrap_or(0)); }
+                record.unit_counts = Option::Some(counts);
+            }
+        }
+        return record;
+    }
+
+    /// The records the programs `names` get from one baseline census run:
+    /// its output `lines` and the object rows it left.  A project's or a
+    /// compile-fail file's verdict is its line's (`ok` once reached,
+    /// `FAILED` when it failed); a program with no verdict line gets no
+    /// record.  The unit suite gets one when the run accounted for it -
+    /// every unit test the roster pins on this host (`unit_pinned`) ran, by
+    /// name, and no other - with the tests that failed before the first
+    /// summary and the warnings printed there, its build's.  A project's
+    /// record holds the build warnings the run listed under its line, when
+    /// the runner lists them.  Each row goes to the record of the program
+    /// that owns its object.
+    public static of_census(lines: &Array<String>, names: &Array<String>, rows: &Array<String>,
+                            unit_pinned: &Array<String>) -> Array<BaselineRecord> {
+        const reading: CensusReading = CensusReading::of(lines);
+        mut verdicts: HashMap<String, String> = HashMap::<String, String>::new();
+        for (line in lines.iterate_references()) {
+            match (BaselineRecord::verdict_line(line.as_str(), Str::new("project"))) {
+                Option::Some(seen) => { verdicts.insert(String::from_str(seen.first), String::from_str(Str::new("ok"))); }
+                Option::None       => { }
+            }
+            match (BaselineRecord::verdict_line(line.as_str(), Str::new("negative"))) {
+                Option::Some(seen) => { verdicts.insert(f"negative/{seen.first}", String::from_str(Str::new("ok"))); }
+                Option::None       => { }
+            }
+        }
+        for (line in lines.iterate_references()) {
+            match (BaselineRecord::verdict_line(line.as_str(), Str::new("project"))) {
+                Option::Some(seen) => { if (seen.second) { verdicts.insert(String::from_str(seen.first), String::from_str(Str::new("FAILED"))); } }
+                Option::None       => { }
+            }
+            match (BaselineRecord::verdict_line(line.as_str(), Str::new("negative"))) {
+                Option::Some(seen) => { if (seen.second) { verdicts.insert(f"negative/{seen.first}", String::from_str(Str::new("FAILED"))); } }
+                Option::None       => { }
+            }
+        }
+        mut records: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+        const unit_suite: String = String::from_str(Str::new("unit suite"));
+        for (name in names.iterate_references()) {
+            if (name.as_str() == unit_suite.as_str()) {
+                const ran: Array<String> = Text::sorted_distinct(reading.unit_names.clone());
+                const pinned: Array<String> = Text::sorted_distinct(unit_pinned.clone());
+                if (!reading.unit.printed || ran != pinned) { continue; }
+                mut failed: Array<String> = Array::<String>::new();
+                for (mut i: i64 = 0; i < lines.length() && i < reading.first_summary; i++) {
+                    match (BaselineRecord::failed_unit(lines[i].as_str())) {
+                        Option::Some(test) => { failed.push(String::from_str(test)); }
+                        Option::None       => { }
+                    }
+                }
+                const failed_sorted: Array<String> = Text::sorted_distinct(failed);
+                mut record: BaselineRecord = BaselineRecord::new(unit_suite.as_str(),
+                    if (failed_sorted.is_empty()) { Str::new("ok") } else { Str::new("FAILED") });
+                record.unit_failed = failed_sorted;
+                mut counts: Array<i64> = Array::<i64>::new();
+                counts.push(reading.unit.passed);
+                counts.push(reading.unit.failed);
+                counts.push(reading.unit.ignored);
+                counts.push(reading.unit.filtered);
+                record.unit_counts = Option::Some(counts);
+                record.warnings = Text::sorted_distinct(reading.warnings.clone());
+                records.push(record);
+                continue;
+            }
+            mut record: BaselineRecord = match (verdicts.get_reference(name)) {
+                Option::Some(verdict) => { BaselineRecord::new(name.as_str(), verdict.as_str()) }
+                Option::None          => { continue; }
+            };
+            if (reading.project_warnings_listed && !name.as_str().starts_with(&Str::new("negative/"))) {
+                record.warnings_listed = true;
+                mut warnings: Array<String> = Array::<String>::new();
+                for (listed in reading.project_warnings.iterate_references()) {
+                    if (listed.first.as_str() == name.as_str()) { warnings.push(listed.second.clone()); }
+                }
+                record.warnings = Text::sorted_distinct(warnings);
+            }
+            records.push(record);
+        }
+        for (row in rows.iterate_references()) {
+            const text: Str = row.as_str();
+            const path: Str = if (text.length() > 66) { text.byte_substring(66, text.length()) } else { Str::new("") };
+            const owner: String = match (ObjectOwner::of(path)) {
+                Option::Some(owner) => { owner }
+                Option::None        => { continue; }
+            };
+            for (mut i: i64 = 0; i < records.length(); i++) {
+                if (records[i].name.as_str() == owner.as_str()) { records[i].rows.push(row.clone()); }
+            }
+        }
+        return records;
+    }
+
+    /// The first field in which `other` differs from this record, rows
+    /// compared as sets; none when the two agree.
+    public difference(&this, other: &BaselineRecord) -> Option<String> {
+        if (this.verdict.as_str() != other.verdict.as_str()) {
+            return Option::Some(f"verdict {this.verdict.as_str()}, derived {other.verdict.as_str()}");
+        }
+        if (this.unit_failed != other.unit_failed) { return Option::Some(String::from_str(Str::new("unit-failed"))); }
+        if (this.unit_counts != other.unit_counts) { return Option::Some(String::from_str(Str::new("unit-counts"))); }
+        if (this.warnings_listed != other.warnings_listed) { return Option::Some(String::from_str(Str::new("warnings-listed"))); }
+        if (this.warnings != other.warnings) { return Option::Some(String::from_str(Str::new("warnings"))); }
+        const rows: Array<String> = Text::sorted_distinct(this.rows.clone());
+        const other_rows: Array<String> = Text::sorted_distinct(other.rows.clone());
+        if (rows != other_rows) {
+            return Option::Some(f"rows {rows.length()}, derived {other_rows.length()}");
+        }
+        return Option::None;
+    }
+
+    /// A census verdict line of `suite` (`project` or `negative`),
+    /// `test (<suite>) <name> ...`, at the line's very start: its name, and
+    /// whether the verdict is `FAILED`.
+    private static verdict_line(line: Str, suite: Str) -> Option<Pair<Str, boolean>> {
+        const opening: String = f"test ({suite}) ";
+        const rest: Str = match (line.strip_prefix(&opening.as_str())) {
+            Option::Some(rest) => { rest }
+            Option::None       => { return Option::None; }
+        };
+        const parts: Pair<Str, Str> = match (rest.split_once(&Str::new(" "))) {
+            Option::Some(parts) => { parts }
+            Option::None        => { return Option::None; }
+        };
+        if (parts.first.is_empty() || !parts.second.starts_with(&Str::new("..."))) { return Option::None; }
+        return Option::Some(Pair::new(parts.first, parts.second.starts_with(&Str::new("... FAILED"))));
+    }
+
+    /// A failed unit test's line, `FAIL  <namespace>::<test>`, at the
+    /// line's very start: the test's full name.
+    private static failed_unit(line: Str) -> Option<Str> {
+        const rest: Str = match (line.strip_prefix(&Str::new("FAIL"))) {
+            Option::Some(rest) => { rest }
+            Option::None       => { return Option::None; }
+        };
+        const spaced: boolean = match (rest.byte_at(0)) {
+            Option::Some(byte) => { byte.is_whitespace() }
+            Option::None       => { false }
+        };
+        if (!spaced) { return Option::None; }
+        for (name in rest.split_whitespace()) {
+            for (mut i: i64 = 1; i + 2 < name.length(); i++) {
+                if (name.byte_substring(i, i + 2) == Str::new("::")) { return Option::Some(name); }
+            }
+            return Option::None;
+        }
+        return Option::None;
+    }
+}

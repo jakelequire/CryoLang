@@ -1,0 +1,331 @@
+///! The declaration files, tests/started-compiling and tests/started-passing:
+///! the lines a change declares, the form each line takes, what each form
+///! names, and the declarations the object comparison reads.
+
+namespace cryogate::verify::declarations;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::text::{ Text };
+
+/// What a declaration line names, by its form.
+public type enum DeclarationKind {
+    /// `moved-runtime:<configuration>/<member>`: a member of one
+    /// configuration's runtime archive that moves.
+    MovedRuntime;
+    /// `moved-archive:<module>`: a stdlib module whose archive objects move.
+    MovedArchive;
+    /// `archive:<file>`: a unit-test file the baseline fails through the archive.
+    Archive;
+    /// `moved:<project>`: a project both compilers pass whose objects move.
+    Moved;
+    /// `negative/<file>.cryo`: a compile-fail file.
+    Negative;
+    /// `examples/<name>`: an example project.
+    Example;
+    /// `<path>.cryo`: a unit-test file under tests/tests.
+    Unit;
+    /// Anything else: a test project's directory name.
+    Project;
+}
+
+/// A prefix a declaration line may carry before the program it names, and
+/// the kind it makes the line.
+public type struct DeclarationForm {
+    /// The text the line starts with, `:` included.
+    public prefix: Str;
+    /// The kind a line carrying `prefix` declares.
+    public kind:   DeclarationKind;
+
+    /// The prefixed forms, in the order a line is matched against them: a
+    /// line takes the first whose prefix it starts with.  A new form is a
+    /// row here.
+    public static prefixed() -> Array<DeclarationForm> {
+        mut forms: Array<DeclarationForm> = Array::<DeclarationForm>::new();
+        forms.push(DeclarationForm { prefix: Str::new("moved-runtime:"), kind: DeclarationKind::MovedRuntime });
+        forms.push(DeclarationForm { prefix: Str::new("moved-archive:"), kind: DeclarationKind::MovedArchive });
+        forms.push(DeclarationForm { prefix: Str::new("archive:"),       kind: DeclarationKind::Archive });
+        forms.push(DeclarationForm { prefix: Str::new("moved:"),         kind: DeclarationKind::Moved });
+        return forms;
+    }
+}
+
+/// One line of a declaration file: the program it names, in its form, and
+/// why the change makes that program pass, compile or move.
+public type struct Declaration {
+    /// The program, as the line spells it, its form's prefix included.
+    public name:   String;
+    /// The rest of the line: why the change moves the program.
+    public reason: String;
+}
+
+/// Reading the declaration files.
+public type struct Declarations {
+    /// The lines of a declaration file's `text`, blank lines and `#`
+    /// comments skipped.  A line is its name up to the first space and the
+    /// reason after it, both trimmed.  A name written twice keeps its first
+    /// place and takes the later reason.
+    public static parse(text: Str) -> Array<Declaration> {
+        mut written: Array<Declaration> = Array::<Declaration>::new();
+        for (raw in Text::lines(text).iterate_references()) {
+            const line: Str = raw.as_str().trim();
+            if (line.is_empty() || line.starts_with(&Str::new("#"))) { continue; }
+            const name: Str = match (line.split_once(&Str::new(" "))) {
+                Option::Some(parts) => { parts.first }
+                Option::None        => { line }
+            };
+            const reason: Str = match (line.split_once(&Str::new(" "))) {
+                Option::Some(parts) => { parts.second.trim() }
+                Option::None        => { Str::new("") }
+            };
+            written.push(Declaration { name: String::from_str(name), reason: String::from_str(reason) });
+        }
+        mut out: Array<Declaration> = Array::<Declaration>::new();
+        for (mut i: i64 = 0; i < written.length(); i++) {
+            mut first: boolean = true;
+            for (mut j: i64 = 0; j < i; j++) {
+                if (written[j].name.as_str() == written[i].name.as_str()) { first = false; }
+            }
+            if (!first) { continue; }
+            mut reason: Str = written[i].reason.as_str();
+            for (mut j: i64 = i + 1; j < written.length(); j++) {
+                if (written[j].name.as_str() == written[i].name.as_str()) { reason = written[j].reason.as_str(); }
+            }
+            out.push(Declaration { name: written[i].name.clone(), reason: String::from_str(reason) });
+        }
+        return out;
+    }
+
+    /// The lines `tree_text` declares that apply against a baseline whose
+    /// copy of the file is `base_text`: a line whose program the baseline's
+    /// copy names with the same reason declares nothing, in whatever form it
+    /// is written there.  So a new line applies, a rewritten reason applies
+    /// again, a removed line declares nothing, and a line rewritten into
+    /// another form with its reason kept declares nothing.
+    public static between(tree_text: Str, base_text: Str) -> Array<Declaration> {
+        const tree: Array<Declaration> = Declarations::parse(tree_text);
+        const base: Array<Declaration> = Declarations::parse(base_text);
+        mut out: Array<Declaration> = Array::<Declaration>::new();
+        for (line in tree.iterate_references()) {
+            const program: Str = Declarations::program_of(line.name.as_str());
+            mut unchanged: boolean = false;
+            for (earlier in base.iterate_references()) {
+                if (Declarations::program_of(earlier.name.as_str()) == program
+                        && earlier.reason.as_str() == line.reason.as_str()) {
+                    unchanged = true;
+                }
+            }
+            if (!unchanged) {
+                out.push(Declaration { name: line.name.clone(), reason: line.reason.clone() });
+            }
+        }
+        return out;
+    }
+
+    /// The kind of program the line `name` declares, by its form.
+    public static kind(name: Str) -> DeclarationKind {
+        for (form in DeclarationForm::prefixed().iterate_references()) {
+            if (name.starts_with(&form.prefix)) { return form.kind; }
+        }
+        if (name.starts_with(&Str::new("negative/"))) { return DeclarationKind::Negative; }
+        if (name.starts_with(&Str::new("examples/"))) { return DeclarationKind::Example; }
+        if (name.ends_with(&Str::new(".cryo"))) { return DeclarationKind::Unit; }
+        return DeclarationKind::Project;
+    }
+
+    /// The program the line `name` names: `name` without its form's prefix.
+    public static program_of(name: Str) -> Str {
+        for (form in DeclarationForm::prefixed().iterate_references()) {
+            match (name.strip_prefix(&form.prefix)) {
+                Option::Some(rest) => { return rest; }
+                Option::None       => { }
+            }
+        }
+        return name;
+    }
+
+    /// The tail of the path of a `moved-archive:` line's module object in
+    /// an archive: `/deps/std/time/clock.o` for `std::time::clock`.
+    public static archive_module_suffix(name: Str) -> String {
+        const module_path: String = Declarations::program_of(name).replace(&Str::new("::"), &Str::new("/"));
+        return f"/deps/{module_path}.o";
+    }
+
+    /// The namespace the unit-test file a line names declares, `A::B::C`:
+    /// the first line of `tests/tests/<file>` reading `namespace A::B::C;`,
+    /// indented or not.  None when the file or such a line is missing.
+    public static unit_namespace(repository: Path, name: Str) -> Option<String> {
+        const path: PathBuf = repository.join(Str::new("tests/tests")).join(Declarations::program_of(name));
+        const text: String = match (File::read_text(path.as_path())) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { return Option::None; }
+        };
+        for (line in Text::lines(text.as_str()).iterate_references()) {
+            const rest: Str = match (line.as_str().trim_start().strip_prefix(&Str::new("namespace"))) {
+                Option::Some(rest) => { rest }
+                Option::None       => { continue; }
+            };
+            const space: boolean = match (rest.byte_at(0)) {
+                Option::Some(byte) => { byte.is_whitespace() }
+                Option::None       => { false }
+            };
+            if (!space) { continue; }
+            const spelled: Str = rest.trim_start();
+            mut end: i64 = 0;
+            while (end < spelled.length()) {
+                const byte: u8 = spelled.byte_at(end).unwrap_or(0);
+                const word: boolean = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90)
+                    || (byte >= 97 && byte <= 122) || byte == 95 || byte == 58;
+                if (!word) { break; }
+                end++;
+            }
+            if (end == 0) { continue; }
+            if (spelled.byte_substring(end, spelled.length()).trim_start().starts_with(&Str::new(";"))) {
+                return Option::Some(String::from_str(spelled.byte_substring(0, end)));
+            }
+        }
+        return Option::None;
+    }
+
+    /// The tail of the path of the object the unit-test file a line names
+    /// compiles to, from its namespace: `namespace A::B::C;` is
+    /// `/deps/A/B/C.o`.  None when it has no namespace.
+    public static unit_object_suffix(repository: Path, name: Str) -> Option<String> {
+        const spelled: String = match (Declarations::unit_namespace(repository, name)) {
+            Option::Some(spelled) => { spelled }
+            Option::None          => { return Option::None; }
+        };
+        const module_path: String = spelled.as_str().replace(&Str::new("::"), &Str::new("/"));
+        return Option::Some(f"/deps/{module_path}.o");
+    }
+
+    /// The source file of the standard-library module a `moved-archive:`
+    /// line names: `std::a::b` is `stdlib/a/b.cryo`, or
+    /// `stdlib/a/b/_module.cryo`.  None when the module is not below `std::`
+    /// or neither file exists.
+    public static archive_module_source(repository: Path, name: Str) -> Option<PathBuf> {
+        const below: Str = match (Declarations::program_of(name).strip_prefix(&Str::new("std::"))) {
+            Option::Some(below) => { below }
+            Option::None        => { return Option::None; }
+        };
+        const relative: String = below.replace(&Str::new("::"), &Str::new("/"));
+        const stdlib: PathBuf = repository.join(Str::new("stdlib"));
+        const file: PathBuf = stdlib.join(f"{relative.as_str()}.cryo".as_str());
+        if (file.as_path().is_file()) { return Option::Some(file); }
+        const aggregator: PathBuf = stdlib.join(relative.as_str()).join(Str::new("_module.cryo"));
+        if (aggregator.as_path().is_file()) { return Option::Some(aggregator); }
+        return Option::None;
+    }
+}
+
+/// The runtime archive member a `moved-runtime:<configuration>/<member>`
+/// line names: one member of one configuration's archive.
+public type struct RuntimeMember {
+    /// The configuration whose archive holds the member.
+    public configuration: String;
+    /// The member's name in that archive.
+    public member:        String;
+
+    /// The configurations the runtime is built in, each archive in a
+    /// directory of its own name below `runtime/.bin/<triple>/`.
+    public static configurations() -> Array<Str> {
+        mut configurations: Array<Str> = Array::<Str>::new();
+        configurations.push(Str::new("freestanding"));
+        configurations.push(Str::new("hosted-abort"));
+        configurations.push(Str::new("hosted-unwind"));
+        return configurations;
+    }
+
+    /// The member the line `name` names; None unless its program is a
+    /// configuration, `/`, and a member name of word bytes, `.` and `-`
+    /// ending in `.o`.
+    public static of(name: Str) -> Option<RuntimeMember> {
+        const parts: Pair<Str, Str> = match (Declarations::program_of(name).split_once(&Str::new("/"))) {
+            Option::Some(parts) => { parts }
+            Option::None        => { return Option::None; }
+        };
+        if (!RuntimeMember::configurations().contains(&parts.first)) { return Option::None; }
+        const member: Str = parts.second;
+        if (member.length() < 3 || !member.ends_with(&Str::new(".o"))) { return Option::None; }
+        for (mut i: i64 = 0; i < member.length(); i++) {
+            const byte: u8 = member.byte_at(i).unwrap();
+            if (!(byte.is_alpha() || byte.is_digit() || byte == '_' || byte == '.' || byte == '-')) { return Option::None; }
+        }
+        return Option::Some(RuntimeMember { configuration: String::from_str(parts.first), member: String::from_str(member) });
+    }
+
+    /// Whether the runtime list path `path`, `runtime/<configuration>/<NN>-<member>`,
+    /// is this member: a member's place in its archive is not part of its name.
+    public matches(&this, path: Str) -> boolean {
+        const prefix: String = f"runtime/{this.configuration.as_str()}/";
+        const rest: Str = match (path.strip_prefix(&prefix.as_str())) {
+            Option::Some(rest) => { rest }
+            Option::None       => { return false; }
+        };
+        return match (rest.split_once(&Str::new("-"))) {
+            Option::Some(parts) => { Text::is_digits(parts.first) && parts.second == this.member.as_str() }
+            Option::None        => { false }
+        };
+    }
+}
+
+/// The declarations the object comparison reads, by what each asks of it.
+public type struct DeclaredChanges {
+    /// Every line's name from both files: the projects and examples among
+    /// them are left out of the comparison, since their objects change by
+    /// declaration.
+    public names: Array<String>;
+    /// Each started-passing unit-test file and the tail of the one object
+    /// it compiles to.
+    public units: Array<Pair<String, String>>;
+    /// The started-passing `moved:` lines.
+    public moved_projects: Array<String>;
+    /// The started-passing `moved-archive:` lines.
+    public moved_modules: Array<String>;
+    /// The started-passing `moved-runtime:` lines.
+    public moved_members: Array<String>;
+    /// The started-passing `archive:` lines, sorted.
+    public archive_files: Array<String>;
+    /// A started-passing unit-test file with no namespace: its object
+    /// cannot be named, so it cannot be judged.
+    public problems: Array<String>;
+
+    /// The changes `declared` (tests/started-compiling) and `fixed`
+    /// (tests/started-passing) make, in the checkout `repository`.
+    public static of(repository: Path, declared: &Array<Declaration>, fixed: &Array<Declaration>) -> DeclaredChanges {
+        mut changes: DeclaredChanges = DeclaredChanges {
+            names: Array::<String>::new(), units: Array::<Pair<String, String>>::new(),
+            moved_projects: Array::<String>::new(), moved_modules: Array::<String>::new(),
+            moved_members: Array::<String>::new(), archive_files: Array::<String>::new(), problems: Array::<String>::new(),
+        };
+        for (line in declared.iterate_references()) { changes.names.push(line.name.clone()); }
+        mut archive_files: Array<String> = Array::<String>::new();
+        for (line in fixed.iterate_references()) {
+            changes.names.push(line.name.clone());
+            match (Declarations::kind(line.name.as_str())) {
+                DeclarationKind::Unit => {
+                    match (Declarations::unit_object_suffix(repository, line.name.as_str())) {
+                        Option::Some(suffix) => { changes.units.push(Pair::new(line.name.clone(), suffix)); }
+                        Option::None         => {
+                            changes.problems.push(f"{line.name.as_str()}: declared in tests/started-passing but tests/tests/{line.name.as_str()} is not a unit-test file with a namespace");
+                        }
+                    }
+                }
+                DeclarationKind::Moved        => { changes.moved_projects.push(line.name.clone()); }
+                DeclarationKind::MovedArchive => { changes.moved_modules.push(line.name.clone()); }
+                DeclarationKind::MovedRuntime => { changes.moved_members.push(line.name.clone()); }
+                DeclarationKind::Archive      => { archive_files.push(line.name.clone()); }
+                _                             => { }
+            }
+        }
+        changes.archive_files = Text::sorted_distinct(archive_files);
+        return changes;
+    }
+}

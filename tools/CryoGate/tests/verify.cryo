@@ -18,21 +18,25 @@ import std::fs::path::{ Path, PathBuf };
 
 import cryogate::core::host::{ Host };
 import cryogate::core::text::{ Text };
-import cryogate::gates::verify::{ BaselineCensus, BaselineRecord, Compared, DeclaredChanges, Declaration, Declarations,
-                                  DeclarationKind, ObjectComparison, ObjectOwner, RuntimeArchives, RuntimeMember, VerifyJudges };
+import cryogate::verify::comparison::{ Compared, ObjectComparison };
+import cryogate::verify::declarations::{ DeclaredChanges, Declaration, Declarations, DeclarationKind, RuntimeMember };
+import cryogate::verify::judges::{ BaselineCensus, VerifyJudges };
+import cryogate::verify::objects::{ ObjectOwner };
+import cryogate::verify::record::{ BaselineRecord };
+import cryogate::verify::runtime::{ RuntimeArchives };
 import std::encoding::sha256::{ Sha256 };
 
 /// The judges' inputs written as text: a list as names joined by `,`, a
 /// map as `key=value` entries joined by `;`.  Each answers how many
 /// problems its judge finds, as verify.py's self-test counts them.
 type struct Judged {
-    static list(text: Str) -> Array<String> {
+    private static list(text: Str) -> Array<String> {
         mut out: Array<String> = Array::<String>::new();
         for (part in text.split_nonempty(&Str::new(","))) { out.push(String::from_str(part)); }
         return out;
     }
 
-    static map(text: Str) -> HashMap<String, String> {
+    private static map(text: Str) -> HashMap<String, String> {
         mut out: HashMap<String, String> = HashMap::<String, String>::new();
         for (entry in text.split_nonempty(&Str::new(";"))) {
             match (entry.split_once(&Str::new("="))) {
@@ -43,7 +47,7 @@ type struct Judged {
         return out;
     }
 
-    static census(declared: Str, accounted: boolean, unit_failed: i64, negatives_failed: i64, failed: Str,
+    private static census(declared: Str, accounted: boolean, unit_failed: i64, negatives_failed: i64, failed: Str,
                   fixed: Str, namespaces: Str) -> i64 {
         const census: BaselineCensus = BaselineCensus {
             accounted: accounted, unit_failed: unit_failed, negatives_failed: negatives_failed,
@@ -53,7 +57,7 @@ type struct Judged {
         return VerifyJudges::baseline_census(&census, &Judged::list(declared), &Judged::list(fixed), &held).length();
     }
 
-    static unit_moves(file: Str, suffix: Str, a: Str, b: Str) -> i64 {
+    private static unit_moves(file: Str, suffix: Str, a: Str, b: Str) -> i64 {
         mut suffixes: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
         suffixes.push(Pair::new(String::from_str(file), String::from_str(suffix)));
         mut left: HashMap<String, String> = Judged::map(a);
@@ -61,19 +65,19 @@ type struct Judged {
         return VerifyJudges::unit_moves(&suffixes, &left, &right).length();
     }
 
-    static project_moves(names: Str, a: Str, b: Str) -> i64 {
+    private static project_moves(names: Str, a: Str, b: Str) -> i64 {
         mut left: HashMap<String, String> = Judged::map(a);
         mut right: HashMap<String, String> = Judged::map(b);
         return VerifyJudges::project_moves(&Judged::list(names), &left, &right).length();
     }
 
-    static archive_module_moves(names: Str, a: Str, b: Str) -> i64 {
+    private static archive_module_moves(names: Str, a: Str, b: Str) -> i64 {
         mut left: HashMap<String, String> = Judged::map(a);
         mut right: HashMap<String, String> = Judged::map(b);
         return VerifyJudges::archive_module_moves(&Judged::list(names), &left, &right).length();
     }
 
-    static runtime_moves(names: Str, a: Str, b: Str) -> i64 {
+    private static runtime_moves(names: Str, a: Str, b: Str) -> i64 {
         mut left: HashMap<String, String> = Judged::map(a);
         mut right: HashMap<String, String> = Judged::map(b);
         return VerifyJudges::runtime_moves(&Judged::list(names), &left, &right).length();
@@ -81,24 +85,24 @@ type struct Judged {
 
     /// A passing project's record, its warnings (joined by `,`) listed or
     /// not.
-    static project(name: Str, listed: boolean, warnings: Str) -> BaselineRecord {
+    private static project(name: Str, listed: boolean, warnings: Str) -> BaselineRecord {
         mut record: BaselineRecord = BaselineRecord::new(name, Str::new("ok"));
         record.warnings_listed = listed;
         record.warnings = Judged::list(warnings);
         return record;
     }
 
-    static new_warnings(base: Str, tree: Str) -> i64 {
+    private static new_warnings(base: Str, tree: Str) -> i64 {
         return VerifyJudges::new_warnings(&Judged::list(base), &Judged::list(tree)).length();
     }
 
-    static builds(base_exit: i32, base_output: Str, tree_exit: i32, tree_output: Str, fixed: boolean) -> i64 {
+    private static builds(base_exit: i32, base_output: Str, tree_exit: i32, tree_output: Str, fixed: boolean) -> i64 {
         return VerifyJudges::builds(Str::new("p"), base_exit, base_output, tree_exit, tree_output, fixed).length();
     }
 
     /// The records a census run's `lines` (joined by `|`) give `names`,
     /// each as `name=verdict:rows` joined by `;`, in the order of `names`.
-    static records(lines: Str, names: Str, rows: Str) -> String {
+    private static records(lines: Str, names: Str, rows: Str) -> String {
         mut output: Array<String> = Array::<String>::new();
         for (line in lines.split_nonempty(&Str::new("|"))) { output.push(String::from_str(line)); }
         const records: Array<BaselineRecord> = BaselineRecord::of_census(&output, &Judged::list(names),
@@ -114,7 +118,7 @@ type struct Judged {
 /// The checkout the test binary was built in, for the cases that read the
 /// real tree.
 type struct Checkout {
-    static root() -> Result<PathBuf, TestError> {
+    private static root() -> Result<PathBuf, TestError> {
         return match (Host::repository()) {
             Result::Ok(root)    => { Result::Ok(root) }
             Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
@@ -211,7 +215,7 @@ function a_unit_test_file_names_its_object_by_its_namespace() -> Result<(), Test
 /// A comparison over maps written as `Judged::map` text, the populations
 /// in the order tests, examples, stdlib, runtime.
 type struct Comparing {
-    static of(changes: &DeclaredChanges, baseline: Array<Str>, tree: Array<Str>, limit: i64) -> Compared {
+    private static of(changes: &DeclaredChanges, baseline: Array<Str>, tree: Array<Str>, limit: i64) -> Compared {
         mut a: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
         mut b: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
         for (text in baseline.iterate_references()) { a.push(Judged::map(*text)); }
@@ -219,7 +223,7 @@ type struct Comparing {
         return ObjectComparison::against(Str::new("HEAD"), changes, a, b, limit, Str::new("run"));
     }
 
-    static nothing_declared() -> DeclaredChanges {
+    private static nothing_declared() -> DeclaredChanges {
         return DeclaredChanges {
             names: Array::<String>::new(), units: Array::<Pair<String, String>>::new(),
             moved_projects: Array::<String>::new(), moved_modules: Array::<String>::new(),
@@ -227,7 +231,7 @@ type struct Comparing {
         };
     }
 
-    static populations(tests: Str, examples: Str, stdlib: Str, runtime: Str) -> Array<Str> {
+    private static populations(tests: Str, examples: Str, stdlib: Str, runtime: Str) -> Array<Str> {
         mut out: Array<Str> = Array::<Str>::new();
         out.push(tests);
         out.push(examples);
@@ -439,15 +443,15 @@ function a_declared_runtime_member_is_judged_before_the_runtime_is_compared() ->
 /// so the NULs an archive holds are pushed as bytes.
 type struct Archived {
     /// A member's 60-byte header.
-    static header(name: Str, size: i64) -> String {
+    private static header(name: Str, size: i64) -> String {
         return f"{name:<16}                                {size:<10}`\n";
     }
 
-    static push(data: mut &Array<u8>, text: Str) -> void {
+    private static push(data: mut &Array<u8>, text: Str) -> void {
         for (byte in text.as_bytes().iter()) { data.push(byte); }
     }
 
-    static push_nuls(data: mut &Array<u8>, count: i64) -> void {
+    private static push_nuls(data: mut &Array<u8>, count: i64) -> void {
         for (mut i: i64 = 0; i < count; i++) { data.push(0); }
     }
 }
@@ -571,7 +575,7 @@ function a_census_run_records_each_projects_listed_build_warnings() -> Result<()
 
 type struct Fixture {
     /// The declarations as `name=reason` entries joined by `;`, in order.
-    static shown(declarations: &Array<Declaration>) -> String {
+    private static shown(declarations: &Array<Declaration>) -> String {
         mut out: String = String::new();
         for (mut i: i64 = 0; i < declarations.length(); i++) {
             if (i > 0) { out.push(';'); }
@@ -582,12 +586,12 @@ type struct Fixture {
         return out;
     }
 
-    static between(tree: Str, base: Str) -> String {
+    private static between(tree: Str, base: Str) -> String {
         const applied: Array<Declaration> = Declarations::between(tree, base);
         return Fixture::shown(&applied);
     }
 
-    static owner(path: Str) -> String {
+    private static owner(path: Str) -> String {
         return match (ObjectOwner::of(path)) {
             Option::Some(name) => { name }
             Option::None       => { String::from_str(Str::new("<none>")) }

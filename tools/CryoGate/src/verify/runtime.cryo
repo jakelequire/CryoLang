@@ -1,0 +1,143 @@
+///! The runtime population's object list, read from the archives
+///! themselves: the runtime's objects exist only inside its archives, so
+///! verify hashes each archive member.
+
+namespace cryogate::verify::runtime;
+
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::encoding::sha256::{ Sha256 };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::text::{ Text };
+import cryogate::core::tree::{ Tree };
+import cryogate::verify::declarations::{ RuntimeMember };
+
+/// The members of the runtime archives one target's runtime directory
+/// holds, each with the digest of its bytes.
+public type struct RuntimeArchives {
+    /// Each member of the `!<arch>` archive `data`, in archive order, as
+    /// its name and the sha256 of its bytes in lowercase hex, without the
+    /// symbol index (derived from the members' offsets); None when `data`
+    /// is not an archive.  Reads the GNU long-name table and the BSD
+    /// `#1/<length>` names alike.
+    public static members(data: &Slice<u8>) -> Option<Array<Pair<String, String>>> {
+        if (data.length() < 8 || RuntimeArchives::text(data, 0, 8) != Str::new("!<arch>\n")) { return Option::None; }
+        mut members: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        mut names_start: i64 = 0;
+        mut names_end: i64 = 0;
+        mut position: i64 = 8;
+        while (position + 60 <= data.length()) {
+            const header: Str = RuntimeArchives::text(data, position, position + 60);
+            const field: Str = header.byte_substring(48, 58).trim();
+            const size: i64 = if (field.is_empty()) { 0 } else { i64::try_from(field).unwrap_or(-1) };
+            if (size < 0) { return Option::None; }
+            mut start: i64 = position + 60;
+            const end: i64 = if (start + size < data.length()) { start + size } else { data.length() };
+            position = position + 60 + size + (size & 1);
+            mut name: Str = header.byte_substring(0, 16).trim_end();
+            if (name == Str::new("/") || name == Str::new("/SYM64/") || name == Str::new("__.SYMDEF") || name == Str::new("__.SYMDEF SORTED")) {
+                continue;
+            }
+            if (name == Str::new("//")) {
+                names_start = start;
+                names_end = end;
+                continue;
+            }
+            match (name.strip_prefix(&Str::new("#1/"))) {
+                Option::Some(length) => {
+                    const name_end: i64 = start + i64::try_from(length).unwrap_or(0);
+                    name = RuntimeArchives::text(data, start, name_end);
+                    while (!name.is_empty() && name.byte_at(name.length() - 1).unwrap() == 0) { name = name.byte_substring(0, name.length() - 1); }
+                    start = if (name_end < end) { name_end } else { end };
+                }
+                Option::None => {
+                    const reference: Str = name.byte_substring(1, name.length());
+                    if (name.starts_with(&Str::new("/")) && Text::is_digits(reference)) {
+                        const table: Str = RuntimeArchives::text(data, names_start, names_end);
+                        const at: i64 = i64::try_from(reference).unwrap_or(0);
+                        const rest: Str = table.byte_substring(at, table.length());
+                        name = match (rest.find(&Str::new("\n"))) {
+                            Option::Some(line_end) => { rest.byte_substring(0, line_end) }
+                            Option::None           => { return Option::None; }
+                        };
+                    }
+                }
+            }
+            const digest: String = Sha256::digest(data.subslice(start, end)).to_hex();
+            while (name.ends_with(&Str::new("/"))) { name = name.byte_substring(0, name.length() - 1); }
+            members.push(Pair::new(String::from_str(name), digest));
+        }
+        return Option::Some(members);
+    }
+
+    /// `<digest>  runtime/<label>/<NN>-<member>` rows of every member of
+    /// the runtime archives one target's `directory` holds, sorted by path:
+    /// the archive of each configuration built there, labelled by the
+    /// configuration, or, for a runtime built as one archive per tier,
+    /// each `libcryort*.a`, labelled by its name.  `NN` is the member's
+    /// place in its archive, two digits at least.
+    public static rows(directory: Path) -> Result<Array<String>, String> {
+        mut archives: Array<Pair<String, PathBuf>> = Array::<Pair<String, PathBuf>>::new();
+        mut configurations: Array<Str> = Array::<Str>::new();
+        for (configuration in RuntimeMember::configurations().iterate_references()) {
+            if (directory.join(*configuration).as_path().is_directory()) { configurations.push(*configuration); }
+        }
+        if (configurations.is_empty()) {
+            for (name in Tree::names(directory, &Array::<String>::new())?.iterate_references()) {
+                if (name.as_str().starts_with(&Str::new("libcryort")) && name.as_str().ends_with(&Str::new(".a"))) {
+                    archives.push(Pair::new(name.clone(), directory.join(name.as_str())));
+                }
+            }
+        }
+        for (configuration in configurations.iterate_references()) {
+            const home: PathBuf = directory.join(*configuration);
+            mut built: Array<PathBuf> = Array::<PathBuf>::new();
+            for (key in Tree::names(home.as_path(), &Array::<String>::new())?.iterate_references()) {
+                const archive: PathBuf = home.join(key.as_str()).join(Str::new("libcryort.a"));
+                if (archive.as_path().is_file()) { built.push(archive); }
+            }
+            if (built.length() > 1) {
+                return Result::Err(f"{home.as_path().as_str()} holds {built.length()} runtime archives; a run's archives are its own only when none is left over");
+            }
+            if (built.length() == 1) { archives.push(Pair::new(String::from_str(*configuration), built.pop().unwrap())); }
+        }
+        mut digests: HashMap<String, String> = HashMap::<String, String>::new();
+        mut paths: Array<String> = Array::<String>::new();
+        for (archive in archives.iterate_references()) {
+            const data: Array<u8> = match (File::read_bytes(archive.second.as_path())) {
+                Result::Ok(data)   => { data }
+                Result::Err(error) => { return Result::Err(f"cannot read {archive.second.as_path().as_str()}: {error.describe()}"); }
+            };
+            const members: Array<Pair<String, String>> = match (RuntimeArchives::members(data.as_slice())) {
+                Option::Some(members) => { members }
+                Option::None          => { return Result::Err(f"{archive.second.as_path().as_str()} is not an archive"); }
+            };
+            for (mut index: i64 = 0; index < members.length(); index++) {
+                const path: String = f"runtime/{archive.first.as_str()}/{index:02}-{members[index].first.as_str()}";
+                paths.push(path.clone());
+                digests.insert(path, members[index].second.clone());
+            }
+        }
+        mut rows: Array<String> = Array::<String>::new();
+        for (path in Text::sorted_distinct(paths).iterate_references()) {
+            rows.push(f"{digests.get_reference(path).unwrap().as_str()}  {path.as_str()}");
+        }
+        return Result::Ok(rows);
+    }
+
+    /// The bytes `start` to `end` of `data`, cut at its end, as text; empty
+    /// when they are not UTF-8.
+    private static text(data: &Slice<u8>, start: i64, end: i64) -> Str {
+        const last: i64 = if (end < data.length()) { end } else { data.length() };
+        if (start >= last) { return Str::new(""); }
+        return Str::from_utf8(data.subslice(start, last)).unwrap_or(Str::new(""));
+    }
+}
