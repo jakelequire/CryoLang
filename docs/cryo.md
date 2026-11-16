@@ -4132,8 +4132,16 @@ the error's fix writes `move`:
 ```cryo
 const n: i32 = 21;
 const h: thread::JoinHandle<i32> = thread::spawn(move () -> i32 { return n * 2; });
-const r: i32 = h.join();   // 42
+const r: i32 = h.join().unwrap();   // 42
 ```
+
+`join` returns `Result<T, PanicInfo>`. Under the unwinding strategy a panic in
+a thread's body ends that thread, not the process: the thread catches it,
+writes the panic report, and `join` returns `Err` with the panic's message and
+place (the message is the joining thread's copy, valid until it joins another
+panicked thread). `thread::scope` joins every scoped thread and then panics,
+`thread::scope: a scoped thread panicked`, if any of them did. Under
+`--panic=abort` a panic on any thread ends the process.
 
 What the rule does **not** do is make `Send` a safety guarantee:
 
