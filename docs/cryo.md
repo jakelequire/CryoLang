@@ -5204,7 +5204,21 @@ turns a freestanding program's code into a call to a C library function it
 did not write (a byte loop into `memset`), since nothing would answer it.
 
 `![config(no_runtime)]` / `![config(not(no_runtime))]` gate a declaration on the
-freestanding build flag, exactly like the OS atoms (`![config(linux)]`, …).
+freestanding build flag, exactly like the OS atoms (`![config(linux)]`, …), and
+`![config(panic_unwind)]` / `![config(not(panic_unwind))]` on the unwind panic
+strategy.
+
+**The runtime.** Every program links the Cryo runtime: the entry where a
+program starts in Cryo, the panic funnel and check handlers, and for a
+freestanding program its allocator and backtrace.  It is one library, the
+`runtime/` directory beside the compiler and the stdlib, built in three
+configurations - freestanding, hosted under `abort`, hosted under `unwind` -
+whose declarations are gated on the options above.  The compiler that links a
+program builds the configuration the program needs the first time it needs
+it, and keeps it in `runtime/.bin/<triple>/<configuration>/`; the archive is
+rebuilt when the compiler, a runtime source or the target changes.
+`CRYO_RUNTIME` names another runtime source directory to use; one that holds
+no `lib.cryo` is refused.
 
 #### Panic strategies
 

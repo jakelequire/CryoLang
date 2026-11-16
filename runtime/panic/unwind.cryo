@@ -1,14 +1,16 @@
 ///! runtime/panic/unwind — the unwinding panic strategy.
 ///!
-///! Defines the panic funnel `__cryo_panic` (see `../../abi/lang_items.def`) to
+///! Defines the panic funnel `__cryo_panic` (see `../abi/lang_items.def`) to
 ///! RAISE a foreign exception through the shared Itanium `_Unwind_*` Level-1 ABI
 ///! instead of terminating. A panic then unwinds
 ///! the native stack: each frame the compiler marked with a cleanup landing pad
 ///! (`--panic=unwind`, see `compiler .../call_emitter.cryo`) runs its local
 ///! destructors and `resume`s; a `catch_unwind`, or the root catch the compiler
-///! wraps `main` in, stops the unwind and turns the panic into an error. This tier is chosen at LINK time —
-///! callers never change; swapping this archive for `panic/abort` swaps the
-///! strategy.
+///! wraps `main` in, stops the unwind and turns the panic into an error. Every
+///! declaration here is gated `panic_unwind`: only a build compiled to unwind
+///! defines it, and `panic/abort` defines the same symbols for the others.
+///! The runtime has no destructors of its own, so compiling it to unwind adds
+///! no landing pad to the machinery itself.
 ///!
 ///! `__cryo_personality_v0` is the language personality the unwinder calls per
 ///! frame. It parses the GCC `.gcc_except_table` LSDA (which LLVM's backend
@@ -42,6 +44,7 @@ import CryoRt::Sys;
 /// declares `_Unwind_Word private_[6]` (see its `unwind.h`, gated on `__SEH__`).
 /// Declaring only two would let the Windows unwinder write 32 bytes past this
 /// object. Linux simply leaves the tail untouched.
+![config(panic_unwind)]
 type struct UnwindException {
     exception_class:   u64;
     exception_cleanup: i64;
@@ -50,6 +53,7 @@ type struct UnwindException {
 
 /// Vendor exception class, the 8 ASCII bytes "CRYOPAN1", identifying a Cryo
 /// panic to the personality (a foreign exception would carry a different class).
+![config(panic_unwind)]
 const CRYO_EXCEPTION_CLASS: u64 = 0x4352594F50414E31;
 
 /// The in-flight panic's exception object, per thread. The unwinder writes its
@@ -57,7 +61,7 @@ const CRYO_EXCEPTION_CLASS: u64 = 0x4352594F50414E31;
 /// at once must NOT share one object - each needs its own in-flight exception.
 /// `![thread_local]` gives each thread a distinct copy; the host C runtime sets
 /// up the per-thread TLS block for the main thread and every spawned worker.
-![thread_local]
+![thread_local] ![config(panic_unwind)]
 mut g_exn: UnwindException = UnwindException {
     exception_class: 0, exception_cleanup: 0, private_: [0; 6],
 };
@@ -75,21 +79,25 @@ mut g_exn: UnwindException = UnwindException {
 /// leaves. A message longer than the copy holds is cut at a character boundary
 /// and ends in `TRUNCATION_MARKER`; the copy stays valid until the thread's next
 /// panic.
+![config(panic_unwind)]
 const HELD_MESSAGE_CAPACITY: u64 = 1024;
+![config(panic_unwind)]
 const TRUNCATION_MARKER: string = "...";
-![thread_local]
+![thread_local] ![config(panic_unwind)]
 mut held_message: [u8; 1024] = [0; 1024];
-![thread_local]
+![thread_local] ![config(panic_unwind)]
 mut g_panic_loc: Sys::Location = Sys::Location { file: null, line: 0, column: 0, function: null };
 
 /// The thread ending the process after an uncaught panic, or 0 while none is
 /// (`Sys::end_panicking_process`). One record for the whole process, so not
 /// thread-local.
+![config(panic_unwind)]
 mut terminating_thread: u64 = 0;
 
 /// Copy `message` into `held_message`, NUL-terminated. A message that does not
 /// fit keeps as many whole characters as leave room for the marker. Copying
 /// forward from the start makes a message already held copy onto itself.
+![config(panic_unwind)]
 function hold_message(message: string) -> void {
     const limit: u64 = HELD_MESSAGE_CAPACITY - 1;
     mut length: u64 = 0;
@@ -114,6 +122,7 @@ function hold_message(message: string) -> void {
 }
 
 /// The held message as a `string`, for the report and the accessors.
+![config(panic_unwind)]
 function held_message_text() -> string {
     return &held_message[0] as string;
 }
@@ -122,6 +131,7 @@ function held_message_text() -> string {
 /// for the catch about to take it, so `catch_unwind` and
 /// the root report name it as foreign rather than reading what an earlier panic
 /// on this thread left (or nothing).
+![config(panic_unwind)]
 function hold_foreign_exception() -> void {
     hold_message("foreign exception: an unwind not raised by a Cryo panic");
     g_panic_loc = Sys::Location { file: "<foreign code>", line: 0, column: 0, function: null };
@@ -133,8 +143,9 @@ function hold_foreign_exception() -> void {
 // transfers control to a landing pad and never returns to its caller.
 //
 // NOT OS-gated: mingw's libgcc implements these same Level-1 entry points on top
-// of Win64 SEH, so the raise side of this tier is identical on both platforms.
+// of Win64 SEH, so the raise side of this strategy is identical on both platforms.
 // Only the personality's CALLING CONVENTION differs (see below).
+![config(panic_unwind)]
 extern "C" {
     function _Unwind_RaiseException(exception_object: i64) -> i32;
     function _Unwind_GetLanguageSpecificData(context: i64) -> i64;
@@ -149,7 +160,7 @@ extern "C" {
 /// two-phase Itanium protocol and calls `gcc_per` per phase, which is exactly
 /// how libstdc++'s `__gxx_personality_seh0` is built. Resolved from
 /// `libgcc_eh.a`, which the gcc driver already links.
-![config(windows)]
+![config(windows)] ![config(panic_unwind)]
 extern "C" {
     function _GCC_specific_handler(ms_exc: i64, this_frame: i64,
                                    ms_orig_context: i64, ms_disp: i64,
@@ -158,6 +169,7 @@ extern "C" {
 
 /// Read a little-endian ULEB128 from `base[*off]`, advancing `*off` past it.
 /// The LSDA call-site and action tables are ULEB128-encoded.
+![config(panic_unwind)]
 function read_uleb128(base: u8*, off: mut u64*) -> u64 {
     mut result: u64 = 0;
     mut shift:  u64 = 0;
@@ -182,7 +194,7 @@ function read_uleb128(base: u8*, off: mut u64*) -> u64 {
 ///
 /// One implementation for both OSes: the raise side goes through the same
 /// Level-1 ABI either way.
-![no_mangle]
+![no_mangle] ![config(panic_unwind)]
 function __cryo_panic(msg: string, loc: Sys::Location*) -> never {
     // Stash the payload BEFORE raising: the raise transfers control to a
     // landing pad and never returns here, so a root `catch_unwind` reads these
@@ -204,20 +216,20 @@ function __cryo_panic(msg: string, loc: Sys::Location*) -> never {
 
 /// The caught panic's message: the runtime's per-thread copy, valid until this
 /// thread panics again.
-![no_mangle]
+![no_mangle] ![config(panic_unwind)]
 function __cryo_panic_taken_message() -> string { return held_message_text(); }
 
-![no_mangle]
+![no_mangle] ![config(panic_unwind)]
 function __cryo_panic_taken_file() -> string { return g_panic_loc.file; }
 
-![no_mangle]
+![no_mangle] ![config(panic_unwind)]
 function __cryo_panic_taken_line() -> u32 { return g_panic_loc.line; }
 
 /// Write the report of the panic this thread last caught, as the root catch
 /// does, without ending the process: a spawned thread's body reports its
 /// panic when the thread catches it, and the thread that joins it reads the
 /// payload.
-![no_mangle]
+![no_mangle] ![config(panic_unwind)]
 function __cryo_panic_write_report() -> void {
     Sys::write_panic_report(held_message_text(), &g_panic_loc);
 }
@@ -228,7 +240,7 @@ function __cryo_panic_write_report() -> void {
 /// the stashed payload here, then terminate with the panic exit code (101).
 /// Never returns. The intermediate frames' cleanup pads have already run (phase
 /// 2), so all pending destructors executed before this point.
-![no_mangle]
+![no_mangle] ![config(panic_unwind)]
 function __cryo_panic_finish() -> never {
     Sys::write_panic_report(held_message_text(), &g_panic_loc);
     Sys::end_panicking_process(&terminating_thread);
@@ -251,6 +263,7 @@ function __cryo_panic_finish() -> never {
 /// OS-agnostic, and NOT the linked symbol: both `__cryo_personality_v0`
 /// definitions below funnel into this, because the LSDA format LLVM emits is the
 /// same on both targets — only how the unwinder REACHES the personality differs.
+![config(panic_unwind)]
 function cryo_personality_imp(version: i32, actions: i32, exception_class: u64,
                               exception_object: i64, context: i64) -> i32 {
     const URC_FATAL_PHASE1_ERROR: i32 = 3;
@@ -353,7 +366,7 @@ function cryo_personality_imp(version: i32, actions: i32, exception_class: u64,
 /// Linux: LLVM names this as the function's `personality`, and the SysV
 /// unwinder calls it with the Itanium 5-argument signature directly, so this is
 /// a straight forward.
-![no_mangle] ![config(linux)]
+![no_mangle] ![config(linux)] ![config(panic_unwind)]
 function __cryo_personality_v0(version: i32, actions: i32, exception_class: u64,
                                exception_object: i64, context: i64) -> i32 {
     return cryo_personality_imp(version, actions, exception_class,
@@ -366,7 +379,7 @@ function __cryo_personality_v0(version: i32, actions: i32, exception_class: u64,
 /// Itanium signature and hoping is how a personality silently reads garbage
 /// arguments; `_GCC_specific_handler` is the supported bridge, and it drives the
 /// two-phase protocol against `cryo_personality_imp` on our behalf.
-![no_mangle] ![config(windows)]
+![no_mangle] ![config(windows)] ![config(panic_unwind)]
 function __cryo_personality_v0(ms_exc: i64, this_frame: i64,
                                ms_orig_context: i64, ms_disp: i64) -> i32 {
     return _GCC_specific_handler(ms_exc, this_frame, ms_orig_context, ms_disp,
@@ -375,10 +388,10 @@ function __cryo_personality_v0(ms_exc: i64, this_frame: i64,
 
 // --- Check handlers (route raw operands through the funnel) ------------------
 // OS-agnostic: each formats its message and diverges via `__cryo_panic`. Signatures mirror `panic/abort` exactly — the
-// compiler emits the identical call shape regardless of tier.
+// compiler emits the identical call shape regardless of strategy.
 
 /// Index out of bounds: "index <index> out of bounds for length <len>".
-![no_mangle]
+![no_mangle] ![config(panic_unwind)]
 function __cryo_panic_bounds_check(loc: Sys::Location*, index: u64, len: u64) -> never {
     mut buf: [u8; 128];
     mut pos: u64 = 0;
@@ -392,7 +405,7 @@ function __cryo_panic_bounds_check(loc: Sys::Location*, index: u64, len: u64) ->
 
 /// Arithmetic overflow. `op` is a raw operation code (mapping pinned later); the
 /// operands are printed so the failure is distinguishable now.
-![no_mangle]
+![no_mangle] ![config(panic_unwind)]
 function __cryo_panic_overflow(loc: Sys::Location*, op: u32, lhs: u64, rhs: u64) -> never {
     mut buf: [u8; 128];
     mut pos: u64 = 0;
@@ -407,13 +420,13 @@ function __cryo_panic_overflow(loc: Sys::Location*, op: u32, lhs: u64, rhs: u64)
 }
 
 /// Division or remainder by zero (also the `INT_MIN / -1` case).
-![no_mangle]
+![no_mangle] ![config(panic_unwind)]
 function __cryo_panic_div_zero(loc: Sys::Location*) -> never {
     __cryo_panic("attempt to divide by zero", loc);
 }
 
 /// Fell through a non-exhaustive match with no arm for the scrutinee.
-![no_mangle]
+![no_mangle] ![config(panic_unwind)]
 function __cryo_panic_no_match(loc: Sys::Location*) -> never {
     __cryo_panic("no matching pattern (non-exhaustive match)", loc);
 }

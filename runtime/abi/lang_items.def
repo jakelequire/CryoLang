@@ -12,8 +12,8 @@
 # DEFINED-IN is what `scripts/runtime-abi-check.sh` checks against the built
 # archives, so it is a list, not prose: the link KINDS whose runtime must
 # define the symbol - `freestanding`, `hosted`, either narrowed to one OS as
-# `freestanding:linux` - and it must be defined under BOTH panic strategies of
-# each. `import` is a system symbol the runtime calls and never defines;
+# `freestanding:linux` - and `hosted` means both hosted configurations, abort
+# and unwind. `import` is a system symbol the runtime calls and never defines;
 # `compiler` is a name the compiler gives a symbol of its own, listed so that
 # every `__cryo_` spelling in compiler/src is accounted for here (a trailing
 # `*` makes it a prefix). The check also refuses an exported `__cryo_` symbol
@@ -93,8 +93,8 @@ __cryo_argv     | () -> i8**                                | freestanding | DON
 # retargets the entry symbol (`-Wl,-e,__cryo_entry`); it does NOT pass
 # -nostartfiles. Dropping them takes atexit + _pei386_runtime_relocator with
 # them, and each of those is a LINK failure -- `atexit` unconditionally so,
-# because libmingwex references it. `-e` also EXTRACTS the entry from the tier
-# archive: ld enters the entry symbol as an undefined reference.
+# because libmingwex references it. `-e` also EXTRACTS the entry from the
+# runtime archive: ld enters the entry symbol as an undefined reference.
 #
 # Entering past mingw's startup means owning what it would have driven: call
 # _pei386_runtime_relocator (fixes auto-imported DLL *data*; msvcrt's _environ
@@ -117,65 +117,52 @@ __cryo_hosted_start | (argc: i64, argv: i8**) -> never       | hosted:windows | 
 _pei386_runtime_relocator | () -> void  (extern, crt2.o)     | import | (system)
 
 # --- Link line -------------------------------------------------------------
-# The driver composes the tier archives itself; a freestanding program links by
-# `cryo build` alone, with no linker arguments from the user.
-# CodegenPasses::resolve_runtime_lib_dir locates them (CRYO_RUNTIME, then
-# CRYO_HOME, then relative to the compiler binary, then relative to the stdlib),
-# preferring a per-triple SUBDIRECTORY at every candidate -- a project's final
-# artifacts hoist to the root of its output_dir, so building the runtime for a
-# second target overwrites the first target's archives in place, and linking a
-# flat directory can hand the linker another architecture's objects.
+# The runtime is one project (runtime/lib.cryo), built per CONFIGURATION into one
+# archive each: freestanding (`--no-runtime`, which aborts), hosted under abort,
+# hosted under unwind. Its declarations are gated on the build's own options
+# (`no_runtime`, `panic_unwind`), so an archive defines exactly the symbols of
+# its configuration. The compiler that links a program builds that program's
+# configuration on first use (compiler/src/compiler/prebuilt_runtime.cryo),
+# from the runtime source it finds (CRYO_RUNTIME, then CRYO_HOME/runtime, then
+# beside the compiler binary, then beside the stdlib), into
+# `<runtime>/.bin/<triple>/<configuration>/<key>/libcryort.a`.
 #
-# append_runtime_tier_libs fixes the ORDER: alloc, backtrace, core, then the
-# panic tier LAST, because ld resolves left to right and every other tier can
-# reach the panic handlers (core's and backtrace's own formatting helpers carry
-# bounds checks). The tiers' imported system libraries (kernel32/ntdll) follow
-# the archives for the same reason.
-#
-# append_hosted_runtime_libs is its hosted counterpart: core-hosted, then the
-# panic tier, then (windows only) `-Wl,-e,__cryo_entry`. The windows `extra_system_libs`
-# (-lntdll) already follows on both link paths, which the core tier needs for the
-# PEB argv parse.
-#
-# The locator is asked which KIND of tier set it is looking for, because the two
-# ship different archives and a directory holding only the other kind is not a
-# hit. That matters more for hosted than freestanding: `-e` naming a symbol
-# nothing defines is a linker WARNING, so a wrong directory would still produce a
-# binary -- one that starts at whatever address ld defaulted to.
+# A link names that one archive: append_freestanding_runtime_libs follows it
+# with the system libraries it imports (kernel32/ntdll) on Windows, and
+# append_hosted_runtime_libs follows it with (windows only)
+# `-Wl,-e,__cryo_entry`. The windows `extra_system_libs` (-lntdll) already
+# follows on both link paths, which the entry needs for the PEB argv parse.
 
 # --- Panic funnel ----------------------------------------------------------
 # The single divergent sink: print "panicked at <file>:<line>:<column> in
 # <function>: <msg>" to stderr (no column when it is 0, no function when it has
-# no name), then terminate (exit code 101). panic/abort/ DEFINES it, dual-OS.
-# The panic/unwind/ tier redefines the same symbol to unwind instead — chosen at
-# link time, no caller change.
+# no name), then terminate (exit code 101). panic/abort.cryo DEFINES it in the
+# freestanding and hosted-abort configurations, dual-OS; panic/unwind.cryo
+# defines the same symbol to unwind instead in the hosted-unwind one.
 #
-# The tier is built TWICE from the same source. Freestanding it writes with
-# Linux write(2) / Windows WriteFile and exits via exit_group / NtTerminateProcess.
-# Hosted (runtime/hosted/, `no_runtime = false`) it keeps the same write path but
+# Freestanding, abort writes with Linux write(2) / Windows WriteFile and exits
+# via exit_group / NtTerminateProcess. Hosted it keeps the same write path but
 # exits through libc `exit`, which runs atexit handlers and flushes stdio — a raw
 # exit there would silently discard whatever the panicking program had buffered.
 # The divergence lives entirely in CryoRt::Sys; the funnel itself is identical.
 #
 # Codegen is routed here: `emit_panic_call` emits a call to the external
-# `__cryo_panic` for every panic of a program that links a tier, and the link
-# line names exactly one panic tier (`append_hosted_runtime_libs` /
-# `append_runtime_tier_libs`).
+# `__cryo_panic` for every panic, and the link names the one runtime archive
+# of the build's configuration.
 __cryo_panic              | (msg: string, loc: Location*) -> never           | freestanding, hosted | DONE (both strategies, dual-OS; compiler routed)
 
 # --- Unwind surface ---------------------------------------------------------
-# BOTH panic tiers export every symbol below, and differ only in behaviour: that
-# is what makes the strategy a pure link-time swap. The abort tier's copies are
-# reachable-but-inert stubs, present because `libcryo.a` is built ONCE with the
-# default strategy, so an `--panic=abort` program can still be handed stdlib
-# objects that name a personality or the caught-panic accessors. Dropping them
-# from either tier turns a strategy switch into an undefined-symbol link error.
+# BOTH panic strategies export every symbol below, and differ only in
+# behaviour. The abort strategy's copies are reachable-but-inert stubs, present
+# because a program's objects can name a personality or the caught-panic
+# accessors under abort too. Dropping them from either strategy turns a
+# strategy switch into an undefined-symbol link error.
 #
 # `__cryo_personality_v0` is the one lang item whose SIGNATURE is per-OS. Linux
 # names it as the LLVM `personality` and the SysV unwinder calls it with the
 # Itanium 5-argument form. Windows-gnu emits the same symbol into `.xdata` as the
 # frame's language handler, so the OS calls it with the 4-argument SEH form; the
-# unwind tier bridges that to the shared Itanium logic via mingw's
+# unwind strategy bridges that to the shared Itanium logic via mingw's
 # `_GCC_specific_handler`, which is how libstdc++'s `__gxx_personality_seh0`
 # works. Declaring the Itanium form on Windows would read garbage arguments.
 # Emitted by codegen (`ExprOps::get_or_decl_personality`), not hand-typed.
@@ -192,8 +179,8 @@ __cryo_panic_write_report | () -> void                                         |
 # --- Check handlers (route raw operands through the funnel) -----------------
 # Each takes RAW operands (not a pre-formatted string) plus a Location POD
 # ({file,line,column,function}, 24 bytes; see layout.def), formats its own
-# message into a stack buffer, and diverges via __cryo_panic. DEFINED in
-# both panic tiers, dual-OS.
+# message into a stack buffer, and diverges via __cryo_panic. DEFINED by
+# both panic strategies, dual-OS.
 # The compiler emits a call to one of these at every check site in every
 # configuration (ExprOps::emit_check_failure), so a failed check reports the
 # same message under abort, unwind and freestanding; under unwind the call is
@@ -216,12 +203,12 @@ __cryo_panic_no_match     | (loc: Location*) -> never                        | f
 # "'malloc' not declared" -- the language's own heap syntax was unusable.
 #
 # A hosted build keeps the malloc-backed ladder. Repointing it too would make
-# every hosted allocation an mmap/VirtualAlloc (this tier maps once PER
+# every hosted allocation an mmap/VirtualAlloc (the allocator maps once PER
 # ALLOCATION), so a hosted repoint waits on a segment/free-list allocator behind
 # the same symbol.
 #
 # `size` is passed 0 at `delete` sites: the site does not carry the allocation
-# size, and the tier recovers the exact mapping from its own header instead.
+# size, and the allocator recovers the exact mapping from its own header instead.
 __cryo_alloc    | (size: u64, align: u64) -> void*          | freestanding | DONE (runtime def weak dual-OS + compiler funnel, no_runtime)
 __cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | freestanding | DONE (runtime def weak dual-OS + compiler funnel, no_runtime)
 

@@ -109,7 +109,7 @@ The **quick-install** binary is statically linked - it only needs a C compiler o
 | `python3`  | 3.8+               | Drives `make selfhost-check`.                                                                                                                            |
 | `glibc`    | 2.34+              | Floor of the committed pinned `bin/cryo` (Ubuntu 22.04+, Debian 12+, Fedora 35+). The quick-install binary is fully static and has no glibc requirement. |
 
-The pinned `bin/cryo` is an x86-64 Linux ELF dynamically linked against `libLLVM.so.20.1` (plus `libstdc++`, `libffi`, `libedit`, `libxml2`, `libicu`, `libz`, `libzstd`, `liblzma`, and glibc). On Debian/Ubuntu, `apt-get install llvm-20 clang-20` covers the runtime; rebuilding from source additionally needs `llvm-20-dev` (and `libpolly-20-dev` for a `--release-static` build). The first program a compiler builds compiles the standard library into an archive under `stdlib/.bin/` (gitignored) and links it, so a clean checkout needs the build toolchain even when using the pinned binary.
+The pinned `bin/cryo` is an x86-64 Linux ELF dynamically linked against `libLLVM.so.20.1` (plus `libstdc++`, `libffi`, `libedit`, `libxml2`, `libicu`, `libz`, `libzstd`, `liblzma`, and glibc). On Debian/Ubuntu, `apt-get install llvm-20 clang-20` covers the runtime; rebuilding from source additionally needs `llvm-20-dev` (and `libpolly-20-dev` for a `--release-static` build). The first program a compiler builds compiles the standard library into an archive under `stdlib/.bin/` and the runtime into one under `runtime/.bin/` (both gitignored) and links them, so a clean checkout needs the build toolchain even when using the pinned binary.
 
 ---
 
@@ -463,7 +463,7 @@ make test              # run the repo-level test suite
 make lsp               # build the Cryo-language LSP from this tree (bin/cryolsp)
 make install-lsp       # make lsp, check the server, install the VS Code extension
 make pin               # refresh bin/cryo and bin/cryo.exe (host-aware)
-make clean             # remove compiler, stdlib, runtime tier and LSP build outputs
+make clean             # remove compiler, stdlib, runtime and LSP build outputs
 make help              # every target, and what each one changes besides its output
 ```
 
@@ -507,7 +507,7 @@ Source -> Lex -> Parse -> Module Resolution -> Declaration Collection -> Type Re
 | Diagnostics                                                                  | `compiler/src/compiler/diag/`    |
 | CLI                                                                          | `compiler/src/CLI/`              |
 
-The compiler runtime, meaning every intrinsic from `stdlib/core/intrinsics.cryo` plus `format()`, is emitted as LLVM IR by `compiler/src/compiler/codegen/intrinsics_codegen.cryo`. There is no separate runtime library.
+The compiler runtime, meaning every intrinsic from `stdlib/core/intrinsics.cryo` plus `format()`, is emitted as LLVM IR by `compiler/src/compiler/codegen/intrinsics_codegen.cryo`. What a program calls that is not emitted inline - the entry, the panic funnel and the check handlers - is the `runtime/` library, which the compiler builds per configuration on first use.
 
 ---
 

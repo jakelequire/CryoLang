@@ -4,26 +4,40 @@
 # runtime/abi/lang_items.def names every `__cryo_` symbol that crosses the
 # boundary between generated code (or the stdlib) and the runtime, and in its
 # DEFINED-IN column the link kinds whose runtime must define it.  Nothing else
-# ties the three together, so a renamed handler, a tier that stopped
+# ties the three together, so a renamed handler, a configuration that stopped
 # exporting one, or a new call emitted by codegen links or fails only in the
-# configuration that happens to reach it.  This refuses, for every target
-# whose runtime archives are built under runtime/.bin/<triple>/:
+# configuration that happens to reach it.  This builds the runtime in every
+# configuration a link names - freestanding, hosted under abort, hosted under
+# unwind - for the compiler's own target, with the compiler under test, and
+# refuses:
 #
-#   - a registry symbol missing from a link set that must define it - every
-#     link set the driver composes (codegen/passes.cryo), freestanding and
-#     hosted, under both panic strategies;
-#   - a `__cryo_` symbol a link set exports that no registry row names;
+#   - a registry symbol missing from a configuration that must define it;
+#   - a `__cryo_` symbol two members of one configuration's archive define;
+#   - a `__cryo_` symbol a configuration exports that no registry row names;
 #   - a `"__cryo_...` name spelled in compiler/src that no row names (a
 #     runtime symbol, or one of the compiler's own, possibly by prefix);
 #   - a `__cryo_...(` call in stdlib/ that is not a hosted runtime symbol.
 #
-# Usage: scripts/runtime-abi-check.sh            (NM=<nm> to pick the tool)
+# Usage: scripts/runtime-abi-check.sh    (CRYO=<compiler>, default the one
+#                                         compiler/build holds; NM=<nm>)
+# The archives are built under runtime/.bin/<triple>/abi-check/<configuration>/.
 # The verdict is the last line: `runtime-abi-check: OK ...` or `... FAIL ...`.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 REGISTRY="$ROOT/runtime/abi/lang_items.def"
 problems=0
 problem() { echo "  FAIL  $*"; problems=$((problems + 1)); }
+
+CRYO=${CRYO:-}
+if [ -z "$CRYO" ]; then
+    for candidate in "$ROOT/compiler/build/cryo.exe" "$ROOT/compiler/build/cryo"; do
+        if [ -x "$candidate" ]; then CRYO=$candidate; break; fi
+    done
+fi
+if [ -z "$CRYO" ]; then
+    echo "runtime-abi-check: FAIL (no compiler under compiler/build; run make cryo, or set CRYO)"
+    exit 1
+fi
 
 # Every OS's objects are read by one tool: llvm-nm reads ELF and COFF alike,
 # a binutils nm only its own host's format.
@@ -74,62 +88,53 @@ undefined() {
         END { for (s in want) { print (s in have ? "ok " : "missing ") s } }'
 }
 
-# The archives the driver links for one kind and strategy, in its order.
-link_set() {
-    case "$1/$2" in
-        freestanding/abort)  echo "libcryort-alloc.a libcryort-backtrace.a libcryort-core.a libcryort-panic-abort.a" ;;
-        freestanding/unwind) echo "libcryort-alloc.a libcryort-backtrace.a libcryort-core.a libcryort-panic-unwind.a" ;;
-        hosted/abort)        echo "libcryort-core-hosted.a libcryort-panic-abort-hosted.a" ;;
-        hosted/unwind)       echo "libcryort-core-hosted.a libcryort-panic-unwind-hosted.a" ;;
-    esac
-}
-
+triple=$("$CRYO" version --triple | tr -d '\r')
+case "$triple" in
+    *windows*) os=windows ;;
+    *linux*)   os=linux ;;
+    *)         echo "runtime-abi-check: FAIL ($CRYO names its target \"$triple\")"; exit 1 ;;
+esac
 sets=0
 symbols=0
-targets=""
-for dir in "$ROOT"/runtime/.bin/*/; do
-    [ -f "$dir/libcryort-core.a" ] || [ -f "$dir/libcryort-core-hosted.a" ] || continue
-    triple=$(basename "$dir")
-    targets="$targets $triple"
-    case "$triple" in *windows*) os=windows ;; *) os=linux ;; esac
-    # Every archive's global definitions, once, each line led by its
-    # `<archive path>:<member>:`.  A native Windows nm ends its lines CRLF.
-    every=$("$NM" -A -g --defined-only "$dir"libcryort-*.a | tr -d '\r')
-    for kind in freestanding hosted; do
-        for strategy in abort unwind; do
-            archives=$(link_set "$kind" "$strategy")
-            built=0
-            for archive in $archives; do
-                if [ -f "$dir$archive" ]; then
-                    built=$((built + 1))
-                else
-                    problem "$triple $kind/$strategy: $archive is not built"
-                fi
-            done
-            [ "$built" -gt 0 ] || continue
-            sets=$((sets + 1))
-            # The set's definitions: a lower-case type is local, `U` undefined.
-            # The archive is matched by name: a native nm on a Windows shell
-            # prints the path with a drive letter, so `:` does not end it.
-            defined=$(printf '%s\n' "$every" | awk -v set=" $archives " '
-                match($1, /libcryort[^:\/\\]*\.a:/) && NF == 4 && $3 ~ /^[A-TV-Z]$/ {
-                    if (index(set, " " substr($1, RSTART, RLENGTH - 1) " ")) print $4 }' | sort -u)
-            verdicts=$(printf '%s\n--\n%s\n' "$rows" "$defined" | undefined "$kind" "$os")
-            symbols=$((symbols + $(printf '%s\n' "$verdicts" | grep -c .)))
-            for symbol in $(printf '%s\n' "$verdicts" | awk '$1 == "missing" { print $2 }'); do
-                problem "$triple $kind/$strategy: $symbol is registered as defined here, and no archive of the set defines it"
-            done
-            for symbol in $(printf '%s\n--\n%s\n' "$rows" "$(printf '%s\n' "$defined" | grep '^__cryo_')" \
-                            | unregistered '(freestanding|hosted)'); do
-                problem "$triple $kind/$strategy: exports $symbol, which no registry row names"
-            done
-        done
+for configuration in freestanding hosted-abort hosted-unwind; do
+    case "$configuration" in
+        freestanding)  kind=freestanding; option=--no-runtime ;;
+        hosted-abort)  kind=hosted;       option=--panic=abort ;;
+        hosted-unwind) kind=hosted;       option=--panic=unwind ;;
+    esac
+    build="$ROOT/runtime/.bin/$triple/abi-check/$configuration"
+    if ! "$CRYO" build "$ROOT/runtime" --build-dir="$build" --no-incremental "$option"; then
+        problem "$triple $configuration: the runtime does not build"
+        continue
+    fi
+    archive="$build/libcryort.a"
+    if [ ! -f "$archive" ]; then
+        problem "$triple $configuration: the build wrote no $archive"
+        continue
+    fi
+    sets=$((sets + 1))
+    # The configuration's definitions, one line per defining member: a
+    # lower-case type is local, `U` undefined.  A native Windows nm ends its
+    # lines CRLF.
+    members_defining=$("$NM" -g --defined-only "$archive" | tr -d '\r' \
+                       | awk 'NF == 3 && $2 ~ /^[A-TV-Z]$/ { print $3 }')
+    defined=$(printf '%s\n' "$members_defining" | sort -u)
+    # Both panic strategies' modules are in every configuration's build, each
+    # gated on the strategy it implements; a symbol two members define is one
+    # a link takes from whichever member it reaches first.
+    for symbol in $(printf '%s\n' "$members_defining" | grep '^__cryo_' | sort | uniq -d); do
+        problem "$triple $configuration: $symbol is defined by more than one member of the archive"
+    done
+    verdicts=$(printf '%s\n--\n%s\n' "$rows" "$defined" | undefined "$kind" "$os")
+    symbols=$((symbols + $(printf '%s\n' "$verdicts" | grep -c .)))
+    for symbol in $(printf '%s\n' "$verdicts" | awk '$1 == "missing" { print $2 }'); do
+        problem "$triple $configuration: $symbol is registered as defined here, and the archive does not define it"
+    done
+    for symbol in $(printf '%s\n--\n%s\n' "$rows" "$(printf '%s\n' "$defined" | grep '^__cryo_')" \
+                    | unregistered '(freestanding|hosted)'); do
+        problem "$triple $configuration: exports $symbol, which no registry row names"
     done
 done
-if [ "$sets" -eq 0 ]; then
-    echo "runtime-abi-check: FAIL (no runtime archives under runtime/.bin/<triple>/; run make runtime-tiers)"
-    exit 1
-fi
 
 compiler_names=$(grep -rhoE '"__cryo_[A-Za-z0-9_]*' "$ROOT/compiler/src" --include='*.cryo' | tr -d '"' | sort -u)
 for name in $(printf '%s\n--\n%s\n' "$rows" "$compiler_names" | unregistered '.'); do
@@ -140,7 +145,7 @@ for name in $(printf '%s\n--\n%s\n' "$rows" "$stdlib_calls" | unregistered 'host
     problem "stdlib/ calls $name, which is not a hosted runtime symbol in the registry"
 done
 
-summary="$sets link set(s) on$targets, $symbols registered definition(s), $(printf '%s\n' "$compiler_names" | grep -c .) compiler name(s), $(printf '%s\n' "$stdlib_calls" | grep -c .) stdlib call(s), $NM"
+summary="$sets configuration(s) on $triple, $symbols registered definition(s), $(printf '%s\n' "$compiler_names" | grep -c .) compiler name(s), $(printf '%s\n' "$stdlib_calls" | grep -c .) stdlib call(s), $NM"
 if [ "$problems" -gt 0 ]; then
     echo "runtime-abi-check: FAIL ($problems problem(s); $summary)"
     exit 1

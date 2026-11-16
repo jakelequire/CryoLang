@@ -1,16 +1,7 @@
-///! runtime/sys — shared freestanding primitives for the runtime tiers.
-///!
-///! Not a standalone archive: this is shared SOURCE, made importable to every
-///! `[[lib]]` tier via `[project] source_paths = ["sys/src"]` in the workspace
-///! cryoconfig. A tier `import CryoRt::Sys;` and calls `Sys::write_cstr(...)`
-///! etc. — the helper is written once here instead of re-inlined per tier.
-///!
-///! Every function is `![weak]`: because the source is compiled into each tier
-///! that imports it, a program linking several tiers would otherwise see
-///! duplicate definitions of e.g. `Sys::write_cstr`. Weak linkage lets the
-///! linker keep one copy (the definitions are identical). This keeps each tier
-///! archive self-contained (no cross-archive undefined symbols) while the final
-///! link deduplicates.
+///! runtime/sys — the primitives every other runtime module uses: writing to
+///! stderr, formatting into a buffer, ending the process.  A module
+///! `import CryoRt::Sys;` and calls `Sys::write_cstr(...)` etc., so each helper
+///! is written once.
 ///!
 ///! Freestanding: no libc, no stdlib. OS-specific primitives (`rt_write_bytes`,
 ///! `rt_terminate_now`, `current_thread_id`, `park_forever`) are gated `![config(linux)]` / `![config(windows)]`; the
@@ -27,7 +18,7 @@ namespace CryoRt::Sys;
 /// Not gated on `no_runtime`: writing straight to the descriptor is correct in a
 /// hosted build too, and it deliberately bypasses libc's stdio so a panic report
 /// cannot be swallowed by a buffer that never gets flushed.
-![weak] ![config(linux)]
+![config(linux)]
 function rt_write_bytes(buf: i64, len: u64) -> i64 {
     const nr: i64 = 1;   // write
     const fd: i64 = 2;   // stderr
@@ -47,7 +38,7 @@ function rt_write_bytes(buf: i64, len: u64) -> i64 {
 
 /// Terminate the process with `code` via `exit_group` (syscall 231), at once:
 /// no atexit handler or stdio flush runs. Never returns.
-![weak] ![config(linux)]
+![config(linux)]
 function rt_terminate_now(code: i32) -> never {
     ![arch(x86_64, att)]
     ![clobber(rcx, r11, memory)]
@@ -60,7 +51,7 @@ function rt_terminate_now(code: i32) -> never {
 }
 
 /// The calling thread's id (`gettid`, syscall 186); never 0.
-![weak] ![config(linux)]
+![config(linux)]
 function current_thread_id() -> u64 {
     const nr: i64 = 186;
     mut id: i64 = 0;
@@ -76,7 +67,7 @@ function current_thread_id() -> u64 {
 
 /// Block the calling thread for good (`pause`, syscall 34, until a signal; and
 /// again after one).
-![weak] ![config(linux)]
+![config(linux)]
 function park_forever() -> never {
     const nr: i64 = 34;
     mut ret: i64 = 0;
@@ -104,7 +95,7 @@ extern "C" {
 }
 
 /// One write to stderr: the bytes written, or -1 when the write failed.
-![weak] ![config(windows)]
+![config(windows)]
 function rt_write_bytes(buf: i64, len: u64) -> i64 {
     const STD_ERROR_HANDLE: i32 = -12;
     mut written: i32 = 0;
@@ -115,7 +106,7 @@ function rt_write_bytes(buf: i64, len: u64) -> i64 {
 
 /// Terminate the process with `code` at once (`NtTerminateProcess` on the
 /// current process): no atexit handler or stdio flush runs. Never returns.
-![weak] ![config(windows)]
+![config(windows)]
 function rt_terminate_now(code: i32) -> never {
     NtTerminateProcess(-1, code);
     while (true) {}
@@ -123,7 +114,7 @@ function rt_terminate_now(code: i32) -> never {
 
 /// The calling thread's id, read from the TEB's `ClientId.UniqueThread` slot
 /// (`%gs:0x48`); never 0.
-![weak] ![config(windows)]
+![config(windows)]
 function current_thread_id() -> u64 {
     mut id: u64 = 0;
     ![arch(x86_64, att)]
@@ -135,7 +126,7 @@ function current_thread_id() -> u64 {
 }
 
 /// Block the calling thread for good.
-![weak] ![config(windows)]
+![config(windows)]
 function park_forever() -> never {
     const INFINITE: u32 = 0xFFFFFFFF;
     while (true) { Sleep(INFINITE); }
@@ -145,7 +136,7 @@ function park_forever() -> never {
 
 /// Terminate a FREESTANDING process: there is no libc exit path to run, so
 /// this is the raw OS exit.
-![weak] ![config(no_runtime)]
+![config(no_runtime)]
 function rt_exit(code: i32) -> never {
     rt_terminate_now(code);
 }
@@ -163,7 +154,7 @@ extern "C" {
 ///
 /// One definition for both OSes - the difference this covers is libc-vs-raw, not
 /// Linux-vs-Windows.
-![weak] ![config(not(no_runtime))]
+![config(not(no_runtime))]
 function rt_exit(code: i32) -> never {
     exit(code);
     while (true) {}
@@ -171,7 +162,6 @@ function rt_exit(code: i32) -> never {
 
 /// Store `desired` into `*slot` if it holds `expected`, in one atomic step
 /// (`lock cmpxchg`), and return what it held before.
-![weak]
 function compare_exchange(slot: mut u64*, expected: u64, desired: u64) -> u64 {
     const address: i64 = slot as i64;
     mut previous: u64 = 0;
@@ -190,14 +180,13 @@ function compare_exchange(slot: mut u64*, expected: u64, desired: u64) -> u64 {
 /// End the process after a panic's report has been written, with the panic
 /// exit code (101), exactly once whatever else is panicking.
 ///
-/// `terminating_thread` is the panic tier's process-wide record of the thread
+/// `terminating_thread` is the panic strategy's process-wide record of the thread
 /// that is ending the process (0 while none is). The first thread to claim it
 /// exits through `rt_exit`. A later panic on ANOTHER thread has written its
 /// report and parks: the process is already ending, and a second `exit` from
 /// another thread is undefined. A later panic on the SAME thread is one raised
 /// while the first `exit` runs (an atexit handler, a destructor `exit` runs)
 /// and terminates at once, since `exit` must not be re-entered.
-![weak]
 function end_panicking_process(terminating_thread: mut u64*) -> never {
     const PANIC_EXIT_CODE: i32 = 101;
     const this_thread: u64 = current_thread_id();
@@ -210,7 +199,6 @@ function end_panicking_process(terminating_thread: mut u64*) -> never {
 // --- OS-agnostic formatting -------------------------------------------------
 
 /// Length of a NUL-terminated `string` (i8*), excluding the terminator.
-![weak]
 function cstr_len(s: string) -> u64 {
     mut n: u64 = 0;
     while (s[n] != 0) { n = n + 1; }
@@ -218,14 +206,12 @@ function cstr_len(s: string) -> u64 {
 }
 
 /// Write a NUL-terminated `string` (excluding the terminator).
-![weak]
 function write_cstr(s: string) -> void {
     write_all(s as i64, cstr_len(s));
 }
 
 /// Write `v` as decimal ASCII (least-significant-first into a stack buffer,
 /// then the filled suffix in one write).
-![weak]
 function write_u32(v: u32) -> void {
     mut buf: [u8; 10];
     if (v == 0) {
@@ -244,14 +230,12 @@ function write_u32(v: u32) -> void {
 }
 
 /// One hex nibble as ASCII.
-![weak]
 function hex_digit(d: u64) -> u8 {
     if (d < 10) { return (48 + d) as u8; }       // '0'..'9'
     return (97 + (d - 10)) as u8;                // 'a'..'f'
 }
 
 /// Write `v` as `0x` + 16 lowercase hex digits (fixed width, leading zeros).
-![weak]
 function write_hex(v: u64) -> void {
     mut buf: [u8; 18];
     buf[0] = 48;    // '0'
@@ -270,7 +254,6 @@ function write_hex(v: u64) -> void {
 
 /// Append a NUL-terminated `string`'s bytes (excluding the terminator) to
 /// `buf` at `*pos`, advancing `*pos`.
-![weak]
 function append_cstr(buf: mut u8*, pos: mut u64*, s: string) -> void {
     mut i: u64 = 0;
     while (s[i] != 0) {
@@ -281,7 +264,6 @@ function append_cstr(buf: mut u8*, pos: mut u64*, s: string) -> void {
 }
 
 /// Append `v` as decimal ASCII to `buf` at `*pos`, advancing `*pos`.
-![weak]
 function append_u64(buf: mut u8*, pos: mut u64*, v: u64) -> void {
     if (v == 0) {
         buf[*pos] = 48;   // '0'
@@ -321,7 +303,6 @@ type struct Location {
 /// given, and on Linux one a signal interrupts (`-EINTR`) takes none and is
 /// tried again. Any other failure ends the attempt - there is nowhere left to
 /// report it.
-![weak]
 function write_all(buf: i64, len: u64) -> void {
     const EINTR: i64 = -4;
     mut done: u64 = 0;
@@ -335,7 +316,6 @@ function write_all(buf: i64, len: u64) -> void {
 
 /// Append `s`'s bytes to `buf` at `*pos`, stopping one short of `capacity` so
 /// the report's newline always fits.
-![weak]
 function append_report_text(buf: mut u8*, pos: mut u64*, capacity: u64, s: string) -> void {
     mut i: u64 = 0;
     while (s[i] != 0 && *pos + 1 < capacity) {
@@ -350,7 +330,6 @@ function append_report_text(buf: mut u8*, pos: mut u64*, capacity: u64, s: strin
 /// no name. The report is built in one buffer and written as one, so two
 /// threads panicking at once do not interleave their lines; one longer than
 /// the buffer is cut before its newline.
-![weak]
 function write_panic_report(msg: string, loc: Location*) -> void {
     const capacity: u64 = 2048;
     mut report: [u8; 2048];

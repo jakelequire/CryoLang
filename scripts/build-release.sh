@@ -30,10 +30,11 @@
 # ships cryo.exe next to LLVM-C.dll (its runtime dep).
 #
 # Both ship the stdlib archives of the default profiles (release and --dev),
-# built by the shipped compiler under `stdlib/.bin/<triple>/prebuilt/`.  An
-# archive's key is the compiler's bytes, the stdlib's sources and the options,
-# not where the stdlib lives, so an installed compiler links them as they are;
-# any other profile it builds on first use.
+# built by the shipped compiler under `stdlib/.bin/<triple>/prebuilt/`, and the
+# runtime source with the archive of its default configuration (hosted,
+# unwind) under `runtime/.bin/<triple>/`.  An archive's key is the compiler's
+# bytes, the sources and the options, not where they live, so an installed
+# compiler links them as they are; any other it builds on first use.
 
 set -euo pipefail
 
@@ -72,42 +73,20 @@ stage_common() {
     echo "$VER" > "${stage}/VERSION"
 }
 
-stage_runtime_tiers() {
-    # $1 = staging dir, $2 = target triple to build the tiers for.
+stage_runtime() {
+    # $1 = staging dir.  Copies the runtime source, beside the stdlib's.
     #
     # HARD requirement, not an extra: codegen emits a call to the external
-    # `__cryo_panic` for every panic, and the definition comes from a panic tier
-    # archive on the link line.  A distribution without these archives produces a
-    # compiler that cannot link ANY program - it fails on an undefined
-    # `__cryo_panic`.  They go in lib/cryo/<triple>/, which is the
-    # `<bindir>/../lib/cryo` candidate the tier locator already searches, under
-    # the per-triple subdirectory it prefers.
-    #
-    # The hosted CORE tier is checked separately below, because its absence fails
-    # differently and worse: the locator would decline the directory, and a
-    # Windows link would omit both the archive and `-Wl,-e,__cryo_entry`, so the
-    # program would quietly start at mingw's entry rather than fail.
-    local stage="$1" triple="$2"
-    local cryo="${ROOT}/compiler/build/cryo"
-    local dest="${stage}/lib/cryo/${triple}"
-
-    echo "[build-release] building runtime tiers for ${triple}"
-    ( cd "${ROOT}/runtime"        && "$cryo" build --target="$triple" >/dev/null )
-    ( cd "${ROOT}/runtime/hosted" && "$cryo" build --target="$triple" >/dev/null )
-
-    mkdir -p "$dest"
-    local a found=0
-    for a in "${ROOT}"/runtime/.bin/libcryort-*.a; do
-        [ -f "$a" ] || continue
-        cp "$a" "$dest/"; found=1
-    done
-    [ "$found" = 1 ] || { echo "error: no runtime tier archives produced for ${triple}" >&2; exit 1; }
-    [ -f "${dest}/libcryort-panic-abort-hosted.a" ] \
-        || { echo "error: hosted panic tier missing for ${triple} - user programs would not link" >&2; exit 1; }
-    [ -f "${dest}/libcryort-core-hosted.a" ] \
-        || { echo "error: hosted core tier missing for ${triple} - the tier locator would decline this directory" >&2; exit 1; }
-    [ -f "${dest}/libcryort-core.a" ] \
-        || { echo "error: freestanding core tier missing for ${triple}" >&2; exit 1; }
+    # `__cryo_panic` for every panic, and the definition comes from the
+    # runtime archive on the link line, which the compiler builds from these
+    # sources on first use (the `<bindir>/../runtime` it looks in).  A
+    # distribution without them produces a compiler that cannot link ANY
+    # program.  The smoke builds the archive of the default configuration,
+    # and it ships beside the sources (smoke_stage).
+    local stage="$1"
+    [ -f "${ROOT}/runtime/lib.cryo" ] || { echo "error: no runtime source at ${ROOT}/runtime" >&2; exit 1; }
+    mkdir -p "${stage}/runtime"
+    ( cd "${ROOT}/runtime" && tar --exclude='.bin' -cf - . ) | ( cd "${stage}/runtime" && tar -xf - )
 }
 
 smoke_stage() {
@@ -145,23 +124,36 @@ smoke_stage() {
             exit 1
         fi
     fi
-    # The first smoke builds the stdlib archives of the default profiles with
-    # the staged compiler; they ship.  The second runs from a copy of the tree
-    # in another directory, as an install is, and must link them as shipped:
-    # an archive it rebuilt, or one more, is one every installed compiler
-    # would build again.
-    rm -rf "${stage}/stdlib/.bin"
+    # The first smoke builds the stdlib archives of the default profiles, and
+    # the runtime archive of the default configuration, with the staged
+    # compiler; they ship.  The second runs from a copy of the tree in another
+    # directory, as an install is, and must link them as shipped: an archive
+    # it rebuilt, or one more, is one every installed compiler would build
+    # again.
+    rm -rf "${stage}/stdlib/.bin" "${stage}/runtime/.bin"
     env "${smoke_env[@]}" bash "${ROOT}/scripts/release-smoke.sh" "$stage" "$exe" "${runner[@]}"
     trim_stdlib_archives "$stage"
+    trim_runtime_archives "$stage"
     local moved="${stage}.moved" shipped
     rm -rf "$moved"
     cp -R "$stage" "$moved"
-    shipped="$(cd "${stage}/stdlib" && find .bin -type f | sort | xargs sha256sum)"
+    shipped="$(cd "$stage" && find stdlib/.bin runtime/.bin -type f | sort | xargs sha256sum)"
     env "${smoke_env[@]}" bash "${ROOT}/scripts/release-smoke.sh" "$moved" "$exe" "${runner[@]}"
-    find "${moved}/stdlib/.bin" -name last-use -delete
-    [ "$shipped" = "$(cd "${moved}/stdlib" && find .bin -type f | sort | xargs sha256sum)" ] \
-        || { echo "error: a copy of the staged tree elsewhere did not link the shipped stdlib archives as they are" >&2; exit 1; }
+    find "${moved}/stdlib/.bin" "${moved}/runtime/.bin" -name last-use -delete
+    [ "$shipped" = "$(cd "$moved" && find stdlib/.bin runtime/.bin -type f | sort | xargs sha256sum)" ] \
+        || { echo "error: a copy of the staged tree elsewhere did not link the shipped stdlib and runtime archives as they are" >&2; exit 1; }
     rm -rf "$moved"
+}
+
+trim_runtime_archives() {
+    # $1 = staging dir.  Keeps what a program's link reads from each runtime
+    # archive directory: the archive and its manifest.
+    local stage="$1" home
+    for home in "${stage}"/runtime/.bin/*/*/*/; do
+        [ -f "${home}runtime.manifest" ] || { echo "error: ${home} holds no runtime manifest" >&2; exit 1; }
+        find "$home" -type f ! -name libcryort.a ! -name runtime.manifest -delete
+        find "$home" -type d -empty -delete
+    done
 }
 
 trim_stdlib_archives() {
@@ -241,7 +233,7 @@ build_linux() {
     fi
 
     stage_common "$stage"
-    stage_runtime_tiers "$stage" "x86_64-unknown-linux-gnu"
+    stage_runtime "$stage"
 
     if host_is linux; then smoke_stage "$stage" "cryo" 0; else smoke_stage "$stage" "cryo" 1; fi
 
@@ -272,7 +264,7 @@ build_windows() {
     cp "$clang_dll" "${stage}/bin/libclang.dll"
 
     stage_common "$stage"
-    stage_runtime_tiers "$stage" "x86_64-pc-windows-gnu"
+    stage_runtime "$stage"
 
     if host_is windows; then
         smoke_stage "$stage" "cryo.exe" 0

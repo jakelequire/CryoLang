@@ -1,0 +1,228 @@
+///! The runtime, compiled once per configuration and linked by every program.
+///!
+///! The runtime is one project (`runtime/`, see its `lib.cryo`) whose
+///! declarations are gated on the build's own options, so the configuration
+///! a program links is the project built with that program's kind of link:
+///! freestanding, or hosted under the program's panic strategy.  Each is
+///! built by the compiler that links it, on first use, into
+///! `<runtime root>/.bin/<triple>/<configuration>/<key>/libcryort.a`; the key
+///! is the compiler's own bytes, every runtime source by its path below the
+///! root, the target and the configuration, so a change to any of them names
+///! a directory that does not exist yet (`PrebuiltCache`).
+
+namespace compiler::prebuilt_runtime;
+
+import compiler::build_manifest::{ ContentHasher, Manifest };
+import compiler::prebuilt_cache::{ PrebuiltCache };
+import std::fmt;
+import std::env;
+import std::core::hash::{ Hasher };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::process::command::{ Command };
+
+const MANIFEST_NAME:   string = "runtime.manifest";
+const MANIFEST_FORMAT: string = "cryo-runtime-manifest 1";
+const ARCHIVE_NAME:    string = "libcryort.a";
+
+/// Which build of the runtime a link needs.
+type enum RuntimeConfiguration {
+    /// No libc: the runtime's own entry, allocator and backtrace; a panic
+    /// aborts.
+    Freestanding;
+    /// Linked beside libc; a panic reports and ends the process.
+    HostedAbort;
+    /// Linked beside libc; a panic unwinds.
+    HostedUnwind;
+}
+
+implement enum RuntimeConfiguration {
+    /// The configuration a build with these options links.  A freestanding
+    /// build always aborts.
+    static of(freestanding: boolean, unwinds: boolean) -> RuntimeConfiguration {
+        if (freestanding) { return RuntimeConfiguration::Freestanding; }
+        if (unwinds) { return RuntimeConfiguration::HostedUnwind; }
+        return RuntimeConfiguration::HostedAbort;
+    }
+
+    /// The configuration's directory name below `.bin/<triple>/`.
+    name(&this) -> string {
+        return match (this) {
+            RuntimeConfiguration::Freestanding => { "freestanding" }
+            RuntimeConfiguration::HostedAbort  => { "hosted-abort" }
+            RuntimeConfiguration::HostedUnwind => { "hosted-unwind" }
+        };
+    }
+
+    /// The option that builds the runtime project as this configuration.
+    build_option(&this) -> string {
+        return match (this) {
+            RuntimeConfiguration::Freestanding => { "--no-runtime" }
+            RuntimeConfiguration::HostedAbort  => { "--panic=abort" }
+            RuntimeConfiguration::HostedUnwind => { "--panic=unwind" }
+        };
+    }
+}
+
+type struct PrebuiltRuntime {
+    directory: string;
+    key:       string;
+
+    /// The key of the archive of `configuration` for `triple`: every input
+    /// that decides its bytes.  The root's own spelling is no input.
+    static key_of(root: string, triple: string, configuration: RuntimeConfiguration) -> string {
+        mut h: ContentHasher = ContentHasher::new();
+        h.fold(MANIFEST_FORMAT);
+        h.fold(Manifest::compiler_fingerprint());
+        h.fold(triple);
+        h.fold(configuration.name());
+        PrebuiltCache::fold_sources(&h, Str::new(root), Str::new(""));
+        return Manifest::hex128(h.finish128());
+    }
+
+    /// The directory the archive with `key` lives in.
+    static directory_for(root: string, triple: string, configuration: RuntimeConfiguration,
+                         key: string) -> string {
+        return Path::from(root).join(".bin").join(triple).join(configuration.name()).join(key).into_raw();
+    }
+
+    /// The archive a link names.
+    archive(&this) -> PathBuf {
+        return Path::from(this.directory).join(ARCHIVE_NAME);
+    }
+
+    /// The archive in `directory`, when its manifest reads and records `key`.
+    static open(directory: string, key: string) -> Option<PrebuiltRuntime> {
+        const text: String = match (File::read_text(Path::from(directory).join(MANIFEST_NAME).as_path())) {
+            Result::Ok(t)  => { t }
+            Result::Err(_) => { return Option::None; }
+        };
+        mut lines: [Str] = [];
+        for (line in text.as_str().lines()) { lines.push(line); }
+        if (lines.length() < 2 || lines[0] != Str::new(MANIFEST_FORMAT)
+                || lines[1] != f"key {key}".as_str()) {
+            return Option::None;
+        }
+        const found: PrebuiltRuntime = PrebuiltRuntime { directory: directory, key: key };
+        if (!found.archive().as_path().exists()) { return Option::None; }
+        return Option::Some(found);
+    }
+
+    /// The archive of `configuration` for `triple`: opened when it exists,
+    /// built by running the runtime's build with this compiler when it does
+    /// not.  `warnings_as_errors` reaches only an archive this call builds:
+    /// it is not in the key.
+    static ensure(root: string, triple: string, configuration: RuntimeConfiguration,
+                  warnings_as_errors: boolean) -> Result<PrebuiltRuntime, String> {
+        const key: string = PrebuiltRuntime::key_of(root, triple, configuration);
+        const directory: string = PrebuiltRuntime::directory_for(root, triple, configuration, key);
+        match (PrebuiltRuntime::open(directory, key)) {
+            Option::Some(found) => {
+                PrebuiltCache::record_use(found.directory);
+                return Result::Ok(found);
+            }
+            Option::None => { }
+        }
+        const cache: PrebuiltCache = PrebuiltCache::new(directory, key, MANIFEST_NAME, "the runtime archive");
+        const must_build: boolean = match (cache.take_lock()) {
+            Result::Ok(held)    => { held }
+            Result::Err(reason) => { return Result::Err(reason); }
+        };
+        if (must_build) {
+            const failure: String = PrebuiltRuntime::build(&cache, root, triple, configuration,
+                                                           warnings_as_errors);
+            cache.unlock();
+            if (failure.length() > 0) {
+                return Result::Err(failure);
+            }
+        }
+        match (PrebuiltRuntime::open(directory, key)) {
+            Option::Some(found) => {
+                PrebuiltCache::record_use(found.directory);
+                if (must_build) { cache.prune(); }
+                return Result::Ok(found);
+            }
+            Option::None => { }
+        }
+        return Result::Err(f"the runtime archive built in {directory} does not record the key {key} this build asked for");
+    }
+
+    /// Run the runtime's build into the cache's directory, under its lock,
+    /// then publish its manifest.  Answers the failure, or an empty string.
+    static build(cache: &PrebuiltCache, root: string, triple: string,
+                 configuration: RuntimeConfiguration, warnings_as_errors: boolean) -> String {
+        mut command: Command = match (cache.command_for()) {
+            Result::Ok(c)       => { c }
+            Result::Err(reason) => { return reason; }
+        };
+        command.argument(Str::new("build"));
+        command.argument(Str::new(root));
+        command.argument(fmt::format("--build-dir=%s", cache.directory).as_str());
+        command.argument(Str::new("--no-incremental"));
+        command.argument(Str::new(configuration.build_option()));
+        command.argument(fmt::format("--target=%s", triple).as_str());
+        if (warnings_as_errors) { command.argument(Str::new("-Werror")); }
+        const failure: String = cache.build_with(&command);
+        if (failure.length() > 0) {
+            return failure;
+        }
+        if (!Path::from(cache.directory).join(ARCHIVE_NAME).as_path().exists()) {
+            return f"building the runtime archive in {cache.directory} wrote no {ARCHIVE_NAME}";
+        }
+        const text: String = f"{MANIFEST_FORMAT}\nkey {cache.key}\noptions {triple} {configuration.name()}\n";
+        return cache.publish(&text);
+    }
+
+    /// The runtime's source root: the first candidate holding a `lib.cryo`,
+    /// as its canonical path, or "" when none does.  `$CRYO_RUNTIME` names
+    /// one outright, and one that holds no runtime is refused rather than
+    /// passed over; then the install root (`$CRYO_HOME/runtime`), the
+    /// directory beside the running compiler's (`<bindir>/../runtime`, and
+    /// `<bindir>/../../runtime` for `compiler/build/cryo`), and the one
+    /// beside the stdlib.
+    static locate_root(stdlib_root: string) -> Result<String, String> {
+        match (env::var(Str::new("CRYO_RUNTIME"))) {
+            Option::Some(named) => {
+                if (!Path::from(named.as_str()).join("lib.cryo").as_path().exists()) {
+                    return Result::Err(f"CRYO_RUNTIME names {named}, which holds no runtime source tree (no lib.cryo)");
+                }
+                return Result::Ok(PrebuiltRuntime::canonical(named));
+            }
+            Option::None => { }
+        }
+        mut candidates: [PathBuf] = [];
+        match (env::var(Str::new("CRYO_HOME"))) {
+            Option::Some(home) => { candidates.push(Path::from(home.as_str()).join("runtime")); }
+            Option::None       => { }
+        }
+        const self_exe: String = env::current_executable().unwrap_or(String::new());
+        match (Path::from(self_exe.as_str()).parent()) {
+            Option::Some(bindir) => {
+                candidates.push(bindir.join("../runtime"));
+                candidates.push(bindir.join("../../runtime"));
+            }
+            Option::None => { }
+        }
+        if (stdlib_root.length() > 0) {
+            candidates.push(Path::from(stdlib_root).join("../runtime"));
+        }
+        for (mut i: i64 = 0; i < candidates.length(); i++) {
+            if (candidates[i].as_path().join("lib.cryo").as_path().exists()) {
+                return Result::Ok(PrebuiltRuntime::canonical(String::from_str(candidates[i].as_path().as_str())));
+            }
+        }
+        return Result::Ok(String::new());
+    }
+
+    /// `root` canonicalized: its archives' directories are spelled from it.
+    /// The search proved it exists, so only a path past the platform's length
+    /// limit fails here, and that one keeps its spelling.
+    static canonical(root: String) -> String {
+        return match (Path::from(root.as_str()).canonicalize()) {
+            Result::Ok(found) => { String::from_str(found.as_path().as_str()) }
+            Result::Err(_)    => { root }
+        };
+    }
+}

@@ -409,22 +409,16 @@ type struct CodegenPasses {
         }
     }
 
-    /// Append the runtime tiers a HOSTED link needs, plus, on Windows, the
+    /// Append the runtime archive a HOSTED link needs, plus, on Windows, the
     /// entry override that makes the program start in Cryo.  Placed after
-    /// the user objects and the stdlib archive so the tiers resolve their
+    /// the user objects and the stdlib archive so the runtime resolves their
     /// undefined `__cryo_panic` (and, under unwind, `__cryo_personality_v0`).
     ///
-    /// The core tier comes first and the panic tier last, for the same
-    /// left-to-right reason `append_runtime_tier_libs` orders them that way: the
-    /// core tier's own formatting helpers carry bounds checks, and a bounds
-    /// check calls into the panic tier.
-    ///
-    /// Both are the `-hosted` builds rather than the freestanding ones: the two
-    /// builds differ in how they terminate, and only the hosted build exits
-    /// through libc `exit`, which flushes the program's buffered stdio.  Linking
-    /// a freestanding archive here would silently discard anything the program
-    /// had printed — and that applies to unwind too, since an uncaught panic
-    /// still terminates (through `__cryo_panic_finish`).
+    /// It is a hosted build of the runtime rather than the freestanding one:
+    /// the two differ in how they terminate, and only the hosted build exits
+    /// through libc `exit`, which flushes the program's buffered stdio.  That
+    /// applies to unwind too, since an uncaught panic still terminates
+    /// (through `__cryo_panic_finish`).
     ///
     /// A Linux program starts where glibc's does: crt1's `_start` calls
     /// `__libc_start_main`, which runs the initializer arrays once, registers
@@ -444,8 +438,8 @@ type struct CodegenPasses {
     /// the entry point.  A `--release-static` link keeps the toolchain's entry
     /// on every target.
     ///
-    /// On Windows the core tier reaches ntdll — argv is parsed out of the PEB by
-    /// the same code the freestanding tier uses, which sizes its vector with
+    /// On Windows the entry reaches ntdll — argv is parsed out of the PEB by
+    /// the same code the freestanding entry uses, which sizes its vector with
     /// `RtlAllocateHeap`, and mingw's default library line stops at kernel32.
     /// No `-lntdll` is added here because the windows `extra_system_libs` already
     /// carries it and both link paths append that AFTER these archives, which is
@@ -462,10 +456,7 @@ type struct CodegenPasses {
                                       triple_text: string, link_cfg: LinkerConfig*,
                                       probe_log: Path) -> void {
         const triple: string = triple_text;
-        const archives: [PathBuf] = CodegenPasses::runtime_archives(ctx, triple_text, false);
-        if (archives.length() == 0) {
-            return;
-        }
+        const archives: [PathBuf] = CodegenPasses::runtime_archives(ctx);
         for (mut i: i64 = 0; i < archives.length(); i++) {
             cmd.push(Str::new(" "));
             cmd.push(CodegenPasses::link_quote(archives[i].as_path().as_str()));
@@ -503,139 +494,16 @@ type struct CodegenPasses {
         }
     }
 
-    /// A directory holds the runtime tiers when the base tier archive for the
-    /// link KIND is in it.  The two kinds ship different archives, so asking the
-    /// wrong question picks a directory that cannot satisfy the link: a hosted
-    /// link that settled for a freestanding-only directory would name an entry
-    /// symbol nothing defines, and `-e` on a missing symbol is a linker WARNING
-    /// — the binary still links, and starts at whatever address ld defaulted to.
-    static runtime_dir_has_core(dir_text: string, hosted: boolean) -> boolean {
-        const dir: string = dir_text;
-        const base: string = match (hosted) {
-            true  => { "libcryort-core-hosted.a" }
-            false => { "libcryort-core.a" }
-        };
-        const archive: PathBuf = Path::from(dir).join(base);
-        return archive.as_path().exists();
-    }
-
-    /// Prefer `<dir>/<triple>`, fall back to `<dir>`, else "".  Always returns a
-    /// freshly allocated path: callers build candidates from borrowed env-var
-    /// views that drop at the end of their match arm.
-    static runtime_dir_pick(dir_text: string, triple_text: string, hosted: boolean) -> string {
-        const dir: string = dir_text;
+    /// Append the runtime archive, plus the system libraries it imports, to a
+    /// freestanding link command.  The system libraries follow the archive
+    /// because ld resolves left to right: the runtime imports
+    /// `NtTerminateProcess`/`RtlVirtualUnwind` (ntdll) and
+    /// `WriteFile`/`VirtualAlloc` (kernel32), so naming those first would
+    /// leave its references unresolved.
+    static append_freestanding_runtime_libs(ctx: CompilationContext*, cmd: mut &String,
+                                            triple_text: string) -> void {
         const triple: string = triple_text;
-        const per_target: string = Path::from(dir).join(triple).into_raw();
-        if (CodegenPasses::runtime_dir_has_core(per_target, hosted)) {
-            return per_target;
-        }
-        if (CodegenPasses::runtime_dir_has_core(dir_text, hosted)) {
-            return fmt::format("%s", dir).into_raw();
-        }
-        return "";
-    }
-
-
-    /// Locate the directory holding the runtime tier archives for `triple`, or
-    /// "" when none can be found (the caller then links no tiers, exactly as
-    /// before this locator existed).
-    ///
-    /// The priority chain mirrors `resolve_stdlib_root`'s so an installed
-    /// toolchain resolves as readily as a dev tree, and every candidate prefers
-    /// a per-triple SUBDIRECTORY over a flat one.  That preference is load
-    /// bearing, not defensive: a project's final artifacts are hoisted to the
-    /// root of its `output_dir`, so building the runtime workspace for a second
-    /// target overwrites the first target's archives in place.  Linking a flat
-    /// directory therefore risks handing the linker another architecture's
-    /// objects, which fails as a pile of undefined symbols that look like a
-    /// runtime bug.  The flat fallback is what a single-target tree looks like.
-    ///
-    /// `hosted` selects WHICH tier set the caller needs; a directory that holds
-    /// only the other kind is not a hit (see `runtime_dir_has_core`).
-    static resolve_runtime_lib_dir(ctx: CompilationContext*, triple_text: string,
-                                   hosted: boolean) -> string {
-        // 0. Explicit override, for a runtime built somewhere else entirely.
-        match (env::var(Str::new("CRYO_RUNTIME"))) {
-            Option::Some(v) => {
-                mut s: String = v;
-                const hit: string = CodegenPasses::runtime_dir_pick(
-                    s.as_c_string() as string, triple_text, hosted);
-                if (hit.length() > 0) { return hit; }
-            }
-            Option::None => {}
-        }
-        // 1. Install root.  install.sh writes CRYO_HOME into the user's shell
-        //    rc; the tiers ship beside the other target libraries.
-        match (env::var(Str::new("CRYO_HOME"))) {
-            Option::Some(v) => {
-                mut s: String = v;
-                const home: Path = Path::from(s.as_c_string() as string);
-                const hit_lib: string = CodegenPasses::runtime_dir_pick(
-                    home.join("lib/cryo").into_raw(), triple_text, hosted);
-                if (hit_lib.length() > 0) { return hit_lib; }
-                const hit_rt: string = CodegenPasses::runtime_dir_pick(
-                    home.join("runtime/.bin").into_raw(), triple_text, hosted);
-                if (hit_rt.length() > 0) { return hit_rt; }
-            }
-            Option::None => {}
-        }
-        // 2. Beside the running compiler.  This is the candidate that carries
-        //    the common case: a freestanding project sets `no_std`, which means
-        //    no stdlib root is ever resolved, so the stdlib-relative candidate
-        //    below cannot fire for exactly the projects that need the tiers.
-        //    `<bin>/../lib/cryo` is the install layout; the two dev-tree depths
-        //    cover `bin/cryo` and `compiler/build/cryo`.
-        mut self_exe: string = "";
-        match (env::current_executable()) {
-            Option::Some(s) => { self_exe = s.into_raw(); }
-            Option::None    => {}
-        }
-        match (Path::from(self_exe).parent()) {
-            Option::Some(bindir) => {
-                const hit_inst: string = CodegenPasses::runtime_dir_pick(
-                    bindir.join("../lib/cryo").into_raw(), triple_text, hosted);
-                if (hit_inst.length() > 0) { return hit_inst; }
-                const hit_dev: string = CodegenPasses::runtime_dir_pick(
-                    bindir.join("../runtime/.bin").into_raw(), triple_text, hosted);
-                if (hit_dev.length() > 0) { return hit_dev; }
-                const hit_dev2: string = CodegenPasses::runtime_dir_pick(
-                    bindir.join("../../runtime/.bin").into_raw(), triple_text, hosted);
-                if (hit_dev2.length() > 0) { return hit_dev2; }
-            }
-            Option::None => {}
-        }
-        // 3. Beside the resolved stdlib.  Covers an install that keeps the two
-        //    together but places neither relative to the binary.
-        if (ctx.options.stdlib_root.length() > 0) {
-            const hit: string = CodegenPasses::runtime_dir_pick(
-                Path::from(ctx.options.stdlib_root).join("../runtime/.bin").into_raw(), triple_text, hosted);
-            if (hit.length() > 0) { return hit; }
-        }
-        return "";
-    }
-
-    /// Append the runtime tier archives, plus the system libraries they import,
-    /// to a freestanding link command.
-    ///
-    /// Order matters and is not arbitrary: ld resolves left to right, so a tier
-    /// must precede whatever satisfies its undefined symbols.  The panic tier
-    /// goes LAST because every other tier can reach it — `core`'s and
-    /// `backtrace`'s own formatting helpers carry bounds checks, and a bounds
-    /// check calls `__cryo_panic_bounds_check`.  WHICH panic archive lands here
-    /// is the panic strategy; that is the entire reason the tiers ship as
-    /// separate archives rather than one.
-    ///
-    /// The system libraries follow the archives for the same reason: the tiers
-    /// import `NtTerminateProcess`/`RtlVirtualUnwind` (ntdll) and
-    /// `WriteFile`/`VirtualAlloc` (kernel32), so naming those first would leave
-    /// the tiers' references unresolved.
-    static append_runtime_tier_libs(ctx: CompilationContext*, cmd: mut &String,
-                                     triple_text: string) -> void {
-        const triple: string = triple_text;
-        const archives: [PathBuf] = CodegenPasses::runtime_archives(ctx, triple_text, true);
-        if (archives.length() == 0) {
-            return;
-        }
+        const archives: [PathBuf] = CodegenPasses::runtime_archives(ctx);
         for (mut i: i64 = 0; i < archives.length(); i++) {
             cmd.push(Str::new(" "));
             cmd.push(CodegenPasses::link_quote(archives[i].as_path().as_str()));
@@ -645,34 +513,15 @@ type struct CodegenPasses {
         }
     }
 
-    /// The runtime tier archives a link for `triple` names, in link order:
-    /// for a `freestanding` link the allocator, backtrace, core and panic
-    /// tiers, for a hosted one the hosted core and panic tiers; the panic tier
-    /// is the build's strategy's. Empty when no runtime directory is found.
-    /// The link names exactly these, and the whole-build fingerprint folds
-    /// their bytes, so a rebuilt runtime relinks a program built against the
-    /// one before.
-    static runtime_archives(ctx: CompilationContext*, triple_text: string,
-                            freestanding: boolean) -> [PathBuf] {
+    /// The runtime archives a link names: the one archive of the build's
+    /// configuration (`PrebuiltRuntime`), or none for a build that links
+    /// nothing.  The link names exactly these, and the whole-build
+    /// fingerprint folds their bytes, so a rebuilt runtime relinks a program
+    /// built against the one before.
+    static runtime_archives(ctx: CompilationContext*) -> [PathBuf] {
         mut archives: [PathBuf] = [];
-        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple_text, !freestanding);
-        if (lib_dir.length() == 0) {
-            return archives;
-        }
-        const directory: Path = Path::from(lib_dir);
-        const unwinds: boolean = ctx.options.unwinds();
-        const names: [string] = match (freestanding) {
-            true => {
-                ["libcryort-alloc.a", "libcryort-backtrace.a", "libcryort-core.a",
-                 if (unwinds) { "libcryort-panic-unwind.a" } else { "libcryort-panic-abort.a" }]
-            }
-            false => {
-                ["libcryort-core-hosted.a",
-                 if (unwinds) { "libcryort-panic-unwind-hosted.a" } else { "libcryort-panic-abort-hosted.a" }]
-            }
-        };
-        for (mut i: i64 = 0; i < names.length(); i++) {
-            archives.push(directory.join(names[i]));
+        if (ctx.runtime_archive.length() > 0) {
+            archives.push(PathBuf::from(ctx.runtime_archive.as_str()));
         }
         return archives;
     }
@@ -948,7 +797,7 @@ type struct CodegenPasses {
         // pre-declaration pass.
 
         // No runtime helper is emitted per-module any more.  A panic calls the
-        // external `__cryo_panic` supplied by the linked panic tier (see
+        // external `__cryo_panic` supplied by the linked runtime (see
         // `emit_panic_call`), and formatting is `fmt::format`, an ordinary
         // stdlib function resolved and linked like any other.
 
@@ -1475,9 +1324,10 @@ type struct CodegenPasses {
         //     runtime's `_start` (the mingw default, `mainCRTStartup`, was
         //     dropped with crt0).  Not `-static`: ntdll is always a DLL,
         //     reached through its import library.  The import libraries
-        //     themselves are named by `append_runtime_tier_libs`, AFTER the
-        //     tier archives that reference them — naming them here would put
-        //     them ahead of those references, which ld would not resolve.
+        //     themselves are named by `append_freestanding_runtime_libs`,
+        //     AFTER the runtime archive that references them — naming them
+        //     here would put them ahead of those references, which ld would
+        //     not resolve.
         if (cfg.no_runtime) {
             if (effective_triple.contains("windows")) {
                 cmd.push(Str::new(" -nostartfiles -nostdlib -Wl,-e,_start"));
@@ -1537,13 +1387,12 @@ type struct CodegenPasses {
             cmd.push(Str::new(llvm_static));
         }
         // A freestanding link has no libc to satisfy the panic/alloc/backtrace
-        // lang items, so the tier archives ARE the runtime and must all be on
-        // the line.  A hosted link takes its allocator from libc, but still
-        // needs the panic funnel (every panic calls the external `__cryo_panic`,
-        // so exactly one panic tier must be named or the link fails on an
-        // undefined symbol) and the core tier, which owns the Windows entry.
+        // lang items, so the runtime archive supplies them all.  A hosted
+        // link takes its allocator from libc, but still needs the panic funnel
+        // (every panic calls the external `__cryo_panic`) and, on Windows, the
+        // entry.  Each comes from the archive of the build's configuration.
         if (cfg.no_runtime) {
-            CodegenPasses::append_runtime_tier_libs(ctx, &cmd, effective_triple);
+            CodegenPasses::append_freestanding_runtime_libs(ctx, &cmd, effective_triple);
         } else {
             const probe_log: PathBuf = PathBuf::from(f"{link_rsp_path.as_str()}.probe".as_str());
             CodegenPasses::append_hosted_runtime_libs(ctx, &cmd, effective_triple,
