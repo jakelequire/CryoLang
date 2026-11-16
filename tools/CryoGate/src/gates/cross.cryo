@@ -1,6 +1,6 @@
 ///! `cryogate cross --cryo <compiler> [--triple T] [--build-root DIR]
 ///! [--min-modules N] [--project P]...`: compile runtime/, stdlib/,
-///! compiler/ and tools/CryoLSP for the other operating system's triple,
+///! compiler/, tools/CryoLSP and tools/CryoGate for the other operating system's triple,
 ///! objects only from a Windows host, and fail if any of it does not
 ///! compile.
 ///!
@@ -60,9 +60,12 @@ public type struct CrossBuild {
 
     /// Every build, in the order they are cheapest to fail: the runtime, the
     /// stdlib, the compiler (the stdlib and its own modules), the LSP (the
-    /// compiler again and its own).  The runtime's declarations are gated on
-    /// the configuration it is built as, so it is built as each configuration
-    /// a link names.
+    /// compiler again and its own), then cryogate.  The runtime's
+    /// declarations are gated on the configuration it is built as, so it is
+    /// built as each configuration a link names.  Cryogate is built by the
+    /// pin to run the gates, so this build is the one that shows the
+    /// compiler under test refusing its source before the next pin is made
+    /// from that compiler.
     public static all() -> Array<CrossBuild> {
         mut builds: Array<CrossBuild> = Array::<CrossBuild>::new();
         builds.push(CrossBuild::new(Str::new("runtime"), Option::Some(Str::new("--no-runtime")), Str::new("runtime freestanding")));
@@ -71,6 +74,7 @@ public type struct CrossBuild {
         builds.push(CrossBuild::new(Str::new("stdlib"), Option::None, Str::new("stdlib")));
         builds.push(CrossBuild::new(Str::new("compiler"), Option::None, Str::new("compiler")));
         builds.push(CrossBuild::new(Str::new("tools/CryoLSP"), Option::None, Str::new("tools/CryoLSP")));
+        builds.push(CrossBuild::new(Str::new("tools/CryoGate"), Option::None, Str::new("tools/CryoGate")));
         return builds;
     }
 
@@ -193,7 +197,7 @@ public type struct CrossCheck {
         const projects: Array<String> = if (chosen.is_empty()) { CrossCheck::projects() } else { chosen.clone() };
         for (project in projects.iterate_references()) {
             if (!CrossCheck::projects().contains(project)) {
-                fmt::eprintln(f"cryogate cross: `--project` is one of runtime, stdlib, compiler, tools/CryoLSP, not `{project.as_str()}`");
+                fmt::eprintln(f"cryogate cross: `--project` is one of {Text::joined(&CrossCheck::projects(), Str::new(", ")).as_str()}, not `{project.as_str()}`");
                 return 2;
             }
         }
@@ -327,13 +331,12 @@ public type struct CrossCheck {
     }
 
     /// The projects `--project` may name, each by its path from the
-    /// repository root, in the order of `CrossBuild::all()`.
-    static projects() -> Array<String> {
+    /// repository root, once each in the order of `CrossBuild::all()`.
+    public static projects() -> Array<String> {
         mut projects: Array<String> = Array::<String>::new();
-        projects.push(String::from_str(Str::new("runtime")));
-        projects.push(String::from_str(Str::new("stdlib")));
-        projects.push(String::from_str(Str::new("compiler")));
-        projects.push(String::from_str(Str::new("tools/CryoLSP")));
+        for (build in CrossBuild::all().iterate_references()) {
+            if (!projects.contains(&build.project)) { projects.push(build.project.clone()); }
+        }
         return projects;
     }
 
