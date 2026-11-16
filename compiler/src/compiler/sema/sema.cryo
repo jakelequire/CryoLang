@@ -1760,6 +1760,13 @@ type struct SemaVisitor {
             else { this.refuse_unresolved_body_annotation(var_node.type_annotation); }
         }
 
+        // An initializer made only of literals stores its exact value; one
+        // the declared type does not hold is left as written, for
+        // `refuse_narrowing_constant` below to refuse.
+        if (var_node.has_initializer() && var_node.type_annotation != null && var_node.has_resolved_type()) {
+            var_node.set_initializer(this.literals.held_literal_of_value(var_node.initializer, var_node.resolved_type));
+        }
+
         if (var_node.has_initializer()) {
             const saved_expected: TypeRef = this.state.expected_type;
             const saved_binding: SymbolStr = this.state.untyped_binding;
@@ -2281,6 +2288,12 @@ type struct SemaVisitor {
             // Only the receiver itself is typed under the expectation, not
             // a call inside it.
             this.state.receiver_of = null;
+        }
+        // An argument made only of literals is the literal of its exact
+        // value, which adopts its parameter's type where that type holds it,
+        // whatever its intermediates are.
+        for (mut i: i64 = 0; i < call.arguments.length(); i++) {
+            call.arguments[i] = this.literals.literal_of_value(call.arguments[i]);
         }
         const typed: TypeRef = this.calls.resolve_call(this, expr, call);
         this.state.receiver_of = saved_receiver_of;
@@ -2965,6 +2978,11 @@ type struct SemaVisitor {
         if (bin.op.kind.is_assignment_op()) {
             lhs = this.resolve_expr(bin.left);
             if (lhs.is_valid()) {
+                // An assigned value made only of literals stores its exact
+                // value, as an initializer does.
+                if (bin.op.kind == TokenType::Equal) {
+                    bin.right = this.literals.held_literal_of_value(bin.right, lhs);
+                }
                 const saved_exp: TypeRef = this.state.expected_type;
                 this.state.expected_type = lhs;
                 rhs = this.resolve_expr(bin.right);
