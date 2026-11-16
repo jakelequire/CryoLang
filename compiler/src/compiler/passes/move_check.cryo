@@ -1698,12 +1698,38 @@ type struct MoveChecker {
         if (!this.may_carry_borrow(vd.resolved_type)) { return; }
         const temporary: ExpressionNode* = this.borrowed_temporary_reached(vd.initializer);
         if (temporary == null) { return; }
-        const spelled: string = this.intern.resolve(vd.name);
+        this.report_borrow_of_released_temporary(vd.name, d.name_span, temporary, true);
+    }
+
+    /// E0460 for `target = value;` where `target` names an existing local:
+    /// the temporaries `value` makes are released when the assignment's
+    /// statement ends, so a borrow of one kept in the local outlives it
+    /// (`s = make_string().as_str();`), as a declaration's would.
+    refuse_assigned_borrow_of_released_temporary(mut &this, target: IdentifierExpr*,
+                                                 target_span: SourceSpan, value: ExpressionNode*,
+                                                 target_type: TypeRef) -> void {
+        if (target == null || value == null || !target.res.local_sym().is_valid()) { return; }
+        if (!this.may_carry_borrow(target_type)) { return; }
+        const temporary: ExpressionNode* = this.borrowed_temporary_reached(value);
+        if (temporary == null) { return; }
+        this.report_borrow_of_released_temporary(target.name, target_span, temporary, false);
+    }
+
+    /// Report E0460 for the local `name` (written at `name_span`) keeping a
+    /// borrow of `temporary`, which the statement that made it - the local's
+    /// declaration when `in_declaration`, an assignment to it otherwise -
+    /// releases when it ends.
+    report_borrow_of_released_temporary(mut &this, name: SymbolStr, name_span: SourceSpan,
+                                        temporary: ExpressionNode*, in_declaration: boolean) -> void {
+        const spelled: string = this.intern.resolve(name);
+        const statement: string = if (in_declaration) { "its declaration" } else { "this assignment" };
+        const ends: string = if (in_declaration) { "the declaration ends" } else { "the assignment ends" };
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0460_BORROWED_TEMPORARY_RELEASED,
-            fmt::format("`%s` would point into a temporary that is released at the end of its declaration", spelled));
-        diag = diag.at_with_label(temporary.span, "this temporary is borrowed, and released when the declaration ends");
-        if (d.name_span.has_location()) {
-            diag = diag.also_at(d.name_span, fmt::format("`%s` keeps the borrow", spelled).as_str());
+            fmt::format("`%s` would point into a temporary that is released at the end of %s", spelled, statement));
+        diag = diag.at_with_label(temporary.span,
+            fmt::format("this temporary is borrowed, and released when %s", ends));
+        if (name_span.has_location()) {
+            diag = diag.also_at(name_span, fmt::format("`%s` keeps the borrow", spelled).as_str());
         }
         diag = diag.help("bind the temporary to a local of its own first, and borrow that local");
         this.ctx.emit_diagnostic(diag);
@@ -2292,6 +2318,7 @@ type struct MoveChecker {
                 // binding).
                 if (b.right != null) { this.walk_expr_move(b.right, false); }
                 this.unmark_moved(left_id.res.local_sym());
+                this.refuse_assigned_borrow_of_released_temporary(left_id, b.left.span, b.right, b.left.resolved_type);
                 return;
             }
             // Field / index LHS: read the LHS place (its address is computed)
