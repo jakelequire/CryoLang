@@ -100,7 +100,7 @@ sweep.  Counted (`grep -E '^\s*implement(<[^>]*>)? (struct|union) '`):
   and `parser.cryo` are the split-type exception and stay; the one in
   `cursor.cryo`, the struct's own file, goes inline.  The others are
   `AsmPiece`, `InlineBodies`, `DirectiveRegistry`, and `StampSlot`,
-  `BuildStamp`, `VersionReport` in `utils/build_stamp.cryo`.
+  `BuildStamp`, `VersionReport` in `compiler/utils/build_stamp.cryo`.
 - standard library: 4.  Three are `BufferedStream<S>` extended from the
   HTTP/1.1, HTTP/2 and WebSocket modules, the split-type exception; one is
   `Array<T, A>`'s second block in its own file, to fold inline (its bound

@@ -5397,7 +5397,7 @@ A project can build a library and one or more executables from one source tree. 
 
 `cryo build` of a project with `[[bin]]` targets builds the executables only: its `[lib]` is what a project depending on it compiles (a dependency is compiled from its source, never linked from an archive). A project with a `[lib]` and no `[[bin]]` builds `lib<name>.a`.
 
-**A library's namespace is the one its `lib.cryo` declares.** The library's `source_dir` holds a `lib.cryo`, and the `namespace` line at its top names the library: a program depending on it imports that namespace (`import Json5;`). No cryoconfig key names it. A dependency whose `[lib]` has no `lib.cryo`, or whose `lib.cryo` declares no namespace, is E0509. `cryo init --type=library` writes a `lib.cryo` beginning with the namespace derived from the project name (`my-lib` -> `My_lib`).
+**A library's namespace is the one its `lib.cryo` declares.** The library's `source_dir` holds a `lib.cryo`, and the `namespace` line at its top names the library: a program depending on it imports that namespace (`import Json5;`). No cryoconfig key names it. A dependency whose `[lib]` has no `lib.cryo`, or whose `lib.cryo` declares no namespace, is E0509. A library has that one top-level namespace: every file of the package declares it or a namespace below it (`Json5::reader`), and a file declaring any other (`Helper`, or `Json5Extra`, which only begins with it) is E0510, so what a program can import from a library is exactly what lies under the name it imports. `cryo init --type=library` writes a `lib.cryo` beginning with the namespace derived from the project name (`my-lib` -> `My_lib`).
 
 ```ini
 [lib]

@@ -18,8 +18,8 @@ import compiler::lex::lexer::{ Lexer };
 import compiler::project_config::{ ProjectConfig, VendorPin };
 import compiler::vendor::registry::{ VendorRegistry };
 import compiler::deps::lockfile::{ LockedVendor };
-import utils::log::{ Log, LogArea, LogLevel };
-import utils::time_trace::{ TimeTrace };
+import compiler::utils::log::{ Log, LogArea, LogLevel };
+import compiler::utils::time_trace::{ TimeTrace };
 import std::fmt;
 import std::fs::{ Directory, DirectoryEntries, File, FileType, Path, PathBuf };
 import std::collections::{ pair };
@@ -165,8 +165,8 @@ type struct ModuleLoader {
 
     /// Extra source roots resolved relative to project_root.  Scanned
     /// alongside entry_dir so that imports targeting siblings of the
-    /// entry point (e.g. a library entry at `src/compiler/_module.cryo`
-    /// whose source imports `utils::*` from `src/utils`) resolve.
+    /// entry point (e.g. a dependency's library sources, beside the
+    /// program's own) resolve.
     extra_roots: [string];
 
     // Circular dependency detection.
@@ -415,8 +415,12 @@ public:
         }
 
         Log::debug(LogArea::Loader, f"pre-scan complete: {this.ns_map.length()} namespaces indexed");
+        // A library's namespace is what the namespace rule compares, so a
+        // library without one, or with files outside it, is reported alone.
         const libraries_named: boolean = this.report_libraries_without_namespace(sink);
-        if (!this.report_namespace_clashes(sink) || !libraries_named) { return false; }
+        const libraries_whole: boolean = this.report_namespaces_outside_libraries(sink);
+        if (!libraries_named || !libraries_whole) { return false; }
+        if (!this.report_namespace_clashes(sink)) { return false; }
 
         return this.discover_module(intern, graph, sink, entry_path);
     }
@@ -653,6 +657,38 @@ public:
             sink.emit(diag);
         }
         return all_named;
+    }
+
+    /// Report every namespace a dependency library's file declares outside
+    /// the library's own (E0510), and whether there was none.  A library
+    /// has one top-level namespace, the one its `lib.cryo` declares: every
+    /// file of the package declares that namespace or one below it, so the
+    /// library's public names are exactly what a program imports by it.
+    report_namespaces_outside_libraries(&this, sink: mut DiagnosticSink*) -> boolean {
+        mut all_inside: boolean = true;
+        for (entry in this.ns_map.entries()) {
+            const declared: Str = entry.first.as_str();
+            const file: string = *entry.second;
+            const package: ModulePackage = this.package_roots.package_of(Path::from(file));
+            if (package.origin != ModuleOrigin::Dep) { continue; }
+            for (mut i: i64 = 0; i < this.package_roots.libraries.length(); i++) {
+                const library: &PackageLibrary = &this.package_roots.libraries[i];
+                if (!library.package.is(&package) || library.namespace.length() == 0) { continue; }
+                const own: Str = library.namespace.as_str();
+                const below: String = f"{own}::";
+                // A namespace that only begins with the library's (`CrateBoxes`
+                // for `CrateBox`) is another one: the match is on whole segments.
+                if (declared == own || declared.starts_with(below.as_str())) { continue; }
+                all_inside = false;
+                const package_text: String = package.describe();
+                mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0510_NAMESPACE_OUTSIDE_LIBRARY,
+                    f"the namespace `{declared}` is outside `{own}`, the namespace of {package_text}");
+                diag = diag.with_note(f"{file} declares it");
+                diag = diag.help(f"every file of a library declares its `lib.cryo`'s namespace or one below it (`{own}::<name>`)");
+                sink.emit(diag);
+            }
+        }
+        return all_inside;
     }
 
     /// Every module the pre-scan indexed, loaded or not, each in the package

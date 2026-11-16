@@ -202,6 +202,13 @@ yet is recorded with the change that builds it, not here.
      resolved.  `cryo init` writes a library's `lib.cryo` beginning with
      that namespace.  (Jake)
 
+712. **A library has one top-level namespace.**  Every file of a
+     dependency library declares its `lib.cryo`'s namespace or one below
+     it, matched on whole segments; a file declaring any other is E0510
+     before any import is resolved, naming the namespace, the library's and
+     the file.  The namespace rule (710) then compares one name per
+     library.  (Jake)
+
 ### 2026-11-12
 
 703. **A hash map's bucket layer is internal.**  `Entry`, the node of a

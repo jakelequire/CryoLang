@@ -67,7 +67,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PINS = [ROOT / "bin" / "cryo", ROOT / "bin" / "cryo.exe"]
 
-# The build stamp region (compiler/src/utils/build_stamp.cryo, `StampSlot`):
+# The build stamp region (compiler/src/compiler/utils/build_stamp.cryo, `StampSlot`):
 # a sixteen-byte marker, then `key=value` lines ended by a NUL in a fixed
 # 496-byte field, all zero when the binary was never stamped.
 STAMP_MARKER = bytes([67, 82, 89, 79, 45, 66, 85, 73, 76, 68, 45, 83, 84, 65, 77, 80])
