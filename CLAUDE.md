@@ -48,7 +48,7 @@ make runtime-abi-check   # runtime/abi/lang_items.def against every built runtim
 make warnings-check      # compiler/ + stdlib archive built with -Werror by the compiler
                          # under test, the stdlib for both OSes and both panic strategies;
                          # DELETES the host's prebuilt stdlib archives first
-make cross-check         # runtime/stdlib/compiler/LSP/cryogate for the OTHER OS, objects only, ~80s;
+make cross-check         # runtime/stdlib/compiler/LSP/cryogate/cryosmith for the OTHER OS, objects only, ~80s;
                          # from WINDOWS only - a Linux host links the windows-gnu
                          # build and fails without mingw + the LLVM-C import lib
 make vendor-check        # every constant shape survives `cryo vendor`

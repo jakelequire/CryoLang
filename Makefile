@@ -279,7 +279,7 @@ Tests and gates
                          build-logs/); DELETES the host's prebuilt stdlib
                          archives first (into build-logs/).
   make cross-check       runtime (each configuration), stdlib, compiler,
-                         CryoLSP and CryoGate for the other OS's triple,
+                         CryoLSP, CryoGate and CryoSmith for the other OS's triple,
                          objects only
                          (ARGS=--triple=...).
   make examples          Build every examples/ project.
@@ -951,8 +951,9 @@ endif
 # resolution sees it, and `![config(windows)]` from a Linux one, so every
 # host-native gate measures a tree with the other OS's half cut out.  This
 # compiles runtime/ (as each configuration a link names), stdlib/, compiler/,
-# tools/CryoLSP and tools/CryoGate (which the pin builds to run the gates, so
-# only this build shows the compiler under test refusing it) for the other OS with
+# tools/CryoLSP, tools/CryoGate and tools/CryoSmith (which the pin builds to run
+# the gates and to generate programs, so only this build shows the compiler
+# under test refusing them) for the other OS with
 # `--target`, which selects that OS's gates and stops at object files - no
 # cross toolchain, no link, no WSL.  A declaration that stops resolving on
 # the other OS is refused here, on this host, in about a minute.
