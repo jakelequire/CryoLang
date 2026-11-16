@@ -1,0 +1,163 @@
+///! The declared programs, checked before the tree's gates run: each line
+///! must name a program of its kind, and a project a change makes compile
+///! is built directly by both compilers.
+
+namespace cryogate::verify::run::declared;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Completion, Job, Outcome };
+import cryogate::core::host::{ Host };
+import cryogate::core::text::{ Text };
+import cryogate::core::tree::{ Tree };
+import cryogate::verify::declarations::{ Declaration, DeclarationKind, Declarations, RuntimeMember };
+import cryogate::verify::judges::{ VerifyJudges };
+import cryogate::verify::run::children::{ VerifyChild };
+import cryogate::verify::run::compiler::{ BaselineCompiler };
+
+/// The direct builds of the declared projects.
+public type struct DeclaredBuilds {
+    /// Whether the line `name` of tests/started-passing (when `fixed`) or
+    /// tests/started-compiling names a program of its kind in the checkout
+    /// `repository`: the problem when it does not; `true` when the project
+    /// it names is to be built by both compilers, `false` when the line asks
+    /// for no build - its claim is the census's or the comparison's.
+    public static step(repository: Path, name: Str, fixed: boolean) -> Result<boolean, String> {
+        const file: Str = if (fixed) { Str::new("tests/started-passing") } else { Str::new("tests/started-compiling") };
+        const kind: DeclarationKind = Declarations::kind(name);
+        const program: Str = Declarations::program_of(name);
+        match (kind) {
+            DeclarationKind::Negative => {
+                if (fixed) {
+                    if (!repository.join(f"tests/tests/{name}".as_str()).as_path().is_file()) {
+                        return Result::Err(f"{name}: declared in {file} but tests/tests/{name} does not exist");
+                    }
+                    return Result::Ok(false);
+                }
+            }
+            DeclarationKind::Example => {
+                if (fixed) {
+                    if (!repository.join(name).join(Str::new("cryoconfig")).as_path().is_file()) {
+                        return Result::Err(f"{name}: declared in {file} but {name} is not an example project");
+                    }
+                    return Result::Ok(false);
+                }
+            }
+            DeclarationKind::Unit => {
+                if (fixed) { return DeclaredBuilds::unit_file(repository, name, file); }
+            }
+            DeclarationKind::Archive => {
+                if (fixed) { return DeclaredBuilds::unit_file(repository, name, file); }
+            }
+            DeclarationKind::MovedArchive => {
+                if (!fixed) {
+                    return Result::Err(f"{name}: a standard-library module's moved objects are declared in tests/started-passing, not {file}");
+                }
+                if (Declarations::archive_module_source(repository, name).is_none()) {
+                    return Result::Err(f"{name}: declared in {file} but {program} is no standard-library module");
+                }
+                return Result::Ok(false);
+            }
+            DeclarationKind::MovedRuntime => {
+                if (!fixed) {
+                    return Result::Err(f"{name}: a runtime archive's moved members are declared in tests/started-passing, not {file}");
+                }
+                if (RuntimeMember::of(name).is_none()) {
+                    return Result::Err(f"{name}: declared in {file} but {program} is not <configuration>/<member>.o");
+                }
+                return Result::Ok(false);
+            }
+            _ => { }
+        }
+        if (!repository.join(f"tests/tests/projects/{program}/test.json".as_str()).as_path().is_file()) {
+            return Result::Err(f"{name}: declared in {file} but tests/tests/projects/{program} is not a test project");
+        }
+        // Both censuses pass a project whose objects move on purpose; the
+        // claim is the comparison's.
+        return match (kind) {
+            DeclarationKind::Moved => { Result::Ok(!fixed) }
+            _                      => { Result::Ok(true) }
+        };
+    }
+
+    /// The problems with the declared lines `declared` (from
+    /// tests/started-compiling) and `fixed` (tests/started-passing), in
+    /// name order: each line checked by `step`, and each project it asks
+    /// for built by `baseline` and by the compiler under test `cryo`, each
+    /// from a copy below `<directory>/declared/`, and judged.
+    public static check(repository: Path, declared: &Array<Declaration>, fixed: &Array<Declaration>,
+                        baseline: &BaselineCompiler, cryo: Str, directory: Path) -> Array<String> {
+        mut entries: Array<String> = Array::<String>::new();
+        for (line in declared.iterate_references()) { entries.push(f"{line.name.as_str()}\n0"); }
+        for (line in fixed.iterate_references()) { entries.push(f"{line.name.as_str()}\n1"); }
+        mut problems: Array<String> = Array::<String>::new();
+        for (entry in Text::sorted_distinct(entries).iterate_references()) {
+            const parts: Pair<Str, Str> = entry.as_str().split_once(&Str::new("\n")).unwrap();
+            const name: Str = parts.first;
+            const is_fixed: boolean = parts.second == Str::new("1");
+            const build: boolean = match (DeclaredBuilds::step(repository, name, is_fixed)) {
+                Result::Ok(build)    => { build }
+                Result::Err(problem) => { problems.push(problem); continue; }
+            };
+            if (!build) { continue; }
+            const base: Pair<i32, String> = DeclaredBuilds::build(repository, baseline.compiler.as_path().as_str(),
+                baseline.runtime_home.as_path().as_str(), name, directory.join(f"declared/base/{name}".as_str()).as_path());
+            const tree: Pair<i32, String> = DeclaredBuilds::build(repository, cryo, Str::new(""), name,
+                directory.join(f"declared/tree/{name}".as_str()).as_path());
+            const found: Array<String> = VerifyJudges::builds(name, base.first, base.second.as_str(), tree.first, tree.second.as_str(), is_fixed);
+            const label: Str = if (is_fixed) { Str::new("passing") } else { Str::new("declared") };
+            const verdict: Str = if (found.is_empty()) { Str::new("ok") } else { Str::new("FAIL") };
+            fmt::println(f"  {label:<9} {name:<40} baseline exit {base.first}, tree exit {tree.first}  {verdict}");
+            for (problem in found.iterate_references()) { problems.push(problem.clone()); }
+        }
+        return problems;
+    }
+
+    /// A started-passing unit-test file must hold a namespace, which names
+    /// its object.
+    private static unit_file(repository: Path, name: Str, file: Str) -> Result<boolean, String> {
+        if (Declarations::unit_object_suffix(repository, name).is_none()) {
+            return Result::Err(f"{name}: declared in {file} but tests/tests/{name} is not a unit-test file with a namespace");
+        }
+        return Result::Ok(false);
+    }
+
+    /// `cryo build --stdlib=<stdlib>` over a fresh copy of the test project
+    /// `name` at `copy`, leaving out its build directory, logged to
+    /// `<copy>.log`: the exit and the output.  An exit that is no exit (a
+    /// signal, a timeout, a compiler that would not start) reads as -1.
+    private static build(repository: Path, cryo: Str, runtime: Str, name: Str, copy: Path) -> Pair<i32, String> {
+        if (copy.exists()) {
+            match (Directory::remove_all(copy)) { Result::Ok(_) => { } Result::Err(_) => { } }
+        }
+        match (copy.parent()) {
+            Option::Some(parent) => { match (Directory::create_all(parent)) { Result::Ok(_) => { } Result::Err(_) => { } } }
+            Option::None         => { }
+        }
+        mut excluded: Array<String> = Array::<String>::new();
+        excluded.push(String::from_str(Str::new("build")));
+        match (Tree::copy(repository.join(f"tests/tests/projects/{name}".as_str()).as_path(), copy, &excluded)) {
+            Result::Ok(_)       => { }
+            Result::Err(reason) => { return Pair::new(-1, reason); }
+        }
+        mut job: Job = VerifyChild::job(cryo, runtime);
+        job.argument(Str::new("build"));
+        job.argument(f"--stdlib={Host::stdlib_directory(repository).as_str()}".as_str());
+        job.directory(copy.as_str());
+        job.log_to(f"{copy.as_str()}.log".as_str());
+        const done: Completion = job.run();
+        const exit: i32 = match (&done.outcome) {
+            Outcome::Exited(code) => { code }
+            _                     => { -1 }
+        };
+        return Pair::new(exit, done.output());
+    }
+}

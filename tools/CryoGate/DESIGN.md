@@ -25,12 +25,17 @@ upward, and no two files of one layer import each other in a cycle.
 | `corpus/` | the test corpus as read from disk and from a runner's output: the roster golden, `![target]` gates, discovery and merging (`roster`); a census run's reading and what the golden pins on this host (`census`) | core |
 | `baseline/` | verify's baseline: what git lists, each program's record key, the baseline compiler's key, the clone it is built in, the bounded cache of homes | core |
 | `verify/` | verify's decisions: the declaration files, object populations and owners, the runtime archives' members, a program's baseline record, the judges, the object comparison | core, corpus |
+| `verify/run/` | a verify run itself: the children it starts, the baseline compiler, the baseline's per-program records, the declared projects' builds, the run from start to report | core, corpus, baseline, verify's decisions |
 | `gates/` | one file per subcommand: its command line, the children it runs, the lines it prints, its exit code | every layer above; **never another gate** |
 | `main.cryo`, `selftest.cryo`, `probe.cryo`, `heavy.cryo` | the entry point and the subcommands that are not gates (`selftest`, its child `probe`, `heavy`) | everything |
 
 Inside `verify/` the files depend on each other in one direction:
-declarations, objects, runtime, record, judges, comparison - each may use
-only those before it.
+declarations, objects, runtime, hashing, record, judges, comparison,
+gates - each may use only those before it.  `verify/run/` comes after all
+of them, and its files are ordered the same way: children, compiler,
+programs, declared, session.  The decision files are pure and run no
+compiler; `verify/run/` is where verify's children are started, so
+`gates/verify.cryo` stays the command line only.
 
 The test files under `tests/` import whichever layer they test.
 

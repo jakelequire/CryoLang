@@ -28,16 +28,21 @@ import cryogate::core::text::{ Text };
 import cryogate::core::tree::{ Tree };
 import cryogate::corpus::census::{ Pinned };
 import cryogate::corpus::roster::{ TestGates };
-import cryogate::verify::comparison::{ Compared, ObjectComparison };
-import cryogate::verify::declarations::{ Declaration, Declarations, DeclaredChanges };
+import cryogate::verify::comparison::{ Compared };
+import cryogate::verify::declarations::{ Declaration, DeclaredChanges };
 import cryogate::verify::hashing::{ ObjectHashes };
 import cryogate::verify::objects::{ ObjectPopulation };
 import cryogate::verify::record::{ BaselineRecord };
+import cryogate::verify::run::session::{ VerifySession, VerifySettings };
 import cryogate::verify::runtime::{ RuntimeArchives };
 
 /// `cryogate verify`, beside `scripts/verify.py` on one checkout, so the two
 /// can be compared over the same inputs:
 ///
+/// - `--cryo <compiler> [--baseline <rev> [--require-identical]] [--only
+///   <gate>,...] [--list-limit <n>] [--sequential]`: a whole verify run -
+///   the gates over the compiler under test, and with a baseline, the
+///   object comparison against the compiler built from `rev`;
 /// - `--declared-since <rev>`: the lines each declaration file declares
 ///   against the commit `rev`, printed as verify prints them before its
 ///   baseline run;
@@ -69,7 +74,12 @@ public type struct VerifyGate {
     /// line's `arguments` from index `first`; the process's exit code.
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
         mut options: Options = Options::new(Str::new(
-            "cryogate verify --declared-since <rev> | --compare <run> --against <rev> [--list-limit <n>] | --records <run> --programs <directory> | --runtime-list <directory> | --baseline-key <rev> | --keys <home> | --sync <clone> --at <rev> | --baselines <directory> [--current <name>] | --hash <population> [--runtime <directory>]"));
+            "cryogate verify --cryo <compiler> [--baseline <rev> [--require-identical]] [--only <gate>,...] [--list-limit <n>] [--sequential] | --declared-since <rev> | --compare <run> --against <rev> [--list-limit <n>] | --records <run> --programs <directory> | --runtime-list <directory> | --baseline-key <rev> | --keys <home> | --sync <clone> --at <rev> | --baselines <directory> [--current <name>] | --hash <population> [--runtime <directory>]"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--baseline"));
+        options.flag(Str::new("--require-identical"));
+        options.valued(Str::new("--only"));
+        options.flag(Str::new("--sequential"));
         options.valued(Str::new("--declared-since"));
         options.valued(Str::new("--compare"));
         options.valued(Str::new("--against"));
@@ -90,14 +100,41 @@ public type struct VerifyGate {
             Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 2; }
         };
         const git: Git = Git::new(repository, logs);
+        mut limit: i64 = 40;
+        match (parsed.value(Str::new("--list-limit"))) {
+            Option::Some(text) => {
+                if (!Text::is_digits(text)) { fmt::eprintln(f"cryogate verify: --list-limit takes a count, not {text}"); return 2; }
+                limit = i64::try_from(text).unwrap_or(0);
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--cryo"))) {
+            Option::Some(cryo) => {
+                mut only: Array<String> = Array::<String>::new();
+                match (parsed.value(Str::new("--only"))) {
+                    Option::Some(list) => { for (name in list.split(&Str::new(","))) { only.push(String::from_str(name.trim())); } }
+                    Option::None       => { }
+                }
+                const baseline: Option<String> = match (parsed.value(Str::new("--baseline"))) {
+                    Option::Some(revision) => { Option::Some(String::from_str(revision)) }
+                    Option::None           => { Option::None }
+                };
+                const settings: VerifySettings = VerifySettings {
+                    cryo: String::from_str(cryo), baseline: baseline, require_identical: parsed.has(Str::new("--require-identical")),
+                    only: only, list_limit: limit, sequential: parsed.has(Str::new("--sequential")),
+                };
+                return VerifySession::run(repository, logs, &settings);
+            }
+            Option::None => { }
+        }
         match (parsed.value(Str::new("--declared-since"))) {
             Option::Some(revision) => {
-                const declared: Array<Declaration> = VerifyGate::declared_since(repository, &git, revision,
+                const declared: Array<Declaration> = VerifySession::declared_since(repository, &git, revision,
                     Str::new("tests/started-compiling"));
-                const fixed: Array<Declaration> = VerifyGate::declared_since(repository, &git, revision,
+                const fixed: Array<Declaration> = VerifySession::declared_since(repository, &git, revision,
                     Str::new("tests/started-passing"));
-                VerifyGate::print_declared(&declared, revision, Str::new("compile"));
-                VerifyGate::print_declared(&fixed, revision, Str::new("pass"));
+                fmt::println(VerifySession::declared_line(&declared, revision, Str::new("compile")));
+                fmt::println(VerifySession::declared_line(&fixed, revision, Str::new("pass")));
                 return 0;
             }
             Option::None => { }
@@ -108,14 +145,6 @@ public type struct VerifyGate {
                     Option::Some(revision) => { revision }
                     Option::None           => { fmt::eprintln(f"cryogate verify: --compare needs --against; usage: {options.usage()}"); return 2; }
                 };
-                mut limit: i64 = 40;
-                match (parsed.value(Str::new("--list-limit"))) {
-                    Option::Some(text) => {
-                        if (!Text::is_digits(text)) { fmt::eprintln(f"cryogate verify: --list-limit takes a count, not {text}"); return 2; }
-                        limit = i64::try_from(text).unwrap_or(0);
-                    }
-                    Option::None => { }
-                }
                 return VerifyGate::compare_run(repository, &git, run, revision, limit);
             }
             Option::None => { }
@@ -240,69 +269,19 @@ public type struct VerifyGate {
         return if (missing == 0 && differing == 0) { 0 } else { 1 };
     }
 
-    /// The lines the working tree's `file` declares against its copy at
-    /// `revision` (none when the commit has no such file).
-    private static declared_since(repository: Path, git: &Git, revision: Str, file: Str) -> Array<Declaration> {
-        const tree_text: String = match (File::read_text(repository.join(file).as_path())) {
-            Result::Ok(text) => { text }
-            Result::Err(_)   => { String::new() }
-        };
-        mut show: Array<Str> = Array::<Str>::new();
-        show.push(Str::new("show"));
-        const spec: String = f"{revision}:{file}";
-        show.push(spec.as_str());
-        const done: Completion = git.run(&show);
-        const base_text: String = if (done.outcome.succeeded()) { done.output() } else { String::new() };
-        return Declarations::between(tree_text.as_str(), base_text.as_str());
-    }
-
-    /// Print `declared`, sorted by name, under the line counting them.
-    private static print_declared(declared: &Array<Declaration>, revision: Str, starting: Str) -> void {
-        mut names: Array<String> = Array::<String>::new();
-        for (line in declared.iterate_references()) { names.push(line.name.clone()); }
-        const sorted: Array<String> = Text::sorted_distinct(names);
-        mut text: String = f"verify: {declared.length()} program(s) declared as starting to {starting} since {revision}";
-        for (name in sorted.iterate_references()) {
-            for (line in declared.iterate_references()) {
-                if (line.name.as_str() == name.as_str()) {
-                    text.push(f"\n      {name.as_str()} -- {line.reason.as_str()}".as_str());
-                }
-            }
-        }
-        fmt::println(text);
-    }
-
     /// `--compare`: the run directory `run`'s baseline and tree object
     /// lists compared with the declarations made against `revision`.
     private static compare_run(repository: Path, git: &Git, run: Str, revision: Str, limit: i64) -> i32 {
-        const declared: Array<Declaration> = VerifyGate::declared_since(repository, git, revision, Str::new("tests/started-compiling"));
-        const fixed: Array<Declaration> = VerifyGate::declared_since(repository, git, revision, Str::new("tests/started-passing"));
+        const declared: Array<Declaration> = VerifySession::declared_since(repository, git, revision, Str::new("tests/started-compiling"));
+        const fixed: Array<Declaration> = VerifySession::declared_since(repository, git, revision, Str::new("tests/started-passing"));
         const changes: DeclaredChanges = DeclaredChanges::of(repository, &declared, &fixed);
-        mut baseline: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
-        mut tree: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
-        for (population in ObjectPopulation::all().iterate_references()) {
-            const baseline_list: String = population.baseline_list(run);
-            const tree_list: String = population.tree_list(run);
-            match (VerifyGate::read_list(repository, baseline_list.as_str())) {
-                Result::Ok(hashes)  => { baseline.push(hashes); }
-                Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
-            }
-            match (VerifyGate::read_list(repository, tree_list.as_str())) {
-                Result::Ok(hashes)  => { tree.push(hashes); }
-                Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
-            }
-        }
-        const compared: Compared = ObjectComparison::against(revision, &changes, baseline, tree, limit, run);
+        const compared: Compared = match (VerifySession::compared(repository, revision, &changes, run, limit)) {
+            Result::Ok(compared) => { compared }
+            Result::Err(reason)  => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
+        };
         for (line in compared.lines.iterate_references()) { fmt::println(line.clone()); }
         for (problem in compared.problems.iterate_references()) { fmt::println(f"verify: FAIL -- {problem.as_str()}"); }
         return if (compared.problems.is_empty()) { 0 } else { 1 };
-    }
-
-    private static read_list(repository: Path, list: Str) -> Result<HashMap<String, String>, String> {
-        return match (File::read_text(repository.join(list).as_path())) {
-            Result::Ok(text)   => { Result::Ok(ObjectComparison::read_list(text.as_str())) }
-            Result::Err(error) => { Result::Err(f"cannot read {list}: {error.describe()}") }
-        };
     }
 
     /// `--records`: the census-side records stored in `programs` (every

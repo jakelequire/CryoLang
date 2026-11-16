@@ -1,0 +1,422 @@
+///! One verify run, start to end: the baseline (when one is asked for),
+///! its records and judgements, the tree's gates, the tree's warnings and
+///! the object comparison, each step's lines printed as it ends, and the
+///! verdict.
+
+namespace cryogate::verify::run::session;
+
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::time::clock::{ Instant };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::git::{ Git };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::text::{ Text };
+import cryogate::corpus::census::{ CensusReading, Pinned };
+import cryogate::corpus::roster::{ TestGates };
+import cryogate::verify::comparison::{ Compared, ObjectComparison };
+import cryogate::verify::declarations::{ Declaration, DeclarationKind, Declarations, DeclaredChanges };
+import cryogate::verify::gates::{ GateCommand };
+import cryogate::verify::judges::{ VerifyJudges };
+import cryogate::verify::objects::{ ObjectPopulation };
+import cryogate::verify::record::{ BaselineRecord };
+import cryogate::verify::run::children::{ PopulationRun, VerifyChild };
+import cryogate::verify::run::compiler::{ BaselineCompiler };
+import cryogate::verify::run::declared::{ DeclaredBuilds };
+import cryogate::verify::run::programs::{ BaselinePrograms, BaselineTotals };
+
+/// What a verify run is asked to do.
+public type struct VerifySettings {
+    /// The compiler under test.
+    public cryo: String;
+    /// The commit whose compiler the objects are compared against, if any.
+    public baseline: Option<String>;
+    /// Whether any moved object fails the run.
+    public require_identical: boolean;
+    /// The gates to run, in order; none means every gate.
+    public only: Array<String>;
+    /// How many paths of each list of moved and unpaired objects to print.
+    public list_limit: i64;
+    /// Whether the gates run one at a time.
+    public sequential: boolean;
+}
+
+/// One verify run.
+public type struct VerifySession {
+    /// Run verify over the checkout `repository` as `settings` asks; the
+    /// process's exit code, 0 when every step passed.
+    public static run(repository: Path, logs: &RunLogs, settings: &VerifySettings) -> i32 {
+        const cryo: String = Host::absolute(settings.cryo.as_str());
+        if (!Path::from(cryo.as_str()).is_file()) {
+            fmt::println(f"verify: FAIL -- compiler under test not found: {cryo.as_str()}");
+            return 1;
+        }
+        const cryogate: PathBuf = repository.join(Str::new("tools/CryoGate/build")).join(Host::executable_name(Str::new("cryogate")).as_str());
+        const known: Array<GateCommand> = GateCommand::table(cryogate.as_path().as_str(), Str::new(""));
+        mut every: Array<String> = Array::<String>::new();
+        for (gate in known.iterate_references()) { every.push(gate.name.clone()); }
+        const names: Array<String> = if (settings.only.is_empty()) { every.clone() } else { settings.only.clone() };
+        for (name in names.iterate_references()) {
+            if (!every.contains(name)) {
+                fmt::println(f"verify: FAIL -- no gate named '{name.as_str()}' (gates: {Text::joined(&every, Str::new(", ")).as_str()})");
+                return 1;
+            }
+        }
+        const census: String = String::from_str(Str::new("census"));
+        const examples: String = String::from_str(Str::new("examples"));
+        if (settings.baseline.is_some() && !(names.contains(&census) && names.contains(&examples))) {
+            fmt::println(String::from_str(Str::new("verify: FAIL -- a baseline comparison needs the census and examples runs")));
+            return 1;
+        }
+        const shown_cryo: String = PopulationRun::relative(repository, cryo.as_str());
+        const triple: String = VerifySession::triple(cryo.as_str(), logs);
+        if (triple.is_empty()) {
+            fmt::println(f"verify: FAIL -- `{shown_cryo.as_str()} version --triple` named no target");
+            return 1;
+        }
+        const run: RunLogs = match (RunLogs::open_below(repository.join(Str::new(".verify/runs")).as_path())) {
+            Result::Ok(run)     => { run }
+            Result::Err(reason) => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); return 1; }
+        };
+        const directory: Path = run.directory();
+        const shown_run: String = PopulationRun::relative(repository, directory.as_str());
+        const started: Instant = Instant::now();
+        const git: Git = Git::new(repository, logs);
+        // The interpreter and the shell are found only for a gate that
+        // needs one, so a run without it does not depend on either.
+        const python: String = if (names.contains(&String::from_str(Str::new("lsp")))) {
+            match (VerifyChild::python(directory)) {
+                Result::Ok(python)  => { python }
+                Result::Err(reason) => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); return 1; }
+            }
+        } else { String::new() };
+        const bash: String = if (names.contains(&String::from_str(Str::new("abi")))) {
+            match (VerifyChild::posix_shell(&git)) {
+                Result::Ok(bash)    => { bash }
+                Result::Err(reason) => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); return 1; }
+            }
+        } else { String::new() };
+        const table: Array<GateCommand> = GateCommand::table(cryogate.as_path().as_str(), python.as_str());
+
+        const revision: String = settings.baseline.clone().unwrap_or(String::new());
+        mut phase: Option<BaselinePhase> = Option::None;
+        if (settings.baseline.is_some()) {
+            match (VerifySession::baseline(repository, logs, &git, revision.as_str(), triple.as_str(), cryo.as_str(),
+                                           cryogate.as_path().as_str(), directory)) {
+                Result::Ok(answer) => { phase = Option::Some(answer); }
+                Result::Err(problems) => {
+                    for (problem in problems.iterate_references()) { fmt::println(f"verify: FAIL -- {problem.as_str()}"); }
+                    return 1;
+                }
+            }
+        }
+
+        const one_at_a_time: Str = if (settings.sequential) { Str::new(" (one at a time)") } else { Str::new("") };
+        fmt::println(f"verify: gates over {shown_cryo.as_str()}: {Text::joined(&names, Str::new(", ")).as_str()}{one_at_a_time}");
+        const tree_runtime: PathBuf = repository.join(Str::new("runtime/.bin")).join(triple.as_str());
+        const population: PopulationRun = match (PopulationRun::run(repository, &table, &names, cryo.as_str(), bash.as_str(),
+                                                                   directory, Str::new("tree"), tree_runtime.as_path(), settings.sequential)) {
+            Result::Ok(population) => { population }
+            Result::Err(reason)    => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); return 1; }
+        };
+        mut ok: boolean = true;
+        for (gate in population.gates.iterate_references()) {
+            fmt::println(gate.report(repository));
+            if (!gate.verdict.ok) { ok = false; }
+        }
+        for (problem in VerifySession::object_lines(repository, &names, &population, directory).iterate_references()) {
+            fmt::println(f"verify: FAIL -- {problem.as_str()}");
+            ok = false;
+        }
+
+        match (&phase) {
+            Option::Some(answer) => {
+                for (problem in VerifySession::warnings(repository, &answer.totals, &answer.declared, &answer.fixed, directory).iterate_references()) {
+                    fmt::println(f"verify: FAIL -- {problem.as_str()}");
+                    ok = false;
+                }
+                fmt::println(f"verify: objects against {revision.as_str()}");
+                const changes: DeclaredChanges = DeclaredChanges::of(repository, &answer.declared, &answer.fixed);
+                match (VerifySession::compared(repository, revision.as_str(), &changes, shown_run.as_str(), settings.list_limit)) {
+                    Result::Ok(compared) => {
+                        for (line in compared.lines.iterate_references()) { fmt::println(line.clone()); }
+                        for (problem in compared.problems.iterate_references()) { fmt::println(f"verify: FAIL -- {problem.as_str()}"); ok = false; }
+                        if (compared.changed > 0 && settings.require_identical) { ok = false; }
+                    }
+                    Result::Err(reason) => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); ok = false; }
+                }
+            }
+            Option::None => { }
+        }
+        const verdict: Str = if (ok) { Str::new("OK") } else { Str::new("FAIL") };
+        fmt::println(f"verify: {verdict} in {started.elapsed().as_seconds_f64():.0} s -- logs in {shown_run.as_str()}");
+        return if (ok) { 0 } else { 1 };
+    }
+
+    /// The lines each declaration file of the checkout `repository`
+    /// (`file`) declares against its copy at `revision`; none when the
+    /// commit has no such file.
+    public static declared_since(repository: Path, git: &Git, revision: Str, file: Str) -> Array<Declaration> {
+        const tree_text: String = match (File::read_text(repository.join(file).as_path())) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { String::new() }
+        };
+        mut show: Array<Str> = Array::<Str>::new();
+        show.push(Str::new("show"));
+        const spec: String = f"{revision}:{file}";
+        show.push(spec.as_str());
+        const done: Completion = git.run(&show);
+        const base_text: String = if (done.outcome.succeeded()) { done.output() } else { String::new() };
+        return Declarations::between(tree_text.as_str(), base_text.as_str());
+    }
+
+    /// The line counting `declared`, which starts to `starting` since
+    /// `revision`, with each line under it in name order.
+    public static declared_line(declared: &Array<Declaration>, revision: Str, starting: Str) -> String {
+        mut names: Array<String> = Array::<String>::new();
+        for (line in declared.iterate_references()) { names.push(line.name.clone()); }
+        mut text: String = f"verify: {declared.length()} program(s) declared as starting to {starting} since {revision}";
+        for (name in Text::sorted_distinct(names).iterate_references()) {
+            for (line in declared.iterate_references()) {
+                if (line.name.as_str() == name.as_str()) { text.push(f"\n      {name.as_str()} -- {line.reason.as_str()}".as_str()); }
+            }
+        }
+        return text;
+    }
+
+    /// The baseline phase: the compiler, the declarations against its
+    /// commit, its programs' records, and the judgements that must pass
+    /// before the tree's gates run.  The problems when one fails.
+    private static baseline(repository: Path, logs: &RunLogs, git: &Git, revision: Str, triple: Str, cryo: Str,
+                            cryogate: Str, directory: Path) -> Result<BaselinePhase, Array<String>> {
+        const compiler: BaselineCompiler = VerifySession::one(BaselineCompiler::obtain(repository, logs, git, revision, triple))?;
+        const declared: Array<Declaration> = VerifySession::declared_since(repository, git, compiler.commit.as_str(), Str::new("tests/started-compiling"));
+        const fixed: Array<Declaration> = VerifySession::declared_since(repository, git, compiler.commit.as_str(), Str::new("tests/started-passing"));
+        fmt::println(VerifySession::declared_line(&declared, revision, Str::new("compile")));
+        fmt::println(VerifySession::declared_line(&fixed, revision, Str::new("pass")));
+        const records: PathBuf = directory.join(Str::new("baseline"));
+        VerifySession::one(VerifySession::created(records.as_path()))?;
+        const tests: PathBuf = repository.join(Str::new("tests"));
+        const gates: TestGates = VerifySession::one(TestGates::read(tests.join(Str::new("tests")).as_path()))?;
+        const pinned: Pinned = VerifySession::one(Pinned::read(tests.join(Str::new("test-roster.txt")).as_path(), &gates))?;
+        const totals: BaselineTotals = VerifySession::one(BaselinePrograms::record(repository, git, &compiler, records.as_path(), &pinned.unit, cryogate))?;
+        // A baseline compiler that links no stdlib archive builds none, so
+        // the archive population alone may be empty.
+        if (totals.lists[0].is_empty() || totals.lists[1].is_empty() || totals.lists[3].is_empty()) {
+            return VerifySession::refused(Str::new("the baseline has no tests, examples or runtime objects; an empty list compares clean against anything"));
+        }
+        mut namespaces: HashMap<String, String> = HashMap::<String, String>::new();
+        mut declared_names: Array<String> = Array::<String>::new();
+        mut fixed_names: Array<String> = Array::<String>::new();
+        for (line in declared.iterate_references()) { declared_names.push(line.name.clone()); }
+        for (line in fixed.iterate_references()) {
+            fixed_names.push(line.name.clone());
+            const holds_tests: boolean = match (Declarations::kind(line.name.as_str())) {
+                DeclarationKind::Unit    => { true }
+                DeclarationKind::Archive => { true }
+                _                        => { false }
+            };
+            if (!holds_tests) { continue; }
+            match (Declarations::unit_namespace(repository, line.name.as_str())) {
+                Option::Some(held) => { namespaces.insert(line.name.clone(), held); }
+                Option::None       => { }
+            }
+        }
+        mut problems: Array<String> = VerifyJudges::baseline_census(&totals.census, &declared_names, &fixed_names, &namespaces);
+        for (problem in DeclaredBuilds::check(repository, &declared, &fixed, &compiler, cryo, directory).iterate_references()) {
+            problems.push(problem.clone());
+        }
+        if (!problems.is_empty()) { return Result::Err(problems); }
+        return Result::Ok(BaselinePhase { declared: declared, fixed: fixed, totals: totals });
+    }
+
+    /// The lines naming the tree's object lists, and a problem for each
+    /// list a gate that ran should have filled and did not: an empty list
+    /// compares clean against anything.  Every hosted program links the
+    /// runtime, so a run that linked one and listed none read the wrong
+    /// directory.
+    private static object_lines(repository: Path, names: &Array<String>, population: &PopulationRun, directory: Path) -> Array<String> {
+        const census_ran: boolean = names.contains(&String::from_str(Str::new("census")));
+        const examples_ran: boolean = names.contains(&String::from_str(Str::new("examples")));
+        mut problems: Array<String> = Array::<String>::new();
+        const all: Array<ObjectPopulation> = ObjectPopulation::all();
+        mut checked: Array<i64> = Array::<i64>::new();
+        if (census_ran || examples_ran) {
+            VerifySession::object_line(repository, &all[2], population.counts[2], directory);
+        }
+        if (census_ran) { checked.push(0); }
+        if (examples_ran) { checked.push(1); }
+        if (census_ran || examples_ran) { checked.push(3); }
+        for (index in checked.iterate_references()) {
+            VerifySession::object_line(repository, &all[*index], population.counts[*index], directory);
+            if (population.counts[*index] == 0) {
+                problems.push(f"no {all[*index].name()} objects were hashed; an empty list compares clean against anything");
+            }
+        }
+        return problems;
+    }
+
+    private static object_line(repository: Path, population: &ObjectPopulation, count: i64, directory: Path) -> void {
+        const list: PathBuf = directory.join(f"tree.{population.name()}.sha256".as_str());
+        fmt::println(f"  objects   {population.name():<8} {count} ({PopulationRun::relative(repository, list.as_path().as_str()).as_str()})");
+    }
+
+    /// The tree's census warnings against the baseline's records, the
+    /// lines counting them printed: the unit suite's build warnings, and
+    /// each test project's when both runners list them.  The census gate's
+    /// own log names the runner log they are read from.
+    private static warnings(repository: Path, baseline: &BaselineTotals, declared: &Array<Declaration>, fixed: &Array<Declaration>,
+                            directory: Path) -> Array<String> {
+        mut problems: Array<String> = Array::<String>::new();
+        const reading: CensusReading = match (VerifySession::tree_census(repository, directory.join(Str::new("census.log")).as_path())) {
+            Option::Some(reading) => { reading }
+            Option::None          => {
+                problems.push(String::from_str(Str::new("the census gate named no runner log to read its warnings from")));
+                return problems;
+            }
+        };
+        mut unit_warnings: Array<String> = Array::<String>::new();
+        mut listed: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+        for (record in baseline.records.iterate_references()) {
+            if (record.name.as_str() == Str::new("unit suite")) { unit_warnings = record.warnings.clone(); }
+            if (record.warnings_listed) { listed.push(record.clone()); }
+        }
+        const found: Array<String> = VerifyJudges::new_warnings(&unit_warnings, &reading.warnings);
+        fmt::println(f"verify: unit-suite build warnings  baseline {Text::sorted_distinct(unit_warnings.clone()).length()}  tree {Text::sorted_distinct(reading.warnings.clone()).length()}  new {found.length()}");
+        for (problem in found.iterate_references()) { problems.push(problem.clone()); }
+        if (listed.is_empty() || !reading.project_warnings_listed) {
+            // A runner from before the projects' warnings were listed
+            // prints none, which is not the same as a build with none.
+            const side: Str = if (listed.is_empty()) { Str::new("the baseline's") } else { Str::new("the tree's") };
+            fmt::println(f"verify: project build warnings  not compared: {side} runner does not list them");
+            return problems;
+        }
+        mut excluded: Array<String> = Array::<String>::new();
+        for (line in declared.iterate_references()) { excluded.push(String::from_str(Declarations::program_of(line.name.as_str()))); }
+        for (line in fixed.iterate_references()) { excluded.push(String::from_str(Declarations::program_of(line.name.as_str()))); }
+        mut compared: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        mut tree_count: Array<String> = Array::<String>::new();
+        for (pair in reading.project_warnings.iterate_references()) {
+            if (excluded.contains(&pair.first)) { continue; }
+            mut known: boolean = false;
+            for (record in listed.iterate_references()) { if (record.name.as_str() == pair.first.as_str()) { known = true; } }
+            if (!known) { continue; }
+            compared.push(Pair::new(pair.first.clone(), pair.second.clone()));
+            tree_count.push(f"{pair.first.as_str()}\n{pair.second.as_str()}");
+        }
+        mut base_count: i64 = 0;
+        for (record in listed.iterate_references()) {
+            if (!excluded.contains(&record.name)) { base_count = base_count + Text::sorted_distinct(record.warnings.clone()).length(); }
+        }
+        const project_found: Array<String> = VerifyJudges::new_project_warnings(&listed, &compared, &excluded);
+        fmt::println(f"verify: project build warnings  baseline {base_count}  tree {Text::sorted_distinct(tree_count).length()}  new {project_found.length()}");
+        for (problem in project_found.iterate_references()) { problems.push(problem.clone()); }
+        return problems;
+    }
+
+    /// The census reading of the runner log the census gate's log
+    /// `gate_log` names on its last `log <path>` line, a relative path read
+    /// below `repository`; none when it names none, or one that is not
+    /// there.
+    private static tree_census(repository: Path, gate_log: Path) -> Option<CensusReading> {
+        const text: String = match (File::read_text(gate_log)) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { return Option::None; }
+        };
+        mut named: String = String::new();
+        const lines: Array<String> = Text::lines(text.as_str());
+        for (line in lines.iterate_references()) {
+            const raw: Str = line.as_str();
+            const indented: boolean = match (raw.byte_at(0)) {
+                Option::Some(byte) => { byte.is_whitespace() }
+                Option::None       => { false }
+            };
+            if (!indented) { continue; }
+            match (raw.trim_start().strip_prefix(&Str::new("log"))) {
+                Option::Some(rest) => {
+                    const spaced: boolean = match (rest.byte_at(0)) {
+                        Option::Some(byte) => { byte.is_whitespace() }
+                        Option::None       => { false }
+                    };
+                    if (spaced && !rest.trim().is_empty()) { named = String::from_str(rest.trim()); }
+                }
+                Option::None => { }
+            }
+        }
+        if (named.is_empty()) { return Option::None; }
+        return match (File::read_text(repository.join(named.as_str()).as_path())) {
+            Result::Ok(log) => { Option::Some(CensusReading::of(&Text::lines(log.as_str()))) }
+            Result::Err(_)  => { Option::None }
+        };
+    }
+
+    /// The comparison of the run directory `run`'s two object lists of
+    /// each population, with the declarations `changes`.
+    public static compared(repository: Path, revision: Str, changes: &DeclaredChanges, run: Str, limit: i64) -> Result<Compared, String> {
+        mut baseline: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
+        mut tree: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
+        for (population in ObjectPopulation::all().iterate_references()) {
+            baseline.push(VerifySession::list(repository, population.baseline_list(run).as_str())?);
+            tree.push(VerifySession::list(repository, population.tree_list(run).as_str())?);
+        }
+        return Result::Ok(ObjectComparison::against(revision, changes, baseline, tree, limit, run));
+    }
+
+    /// A list file of the checkout `repository`, read as path to digest.
+    private static list(repository: Path, list: Str) -> Result<HashMap<String, String>, String> {
+        return match (File::read_text(repository.join(list).as_path())) {
+            Result::Ok(text)   => { Result::Ok(ObjectComparison::read_list(text.as_str())) }
+            Result::Err(error) => { Result::Err(f"cannot read {list}: {error.describe()}") }
+        };
+    }
+
+    /// The target `cryo version --triple` names; empty when it names none.
+    private static triple(cryo: Str, logs: &RunLogs) -> String {
+        mut job: Job = Job::new(cryo);
+        job.argument(Str::new("version"));
+        job.argument(Str::new("--triple"));
+        job.log_to(logs.file(Str::new("verify-triple")).as_str());
+        const done: Completion = job.run();
+        if (!done.outcome.succeeded()) { return String::new(); }
+        return String::from_str(done.output().as_str().trim());
+    }
+
+    private static created(directory: Path) -> Result<(), String> {
+        return match (Directory::create_all(directory)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot create {directory.as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// A step's one problem, as the list the baseline phase returns.
+    private static one<T>(result: Result<T, String>) -> Result<T, Array<String>> {
+        return match (result) {
+            Result::Ok(value)    => { Result::Ok(value) }
+            Result::Err(problem) => { VerifySession::refused::<T>(problem.as_str()) }
+        };
+    }
+
+    private static refused<T>(problem: Str) -> Result<T, Array<String>> {
+        mut problems: Array<String> = Array::<String>::new();
+        problems.push(String::from_str(problem));
+        return Result::Err(problems);
+    }
+}
+
+/// What the baseline phase hands the rest of the run.
+private type struct BaselinePhase {
+    declared: Array<Declaration>;
+    fixed: Array<Declaration>;
+    totals: BaselineTotals;
+}
