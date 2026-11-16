@@ -5436,7 +5436,9 @@ A path dependency names a directory holding a `cryoconfig`, relative to the cryo
 - A commit read back from `cryoconfig.lock` must be a full 40-digit commit id.
 - A `file://` repository may be named by the program, and by a package that is itself on this machine: one reached from the program through path dependencies and `file://` repositories alone. A package fetched from an `https` or `ssh` repository, and every package below it, names only remote repositories, so a repository nobody on this machine controls cannot point the build at this machine's files.
 
-A git dependency's repository and its checkouts are cached under a directory named by the first 16 hex digits of the SHA-256 of its URL and the URL's last path segment (`<16 hex digits>-json5`), so two URLs never share an entry and a cached file's path stays the same length however long the URL is.
+A git dependency's repository and the files of its pinned commits are cached under a directory named by the first 16 hex digits of the SHA-256 of its URL and the URL's last path segment (`<16 hex digits>-json5`), so two URLs never share an entry and a cached file's path stays the same length however long the URL is: the bare clone in `git/<id>`, a commit's files in `src/<id>/<commit>`.
+
+A commit's files are extracted from the bare clone as git stores them, each blob's bytes as they are: there is no working tree, so no line-ending conversion, no `.gitattributes` filter and no hook applies, and one commit is the same bytes on every host. They are written beside their place and moved into it once all are there, so an interrupted extraction never reads as done, and the next one removes what it left. A commit holding a submodule, a symbolic link, or a path with an empty, `.`, `..` or `.git` segment, a `\` or a `:`, is refused, naming the dependency. A build whose extraction is missing makes it again from the bare clone, which is local; a build never fetches.
 
 Each `git` process the build or `cryo fetch` starts may use only the transport its URL names (`-c protocol.allow=never` plus that one), and is given every URL and path after `--`.
 

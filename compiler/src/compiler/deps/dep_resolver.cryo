@@ -3,16 +3,16 @@
 ///! Top-level orchestrator for `[dependencies]`.  Walks the dep
 ///! tree from a consumer's cryoconfig and either:
 ///!
-///!   - Build mode:  reads `cryoconfig.lock`, materializes any missing
-///!                  checkouts, and returns the source roots the
+///!   - Build mode:  reads `cryoconfig.lock`, extracts any missing
+///!                  commit from its bare clone, and returns the source roots the
 ///!                  module loader should scan.  No network, no
 ///!                  lockfile writes; everything must already be
 ///!                  resolved.
 ///!
 ///!   - Fetch mode:  resolves git deps against their remotes,
 ///!                  re-using existing lockfile entries when their
-///!                  ref-spec is unchanged, materializes the
-///!                  checkouts, and writes a fresh lockfile.
+///!                  ref-spec is unchanged, extracts each pinned
+///!                  commit's files, and writes a fresh lockfile.
 ///!
 ///!   - Update mode: like Fetch but ignores existing lockfile entries
 ///!                  entirely; every git dep is re-resolved.
@@ -29,6 +29,7 @@ import std::fmt;
 import compiler::project_config::{ Dependency, DepKind, GitRefKind, ProjectConfig };
 import compiler::deps::{ cache, git, semver, lockfile };
 import std::collections::str;
+import compiler::deps::cache::{ Cache };
 import compiler::deps::git::{ Git };
 import compiler::deps::git_url::{ GitUrl };
 import compiler::module_graph::{ PackageDeclaration };
@@ -308,7 +309,7 @@ type struct DepResolver {
 
     /// Git dep: the source-of-truth for what's on disk is the lockfile.
     /// In Build mode we trust the lockfile completely; in Fetch/Update we
-    /// (re)resolve the ref to a SHA, materialize the checkout, and write
+    /// (re)resolve the ref to a SHA, extract the commit's files, and write
     /// a fresh lockfile entry.
     static resolve_git_dep(cfg: const ProjectConfig*,
                              declarer: str::Str,
@@ -349,11 +350,11 @@ type struct DepResolver {
                     outcome.failed = true;
                     return;
                 }
-                if (!Git::is_checkout_present(dep.git_url.as_str(), sha.as_str())) {
-                    if (!Git::materialize_checkout(dep.git_url.as_str(), sha.as_str())) {
-                        outcome.failed = true;
-                        return;
-                    }
+                // A missing extraction is made again from the bare clone,
+                // which is local: a build starts no network fetch.
+                if (!Git::extract(dep.name.as_str(), dep.git_url.as_str(), sha.as_str())) {
+                    outcome.failed = true;
+                    return;
                 }
             }
             _ => {
@@ -368,18 +369,23 @@ type struct DepResolver {
                         reused = true;
                     }
                 }
-                if (!reused) {
-                    if (!Git::ensure_bare_clone(dep.git_url.as_str(), true)) {
+                // A reused pin needs the bare clone too when its files are
+                // not extracted (a fresh cache with a committed lock), but
+                // not its remote refs refreshed.
+                if (!reused || !Git::is_extracted(dep.git_url.as_str(), sha.as_str())) {
+                    if (!Git::ensure_bare_clone(dep.git_url.as_str(), !reused)) {
                         outcome.failed = true;
                         return;
                     }
+                }
+                if (!reused) {
                     sha = DepResolver::resolve_to_sha(dep);
                     if (sha.length() == 0) {
                         outcome.failed = true;
                         return;
                     }
                 }
-                if (!Git::materialize_checkout(dep.git_url.as_str(), sha.as_str())) {
+                if (!Git::extract(dep.name.as_str(), dep.git_url.as_str(), sha.as_str())) {
                     outcome.failed = true;
                     return;
                 }
@@ -394,7 +400,7 @@ type struct DepResolver {
             }
         }
 
-        const checkout: PathBuf = Git::checkout_path(dep.git_url.as_str(), sha.as_str());
+        const checkout: PathBuf = Cache::extraction_dir_for(dep.git_url.as_str(), sha.as_str());
         const dep_root: PathBuf = if (dep.subdir.length() > 0) {
             checkout.join(dep.subdir.as_str())
         } else {
