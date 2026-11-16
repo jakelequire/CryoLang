@@ -677,6 +677,19 @@ Open: whether every function-typed value becomes the two-pointer form or
 only a separate closure-value type does; and whether a non-capturing
 function keeps its single-pointer form across the C boundary.
 
+## A forced unwind releases what the catching frame owns
+
+A forced unwind - a thread ending through the C library's thread exit, or
+being cancelled - passes through `catch_unwind` without being caught: under
+it the personality answers "keep unwinding" for the catching call site. That
+call site's one landing pad is the catch, which never reads the selector, so
+the frame that holds the catch is left without running any of its drops:
+the body `catch_unwind` was given, and what that body captured, are not
+released, while every frame further out, the caller of `catch_unwind`
+included, is. Releasing them needs the catching call site to carry a cleanup
+separate from its catch, for the personality to choose under a forced
+unwind.
+
 ## Moving a value out from behind a reference
 
 A field that owns a resource, moved by value out of a place reached through

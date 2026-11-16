@@ -409,8 +409,8 @@ type struct CodegenPasses {
         }
     }
 
-    /// Append the runtime tiers a HOSTED link needs, plus the entry override
-    /// that makes the program start in Cryo instead of in crt0.  Placed after
+    /// Append the runtime tiers a HOSTED link needs, plus, on Windows, the
+    /// entry override that makes the program start in Cryo.  Placed after
     /// the user objects and the stdlib archive so the tiers resolve their
     /// undefined `__cryo_panic` (and, under unwind, `__cryo_personality_v0`).
     ///
@@ -426,22 +426,23 @@ type struct CodegenPasses {
     /// had printed — and that applies to unwind too, since an uncaught panic
     /// still terminates (through `__cryo_panic_finish`).
     ///
-    /// `-Wl,-e,__cryo_entry` is what actually retargets the entry, and it also
-    /// pulls the entry out of the archive: ld enters the entry symbol as an
-    /// undefined reference, so naming it here extracts the member.  The crt
-    /// objects are deliberately NOT dropped (no `-nostartfiles`) — see
-    /// `runtime/core/src/entry.cryo` for why removing them costs far more than
-    /// the entry point.
+    /// A Linux program starts where glibc's does: crt1's `_start` calls
+    /// `__libc_start_main`, which runs the initializer arrays once, registers
+    /// the dynamic linker's finalizer and the executable's `.fini_array`, and
+    /// calls the widened `main(argc, argv, envp)`, exiting through libc `exit`
+    /// with its result.  Linux arguments are already NUL-terminated byte
+    /// strings, so there is nothing for Cryo to do before `main`, and owning
+    /// the entry would only mean redoing glibc's startup and differing from it.
     ///
-    /// `--release-static` is the one link that keeps crt0's entry, and that is
-    /// forced rather than chosen: it passes `-static`, and a fully static glibc
-    /// sets up its own thread control block INSIDE `__libc_start_main` — the job
-    /// ld.so does before the entry runs in every dynamic link.  Entering past it
-    /// therefore leaves TLS unmapped, and the program dies on the first
-    /// thread-local access, which the panic tier makes early.  Measured: a
-    /// static binary with a retargeted entry segfaults before reaching `main`.
-    /// Nothing else emits `-static`, so this exception is exactly as narrow as
-    /// the flag.
+    /// A Windows program starts in Cryo, because its arguments must be split
+    /// out of the PEB's UTF-16 command line by the runtime's one parser.
+    /// `-Wl,-e,__cryo_entry` retargets the entry, and it also pulls the entry
+    /// out of the archive: ld enters the entry symbol as an undefined
+    /// reference, so naming it here extracts the member.  The crt objects are
+    /// deliberately NOT dropped (no `-nostartfiles`) — see
+    /// `runtime/core/src/entry.cryo` for why removing them costs far more than
+    /// the entry point.  A `--release-static` link keeps the toolchain's entry
+    /// on every target.
     ///
     /// On Windows the core tier reaches ntdll — argv is parsed out of the PEB by
     /// the same code the freestanding tier uses, which sizes its vector with
@@ -497,7 +498,7 @@ type struct CodegenPasses {
                     DriverFacts::directory_for(ctx.options.stdlib_root, triple), probe_log)) {
             cmd.push(Str::new(" --unwindlib=none -Wl,-Bstatic -lunwind -Wl,-Bdynamic"));
         }
-        if (!ctx.options.static_link) {
+        if (triple.contains("windows") && !ctx.options.static_link) {
             cmd.push(Str::new(" -Wl,-e,__cryo_entry"));
         }
     }
@@ -1540,7 +1541,7 @@ type struct CodegenPasses {
         // the line.  A hosted link takes its allocator from libc, but still
         // needs the panic funnel (every panic calls the external `__cryo_panic`,
         // so exactly one panic tier must be named or the link fails on an
-        // undefined symbol) and the core tier, which owns the entry.
+        // undefined symbol) and the core tier, which owns the Windows entry.
         if (cfg.no_runtime) {
             CodegenPasses::append_runtime_tier_libs(ctx, &cmd, effective_triple);
         } else {

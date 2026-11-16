@@ -163,6 +163,13 @@ TEST_CPP_HELPERS_O   := $(TEST_HELPERS_DIR)/cpp_link_helper-unix.o
 TEST_CPP_HELPERS_A   := $(TEST_HELPERS_DIR)/libcpplinkhelper-unix.a
 CXX                  ?= c++
 
+# C startup hooks (a .preinit_array entry, a constructor, a destructor) for the
+# linux_startup_runs_c_initializers_once project, which runs only on Linux.
+# Built only on unix, like the C++ helper.
+TEST_STARTUP_HELPERS_C := $(TEST_HELPERS_DIR)/startup_helpers.c
+TEST_STARTUP_HELPERS_O := $(TEST_HELPERS_DIR)/startup_helpers-unix.o
+TEST_STARTUP_HELPERS_A := $(TEST_HELPERS_DIR)/libstartuphelpers-unix.a
+
 # Python interpreter for the helper scripts, and the only spelling of it in
 # the recipes.  Windows ships `python.exe`, and its `python3` is an App
 # Execution Alias that exits 49; Linux/macOS use `python3`.  NOOP is a recipe
@@ -638,6 +645,12 @@ $(TEST_CPP_HELPERS_A): $(TEST_CPP_HELPERS_CPP)
 	@$(CXX) -O0 -fPIC -c -o $(TEST_CPP_HELPERS_O) $<
 	@ar rcs $@ $(TEST_CPP_HELPERS_O)
 
+# C startup-hook archive for the linux_startup_runs_c_initializers_once project.
+$(TEST_STARTUP_HELPERS_A): $(TEST_STARTUP_HELPERS_C)
+	@echo "==> Building C startup-hook helper archive"
+	@cc -O0 -fPIC -c -o $(TEST_STARTUP_HELPERS_O) $<
+	@ar rcs $@ $(TEST_STARTUP_HELPERS_O)
+
 ifeq ($(HOST_OS),windows)
 # Native Windows host: recipes run under cmd, which can't execute a quoted
 # forward-slash path and needs the `.exe` the native build emits - so the
@@ -661,16 +674,16 @@ test-census: $(STAGE2_EXE) $(TEST_HELPERS_A) runtime-tiers
 vendor-check: $(STAGE2_EXE) runtime-tiers
 	@$(PYTHON) scripts/vendor-consts-gate.py "$(STAGE2_EXE_WIN)" $(ARGS)
 else
-test: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
+test: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A) runtime-tiers
 	@cd tests && "$(STAGE2)" test $(ARGS)
 
-test-list: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
+test-list: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A)
 	@cd tests && "$(STAGE2)" test --list $(ARGS)
 
 # Golden-file gate on the DISCOVERED unit-test roster: a compiler change
 # that silently breaks `![test]` discovery would otherwise stay green
 # ("0 of 0 failed" is a pass).  Re-pin deliberately with ARGS=--update.
-roster-check: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
+roster-check: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A)
 	@$(PYTHON) scripts/roster-check.py "$(STAGE2)" $(ARGS)
 
 # `make test` with the counts asserted.  The runner reports a zero the same way
@@ -679,7 +692,7 @@ roster-check: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 # same output, and then reconciles what ran against the roster golden.  Use it
 # wherever the run is being taken as evidence; `make test` stays for the
 # working loop, where a pattern filter is the point.
-test-census: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
+test-census: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A) runtime-tiers
 	@$(PYTHON) scripts/test-census.py --cryo "$(STAGE2)" $(ARGS)
 
 # End-to-end gate on the constants `cryo vendor` carries out of a C header.
@@ -711,7 +724,7 @@ ifeq ($(HOST_OS),windows)
 verify: cryo $(TEST_HELPERS_A)
 	@$(PYTHON) scripts/verify.py --cryo "$(STAGE2_EXE)" $(ARGS)
 else
-verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
+verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A)
 	@$(PYTHON) scripts/verify.py --cryo "$(STAGE2)" $(ARGS)
 endif
 
