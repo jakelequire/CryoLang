@@ -541,6 +541,17 @@ the comparison reads:
   SOURCE never needs it: verify builds this tree's stdlib with both
   compilers, so a source edit moves nothing there by construction - prove one
   by building the library before and after at one path.
+- `moved-runtime:<archive>/<member>` in `tests/started-passing` - a member of
+  a runtime tier archive, written by the archive's file name and the
+  member's (`moved-runtime:libcryort-panic-unwind-hosted.a/Unwind.o`), that
+  the change moves on purpose: a runtime source edit, or a compiler change
+  that alters what the runtime compiles to.  The baseline's archives are
+  built from the baseline's `runtime/`, so a runtime edit moves its members.
+  The member is left out of the runtime comparison and must have moved; a
+  declared member that is unchanged fails, and so does a name that matches
+  no member of that archive in both runs, and any member that moved in an
+  archive nothing declares.  Every tier compiles the shared sources, so a
+  change to one of them declares its member once per archive that holds it.
 
 A line stays once committed: against a later baseline it is inert.
 Rewriting a line into another form with its reason kept declares nothing

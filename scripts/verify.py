@@ -818,16 +818,23 @@ EXAMPLE_FAILED = re.compile(r"^\s*FAIL\s+(examples/\S+)")
 # module written `moved-archive:<module>` (`moved-archive:std::time::clock`)
 # names no program: the change moves the module's objects in the stdlib
 # archives on purpose, so they are left out of the archive comparison, and one
-# of them must have moved.
+# of them must have moved.  A runtime archive member written
+# `moved-runtime:<archive>/<member>` (`moved-runtime:libcryort-core.a/Sys.o`)
+# names no program either: the change moves that member of that tier archive
+# on purpose, so it is left out of the runtime comparison, and it must have
+# moved.
 NEGATIVE = "negative/"
 EXAMPLE = "examples/"
 ARCHIVE = "archive:"
 MOVED = "moved:"
 MOVED_ARCHIVE = "moved-archive:"
+MOVED_RUNTIME = "moved-runtime:"
 UNIT_DIR = "tests/tests"
 
 
 def declared_kind(name):
+    if name.startswith(MOVED_RUNTIME):
+        return "moved-runtime"
     if name.startswith(MOVED_ARCHIVE):
         return "moved-archive"
     if name.startswith(ARCHIVE):
@@ -846,8 +853,9 @@ def declared_kind(name):
 def program_of(name):
     """The program a declaration line names, without the form it is written
     in: `archive:stdlib/x.cryo` names `stdlib/x.cryo`, `moved:p` names `p`,
-    `moved-archive:std::m` names `std::m`."""
-    for form in (MOVED_ARCHIVE, ARCHIVE, MOVED):
+    `moved-archive:std::m` names `std::m`, `moved-runtime:a.a/m.o` names
+    `a.a/m.o`."""
+    for form in (MOVED_RUNTIME, MOVED_ARCHIVE, ARCHIVE, MOVED):
         if name.startswith(form):
             return name[len(form):]
     return name
@@ -892,6 +900,20 @@ def archive_module_suffix(name):
     """The object path tail a standard-library module compiles to in every
     stdlib archive: `std::time::clock` is `.../deps/std/time/clock.o`."""
     return "/deps/" + "/".join(program_of(name).split("::")) + ".o"
+
+
+RUNTIME_MEMBER = re.compile(r"^(libcryort[\w.-]*\.a)/([\w.-]+\.o)$")
+
+
+def runtime_member_pattern(name):
+    """The hash-row path a `moved-runtime:<archive>/<member>` line names, as a
+    pattern over `runtime/<archive>/<NN>-<member>` (a member's place in its
+    archive is not part of its name); None when the line does not name a
+    tier archive's member."""
+    m = RUNTIME_MEMBER.match(program_of(name))
+    if not m:
+        return None
+    return re.compile(r"^runtime/%s/\d+-%s$" % (re.escape(m.group(1)), re.escape(m.group(2))))
 
 
 def parse_declared(text):
@@ -972,7 +994,7 @@ def judge_baseline_census(declared, accounted, unit_failed, neg_failed, failed, 
         problems.append("the baseline fails %s, which neither %s nor %s declares"
                         % (p, DECLARED, FIXED))
     judged = set(declared) | {p for p in fixed if declared_kind(p) not in
-                              ("unit", "archive", "moved", "moved-archive")}
+                              ("unit", "archive", "moved", "moved-archive", "moved-runtime")}
     for p in sorted(judged - set(failed)):
         problems.append("%s is declared as changed by this change, but the baseline census "
                         "passes it; a program this change makes compile or corrects fails "
@@ -1043,6 +1065,14 @@ def check_declared(declared, base_exe, cryo, logdir, base_env, env, fixed=()):
                                 "in %s, not %s" % (name, FIXED, DECLARED))
             elif archive_module_source(name) is None:
                 problems.append("%s: declared in %s but %s is no standard-library module"
+                                % (name, rel, program_of(name)))
+            continue
+        if kind == "moved-runtime":
+            if not is_fixed:
+                problems.append("%s: a runtime archive's moved members are declared in %s, "
+                                "not %s" % (name, FIXED, DECLARED))
+            elif runtime_member_pattern(name) is None:
+                problems.append("%s: declared in %s but %s is not <libcryort-*.a>/<member>.o"
                                 % (name, rel, program_of(name)))
             continue
         if not os.path.isfile(os.path.join(ROOT, PROJECTS, program_of(name), "test.json")):
@@ -1230,6 +1260,38 @@ def selftest():
          [] if archive_module_source("moved-archive:std::no_such_module_here") is None
          and archive_module_source("moved-archive:fmt::display") is None
          and archive_module_source("moved-archive:std::time::clock") is not None else ["bad"], 0),
+        ("moved-runtime: the form is its own kind, naming archive and member",
+         [] if declared_kind("moved-runtime:libcryort-core.a/Sys.o") == "moved-runtime"
+         and program_of("moved-runtime:libcryort-core.a/Sys.o") == "libcryort-core.a/Sys.o"
+         and runtime_member_pattern("moved-runtime:Sys.o") is None
+         and runtime_member_pattern("moved-runtime:libother.a/Sys.o") is None else ["bad"], 0),
+        ("census: a runtime member declared moved asks nothing of the baseline",
+         judge_baseline_census({}, True, 0, 0, [], {"moved-runtime:libcryort-core.a/Sys.o"}), 0),
+        ("moved-runtime: a declared member that moved",
+         judge_runtime_moves(["moved-runtime:libcryort-core.a/Sys.o"],
+                             {"runtime/libcryort-core.a/00-Sys.o": "1"},
+                             {"runtime/libcryort-core.a/00-Sys.o": "2"}), 0),
+        ("moved-runtime: a declared member whose place in the archive changed",
+         judge_runtime_moves(["moved-runtime:libcryort-core.a/Sys.o"],
+                             {"runtime/libcryort-core.a/00-Sys.o": "1"},
+                             {"runtime/libcryort-core.a/01-Sys.o": "2"}), 0),
+        ("moved-runtime: a declared member that did not move",
+         judge_runtime_moves(["moved-runtime:libcryort-core.a/Sys.o"],
+                             {"runtime/libcryort-core.a/00-Sys.o": "1"},
+                             {"runtime/libcryort-core.a/00-Sys.o": "1"}), 1),
+        ("moved-runtime: a declared member no archive holds",
+         judge_runtime_moves(["moved-runtime:libcryort-core.a/Sys.o"], {}, {}), 1),
+        ("moved-runtime: the same member of another archive is not the declared one",
+         judge_runtime_moves(["moved-runtime:libcryort-core.a/Sys.o"],
+                             {"runtime/libcryort-core-hosted.a/00-Sys.o": "1"},
+                             {"runtime/libcryort-core-hosted.a/00-Sys.o": "2"}), 1),
+        ("moved-runtime: another member's move is still compared",
+         [] if (lambda a, b: (judge_runtime_moves(["moved-runtime:libcryort-core.a/Sys.o"], a, b),
+                              a, b))(
+             {"runtime/libcryort-core.a/00-Sys.o": "1", "runtime/libcryort-core.a/01-Entry.o": "1"},
+             {"runtime/libcryort-core.a/00-Sys.o": "2", "runtime/libcryort-core.a/01-Entry.o": "2"})[1:]
+         == ({"runtime/libcryort-core.a/01-Entry.o": "1"},
+             {"runtime/libcryort-core.a/01-Entry.o": "2"}) else ["bad"], 0),
         ("declarations: parse skips comments and blanks",
          [] if parse_declared("# c\n\np why\nq\n") == {"p": "why", "q": ""} else ["bad"], 0),
         ("declarations: a new line applies",
@@ -1329,6 +1391,28 @@ def judge_archive_module_moves(names, a, b):
     return problems
 
 
+def judge_runtime_moves(names, a, b):
+    """Problems with the runtime archive members `names` declared
+    `moved-runtime:` over the runtime hash maps `a` and `b`: each must be in
+    both, once, and must have moved.  The members are removed from both."""
+    problems = []
+    for name in sorted(names):
+        pattern = runtime_member_pattern(name)
+        ka = [p for p in a if pattern and pattern.match(p)]
+        kb = [p for p in b if pattern and pattern.match(p)]
+        if len(ka) != 1 or len(kb) != 1:
+            problems.append("%s: %d baseline and %d tree runtime members match it; a member "
+                            "declared as moving is in both runs' archives once"
+                            % (name, len(ka), len(kb)))
+        elif a[ka[0]] == b[kb[0]]:
+            problems.append("%s is declared as moving, but %s did not move" % (name, ka[0]))
+        for p in ka:
+            del a[p]
+        for p in kb:
+            del b[p]
+    return problems
+
+
 def judge_archive_moves(names, archive_changed):
     """Problems with the unit-test files `names` declared as failing on the
     baseline through the stdlib archive: the archive is their cause, so some
@@ -1350,8 +1434,14 @@ def split_replaced(only_baseline, replaced_by_archive):
 
 
 def compare(tag_a, a_path, b_path, limit, excluded=(), units=None, problems=None,
-            replaced_by_archive=False, moved_projects=(), moved_modules=()):
+            replaced_by_archive=False, moved_projects=(), moved_modules=(),
+            moved_members=()):
     a, b = read_hashes(a_path), read_hashes(b_path)
+    if moved_members:
+        found = judge_runtime_moves(moved_members, a, b)
+        print("  %-9s declared moved runtime members left out: %d, %d problem(s)"
+              % (tag_a, len(moved_members), len(found)))
+        problems.extend(found)
     if units:
         found = judge_unit_moves(units, a, b)
         print("  %-9s declared unit-test objects left out: %d, %d problem(s)"
@@ -1550,7 +1640,9 @@ def main():
                               moved_projects=[n for n in fixed if declared_kind(n) == "moved"]
                               if base == "tests" else (),
                               moved_modules=[n for n in fixed if declared_kind(n) == "moved-archive"]
-                              if base == "stdlib" else ())
+                              if base == "stdlib" else (),
+                              moved_members=[n for n in fixed if declared_kind(n) == "moved-runtime"]
+                              if base == "runtime" else ())
             diff += changed
             if base == "stdlib":
                 archive_changed = changed
