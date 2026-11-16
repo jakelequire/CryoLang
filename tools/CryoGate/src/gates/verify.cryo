@@ -1,0 +1,254 @@
+///! verify's decisions over the declaration files (tests/started-compiling
+///! and tests/started-passing) and over the object lists it compares: which
+///! lines a change declares, the form each line takes, which program owns an
+///! object, and whether an object only the baseline built is one the tree
+///! takes from the stdlib archive.  Pure: files and lists are handed in.
+namespace cryogate::gates::verify;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::file::{ File };
+import std::fs::path::{ Path };
+
+import cryogate::core::child::{ Completion };
+import cryogate::core::git::{ Git };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
+
+/// `cryogate verify --declared-since <rev>`: the lines each declaration file
+/// declares against the commit `rev`, printed as `scripts/verify.py` prints
+/// them before its baseline run, so the two can be compared on one checkout.
+public type struct VerifyGate {
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate verify --declared-since <rev>"));
+        options.valued(Str::new("--declared-since"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 2; }
+        };
+        const revision: Str = match (parsed.value(Str::new("--declared-since"))) {
+            Option::Some(revision) => { revision }
+            Option::None           => { fmt::eprintln(f"cryogate verify: usage: {options.usage()}"); return 2; }
+        };
+        const git: Git = Git::new(repository, logs);
+        VerifyGate::print_declared(repository, &git, revision, Str::new("tests/started-compiling"),
+            Str::new("compile"));
+        VerifyGate::print_declared(repository, &git, revision, Str::new("tests/started-passing"),
+            Str::new("pass"));
+        return 0;
+    }
+
+    /// Print the lines the working tree's `file` declares against its copy
+    /// at `revision` (none when the commit has no such file), sorted by name.
+    static print_declared(repository: Path, git: &Git, revision: Str, file: Str, starting: Str) -> void {
+        const tree_text: String = match (File::read_text(repository.join(file).as_path())) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { String::new() }
+        };
+        mut show: Array<Str> = Array::<Str>::new();
+        show.push(Str::new("show"));
+        const spec: String = f"{revision}:{file}";
+        show.push(spec.as_str());
+        const done: Completion = git.run(&show);
+        const base_text: String = if (done.outcome.succeeded()) { done.output() } else { String::new() };
+        const declared: Array<Declaration> = Declarations::between(tree_text.as_str(), base_text.as_str());
+        mut names: Array<String> = Array::<String>::new();
+        for (line in declared.iterate_references()) { names.push(line.name.clone()); }
+        const sorted: Array<String> = Text::sorted_distinct(names);
+        mut text: String = f"verify: {declared.length()} program(s) declared as starting to {starting} since {revision}";
+        for (name in sorted.iterate_references()) {
+            for (line in declared.iterate_references()) {
+                if (line.name.as_str() == name.as_str()) {
+                    text.push(f"\n      {name.as_str()} -- {line.reason.as_str()}".as_str());
+                }
+            }
+        }
+        fmt::println(text);
+    }
+}
+
+/// What a declaration line names, by its form.
+public type enum DeclarationKind {
+    /// `moved-archive:<module>`: a stdlib module whose archive objects move.
+    MovedArchive;
+    /// `archive:<file>`: a unit-test file the baseline fails through the archive.
+    Archive;
+    /// `moved:<project>`: a project both compilers pass whose objects move.
+    Moved;
+    /// `negative/<file>.cryo`: a compile-fail file.
+    Negative;
+    /// `examples/<name>`: an example project.
+    Example;
+    /// `<path>.cryo`: a unit-test file under tests/tests.
+    Unit;
+    /// Anything else: a test project's directory name.
+    Project;
+}
+
+/// A prefix a declaration line may carry before the program it names, and
+/// the kind it makes the line.
+public type struct DeclarationForm {
+    public prefix: Str;
+    public kind:   DeclarationKind;
+
+    /// The prefixed forms, in the order a line is matched against them: a
+    /// line takes the first whose prefix it starts with.  A new form is a
+    /// row here.
+    public static prefixed() -> Array<DeclarationForm> {
+        mut forms: Array<DeclarationForm> = Array::<DeclarationForm>::new();
+        forms.push(DeclarationForm { prefix: Str::new("moved-archive:"), kind: DeclarationKind::MovedArchive });
+        forms.push(DeclarationForm { prefix: Str::new("archive:"),       kind: DeclarationKind::Archive });
+        forms.push(DeclarationForm { prefix: Str::new("moved:"),         kind: DeclarationKind::Moved });
+        return forms;
+    }
+}
+
+/// One line of a declaration file: the program it names, in its form, and
+/// why the change makes that program pass, compile or move.
+public type struct Declaration {
+    public name:   String;
+    public reason: String;
+}
+
+/// Reading the declaration files.
+public type struct Declarations {
+    /// The lines of a declaration file's `text`, blank lines and `#`
+    /// comments skipped.  A line is its name up to the first space and the
+    /// reason after it, both trimmed.  A name written twice keeps its first
+    /// place and takes the later reason.
+    public static parse(text: Str) -> Array<Declaration> {
+        mut written: Array<Declaration> = Array::<Declaration>::new();
+        const lines: Array<String> = Text::lines(text);
+        for (raw in lines.iterate_references()) {
+            const line: Str = raw.as_str().trim();
+            if (line.is_empty() || line.starts_with(&Str::new("#"))) { continue; }
+            const name: Str = match (line.split_once(&Str::new(" "))) {
+                Option::Some(parts) => { parts.first }
+                Option::None        => { line }
+            };
+            const reason: Str = match (line.split_once(&Str::new(" "))) {
+                Option::Some(parts) => { parts.second.trim() }
+                Option::None        => { Str::new("") }
+            };
+            written.push(Declaration { name: String::from_str(name), reason: String::from_str(reason) });
+        }
+        mut out: Array<Declaration> = Array::<Declaration>::new();
+        for (mut i: i64 = 0; i < written.length(); i++) {
+            mut first: boolean = true;
+            for (mut j: i64 = 0; j < i; j++) {
+                if (written[j].name.as_str() == written[i].name.as_str()) { first = false; }
+            }
+            if (!first) { continue; }
+            mut reason: Str = written[i].reason.as_str();
+            for (mut j: i64 = i + 1; j < written.length(); j++) {
+                if (written[j].name.as_str() == written[i].name.as_str()) { reason = written[j].reason.as_str(); }
+            }
+            out.push(Declaration { name: written[i].name.clone(), reason: String::from_str(reason) });
+        }
+        return out;
+    }
+
+    /// The lines `tree_text` declares that apply against a baseline whose
+    /// copy of the file is `base_text`: a line whose program the baseline's
+    /// copy names with the same reason declares nothing, in whatever form it
+    /// is written there.  So a new line applies, a rewritten reason applies
+    /// again, a removed line declares nothing, and a line rewritten into
+    /// another form with its reason kept declares nothing.
+    public static between(tree_text: Str, base_text: Str) -> Array<Declaration> {
+        const tree: Array<Declaration> = Declarations::parse(tree_text);
+        const base: Array<Declaration> = Declarations::parse(base_text);
+        mut out: Array<Declaration> = Array::<Declaration>::new();
+        for (line in tree.iterate_references()) {
+            const program: Str = Declarations::program_of(line.name.as_str());
+            mut unchanged: boolean = false;
+            for (earlier in base.iterate_references()) {
+                if (Declarations::program_of(earlier.name.as_str()) == program
+                        && earlier.reason.as_str() == line.reason.as_str()) {
+                    unchanged = true;
+                }
+            }
+            if (!unchanged) {
+                out.push(Declaration { name: line.name.clone(), reason: line.reason.clone() });
+            }
+        }
+        return out;
+    }
+
+    /// The kind of program the line `name` declares, by its form.
+    public static kind(name: Str) -> DeclarationKind {
+        const forms: Array<DeclarationForm> = DeclarationForm::prefixed();
+        for (form in forms.iterate_references()) {
+            if (name.starts_with(&form.prefix)) { return form.kind; }
+        }
+        if (name.starts_with(&Str::new("negative/"))) { return DeclarationKind::Negative; }
+        if (name.starts_with(&Str::new("examples/"))) { return DeclarationKind::Example; }
+        if (name.ends_with(&Str::new(".cryo"))) { return DeclarationKind::Unit; }
+        return DeclarationKind::Project;
+    }
+
+    /// The program the line `name` names: `name` without its form's prefix.
+    public static program_of(name: Str) -> Str {
+        const forms: Array<DeclarationForm> = DeclarationForm::prefixed();
+        for (form in forms.iterate_references()) {
+            match (name.strip_prefix(&form.prefix)) {
+                Option::Some(rest) => { return rest; }
+                Option::None       => { }
+            }
+        }
+        return name;
+    }
+
+    /// The tail of the path of a `moved-archive:` line's module object in
+    /// an archive: `/deps/std/time/clock.o` for `std::time::clock`.
+    public static archive_module_suffix(name: Str) -> String {
+        const module_path: String = Declarations::program_of(name).replace(&Str::new("::"), &Str::new("/"));
+        return f"/deps/{module_path}.o";
+    }
+}
+
+/// Which program the objects in verify's lists belong to.
+public type struct ObjectOwner {
+    /// The program an object at `path` (relative to the checkout, `/`
+    /// separated) was built for: the unit suite for one under
+    /// `tests/build/`, a project for one under its directory in
+    /// `tests/tests/projects/`, an example for one under its directory in
+    /// `examples/`; none for any other object.
+    public static of(path: Str) -> Option<String> {
+        if (path.starts_with(&Str::new("tests/build/"))) {
+            return Option::Some(String::from_str(Str::new("unit suite")));
+        }
+        match (path.strip_prefix(&Str::new("tests/tests/projects/"))) {
+            Option::Some(rest) => {
+                return match (rest.split_once(&Str::new("/"))) {
+                    Option::Some(parts) => { Option::Some(String::from_str(parts.first)) }
+                    Option::None        => { Option::Some(String::from_str(rest)) }
+                };
+            }
+            Option::None => { }
+        }
+        match (path.strip_prefix(&Str::new("examples/"))) {
+            Option::Some(rest) => {
+                const project: Str = match (rest.split_once(&Str::new("/"))) {
+                    Option::Some(parts) => { parts.first }
+                    Option::None        => { rest }
+                };
+                return Option::Some(f"examples/{project}");
+            }
+            Option::None => { }
+        }
+        return Option::None;
+    }
+
+    /// Whether an object at `path` that only the baseline built is one the
+    /// tree takes from the stdlib archive instead: a stdlib module's object
+    /// in a program's build, when the tree's builds linked an archive
+    /// (`archive_linked`).  Such an object is not counted as missing.
+    public static replaced_by_archive(path: Str, archive_linked: boolean) -> boolean {
+        return archive_linked && path.contains(&Str::new("/std/deps/"));
+    }
+}

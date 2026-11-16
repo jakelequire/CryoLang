@@ -1,0 +1,146 @@
+///! verify's decisions over the declaration files and the object lists,
+///! case for case with scripts/verify.py's self-test while both exist.
+![config(testing)]
+namespace cryogate::tests::verify;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_equal };
+
+import cryogate::gates::verify::{ Declaration, Declarations, DeclarationKind, ObjectOwner };
+
+type struct Fixture {
+    /// The declarations as `name=reason` entries joined by `;`, in order.
+    static shown(declarations: &Array<Declaration>) -> String {
+        mut out: String = String::new();
+        for (mut i: i64 = 0; i < declarations.length(); i++) {
+            if (i > 0) { out.push(';'); }
+            out.push(declarations[i].name.as_str());
+            out.push('=');
+            out.push(declarations[i].reason.as_str());
+        }
+        return out;
+    }
+
+    static between(tree: Str, base: Str) -> String {
+        const applied: Array<Declaration> = Declarations::between(tree, base);
+        return Fixture::shown(&applied);
+    }
+
+    static owner(path: Str) -> String {
+        return match (ObjectOwner::of(path)) {
+            Option::Some(name) => { name }
+            Option::None       => { String::from_str(Str::new("<none>")) }
+        };
+    }
+}
+
+![test]
+function parse_skips_comments_and_blank_lines() -> Result<(), TestError> {
+    const parsed: Array<Declaration> = Declarations::parse(Str::new("# c\n\np why\nq\n"));
+    const shown: String = Fixture::shown(&parsed);
+    return expect_equal(shown.as_str(), Str::new("p=why;q="));
+}
+
+![test]
+function a_name_written_twice_keeps_its_place_and_takes_the_later_reason() -> Result<(), TestError> {
+    const parsed: Array<Declaration> = Declarations::parse(Str::new("p a\nq b\np c\n"));
+    const shown: String = Fixture::shown(&parsed);
+    return expect_equal(shown.as_str(), Str::new("p=c;q=b"));
+}
+
+![test]
+function a_new_line_applies() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new("p a\nq b\n"), Str::new("p a\n"));
+    return expect_equal(applied.as_str(), Str::new("q=b"));
+}
+
+![test]
+function an_unchanged_line_does_not_apply() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new("p a\n"), Str::new("p a\n"));
+    return expect_equal(applied.as_str(), Str::new(""));
+}
+
+![test]
+function a_rewritten_reason_applies_again() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new("p b\n"), Str::new("p a\n"));
+    return expect_equal(applied.as_str(), Str::new("p=b"));
+}
+
+![test]
+function a_removed_line_declares_nothing() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new(""), Str::new("p a\n"));
+    return expect_equal(applied.as_str(), Str::new(""));
+}
+
+![test]
+function a_line_rewritten_into_the_archive_form_with_its_reason_kept_declares_nothing() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new("archive:p a\n"), Str::new("p a\n"));
+    return expect_equal(applied.as_str(), Str::new(""));
+}
+
+![test]
+function a_new_line_in_the_archive_form_applies() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new("archive:p a\n"), Str::new(""));
+    return expect_equal(applied.as_str(), Str::new("archive:p=a"));
+}
+
+![test]
+function a_line_rewritten_into_the_moved_form_with_its_reason_kept_declares_nothing() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new("moved:p a\n"), Str::new("p a\n"));
+    return expect_equal(applied.as_str(), Str::new(""));
+}
+
+![test]
+function the_moved_archive_form_is_its_own_kind_naming_the_module() -> Result<(), TestError> {
+    const name: Str = Str::new("moved-archive:std::a::b");
+    const kind: DeclarationKind = Declarations::kind(name);
+    expect(match (kind) { DeclarationKind::MovedArchive => { true } _ => { false } }, Str::new("kind moved-archive"))?;
+    expect_equal(Declarations::program_of(name), Str::new("std::a::b"))?;
+    const suffix: String = Declarations::archive_module_suffix(name);
+    return expect_equal(suffix.as_str(), Str::new("/deps/std/a/b.o"));
+}
+
+![test]
+function each_form_names_its_kind() -> Result<(), TestError> {
+    expect(match (Declarations::kind(Str::new("archive:lang/u.cryo"))) { DeclarationKind::Archive => { true } _ => { false } }, Str::new("archive"))?;
+    expect(match (Declarations::kind(Str::new("moved:p"))) { DeclarationKind::Moved => { true } _ => { false } }, Str::new("moved"))?;
+    expect(match (Declarations::kind(Str::new("negative/E1_x.cryo"))) { DeclarationKind::Negative => { true } _ => { false } }, Str::new("negative before unit"))?;
+    expect(match (Declarations::kind(Str::new("examples/01-hello"))) { DeclarationKind::Example => { true } _ => { false } }, Str::new("example"))?;
+    expect(match (Declarations::kind(Str::new("lang/u.cryo"))) { DeclarationKind::Unit => { true } _ => { false } }, Str::new("unit"))?;
+    return expect(match (Declarations::kind(Str::new("p"))) { DeclarationKind::Project => { true } _ => { false } }, Str::new("project"));
+}
+
+![test]
+function an_object_outside_every_program_build_belongs_to_none() -> Result<(), TestError> {
+    const outside: String = Fixture::owner(Str::new("tests/tests/lang/build/x.o"));
+    expect_equal(outside.as_str(), Str::new("<none>"))?;
+    const unit: String = Fixture::owner(Str::new("tests/build/deps/A.o"));
+    expect_equal(unit.as_str(), Str::new("unit suite"))?;
+    const project: String = Fixture::owner(Str::new("tests/tests/projects/p/build/a.o"));
+    expect_equal(project.as_str(), Str::new("p"))?;
+    const example: String = Fixture::owner(Str::new("examples/01-hello/build/m.o"));
+    return expect_equal(example.as_str(), Str::new("examples/01-hello"));
+}
+
+![test]
+function a_stdlib_object_the_tree_takes_from_the_archive_is_replaced() -> Result<(), TestError> {
+    return expect(ObjectOwner::replaced_by_archive(Str::new("p/build/x/std/deps/std/io.o"), true),
+        Str::new("a stdlib module's object, archive linked"));
+}
+
+![test]
+function a_program_object_missing_from_the_tree_is_not_replaced() -> Result<(), TestError> {
+    return expect(!ObjectOwner::replaced_by_archive(Str::new("p/build/x/local/deps/main.o"), true),
+        Str::new("a program's own object"));
+}
+
+![test]
+function a_stdlib_object_missing_when_no_archive_was_linked_is_not_replaced() -> Result<(), TestError> {
+    return expect(!ObjectOwner::replaced_by_archive(Str::new("p/build/x/std/deps/std/io.o"), false),
+        Str::new("no archive linked"));
+}
