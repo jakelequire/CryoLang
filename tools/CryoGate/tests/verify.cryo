@@ -11,7 +11,157 @@ import std::core::result::{ Result };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect, expect_equal };
 
-import cryogate::gates::verify::{ Declaration, Declarations, DeclarationKind, ObjectOwner };
+import std::collections::hashmap::{ HashMap };
+import std::collections::pair::{ Pair };
+
+import cryogate::gates::verify::{ BaselineCensus, Declaration, Declarations, DeclarationKind, ObjectOwner, VerifyJudges };
+
+/// The judges' inputs written as text: a list as names joined by `,`, a
+/// map as `key=value` entries joined by `;`.  Each answers how many
+/// problems its judge finds, as verify.py's self-test counts them.
+type struct Judged {
+    static list(text: Str) -> Array<String> {
+        mut out: Array<String> = Array::<String>::new();
+        for (part in text.split_nonempty(&Str::new(","))) { out.push(String::from_str(part)); }
+        return out;
+    }
+
+    static map(text: Str) -> HashMap<String, String> {
+        mut out: HashMap<String, String> = HashMap::<String, String>::new();
+        for (entry in text.split_nonempty(&Str::new(";"))) {
+            match (entry.split_once(&Str::new("="))) {
+                Option::Some(parts) => { out.insert(String::from_str(parts.first), String::from_str(parts.second)); }
+                Option::None        => { }
+            }
+        }
+        return out;
+    }
+
+    static census(declared: Str, accounted: boolean, unit_failed: i64, negatives_failed: i64, failed: Str,
+                  fixed: Str, namespaces: Str) -> i64 {
+        const census: BaselineCensus = BaselineCensus {
+            accounted: accounted, unit_failed: unit_failed, negatives_failed: negatives_failed,
+            failed: Judged::list(failed),
+        };
+        const held: HashMap<String, String> = Judged::map(namespaces);
+        return VerifyJudges::baseline_census(&census, &Judged::list(declared), &Judged::list(fixed), &held).length();
+    }
+
+    static unit_moves(file: Str, suffix: Str, a: Str, b: Str) -> i64 {
+        mut suffixes: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        suffixes.push(Pair::new(String::from_str(file), String::from_str(suffix)));
+        mut left: HashMap<String, String> = Judged::map(a);
+        mut right: HashMap<String, String> = Judged::map(b);
+        return VerifyJudges::unit_moves(&suffixes, &left, &right).length();
+    }
+
+    static project_moves(names: Str, a: Str, b: Str) -> i64 {
+        mut left: HashMap<String, String> = Judged::map(a);
+        mut right: HashMap<String, String> = Judged::map(b);
+        return VerifyJudges::project_moves(&Judged::list(names), &left, &right).length();
+    }
+
+    static archive_module_moves(names: Str, a: Str, b: Str) -> i64 {
+        mut left: HashMap<String, String> = Judged::map(a);
+        mut right: HashMap<String, String> = Judged::map(b);
+        return VerifyJudges::archive_module_moves(&Judged::list(names), &left, &right).length();
+    }
+
+    static new_warnings(base: Str, tree: Str) -> i64 {
+        return VerifyJudges::new_warnings(&Judged::list(base), &Judged::list(tree)).length();
+    }
+}
+
+![test]
+function the_baseline_census_fails_on_declared_programs_only() -> Result<(), TestError> {
+    expect_equal(Judged::census(Str::new("p"), true, 0, 0, Str::new("p"), Str::new(""), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new(""), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new("p"), true, 0, 0, Str::new("p,q"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new("p,q"), true, 0, 0, Str::new("p"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new("p"), true, 1, 0, Str::new("p"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new("p"), false, 0, 0, Str::new("p"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new("q"), Str::new("q"), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("q"), Str::new("")), 1)?;
+    return expect_equal(Judged::census(Str::new("q"), true, 0, 0, Str::new("q"), Str::new("q"), Str::new("")), 1);
+}
+
+![test]
+function the_baseline_census_judges_negative_files_and_examples_by_name() -> Result<(), TestError> {
+    expect_equal(Judged::census(Str::new(""), true, 0, 1, Str::new("negative/n.cryo"), Str::new("negative/n.cryo"), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 1, Str::new("negative/n.cryo"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("negative/n.cryo"), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 2, Str::new("negative/n.cryo"), Str::new("negative/n.cryo"), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new("examples/e"), Str::new("examples/e"), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new("examples/e"), Str::new(""), Str::new("")), 1)?;
+    return expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("examples/e"), Str::new("")), 1);
+}
+
+![test]
+function a_unit_failure_must_be_held_by_a_declared_unit_test_file() -> Result<(), TestError> {
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("lang/u.cryo"), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 1, 0, Str::new(""), Str::new("lang/u.cryo"), Str::new("lang/u.cryo=A::U")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 1, 0, Str::new("A::U::t"), Str::new("lang/u.cryo"), Str::new("lang/u.cryo=A::U")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 1, 0, Str::new("A::V::t"), Str::new("lang/u.cryo"), Str::new("lang/u.cryo=A::U")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 1, 0, Str::new("A::U::t"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 1, 0, Str::new("A::U::t"), Str::new("archive:lang/u.cryo"), Str::new("archive:lang/u.cryo=A::U")), 0)?;
+    return expect_equal(Judged::census(Str::new(""), true, 1, 0, Str::new("A::V::t"), Str::new("archive:lang/u.cryo"), Str::new("archive:lang/u.cryo=A::U")), 1);
+}
+
+![test]
+function a_program_declared_moved_is_one_the_baseline_passes() -> Result<(), TestError> {
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("moved:p"), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new("p"), Str::new("moved:p"), Str::new("")), 1)?;
+    return expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("moved-archive:std::m"), Str::new("")), 0);
+}
+
+![test]
+function a_declared_unit_test_object_must_move() -> Result<(), TestError> {
+    expect_equal(Judged::unit_moves(Str::new("u"), Str::new("/U.o"), Str::new("x/U.o=1"), Str::new("x/U.o=2")), 0)?;
+    expect_equal(Judged::unit_moves(Str::new("u"), Str::new("/U.o"), Str::new("x/U.o=1"), Str::new("x/U.o=1")), 1)?;
+    return expect_equal(Judged::unit_moves(Str::new("u"), Str::new("/U.o"), Str::new(""), Str::new("")), 1);
+}
+
+![test]
+function a_project_declared_moved_must_move_one_of_its_objects() -> Result<(), TestError> {
+    const prefix: Str = Str::new("tests/tests/projects/p/");
+    expect_equal(Judged::project_moves(Str::new("moved:p"), f"{prefix}a.o=1;{prefix}b.o=1".as_str(), f"{prefix}a.o=1;{prefix}b.o=2".as_str()), 0)?;
+    expect_equal(Judged::project_moves(Str::new("moved:p"), f"{prefix}a.o=1".as_str(), f"{prefix}a.o=1".as_str()), 1)?;
+    expect_equal(Judged::project_moves(Str::new("moved:p"), Str::new(""), Str::new("")), 1)?;
+    return expect_equal(Judged::project_moves(Str::new("moved:p"), f"{prefix}a.o=1".as_str(), f"{prefix}a.o=1;{prefix}b.o=1".as_str()), 0);
+}
+
+![test]
+function a_module_declared_moved_archive_must_move_an_archive_object() -> Result<(), TestError> {
+    expect_equal(Judged::archive_module_moves(Str::new("moved-archive:std::m"),
+        Str::new("stdlib-archive/t/O0/x/deps/std/m.o=1;stdlib-archive/t/O2/x/deps/std/m.o=1"),
+        Str::new("stdlib-archive/t/O0/x/deps/std/m.o=1;stdlib-archive/t/O2/x/deps/std/m.o=2")), 0)?;
+    expect_equal(Judged::archive_module_moves(Str::new("moved-archive:std::m"),
+        Str::new("stdlib-archive/t/O0/x/deps/std/m.o=1"), Str::new("stdlib-archive/t/O0/x/deps/std/m.o=1")), 1)?;
+    expect_equal(Judged::archive_module_moves(Str::new("moved-archive:std::m"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::archive_module_moves(Str::new("moved-archive:std::m"),
+        Str::new("stdlib-archive/t/O0/x/deps/std/am.o=1"), Str::new("stdlib-archive/t/O0/x/deps/std/am.o=2")), 1)?;
+    // Another module's moved object stays in both maps, to be compared.
+    mut left: HashMap<String, String> = Judged::map(Str::new("s/x/deps/std/m.o=1;s/x/deps/std/n.o=1"));
+    mut right: HashMap<String, String> = Judged::map(Str::new("s/x/deps/std/m.o=2;s/x/deps/std/n.o=2"));
+    expect_equal(VerifyJudges::archive_module_moves(&Judged::list(Str::new("moved-archive:std::m")), &left, &right).length(), 0)?;
+    return expect(left.length() == 1 && right.length() == 1
+        && left.contains_key(&String::from_str(Str::new("s/x/deps/std/n.o"))), Str::new("only the declared module's objects are removed"));
+}
+
+![test]
+function an_archive_declared_unit_test_file_needs_an_archive_object_to_move() -> Result<(), TestError> {
+    expect_equal(VerifyJudges::archive_moves(&Judged::list(Str::new("archive:lang/u.cryo")), 0).length(), 1)?;
+    expect_equal(VerifyJudges::archive_moves(&Judged::list(Str::new("archive:lang/u.cryo")), 2).length(), 0)?;
+    return expect_equal(VerifyJudges::archive_moves(&Judged::list(Str::new("")), 0).length(), 0);
+}
+
+![test]
+function a_warning_only_the_tree_reports_is_new() -> Result<(), TestError> {
+    expect_equal(Judged::new_warnings(Str::new("W0001 ./a.cryo:3"), Str::new("W0001 ./a.cryo:3")), 0)?;
+    expect_equal(Judged::new_warnings(Str::new("W0001 ./a.cryo:3"), Str::new("W0001 ./a.cryo:3,E0619 ./b.cryo:9")), 1)?;
+    expect_equal(Judged::new_warnings(Str::new("W0001 ./a.cryo:3"), Str::new("W0001 ./a.cryo:4")), 1)?;
+    return expect_equal(Judged::new_warnings(Str::new("W0001 ./a.cryo:3,W0009 ./c.cryo:1"), Str::new("W0001 ./a.cryo:3")), 0);
+}
 
 type struct Fixture {
     /// The declarations as `name=reason` entries joined by `;`, in order.
