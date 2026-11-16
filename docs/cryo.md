@@ -5245,11 +5245,16 @@ Under `unwind`:
   unwind destroyed. It stays valid until the same thread panics again. A
   message longer than 1023 bytes is cut at a character boundary and ends in
   `...`.
-- An exception that foreign code raised (a C++ `throw`, a thread-exit unwind)
-  and that unwinds into Cryo frames runs their destructors like a panic.
-  `catch_unwind` catches it, with a `PanicInfo` whose message names it as a
-  foreign exception and whose file is `<foreign code>`; the catch around
-  `main` reports it the same way and exits 101.
+- An exception that foreign code raised (a C++ `throw`) and that unwinds into
+  Cryo frames runs their destructors like a panic. `catch_unwind` catches it,
+  with a `PanicInfo` whose message names it as a foreign exception and whose
+  file is `<foreign code>`; the catch around `main` reports it the same way and
+  exits 101.
+- A forced unwind - a thread's exit or cancellation through the C library - is
+  never caught: it runs the destructors of the frames it passes, passes over
+  every `catch_unwind` and the catch around `main` without entering them (the
+  frame that called `catch_unwind` drops nothing of its own on the way), and
+  reaches the code that forced it.
 - A destructor that panics while an unwind is running it starts a new panic,
   which replaces the first: the first panic's message is not reported, and the
   unwind continues from the destructor's frame with the new one.

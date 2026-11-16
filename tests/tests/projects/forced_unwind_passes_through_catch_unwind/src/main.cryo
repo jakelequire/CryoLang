@@ -1,0 +1,36 @@
+namespace ForcedUnwindPassesThroughCatchUnwind;
+
+import std::core::panic_unwind::{ catch_unwind, PanicInfo };
+import std::core::result::{ Result };
+import std::ffi::libc::{ pthread_create, pthread_exit, pthread_join };
+import std::fmt;
+
+extern "C" {
+    function __cryo_personality_v0(version: i32, actions: i32, exception_class: u64,
+                                   exception_object: i64, context: i64) -> i32;
+}
+
+/// Ends its thread from inside the body `catch_unwind` runs: the C library
+/// unwinds the thread's stack with a forced unwind.
+function exit_the_thread() -> i32 {
+    pthread_exit(null);
+    return 0;
+}
+
+function thread_start(argument: mut u8*) -> u8* {
+    const outcome: Result<i32, PanicInfo> = catch_unwind(exit_the_thread);
+    if (outcome.is_err()) { fmt::println("the thread's exit was caught"); }
+    return null;
+}
+
+function main() -> int {
+    mut thread_id: [u8; 8] = [0; 8];
+    if (pthread_create(&thread_id[0], null, thread_start as void*, null) != 0) { return 1; }
+    mut result: mut u8* = null;
+    pthread_join(*(&thread_id[0] as u64*), &result);
+    fmt::println("the thread exited through catch_unwind");
+    // A caller of another version of the unwind protocol is refused before
+    // the personality reads its context.
+    fmt::printf("version 2 answered %d\n", __cryo_personality_v0(2, 1, 0, 0, 0));
+    return 0;
+}

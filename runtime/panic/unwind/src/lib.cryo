@@ -118,8 +118,8 @@ function held_message_text() -> string {
     return &held_message[0] as string;
 }
 
-/// Hold the payload of an exception a Cryo panic did not raise - a C++ throw,
-/// a thread-exit unwind - for the catch about to take it, so `catch_unwind` and
+/// Hold the payload of an exception a Cryo panic did not raise - a C++ throw -
+/// for the catch about to take it, so `catch_unwind` and
 /// the root report name it as foreign rather than reading what an earlier panic
 /// on this thread left (or nothing).
 function hold_foreign_exception() -> void {
@@ -253,11 +253,17 @@ function __cryo_panic_finish() -> never {
 /// same on both targets — only how the unwinder REACHES the personality differs.
 function cryo_personality_imp(version: i32, actions: i32, exception_class: u64,
                               exception_object: i64, context: i64) -> i32 {
+    const URC_FATAL_PHASE1_ERROR: i32 = 3;
     const URC_HANDLER_FOUND:   i32 = 6;
     const URC_INSTALL_CONTEXT: i32 = 7;
     const URC_CONTINUE_UNWIND: i32 = 8;
     const UA_SEARCH_PHASE:     i32 = 1;
     const UA_CLEANUP_PHASE:    i32 = 2;
+    const UA_FORCE_UNWIND:     i32 = 8;
+
+    // Version 1 is the protocol whose context and exception object this
+    // reads; under any other the arguments mean something else.
+    if (version != 1) { return URC_FATAL_PHASE1_ERROR; }
 
     const lsda: i64 = _Unwind_GetLanguageSpecificData(context);
     if (lsda == 0) { return URC_CONTINUE_UNWIND; }
@@ -312,6 +318,14 @@ function cryo_personality_imp(version: i32, actions: i32, exception_class: u64,
             }
 
             if ((actions & UA_CLEANUP_PHASE) != 0) {
+                // A forced unwind (a thread's exit or cancellation) must reach
+                // the frame that forced it: a catch frame's pad takes every
+                // exception that enters it and never resumes, and the C
+                // library aborts the process when one is caught. So the catch
+                // frame is passed over, its pad not entered.
+                if (cs_action != 0 && (actions & UA_FORCE_UNWIND) != 0) {
+                    return URC_CONTINUE_UNWIND;
+                }
                 // Populate the EH data registers the landing pad reads back as
                 // `{ exn_ptr, selector }`: reg 0 = exception object, reg 1 =
                 // selector (0 drives cleanup-then-resume; 1 enters a catch arm).
