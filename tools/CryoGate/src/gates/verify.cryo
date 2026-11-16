@@ -23,6 +23,8 @@ import std::fmt;
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
 
+import cryogate::baseline::cache::{ BaselineCache };
+import cryogate::baseline::clone::{ BaselineClone };
 import cryogate::baseline::keys::{ BaselineKey, Program, ProgramKeys, Programs };
 import cryogate::core::child::{ Completion };
 import cryogate::core::host::{ Host };
@@ -54,11 +56,16 @@ import cryogate::gates::roster::{ TestGates };
 /// - `--keys <home>`: every program's record key computed over the working
 ///   tree for the baseline compiler in `home` (a `.verify/baseline/<key>`
 ///   directory), each of which must name a record of that program in the
-///   home's store; every one that does not is named.
+///   home's store; every one that does not is named;
+/// - `--sync <clone> --at <rev>`: make `clone` the checkout verify builds a
+///   baseline compiler from `rev` in;
+/// - `--baselines <directory> [--current <name>]`: the baseline homes in
+///   `directory` the bounded cache keeps, most recently used first, with
+///   `current` among them as the home in use.
 public type struct VerifyGate {
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
         mut options: Options = Options::new(Str::new(
-            "cryogate verify --declared-since <rev> | --compare <run> --against <rev> [--list-limit <n>] | --records <run> --programs <directory> | --runtime-list <directory> | --baseline-key <rev> | --keys <home>"));
+            "cryogate verify --declared-since <rev> | --compare <run> --against <rev> [--list-limit <n>] | --records <run> --programs <directory> | --runtime-list <directory> | --baseline-key <rev> | --keys <home> | --sync <clone> --at <rev> | --baselines <directory> [--current <name>]"));
         options.valued(Str::new("--declared-since"));
         options.valued(Str::new("--compare"));
         options.valued(Str::new("--against"));
@@ -68,6 +75,10 @@ public type struct VerifyGate {
         options.valued(Str::new("--runtime-list"));
         options.valued(Str::new("--baseline-key"));
         options.valued(Str::new("--keys"));
+        options.valued(Str::new("--sync"));
+        options.valued(Str::new("--at"));
+        options.valued(Str::new("--baselines"));
+        options.valued(Str::new("--current"));
         const parsed: Parsed = match (options.parse(arguments, first)) {
             Result::Ok(parsed)  => { parsed }
             Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 2; }
@@ -134,6 +145,34 @@ public type struct VerifyGate {
         match (parsed.value(Str::new("--keys"))) {
             Option::Some(home) => { return VerifyGate::check_keys(repository, &git, home); }
             Option::None       => { }
+        }
+        match (parsed.value(Str::new("--sync"))) {
+            Option::Some(clone) => {
+                const revision: Str = match (parsed.value(Str::new("--at"))) {
+                    Option::Some(revision) => { revision }
+                    Option::None           => { fmt::eprintln(f"cryogate verify: --sync needs --at; usage: {options.usage()}"); return 2; }
+                };
+                return match (BaselineClone::sync(repository, logs, repository.join(clone).as_path(), revision)) {
+                    Result::Ok(_)       => { fmt::println(f"verify: {clone} synced to {revision}"); 0 }
+                    Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); 1 }
+                };
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--baselines"))) {
+            Option::Some(directory) => {
+                const current: Str = parsed.value(Str::new("--current")).unwrap_or(Str::new(""));
+                return match (BaselineCache::homes(repository.join(directory).as_path())) {
+                    Result::Ok(homes) => {
+                        for (home in BaselineCache::kept(&homes, BaselineCache::KEPT, current).iterate_references()) {
+                            fmt::println(home.clone());
+                        }
+                        0
+                    }
+                    Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); 1 }
+                };
+            }
+            Option::None => { }
         }
         fmt::eprintln(f"cryogate verify: usage: {options.usage()}");
         return 2;

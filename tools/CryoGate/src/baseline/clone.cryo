@@ -1,0 +1,134 @@
+///! The clone a baseline compiler is built in: a commit's compiler/src and
+///! runtime/ with the working tree's other build inputs.
+
+namespace cryogate::baseline::clone;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::encoding::sha256::{ Sha256 };
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::baseline::keys::{ BaselineKey };
+import cryogate::core::child::{ Completion };
+import cryogate::core::git::{ Git };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::tree::{ Tree };
+
+/// The checkout below `.verify/` a baseline compiler is built in.
+public type struct BaselineClone {
+    /// Make `clone` the commit `revision` names: its compiler/src and runtime/ with the
+    /// working tree's build inputs (`BaselineKey::build_inputs`), cloning it
+    /// from `repository` first when it is not a checkout yet.  A build input
+    /// the clone holds and the working tree does not is removed, and one
+    /// whose bytes differ is copied over.  The runtime's ignored files are
+    /// removed: a checkout keeps the runtime/.bin of whatever the clone held
+    /// before, and the baseline builds its runtime afresh.  The ignored
+    /// inputs a build needs and git does not carry - the libraries beside
+    /// the pins, the import libraries under .toolchains/llvm-win/lib - are
+    /// copied when missing or of another length.
+    public static sync(repository: Path, logs: &RunLogs, clone: Path, revision: Str) -> Result<(), String> {
+        const git: Git = Git::new(repository, logs);
+        // A fetch names the commit in full: another repository cannot read
+        // an abbreviation, or a name only this checkout holds.
+        const named: String = BaselineKey::commit(&git, revision)?;
+        const commit: Str = named.as_str();
+        if (!clone.join(Str::new(".git")).as_path().is_directory()) {
+            match (clone.parent()) {
+                Option::Some(parent) => {
+                    match (Directory::create_all(parent)) {
+                        Result::Ok(_)      => { }
+                        Result::Err(error) => { return Result::Err(f"cannot create {parent.as_str()}: {error.describe()}"); }
+                    }
+                }
+                Option::None => { }
+            }
+            BaselineClone::must(&git, Str::new("clone --quiet --no-checkout"), repository.as_str(), clone.as_str())?;
+        }
+        const cloned: Git = Git::new(clone, logs);
+        BaselineClone::must(&cloned, Str::new("fetch --quiet"), repository.as_str(), commit)?;
+        BaselineClone::must(&cloned, Str::new("checkout --quiet --force --detach"), commit, Str::new(""))?;
+        BaselineClone::must(&cloned, Str::new("clean --quiet -fdx --"), Str::new("runtime"), Str::new(""))?;
+
+        const wanted: Array<String> = BaselineKey::build_inputs(&git)?;
+        const held: Array<String> = BaselineKey::build_inputs(&cloned)?;
+        for (file in held.iterate_references()) {
+            if (wanted.contains(file)) { continue; }
+            const path: PathBuf = clone.join(file.as_str());
+            match (File::remove(path.as_path())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { return Result::Err(f"cannot remove {path.as_path().as_str()}: {error.describe()}"); }
+            }
+        }
+        for (file in wanted.iterate_references()) {
+            const from: PathBuf = repository.join(file.as_str());
+            if (!from.as_path().is_file()) { continue; }
+            const to: PathBuf = clone.join(file.as_str());
+            if (to.as_path().is_file() && BaselineClone::digest(from.as_path())? == BaselineClone::digest(to.as_path())?) { continue; }
+            BaselineClone::copy(from.as_path(), to.as_path())?;
+        }
+        mut extras: Array<Str> = Array::<Str>::new();
+        extras.push(Str::new("bin"));
+        extras.push(Str::new(".toolchains/llvm-win/lib"));
+        for (extra in extras.iterate_references()) {
+            const root: PathBuf = repository.join(*extra);
+            if (!root.as_path().is_directory()) { continue; }
+            for (file in Tree::files(root.as_path(), &Array::<String>::new())?.iterate_references()) {
+                const from: PathBuf = root.join(file.as_str());
+                const to: PathBuf = clone.join(*extra).join(file.as_str());
+                if (to.as_path().is_file() && BaselineClone::length(from.as_path())? == BaselineClone::length(to.as_path())?) { continue; }
+                BaselineClone::copy(from.as_path(), to.as_path())?;
+            }
+        }
+        return Result::Ok(());
+    }
+
+    /// Run `git <words> <first> <second>`, the empty operands left out.
+    static must(git: &Git, words: Str, first: Str, second: Str) -> Result<(), String> {
+        mut arguments: Array<Str> = Array::<Str>::new();
+        for (word in words.split_whitespace()) { arguments.push(word); }
+        if (!first.is_empty()) { arguments.push(first); }
+        if (!second.is_empty()) { arguments.push(second); }
+        const done: Completion = git.run(&arguments);
+        if (!done.outcome.succeeded()) {
+            return Result::Err(f"git {words} {first} {second}: {done.outcome.describe().as_str()}");
+        }
+        return Result::Ok(());
+    }
+
+    /// Copy `from` over `to`, with its permissions, creating `to`'s
+    /// directory first.
+    static copy(from: Path, to: Path) -> Result<(), String> {
+        match (to.parent()) {
+            Option::Some(parent) => {
+                match (Directory::create_all(parent)) {
+                    Result::Ok(_)      => { }
+                    Result::Err(error) => { return Result::Err(f"cannot create {parent.as_str()}: {error.describe()}"); }
+                }
+            }
+            Option::None => { }
+        }
+        return match (File::copy(from, to)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot copy {from.as_str()} to {to.as_str()}: {error.describe()}") }
+        };
+    }
+
+    static digest(path: Path) -> Result<String, String> {
+        return match (File::read_bytes(path)) {
+            Result::Ok(bytes)  => { Result::Ok(Sha256::digest(bytes.as_slice()).to_hex()) }
+            Result::Err(error) => { Result::Err(f"cannot read {path.as_str()}: {error.describe()}") }
+        };
+    }
+
+    static length(path: Path) -> Result<i64, String> {
+        return match (path.metadata()) {
+            Result::Ok(metadata) => { Result::Ok(metadata.length()) }
+            Result::Err(error)   => { Result::Err(f"cannot read {path.as_str()}: {error.describe()}") }
+        };
+    }
+}

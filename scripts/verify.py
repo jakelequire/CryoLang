@@ -502,6 +502,31 @@ def tiered_runtime(src):
     return os.path.isfile(os.path.join(src, "runtime", "hosted", "cryoconfig"))
 
 
+# Baseline homes kept: each holds a compiler, its runtime and its programs'
+# records, and a cache that only grows fills the disk unnoticed.
+KEEP_BASELINES = 6
+
+
+def keep_recent_baselines(home):
+    """Stamp `home` as used now (its `last-use` file's modification time) and
+    delete every baseline home but the KEEP_BASELINES used most recently, a
+    never-stamped one counting as oldest and a tie going to the name that
+    sorts first; `home` itself is always kept."""
+    used = os.path.join(home, "last-use")
+    with open(used, "w"):
+        pass
+    os.utime(used, None)
+    parent = os.path.dirname(home)
+
+    def stamp(name):
+        p = os.path.join(parent, name, "last-use")
+        return int(os.path.getmtime(p)) if os.path.isfile(p) else 0
+    homes = sorted(os.listdir(parent), key=lambda name: (-stamp(name), name))
+    for old in homes[KEEP_BASELINES:]:
+        if os.path.join(parent, old) != home:
+            shutil.rmtree(os.path.join(parent, old), ignore_errors=True)
+
+
 def baseline_compiler(rev, env, triple):
     """Path to a compiler built from REV's compiler/src and runtime/ and the
     tree's everything else, its home, REV's commit, what CRYO_RUNTIME names
@@ -522,6 +547,7 @@ def baseline_compiler(rev, env, triple):
     if os.path.isfile(exe) and os.path.isdir(runtime_home):
         print("verify: baseline compiler for %s (compiler/src %s, runtime %s) is cached: %s"
               % (rev, src_tree[:12], runtime_tree[:12], rel(exe)))
+        keep_recent_baselines(home)
         return exe, home, sha, runtime_home, archives()
     print("verify: building the baseline compiler for %s (compiler/src %s) in %s"
           % (rev, src_tree[:12], rel(os.path.join(STATE, "src"))))
@@ -576,6 +602,7 @@ def baseline_compiler(rev, env, triple):
         if f.lower().endswith(".dll"):
             shutil.copyfile(os.path.join(ROOT, "bin", f), os.path.join(home, f))
     copy_over(built, exe)
+    keep_recent_baselines(home)
     return exe, home, sha, runtime_home, archives()
 
 
