@@ -16,19 +16,25 @@
 ///! Nothing here is gated on `no_runtime`: this same source is compiled twice,
 ///! once by `runtime/` for a freestanding link and once by `runtime/hosted/` for
 ///! a libc-linked one. The only difference between the two archives is which
-///! `Sys::rt_exit` they bind — raw `exit_group`/`NtTerminateProcess`, or libc
-///! `exit` so the panicking program's buffered stdio is flushed on the way out.
+///! `Sys::rt_exit` `Sys::end_panicking_process` reaches — raw
+///! `exit_group`/`NtTerminateProcess`, or libc `exit` so the panicking
+///! program's buffered stdio is flushed on the way out.
 
 namespace CryoRt::Panic::Abort;
 
 import CryoRt::Sys;
+
+/// The thread ending the process after a panic, or 0 while none is
+/// (`Sys::end_panicking_process`). A plain global, not thread-local: it is one
+/// record for the whole process.
+mut terminating_thread: u64 = 0;
 
 /// The single panic sink. Prints the report (`Sys::write_panic_report`) and
 /// terminates. `![no_mangle]` makes the source name the emitted symbol.
 ![no_mangle]
 function __cryo_panic(msg: string, loc: Sys::Location*) -> never {
     Sys::write_panic_report(msg, loc);
-    Sys::rt_exit(101);
+    Sys::end_panicking_process(&terminating_thread);
 }
 
 // --- Unwind-surface stubs ---------------------------------------------------
@@ -64,7 +70,7 @@ function __cryo_panic_taken_line() -> u32 { return 0; }
 /// that assumed divergence.
 ![no_mangle]
 function __cryo_panic_finish() -> never {
-    Sys::rt_exit(101);
+    Sys::end_panicking_process(&terminating_thread);
 }
 
 /// The language personality, in each OS's calling convention: Linux is called

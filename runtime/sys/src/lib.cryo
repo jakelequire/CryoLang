@@ -13,21 +13,22 @@
 ///! link deduplicates.
 ///!
 ///! Freestanding: no libc, no stdlib. OS-specific primitives (`rt_write_bytes`,
-///! `rt_exit`) are gated `![config(linux)]` / `![config(windows)]`; the
+///! `rt_terminate_now`, `current_thread_id`, `park_forever`) are gated `![config(linux)]` / `![config(windows)]`; the
 ///! formatting helpers above them are OS-agnostic.
 
 namespace CryoRt::Sys;
 
 // --- Linux OS primitives ----------------------------------------------------
 
-/// Best-effort raw write to stderr (fd 2). Operands are register-pinned so the
-/// syscall's rax/rcx/r11 clobbers cannot corrupt buf/len before they are read.
+/// One raw write to stderr (fd 2): the bytes written, or `-errno`. Operands are
+/// register-pinned so the syscall's rax/rcx/r11 clobbers cannot corrupt
+/// buf/len before they are read.
 ///
 /// Not gated on `no_runtime`: writing straight to the descriptor is correct in a
 /// hosted build too, and it deliberately bypasses libc's stdio so a panic report
 /// cannot be swallowed by a buffer that never gets flushed.
 ![weak] ![config(linux)]
-function rt_write_bytes(buf: i64, len: u64) -> void {
+function rt_write_bytes(buf: i64, len: u64) -> i64 {
     const nr: i64 = 1;   // write
     const fd: i64 = 2;   // stderr
     mut ret: i64 = 0;
@@ -41,12 +42,13 @@ function rt_write_bytes(buf: i64, len: u64) -> void {
         syscall
         mov ${=ret:"rax"}, rax
     }
+    return ret;
 }
 
-/// Terminate the process with `code` via `exit_group` (syscall 231). Never
-/// returns; there is no libc, so no atexit/stdio flush runs.
-![weak] ![config(no_runtime)] ![config(linux)]
-function rt_exit(code: i32) -> never {
+/// Terminate the process with `code` via `exit_group` (syscall 231), at once:
+/// no atexit handler or stdio flush runs. Never returns.
+![weak] ![config(linux)]
+function rt_terminate_now(code: i32) -> never {
     ![arch(x86_64, att)]
     ![clobber(rcx, r11, memory)]
     asm {
@@ -55,6 +57,38 @@ function rt_exit(code: i32) -> never {
         syscall
     }
     while (true) {}
+}
+
+/// The calling thread's id (`gettid`, syscall 186); never 0.
+![weak] ![config(linux)]
+function current_thread_id() -> u64 {
+    const nr: i64 = 186;
+    mut id: i64 = 0;
+    ![arch(x86_64, intel)]
+    ![clobber(rcx, r11, memory)]
+    asm {
+        mov rax, ${nr:"rax"}
+        syscall
+        mov ${=id:"rax"}, rax
+    }
+    return id as u64;
+}
+
+/// Block the calling thread for good (`pause`, syscall 34, until a signal; and
+/// again after one).
+![weak] ![config(linux)]
+function park_forever() -> never {
+    const nr: i64 = 34;
+    mut ret: i64 = 0;
+    while (true) {
+        ![arch(x86_64, intel)]
+        ![clobber(rcx, r11, memory)]
+        asm {
+            mov rax, ${nr:"rax"}
+            syscall
+            mov ${=ret:"rax"}, rax
+        }
+    }
 }
 
 // --- Windows OS primitives --------------------------------------------------
@@ -66,23 +100,55 @@ extern "C" {
     function WriteFile(handle: i64, buffer: i64, nbytes: i32,
                        written: i32*, overlapped: i64) -> i32;
     function NtTerminateProcess(process: i64, status: i32) -> i32;
+    function Sleep(milliseconds: u32) -> void;
 }
 
+/// One write to stderr: the bytes written, or -1 when the write failed.
 ![weak] ![config(windows)]
-function rt_write_bytes(buf: i64, len: u64) -> void {
+function rt_write_bytes(buf: i64, len: u64) -> i64 {
     const STD_ERROR_HANDLE: i32 = -12;
     mut written: i32 = 0;
-    const h: i64 = GetStdHandle(STD_ERROR_HANDLE);
-    WriteFile(h, buf, len as i32, &written, 0);
+    const handle: i64 = GetStdHandle(STD_ERROR_HANDLE);
+    if (WriteFile(handle, buf, len as i32, &written, 0) == 0) { return -1; }
+    return written as i64;
 }
 
-![weak] ![config(no_runtime)] ![config(windows)]
-function rt_exit(code: i32) -> never {
+/// Terminate the process with `code` at once (`NtTerminateProcess` on the
+/// current process): no atexit handler or stdio flush runs. Never returns.
+![weak] ![config(windows)]
+function rt_terminate_now(code: i32) -> never {
     NtTerminateProcess(-1, code);
     while (true) {}
 }
 
-// --- Hosted termination -----------------------------------------------------
+/// The calling thread's id, read from the TEB's `ClientId.UniqueThread` slot
+/// (`%gs:0x48`); never 0.
+![weak] ![config(windows)]
+function current_thread_id() -> u64 {
+    mut id: u64 = 0;
+    ![arch(x86_64, att)]
+    asm {
+        movq %gs:0x48, %rax
+        movq %rax, ${=id:"rax"}
+    }
+    return id;
+}
+
+/// Block the calling thread for good.
+![weak] ![config(windows)]
+function park_forever() -> never {
+    const INFINITE: u32 = 0xFFFFFFFF;
+    while (true) { Sleep(INFINITE); }
+}
+
+// --- Termination ------------------------------------------------------------
+
+/// Terminate a FREESTANDING process: there is no libc exit path to run, so
+/// this is the raw OS exit.
+![weak] ![config(no_runtime)]
+function rt_exit(code: i32) -> never {
+    rt_terminate_now(code);
+}
 
 ![config(not(no_runtime))]
 extern "C" {
@@ -103,6 +169,44 @@ function rt_exit(code: i32) -> never {
     while (true) {}
 }
 
+/// Store `desired` into `*slot` if it holds `expected`, in one atomic step
+/// (`lock cmpxchg`), and return what it held before.
+![weak]
+function compare_exchange(slot: mut u64*, expected: u64, desired: u64) -> u64 {
+    const address: i64 = slot as i64;
+    mut previous: u64 = 0;
+    ![arch(x86_64, intel)]
+    ![clobber(memory)]
+    asm {
+        mov rax, ${expected:"rax"}
+        mov rdx, ${address:"rdx"}
+        mov rcx, ${desired:"rcx"}
+        lock cmpxchg qword ptr [rdx], rcx
+        mov ${=previous:"rax"}, rax
+    }
+    return previous;
+}
+
+/// End the process after a panic's report has been written, with the panic
+/// exit code (101), exactly once whatever else is panicking.
+///
+/// `terminating_thread` is the panic tier's process-wide record of the thread
+/// that is ending the process (0 while none is). The first thread to claim it
+/// exits through `rt_exit`. A later panic on ANOTHER thread has written its
+/// report and parks: the process is already ending, and a second `exit` from
+/// another thread is undefined. A later panic on the SAME thread is one raised
+/// while the first `exit` runs (an atexit handler, a destructor `exit` runs)
+/// and terminates at once, since `exit` must not be re-entered.
+![weak]
+function end_panicking_process(terminating_thread: mut u64*) -> never {
+    const PANIC_EXIT_CODE: i32 = 101;
+    const this_thread: u64 = current_thread_id();
+    const previous: u64 = compare_exchange(terminating_thread, 0, this_thread);
+    if (previous == 0) { rt_exit(PANIC_EXIT_CODE); }
+    if (previous == this_thread) { rt_terminate_now(PANIC_EXIT_CODE); }
+    park_forever();
+}
+
 // --- OS-agnostic formatting -------------------------------------------------
 
 /// Length of a NUL-terminated `string` (i8*), excluding the terminator.
@@ -116,7 +220,7 @@ function cstr_len(s: string) -> u64 {
 /// Write a NUL-terminated `string` (excluding the terminator).
 ![weak]
 function write_cstr(s: string) -> void {
-    rt_write_bytes(s as i64, cstr_len(s));
+    write_all(s as i64, cstr_len(s));
 }
 
 /// Write `v` as decimal ASCII (least-significant-first into a stack buffer,
@@ -126,7 +230,7 @@ function write_u32(v: u32) -> void {
     mut buf: [u8; 10];
     if (v == 0) {
         buf[0] = 48;
-        rt_write_bytes(&buf[0] as i64, 1);
+        write_all(&buf[0] as i64, 1);
         return;
     }
     mut n: u32 = v;
@@ -136,7 +240,7 @@ function write_u32(v: u32) -> void {
         buf[i] = (48 + (n % 10)) as u8;
         n = n / 10;
     }
-    rt_write_bytes(&buf[i] as i64, (10 - i) as u64);
+    write_all(&buf[i] as i64, (10 - i) as u64);
 }
 
 /// One hex nibble as ASCII.
@@ -161,7 +265,7 @@ function write_hex(v: u64) -> void {
         i = i - 1;
         k = k + 1;
     }
-    rt_write_bytes(&buf[0] as i64, 18);
+    write_all(&buf[0] as i64, 18);
 }
 
 /// Append a NUL-terminated `string`'s bytes (excluding the terminator) to
@@ -213,24 +317,61 @@ type struct Location {
     function: string;
 }
 
+/// Write all `len` bytes at `buf` to stderr: a write may take fewer than it is
+/// given, and on Linux one a signal interrupts (`-EINTR`) takes none and is
+/// tried again. Any other failure ends the attempt - there is nowhere left to
+/// report it.
+![weak]
+function write_all(buf: i64, len: u64) -> void {
+    const EINTR: i64 = -4;
+    mut done: u64 = 0;
+    while (done < len) {
+        const written: i64 = rt_write_bytes(buf + (done as i64), len - done);
+        if (written == EINTR) { continue; }
+        if (written <= 0) { return; }
+        done = done + (written as u64);
+    }
+}
+
+/// Append `s`'s bytes to `buf` at `*pos`, stopping one short of `capacity` so
+/// the report's newline always fits.
+![weak]
+function append_report_text(buf: mut u8*, pos: mut u64*, capacity: u64, s: string) -> void {
+    mut i: u64 = 0;
+    while (s[i] != 0 && *pos + 1 < capacity) {
+        buf[*pos] = s[i] as u8;
+        *pos = *pos + 1;
+        i = i + 1;
+    }
+}
+
 /// Write `panicked at <file>:<line>:<column> in <function>: <msg>` and a
 /// newline, leaving out the column when it is 0 and the function when it has
-/// no name.
+/// no name. The report is built in one buffer and written as one, so two
+/// threads panicking at once do not interleave their lines; one longer than
+/// the buffer is cut before its newline.
 ![weak]
 function write_panic_report(msg: string, loc: Location*) -> void {
-    write_cstr("panicked at ");
-    write_cstr(loc.file);
-    write_cstr(":");
-    write_u32(loc.line);
+    const capacity: u64 = 2048;
+    mut report: [u8; 2048];
+    mut pos: u64 = 0;
+    append_report_text(&report[0], &pos, capacity, "panicked at ");
+    append_report_text(&report[0], &pos, capacity, loc.file);
+    append_report_text(&report[0], &pos, capacity, ":");
+    // A u32 is at most 10 digits, so a number never takes the newline's room
+    // when the text before it left 11 bytes.
+    if (pos + 11 < capacity) { append_u64(&report[0], &pos, loc.line as u64); }
     if (loc.column != 0) {
-        write_cstr(":");
-        write_u32(loc.column);
+        append_report_text(&report[0], &pos, capacity, ":");
+        if (pos + 11 < capacity) { append_u64(&report[0], &pos, loc.column as u64); }
     }
     if (loc.function != null && loc.function[0] != 0) {
-        write_cstr(" in ");
-        write_cstr(loc.function);
+        append_report_text(&report[0], &pos, capacity, " in ");
+        append_report_text(&report[0], &pos, capacity, loc.function);
     }
-    write_cstr(": ");
-    write_cstr(msg);
-    write_cstr("\n");
+    append_report_text(&report[0], &pos, capacity, ": ");
+    append_report_text(&report[0], &pos, capacity, msg);
+    report[pos] = 10;   // '\n'
+    pos = pos + 1;
+    write_all(&report[0] as i64, pos);
 }

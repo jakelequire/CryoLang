@@ -5216,6 +5216,13 @@ takes precedence:
   once. No destructor runs, and `catch_unwind` does not compile.
 - A freestanding build (`no_runtime = true`) always aborts.
 
+The report is one write of one line (cut short, before its newline, past 2047
+bytes), so reports from two threads do not interleave. The process ends once:
+the first panic to reach its exit ends it; a panic on another thread after
+that writes its report and waits for the process to end; a panic on the same
+thread - raised by an exit handler or a destructor the exit runs - ends the
+process at once with code 101, and the exit handlers still queued do not run.
+
 Under `unwind`:
 
 - `PanicInformation.msg` is the runtime's per-thread copy of the message, so it reads
