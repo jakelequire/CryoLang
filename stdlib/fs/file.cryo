@@ -352,7 +352,9 @@ public type struct File {
     }
 
     /// Delete the file at `path`. A directory is refused; see
-    /// `Directory::remove`.
+    /// `Directory::remove`. A read-only file is deleted too: whether a
+    /// file may be removed is its directory's to say, not the file's own
+    /// permissions.
     ![target(unix)]
     public static remove(path: Path) -> Result<(), IoError> {
         mut c_path: String = String::with_null(path.as_str());
@@ -365,11 +367,26 @@ public type struct File {
         return Result::Ok(());
     }
     /// Delete the file at `path` (`DeleteFileW`); as the copy above.
+    /// Windows refuses to delete a file with the read-only attribute, so a
+    /// refused delete of one clears the attribute and deletes it again; if
+    /// that fails too, the attribute is put back and the second refusal is
+    /// the error.
     ![target(windows)]
     public static remove(path: Path) -> Result<(), IoError> {
         const wide: Array<u16> = Utf16::encode(path.as_str());
+        if (syscall::DeleteFileW(wide.as_pointer()) != 0) { return Result::Ok(()); }
+        const refusal: IoError = IoError::last_os_error();
+        const attributes: u32 = syscall::GetFileAttributesW(wide.as_pointer());
+        const read_only: boolean = attributes != syscall::INVALID_FILE_ATTRIBUTES
+            && (attributes & syscall::FILE_ATTRIBUTE_READONLY) != 0;
+        if (!read_only
+                || syscall::SetFileAttributesW(wide.as_pointer(), attributes & ~syscall::FILE_ATTRIBUTE_READONLY) == 0) {
+            return Result::Err(refusal.with_context(IoOperation::Remove, path));
+        }
         if (syscall::DeleteFileW(wide.as_pointer()) == 0) {
-            return Result::Err(IoError::last_os_error().with_context(IoOperation::Remove, path));
+            const second: IoError = IoError::last_os_error();
+            syscall::SetFileAttributesW(wide.as_pointer(), attributes);
+            return Result::Err(second.with_context(IoOperation::Remove, path));
         }
         return Result::Ok(());
     }
