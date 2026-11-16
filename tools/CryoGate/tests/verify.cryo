@@ -20,6 +20,7 @@ import cryogate::core::host::{ Host };
 import cryogate::core::text::{ Text };
 import cryogate::verify::comparison::{ Compared, ObjectComparison };
 import cryogate::verify::declarations::{ DeclaredChanges, Declaration, Declarations, DeclarationKind, RuntimeMember };
+import cryogate::verify::gates::{ GateCommand, GateVerdict };
 import cryogate::verify::hashing::{ ObjectHashes };
 import cryogate::verify::judges::{ BaselineCensus, VerifyJudges };
 import cryogate::verify::objects::{ ObjectOwner };
@@ -140,6 +141,40 @@ function a_stdlib_archive_is_labelled_by_its_manifests_options() -> Result<(), T
     expect_equal(ObjectHashes::options_label(Str::new("key 1\noptions -O2 --panic=unwind\n")).as_str(), Str::new("-O2_--panic_unwind"))?;
     expect_equal(ObjectHashes::options_label(Str::new("options a,  b\n")).as_str(), Str::new("a_b"))?;
     return expect_equal(ObjectHashes::options_label(Str::new("key 1\n")).as_str(), Str::new("_"));
+}
+
+![test]
+function a_gate_passes_on_its_exit_code_and_its_own_verdict_line() -> Result<(), TestError> {
+    const gates: Array<GateCommand> = GateCommand::table(Str::new("cryogate"), Str::new("python"));
+    const census: &GateCommand = &gates[0];
+    expect_equal(GateVerdict::of(census, Str::new("x\ntest-census: OK -- all\n"), 0).ok, true)?;
+    expect_equal(GateVerdict::of(census, Str::new("x\ntest-census: OK -- all\n"), 1).ok, false)?;
+    expect_equal(GateVerdict::of(census, Str::new("everything fine\n"), 0).ok, false)?;
+    expect_equal(GateVerdict::of(census, Str::new("test-census: OK\ntest-census: FAIL -- two\n"), 0).ok, false)?;
+    expect_equal(GateVerdict::of(census, Str::new("  test-census: OK -- indented\n"), 0).ok, false)?;
+    const fast: &GateCommand = &gates[7];
+    expect_equal(fast.name.as_str(), Str::new("fast"))?;
+    const quoted: GateVerdict = GateVerdict::of(fast, Str::new("\"check-fast: OK (all)\"\n"), 0);
+    expect_equal(quoted.line.as_str(), Str::new("check-fast: OK (all)"))?;
+    return expect_equal(quoted.ok, true);
+}
+
+![test]
+function a_gate_reports_its_time_in_tenths_and_its_log_when_it_printed_no_verdict() -> Result<(), TestError> {
+    const gates: Array<GateCommand> = GateCommand::table(Str::new("cryogate"), Str::new("python"));
+    const passed: GateVerdict = GateVerdict::of(&gates[0], Str::new("test-census: OK -- all\n"), 0);
+    expect_equal(passed.report(Str::new("census"), 1171049, Str::new("c.log")).as_str(), Str::new("  census    ok   1171.0 s  test-census: OK -- all"))?;
+    const silent: GateVerdict = GateVerdict::of(&gates[0], Str::new(""), 0);
+    return expect_equal(silent.report(Str::new("census"), 950, Str::new("c.log")).as_str(), Str::new("  census    FAIL    1.0 s  <no verdict line; see c.log>"));
+}
+
+![test]
+function a_gates_command_line_fills_in_the_compiler_the_stdlib_and_the_shell() -> Result<(), TestError> {
+    const gates: Array<GateCommand> = GateCommand::table(Str::new("cryogate"), Str::new("python"));
+    expect_equal(Text::joined(&gates[1].command(Str::new("C"), Str::new("S"), Str::new("B")), Str::new(" ")).as_str(),
+        Str::new("cryogate examples --cryo C --stdlib S"))?;
+    return expect_equal(Text::joined(&gates[6].command(Str::new("C"), Str::new("S"), Str::new("B")), Str::new(" ")).as_str(),
+        Str::new("B scripts/runtime-abi-check.sh"));
 }
 
 ![test]
