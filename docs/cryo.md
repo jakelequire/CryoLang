@@ -5209,7 +5209,7 @@ takes precedence:
 
 - **`unwind`**, the default for a hosted build: the panic unwinds the stack and
   each frame's destructors run on the way out. `catch_unwind` stops it and
-  returns `Err(PanicInformation)`. A panic no `catch_unwind` stops reaches the catch
+  returns `Err(PanicInfo)`. A panic no `catch_unwind` stops reaches the catch
   the compiler wraps `main` in, which writes the report and exits with code
   101.
 - **`abort`**: the report is written and the process exits with code 101 at
@@ -5223,16 +5223,23 @@ that writes its report and waits for the process to end; a panic on the same
 thread - raised by an exit handler or a destructor the exit runs - ends the
 process at once with code 101, and the exit handlers still queued do not run.
 
+A failed runtime check - an index out of bounds, a division or remainder by
+zero, a `match` no arm takes, an array allocation whose byte size overflows -
+is a panic like any other, under every strategy and in a freestanding build:
+it writes the same report, with the operands in the message where the check
+has them (`index 5 out of bounds for length 3`), then aborts with exit code
+101 or unwinds.
+
 Under `unwind`:
 
-- `PanicInformation.msg` is the runtime's per-thread copy of the message, so it reads
+- `PanicInfo.msg` is the runtime's per-thread copy of the message, so it reads
   back whole even when the panicking code built the message in a value the
   unwind destroyed. It stays valid until the same thread panics again. A
   message longer than 1023 bytes is cut at a character boundary and ends in
   `...`.
 - An exception that foreign code raised (a C++ `throw`, a thread-exit unwind)
   and that unwinds into Cryo frames runs their destructors like a panic.
-  `catch_unwind` catches it, with a `PanicInformation` whose message names it as a
+  `catch_unwind` catches it, with a `PanicInfo` whose message names it as a
   foreign exception and whose file is `<foreign code>`; the catch around
   `main` reports it the same way and exits 101.
 - A destructor that panics while an unwind is running it starts a new panic,

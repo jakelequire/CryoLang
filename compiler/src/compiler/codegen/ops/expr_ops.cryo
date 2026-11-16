@@ -1148,31 +1148,36 @@ type struct ExprOps {
         if (saved_bb.is_valid()) { this.builder.position_at_end(saved_bb); }
     }
 
-    /// Emit a diverging raise through `__cryo_panic(msg, loc)` for a
-    /// synthesized check (div-by-zero, non-exhaustive match, `new[]` overflow)
-    /// under `--panic=unwind`, `loc` the address of a `Location`.  When the
-    /// frame has live droppable locals (`sched` non-empty) the raise is an
-    /// `invoke` into a cleanup landing pad that drops them before the unwind
-    /// continues; otherwise a plain `call`.  Either way it diverges
-    /// (`unreachable` on the normal edge).  Callers gate this on
-    /// `ctx.options.unwinds()` and keep the `abort` trap on the default path,
-    /// so emitted IR is unchanged there.
-    emit_panic_diverge_cleanup(mut &this, visitor: mut IRGeneratorVisitor*, sched: [Stmt*]*,
-                               msg: LValue, loc: LValue) -> void {
-        const panic_fn: LValue = this.intrinsics.get_or_decl_cryo_panic();
-        if (!panic_fn.is_valid()) { return; }
-        const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(panic_fn.raw) };
-        const arg_buf: mut void* = libc::malloc(16);
+    /// Lower a failed runtime check (bounds, division, non-exhaustive match,
+    /// `new[]` size overflow) at `span`: call the runtime's check handler
+    /// `handler` with the address of the site's `Location` and `operands`,
+    /// already widened to the handler's declared types (`lang_items.def`), then
+    /// `unreachable`.  The handler formats the operands into the message and
+    /// diverges through `__cryo_panic`, so every configuration reports the
+    /// same `panicked at ...` line: the abort tiers print it and exit 101, the
+    /// unwind tier raises it.
+    ///
+    /// Under `--panic=unwind` (hosted) a frame with live droppable locals
+    /// (`sched` non-empty), or with live anonymous argument temps (a check
+    /// nested in a later argument must drop the temps earlier arguments
+    /// built), `invoke`s the handler into a cleanup landing pad that drops
+    /// them before the unwind leaves the frame.  Every other call is plain:
+    /// nothing unwinds through it.
+    emit_check_failure(mut &this, visitor: mut IRGeneratorVisitor*, sched: [Stmt*]*,
+                       span: SourceSpan, handler: MangledName, operands: &[LValue]) -> void {
+        const handler_fn: LValue = this.intrinsics.get_or_decl_check_handler(handler, operands);
+        const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(handler_fn.raw) };
+        const count: i64 = 1 + operands.length();
+        const arg_buf: mut void* = libc::malloc((count * 8) as u64);
         const arg_slots: mut (mut void*)* = arg_buf as mut (mut void*)*;
-        arg_slots[0] = msg.raw;
-        arg_slots[1] = loc.raw;
+        arg_slots[0] = this.intrinsics.location_global(span).raw;
+        for (mut i: i64 = 0; i < operands.length(); i++) {
+            arg_slots[i + 1] = operands[i].raw;
+        }
 
-        // Live anonymous arg temps also demand the invoke+pad path even when the
-        // frame has no named schedule (`sched` empty): a div/bounds/no-match/
-        // overflow check nested in a later argument must drop the temps built by
-        // earlier arguments before the unwind leaves the frame.
-        const has_cleanup: boolean = (sched != null && sched.length() > 0)
-            || this.has_live_arg_temps();
+        const unwinds: boolean = this.ctx.options.unwinds() && !this.intrinsics.no_runtime;
+        const has_cleanup: boolean = unwinds
+            && ((sched != null && sched.length() > 0) || this.has_live_arg_temps());
         if (has_cleanup) {
             const cur_bb: LBasicBlock = this.builder.get_insert_block();
             const cur_fn: LValue = cur_bb.get_parent();
@@ -1181,26 +1186,16 @@ type struct ExprOps {
             this.invoke_active = true;
             this.invoke_normal = cont_bb;
             this.invoke_lpad   = lpad_bb;
-            this.build_call_maybe_invoke(fty, panic_fn, arg_buf, 2, "");
+            this.build_call_maybe_invoke(fty, handler_fn, arg_buf, count as u32, "");
             this.invoke_active = false;
             libc::free(arg_buf);
             this.builder.build_unreachable();
             this.emit_cleanup_landingpad_sched(visitor, sched, cur_fn, lpad_bb);
         } else {
-            this.builder.build_call(fty, panic_fn, arg_buf, 2, "");
+            this.builder.build_call(fty, handler_fn, arg_buf, count as u32, "");
             libc::free(arg_buf);
             this.builder.build_unreachable();
         }
-    }
-
-    /// Raise a synthesized check's compile-time `message` at the origin's
-    /// `span`, cleaning up via `emit_panic_diverge_cleanup`.  The shared body
-    /// of every synthesized-check raise (div-by-zero, non-exhaustive match,
-    /// `new[]` overflow).
-    emit_check_raise(mut &this, visitor: mut IRGeneratorVisitor*, sched: [Stmt*]*,
-                     span: SourceSpan, message: string) -> void {
-        const msg: LValue = this.builder.build_global_string_ptr(message, "check.msg");
-        this.emit_panic_diverge_cleanup(visitor, sched, msg, this.intrinsics.location_global(span));
     }
 
     /// The pre-Phase-1 call lowering: coerce integer widths to match
@@ -2107,19 +2102,10 @@ type struct ExprOps {
 
         this.builder.build_cond_br(trap_cond, trap_bb, ok_bb);
 
-        // Trap arm.  `--panic=unwind` (hosted): raise through `__cryo_panic`
-        // (call-or-invoke + cleanup) so the failure unwinds and drops the
-        // frame's live locals.  Default abort path: `call @abort();
-        // unreachable` - a bare `unreachable` lowers to no instruction on x86
-        // and would silently slide into adjacent code, so abort guarantees a
-        // clean SIGABRT.  Byte-identical on the default path.
+        // Trap arm: the runtime's handler reports the failure and diverges.
         this.builder.position_at_end(trap_bb);
-        if (this.ctx.options.unwinds() && !this.intrinsics.no_runtime) {
-            this.emit_check_raise(visitor, div_sched, div_span, "attempt to divide by zero");
-        } else {
-            mut dz_ops: [LValue] = [];
-            this.intrinsics.emit_check_sink(MangledName::new("__cryo_panic_div_zero"), div_span, &dz_ops);
-        }
+        mut dz_ops: [LValue] = [];
+        this.emit_check_failure(visitor, div_sched, div_span, MangledName::new("__cryo_panic_div_zero"), &dz_ops);
 
         // OK arm: caller continues with the div/rem here.
         this.builder.position_at_end(ok_bb);
@@ -2155,24 +2141,17 @@ type struct ExprOps {
 
         this.builder.build_cond_br(overflow, trap_bb, ok_bb);
 
-        // Trap arm.  `--panic=unwind` (hosted): raise + cleanup so the failure
-        // unwinds and drops the frame's live locals.  Default abort path: `call
-        // @abort(); unreachable` - a clean SIGABRT instead of a silently
-        // truncated allocation.  Byte-identical on the default path.
+        // Trap arm: the runtime's handler reports the failure and diverges,
+        // instead of a silently truncated allocation. `op` 2 = multiply: this
+        // guard is the array-size product, and the handler prints both
+        // operands, so it takes them raw rather than a pre-baked message.
         this.builder.position_at_end(trap_bb);
-        if (this.ctx.options.unwinds() && !this.intrinsics.no_runtime) {
-            this.emit_check_raise(visitor, ovf_sched, ovf_span, "arithmetic overflow");
-        } else {
-            // `op` 2 = multiply: this guard is the array-size product. The
-            // handler formats "arithmetic overflow (op 2): <lhs>, <rhs>", so it
-            // takes the raw operands rather than a pre-baked message.
-            mut ovf_ops: [LValue] = [
-                LType::const_int(LType::i32(), 2, false),
-                count_i64,
-                LType::const_int(LType::i64(), elem_size, false)
-            ];
-            this.intrinsics.emit_check_sink(MangledName::new("__cryo_panic_overflow"), ovf_span, &ovf_ops);
-        }
+        mut ovf_ops: [LValue] = [
+            LType::const_int(LType::i32(), 2, false),
+            count_i64,
+            LType::const_int(LType::i64(), elem_size, false)
+        ];
+        this.emit_check_failure(visitor, ovf_sched, ovf_span, MangledName::new("__cryo_panic_overflow"), &ovf_ops);
 
         this.builder.position_at_end(ok_bb);
     }

@@ -1,7 +1,7 @@
 ///! catch_unwind: turn a panic into a value.
 ///!
 ///! `catch_unwind(f)` runs `f` and, if a panic unwinds out of it, catches the
-///! unwind and returns `Err(PanicInformation)` instead of letting it reach the process
+///! unwind and returns `Err(PanicInfo)` instead of letting it reach the process
 ///! root. It is the async task-isolation primitive (a panicking task becomes an
 ///! error, not a process abort) AND the mechanism that makes destructors run on
 ///! panic: by the Itanium two-phase contract, a catch is the phase-1 handler
@@ -49,7 +49,7 @@ import std::core::result::{ Result };
 /// (`runtime/panic/unwind`) stashes when it raises. `msg` is the runtime's
 /// per-thread copy of the message, so it outlives whatever the panicking code
 /// built it in, but only until this thread panics again: copy it to keep it.
-public type struct PanicInformation {
+public type struct PanicInfo {
     public msg:  string;
     public file: string;
     public line: u32;
@@ -80,7 +80,7 @@ private function run_catch_body<F, T>(data: mut u8*) -> void where F: () -> T {
 
 /// The unwind runtime tier stashes the in-flight panic's message/file/line
 /// before it raises; these read them back to build a caught panic's
-/// `PanicInformation`. Defined in `runtime/panic/unwind` (linked under
+/// `PanicInfo`. Defined in `runtime/panic/unwind` (linked under
 /// `--panic=unwind`). Referenced only from the generic `catch_unwind` below, so
 /// they stay unreferenced - and therefore unemitted - on the default abort path.
 private extern "C" {
@@ -93,7 +93,7 @@ private extern "C" {
 /// body's result on a normal return, or `Err(info)` if `f` (or anything it
 /// transitively calls) panicked. See the module doc for the requirements and
 /// the abort-strategy caveat.
-public function catch_unwind<F, T>(f: F) -> Result<T, PanicInformation> where F: () -> T {
+public function catch_unwind<F, T>(f: F) -> Result<T, PanicInfo> where F: () -> T {
     // Uninitialized result slot: written only on the normal path (through the
     // trampoline's raw `T*`, invisible to drop-synthesis) and moved out into
     // `Ok` there; on the `Err` path it is never assigned, so it is not dropped.
@@ -102,7 +102,7 @@ public function catch_unwind<F, T>(f: F) -> Result<T, PanicInformation> where F:
     const tramp: (mut u8*) -> void = run_catch_body::<F, T>;
     const caught: boolean = intrinsics::try_catch(tramp as void*, &ctx as mut void*);
     if (caught) {
-        return Result::Err(PanicInformation {
+        return Result::Err(PanicInfo {
             msg:  __cryo_panic_taken_message(),
             file: __cryo_panic_taken_file(),
             line: __cryo_panic_taken_line(),
@@ -111,7 +111,7 @@ public function catch_unwind<F, T>(f: F) -> Result<T, PanicInformation> where F:
     return Result::Ok(result);
 }
 
-/// Read the in-flight panic's stashed message/file/line back as a `PanicInformation`.
+/// Read the in-flight panic's stashed message/file/line back as a `PanicInfo`.
 /// For a caller that catches with `intrinsics::try_catch` directly (rather than
 /// through generic `catch_unwind`) and needs the payload — the async executor's
 /// poll boundary. Gated `![config(panic_unwind)]` so the `__cryo_panic_taken_*`
@@ -119,8 +119,8 @@ public function catch_unwind<F, T>(f: F) -> Result<T, PanicInformation> where F:
 /// the unwinding strategy; under `--panic=abort` this is stripped and the
 /// externs stay unreferenced, exactly as generic `catch_unwind` leaves them.
 ![config(panic_unwind)]
-public function taken_panic_information() -> PanicInformation {
-    return PanicInformation {
+public function taken_panic_info() -> PanicInfo {
+    return PanicInfo {
         msg:  __cryo_panic_taken_message(),
         file: __cryo_panic_taken_file(),
         line: __cryo_panic_taken_line(),
