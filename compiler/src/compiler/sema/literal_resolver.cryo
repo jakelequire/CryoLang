@@ -449,4 +449,31 @@ type struct LiteralResolver {
         if (sema_int_unsigned_bound(it.narrowest_bit_width()) == 0) { return true; }
         return this.int_literal_fits_target(arg, ty);
     }
+
+    /// The type an operand made only of integer literals (`(200 / 2)`,
+    /// `-129`) is typed with beside an operand of the integer type `peer`,
+    /// once it is written as the literal of its exact value
+    /// (`literal_of_value`): `peer` where `peer` holds the value, so with
+    /// `x: i8`, `x + (200 / 2)` adds 100 where computing the operand at `i8`
+    /// added -28; no type where it does not, so the literal keeps its default
+    /// type and the operation widens `peer` or is refused, where adopting
+    /// `peer` would compute another number (`-129` beside an `i8` is 127).
+    /// None when `operand` is not made only of integer literals or `peer` is
+    /// not an integer type, and when the value is negative and `peer`
+    /// unsigned: a complement of a literal there (`x & ~0xFF` with `x: u32`)
+    /// is a bit pattern of `peer`'s width rather than a negative number, and
+    /// is typed as any other constant operand is.
+    operand_type_of_literal_value(&this, operand: ExpressionNode*, peer: TypeRef) -> Option<TypeRef> {
+        if (!is_constant_numeric_expr(operand)) { return Option::None; }
+        const folded: Option<i128> = try_fold_const_integer(operand);
+        if (folded.is_none() || !peer.is_valid()) { return Option::None; }
+        const t: Type* = this.arena.lookup(peer);
+        if (t == null || t.kind != TypeKind::Int) { return Option::None; }
+        const it: IntegerKind = t.int_kind();
+        const value: i128 = folded.unwrap();
+        if (value < 0 && !it.is_signed()) { return Option::None; }
+        const held: boolean = sema_int_unsigned_bound(it.narrowest_bit_width()) == 0
+            || LiteralResolver::holds_value(it, value);
+        return Option::Some(if (held) { peer } else { TypeRef::invalid() });
+    }
 }

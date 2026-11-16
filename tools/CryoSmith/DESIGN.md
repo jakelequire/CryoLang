@@ -103,20 +103,20 @@ is generated only where the language converts implicitly: an initializer, an
 assignment, a call's argument, a return value and a struct literal's field.
 
 **Literal-only expressions.** A bare literal beside a typed operand takes
-that operand's type, but literals combined with each other (`(12 & 63)`) are
-typed only by where the whole stands, and an operand gives them nothing: they
-are an `i32`, and `x + (12 & 63)` with `x: u32` is refused. So every
-composite expression the generator writes **reads a name**: its first operand
-does, and every masked operand does. Some places give even a bare literal no
-type (a method's receiver, a cast's operand, a shifted value, an operand of
-`~`, an `if` expression's arms, the left side of a comparison); there the
-expression reads a name too. Every scope has one: `observed`, the program's
+that operand's type, and so does an operand made only of literals
+(`x + (12 & 63)`), which is its exact value - but only where the operand's
+type holds that value; one it does not hold stays an `i32` or wider, and
+the operation widens. Some places give even a bare literal no type (a
+method's receiver, a cast's operand, a shifted value, an operand of `~`, an
+`if` expression's arms, the left side of a comparison). So every composite
+expression the generator writes **reads a name**: its first operand does,
+and every masked operand does, and its type is never decided by a value. Every scope has one: `observed`, the program's
 global hash state, is always readable, a named limit (`u8::MAX`) is a typed
 constant, and a function has at least one parameter.
 
-**Constants.** A parameter does type literals combined with each other: an
-argument made only of literals takes its parameter's type when every value
-it computes on the way is one the parameter holds. With `constants`, an
+**Constants.** A parameter types literals combined with each other: an
+argument made only of literals is its exact value, and takes its
+parameter's type when the parameter holds that value. With `constants`, an
 integer argument - of a call, a method call or a wrapping method - is now
 and then such an expression: `(a & b)`, `(a | b)` or `(a ^ b)` of two
 literals in `[0, M]` (`M` the type's largest literal), and for a signed type
