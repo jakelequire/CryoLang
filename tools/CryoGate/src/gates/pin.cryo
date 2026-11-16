@@ -1,0 +1,426 @@
+///! `cryogate verify-pin [--require-clean] [--pin <binary>]...`: each pinned
+///! compiler (`bin/cryo`, `bin/cryo.exe`) is exactly the bytes its
+///! `<binary>.pin.txt` sidecar describes.
+///!
+///! For each pin:
+///!
+///! 1. the binary's sha256 is the sidecar's `sha256:`;
+///! 2. the commit `cryo stamp` wrote into the binary is the sidecar's
+///!    `git-commit:`, so the commit `cryo version` reports for a pin is the
+///!    one its sidecar names.  The sha256 cannot see a stamp that disagrees:
+///!    the sidecar is written from the stamped bytes.  The stamp is read from
+///!    the bytes, not by running the pin, so both pins are checked on either
+///!    host;
+///! 3. a Windows (PE32+) pin based above 4 GiB carries no 32-bit (HIGHLOW)
+///!    base relocation.  Such a field cannot hold an address in that image,
+///!    so the loader adding the relocation delta corrupts whatever it holds:
+///!    one over a thread-local's offset faults on every thread-local access
+///!    whenever the image is not at its preferred base, which under ASLR is
+///!    every run, while its sha256 and stamp verify perfectly;
+///! 4. with `--require-clean`, the sidecar recorded `worktree: clean`, which a
+///!    release pin must: a pin built from a dirty tree is not reproducible
+///!    from any commit.
+///!
+///! Then the pair agrees: both sidecars name one `git-commit`.  A half-finished
+///! re-pin rewrites each sidecar beside the binary it just wrote, so each
+///! half verifies against its own sidecar while the two come from different
+///! commits, and each OS only ever loads its own half.
+///!
+///! A pin whose binary and sidecar are both absent is skipped with a note (a
+///! Linux-only checkout may not carry `bin/cryo.exe`); one without the other
+///! is a failure, and so is finding no pin at all.
+
+namespace cryogate::gates::pin;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::encoding::sha256::{ Sha256 };
+import std::fmt;
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
+
+/// What checking one pin found: whether there was anything to check,
+/// whether it passed, and the lines that say so.
+public type struct PinVerdict {
+    public checked: boolean;
+    public ok: boolean;
+    public lines: Array<String>;
+
+    static skipped(line: String) -> PinVerdict {
+        mut lines: Array<String> = Array::<String>::new();
+        lines.push(line);
+        return PinVerdict { checked: false, ok: true, lines: lines };
+    }
+
+    static failed(lines: Array<String>) -> PinVerdict {
+        return PinVerdict { checked: true, ok: false, lines: lines };
+    }
+}
+
+public type struct PinIntegrity {
+    public static run(repository: Path, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate verify-pin [--require-clean] [--pin <binary>]..."));
+        options.flag(Str::new("--require-clean"));
+        options.valued(Str::new("--pin"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate verify-pin: {reason.as_str()}"); return 2; }
+        };
+        const require_clean: boolean = parsed.has(Str::new("--require-clean"));
+        mut pins: Array<String> = parsed.values_of(Str::new("--pin"));
+        if (pins.is_empty()) {
+            const binaries: PathBuf = repository.join(Str::new("bin"));
+            pins.push(String::from_str(binaries.as_path().join(Str::new("cryo")).as_path().as_str()));
+            pins.push(String::from_str(binaries.as_path().join(Str::new("cryo.exe")).as_path().as_str()));
+        }
+
+        fmt::println(String::from_str(Str::new("verify-pin - pinned compiler integrity")));
+        mut any_checked: boolean = false;
+        mut all_ok: boolean = true;
+        for (pin in pins.iterate_references()) {
+            const verdict: PinVerdict = PinIntegrity::verify_one(Path::from(pin.as_str()), require_clean);
+            for (line in verdict.lines.iterate_references()) { fmt::println(line.clone()); }
+            if (verdict.checked) { any_checked = true; }
+            if (!verdict.ok) { all_ok = false; }
+        }
+        const pair: PinVerdict = PinIntegrity::verify_pair(&pins);
+        for (line in pair.lines.iterate_references()) { fmt::println(line.clone()); }
+        if (!pair.ok) { all_ok = false; }
+
+        if (!any_checked) {
+            fmt::eprintln(String::from_str(Str::new("ERROR: no pins found to verify")));
+            return 1;
+        }
+        if (!all_ok) {
+            fmt::println(String::from_str(Str::new("verify-pin: FAILED")));
+            return 1;
+        }
+        fmt::println(String::from_str(Str::new("verify-pin: OK")));
+        return 0;
+    }
+
+    /// The sidecar beside `pin`: `bin/cryo` -> `bin/cryo.pin.txt`.
+    public static sidecar_of(pin: Path) -> PathBuf {
+        return PathBuf::from(f"{pin.as_str()}.pin.txt".as_str());
+    }
+
+    /// The sha256 of `bytes` as lowercase hex.
+    public static digest_of(bytes: &Array<u8>) -> String {
+        return Sha256::digest(bytes.as_slice()).to_hex();
+    }
+
+    /// Check one pin and its sidecar.
+    public static verify_one(pin: Path, require_clean: boolean) -> PinVerdict {
+        const name: Str = pin.file_name().unwrap_or(pin.as_str());
+        const sidecar: PathBuf = PinIntegrity::sidecar_of(pin);
+        const sidecar_name: Str = sidecar.as_path().file_name().unwrap_or(sidecar.as_path().as_str());
+        mut lines: Array<String> = Array::<String>::new();
+        const has_binary: boolean = pin.exists();
+        const has_sidecar: boolean = sidecar.as_path().exists();
+        if (!has_binary && !has_sidecar) {
+            return PinVerdict::skipped(f"  [skip] {name}: neither binary nor sidecar present");
+        }
+        if (!has_binary) {
+            lines.push(f"  [FAIL] {name}: sidecar present but binary missing");
+            return PinVerdict::failed(lines);
+        }
+        if (!has_sidecar) {
+            lines.push(f"  [FAIL] {name}: binary present but sidecar {sidecar_name} missing");
+            return PinVerdict::failed(lines);
+        }
+        const data: Array<u8> = match (File::read_bytes(pin)) {
+            Result::Ok(bytes)  => { bytes }
+            Result::Err(error) => {
+                lines.push(f"  [FAIL] {name}: cannot read it: {error.describe()}");
+                return PinVerdict::failed(lines);
+            }
+        };
+        const fields: Array<Pair<String, String>> = match (File::read_text(sidecar.as_path())) {
+            Result::Ok(text)   => { PinIntegrity::sidecar_fields(text.as_str()) }
+            Result::Err(error) => {
+                lines.push(f"  [FAIL] {name}: cannot read its sidecar: {error.describe()}");
+                return PinVerdict::failed(lines);
+            }
+        };
+
+        const want: Str = PinIntegrity::field(&fields, Str::new("sha256"));
+        const got: String = PinIntegrity::digest_of(&data);
+        if (want.is_empty()) {
+            lines.push(f"  [FAIL] {name}: sidecar has no sha256 field");
+            return PinVerdict::failed(lines);
+        }
+        if (got.as_str() != want) {
+            lines.push(f"  [FAIL] {name}: sha256 mismatch");
+            lines.push(f"           sidecar: {want}");
+            lines.push(f"           binary:  {got.as_str()}");
+            return PinVerdict::failed(lines);
+        }
+
+        // The commit stamped into the binary is the commit its sidecar names.
+        match (PinIntegrity::stamp_fields(&data)) {
+            Result::Ok(stamp) => {
+                const stamped: Str = PinIntegrity::field(&stamp, Str::new("commit"));
+                const named: Str = PinIntegrity::field(&fields, Str::new("git-commit"));
+                if (stamped != named) {
+                    lines.push(f"  [FAIL] {name}: stamped with a different commit than its sidecar names");
+                    lines.push(f"           stamp:   {stamped}");
+                    const shown: Str = if (named.is_empty()) { Str::new("<absent>") } else { named };
+                    lines.push(f"           sidecar: {shown}");
+                    return PinVerdict::failed(lines);
+                }
+            }
+            Result::Err(why) => {
+                lines.push(f"  [FAIL] {name}: {why.as_str()}; `make pin` stamps both pins");
+                return PinVerdict::failed(lines);
+            }
+        }
+
+        // A 64-bit Windows pin holds no 32-bit base relocation.
+        match (PinIntegrity::highlow_relocations(&data)) {
+            Result::Ok(found) => {
+                if (!found.is_empty()) {
+                    const first_rva: u64 = found.get(0).unwrap();
+                    lines.push(f"  [FAIL] {name}: {found.length()} 32-bit base relocation(s) in a 64-bit image based above 4 GiB, first at RVA {first_rva:#x}");
+                    lines.push(String::from_str(Str::new("           such a field holds no address; relocating it corrupts it (a")));
+                    lines.push(String::from_str(Str::new("           thread-local's offset faults on first use).  Link with a")));
+                    lines.push(String::from_str(Str::new("           linker that emits none: the Makefile's WIN_LINK_CC")));
+                    return PinVerdict::failed(lines);
+                }
+            }
+            Result::Err(why) => {
+                lines.push(f"  [FAIL] {name}: its PE headers do not parse: {why.as_str()}");
+                return PinVerdict::failed(lines);
+            }
+        }
+
+        if (require_clean) {
+            const worktree: Str = PinIntegrity::field(&fields, Str::new("worktree"));
+            if (worktree != Str::new("clean")) {
+                const state: Str = if (worktree.is_empty()) { Str::new("unknown") } else { worktree };
+                const describe: Str = match (PinIntegrity::find_field(&fields, Str::new("git-describe"))) {
+                    Option::Some(value) => { value }
+                    Option::None        => { Str::new("?") }
+                };
+                lines.push(f"  [FAIL] {name}: pinned from a {state} worktree (git-describe: {describe}); release pins must be built from a clean tree at the release commit");
+                return PinVerdict::failed(lines);
+            }
+        }
+
+        const note: Str = if (require_clean) { Str::new(" (clean)") } else { Str::new("") };
+        lines.push(f"  [ ok ] {name}: sha256 and stamp match{note}  {got.as_str().byte_substring(0, 16)}...");
+        return PinVerdict { checked: true, ok: true, lines: lines };
+    }
+
+    /// Every present pin was built from the same commit.  Silent when fewer
+    /// than two pins carry a sidecar: a Linux-only checkout has nothing to
+    /// compare, and a gate that invents a failure there gets switched off.
+    public static verify_pair(pins: &Array<String>) -> PinVerdict {
+        mut seen: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        for (pin in pins.iterate_references()) {
+            const binary: Path = Path::from(pin.as_str());
+            const sidecar: PathBuf = PinIntegrity::sidecar_of(binary);
+            if (!binary.exists() || !sidecar.as_path().exists()) { continue; }
+            const text: String = File::read_text(sidecar.as_path()).unwrap_or(String::new());
+            const fields: Array<Pair<String, String>> = PinIntegrity::sidecar_fields(text.as_str());
+            const commit: Str = PinIntegrity::field(&fields, Str::new("git-commit"));
+            const shown: Str = if (commit.is_empty()) { Str::new("<absent>") } else { commit };
+            seen.push(Pair::new(String::from_str(binary.file_name().unwrap_or(binary.as_str())), String::from_str(shown)));
+        }
+        mut lines: Array<String> = Array::<String>::new();
+        if (seen.length() < 2) { return PinVerdict { checked: false, ok: true, lines: lines }; }
+        mut agree: boolean = true;
+        const first: Str = seen.get_reference(0).unwrap().second.as_str();
+        for (entry in seen.iterate_references()) {
+            if (entry.second.as_str() != first || entry.second.as_str() == Str::new("<absent>")) { agree = false; }
+        }
+        if (agree) {
+            const short: Str = if (first.length() > 12) { first.byte_substring(0, 12) } else { first };
+            lines.push(f"  [ ok ] pair: both pins built from {short}");
+            return PinVerdict { checked: false, ok: true, lines: lines };
+        }
+        lines.push(String::from_str(Str::new("  [FAIL] the pins disagree on the commit they were built from:")));
+        mut names: Array<String> = Array::<String>::new();
+        for (entry in seen.iterate_references()) { names.push(entry.first.clone()); }
+        names.sort();
+        for (sorted in names.iterate_references()) {
+            for (entry in seen.iterate_references()) {
+                if (entry.first.as_str() == sorted.as_str()) {
+                    lines.push(f"           {entry.first.as_str():<12} {entry.second.as_str()}");
+                    break;
+                }
+            }
+        }
+        lines.push(String::from_str(Str::new("           a re-pin refreshes both from one tree; one of these did")));
+        lines.push(String::from_str(Str::new("           not finish, and each half still matches its own sidecar")));
+        return PinVerdict { checked: false, ok: false, lines: lines };
+    }
+
+    /// The `key: value` lines of a sidecar, in order.
+    public static sidecar_fields(text: Str) -> Array<Pair<String, String>> {
+        mut fields: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        const lines: Array<String> = Text::lines(text);
+        for (line in lines.iterate_references()) {
+            match (line.as_str().split_once(&Str::new(":"))) {
+                Option::Some(pair) => { fields.push(Pair::new(String::from_str(pair.first.trim()), String::from_str(pair.second.trim()))); }
+                Option::None       => { }
+            }
+        }
+        return fields;
+    }
+
+    /// The value of the last field named `key`, or nothing.
+    static find_field(fields: &Array<Pair<String, String>>, key: Str) -> Option<Str> {
+        mut found: Option<Str> = Option::None;
+        for (entry in fields.iterate_references()) {
+            if (entry.first.as_str() == key) { found = Option::Some(entry.second.as_str()); }
+        }
+        return found;
+    }
+
+    /// The value of the last field named `key`, empty when there is none.
+    static field(fields: &Array<Pair<String, String>>, key: Str) -> Str {
+        return PinIntegrity::find_field(fields, key).unwrap_or(Str::new(""));
+    }
+
+    /// The build stamp's `key=value` fields, or why there are none.  One
+    /// marker exactly: `cryo stamp` refuses a binary holding two, since it
+    /// cannot tell which region is the compiler's, and so does this.
+    public static stamp_fields(data: &Array<u8>) -> Result<Array<Pair<String, String>>, String> {
+        const bytes: &Slice<u8> = data.as_slice();
+        const marker_length: i64 = 16;
+        mut count: i64 = 0;
+        mut start: i64 = -1;
+        mut at: i64 = 0;
+        while (at + marker_length <= bytes.length()) {
+            if (PinIntegrity::marker_at(bytes, at)) {
+                if (count == 0) { start = at + marker_length; }
+                count++;
+                at = at + marker_length;
+            } else {
+                at++;
+            }
+        }
+        if (count != 1) { return Result::Err(f"holds {count} stamp regions, not one"); }
+        mut end: i64 = start;
+        while (end < bytes.length() && end < start + PinIntegrity::STAMP_TEXT_LENGTH && bytes.get(end).unwrap() != 0) { end++; }
+        mut text: Array<u8> = Array::<u8>::new();
+        mut index: i64 = start;
+        while (index < end) { text.push(bytes.get(index).unwrap()); index++; }
+        const decoded: String = String::from_utf8(text).unwrap_or(String::new());
+        mut fields: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        const lines: Array<String> = Text::lines(decoded.as_str());
+        for (line in lines.iterate_references()) {
+            match (line.as_str().split_once(&Str::new("="))) {
+                Option::Some(pair) => {
+                    if (!pair.first.is_empty()) { fields.push(Pair::new(String::from_str(pair.first), String::from_str(pair.second))); }
+                }
+                Option::None => { }
+            }
+        }
+        if (PinIntegrity::field(&fields, Str::new("commit")).is_empty()) {
+            return Result::Err(String::from_str(Str::new("was never stamped (its stamp region is empty)")));
+        }
+        return Result::Ok(fields);
+    }
+
+    /// Whether the stamp marker starts at `at`.
+    static marker_at(bytes: &Slice<u8>, at: i64) -> boolean {
+        mut k: i64 = 0;
+        while (k < 16) {
+            if (bytes.get(at + k).unwrap() != PinIntegrity::STAMP_MARKER[k]) { return false; }
+            k++;
+        }
+        return true;
+    }
+
+    /// The RVAs of a PE32+ image's HIGHLOW base relocations when the image
+    /// is based above 4 GiB; none when the bytes are not such an image.  An
+    /// image whose headers or relocation table do not parse is an error: a
+    /// pin that cannot be read is not a pin that passed.
+    public static highlow_relocations(data: &Array<u8>) -> Result<Array<u64>, String> {
+        const bytes: &Slice<u8> = data.as_slice();
+        mut found: Array<u64> = Array::<u64>::new();
+        if (PinIntegrity::little(bytes, 0, 2) != 0x5A4D) { return Result::Ok(found); }
+        const pe: i64 = PinIntegrity::little(bytes, 0x3C, 4) as i64;
+        if (PinIntegrity::little(bytes, pe, 4) != 0x4550) { return Result::Err(String::from_str(Str::new("no PE signature"))); }
+        const coff: i64 = pe + 4;
+        const sections: i64 = PinIntegrity::little(bytes, coff + 2, 2) as i64;
+        const optional_size: i64 = PinIntegrity::little(bytes, coff + 16, 2) as i64;
+        const optional: i64 = coff + 20;
+        if (PinIntegrity::little(bytes, optional, 2) != 0x20B) { return Result::Ok(found); }
+        if (PinIntegrity::little(bytes, optional + 24, 8) <= 0xFFFFFFFF) { return Result::Ok(found); }
+        if (PinIntegrity::little(bytes, optional + 108, 4) <= PinIntegrity::BASE_RELOCATION_DIRECTORY) { return Result::Ok(found); }
+        const directory: i64 = optional + 112 + 8 * (PinIntegrity::BASE_RELOCATION_DIRECTORY as i64);
+        const rva: u64 = PinIntegrity::little(bytes, directory, 4);
+        const size: i64 = PinIntegrity::little(bytes, directory + 4, 4) as i64;
+        if (size == 0) { return Result::Ok(found); }
+        const table: i64 = optional + optional_size;
+        mut start: i64 = -1;
+        mut section: i64 = 0;
+        while (section < sections) {
+            const header: i64 = table + 40 * section;
+            const virtual_size: u64 = PinIntegrity::little(bytes, header + 8, 4);
+            const virtual_address: u64 = PinIntegrity::little(bytes, header + 12, 4);
+            const raw_size: u64 = PinIntegrity::little(bytes, header + 16, 4);
+            const raw_pointer: u64 = PinIntegrity::little(bytes, header + 20, 4);
+            const extent: u64 = if (virtual_size > raw_size) { virtual_size } else { raw_size };
+            if (virtual_address <= rva && rva < virtual_address + extent) {
+                start = (raw_pointer + rva - virtual_address) as i64;
+                break;
+            }
+            section++;
+        }
+        if (start < 0 || start + size > bytes.length()) {
+            return Result::Err(String::from_str(Str::new("the base relocation table lies outside the image")));
+        }
+        mut at: i64 = start;
+        const end: i64 = start + size;
+        while (at + 8 <= end) {
+            const page: u64 = PinIntegrity::little(bytes, at, 4);
+            const block: i64 = PinIntegrity::little(bytes, at + 4, 4) as i64;
+            if (block < 8 || at + block > end) {
+                return Result::Err(String::from_str(Str::new("a malformed base relocation block")));
+            }
+            mut entry: i64 = at + 8;
+            while (entry < at + block) {
+                const value: u64 = PinIntegrity::little(bytes, entry, 2);
+                if ((value >> 12) == PinIntegrity::HIGHLOW) { found.push(page + (value & 0xFFF)); }
+                entry = entry + 2;
+            }
+            at = at + block;
+        }
+        return Result::Ok(found);
+    }
+
+    /// The `width`-byte little-endian number at `at`; a byte past the end
+    /// reads as zero, as a short read of the header would.
+    static little(bytes: &Slice<u8>, at: i64, width: i64) -> u64 {
+        mut value: u64 = 0;
+        mut k: i64 = width - 1;
+        while (k >= 0) {
+            const byte: u64 = if (at + k >= 0 && at + k < bytes.length()) { bytes.get(at + k).unwrap() as u64 } else { 0 };
+            value = (value << 8) | byte;
+            k--;
+        }
+        return value;
+    }
+
+    /// The sixteen bytes that open the build stamp region
+    /// (compiler/src/utils/build_stamp.cryo), spelled as numbers so this
+    /// file's own text never holds a second copy.
+    public const STAMP_MARKER: [u8; 16] = [67, 82, 89, 79, 45, 66, 85, 73, 76, 68, 45, 83, 84, 65, 77, 80];
+    /// The stamp's text field after the marker, NUL-padded.
+    public const STAMP_TEXT_LENGTH: i64 = 496;
+    /// A PE base relocation entry's type for a 32-bit field.
+    public const HIGHLOW: u64 = 3;
+    /// The base relocation table's index among the data directories.
+    public const BASE_RELOCATION_DIRECTORY: u64 = 5;
+}

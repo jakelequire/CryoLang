@@ -200,7 +200,7 @@ compiler subcommand, because the compiler already holds the answer), **keep**
 | `scripts/api-index.py` | 498 | generates `docs/stdlib-api.txt` from a line scanner over the stdlib plus `nm` of the archive demangled by the pin | **fold** → a compiler subcommand that prints the index from the parsed stdlib (§5) | the parser already knows every declaration; a text scanner is why bug 0178 exists |
 | `scripts/annotate-negative-tests.py` | 171 | writes `//~` lines from a real `cryo check` run, keeps only annotations that verify | **fold** → `cryo test` writing annotations (§5) | the code that checks an annotation is the one that should write it: one answering path |
 | `scripts/cryo-pin.py` | 233 | copies, strips and writes the `.pin.txt` sidecar | **port** → `cryogate pin` | sha256, git, strip; runs where `make pin` runs (Linux / WSL) |
-| `scripts/verify-pin.py` | 414 | sidecar sha256, stamped commit, the pair, and no PE HIGHLOW relocation; `--require-clean`, `--selftest` | **port** → `cryogate verify-pin` | pure byte reading; its 12 self-test cases become `![test]`s |
+| `scripts/verify-pin.py` | 414 | sidecar sha256, stamped commit, the pair, and no PE HIGHLOW relocation; `--require-clean`, `--selftest` | **ported** → `cryogate verify-pin` (script deleted) | pure byte reading; its 12 self-test cases are `![test]`s, each refusal also checked for the line naming its reason, with two pair cases the script never tested |
 | `scripts/pin-windows.cmd` | 42 | Windows host: `make pin` inside WSL | **port** into `cryogate pin` (the WSL re-entry selfhost already needs) | one way to reach WSL |
 | `scripts/selfhost-check.py` | 1240 | the fixed point, both arms at once on a Windows host (the Linux arm from a digest-checked mirror on WSL's own filesystem), the stage archives compared object by object (`STDLIB ARCHIVES OK`); wine arm on Linux | **port** → `cryogate selfhost` (§4f) | the post-perf script is final; helpers nothing calls (the design read named `_win_prereqs_missing`, `_llvm_link`, `_llvm_link_named`, `_config_without_bin`, `W4_BUILD_TIMEOUT`; re-check each at the port) are not carried over |
 | `scripts/selfhost-check-windows.cmd` | 35 | finds Python and WSL, runs the script | **drop** with the port | the Makefile calls cryogate directly |
@@ -650,7 +650,10 @@ baseline run from `cryogate census --read <log>`, one JSON record), `cross`
 `--run`, which runs every example holding an `expected.out` and compares
 its output, on both hosts, with the old script's comparison rule, and
 `--under=valgrind`, which makes those runs under valgrind on Linux),
-with `core/text` (lines, joining, a line scanner) beside the core.
+`verify-pin` (the first half of G5: the stdlib's sha256 made it possible;
+`make verify-pin` now builds cryogate, so it needs the host triple like
+check-fast), with `core/text` (lines, joining, a line scanner) beside the
+core.
 `check-fast` runs `cryogate selftest` (so it builds cryogate), which carries
 the roster merge's self-test cases. The self-test runs the unit-test binary
 `make cryogate` built rather than `cryo test`: the pin building inside a

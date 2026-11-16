@@ -100,7 +100,7 @@ PIN_EXE      := $(ROOT)/bin/cryo.exe
 # pin to ask: starting it costs more than the rest of a no-change `make cryo`.
 # One file per host OS: a Windows checkout's `compiler/build` is the one WSL
 # builds in, and each host's pin answers its own triple.
-NO_TRIPLE_GOALS := help clean verify-pin verify-pin-clean
+NO_TRIPLE_GOALS := help clean
 HOST_TRIPLE_MK  := $(ROOT)/compiler/build/host-triple-$(HOST_OS).mk
 ifneq ($(filter-out $(NO_TRIPLE_GOALS),$(or $(MAKECMDGOALS),help)),)
 -include $(HOST_TRIPLE_MK)
@@ -243,9 +243,11 @@ Tests and gates
                          concurrently and their objects are hashed
                          (ARGS="--baseline HEAD --require-identical";
                          --sequential runs them one at a time).
-  make check-fast        verify's self-test and verify-pin; builds nothing.
-  make verify-selftest   verify's judges and verify-pin's checks, driven
-                         through fixtures they must accept and refuse.
+  make check-fast        verify-selftest and verify-pin; builds only cryogate
+                         and its unit tests, with the pin.
+  make verify-selftest   verify's and selfhost-check's judges and cryogate's
+                         checks (verify-pin's among them), driven through
+                         fixtures they must accept and refuse.
   make lsp-check         tools/CryoLSP builds with the compiler under test
                          (into its own directory; installs nothing), and
                          the binary passes its behavioural checks
@@ -287,8 +289,9 @@ Pins and release
   make pin               Refresh bin/cryo and bin/cryo.exe and their sidecars
                          (Windows host: through WSL).
   make verify-pin        Each pin matches its sidecar's sha256 and is stamped
-                         with the commit the sidecar names, and both name the
-                         same commit.
+                         with the commit the sidecar names, both name the
+                         same commit, and the Windows pin has no 32-bit base
+                         relocation (`cryogate verify-pin`; builds cryogate).
   make verify-pin-clean  The same, and the pins were built from a clean tree.
   make release           Alias of release-linux.
   make release-linux     dist/ tarball with a static, stamped cryo (POSIX).
@@ -649,16 +652,19 @@ endif
 # Assert each committed pin's bytes match its .pin.txt sidecar sha256
 # (catches a binary committed without regenerating its sidecar, corruption,
 # or a hand-edited sidecar), and that the commit `cryo stamp` wrote into each
-# pin is the one its sidecar names.  Pure-python, no build, runs on any host;
-# it reads the stamp from the bytes, so both pins are checked on either host.
+# pin is the one its sidecar names, that both sidecars name one commit, and
+# that the Windows pin carries no 32-bit base relocation.  `cryogate
+# verify-pin` reads the stamp from the bytes, so both pins are checked on
+# either host; cryogate is built by the pin it checks, which reads the pin's
+# bytes, not its behaviour.
 #   verify-pin        integrity (sha256 and stamped commit == sidecar)
 #   verify-pin-clean  ALSO require a clean-worktree pin - the release gate
 #                     (a pin built from a dirty tree isn't reproducible).
-verify-pin:
-	@$(PYTHON) scripts/verify-pin.py
+verify-pin: $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) verify-pin
 
-verify-pin-clean:
-	@$(PYTHON) scripts/verify-pin.py --require-clean
+verify-pin-clean: $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) verify-pin --require-clean
 
 # ---- incremental-build soundness --------------------------------------
 # Run the per-module incremental byte-identity matrix: every incremental
@@ -774,12 +780,11 @@ incremental-instance-check: cryo $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) incr --instance --cryo "$(STAGE2_FILE)"
 
 # The judges behind verify's tests/started-compiling declarations, and
-# verify-pin's checks, and selfhost-check's stage-archive comparison, and
-# cryogate's own (the roster merge and the census among them), driven through
+# selfhost-check's stage-archive comparison, and cryogate's own (the roster
+# merge, the census and verify-pin's checks among them), driven through
 # every case they must refuse and every case they must allow.
 verify-selftest: $(CRYOGATE) $(CRYOGATE_TESTS)
 	@$(PYTHON) scripts/verify.py --selftest
-	@$(PYTHON) scripts/verify-pin.py --selftest
 	@$(PYTHON) scripts/selfhost-check.py --selftest
 	@$(CRYOGATE_COMMAND) selftest
 

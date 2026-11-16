@@ -217,14 +217,13 @@ def main() -> int:
     # A pin built from a dirty worktree is not reproducible from any commit
     # (M12). That is fine mid-development, but a *release* pin must be built
     # from a clean tree at the release commit. Warn loudly so it can't slip
-    # into a tag unnoticed; `scripts/verify-pin.py --require-clean` is the
-    # hard gate for that.
+    # into a tag unnoticed; `make verify-pin-clean` is the hard gate for that.
     if worktree_dirty():
         print("    WARNING: worktree is dirty - this pin is not reproducible "
               "from a commit.", file=sys.stderr)
         print("             For a release pin, commit first and re-pin from a "
               "clean tree", file=sys.stderr)
-        print("             (verify with: scripts/verify-pin.py --require-clean).",
+        print("             (verify with: make verify-pin-clean).",
               file=sys.stderr)
     return 0
 

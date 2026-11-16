@@ -113,9 +113,10 @@ sweep.  Counted (`grep -E '^\s*implement(<[^>]*>)? (struct|union) '`):
 notes keep what the gates mean and what is still red or unexercised.
 
 **What the local gates mean.**  `make check-fast` runs verify's self-test,
-verify-pin's self-test and `make verify-pin` (each pin's sha256 and stamped
-commit match its sidecar, and both pins name one commit).  It builds
-nothing, so it says nothing about the compiler.  `make verify` is the
+cryogate's self-test (verify-pin's checks among its unit tests) and `make
+verify-pin` (each pin's sha256 and stamped commit match its sidecar, and
+both pins name one commit).  It builds only cryogate, with the pin, so it
+says nothing about the compiler.  `make verify` is the
 evidence: it builds the compiler once, then runs the census (every suite,
 counts against `tests/test-roster.txt`), every example's build, the LSP
 build with the compiler under test, the other OS's half (objects only), the
