@@ -29,9 +29,9 @@ import std::fmt;
 import compiler::project_config::{ Dependency, DepKind, GitRefKind, ProjectConfig };
 import compiler::deps::{ cache, git, semver, lockfile };
 import std::collections::str;
-import compiler::deps::cache::{ Cache };
 import compiler::deps::git::{ Git };
 import compiler::deps::git_url::{ GitUrl };
+import compiler::module_graph::{ PackageDeclaration };
 import compiler::deps::lockfile::{ LockedDep, LockedVendor, Lockfile };
 import compiler::deps::semver::{ Constraint };
 
@@ -60,6 +60,9 @@ type struct DepRoot {
     /// The dependency's name (the `[dependencies]` table key) - used as
     /// the per-package output folder name.
     name:  string;
+    /// The package's identity: its directory, canonicalized
+    /// (`DepKey`), the same however a cryoconfig spells the path to it.
+    package: String;
 }
 
 type struct ResolveOutcome {
@@ -68,6 +71,10 @@ type struct ResolveOutcome {
     /// `failed` is true (so debug builds can see partial progress); the
     /// caller MUST check `failed` before proceeding.
     roots:  [DepRoot];
+    /// Every `[dependencies]` entry of every cryoconfig walked, the
+    /// program's included, once per (declarer, declared) pair, each
+    /// package named by its `DepKey`.
+    declarations: [PackageDeclaration];
     /// True <=> at least one dep failed to resolve.
     failed: boolean;
     /// The lockfile produced by Fetch/Update.  In Build mode this is
@@ -76,29 +83,44 @@ type struct ResolveOutcome {
 
     static empty() -> ResolveOutcome {
         return ResolveOutcome {
-            roots:  [],
-            failed: false,
-            lock:   Lockfile::empty(),
+            roots:        [],
+            declarations: [],
+            failed:       false,
+            lock:         Lockfile::empty(),
         };
+    }
+
+    /// Record that `declarer`'s cryoconfig names `declared`.
+    declare(mut &this, declarer: str::Str, declared: str::Str) -> void {
+        for (mut i: i64 = 0; i < this.declarations.length(); i++) {
+            if (this.declarations[i].declarer.as_str() == declarer
+                    && this.declarations[i].declared.as_str() == declared) { return; }
+        }
+        this.declarations.push(PackageDeclaration {
+            declarer: String::from_str(declarer),
+            declared: String::from_str(declared),
+        });
     }
 }
 
 
 // Visited tracker (cycle detection)
 
-/// Identity keys we hand to the visited set.  Two deps with the
-/// same key produce the same source roots, so we resolve each
-/// only once even when the dep graph has diamonds.
-type struct DepKey with [Eq] {
-    /// "path:<abs>" or "git:<sanitized-url>@<sha>".
+/// A package's identity: its directory, canonicalized, so that every
+/// spelling of the path to one package - `a`, `b/../a`, a checkout reached
+/// by two cryoconfigs - names it once.  Two deps with the same key produce
+/// the same source roots, so each is resolved only once even when the dep
+/// graph has diamonds, and declarations name packages by it.
+type struct DepKey with [Eq, Clone] {
     val: String;
 
-    static for_path(abs_path: str::Str) -> DepKey {
-        return DepKey { val: f"path:{abs_path}" };
-    }
-    static for_git(url: str::Str, sha: str::Str) -> DepKey {
-        const sanitized: String = Cache::sanitize_url(url);
-        return DepKey { val: f"git:{sanitized}@{sha}" };
+    /// The key of the package in `directory`, which exists; `None` when
+    /// the operating system cannot canonicalize it.
+    static for_directory(directory: Path) -> Option<DepKey> {
+        match (directory.canonicalize()) {
+            Result::Ok(canonical) => { return Option::Some(DepKey { val: String::from_str(canonical.as_path().as_str()) }); }
+            Result::Err(_)        => { return Option::None; }
+        }
     }
 }
 
@@ -129,7 +151,7 @@ type struct DepResolver {
         };
         mut new_lock: Lockfile = Lockfile::empty();
 
-        DepResolver::walk_deps(top_config, mode, &existing, &new_lock, &visited, &outcome);
+        DepResolver::walk_deps(top_config, str::Str::from(""), Path::from(""), mode, &existing, &new_lock, &visited, &outcome);
 
         // Write the lockfile only on the success path of Fetch/Update.
         // A failed Fetch leaves the on-disk lock untouched so the user's
@@ -172,10 +194,18 @@ type struct DepResolver {
     // Walk
 
     /// Recursive walk: for each dep in `cfg.dependencies`, resolve it and
-    /// then descend into the dep's own `[dependencies]`.
+    /// then descend into the dep's own `[dependencies]`.  `declarer` is the
+    /// identity of the package `cfg` belongs to ("" for the program), and
+    /// `base` its directory in the form the loader takes a root in: ""
+    /// for the program, relative to the program's root below a path
+    /// dependency, absolute below a git one.  A path dependency's `path`
+    /// is relative to the cryoconfig that writes it, so it is joined onto
+    /// that package's `base`.
     ///
-    /// Cycle detection keys deps by `(kind, identifier)`; see `DepKey`.
+    /// Cycle detection keys deps by their directory; see `DepKey`.
     static walk_deps(cfg: const ProjectConfig*,
+                       declarer: str::Str,
+                       base: Path,
                        mode: ResolveMode,
                        existing: Lockfile*,
                        new_lock: mut Lockfile*,
@@ -192,10 +222,10 @@ type struct DepResolver {
                     outcome.failed = true;
                 }
                 DepKind::Path => {
-                    DepResolver::resolve_path_dep(cfg, dep, mode, existing, new_lock, visited, outcome);
+                    DepResolver::resolve_path_dep(cfg, declarer, base, dep, mode, existing, new_lock, visited, outcome);
                 }
                 DepKind::Git => {
-                    DepResolver::resolve_git_dep(cfg, dep, mode, existing, new_lock, visited, outcome);
+                    DepResolver::resolve_git_dep(cfg, declarer, dep, mode, existing, new_lock, visited, outcome);
                 }
             }
         }
@@ -205,6 +235,8 @@ type struct DepResolver {
     /// the relative path.  We then read the dep's own cryoconfig and
     /// recurse, harvesting its source roots into `outcome.roots`.
     static resolve_path_dep(cfg: const ProjectConfig*,
+                              declarer: str::Str,
+                              base: Path,
                               dep: const Dependency*,
                               mode: ResolveMode,
                               existing: Lockfile*,
@@ -226,9 +258,11 @@ type struct DepResolver {
             return;
         }
 
-        const key: DepKey = DepKey::for_path(dep_root.as_path().as_str());
+        const found: Option<DepKey> = DepResolver::key_declared_by(declarer, dep, dep_root.as_path(), outcome);
+        if (found.is_none()) { return; }
+        const key: DepKey = found.unwrap();
         if (visited.contains(&key)) { return; }
-        visited.push(key);
+        visited.push(key.clone());
 
         const dep_cfg: ProjectConfig = ProjectConfig::parse(dep_config.into_raw());
         if (dep_cfg.error_count > 0) {
@@ -236,10 +270,31 @@ type struct DepResolver {
             outcome.failed = true;
             return;
         }
-        // The loader prefixes a path dependency's roots with the consumer's
-        // project root itself, so they are handed over relative.
-        DepResolver::harvest_roots(&dep_cfg, Path::from(dep.path.as_str()), dep.name.as_str(), outcome);
-        DepResolver::walk_deps(&dep_cfg, mode, existing, new_lock, visited, outcome);
+        // The loader prefixes a relative root with the program's project
+        // root itself, so a path dependency's roots are handed over relative
+        // to it (or absolute, below a git dependency).
+        const package_base: PathBuf = if (base.is_empty()) { PathBuf::from(dep.path.as_str()) }
+            else { base.join(dep.path.as_str()) };
+        DepResolver::harvest_roots(&dep_cfg, package_base.as_path(), dep.name.as_str(), key.val.as_str(), outcome);
+        DepResolver::walk_deps(&dep_cfg, key.val.as_str(), package_base.as_path(), mode, existing, new_lock, visited, outcome);
+    }
+
+    /// The identity of the package `dep` names, in `directory`, recorded as
+    /// declared by `declarer`; `None`, with the build failed, when the
+    /// directory cannot be canonicalized.
+    static key_declared_by(declarer: str::Str, dep: const Dependency*, directory: Path,
+                           outcome: mut ResolveOutcome*) -> Option<DepKey> {
+        match (DepKey::for_directory(directory)) {
+            Option::Some(key) => {
+                outcome.declare(declarer, key.val.as_str());
+                return Option::Some(key);
+            }
+            Option::None => {
+                fmt::eprintln(f"error: dependency '{dep.name}': cannot resolve the directory {directory.as_str()}");
+                outcome.failed = true;
+                return Option::None;
+            }
+        }
     }
 
     /// Git dep: the source-of-truth for what's on disk is the lockfile.
@@ -247,6 +302,7 @@ type struct DepResolver {
     /// (re)resolve the ref to a SHA, materialize the checkout, and write
     /// a fresh lockfile entry.
     static resolve_git_dep(cfg: const ProjectConfig*,
+                             declarer: str::Str,
                              dep: const Dependency*,
                              mode: ResolveMode,
                              existing: Lockfile*,
@@ -319,11 +375,6 @@ type struct DepResolver {
             }
         }
 
-        // Cycle detection: scoped to this URL@SHA pair.
-        const key: DepKey = DepKey::for_git(dep.git_url.as_str(), sha.as_str());
-        if (visited.contains(&key)) { return; }
-        visited.push(key);
-
         const checkout: PathBuf = Git::checkout_path(dep.git_url.as_str(), sha.as_str());
         const dep_root: PathBuf = if (dep.subdir.length() > 0) {
             checkout.join(dep.subdir.as_str())
@@ -337,6 +388,14 @@ type struct DepResolver {
             outcome.failed = true;
             return;
         }
+
+        // Cycle detection: one package directory is one checkout of one
+        // commit, so this is scoped to the URL, the commit and the subdir.
+        const found: Option<DepKey> = DepResolver::key_declared_by(declarer, dep, dep_root.as_path(), outcome);
+        if (found.is_none()) { return; }
+        const key: DepKey = found.unwrap();
+        if (visited.contains(&key)) { return; }
+        visited.push(key.clone());
         const dep_cfg: ProjectConfig = ProjectConfig::parse(dep_cryo.into_raw());
         if (dep_cfg.error_count > 0) {
             fmt::eprintln(f"error: dependency '{dep.name}' has invalid cryoconfig at {dep_root.as_path().as_str()}");
@@ -346,8 +405,8 @@ type struct DepResolver {
         // Harvest using the absolute checkout path so source roots are
         // self-contained; the consumer's project_root is irrelevant for
         // git deps.
-        DepResolver::harvest_roots(&dep_cfg, dep_root.as_path(), dep.name.as_str(), outcome);
-        DepResolver::walk_deps(&dep_cfg, mode, existing, new_lock, visited, outcome);
+        DepResolver::harvest_roots(&dep_cfg, dep_root.as_path(), dep.name.as_str(), key.val.as_str(), outcome);
+        DepResolver::walk_deps(&dep_cfg, key.val.as_str(), dep_root.as_path(), mode, existing, new_lock, visited, outcome);
     }
 
 
@@ -402,10 +461,12 @@ type struct DepResolver {
     /// Harvest a dep's published source roots into `outcome.roots`, each
     /// joined onto `base`: the form the loader expects, relative for a path
     /// dependency (the loader prefixes the consumer's root) and absolute for
-    /// a git one.
+    /// a git one.  Each root is tagged with `package`, the dependency's
+    /// identity.
     static harvest_roots(dep_cfg: const ProjectConfig*,
                            base: Path,
                            dep_name: str::Str,
+                           package: str::Str,
                            outcome: mut ResolveOutcome*) -> void {
         // `DepRoot` is string-typed: it feeds the loader's scan list and
         // `ModuleInfo.origin_name`, which are.
@@ -414,12 +475,14 @@ type struct DepResolver {
             outcome.roots.push(DepRoot {
                 path: base.join(dep_cfg.lib.source_dir).into_raw(),
                 name: name,
+                package: String::from_str(package),
             });
         }
         for (mut j: i64 = 0; j < dep_cfg.source_paths.length(); j++) {
             outcome.roots.push(DepRoot {
                 path: base.join(dep_cfg.source_paths[j]).into_raw(),
                 name: name,
+                package: String::from_str(package),
             });
         }
     }

@@ -5413,13 +5413,19 @@ Each entry is an inline table - a local path dependency or a git dependency. `cr
 
 ```ini
 [dependencies]
-mylib    = { path = "../mylib", alias = "MyLib" }
-remote   = { git = "https://example.com/lib.git", tag = "v0.1.0", alias = "Remote" }
+mylib    = { path = "../mylib" }
+remote   = { git = "https://example.com/lib.git", tag = "v0.1.0" }
 ```
 
-A git dependency requires exactly one of `version`, `tag`, `branch`, or `rev`, and may set `subdir` (the path to the dependency's `cryoconfig` inside the repo). `alias` is the top-level namespace the consumer imports.
+A git dependency requires exactly one of `version`, `tag`, `branch`, or `rev`, and may set `subdir` (the path to the dependency's `cryoconfig` inside the repo). The name on the left is local to the cryoconfig that writes it: it labels the dependency in messages and names its output folder, and nothing else.
 
-A path dependency names a directory holding a `cryoconfig`. One that names a directory that does not exist, or one without a `cryoconfig`, fails the build and names the dependency.
+A path dependency names a directory holding a `cryoconfig`, relative to the cryoconfig that writes it. One that names a directory that does not exist, or one without a `cryoconfig`, fails the build and names the dependency.
+
+**How a program names a dependency's code.** An import names a dependency's modules by the namespaces its files declare (`import Json5;`), exactly as it names the program's own. A dependency entry takes no second name for them: `alias` is refused.
+
+- **A top-level namespace belongs to one package in a build.** Two packages declaring the same one (`Util` in the program and in a dependency, or in two dependencies) is E0507, naming both packages and a file of each; so is a package declaring `std`, the standard library's. The program counts as a package.
+- **A package names only what its own cryoconfig declares.** A module path written in a package names that package's own modules, the standard library's, a vendored C library's, and those of the dependencies its own `[dependencies]` lists. Naming a module of any other package in the build - one the program declares but the package does not, or one only a dependency of a dependency declares - is E0508, naming the package to add and the cryoconfig to add it to. This holds for the program too: it names its direct dependencies, not theirs. A package never names the program that uses it.
+- **When a package moves to a new major version (2 and later)**, its top-level namespace carries the major as a suffix: `Json5` for 0.x and 1.x, `Json5V2` for 2.x. Two majors of one package are not built together today, but their namespaces already differ when they can be.
 
 **What a git dependency may name.** Every cryoconfig in the dependency graph writes these values, the dependencies' own included, so they are checked before anything is done with them, and a refused one fails as soon as its cryoconfig is read:
 

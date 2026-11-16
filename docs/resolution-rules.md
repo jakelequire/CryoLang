@@ -105,7 +105,7 @@ or reads the store by identity.  Locked so far:
 | `module-by-path` | `ModuleGraph::module_named` | `compiler/src/compiler/module_graph.cryo` | written module path to its module |
 | `module-by-path` | `ModuleGraph::module_path_over` | `compiler/src/compiler/module_graph.cryo` | an import's written path to itself as a path to list modules within, when the graph holds a module at it or under it, whether or not it names a module (`import std::`) |
 | `module-by-path` | `ModuleGraph::modules_in_view` | `compiler/src/compiler/module_graph.cryo` | a path written in a body to the modules it names, among those the writing file can see: its own, the ones it imports, the prelude, or a package root written whole |
-| `loader-path` | `ModuleLoader::resolve_import_path` | `compiler/src/compiler/module_loader.cryo` | a module path written in an `import`, an `export` or a `module` line to the file of the module it names: a vendored library, a file declaring the namespace, or a file at the path on disk, only ever in a package the writing file's package may name (`ModulePackage::may_name`) |
+| `loader-path` | `ModuleLoader::resolve_import_path` | `compiler/src/compiler/module_loader.cryo` | a module path written in an `import`, an `export` or a `module` line to the file of the module it names: a vendored library, a file declaring the namespace, or a file at the path on disk, only ever in a package the writing file's package may name (`PackageRoots::may_name`): its own, the standard library, a vendored library, and the dependencies its own cryoconfig declares |
 | `loader-path` | `ModuleLoader::binding_of` | `compiler/src/compiler/module_loader.cryo` | a body path's head to the import of the file that binds it |
 | `loader-path` | `ModuleLoader::sub_module_file` | `compiler/src/compiler/module_loader.cryo` | a path's continuation past an import binding to the file of the sub-module it names |
 | `primitive` | `ResBase::is_primitive_spelling` | `compiler/src/compiler/resolver/res.cryo` | the fixed primitive table |
@@ -167,6 +167,31 @@ yet is recorded with the change that builds it, not here.
 706. **`thread::sleep` takes a `Duration`**, as `time::clock::sleep`
      does, and there is no `sleep_ms`: a length of time is written as a
      `Duration` wherever the library takes one.  (Jake)
+
+### 2026-11-16
+
+704. **A package's module paths name only the packages its own cryoconfig
+     declares.**  A path written in an `import`, an `export` or a `module`
+     line names a file of the writer's own package, of the standard
+     library, of a vendored C library, or of a dependency the writer's
+     package lists in its own `[dependencies]`, and of no other package in
+     the build.  The program is a package: it names its direct
+     dependencies, not its dependencies' dependencies.  A path whose only file is in
+     an undeclared package is E0508 at the path, naming that package and
+     the cryoconfig to add it to.  Packages are told apart by their
+     directory, canonicalized, so two spellings of the path to one package
+     are one package.  Supersedes the rule that let a dependency name any
+     package but the program's.  (Jake)
+
+705. **A top-level namespace belongs to one package in a build.**  Two
+     packages whose files declare the same first namespace segment - the
+     program and a dependency, two dependencies, or any package and the
+     standard library's `std` - are E0507 before any import is resolved,
+     naming both packages and a file of each.  An import of the namespace
+     would otherwise name whichever file was indexed last, and the two
+     packages' symbols would share mangled names.  `alias` in a dependency
+     entry is refused: an import names a dependency by the namespace its
+     files declare, and no entry renames it.  (Jake)
 
 ### 2026-11-12
 
