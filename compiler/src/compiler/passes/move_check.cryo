@@ -1401,6 +1401,9 @@ type struct MoveChecker {
                 if (ds.declaration != null) {
                     if (DeclarationNode::var_of(ds.declaration) != null) {
                         this.walk_var_decl(ds.declaration);
+                        if (!ds.temporaries_outlive_statement) {
+                            this.refuse_borrow_of_released_temporary(ds.declaration);
+                        }
                     } else if (DeclarationNode::destructure_of(ds.declaration) != null) {
                         this.walk_destructure_decl(DeclarationNode::destructure_of(ds.declaration));
                     }
@@ -1681,6 +1684,97 @@ type struct MoveChecker {
             this.uninitialised_keys.push(vd.sym_id.key());
             this.uninitialised_spans.push(d.span);
         }
+    }
+
+    /// E0460: the local `d` declares would point into a temporary its own
+    /// initializer made and borrowed. A borrowed temporary is released when
+    /// its statement ends, so the local would outlive what it points into
+    /// (`const s: Str = make_string().as_str();`). A `for` loop's iterator
+    /// is declared with its temporaries kept until the loop ends, and is not
+    /// asked.
+    refuse_borrow_of_released_temporary(mut &this, d: DeclarationNode*) -> void {
+        const vd: VarDecl* = DeclarationNode::var_of(d);
+        if (vd == null || vd.initializer == null || vd.is_global || vd.is_capture_alias) { return; }
+        if (!this.may_carry_borrow(vd.resolved_type)) { return; }
+        const temporary: ExpressionNode* = this.borrowed_temporary_reached(vd.initializer);
+        if (temporary == null) { return; }
+        const spelled: string = this.intern.resolve(vd.name);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0460_BORROWED_TEMPORARY_RELEASED,
+            fmt::format("`%s` would point into a temporary that is released at the end of its declaration", spelled));
+        diag = diag.at_with_label(temporary.span, "this temporary is borrowed, and released when the declaration ends");
+        if (d.name_span.has_location()) {
+            diag = diag.also_at(d.name_span, fmt::format("`%s` keeps the borrow", spelled).as_str());
+        }
+        diag = diag.help("bind the temporary to a local of its own first, and borrow that local");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
+    /// Whether a value of `ty` could carry a borrow onward: it has room for
+    /// an address and owns nothing. A value that owns something is a value of
+    /// its own, made by the call that returned it; one whose type is still
+    /// generic cannot be judged until it is not.
+    may_carry_borrow(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid() || this.arena.contains_generic_param(ty)) { return false; }
+        if (OwnershipQuery::cannot_hold_address(this.arena, this.registry, ty)) { return false; }
+        return !OwnershipQuery::needs_drop(this.arena, this.registry, this.intern, ty);
+    }
+
+    /// The owning temporary `e` borrows - a borrowing method's receiver, an
+    /// argument passed by reference, the operand of `&` - reached through
+    /// values that could carry the borrow on to `e`'s result; null when
+    /// there is none.
+    borrowed_temporary_reached(mut &this, e: ExpressionNode*) -> ExpressionNode* {
+        if (e == null) { return null; }
+        const c: CallExpr* = ExpressionNode::call_of(e);
+        if (c != null) {
+            const method: MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
+            if (method != null && method.object != null) {
+                if (!OwnershipQuery::call_consumes_receiver(this.arena, this.intern, this.ctx.decl_index, c)) {
+                    const borrowed: ExpressionNode* = this.released_temporary(method.object);
+                    if (borrowed != null) { return borrowed; }
+                }
+                const through_receiver: ExpressionNode* = this.borrowed_temporary_carried(method.object);
+                if (through_receiver != null) { return through_receiver; }
+            }
+            for (mut i: i64 = 0; i < c.arguments.length(); i++) {
+                if (c.arguments[i].autoref) {
+                    const borrowed: ExpressionNode* = this.released_temporary(c.arguments[i]);
+                    if (borrowed != null) { return borrowed; }
+                }
+                const through_argument: ExpressionNode* = this.borrowed_temporary_carried(c.arguments[i]);
+                if (through_argument != null) { return through_argument; }
+            }
+            return null;
+        }
+        const un: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (un != null && un.op.kind == TokenType::Amp) {
+            return this.released_temporary(un.operand);
+        }
+        const cast: CastExpr* = ExpressionNode::cast_of(e);
+        if (cast != null) { return this.borrowed_temporary_carried(cast.expression); }
+        return null;
+    }
+
+    /// `borrowed_temporary_reached` of `e`, when `e`'s value could carry a
+    /// borrow on to the expression that uses it.
+    borrowed_temporary_carried(mut &this, e: ExpressionNode*) -> ExpressionNode* {
+        if (e == null || !this.may_carry_borrow(e.resolved_type)) { return null; }
+        return this.borrowed_temporary_reached(e);
+    }
+
+    /// The owning temporary that borrowing `e` borrows: `e` itself when it
+    /// is a call's result or a struct literal with something to release, or
+    /// the value a field read of `e` reads out of (`make()` in
+    /// `make().name`); null when `e` names storage a binding owns.
+    released_temporary(mut &this, e: ExpressionNode*) -> ExpressionNode* {
+        if (e == null) { return null; }
+        if (ExpressionNode::member_access_of(e) != null) {
+            return OwnershipQuery::temporary_field_root(this.arena, this.registry, this.intern, e);
+        }
+        if (OwnershipQuery::is_owning_temporary(this.arena, this.registry, this.intern, e)) { return e; }
+        return null;
     }
 
     /// Where `sym` was declared without a value, when the moved-set still
