@@ -23,7 +23,6 @@
 
 namespace compiler::deps::dep_resolver;
 
-import utils::log::{ Log, LogArea };
 import std::fs::path::{ Path, PathBuf };
 import std::collections::string::{ String };
 import std::fmt;
@@ -32,6 +31,7 @@ import compiler::deps::{ cache, git, semver, lockfile };
 import std::collections::str;
 import compiler::deps::cache::{ Cache };
 import compiler::deps::git::{ Git };
+import compiler::deps::git_url::{ GitUrl };
 import compiler::deps::lockfile::{ LockedDep, LockedVendor, Lockfile };
 import compiler::deps::semver::{ Constraint };
 
@@ -214,8 +214,15 @@ type struct DepResolver {
         const dep_root: PathBuf = if (cfg.project_root.eq(".")) { PathBuf::from(dep.path.as_str()) }
             else { Path::from(cfg.project_root).join(dep.path.as_str()) };
         const dep_config: PathBuf = dep_root.join("cryoconfig");
+        if (!dep_root.as_path().exists()) {
+            fmt::eprintln(f"error: path dependency '{dep.name}' names {dep_root.as_path().as_str()}, which does not exist");
+            outcome.failed = true;
+            return;
+        }
         if (!dep_config.as_path().exists()) {
-            Log::warn(LogArea::Deps, f"path dependency '{dep.name}': no cryoconfig at {dep_root.as_path().as_str()}");
+            fmt::eprintln(f"error: path dependency '{dep.name}' has no cryoconfig at {dep_root.as_path().as_str()}");
+            fmt::eprintln("  help: a dependency is a Cryo project; its directory holds a cryoconfig with a [lib] section");
+            outcome.failed = true;
             return;
         }
 
@@ -262,6 +269,11 @@ type struct DepResolver {
                     return;
                 }
                 sha = locked.sha.clone();
+                if (!GitUrl::is_commit_id(sha.as_str())) {
+                    fmt::eprintln(f"error: lockfile entry for '{dep.name}' holds `{sha}`, which is not a commit id; run `cryo fetch`");
+                    outcome.failed = true;
+                    return;
+                }
                 if (!Git::is_checkout_present(dep.git_url.as_str(), sha.as_str())) {
                     if (!Git::materialize_checkout(dep.git_url.as_str(), sha.as_str())) {
                         outcome.failed = true;
@@ -275,7 +287,8 @@ type struct DepResolver {
                 mut reused: boolean = false;
                 if (mode == ResolveMode::Fetch) {
                     const locked: const LockedDep* = existing.find(dep.name.as_str());
-                    if (locked != null && DepResolver::locked_matches_dep(locked, dep)) {
+                    if (locked != null && DepResolver::locked_matches_dep(locked, dep)
+                            && GitUrl::is_commit_id(locked.sha.as_str())) {
                         sha    = locked.sha.clone();
                         reused = true;
                     }
@@ -299,7 +312,7 @@ type struct DepResolver {
                 new_lock.packages.push(LockedDep {
                     name:     dep.name.clone(),
                     url:      dep.git_url.clone(),
-                    ref_kind: String::from_str(DepResolver::ref_kind_label(dep.ref_kind)),
+                    ref_kind: String::from_str(GitRefKind::key_name(dep.ref_kind)),
                     ref_val:  dep.ref_val.clone(),
                     sha:      sha.clone(),
                 });
@@ -381,21 +394,9 @@ type struct DepResolver {
     /// `version = ...`" case and forces a re-resolve.
     static locked_matches_dep(locked: const LockedDep*, dep: const Dependency*) -> boolean {
         if (locked.url.as_str() != dep.git_url.as_str()) { return false; }
-        if (locked.ref_kind.as_str() != DepResolver::ref_kind_label(dep.ref_kind)) { return false; }
+        if (locked.ref_kind.as_str() != GitRefKind::key_name(dep.ref_kind)) { return false; }
         if (locked.ref_val.as_str() != dep.ref_val.as_str()) { return false; }
         return true;
-    }
-
-    /// String label for a `GitRefKind`; used in lockfile round-tripping
-    /// (the inverse of parsing the `ref_kind` field back into the enum).
-    static ref_kind_label(k: GitRefKind) -> str::Str {
-        return match (k) {
-            GitRefKind::Version => { str::Str::from("version") }
-            GitRefKind::Tag     => { str::Str::from("tag") }
-            GitRefKind::Branch  => { str::Str::from("branch") }
-            GitRefKind::Rev     => { str::Str::from("rev") }
-            GitRefKind::None    => { str::Str::from("") }
-        };
     }
 
     /// Harvest a dep's published source roots into `outcome.roots`, each

@@ -8,6 +8,11 @@
 ///! All operations run the `git` binary via `std::process::Command` (argv,
 ///! no shell).  We rely on the user's git installation for protocol/auth
 ///! handling; nothing here is reimplemented in-process.
+///!
+///! A URL or ref reaches git only after `GitUrl` accepts it, always behind
+///! `--` or `--end-of-options`, and every command permits only the one
+///! transport its URL names.  So no value a cryoconfig writes is read as
+///! a git option, and no URL makes git run a command.
 
 namespace compiler::deps::git;
 
@@ -16,8 +21,10 @@ import std::fs::path::{ PathBuf };
 import std::fmt;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::io::error::{ IoError, IoErrorKind };
 import std::process::command::{ Command, Output, Stdio };
 import compiler::deps::cache::{ Cache };
+import compiler::deps::git_url::{ GitTransport, GitUrl };
 import compiler::project_config::{ GitRefKind };
 
 
@@ -32,6 +39,14 @@ type struct Git {
     /// Ensure the bare clone for `url` exists and (when `refresh` is true)
     /// has the latest remote refs. Idempotent.  Returns true on success.
     static ensure_bare_clone(url: Str, refresh: boolean) -> boolean {
+        mut transport: GitTransport = GitTransport::File;
+        match (GitUrl::transport_of(url)) {
+            Result::Ok(accepted) => { transport = accepted; }
+            Result::Err(reason) => {
+                fmt::eprintln(f"error: refusing to fetch `{url}`: the URL {reason}");
+                return false;
+            }
+        }
         const dir: PathBuf = Cache::git_dir_for(url);
 
         if (!dir.as_path().exists()) {
@@ -44,8 +59,8 @@ type struct Git {
                 Option::None         => { }
             }
             fmt::println(f"[deps] cloning {url}");
-            mut clone: Command = Command::new("git");
-            clone.argument("clone").argument("--bare").argument("--quiet").argument(url).argument(dir.as_path().as_str());
+            mut clone: Command = Git::command(transport);
+            clone.argument("clone").argument("--bare").argument("--quiet").argument("--").argument(url).argument(dir.as_path().as_str());
             if (Git::run(&clone) != 0) {
                 fmt::eprintln(f"error: git clone failed for {url}");
                 return false;
@@ -55,7 +70,7 @@ type struct Git {
 
         if (refresh) {
             fmt::println(f"[deps] refreshing {url}");
-            mut fetch: Command = Git::on_bare_clone(&dir);
+            mut fetch: Command = Git::on_bare_clone(&dir, transport);
             fetch.argument("fetch").argument("--quiet").argument("--tags").argument("--prune").argument("--all");
             if (Git::run(&fetch) != 0) {
                 fmt::eprintln(f"warning: git fetch failed for {url} (using stale refs)");
@@ -78,6 +93,13 @@ type struct Git {
     /// doesn't track local branches, so we look at the remote-tracking
     /// `refs/heads/<branch>` ref directly.
     static resolve_ref_to_sha(url: Str, ref_kind: GitRefKind, ref_value: Str) -> String {
+        match (GitUrl::ref_refusal(ref_value)) {
+            Option::Some(reason) => {
+                fmt::eprintln(f"error: refusing to resolve `{ref_value}` inside {url}: the value {reason}");
+                return String::new();
+            }
+            Option::None => { }
+        }
         const dir: PathBuf = Cache::git_dir_for(url);
 
         // Build the candidate refspec list.  We try them in order; the
@@ -114,8 +136,8 @@ type struct Git {
         for (mut i: i64 = 0; i < candidates.length(); i++) {
             mut commit: String = String::from_str(candidates[i].as_str());
             commit.push(Str::new("^{commit}"));
-            mut rev_parse: Command = Git::on_bare_clone(&dir);
-            rev_parse.argument("rev-parse").argument("--verify").argument("--quiet").argument(commit.as_str());
+            mut rev_parse: Command = Git::on_bare_clone(&dir, GitTransport::File);
+            rev_parse.argument("rev-parse").argument("--verify").argument("--quiet").argument("--end-of-options").argument(commit.as_str());
             const lines: [String] = Git::capture(&rev_parse);
             if (lines.length() > 0) {
                 return String::from_str(lines[0].as_str());
@@ -131,7 +153,7 @@ type struct Git {
     /// Returns an empty list on failure (and prints a diagnostic).
     static list_tags(url: Str) -> [String] {
         const dir: PathBuf = Cache::git_dir_for(url);
-        mut list: Command = Git::on_bare_clone(&dir);
+        mut list: Command = Git::on_bare_clone(&dir, GitTransport::File);
         list.argument("tag").argument("--list");
         return Git::capture(&list);
     }
@@ -159,6 +181,10 @@ type struct Git {
     /// the filesystem permits, so per-SHA storage cost is dominated by the
     /// working tree itself rather than the .git history.
     static materialize_checkout(url: Str, sha: Str) -> boolean {
+        if (!GitUrl::is_commit_id(sha)) {
+            fmt::eprintln(f"error: refusing to check out `{sha}` from {url}: it is not a full commit id");
+            return false;
+        }
         if (Git::is_checkout_present(url, sha)) { return true; }
 
         const bare: PathBuf = Cache::git_dir_for(url);
@@ -182,13 +208,13 @@ type struct Git {
             }
         }
 
-        mut clone: Command = Command::new("git");
-        clone.argument("clone").argument("--local").argument("--quiet").argument(bare.as_path().as_str()).argument(tree_text);
+        mut clone: Command = Git::command(GitTransport::File);
+        clone.argument("clone").argument("--local").argument("--quiet").argument("--").argument(bare.as_path().as_str()).argument(tree_text);
         if (Git::run(&clone) != 0) {
             fmt::eprintln(f"error: failed to materialize working tree at {tree_text}");
             return false;
         }
-        mut checkout: Command = Command::new("git");
+        mut checkout: Command = Git::command(GitTransport::File);
         checkout.argument("-C").argument(tree_text).argument("checkout").argument("--quiet").argument("--detach").argument(sha);
         if (Git::run(&checkout) != 0) {
             fmt::eprintln(f"error: failed to checkout {sha} in {tree_text}");
@@ -200,11 +226,22 @@ type struct Git {
 
     // Subprocess helpers (argv via std::process::Command, no shell)
 
-    /// `git --git-dir=<dir>`: a command on the bare clone at `dir`, which
-    /// the caller gives its arguments.
-    static on_bare_clone(dir: &PathBuf) -> Command {
-        const flag: String = f"--git-dir={dir.as_path().as_str()}";
+    /// `git -c protocol.allow=never -c protocol.<transport>.allow=always`:
+    /// a git command that may reach a repository only over `transport`,
+    /// which the caller gives its arguments.  A remote that redirects, or
+    /// a URL git would hand to another transport helper, is refused by git.
+    static command(transport: GitTransport) -> Command {
+        const allowed: String = f"protocol.{GitTransport::setting_name(transport)}.allow=always";
         mut command: Command = Command::new("git");
+        command.argument("-c").argument("protocol.allow=never").argument("-c").argument(allowed.as_str());
+        return command;
+    }
+
+    /// `git --git-dir=<dir>`: a command on the bare clone at `dir`, reaching
+    /// its remote only over `transport`, which the caller gives its arguments.
+    static on_bare_clone(dir: &PathBuf, transport: GitTransport) -> Command {
+        const flag: String = f"--git-dir={dir.as_path().as_str()}";
+        mut command: Command = Git::command(transport);
         command.argument(flag.as_str());
         return command;
     }
@@ -221,8 +258,23 @@ type struct Git {
                     Option::None       => { return -1; }
                 }
             }
-            Result::Err(_) => { return -1; }
+            Result::Err(error) => {
+                Git::report_spawn_failure(&error);
+                return -1;
+            }
         }
+    }
+
+    /// Say why `git` could not be started.  A git that is not installed or
+    /// not on `PATH` is named as such, since it otherwise reads as a failed
+    /// clone of whatever URL was being fetched.
+    static report_spawn_failure(error: &IoError) -> void {
+        if (error.kind == IoErrorKind::NotFound) {
+            fmt::eprintln("error: cannot run `git`: it is not installed, or not on PATH");
+            fmt::eprintln("  help: git dependencies are fetched with the git command-line tool; install git or add it to PATH, then run `cryo fetch` again");
+            return;
+        }
+        fmt::eprintln(f"error: cannot run `git`: {error}");
     }
 
     /// Run a `git` command, capturing stdout with stderr suppressed (the
@@ -246,7 +298,7 @@ type struct Git {
                     Result::Err(_) => { }
                 }
             }
-            Result::Err(_) => {}
+            Result::Err(error) => { Git::report_spawn_failure(&error); }
         }
         return out;
     }

@@ -5419,6 +5419,18 @@ remote   = { git = "https://example.com/lib.git", tag = "v0.1.0", alias = "Remot
 
 A git dependency requires exactly one of `version`, `tag`, `branch`, or `rev`, and may set `subdir` (the path to the dependency's `cryoconfig` inside the repo). `alias` is the top-level namespace the consumer imports.
 
+A path dependency names a directory holding a `cryoconfig`. One that names a directory that does not exist, or one without a `cryoconfig`, fails the build and names the dependency.
+
+**What a git dependency may name.** Every cryoconfig in the dependency graph writes these values, the dependencies' own included, so they are checked before anything is done with them, and a refused one fails as soon as its cryoconfig is read:
+
+- The URL is `https://host/path`, `ssh://[user@]host/path`, `user@host:path`, or `file:///path` for a repository on this machine. `http://` and `git://`, which carry no encryption, a local path written without `file://`, and any other transport are refused.
+- Neither the URL, its user, its host, nor a `tag`, `branch` or `rev` value may begin with `-`, and none may hold a space or a control character, so that no value is ever read by git or ssh as an option.
+- A commit read back from `cryoconfig.lock` must be a full 40-digit commit id.
+
+Each `git` process the build or `cryo fetch` starts may use only the transport its URL names (`-c protocol.allow=never` plus that one), and is given every URL and path after `--`.
+
+**Nothing runs at fetch or build time but `git` and the compiler.** A package has no build script, no fetch hook and no code generator that the build runs on its behalf: fetching a package copies files, and building it compiles them. A package's effect on a machine is therefore exactly the program it becomes, run when its user runs it. Cryo adds no mechanism that runs a package's code during `cryo fetch` or `cryo build`.
+
 ### 23.6 `[test]`
 
 Defaults for the test runner; forwarded to the spawned test binary unless overridden on the CLI.

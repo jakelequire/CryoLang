@@ -16,6 +16,7 @@ import std::collections::string::{ String };
 import std::ffi::libc;
 import std::core::mem;
 import utils::keyword::{ Keyword };
+import compiler::deps::git_url::{ GitUrl };
 
 
 // Native-build cache bucket, stamped at compile time per the OS this compiler
@@ -150,6 +151,21 @@ type enum GitRefKind with [Clone] {
     Branch;
     /// `rev = "<full or short sha>"`.
     Rev;
+}
+
+implement enum GitRefKind {
+    /// The `[dependencies]` key that selects `kind` (`"version"`, `"tag"`,
+    /// `"branch"`, `"rev"`), and `""` for `None`.  The lock file records a
+    /// git dependency's selector by this name.
+    static key_name(kind: GitRefKind) -> Str {
+        return match (kind) {
+            GitRefKind::Version => { Str::new("version") }
+            GitRefKind::Tag     => { Str::new("tag") }
+            GitRefKind::Branch  => { Str::new("branch") }
+            GitRefKind::Rev     => { Str::new("rev") }
+            GitRefKind::None    => { Str::new("") }
+        };
+    }
 }
 
 /// One entry in `[dependencies]`.  Two forms are accepted:
@@ -1282,6 +1298,25 @@ type struct ProjectConfig {
             if (dep.git_url.length() == 0) {
                 fmt::eprintln(f"error: git dependency '{dep.name}' has empty `git` URL");
                 errors += 1;
+            } else {
+                match (GitUrl::transport_of(dep.git_url.as_str())) {
+                    Result::Ok(_) => { }
+                    Result::Err(reason) => {
+                        fmt::eprintln(f"error: git dependency '{dep.name}' is refused: its URL `{dep.git_url}` {reason}");
+                        fmt::eprintln("  help: a git dependency's URL is `https://host/path`, `ssh://host/path`, `user@host:path`, or `file:///path` for a repository on this machine");
+                        errors += 1;
+                    }
+                }
+            }
+            if (saw_tag || saw_branch || saw_rev) {
+                match (GitUrl::ref_refusal(dep.ref_val.as_str())) {
+                    Option::Some(reason) => {
+                        const ref_key: str::Str = GitRefKind::key_name(dep.ref_kind);
+                        fmt::eprintln(f"error: git dependency '{dep.name}' is refused: its `{ref_key}` value `{dep.ref_val}` {reason}");
+                        errors += 1;
+                    }
+                    Option::None => { }
+                }
             }
         } else if (saw_path) {
             dep.kind = DepKind::Path;
