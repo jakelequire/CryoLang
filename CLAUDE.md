@@ -31,7 +31,9 @@ make verify              # build once; census, examples, lsp, cross, incr, check
                          # its results recorded per program, so a new test re-runs only itself);
                          # a change that makes a refused program compile DECLARES its project in
                          # tests/started-compiling (refused before, builds now); one that corrects
-                         # a program the baseline built, in tests/started-passing
+                         # a program the baseline built, in tests/started-passing; with a
+                         # baseline it also FAILS on a unit-suite build warning the baseline's
+                         # build did not print (code, file, line, compared as sets)
 make roster-check        # every unit test, project and negative file against the roster
                          # golden (tests/test-roster.txt); its OK line prints the current counts
 make check-fast          # verify's, selfhost-check's and cryogate's self-tests + pin integrity;

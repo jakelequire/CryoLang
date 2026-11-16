@@ -26,7 +26,8 @@
 ///! `cryogate census --read <log>` reads a log the runner wrote and prints
 ///! the parse as one JSON record (the line the first summary opens on, the
 ///! unit summary, the unit tests that ran and the ones the roster pins on
-///! this host), for a gate that runs the suite itself.
+///! this host, and the unit suite's build warnings), for a gate that runs
+///! the suite itself.
 
 namespace cryogate::gates::census;
 
@@ -97,6 +98,11 @@ public type struct CensusReading {
     /// Each passing project's verdict count: a collect project's `ok (12
     /// tests)`, 0 for a bare `ok`.
     public passed_counts: HashMap<String, i64>;
+    /// The warnings printed before the first summary - the unit suite's
+    /// build, which every run makes - each as `<code> <file>:<line>`, or
+    /// `<code> <message>` for one with no span.  A project echoes its own
+    /// build only when it fails, so its warnings are not here.
+    public warnings: Array<String>;
 
     public static of(lines: &Array<String>) -> CensusReading {
         mut reading: CensusReading = CensusReading {
@@ -109,15 +115,28 @@ public type struct CensusReading {
             skipped: Array::<Pair<String, String>>::new(),
             ignored: 0,
             passed_counts: HashMap::<String, i64>::new(),
+            warnings: Array::<String>::new(),
         };
         mut last_project: Option<String> = Option::None;
         mut current: String = String::new();
+        // (code, message) of a warning whose span line comes next.
+        mut open_warning: Option<Pair<String, String>> = Option::None;
         mut index: i64 = 0;
         for (raw in lines.iterate_references()) {
             const line: Str = raw.as_str();
             const stripped: Str = line.trim();
             const position: i64 = index;
             index++;
+            if (reading.first_summary == lines.length()) {
+                match (&open_warning) {
+                    Option::Some(warning) => {
+                        reading.warnings.push(CensusReading::warning_key(warning, stripped.strip_prefix(&Str::new("-->"))));
+                    }
+                    Option::None => { }
+                }
+                open_warning = CensusReading::warning(line);
+                if (open_warning.is_some()) { continue; }
+            }
             if (!reading.unit.printed) {
                 match (CensusReading::unit_line(stripped)) {
                     Option::Some(name) => { reading.unit_names.push(String::from_str(name)); }
@@ -180,7 +199,39 @@ public type struct CensusReading {
                 }
             }
         }
+        match (&open_warning) {
+            Option::Some(warning) => { reading.warnings.push(CensusReading::warning_key(warning, Option::None)); }
+            Option::None          => { }
+        }
         return reading;
+    }
+
+    /// The (code, message) of a `warning[<code>]: <message>` line.
+    public static warning(line: Str) -> Option<Pair<String, String>> {
+        const rest: Str = match (line.strip_prefix(&Str::new("warning["))) {
+            Option::Some(rest) => { rest }
+            Option::None       => { return Option::None; }
+        };
+        return match (rest.split_once(&Str::new("]: "))) {
+            Option::Some(parts) => { Option::Some(Pair::new(String::from_str(parts.first), String::from_str(parts.second))) }
+            Option::None        => { Option::None }
+        };
+    }
+
+    /// A warning as the census compares it: its code and the file and line
+    /// of its span (`location`, the text after `-->`, column dropped), or its
+    /// message when the line after it is not a span.
+    public static warning_key(warning: &Pair<String, String>, location: Option<Str>) -> String {
+        const code: Str = warning.first.as_str();
+        return match (location) {
+            Option::Some(span) => {
+                match (span.trim().split_once_from_end(&Str::new(":"))) {
+                    Option::Some(parts) => { f"{code} {parts.first}" }
+                    Option::None        => { f"{code} {span.trim()}" }
+                }
+            }
+            Option::None => { f"{code} {warning.second.as_str()}" }
+        };
     }
 
     /// The summary block named `kind`.
@@ -575,6 +626,7 @@ public type struct Census {
         }
         record.insert(String::from_str(Str::new("unit_ran")), Census::string_list(&reading.unit_names));
         record.insert(String::from_str(Str::new("unit_pinned")), Census::string_list(&pinned.unit));
+        record.insert(String::from_str(Str::new("warnings")), Census::string_list(&reading.warnings));
         fmt::println(serializer::stringify(&JsonValue::Object(record)));
         return 0;
     }

@@ -573,6 +573,14 @@ A line stays once committed: against a later baseline it is inert.
 Rewriting a line into another form with its reason kept declares nothing
 again.
 
+A baseline run also fails on a NEW warning.  The warnings the unit suite's
+build prints in the census are compared with the baseline's as sets of code,
+file and line, so one warning traded for another fails as surely as one
+added; a warning the change removes passes.  There is no declaration for a
+new warning: a change that introduces one fixes it.  A project's own build
+warnings are not compared - the census log holds a project's build only when
+the project fails.
+
 ## 9. The language server's tests
 
 `make lsp-check` builds `tools/CryoLSP` with the compiler under test and then

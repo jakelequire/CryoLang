@@ -47,6 +47,13 @@ Every count this relies on is printed.  A zero is only evidence when the
 instrument can report non-zero, so the object counts are floors: a hash list
 with no objects is a failure, not a clean comparison.
 
+With a baseline, the warnings the unit suite's build printed in each census
+are compared as sets of code, file and line (the baseline's are kept in the
+unit suite's record), and any warning only the tree reports fails the run: a
+change that only adds warnings moves no object and passes every suite.  A
+project's build warnings are not in the census log - a project echoes its
+build only when it fails - so this covers the unit suite alone.
+
 A change that makes a refused program compile makes the baseline's census fail
 on that program's project, by design; so does any change that makes a project
 pass that the baseline's run of it failed - a program that ran wrong, a
@@ -482,9 +489,15 @@ def program_keys(exe, owned):
     return keys
 
 
+def new_record(verdict, rows=()):
+    return {"verdict": verdict, "unit_failed": [], "unit_counts": None, "warnings": [],
+            "rows": list(rows)}
+
+
 def read_record(path):
-    """{"verdict", "unit_failed", "unit_counts", "rows"} from a record file."""
-    rec = {"verdict": None, "unit_failed": [], "unit_counts": None, "rows": []}
+    """{"verdict", "unit_failed", "unit_counts", "warnings", "rows"} from a
+    record file."""
+    rec = new_record(None)
     with io.open(path, encoding="utf-8") as fh:
         for line in fh:
             tag, _, rest = line.rstrip("\n").partition(" ")
@@ -494,6 +507,8 @@ def read_record(path):
                 rec["unit_failed"].append(rest)
             elif tag == "unit-counts":
                 rec["unit_counts"] = [int(n) for n in rest.split()]
+            elif tag == "warning":
+                rec["warnings"].append(rest)
             elif tag == "row":
                 rec["rows"].append(rest)
     return rec
@@ -504,6 +519,7 @@ def write_record(path, name, rec):
     lines += ["unit-failed " + n for n in rec["unit_failed"]]
     if rec["unit_counts"] is not None:
         lines.append("unit-counts " + " ".join(str(n) for n in rec["unit_counts"]))
+    lines += ["warning " + w for w in rec["warnings"]]
     lines += ["row " + r for r in rec["rows"]]
     tmp = path + ".tmp"
     with io.open(tmp, "w", encoding="utf-8", newline="\n") as fh:
@@ -551,14 +567,16 @@ def census_records(lines, names, rows, log=None):
             end = census["first_summary"]
             failed = sorted({m.group(1) for m in map(UNIT_FAILED.match, lines[:end]) if m})
             verdicts[UNIT_SUITE] = "FAILED" if failed else "ok"
-            out[UNIT_SUITE] = {"verdict": verdicts[UNIT_SUITE], "unit_failed": failed,
-                               "unit_counts": [counts.get(t, 0) for t in
-                                               ("passed", "failed", "ignored", "filtered")],
-                               "rows": []}
+            out[UNIT_SUITE] = new_record(verdicts[UNIT_SUITE])
+            out[UNIT_SUITE]["unit_failed"] = failed
+            out[UNIT_SUITE]["unit_counts"] = [counts.get(t, 0) for t in
+                                              ("passed", "failed", "ignored", "filtered")]
+            # The warnings before the first summary are the unit suite's
+            # build, which every census run makes; they are its record's.
+            out[UNIT_SUITE]["warnings"] = sorted(set(census["warnings"]))
     for name in names:
         if name in verdicts and name not in out:
-            out[name] = {"verdict": verdicts[name], "unit_failed": [], "unit_counts": None,
-                         "rows": []}
+            out[name] = new_record(verdicts[name])
     for r in rows:
         owner = owner_of(r[66:])
         if owner in out:
@@ -626,13 +644,11 @@ def baseline_programs(exe, home, bdir, env):
         built = {m.group(1) for m in map(EXAMPLE_OK.match, ex_lines) if m}
         for n in examples:
             if n in failed or n in built:
-                fresh[n] = {"verdict": "FAILED" if n in failed else "ok", "unit_failed": [],
-                            "unit_counts": None, "rows": []}
+                fresh[n] = new_record("FAILED" if n in failed else "ok")
         for r in object_rows("examples"):
             if owner_of(r[66:]) in fresh:
                 fresh[owner_of(r[66:])]["rows"].append(r)
-        fresh[EXAMPLE_ARCHIVES] = {"verdict": "ok", "unit_failed": [], "unit_counts": None,
-                                   "rows": prebuilt_rows()}
+        fresh[EXAMPLE_ARCHIVES] = new_record("ok", prebuilt_rows())
         for d in prebuilt_dirs():
             shutil.rmtree(d, ignore_errors=True)
     if run_census:
@@ -647,8 +663,7 @@ def baseline_programs(exe, home, bdir, env):
         else:
             for name, (log, lines) in zip(sorted(run_census), runs):
                 fresh.update(census_records(lines, [name], rows, log))
-        fresh[CENSUS_ARCHIVES] = {"verdict": "ok", "unit_failed": [], "unit_counts": None,
-                                  "rows": prebuilt_rows()}
+        fresh[CENSUS_ARCHIVES] = new_record("ok", prebuilt_rows())
     unanswered = [n for n in missing if n not in fresh]
     if unanswered:
         print("verify: FAIL -- the baseline run gave no verdict for %d program(s): %s"
@@ -687,7 +702,7 @@ def baseline_programs(exe, home, bdir, env):
     neg_failed = sum(n.startswith(NEGATIVE) and r["verdict"] == "FAILED" for n, r in have.items())
     print("verify: baseline objects  tests %d  examples %d  stdlib %d"
           % (len(lists["tests"]), len(lists["examples"]), len(lists["stdlib"])))
-    return (True, unit["unit_counts"][1], neg_failed, failed), lists
+    return (True, unit["unit_counts"][1], neg_failed, failed), lists, unit["warnings"]
 
 
 # ---- programs a change makes compile ---------------------------------------
@@ -847,6 +862,30 @@ def census_reading(log):
         raise SystemExit("verify: cryogate census --read %s failed: %s"
                          % (log, r.stderr.decode("utf-8", "replace").strip()))
     return json.loads(r.stdout.decode("utf-8"))
+
+
+# The census gate's line naming the runner log it wrote.
+CENSUS_LOG = re.compile(r"^\s+log\s+(\S.*?)\s*$")
+
+
+def census_warnings(gate_log):
+    """The unit suite's build warnings in the tree's census run, read off the
+    runner log the census gate's own log (`gate_log`) names; None when it
+    names none."""
+    with io.open(gate_log, encoding="utf-8", errors="replace") as fh:
+        found = [m.group(1) for m in map(CENSUS_LOG.match, fh) if m]
+    if not found or not os.path.isfile(found[-1]):
+        return None
+    return census_reading(found[-1])["warnings"]
+
+
+def judge_new_warnings(base, tree):
+    """Problems with the tree's unit-suite build warnings against the
+    baseline's, compared as sets of `<code> <file>:<line>`: a total hides one
+    warning traded for another.  Each warning only the tree reports is one;
+    one the change removed is not."""
+    return ["the tree's build reports a warning the baseline's does not: %s" % w
+            for w in sorted(set(tree) - set(base))]
 
 
 def judge_baseline_census(declared, accounted, unit_failed, neg_failed, failed, fixed=(),
@@ -1139,6 +1178,14 @@ def selftest():
          split_replaced(["p/build/x/local/deps/main.o"], True)[1], 1),
         ("archive: a stdlib object missing when no archive was linked",
          split_replaced(["p/build/x/std/deps/std/io.o"], False)[1], 1),
+        ("warnings: the same set",
+         judge_new_warnings(["W0001 ./a.cryo:3"], ["W0001 ./a.cryo:3"]), 0),
+        ("warnings: one the tree adds",
+         judge_new_warnings(["W0001 ./a.cryo:3"], ["W0001 ./a.cryo:3", "E0619 ./b.cryo:9"]), 1),
+        ("warnings: one traded for another at the same total",
+         judge_new_warnings(["W0001 ./a.cryo:3"], ["W0001 ./a.cryo:4"]), 1),
+        ("warnings: one the change removed",
+         judge_new_warnings(["W0001 ./a.cryo:3", "W0009 ./c.cryo:1"], ["W0001 ./a.cryo:3"]), 0),
     ]
     bad = 0
     for label, problems, want in cases:
@@ -1373,7 +1420,7 @@ def main():
         answer = baseline_programs(exe, home, bdir, env)
         if answer is None:
             return 1
-        census, lists = answer
+        census, lists, base_warnings = answer
         # A baseline compiler that links no stdlib archive builds none, so
         # the archive population alone may be empty.
         if not lists["tests"] or not lists["examples"]:
@@ -1408,6 +1455,17 @@ def main():
             ok = False
 
     if base_counts:
+        tree_warnings = census_warnings(os.path.join(logdir, "census.log"))
+        if tree_warnings is None:
+            print("verify: FAIL -- the census gate named no runner log to read its warnings from")
+            ok = False
+        else:
+            found = judge_new_warnings(base_warnings, tree_warnings)
+            print("verify: unit-suite build warnings  baseline %d  tree %d  new %d"
+                  % (len(set(base_warnings)), len(set(tree_warnings)), len(found)))
+            for p in found:
+                print("verify: FAIL -- %s" % p)
+                ok = False
         print("verify: objects against %s" % args.baseline)
         diff = 0
         units = {n: unit_object_suffix(n) for n in fixed if declared_kind(n) == "unit"}
