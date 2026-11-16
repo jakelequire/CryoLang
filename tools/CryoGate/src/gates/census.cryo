@@ -26,8 +26,9 @@
 ///! `cryogate census --read <log>` reads a log the runner wrote and prints
 ///! the parse as one JSON record (the line the first summary opens on, the
 ///! unit summary, the unit tests that ran and the ones the roster pins on
-///! this host, and the unit suite's build warnings), for a gate that runs
-///! the suite itself.
+///! this host, the unit suite's build warnings, each project's build
+///! warnings and whether the runner lists them), for a gate that runs the
+///! suite itself.
 
 namespace cryogate::gates::census;
 
@@ -100,9 +101,17 @@ public type struct CensusReading {
     public passed_counts: HashMap<String, i64>;
     /// The warnings printed before the first summary - the unit suite's
     /// build, which every run makes - each as `<code> <file>:<line>`, or
-    /// `<code> <message>` for one with no span.  A project echoes its own
-    /// build only when it fails, so its warnings are not here.
+    /// `<code> <message>` for one with no span.  A project's are in
+    /// `project_warnings`.
     public warnings: Array<String>;
+    /// (project, `<code> <file>:<line>`) for each build warning the runner
+    /// lists under a project's verdict line, `    warning <code>
+    /// <file>:<line>`, in the order listed.
+    public project_warnings: Array<Pair<String, String>>;
+    /// Whether the projects summary has a `warnings` row.  A runner that
+    /// lists project build warnings prints it whatever the count, so its
+    /// absence means the runner listed none, not that there were none.
+    public project_warnings_listed: boolean;
 
     public static of(lines: &Array<String>) -> CensusReading {
         mut reading: CensusReading = CensusReading {
@@ -116,6 +125,8 @@ public type struct CensusReading {
             ignored: 0,
             passed_counts: HashMap::<String, i64>::new(),
             warnings: Array::<String>::new(),
+            project_warnings: Array::<Pair<String, String>>::new(),
+            project_warnings_listed: false,
         };
         mut last_project: Option<String> = Option::None;
         mut current: String = String::new();
@@ -163,6 +174,18 @@ public type struct CensusReading {
                 }
                 Option::None => { }
             }
+            match (stripped.strip_prefix(&Str::new("warning "))) {
+                Option::Some(warning) => {
+                    match (&last_project) {
+                        Option::Some(name) => {
+                            reading.project_warnings.push(Pair::new(name.clone(), String::from_str(warning)));
+                            continue;
+                        }
+                        Option::None => { }
+                    }
+                }
+                Option::None => { }
+            }
             match (CensusReading::skip_reason(stripped)) {
                 Option::Some(reason) => {
                     const project: String = match (&last_project) {
@@ -192,7 +215,13 @@ public type struct CensusReading {
             }
             if (!current.is_empty()) {
                 match (CensusReading::row(line)) {
-                    Option::Some(row) => { reading.summary(current.as_str()).set(row.first, row.second); }
+                    Option::Some(row) => {
+                        if (row.first == Str::new("warnings")) {
+                            if (current.as_str() == Str::new("projects")) { reading.project_warnings_listed = true; }
+                        } else {
+                            reading.summary(current.as_str()).set(row.first, row.second);
+                        }
+                    }
                     Option::None      => {
                         if (stripped.starts_with(&Str::new("result"))) { current = String::new(); }
                     }
@@ -323,7 +352,8 @@ public type struct CensusReading {
             Option::Some(key) => { key }
             Option::None      => { return Option::None; }
         };
-        if (key != Str::new("passed") && key != Str::new("failed") && key != Str::new("ignored") && key != Str::new("filtered")) { return Option::None; }
+        if (key != Str::new("passed") && key != Str::new("failed") && key != Str::new("ignored") && key != Str::new("filtered")
+                && key != Str::new("warnings")) { return Option::None; }
         if (scanner.skip_whitespace() == 0) { return Option::None; }
         const number: Str = scanner.rest();
         if (!Text::is_digits(number)) { return Option::None; }
@@ -627,6 +657,16 @@ public type struct Census {
         record.insert(String::from_str(Str::new("unit_ran")), Census::string_list(&reading.unit_names));
         record.insert(String::from_str(Str::new("unit_pinned")), Census::string_list(&pinned.unit));
         record.insert(String::from_str(Str::new("warnings")), Census::string_list(&reading.warnings));
+        mut by_project: JsonObject = JsonObject::new();
+        for (listed in reading.project_warnings.iterate_references()) {
+            mut warnings: Array<String> = Array::<String>::new();
+            for (other in reading.project_warnings.iterate_references()) {
+                if (other.first.as_str() == listed.first.as_str()) { warnings.push(other.second.clone()); }
+            }
+            by_project.insert(listed.first.clone(), Census::string_list(&warnings));
+        }
+        record.insert(String::from_str(Str::new("project_warnings")), JsonValue::Object(by_project));
+        record.insert(String::from_str(Str::new("project_warnings_listed")), JsonValue::Bool(reading.project_warnings_listed));
         fmt::println(serializer::stringify(&JsonValue::Object(record)));
         return 0;
     }

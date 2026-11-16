@@ -65,11 +65,14 @@ const VENDOR_BOX_WIDTH:   i64 = 76;   // '+' to '+' inclusive
 const VENDOR_LABEL_WIDTH: i64 = 12;
 const VENDOR_VALUE_WIDTH: i64 = 58;   // BOX_WIDTH - 2 bars - 4 padding - LABEL
 
-/// Tally returned by the compile-fail suite so `cmd_test`'s unified
-/// OVERALL footer can quote it alongside the unit-suite outcome.
+/// Tally returned by the compile-fail and project suites so `cmd_test`'s
+/// unified OVERALL footer can quote it alongside the unit-suite outcome.
 type struct NegSuiteResult {
     ran:      i32;
     failures: i32;
+    /// The build warnings the project suite listed; none for the
+    /// compile-fail suite, whose diagnostics are its subject.
+    warnings: i32;
 }
 
 /// One `//~` expectation parsed from a negative-test source file: the compiler
@@ -84,17 +87,19 @@ type struct NegExpect {
     msg:      String;
 }
 
-/// One diagnostic parsed back out of `cryo check`'s rendered output: `severity`
+/// One diagnostic parsed back out of a build's rendered output: `severity`
 /// and `code` from the `error[Exxxx]:` / `warning[Wxxxx]:` header, `message` the
-/// remainder of that header line, and `line` the source line from the following
-/// `--> file:line:col` arrow.  Only diagnostics anchored in the test file itself
-/// are collected (an arrow pointing elsewhere - e.g. into the stdlib - is not the
-/// test's concern), so `//~` exhaustiveness is scoped to the file under test.
+/// remainder of that header line, and `file` and `line` the place the following
+/// `--> file:line:col` arrow names.  A negative test collects only diagnostics
+/// anchored in the test file itself (an arrow pointing elsewhere - e.g. into the
+/// stdlib - is not the test's concern), so `//~` exhaustiveness is scoped to the
+/// file under test; a project's build warnings are collected wherever they are.
 type struct NegDiag {
     line:     i64;
     severity: string;
     code:     String;
     message:  String;
+    file:     String;
 }
 
 /// Parsed `test.json` for a multi-module test project (see
@@ -1784,19 +1789,23 @@ type struct Executor {
         return String::from_str(arguments.unwrap().first.trim());
     }
 
-    /// The source LINE of a `--> file:line:col` arrow line: the number between
-    /// its last two colons.  Read from the tail, so a drive-letter colon
-    /// (`C:\...`) sits earlier and never becomes one of the final two.  -1 if
+    /// The FILE and source LINE of a `--> file:line:col` arrow line: the line
+    /// is the number between its last two colons, the file what precedes them
+    /// after the arrow.  Read from the tail, so a drive-letter colon (`C:\...`)
+    /// sits earlier and never becomes one of the final two.  The line is -1 if
     /// unparseable.
-    static neg_arrow_line(arrow: str::Str) -> i64 {
+    static neg_arrow_site(arrow: str::Str) -> Pair<str::Str, i64> {
         const colon: str::Str = str::Str::new(":");
         const column: Option<Pair<str::Str, str::Str>> = arrow.split_once_from_end(&colon);
-        if (column.is_none()) { return -1; }
+        if (column.is_none()) { return Pair::new(str::Str::new(""), -1); }
         const line: Option<Pair<str::Str, str::Str>> = column.unwrap().first.split_once_from_end(&colon);
-        if (line.is_none()) { return -1; }
-        return match (u64::parse_radix(line.unwrap().second.as_bytes(), 10)) {
-            Option::Some(number) => { number as i64 }
-            Option::None         => { -1 }
+        if (line.is_none()) { return Pair::new(str::Str::new(""), -1); }
+        const place: Pair<str::Str, str::Str> = line.unwrap();
+        const after_arrow: str::Str = place.first.trim_start();
+        const file: str::Str = after_arrow.strip_prefix(&str::Str::new("-->")).unwrap_or(after_arrow).trim();
+        return match (u64::parse_radix(place.second.as_bytes(), 10)) {
+            Option::Some(number) => { Pair::new(file, number as i64) }
+            Option::None         => { Pair::new(file, -1) }
         };
     }
 
@@ -1864,10 +1873,11 @@ type struct Executor {
         return f"error[{expected}]";
     }
 
-    /// Enumerate the diagnostics `cryo check` rendered into `out` that are
-    /// anchored in the test file `fname` (its basename must appear in the `-->`
-    /// arrow line).  Scoping to the file keeps `//~` exhaustiveness from tripping
-    /// on stdlib-internal diagnostics.
+    /// Enumerate the diagnostics rendered into `out` that are anchored in the
+    /// file `file_name` (its basename must appear in the `-->` arrow line), or
+    /// in any file when `file_name` is empty.  Scoping to the file keeps `//~`
+    /// exhaustiveness from tripping on stdlib-internal diagnostics.  A
+    /// diagnostic with no arrow has no place, and is not enumerated.
     static parse_diagnostics(out: Str, file_name: Str) -> [NegDiag] {
         mut diags: [NegDiag] = [];
         const newline: str::Str = str::Str::new("\n");
@@ -1888,11 +1898,12 @@ type struct Executor {
             if (stacked.is_some()) {
                 if (line.trim_start().starts_with(&arrow)) {
                     const head: i64 = stacked.unwrap();
-                    const site_line: i64 = Executor::neg_arrow_line(line);
-                    if (line.contains(&file_name) && site_line >= 0) {
-                        const site: NegDiag = NegDiag { line: site_line, severity: diags[head].severity,
+                    const place: Pair<str::Str, i64> = Executor::neg_arrow_site(line);
+                    if ((file_name.is_empty() || line.contains(&file_name)) && place.second >= 0) {
+                        const site: NegDiag = NegDiag { line: place.second, severity: diags[head].severity,
                                                         code: diags[head].code.clone(),
-                                                        message: diags[head].message.clone() };
+                                                        message: diags[head].message.clone(),
+                                                        file: String::from_str(place.first) };
                         diags.push(site);
                     }
                     continue;
@@ -1913,15 +1924,18 @@ type struct Executor {
                 message = message.strip_prefix(&colon).unwrap_or(message);
                 pending = Option::Some(NegDiag { line: -1, severity: severity,
                                                  code: String::from_str(code),
-                                                 message: String::from_str(message.trim_start()) });
+                                                 message: String::from_str(message.trim_start()),
+                                                 file: String::new() });
                 continue;
             }
             // The diagnostic's first arrow places it, and binds it to the test
             // file only when that arrow's own line names the file.
             if (pending.is_none() || !line.trim_start().starts_with(&arrow)) { continue; }
             mut diagnostic: NegDiag = pending.take().unwrap();
-            if (!line.contains(&file_name)) { continue; }
-            diagnostic.line = Executor::neg_arrow_line(line);
+            if (!file_name.is_empty() && !line.contains(&file_name)) { continue; }
+            const place: Pair<str::Str, i64> = Executor::neg_arrow_site(line);
+            diagnostic.line = place.second;
+            diagnostic.file = String::from_str(place.first);
             if (diagnostic.line >= 0) {
                 stacked = Option::Some(diags.length());
                 diags.push(diagnostic);
@@ -2108,7 +2122,7 @@ type struct Executor {
             Result::Err(_) => { }
         }
         if (names.length() == 0) {
-            return NegSuiteResult { ran: 0, failures: 0 };
+            return NegSuiteResult { ran: 0, failures: 0, warnings: 0 };
         }
 
         const is_pretty:  boolean = fmt_choice == "pretty";
@@ -2220,7 +2234,7 @@ type struct Executor {
                 }
                 ran += 1;
             }
-            return NegSuiteResult { ran: ran, failures: failures };
+            return NegSuiteResult { ran: ran, failures: failures, warnings: 0 };
         });
         const failures: i32 = tally.failures;
         const ran: i32 = tally.ran;
@@ -2249,7 +2263,7 @@ type struct Executor {
             }
             fmt::printf("%s\n", TEST_RULE_HEAVY);
         }
-        return NegSuiteResult { ran: ran, failures: failures };
+        return NegSuiteResult { ran: ran, failures: failures, warnings: 0 };
     }
 
     /// The first `requires` token NOT satisfied in this environment, or "" when
@@ -2555,7 +2569,7 @@ type struct Executor {
         mut cmds:       [String]   = [];
         const entries: DirectoryEntries = match (Directory::entries(projects_dir)) {
             Result::Ok(listing) => { listing }
-            Result::Err(_)      => { return NegSuiteResult { ran: 0, failures: 0 }; }
+            Result::Err(_)      => { return NegSuiteResult { ran: 0, failures: 0, warnings: 0 }; }
         };
         for (entry in entries) {
             const name: str::Str = entry.name();
@@ -2658,7 +2672,7 @@ type struct Executor {
         }
 
         if (names.length() == 0) {
-            return NegSuiteResult { ran: 0, failures: 0 };
+            return NegSuiteResult { ran: 0, failures: 0, warnings: 0 };
         }
         const is_pretty:  boolean = fmt_choice == "pretty";
         const is_compact: boolean = fmt_choice == "compact";
@@ -2691,6 +2705,7 @@ type struct Executor {
         const tally: NegSuiteResult = thread::scope((scope: mut &thread::Scope) -> NegSuiteResult {
             mut failures: i32 = 0;
             mut ran: i32 = 0;
+            mut warnings: i32 = 0;
             mut w: u32 = 0;
             while (w < jobs && (w as u64) < n_jobs) {
                 scope.spawn(move () -> void { batch.run(); });
@@ -2801,6 +2816,7 @@ type struct Executor {
                         if (err.length() > 0) { fmt::printf("%.*s\n", err.length() as i32, err.as_str().as_pointer()); }
                     }
                 }
+                warnings += Executor::list_build_warnings(out_path.as_str(), !is_compact);
                 const out_error: String = Executor::stderr_path(out_path.as_str());
                 Executor::remove_capture(path::Path::from(out_path.as_str()));
                 Executor::remove_capture(path::Path::from(out_error.as_str()));
@@ -2814,7 +2830,7 @@ type struct Executor {
                 }
                 ran += 1;
             }
-            return NegSuiteResult { ran: ran, failures: failures };
+            return NegSuiteResult { ran: ran, failures: failures, warnings: warnings };
         });
         const failures: i32 = tally.failures;
         const ran: i32 = tally.ran;
@@ -2831,6 +2847,9 @@ type struct Executor {
             fmt::printf("%s\n", TEST_RULE_THIN);
             fmt::printf("    %-9s%6d\n", "passed", ran - failures);
             fmt::printf("    %-9s%6d\n", "failed", failures);
+            // Printed whatever the count, so a reader can tell a runner that
+            // lists build warnings and found none from one that lists none.
+            fmt::printf("    %-9s%6d\n", "warnings", tally.warnings);
             fmt::printf("%s\n", TEST_RULE_THIN);
             if (color_on && failures == 0) {
                 fmt::printf("    result   %s%s%s\n", NEG_ANSI_GREEN, verdict, NEG_ANSI_RESET);
@@ -2841,7 +2860,37 @@ type struct Executor {
             }
             fmt::printf("%s\n", TEST_RULE_HEAVY);
         }
-        return NegSuiteResult { ran: ran, failures: failures };
+        return NegSuiteResult { ran: ran, failures: failures, warnings: tally.warnings };
+    }
+
+    /// The warnings a project's build reported in its captured output at
+    /// `capture` and the stderr captured beside it, each listed under the
+    /// project's verdict line when `shown`, as `    warning <code>
+    /// <file>:<line>`: a passing project's output is not echoed, and its
+    /// warnings are seen there or nowhere.  A warning with no span has no
+    /// place and is not listed.  Returns how many there were.
+    static list_build_warnings(capture: Str, shown: boolean) -> i32 {
+        const output: String = Executor::read_file_or_empty(path::Path::from(capture));
+        const error_path: String = Executor::stderr_path(capture);
+        const errors: String = Executor::read_file_or_empty(path::Path::from(error_path.as_str()));
+        const from_output: [NegDiag] = Executor::parse_diagnostics(output.as_str(), str::Str::new(""));
+        const from_errors: [NegDiag] = Executor::parse_diagnostics(errors.as_str(), str::Str::new(""));
+        return Executor::list_warnings_of(&from_output, shown) + Executor::list_warnings_of(&from_errors, shown);
+    }
+
+    /// The warnings among `diagnostics`, listed when `shown`; their count.
+    static list_warnings_of(diagnostics: &[NegDiag], shown: boolean) -> i32 {
+        mut count: i32 = 0;
+        for (mut d: i64 = 0; d < diagnostics.length(); d++) {
+            const found: const NegDiag* = &diagnostics[d];
+            if (found.severity != "warning") { continue; }
+            count += 1;
+            if (shown) {
+                const listed: String = f"    warning {found.code} {found.file}:{found.line}";
+                fmt::printf("%.*s\n", listed.length() as i32, listed.as_str().as_pointer());
+            }
+        }
+        return count;
     }
 
     /// Print one project's PASS/FAIL line in the active format. `detail` is

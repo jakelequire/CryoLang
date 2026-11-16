@@ -381,6 +381,12 @@ hands to every project's build too: a unit test or a project that discards a
 example to the same.  A project that wants to show the warning asserts it
 from a compile-fail file instead, which is checked without the flag.
 
+A project's build output is echoed only when the project fails, so the runner
+lists each warning its build reported under the project's line, passing or
+not, as `    warning <code> <file>:<line>` (a warning with no span has no
+place and is not listed).  The projects summary counts them in a `warnings`
+row, printed whatever the count.
+
 ### Outcomes
 
 - **`collect`** - build the package and run *its own* `![test]` functions
@@ -578,8 +584,10 @@ build prints in the census are compared with the baseline's as sets of code,
 file and line, so one warning traded for another fails as surely as one
 added; a warning the change removes passes.  There is no declaration for a
 new warning: a change that introduces one fixes it.  A project's own build
-warnings are not compared - the census log holds a project's build only when
-the project fails.
+warnings are not compared yet.  The runner lists them under each project's
+line (see the projects suite above), but a baseline whose runner predates that
+listing has none to compare against; its projects summary has no `warnings`
+row, which is how the two are told apart.
 
 ## 9. The language server's tests
 
