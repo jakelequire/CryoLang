@@ -1,0 +1,743 @@
+///! Type-directed generation of a `Program` from a seed.
+///!
+///! An expression is generated for a wanted type, with a depth budget, from
+///! the forms the enabled features allow; the environment lists the names
+///! in scope.  Every form is valid under both overflow rules (wrapping, or
+///! debug traps): plain `+`, `-`, `*` and negation only meet masked
+///! operands whose result fits, a divisor is guarded into `[1, M]` and a
+///! shift amount is masked below the width.  Loops count to a literal trip
+///! count, a function calls only earlier functions, and a cost model bounds
+///! the work of every call, so every program terminates.
+
+namespace cryosmith::generator;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::core::option::{ Option };
+import std::random::generator::{ Rng };
+import std::random::source::{ RandomSource };
+
+import cryosmith::features::{ Feature, FeatureSet };
+import cryosmith::program::{
+    BinaryOperator, ExpressionKind, Function, LoopShape, Program, ScalarType, StatementKind,
+    UnaryOperator, Variable, VariableRole, WrappingOperator
+};
+
+/// The generator's version: raised whenever one seed and one set of
+/// options may generate different text.
+public const GENERATOR_VERSION: i64 = 1;
+
+/// The spacing between the seeds of two functions' random streams.
+const STREAM_SPACING: u64 = 0x9E3779B97F4A7C15;
+
+/// The most work one call of a helper function may do.
+const HELPER_COST_LIMIT: u64 = 20000;
+
+/// The most work `main` may do.
+const MAIN_COST_LIMIT: u64 = 2000000;
+
+/// The largest trip count of a loop.
+const MOST_TRIPS: i64 = 6;
+
+/// How deep loops nest.
+const MOST_LOOPS: i64 = 3;
+
+/// How deep blocks nest.
+const MOST_BLOCKS: i64 = 4;
+
+/// The largest literal magnitude: `i64::MAX`, so no unsigned literal is
+/// written past it.
+const LARGEST_LITERAL: u64 = 9223372036854775807;
+
+/// A deliberate defect, for proving that a check can refuse.
+public type enum Plant {
+    /// No defect.
+    Unplanted;
+    /// A divisor loses its `| 1` and may be zero.
+    UnguardedDivision;
+}
+
+implement enum Plant {
+    /// The plant's name on a command line.
+    public name(&this) -> Str {
+        return match (&this) {
+            Plant::Unplanted         => { Str::new("none") }
+            Plant::UnguardedDivision => { Str::new("unguarded-division") }
+        };
+    }
+
+    /// The plant named `name`, if there is one.
+    public static named(name: Str) -> Option<Plant> {
+        if (name == Str::new("none")) { return Option::Some(Plant::Unplanted); }
+        if (name == Str::new("unguarded-division")) { return Option::Some(Plant::UnguardedDivision); }
+        return Option::None;
+    }
+
+    /// Whether this is a defect.
+    public is_planted(&this) -> boolean {
+        return match (&this) {
+            Plant::Unplanted => { false }
+            _                => { true }
+        };
+    }
+}
+
+/// What a program is generated from.
+public type struct GenerationOptions {
+    /// The seed.
+    public seed: u64;
+    /// The enabled features.
+    public features: FeatureSet;
+    /// How many helper functions; -1 chooses from the seed.
+    public functions: i64;
+    /// The statement budget of one function.
+    public size: i64;
+    /// Whether the program starts with the header comment.
+    public header: boolean;
+    /// A deliberate defect, or none.
+    public plant: Plant;
+
+    /// The defaults for `seed`.
+    public static new(seed: u64) -> GenerationOptions {
+        return GenerationOptions {
+            seed: seed, features: FeatureSet::default_set(), functions: -1, size: 24, header: true,
+            plant: Plant::Unplanted,
+        };
+    }
+
+    /// How many helper functions the program has: `functions`, or 2 to 6
+    /// chosen from the seed.
+    public function_count(&this) -> i64 {
+        if (this.functions >= 0) { return this.functions; }
+        mut stream: Rng = Rng::from_seed(this.seed);
+        return 2 + stream.next_below(5);
+    }
+}
+
+/// Builds one program.
+public type struct Generator {
+    program: Program;
+    options: GenerationOptions;
+    random: Rng;
+    scope: Array<i64>;
+    locals: i64;
+    counters: i64;
+    loop_depth: i64;
+    block_depth: i64;
+    multiplier: u64;
+    spent: u64;
+    limit: u64;
+    statements_left: i64;
+    in_main: boolean;
+    returns: ScalarType;
+
+    /// The program `options` describe.
+    public static generate(options: GenerationOptions) -> Program {
+        mut generator: Generator = Generator {
+            program: Program::new(), options: options, random: Rng::from_seed(options.seed),
+            scope: Array::<i64>::new(), locals: 0, counters: 0, loop_depth: 0, block_depth: 0,
+            multiplier: 1, spent: 0, limit: 0, statements_left: 0, in_main: false, returns: ScalarType::I32,
+        };
+        const count: i64 = options.function_count();
+        mut number: i64 = 0;
+        while (number < count) {
+            generator.define(number, false);
+            number = number + 1;
+        }
+        generator.define(count, true);
+        return generator.program;
+    }
+
+    /// Generate function `number`, or `main`, from its own random stream.
+    define(mut &this, number: i64, is_main: boolean) -> void {
+        const stream: u64 = this.options.seed ^ ((number as u64) + 1).wrapping_multiply(STREAM_SPACING);
+        this.random = Rng::from_seed(stream);
+        this.scope.clear();
+        this.scope.push(Program::observed());
+        this.locals = 0;
+        this.counters = 0;
+        this.loop_depth = 0;
+        this.block_depth = 0;
+        this.multiplier = 1;
+        this.spent = 0;
+        this.limit = if (is_main) { MAIN_COST_LIMIT } else { HELPER_COST_LIMIT };
+        this.statements_left = this.options.size;
+        this.in_main = is_main;
+        const first_parameter: i64 = this.program.lists.length();
+        mut parameter_count: i64 = 0;
+        if (!is_main) {
+            parameter_count = 1 + this.below(4);
+            mut index: i64 = 0;
+            while (index < parameter_count) {
+                const scalar: ScalarType = this.any_type();
+                const parameter: i64 = this.program.variable(Variable { role: VariableRole::Parameter, number: index, scalar: scalar, mutable: false });
+                this.program.lists.push(parameter);
+                this.scope.push(parameter);
+                index = index + 1;
+            }
+        }
+        this.returns = if (is_main) { ScalarType::I32 } else { this.any_type() };
+        mut statements: Array<i64> = Array::<i64>::new();
+        const body_start: i64 = this.scope.length();
+        this.fill(&statements, true);
+        this.observe_declared(body_start, &statements);
+        if (is_main) {
+            mut helper: i64 = 0;
+            while (helper < number) {
+                const helper_returns: ScalarType = this.program.function_at(helper).returns;
+                if (this.callees(helper_returns).contains(&helper)) {
+                    statements.push(this.observation(this.call(helper, 2)));
+                }
+                helper = helper + 1;
+            }
+            statements.push(this.program.statement(StatementKind::Finish));
+        } else {
+            mut index: i64 = 0;
+            while (index < parameter_count) {
+                const parameter: i64 = this.program.list_at(first_parameter + index);
+                statements.push(this.observation(this.read(parameter)));
+                index = index + 1;
+            }
+            const value: i64 = this.typed_place(this.returns, this.depth());
+            statements.push(this.program.statement(StatementKind::Return(value)));
+        }
+        const body: i64 = this.program.block(&statements);
+        this.program.functions.push(Function {
+            number: number, is_main: is_main, first_parameter: first_parameter, parameter_count: parameter_count,
+            returns: this.returns, body: body, cost: this.spent,
+        });
+    }
+
+    // ---- statements ------------------------------------------------------
+
+    /// Append statements to `statements`: until the budget is spent for a
+    /// function's top block, else one to six.
+    fill(mut &this, statements: mut &Array<i64>, top: boolean) -> void {
+        if (this.statements_left <= 0) { return; }
+        mut count: i64 = 1 + this.below(if (this.statements_left < 6) { this.statements_left } else { 6 });
+        while (this.statements_left > 0 && (top || count > 0)) {
+            this.statements_left = this.statements_left - 1;
+            count = count - 1;
+            statements.push(this.statement());
+        }
+    }
+
+    /// A nested block: its statements, then an observation of each local
+    /// it declared.
+    /// It spends at most half the statements left, so the block holding it
+    /// keeps statements of its own.
+    block(mut &this) -> i64 {
+        const start: i64 = this.scope.length();
+        const reserved: i64 = this.statements_left / 2;
+        this.statements_left = this.statements_left - reserved;
+        this.block_depth = this.block_depth + 1;
+        mut statements: Array<i64> = Array::<i64>::new();
+        this.fill(&statements, false);
+        this.observe_declared(start, &statements);
+        this.scope.truncate(start);
+        this.block_depth = this.block_depth - 1;
+        this.statements_left = this.statements_left + reserved;
+        return this.program.block(&statements);
+    }
+
+    /// Observe every local declared in the scope from `start`.
+    observe_declared(mut &this, start: i64, statements: mut &Array<i64>) -> void {
+        mut index: i64 = start;
+        while (index < this.scope.length()) {
+            const variable: i64 = this.scope.get(index).unwrap();
+            match (this.program.variable_at(variable).role) {
+                VariableRole::Local => { statements.push(this.observation(this.read(variable))); }
+                _                   => { }
+            }
+            index = index + 1;
+        }
+    }
+
+    /// One statement, chosen by weight from those allowed here.
+    statement(mut &this) -> i64 {
+        const features: FeatureSet = this.options.features;
+        const nested: boolean = this.block_depth < MOST_BLOCKS;
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(30);
+        weights.push(if (this.assignable().length() > 0) { 20 } else { 0 });
+        weights.push(12);
+        weights.push(if (features.has(Feature::Branches) && nested) { 10 } else { 0 });
+        weights.push(if (features.has(Feature::Loops) && nested && this.loop_depth < MOST_LOOPS) { 10 } else { 0 });
+        weights.push(if (features.has(Feature::LoopExits) && this.loop_depth > 0) { 4 } else { 0 });
+        weights.push(if (features.has(Feature::EarlyReturns) && !this.in_main) { 4 } else { 0 });
+        const form: i64 = this.pick(&weights);
+        this.charge(1);
+        if (form == 0) { return this.declaration(); }
+        if (form == 1) { return this.assignment(); }
+        if (form == 2) {
+            const scalar: ScalarType = this.any_type();
+            return this.observation(this.expression(scalar, this.depth(), true));
+        }
+        if (form == 3) {
+            const condition: i64 = this.condition(this.depth());
+            const then_block: i64 = this.block();
+            const else_block: i64 = if (this.chance(50)) { this.block() } else { -1 };
+            return this.program.statement(StatementKind::Branch(condition, then_block, else_block));
+        }
+        if (form == 4) { return this.loop_statement(); }
+        if (form == 5) {
+            const condition: i64 = this.condition(this.depth());
+            return this.program.statement(StatementKind::Exit(this.chance(50), condition));
+        }
+        const condition: i64 = this.condition(this.depth());
+        const value: i64 = this.typed_place(this.returns, this.depth());
+        return this.program.statement(StatementKind::ReturnIf(condition, value));
+    }
+
+    /// `const` or `mut` local with its initial value; the name is in scope
+    /// only after the value, so the value cannot read it.
+    declaration(mut &this) -> i64 {
+        const scalar: ScalarType = this.any_type();
+        const value: i64 = this.typed_place(scalar, this.depth());
+        const variable: i64 = this.program.variable(Variable { role: VariableRole::Local, number: this.locals, scalar: scalar, mutable: this.chance(50) });
+        this.locals = this.locals + 1;
+        this.scope.push(variable);
+        return this.program.statement(StatementKind::Declare(variable, value));
+    }
+
+    /// An assignment to a `mut` local: plain, or a compound operator that
+    /// cannot overflow.
+    assignment(mut &this) -> i64 {
+        const candidates: Array<i64> = this.assignable();
+        const variable: i64 = candidates.get(this.below(candidates.length())).unwrap();
+        const scalar: ScalarType = this.program.variable_at(variable).scalar;
+        const features: FeatureSet = this.options.features;
+        if (scalar.is_integer() && this.chance(35)) {
+            mut weights: Array<i64> = Array::<i64>::new();
+            weights.push(if (features.has(Feature::Bitwise)) { 3 } else { 0 });
+            weights.push(if (features.has(Feature::Shifts)) { 2 } else { 0 });
+            weights.push(if (features.has(Feature::Division)) { 2 } else { 0 });
+            const total: i64 = weights.iter().sum();
+            if (total > 0) {
+                const form: i64 = this.pick(&weights);
+                const depth: i64 = this.depth();
+                if (form == 0) {
+                    const operator: BinaryOperator = match (this.below(3)) {
+                        0 => { BinaryOperator::BitAnd }
+                        1 => { BinaryOperator::BitOr }
+                        _ => { BinaryOperator::BitXor }
+                    };
+                    return this.program.statement(StatementKind::Compound(operator, variable, this.expression(scalar, depth, false)));
+                }
+                if (form == 1) {
+                    const operator: BinaryOperator = if (this.chance(50)) { BinaryOperator::ShiftLeft } else { BinaryOperator::ShiftRight };
+                    return this.program.statement(StatementKind::Compound(operator, variable, this.shift_amount(scalar, depth)));
+                }
+                const operator: BinaryOperator = if (this.chance(50)) { BinaryOperator::Divide } else { BinaryOperator::Remainder };
+                return this.program.statement(StatementKind::Compound(operator, variable, this.divisor(scalar, depth)));
+            }
+        }
+        return this.program.statement(StatementKind::Assign(variable, this.typed_place(scalar, this.depth())));
+    }
+
+    /// A bounded loop.  The counter is read only, and the body's work is
+    /// charged once per trip.
+    loop_statement(mut &this) -> i64 {
+        const shape: LoopShape = match (this.below(3)) {
+            0 => { LoopShape::Counted }
+            1 => { LoopShape::Conditioned }
+            _ => { LoopShape::Ranged }
+        };
+        const scalar: ScalarType = match (shape) {
+            LoopShape::Ranged => { ScalarType::I32 }
+            _                 => { this.integer_type() }
+        };
+        const trips: i64 = this.below(MOST_TRIPS + 1);
+        const counter: i64 = this.program.variable(Variable { role: VariableRole::Counter, number: this.counters, scalar: scalar, mutable: true });
+        this.counters = this.counters + 1;
+        const outer: u64 = this.multiplier;
+        this.multiplier = outer * (if (trips > 0) { trips as u64 } else { 1 });
+        this.charge(2);
+        this.loop_depth = this.loop_depth + 1;
+        this.scope.push(counter);
+        const body: i64 = this.block();
+        this.scope.truncate(this.scope.length() - 1);
+        this.loop_depth = this.loop_depth - 1;
+        this.multiplier = outer;
+        return this.program.statement(StatementKind::Loop(shape, counter, trips as u64, body));
+    }
+
+    /// `observed = mix(observed, value)`.
+    observation(mut &this, value: i64) -> i64 {
+        return this.program.statement(StatementKind::Observe(value));
+    }
+
+    /// The `mut` locals in scope.
+    assignable(&this) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.scope.iter()) {
+            const declared: Variable = this.program.variable_at(variable);
+            match (declared.role) {
+                VariableRole::Local => { if (declared.mutable) { found.push(variable); } }
+                _                   => { }
+            }
+        }
+        return found;
+    }
+
+    // ---- expressions -----------------------------------------------------
+
+    /// An expression of `wanted` where the language converts implicitly:
+    /// an initializer, an assignment, an argument or a return value.  It
+    /// may be a narrower value, widened.
+    typed_place(mut &this, wanted: ScalarType, depth: i64) -> i64 {
+        if (this.options.features.has(Feature::Widening) && wanted.is_integer() && this.chance(15)) {
+            mut narrower: Array<ScalarType> = Array::<ScalarType>::new();
+            for (candidate in ScalarType::integers().iter()) {
+                if (candidate.widens_to(wanted)) { narrower.push(candidate); }
+            }
+            if (narrower.length() > 0) {
+                const source: ScalarType = narrower.get(this.below(narrower.length())).unwrap();
+                const operand: i64 = this.expression(source, depth, true);
+                return this.node(ExpressionKind::Widen(operand), wanted);
+            }
+        }
+        return this.expression(wanted, depth, false);
+    }
+
+    /// An expression of `wanted`: a bare literal, or one that reads a name
+    /// (a variable, a call, a named limit), never only literals combined.
+    /// A literal combined with a name takes the name's type, but literals
+    /// combined with each other are typed by where the whole stands, and
+    /// an operand gives them none.  With `reads_name`, not even a bare
+    /// literal: a method's receiver, a cast's operand and an `if`
+    /// expression's arms give a literal no type either.
+    expression(mut &this, wanted: ScalarType, depth: i64, reads_name: boolean) -> i64 {
+        match (wanted) {
+            ScalarType::Boolean => { return this.boolean_expression(depth, reads_name); }
+            _                   => { return this.integer_expression(wanted, depth, reads_name); }
+        }
+    }
+
+    /// An integer expression of `wanted`.
+    integer_expression(mut &this, wanted: ScalarType, depth: i64, reads_name: boolean) -> i64 {
+        const features: FeatureSet = this.options.features;
+        const deeper: boolean = depth > 0;
+        const next: i64 = depth - 1;
+        const variables: Array<i64> = this.variables_of(wanted);
+        const callees: Array<i64> = this.callees(wanted);
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(if (reads_name) { 0 } else { 10 });
+        weights.push(1);
+        weights.push(if (variables.length() > 0) { 14 } else { 0 });
+        const others: Array<i64> = this.integer_variables_except(wanted);
+        weights.push(if (features.has(Feature::Casts) && (deeper || others.length() > 0)) { 6 } else { 0 });
+        weights.push(if (features.has(Feature::Wrapping) && deeper) { 10 } else { 0 });
+        weights.push(if (features.has(Feature::Guarded) && deeper) { 10 } else { 0 });
+        weights.push(if (features.has(Feature::Bitwise) && deeper) { 8 } else { 0 });
+        weights.push(if (features.has(Feature::Shifts) && deeper) { 5 } else { 0 });
+        weights.push(if (features.has(Feature::Division) && deeper) { 5 } else { 0 });
+        weights.push(if (features.has(Feature::Guarded) && wanted.is_signed() && deeper) { 3 } else { 0 });
+        weights.push(if (features.has(Feature::IfExpressions) && deeper) { 3 } else { 0 });
+        weights.push(if (callees.length() > 0 && deeper) { 6 } else { 0 });
+        const form: i64 = this.pick(&weights);
+        if (form == 0) { return this.literal(wanted); }
+        if (form == 1) { return this.node(ExpressionKind::Limit(this.chance(50)), wanted); }
+        if (form == 2) { return this.read(variables.get(this.below(variables.length())).unwrap()); }
+        if (form == 3) {
+            if (!deeper) {
+                return this.node(ExpressionKind::Cast(this.read(others.get(this.below(others.length())).unwrap())), wanted);
+            }
+            mut source: ScalarType = this.integer_type();
+            while (source.same(wanted)) { source = this.integer_type(); }
+            return this.node(ExpressionKind::Cast(this.expression(source, next, true)), wanted);
+        }
+        if (form == 4) {
+            const operator: WrappingOperator = match (this.below(3)) {
+                0 => { WrappingOperator::Add }
+                1 => { WrappingOperator::Subtract }
+                _ => { WrappingOperator::Multiply }
+            };
+            const receiver: i64 = this.expression(wanted, next, true);
+            const argument: i64 = this.expression(wanted, next, false);
+            return this.node(ExpressionKind::Wrapping(operator, receiver, argument), wanted);
+        }
+        if (form == 5) { return this.guarded(wanted, next); }
+        if (form == 6) {
+            if (this.chance(25)) {
+                return this.node(ExpressionKind::Unary(UnaryOperator::Complement, this.expression(wanted, next, true)), wanted);
+            }
+            const operator: BinaryOperator = match (this.below(3)) {
+                0 => { BinaryOperator::BitAnd }
+                1 => { BinaryOperator::BitOr }
+                _ => { BinaryOperator::BitXor }
+            };
+            const left: i64 = this.expression(wanted, next, true);
+            const right: i64 = this.expression(wanted, next, false);
+            return this.node(ExpressionKind::Binary(operator, left, right), wanted);
+        }
+        if (form == 7) {
+            const operator: BinaryOperator = if (this.chance(50)) { BinaryOperator::ShiftLeft } else { BinaryOperator::ShiftRight };
+            const value: i64 = this.expression(wanted, next, true);
+            const amount: i64 = this.shift_amount(wanted, next);
+            return this.node(ExpressionKind::Binary(operator, value, amount), wanted);
+        }
+        if (form == 8) {
+            const operator: BinaryOperator = if (this.chance(50)) { BinaryOperator::Divide } else { BinaryOperator::Remainder };
+            const dividend: i64 = this.expression(wanted, next, true);
+            const divisor: i64 = this.divisor(wanted, next);
+            return this.node(ExpressionKind::Binary(operator, dividend, divisor), wanted);
+        }
+        if (form == 9) {
+            const operand: i64 = this.masked(this.expression(wanted, next, true), wanted.maximum(), wanted);
+            return this.node(ExpressionKind::Unary(UnaryOperator::Negate, operand), wanted);
+        }
+        if (form == 10) {
+            const condition: i64 = this.condition(next);
+            const then_value: i64 = this.expression(wanted, next, true);
+            const else_value: i64 = this.expression(wanted, next, true);
+            return this.node(ExpressionKind::Conditional(condition, then_value, else_value), wanted);
+        }
+        return this.call(callees.get(this.below(callees.length())).unwrap(), next);
+    }
+
+    /// A plain `+`, `-` or `*` over operands masked so that the result fits
+    /// `wanted` (`W` its width): `+` and signed `-` mask both sides to
+    /// `2^(W-2) - 1`; unsigned `-` sets bit `W-2` of the left side and
+    /// masks the right below it, so the left is larger; `*` masks both sides
+    /// below the square root of the range.
+    guarded(mut &this, wanted: ScalarType, depth: i64) -> i64 {
+        const width: u64 = wanted.width();
+        const quarter: u64 = 1 << (width - 2);
+        const left: i64 = this.expression(wanted, depth, true);
+        const right: i64 = this.expression(wanted, depth, true);
+        const choice: i64 = this.below(3);
+        if (choice == 0) {
+            return this.node(ExpressionKind::Binary(BinaryOperator::Add, this.masked(left, quarter - 1, wanted), this.masked(right, quarter - 1, wanted)), wanted);
+        }
+        if (choice == 1) {
+            if (wanted.is_signed()) {
+                return this.node(ExpressionKind::Binary(BinaryOperator::Subtract, this.masked(left, quarter - 1, wanted), this.masked(right, quarter - 1, wanted)), wanted);
+            }
+            const raised: i64 = this.node(ExpressionKind::Binary(BinaryOperator::BitOr, left, this.integer(quarter, wanted)), wanted);
+            return this.node(ExpressionKind::Binary(BinaryOperator::Subtract, raised, this.masked(right, quarter - 1, wanted)), wanted);
+        }
+        const root_bits: u64 = if (wanted.is_signed()) { (width - 1) / 2 } else { width / 2 };
+        const root: u64 = (1 << root_bits) - 1;
+        return this.node(ExpressionKind::Binary(BinaryOperator::Multiply, this.masked(left, root, wanted), this.masked(right, root, wanted)), wanted);
+    }
+
+    /// `(value & mask)`.
+    masked(mut &this, value: i64, mask: u64, scalar: ScalarType) -> i64 {
+        return this.node(ExpressionKind::Binary(BinaryOperator::BitAnd, value, this.integer(mask, scalar)), scalar);
+    }
+
+    /// A shift amount for a `scalar` value: `(e & (W - 1))`.
+    shift_amount(mut &this, scalar: ScalarType, depth: i64) -> i64 {
+        return this.masked(this.expression(scalar, depth, true), scalar.width() - 1, scalar);
+    }
+
+    /// A divisor for a `scalar` dividend: `((e & M) | 1)`, `M = 2^(W-2) - 1`,
+    /// never zero and never negative.  The unguarded-division plant leaves
+    /// the `| 1` out.
+    divisor(mut &this, scalar: ScalarType, depth: i64) -> i64 {
+        const mask: u64 = (1 << (scalar.width() - 2)) - 1;
+        const bounded: i64 = this.masked(this.expression(scalar, depth, true), mask, scalar);
+        match (this.options.plant) {
+            Plant::UnguardedDivision => { return bounded; }
+            _                        => { }
+        }
+        return this.node(ExpressionKind::Binary(BinaryOperator::BitOr, bounded, this.integer(1, scalar)), scalar);
+    }
+
+    /// A call of function `callee` with arguments for its parameters.
+    call(mut &this, callee: i64, depth: i64) -> i64 {
+        const called: Function = this.program.function_at(callee);
+        this.charge(called.cost);
+        mut arguments: Array<i64> = Array::<i64>::new();
+        mut index: i64 = 0;
+        while (index < called.parameter_count) {
+            const parameter: Variable = this.program.variable_at(this.program.list_at(called.first_parameter + index));
+            arguments.push(this.typed_place(parameter.scalar, if (depth < 0) { 0 } else { depth }));
+            index = index + 1;
+        }
+        const first: i64 = this.program.lists.length();
+        for (argument in arguments.iter()) { this.program.lists.push(argument); }
+        return this.node(ExpressionKind::Call(callee, first, called.parameter_count), called.returns);
+    }
+
+    /// A boolean expression.
+    boolean_expression(mut &this, depth: i64, reads_name: boolean) -> i64 {
+        const features: FeatureSet = this.options.features;
+        const deeper: boolean = depth > 0 && features.has(Feature::Booleans);
+        const next: i64 = if (depth > 0) { depth - 1 } else { 0 };
+        const variables: Array<i64> = this.variables_of(ScalarType::Boolean);
+        const callees: Array<i64> = this.callees(ScalarType::Boolean);
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(if (reads_name || !features.has(Feature::Booleans)) { 0 } else { 2 });
+        weights.push(if (variables.length() > 0) { 10 } else { 0 });
+        weights.push(12);
+        weights.push(if (features.has(Feature::Booleans)) { 4 } else { 0 });
+        weights.push(if (deeper) { 6 } else { 0 });
+        weights.push(if (deeper) { 3 } else { 0 });
+        weights.push(if (deeper) { 2 } else { 0 });
+        weights.push(if (callees.length() > 0 && depth > 0) { 4 } else { 0 });
+        const form: i64 = this.pick(&weights);
+        if (form == 0) { return this.node(ExpressionKind::BooleanLiteral(this.chance(50)), ScalarType::Boolean); }
+        if (form == 1) { return this.read(variables.get(this.below(variables.length())).unwrap()); }
+        if (form == 2) {
+            const scalar: ScalarType = this.integer_type();
+            const left: i64 = this.expression(scalar, next, true);
+            const right: i64 = this.expression(scalar, next, false);
+            return this.node(ExpressionKind::Binary(this.comparison(), left, right), ScalarType::Boolean);
+        }
+        if (form == 3) {
+            const left_type: ScalarType = this.integer_type();
+            mut right_type: ScalarType = this.integer_type();
+            while (right_type.same(left_type)) { right_type = this.integer_type(); }
+            const left: i64 = this.expression(left_type, next, true);
+            const right: i64 = this.expression(right_type, next, true);
+            return this.node(ExpressionKind::Binary(this.comparison(), left, right), ScalarType::Boolean);
+        }
+        if (form == 4) {
+            const operator: BinaryOperator = if (this.chance(50)) { BinaryOperator::And } else { BinaryOperator::Or };
+            const left: i64 = this.boolean_expression(next, reads_name);
+            const right: i64 = this.boolean_expression(next, false);
+            return this.node(ExpressionKind::Binary(operator, left, right), ScalarType::Boolean);
+        }
+        if (form == 5) {
+            return this.node(ExpressionKind::Unary(UnaryOperator::Not, this.boolean_expression(next, true)), ScalarType::Boolean);
+        }
+        if (form == 6) {
+            const operator: BinaryOperator = if (this.chance(50)) { BinaryOperator::Equal } else { BinaryOperator::NotEqual };
+            const left: i64 = this.boolean_expression(next, true);
+            const right: i64 = this.boolean_expression(next, false);
+            return this.node(ExpressionKind::Binary(operator, left, right), ScalarType::Boolean);
+        }
+        return this.call(callees.get(this.below(callees.length())).unwrap(), next);
+    }
+
+    /// A condition for a branch, loop exit or early return.
+    condition(mut &this, depth: i64) -> i64 { return this.boolean_expression(depth, false); }
+
+    /// One of the six comparison operators.
+    comparison(mut &this) -> BinaryOperator {
+        return match (this.below(6)) {
+            0 => { BinaryOperator::Equal }
+            1 => { BinaryOperator::NotEqual }
+            2 => { BinaryOperator::Less }
+            3 => { BinaryOperator::LessEqual }
+            4 => { BinaryOperator::Greater }
+            _ => { BinaryOperator::GreaterEqual }
+        };
+    }
+
+    /// A literal of `wanted`: small values, 1, the largest magnitude, or a
+    /// random one; never past `i64::MAX`, and negative only for a signed
+    /// type, never its minimum.
+    literal(mut &this, wanted: ScalarType) -> i64 {
+        const maximum: u64 = if (wanted.maximum() > LARGEST_LITERAL) { LARGEST_LITERAL } else { wanted.maximum() };
+        const roll: i64 = this.below(10);
+        mut magnitude: u64 = this.random.next_64() & maximum;
+        if (roll < 3) { magnitude = this.below(17) as u64; }
+        if (roll == 3) { magnitude = 1; }
+        if (roll == 4) { magnitude = maximum; }
+        const negative: boolean = wanted.is_signed() && magnitude != 0 && this.chance(40);
+        return this.node(ExpressionKind::IntegerLiteral(magnitude, negative), wanted);
+    }
+
+    /// A non-negative literal of `scalar` whose value the caller chose.
+    integer(mut &this, value: u64, scalar: ScalarType) -> i64 {
+        return this.node(ExpressionKind::IntegerLiteral(value, false), scalar);
+    }
+
+    /// A read of `variable`.
+    read(mut &this, variable: i64) -> i64 {
+        return this.node(ExpressionKind::Variable(variable), this.program.variable_at(variable).scalar);
+    }
+
+    /// An expression node, charged as one unit of work.
+    node(mut &this, kind: ExpressionKind, scalar: ScalarType) -> i64 {
+        this.charge(1);
+        return this.program.expression(kind, scalar);
+    }
+
+    /// The variables in scope of type `wanted`.
+    variables_of(&this, wanted: ScalarType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.scope.iter()) {
+            if (this.program.variable_at(variable).scalar.same(wanted)) { found.push(variable); }
+        }
+        return Generator::observed_last(found);
+    }
+
+    /// The integer variables in scope of a type other than `excluded`.
+    integer_variables_except(&this, excluded: ScalarType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.scope.iter()) {
+            const scalar: ScalarType = this.program.variable_at(variable).scalar;
+            if (scalar.is_integer() && !scalar.same(excluded)) { found.push(variable); }
+        }
+        return Generator::observed_last(found);
+    }
+
+    /// `found` without `observed`, unless `observed` is all it holds: a
+    /// value read from the hash state and folded back into it cancels out
+    /// (`x ^ x`), so the state is read only where nothing else is in scope.
+    static observed_last(found: Array<i64>) -> Array<i64> {
+        if (found.length() <= 1) { return found; }
+        mut others: Array<i64> = Array::<i64>::new();
+        for (variable in found.iter()) {
+            if (variable != Program::observed()) { others.push(variable); }
+        }
+        return others;
+    }
+
+    /// The earlier functions returning `wanted` that one more call of
+    /// keeps this function's work under its limit.
+    callees(&this, wanted: ScalarType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        if (!this.options.features.has(Feature::Calls)) { return found; }
+        mut index: i64 = 0;
+        while (index < this.program.functions.length()) {
+            const candidate: Function = this.program.function_at(index);
+            if (candidate.returns.same(wanted) && this.spent + this.multiplier * (candidate.cost + 1) <= this.limit) {
+                found.push(index);
+            }
+            index = index + 1;
+        }
+        return found;
+    }
+
+    // ---- choices ---------------------------------------------------------
+
+    /// Charge `units` of work, once per trip of every enclosing loop.
+    charge(mut &this, units: u64) -> void { this.spent = this.spent + units * this.multiplier; }
+
+    /// An expression depth for a statement: 1 to 4.
+    depth(mut &this) -> i64 { return 1 + this.below(4); }
+
+    /// An integer type.
+    integer_type(mut &this) -> ScalarType { return ScalarType::integers().get(this.below(8)).unwrap(); }
+
+    /// An integer type, or sometimes `boolean` when booleans are enabled.
+    any_type(mut &this) -> ScalarType {
+        if (this.options.features.has(Feature::Booleans) && this.chance(15)) { return ScalarType::Boolean; }
+        return this.integer_type();
+    }
+
+    /// A number in `[0, bound)`.
+    below(mut &this, bound: i64) -> i64 { return this.random.next_below(bound); }
+
+    /// True `percent` times in a hundred.
+    chance(mut &this, percent: i64) -> boolean { return this.below(100) < percent; }
+
+    /// An index into `weights`, chosen in proportion to its weight.
+    pick(mut &this, weights: &Array<i64>) -> i64 {
+        const total: i64 = weights.iter().sum();
+        mut roll: i64 = this.below(total);
+        mut index: i64 = 0;
+        while (index < weights.length()) {
+            const weight: i64 = weights.get(index).unwrap();
+            if (roll < weight) { return index; }
+            roll = roll - weight;
+            index = index + 1;
+        }
+        return weights.length() - 1;
+    }
+}

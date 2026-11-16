@@ -1,0 +1,171 @@
+///! The features a program may use, named, and the set a command line
+///! enables.
+///!
+///! A feature list is comma-separated: `default` is every feature of the
+///! current stage, a name adds one, `no-<name>` removes one, read left to
+///! right.  The canonical spelling, written into a program's header, lists
+///! the enabled names in declaration order.
+
+namespace cryosmith::features;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+/// One generation feature.
+public type enum Feature {
+    /// Boolean values, comparisons and logic beyond loop and branch
+    /// conditions' own.
+    Booleans;
+    /// `wrapping_add`, `wrapping_subtract`, `wrapping_multiply`.
+    Wrapping;
+    /// Plain `+`, `-`, `*` and negation over masked operands.
+    Guarded;
+    /// `&`, `|`, `^`, `~`.
+    Bitwise;
+    /// `<<` and `>>` by a masked amount.
+    Shifts;
+    /// `/` and `%` by a divisor guarded to be at least 1.
+    Division;
+    /// `as` between integer types.
+    Casts;
+    /// A narrower value where the language converts it implicitly.
+    Widening;
+    /// `if` expressions.
+    IfExpressions;
+    /// `if` / `else` statements.
+    Branches;
+    /// Bounded loops.
+    Loops;
+    /// `break` and `continue`.
+    LoopExits;
+    /// Calls to earlier functions.
+    Calls;
+    /// `if (c) { return e; }` before a function's end.
+    EarlyReturns;
+}
+
+implement enum Feature {
+    /// Every feature, in declaration order.
+    public static all() -> Array<Feature> {
+        mut every: Array<Feature> = Array::<Feature>::new();
+        every.push(Feature::Booleans);
+        every.push(Feature::Wrapping);
+        every.push(Feature::Guarded);
+        every.push(Feature::Bitwise);
+        every.push(Feature::Shifts);
+        every.push(Feature::Division);
+        every.push(Feature::Casts);
+        every.push(Feature::Widening);
+        every.push(Feature::IfExpressions);
+        every.push(Feature::Branches);
+        every.push(Feature::Loops);
+        every.push(Feature::LoopExits);
+        every.push(Feature::Calls);
+        every.push(Feature::EarlyReturns);
+        return every;
+    }
+
+    /// The feature's name on a command line.
+    public name(&this) -> Str {
+        return match (&this) {
+            Feature::Booleans      => { Str::new("booleans") }
+            Feature::Wrapping      => { Str::new("wrapping") }
+            Feature::Guarded       => { Str::new("guarded") }
+            Feature::Bitwise       => { Str::new("bitwise") }
+            Feature::Shifts        => { Str::new("shifts") }
+            Feature::Division      => { Str::new("division") }
+            Feature::Casts         => { Str::new("casts") }
+            Feature::Widening      => { Str::new("widening") }
+            Feature::IfExpressions => { Str::new("if-expressions") }
+            Feature::Branches      => { Str::new("branches") }
+            Feature::Loops         => { Str::new("loops") }
+            Feature::LoopExits     => { Str::new("loop-exits") }
+            Feature::Calls         => { Str::new("calls") }
+            Feature::EarlyReturns  => { Str::new("early-returns") }
+        };
+    }
+
+    /// The stage that added the feature.
+    public stage(&this) -> i64 { return 1; }
+
+    /// The feature's bit in a `FeatureSet`.
+    public bit(&this) -> u64 {
+        const position: u64 = match (&this) {
+            Feature::Booleans      => { 0 }
+            Feature::Wrapping      => { 1 }
+            Feature::Guarded       => { 2 }
+            Feature::Bitwise       => { 3 }
+            Feature::Shifts        => { 4 }
+            Feature::Division      => { 5 }
+            Feature::Casts         => { 6 }
+            Feature::Widening      => { 7 }
+            Feature::IfExpressions => { 8 }
+            Feature::Branches      => { 9 }
+            Feature::Loops         => { 10 }
+            Feature::LoopExits     => { 11 }
+            Feature::Calls         => { 12 }
+            Feature::EarlyReturns  => { 13 }
+        };
+        return 1 << position;
+    }
+
+    /// The feature named `name`, if there is one.
+    public static named(name: Str) -> Option<Feature> {
+        for (feature in Feature::all().iter()) {
+            if (feature.name() == name) { return Option::Some(feature); }
+        }
+        return Option::None;
+    }
+}
+
+/// A set of enabled features.
+public type struct FeatureSet {
+    bits: u64;
+
+    /// Every feature of the current stage.
+    public static default_set() -> FeatureSet {
+        mut set: FeatureSet = FeatureSet { bits: 0 };
+        for (feature in Feature::all().iter()) { set.bits = set.bits | feature.bit(); }
+        return set;
+    }
+
+    /// Read a feature list.  The refusal names the word it could not read.
+    public static parse(list: Str) -> Result<FeatureSet, String> {
+        mut set: FeatureSet = FeatureSet { bits: 0 };
+        for (word in list.split(&Str::new(","))) {
+            const name: Str = word.trim();
+            if (name == Str::new("default")) {
+                set.bits = set.bits | FeatureSet::default_set().bits;
+                continue;
+            }
+            const removed: Option<Str> = name.strip_prefix(&Str::new("no-"));
+            const removing: boolean = removed.is_some();
+            match (Feature::named(removed.unwrap_or(name))) {
+                Option::Some(feature) => {
+                    if (removing) { set.bits = set.bits & (~feature.bit()); } else { set.bits = set.bits | feature.bit(); }
+                }
+                Option::None => { return Result::Err(f"unknown feature `{name}`; `cryosmith features` lists them"); }
+            }
+        }
+        return Result::Ok(set);
+    }
+
+    /// Whether `feature` is enabled.
+    public has(&this, feature: Feature) -> boolean { return (this.bits & feature.bit()) != 0; }
+
+    /// The enabled features' names, comma-separated, in declaration order;
+    /// `none` when no feature is enabled.
+    public canonical(&this) -> String {
+        mut text: String = String::new();
+        for (feature in Feature::all().iter()) {
+            if (!this.has(feature)) { continue; }
+            if (text.length() != 0) { text.push(Str::new(",")); }
+            text.push(feature.name());
+        }
+        if (text.length() == 0) { text.push(Str::new("none")); }
+        return text;
+    }
+}

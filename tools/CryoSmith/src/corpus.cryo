@@ -1,0 +1,208 @@
+///! `cryosmith corpus-check`: CryoSmith's acceptance test, and the one place
+///! it runs a compiler.
+///!
+///! For each seed it writes the program, builds it at `--opt-level=0` and at
+///! `--opt-level=2`, and runs both.  A program passes when both builds
+///! succeed, both runs exit 0, and both print the same single line,
+///! `cryosmith-hash <u64>`.  A failure is a generator defect or a compiler
+///! finding; either way the program and its builds stay in the work
+///! directory, and a passing seed's executables are removed.
+///!
+///! Every program terminates by construction, so a run is not timed out: a
+///! program that does not end is itself a finding, seen as a check that
+///! does not end.
+
+namespace cryosmith::corpus;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env::arguments::{ ArgumentParser, ParsedArguments };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ PathBuf };
+import std::process::command::{ Command, Output };
+
+import cryosmith::generator::{ GenerationOptions, Generator };
+import cryosmith::main::{ GenerationArguments };
+import cryosmith::printer::{ Printer };
+
+/// The corpus check's settings.
+public type struct CorpusCheck {
+    compiler: String;
+    work: String;
+    stdlib: Option<String>;
+
+    /// Run the check over the arguments after `corpus-check`; 0 when every
+    /// program passed, 1 when one failed, 2 on a usage error.
+    public static run(arguments: &Array<String>) -> i32 {
+        mut parser: ArgumentParser = ArgumentParser::new(Str::new("cryosmith corpus-check"));
+        GenerationArguments::declare(&parser);
+        parser.option(Str::new("cryo"), Option::None, Str::new("COMPILER"), Str::new("the compiler to build with"))
+            .option(Str::new("work"), Option::None, Str::new("DIR"), Str::new("where the programs and builds go"))
+            .option(Str::new("stdlib"), Option::None, Str::new("DIR"), Str::new("the standard library the compiler builds against"))
+            .option(Str::new("first-seed"), Option::None, Str::new("N"), Str::new("the first seed"))
+            .option(Str::new("count"), Option::None, Str::new("K"), Str::new("how many programs"));
+        const parsed: ParsedArguments = match (parser.parse(arguments.as_slice())) {
+            Result::Ok(parsed) => { parsed }
+            Result::Err(error) => { fmt::eprintln(f"{error}"); fmt::eprint(parser.help_text()); return 2; }
+        };
+        const compiler: Str = match (parsed.value(Str::new("cryo"))) {
+            Option::Some(compiler) => { compiler }
+            Option::None           => { fmt::eprintln(String::from_str(Str::new("cryosmith corpus-check: --cryo is required"))); return 2; }
+        };
+        const work: Str = match (parsed.value(Str::new("work"))) {
+            Option::Some(work) => { work }
+            Option::None       => { fmt::eprintln(String::from_str(Str::new("cryosmith corpus-check: --work is required"))); return 2; }
+        };
+        const first: u64 = match (GenerationArguments::number(&parsed, Str::new("first-seed"))) {
+            Result::Ok(value)   => { value.unwrap_or(1) }
+            Result::Err(reason) => { fmt::eprintln(reason); return 2; }
+        };
+        const count: u64 = match (GenerationArguments::number(&parsed, Str::new("count"))) {
+            Result::Ok(value)   => { value.unwrap_or(200) }
+            Result::Err(reason) => { fmt::eprintln(reason); return 2; }
+        };
+        match (Directory::create_all(PathBuf::from(work).as_path())) {
+            Result::Ok(_)       => { }
+            Result::Err(reason) => { fmt::eprintln(f"cryosmith: cannot create {work}: {reason}"); return 1; }
+        }
+        const check: CorpusCheck = CorpusCheck {
+            compiler: String::from_str(compiler),
+            work: String::from_str(work),
+            stdlib: match (parsed.value(Str::new("stdlib"))) {
+                Option::Some(stdlib) => { Option::Some(String::from_str(stdlib)) }
+                Option::None         => { Option::None }
+            },
+        };
+        mut failed: u64 = 0;
+        mut offset: u64 = 0;
+        while (offset < count) {
+            const seed: u64 = first.wrapping_add(offset);
+            const options: GenerationOptions = match (GenerationArguments::read(&parsed, seed)) {
+                Result::Ok(options) => { options }
+                Result::Err(reason) => { fmt::eprintln(reason); return 2; }
+            };
+            match (check.program(options)) {
+                Result::Ok(hash)    => { fmt::println(f"ok    seed {seed} {hash.as_str()}"); }
+                Result::Err(reason) => { fmt::println(f"FAIL  seed {seed}: {reason.as_str()}"); failed = failed + 1; }
+            }
+            offset = offset + 1;
+        }
+        if (failed > 0) {
+            fmt::println(f"corpus-check: FAIL ({failed} of {count} programs)");
+            return 1;
+        }
+        fmt::println(f"corpus-check: OK ({count} programs, -O0 and -O2 agree)");
+        return 0;
+    }
+
+    /// Write, build twice and run twice the program `options` describe; its
+    /// hash line, or why it failed.
+    program(&this, options: GenerationOptions) -> Result<String, String> {
+        const name: String = f"smith-{options.seed}";
+        const source: PathBuf = this.path(f"{name.as_str()}.cryo".as_str());
+        const text: String = Printer::print(&Generator::generate(options), &options);
+        match (File::write_text(source.as_path(), text.as_str())) {
+            Result::Ok(_)       => { }
+            Result::Err(reason) => { return Result::Err(f"cannot write {source.as_path().as_str()}: {reason}"); }
+        }
+        const unoptimised: PathBuf = this.path(f"{name.as_str()}-O0.exe".as_str());
+        const optimised: PathBuf = this.path(f"{name.as_str()}-O2.exe".as_str());
+        this.build(&source, &unoptimised, Str::new("--opt-level=0"))?;
+        this.build(&source, &optimised, Str::new("--opt-level=2"))?;
+        const first: String = this.execute(&unoptimised)?;
+        const second: String = this.execute(&optimised)?;
+        if (first.as_str() != second.as_str()) {
+            return Result::Err(f"-O0 printed `{first.as_str()}`, -O2 printed `{second.as_str()}`");
+        }
+        CorpusCheck::remove(&unoptimised)?;
+        CorpusCheck::remove(&optimised)?;
+        return Result::Ok(first);
+    }
+
+    /// Build `source` into `output` at `level`.
+    build(&this, source: &PathBuf, output: &PathBuf, level: Str) -> Result<(), String> {
+        mut command: Command = Command::new(this.compiler.as_str());
+        command.current_directory(this.work.as_str());
+        command.argument(Str::new("build")).argument(f"{source.as_path().as_str()}".as_str()).argument(level)
+            .argument(Str::new("-o")).argument(f"{output.as_path().as_str()}".as_str());
+        match (&this.stdlib) {
+            Option::Some(stdlib) => { command.argument(f"--stdlib={stdlib.as_str()}".as_str()); }
+            Option::None         => { }
+        }
+        const result: Output = match (command.output()) {
+            Result::Ok(result)  => { result }
+            Result::Err(reason) => { return Result::Err(f"the compiler could not start: {reason}"); }
+        };
+        if (!result.status().success()) {
+            return Result::Err(f"{level} build failed ({CorpusCheck::status_text(&result)}): {CorpusCheck::first_lines(&result)}");
+        }
+        return Result::Ok(());
+    }
+
+    /// Run `program`; the one line it printed, which must be the hash line.
+    execute(&this, program: &PathBuf) -> Result<String, String> {
+        mut command: Command = Command::new(f"{program.as_path().as_str()}".as_str());
+        command.current_directory(this.work.as_str());
+        const result: Output = match (command.output()) {
+            Result::Ok(result)  => { result }
+            Result::Err(reason) => { return Result::Err(f"{program.as_path().as_str()} could not start: {reason}"); }
+        };
+        if (!result.status().success()) {
+            return Result::Err(f"{program.as_path().as_str()} ended with {CorpusCheck::status_text(&result)}");
+        }
+        const printed: Str = match (Str::from_utf8(result.stdout())) {
+            Result::Ok(printed) => { printed.trim_end() }
+            Result::Err(_)      => { return Result::Err(f"{program.as_path().as_str()} printed bytes that are not UTF-8"); }
+        };
+        if (!printed.starts_with(&Str::new("cryosmith-hash ")) || printed.contains(&Str::new("\n"))) {
+            return Result::Err(f"{program.as_path().as_str()} printed `{printed}`, not one hash line");
+        }
+        return Result::Ok(String::from_str(printed));
+    }
+
+    path(&this, file: Str) -> PathBuf {
+        mut path: PathBuf = PathBuf::from(this.work.as_str());
+        path.push(file);
+        return path;
+    }
+
+    static remove(path: &PathBuf) -> Result<(), String> {
+        return match (File::remove(path.as_path())) {
+            Result::Ok(_)       => { Result::Ok(()) }
+            Result::Err(reason) => { Result::Err(f"cannot remove {path.as_path().as_str()}: {reason}") }
+        };
+    }
+
+    static status_text(result: &Output) -> String {
+        return match (result.status().exit_code()) {
+            Option::Some(code) => { f"exit {code}" }
+            Option::None       => { f"signal {result.status().terminating_signal().unwrap_or(0)}" }
+        };
+    }
+
+    /// The first lines of a child's error and output streams, for a report.
+    static first_lines(result: &Output) -> String {
+        mut text: String = String::new();
+        mut lines: i64 = 0;
+        for (stream in [result.stderr(), result.stdout()]) {
+            match (Str::from_utf8(stream)) {
+                Result::Ok(content) => {
+                    for (line in content.lines()) {
+                        if (lines >= 6) { break; }
+                        if (line.trim().is_empty()) { continue; }
+                        text.push(Str::new(" | "));
+                        text.push(line.trim());
+                        lines = lines + 1;
+                    }
+                }
+                Result::Err(_) => { }
+            }
+        }
+        return text;
+    }
+}

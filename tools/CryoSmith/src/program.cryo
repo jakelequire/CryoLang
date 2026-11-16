@@ -1,0 +1,401 @@
+///! The program model CryoSmith builds before it prints anything.
+///!
+///! A `Program` is four arenas of plain data: variables, expressions,
+///! statements and functions, with a fifth holding runs of indices (a call's
+///! arguments, a function's parameters).  A node names its children by
+///! index, and a block is a chain of statements each naming the next, so no
+///! node owns another.
+
+namespace cryosmith::program;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+
+/// The type of a generated value.
+public type enum ScalarType {
+    I8;
+    I16;
+    I32;
+    I64;
+    U8;
+    U16;
+    U32;
+    U64;
+    Boolean;
+}
+
+implement enum ScalarType {
+    /// The integer types, narrowest first, signed before unsigned.
+    public static integers() -> Array<ScalarType> {
+        mut all: Array<ScalarType> = Array::<ScalarType>::new();
+        all.push(ScalarType::I8);
+        all.push(ScalarType::I16);
+        all.push(ScalarType::I32);
+        all.push(ScalarType::I64);
+        all.push(ScalarType::U8);
+        all.push(ScalarType::U16);
+        all.push(ScalarType::U32);
+        all.push(ScalarType::U64);
+        return all;
+    }
+
+    /// The type's name as a program spells it.
+    public name(&this) -> Str {
+        return match (&this) {
+            ScalarType::I8      => { Str::new("i8") }
+            ScalarType::I16     => { Str::new("i16") }
+            ScalarType::I32     => { Str::new("i32") }
+            ScalarType::I64     => { Str::new("i64") }
+            ScalarType::U8      => { Str::new("u8") }
+            ScalarType::U16     => { Str::new("u16") }
+            ScalarType::U32     => { Str::new("u32") }
+            ScalarType::U64     => { Str::new("u64") }
+            ScalarType::Boolean => { Str::new("boolean") }
+        };
+    }
+
+    /// The width in bits of an integer type; 0 for `boolean`.
+    public width(&this) -> u64 {
+        return match (&this) {
+            ScalarType::I8      => { 8 }
+            ScalarType::I16     => { 16 }
+            ScalarType::I32     => { 32 }
+            ScalarType::I64     => { 64 }
+            ScalarType::U8      => { 8 }
+            ScalarType::U16     => { 16 }
+            ScalarType::U32     => { 32 }
+            ScalarType::U64     => { 64 }
+            ScalarType::Boolean => { 0 }
+        };
+    }
+
+    /// Whether the type is a signed integer.
+    public is_signed(&this) -> boolean {
+        return match (&this) {
+            ScalarType::I8  => { true }
+            ScalarType::I16 => { true }
+            ScalarType::I32 => { true }
+            ScalarType::I64 => { true }
+            _               => { false }
+        };
+    }
+
+    /// Whether the type is an integer.
+    public is_integer(&this) -> boolean { return this.width() != 0; }
+
+    /// Whether the type is the same type as `other`.
+    public same(&this, other: ScalarType) -> boolean {
+        return this.width() == other.width() && this.is_signed() == other.is_signed();
+    }
+
+    /// Whether the language converts a value of this type to `wider`
+    /// implicitly: to a wider integer of the same signedness, or from an
+    /// unsigned integer to a wider signed one.
+    public widens_to(&this, wider: ScalarType) -> boolean {
+        if (!this.is_integer() || !wider.is_integer()) { return false; }
+        if (this.width() >= wider.width()) { return false; }
+        return this.is_signed() == wider.is_signed() || !this.is_signed();
+    }
+
+    /// The largest value of an integer type, as a magnitude.
+    public maximum(&this) -> u64 {
+        const width: u64 = this.width();
+        if (this.is_signed()) { return (1 << (width - 1)) - 1; }
+        if (width == 64) { return u64::MAX; }
+        return (1 << width) - 1;
+    }
+}
+
+/// A unary operator.
+public type enum UnaryOperator {
+    /// `-x`, on a signed integer.
+    Negate;
+    /// `~x`, on an integer.
+    Complement;
+    /// `!x`, on a boolean.
+    Not;
+}
+
+implement enum UnaryOperator {
+    /// The operator as a program spells it.
+    public symbol(&this) -> Str {
+        return match (&this) {
+            UnaryOperator::Negate     => { Str::new("-") }
+            UnaryOperator::Complement => { Str::new("~") }
+            UnaryOperator::Not        => { Str::new("!") }
+        };
+    }
+}
+
+/// A binary operator, arithmetic, bitwise, comparison or logical.
+public type enum BinaryOperator {
+    Add;
+    Subtract;
+    Multiply;
+    Divide;
+    Remainder;
+    BitAnd;
+    BitOr;
+    BitXor;
+    ShiftLeft;
+    ShiftRight;
+    Equal;
+    NotEqual;
+    Less;
+    LessEqual;
+    Greater;
+    GreaterEqual;
+    And;
+    Or;
+}
+
+implement enum BinaryOperator {
+    /// The operator as a program spells it.
+    public symbol(&this) -> Str {
+        return match (&this) {
+            BinaryOperator::Add          => { Str::new("+") }
+            BinaryOperator::Subtract     => { Str::new("-") }
+            BinaryOperator::Multiply     => { Str::new("*") }
+            BinaryOperator::Divide       => { Str::new("/") }
+            BinaryOperator::Remainder    => { Str::new("%") }
+            BinaryOperator::BitAnd       => { Str::new("&") }
+            BinaryOperator::BitOr        => { Str::new("|") }
+            BinaryOperator::BitXor       => { Str::new("^") }
+            BinaryOperator::ShiftLeft    => { Str::new("<<") }
+            BinaryOperator::ShiftRight   => { Str::new(">>") }
+            BinaryOperator::Equal        => { Str::new("==") }
+            BinaryOperator::NotEqual     => { Str::new("!=") }
+            BinaryOperator::Less         => { Str::new("<") }
+            BinaryOperator::LessEqual    => { Str::new("<=") }
+            BinaryOperator::Greater      => { Str::new(">") }
+            BinaryOperator::GreaterEqual => { Str::new(">=") }
+            BinaryOperator::And          => { Str::new("&&") }
+            BinaryOperator::Or           => { Str::new("||") }
+        };
+    }
+}
+
+/// An arithmetic operation written as a wrapping method call, defined for
+/// every pair of values.
+public type enum WrappingOperator {
+    Add;
+    Subtract;
+    Multiply;
+}
+
+implement enum WrappingOperator {
+    /// The method's name.
+    public method(&this) -> Str {
+        return match (&this) {
+            WrappingOperator::Add      => { Str::new("wrapping_add") }
+            WrappingOperator::Subtract => { Str::new("wrapping_subtract") }
+            WrappingOperator::Multiply => { Str::new("wrapping_multiply") }
+        };
+    }
+}
+
+/// What an expression node is.  Indices name other nodes of the same
+/// program: expressions, variables, functions, or a run of the program's
+/// index lists.
+public type enum ExpressionKind {
+    /// An integer literal: its magnitude and whether it is negative.
+    IntegerLiteral(u64, boolean);
+    /// `true` or `false`.
+    BooleanLiteral(boolean);
+    /// The type's named limit: `T::MAX` when true, `T::MIN` when false.
+    Limit(boolean);
+    /// A read of a variable.
+    Variable(i64);
+    /// A unary operator and its operand.
+    Unary(UnaryOperator, i64);
+    /// A binary operator and its two operands.
+    Binary(BinaryOperator, i64, i64);
+    /// `receiver.wrapping_<operation>(argument)`.
+    Wrapping(WrappingOperator, i64, i64);
+    /// `operand as T`, `T` the node's own type.
+    Cast(i64);
+    /// A narrower operand where the node's type is wanted, converted
+    /// implicitly; printed as the operand alone.
+    Widen(i64);
+    /// `if (condition) { a } else { b }`.
+    Conditional(i64, i64, i64);
+    /// A call: the function, the first argument's place in the index
+    /// lists, and the argument count.
+    Call(i64, i64, i64);
+}
+
+/// One expression: what it is and its type.
+public type struct ExpressionNode {
+    /// What the expression is.
+    public kind: ExpressionKind;
+    /// The expression's type.
+    public scalar: ScalarType;
+}
+
+/// How a variable is named and what may be done to it.
+public type enum VariableRole {
+    /// The program's global hash state, `observed`.
+    Observed;
+    /// A function's parameter, `p<N>`: read only.
+    Parameter;
+    /// A local, `v<N>`.
+    Local;
+    /// A loop counter, `n<N>`: read only.  No name a program declares is
+    /// spelled like a type (`i8`, `f32`): a value of that name would stand
+    /// in front of the type in `i8::MIN`.
+    Counter;
+}
+
+/// A named value.
+public type struct Variable {
+    /// How it is named and what may be done to it.
+    public role: VariableRole;
+    /// The number in its name, counted per function and role.
+    public number: i64;
+    /// Its type.
+    public scalar: ScalarType;
+    /// Whether it is declared `mut`.
+    public mutable: boolean;
+}
+
+/// The three loop shapes, each counting a counter from 0 to a trip count.
+public type enum LoopShape {
+    /// `for (mut i: T = 0; i < K; i = i + 1) { ... }`.
+    Counted;
+    /// `mut i: T = 0; while (i < K) { i = i + 1; ... }`: the increment
+    /// comes first, so a `continue` cannot skip it.
+    Conditioned;
+    /// `for (i in 0..K) { ... }`.
+    Ranged;
+}
+
+/// What a statement node is.  A block is the index of its first statement,
+/// or -1 when it is empty.
+public type enum StatementKind {
+    /// Declare a variable with its initial value.
+    Declare(i64, i64);
+    /// `variable = value`.
+    Assign(i64, i64);
+    /// `variable op= value`.
+    Compound(BinaryOperator, i64, i64);
+    /// Fold a value into `observed`.
+    Observe(i64);
+    /// `if (condition) { then } else { otherwise }`; an empty `otherwise`
+    /// prints no `else`.
+    Branch(i64, i64, i64);
+    /// A loop: its shape, counter, trip count and body.
+    Loop(LoopShape, i64, u64, i64);
+    /// `if (condition) { break; }` when true, `continue` when false.
+    Exit(boolean, i64);
+    /// `if (condition) { return value; }`.
+    ReturnIf(i64, i64);
+    /// `return value;`.
+    Return(i64);
+    /// `main`'s end: print the hash line and return 0.
+    Finish;
+}
+
+/// One statement and the statement after it in its block, or -1.
+public type struct StatementNode {
+    /// What the statement is.
+    public kind: StatementKind;
+    /// The next statement of the block, or -1.
+    public next: i64;
+}
+
+/// One function.
+public type struct Function {
+    /// The number in its name, `h<N>`; `main` has none.
+    public number: i64;
+    /// Whether this is `main`.
+    public is_main: boolean;
+    /// The first parameter's place in the index lists.
+    public first_parameter: i64;
+    /// How many parameters it takes.
+    public parameter_count: i64;
+    /// What it returns.
+    public returns: ScalarType;
+    /// The first statement of its body.
+    public body: i64;
+    /// The most work one call can do, in the cost model's units.
+    public cost: u64;
+}
+
+/// A whole generated program.
+public type struct Program {
+    /// Every variable, `observed` first.
+    public variables: Array<Variable>;
+    /// Every expression node.
+    public expressions: Array<ExpressionNode>;
+    /// Every statement node.
+    public statements: Array<StatementNode>;
+    /// Runs of indices: call arguments and function parameters.
+    public lists: Array<i64>;
+    /// The functions in the order they are printed, `main` last.
+    public functions: Array<Function>;
+
+    /// A program holding only `observed`.
+    public static new() -> Program {
+        mut program: Program = Program {
+            variables:   Array::<Variable>::new(),
+            expressions: Array::<ExpressionNode>::new(),
+            statements:  Array::<StatementNode>::new(),
+            lists:       Array::<i64>::new(),
+            functions:   Array::<Function>::new(),
+        };
+        program.variables.push(Variable { role: VariableRole::Observed, number: 0, scalar: ScalarType::U64, mutable: true });
+        return program;
+    }
+
+    /// The index of `observed`.
+    public static observed() -> i64 { return 0; }
+
+    /// Add an expression node; its index.
+    public expression(mut &this, kind: ExpressionKind, scalar: ScalarType) -> i64 {
+        this.expressions.push(ExpressionNode { kind: kind, scalar: scalar });
+        return this.expressions.length() - 1;
+    }
+
+    /// Add a statement node with no successor; its index.
+    public statement(mut &this, kind: StatementKind) -> i64 {
+        this.statements.push(StatementNode { kind: kind, next: -1 });
+        return this.statements.length() - 1;
+    }
+
+    /// Add a variable; its index.
+    public variable(mut &this, variable: Variable) -> i64 {
+        this.variables.push(variable);
+        return this.variables.length() - 1;
+    }
+
+    /// Chain `statements` into a block, in order; the block's first
+    /// statement, or -1 for none.
+    public block(mut &this, statements: &Array<i64>) -> i64 {
+        mut index: i64 = statements.length() - 1;
+        mut next: i64 = -1;
+        while (index >= 0) {
+            const current: i64 = statements.get(index).unwrap();
+            mut node: StatementNode = this.statements.get(current).unwrap();
+            node.next = next;
+            this.statements.set(current, node);
+            next = current;
+            index = index - 1;
+        }
+        return next;
+    }
+
+    /// The expression at `index`.
+    public expression_at(&this, index: i64) -> ExpressionNode { return this.expressions.get(index).unwrap(); }
+
+    /// The statement at `index`.
+    public statement_at(&this, index: i64) -> StatementNode { return this.statements.get(index).unwrap(); }
+
+    /// The variable at `index`.
+    public variable_at(&this, index: i64) -> Variable { return this.variables.get(index).unwrap(); }
+
+    /// The function at `index`.
+    public function_at(&this, index: i64) -> Function { return this.functions.get(index).unwrap(); }
+
+    /// The index-list entry at `index`.
+    public list_at(&this, index: i64) -> i64 { return this.lists.get(index).unwrap(); }
+}

@@ -211,7 +211,7 @@ EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 .DEFAULT_GOAL := help
 .PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-abi-check pin \
         pin-impl pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
-        install uninstall clean lsp install-lsp cryogate release release-linux release-windows
+        install uninstall clean lsp install-lsp cryogate cryosmith cryosmith-selftest release release-linux release-windows
 
 # The help text is printed by make itself (`$(info)`), not by a shell, so it
 # reads the same under cmd and sh.  A target added to this Makefile is added
@@ -237,6 +237,8 @@ Build
                          build-logs/cryogate/, newest 20 kept.  verify,
                          test-census, selfhost-check and pin run under its
                          heavy-run lock (see below).
+  make cryosmith         Build the program generator tools/CryoSmith with the
+                         pin (tools/CryoSmith/build/); see its DESIGN.md.
 
 Tests and gates
   make test              cryo test over tests/ (the working loop; ARGS=filter).
@@ -254,8 +256,13 @@ Tests and gates
                          concurrently and their objects are hashed
                          (ARGS="--baseline HEAD --require-identical";
                          --sequential runs them one at a time).
-  make check-fast        verify-selftest and verify-pin; builds only cryogate
-                         and its unit tests, with the pin.
+  make check-fast        verify-selftest, verify-pin and cryosmith-selftest;
+                         builds only cryogate, its unit tests and cryosmith,
+                         with the pin.
+  make cryosmith-selftest
+                         cryosmith's in-process checks: one seed, one
+                         program; the feature switches; the static audit of
+                         guarded division and shifts, and its plant.
   make verify-selftest   verify's and selfhost-check's judges and cryogate's
                          checks (verify-pin's among them), driven through
                          fixtures they must accept and refuse.
@@ -417,6 +424,18 @@ else
 CRYOGATE_COMMAND := "$(CRYOGATE)"
 endif
 CRYOGATE_HEAVY  := $(CRYOGATE_COMMAND) heavy --
+
+# The program generator (tools/CryoSmith, built below by `make cryosmith`),
+# built and run like cryogate.
+CRYOSMITH_DIR    := $(ROOT)/tools/CryoSmith
+CRYOSMITH        := $(CRYOSMITH_DIR)/build/cryosmith$(EXE_SUFFIX)
+CRYOSMITH_INPUTS := $(call rwildcard,$(CRYOSMITH_DIR)/src,*.cryo) $(CRYOSMITH_DIR)/cryoconfig \
+                    $(call rwildcard,$(ROOT)/stdlib,*.cryo) $(RUNTIME_SOURCES) $(STAGE2_PIN)
+ifeq ($(HOST_OS),windows)
+CRYOSMITH_COMMAND := "$(subst /,\,$(CRYOSMITH))"
+else
+CRYOSMITH_COMMAND := "$(CRYOSMITH)"
+endif
 STAGE2_INPUTS := $(CRYO_SOURCES) $(ROOT)/compiler/cryoconfig $(wildcard $(ROOT)/compiler/*.h) \
                  $(RUNTIME_SOURCES) $(STAGE2_PIN) $(wildcard $(ROOT)/.git/index)
 
@@ -598,6 +617,27 @@ $(CRYOGATE_TESTS): $(CRYOGATE_INPUTS) $(call rwildcard,$(CRYOGATE_DIR)/tests,*.c
 	@echo "==> Building cryogate's unit tests via bin/cryo"
 	@cd tools/CryoGate && "$(PIN)" test --list
 endif
+
+# ---- cryosmith ----------------------------------------------------------
+# The program generator (tools/CryoSmith), built by the pin against the
+# tree's stdlib and linked against the stdlib only: it writes program text
+# and needs nothing from the compiler it helps to test.  Rebuilt when its
+# sources, the stdlib, the runtime's sources or the pin are newer than the
+# binary.  `cryosmith selftest` builds nothing, so check-fast runs it.
+cryosmith: $(CRYOSMITH)
+
+ifeq ($(HOST_OS),windows)
+$(CRYOSMITH): $(CRYOSMITH_INPUTS)
+	@echo "==> Building cryosmith via bin/cryo.exe"
+	@cd tools/CryoSmith && "$(subst /,\,$(PIN_EXE))" build
+else
+$(CRYOSMITH): $(CRYOSMITH_INPUTS)
+	@echo "==> Building cryosmith via bin/cryo"
+	@cd tools/CryoSmith && "$(PIN)" build
+endif
+
+cryosmith-selftest: $(CRYOSMITH)
+	@$(CRYOSMITH_COMMAND) selftest
 
 # ---- CryoAnalyzer VS Code extension -----------------------------------
 # Builds and installs the server from the current tree (`lsp`), runs its
@@ -784,13 +824,14 @@ vendor-check: $(STAGE2_FILE) $(CRYOGATE)
 # Everything it needs built is a prerequisite HERE, before any gate starts:
 # the gates run concurrently, and a phony prerequisite rebuilt by one of them
 # (a test helper archive) would be rewritten while another is linking against it.
-# cryogate's unit tests are one: check-fast runs them, and building them there
-# makes the pin's own stdlib archive among the archives verify hashes.
+# cryogate's unit tests and cryosmith are two: check-fast runs them, and
+# building them there makes the pin's own stdlib archive among the archives
+# verify hashes.
 ifeq ($(HOST_OS),windows)
-verify: cryo $(TEST_HELPERS_A) $(CRYOGATE) $(CRYOGATE_TESTS)
+verify: cryo $(TEST_HELPERS_A) $(CRYOGATE) $(CRYOGATE_TESTS) $(CRYOSMITH)
 	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/verify.py --cryo "$(STAGE2_EXE)" $(ARGS)
 else
-verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A) $(CRYOGATE) $(CRYOGATE_TESTS)
+verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A) $(CRYOGATE) $(CRYOGATE_TESTS) $(CRYOSMITH)
 	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/verify.py --cryo "$(STAGE2)" $(ARGS)
 endif
 
@@ -809,12 +850,13 @@ verify-selftest: $(CRYOGATE) $(CRYOGATE_TESTS)
 	@$(CRYOGATE_COMMAND) selftest
 
 # ---- the pre-commit sweep ----------------------------------------------
-# Every gate here is source-derived; the one thing it builds is cryogate
-# and its unit tests, with the pin, and only when they are stale, so run
-# inside verify it makes no stdlib archive.  A short gate everybody runs is worth more than a
-# twenty-minute one nobody does.
-check-fast: verify-selftest verify-pin
-	@echo "check-fast: OK (verify's declared-program self-test, cryogate's self-test, selfhost archive-comparison self-test, pin integrity)"
+# Every gate here is source-derived; the only things it builds are cryogate,
+# its unit tests and cryosmith, with the pin, and only when they are stale,
+# so run inside verify it makes no stdlib archive the pin's other builds do
+# not.  A short gate everybody runs is worth more than a twenty-minute one
+# nobody does.
+check-fast: verify-selftest verify-pin cryosmith-selftest
+	@echo "check-fast: OK (verify's declared-program self-test, cryogate's self-test, selfhost archive-comparison self-test, pin integrity, cryosmith's self-test)"
 
 # ---- language-server compile gate --------------------------------------
 # The LSP links the compiler as a LIBRARY (tools/CryoLSP/cryoconfig ->
@@ -1066,17 +1108,18 @@ clean:
 	@if exist runtime\.bin rmdir /s /q runtime\.bin
 	@if exist tools\CryoLSP\build rmdir /s /q tools\CryoLSP\build
 	@if exist tools\CryoGate\build rmdir /s /q tools\CryoGate\build
+	@if exist tools\CryoSmith\build rmdir /s /q tools\CryoSmith\build
 	@if exist bin\cryolsp.exe del /q bin\cryolsp.exe
 	@if exist bin\cryolsp del /q bin\cryolsp
 	@del /q tests\helpers\*.o tests\helpers\*.a 2>NUL || rem
 	@for %%d in (tests\build tests\tests\negative\.bin .verify .cross-check build-logs dist) do @if exist %%d rmdir /s /q %%d
 	@for /d %%p in (examples\* tests\tests\projects\*) do @if exist %%p\build rmdir /s /q %%p\build
-	@for %%d in (compiler\build stdlib\.bin runtime\.bin tools\CryoLSP\build tools\CryoGate\build bin\cryolsp.exe) do @if exist %%d (echo clean: %%d is still there; a running process holds a file in it & exit /b 1)
+	@for %%d in (compiler\build stdlib\.bin runtime\.bin tools\CryoLSP\build tools\CryoGate\build tools\CryoSmith\build bin\cryolsp.exe) do @if exist %%d (echo clean: %%d is still there; a running process holds a file in it & exit /b 1)
 else
 clean:
 	@echo "==> Cleaning build outputs, test and example builds, and gate state"
 	@rm -rf compiler/build stdlib/.bin runtime/.bin
-	@rm -rf tools/CryoLSP/build tools/CryoGate/build
+	@rm -rf tools/CryoLSP/build tools/CryoGate/build tools/CryoSmith/build
 	@rm -f bin/cryolsp bin/cryolsp.exe
 	@rm -f $(TEST_HELPERS_DIR)/*.o $(TEST_HELPERS_DIR)/*.a
 	@rm -rf tests/build tests/tests/negative/.bin .verify .cross-check build-logs dist
