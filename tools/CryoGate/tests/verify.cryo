@@ -72,6 +72,15 @@ type struct Judged {
         return VerifyJudges::archive_module_moves(&Judged::list(names), &left, &right).length();
     }
 
+    /// A passing project's record, its warnings (joined by `,`) listed or
+    /// not.
+    static project(name: Str, listed: boolean, warnings: Str) -> BaselineRecord {
+        mut record: BaselineRecord = BaselineRecord::new(name, Str::new("ok"));
+        record.warnings_listed = listed;
+        record.warnings = Judged::list(warnings);
+        return record;
+    }
+
     static new_warnings(base: Str, tree: Str) -> i64 {
         return VerifyJudges::new_warnings(&Judged::list(base), &Judged::list(tree)).length();
     }
@@ -148,7 +157,8 @@ function a_program_the_run_printed_no_verdict_for_has_no_record() -> Result<(), 
 ![test]
 function a_record_file_reads_back_every_field() -> Result<(), TestError> {
     const record: BaselineRecord = BaselineRecord::read(Str::new(
-        "name unit suite\nverdict FAILED\nunit-failed A::U::t\nunit-counts 5 1 0 2\nwarning W0001 ./a.cryo:3\nrow d  tests/build/x.o\n"));
+        "name unit suite\nverdict FAILED\nunit-failed A::U::t\nunit-counts 5 1 0 2\nwarnings-listed\nwarning W0001 ./a.cryo:3\nrow d  tests/build/x.o\n"));
+    expect(record.warnings_listed, Str::new("warnings-listed, a tag with no value"))?;
     expect_equal(record.name.as_str(), Str::new("unit suite"))?;
     expect_equal(record.verdict.as_str(), Str::new("FAILED"))?;
     expect_equal(record.unit_failed.length(), 1)?;
@@ -357,6 +367,78 @@ function a_warning_only_the_tree_reports_is_new() -> Result<(), TestError> {
     expect_equal(Judged::new_warnings(Str::new("W0001 ./a.cryo:3"), Str::new("W0001 ./a.cryo:3,E0619 ./b.cryo:9")), 1)?;
     expect_equal(Judged::new_warnings(Str::new("W0001 ./a.cryo:3"), Str::new("W0001 ./a.cryo:4")), 1)?;
     return expect_equal(Judged::new_warnings(Str::new("W0001 ./a.cryo:3,W0009 ./c.cryo:1"), Str::new("W0001 ./a.cryo:3")), 0);
+}
+
+![test]
+function a_project_warning_only_the_tree_lists_is_new() -> Result<(), TestError> {
+    mut tree: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+    tree.push(Pair::new(String::from_str(Str::new("p")), String::from_str(Str::new("W0001 src/main.cryo:7"))));
+    const none: Array<String> = Array::<String>::new();
+
+    mut same: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+    same.push(Judged::project(Str::new("p"), true, Str::new("W0001 src/main.cryo:7")));
+    expect_equal(VerifyJudges::new_project_warnings(&same, &tree, &none).length(), 0)?;
+
+    mut added: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+    added.push(Judged::project(Str::new("p"), true, Str::new("")));
+    added.push(Judged::project(Str::new("q"), true, Str::new("")));
+    const found: Array<String> = VerifyJudges::new_project_warnings(&added, &tree, &none);
+    expect_equal(found.length(), 1)?;
+    expect_equal(found[0].as_str(), Str::new("the tree's build of p reports a warning the baseline's does not: W0001 src/main.cryo:7"))?;
+
+    mut not_listed: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+    not_listed.push(Judged::project(Str::new("p"), false, Str::new("")));
+    not_listed.push(Judged::project(Str::new("q"), true, Str::new("")));
+    expect_equal(VerifyJudges::new_project_warnings(&not_listed, &tree, &none).length(), 0)?;
+
+    return expect_equal(VerifyJudges::new_project_warnings(&added, &tree, &Judged::list(Str::new("p"))).length(), 0);
+}
+
+![test]
+function a_census_run_records_the_unit_suites_build_warnings() -> Result<(), TestError> {
+    const lines: Array<String> = Text::lines(Str::new(
+        "warning[W0001]: unused variable `p`; prefix it with `_` to silence this warning\r\n"
+        " --> ./tests/lang/a.cryo:113:5\r\n"
+        "ok    A::one\r\n"
+        "  unit test summary\r\n"
+        "    passed 1\r\n"));
+    const records: Array<BaselineRecord> = BaselineRecord::of_census(&lines, &Judged::list(Str::new("unit suite")),
+        &Array::<String>::new(), &Judged::list(Str::new("A::one")));
+    expect_equal(records.length(), 1)?;
+    expect_equal(records[0].warnings.length(), 1)?;
+    expect_equal(records[0].warnings[0].as_str(), Str::new("W0001 ./tests/lang/a.cryo:113"))?;
+    return expect(!records[0].warnings_listed, Str::new("the unit suite's warnings are not a project's listing"));
+}
+
+![test]
+function a_census_run_records_each_projects_listed_build_warnings() -> Result<(), TestError> {
+    const lines: Array<String> = Text::lines(Str::new(
+        "test (negative) E1_x.cryo ... ok\r\n"
+        "test (project) quiet ... ok\r\n"
+        "test (project) noisy ... ok\r\n"
+        "    warning W0002 src/other.cryo:12\r\n"
+        "    warning W0001 src/main.cryo:3\r\n"
+        "  projects summary\r\n"
+        "    passed        2\r\n"
+        "    failed        0\r\n"
+        "    warnings      2\r\n"
+        "    result   PASS\r\n"));
+    const records: Array<BaselineRecord> = BaselineRecord::of_census(&lines,
+        &Judged::list(Str::new("noisy,quiet,negative/E1_x.cryo")), &Array::<String>::new(), &Array::<String>::new());
+    expect_equal(records.length(), 3)?;
+    expect(records[0].warnings_listed && records[0].warnings.length() == 2, Str::new("noisy lists two"))?;
+    expect_equal(records[0].warnings[0].as_str(), Str::new("W0001 src/main.cryo:3"))?;
+    expect(records[1].warnings_listed && records[1].warnings.is_empty(), Str::new("quiet lists none, and says so"))?;
+    expect(!records[2].warnings_listed, Str::new("a compile-fail file lists no build warnings"))?;
+    const older: Array<String> = Text::lines(Str::new(
+        "test (project) noisy ... ok\r\n"
+        "  projects summary\r\n"
+        "    passed        1\r\n"
+        "    failed        0\r\n"
+        "    result   PASS\r\n"));
+    const unlisted: Array<BaselineRecord> = BaselineRecord::of_census(&older, &Judged::list(Str::new("noisy")),
+        &Array::<String>::new(), &Array::<String>::new());
+    return expect(!unlisted[0].warnings_listed, Str::new("a runner that prints no warnings row lists none"));
 }
 
 type struct Fixture {

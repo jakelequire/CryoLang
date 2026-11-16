@@ -769,11 +769,13 @@ vendor-check: $(STAGE2_FILE) $(CRYOGATE) runtime-tiers
 # Everything it needs built is a prerequisite HERE, before any gate starts:
 # the gates run concurrently, and a phony prerequisite rebuilt by one of them
 # (the runtime tiers) would be rewritten while another is linking against it.
+# cryogate's unit tests are one: check-fast runs them, and building them there
+# makes the pin's own stdlib archive among the archives verify hashes.
 ifeq ($(HOST_OS),windows)
-verify: cryo $(TEST_HELPERS_A) $(CRYOGATE)
+verify: cryo $(TEST_HELPERS_A) $(CRYOGATE) $(CRYOGATE_TESTS)
 	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/verify.py --cryo "$(STAGE2_EXE)" $(ARGS)
 else
-verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE)
+verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE) $(CRYOGATE_TESTS)
 	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/verify.py --cryo "$(STAGE2)" $(ARGS)
 endif
 

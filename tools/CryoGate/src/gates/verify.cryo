@@ -627,6 +627,34 @@ public type struct VerifyJudges {
         return problems;
     }
 
+    /// Problems with each project's build warnings in the tree's census run
+    /// (`tree`: project and warning, one pair per listed line) against the
+    /// baseline's records, as sets: each warning only the tree reports is
+    /// one.  A project whose baseline record did not list its warnings, or
+    /// one declared as changed (`excluded`), is not compared.
+    public static new_project_warnings(baseline: &Array<BaselineRecord>, tree: &Array<Pair<String, String>>,
+                                       excluded: &Array<String>) -> Array<String> {
+        mut projects: Array<String> = Array::<String>::new();
+        for (listed in tree.iterate_references()) { projects.push(listed.first.clone()); }
+        mut problems: Array<String> = Array::<String>::new();
+        for (project in Text::sorted_distinct(projects).iterate_references()) {
+            if (excluded.contains(project)) { continue; }
+            for (record in baseline.iterate_references()) {
+                if (record.name.as_str() != project.as_str() || !record.warnings_listed) { continue; }
+                mut warnings: Array<String> = Array::<String>::new();
+                for (listed in tree.iterate_references()) {
+                    if (listed.first.as_str() == project.as_str()) { warnings.push(listed.second.clone()); }
+                }
+                for (warning in Text::sorted_distinct(warnings).iterate_references()) {
+                    if (!record.warnings.contains(warning)) {
+                        problems.push(f"the tree's build of {project.as_str()} reports a warning the baseline's does not: {warning.as_str()}");
+                    }
+                }
+            }
+        }
+        return problems;
+    }
+
     /// Problems with declared unit-test objects (`suffixes`: each declared
     /// file and the tail of the one object it compiles to) over the hash
     /// maps `a` and `b`, path to digest: each must be in both, and must
@@ -1045,8 +1073,9 @@ public type struct ObjectComparison {
 }
 
 /// One program's record of a baseline run: its verdict; the unit suite's
-/// failed tests, counts and build warnings when it is the unit suite; and
-/// its objects, as `<sha256 digest>  <path>` rows.
+/// failed tests, counts and build warnings when it is the unit suite; a
+/// project's build warnings, when the runner listed them; and its objects,
+/// as `<sha256 digest>  <path>` rows.
 public type struct BaselineRecord {
     public name: String;
     public verdict: String;
@@ -1054,19 +1083,23 @@ public type struct BaselineRecord {
     /// passed, failed, ignored and filtered, when the record has them.
     public unit_counts: Option<Array<i64>>;
     public warnings: Array<String>;
+    /// Whether the runner listed this project's build warnings, so that
+    /// none recorded means none and not a runner that never said.
+    public warnings_listed: boolean;
     public rows: Array<String>;
 
     /// A record of `name` with `verdict` and nothing else.
     public static new(name: Str, verdict: Str) -> BaselineRecord {
         return BaselineRecord {
             name: String::from_str(name), verdict: String::from_str(verdict), unit_failed: Array::<String>::new(),
-            unit_counts: Option::None, warnings: Array::<String>::new(), rows: Array::<String>::new(),
+            unit_counts: Option::None, warnings: Array::<String>::new(), warnings_listed: false,
+            rows: Array::<String>::new(),
         };
     }
 
     /// A record file's text read back: a tag and its value per line,
     /// `name`, `verdict`, `unit-failed`, `unit-counts` (four numbers),
-    /// `warning` and `row`.
+    /// `warnings-listed` (no value), `warning` and `row`.
     public static read(text: Str) -> BaselineRecord {
         mut record: BaselineRecord = BaselineRecord::new(Str::new(""), Str::new(""));
         for (line in Text::lines(text).iterate_references()) {
@@ -1082,6 +1115,7 @@ public type struct BaselineRecord {
             if (tag == Str::new("verdict")) { record.verdict = String::from_str(value); }
             if (tag == Str::new("unit-failed")) { record.unit_failed.push(String::from_str(value)); }
             if (tag == Str::new("warning")) { record.warnings.push(String::from_str(value)); }
+            if (tag == Str::new("warnings-listed")) { record.warnings_listed = true; }
             if (tag == Str::new("row")) { record.rows.push(String::from_str(value)); }
             if (tag == Str::new("unit-counts")) {
                 mut counts: Array<i64> = Array::<i64>::new();
@@ -1099,10 +1133,13 @@ public type struct BaselineRecord {
     /// record.  The unit suite gets one when the run accounted for it -
     /// every unit test the roster pins on this host (`unit_pinned`) ran, by
     /// name, and no other - with the tests that failed before the first
-    /// summary and the warnings printed there, its build's.  Each row goes
-    /// to the record of the program that owns its object.
+    /// summary and the warnings printed there, its build's.  A project's
+    /// record holds the build warnings the run listed under its line, when
+    /// the runner lists them.  Each row goes to the record of the program
+    /// that owns its object.
     public static of_census(lines: &Array<String>, names: &Array<String>, rows: &Array<String>,
                             unit_pinned: &Array<String>) -> Array<BaselineRecord> {
+        const reading: CensusReading = CensusReading::of(lines);
         mut verdicts: HashMap<String, String> = HashMap::<String, String>::new();
         for (line in lines.iterate_references()) {
             match (BaselineRecord::verdict_line(line.as_str(), Str::new("project"))) {
@@ -1128,7 +1165,6 @@ public type struct BaselineRecord {
         const unit_suite: String = String::from_str(Str::new("unit suite"));
         for (name in names.iterate_references()) {
             if (name.as_str() == unit_suite.as_str()) {
-                const reading: CensusReading = CensusReading::of(lines);
                 const ran: Array<String> = Text::sorted_distinct(reading.unit_names.clone());
                 const pinned: Array<String> = Text::sorted_distinct(unit_pinned.clone());
                 if (!reading.unit.printed || ran != pinned) { continue; }
@@ -1153,10 +1189,19 @@ public type struct BaselineRecord {
                 records.push(record);
                 continue;
             }
-            match (verdicts.get_reference(name)) {
-                Option::Some(verdict) => { records.push(BaselineRecord::new(name.as_str(), verdict.as_str())); }
-                Option::None          => { }
+            mut record: BaselineRecord = match (verdicts.get_reference(name)) {
+                Option::Some(verdict) => { BaselineRecord::new(name.as_str(), verdict.as_str()) }
+                Option::None          => { continue; }
+            };
+            if (reading.project_warnings_listed && !name.as_str().starts_with(&Str::new("negative/"))) {
+                record.warnings_listed = true;
+                mut warnings: Array<String> = Array::<String>::new();
+                for (listed in reading.project_warnings.iterate_references()) {
+                    if (listed.first.as_str() == name.as_str()) { warnings.push(listed.second.clone()); }
+                }
+                record.warnings = Text::sorted_distinct(warnings);
             }
+            records.push(record);
         }
         for (row in rows.iterate_references()) {
             const text: Str = row.as_str();
@@ -1180,6 +1225,7 @@ public type struct BaselineRecord {
         }
         if (this.unit_failed != other.unit_failed) { return Option::Some(String::from_str(Str::new("unit-failed"))); }
         if (this.unit_counts != other.unit_counts) { return Option::Some(String::from_str(Str::new("unit-counts"))); }
+        if (this.warnings_listed != other.warnings_listed) { return Option::Some(String::from_str(Str::new("warnings-listed"))); }
         if (this.warnings != other.warnings) { return Option::Some(String::from_str(Str::new("warnings"))); }
         const rows: Array<String> = Text::sorted_distinct(this.rows.clone());
         const other_rows: Array<String> = Text::sorted_distinct(other.rows.clone());

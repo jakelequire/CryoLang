@@ -583,11 +583,15 @@ A baseline run also fails on a NEW warning.  The warnings the unit suite's
 build prints in the census are compared with the baseline's as sets of code,
 file and line, so one warning traded for another fails as surely as one
 added; a warning the change removes passes.  There is no declaration for a
-new warning: a change that introduces one fixes it.  A project's own build
-warnings are not compared yet.  The runner lists them under each project's
-line (see the projects suite above), but a baseline whose runner predates that
-listing has none to compare against; its projects summary has no `warnings`
-row, which is how the two are told apart.
+new warning: a change that introduces one fixes it.  Each project's own build
+warnings, which the runner lists under its line (see the projects suite
+above), are compared the same way, project by project, and a warning only the
+tree's build of a project reports fails the run; a project declared in
+`tests/started-compiling` or `tests/started-passing` is left out, since the
+change is declared to alter its build.  A baseline whose runner predates that
+listing has none to compare against - its projects summary has no `warnings`
+row, which is how "none listed" is told from "no warnings" - so its run prints
+`project build warnings  not compared` instead.
 
 ## 9. The language server's tests
 
