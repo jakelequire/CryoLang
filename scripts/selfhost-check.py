@@ -73,29 +73,6 @@ BOOT   = ROOT / "bin" / "cryo"                                       # pinned bo
 STAGE2 = ROOT / "compiler" / "build"                 / "cryo"      # boot -> stage-2
 
 
-def target_triple(exe, runner=None, env=None) -> str:
-    """The triple a native build with `exe` resolves to.
-
-    Asked of the compiler instead of derived from the host: the value comes
-    from a toolchain probe (mingw `gcc` on PATH vs an MSVC linker on Windows,
-    whatever libLLVM reports on Linux), so it is not computable here.  A wrong
-    directory name is SILENT -- the tier lookup prefers `<dir>/<triple>` and
-    falls back to the flat directory, which is where the two chains used to
-    overwrite each other's archives.
-    """
-    cmd = (list(runner) if runner else []) + [str(exe), "version", "--triple"]
-    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    out = r.stdout.strip()
-    if not out:
-        # Empty is two different failures: a compiler that predates the
-        # subcommand answers and exits non-zero with its usage, while one that
-        # never started (a missing DLL, a runner that cannot launch it) says
-        # nothing of its own.  The exit code and stderr tell them apart.
-        sys.exit("selfhost-check: `%s` printed no triple (exit %d).\n"
-                 "  stderr: %s"
-                 % (" ".join(cmd), r.returncode,
-                    r.stderr.strip()[-2000:] or "<empty>"))
-    return out
 def stage_answers(exe, runner=None, env=None):
     """What a stage compiler says when RUN, or None if it cannot be.
 
@@ -229,40 +206,16 @@ class Stage:
     cwd: Path
     cmd: list
     env: dict = None # extra env vars merged over os.environ (windows stages)
-    copies: list = None  # (from, to) paths below cwd, copied once cmd succeeds
 
     @property
     def label(self):
         return f"{self.src:<8}  via {self.via:<10}  →  {self.to}"
 
 
-def pin_runtime_stage(boot, runner, triple, env):
-    """The pin's build of the runtime for `triple`, copied under the tier
-    names the pin links (see make_stages' round 0)."""
-    built = f".bin/{triple}/pin/libcryort.a"
-    return Stage(
-        src="runtime", via="pinned", to=f".bin/{triple}",
-        cwd=ROOT / "runtime",
-        cmd=list(runner) + [str(boot), "build", "--no-incremental", "--panic=unwind",
-                            f"--build-dir=.bin/{triple}/pin"],
-        env=env,
-        copies=[(built, f".bin/{triple}/libcryort-core-hosted.a"),
-                (built, f".bin/{triple}/libcryort-panic-unwind-hosted.a")],
-    )
-
-
 def make_stages():
-    host_triple = target_triple(BOOT)
+    # Each compiler builds the runtime it links, on first use, so no round
+    # builds it ahead of the compilers.
     return [
-        # ------------------------------------------------------------------
-        # Round 0: the runtime the pin links stage-2 against.  The pin links
-        # it as one archive per tier, `libcryort-core-hosted.a` and
-        # `libcryort-panic-unwind-hosted.a` in `.bin/<triple>`; the runtime's
-        # hosted unwind build defines both tiers' symbols, so the pin builds
-        # it once and it is copied under both names.  Stage-2 and stage-3
-        # build their own runtime on first use.
-        # ------------------------------------------------------------------
-        pin_runtime_stage(BOOT, [], host_triple, None),
         # ------------------------------------------------------------------
         # Round 1: pinned boot -> stage-2  (default build dirs)
         # ------------------------------------------------------------------
@@ -359,10 +312,6 @@ def run_stage(idx: int, total: int, stage: Stage, log_path: Path,
                     sys.stdout.write(line)
             proc.wait()
             rc = proc.returncode
-            if rc == 0:
-                for source, dest in stage.copies or []:
-                    shutil.copyfile(stage.cwd / source, stage.cwd / dest)
-                    logf.write(f"copied {source} -> {dest}\n")
     except FileNotFoundError as e:
         stop.set()
         if t:
@@ -607,12 +556,7 @@ def make_windows_stages(runner: list, env: dict) -> list:
         return cmd
 
     cm = ROOT / "compiler"
-    # The runtime the WINDOWS boot compiler links stage-2 against, for the
-    # same reason as the Linux chain, into `.bin/<its triple>`, so this
-    # chain's archives and the Linux chain's occupy different directories.
-    wt = target_triple(boot, runner, env)
     return [
-        pin_runtime_stage(boot, runner, wt, env),
         Stage("compiler", "pinned",  "build/self/win-s2", cm, build(boot, "build/self/win-s2"), env),
         Stage("compiler", "stage-2", "build/self/win-s3", cm, build(s2,   "build/self/win-s3", emit=True), env),
         Stage("compiler", "stage-3", "build/self/win-s4", cm, build(s3,   "build/self/win-s4", emit=True), env),

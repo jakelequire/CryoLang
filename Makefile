@@ -209,7 +209,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check pin-runtime runtime-abi-check pin \
+.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-abi-check pin \
         pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -224,9 +224,6 @@ Build
                          commit it was built from (`cryo stamp`, which is what
                          `cryo version` reports; the stamp rewrites a region
                          of the binary, so no object changes).
-  make pin-runtime       The runtime built by the pin under the archive names
-                         the pin links (its hosted unwind build), so the pin
-                         can link the compiler; until the next repin.
   make cryo-exe          Cross-build compiler/build/cryo.exe from Linux, and
                          stamp it.
   make lsp               Build tools/CryoLSP from the current tree with the pin
@@ -354,13 +351,10 @@ $(PIN):
 	@exit 1
 
 # ---- self-hosted compiler via the pin ---------------------------------
-# Depends on `pin-runtime` because linking ANY hosted binary - including this
-# compiler - needs the runtime to resolve `__cryo_panic`, and the pin links
-# the runtime under the archive names it was built to look for.
-#
-# The pin links the compiler against the stdlib archive it builds for its own
-# key under stdlib/.bin/<triple>/prebuilt/ the first time it needs one, so
-# nothing here builds the stdlib.
+# The pin links the compiler against the stdlib archive and the runtime
+# archive it builds for its own key, under stdlib/.bin/<triple>/prebuilt/ and
+# runtime/.bin/<triple>/, the first time it needs each, so nothing here builds
+# either.
 #
 # The linked compiler is then stamped (`cryo stamp`) with the checkout it was
 # built from, which is what `cryo version` reports.  The stamp is a region of
@@ -378,8 +372,6 @@ $(PIN):
 CRYO_PROFILE  := release
 STAMP_EXCLUDE := bin/cryo,bin/cryo.pin.txt,bin/cryo.exe,bin/cryo.exe.pin.txt
 RUNTIME_SOURCES := $(call rwildcard,$(ROOT)/runtime,*.cryo) $(ROOT)/runtime/cryoconfig
-# The runtime under the panic archive name the pin links (`pin-runtime`).
-PIN_RUNTIME_A    = $(ROOT)/runtime/.bin/$(HOST_TRIPLE)/libcryort-panic-unwind-hosted.a
 ifeq ($(HOST_OS),windows)
 STAGE2_FILE := $(STAGE2_EXE)
 STAGE2_PIN  := $(PIN_EXE)
@@ -388,7 +380,7 @@ STAGE2_FILE := $(STAGE2)
 STAGE2_PIN  := $(PIN)
 endif
 STAGE2_INPUTS := $(CRYO_SOURCES) $(ROOT)/compiler/cryoconfig $(wildcard $(ROOT)/compiler/*.h) \
-                 $(PIN_RUNTIME_A) $(STAGE2_PIN) $(wildcard $(ROOT)/.git/index)
+                 $(RUNTIME_SOURCES) $(STAGE2_PIN) $(wildcard $(ROOT)/.git/index)
 
 cryo: $(STAGE2_FILE)
 
@@ -936,31 +928,8 @@ endif
 # ---- the runtime -------------------------------------------------------
 # Every program links the runtime (`runtime/`, one project), and the compiler
 # that links it builds it, on first use, under runtime/.bin/<triple>/; see
-# compiler/src/compiler/prebuilt_runtime.cryo.  Nothing here builds it for
-# the compiler under test.
-#
-# `pin-runtime` is for the PIN, which was built to link the runtime as one
-# archive per tier under runtime/.bin/<triple>/, and links the hosted
-# `libcryort-core-hosted.a` and `libcryort-panic-unwind-hosted.a` there.  The
-# runtime's hosted unwind build defines both tiers' symbols, so the pin builds
-# it once and it is copied under both names.  It goes with the next repin.
-pin-runtime: $(PIN_RUNTIME_A)
-
-ifeq ($(HOST_OS),windows)
-$(PIN_RUNTIME_A): $(RUNTIME_SOURCES) $(PIN_EXE)
-	$(if $(strip $(HOST_TRIPLE)),,$(error pin-runtime: `cryo version --triple` returned nothing; the pinned compiler is too old))
-	@echo "==> Building the runtime for the pin ($(HOST_TRIPLE)) via bin/cryo.exe"
-	@cd runtime && "$(subst /,\,$(PIN_EXE))" build --no-incremental --panic=unwind --build-dir=.bin/$(HOST_TRIPLE)/pin
-	@copy /Y "runtime\.bin\$(HOST_TRIPLE)\pin\libcryort.a" "runtime\.bin\$(HOST_TRIPLE)\libcryort-core-hosted.a"
-	@copy /Y "runtime\.bin\$(HOST_TRIPLE)\pin\libcryort.a" "runtime\.bin\$(HOST_TRIPLE)\libcryort-panic-unwind-hosted.a"
-else
-$(PIN_RUNTIME_A): $(RUNTIME_SOURCES) $(PIN)
-	$(if $(strip $(HOST_TRIPLE)),,$(error pin-runtime: `cryo version --triple` returned nothing; the pinned compiler is too old))
-	@echo "==> Building the runtime for the pin ($(HOST_TRIPLE)) via bin/cryo"
-	@cd runtime && "$(PIN)" build --no-incremental --panic=unwind --build-dir=.bin/$(HOST_TRIPLE)/pin
-	@cp runtime/.bin/$(HOST_TRIPLE)/pin/libcryort.a runtime/.bin/$(HOST_TRIPLE)/libcryort-core-hosted.a
-	@cp runtime/.bin/$(HOST_TRIPLE)/pin/libcryort.a runtime/.bin/$(HOST_TRIPLE)/libcryort-panic-unwind-hosted.a
-endif
+# compiler/src/compiler/prebuilt_runtime.cryo.  Nothing here builds it - not
+# for the pin, and not for the compiler under test.
 
 # The lang-item registry (runtime/abi/lang_items.def) against the runtime the
 # compiler under test builds in each configuration, and the `__cryo_` names
