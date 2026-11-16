@@ -11,6 +11,8 @@ build:
     cross      cryogate cross            the other OS's gated half compiles
     incr       cryogate incr --instance  an edit asking a cached module for a
                                          new generic instance still links
+    relink     cryogate incr --runtime   a rebuilt runtime is linked again
+                                         with nothing else changed
     abi        scripts/runtime-abi-check.sh
                                          the lang-item registry against the
                                          runtime archives and the names the
@@ -135,6 +137,8 @@ GATES = {
     "cross":    ([CRYOGATE, "cross", "--cryo", "{cryo}"], r"^cross-check: "),
     "incr":     ([CRYOGATE, "incr", "--instance", "--cryo", "{cryo}"],
                  r"^incremental-instance-check: "),
+    "relink":   ([CRYOGATE, "incr", "--runtime", "--cryo", "{cryo}"],
+                 r"^incremental-runtime-check: "),
     "abi":      (["{bash}", "scripts/runtime-abi-check.sh"], r"^runtime-abi-check: "),
     # `ARGS=` on the command line: `make verify ARGS=...` exports ARGS to
     # child makes, and no check-fast target is meant to receive verify's flags.

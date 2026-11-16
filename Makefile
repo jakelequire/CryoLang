@@ -209,7 +209,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-abi-check pin \
+.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check incremental-runtime-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-abi-check pin \
         pin-impl pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
         install uninstall clean lsp install-lsp cryogate release release-linux release-windows
 
@@ -250,7 +250,8 @@ Tests and gates
   make roster-check      The discovered roster against tests/test-roster.txt
                          (ARGS=--merge after adding, --update after removing).
   make verify            Build once; census, examples, lsp-check, cross-check,
-                         incremental-instance-check and check-fast run
+                         incremental-instance-check, incremental-runtime-check,
+                         runtime-abi-check and check-fast run
                          concurrently and their objects are hashed
                          (ARGS="--baseline HEAD --require-identical";
                          --sequential runs them one at a time).
@@ -281,6 +282,9 @@ Tests and gates
                          (refuses on Windows: a PE carries a link timestamp).
   make incremental-instance-check  An edit asking a cached module for a new
                          generic instance still links.
+  make incremental-runtime-check  A program is linked again when its runtime
+                         is rebuilt with nothing else changed; writes
+                         .verify/incremental-runtime.
   make vendor-check      Every constant shape survives `cryo vendor`.
   make verify-freestanding  The runtime's freestanding acceptance check
                          (POSIX only; refuses on Windows).
@@ -776,7 +780,8 @@ vendor-check: $(STAGE2_FILE) $(CRYOGATE)
 
 # ---- one verification run ----------------------------------------------
 # Build once, then run census, examples, lsp-check, cross-check,
-# incremental-instance-check and check-fast at the same time, and hash the objects the census and examples compiled.
+# incremental-instance-check, incremental-runtime-check, runtime-abi-check and
+# check-fast at the same time, and hash the objects the census and examples compiled.
 # ARGS="--baseline HEAD" also compares those objects against a compiler built
 # from HEAD's compiler/src (in a clone under .verify/, cached), which is the
 # evidence that a change moved no compiled output.  See scripts/verify.py.
@@ -798,6 +803,11 @@ endif
 # generic instance must link (tests/fixtures/incremental-new-instance).
 incremental-instance-check: cryo $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) incr --instance --cryo "$(STAGE2_FILE)"
+
+# A program built against a runtime must be linked again when the runtime
+# is rebuilt with nothing else changed (tests/fixtures/incremental-runtime-change).
+incremental-runtime-check: cryo $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) incr --runtime --cryo "$(STAGE2_FILE)"
 
 # The judges behind verify's tests/started-compiling declarations, and
 # selfhost-check's stage-archive comparison, and cryogate's own (the roster

@@ -35,7 +35,9 @@ heavy-run lock and `cryogate heavy`, the run logs, `cryogate selftest`, and
 `make cryogate`; the heavy Makefile targets run under the lock. Ported:
 `roster` and `census` (G2, G3), `incr --instance`, `examples` (with
 `--run` and `--under=valgrind`) and `vendor` (G4), `cross` (G7): G4 is
-complete. `cryogate` is merged into `test-infra`, cut from `main`; the
+complete. New beside them: `incr --runtime`, verify's `relink` gate (a
+program is linked again when its runtime is rebuilt with nothing else
+changed). `cryogate` is merged into `test-infra`, cut from `main`; the
 ports carry what `main` changed in the scripts they replaced (the census and
 the examples sweep build with `-Werror=W0017`, a project's roster line ends
 in `applied=<exit code>`, the vendor gate requires named records and enums,

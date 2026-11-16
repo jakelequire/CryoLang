@@ -24,7 +24,7 @@ api-index-check` fails if it is stale.
 make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS and unit/project NAMES asserted
-make verify              # build once; census, examples, lsp, cross, incr, abi, check-fast
+make verify              # build once; census, examples, lsp, cross, incr, relink, abi, check-fast
                          # CONCURRENTLY (ARGS="--sequential": one at a time, for a host short
                          # of memory), objects hashed (tests, examples, stdlib archives,
                          # runtime archive members); ARGS="--baseline HEAD --require-identical"
@@ -69,6 +69,8 @@ make examples-golden     # build them AND run each with an expected.out, compare
 make incremental-check   # incremental build == clean build, per module
 make incremental-instance-check  # an edit asking a cached module for a new generic
                          # instance still links (a verify gate: `incr`)
+make incremental-runtime-check   # a program is linked again when its runtime is rebuilt
+                         # with nothing else changed (a verify gate: `relink`)
 make selfhost-check      # byte-identity fixed point, BOTH OS (arms run concurrently), ~2.5 min
 make help                # every target, and every side effect beyond its named output
 ```
