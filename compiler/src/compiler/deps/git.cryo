@@ -177,13 +177,16 @@ type struct Git {
     /// written, so an interrupted extraction never reads as extracted, and
     /// one left behind is removed before the next starts.  A commit holding
     /// a submodule, a symbolic link or a path that would leave the tree is
-    /// refused, naming the dependency `package`.  True on success.
-    static extract(package: Str, url: Str, sha: Str) -> boolean {
+    /// refused, naming the dependency `package`.  An extraction already
+    /// there is kept, unless `fresh`, which replaces it: `cryo fetch`
+    /// restores a tree that no longer holds its commit's files.  True on
+    /// success.
+    static extract(package: Str, url: Str, sha: Str, fresh: boolean) -> boolean {
         if (!GitUrl::is_commit_id(sha)) {
             fmt::eprintln(f"error: refusing to extract `{sha}` from {url}: it is not a full commit id");
             return false;
         }
-        if (Git::is_extracted(url, sha)) { return true; }
+        if (!fresh && Git::is_extracted(url, sha)) { return true; }
         const bare: PathBuf = Cache::git_dir_for(url);
         if (!bare.as_path().exists()) {
             fmt::eprintln(f"error: dependency '{package}' is not in the cache ({url} has not been fetched); run `cryo fetch`");
@@ -227,6 +230,15 @@ type struct Git {
             const end: i64 = rest.find_byte(0).unwrap_or(rest.length());
             if (!Git::extract_entry(package, url, &bare, partial.as_path(), rest.byte_substring(0, end))) { return false; }
             rest = rest.byte_substring(if (end < rest.length()) { end + 1 } else { end }, rest.length());
+        }
+        if (tree.as_path().exists()) {
+            match (Directory::remove_all(tree.as_path())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => {
+                    fmt::eprintln(f"error: cannot replace the extraction at {tree.as_path().as_str()}: {error}");
+                    return false;
+                }
+            }
         }
         match (partial.as_path().rename_to(tree.as_path())) {
             Result::Ok(_)      => { return true; }

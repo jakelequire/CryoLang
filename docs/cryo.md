@@ -5421,6 +5421,8 @@ remote   = { git = "https://example.com/lib.git", tag = "v0.1.0" }
 
 A git dependency requires exactly one of `version`, `tag`, `branch`, or `rev`, and may set `subdir` (the path to the dependency's `cryoconfig` inside the repo). The name on the left is local to the cryoconfig that writes it: it labels the dependency in messages and names its output folder, and nothing else.
 
+**The lock.** `cryoconfig.lock` (JSON, `schema_version` 3) pins each git dependency, found by its URL and the ref its entry writes (never by the name on the left): the `commit` the ref resolved to, and the `content` hash of that commit's files, `sha256-<hex>` over every file in the byte order of its path, each as its path, a NUL, its length in decimal, a NUL and its bytes. The bytes are the ones git stores, so the hash is the same on every host. **Every build checks the cached files against `content`** and refuses a dependency whose files differ, naming it and the remedy: `cryo fetch` extracts the commit again. `cryo fetch` keeps an extraction that still matches, extracts any other afresh, and records the hash from what it extracted, so the lock's hash always comes from git. A schema 2 lock (no content) builds nothing until `cryo fetch` rewrites it; a build never writes the `packages` section.
+
 A path dependency names a directory holding a `cryoconfig`, relative to the cryoconfig that writes it. One that names a directory that does not exist, or one without a `cryoconfig`, fails the build and names the dependency.
 
 **How a program names a dependency's code.** An import names a dependency's modules by the namespaces its files declare (`import Json5;`), exactly as it names the program's own. A dependency entry takes no second name for them: `alias` is refused.
