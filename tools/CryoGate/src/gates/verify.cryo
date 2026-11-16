@@ -2,9 +2,12 @@
 ///! and tests/started-passing) and over the object lists it compares: which
 ///! lines a change declares, the form each line takes, which program owns an
 ///! object, and whether an object only the baseline built is one the tree
-///! takes from the stdlib archive; and the judgements verify passes over a
-///! baseline census, the tree's warnings and the objects declared as
-///! moving.  Pure: files and lists are handed in.
+///! takes from the stdlib archive; the judgements verify passes over a
+///! baseline census, a declared project's builds, the tree's warnings and
+///! the objects declared as moving; the records a baseline census gives
+///! each program; and the comparison of the two runs' objects.  The
+///! judgements, the records and the comparison are pure: logs and lists are
+///! handed in.
 namespace cryogate::gates::verify;
 
 import std::collections::array::{ Array };
@@ -16,40 +19,91 @@ import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::fmt;
 import std::fs::file::{ File };
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 
 import cryogate::core::child::{ Completion };
 import cryogate::core::git::{ Git };
 import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::text::{ Text };
+import cryogate::core::tree::{ Tree };
+import cryogate::gates::census::{ CensusReading, Pinned };
+import cryogate::gates::roster::{ TestGates };
 
-/// `cryogate verify --declared-since <rev>`: the lines each declaration file
-/// declares against the commit `rev`, printed as `scripts/verify.py` prints
-/// them before its baseline run, so the two can be compared on one checkout.
+/// `cryogate verify`, beside `scripts/verify.py` on one checkout, so the two
+/// can be compared over the same inputs:
+///
+/// - `--declared-since <rev>`: the lines each declaration file declares
+///   against the commit `rev`, printed as verify prints them before its
+///   baseline run;
+/// - `--compare <run> --against <rev>`: the object comparison of a verify
+///   run directory's recorded lists, printed as verify printed it after
+///   that run, with the declarations made against `rev`;
+/// - `--records <run> --programs <directory>`: each census-side record
+///   verify stored in `directory`, derived again from the run's baseline
+///   census log and object list; every record that differs is named.
 public type struct VerifyGate {
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
-        mut options: Options = Options::new(Str::new("cryogate verify --declared-since <rev>"));
+        mut options: Options = Options::new(Str::new(
+            "cryogate verify --declared-since <rev> | --compare <run> --against <rev> [--list-limit <n>] | --records <run> --programs <directory>"));
         options.valued(Str::new("--declared-since"));
+        options.valued(Str::new("--compare"));
+        options.valued(Str::new("--against"));
+        options.valued(Str::new("--list-limit"));
+        options.valued(Str::new("--records"));
+        options.valued(Str::new("--programs"));
         const parsed: Parsed = match (options.parse(arguments, first)) {
             Result::Ok(parsed)  => { parsed }
             Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 2; }
         };
-        const revision: Str = match (parsed.value(Str::new("--declared-since"))) {
-            Option::Some(revision) => { revision }
-            Option::None           => { fmt::eprintln(f"cryogate verify: usage: {options.usage()}"); return 2; }
-        };
         const git: Git = Git::new(repository, logs);
-        VerifyGate::print_declared(repository, &git, revision, Str::new("tests/started-compiling"),
-            Str::new("compile"));
-        VerifyGate::print_declared(repository, &git, revision, Str::new("tests/started-passing"),
-            Str::new("pass"));
-        return 0;
+        match (parsed.value(Str::new("--declared-since"))) {
+            Option::Some(revision) => {
+                const declared: Array<Declaration> = VerifyGate::declared_since(repository, &git, revision,
+                    Str::new("tests/started-compiling"));
+                const fixed: Array<Declaration> = VerifyGate::declared_since(repository, &git, revision,
+                    Str::new("tests/started-passing"));
+                VerifyGate::print_declared(&declared, revision, Str::new("compile"));
+                VerifyGate::print_declared(&fixed, revision, Str::new("pass"));
+                return 0;
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--compare"))) {
+            Option::Some(run) => {
+                const revision: Str = match (parsed.value(Str::new("--against"))) {
+                    Option::Some(revision) => { revision }
+                    Option::None           => { fmt::eprintln(f"cryogate verify: --compare needs --against; usage: {options.usage()}"); return 2; }
+                };
+                mut limit: i64 = 40;
+                match (parsed.value(Str::new("--list-limit"))) {
+                    Option::Some(text) => {
+                        if (!Text::is_digits(text)) { fmt::eprintln(f"cryogate verify: --list-limit takes a count, not {text}"); return 2; }
+                        limit = i64::try_from(text).unwrap_or(0);
+                    }
+                    Option::None => { }
+                }
+                return VerifyGate::compare_run(repository, &git, run, revision, limit);
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--records"))) {
+            Option::Some(run) => {
+                const programs: Str = match (parsed.value(Str::new("--programs"))) {
+                    Option::Some(programs) => { programs }
+                    Option::None           => { fmt::eprintln(f"cryogate verify: --records needs --programs; usage: {options.usage()}"); return 2; }
+                };
+                return VerifyGate::rederive_records(repository, run, programs);
+            }
+            Option::None => { }
+        }
+        fmt::eprintln(f"cryogate verify: usage: {options.usage()}");
+        return 2;
     }
 
-    /// Print the lines the working tree's `file` declares against its copy
-    /// at `revision` (none when the commit has no such file), sorted by name.
-    static print_declared(repository: Path, git: &Git, revision: Str, file: Str, starting: Str) -> void {
+    /// The lines the working tree's `file` declares against its copy at
+    /// `revision` (none when the commit has no such file).
+    static declared_since(repository: Path, git: &Git, revision: Str, file: Str) -> Array<Declaration> {
         const tree_text: String = match (File::read_text(repository.join(file).as_path())) {
             Result::Ok(text) => { text }
             Result::Err(_)   => { String::new() }
@@ -60,7 +114,11 @@ public type struct VerifyGate {
         show.push(spec.as_str());
         const done: Completion = git.run(&show);
         const base_text: String = if (done.outcome.succeeded()) { done.output() } else { String::new() };
-        const declared: Array<Declaration> = Declarations::between(tree_text.as_str(), base_text.as_str());
+        return Declarations::between(tree_text.as_str(), base_text.as_str());
+    }
+
+    /// Print `declared`, sorted by name, under the line counting them.
+    static print_declared(declared: &Array<Declaration>, revision: Str, starting: Str) -> void {
         mut names: Array<String> = Array::<String>::new();
         for (line in declared.iterate_references()) { names.push(line.name.clone()); }
         const sorted: Array<String> = Text::sorted_distinct(names);
@@ -73,6 +131,111 @@ public type struct VerifyGate {
             }
         }
         fmt::println(text);
+    }
+
+    /// `--compare`: the run directory `run`'s baseline and tree object
+    /// lists compared with the declarations made against `revision`.
+    static compare_run(repository: Path, git: &Git, run: Str, revision: Str, limit: i64) -> i32 {
+        const declared: Array<Declaration> = VerifyGate::declared_since(repository, git, revision, Str::new("tests/started-compiling"));
+        const fixed: Array<Declaration> = VerifyGate::declared_since(repository, git, revision, Str::new("tests/started-passing"));
+        const changes: DeclaredChanges = DeclaredChanges::of(repository, &declared, &fixed);
+        mut baseline: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
+        mut tree: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
+        const populations: Array<ObjectPopulation> = ObjectPopulation::all();
+        for (population in populations.iterate_references()) {
+            const baseline_list: String = population.baseline_list(run);
+            const tree_list: String = population.tree_list(run);
+            match (VerifyGate::read_list(repository, baseline_list.as_str())) {
+                Result::Ok(hashes)  => { baseline.push(hashes); }
+                Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
+            }
+            match (VerifyGate::read_list(repository, tree_list.as_str())) {
+                Result::Ok(hashes)  => { tree.push(hashes); }
+                Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
+            }
+        }
+        const compared: Compared = ObjectComparison::against(revision, &changes, baseline, tree, limit, run);
+        for (line in compared.lines.iterate_references()) { fmt::println(line.clone()); }
+        for (problem in compared.problems.iterate_references()) { fmt::println(f"verify: FAIL -- {problem.as_str()}"); }
+        return if (compared.problems.is_empty()) { 0 } else { 1 };
+    }
+
+    static read_list(repository: Path, list: Str) -> Result<HashMap<String, String>, String> {
+        return match (File::read_text(repository.join(list).as_path())) {
+            Result::Ok(text)   => { Result::Ok(ObjectComparison::read_list(text.as_str())) }
+            Result::Err(error) => { Result::Err(f"cannot read {list}: {error.describe()}") }
+        };
+    }
+
+    /// `--records`: the census-side records stored in `programs` (every
+    /// record but an example's and an archive's), each derived again from
+    /// the run directory `run`'s baseline census log and its tests object
+    /// list.  The log must be the run's only one: a baseline census run in
+    /// parts gave each part its own records.
+    static rederive_records(repository: Path, run: Str, programs: Str) -> i32 {
+        const log: String = f"{run}/baseline/census-000.log";
+        const second: String = f"{run}/baseline/census-001.log";
+        if (repository.join(second.as_str()).as_path().is_file()) {
+            fmt::eprintln(f"cryogate verify: {run}'s baseline census ran in parts; its records came from more than one log");
+            return 1;
+        }
+        const log_text: String = match (File::read_text(repository.join(log.as_str()).as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { fmt::eprintln(f"cryogate verify: cannot read {log.as_str()}: {error.describe()}"); return 1; }
+        };
+        const rows_list: String = f"{run}/baseline/base.tests.sha256";
+        const rows_text: String = match (File::read_text(repository.join(rows_list.as_str()).as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { fmt::eprintln(f"cryogate verify: cannot read {rows_list.as_str()}: {error.describe()}"); return 1; }
+        };
+        const tests: PathBuf = repository.join(Str::new("tests"));
+        const gates: TestGates = match (TestGates::read(tests.join(Str::new("tests")).as_path())) {
+            Result::Ok(gates)   => { gates }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate verify: cannot read the test sources: {reason.as_str()}"); return 1; }
+        };
+        const pinned: Pinned = match (Pinned::read(tests.join(Str::new("test-roster.txt")).as_path(), &gates)) {
+            Result::Ok(pinned)  => { pinned }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
+        };
+        const files: Array<String> = match (Tree::names(Path::from(programs), &Array::<String>::new())) {
+            Result::Ok(files)   => { files }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate verify: cannot list {programs}: {reason.as_str()}"); return 1; }
+        };
+        mut stored: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+        mut names: Array<String> = Array::<String>::new();
+        for (file in files.iterate_references()) {
+            const path: PathBuf = Path::from(programs).join(file.as_str());
+            const text: String = match (File::read_text(path.as_path())) {
+                Result::Ok(text)   => { text }
+                Result::Err(error) => { fmt::eprintln(f"cryogate verify: cannot read {path.as_path().as_str()}: {error.describe()}"); return 1; }
+            };
+            const record: BaselineRecord = BaselineRecord::read(text.as_str());
+            const name: Str = record.name.as_str();
+            if (name.starts_with(&Str::new("examples/")) || name.starts_with(&Str::new("archives/"))) { continue; }
+            names.push(record.name.clone());
+            stored.push(record);
+        }
+        const lines: Array<String> = Text::lines(log_text.as_str());
+        const rows: Array<String> = Text::lines(rows_text.as_str());
+        const derived: Array<BaselineRecord> = BaselineRecord::of_census(&lines, &names, &rows, &pinned.unit);
+        mut differing: i64 = 0;
+        for (record in stored.iterate_references()) {
+            mut found: boolean = false;
+            for (again in derived.iterate_references()) {
+                if (again.name.as_str() != record.name.as_str()) { continue; }
+                found = true;
+                const difference: Option<String> = record.difference(again);
+                match (difference) {
+                    Option::Some(field) => { fmt::println(f"  differs  {record.name.as_str()}: {field.as_str()}"); differing++; }
+                    Option::None        => { }
+                }
+            }
+            if (!found) { fmt::println(f"  missing  {record.name.as_str()}: the log gives it no verdict"); differing++; }
+        }
+        fmt::println(f"verify: {stored.length()} census record(s) derived again from {log.as_str()}, {differing} differ");
+        // No record read is no comparison: a wrong directory reports the
+        // same zero differences as a faithful port.
+        return if (differing == 0 && !stored.is_empty()) { 0 } else { 1 };
     }
 }
 
@@ -212,6 +375,73 @@ public type struct Declarations {
     public static archive_module_suffix(name: Str) -> String {
         const module_path: String = Declarations::program_of(name).replace(&Str::new("::"), &Str::new("/"));
         return f"/deps/{module_path}.o";
+    }
+
+    /// The namespace the unit-test file a line names declares, `A::B::C`:
+    /// the first line of `tests/tests/<file>` reading `namespace A::B::C;`,
+    /// indented or not.  None when the file or such a line is missing.
+    public static unit_namespace(repository: Path, name: Str) -> Option<String> {
+        const path: PathBuf = repository.join(Str::new("tests/tests")).join(Declarations::program_of(name));
+        const text: String = match (File::read_text(path.as_path())) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { return Option::None; }
+        };
+        const lines: Array<String> = Text::lines(text.as_str());
+        for (line in lines.iterate_references()) {
+            const rest: Str = match (line.as_str().trim_start().strip_prefix(&Str::new("namespace"))) {
+                Option::Some(rest) => { rest }
+                Option::None       => { continue; }
+            };
+            const space: boolean = match (rest.byte_at(0)) {
+                Option::Some(byte) => { byte.is_whitespace() }
+                Option::None       => { false }
+            };
+            if (!space) { continue; }
+            const spelled: Str = rest.trim_start();
+            mut end: i64 = 0;
+            while (end < spelled.length()) {
+                const byte: u8 = spelled.byte_at(end).unwrap_or(0);
+                const word: boolean = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90)
+                    || (byte >= 97 && byte <= 122) || byte == 95 || byte == 58;
+                if (!word) { break; }
+                end++;
+            }
+            if (end == 0) { continue; }
+            if (spelled.byte_substring(end, spelled.length()).trim_start().starts_with(&Str::new(";"))) {
+                return Option::Some(String::from_str(spelled.byte_substring(0, end)));
+            }
+        }
+        return Option::None;
+    }
+
+    /// The tail of the path of the object the unit-test file a line names
+    /// compiles to, from its namespace: `namespace A::B::C;` is
+    /// `/deps/A/B/C.o`.  None when it has no namespace.
+    public static unit_object_suffix(repository: Path, name: Str) -> Option<String> {
+        const spelled: String = match (Declarations::unit_namespace(repository, name)) {
+            Option::Some(spelled) => { spelled }
+            Option::None          => { return Option::None; }
+        };
+        const module_path: String = spelled.as_str().replace(&Str::new("::"), &Str::new("/"));
+        return Option::Some(f"/deps/{module_path}.o");
+    }
+
+    /// The source file of the standard-library module a `moved-archive:`
+    /// line names: `std::a::b` is `stdlib/a/b.cryo`, or
+    /// `stdlib/a/b/_module.cryo`.  None when the module is not below `std::`
+    /// or neither file exists.
+    public static archive_module_source(repository: Path, name: Str) -> Option<PathBuf> {
+        const below: Str = match (Declarations::program_of(name).strip_prefix(&Str::new("std::"))) {
+            Option::Some(below) => { below }
+            Option::None        => { return Option::None; }
+        };
+        const relative: String = below.replace(&Str::new("::"), &Str::new("/"));
+        const stdlib: PathBuf = repository.join(Str::new("stdlib"));
+        const file: PathBuf = stdlib.join(f"{relative.as_str()}.cryo".as_str());
+        if (file.as_path().is_file()) { return Option::Some(file); }
+        const aggregator: PathBuf = stdlib.join(relative.as_str()).join(Str::new("_module.cryo"));
+        if (aggregator.as_path().is_file()) { return Option::Some(aggregator); }
+        return Option::None;
     }
 }
 
@@ -353,6 +583,44 @@ public type struct VerifyJudges {
         return problems;
     }
 
+    /// Problems with the two direct builds of the declared project `name`:
+    /// a started-compiling project must be refused by the baseline, with an
+    /// error diagnostic (a crash or a link failure is no refusal), and built
+    /// by the tree.  A started-passing (`fixed`) project's claim is its
+    /// census verdicts, so its builds are reported and not judged.
+    public static builds(name: Str, base_exit: i32, base_output: Str, tree_exit: i32, tree_output: Str,
+                         fixed: boolean) -> Array<String> {
+        mut problems: Array<String> = Array::<String>::new();
+        if (fixed) { return problems; }
+        if (base_exit == 0) {
+            problems.push(f"{name}: the baseline compiler BUILDS it (exit 0); it is not a program this change makes compile");
+        } else if (!VerifyJudges::reports_an_error(base_output)) {
+            problems.push(f"{name}: the baseline exits {base_exit} with no error diagnostic; a crash or a link failure is not a refusal");
+        }
+        if (tree_exit != 0) {
+            problems.push(f"{name}: the compiler under test does not build it (exit {tree_exit})");
+        }
+        return problems;
+    }
+
+    /// Whether `output` holds an error diagnostic's code, `error[E` and
+    /// four digits and `]`, anywhere in it.
+    static reports_an_error(output: Str) -> boolean {
+        mut rest: Str = output;
+        while (true) {
+            const at: i64 = match (rest.find(&Str::new("error[E"))) {
+                Option::Some(at) => { at }
+                Option::None     => { return false; }
+            };
+            const after: Str = rest.byte_substring(at + 7, rest.length());
+            if (after.length() >= 5 && Text::is_digits(after.byte_substring(0, 4)) && after.byte_substring(4, 5) == Str::new("]")) {
+                return true;
+            }
+            rest = after;
+        }
+        return false;
+    }
+
     /// Problems with the tree's unit-suite build warnings against the
     /// baseline's, as sets of `<code> <file>:<line>`: a total hides one
     /// warning traded for another.  Each warning only the tree reports is
@@ -485,5 +753,489 @@ public type struct VerifyJudges {
 
     static remove_all(hashes: mut &HashMap<String, String>, paths: &Array<String>) -> void {
         for (path in paths.iterate_references()) { hashes.remove(path); }
+    }
+}
+
+/// The declarations the object comparison reads, by what each asks of it.
+public type struct DeclaredChanges {
+    /// Every line's name from both files: the projects and examples among
+    /// them are left out of the comparison, since their objects change by
+    /// declaration.
+    public names: Array<String>;
+    /// Each started-passing unit-test file and the tail of the one object
+    /// it compiles to.
+    public units: Array<Pair<String, String>>;
+    /// The started-passing `moved:` lines.
+    public moved_projects: Array<String>;
+    /// The started-passing `moved-archive:` lines.
+    public moved_modules: Array<String>;
+    /// The started-passing `archive:` lines, sorted.
+    public archive_files: Array<String>;
+    /// A started-passing unit-test file with no namespace: its object
+    /// cannot be named, so it cannot be judged.
+    public problems: Array<String>;
+
+    /// The changes `declared` (tests/started-compiling) and `fixed`
+    /// (tests/started-passing) make, in the checkout `repository`.
+    public static of(repository: Path, declared: &Array<Declaration>, fixed: &Array<Declaration>) -> DeclaredChanges {
+        mut changes: DeclaredChanges = DeclaredChanges {
+            names: Array::<String>::new(), units: Array::<Pair<String, String>>::new(),
+            moved_projects: Array::<String>::new(), moved_modules: Array::<String>::new(),
+            archive_files: Array::<String>::new(), problems: Array::<String>::new(),
+        };
+        for (line in declared.iterate_references()) { changes.names.push(line.name.clone()); }
+        mut archive_files: Array<String> = Array::<String>::new();
+        for (line in fixed.iterate_references()) {
+            changes.names.push(line.name.clone());
+            match (Declarations::kind(line.name.as_str())) {
+                DeclarationKind::Unit => {
+                    match (Declarations::unit_object_suffix(repository, line.name.as_str())) {
+                        Option::Some(suffix) => { changes.units.push(Pair::new(line.name.clone(), suffix)); }
+                        Option::None         => {
+                            changes.problems.push(f"{line.name.as_str()}: declared in tests/started-passing but tests/tests/{line.name.as_str()} is not a unit-test file with a namespace");
+                        }
+                    }
+                }
+                DeclarationKind::Moved        => { changes.moved_projects.push(line.name.clone()); }
+                DeclarationKind::MovedArchive => { changes.moved_modules.push(line.name.clone()); }
+                DeclarationKind::Archive      => { archive_files.push(line.name.clone()); }
+                _                             => { }
+            }
+        }
+        changes.archive_files = Text::sorted_distinct(archive_files);
+        return changes;
+    }
+}
+
+/// The populations of objects verify hashes and compares, in the order it
+/// compares them.
+public type enum ObjectPopulation {
+    /// What the census builds: the unit suite and the test projects.
+    Tests;
+    /// What the examples sweep builds.
+    Examples;
+    /// The stdlib archives the two sweeps' programs link.
+    Stdlib;
+}
+
+implement enum ObjectPopulation {
+    /// Every population, in the order compared.
+    public static all() -> Array<ObjectPopulation> {
+        mut populations: Array<ObjectPopulation> = Array::<ObjectPopulation>::new();
+        populations.push(ObjectPopulation::Tests);
+        populations.push(ObjectPopulation::Examples);
+        populations.push(ObjectPopulation::Stdlib);
+        return populations;
+    }
+
+    /// The population's name in the report and in its lists' file names.
+    public name(&this) -> Str {
+        return match (this) {
+            ObjectPopulation::Tests    => { Str::new("tests") }
+            ObjectPopulation::Examples => { Str::new("examples") }
+            ObjectPopulation::Stdlib   => { Str::new("stdlib") }
+        };
+    }
+
+    /// Whether this is the stdlib archives' population.
+    public is_stdlib(&this) -> boolean {
+        return match (this) { ObjectPopulation::Stdlib => { true } _ => { false } };
+    }
+
+    /// The baseline's list of the population's objects in the run
+    /// directory `run`.
+    public baseline_list(&this, run: Str) -> String {
+        return f"{run}/baseline/base.{this.name()}.sha256";
+    }
+
+    /// The tree's list of the population's objects in the run directory
+    /// `run`.
+    public tree_list(&this, run: Str) -> String {
+        return f"{run}/tree.{this.name()}.sha256";
+    }
+}
+
+/// What a comparison found: the lines it reports, the problems with the
+/// declared moves, and how many objects differ (moved, or in one run
+/// only, not counting those the tree takes from the archive).
+public type struct Compared {
+    public lines: Array<String>;
+    public problems: Array<String>;
+    public changed: i64;
+}
+
+/// verify's comparison of the baseline's objects with the tree's.
+public type struct ObjectComparison {
+    /// An object list's text, one `<sha256 digest>  <path>` row per line,
+    /// as a map from path to digest.
+    public static read_list(text: Str) -> HashMap<String, String> {
+        mut hashes: HashMap<String, String> = HashMap::<String, String>::new();
+        const lines: Array<String> = Text::lines(text);
+        for (line in lines.iterate_references()) {
+            const row: Str = line.as_str();
+            if (row.is_empty()) { continue; }
+            const path: Str = if (row.length() > 66) { row.byte_substring(66, row.length()) } else { Str::new("") };
+            const digest: Str = if (row.length() > 64) { row.byte_substring(0, 64) } else { row };
+            hashes.insert(String::from_str(path), String::from_str(digest));
+        }
+        return hashes;
+    }
+
+    /// Every population's comparison against the baseline built from
+    /// `revision`: `baseline` and `tree` hold the maps of each population
+    /// of `ObjectPopulation::all()`, in that order, read from the lists in
+    /// the run directory `run`.  An object only the baseline has is one the
+    /// tree takes from the archive when the tree's programs linked one.
+    /// The `archive:` declarations are judged by the archive's moves last.
+    public static against(revision: Str, changes: &DeclaredChanges, baseline: Array<HashMap<String, String>>,
+                          tree: Array<HashMap<String, String>>, limit: i64, run: Str) -> Compared {
+        mut compared: Compared = Compared { lines: Array::<String>::new(), problems: Array::<String>::new(), changed: 0 };
+        for (problem in changes.problems.iterate_references()) { compared.problems.push(problem.clone()); }
+        compared.lines.push(f"verify: objects against {revision}");
+        const populations: Array<ObjectPopulation> = ObjectPopulation::all();
+        mut archive_linked: boolean = false;
+        for (mut i: i64 = 0; i < populations.length(); i++) {
+            if (populations[i].is_stdlib() && !tree[i].is_empty()) { archive_linked = true; }
+        }
+        mut archive_changed: i64 = 0;
+        for (mut i: i64 = 0; i < populations.length(); i++) {
+            const baseline_list: String = populations[i].baseline_list(run);
+            const tree_list: String = populations[i].tree_list(run);
+            const changed: i64 = ObjectComparison::population(&populations[i], baseline[i].clone(), tree[i].clone(), changes,
+                archive_linked, limit, baseline_list.as_str(), tree_list.as_str(), &compared);
+            compared.changed = compared.changed + changed;
+            if (populations[i].is_stdlib()) { archive_changed = changed; }
+        }
+        const archive_problems: Array<String> = VerifyJudges::archive_moves(&changes.archive_files, archive_changed);
+        for (problem in archive_problems.iterate_references()) { compared.problems.push(problem.clone()); }
+        return compared;
+    }
+
+    /// One population's comparison, its lines and problems added to
+    /// `compared`; the count of objects that differ.  The declared unit-test
+    /// objects and `moved:` projects are judged in the tests, the
+    /// `moved-archive:` modules in the stdlib; the declared projects' and
+    /// examples' objects are left out; and in the stdlib, an archive only
+    /// one run built came from a gate only that run ran, and is left out.
+    static population(population: &ObjectPopulation, baseline: HashMap<String, String>, tree: HashMap<String, String>,
+                      changes: &DeclaredChanges, archive_linked: boolean, limit: i64, baseline_list: Str, tree_list: Str,
+                      compared: mut &Compared) -> i64 {
+        const tag: Str = population.name();
+        mut a: HashMap<String, String> = baseline;
+        mut b: HashMap<String, String> = tree;
+        const tests: boolean = match (population) { ObjectPopulation::Tests => { true } _ => { false } };
+        const stdlib: boolean = population.is_stdlib();
+        if (tests && !changes.units.is_empty()) {
+            const found: Array<String> = VerifyJudges::unit_moves(&changes.units, &a, &b);
+            compared.lines.push(f"  {tag:<9} declared unit-test objects left out: {changes.units.length()}, {found.length()} problem(s)");
+            for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+        }
+        if (tests && !changes.moved_projects.is_empty()) {
+            const found: Array<String> = VerifyJudges::project_moves(&changes.moved_projects, &a, &b);
+            compared.lines.push(f"  {tag:<9} declared moved projects left out: {changes.moved_projects.length()}, {found.length()} problem(s)");
+            for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+        }
+        mut prefixes: Array<String> = Array::<String>::new();
+        for (name in changes.names.iterate_references()) {
+            match (Declarations::kind(name.as_str())) {
+                DeclarationKind::Example => { prefixes.push(f"{name.as_str()}/"); }
+                DeclarationKind::Project => { prefixes.push(f"tests/tests/projects/{name.as_str()}/"); }
+                _                        => { }
+            }
+        }
+        if (!prefixes.is_empty()) {
+            const dropped_a: Array<String> = ObjectComparison::paths_under(&a, &prefixes);
+            const dropped_b: Array<String> = ObjectComparison::paths_under(&b, &prefixes);
+            for (path in dropped_a.iterate_references()) { a.remove(path); }
+            for (path in dropped_b.iterate_references()) { b.remove(path); }
+            if (!dropped_a.is_empty() || !dropped_b.is_empty()) {
+                compared.lines.push(f"  {tag:<9} declared projects' objects left out: baseline {dropped_a.length()}, tree {dropped_b.length()}");
+            }
+        }
+        if (stdlib) {
+            mut unpaired: i64 = 0;
+            mut paired_a: HashMap<String, String> = HashMap::<String, String>::new();
+            mut paired_b: HashMap<String, String> = HashMap::<String, String>::new();
+            const archives_a: Array<String> = ObjectComparison::archives(&a);
+            const archives_b: Array<String> = ObjectComparison::archives(&b);
+            for (entry in a.entries()) {
+                if (archives_b.contains(&ObjectComparison::archive_of(entry.first.as_str()))) {
+                    paired_a.insert(entry.first.clone(), entry.second.clone());
+                } else {
+                    unpaired++;
+                }
+            }
+            for (entry in b.entries()) {
+                if (archives_a.contains(&ObjectComparison::archive_of(entry.first.as_str()))) {
+                    paired_b.insert(entry.first.clone(), entry.second.clone());
+                } else {
+                    unpaired++;
+                }
+            }
+            a = paired_a;
+            b = paired_b;
+            if (unpaired > 0) {
+                compared.lines.push(f"  {tag:<9} archive objects of a stdlib root only one run used, left out: {unpaired}");
+            }
+            if (!changes.moved_modules.is_empty()) {
+                const found: Array<String> = VerifyJudges::archive_module_moves(&changes.moved_modules, &a, &b);
+                compared.lines.push(f"  {tag:<9} declared moved modules left out: {changes.moved_modules.length()}, {found.length()} problem(s)");
+                for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+            }
+        }
+        mut moved: Array<String> = Array::<String>::new();
+        mut only_a: Array<String> = Array::<String>::new();
+        mut replaced: Array<String> = Array::<String>::new();
+        mut only_b: Array<String> = Array::<String>::new();
+        for (entry in a.entries()) {
+            const path: String = entry.first.clone();
+            match (b.get_reference(&path)) {
+                Option::Some(digest) => { if (digest.as_str() != entry.second.as_str()) { moved.push(path.clone()); } }
+                Option::None         => {
+                    if (ObjectOwner::replaced_by_archive(path.as_str(), archive_linked)) { replaced.push(path.clone()); }
+                    else { only_a.push(path.clone()); }
+                }
+            }
+        }
+        for (entry in b.entries()) {
+            const path: String = entry.first.clone();
+            if (!a.contains_key(&path)) { only_b.push(path.clone()); }
+        }
+        const moved_sorted: Array<String> = Text::sorted_distinct(moved);
+        const only_a_sorted: Array<String> = Text::sorted_distinct(only_a);
+        const only_b_sorted: Array<String> = Text::sorted_distinct(only_b);
+        compared.lines.push(f"  {tag:<9} baseline {a.length():>5}  tree {b.length():>5}  moved {moved_sorted.length()}  only-baseline {only_a_sorted.length()}  only-tree {only_b_sorted.length()}  replaced by the archive {replaced.length()}");
+        ObjectComparison::list(Str::new("moved"), &moved_sorted, limit, baseline_list, tree_list, compared);
+        ObjectComparison::list(Str::new("only-baseline"), &only_a_sorted, limit, baseline_list, tree_list, compared);
+        ObjectComparison::list(Str::new("only-tree"), &only_b_sorted, limit, baseline_list, tree_list, compared);
+        return moved_sorted.length() + only_a_sorted.length() + only_b_sorted.length();
+    }
+
+    /// The first `limit` of `paths` under `label`, then how many more
+    /// there are and where the full lists are.
+    static list(label: Str, paths: &Array<String>, limit: i64, baseline_list: Str, tree_list: Str, compared: mut &Compared) -> void {
+        for (mut i: i64 = 0; i < paths.length() && i < limit; i++) {
+            compared.lines.push(f"      {label:<13} {paths[i].as_str()}");
+        }
+        if (paths.length() > limit) {
+            compared.lines.push(f"      ... {paths.length() - limit} more {label} (full lists: {baseline_list}, {tree_list})");
+        }
+    }
+
+    /// The paths of `hashes` that start with one of `prefixes`.
+    static paths_under(hashes: &HashMap<String, String>, prefixes: &Array<String>) -> Array<String> {
+        mut paths: Array<String> = Array::<String>::new();
+        for (entry in hashes.entries()) {
+            for (prefix in prefixes.iterate_references()) {
+                if (entry.first.as_str().starts_with(&prefix.as_str())) { paths.push(entry.first.clone()); break; }
+            }
+        }
+        return paths;
+    }
+
+    /// The archive an archive object's path names: its second and third
+    /// components, `<triple>/<options>`, of
+    /// `stdlib-archive/<triple>/<options>/...`.
+    public static archive_of(path: Str) -> String {
+        mut parts: Array<Str> = Array::<Str>::new();
+        for (part in path.split(&Str::new("/"))) { parts.push(part); }
+        mut archive: String = String::new();
+        for (mut i: i64 = 1; i < parts.length() && i < 3; i++) {
+            if (i > 1) { archive.push('/'); }
+            archive.push(parts[i]);
+        }
+        return archive;
+    }
+
+    /// The archives the paths of `hashes` name.
+    static archives(hashes: &HashMap<String, String>) -> Array<String> {
+        mut archives: Array<String> = Array::<String>::new();
+        for (entry in hashes.entries()) { archives.push(ObjectComparison::archive_of(entry.first.as_str())); }
+        return Text::sorted_distinct(archives);
+    }
+}
+
+/// One program's record of a baseline run: its verdict; the unit suite's
+/// failed tests, counts and build warnings when it is the unit suite; and
+/// its objects, as `<sha256 digest>  <path>` rows.
+public type struct BaselineRecord {
+    public name: String;
+    public verdict: String;
+    public unit_failed: Array<String>;
+    /// passed, failed, ignored and filtered, when the record has them.
+    public unit_counts: Option<Array<i64>>;
+    public warnings: Array<String>;
+    public rows: Array<String>;
+
+    /// A record of `name` with `verdict` and nothing else.
+    public static new(name: Str, verdict: Str) -> BaselineRecord {
+        return BaselineRecord {
+            name: String::from_str(name), verdict: String::from_str(verdict), unit_failed: Array::<String>::new(),
+            unit_counts: Option::None, warnings: Array::<String>::new(), rows: Array::<String>::new(),
+        };
+    }
+
+    /// A record file's text read back: a tag and its value per line,
+    /// `name`, `verdict`, `unit-failed`, `unit-counts` (four numbers),
+    /// `warning` and `row`.
+    public static read(text: Str) -> BaselineRecord {
+        mut record: BaselineRecord = BaselineRecord::new(Str::new(""), Str::new(""));
+        const lines: Array<String> = Text::lines(text);
+        for (line in lines.iterate_references()) {
+            const tag: Str = match (line.as_str().split_once(&Str::new(" "))) {
+                Option::Some(parts) => { parts.first }
+                Option::None        => { line.as_str() }
+            };
+            const value: Str = match (line.as_str().split_once(&Str::new(" "))) {
+                Option::Some(parts) => { parts.second }
+                Option::None        => { Str::new("") }
+            };
+            if (tag == Str::new("name")) { record.name = String::from_str(value); }
+            if (tag == Str::new("verdict")) { record.verdict = String::from_str(value); }
+            if (tag == Str::new("unit-failed")) { record.unit_failed.push(String::from_str(value)); }
+            if (tag == Str::new("warning")) { record.warnings.push(String::from_str(value)); }
+            if (tag == Str::new("row")) { record.rows.push(String::from_str(value)); }
+            if (tag == Str::new("unit-counts")) {
+                mut counts: Array<i64> = Array::<i64>::new();
+                for (number in value.split_whitespace()) { counts.push(i64::try_from(number).unwrap_or(0)); }
+                record.unit_counts = Option::Some(counts);
+            }
+        }
+        return record;
+    }
+
+    /// The records the programs `names` get from one baseline census run:
+    /// its output `lines` and the object rows it left.  A project's or a
+    /// compile-fail file's verdict is its line's (`ok` once reached,
+    /// `FAILED` when it failed); a program with no verdict line gets no
+    /// record.  The unit suite gets one when the run accounted for it -
+    /// every unit test the roster pins on this host (`unit_pinned`) ran, by
+    /// name, and no other - with the tests that failed before the first
+    /// summary and the warnings printed there, its build's.  Each row goes
+    /// to the record of the program that owns its object.
+    public static of_census(lines: &Array<String>, names: &Array<String>, rows: &Array<String>,
+                            unit_pinned: &Array<String>) -> Array<BaselineRecord> {
+        mut verdicts: HashMap<String, String> = HashMap::<String, String>::new();
+        for (line in lines.iterate_references()) {
+            match (BaselineRecord::verdict_line(line.as_str(), Str::new("project"))) {
+                Option::Some(seen) => { verdicts.insert(String::from_str(seen.first), String::from_str(Str::new("ok"))); }
+                Option::None       => { }
+            }
+            match (BaselineRecord::verdict_line(line.as_str(), Str::new("negative"))) {
+                Option::Some(seen) => { verdicts.insert(f"negative/{seen.first}", String::from_str(Str::new("ok"))); }
+                Option::None       => { }
+            }
+        }
+        for (line in lines.iterate_references()) {
+            match (BaselineRecord::verdict_line(line.as_str(), Str::new("project"))) {
+                Option::Some(seen) => { if (seen.second) { verdicts.insert(String::from_str(seen.first), String::from_str(Str::new("FAILED"))); } }
+                Option::None       => { }
+            }
+            match (BaselineRecord::verdict_line(line.as_str(), Str::new("negative"))) {
+                Option::Some(seen) => { if (seen.second) { verdicts.insert(f"negative/{seen.first}", String::from_str(Str::new("FAILED"))); } }
+                Option::None       => { }
+            }
+        }
+        mut records: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+        const unit_suite: String = String::from_str(Str::new("unit suite"));
+        for (name in names.iterate_references()) {
+            if (name.as_str() == unit_suite.as_str()) {
+                const reading: CensusReading = CensusReading::of(lines);
+                const ran: Array<String> = Text::sorted_distinct(reading.unit_names.clone());
+                const pinned: Array<String> = Text::sorted_distinct(unit_pinned.clone());
+                if (!reading.unit.printed || ran != pinned) { continue; }
+                mut failed: Array<String> = Array::<String>::new();
+                for (mut i: i64 = 0; i < lines.length() && i < reading.first_summary; i++) {
+                    match (BaselineRecord::failed_unit(lines[i].as_str())) {
+                        Option::Some(test) => { failed.push(String::from_str(test)); }
+                        Option::None       => { }
+                    }
+                }
+                const failed_sorted: Array<String> = Text::sorted_distinct(failed);
+                mut record: BaselineRecord = BaselineRecord::new(unit_suite.as_str(),
+                    if (failed_sorted.is_empty()) { Str::new("ok") } else { Str::new("FAILED") });
+                record.unit_failed = failed_sorted;
+                mut counts: Array<i64> = Array::<i64>::new();
+                counts.push(reading.unit.passed);
+                counts.push(reading.unit.failed);
+                counts.push(reading.unit.ignored);
+                counts.push(reading.unit.filtered);
+                record.unit_counts = Option::Some(counts);
+                record.warnings = Text::sorted_distinct(reading.warnings.clone());
+                records.push(record);
+                continue;
+            }
+            match (verdicts.get_reference(name)) {
+                Option::Some(verdict) => { records.push(BaselineRecord::new(name.as_str(), verdict.as_str())); }
+                Option::None          => { }
+            }
+        }
+        for (row in rows.iterate_references()) {
+            const text: Str = row.as_str();
+            const path: Str = if (text.length() > 66) { text.byte_substring(66, text.length()) } else { Str::new("") };
+            const owner: String = match (ObjectOwner::of(path)) {
+                Option::Some(owner) => { owner }
+                Option::None        => { continue; }
+            };
+            for (mut i: i64 = 0; i < records.length(); i++) {
+                if (records[i].name.as_str() == owner.as_str()) { records[i].rows.push(row.clone()); }
+            }
+        }
+        return records;
+    }
+
+    /// The first field in which `other` differs from this record, rows
+    /// compared as sets; none when the two agree.
+    public difference(&this, other: &BaselineRecord) -> Option<String> {
+        if (this.verdict.as_str() != other.verdict.as_str()) {
+            return Option::Some(f"verdict {this.verdict.as_str()}, derived {other.verdict.as_str()}");
+        }
+        if (this.unit_failed != other.unit_failed) { return Option::Some(String::from_str(Str::new("unit-failed"))); }
+        if (this.unit_counts != other.unit_counts) { return Option::Some(String::from_str(Str::new("unit-counts"))); }
+        if (this.warnings != other.warnings) { return Option::Some(String::from_str(Str::new("warnings"))); }
+        const rows: Array<String> = Text::sorted_distinct(this.rows.clone());
+        const other_rows: Array<String> = Text::sorted_distinct(other.rows.clone());
+        if (rows != other_rows) {
+            return Option::Some(f"rows {rows.length()}, derived {other_rows.length()}");
+        }
+        return Option::None;
+    }
+
+    /// A census verdict line of `suite` (`project` or `negative`),
+    /// `test (<suite>) <name> ...`, at the line's very start: its name, and
+    /// whether the verdict is `FAILED`.
+    static verdict_line(line: Str, suite: Str) -> Option<Pair<Str, boolean>> {
+        const opening: String = f"test ({suite}) ";
+        const rest: Str = match (line.strip_prefix(&opening.as_str())) {
+            Option::Some(rest) => { rest }
+            Option::None       => { return Option::None; }
+        };
+        const parts: Pair<Str, Str> = match (rest.split_once(&Str::new(" "))) {
+            Option::Some(parts) => { parts }
+            Option::None        => { return Option::None; }
+        };
+        if (parts.first.is_empty() || !parts.second.starts_with(&Str::new("..."))) { return Option::None; }
+        return Option::Some(Pair::new(parts.first, parts.second.starts_with(&Str::new("... FAILED"))));
+    }
+
+    /// A failed unit test's line, `FAIL  <namespace>::<test>`, at the
+    /// line's very start: the test's full name.
+    static failed_unit(line: Str) -> Option<Str> {
+        const rest: Str = match (line.strip_prefix(&Str::new("FAIL"))) {
+            Option::Some(rest) => { rest }
+            Option::None       => { return Option::None; }
+        };
+        const spaced: boolean = match (rest.byte_at(0)) {
+            Option::Some(byte) => { byte.is_whitespace() }
+            Option::None       => { false }
+        };
+        if (!spaced) { return Option::None; }
+        for (name in rest.split_whitespace()) {
+            for (mut i: i64 = 1; i + 2 < name.length(); i++) {
+                if (name.byte_substring(i, i + 2) == Str::new("::")) { return Option::Some(name); }
+            }
+            return Option::None;
+        }
+        return Option::None;
     }
 }

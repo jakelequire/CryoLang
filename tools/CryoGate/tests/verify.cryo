@@ -14,7 +14,12 @@ import std::test::assert::{ expect, expect_equal };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 
-import cryogate::gates::verify::{ BaselineCensus, Declaration, Declarations, DeclarationKind, ObjectOwner, VerifyJudges };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::host::{ Host };
+import cryogate::core::text::{ Text };
+import cryogate::gates::verify::{ BaselineCensus, BaselineRecord, Compared, DeclaredChanges, Declaration, Declarations,
+                                  DeclarationKind, ObjectComparison, ObjectOwner, VerifyJudges };
 
 /// The judges' inputs written as text: a list as names joined by `,`, a
 /// map as `key=value` entries joined by `;`.  Each answers how many
@@ -70,6 +75,197 @@ type struct Judged {
     static new_warnings(base: Str, tree: Str) -> i64 {
         return VerifyJudges::new_warnings(&Judged::list(base), &Judged::list(tree)).length();
     }
+
+    static builds(base_exit: i32, base_output: Str, tree_exit: i32, tree_output: Str, fixed: boolean) -> i64 {
+        return VerifyJudges::builds(Str::new("p"), base_exit, base_output, tree_exit, tree_output, fixed).length();
+    }
+
+    /// The records a census run's `lines` (joined by `|`) give `names`,
+    /// each as `name=verdict:rows` joined by `;`, in the order of `names`.
+    static records(lines: Str, names: Str, rows: Str) -> String {
+        mut output: Array<String> = Array::<String>::new();
+        for (line in lines.split_nonempty(&Str::new("|"))) { output.push(String::from_str(line)); }
+        const records: Array<BaselineRecord> = BaselineRecord::of_census(&output, &Judged::list(names),
+            &Judged::list(rows), &Array::<String>::new());
+        mut shown: Array<String> = Array::<String>::new();
+        for (record in records.iterate_references()) {
+            shown.push(f"{record.name.as_str()}={record.verdict.as_str()}:{record.rows.length()}");
+        }
+        return Text::joined(&shown, Str::new(";"));
+    }
+}
+
+/// The checkout the test binary was built in, for the cases that read the
+/// real tree.
+type struct Checkout {
+    static root() -> Result<PathBuf, TestError> {
+        return match (Host::repository()) {
+            Result::Ok(root)    => { Result::Ok(root) }
+            Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
+        };
+    }
+}
+
+![test]
+function a_started_compiling_project_is_refused_by_the_baseline_and_built_by_the_tree() -> Result<(), TestError> {
+    expect_equal(Judged::builds(1, Str::new("error[E0203]: x"), 0, Str::new(""), false), 0)?;
+    expect_equal(Judged::builds(0, Str::new(""), 0, Str::new(""), false), 1)?;
+    expect_equal(Judged::builds(3, Str::new("segfault"), 0, Str::new(""), false), 1)?;
+    return expect_equal(Judged::builds(1, Str::new("error[E0203]: x"), 1, Str::new("error[E0203]: x"), false), 1);
+}
+
+![test]
+function a_started_passing_project_builds_are_not_judged() -> Result<(), TestError> {
+    expect_equal(Judged::builds(0, Str::new(""), 0, Str::new(""), true), 0)?;
+    return expect_equal(Judged::builds(1, Str::new("error[E0900]: x"), 1, Str::new("error[E0900]: x"), true), 0);
+}
+
+![test]
+function only_a_whole_error_code_is_a_refusal() -> Result<(), TestError> {
+    expect_equal(Judged::builds(1, Str::new("note: error[E12]: x"), 0, Str::new(""), false), 1)?;
+    expect_equal(Judged::builds(1, Str::new("error[Exxxx] error[E1234 error[E0001]"), 0, Str::new(""), false), 0)?;
+    return expect_equal(Judged::builds(1, Str::new("warning[W0001]: x"), 0, Str::new(""), false), 1);
+}
+
+![test]
+function a_census_run_records_a_failed_project_and_a_passing_negative_file() -> Result<(), TestError> {
+    const zeros: String = Str::new("0").repeat(64);
+    const ones: String = Str::new("1").repeat(64);
+    const rows: String = f"{zeros.as_str()}  tests/tests/projects/p/build/a.o,{ones.as_str()}  tests/tests/projects/q/build/b.o";
+    const shown: String = Judged::records(Str::new("test (project) p ... FAILED (exit 1, expected 0)|test (negative) E1_x.cryo ... ok"),
+        Str::new("p,negative/E1_x.cryo"), rows.as_str());
+    return expect_equal(shown.as_str(), Str::new("p=FAILED:1;negative/E1_x.cryo=ok:0"));
+}
+
+![test]
+function a_program_the_run_printed_no_verdict_for_has_no_record() -> Result<(), TestError> {
+    const shown: String = Judged::records(Str::new("test (project) other ... ok"), Str::new("p"), Str::new(""));
+    expect_equal(shown.as_str(), Str::new(""))?;
+    const indented: String = Judged::records(Str::new(" test (project) p ... ok"), Str::new("p"), Str::new(""));
+    return expect_equal(indented.as_str(), Str::new(""));
+}
+
+![test]
+function a_record_file_reads_back_every_field() -> Result<(), TestError> {
+    const record: BaselineRecord = BaselineRecord::read(Str::new(
+        "name unit suite\nverdict FAILED\nunit-failed A::U::t\nunit-counts 5 1 0 2\nwarning W0001 ./a.cryo:3\nrow d  tests/build/x.o\n"));
+    expect_equal(record.name.as_str(), Str::new("unit suite"))?;
+    expect_equal(record.verdict.as_str(), Str::new("FAILED"))?;
+    expect_equal(record.unit_failed.length(), 1)?;
+    expect_equal(record.warnings[0].as_str(), Str::new("W0001 ./a.cryo:3"))?;
+    expect_equal(record.rows[0].as_str(), Str::new("d  tests/build/x.o"))?;
+    const counts: Array<i64> = record.unit_counts.unwrap_or(Array::<i64>::new());
+    return expect(counts.length() == 4 && counts[0] == 5 && counts[3] == 2, Str::new("unit-counts 5 1 0 2"));
+}
+
+![test]
+function another_projects_moved_object_is_still_compared() -> Result<(), TestError> {
+    const p: Str = Str::new("tests/tests/projects/p/");
+    const q: Str = Str::new("tests/tests/projects/q/");
+    mut left: HashMap<String, String> = Judged::map(f"{p}a.o=1;{q}a.o=1".as_str());
+    mut right: HashMap<String, String> = Judged::map(f"{p}a.o=2;{q}a.o=2".as_str());
+    expect_equal(VerifyJudges::project_moves(&Judged::list(Str::new("moved:p")), &left, &right).length(), 0)?;
+    const kept: String = f"{q}a.o";
+    return expect(left.length() == 1 && right.length() == 1 && left.contains_key(&kept) && right.contains_key(&kept),
+        Str::new("only the declared project's objects are removed"));
+}
+
+![test]
+function a_moved_archive_module_needs_its_source_below_std() -> Result<(), TestError> {
+    const root: PathBuf = Checkout::root()?;
+    expect(Declarations::archive_module_source(root.as_path(), Str::new("moved-archive:std::no_such_module_here")).is_none(),
+        Str::new("no such module"))?;
+    expect(Declarations::archive_module_source(root.as_path(), Str::new("moved-archive:fmt::display")).is_none(),
+        Str::new("not below std::"))?;
+    return expect(Declarations::archive_module_source(root.as_path(), Str::new("moved-archive:std::time::clock")).is_some(),
+        Str::new("std::time::clock"));
+}
+
+![test]
+function a_unit_test_file_names_its_object_by_its_namespace() -> Result<(), TestError> {
+    const root: PathBuf = Checkout::root()?;
+    const suffix: String = Declarations::unit_object_suffix(root.as_path(), Str::new("archive:lang/slice_reference_two_words.cryo"))
+        .unwrap_or(String::new());
+    expect_equal(suffix.as_str(), Str::new("/deps/CryoTests/Tests/Lang/SliceReferenceTwoWords.o"))?;
+    return expect(Declarations::unit_object_suffix(root.as_path(), Str::new("lang/no_such_file_here.cryo")).is_none(),
+        Str::new("no such file"));
+}
+
+/// A comparison over maps written as `Judged::map` text, the populations
+/// in the order tests, examples, stdlib.
+type struct Comparing {
+    static of(changes: &DeclaredChanges, baseline: Array<Str>, tree: Array<Str>, limit: i64) -> Compared {
+        mut a: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
+        mut b: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
+        for (text in baseline.iterate_references()) { a.push(Judged::map(*text)); }
+        for (text in tree.iterate_references()) { b.push(Judged::map(*text)); }
+        return ObjectComparison::against(Str::new("HEAD"), changes, a, b, limit, Str::new("run"));
+    }
+
+    static nothing_declared() -> DeclaredChanges {
+        return DeclaredChanges {
+            names: Array::<String>::new(), units: Array::<Pair<String, String>>::new(),
+            moved_projects: Array::<String>::new(), moved_modules: Array::<String>::new(),
+            archive_files: Array::<String>::new(), problems: Array::<String>::new(),
+        };
+    }
+
+    static three(tests: Str, examples: Str, stdlib: Str) -> Array<Str> {
+        mut out: Array<Str> = Array::<Str>::new();
+        out.push(tests);
+        out.push(examples);
+        out.push(stdlib);
+        return out;
+    }
+}
+
+![test]
+function the_comparison_reports_each_population_as_verify_does() -> Result<(), TestError> {
+    const changes: DeclaredChanges = Comparing::nothing_declared();
+    const compared: Compared = Comparing::of(&changes,
+        Comparing::three(Str::new("t/build/a.o=1;t/build/b.o=1;t/build/x/std/deps/std/io.o=1"), Str::new(""),
+            Str::new("stdlib-archive/w/O0/x.o=1;stdlib-archive/w/O2/x.o=1")),
+        Comparing::three(Str::new("t/build/a.o=2;t/build/c.o=1"), Str::new(""),
+            Str::new("stdlib-archive/w/O0/x.o=1")), 1);
+    const shown: String = Text::joined(&compared.lines, Str::new("\n"));
+    expect_equal(shown.as_str(), Str::new(
+        "verify: objects against HEAD\n"
+        "  tests     baseline     3  tree     2  moved 1  only-baseline 1  only-tree 1  replaced by the archive 1\n"
+        "      moved         t/build/a.o\n"
+        "      only-baseline t/build/b.o\n"
+        "      only-tree     t/build/c.o\n"
+        "  examples  baseline     0  tree     0  moved 0  only-baseline 0  only-tree 0  replaced by the archive 0\n"
+        "  stdlib    archive objects of a stdlib root only one run used, left out: 1\n"
+        "  stdlib    baseline     1  tree     1  moved 0  only-baseline 0  only-tree 0  replaced by the archive 0"))?;
+    return expect_equal(compared.changed, 3);
+}
+
+![test]
+function a_long_list_names_how_many_more_and_where() -> Result<(), TestError> {
+    const changes: DeclaredChanges = Comparing::nothing_declared();
+    const compared: Compared = Comparing::of(&changes,
+        Comparing::three(Str::new("a.o=1;b.o=1;c.o=1"), Str::new(""), Str::new("")),
+        Comparing::three(Str::new("a.o=2;b.o=2;c.o=2"), Str::new(""), Str::new("")), 2);
+    return expect_equal(compared.lines[4].as_str(),
+        Str::new("      ... 1 more moved (full lists: run/baseline/base.tests.sha256, run/tree.tests.sha256)"));
+}
+
+![test]
+function a_declared_projects_objects_are_left_out_of_the_comparison() -> Result<(), TestError> {
+    mut changes: DeclaredChanges = Comparing::nothing_declared();
+    changes.names.push(String::from_str(Str::new("p")));
+    changes.names.push(String::from_str(Str::new("examples/e")));
+    changes.archive_files.push(String::from_str(Str::new("archive:lang/u.cryo")));
+    const compared: Compared = Comparing::of(&changes,
+        Comparing::three(Str::new("tests/tests/projects/p/build/a.o=1;tests/tests/projects/pq/build/a.o=1"),
+            Str::new("examples/e/build/m.o=1"), Str::new("")),
+        Comparing::three(Str::new("tests/tests/projects/p/build/a.o=2;tests/tests/projects/pq/build/a.o=1"),
+            Str::new("examples/e/build/m.o=2"), Str::new("")), 40);
+    expect_equal(compared.lines[1].as_str(), Str::new("  tests     declared projects' objects left out: baseline 1, tree 1"))?;
+    expect_equal(compared.lines[3].as_str(), Str::new("  examples  declared projects' objects left out: baseline 1, tree 1"))?;
+    expect_equal(compared.changed, 0)?;
+    // No archive object moved, so the file declared through the archive is a problem.
+    return expect_equal(compared.problems.length(), 1);
 }
 
 ![test]
