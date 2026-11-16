@@ -1,0 +1,232 @@
+///! cryosmith - a seeded generator of random, valid, deterministic Cryo
+///! programs, for differential testing of the compiler.
+///!
+///! `cryosmith <command> [options]`; `cryosmith help` lists the commands.
+///! DESIGN.md beside this tool states what a generated program guarantees.
+
+namespace cryosmith::main;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::convert::{ TryFrom };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env;
+import std::env::arguments::{ ArgumentParser, ParsedArguments };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ PathBuf };
+
+import cryosmith::corpus::{ CorpusCheck };
+import cryosmith::features::{ Feature, FeatureSet };
+import cryosmith::generator::{ GENERATOR_VERSION, GenerationOptions, Generator, Plant };
+import cryosmith::printer::{ Printer };
+import cryosmith::selftest::{ SelfTest };
+
+function main() -> i32 {
+    const arguments: Array<String> = env::args();
+    if (arguments.length() < 2) {
+        Main::usage();
+        return 2;
+    }
+    const command: Str = arguments.get_reference(1).unwrap().as_str();
+    const rest: Array<String> = Main::after_command(&arguments);
+    if (command == Str::new("generate")) { return Main::generate(&rest); }
+    if (command == Str::new("batch")) { return Main::batch(&rest); }
+    if (command == Str::new("features")) { return Main::features(); }
+    if (command == Str::new("version")) { fmt::println(f"cryosmith {GENERATOR_VERSION}"); return 0; }
+    if (command == Str::new("selftest")) { return SelfTest::run(); }
+    if (command == Str::new("corpus-check")) { return CorpusCheck::run(&rest); }
+    if (command == Str::new("help")) { Main::usage(); return 0; }
+    fmt::eprintln(f"cryosmith: unknown command `{command}`");
+    Main::usage();
+    return 2;
+}
+
+type struct Main {
+    static usage() -> void {
+        fmt::eprintln(String::from_str(Str::new(
+            "usage: cryosmith <command> [options]\n\n"
+            "  generate --seed N [generation options] [--out FILE]\n"
+            "                      write one program, to FILE or standard output\n"
+            "  batch --first-seed N --count K --out-dir DIR [generation options]\n"
+            "                      write DIR/smith-<seed>.cryo for K seeds, one path\n"
+            "                      per line\n"
+            "  features            every feature, its stage, and whether `default`\n"
+            "                      holds it\n"
+            "  version             the generator version\n"
+            "  selftest            determinism, the feature switches and the static\n"
+            "                      audit, in process; builds nothing\n"
+            "  corpus-check --cryo COMPILER --work DIR [--first-seed N] [--count K]\n"
+            "               [--stdlib DIR] [generation options]\n"
+            "                      build every program at -O0 and -O2, run both, and\n"
+            "                      require one equal hash line and exit 0\n\n"
+            "generation options: --features LIST (default `default`; `no-<name>`\n"
+            "removes one), --functions N, --size N, --no-header, --plant NAME\n\n"
+            "exit codes: 0 done, 1 a file could not be written or a check failed,\n"
+            "2 a usage error")));
+    }
+
+    /// The arguments after the command's name.
+    static after_command(arguments: &Array<String>) -> Array<String> {
+        mut rest: Array<String> = Array::<String>::new();
+        mut index: i64 = 2;
+        while (index < arguments.length()) {
+            rest.push(arguments.get_reference(index).unwrap().clone());
+            index = index + 1;
+        }
+        return rest;
+    }
+
+    static generate(arguments: &Array<String>) -> i32 {
+        mut parser: ArgumentParser = ArgumentParser::new(Str::new("cryosmith generate"));
+        GenerationArguments::declare(&parser);
+        parser.option(Str::new("seed"), Option::None, Str::new("N"), Str::new("the seed"))
+            .option(Str::new("out"), Option::None, Str::new("FILE"), Str::new("where to write the program"));
+        const parsed: ParsedArguments = match (Main::parse(&parser, arguments)) {
+            Option::Some(parsed) => { parsed }
+            Option::None         => { return 2; }
+        };
+        const seed: u64 = match (GenerationArguments::number(&parsed, Str::new("seed"))) {
+            Result::Ok(Option::Some(seed)) => { seed }
+            Result::Ok(Option::None)       => { fmt::eprintln(String::from_str(Str::new("cryosmith generate: --seed is required"))); return 2; }
+            Result::Err(reason)            => { fmt::eprintln(reason); return 2; }
+        };
+        const options: GenerationOptions = match (GenerationArguments::read(&parsed, seed)) {
+            Result::Ok(options) => { options }
+            Result::Err(reason) => { fmt::eprintln(reason); return 2; }
+        };
+        const text: String = Printer::print(&Generator::generate(options), &options);
+        match (parsed.value(Str::new("out"))) {
+            Option::Some(path) => {
+                match (File::write_text(PathBuf::from(path).as_path(), text.as_str())) {
+                    Result::Ok(_)       => { return 0; }
+                    Result::Err(reason) => { fmt::eprintln(f"cryosmith: cannot write {path}: {reason}"); return 1; }
+                }
+            }
+            Option::None => { fmt::print(text); return 0; }
+        }
+    }
+
+    static batch(arguments: &Array<String>) -> i32 {
+        mut parser: ArgumentParser = ArgumentParser::new(Str::new("cryosmith batch"));
+        GenerationArguments::declare(&parser);
+        parser.option(Str::new("first-seed"), Option::None, Str::new("N"), Str::new("the first seed"))
+            .option(Str::new("count"), Option::None, Str::new("K"), Str::new("how many programs"))
+            .option(Str::new("out-dir"), Option::None, Str::new("DIR"), Str::new("where to write them"));
+        const parsed: ParsedArguments = match (Main::parse(&parser, arguments)) {
+            Option::Some(parsed) => { parsed }
+            Option::None         => { return 2; }
+        };
+        const first: u64 = match (GenerationArguments::number(&parsed, Str::new("first-seed"))) {
+            Result::Ok(value)   => { value.unwrap_or(1) }
+            Result::Err(reason) => { fmt::eprintln(reason); return 2; }
+        };
+        const count: u64 = match (GenerationArguments::number(&parsed, Str::new("count"))) {
+            Result::Ok(value)   => { value.unwrap_or(1) }
+            Result::Err(reason) => { fmt::eprintln(reason); return 2; }
+        };
+        const directory: Str = match (parsed.value(Str::new("out-dir"))) {
+            Option::Some(directory) => { directory }
+            Option::None            => { fmt::eprintln(String::from_str(Str::new("cryosmith batch: --out-dir is required"))); return 2; }
+        };
+        match (Directory::create_all(PathBuf::from(directory).as_path())) {
+            Result::Ok(_)       => { }
+            Result::Err(reason) => { fmt::eprintln(f"cryosmith: cannot create {directory}: {reason}"); return 1; }
+        }
+        mut offset: u64 = 0;
+        while (offset < count) {
+            const seed: u64 = first.wrapping_add(offset);
+            const options: GenerationOptions = match (GenerationArguments::read(&parsed, seed)) {
+                Result::Ok(options) => { options }
+                Result::Err(reason) => { fmt::eprintln(reason); return 2; }
+            };
+            mut path: PathBuf = PathBuf::from(directory);
+            path.push(f"smith-{seed}.cryo".as_str());
+            const text: String = Printer::print(&Generator::generate(options), &options);
+            match (File::write_text(path.as_path(), text.as_str())) {
+                Result::Ok(_)       => { fmt::println(f"{path.as_path().as_str()}"); }
+                Result::Err(reason) => { fmt::eprintln(f"cryosmith: cannot write {path.as_path().as_str()}: {reason}"); return 1; }
+            }
+            offset = offset + 1;
+        }
+        return 0;
+    }
+
+    static features() -> i32 {
+        const defaults: FeatureSet = FeatureSet::default_set();
+        for (feature in Feature::all().iter()) {
+            const in_default: Str = if (defaults.has(feature)) { Str::new("default") } else { Str::new("") };
+            fmt::println(f"{feature.name()} stage {feature.stage()} {in_default}");
+        }
+        return 0;
+    }
+
+    /// Parse `arguments` with `parser`; on a refusal, say why and print the
+    /// parser's help.
+    static parse(parser: &ArgumentParser, arguments: &Array<String>) -> Option<ParsedArguments> {
+        match (parser.parse(arguments.as_slice())) {
+            Result::Ok(parsed) => { return Option::Some(parsed); }
+            Result::Err(error) => {
+                fmt::eprintln(f"{error}");
+                fmt::eprint(parser.help_text());
+                return Option::None;
+            }
+        }
+    }
+}
+
+/// The options every generating command takes.
+public type struct GenerationArguments {
+    /// Declare the generation options on `parser`.
+    public static declare(parser: mut &ArgumentParser) -> void {
+        parser.option(Str::new("features"), Option::None, Str::new("LIST"), Str::new("enabled features, comma-separated"))
+            .option(Str::new("functions"), Option::None, Str::new("N"), Str::new("helper functions (default: from the seed)"))
+            .option(Str::new("size"), Option::None, Str::new("N"), Str::new("statements per function"))
+            .option(Str::new("plant"), Option::None, Str::new("NAME"), Str::new("a deliberate defect, for a check's control"))
+            .flag(Str::new("no-header"), Option::None, Str::new("leave the header comment out"));
+    }
+
+    /// The generation options `parsed` gives, for `seed`.
+    public static read(parsed: &ParsedArguments, seed: u64) -> Result<GenerationOptions, String> {
+        mut options: GenerationOptions = GenerationOptions::new(seed);
+        match (parsed.value(Str::new("features"))) {
+            Option::Some(list) => { options.features = FeatureSet::parse(list)?; }
+            Option::None       => { }
+        }
+        match (GenerationArguments::number(parsed, Str::new("functions"))?) {
+            Option::Some(count) => { options.functions = count as i64; }
+            Option::None        => { }
+        }
+        match (GenerationArguments::number(parsed, Str::new("size"))?) {
+            Option::Some(size) => { options.size = size as i64; }
+            Option::None       => { }
+        }
+        match (parsed.value(Str::new("plant"))) {
+            Option::Some(name) => {
+                match (Plant::named(name)) {
+                    Option::Some(plant) => { options.plant = plant; }
+                    Option::None        => { return Result::Err(f"unknown plant `{name}`; the plants are `none` and `unguarded-division`"); }
+                }
+            }
+            Option::None => { }
+        }
+        options.header = !parsed.flag(Str::new("no-header"));
+        return Result::Ok(options);
+    }
+
+    /// The decimal value of option `name`, if it was given.
+    public static number(parsed: &ParsedArguments, name: Str) -> Result<Option<u64>, String> {
+        match (parsed.value(name)) {
+            Option::Some(text) => {
+                return match (u64::try_from(text)) {
+                    Result::Ok(value) => { Result::Ok(Option::Some(value)) }
+                    Result::Err(_)    => { Result::Err(f"--{name} takes a decimal number, not `{text}`") }
+                };
+            }
+            Option::None => { return Result::Ok(Option::None); }
+        }
+    }
+}
