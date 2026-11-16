@@ -371,7 +371,8 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 
 | `test.json` field | Meaning |
 | --- | --- |
-| `"outcome"` | `"collect"` (default) / `"build"` / `"compile_fail"` / `"run"` |
+| `"outcome"` | `"collect"` (default) / `"build"` / `"compile_fail"` / `"run"` / `"command"` |
+| `"command"` | the compiler command a `"command"` project runs, verb first (below) |
 | `"ignore"` | `true` skips the project (reported as ignored) |
 | `"expect"` | per-outcome assertions (below) |
 | `"steps"` | commands of the compiler run before the outcome's own (below) |
@@ -422,6 +423,24 @@ from a compile-fail file instead, which is checked without the flag.
 
   ```json
   { "outcome": "run", "expect": { "exit_code": 0, "stdout_contains": "ready" } }
+  ```
+
+- **`command`** - run the compiler command `command` names (a list of
+  arguments, its verb first, as a step is written) and judge it by `expect`
+  as a build is judged: its exit, its streams and the file it writes. It gets
+  the suite's `--stdlib` and none of the build's flags. For a test of a
+  command other than `build`, `run` and `test`, above all one that must
+  refuse: a step must exit 0, so only the judged command can be expected to
+  fail. `command` is written exactly when the outcome is `command`; anything
+  else makes the file malformed.
+
+  ```json
+  {
+    "outcome": "command",
+    "steps": [["init", "build/twice", "--name=first", "--type=library"]],
+    "command": ["init", "build/twice", "--name=second", "--type=library"],
+    "expect": { "fails": true, "stderr_contains": ["already exists"] }
+  }
   ```
 
 A project whose report carries a machine-applicable suggestion proves the

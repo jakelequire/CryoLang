@@ -99,14 +99,14 @@ type struct NegDiag {
 
 /// Parsed `test.json` for a multi-module test project (see
 /// `run_projects_suite`). The FIXTURE (`outcome`: 0 = collect, 1 = build,
-/// 2 = run), with its `environment` and `arguments`, and the ASSERTIONS (the
+/// 2 = run, 3 = command), with its `environment` and `arguments`, and the ASSERTIONS (the
 /// `expect` fields) are orthogonal.
 /// `compile_fail` is a recognized alias for `build` + `fails`, and
 /// `expect.diagnostic` is sugar for `fails` + an `error[<code>]` marker in
 /// `output_contains`.
 type struct ProjSpec {
     /// FIXTURE: 0 = collect (run the project's own `cryo test`), 1 = build
-    /// (`cryo build`), 2 = run (`cryo run`).  The fixture (what is set up) and
+    /// (`cryo build`), 2 = run (`cryo run`), 3 = command (`command`).  The fixture (what is set up) and
     /// the ASSERTION (what is checked, via the `expect` fields below) are
     /// orthogonal: `compile_fail` is simply `build` + `expect.fails`.
     outcome:    i32;
@@ -144,6 +144,11 @@ type struct ProjSpec {
     /// Extra arguments (test.json `arguments`) given to the compiler after
     /// the fixture's own verb and flags.
     arguments:  [String];
+    /// The fixture of outcome 3 (test.json `command`): the compiler's
+    /// arguments, verb first, run as a step is and judged by the `expect`
+    /// fields as a build is.  Present exactly when the outcome is
+    /// `command`.
+    command:    [String];
     /// Commands of the compiler (test.json `steps`), run in order in the
     /// project's directory before the fixture's own; each must exit 0, or
     /// the project fails with that step's output and the fixture never runs.
@@ -182,7 +187,7 @@ type struct ProjSpec {
         return ProjSpec {
             outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: String::new(),
             output_contains: [], output_excludes: [], output_in_order: [], requires: [],
-            environment: [], arguments: [], steps: [], fixtures: [], stderr_contains: [], stderr_excludes: [],
+            environment: [], arguments: [], command: [], steps: [], fixtures: [], stderr_contains: [], stderr_excludes: [],
             stdout_line_prefixes: [], stderr_line_prefixes: [],
             file: String::new(), file_contains: [], file_excludes: [],
             applied: false, applied_exit_code: 0
@@ -463,6 +468,9 @@ implement enum CommandKind {
                 fmt::printf("With a [dir] argument the directory, and any missing parent, is\n");
                 fmt::printf("created and its name is offered as the default project name.\n");
                 fmt::printf("Pressing Enter at a prompt accepts the bracketed default.\n\n");
+                fmt::printf("Init never overwrites a file: in a directory that already has a\n");
+                fmt::printf("cryoconfig it asks nothing and writes nothing, and it stops before\n");
+                fmt::printf("writing a source file that is already there.\n\n");
                 fmt::printf("Flags (each answers its prompt, so giving all four reads nothing):\n");
                 fmt::printf("  --name=NAME         The project name\n");
                 fmt::printf("  --type=TYPE         executable or library\n");
@@ -1165,6 +1173,9 @@ type struct Executor {
     /// With no positional argument, scaffolds in the current directory.
     /// With `cryo init <dir>`, the directory and any missing parent are
     /// created, and the directory's own name is the default project name.
+    /// A file already there is never overwritten: an existing cryoconfig
+    /// stops init before it asks anything, an existing source file before
+    /// it writes anything.
     static cmd_init(args: cli::ParsedArgs) -> int {
         const has_positional: boolean = args.positional_count() > 0;
         const target_dir: string = if (has_positional) {
@@ -1172,6 +1183,10 @@ type struct Executor {
         } else {
             "."
         };
+        // A directory that is already a project keeps its cryoconfig: init
+        // asks nothing and writes nothing there.
+        const config_path: path::PathBuf = path::Path::from(Str::new(target_dir)).join("cryoconfig");
+        if (!Executor::refuse_existing_scaffold_file(config_path.as_path())) { return 1; }
         if (target_dir != ".") {
             match (Directory::create_all(path::Path::from(Str::new(target_dir)))) {
                 Result::Ok(_)  => { }
@@ -1238,9 +1253,9 @@ type struct Executor {
         } else {
             Executor::program_source(ns_name.as_str())
         };
+        if (!Executor::refuse_existing_scaffold_file(source_path.as_path())) { return 1; }
         if (!Executor::write_scaffold_file(source_path.as_path(), source_text.as_str())) { return 1; }
 
-        const config_path: path::PathBuf = path::Path::from(Str::new(target_dir)).join("cryoconfig");
         if (!Executor::write_cryoconfig(config_path.as_path(), name.as_str(), src_dir.as_str(),
                                         out_dir.as_str(), is_library)) { return 1; }
 
@@ -1337,6 +1352,15 @@ type struct Executor {
         text.push("    return a + b;\n");
         text.push("}\n");
         return text;
+    }
+
+    /// Whether `path`, a file `cryo init` would write, is free; when a file
+    /// is already there, says so, naming it, and false.  Init never
+    /// overwrites a file: a project's cryoconfig and sources are the user's.
+    static refuse_existing_scaffold_file(path: path::Path) -> boolean {
+        if (!path.exists()) { return true; }
+        fmt::eprintln(f"Error: {path.as_str()} already exists; `cryo init` does not overwrite a file");
+        return false;
     }
 
     /// Write one file of a new project, reporting a failure the way every
@@ -2402,6 +2426,7 @@ type struct Executor {
         const build_str: str::Str = str::Str::new("build");
         const cf_str:    str::Str = str::Str::new("compile_fail");
         const run_str:   str::Str = str::Str::new("run");
+        const command_str: str::Str = str::Str::new("command");
         match (root.get(str::Str::new("outcome"))) {
             Option::Some(vp) => {
                 match (vp.as::<str::Str>()) {
@@ -2409,6 +2434,7 @@ type struct Executor {
                         if (os.equals(&build_str))    { spec.outcome = 1; }
                         else if (os.equals(&cf_str))  { spec.outcome = 1; spec.fails = true; }
                         else if (os.equals(&run_str)) { spec.outcome = 2; }
+                        else if (os.equals(&command_str)) { spec.outcome = 3; }
                     }
                     Option::None => { }
                 }
@@ -2427,6 +2453,7 @@ type struct Executor {
         Executor::read_strings(&root, "requires", &spec.requires);
         Executor::read_strings(&root, "environment", &spec.environment);
         Executor::read_strings(&root, "arguments", &spec.arguments);
+        Executor::read_strings(&root, "command", &spec.command);
         // A step is a list of strings, its verb first; anything else makes
         // the file malformed rather than running a different command.
         mut malformed_step: boolean = false;
@@ -2581,6 +2608,9 @@ type struct Executor {
         }
         mem::drop(root);
         if (malformed_step) { return Option::None; }
+        // A `command` project with nothing to run, or a `command` given to
+        // another outcome, would judge a command the file does not describe.
+        if ((spec.outcome == 3) != (spec.command.length() > 0)) { return Option::None; }
         return Option::Some(spec);
     }
 
@@ -2975,8 +3005,6 @@ type struct Executor {
         // FIXTURE build (`cryo build`), run (`cryo run`) or collect (the
         // project's own `cryo test`).  Stdout and stderr are captured apart so
         // the ASSERTIONS in `project_outcome` can tell the streams apart.
-        const verb: string = if (spec.outcome == 1) { "build" }
-            else { if (spec.outcome == 2) { "run" } else { "test --format=plain" } };
         mut command: String = String::new();
         for (mut i: i64 = 0; i < spec.environment.length(); i++) {
             command.push(shell_set_environment(spec.environment[i].as_str()));
@@ -2993,9 +3021,22 @@ type struct Executor {
             command.push(if (s == 0) { " > " } else { " >> " });
             command.push(f"{steps_output} 2>&1 && ");
         }
-        command.push(f"{self_exe} {verb}");
-        if (stdlib_abs.length() > 0) { command.push(f" --stdlib={stdlib_abs}"); }
-        command.push(build_flags);
+        // A `command` project's command is a step's, judged as the fixture:
+        // its own arguments and the suite's `--stdlib`, none of the build's
+        // flags.
+        if (spec.outcome == 3) {
+            command.push(self_exe);
+            for (mut a: i64 = 0; a < spec.command.length(); a++) {
+                command.push(f" \"{spec.command[a]}\"");
+            }
+            if (stdlib_abs.length() > 0) { command.push(f" --stdlib={stdlib_abs}"); }
+        } else {
+            const verb: string = if (spec.outcome == 1) { "build" }
+                else { if (spec.outcome == 2) { "run" } else { "test --format=plain" } };
+            command.push(f"{self_exe} {verb}");
+            if (stdlib_abs.length() > 0) { command.push(f" --stdlib={stdlib_abs}"); }
+            command.push(build_flags);
+        }
         for (mut i: i64 = 0; i < spec.arguments.length(); i++) {
             command.push(f" \"{spec.arguments[i]}\"");
         }
@@ -3183,7 +3224,9 @@ type struct Executor {
         // canary's exit to 0 and fails the canary project (and the suite)
         // instead of shipping silently.
         const verb: string = if (spec.outcome == 1) { "build" } else {
-            if (spec.outcome == 2) { "run" } else { "project tests" }
+            if (spec.outcome == 2) { "run" } else {
+                if (spec.outcome == 3) { "the command" } else { "project tests" }
+            }
         };
         const ec: i64 = st as i64;
         if (spec.fails) {

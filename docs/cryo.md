@@ -5147,7 +5147,7 @@ For the full grammar, including type and pattern productions, see [`grammar.md`]
 
 ## 23. Project Configuration (cryoconfig)
 
-A project is a directory containing a `cryoconfig` file. `cryo build`, `cryo run`, and `cryo test` search upward from the working directory for it, then build the project it describes. Scaffold a starter project with `cryo init [dir]`: it asks for the project name, the source and output directories and whether the project is an executable or a library, and writes a cryoconfig with a `main.cryo` or a library's `lib.cryo` (section 23.4). Each question also has a flag that answers it (`--name=`, `--source-dir=`, `--output-dir=`, `--type=executable|library`), so a script giving all four reads nothing from the terminal.
+A project is a directory containing a `cryoconfig` file. `cryo build`, `cryo run`, and `cryo test` search upward from the working directory for it, then build the project it describes. Scaffold a starter project with `cryo init [dir]`: it asks for the project name, the source and output directories and whether the project is an executable or a library, and writes a cryoconfig with a `main.cryo` or a library's `lib.cryo` (section 23.4). Each question also has a flag that answers it (`--name=`, `--source-dir=`, `--output-dir=`, `--type=executable|library`), so a script giving all four reads nothing from the terminal. Init never overwrites a file: in a directory that already has a cryoconfig it fails naming it before asking anything, and it fails before writing a source file that is already there.
 
 `cryoconfig` is an INI-like file: `[section]` headers, `key = value` lines, `#` comments. List values use TOML-style arrays (`["a", "b"]`). Unknown keys are ignored with a warning; keys removed in 1.0 are a hard error that names the replacement.
 
@@ -5397,12 +5397,12 @@ A project can build a library and one or more executables from one source tree. 
 
 `cryo build` of a project with `[[bin]]` targets builds the executables only: its `[lib]` is what a project depending on it compiles (a dependency is compiled from its source, never linked from an archive). A project with a `[lib]` and no `[[bin]]` builds `lib<name>.a`.
 
-**A library's namespace is the one its `lib.cryo` declares.** The library's `source_dir` holds a `lib.cryo`, and the `namespace` line at its top names the library: a program depending on it imports that namespace (`import Json5;`). No cryoconfig key names it. A dependency whose `[lib]` has no `lib.cryo`, or whose `lib.cryo` declares no namespace, is E0509. A library has that one top-level namespace: every file of the package declares it or a namespace below it (`Json5::reader`), and a file declaring any other (`Helper`, or `Json5Extra`, which only begins with it) is E0510, so what a program can import from a library is exactly what lies under the name it imports. `cryo init --type=library` writes a `lib.cryo` beginning with the namespace derived from the project name (`my-lib` -> `My_lib`).
+**A library's namespace is the one its `lib.cryo` declares.** The library's `source_dir` holds a `lib.cryo`, and the `namespace` line at its top names the library: a program depending on it imports that namespace (`import Json5;`). No cryoconfig key names it. A dependency whose `[lib]` has no `lib.cryo`, or whose `lib.cryo` declares no namespace, is E0509. A library has that one top-level namespace: every file of the package declares it or a namespace below it (`Json5::reader`), and a file declaring any other (`Helper`, or `Json5Extra`, which only begins with it) is E0510, so what a program can import from a library is exactly what lies under the name it imports. Both rules hold in the library's own project too, in every build of it that indexes the library's `source_dir`, so a library is refused where it is written rather than where it is first used; there the library's files are those under its `source_dir`, and a binary's entry point outside that directory is the program's (E0509 and E0510 name the package "the program"). `cryo init --type=library` writes a `lib.cryo` beginning with the namespace derived from the project name (`my-lib` -> `My_lib`).
 
 ```ini
 [lib]
 name       = "mylib"
-source_dir = "src"
+source_dir = "src/mylib"
 
 [[bin]]
 name        = "mytool"

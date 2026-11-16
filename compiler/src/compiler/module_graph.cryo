@@ -471,14 +471,29 @@ type struct PackageDeclaration {
     declared: String;
 }
 
-/// A dependency's `[lib]`: the package, its `lib.cryo`, and the namespace
-/// that file declares - the library's own, the one a program imports it by.
-/// `namespace` is empty until the pre-scan reads the file, and stays empty
-/// when the file is missing or declares none.
+/// A package's `[lib]`, a dependency's or the program's own: the package,
+/// its `lib.cryo`, and the namespace that file declares - the library's
+/// own, the one a program imports it by.  `namespace` is empty until the
+/// pre-scan reads the file, and stays empty when the file is missing or
+/// declares none.
 type struct PackageLibrary {
     package:   ModulePackage;
     file:      PathBuf;
     namespace: String;
+
+    /// Whether `file`, a file of `package`, is one of this library's.  A
+    /// dependency publishes every root of its package, so each of its
+    /// files is; the program's binaries are its own and not its library's,
+    /// so of the program's files only those under the library's directory
+    /// are.
+    covers(&this, package: &ModulePackage, file: Path) -> boolean {
+        if (!this.package.is(package)) { return false; }
+        if (package.origin != ModuleOrigin::Local) { return true; }
+        return match (this.file.as_path().parent()) {
+            Option::Some(directory) => { file.starts_with(directory) }
+            Option::None            => { false }
+        };
+    }
 }
 
 /// The roots a module's file is classified by: under the vendored
@@ -497,11 +512,12 @@ type struct PackageRoots {
     /// Each dependency root's package identity, beside `dep_roots`.
     dep_identities: [String];
     declarations: [PackageDeclaration];
-    /// Every dependency with a `[lib]`, once each.
+    /// Every dependency with a `[lib]`, once each, and the program's own
+    /// `[lib]` when the build indexes it.
     libraries: [PackageLibrary];
 
     /// Record that the file `file` declares the namespace `declared`: when
-    /// it is a dependency library's `lib.cryo`, that is the library's.
+    /// it is a library's `lib.cryo`, that is the library's.
     note_declared_namespace(mut &this, file: Str, declared: Str) -> void {
         const key: String = ModuleGraph::module_key(file);
         for (mut i: i64 = 0; i < this.libraries.length(); i++) {

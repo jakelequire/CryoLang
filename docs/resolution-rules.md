@@ -209,6 +209,14 @@ yet is recorded with the change that builds it, not here.
      the file.  The namespace rule (710) then compares one name per
      library.  (Jake)
 
+713. **A library's rules hold in its own project's build.**  711 and 712
+     apply to a project's own `[lib]` in every build of it that indexes the
+     library's directory, not only where a dependent compiles it, so a
+     library is refused where it is written rather than where it is first
+     used.  The library's files there are those under its `source_dir`: a
+     binary's entry point beside it is the program's.  (Decided on Jake's
+     behalf; his to overrule.)
+
 ### 2026-11-12
 
 703. **A hash map's bucket layer is internal.**  `Entry`, the node of a

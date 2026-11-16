@@ -334,6 +334,14 @@ type struct CompilerInstance {
         return String::from_str(Str::new(s)).into_raw();
     }
 
+    /// `path`, written relative to the project, in the form the loader
+    /// indexes the project's files by: as written when the project root is
+    /// the current directory, below the root otherwise.
+    static under_project_root(project_root: string, path: Str) -> PathBuf {
+        if (project_root.length() == 0 || project_root.eq(".")) { return PathBuf::from(path); }
+        return Path::from(project_root).join(path);
+    }
+
     /// Build a ProjectConfig view that compiles the `[lib]` half of a
     /// multi-target project as a Library.  Inherits debug/optimize/no_std/
     /// stdlib + linkage settings from the base config; overrides only the
@@ -999,12 +1007,8 @@ type struct CompilerInstance {
             });
         }
         for (mut drc: i64 = 0; drc < dep_outcome.roots.length(); drc++) {
-            const dr_path: Str = Str::new(dep_outcome.roots[drc].path);
-            roots.dep_roots.push(if (config.project_root.length() == 0 || config.project_root.eq(".")) {
-                PathBuf::from(dr_path)
-            } else {
-                Path::from(config.project_root).join(dr_path)
-            });
+            roots.dep_roots.push(CompilerInstance::under_project_root(
+                config.project_root, Str::new(dep_outcome.roots[drc].path)));
             roots.dep_names.push(String::from_string(dep_outcome.roots[drc].name));
             roots.dep_identities.push(dep_outcome.roots[drc].package.clone());
             if (dep_outcome.roots[drc].library) {
@@ -1013,6 +1017,23 @@ type struct CompilerInstance {
                         String::from_string(dep_outcome.roots[drc].name),
                         dep_outcome.roots[drc].package.clone()),
                     file: roots.dep_roots[drc].join(Str::new("lib.cryo")),
+                    namespace: String::new(),
+                });
+            }
+        }
+        // The program's own `[lib]` is held to a library's rules in every
+        // build that indexes it, not only where a dependent compiles it: its
+        // `lib.cryo` declares the library's one namespace, and every file
+        // under its directory declares that one or one below.  The pre-scan
+        // indexes the files under the entry point's directory, so a library
+        // outside it is not part of this build.
+        if (config.lib.is_present() && config.lib.source_dir.length() > 0) {
+            const library_directory: PathBuf = CompilerInstance::under_project_root(
+                config.project_root, Str::new(config.lib.source_dir));
+            if (library_directory.as_path().starts_with(Path::from(root_path.parent_directory()))) {
+                roots.libraries.push(PackageLibrary {
+                    package: ModulePackage::of(ModuleOrigin::Local, String::new(), String::new()),
+                    file: library_directory.join(Str::new("lib.cryo")),
                     namespace: String::new(),
                 });
             }
