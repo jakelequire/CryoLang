@@ -100,7 +100,7 @@ PIN_EXE      := $(ROOT)/bin/cryo.exe
 # pin to ask: starting it costs more than the rest of a no-change `make cryo`.
 # One file per host OS: a Windows checkout's `compiler/build` is the one WSL
 # builds in, and each host's pin answers its own triple.
-NO_TRIPLE_GOALS := help clean check-fast verify-selftest verify-pin verify-pin-clean
+NO_TRIPLE_GOALS := help clean verify-pin verify-pin-clean
 HOST_TRIPLE_MK  := $(ROOT)/compiler/build/host-triple-$(HOST_OS).mk
 ifneq ($(filter-out $(NO_TRIPLE_GOALS),$(or $(MAKECMDGOALS),help)),)
 -include $(HOST_TRIPLE_MK)
@@ -194,8 +194,8 @@ EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
 .PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-tiers runtime-tiers-win pin \
-        pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
-        install uninstall clean lsp install-lsp release release-linux release-windows
+        pin-impl pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
+        install uninstall clean lsp install-lsp cryogate release release-linux release-windows
 
 # The help text is printed by make itself (`$(info)`), not by a shell, so it
 # reads the same under cmd and sh.  A target added to this Makefile is added
@@ -214,12 +214,18 @@ Build
                          (skipped without the mingw toolchain).
   make cryo-exe          Cross-build compiler/build/cryo.exe from Linux, and
                          stamp it.
+<<<<<<< HEAD
   make lsp               Build tools/CryoLSP from the current tree with the pin
                          and install it as bin/cryolsp.
   make install-lsp       lsp, the server's behavioural checks on the installed
                          binary, then package tools/CryoAnalyzer and install
                          it into VS Code, REPLACING the installed extension.
                          No gates; reload the VS Code window afterwards.
+  make cryogate          Build the gate runner tools/CryoGate with the pin
+                         (tools/CryoGate/build/); its runs log to
+                         build-logs/cryogate/, newest 20 kept.  verify,
+                         test-census, selfhost-check and pin run under its
+                         heavy-run lock (see below).
 
 Tests and gates
   make test              cryo test over tests/ (the working loop; ARGS=filter).
@@ -253,9 +259,9 @@ Tests and gates
   make cross-check       runtime, stdlib, compiler and CryoLSP for the other
                          OS's triple, objects only (ARGS=--triple=...).
   make examples          Build every examples/ project.
-  make examples-golden   Build and run four examples, diff their stdout
-                         (POSIX only; refuses on Windows).
-  make valgrind-check    The same four under valgrind (Linux only).
+  make examples-golden   Build every example, run the ones with an
+                         expected.out and compare their output with it.
+  make valgrind-check    The same runs under valgrind (Linux only).
   make incremental-check Incremental build == clean build, per module
                          (refuses on Windows: a PE carries a link timestamp).
   make incremental-instance-check  An edit asking a cached module for a new
@@ -294,7 +300,8 @@ Pins and release
                          example builds, .verify/, .cross-check/,
                          build-logs/ and dist/.
 
-Internal, called by pin: pin-linux-impl, pin-windows-impl, _pin-windows-do.
+Internal, called by pin: pin-impl (the refresh, without the lock),
+pin-linux-impl, pin-windows-impl, _pin-windows-do.
 
 Side effects beyond the named output
   lsp             replaces bin/cryolsp and tools/CryoLSP/build/cryolsp (Windows:
@@ -318,6 +325,15 @@ Side effects beyond the named output
                   `make clean`; clears stdlib/.bin/*/prebuilt/ before each
                   population run.
   install         writes symlinks outside the repository (may need sudo).
+  verify, test-census, selfhost-check, pin, examples-golden, valgrind-check
+                  hold the heavy-run lock, cryo-heavy-run.lock in the
+                  directory holding the MAIN checkout, the one file for every
+                  worktree (CRYOGATE_HEAVY_LOCK names another), while their
+                  recipe runs (their prerequisites build before it is
+                  taken): one waits, polling each minute,
+                  while another checkout's heavy run holds it, and refuses a
+                  lock older than three hours.  An interrupted run leaves
+                  the file behind; delete it once nobody holds it.
 endef
 
 help:
@@ -368,6 +384,25 @@ else
 STAGE2_FILE := $(STAGE2)
 STAGE2_PIN  := $(PIN)
 endif
+
+# The gate runner (tools/CryoGate, built below by `make cryogate`); a recipe
+# runs it as `$(CRYOGATE_COMMAND) <gate> ...`.  A heavy
+# target (verify, test-census, selfhost-check, pin, examples-golden,
+# valgrind-check) runs its recipe as
+# `$(CRYOGATE_HEAVY) <command>`: under the machine's heavy-run lock, beside
+# the main checkout, waited for while another checkout's heavy run holds it, and
+# released when the command ends.  cmd cannot run a quoted forward-slash path.
+CRYOGATE_DIR    := $(ROOT)/tools/CryoGate
+CRYOGATE        := $(CRYOGATE_DIR)/build/cryogate$(EXE_SUFFIX)
+CRYOGATE_TESTS  := $(CRYOGATE_DIR)/build/cryogate-test$(EXE_SUFFIX)
+CRYOGATE_INPUTS := $(call rwildcard,$(CRYOGATE_DIR)/src,*.cryo) $(CRYOGATE_DIR)/cryoconfig \
+                   $(call rwildcard,$(ROOT)/stdlib,*.cryo) $(RUNTIME_TIERS_A) $(STAGE2_PIN)
+ifeq ($(HOST_OS),windows)
+CRYOGATE_COMMAND := "$(subst /,\,$(CRYOGATE))"
+else
+CRYOGATE_COMMAND := "$(CRYOGATE)"
+endif
+CRYOGATE_HEAVY  := $(CRYOGATE_COMMAND) heavy --
 STAGE2_INPUTS := $(CRYO_SOURCES) $(ROOT)/compiler/cryoconfig $(wildcard $(ROOT)/compiler/*.h) \
                  $(RUNTIME_TIERS_A) $(STAGE2_PIN) $(wildcard $(ROOT)/.git/index)
 
@@ -438,15 +473,18 @@ ifeq ($(HOST_OS),windows)
 # unchanged whether you invoked `make` from cmd / PowerShell (recipe shell
 # is cmd) or from MSYS2 / Git Bash (recipe shell is bash).  The wrapper
 # checks for wsl.exe, resolves the WSL path, and re-enters this Makefile
-# inside WSL.
-pin:
-	scripts\pin-windows.cmd
+# inside WSL at `pin-impl`, which takes no lock: this host's run holds it.
+pin: $(CRYOGATE)
+	@$(CRYOGATE_HEAVY) cmd /c scripts\pin-windows.cmd
 else
 # Linux/macOS host: native build for bin/cryo, cross-build for bin/cryo.exe.
 # The Windows half is skipped (not failed) when the mingw toolchain or
 # the fetched .toolchains artifacts are absent, so a Linux-only checkout
 # can still refresh the Linux pin without dragging in the Windows bits.
-pin: pin-linux-impl pin-windows-impl
+pin: $(CRYOGATE)
+	@$(CRYOGATE_HEAVY) $(MAKE) --no-print-directory pin-impl
+
+pin-impl: pin-linux-impl pin-windows-impl
 
 pin-linux-impl: cryo
 	@$(PYTHON) scripts/cryo-pin.py --source "$(STAGE2)" --pin "$(PIN)" --stamp-profile=$(CRYO_PROFILE)
@@ -515,6 +553,35 @@ lsp: $(PIN)
 	@echo "==> bin/cryolsp ready"
 endif
 
+# ---- cryogate -----------------------------------------------------------
+# The gate runner (tools/CryoGate), built by the pin against the tree's
+# stdlib and linked against the stdlib only, so a compiler under test that
+# does not build or misbehaves cannot break the program that reports it.
+# Rebuilt when its sources, the stdlib, the runtime tiers or the pin are
+# newer than the binary.  Its variables are set beside the pin's, above,
+# because the heavy targets name it as a prerequisite.  Its unit tests are
+# built here too, by listing them (`cryo test --list` builds the test binary
+# and prints its tests), and `cryogate selftest` runs that binary: a check-fast
+# run inside verify then builds nothing with the pin, whose stdlib archive
+# would otherwise land among the archives verify hashes.
+cryogate: $(CRYOGATE) $(CRYOGATE_TESTS)
+
+ifeq ($(HOST_OS),windows)
+$(CRYOGATE): $(CRYOGATE_INPUTS)
+	@echo "==> Building cryogate via bin/cryo.exe"
+	@cd tools/CryoGate && "$(subst /,\,$(PIN_EXE))" build
+$(CRYOGATE_TESTS): $(CRYOGATE_INPUTS) $(call rwildcard,$(CRYOGATE_DIR)/tests,*.cryo)
+	@echo "==> Building cryogate's unit tests via bin/cryo.exe"
+	@cd tools/CryoGate && "$(subst /,\,$(PIN_EXE))" test --list
+else
+$(CRYOGATE): $(CRYOGATE_INPUTS)
+	@echo "==> Building cryogate via bin/cryo"
+	@cd tools/CryoGate && "$(PIN)" build
+$(CRYOGATE_TESTS): $(CRYOGATE_INPUTS) $(call rwildcard,$(CRYOGATE_DIR)/tests,*.cryo)
+	@echo "==> Building cryogate's unit tests via bin/cryo"
+	@cd tools/CryoGate && "$(PIN)" test --list
+endif
+
 # ---- CryoAnalyzer VS Code extension -----------------------------------
 # Builds and installs the server from the current tree (`lsp`), runs its
 # behavioural checks on the installed binary, then packages
@@ -571,11 +638,11 @@ ifeq ($(HOST_OS),windows)
 # `make` from cmd / PowerShell or from MSYS2 / Git Bash.
 # `runtime-tiers` first: the check's stage-2 and stage-3 rounds are hosted links
 # that need libcryort-panic-abort-hosted.a to resolve `__cryo_panic`.
-selfhost-check: runtime-tiers
-	scripts\selfhost-check-windows.cmd $(ARGS)
+selfhost-check: $(CRYOGATE) runtime-tiers
+	$(CRYOGATE_HEAVY) cmd /c scripts\selfhost-check-windows.cmd $(ARGS)
 else
-selfhost-check: $(PIN) runtime-tiers
-	@$(PYTHON) scripts/selfhost-check.py $(ARGS)
+selfhost-check: $(PIN) $(CRYOGATE) runtime-tiers
+	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/selfhost-check.py $(ARGS)
 endif
 
 # ---- pin self-verification --------------------------------------------
@@ -639,14 +706,11 @@ test: $(STAGE2_EXE) $(TEST_HELPERS_A) runtime-tiers
 test-list: $(STAGE2_EXE) $(TEST_HELPERS_A)
 	@cd tests && "$(STAGE2_EXE_WIN)" test --list $(ARGS)
 
-roster-check: $(STAGE2_EXE) $(TEST_HELPERS_A)
-	@$(PYTHON) scripts/roster-check.py "$(STAGE2_EXE_WIN)" $(ARGS)
+roster-check: $(STAGE2_EXE) $(TEST_HELPERS_A) $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) roster --cryo "$(STAGE2_FILE)" $(ARGS)
 
-test-census: $(STAGE2_EXE) $(TEST_HELPERS_A) runtime-tiers
-	@$(PYTHON) scripts/test-census.py --cryo "$(STAGE2_EXE)" $(ARGS)
-
-vendor-check: $(STAGE2_EXE) runtime-tiers
-	@$(PYTHON) scripts/vendor-consts-gate.py "$(STAGE2_EXE_WIN)" $(ARGS)
+test-census: $(STAGE2_EXE) $(TEST_HELPERS_A) $(CRYOGATE) runtime-tiers
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) census --cryo "$(STAGE2_FILE)" -- $(ARGS)
 else
 test: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
 	@cd tests && "$(STAGE2)" test $(ARGS)
@@ -656,18 +720,21 @@ test-list: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 
 # Golden-file gate on the DISCOVERED unit-test roster: a compiler change
 # that silently breaks `![test]` discovery would otherwise stay green
-# ("0 of 0 failed" is a pass).  Re-pin deliberately with ARGS=--update.
-roster-check: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
-	@$(PYTHON) scripts/roster-check.py "$(STAGE2)" $(ARGS)
+# ("0 of 0 failed" is a pass).  Re-pin with ARGS=--merge when adding tests,
+# ARGS=--update when removing them.  `cryogate roster`.
+roster-check: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) roster --cryo "$(STAGE2_FILE)" $(ARGS)
 
 # `make test` with the counts asserted.  The runner reports a zero the same way
 # it reports success - silently - so an exit code cannot tell a suite that ran
-# everything from one that ran nothing.  This runs the same suite, streams the
-# same output, and then reconciles what ran against the roster golden.  Use it
-# wherever the run is being taken as evidence; `make test` stays for the
-# working loop, where a pattern filter is the point.
-test-census: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
-	@$(PYTHON) scripts/test-census.py --cryo "$(STAGE2)" $(ARGS)
+# everything from one that ran nothing.  This runs the same suite (its output
+# in the run's log; the tail printed when it fails), and then reconciles what
+# ran against the roster golden.  Use it wherever the run is being taken as
+# evidence; `make test` stays for the working loop, where a pattern filter is
+# the point.  ARGS are passed to `cryo test`.  `cryogate census`.
+test-census: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE) runtime-tiers
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) census --cryo "$(STAGE2_FILE)" -- $(ARGS)
+endif
 
 # End-to-end gate on the constants `cryo vendor` carries out of a C header.
 # The importer binds a constant and the serializer writes it, and when those
@@ -679,10 +746,9 @@ test-census: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
 # Needs the compiler and a working link (it builds and RUNS a consumer), but no
 # external library and no display, so unlike the raylib acceptance project this
 # runs everywhere.  Hermetic: the fixture registers under a throwaway
-# $CRYO_HOME and leaves nothing on the machine.
-vendor-check: $(STAGE2) runtime-tiers
-	@$(PYTHON) scripts/vendor-consts-gate.py "$(STAGE2)" $(ARGS)
-endif
+# $CRYO_HOME and leaves nothing on the machine.  `cryogate vendor`.
+vendor-check: $(STAGE2_FILE) $(CRYOGATE) runtime-tiers
+	@$(CRYOGATE_COMMAND) vendor --cryo "$(STAGE2_FILE)"
 
 # ---- one verification run ----------------------------------------------
 # Build once, then run census, examples, lsp-check, cross-check,
@@ -695,37 +761,35 @@ endif
 # the gates run concurrently, and a phony prerequisite rebuilt by one of them
 # (the runtime tiers) would be rewritten while another is linking against it.
 ifeq ($(HOST_OS),windows)
-verify: cryo $(TEST_HELPERS_A)
-	@$(PYTHON) scripts/verify.py --cryo "$(STAGE2_EXE)" $(ARGS)
+verify: cryo $(TEST_HELPERS_A) $(CRYOGATE)
+	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/verify.py --cryo "$(STAGE2_EXE)" $(ARGS)
 else
-verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
-	@$(PYTHON) scripts/verify.py --cryo "$(STAGE2)" $(ARGS)
+verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE)
+	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/verify.py --cryo "$(STAGE2)" $(ARGS)
 endif
 
 # An incremental build after an edit that asks an unchanged module for a new
 # generic instance must link (tests/fixtures/incremental-new-instance).
-ifeq ($(HOST_OS),windows)
-incremental-instance-check: cryo
-	@$(PYTHON) scripts/incremental-instance-check.py --cryo "$(STAGE2_EXE)"
-else
-incremental-instance-check: cryo
-	@$(PYTHON) scripts/incremental-instance-check.py --cryo "$(STAGE2)"
-endif
+incremental-instance-check: cryo $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) incr --instance --cryo "$(STAGE2_FILE)"
 
 # The judges behind verify's tests/started-compiling declarations, and
-# verify-pin's checks, and selfhost-check's stage-archive comparison, driven
-# through every case they must refuse and every case they must allow.
-verify-selftest:
+# verify-pin's checks, and selfhost-check's stage-archive comparison, and
+# cryogate's own (the roster merge and the census among them), driven through
+# every case they must refuse and every case they must allow.
+verify-selftest: $(CRYOGATE) $(CRYOGATE_TESTS)
 	@$(PYTHON) scripts/verify.py --selftest
 	@$(PYTHON) scripts/verify-pin.py --selftest
-	@$(PYTHON) scripts/roster-check.py --selftest
 	@$(PYTHON) scripts/selfhost-check.py --selftest
+	@$(CRYOGATE_COMMAND) selftest
 
 # ---- the pre-commit sweep ----------------------------------------------
-# Every gate here is source-derived, so this target builds nothing.  A short
-# gate everybody runs is worth more than a twenty-minute one nobody does.
+# Every gate here is source-derived; the one thing it builds is cryogate
+# and its unit tests, with the pin, and only when they are stale, so run
+# inside verify it makes no stdlib archive.  A short gate everybody runs is worth more than a
+# twenty-minute one nobody does.
 check-fast: verify-selftest verify-pin
-	@echo "check-fast: OK (verify's declared-program self-test, roster merge self-test, selfhost archive-comparison self-test, pin integrity)"
+	@echo "check-fast: OK (verify's declared-program self-test, cryogate's self-test, selfhost archive-comparison self-test, pin integrity)"
 
 # ---- language-server compile gate --------------------------------------
 # The LSP links the compiler as a LIBRARY (tools/CryoLSP/cryoconfig ->
@@ -803,13 +867,9 @@ endif
 # the checking is the surface being gated, and the pin performs an older one.
 # Objects only: nothing links and nothing runs, so a link-time or runtime
 # defect on the other OS is still `verify-freestanding` / CI's to find.
-ifeq ($(HOST_OS),windows)
-cross-check: $(STAGE2_EXE)
-	@$(PYTHON) scripts/cross-check.py --cryo "$(STAGE2_EXE)" $(ARGS)
-else
-cross-check: $(STAGE2)
-	@$(PYTHON) scripts/cross-check.py --cryo "$(STAGE2)" $(ARGS)
-endif
+# `cryogate cross`; ARGS passes --triple, --project, --min-modules through.
+cross-check: $(STAGE2_FILE) $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) cross --cryo "$(STAGE2_FILE)" $(ARGS)
 
 # ---- stdlib API index --------------------------------------------------
 # Regenerate docs/stdlib-api.txt, the one-file answer to "does this already
@@ -852,48 +912,36 @@ endif
 # Compile every examples/*/ project with the freshly-built stage-2 compiler
 # so a stdlib/compiler change that breaks a shipped "getting started" example
 # fails CI instead of reaching users.  Build-only (no run); the per-example
-# build/ dirs are gitignored.  The script pins CRYO_STDLIB to the in-tree
-# stdlib so resolution is independent of which compiler binary builds the
-# examples.
-# Driven by a script rather than a shell loop because the loop was POSIX-only
-# and the Windows branch printed "run it from WSL" and exited 0.  A gate that
-# exits 0 having done nothing is counted as evidence, so this one refuses to
-# report success unless it can say what it swept.
-ifeq ($(HOST_OS),windows)
-examples: $(STAGE2_EXE)
-	@$(PYTHON) scripts/examples-gate.py --cryo "$(STAGE2_EXE)"
-else
-examples: $(STAGE2)
-	@$(PYTHON) scripts/examples-gate.py --cryo "$(STAGE2)"
-endif
+# build/ dirs are gitignored.  `cryogate examples` pins CRYO_STDLIB to the
+# in-tree stdlib so resolution is independent of which compiler binary builds
+# the examples.  A gate that exits 0 having done nothing is counted as
+# evidence, so this one refuses to report success unless it swept at least
+# the shipped set (its floor; raise it when an example is added).
+examples: $(STAGE2_FILE) $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) examples --cryo "$(STAGE2_FILE)"
 
 # ---- examples golden-output check -------------------------------------
-# Build AND run the deterministic, input-free examples and diff their stdout
-# against committed goldens (examples/<name>/expected.out).  Catches runtime
-# regressions that the build-only `examples` target misses.  POSIX-only: the
-# script is bash, so a Windows host refuses rather than reporting success,
-# and builds nothing first.
-ifeq ($(HOST_OS),windows)
-examples-golden:
-	$(error examples-golden: UNAVAILABLE on this host -- it builds AND RUNS the examples and diffs stdout with bash; run it from WSL)
-else
-examples-golden: $(STAGE2)
-	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/check-examples-output.sh
-endif
+# Build every example, then run each one holding a committed golden
+# (examples/<name>/expected.out) with no input and compare its output with
+# it.  Catches runtime regressions that the build-only `examples` target
+# misses.  Heavy: it runs under the heavy-run lock.
+examples-golden: $(STAGE2_FILE) $(CRYOGATE)
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) examples --run --cryo "$(STAGE2_FILE)"
 
 # ---- runtime memory-safety gate (valgrind) ----------------------------
-# Build AND run the deterministic examples under valgrind, failing on any
-# invalid free/read/write or definite leak.  The static move-checker rejects
+# Build every example, then run each one holding an expected.out under
+# valgrind, failing on any invalid free/read/write or definite leak, or on
+# output that differs from its golden.  The static move-checker rejects
 # use-after-move at compile time; this exercises the generated drop/free paths
 # at runtime, so a miscompile that double-freed or leaked an owned value is
-# caught here.  POSIX/Linux-only and requires valgrind on PATH; a Windows host
-# refuses and builds nothing first.
+# caught here.  Linux-only and requires valgrind on PATH; a Windows host
+# refuses and builds nothing first.  Heavy: it runs under the heavy-run lock.
 ifeq ($(HOST_OS),windows)
 valgrind-check:
 	$(error valgrind-check: UNAVAILABLE on this host -- valgrind is POSIX/Linux only; run it from WSL)
 else
-valgrind-check: $(STAGE2)
-	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" ROOT="$(ROOT)" bash -c "$$(cat scripts/valgrind-check.sh | tr -d '\r')" valgrind-check
+valgrind-check: $(STAGE2_FILE) $(CRYOGATE)
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) examples --run --under=valgrind --cryo "$(STAGE2_FILE)"
 endif
 
 # ---- runtime tier archives --------------------------------------------
@@ -987,7 +1035,7 @@ runtime-tiers-win: $(PIN)
 # never produces, and its recipe is sh syntax under a cmd shell.  A gate with no
 # local invocation on half the supported hosts is a gate only CI runs - and CI
 # fires on `main` alone.  It now refuses out loud there instead, the same way
-# examples-golden and valgrind-check do.
+# valgrind-check does.
 ifeq ($(HOST_OS),windows)
 verify-freestanding:
 	$(error verify-freestanding: UNAVAILABLE on this host -- the acceptance script is bash and links ELF objects natively; run it from WSL)
@@ -1038,17 +1086,18 @@ clean:
 	@if exist stdlib\.bin rmdir /s /q stdlib\.bin
 	@if exist runtime\.bin rmdir /s /q runtime\.bin
 	@if exist tools\CryoLSP\build rmdir /s /q tools\CryoLSP\build
+	@if exist tools\CryoGate\build rmdir /s /q tools\CryoGate\build
 	@if exist bin\cryolsp.exe del /q bin\cryolsp.exe
 	@if exist bin\cryolsp del /q bin\cryolsp
 	@del /q tests\helpers\*.o tests\helpers\*.a 2>NUL || rem
 	@for %%d in (tests\build tests\tests\negative\.bin .verify .cross-check build-logs dist) do @if exist %%d rmdir /s /q %%d
 	@for /d %%p in (examples\* tests\tests\projects\*) do @if exist %%p\build rmdir /s /q %%p\build
-	@for %%d in (compiler\build stdlib\.bin runtime\.bin tools\CryoLSP\build bin\cryolsp.exe) do @if exist %%d (echo clean: %%d is still there; a running process holds a file in it & exit /b 1)
+	@for %%d in (compiler\build stdlib\.bin runtime\.bin tools\CryoLSP\build tools\CryoGate\build bin\cryolsp.exe) do @if exist %%d (echo clean: %%d is still there; a running process holds a file in it & exit /b 1)
 else
 clean:
 	@echo "==> Cleaning build outputs, test and example builds, and gate state"
 	@rm -rf compiler/build stdlib/.bin runtime/.bin
-	@rm -rf tools/CryoLSP/build
+	@rm -rf tools/CryoLSP/build tools/CryoGate/build
 	@rm -f bin/cryolsp bin/cryolsp.exe
 	@rm -f $(TEST_HELPERS_DIR)/*.o $(TEST_HELPERS_DIR)/*.a
 	@rm -rf tests/build tests/tests/negative/.bin .verify .cross-check build-logs dist

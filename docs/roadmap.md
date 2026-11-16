@@ -137,7 +137,8 @@ manual dispatch.  As it stands:
 | `check-fast` (the two self-tests) | yes | yes, both hosts |
 | object comparison against a baseline | yes | no: a baseline from before a language feature's removal does not build with the current pin, so it is run locally (ruling 508) |
 | `roster-check` | no (the census reads the same golden) | yes |
-| `examples-golden`, `valgrind-check`, `verify-freestanding` | no (POSIX only) | yes |
+| `examples-golden` | no | yes |
+| `valgrind-check`, `verify-freestanding` | no (POSIX only) | yes |
 | `incremental-check` | no | yes |
 | `vendor-check` | no | yes |
 | `api-index-check` | no | yes |
@@ -290,14 +291,15 @@ whether branch pushes trigger anything at all.
 Not built: `cryo test` is to print a count for each of its three suites -
 zero included - and `--list` to list all three, not the unit suite alone
 (ruling 272: the runner prints each suite's count and lists every suite,
-retiring the census and roster scripts).  `test-census.py` then reduces to
-nothing, and `roster-check.py` to a diff of `--list` against the golden.
+retiring the census's and the roster's text reading).  `cryogate census` then
+reads the runner's own counts, and `cryogate roster` reduces to a diff of
+`--list` against the golden.
 
 A project's `test.json` gains `stdout_file`, which compares the program's
 whole output against a file (ruling 271: a `stdout_file` field compares a
 program's output against a file).  The examples' `expected.out` goldens move
-onto it, which retires `scripts/check-examples-output.sh` and makes the
-check run on Windows as well.
+onto it, so the comparison `cryogate examples --run` makes today (on both
+hosts) is the runner's own.
 
 Open: the summary line's exact format, and whether line endings are
 normalised before the comparison.

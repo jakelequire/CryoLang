@@ -5,12 +5,11 @@
 archives) once, then this runs, AT THE SAME TIME, the gates that read that
 build:
 
-    census     scripts/test-census.py    the three suites, counts reconciled
-    examples   scripts/examples-gate.py  every examples/ project builds
+    census     cryogate census           the three suites, counts reconciled
+    examples   cryogate examples         every examples/ project builds
     lsp        scripts/lsp-gate.py       tools/CryoLSP builds and answers
-    cross      scripts/cross-check.py    the other OS's gated half compiles
-    incr       scripts/incremental-instance-check.py
-                                         an edit asking a cached module for a
+    cross      cryogate cross            the other OS's gated half compiles
+    incr       cryogate incr --instance  an edit asking a cached module for a
                                          new generic instance still links
     fast       make check-fast           verify's self-test, pin integrity
 
@@ -80,8 +79,8 @@ moved); 1 otherwise.
 """
 import argparse
 import hashlib
-import importlib.util
 import io
+import json
 import os
 import re
 import shutil
@@ -102,16 +101,19 @@ STDLIB = os.path.join(ROOT, "stdlib").replace("\\", "/")
 KEEP_RUNS = 20
 PY = sys.executable
 EXE = ".exe" if os.name == "nt" else ""
+# The gate runner `make verify` builds first; the gates it has taken over run
+# as its subcommands.
+CRYOGATE = os.path.join(ROOT, "tools", "CryoGate", "build", "cryogate" + EXE)
 
 # Each gate's own verdict line: the run is judged on it and on the exit code,
 # never on the exit code alone.
 GATES = {
-    "census":   ([PY, "scripts/test-census.py", "--cryo", "{cryo}"], r"^test-census: "),
-    "examples": ([PY, "scripts/examples-gate.py", "--cryo", "{cryo}", "--stdlib", "{stdlib}"],
+    "census":   ([CRYOGATE, "census", "--cryo", "{cryo}"], r"^test-census: "),
+    "examples": ([CRYOGATE, "examples", "--cryo", "{cryo}", "--stdlib", "{stdlib}"],
                  r"^examples-gate: "),
     "lsp":      ([PY, "scripts/lsp-gate.py", "--cryo", "{cryo}"], r"^lsp-gate: "),
-    "cross":    ([PY, "scripts/cross-check.py", "--cryo", "{cryo}"], r"^cross-check: "),
-    "incr":     ([PY, "scripts/incremental-instance-check.py", "--cryo", "{cryo}"],
+    "cross":    ([CRYOGATE, "cross", "--cryo", "{cryo}"], r"^cross-check: "),
+    "incr":     ([CRYOGATE, "incr", "--instance", "--cryo", "{cryo}"],
                  r"^incremental-instance-check: "),
     # `ARGS=` on the command line: `make verify ARGS=...` exports ARGS to
     # child makes, and no check-fast target is meant to receive verify's flags.
@@ -415,7 +417,8 @@ EXAMPLE_ARCHIVES = "archives/examples"
 BOOKKEEPING = {"tests/test-roster.txt", "tests/started-compiling", "tests/started-passing"}
 # The procedure that takes the hashes decides them too (how the stdlib is
 # spelled to each run, which flags a build gets).
-PROCEDURE = ["scripts/verify.py", "scripts/test-census.py", "scripts/examples-gate.py"]
+PROCEDURE = ["scripts/verify.py", "tools/CryoGate/src/gates/census.cryo", "tools/CryoGate/src/gates/roster.cryo",
+             "tools/CryoGate/src/gates/examples.cryo", "tools/CryoGate/src/core/host.cryo"]
 NEG_LINE = re.compile(r"^test \(negative\) (\S+) \.\.\.")
 PROJ_REACHED = re.compile(r"^test \(project\) (\S+) \.\.\.")
 EXAMPLE_OK = re.compile(r"^\s*ok\s+(examples/\S+)")
@@ -519,12 +522,11 @@ def owner_of(path):
     return None
 
 
-def census_records(lines, names, rows):
-    """The records `names` get from one census run's output and the objects
-    it left: a program with no verdict line in it gets none."""
-    census = census_module()
+def census_records(lines, names, rows, log=None):
+    """The records `names` get from one census run's output (`lines`, read
+    from `log`) and the objects it left: a program with no verdict line in it
+    gets none."""
     out = {}
-    end = next((i for i, l in enumerate(lines) if census.BLOCK.match(l.rstrip())), len(lines))
     verdicts = {}
     for l in lines:
         m = PROJ_REACHED.match(l)
@@ -541,11 +543,12 @@ def census_records(lines, names, rows):
         if m:
             verdicts[NEGATIVE + m.group(1)] = "FAILED"
     if UNIT_SUITE in names:
-        blocks, _, unit_names, _, _, _ = census.parse(lines)
-        counts = blocks.get("unit test")
+        census = census_reading(log)
+        counts = census["unit"]
         # The unit suite is accounted for when every unit test the roster
         # pins on this host ran, by name, and no other did.
-        if counts is not None and set(unit_names) == census.pinned()[0]:
+        if counts is not None and set(census["unit_ran"]) == set(census["unit_pinned"]):
+            end = census["first_summary"]
             failed = sorted({m.group(1) for m in map(UNIT_FAILED.match, lines[:end]) if m})
             verdicts[UNIT_SUITE] = "FAILED" if failed else "ok"
             out[UNIT_SUITE] = {"verdict": verdicts[UNIT_SUITE], "unit_failed": failed,
@@ -567,19 +570,19 @@ def run_census_programs(exe, names, everything, logdir, env):
     """Run the census over `names` with `exe`: all of it at once when
     `everything`, else one filtered run per program - the unit suite's tests
     by their namespace, which no project or compile-fail file name holds, and
-    every other program by its name.  Returns the output lines of each run."""
+    every other program by its name.  Returns each run's log and its lines."""
     patterns = [""] if everything else \
         ["CryoTests::" if n == UNIT_SUITE else n[len(NEGATIVE):] if n.startswith(NEGATIVE) else n
          for n in sorted(names)]
     runs = []
     for i, pattern in enumerate(patterns):
         log = os.path.join(logdir, "census-%03d.log" % i)
-        argv = [exe, "test"] + census_module().RUN_FLAGS + ([pattern] if pattern else [])
+        argv = [exe, "test"] + CENSUS_RUN_FLAGS + ([pattern] if pattern else [])
         with open(log, "wb") as fh:
             subprocess.run(argv, cwd=os.path.join(ROOT, "tests"), env=env, stdout=fh,
                            stderr=subprocess.STDOUT)
         with io.open(log, encoding="utf-8", errors="replace") as fh:
-            runs.append(fh.readlines())
+            runs.append((log, fh.readlines()))
     return runs
 
 
@@ -639,10 +642,11 @@ def baseline_programs(exe, home, bdir, env):
         print("  census    %d run(s) in %.1f s" % (len(runs), time.monotonic() - t0))
         rows = object_rows("tests")
         if everything:
-            fresh.update(census_records([l for r in runs for l in r], run_census, rows))
+            log, lines = runs[0]
+            fresh.update(census_records(lines, run_census, rows, log))
         else:
-            for name, lines in zip(sorted(run_census), runs):
-                fresh.update(census_records(lines, [name], rows))
+            for name, (log, lines) in zip(sorted(run_census), runs):
+                fresh.update(census_records(lines, [name], rows, log))
         fresh[CENSUS_ARCHIVES] = {"verdict": "ok", "unit_failed": [], "unit_counts": None,
                                   "rows": prebuilt_rows()}
     unanswered = [n for n in missing if n not in fresh]
@@ -828,13 +832,21 @@ def declared_since(sha, rel=DECLARED):
     return declarations_between(tree_text, base_text)
 
 
-def census_module():
-    """scripts/test-census.py as a module: its parse is the one both use."""
-    spec = importlib.util.spec_from_file_location(
-        "test_census", os.path.join(ROOT, "scripts", "test-census.py"))
-    census = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(census)
-    return census
+# The flags the census gate (tools/CryoGate/src/gates/census.cryo) runs `cryo
+# test` with; a baseline census run with other flags would not be the same
+# census.  The two lists are one list once verify is ported to cryogate.
+CENSUS_RUN_FLAGS = ["--format=plain", "-Werror=W0017"]
+
+
+def census_reading(log):
+    """`cryogate census --read`'s parse of a runner's log: the census gate's
+    own reading, so the two cannot disagree on what a run accounted for."""
+    r = subprocess.run([CRYOGATE, "census", "--read", log], cwd=ROOT,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        raise SystemExit("verify: cryogate census --read %s failed: %s"
+                         % (log, r.stderr.decode("utf-8", "replace").strip()))
+    return json.loads(r.stdout.decode("utf-8"))
 
 
 def judge_baseline_census(declared, accounted, unit_failed, neg_failed, failed, fixed=(),

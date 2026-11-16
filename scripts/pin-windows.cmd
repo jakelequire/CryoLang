@@ -38,5 +38,7 @@ if not defined WSL_ROOT (
 )
 
 echo ==^> [windows host] refreshing both pins via WSL ^(%WSL_ROOT%^)
-wsl.exe -- bash -lc "cd '%WSL_ROOT%' && make pin"
+rem `pin-impl`, not `pin`: the Windows side's `make pin` holds the heavy-run
+rem lock for the whole refresh, and `pin` would wait for it.
+wsl.exe -- bash -lc "cd '%WSL_ROOT%' && make pin-impl"
 exit /b %ERRORLEVEL%

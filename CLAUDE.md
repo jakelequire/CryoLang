@@ -34,8 +34,9 @@ make verify              # build once; census, examples, lsp, cross, incr, check
                          # a program the baseline built, in tests/started-passing
 make roster-check        # every unit test, project and negative file against the roster
                          # golden (tests/test-roster.txt); its OK line prints the current counts
-make check-fast          # verify's and verify-pin's self-tests + pin integrity, builds nothing.
-                         # Run before committing.
+make check-fast          # verify's, verify-pin's and cryogate's self-tests + pin integrity;
+                         # builds only cryogate and its unit tests, with the pin. Run
+                         # before committing.
 make lsp-check           # compile tools/CryoLSP with the compiler under test
 make warnings-check      # compiler/ + stdlib archive built with -Werror by the compiler
                          # under test, the stdlib for both OSes and both panic strategies;
@@ -54,8 +55,9 @@ make verify-pin          # both pins match their sidecars (sha256 and stamped co
                          # each other
 make verify-freestanding # runtime/ tiers built by the compiler under test
 make examples            # smoke-build every examples/ project (refuses a sweep below
-                         # scripts/examples-gate.py's --min)
-make examples-golden     # build AND run them, diff stdout (POSIX only)
+                         # the shipped count, `cryogate examples`' --min)
+make examples-golden     # build them AND run each with an expected.out, compare its
+                         # output (`cryogate examples --run`, both hosts, heavy)
 make incremental-check   # incremental build == clean build, per module
 make incremental-instance-check  # an edit asking a cached module for a new generic
                          # instance still links (a verify gate: `incr`)
@@ -81,9 +83,10 @@ only things that run are what a person or an agent runs.
 
 So:
 
-- **`make check-fast`** before committing: verify's and verify-pin's
-  self-tests and pin integrity. It builds nothing and takes seconds, so it is
-  no evidence about the compiler; `make verify` is.
+- **`make check-fast`** before committing: verify's, verify-pin's and
+  cryogate's self-tests and pin integrity. It builds only cryogate and its
+  unit tests, with the pin, so it is no evidence about the compiler; `make
+  verify` is.
 - **No commit hook runs.** Nothing refuses a commit; the gates above are
   what a person or an agent runs.
 

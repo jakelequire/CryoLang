@@ -1,4 +1,4 @@
-/* Fixture for scripts/vendor-consts-gate.py: the constant shapes a C API
+/* Fixture for `cryogate vendor` (make vendor-check): the constant shapes a C API
  * publishes, one per way the importer can arrive at a value.  A constant the
  * importer binds and the serializer then fails to write has no trace anywhere
  * downstream - the use site fails with "cannot find value" and nothing
