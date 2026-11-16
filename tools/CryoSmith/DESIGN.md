@@ -219,17 +219,18 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   decides a struct's value. (`observed` is the exception the stage-1 forms
   already make: a call inside `mix(observed, ...)` may observe, and so
   change `observed`, while the same statement reads it.)
-- **Open guarantee: operand evaluation order.** That exception's hash
+- **Operand evaluation order is guaranteed.** That exception's hash
   depends on the order a call's arguments and an operator's operands are
   evaluated in: `observed = mix(observed, (h1(v0) as u64))` reads
-  `observed` before `h1` changes it only when the arguments are evaluated
-  left to right. The pin and the current compiler both evaluate left to
-  right, but the spec does not yet promise an order; the question is open.
-  Until it is answered CryoSmith keeps generating these statements, and a
-  compiler that changed the order would print a different hash at every
-  optimisation level alike, so the corpus check (which compares -O0 with
-  -O2) would not see it. If the spec leaves the order unspecified, every
-  call is bound to a local before the statement that observes it.
+  `observed` before `h1` changes it because the language evaluates
+  operands left to right - a binary operator's left operand first, a
+  call's arguments in the order written, a method call's receiver before
+  its arguments (docs/cryo.md section 5.8, "Evaluation Order"). So the
+  hash a program prints is fixed by the source, and these statements stay.
+  A compiler that changed the order would print a different hash at every
+  optimisation level alike, which the corpus check (comparing -O0 with
+  -O2) cannot see; the test project `evaluation_order_left_to_right` is
+  what refuses it.
 
 ### 3.5 Reproducible from the seed
 

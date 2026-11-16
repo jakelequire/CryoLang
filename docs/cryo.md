@@ -1457,6 +1457,31 @@ From **lowest** to **highest**:
 
 The range operators `..` / `..=` bind looser than every arithmetic and comparison operator, so `a + 1 .. b * 2` is `(a + 1) .. (b * 2)`. They desugar at parse time to `Range::new` / `RangeInclusive::new` (see [section 6.3](#63-for-loops)). A range may leave an end open where the next token cannot start its operand - `]`, `)`, `,`, `;` or `}`: `a..` is `RangeFrom::new(a)`, `..b` is `RangeTo::new(b)` and a bare `..` is `RangeFull::new()`, the forms a slice takes ([section 10.6](#106-operator-overloading)). `RangeFrom` is an endless iterator over a `Step` type: `for (n in 5..)` counts up until the loop breaks. A range passed for a parameter whose type is the method's own type parameter, bound by a trait written with arguments, takes its element type from that bound: `map.range(10..20)` on a `BTreeMap<i64, V>`, whose `range<R>` requires `R: RangeBounds<K>`, passes a `Range<i64>`. The same holds for any static call written there without its owner's type arguments: the owner's implementation of the bound's trait at those arguments decides them (`Wrap::new(5000000000)` for `R: Measures<i64>` with `implement<T> Measures<T> for Wrap<T>` is a `Wrap<i64>`). An argument of a type of its own keeps it, and is checked against the bound.
 
+### 5.8 Evaluation Order
+
+**Operands are evaluated left to right.** Each operand is evaluated completely, its calls and their effects included, before the next one begins:
+
+- a binary operator's left operand before its right one, for every binary operator but the assignments ([section 5.5](#55-assignment)); `&&`, `||` and `??` evaluate the right operand only when the left one does not decide the result;
+- a call's arguments in the order they are written, each before the function is entered;
+- a method call's receiver before its arguments.
+
+The order is part of a program's meaning, so it is the same at every optimisation level. Precedence decides only how operands group, not when they run: in `note(1) + note(2) * note(3)` the three calls run in the order written, and the product is formed before the sum.
+
+```cryo
+mut trace: u64 = 0;
+
+function note(digit: u64) -> u64 {
+    trace = trace * 10 + digit;
+    return digit;
+}
+
+function main() -> i32 {
+    const s: u64 = note(1) + note(2) * note(3);   // trace is 123
+    const c: u64 = combine(note(4), note(5));     // trace is 12345
+    return 0;
+}
+```
+
 ---
 
 ## 6. Control Flow
@@ -3704,7 +3729,19 @@ Two candidates are ambiguous only within one tier: two wildcards offering one na
 
 Nothing outside the tiers is reachable. A name declared exactly once in the whole program still does not resolve where nothing brings it into scope, and a path whose first segment no tier binds is not found, however fully it is spelled: `std::math::power(2.0, 3.0)` in a file that imports no `std::math` is E0203.
 
-A path resolves one segment at a time. Its first segment is a bare name, looked up as above; each later segment is looked up in what the segment before it named. A module is found only among those the file can see - its own and the ones it imports, spelled as [section 13.6](#136-modules-and-types-share-one-namespace) allows - never by searching the program for its spelling, so what a path means never depends on which other modules exist in the program. A path that does not resolve is an error, with a suggestion where one exists.
+A path resolves one segment at a time. Its first segment is a bare name, looked up as above in the type namespace, since it names what owns the rest of the path - a type or a module, never a function or a variable; each later segment is looked up in what the segment before it named. A first segment spelled like a primitive type (`u16`, `boolean`, `string`) names that type before any tier is asked, as it does in a type annotation, so a function named `u16` neither hides `u16::MAX` nor is reached by it, and a plain call `u16()` still names the function:
+
+```cryo
+function u16() -> i32 { return 7; }
+
+function main() -> i32 {
+    const top: u16 = u16::MAX;            // the primitive's constant
+    const next: u16 = u16::wrapping_add(top, 2);
+    return u16();                         // the function
+}
+```
+
+A function sharing its name with a type of the same scope leaves the path through the type: `Limits::make()` is the type's static method beside a `function Limits()`. A module is found only among those the file can see - its own and the ones it imports, spelled as [section 13.6](#136-modules-and-types-share-one-namespace) allows - never by searching the program for its spelling, so what a path means never depends on which other modules exist in the program. A path that does not resolve is an error, with a suggestion where one exists.
 
 ---
 
