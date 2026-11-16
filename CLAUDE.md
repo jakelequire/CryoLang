@@ -57,7 +57,8 @@ make doc-coverage-check  # the stdlib's undocumented public declarations are EXA
                          # its own self-test first
 make verify-pin          # both pins match their sidecars (sha256 and stamped commit) AND
                          # each other
-make verify-freestanding # runtime/ tiers built by the compiler under test
+make verify-freestanding # the runtime's freestanding configuration, built by the compiler
+                         # under test, linked and run
 make examples            # smoke-build every examples/ project (refuses a sweep below
                          # scripts/examples-gate.py's --min)
 make examples-golden     # build AND run them, diff stdout (POSIX only)
@@ -406,7 +407,10 @@ Cryo does and why, so the point stands without the reader knowing another
 language, and so the text does not go wrong when Cryo's rule and the other
 language's diverge. Naming C where it is the actual interface - the C ABI, an
 `extern "C"` declaration, a C header, libc - is a fact about the boundary, not
-a comparison, and stays.
+a comparison, and stays. The same holds for any other language's construct
+named where it actually crosses a language boundary - "a C++ throw" for a
+foreign exception unwinding into Cryo code - since that names what arrives,
+not what Cryo resembles.
 
 **Commit a generator with what it generated.** Work that exists only as a diff,
 produced by tooling that exists only in a scratch directory, is not reproducible

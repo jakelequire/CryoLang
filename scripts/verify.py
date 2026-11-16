@@ -20,8 +20,8 @@ build:
 
 They are independent: each writes its own build directory, and nothing here
 rebuilds a shared archive while another reads it (which is why the gates are
-called as scripts, not as `make` targets whose phony prerequisites rebuild the
-runtime tiers).  Run one after another they take the sum of their times; run
+called as scripts, not as `make` targets whose prerequisites rebuild the
+compiler and the test helpers).  Run one after another they take the sum of their times; run
 together, about the longest one.
 
 Then it hashes the objects the census and the examples sweep compiled - the

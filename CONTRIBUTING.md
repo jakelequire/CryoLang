@@ -65,10 +65,12 @@ least recently used beyond six per configuration.
 the compiler.
 
 `file` on the archive does not tell you which target it holds - it prints
-`current ar archive` either way. Check a member:
+`current ar archive` either way. Check a member, `Sys.o`, which every
+configuration has, in one key's directory (`ls` the configuration's directory
+for the keys):
 
 ```bash
-ar p runtime/.bin/x86_64-pc-linux-gnu/hosted-unwind/*/libcryort.a Entry.o | file -
+ar p runtime/.bin/x86_64-pc-linux-gnu/hosted-unwind/<key>/libcryort.a Sys.o | file -
 ```
 
 ## Filing issues

@@ -85,10 +85,10 @@ PIN_EXE      := $(ROOT)/bin/cryo.exe
 # It cannot be derived from the host OS: the value comes from a toolchain probe
 # (mingw `gcc` on PATH -> `...-windows-gnu`, an MSVC linker -> `...-windows-msvc`;
 # on Linux whatever the linked libLLVM reports).  `cryo version --triple` prints
-# exactly what `resolve_effective_triple` hands the tier lookup, so the directory
-# named from it is the one the linker will search.  Guessing is SILENT when
-# wrong: `runtime_dir_pick` falls back to the flat directory and the two
-# toolchains resume overwriting each other's archives there.
+# exactly the triple a build names its archive directories by (`.bin/<triple>/`
+# in stdlib/ and runtime/), so the directory named from it is the one the
+# compiler fills.  Guessing is SILENT when wrong: warnings-check would delete
+# another target's stdlib archives and then link the host's, already built.
 #
 # Asking means launching the pin, and the rules below name the triple in their
 # prerequisites, so it would be asked while the Makefile is read.  The goals in
@@ -274,12 +274,12 @@ Tests and gates
   make incremental-instance-check  An edit asking a cached module for a new
                          generic instance still links.
   make vendor-check      Every constant shape survives `cryo vendor`.
-  make verify-freestanding  Runtime tiers' freestanding acceptance check
+  make verify-freestanding  The runtime's freestanding acceptance check
                          (POSIX only; refuses on Windows).
   make runtime-abi-check The lang-item registry (runtime/abi/lang_items.def)
-                         against every built runtime link set, and the
+                         against the runtime's three configurations, and the
                          `__cryo_` names compiler/src and stdlib/ spell.
-                         Builds the runtime tiers first; a verify gate.
+                         Builds each configuration first; a verify gate.
   make selfhost-check    Byte-identity fixed point.  Linux host: the Linux
                          chain, then the Windows chain under wine (a skipped
                          arm fails unless ARGS=--allow-skipped-arm).  Windows
@@ -307,7 +307,7 @@ Pins and release
   make install           Symlink bin/cryo and the stdlib into a prefix (POSIX).
   make uninstall         Remove those symlinks.
   make clean             Remove every build output in the tree: compiler,
-                         stdlib, runtime tiers, LSP, test helpers, test and
+                         stdlib, runtime archives, LSP, test helpers, test and
                          example builds, .verify/, .cross-check/,
                          build-logs/ and dist/.
 
@@ -708,7 +708,7 @@ endif
 #
 # Everything it needs built is a prerequisite HERE, before any gate starts:
 # the gates run concurrently, and a phony prerequisite rebuilt by one of them
-# (the runtime tiers) would be rewritten while another is linking against it.
+# (a test helper archive) would be rewritten while another is linking against it.
 ifeq ($(HOST_OS),windows)
 verify: cryo $(TEST_HELPERS_A)
 	@$(PYTHON) scripts/verify.py --cryo "$(STAGE2_EXE)" $(ARGS)
@@ -989,7 +989,7 @@ uninstall:
 
 # ---- clean ------------------------------------------------------------
 # Every output the targets above write inside the tree, for every triple:
-# the compiler, the stdlib and runtime tier archives, the LSP build and its
+# the compiler, the stdlib and runtime archives, the LSP build and its
 # installed copy, the test helper archives, the test suite's and the
 # examples' build directories, the namespace-index caches the compile-fail
 # suite's single-file checks keep in tests/tests/negative/.bin, the gates' state (.verify/ with its cached

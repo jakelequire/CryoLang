@@ -41,9 +41,9 @@ type struct IntrinsicEmitter {
     /// for the active target (SysV-amd64 vs Win64).
     /// Null between `null()` and `wire()`.
     abi:         AbiClassifier*;
-    /// `[compiler] no_runtime`: a freestanding build links no panic tier, so
-    /// `emit_panic_call` diverges through `llvm.trap` (`ud2`) instead of the
-    /// funnel.  Wired from `ctx.options.freestanding()`.
+    /// `[compiler] no_runtime`: a freestanding build, which links the runtime's
+    /// freestanding configuration and allocates through its `__cryo_alloc`.
+    /// Wired from `ctx.options.freestanding()`.
     no_runtime:  boolean;
     /// The name a `Location`'s file is written under.
     file_names:  ProgramFileNames;
@@ -643,8 +643,8 @@ type struct IntrinsicEmitter {
             IntrinsicKind::FpClass => { this.emit_fpclass(a0, a1) }
 
             // -- trap(): `call void @llvm.trap()` then `unreachable`.  llvm.trap
-            //    lowers to `ud2` (SIGILL) with no libc dependency - the
-            //    divergent sink for a `no_runtime` check failure.  Declared
+            //    lowers to `ud2` (SIGILL) with no libc dependency and no
+            //    report; a failed check never takes it.  Declared
             //    `-> never`, but the dispatcher's early return bypasses the
             //    post-call divergent-name check (see Panic), so the
             //    `unreachable` is emitted here. --
@@ -774,7 +774,7 @@ type struct IntrinsicEmitter {
     // Per-intrinsic emission paths
 
     /// Get-or-declare the panic funnel `__cryo_panic(msg, loc)`, defined by
-    /// whichever panic tier the link names (`runtime/abi/lang_items.def`):
+    /// the runtime archive the link names (`runtime/abi/lang_items.def`):
     /// the message and the address of a `Location`.  Typed `(ptr, ptr) ->
     /// void`; the caller emits `unreachable` after the call since it diverges.
     get_or_decl_cryo_panic(mut &this) -> LValue {
@@ -794,11 +794,11 @@ type struct IntrinsicEmitter {
     /// of a `Location`.
     emit_panic_call(mut &this, msg: LValue, loc: LValue) -> LValue {
         // Every panic goes through the external funnel, declared here and
-        // defined by whichever panic tier the link line names, freestanding
+        // defined by the runtime archive the link line names, freestanding
         // links included: `panic/abort` prints and terminates, `panic/unwind`
         // raises through libunwind so the cleanup landing pads on the
-        // enclosing calls run as the unwind passes through.  Which strategy a
-        // program gets is a link-time choice, not a codegen one, which is why
+        // enclosing calls run as the unwind passes through.  Which of the two
+        // a program gets is the runtime configuration its link names, so
         // nothing here branches on it.
         const panic_fn: LValue = this.get_or_decl_cryo_panic();
         if (!panic_fn.is_valid()) { return LValue::null(); }
@@ -1046,9 +1046,9 @@ type struct IntrinsicEmitter {
     //
     // Every check site, in every configuration, calls the runtime's handler for
     // its failure (`ExprOps::emit_check_failure`). The handler formats the
-    // operands and diverges through `__cryo_panic` (exit 101 for the abort
-    // tiers, an unwind for the unwind tier - chosen by which archive is on the
-    // link line, no caller change); a freestanding link has no libc `abort` to
+    // operands and diverges through `__cryo_panic` (exit 101 under abort and
+    // freestanding, an unwind under unwind - chosen by the runtime configuration
+    // the link names, no caller change); a freestanding link has no libc `abort` to
     // reach for in any case. The place is passed as the address of a
     // `Location` (`location_global`), by pointer so neither side has to
     // classify the aggregate by hand under two different C ABIs.
@@ -1078,7 +1078,7 @@ type struct IntrinsicEmitter {
     /// Declare the allocator lang item `__cryo_alloc(u64 size, u64 align) ->
     /// void*` (see `runtime/abi/lang_items.def`).  Idempotent.
     ///
-    /// The alloc tier defines this `![weak]`, so a program that wants its own
+    /// The freestanding runtime defines this `![weak]`, so a program that wants its own
     /// allocator supplies a strong definition and the linker prefers it — which
     /// is the whole point of routing allocation through a named symbol instead
     /// of open-coding a `malloc` call.

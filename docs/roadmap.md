@@ -690,6 +690,26 @@ included, is. Releasing them needs the catching call site to carry a cleanup
 separate from its catch, for the personality to choose under a forced
 unwind.
 
+## One definition of the runtime's check handlers
+
+`runtime/panic/abort.cryo` and `runtime/panic/unwind.cryo` each define the
+four check handlers (`__cryo_panic_bounds_check`, `_overflow`, `_div_zero`,
+`_no_match`), and the two copies are the same: each formats its operands and
+diverges through the strategy's `__cryo_panic`. They belong once, ungated,
+beside the report they write (`runtime/sys.cryo`), leaving each strategy file
+only what differs between the strategies. Decided for after the merge of the
+runtime work.
+
+## The installer requires the runtime
+
+A program cannot link without the runtime's sources (`E0900` names
+`CRYO_RUNTIME`), but `install.sh` checks an extracted release for `bin/cryo`
+and `stdlib/lib.cryo` only, and its `--dev` mode links no runtime directory
+(the compiler finds `<bindir>/../runtime` through the symlinked binary). Once
+a release that ships `runtime/` is out, the installer refuses an archive
+without `runtime/lib.cryo`, as it does one without the stdlib; before that it
+cannot, since every earlier archive lacks it.
+
 ## Moving a value out from behind a reference
 
 A field that owns a resource, moved by value out of a place reached through

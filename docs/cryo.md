@@ -5181,7 +5181,7 @@ debug      = false                  # compiler logging, as --log=debug
 optimize   = "O2"                   # O0 | O1 | O2 | O3 (default O2)
 emit_llvm  = false                  # also write LLVM IR (.ll) beside the object
 no_std     = false                  # build without linking the standard library
-no_runtime = false                  # freestanding: no crt0 / libc / panic runtime
+no_runtime = false                  # freestanding: no crt0 / libc; the runtime's own entry
 panic      = "unwind"               # unwind | abort (see Panic strategies below)
 ```
 
@@ -5218,7 +5218,11 @@ program builds the configuration the program needs the first time it needs
 it, and keeps it in `runtime/.bin/<triple>/<configuration>/`; the archive is
 rebuilt when the compiler, a runtime source or the target changes.
 `CRYO_RUNTIME` names another runtime source directory to use; one that holds
-no `lib.cryo` is refused.
+no `lib.cryo` is refused. Without it the runtime is the first of
+`$CRYO_HOME/runtime`, `<bindir>/../runtime`, `<bindir>/../../runtime` (the
+compiler's own directory, `<bindir>`) and the `runtime` directory beside the
+stdlib that holds a `lib.cryo`; a build that links a program and finds none
+is refused with `E0900`, which names `CRYO_RUNTIME`.
 
 #### Panic strategies
 
@@ -5466,7 +5470,10 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--ast`               | Dump the AST after parsing.                                                                                                             |
 | `--emit-llvm`         | Emit LLVM IR (`.ll`) beside the object output, including a module that fails LLVM verification (the build still fails).                 |
 | `--build-dir=PATH`    | Override `[project] output_dir`.                                                                                                        |
-| `--stdlib=PATH`       | Standard-library root for this run (highest priority; see section 23.3).                                                                |
+| `--stdlib=PATH`       | Standard-library root for this run (highest priority; see section 24.3).                                                                |
+| `--panic=STRATEGY`    | `unwind` (the default for a hosted build) or `abort`; overrides `[compiler] panic` (see Panic strategies in section 23.2).              |
+| `--no-std`            | Build without the prelude and the standard library, as `[compiler] no_std = true`.                                                      |
+| `--no-runtime`        | Freestanding build, as `[compiler] no_runtime = true`: no crt0 or libc, and the runtime's freestanding configuration is linked.         |
 | `--target=TRIPLE`     | Cross-compile for an LLVM target triple. `x86_64-pc-windows-gnu` links to a `.exe` via mingw-w64; other x86-64 triples emit object files only; another architecture is `E0647`. |
 | `--opt-level=N`       | Optimization level `0`..`3`; overrides the profile and `[compiler] optimize`.                                                           |
 | `-g`, `--debug-info`  | Emit DWARF debug info.                                                                                                                  |
