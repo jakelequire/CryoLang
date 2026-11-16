@@ -1457,7 +1457,10 @@ type struct CompilerInstance {
                 ctx.project_config, build_shape, ctx.options.opt_level, ctx.options.debug_info,
                 ctx.options.target_triple, manifest_stdlib_archive, manifest_stdlib_archive_key);
             const recorded_headers: [String] = manifest.recorded_headers();
-            const build_fp: u128 = manifest.compute_fingerprint(&mod_entries, &recorded_headers);
+            const runtime_archives: [PathBuf] = CodegenPasses::runtime_archives(
+                ctx, ctx.options.target_triple, ctx.project_config.no_runtime);
+            const build_fp: u128 = manifest.compute_fingerprint(&mod_entries, &recorded_headers,
+                                                                &runtime_archives);
             build_fp_hex = compiler::build_manifest::Manifest::hex128(build_fp);
 
             if (manifest.is_up_to_date(build_fp_hex, &manifest_artifacts)) {
@@ -2046,9 +2049,14 @@ type struct CompilerInstance {
                     cg_job.keyed = true;
                     cg_job.key_hasher = module_cache.key_hasher();
                     match (module_cache.prior.lookup(mod_name)) {
-                        Option::Some(prior_key) => {
-                            cg_job.prior_key = prior_key;
-                            cg_job.reusable = Path::from(tgt.emit_path).exists();
+                        Option::Some(prior) => {
+                            // The object at the path is the one the key
+                            // describes only while it has the digest the
+                            // last build recorded: a project sharing the
+                            // build directory may have written its own.
+                            cg_job.prior_key = prior.key;
+                            cg_job.reusable = compiler::build_manifest::Manifest::file_digest(
+                                Path::from(tgt.emit_path)) == prior.object;
                         }
                         Option::None => { }
                     }
@@ -2303,8 +2311,10 @@ type struct CompilerInstance {
             const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
                 ctx.project_config, build_shape, ctx.options.opt_level, ctx.options.debug_info,
                 ctx.options.target_triple, manifest_stdlib_archive, manifest_stdlib_archive_key);
+            const runtime_archives: [PathBuf] = CodegenPasses::runtime_archives(
+                ctx, ctx.options.target_triple, ctx.project_config.no_runtime);
             const built_fp_hex: string = compiler::build_manifest::Manifest::hex128(
-                manifest.compute_fingerprint(&mod_entries, &ctx.imported_headers));
+                manifest.compute_fingerprint(&mod_entries, &ctx.imported_headers, &runtime_archives));
             manifest.write_fingerprint(built_fp_hex, &ctx.imported_headers, ctx.diagnostics.has_warnings());
             manifest.write_manifest(&mod_entries, built_fp_hex, &manifest_artifacts);
             // Per-module cache keys for the NEXT build to consult: every
@@ -3278,7 +3288,7 @@ type struct CompilerInstance {
             return;
         }
         if (job.keyed) {
-            (*cache).record(job.module_name, job.key, job.reused);
+            (*cache).record(job.module_name, job.key, job.emit_path, job.reused);
         }
         if (job.reused) {
             (*objects)[job.position as i64] = job.emit_path;

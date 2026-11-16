@@ -461,19 +461,14 @@ type struct CodegenPasses {
                                       triple_text: string, link_cfg: LinkerConfig*,
                                       probe_log: Path) -> void {
         const triple: string = triple_text;
-        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple_text, true);
-        if (lib_dir.length() == 0) {
+        const archives: [PathBuf] = CodegenPasses::runtime_archives(ctx, triple_text, false);
+        if (archives.length() == 0) {
             return;
         }
-        const directory: Path = Path::from(lib_dir);
-        cmd.push(Str::new(" "));
-        cmd.push(CodegenPasses::link_quote(directory.join("libcryort-core-hosted.a").as_path().as_str()));
-        const archive: string = match (ctx.options.unwinds()) {
-            true  => { "libcryort-panic-unwind-hosted.a" }
-            false => { "libcryort-panic-abort-hosted.a" }
-        };
-        cmd.push(Str::new(" "));
-        cmd.push(CodegenPasses::link_quote(directory.join(archive).as_path().as_str()));
+        for (mut i: i64 = 0; i < archives.length(); i++) {
+            cmd.push(Str::new(" "));
+            cmd.push(CodegenPasses::link_quote(archives[i].as_path().as_str()));
+        }
         // A windows toolchain built on LLVM's runtimes (llvm-mingw) resolves the
         // `_Unwind_*` ABI through libunwind, and its clang driver links that
         // SHARED whenever the toolchain ships `libunwind.dll.a` - which makes
@@ -636,23 +631,49 @@ type struct CodegenPasses {
     static append_runtime_tier_libs(ctx: CompilationContext*, cmd: mut &String,
                                      triple_text: string) -> void {
         const triple: string = triple_text;
-        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple_text, false);
-        if (lib_dir.length() == 0) {
+        const archives: [PathBuf] = CodegenPasses::runtime_archives(ctx, triple_text, true);
+        if (archives.length() == 0) {
             return;
         }
-        const directory: Path = Path::from(lib_dir);
-        const panic_tier: string = match (ctx.options.unwinds()) {
-            true  => { "libcryort-panic-unwind.a" }
-            false => { "libcryort-panic-abort.a" }
-        };
-        const tiers: [string] = ["libcryort-alloc.a", "libcryort-backtrace.a", "libcryort-core.a", panic_tier];
-        for (mut i: i64 = 0; i < tiers.length(); i++) {
+        for (mut i: i64 = 0; i < archives.length(); i++) {
             cmd.push(Str::new(" "));
-            cmd.push(CodegenPasses::link_quote(directory.join(tiers[i]).as_path().as_str()));
+            cmd.push(CodegenPasses::link_quote(archives[i].as_path().as_str()));
         }
         if (triple.contains("windows")) {
             cmd.push(Str::new(" -lkernel32 -lntdll"));
         }
+    }
+
+    /// The runtime tier archives a link for `triple` names, in link order:
+    /// for a `freestanding` link the allocator, backtrace, core and panic
+    /// tiers, for a hosted one the hosted core and panic tiers; the panic tier
+    /// is the build's strategy's. Empty when no runtime directory is found.
+    /// The link names exactly these, and the whole-build fingerprint folds
+    /// their bytes, so a rebuilt runtime relinks a program built against the
+    /// one before.
+    static runtime_archives(ctx: CompilationContext*, triple_text: string,
+                            freestanding: boolean) -> [PathBuf] {
+        mut archives: [PathBuf] = [];
+        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple_text, !freestanding);
+        if (lib_dir.length() == 0) {
+            return archives;
+        }
+        const directory: Path = Path::from(lib_dir);
+        const unwinds: boolean = ctx.options.unwinds();
+        const names: [string] = match (freestanding) {
+            true => {
+                ["libcryort-alloc.a", "libcryort-backtrace.a", "libcryort-core.a",
+                 if (unwinds) { "libcryort-panic-unwind.a" } else { "libcryort-panic-abort.a" }]
+            }
+            false => {
+                ["libcryort-core-hosted.a",
+                 if (unwinds) { "libcryort-panic-unwind-hosted.a" } else { "libcryort-panic-abort-hosted.a" }]
+            }
+        };
+        for (mut i: i64 = 0; i < names.length(); i++) {
+            archives.push(directory.join(names[i]));
+        }
+        return archives;
     }
 
     /// Copy the freshly-linked binary from the per-profile cache to the build
