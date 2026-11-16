@@ -442,6 +442,33 @@ with no second copy of the program written by hand:
 The roster golden records the `applied` exit code on the project's line
 (`applied=0`), so dropping the field from a `test.json` is a roster change.
 
+A project that tests what a SECOND build does - an incremental build after
+an edit, or after a change of input - says so with `rebuild`. The runner
+copies the project (outside the tree, without its `build/`), builds the copy
+once (`cryo build`, or the project's own `cryo test` for a collect
+fixture), which must exit 0; then overwrites each `replace` entry's `file`
+in the copy with the project's own `with` file, and runs the project's
+outcome again in the same copy, so the second build finds the first one's
+build directory. `rebuild.arguments`, when given, replace the project's
+`arguments` for the second run. `expect` judges the second run only. A
+`rebuild` that replaces nothing and changes no argument, or a replacement
+missing `file` or `with`, makes the `test.json` malformed. A `with` file
+outside `src/` is never compiled by the first build, since module discovery
+is import-driven:
+
+```json
+{
+  "outcome": "run",
+  "rebuild": {
+    "replace": [ { "file": "src/value.cryo", "with": "edits/value.cryo" } ]
+  },
+  "expect": { "exit_code": 2, "output_contains": ["reusing 1 cached object(s)"] }
+}
+```
+
+The roster golden records the number of replaced files on the project's
+line (`rebuild=1`).
+
 A project can also drive the compiler itself, for a test of what `cryo`
 writes rather than what the program does. `environment` sets variables for
 that one command (`"NAME=value"` entries), `arguments` adds to its command

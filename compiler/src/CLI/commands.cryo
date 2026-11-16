@@ -165,6 +165,18 @@ type struct ProjSpec {
     /// source and exit with `applied.exit_code` (default 0).
     applied: boolean;
     applied_exit_code: i64;
+    /// test.json `rebuild`: the project is built twice into one build
+    /// directory.  A copy of it is built once, which must succeed; then each
+    /// `rebuild_files[k]` in the copy is overwritten with the project's own
+    /// `rebuild_sources[k]`, and the copy is run again, with
+    /// `rebuild_arguments` instead of `arguments` when
+    /// `rebuild_sets_arguments`.  Everything else in the spec judges that
+    /// second run.
+    rebuild: boolean;
+    rebuild_files: [String];
+    rebuild_sources: [String];
+    rebuild_arguments: [String];
+    rebuild_sets_arguments: boolean;
 
     static empty() -> ProjSpec {
         return ProjSpec {
@@ -173,8 +185,26 @@ type struct ProjSpec {
             environment: [], arguments: [], stderr_contains: [], stderr_excludes: [],
             stdout_line_prefixes: [], stderr_line_prefixes: [],
             file: String::new(), file_contains: [], file_excludes: [],
-            applied: false, applied_exit_code: 0
+            applied: false, applied_exit_code: 0,
+            rebuild: false, rebuild_files: [], rebuild_sources: [], rebuild_arguments: [],
+            rebuild_sets_arguments: false
         };
+    }
+
+    /// What the first build of a `rebuild` project is held to: a build (a
+    /// run fixture's program is not run; a collect fixture builds through
+    /// its own `cryo test`), in this project's environment and with its
+    /// arguments, exiting 0 with nothing else asserted.
+    first_build(&this) -> ProjSpec {
+        mut first: ProjSpec = ProjSpec::empty();
+        first.outcome = if (this.outcome == 0) { 0 } else { 1 };
+        for (mut i: i64 = 0; i < this.environment.length(); i++) {
+            first.environment.push(this.environment[i].clone());
+        }
+        for (mut i: i64 = 0; i < this.arguments.length(); i++) {
+            first.arguments.push(this.arguments[i].clone());
+        }
+        return first;
     }
 
     /// What the copy with its fixes applied is held to: it runs, with
@@ -2356,6 +2386,43 @@ type struct Executor {
             }
             Option::None => { }
         }
+        // A `rebuild` that replaces no file and changes no argument would
+        // build the same project twice and prove nothing about the second
+        // build, and a replacement missing either side names nothing to
+        // copy: both make the test.json malformed.
+        mut rebuild_malformed: boolean = false;
+        match (root.get(str::Str::new("rebuild"))) {
+            Option::Some(rp) => {
+                spec.rebuild = true;
+                if (!rp.is_object()) { rebuild_malformed = true; }
+                match (rp.get(str::Str::new("replace"))) {
+                    Option::Some(list) => {
+                        if (!list.is_array()) { rebuild_malformed = true; }
+                        for (mut i: i64 = 0; i < list.length(); i++) {
+                            const entry: value::JsonValue* = list.at(i).unwrap();
+                            const target: Option<str::Str> = match (entry.get(str::Str::new("file"))) {
+                                Option::Some(fp) => { fp.as::<str::Str>() }
+                                Option::None     => { Option::None }
+                            };
+                            const source: Option<str::Str> = match (entry.get(str::Str::new("with"))) {
+                                Option::Some(wp) => { wp.as::<str::Str>() }
+                                Option::None     => { Option::None }
+                            };
+                            if (target.is_none() || source.is_none()) { rebuild_malformed = true; continue; }
+                            spec.rebuild_files.push(String::from_str(target.unwrap()));
+                            spec.rebuild_sources.push(String::from_str(source.unwrap()));
+                        }
+                    }
+                    Option::None => { }
+                }
+                if (rp.get(str::Str::new("arguments")).is_some()) {
+                    spec.rebuild_sets_arguments = true;
+                    Executor::read_strings(rp, "arguments", &spec.rebuild_arguments);
+                }
+                if (spec.rebuild_files.length() == 0 && !spec.rebuild_sets_arguments) { rebuild_malformed = true; }
+            }
+            Option::None => { }
+        }
         match (root.get(str::Str::new("expect"))) {
             Option::Some(ep) => {
                 match (ep.get(str::Str::new("exit_code"))) {
@@ -2422,6 +2489,7 @@ type struct Executor {
             Option::None => { }
         }
         mem::drop(root);
+        if (rebuild_malformed) { return Option::None; }
         return Option::Some(spec);
     }
 
@@ -2469,7 +2537,8 @@ type struct Executor {
         //   verdict_of[i]: 0 run job_of[i], 1 malformed test.json, 2 ignored,
         //                  3 unknown requirement, 4 unmet requirement,
         //                  5 project directory missing, 6 an earlier run's
-        //                  `expect.file` that could not be removed
+        //                  `expect.file` that could not be removed, 7 a
+        //                  `rebuild` whose first build or replacement failed
         const tmp: path::PathBuf = neg_tmp_path();
         const filter: str::Str = str::Str::new(pattern);
         mut names:      [String]   = [];
@@ -2479,6 +2548,9 @@ type struct Executor {
         //   applied_job_of[i]: the job running the copy of project i with its
         //                      fixes applied, or -1 when it has no `applied`
         mut applied_job_of: [i64]  = [];
+        //   copy_of[i]: the copy a `rebuild` project was built twice in, or
+        //               empty
+        mut copy_of:    [String]   = [];
         mut specs:      [ProjSpec] = [];
         mut cmds:       [String]   = [];
         const entries: DirectoryEntries = match (Directory::entries(projects_dir)) {
@@ -2527,13 +2599,32 @@ type struct Executor {
                     }
                 }
             }
+            // A `rebuild` project's job is its second build, in the copy its
+            // first build ran in; its project directory is that copy from
+            // here on.  A first build that failed fails the project (7).
+            mut copy_text: String = String::new();
+            if (verdict == 0 && spec.rebuild) {
+                copy_text = f"{tmp.as_path().as_str()}.rebuild.{cmds.length()}";
+                const failure: String = Executor::build_first(self_exe, stdlib_abs, proj_dir.as_path(),
+                    path::Path::from(copy_text.as_str()), &spec, build_flags);
+                if (failure.length() > 0) {
+                    verdict = 7; reason = failure;
+                } else if (spec.rebuild_sets_arguments) {
+                    spec.arguments = [];
+                    for (mut k: i64 = 0; k < spec.rebuild_arguments.length(); k++) {
+                        spec.arguments.push(spec.rebuild_arguments[k].clone());
+                    }
+                }
+            }
+            copy_of.push(copy_text.clone());
+            const run_dir: path::PathBuf = if (copy_text.length() > 0) { path::PathBuf::from(copy_text.as_str()) } else { path::PathBuf::from(proj_dir.as_path().as_str()) };
             names.push(String::from_str(name));
             verdict_of.push(verdict);
             reason_of.push(reason);
             if (verdict == 0) {
                 const out_path: String = Executor::job_tmp_path(tmp.as_path(), cmds.length() as u64);
                 job_of.push(cmds.length() as i64);
-                cmds.push(Executor::project_command(self_exe, stdlib_abs, proj_dir.as_path(), &spec,
+                cmds.push(Executor::project_command(self_exe, stdlib_abs, run_dir.as_path(), &spec,
                     out_path.as_str(), build_flags));
                 // The fixes are made in a copy, never in the tree's own
                 // sources; the copy's build output is left behind so its
@@ -2649,11 +2740,19 @@ type struct Executor {
                     Executor::proj_report(is_pretty, is_compact, color_on, false, stale.as_str());
                     failures += 1; ran += 1; continue;
                 }
+                // A copy left behind is removed before the next run copies
+                // the project there, or fails that project.
+                const copy_text: str::Str = copy_of[i].as_str();
+                if (verdict == 7) {
+                    Executor::proj_report(is_pretty, is_compact, color_on, false, reason);
+                    match (Directory::remove_all(path::Path::from(copy_text))) { Result::Ok(_) => { } Result::Err(_) => { } }
+                    failures += 1; ran += 1; continue;
+                }
 
                 const k: u64 = job_of[i] as u64;
                 Executor::wait_job(done.as_pointer(), k);
                 const out_path: String = Executor::job_tmp_path(tmp.as_path(), k);
-                const proj_dir: path::PathBuf = projects_dir.join(name);
+                const proj_dir: path::PathBuf = if (copy_text.length() > 0) { path::PathBuf::from(copy_text) } else { projects_dir.join(name) };
                 mut res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path.as_str(), proj_dir.as_path());
                 if (!Executor::remove_project_file(proj_dir.as_path(), &specs[i]) && res.passed) {
                     res = ProjOutcome { passed: false,
@@ -2705,6 +2804,9 @@ type struct Executor {
                 const out_error: String = Executor::stderr_path(out_path.as_str());
                 Executor::remove_capture(path::Path::from(out_path.as_str()));
                 Executor::remove_capture(path::Path::from(out_error.as_str()));
+                if (copy_text.length() > 0) {
+                    match (Directory::remove_all(path::Path::from(copy_text))) { Result::Ok(_) => { } Result::Err(_) => { } }
+                }
                 if (applied_out.length() > 0) {
                     const applied_error: String = Executor::stderr_path(applied_out.as_str());
                     Executor::remove_capture(path::Path::from(applied_out.as_str()));
@@ -2792,6 +2894,43 @@ type struct Executor {
         command.push(f" > {tmp} 2> ");
         command.push(Executor::stderr_path(tmp));
         return shell_in_dir(proj_dir.as_str(), command.as_str());
+    }
+
+    /// A `rebuild` project's first build, in a fresh copy of it at
+    /// `copy_dir` without its `build/`, then its replacements made in the
+    /// copy, which its second build then reads.  Empty when the copy is ready
+    /// for the second build, else why it is not.  The first build runs here,
+    /// before the worker pool starts, since the second must follow it.
+    static build_first(self_exe: Str, stdlib_abs: Str, proj_dir: path::Path, copy_dir: path::Path,
+                       spec: &ProjSpec, build_flags: str::Str) -> String {
+        const fresh: boolean = !copy_dir.exists() || Directory::remove_all(copy_dir).is_ok();
+        if (!fresh || Directory::copy_all(proj_dir, copy_dir).is_err()) {
+            return String::from_str(str::Str::new("the project could not be copied to build it twice"));
+        }
+        const copied_build: path::PathBuf = copy_dir.join(str::Str::new("build"));
+        if (copied_build.as_path().exists() && Directory::remove_all(copied_build.as_path()).is_err()) {
+            return String::from_str(str::Str::new("the copy's build directory could not be cleared"));
+        }
+        const first: ProjSpec = spec.first_build();
+        const capture: String = f"{copy_dir.as_str()}.first";
+        const status: i32 = Command::shell(Executor::project_command(self_exe, stdlib_abs, copy_dir, &first,
+            capture.as_str(), build_flags).as_str());
+        const outcome: ProjOutcome = Executor::project_outcome(&first, status, capture.as_str(), copy_dir);
+        const capture_error: String = Executor::stderr_path(capture.as_str());
+        Executor::remove_capture(path::Path::from(capture.as_str()));
+        Executor::remove_capture(path::Path::from(capture_error.as_str()));
+        if (!outcome.passed) { return f"the first build: {outcome.detail}"; }
+        for (mut k: i64 = 0; k < spec.rebuild_files.length(); k++) {
+            const source: path::PathBuf = proj_dir.join(spec.rebuild_sources[k].as_str());
+            const target: path::PathBuf = copy_dir.join(spec.rebuild_files[k].as_str());
+            if (File::copy(source.as_path(), target.as_path()).is_err()) {
+                return f"cannot replace {spec.rebuild_files[k]} with {spec.rebuild_sources[k]}";
+            }
+        }
+        if (!Executor::remove_project_file(copy_dir, spec)) {
+            return f"cannot remove the {spec.file} the first build wrote";
+        }
+        return String::new();
     }
 
     /// Remove the file a project's expectations read (`expect.file`), if any,
