@@ -495,7 +495,14 @@ type struct CallResolver {
             return this.binding.param_types_through_param_bounds(
                 base_t.as_generic_param(), member.member, arg_count);
         } else {
-            return [];
+            // A primitive's methods are its `implement` blocks', not a
+            // method list.  Left without them, an argument of
+            // `x.wrapping_subtract(-(19371 & 32767))` with `x: i16` is
+            // typed at its default width before its parameter is seen.
+            mut cands: ArgCandidates = ArgCandidates::new(arg_count);
+            this.collect_on_primitive(visitor, call, member, base_ref, &cands);
+            if (cands.count == 1) { *chosen = cands.declarations[0]; }
+            return this.agreed_candidate_params(&cands);
         }
 
         if (found.length() == 0) { return []; }
@@ -3729,6 +3736,29 @@ type struct CallResolver {
             this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), true, true, &sel);
         }
         return true;
+    }
+
+    /// Record in `found` the candidates the selection tries for `call` on
+    /// the primitive `receiver`: the methods of its inherent `implement`
+    /// blocks, then, when none has the member's name, those of the trait
+    /// impls selected for it.
+    collect_on_primitive(mut &this, visitor: SemaVisitor*, call: CallExpr*,
+                         member: MemberAccessExpr*, receiver: TypeRef, found: mut ArgCandidates*) -> void {
+        mut sel: Selection = Selection::none();
+        sel.recv = receiver;
+        sel.collect = found;
+        const no_args: [TypeRef] = [];
+        const inherent: [DeclarationNode*] = this.ctx.generic_registry.inherent_impl_blocks(receiver);
+        for (mut bi: i64 = 0; bi < inherent.length(); bi++) {
+            this.bind_on_impl_block(visitor, call, member, DeclarationNode::impl_of(inherent[bi]), &no_args, false, &sel);
+            this.bind_on_impl_block(visitor, call, member, DeclarationNode::impl_of(inherent[bi]), &no_args, true, &sel);
+        }
+        if (found.name_seen > 0) { return; }
+        const blocks: [ImplBlock*] = this.trait_checker().impls_of(receiver);
+        for (mut ti: i64 = 0; ti < blocks.length(); ti++) {
+            this.bind_on_impl_block(visitor, call, member, blocks[ti], &no_args, false, &sel);
+            this.bind_on_impl_block(visitor, call, member, blocks[ti], &no_args, true, &sel);
+        }
     }
 
     /// Record in `found` a candidate method the selection tried, with its
