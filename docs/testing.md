@@ -374,6 +374,7 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 | `"outcome"` | `"collect"` (default) / `"build"` / `"compile_fail"` / `"run"` |
 | `"ignore"` | `true` skips the project (reported as ignored) |
 | `"expect"` | per-outcome assertions (below) |
+| `"steps"` | commands of the compiler run before the outcome's own (below) |
 
 `make test-census` runs the suite with `-Werror=W0017`, which `cryo test`
 hands to every project's build too: a unit test or a project that discards a
@@ -459,6 +460,23 @@ kept apart, so `expect` can say which stream a line belongs on:
 - `file`, with `file_contains` / `file_excludes` - a file the command writes,
   relative to the project; it is removed before the command runs and after
   it is read, so what is checked is always this run's.
+
+`steps` runs other commands of the same compiler first, in order, in the
+project's directory: each is a list of arguments, its verb first, and each
+gets the suite's `--stdlib`. A step runs only once the one before it exited
+0, and the project's own command only once every step has; a failing step
+fails the project and its output is shown. A project with steps starts from
+no `build/` folder, so a step that writes there (`cryo init build/lib ...`)
+leaves only this run's files for the build and the `file` assertions to
+read:
+
+```json
+{
+  "outcome": "run",
+  "steps": [["init", "build/tally", "--name=tally-lib", "--type=library"]],
+  "expect": { "exit_code": 0 }
+}
+```
 
 A `.cryo` file named in `arguments` makes a `build` project a single-file
 build of that file (the directory then needs no `cryoconfig`), so the flags
