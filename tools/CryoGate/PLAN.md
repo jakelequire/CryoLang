@@ -527,7 +527,12 @@ Re-checked at `8828ddc3`: perf added none of these; the table stands.
 (`ExitStatus.peak_memory_bytes`) and 9 (`Directory::copy_all`) exist, and
 row 12's `Str.lines()` and row 16's `Array.deduplicate` do; row 4 is a raw
 `GlobalMemoryStatusEx` binding only; row 13 (a running child's pipes) is
-still absent, so the LSP port waits for it or follows a log.
+still absent, so the LSP port waits for it or follows a log. The child
+runner removes a variable through `env_remove` (Windows names match without
+case). It does not use row 2 yet: `group_descendants` takes the child out of
+the terminal's Ctrl-C group, so until row 7 gives cryogate an interrupt
+hook that kills its trees, a Ctrl-C would end cryogate and leave its
+children running.
 
 **Missing or too weak, most important first:**
 
