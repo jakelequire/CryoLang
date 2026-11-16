@@ -38,7 +38,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::node::{ Node, ProgramNode };
 import compiler::mono::monomorphizer::{ Monomorphizer };
-import compiler::mono::state::{ SpecializationEntry };
+import compiler::mono::state::{ BlockPlacement, SpecializationEntry };
 import compiler::passes::pass_id::{ PassResult };
 import compiler::sema::sema::{ SemaVisitor };
 import compiler::passes::type_resolution::{ TypeResolutionPasses };
@@ -389,9 +389,19 @@ type struct SpecializationPasses {
     /// the same rule, its own type arguments considered first, then its
     /// receiver as a type argument, then the module declaring the method.
     ///
+    /// An implementation block an instantiation carries that was written
+    /// in another module than the template's is placed by the same rule
+    /// with the module it was written in (`written_in`, none for the
+    /// instantiation itself) a candidate just ahead of the template's: a
+    /// program's implementation of its own trait for a standard-library
+    /// instantiation is emitted in the program, which depends on the
+    /// instantiation's module, and one module's implementation of its
+    /// trait for an instantiation of a template it imports is emitted
+    /// beside the trait, keeping the template's object free of it.
+    ///
     /// Invalid when no candidate is a module of the build.
-    static owner_module_for_spec(ctx: CompilationContext*,
-                                 entry: SpecializationEntry*) -> ModulePath {
+    static owner_module_for_spec(ctx: CompilationContext*, entry: SpecializationEntry*,
+                                 written_in: ModulePath) -> ModulePath {
         mut owner: InstanceOwner = InstanceOwner::new();
         if (ctx.module_graph == null) { return ModulePath::none(); }
         for (mut i: i64 = 0; i < entry.method_arguments.length(); i++) {
@@ -411,10 +421,29 @@ type struct SpecializationPasses {
                 owner.consider_type(ctx, arena.inst_type_arg_at(entry.instantiated_type, i), 0);
             }
         }
+        owner.consider(ctx.module_graph, written_in);
         owner.consider(ctx.module_graph, entry.template_module);
         return owner.chosen(ctx.module_graph);
     }
 
+
+    /// The source file of the module the block `impl_nodes[block]` of
+    /// `entry` is emitted in: the entry's own when the entry is no
+    /// instantiation (a method instance, or a blanket or object
+    /// implementation, whose one block the entry was made to place) or the
+    /// block was written in the template's module, else the owner of the
+    /// block written in its module (`owner_module_for_spec`).
+    static block_owner_source(ctx: CompilationContext*, entry: SpecializationEntry*,
+                              block: i64) -> SymbolStr {
+        if (entry.ast_node == null) { return entry.owner_source; }
+        const written_in: ModulePath = ctx.module_of_file(entry.impl_nodes[block].source_file);
+        if (!written_in.is_valid() || written_in.equals(entry.template_module)) { return entry.owner_source; }
+        const owner: ModulePath = SpecializationPasses::owner_module_for_spec(ctx, entry, written_in);
+        // Candidates that all depend on one another choose none, as for the
+        // instantiation itself; the block then stays with the instantiation.
+        if (!owner.is_valid()) { return entry.owner_source; }
+        return ctx.module_graph.source_file_of(owner, ctx.intern_table);
+    }
 
     /// Register a single specialization into the DeclarationIndex, scope-tag its
     /// AST nodes, and re-register its impl methods.  Runs under the DEMANDING
@@ -464,12 +493,19 @@ type struct SpecializationPasses {
         // A spec none of whose candidates is a module of the build stays with
         // the module registering it.
         const owner_module: ModulePath =
-            SpecializationPasses::owner_module_for_spec(ctx, entry);
+            SpecializationPasses::owner_module_for_spec(ctx, entry, ModulePath::none());
         entry.owner_source = if (owner_module.is_valid()) {
             ctx.module_graph.source_file_of(owner_module, ctx.intern_table)
         } else {
             module_sym
         };
+        entry.block_placements = [];
+        for (mut j: i64 = 0; j < entry.impl_nodes.length(); j++) {
+            entry.block_placements.push(BlockPlacement {
+                owner_source: SpecializationPasses::block_owner_source(ctx, entry, j),
+                injected:     false,
+            });
+        }
 
         // Scope-tag the main AST with its template module origin in the
         // CompilationContext's node-identity side table.  A FUNCTION spec's
@@ -618,6 +654,16 @@ type struct SpecializationPasses {
         return shown.append(">");
     }
 
+    /// How the placement trace names block `block` of `entry`: its trait
+    /// and the instantiation (`Shapes::Measure for Slice<i32>`), or the
+    /// instantiation alone for a block that implements no trait.
+    static block_shown(ctx: CompilationContext*, entry: SpecializationEntry*, block: i64) -> string {
+        const shown: string = SpecializationPasses::instance_shown(ctx, entry);
+        const implementation: ImplBlock* = DeclarationNode::impl_of(entry.impl_nodes[block]);
+        if (!implementation.is_trait_impl()) { return shown; }
+        return ctx.intern_table.shown(ctx.defs.path_of(implementation.trait_def)).append(" for ").append(shown);
+    }
+
     static route_specializations_to_owners(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
@@ -633,22 +679,27 @@ type struct SpecializationPasses {
         mut place_count: i64 = 0;
         for (mut i: i64 = 0; i < total; i++) {
             mut entry: mut SpecializationEntry* = mono.spec_entry_at(i);
-            if (entry.injected) { continue; }
-            if (!entry.owner_source.is_valid()) { continue; }
-            if (!entry.owner_source.equals(my_src)) { continue; }
-            entry.injected = true;
-            if (Log::enabled(LogArea::Mono, LogLevel::Trace)) {
-                Log::trace(LogArea::Mono, f"instance {SpecializationPasses::instance_shown(ctx, entry)} placed in {ctx.intern_table.shown(ctx.unit_module.decl_name())}");
-            }
-            if (entry.ast_node != null) {
-                SpecializationPasses::mark_specialized(entry.ast_node);
-                root.add_statement(Node::Decl(entry.ast_node));
+            if (!entry.injected && entry.owner_source.is_valid() && entry.owner_source.equals(my_src)) {
+                entry.injected = true;
+                if (Log::enabled(LogArea::Mono, LogLevel::Trace)) {
+                    Log::trace(LogArea::Mono, f"instance {SpecializationPasses::instance_shown(ctx, entry)} placed in {ctx.intern_table.shown(ctx.unit_module.decl_name())}");
+                }
+                if (entry.ast_node != null) {
+                    SpecializationPasses::mark_specialized(entry.ast_node);
+                    root.add_statement(Node::Decl(entry.ast_node));
+                }
+                place_count += 1;
             }
             for (mut j: i64 = 0; j < entry.impl_nodes.length(); j++) {
+                const placement: mut BlockPlacement* = &entry.block_placements[j];
+                if (placement.injected || !placement.owner_source.equals(my_src)) { continue; }
+                placement.injected = true;
+                if (!placement.owner_source.equals(entry.owner_source) && Log::enabled(LogArea::Mono, LogLevel::Trace)) {
+                    Log::trace(LogArea::Mono, f"implementation {SpecializationPasses::block_shown(ctx, entry, j)} placed in {ctx.intern_table.shown(ctx.unit_module.decl_name())}");
+                }
                 SpecializationPasses::mark_specialized(entry.impl_nodes[j]);
                 root.add_statement(Node::Decl(entry.impl_nodes[j]));
             }
-            place_count += 1;
         }
 
         if (Log::enabled(LogArea::Mono, LogLevel::Debug)) {
