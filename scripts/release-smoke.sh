@@ -12,9 +12,9 @@
 # So the archive's own reason for existing was ungated.  It ships a stdlib and
 # the runtime tier archives because without them, in build-release.sh's own
 # words, the compiler "cannot link ANY program" - it fails on an undefined
-# `__cryo_panic` - and a missing hosted CORE tier is worse than that: the link
-# quietly omits `-Wl,-e,__cryo_entry` and the program goes back to starting at
-# crt0. Neither shows up in `--version`.
+# `__cryo_panic` - and a missing hosted CORE tier is worse than that: a Windows
+# link quietly omits `-Wl,-e,__cryo_entry` and the program starts at mingw's
+# entry instead. Neither shows up in `--version`.
 #
 # This compiles a hello-world with the staged compiler, against the staged
 # stdlib and the staged tiers, runs it, and checks its output and exit code.

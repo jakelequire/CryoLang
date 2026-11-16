@@ -84,9 +84,9 @@ stage_runtime_tiers() {
     # the per-triple subdirectory it prefers.
     #
     # The hosted CORE tier is checked separately below, because its absence fails
-    # differently and worse: the locator would decline the directory, the link
-    # would omit both the archive and `-Wl,-e,__cryo_entry`, and the program would
-    # quietly go back to starting at crt0 rather than fail.
+    # differently and worse: the locator would decline the directory, and a
+    # Windows link would omit both the archive and `-Wl,-e,__cryo_entry`, so the
+    # program would quietly start at mingw's entry rather than fail.
     local stage="$1" triple="$2"
     local cryo="${ROOT}/compiler/build/cryo"
     local dest="${stage}/lib/cryo/${triple}"
@@ -105,7 +105,7 @@ stage_runtime_tiers() {
     [ -f "${dest}/libcryort-panic-abort-hosted.a" ] \
         || { echo "error: hosted panic tier missing for ${triple} - user programs would not link" >&2; exit 1; }
     [ -f "${dest}/libcryort-core-hosted.a" ] \
-        || { echo "error: hosted core tier missing for ${triple} - user programs would not start at the Cryo entry" >&2; exit 1; }
+        || { echo "error: hosted core tier missing for ${triple} - the tier locator would decline this directory" >&2; exit 1; }
     [ -f "${dest}/libcryort-core.a" ] \
         || { echo "error: freestanding core tier missing for ${triple}" >&2; exit 1; }
 }

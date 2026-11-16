@@ -85,48 +85,36 @@ __cryo_argv     | () -> i8**                                | freestanding | DON
 # A hosted LINUX program starts where glibc's does: crt1's `_start` calls
 # __libc_start_main, which runs .preinit_array/_init/.init_array once, registers
 # the dynamic linker's finalizer and the executable's .fini_array, and calls the
-# widened `main`, exiting through libc `exit`. The driver passes no `-e` there.
-# The Linux rows below are defined only while a compiler that still retargets
-# the Linux entry builds this tree.
+# widened `main`, exiting through libc `exit`. The driver passes no `-e` there,
+# and the runtime defines no hosted Linux entry.
 #
-# A hosted WINDOWS program starts in Cryo. The link KEEPS the crt objects and only
+# A hosted WINDOWS program starts in Cryo, so that its arguments come from the
+# runtime's one command-line parser. The link KEEPS the crt objects and only
 # retargets the entry symbol (`-Wl,-e,__cryo_entry`); it does NOT pass
-# -nostartfiles. Dropping them takes __dso_handle + _init (linux) and atexit +
-# _pei386_runtime_relocator (windows) with them, and each of those is a LINK
-# failure -- `atexit` unconditionally so, because libmingwex references it. `-e`
-# also EXTRACTS the entry from the tier archive: ld enters the entry symbol as an
-# undefined reference.
+# -nostartfiles. Dropping them takes atexit + _pei386_runtime_relocator with
+# them, and each of those is a LINK failure -- `atexit` unconditionally so,
+# because libmingwex references it. `-e` also EXTRACTS the entry from the tier
+# archive: ld enters the entry symbol as an undefined reference.
 #
-# Entering past crt0 means owning what its startup would have driven, which is
-# per-OS. Linux: walk .preinit_array, call _init (crti.o), walk .init_array --
-# glibc's call_init order -- each entry receiving (argc, argv, envp). Windows:
-# call _pei386_runtime_relocator (fixes auto-imported DLL *data*; msvcrt's
-# _environ reads as garbage without it) then mingw's real __main (C global ctors,
+# Entering past mingw's startup means owning what it would have driven: call
+# _pei386_runtime_relocator (fixes auto-imported DLL *data*; msvcrt's _environ
+# reads as garbage without it) then mingw's real __main (C global ctors,
 # idempotent). Skipping either leaves every static constructor unrun.
 #
-# Linux is `![naked]` for the same reason `_start` is (kernel entry, argc at
-# %rsp); Windows is NOT, because the loader `call`s the entry on an ordinary
-# frame -- and a real frame carries the .pdata unwind info a naked stub lacks.
+# The entry is NOT `![naked]`: the loader `call`s it on an ordinary frame -- and
+# a real frame carries the .pdata unwind info a naked stub lacks.
 #
-# ONE EXCEPTION, forced not chosen: `--release-static` keeps crt0's entry. It
-# passes `-static`, and a fully static glibc sets up its own thread control block
-# inside __libc_start_main -- the job ld.so does before the entry runs in a
-# dynamic link. Entering past it leaves TLS unmapped and the program dies on the
-# first thread-local access (the unwind tier's panic state is thread-local).
-# Measured: a static binary with a retargeted entry segfaults before `main`.
-# Nothing else emits `-static`, so the exception is exactly as narrow as the flag.
-__cryo_entry        | ![naked] () -> void (linux) / () -> never (windows) | hosted | DONE (dual-OS)
-# Shared startup trampoline: image fixups, capture arguments, run static
-# constructors, then `main` -- which here carries the WIDENED C signature
+# A `--release-static` link keeps the toolchain's own entry.
+__cryo_entry        | () -> never                            | hosted:windows | DONE
+# Startup trampoline: image fixups, capture arguments, run static constructors,
+# then `main` -- which here carries the WIDENED C signature
 # `int main(int, char**, char**)` codegen emits for a hosted program, not the
 # zero-arg freestanding form. Terminates through libc `exit`, which is what
 # flushes buffered stdio and runs atexit handlers.
-__cryo_hosted_start | (argc: i64, argv: i8**) -> never       | hosted | DONE (dual-OS)
-# Startup services the retained crt objects provide, called BY the hosted entry
-# rather than defined by it: the relocator on windows (mingw crt2.o), `_init` on
-# linux (glibc crti.o).
+__cryo_hosted_start | (argc: i64, argv: i8**) -> never       | hosted:windows | DONE
+# A startup service the retained crt objects provide, called BY the hosted entry
+# rather than defined by it (mingw crt2.o).
 _pei386_runtime_relocator | () -> void  (extern, crt2.o)     | import | (system)
-_init                     | () -> void  (extern, crti.o)     | import | (system)
 
 # --- Link line -------------------------------------------------------------
 # The driver composes the tier archives itself; a freestanding program links by
