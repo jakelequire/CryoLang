@@ -1,0 +1,235 @@
+///! The object lists verify compares: every object of a population the run
+///! built, as `<sha256 digest>  <path>` rows sorted by path, and the wipe
+///! that makes a run's objects its own.
+
+namespace cryogate::verify::hashing;
+
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::encoding::sha256::{ Sha256 };
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::text::{ Text };
+import cryogate::core::tree::{ Tree };
+import cryogate::verify::declarations::{ RuntimeMember };
+import cryogate::verify::objects::{ ObjectPopulation };
+import cryogate::verify::runtime::{ RuntimeArchives };
+
+/// The rows of each population, read off the build outputs on disk.
+public type struct ObjectHashes {
+    /// The rows of `population` in the checkout `repository`: every `.o`
+    /// below a `build` directory under `tests/` or `examples/`, the objects
+    /// of the stdlib archives the run built, or the members of the runtime
+    /// archives one target's `runtime` directory holds - sorted by path.
+    public static rows(repository: Path, population: &ObjectPopulation, runtime: Path) -> Result<Array<String>, String> {
+        return match (population) {
+            ObjectPopulation::Tests    => { ObjectHashes::built(repository, Str::new("tests")) }
+            ObjectPopulation::Examples => { ObjectHashes::built(repository, Str::new("examples")) }
+            ObjectPopulation::Stdlib   => { ObjectHashes::archives(repository) }
+            ObjectPopulation::Runtime  => { RuntimeArchives::rows(runtime) }
+        };
+    }
+
+    /// A list file's text: `rows`, one per line, each line ended.
+    public static text(rows: &Array<String>) -> String {
+        mut text: String = Text::joined(rows, Str::new("\n"));
+        if (!rows.is_empty()) { text.push(Str::new("\n")); }
+        return text;
+    }
+
+    /// Delete every directory a run's objects are read from - each build
+    /// directory under `tests/` and `examples/`, the prebuilt stdlib
+    /// archives and the runtime configurations' archives of every target -
+    /// so that the run's lists hold only what it built.  The stdlib and
+    /// runtime archives programs link are built by the compiler that links
+    /// them; one left over would be linked, and listed, as the run's own.
+    public static wipe(repository: Path) -> Result<(), String> {
+        for (directory in ObjectHashes::populated(repository)?.iterate_references()) {
+            match (Directory::remove_all(directory.as_path())) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { }
+            }
+        }
+        const left: Array<PathBuf> = ObjectHashes::populated(repository)?;
+        if (!left.is_empty()) {
+            return Result::Err(f"could not clear {left[0].as_path().as_str()}; a warm build compiles nothing and hashes stale objects");
+        }
+        return Result::Ok(());
+    }
+
+    /// The directories `wipe` clears that exist.
+    private static populated(repository: Path) -> Result<Array<PathBuf>, String> {
+        mut directories: Array<PathBuf> = Array::<PathBuf>::new();
+        for (base in ObjectHashes::sweeps().iterate_references()) {
+            ObjectHashes::build_directories(repository.join(*base).as_path(), &directories)?;
+        }
+        ObjectHashes::prebuilt(repository, &directories)?;
+        const runtime_bin: PathBuf = repository.join(Str::new("runtime/.bin"));
+        if (runtime_bin.as_path().is_directory()) {
+            for (target in Tree::names(runtime_bin.as_path(), &Array::<String>::new())?.iterate_references()) {
+                for (configuration in RuntimeMember::configurations().iterate_references()) {
+                    const directory: PathBuf = runtime_bin.join(target.as_str()).join(*configuration);
+                    if (directory.as_path().is_directory()) { directories.push(directory); }
+                }
+            }
+        }
+        return Result::Ok(directories);
+    }
+
+    /// The two directories the census and the examples sweep build under.
+    private static sweeps() -> Array<Str> {
+        mut bases: Array<Str> = Array::<Str>::new();
+        bases.push(Str::new("tests"));
+        bases.push(Str::new("examples"));
+        return bases;
+    }
+
+    /// Each directory named `build` below `directory`, not looking inside
+    /// one, added to `found`.
+    private static build_directories(directory: Path, found: mut &Array<PathBuf>) -> Result<(), String> {
+        if (!directory.is_directory()) { return Result::Ok(()); }
+        for (name in Tree::names(directory, &Array::<String>::new())?.iterate_references()) {
+            const path: PathBuf = directory.join(name.as_str());
+            if (!path.as_path().is_directory()) { continue; }
+            if (name.as_str() == Str::new("build")) { found.push(path); continue; }
+            ObjectHashes::build_directories(path.as_path(), found)?;
+        }
+        return Result::Ok(());
+    }
+
+    /// Every target's `stdlib/.bin/<triple>/prebuilt` directory, added to
+    /// `found`.
+    private static prebuilt(repository: Path, found: mut &Array<PathBuf>) -> Result<(), String> {
+        const bin: PathBuf = repository.join(Str::new("stdlib/.bin"));
+        if (!bin.as_path().is_directory()) { return Result::Ok(()); }
+        for (target in Tree::names(bin.as_path(), &Array::<String>::new())?.iterate_references()) {
+            const prebuilt: PathBuf = bin.join(target.as_str()).join(Str::new("prebuilt"));
+            if (prebuilt.as_path().is_directory()) { found.push(prebuilt); }
+        }
+        return Result::Ok(());
+    }
+
+    /// Rows of every `.o` below `base` whose path has a `build` component,
+    /// named by its path in the checkout.
+    private static built(repository: Path, base: Str) -> Result<Array<String>, String> {
+        mut rows: Array<String> = Array::<String>::new();
+        const root: PathBuf = repository.join(base);
+        if (!root.as_path().is_directory()) { return Result::Ok(rows); }
+        for (file in Tree::files(root.as_path(), &Array::<String>::new())?.iterate_references()) {
+            if (!file.as_str().ends_with(&Str::new(".o"))) { continue; }
+            mut in_build: boolean = false;
+            for (part in file.as_str().split(&Str::new("/"))) {
+                if (part == Str::new("build")) { in_build = true; }
+            }
+            if (!in_build) { continue; }
+            const name: String = f"{base}/{file.as_str()}";
+            rows.push(f"{ObjectHashes::digest(repository.join(name.as_str()).as_path())?.as_str()}  {name.as_str()}");
+        }
+        return Result::Ok(ObjectHashes::by_path(rows));
+    }
+
+    /// Rows of every object of every stdlib archive the run built, each
+    /// named `stdlib-archive/<triple>/<options>/<path in the archive's
+    /// build>`, so two compilers' archives line up whatever their keys.
+    /// `<options>` is the manifest's `options` line, each run of bytes other
+    /// than letters, digits, `_`, `.` and `-` written `_`; an archive whose
+    /// manifest is not there yet is not built, and is left out.  Two
+    /// archives of one target with the same options are refused: their
+    /// objects could not be told apart.
+    private static archives(repository: Path) -> Result<Array<String>, String> {
+        mut rows: Array<String> = Array::<String>::new();
+        mut homes: HashMap<String, String> = HashMap::<String, String>::new();
+        mut prebuilts: Array<PathBuf> = Array::<PathBuf>::new();
+        ObjectHashes::prebuilt(repository, &prebuilts)?;
+        for (prebuilt in prebuilts.iterate_references()) {
+            const triple: String = match (prebuilt.as_path().parent()) {
+                Option::Some(parent) => { String::from_str(parent.file_name().unwrap_or(Str::new(""))) }
+                Option::None         => { String::new() }
+            };
+            for (key in Tree::names(prebuilt.as_path(), &Array::<String>::new())?.iterate_references()) {
+                const home: PathBuf = prebuilt.join(key.as_str());
+                const manifest: PathBuf = home.join(Str::new("stdlib.manifest"));
+                if (!manifest.as_path().is_file()) { continue; }
+                const text: String = match (File::read_text(manifest.as_path())) {
+                    Result::Ok(text)   => { text }
+                    Result::Err(error) => { return Result::Err(f"cannot read {manifest.as_path().as_str()}: {error.describe()}"); }
+                };
+                const label: String = f"stdlib-archive/{triple.as_str()}/{ObjectHashes::options_label(text.as_str()).as_str()}";
+                const spelled: String = f"stdlib/.bin/{triple.as_str()}/prebuilt/{key.as_str()}";
+                match (homes.get_reference(&label)) {
+                    Option::Some(earlier) => {
+                        return Result::Err(f"two stdlib archives, {earlier.as_str()} and {spelled.as_str()}, record the same options; their objects cannot be told apart");
+                    }
+                    Option::None => { }
+                }
+                homes.insert(label.clone(), spelled);
+                for (file in Tree::files(home.as_path(), &Array::<String>::new())?.iterate_references()) {
+                    if (!file.as_str().ends_with(&Str::new(".o"))) { continue; }
+                    rows.push(f"{ObjectHashes::digest(home.join(file.as_str()).as_path())?.as_str()}  {label.as_str()}/{file.as_str()}");
+                }
+            }
+        }
+        return Result::Ok(ObjectHashes::by_path(rows));
+    }
+
+    /// The label of a manifest's `options` line, read from its first 4096
+    /// bytes (`?` when it has none).
+    public static options_label(manifest: Str) -> String {
+        const head: Str = if (manifest.length() > 4096) { manifest.byte_substring(0, 4096) } else { manifest };
+        // `options` is a view into one of `lines`, which must outlive it.
+        const lines: Array<String> = Text::lines(head);
+        mut options: Str = Str::new("?");
+        mut found: boolean = false;
+        for (line in lines.iterate_references()) {
+            if (found) { break; }
+            match (line.as_str().strip_prefix(&Str::new("options "))) {
+                Option::Some(rest) => { options = rest.trim(); found = true; }
+                Option::None       => { }
+            }
+        }
+        mut label: String = String::new();
+        mut replacing: boolean = false;
+        for (mut i: i64 = 0; i < options.length(); i++) {
+            const byte: u8 = options.byte_at(i).unwrap();
+            if (byte.is_alpha() || byte.is_digit() || byte == '_' || byte == '.' || byte == '-') {
+                label.push(options.byte_substring(i, i + 1));
+                replacing = false;
+            } else if (!replacing) {
+                label.push('_');
+                replacing = true;
+            }
+        }
+        return label;
+    }
+
+    /// The sha256 of the file at `path`, in lowercase hex.
+    private static digest(path: Path) -> Result<String, String> {
+        return match (File::read_bytes(path)) {
+            Result::Ok(data)   => { Result::Ok(Sha256::digest(data.as_slice()).to_hex()) }
+            Result::Err(error) => { Result::Err(f"cannot read {path.as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// `rows` sorted by their paths, the text after the digest and its two
+    /// spaces.
+    private static by_path(rows: Array<String>) -> Array<String> {
+        mut paths: Array<String> = Array::<String>::new();
+        mut by: HashMap<String, String> = HashMap::<String, String>::new();
+        for (row in rows.iterate_references()) {
+            const path: String = String::from_str(row.as_str().byte_substring(66, row.as_str().length()));
+            paths.push(path.clone());
+            by.insert(path, row.clone());
+        }
+        mut sorted: Array<String> = Array::<String>::new();
+        for (path in Text::sorted_distinct(paths).iterate_references()) {
+            sorted.push(by.get_reference(path).unwrap().clone());
+        }
+        return sorted;
+    }
+}

@@ -30,6 +30,7 @@ import cryogate::corpus::census::{ Pinned };
 import cryogate::corpus::roster::{ TestGates };
 import cryogate::verify::comparison::{ Compared, ObjectComparison };
 import cryogate::verify::declarations::{ Declaration, Declarations, DeclaredChanges };
+import cryogate::verify::hashing::{ ObjectHashes };
 import cryogate::verify::objects::{ ObjectPopulation };
 import cryogate::verify::record::{ BaselineRecord };
 import cryogate::verify::runtime::{ RuntimeArchives };
@@ -59,13 +60,16 @@ import cryogate::verify::runtime::{ RuntimeArchives };
 ///   baseline compiler from `rev` in;
 /// - `--baselines <directory> [--current <name>]`: the baseline homes in
 ///   `directory` the bounded cache keeps, most recently used first, with
-///   `current` among them as the home in use.
+///   `current` among them as the home in use;
+/// - `--hash <population> [--runtime <directory>]`: the rows of one object
+///   population (`tests`, `examples`, `stdlib`, or `runtime`, read from one
+///   target's runtime `directory`) as verify lists them after a run.
 public type struct VerifyGate {
     /// Run the subcommand over the checkout `repository` with the command
     /// line's `arguments` from index `first`; the process's exit code.
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
         mut options: Options = Options::new(Str::new(
-            "cryogate verify --declared-since <rev> | --compare <run> --against <rev> [--list-limit <n>] | --records <run> --programs <directory> | --runtime-list <directory> | --baseline-key <rev> | --keys <home> | --sync <clone> --at <rev> | --baselines <directory> [--current <name>]"));
+            "cryogate verify --declared-since <rev> | --compare <run> --against <rev> [--list-limit <n>] | --records <run> --programs <directory> | --runtime-list <directory> | --baseline-key <rev> | --keys <home> | --sync <clone> --at <rev> | --baselines <directory> [--current <name>] | --hash <population> [--runtime <directory>]"));
         options.valued(Str::new("--declared-since"));
         options.valued(Str::new("--compare"));
         options.valued(Str::new("--against"));
@@ -79,6 +83,8 @@ public type struct VerifyGate {
         options.valued(Str::new("--at"));
         options.valued(Str::new("--baselines"));
         options.valued(Str::new("--current"));
+        options.valued(Str::new("--hash"));
+        options.valued(Str::new("--runtime"));
         const parsed: Parsed = match (options.parse(arguments, first)) {
             Result::Ok(parsed)  => { parsed }
             Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 2; }
@@ -154,6 +160,24 @@ public type struct VerifyGate {
                 };
                 return match (BaselineClone::sync(repository, logs, repository.join(clone).as_path(), revision)) {
                     Result::Ok(_)       => { fmt::println(f"verify: {clone} synced to {revision}"); 0 }
+                    Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); 1 }
+                };
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--hash"))) {
+            Option::Some(name) => {
+                mut chosen: Option<ObjectPopulation> = Option::None;
+                for (population in ObjectPopulation::all().iterate_references()) {
+                    if (population.name() == name) { chosen = Option::Some(*population); }
+                }
+                const population: ObjectPopulation = match (chosen) {
+                    Option::Some(population) => { population }
+                    Option::None             => { fmt::eprintln(f"cryogate verify: --hash takes tests, examples, stdlib or runtime, not {name}"); return 2; }
+                };
+                const runtime: PathBuf = repository.join(parsed.value(Str::new("--runtime")).unwrap_or(Str::new("")));
+                return match (ObjectHashes::rows(repository, &population, runtime.as_path())) {
+                    Result::Ok(rows)    => { for (row in rows.iterate_references()) { fmt::println(row.clone()); } 0 }
                     Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); 1 }
                 };
             }
