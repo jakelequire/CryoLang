@@ -131,7 +131,8 @@ type struct ProjSpec {
     /// where every token holds, and is otherwise SKIPPED with a reason (not a
     /// failure).  Recognized tokens: `"display"` (an X11/Wayland display is
     /// present), `"vendor:<Name>"` (that vendor library is registered with
-    /// host bindings), `"cxx"` (a C++ toolchain responds), and `"os:<name>"`
+    /// host bindings), `"cxx"` (a C++ toolchain responds), `"git"` (`git`
+    /// is on PATH, for a project with git fixtures), and `"os:<name>"`
     /// (the host OS is `linux`/`windows`/`macos` - for projects whose sources
     /// hard-use one platform's surface).  Lets a real integration test (e.g.
     /// the raylib window demo) stay live without turning a portable
@@ -149,6 +150,11 @@ type struct ProjSpec {
     /// A project with steps starts from no `build/` folder, so what a step
     /// writes there is that run's.
     steps:      [ProjStep];
+    /// Git repositories (test.json `git_fixtures`) built before the steps
+    /// from directories the project commits.  A project with fixtures runs
+    /// in a copy of itself, outside the tree, whose cryoconfigs name each
+    /// repository as `{fixture:<name>}`, with its own `CRYO_HOME`.
+    fixtures:   [ProjFixture];
     /// Every entry must appear in the compiler's stderr alone; no entry of
     /// `stderr_excludes` may.
     stderr_contains: [String];
@@ -176,7 +182,7 @@ type struct ProjSpec {
         return ProjSpec {
             outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: String::new(),
             output_contains: [], output_excludes: [], output_in_order: [], requires: [],
-            environment: [], arguments: [], steps: [], stderr_contains: [], stderr_excludes: [],
+            environment: [], arguments: [], steps: [], fixtures: [], stderr_contains: [], stderr_excludes: [],
             stdout_line_prefixes: [], stderr_line_prefixes: [],
             file: String::new(), file_contains: [], file_excludes: [],
             applied: false, applied_exit_code: 0
@@ -202,6 +208,22 @@ type struct ProjSpec {
 /// One command of a project's `steps`: the compiler's arguments, verb first.
 type struct ProjStep {
     arguments: [String];
+}
+
+/// One of a project's `git_fixtures`: a repository named `name`, whose
+/// commits are made in order, each holding exactly the files of one
+/// directory below `from` and tagged.
+type struct ProjFixture {
+    name:    String;
+    from:    String;
+    commits: [ProjFixtureCommit];
+}
+
+/// One commit of a git fixture: the directory below the fixture's `from`
+/// whose files it holds, and the tag it carries.
+type struct ProjFixtureCommit {
+    tree: String;
+    tag:  String;
 }
 
 /// Result of dispatching one project: did it meet its declared outcome, and
@@ -2306,6 +2328,7 @@ type struct Executor {
         for (mut i: i64 = 0; i < reqs.length(); i++) {
             const r: Str = reqs[i].as_str();
             const known: boolean = r.equals(&Str::new("display")) || r.equals(&Str::new("cxx"))
+                || r.equals(&Str::new("git"))
                 || r.starts_with(&Str::new("vendor:")) || r.starts_with(&Str::new("os:"));
             if (!known) { return r; }
         }
@@ -2324,6 +2347,11 @@ type struct Executor {
                 Option::None => {}
             }
             return false;
+        }
+        if (req.equals(&Str::new("git"))) {
+            // `git` answers on PATH: a project with git fixtures builds its
+            // repositories with it, and `cryo fetch` reads them with it.
+            return ExecutablePath::find("git").length() > 0;
         }
         const vendor_prefix: Str = Str::new("vendor:");
         const os_prefix: Str = Str::new("os:");
@@ -2421,6 +2449,49 @@ type struct Executor {
                             }
                             if (one.arguments.length() == 0) { malformed_step = true; }
                             spec.steps.push(one);
+                        }
+                        Option::None => { }
+                    }
+                }
+            }
+            Option::None => { }
+        }
+        // A fixture needs a name, a directory and at least one commit, and
+        // each commit a tree and a tag; anything less makes the file
+        // malformed rather than building a repository the project did not
+        // describe.
+        match (root.get(str::Str::new("git_fixtures"))) {
+            Option::Some(fp) => {
+                for (mut i: i64 = 0; i < fp.length(); i++) {
+                    match (fp.at(i)) {
+                        Option::Some(fixture) => {
+                            mut one: ProjFixture = ProjFixture {
+                                name: registry::VendorRegistry::text_field(fixture, str::Str::new("name"), str::Str::new("")),
+                                from: registry::VendorRegistry::text_field(fixture, str::Str::new("from"), str::Str::new("")),
+                                commits: [],
+                            };
+                            match (fixture.get(str::Str::new("commits"))) {
+                                Option::Some(cp) => {
+                                    for (mut j: i64 = 0; j < cp.length(); j++) {
+                                        match (cp.at(j)) {
+                                            Option::Some(commit) => {
+                                                const made: ProjFixtureCommit = ProjFixtureCommit {
+                                                    tree: registry::VendorRegistry::text_field(commit, str::Str::new("tree"), str::Str::new("")),
+                                                    tag:  registry::VendorRegistry::text_field(commit, str::Str::new("tag"), str::Str::new("")),
+                                                };
+                                                if (made.tree.is_empty() || made.tag.is_empty()) { malformed_step = true; }
+                                                one.commits.push(made);
+                                            }
+                                            Option::None => { }
+                                        }
+                                    }
+                                }
+                                Option::None => { }
+                            }
+                            if (one.name.is_empty() || one.from.is_empty() || one.commits.length() == 0) {
+                                malformed_step = true;
+                            }
+                            spec.fixtures.push(one);
                         }
                         Option::None => { }
                     }
@@ -2569,6 +2640,9 @@ type struct Executor {
         mut applied_job_of: [i64]  = [];
         mut specs:      [ProjSpec] = [];
         mut cmds:       [String]   = [];
+        //   run_dirs[i]: where project i's commands run - its own directory,
+        //                or the copy that holds its git fixtures
+        mut run_dirs:   [String]   = [];
         const entries: DirectoryEntries = match (Directory::entries(projects_dir)) {
             Result::Ok(listing) => { listing }
             Result::Err(_)      => { return NegSuiteResult { ran: 0, failures: 0 }; }
@@ -2617,6 +2691,17 @@ type struct Executor {
                     }
                 }
             }
+            // A project with git fixtures runs in a copy of itself, which
+            // names its fixtures' repositories; every other runs in place.
+            mut run_dir: String = String::from_str(proj_dir.as_path().as_str());
+            if (verdict == 0 && spec.fixtures.length() > 0) {
+                const copy_text: String = f"{tmp.as_path().as_str()}.fixtures.{names.length()}";
+                match (Executor::prepare_fixture_copy(proj_dir.as_path(), copy_text.as_str(), &spec)) {
+                    Result::Ok(_)    => { run_dir = copy_text; }
+                    Result::Err(why) => { verdict = 7; reason = why; }
+                }
+            }
+            run_dirs.push(run_dir.clone());
             names.push(String::from_str(name));
             verdict_of.push(verdict);
             reason_of.push(reason);
@@ -2626,7 +2711,7 @@ type struct Executor {
                 // Whether the fixture's command ran is read off its capture
                 // being there, so none may be left from an earlier run.
                 if (spec.steps.length() > 0) { Executor::remove_capture(path::Path::from(out_path.as_str())); }
-                cmds.push(Executor::project_command(self_exe, stdlib_abs, proj_dir.as_path(), &spec,
+                cmds.push(Executor::project_command(self_exe, stdlib_abs, path::Path::from(run_dir.as_str()), &spec,
                     out_path.as_str(), build_flags));
                 // The fixes are made in a copy, never in the tree's own
                 // sources; the copy's build output is left behind so its
@@ -2742,11 +2827,15 @@ type struct Executor {
                     Executor::proj_report(is_pretty, is_compact, color_on, false, stale.as_str());
                     failures += 1; ran += 1; continue;
                 }
+                if (verdict == 7) {
+                    Executor::proj_report(is_pretty, is_compact, color_on, false, reason);
+                    failures += 1; ran += 1; continue;
+                }
 
                 const k: u64 = job_of[i] as u64;
                 Executor::wait_job(done.as_pointer(), k);
                 const out_path: String = Executor::job_tmp_path(tmp.as_path(), k);
-                const proj_dir: path::PathBuf = projects_dir.join(name);
+                const proj_dir: path::PathBuf = path::PathBuf::from(run_dirs[i].as_str());
                 mut res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path.as_str(), proj_dir.as_path());
                 const steps_output: String = Executor::steps_path(out_path.as_str());
                 if (specs[i].steps.length() > 0 && !path::Path::from(out_path.as_str()).exists()) {
@@ -2806,6 +2895,14 @@ type struct Executor {
                 Executor::remove_capture(path::Path::from(out_path.as_str()));
                 Executor::remove_capture(path::Path::from(out_error.as_str()));
                 Executor::remove_capture(path::Path::from(steps_output.as_str()));
+                if (specs[i].fixtures.length() > 0) {
+                    match (Directory::remove_all(proj_dir.as_path())) {
+                        Result::Ok(_)  => { }
+                        // A copy left behind is removed before the next run
+                        // copies the project there, or fails that project.
+                        Result::Err(_) => { }
+                    }
+                }
                 if (applied_out.length() > 0) {
                     const applied_error: String = Executor::stderr_path(applied_out.as_str());
                     Executor::remove_capture(path::Path::from(applied_out.as_str()));
@@ -2914,6 +3011,118 @@ type struct Executor {
         if (spec.file.length() == 0) { return true; }
         const file_path: path::PathBuf = proj_dir.join(spec.file.as_str());
         return !file_path.as_path().exists() || File::remove(file_path.as_path()).is_ok();
+    }
+
+    /// Copy the project at `proj_dir` to `copy_text`, outside the tree and
+    /// without its `build/`, build its git fixtures there, write each
+    /// fixture's `file://` URL for `{fixture:<name>}` in every cryoconfig of
+    /// the copy (a fixture's own commits included, so one fixture package
+    /// can name another), and give the project's commands a `CRYO_HOME` of
+    /// their own in the copy.  `Err` says what could not be done.
+    static prepare_fixture_copy(proj_dir: path::Path, copy_text: Str, spec: mut &ProjSpec) -> Result<(), String> {
+        const copy: path::Path = path::Path::from(copy_text);
+        if (copy.exists() && Directory::remove_all(copy).is_err()) {
+            return Result::Err(f"cannot remove the earlier run's copy {copy_text}");
+        }
+        if (Directory::copy_all(proj_dir, copy).is_err()) {
+            return Result::Err(f"cannot copy the project to {copy_text}");
+        }
+        const build: path::PathBuf = copy.join(str::Str::new("build"));
+        if (build.as_path().exists() && Directory::remove_all(build.as_path()).is_err()) {
+            return Result::Err(f"cannot remove the copy's {build.as_path().as_str()}");
+        }
+        const repositories: path::PathBuf = build.join(str::Str::new("fixtures"));
+        mut urls: [String] = [];
+        for (mut i: i64 = 0; i < spec.fixtures.length(); i++) {
+            const repository: path::PathBuf = repositories.join(f"{spec.fixtures[i].name}.git".as_str());
+            const written: String = repository.as_path().as_str().replace(&str::Str::new("\\"), &str::Str::new("/"));
+            // An absolute path begins with `/` on Unix and with a drive on
+            // Windows; either way the URL's path is the whole of it.
+            urls.push(if (written.as_str().starts_with(str::Str::new("/"))) { f"file://{written}" } else { f"file:///{written}" });
+        }
+        if (!Executor::substitute_fixture_urls(copy, &spec.fixtures, &urls)) {
+            return Result::Err(f"cannot write the fixtures' URLs into the cryoconfigs of {copy_text}");
+        }
+        for (mut i: i64 = 0; i < spec.fixtures.length(); i++) {
+            if (!Executor::build_git_fixture(repositories.as_path(), copy, &spec.fixtures[i])) {
+                return Result::Err(f"cannot build the git fixture `{spec.fixtures[i].name}`");
+            }
+        }
+        spec.environment.push(f"CRYO_HOME={build.join(str::Str::new("cryo-home")).as_path().as_str()}");
+        return Result::Ok(());
+    }
+
+    /// Write each fixture's URL (`urls`, beside `fixtures`) for its
+    /// `{fixture:<name>}` in every file named `cryoconfig` below `directory`.
+    static substitute_fixture_urls(directory: path::Path, fixtures: &[ProjFixture], urls: &[String]) -> boolean {
+        const entries: DirectoryEntries = match (Directory::entries(directory)) {
+            Result::Ok(listing) => { listing }
+            Result::Err(_)      => { return false; }
+        };
+        for (entry in entries) {
+            const child: path::PathBuf = directory.join(entry.name());
+            if (entry.is_directory()) {
+                if (!Executor::substitute_fixture_urls(child.as_path(), fixtures, urls)) { return false; }
+            } else if (entry.name() == str::Str::new("cryoconfig")) {
+                mut text: String = match (File::read_text(child.as_path())) {
+                    Result::Ok(t)  => { t }
+                    Result::Err(_) => { return false; }
+                };
+                for (mut i: i64 = 0; i < fixtures.length(); i++) {
+                    mut placeholder: String = String::from_str(str::Str::new("{fixture:"));
+                    placeholder.push(fixtures[i].name.as_str());
+                    placeholder.push("}");
+                    text = text.as_str().replace(&placeholder.as_str(), &urls[i].as_str());
+                }
+                if (File::write_text(child.as_path(), text.as_str()).is_err()) { return false; }
+            }
+        }
+        return true;
+    }
+
+    /// Build the bare repository `<repositories>/<name>.git` of `fixture`:
+    /// one commit per entry, in order, each holding exactly the files of
+    /// `<copy>/<from>/<tree>` and carrying its tag.  Every git command runs
+    /// with a fixed author, committer and date and with no system or user
+    /// configuration, so a fixture's commits do not depend on who runs it.
+    static build_git_fixture(repositories: path::Path, copy: path::Path, fixture: &ProjFixture) -> boolean {
+        const repository: path::PathBuf = repositories.join(f"{fixture.name}.git".as_str());
+        if (Directory::create_all(repository.as_path()).is_err()) { return false; }
+        const no_config: path::PathBuf = repositories.join(str::Str::new("no-user-config"));
+        const git_dir: String = f"--git-dir={repository.as_path().as_str()}";
+        if (!Executor::fixture_git(no_config.as_path(), [str::Str::new("init"), str::Str::new("--bare"), str::Str::new("-q"), repository.as_path().as_str()])) {
+            return false;
+        }
+        for (mut c: i64 = 0; c < fixture.commits.length(); c++) {
+            const tree: path::PathBuf = copy.join(fixture.from.as_str()).join(fixture.commits[c].tree.as_str());
+            if (!tree.as_path().is_directory()) { return false; }
+            const work_tree: String = f"--work-tree={tree.as_path().as_str()}";
+            const tag: str::Str = fixture.commits[c].tag.as_str();
+            if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), work_tree.as_str(), str::Str::new("add"), str::Str::new("-A")])) { return false; }
+            if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), work_tree.as_str(), str::Str::new("commit"), str::Str::new("-q"), str::Str::new("--allow-empty"), str::Str::new("-m"), tag])) { return false; }
+            if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), str::Str::new("tag"), tag])) { return false; }
+        }
+        return true;
+    }
+
+    /// Run `git` with `arguments` for a fixture, its output kept, with a
+    /// fixed identity and date and no configuration but `no_config`, a
+    /// file that does not exist.  True when it exits 0.
+    static fixture_git(no_config: path::Path, arguments: [str::Str]) -> boolean {
+        mut git: Command = Command::new(str::Str::new("git"));
+        for (mut i: i64 = 0; i < arguments.length(); i++) { git.argument(arguments[i]); }
+        git.env(str::Str::new("GIT_CONFIG_NOSYSTEM"), str::Str::new("1"));
+        git.env(str::Str::new("GIT_CONFIG_GLOBAL"), no_config.as_str());
+        git.env(str::Str::new("GIT_AUTHOR_NAME"), str::Str::new("cryo fixture"));
+        git.env(str::Str::new("GIT_AUTHOR_EMAIL"), str::Str::new("fixture@cryo.invalid"));
+        git.env(str::Str::new("GIT_AUTHOR_DATE"), str::Str::new("2026-01-01T00:00:00Z"));
+        git.env(str::Str::new("GIT_COMMITTER_NAME"), str::Str::new("cryo fixture"));
+        git.env(str::Str::new("GIT_COMMITTER_EMAIL"), str::Str::new("fixture@cryo.invalid"));
+        git.env(str::Str::new("GIT_COMMITTER_DATE"), str::Str::new("2026-01-01T00:00:00Z"));
+        return match (git.output()) {
+            Result::Ok(out) => { out.status().success() }
+            Result::Err(_)  => { false }
+        };
     }
 
     /// Remove a project's `build/` folder, so what its steps write there is

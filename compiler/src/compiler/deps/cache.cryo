@@ -23,6 +23,7 @@ import std::fs::path::{ Path, PathBuf };
 import std::fmt;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::encoding::sha256::{ Sha256 };
 
 
 /// Stateless namespace for the per-machine dependency cache layout.
@@ -116,50 +117,41 @@ type struct Cache {
         return PathBuf::from("/tmp/cryo-cache");
     }
 
-    /// `<cache_root>/git/<sanitized>`: bare clone for a given remote URL.
+    /// `<cache_root>/git/<short id>`: bare clone for a given remote URL.
     static git_dir_for(url: Str) -> PathBuf {
-        const sanitized: String = Cache::sanitize_url(url);
-        return Cache::cache_root().join("git").join(sanitized.as_str());
+        const id: String = Cache::short_id(url);
+        return Cache::cache_root().join("git").join(id.as_str());
     }
 
-    /// `<cache_root>/checkouts/<sanitized>/<sha>`: working tree at a
+    /// `<cache_root>/checkouts/<short id>/<sha>`: working tree at a
     /// specific resolved commit.  Multiple SHAs from the same remote can
     /// coexist (e.g., when two projects pin different versions).
     static checkout_dir_for(url: Str, sha: Str) -> PathBuf {
-        const sanitized: String = Cache::sanitize_url(url);
-        return Cache::cache_root().join("checkouts").join(sanitized.as_str()).join(sha);
+        const id: String = Cache::short_id(url);
+        return Cache::cache_root().join("checkouts").join(id.as_str()).join(sha);
     }
 
-
-    // URL sanitization
-
-    /// Normalize a remote URL into a filesystem-safe directory name.
-    ///
-    /// Examples:
-    ///   https://github.com/foo/bar.git     ->  github.com_foo_bar
-    ///   git@github.com:foo/bar.git         ->  github.com_foo_bar
-    ///   ssh://git@github.com/foo/bar       ->  github.com_foo_bar
-    ///
-    /// Collisions between distinct URLs that normalize to the same name
-    /// are theoretically possible but vanishingly unlikely for real-world
-    /// remotes; we accept the risk for a much friendlier cache layout
-    /// than a raw hash would give.
-    static sanitize_url(url: Str) -> String {
-        // Stripped in this order, so `ssh://git@host` loses both.
-        const schemes: [Str; 5] = [Str::new("https://"), Str::new("http://"), Str::new("ssh://"),
-                                   Str::new("git://"), Str::new("git@")];
-        mut rest: Str = url;
-        for (mut i: i64 = 0; i < 5; i++) {
-            rest = rest.strip_prefix(&schemes[i]).unwrap_or(rest);
+    /// The directory name a repository's cache entries are kept under: the
+    /// first 16 hex digits of the SHA-256 of its URL, then `-` and the
+    /// URL's last path segment without `.git`, each byte outside letters,
+    /// digits, `.`, `-` and `_` written `_`
+    /// (`https://example.com/acme/json5.git` -> `<16 hex digits>-json5`).
+    /// The digest tells URLs apart, so two that end alike never share an
+    /// entry, and the length stays the same however long the URL is, which
+    /// keeps a cached file's path inside the operating system's limit.
+    static short_id(url: Str) -> String {
+        mut out: String = Sha256::digest(url.as_bytes()).to_hex();
+        out.truncate(16);
+        out.push("-");
+        mut segment: Str = url.strip_suffix(&Str::new("/")).unwrap_or(url);
+        segment = segment.strip_suffix(&Str::new(".git")).unwrap_or(segment);
+        mut start: i64 = 0;
+        for (mut i: i64 = 0; i < segment.length(); i++) {
+            const byte: u8 = segment.byte_at(i).unwrap_or(0);
+            if (byte == '/' as u8 || byte == ':' as u8) { start = i + 1; }
         }
-        const git_suffix: Str = Str::new(".git");
-        rest = rest.strip_suffix(&git_suffix).unwrap_or(rest);
-
-        // Replace path-unfriendly bytes with '_'; a byte is kept as it is,
-        // so a name in UTF-8 stays the same bytes.
-        mut out: String = String::with_capacity(rest.length());
-        for (mut i: i64 = 0; i < rest.length(); i++) {
-            const byte: u8 = rest.byte_at(i).unwrap_or(0);
+        for (mut i: i64 = start; i < segment.length(); i++) {
+            const byte: u8 = segment.byte_at(i).unwrap_or(0);
             const c: char = byte as char;
             const safe: boolean = c.is_alphanumeric() || c == '.' || c == '-' || c == '_';
             out.push_byte(if (safe) { byte } else { '_' as u8 });

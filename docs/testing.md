@@ -478,6 +478,32 @@ read:
 }
 ```
 
+`git_fixtures` gives a project git repositories with no network. Each
+fixture names a repository, a directory of the project (`from`) and its
+commits in order; each commit holds exactly the files of one directory below
+`from` (`tree`) and carries a tag. The project then runs in a copy of
+itself outside the tree: the runner builds each repository there with a
+fixed author and date and no user or system git configuration, writes its
+`file://` URL wherever a cryoconfig of the copy says `{fixture:<name>}` (a
+fixture's own commits included, so one fixture package can depend on
+another), and sets `CRYO_HOME` to a cache of the copy's own. A step then
+fetches (`["fetch"]`) before the outcome builds. Such a project
+`requires: ["git"]`, which holds when `git` is on `PATH`:
+
+```json
+{
+  "outcome": "run",
+  "requires": ["git"],
+  "git_fixtures": [
+    { "name": "greeter", "from": "fixtures/greeter",
+      "commits": [ { "tree": "v1.0.0", "tag": "v1.0.0" },
+                   { "tree": "v1.1.0", "tag": "v1.1.0" } ] }
+  ],
+  "steps": [["fetch"]],
+  "expect": { "exit_code": 0 }
+}
+```
+
 A `.cryo` file named in `arguments` makes a `build` project a single-file
 build of that file (the directory then needs no `cryoconfig`), so the flags
 a single-file build takes are tested the same way:

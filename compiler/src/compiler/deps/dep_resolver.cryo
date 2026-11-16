@@ -154,7 +154,7 @@ type struct DepResolver {
         };
         mut new_lock: Lockfile = Lockfile::empty();
 
-        DepResolver::walk_deps(top_config, str::Str::from(""), Path::from(""), mode, &existing, &new_lock, &visited, &outcome);
+        DepResolver::walk_deps(top_config, str::Str::from(""), Path::from(""), true, mode, &existing, &new_lock, &visited, &outcome);
 
         // Write the lockfile only on the success path of Fetch/Update.
         // A failed Fetch leaves the on-disk lock untouched so the user's
@@ -203,12 +203,17 @@ type struct DepResolver {
     /// for the program, relative to the program's root below a path
     /// dependency, absolute below a git one.  A path dependency's `path`
     /// is relative to the cryoconfig that writes it, so it is joined onto
-    /// that package's `base`.
+    /// that package's `base`.  `on_this_machine` says where `cfg`'s package
+    /// came from: the program, and every package reached from it through
+    /// path dependencies and `file://` repositories alone, is on this
+    /// machine; a package fetched from a remote, and everything below it,
+    /// is not, and may not name a `file://` repository.
     ///
     /// Cycle detection keys deps by their directory; see `DepKey`.
     static walk_deps(cfg: const ProjectConfig*,
                        declarer: str::Str,
                        base: Path,
+                       on_this_machine: boolean,
                        mode: ResolveMode,
                        existing: Lockfile*,
                        new_lock: mut Lockfile*,
@@ -225,10 +230,10 @@ type struct DepResolver {
                     outcome.failed = true;
                 }
                 DepKind::Path => {
-                    DepResolver::resolve_path_dep(cfg, declarer, base, dep, mode, existing, new_lock, visited, outcome);
+                    DepResolver::resolve_path_dep(cfg, declarer, base, on_this_machine, dep, mode, existing, new_lock, visited, outcome);
                 }
                 DepKind::Git => {
-                    DepResolver::resolve_git_dep(cfg, declarer, dep, mode, existing, new_lock, visited, outcome);
+                    DepResolver::resolve_git_dep(cfg, declarer, on_this_machine, dep, mode, existing, new_lock, visited, outcome);
                 }
             }
         }
@@ -240,6 +245,7 @@ type struct DepResolver {
     static resolve_path_dep(cfg: const ProjectConfig*,
                               declarer: str::Str,
                               base: Path,
+                              on_this_machine: boolean,
                               dep: const Dependency*,
                               mode: ResolveMode,
                               existing: Lockfile*,
@@ -279,7 +285,7 @@ type struct DepResolver {
         const package_base: PathBuf = if (base.is_empty()) { PathBuf::from(dep.path.as_str()) }
             else { base.join(dep.path.as_str()) };
         DepResolver::harvest_roots(&dep_cfg, package_base.as_path(), dep.name.as_str(), key.val.as_str(), outcome);
-        DepResolver::walk_deps(&dep_cfg, key.val.as_str(), package_base.as_path(), mode, existing, new_lock, visited, outcome);
+        DepResolver::walk_deps(&dep_cfg, key.val.as_str(), package_base.as_path(), on_this_machine, mode, existing, new_lock, visited, outcome);
     }
 
     /// The identity of the package `dep` names, in `directory`, recorded as
@@ -306,6 +312,7 @@ type struct DepResolver {
     /// a fresh lockfile entry.
     static resolve_git_dep(cfg: const ProjectConfig*,
                              declarer: str::Str,
+                             on_this_machine: boolean,
                              dep: const Dependency*,
                              mode: ResolveMode,
                              existing: Lockfile*,
@@ -313,6 +320,15 @@ type struct DepResolver {
                              visited: mut [DepKey]*,
                              outcome: mut ResolveOutcome*) -> void {
         mut sha: String = String::new();
+        const local_repository: boolean = match (GitUrl::package_on_this_machine(on_this_machine, dep.git_url.as_str())) {
+            Option::Some(local) => { local }
+            Option::None => {
+                fmt::eprintln(f"error: dependency '{dep.name}' names a repository on this machine ({dep.git_url}), from a package fetched from a remote");
+                fmt::eprintln("  help: only the program, and packages on this machine, may name a `file://` repository");
+                outcome.failed = true;
+                return;
+            }
+        };
 
         match (mode) {
             ResolveMode::Build => {
@@ -409,7 +425,7 @@ type struct DepResolver {
         // self-contained; the consumer's project_root is irrelevant for
         // git deps.
         DepResolver::harvest_roots(&dep_cfg, dep_root.as_path(), dep.name.as_str(), key.val.as_str(), outcome);
-        DepResolver::walk_deps(&dep_cfg, key.val.as_str(), dep_root.as_path(), mode, existing, new_lock, visited, outcome);
+        DepResolver::walk_deps(&dep_cfg, key.val.as_str(), dep_root.as_path(), local_repository, mode, existing, new_lock, visited, outcome);
     }
 
 

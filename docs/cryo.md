@@ -5434,6 +5434,9 @@ A path dependency names a directory holding a `cryoconfig`, relative to the cryo
 - The URL is `https://host/path`, `ssh://[user@]host/path`, `user@host:path`, or `file:///path` for a repository on this machine. `http://` and `git://`, which carry no encryption, a local path written without `file://`, and any other transport are refused.
 - Neither the URL, its user, its host, nor a `tag`, `branch` or `rev` value may begin with `-`, and none may hold a space or a control character, so that no value is ever read by git or ssh as an option.
 - A commit read back from `cryoconfig.lock` must be a full 40-digit commit id.
+- A `file://` repository may be named by the program, and by a package that is itself on this machine: one reached from the program through path dependencies and `file://` repositories alone. A package fetched from an `https` or `ssh` repository, and every package below it, names only remote repositories, so a repository nobody on this machine controls cannot point the build at this machine's files.
+
+A git dependency's repository and its checkouts are cached under a directory named by the first 16 hex digits of the SHA-256 of its URL and the URL's last path segment (`<16 hex digits>-json5`), so two URLs never share an entry and a cached file's path stays the same length however long the URL is.
 
 Each `git` process the build or `cryo fetch` starts may use only the transport its URL names (`-c protocol.allow=never` plus that one), and is given every URL and path after `--`.
 
