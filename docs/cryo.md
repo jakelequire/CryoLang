@@ -4134,8 +4134,16 @@ the error's fix writes `move`:
 ```cryo
 const n: i32 = 21;
 const h: thread::JoinHandle<i32> = thread::spawn(move () -> i32 { return n * 2; });
-const r: i32 = h.join();   // 42
+const r: i32 = h.join().unwrap();   // 42
 ```
+
+`join` returns `Result<T, PanicInfo>`. Under the unwinding strategy a panic in
+a thread's body ends that thread, not the process: the thread catches it,
+writes the panic report, and `join` returns `Err` with the panic's message and
+place (the message is the joining thread's copy, valid until it joins another
+panicked thread). `thread::scope` joins every scoped thread and then panics,
+`thread::scope: a scoped thread panicked`, if any of them did. Under
+`--panic=abort` a panic on any thread ends the process.
 
 What the rule does **not** do is make `Send` a safety guarantee:
 
@@ -4888,7 +4896,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 
 | Module               | What it brings in                                                                                                     |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `core`               | `panic(message: string, loc: intrinsics::Location) -> never` (does not return; aborts the process)                    |
+| `core`               | `panic(message: string, loc: intrinsics::Location) -> never` (does not return; see §23.2, Panic strategies)           |
 | `core::option`       | `Option<T>` (`Some` / `None`) and its methods                                                                         |
 | `core::result`       | `Result<T, E>` (`Ok` / `Err`) and its methods                                                                         |
 | `core::primitives`   | Methods on built-in types (`(-5 as i32).abs()`, `(2.0).sqrt()`, `x.clamp(lo, hi)`, `char::is_digit`, ...)             |
@@ -4915,7 +4923,7 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | **`json`**        | RFC 8259 parser and serialiser. `JsonValue`, `JsonNumber`, `JsonObject` (insertion-ordered). `parse`, `stringify`, `stringify_pretty`. `json::convert`: `ToJson` writes a value as a `JsonValue` (`ports.to_json()`) and `FromJson` reads one back (`Array::<u16>::from_json(&value)`), for `boolean`, every integer width, `f32`, `f64`, `String`, `Array<T>`, and `HashMap<String, V>` / `BTreeMap<String, V>` (a JSON object), and `Option<T>` (`None` as `null`); `Str` is written only. Reading refuses a value of the wrong shape, an integer out of range or with a fraction, with a `JsonDecodeError` that says where (`at .servers[2].port: expected a u16, found a string`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | **`fs`**          | Each operation on the type it is about, all re-exported from `std::fs`. `File`: `open` / `create` / `open_with(path, &OpenOptions)` (`Read + Write + Seek`, closed on drop, `metadata`, `set_length`, `synchronize_all`) and whole-file statics `read_text` (UTF-8 checked) / `read_bytes` / `write_text` / `write_bytes` / `append_text` / `copy` / `remove`. `Directory`: `create` / `create_all` / `remove` / `remove_all` / `entries` (a `DirectoryEntries` iterator of `DirectoryEntry`: `name`, `path`, `file_type`, `metadata`). `Path` (borrowed; a `string` or `Str` converts to one implicitly) and `PathBuf` (owned, `push` and `pop` changing it; it holds a `Path` view of its text and dereferences to it, so every `Path` method reads a `PathBuf`): lexical `parent` / `file_name` / `stem` / `extension` / `with_extension` / `join`, and what is at the path: `exists`, `is_file`, `is_directory`, `metadata` / `symlink_metadata` (typed `Metadata`), `rename_to`, `canonicalize`. `TemporaryFile` / `TemporaryDirectory`: created exclusively under `env::temporary_directory()`, removed when dropped unless `keep` is called. Every failure is an `IoError` naming its path. Windows goes through the wide-character (`*W`) calls, so any filename works. |
 | **`ffi`**         | The C ABI boundary. `libc` is the single home for every `extern "C"` the stdlib needs (POSIX I/O, sockets, math) and the named POSIX constants. A C string is a `string`; `Str::new` reads one, and `String::with_null` / `as_c_string` make one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| **`env`**         | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `temporary_directory() -> PathBuf`. On Windows these, `vars`, `current_directory`, `set_current_directory` and `current_executable` go through the wide-character calls (`CommandLineToArgvW` for the arguments, the UTF-16 environment block for `vars`, which so reads the live environment and leaves out the `=C:` drive records), so non-ASCII arguments, variables and directories round-trip; a lone surrogate in an argument or variable reads as U+FFFD (`Utf16::decode_lossy`). `env::arguments` reads a command line against a declaration: `ArgumentParser::new(program)` with chained `flag(long, short, help)`, `option(long, short, value_name, help)`, `positional(name, help)` and `optional_positional(name, help)`; `parse(arguments.as_slice())` gives `ParsedArguments` - `flag(name)`, `occurrences(name)` (`-vvv` is 3), `value(name)` (the last given) and `values(name)` - or an `ArgumentError` naming the argument and its `ArgumentErrorKind`, printed as `unknown option '--colour'`. An option's value is written `--name=v`, `--name v`, `-nv` or `-n v`, short flags group (`-cv`), and `--` ends the options. `help_text()` is a usage line and an aligned list of every declaration.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **`env`**         | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `temporary_directory() -> PathBuf`. On Windows `args()` reads the vector the runtime's entry split from the wide command line before `main` (the current C runtime's quoting rules: `""` inside quotes is a literal quote), and these others, `vars`, `current_directory`, `set_current_directory` and `current_executable` go through the wide-character calls (the UTF-16 environment block for `vars`, which so reads the live environment and leaves out the `=C:` drive records), so non-ASCII arguments, variables and directories round-trip; a lone surrogate in an argument or variable reads as U+FFFD. `env::arguments` reads a command line against a declaration: `ArgumentParser::new(program)` with chained `flag(long, short, help)`, `option(long, short, value_name, help)`, `positional(name, help)` and `optional_positional(name, help)`; `parse(arguments.as_slice())` gives `ParsedArguments` - `flag(name)`, `occurrences(name)` (`-vvv` is 3), `value(name)` (the last given) and `values(name)` - or an `ArgumentError` naming the argument and its `ArgumentErrorKind`, printed as `unknown option '--colour'`. An option's value is written `--name=v`, `--name v`, `-nv` or `-n v`, short flags group (`-cv`), and `--` ends the options. `help_text()` is a usage line and an aligned list of every declaration.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | **`math`**        | `f64` functions: `cbrt`, `power`, `power_integer`, `hypot`, `mul_add`, `exp` / `exp2` / `expm1`, `ln`, `log` / `log2` / `log10` / `log1p`, `sin` / `cos` / `tan` (plus the `a*` inverses, `atan2`, and the `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fract`, `copysign`, `fmod`, `signum`, classification (`is_nan`, `is_finite`, `classify`, ...), integer `gcd` / `lcm` / `is_power_of_two`, `align_up` / `align_down`, and the mathematical constants (`PI`, `TAU`, `E`, `SQRT_2`, ...); the float types' limits are constants of the types (`f64::EPSILON`, `f64::INFINITY`, [section 12.3](#123-implement-blocks-on-primitives)). `sqrt`, `abs`, `checked_abs` and `clamp` are **methods of each numeric primitive** in `core::primitives`, not `math` functions: `(16.0).sqrt()`, `(-5 as i32).abs()`, `x.clamp(lo, hi)`. A float's `abs` clears the sign bit; there is no `fabs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | **`time`**        | `Duration` (normalized seconds + sub-second nanoseconds; `from_seconds`/`from_milliseconds`/`from_microseconds`/`from_nanoseconds`, `as_seconds`/`as_milliseconds`/`as_microseconds`/`as_nanoseconds`/`subsec_*`, which panic when the total overflows `u64`; `checked_add`/`checked_subtract`/`checked_multiply`/`checked_divide` answer `None` where `scale`/`divide` panic, and the `saturating_*` forms clamp; `try_from_seconds_f64` refuses NaN, a negative and infinity, which `from_seconds_f64` panics on; `is_zero`, `Eq` + `Ord`). `Instant` (monotonic `CLOCK_MONOTONIC`; `now`, `elapsed`, `duration_since`, which saturates at zero). `SystemTime` (wall `CLOCK_REALTIME`; `now`, `unix_epoch`, `duration_since_epoch`; `duration_since` is `None` when the clock was stepped back between the readings, `saturating_duration_since` zero). `sleep(Duration)` (EINTR-restarting). `DateTime`, a civil reading at a fixed `UtcOffset` (`utc`, `from_seconds` in whole minutes): `parse_rfc3339` / `format_rfc3339` (`Display` writes the same text, `1996-12-19T16:39:57-08:00`; a parse error is a `DateTimeError` naming the byte; a leap second is refused), `from_parts` checking every field, `unix_seconds`, `weekday`, `to_offset`, and `add` / `subtract` / `duration_since` with a `Duration`. Every timeout the library takes is a `Duration` (`HttpServer.with_read_timeout`, `Futures::timeout`, `Child.wait_timeout`).                                                                                                                                                                                                                                                                                                                                                                               |
 | **`log`**         | `Logger::new(area)` names an area and logs at a `LogLevel` (`Error`, `Warning`, `Information`, `Debug`, `Trace`): `log.warning(f"no route for {path}")`, `error` / `information` / `debug` / `trace`, or `log(level, message)`. The message is an f-string formatted only when a sink writes it, so a refused record costs one atomic load; the record carries the logging call's location. `Logging` holds the process-wide settings: `set_level`, `set_area_level` (an area's level covers the areas below it, `http` for `http::server`; the longest named area wins), `configure("information,http=debug")` and `configure_from_environment(variable)`, which apply nothing when an entry cannot be read (`LogSpecificationError`), and `set_sink(&sink)` for a `LogSink` of the program's own, which receives one `LogRecord` (level, area, message, location, time) at a time. Until then records at `Warning` and above go to `StandardErrorSink`: `2026-11-09T14:03:07Z warning http: ...`, the level coloured when standard error takes colour. |
@@ -5175,7 +5183,8 @@ debug      = false                  # compiler logging, as --log=debug
 optimize   = "O2"                   # O0 | O1 | O2 | O3 (default O2)
 emit_llvm  = false                  # also write LLVM IR (.ll) beside the object
 no_std     = false                  # build without linking the standard library
-no_runtime = false                  # freestanding: no crt0 / libc / panic runtime
+no_runtime = false                  # freestanding: no crt0 / libc; the runtime's own entry
+panic      = "unwind"               # unwind | abort (see Panic strategies below)
 ```
 
 **`no_std` vs `no_runtime`.** These are orthogonal knobs, each also settable
@@ -5187,17 +5196,88 @@ never off):
 | `false`  | `false`      | Default hosted build: prelude + stdlib linked, crt0 + libc, the `@panic` runtime.                                                                                                                   |
 | `true`   | `false`      | No prelude/stdlib, but still hosted: crt0, libc, and the `@panic` runtime remain.                                                                                                                   |
 | `false`  | `true`       | Freestanding link (no crt0/libc/`libcryo.a`) but the stdlib source is still in scope — rarely useful.                                                                                               |
-| `true`   | `true`       | Fully freestanding: no stdlib, no crt0/libc, `main` is not widened, and check failures diverge through `llvm.trap` instead of the libc-backed `@panic`. This is how a `runtime/core` tier is built. |
+| `true`   | `true`       | Fully freestanding: no stdlib, no crt0/libc, `main` is not widened, and a failed check calls the runtime's check handler, which reports it and exits 101. This is how the freestanding runtime is built. |
 
 `no_runtime = true` normally implies `no_std = true`: a freestanding link drops
 `libcryo.a`, so any stdlib symbol the program references would fail to resolve.
-A freestanding program supplies its own entry point (an `![naked] _start`);
-without one the linker warns that `_start` is missing.  The optimizer never
+The runtime's freestanding entry (`_start`) is the program's entry point; it
+captures the arguments, runs `main` and exits with its result.  The optimizer never
 turns a freestanding program's code into a call to a C library function it
 did not write (a byte loop into `memset`), since nothing would answer it.
 
 `![config(no_runtime)]` / `![config(not(no_runtime))]` gate a declaration on the
-freestanding build flag, exactly like the OS atoms (`![config(linux)]`, …).
+freestanding build flag, exactly like the OS atoms (`![config(linux)]`, …), and
+`![config(panic_unwind)]` / `![config(not(panic_unwind))]` on the unwind panic
+strategy.
+
+**The runtime.** Every program links the Cryo runtime: the entry where a
+program starts in Cryo, the panic funnel and check handlers, and for a
+freestanding program its allocator and backtrace.  It is one library, the
+`runtime/` directory beside the compiler and the stdlib, built in three
+configurations - freestanding, hosted under `abort`, hosted under `unwind` -
+whose declarations are gated on the options above.  The compiler that links a
+program builds the configuration the program needs the first time it needs
+it, and keeps it in `runtime/.bin/<triple>/<configuration>/`; the archive is
+rebuilt when the compiler, a runtime source or the target changes.
+`CRYO_RUNTIME` names another runtime source directory to use; one that holds
+no `lib.cryo` is refused. Without it the runtime is the first of
+`$CRYO_HOME/runtime`, `<bindir>/../runtime`, `<bindir>/../../runtime` (the
+compiler's own directory, `<bindir>`) and the `runtime` directory beside the
+stdlib that holds a `lib.cryo`; a build that links a program and finds none
+is refused with `E0900`, which names `CRYO_RUNTIME`.
+
+#### Panic strategies
+
+A panic - `core::panic`, a failed `expect` or `unwrap` - ends in the runtime's
+panic funnel, which reports `panicked at <file>:<line>:<column> in <function>:
+<message>` on stderr (no column when it is unknown, no function when it has no
+name). What happens next is the build's panic strategy, `panic = "unwind"` or
+`"abort"` in `[compiler]`, or `--panic=unwind|abort` on the command line, which
+takes precedence:
+
+- **`unwind`**, the default for a hosted build: the panic unwinds the stack and
+  each frame's destructors run on the way out. `catch_unwind` stops it and
+  returns `Err(PanicInfo)`. A panic no `catch_unwind` stops reaches the catch
+  the compiler wraps `main` in, which writes the report and exits with code
+  101.
+- **`abort`**: the report is written and the process exits with code 101 at
+  once. No destructor runs, and `catch_unwind` does not compile.
+- A freestanding build (`no_runtime = true`) always aborts.
+
+The report is one write of one line (cut short, before its newline, past 2047
+bytes), so reports from two threads do not interleave. The process ends once:
+the first panic to reach its exit ends it; a panic on another thread after
+that writes its report and waits for the process to end; a panic on the same
+thread - raised by an exit handler or a destructor the exit runs - ends the
+process at once with code 101, and the exit handlers still queued do not run.
+
+A failed runtime check - an index out of bounds, a division or remainder by
+zero, a `match` no arm takes, an array allocation whose byte size overflows -
+is a panic like any other, under every strategy and in a freestanding build:
+it writes the same report, with the operands in the message where the check
+has them (`index 5 out of bounds for length 3`), then aborts with exit code
+101 or unwinds.
+
+Under `unwind`:
+
+- `PanicInfo.msg` is the runtime's per-thread copy of the message, so it reads
+  back whole even when the panicking code built the message in a value the
+  unwind destroyed. It stays valid until the same thread panics again. A
+  message longer than 1023 bytes is cut at a character boundary and ends in
+  `...`.
+- An exception that foreign code raised (a C++ `throw`) and that unwinds into
+  Cryo frames runs their destructors like a panic. `catch_unwind` catches it,
+  with a `PanicInfo` whose message names it as a foreign exception and whose
+  file is `<foreign code>`; the catch around `main` reports it the same way and
+  exits 101.
+- A forced unwind - a thread's exit or cancellation through the C library - is
+  never caught: it runs the destructors of the frames it passes, passes over
+  every `catch_unwind` and the catch around `main` without entering them (the
+  frame that called `catch_unwind` drops nothing of its own on the way), and
+  reaches the code that forced it.
+- A destructor that panics while an unwind is running it starts a new panic,
+  which replaces the first: the first panic's message is not reported, and the
+  unwind continues from the destructor's frame with the new one.
 
 **Build profiles.** A build runs under a named *profile* that supplies a
 default optimization level and debug-info setting and names the per-profile
@@ -5392,7 +5472,10 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--ast`               | Dump the AST after parsing.                                                                                                             |
 | `--emit-llvm`         | Emit LLVM IR (`.ll`) beside the object output, including a module that fails LLVM verification (the build still fails).                 |
 | `--build-dir=PATH`    | Override `[project] output_dir`.                                                                                                        |
-| `--stdlib=PATH`       | Standard-library root for this run (highest priority; see section 23.3).                                                                |
+| `--stdlib=PATH`       | Standard-library root for this run (highest priority; see section 24.3).                                                                |
+| `--panic=STRATEGY`    | `unwind` (the default for a hosted build) or `abort`; overrides `[compiler] panic` (see Panic strategies in section 23.2).              |
+| `--no-std`            | Build without the prelude and the standard library, as `[compiler] no_std = true`.                                                      |
+| `--no-runtime`        | Freestanding build, as `[compiler] no_runtime = true`: no crt0 or libc, and the runtime's freestanding configuration is linked.         |
 | `--target=TRIPLE`     | Cross-compile for an LLVM target triple. `x86_64-pc-windows-gnu` links to a `.exe` via mingw-w64; other x86-64 triples emit object files only; another architecture is `E0647`. |
 | `--opt-level=N`       | Optimization level `0`..`3`; overrides the profile and `[compiler] optimize`.                                                           |
 | `-g`, `--debug-info`  | Emit DWARF debug info.                                                                                                                  |

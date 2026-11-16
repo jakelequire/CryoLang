@@ -928,14 +928,14 @@ type struct IRGeneratorVisitor {
         return this.dispatch.codegen_lvalue(this, subject_node);
     }
 
-    /// `--panic=unwind`: emit the non-exhaustive-match `no_match` raise through
-    /// `__cryo_panic` (call-or-invoke + cleanup landing pad), replacing the
-    /// `abort` trap so the failure unwinds and the frame's live locals drop.
-    /// `sched` is the match node's `unwind_cleanup` (empty => plain call).
-    /// Shared by the statement and expression match forms.
-    emit_no_match_raise(mut &this, span: SourceSpan, sched: [Stmt*]*) -> void {
-        this.cg.expr_ops.emit_check_raise(this, sched, span,
-            "no matching pattern (non-exhaustive match)");
+    /// Emit the failure of a match no arm took, through the runtime's
+    /// `no_match` handler. `sched` is the match node's `unwind_cleanup`, the
+    /// locals a `--panic=unwind` raise drops on its way out (empty => plain
+    /// call). Shared by the statement and expression match forms.
+    emit_no_match_failure(mut &this, span: SourceSpan, sched: [Stmt*]*) -> void {
+        mut no_operands: [LValue] = [];
+        this.cg.expr_ops.emit_check_failure(this, sched, span,
+            MangledName::new("__cryo_panic_no_match"), &no_operands);
     }
 
     visit_match_stmt(mut &this, stmt: Stmt*, node: MatchStmt*) -> Emitted {
@@ -1005,27 +1005,16 @@ type struct IRGeneratorVisitor {
             this.cg.values.pop_scope();
         }
 
-        // no_match_bb is reached when the discriminant matched no arm.
-        // Emit `call @abort(); unreachable` rather than a bare `unreachable`:
-        // LLVM's x86 backend lowers a bare `unreachable` to *no instruction*,
-        // so a runtime fall-through silently slides into whatever code is
-        // laid out next in the binary (the original symptom: pack_sockaddr_in
-        // sliding into TcpStream::connect, then recursing to a stack-overflow
-        // SIGSEGV).  The abort+unreachable pair guarantees a clean SIGABRT.
-        // If a wildcard arm exists, no_match_bb has no incoming edges and
-        // LLVM elides the whole thing; either way the IR stays well-formed.
+        // no_match_bb is reached when the discriminant matched no arm. It
+        // calls the runtime's handler rather than ending in a bare
+        // `unreachable`: LLVM's x86 backend lowers a bare `unreachable` to *no
+        // instruction*, so a runtime fall-through would silently slide into
+        // whatever code is laid out next in the binary. If a wildcard arm
+        // exists, no_match_bb has no incoming edges and LLVM elides the whole
+        // thing; either way the IR stays well-formed.
         if (!no_match_bb.has_terminator()) {
             this.cg.builder.position_at_end(no_match_bb);
-            // `--panic=unwind` (hosted): raise through `__cryo_panic` so the
-            // failure unwinds and drops the frame's live locals; the default
-            // abort path stays byte-identical.
-            if (this.cg.ctx.options.unwinds() && !this.cg.intrinsics.no_runtime) {
-                this.emit_no_match_raise(stmt.span, &node.unwind_cleanup);
-            } else {
-                mut no_ops: [LValue] = [];
-                this.cg.intrinsics.emit_check_sink(MangledName::new("__cryo_panic_no_match"),
-                                                   stmt.span, &no_ops);
-            }
+            this.emit_no_match_failure(stmt.span, &node.unwind_cleanup);
         }
 
         this.cg.builder.position_at_end(merge_bb);
@@ -2134,22 +2123,13 @@ type struct IRGeneratorVisitor {
             this.cg.values.pop_scope();
         }
 
-        // No arm matched; trap with `call @abort(); unreachable`.  Bare
-        // `unreachable` lowers to nothing on x86, letting a runtime
-        // fall-through silently continue into the next function in the
-        // binary; the abort call guarantees a clean SIGABRT.  If the match
-        // is exhaustive (e.g., wildcard arm), default_bb is unreachable and
-        // LLVM elides it.
+        // No arm matched: the runtime's handler reports it (a bare
+        // `unreachable` lowers to nothing on x86 and would continue into the
+        // next function in the binary). If the match is exhaustive (e.g., a
+        // wildcard arm), default_bb is unreachable and LLVM elides it.
         if (!default_bb.has_terminator()) {
             this.cg.builder.position_at_end(default_bb);
-            // `--panic=unwind` (hosted): raise + cleanup instead of abort.
-            if (this.cg.ctx.options.unwinds() && !this.cg.intrinsics.no_runtime) {
-                this.emit_no_match_raise(e.span, &node.unwind_cleanup);
-            } else {
-                mut no_ops_e: [LValue] = [];
-                this.cg.intrinsics.emit_check_sink(MangledName::new("__cryo_panic_no_match"),
-                                                   e.span, &no_ops_e);
-            }
+            this.emit_no_match_failure(e.span, &node.unwind_cleanup);
         }
 
         this.cg.builder.position_at_end(merge_bb);

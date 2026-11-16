@@ -1,0 +1,342 @@
+///! Where an archive the compiler builds for itself on first use is kept: the
+///! stdlib archive (`PrebuiltStdlib`) and the runtime archive
+///! (`PrebuiltRuntime`).
+///!
+///! Each archive lives in a directory named by its key - every input that
+///! decides its bytes - beside a manifest whose second line records that
+///! key.  A build that finds the directory's manifest links the archive; one
+///! that does not takes a lock beside the directory, builds the archive into
+///! it by running the compiler on the archive's sources, and publishes the
+///! manifest last, by a rename, so no build opens an archive before it is
+///! whole.  Each use rewrites the directory's `last-use`, and a build that
+///! makes a new archive removes the least recently used beyond the few a
+///! machine runs at once.
+
+namespace compiler::prebuilt_cache;
+
+import compiler::build_manifest::{ ContentHasher, Manifest };
+import utils::log::{ Log, LogArea };
+import std::fmt;
+import std::env;
+import std::thread;
+import std::time::duration::{ Duration };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::fs::directory::{ Directory, DirectoryEntries };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::io::error::{ IoErrorKind };
+import std::process::command::{ Command, Output };
+import std::time::clock::{ SystemTime };
+
+/// A lock older than this is taken to be left by a build that died.
+const LOCK_EXPIRY_SECONDS: i64 = 600;
+
+/// How many archives a directory of archives keeps: one per compiler and
+/// option set in use at once (a selfhost's stages, verify's two compilers
+/// under two option sets).
+const ARCHIVES_KEPT: i64 = 6;
+
+/// An archive used this recently is kept whatever newer ones exist: longer
+/// than any build holds an archive between opening it and linking it.
+const ARCHIVE_IDLE_SECONDS: i64 = 3600;
+
+/// The file an archive's every use rewrites, so its time is the last use.
+const LAST_USE_NAME: string = "last-use";
+
+/// Lock attempts refused with the lock absent (200 ms apart) before the
+/// refusal is reported rather than waited out.
+const LOCK_REFUSALS_REPORTED: i64 = 25;
+
+/// One archive's place: its directory, the key that names it, its
+/// manifest's file name, and what it is, for messages ("the stdlib
+/// archive").
+type struct PrebuiltCache {
+    directory:     string;
+    key:           string;
+    manifest_name: string;
+    what:          string;
+
+    static new(directory: string, key: string, manifest_name: string, what: string) -> PrebuiltCache {
+        return PrebuiltCache { directory: directory, key: key, manifest_name: manifest_name, what: what };
+    }
+
+    /// Whether the directory's manifest is there and records this key: the
+    /// archive beside it is whole.
+    published(&this) -> boolean {
+        const text: String = match (File::read_text(Path::from(this.directory).join(this.manifest_name).as_path())) {
+            Result::Ok(t)  => { t }
+            Result::Err(_) => { return false; }
+        };
+        mut index: i64 = 0;
+        for (line in text.as_str().lines()) {
+            if (index == 1) { return line == f"key {this.key}".as_str(); }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    /// Wait for the lock beside the directory.  Answers true holding it,
+    /// with the archive still to build, or false when another build
+    /// published the archive meanwhile (the lock is then not held).
+    /// Windows refuses to create a directory whose deletion is pending, so
+    /// a lock another build is releasing can fail to be taken with access
+    /// denied for a moment; only a failure that outlasts that is reported.
+    take_lock(&this) -> Result<boolean, String> {
+        const lock: string = this.directory + ".lock";
+        match (Path::from(this.directory).parent()) {
+            Option::Some(parent) => {
+                match (Directory::create_all(parent)) {
+                    Result::Ok(_)  => { }
+                    Result::Err(error) => {
+                        return Result::Err(f"cannot make {parent.as_str()} to build {this.what} in: {error}");
+                    }
+                }
+            }
+            Option::None => { }
+        }
+        mut refusals: i64 = 0;
+        loop {
+            match (Directory::create(Path::from(lock))) {
+                Result::Ok(_) => {
+                    // Another build may have finished it between the last
+                    // look and the lock.
+                    if (this.published()) {
+                        PrebuiltCache::release(lock);
+                        return Result::Ok(false);
+                    }
+                    return Result::Ok(true);
+                }
+                Result::Err(error) => {
+                    const held: boolean = match (error.kind) {
+                        IoErrorKind::AlreadyExists => { true }
+                        _                          => { Path::from(lock).exists() }
+                    };
+                    if (held) {
+                        refusals = 0;
+                    } else {
+                        refusals = refusals + 1;
+                        if (refusals > LOCK_REFUSALS_REPORTED) {
+                            return Result::Err(f"cannot take the lock {lock} to build {this.what}: {error}");
+                        }
+                    }
+                }
+            }
+            if (this.published()) { return Result::Ok(false); }
+            // A lock older than any archive's build takes was left by one
+            // that died.
+            const expired: boolean = match (Path::from(lock).metadata()) {
+                Result::Ok(m)  => { SystemTime::now().unix_seconds() - m.modified_seconds() > LOCK_EXPIRY_SECONDS }
+                Result::Err(_) => { false }
+            };
+            if (expired) {
+                PrebuiltCache::release(lock);
+                continue;
+            }
+            thread::sleep(Duration::from_milliseconds(200));
+        }
+    }
+
+    /// Give up the lock `take_lock` took.
+    unlock(&this) -> void {
+        PrebuiltCache::release(this.directory + ".lock");
+    }
+
+    static release(lock: string) -> void {
+        match (Directory::remove_all(Path::from(lock))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+    }
+
+    /// Note that a build is about to link the archive in `directory`, so a
+    /// prune spares it.  A tree this build cannot write to is one it never
+    /// prunes either, so a use that cannot be recorded costs nothing.
+    static record_use(directory: string) -> void {
+        const record: PathBuf = Path::from(directory).join(LAST_USE_NAME);
+        match (File::write_text(record.as_path(), Str::new(""))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+    }
+
+    /// Run `command`, the build of the archive into the directory, under
+    /// its lock.  The directory is cleared first: one that does not open
+    /// was left by a build that died, or by a prune that failed partway,
+    /// and nothing links from it.  Answers the failure, or an empty string.
+    build_with(&this, command: mut &Command) -> String {
+        if (Path::from(this.directory).exists()) {
+            match (Directory::remove_all(Path::from(this.directory))) {
+                Result::Ok(_) => { }
+                Result::Err(error) => {
+                    return f"cannot clear {this.directory} to build {this.what} in it: {error}";
+                }
+            }
+        }
+        Log::debug(LogArea::Driver, f"building {this.what} in {this.directory}");
+        match (command.output()) {
+            Result::Ok(result) => {
+                mut output: Output = result;
+                if (!output.status().success()) {
+                    mut report: String = f"building {this.what} in {this.directory} failed:\n";
+                    report.push(Str::from_raw(output.stdout().as_pointer(), output.stdout().length()));
+                    report.push(Str::from_raw(output.stderr().as_pointer(), output.stderr().length()));
+                    return report;
+                }
+                // A warning the archive's build reports is the archive's
+                // sources', not the program's, so a program's build shows
+                // none of them.  The archive's own build (`cryo build
+                // stdlib`, `cryo build runtime`) reports them, and under
+                // `-Werror`, which the archive's build inherits, they fail
+                // it above.
+            }
+            Result::Err(_) => {
+                return f"could not run the compiler to build {this.what}";
+            }
+        }
+        return String::new();
+    }
+
+    /// The running compiler, as a command to build an archive with: an
+    /// archive is built by the compiler that links it.
+    command_for(&this) -> Result<Command, String> {
+        const exe: String = env::current_executable().unwrap_or(String::new());
+        if (exe.length() == 0) {
+            return Result::Err(f"the running compiler's own path is unknown, so it cannot build {this.what}");
+        }
+        return Result::Ok(Command::new(exe.as_str()));
+    }
+
+    /// Write the manifest `text` into the directory.  A build opens the
+    /// archive as soon as the manifest is there, so it appears whole, by a
+    /// rename, or not at all.  Answers the failure, or an empty String.
+    publish(&this, text: &String) -> String {
+        const path: PathBuf = Path::from(this.directory).join(this.manifest_name);
+        const partial: String = f"{path.as_path().as_str()}.partial";
+        match (File::write_bytes(Path::from(partial.as_str()), text.as_bytes())) {
+            Result::Ok(_)  => { }
+            Result::Err(error) => { return f"cannot write the manifest of {this.what}: {error}"; }
+        }
+        match (Path::from(partial.as_str()).rename_to(path.as_path())) {
+            Result::Ok(_)  => { return String::new(); }
+            Result::Err(error) => {
+                return f"cannot publish the manifest of {this.what} as {path.as_path().as_str()}: {error}";
+            }
+        }
+    }
+
+    /// Fold every source under `root`/`relative` - each `.cryo` file and
+    /// `cryoconfig`, by its path relative to the root and its bytes - in
+    /// name order, so the digest does not depend on how the directory lists
+    /// or where the root is.  Directories whose name starts with `.` hold
+    /// build outputs and are not read.
+    static fold_sources(h: mut ContentHasher*, root: Str, relative: Str) -> void {
+        const directory: PathBuf = if (relative.length() == 0) { PathBuf::from(root) } else {
+            Path::from(root).join(relative)
+        };
+        mut entries: DirectoryEntries = match (Directory::entries(directory.as_path())) {
+            Result::Ok(r)  => { r }
+            Result::Err(_) => { h.fold("<unlistable>"); h.fold_text(relative); return; }
+        };
+        mut names: [String] = [];
+        loop {
+            match (entries.next()) {
+                Option::Some(entry) => { names.push(String::from_str(entry.name())); }
+                Option::None => { break; }
+            }
+        }
+        names.sort();
+        for (mut i: i64 = 0; i < names.length(); i++) {
+            const name: Str = names[i].as_str();
+            if (name.starts_with(&Str::new("."))) { continue; }
+            const child: String = if (relative.length() == 0) { String::from_str(name) } else { f"{relative}/{name}" };
+            const full: PathBuf = Path::from(root).join(child.as_str());
+            if (full.as_path().is_directory()) {
+                PrebuiltCache::fold_sources(h, root, child.as_str());
+            } else if (name.ends_with(&Str::new(".cryo")) || name == Str::new("cryoconfig")) {
+                h.fold_text(child.as_str());
+                Manifest::fold_file::<ContentHasher>(h, full.as_path());
+            }
+        }
+    }
+
+    /// When the archive in `directory` was last used: its use record, else
+    /// its manifest, else the directory itself (a build that died before
+    /// writing a manifest).  0 when none of them can be read.
+    static last_use_secs(directory: Str, manifest_name: string) -> i64 {
+        const candidates: [PathBuf] = [
+            Path::from(directory).join(LAST_USE_NAME),
+            Path::from(directory).join(manifest_name),
+            PathBuf::from(directory),
+        ];
+        for (mut i: i64 = 0; i < candidates.length(); i++) {
+            match (candidates[i].metadata()) {
+                Result::Ok(m)  => { return m.modified_seconds(); }
+                Result::Err(_) => { }
+            }
+        }
+        return 0;
+    }
+
+    /// Every compiler rebuilt keys a new archive, so the older ones would
+    /// pile up: remove those beside this one beyond the ARCHIVES_KEPT used
+    /// most recently.  Spared whatever their rank: this one, one being
+    /// built (its lock is held), and one used within ARCHIVE_IDLE_SECONDS,
+    /// which a build running beside this one may be about to link.  An
+    /// archive stops opening when its manifest goes, so that goes first: a
+    /// removal that fails partway leaves a directory no build links, which
+    /// the next build of its key clears.
+    prune(&this) -> void {
+        const parent: Path = match (Path::from(this.directory).parent()) {
+            Option::Some(p) => { p }
+            Option::None    => { return; }
+        };
+        mut archives: [PathBuf] = [];
+        mut last_uses: [i64] = [];
+        match (Directory::entries(parent)) {
+            Result::Ok(listing) => {
+                mut entries: DirectoryEntries = listing;
+                loop {
+                    match (entries.next()) {
+                        Option::Some(entry) => {
+                            const name: Str = entry.name();
+                            const at: PathBuf = parent.join(name);
+                            if (name.contains(&Str::new(".")) || !at.as_path().is_directory()) { continue; }
+                            last_uses.push(PrebuiltCache::last_use_secs(at.as_path().as_str(), this.manifest_name));
+                            archives.push(at);
+                        }
+                        Option::None => { break; }
+                    }
+                }
+            }
+            Result::Err(_) => { return; }
+        }
+        const now: i64 = SystemTime::now().unix_seconds();
+        const built: Str = Path::from(this.directory).as_str();
+        for (mut i: i64 = 0; i < archives.length(); i++) {
+            mut newer: i64 = 0;
+            for (mut k: i64 = 0; k < archives.length(); k++) {
+                if (last_uses[k] > last_uses[i] || (last_uses[k] == last_uses[i] && k > i)) {
+                    newer = newer + 1;
+                }
+            }
+            const archive: Str = archives[i].as_path().as_str();
+            if (newer < ARCHIVES_KEPT || archive == built
+                    || now - last_uses[i] <= ARCHIVE_IDLE_SECONDS
+                    || Path::from(f"{archive}.lock".as_str()).exists()) {
+                continue;
+            }
+            const manifest: PathBuf = archives[i].as_path().join(this.manifest_name);
+            if (manifest.as_path().exists()) {
+                match (File::remove(manifest.as_path())) {
+                    Result::Ok(_)  => { }
+                    Result::Err(_) => { continue; }
+                }
+            }
+            match (Directory::remove_all(archives[i].as_path())) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { }
+            }
+        }
+    }
+}

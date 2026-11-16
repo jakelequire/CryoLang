@@ -574,6 +574,21 @@ the comparison reads:
   SOURCE never needs it: verify builds this tree's stdlib with both
   compilers, so a source edit moves nothing there by construction - prove one
   by building the library before and after at one path.
+- `moved-runtime:<configuration>/<member>` in `tests/started-passing` - a
+  member of the runtime archive of one configuration (`freestanding`,
+  `hosted-abort` or `hosted-unwind`), written by the configuration and the
+  member's file name (`moved-runtime:hosted-unwind/Unwind.o`), that the change
+  moves on purpose: a runtime source edit, or a compiler change that alters
+  what the runtime compiles to.  Each compiler builds the runtime it links -
+  the baseline's from the baseline's `runtime/`, the tree's from the tree's -
+  so a runtime edit moves its members, and so can a codegen change.  The
+  member is left out of the runtime comparison and must have moved; a declared
+  member that is unchanged fails, and so does a name that matches no member
+  of that archive in both runs, and any member that moved in an archive
+  nothing declares.  Every configuration compiles every module, so a change to
+  one declares its member once per configuration whose archive it moved in.
+  Against a baseline whose runtime is laid out as one archive per tier, the
+  runtime population is reported as not compared: no member pairs with one.
 
 A line stays once committed: against a later baseline it is inert.
 Rewriting a line into another form with its reason kept declares nothing

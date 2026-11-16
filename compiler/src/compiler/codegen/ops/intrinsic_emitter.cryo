@@ -41,9 +41,9 @@ type struct IntrinsicEmitter {
     /// for the active target (SysV-amd64 vs Win64).
     /// Null between `null()` and `wire()`.
     abi:         AbiClassifier*;
-    /// `[compiler] no_runtime`: a freestanding build links no panic tier, so
-    /// `emit_panic_call` diverges through `llvm.trap` (`ud2`) instead of the
-    /// funnel.  Wired from `ctx.options.freestanding()`.
+    /// `[compiler] no_runtime`: a freestanding build, which links the runtime's
+    /// freestanding configuration and allocates through its `__cryo_alloc`.
+    /// Wired from `ctx.options.freestanding()`.
     no_runtime:  boolean;
     /// The name a `Location`'s file is written under.
     file_names:  ProgramFileNames;
@@ -643,8 +643,8 @@ type struct IntrinsicEmitter {
             IntrinsicKind::FpClass => { this.emit_fpclass(a0, a1) }
 
             // -- trap(): `call void @llvm.trap()` then `unreachable`.  llvm.trap
-            //    lowers to `ud2` (SIGILL) with no libc dependency - the
-            //    divergent sink for a `no_runtime` check failure.  Declared
+            //    lowers to `ud2` (SIGILL) with no libc dependency and no
+            //    report; a failed check never takes it.  Declared
             //    `-> never`, but the dispatcher's early return bypasses the
             //    post-call divergent-name check (see Panic), so the
             //    `unreachable` is emitted here. --
@@ -774,7 +774,7 @@ type struct IntrinsicEmitter {
     // Per-intrinsic emission paths
 
     /// Get-or-declare the panic funnel `__cryo_panic(msg, loc)`, defined by
-    /// whichever panic tier the link names (`runtime/abi/lang_items.def`):
+    /// the runtime archive the link names (`runtime/abi/lang_items.def`):
     /// the message and the address of a `Location`.  Typed `(ptr, ptr) ->
     /// void`; the caller emits `unreachable` after the call since it diverges.
     get_or_decl_cryo_panic(mut &this) -> LValue {
@@ -793,24 +793,13 @@ type struct IntrinsicEmitter {
     /// Emit `call @__cryo_panic(msg, loc); unreachable`, `loc` the address
     /// of a `Location`.
     emit_panic_call(mut &this, msg: LValue, loc: LValue) -> LValue {
-        // Freestanding: no panic tier is linked.  The panic diverges through
-        // `llvm.trap` (`ud2`/SIGILL) instead, and the message is discarded -
-        // there is nothing to print to.
-        if (this.no_runtime) {
-            const trap_fn: LValue = this.get_or_decl_void_noarg(MangledName::new("llvm.trap"));
-            if (trap_fn.is_valid()) {
-                const trap_fty: LType = LType::function_type(LType::void_type(), null, 0, false);
-                this.builder.build_call(trap_fty, trap_fn, null, 0, "");
-            }
-            this.builder.build_unreachable();
-            return LValue::null();
-        }
         // Every panic goes through the external funnel, declared here and
-        // defined by whichever panic tier the link line names: `panic/abort`
-        // prints and terminates, `panic/unwind` raises through libunwind so the
-        // cleanup landing pads on the enclosing calls run as the unwind passes
-        // through.  Which strategy a program gets is a link-time choice, not a
-        // codegen one, which is why nothing here branches on it.
+        // defined by the runtime archive the link line names, freestanding
+        // links included: `panic/abort` prints and terminates, `panic/unwind`
+        // raises through libunwind so the cleanup landing pads on the
+        // enclosing calls run as the unwind passes through.  Which of the two
+        // a program gets is the runtime configuration its link names, so
+        // nothing here branches on it.
         const panic_fn: LValue = this.get_or_decl_cryo_panic();
         if (!panic_fn.is_valid()) { return LValue::null(); }
         const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(panic_fn.raw) };
@@ -1053,18 +1042,16 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function(MangledName::new("llvm.va_end.p0"), fty);
     }
 
-    // -- Freestanding check handlers (`runtime/abi/lang_items.def`) -----------
+    // -- Check handlers (`runtime/abi/lang_items.def`) ------------------------
     //
-    // Under `no_runtime` a failed check has no libc to fall back on: a `call
-    // @abort` cannot be resolved by a `-nostdlib` link at all, which is what
-    // made every panic tier of `runtime/` fail its own acceptance check while
-    // still compiling. These route the five check sites to the runtime's own
-    // handlers instead, which format the operands and diverge through
-    // `__cryo_panic` (exit 101 for the abort tier, an unwind for the unwind
-    // tier — chosen by which archive is on the link line, no caller change).
-    // The place is passed as the address of a `Location` (`location_global`),
-    // by pointer so neither side has to classify the aggregate by hand under
-    // two different C ABIs.
+    // Every check site, in every configuration, calls the runtime's handler for
+    // its failure (`ExprOps::emit_check_failure`). The handler formats the
+    // operands and diverges through `__cryo_panic` (exit 101 under abort and
+    // freestanding, an unwind under unwind - chosen by the runtime configuration
+    // the link names, no caller change); a freestanding link has no libc `abort` to
+    // reach for in any case. The place is passed as the address of a
+    // `Location` (`location_global`), by pointer so neither side has to
+    // classify the aggregate by hand under two different C ABIs.
 
     /// Get-or-declare one of the runtime's check handlers. Every one takes the
     /// `Location*` first and returns void (declared `-> never` on the runtime
@@ -1088,57 +1075,10 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function(name, fty);
     }
 
-    /// `call @<handler>(&location, <operands...>); unreachable`.
-    ///
-    /// Returns false when there is no handler for this shape, so the caller can
-    /// keep its previous behaviour rather than emit a call to nothing.
-    emit_check_handler_call(mut &this, name: MangledName, span: SourceSpan,
-                            operands: &[LValue]) -> boolean {
-        const fn: LValue = this.get_or_decl_check_handler(name, operands);
-        if (!fn.is_valid()) { return false; }
-        const loc: LValue = this.location_global(span);
-
-        const count: i64 = 1 + operands.length();
-        const arg_buf: mut void* = libc::malloc((count * 8) as u64);
-        const slots: mut (mut void*)* = arg_buf as mut (mut void*)*;
-        slots[0] = loc.raw;
-        for (mut i: i64 = 0; i < operands.length(); i++) {
-            slots[i + 1] = operands[i].raw;
-        }
-        const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(fn.raw) };
-        this.builder.build_call(fty, fn, arg_buf, count as u32, "");
-        libc::free(arg_buf);
-        this.builder.build_unreachable();
-        return true;
-    }
-
-    /// The freestanding sink for a check site: route to the runtime handler when
-    /// `no_runtime`, else the libc `abort` the hosted abort strategy has always
-    /// used. `operands` are the handler's extra arguments, already widened to
-    /// the declared types.
-    emit_check_sink(mut &this, name: MangledName, span: SourceSpan,
-                    operands: &[LValue]) -> void {
-        if (this.no_runtime) {
-            if (this.emit_check_handler_call(name, span, operands)) { return; }
-        }
-        const abort_fn: LValue = this.get_or_decl_abort();
-        const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
-        this.builder.build_call(abort_ty, abort_fn, null, 0, "");
-        this.builder.build_unreachable();
-    }
-
-    /// Declare libc `abort` extern: `void abort(void) __attribute__((noreturn))`.
-    get_or_decl_abort(mut &this) -> LValue {
-        mut fn: LValue = this.llvm_module.get_named_function(MangledName::new("abort"));
-        if (fn.is_valid()) { return fn; }
-        const fty: LType = LType::function_type(LType::void_type(), null, 0, false);
-        return this.llvm_module.add_function(MangledName::new("abort"), fty);
-    }
-
     /// Declare the allocator lang item `__cryo_alloc(u64 size, u64 align) ->
     /// void*` (see `runtime/abi/lang_items.def`).  Idempotent.
     ///
-    /// The alloc tier defines this `![weak]`, so a program that wants its own
+    /// The freestanding runtime defines this `![weak]`, so a program that wants its own
     /// allocator supplies a strong definition and the linker prefers it — which
     /// is the whole point of routing allocation through a named symbol instead
     /// of open-coding a `malloc` call.

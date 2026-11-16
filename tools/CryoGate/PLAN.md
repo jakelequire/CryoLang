@@ -251,7 +251,7 @@ compiler under test by a target like `lsp-check`'s, into
 
   cryogate is not pinned itself (question 2: built from the tree by the pin).
 - **Built:** `make cryogate`, a file rule over `tools/CryoGate/src`, its
-  cryoconfig, the stdlib sources, the runtime tiers and the pin; the pin's
+  cryoconfig, the stdlib sources, the runtime's sources and the pin; the pin's
   build of it links the prebuilt stdlib archive
   (`stdlib/.bin/<triple>/prebuilt/<key>/`), which perf made the only stdlib
   build there is (`make stdlib` is gone).
@@ -262,13 +262,12 @@ compiler under test by a target like `lsp-check`'s, into
 - **On a Linux host inside WSL**, the same source builds with `bin/cryo`
   (the ELF pin) into the mirror's own `tools/CryoGate/build/`.
 - **In a fresh git worktree** (the `cryogate` branch is worked in one, beside
-  the main checkout), two things the build needs are per-checkout and not in
-  git, so set them up once before `make cryo` or `make cryogate`:
-  1. On Windows, copy the main checkout's `.toolchains/llvm-win/` into the
-     worktree's `.toolchains/` (gitignored, ~190 MB; the Windows LLVM
-     `make cryo` links against). It is never committed.
-  2. Run `make runtime-tiers` once: until `runtime/.bin/<triple>/` holds the
-     tier archives, nothing links (`__cryo_panic` undefined).
+  the main checkout), one thing the build needs is per-checkout and not in
+  git, so set it up once before `make cryo` or `make cryogate`: on Windows,
+  copy the main checkout's `.toolchains/llvm-win/` into the worktree's
+  `.toolchains/` (gitignored, ~190 MB; the Windows LLVM `make cryo` links
+  against). It is never committed. The runtime needs no setup: each compiler
+  builds the configuration it links on first use, under `runtime/.bin/`.
 
   `.claude/settings.json` is per-checkout too (CLAUDE.md, Conventions).
 
@@ -404,8 +403,9 @@ Additions the port makes because it is the natural place:
   `cryogate selfhost --arm=linux` from the mirror. The tree digest is
   computed by the same Cryo function on both sides, on the working tree and on
   the mirror, and a mismatch refuses the arm, as today.
-- **Stages are data**: the six-stage table (runtime tiers by the pin, stdlib
-  and compiler by the pin, stage 2, stage 3) is a list, with each stage's
+- **Stages are data**: the stage table (the compiler by the pin, by stage 2,
+  by stage 3; each compiler builds the runtime it links on first use) is a
+  list, with each stage's
   directory pre-created (the compiler's single-level mkdir).
 - **The comparison is the whole tree**: the linked `cryo.ll` and every
   per-module `.ll` of stage 3 against stage 4, plus stage 3 and stage 4
@@ -643,9 +643,9 @@ final form, and **every port takes the post-perf script as it stands**
 |---|---|---|
 | `selfhost-check.py` | both arms at once on Windows, the Linux arm from a digest-checked copy at `~/.cache/cryo-selfhost/<checkout>` on WSL's own filesystem; the stage stdlib rebuilds dropped; the stage archives compared by object (`STDLIB ARCHIVES OK` x2 beside `FIXED POINT OK` x2) | ported as landed (§4f), with the archive comparison reading each stage's own build; needs WSL started (`wsl.exe -e true`) |
 | `verify.py` | the baseline recorded per program and reused while its keys hold; the archive-replaced column and the stdlib population; baselines cached in `.verify/` | ported as landed (§4e); a clean `--baseline` for a C-header change needs the header trick perf documented |
-| `incremental-check.py`, `incremental-instance-check.py` | module objects keyed on their bitcode; every module analysed, so warnings are always shown; the runtime tiers rebuild only when an input is newer | G12 is no longer waiting: cryogate writes the edit-fuzz gate (question 3) |
+| `incremental-check.py`, `incremental-instance-check.py` | module objects keyed on their bitcode; every module analysed, so warnings are always shown; a runtime configuration is rebuilt only when its key (the compiler's bytes, the runtime's sources, the target, the configuration) changes | G12 is no longer waiting: cryogate writes the edit-fuzz gate (question 3) |
 | `test-census.py` | the census is warm-valid and ~4x faster; the script itself unchanged | portable now |
-| the build | `make stdlib` is gone (the stdlib archive is prebuilt per compiler key under `stdlib/.bin/<triple>/prebuilt/`); `make cryo` is timestamp-gated, so after a branch switch `rm -rf compiler/build`; a build with warnings is never "up to date" | `make cryogate` depends on the runtime tiers, not on a stdlib target; gates that compare builds read the prebuilt archive's key |
+| the build | `make stdlib` is gone (the stdlib archive is prebuilt per compiler key under `stdlib/.bin/<triple>/prebuilt/`); `make cryo` is timestamp-gated, so after a branch switch `rm -rf compiler/build`; a build with warnings is never "up to date" | `make cryogate` depends on the runtime's sources, not on a stdlib target; gates that compare builds read the prebuilt archive's key |
 | C headers | a header edit is not seen by the compiler's up-to-date check (bug 0203) | a gate that builds after a header change does so from a clean build directory |
 | `examples-gate.py`, `lsp-gate.py`, `cross-check.py`, `vendor-consts-gate.py`, `roster-check.py`, `cryo-pin.py`, `verify-pin.py`, `api-index.py`, `annotate-negative-tests.py` | timings only | portable now |
 

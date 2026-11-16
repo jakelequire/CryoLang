@@ -85,10 +85,10 @@ PIN_EXE      := $(ROOT)/bin/cryo.exe
 # It cannot be derived from the host OS: the value comes from a toolchain probe
 # (mingw `gcc` on PATH -> `...-windows-gnu`, an MSVC linker -> `...-windows-msvc`;
 # on Linux whatever the linked libLLVM reports).  `cryo version --triple` prints
-# exactly what `resolve_effective_triple` hands the tier lookup, so the directory
-# named from it is the one the linker will search.  Guessing is SILENT when
-# wrong: `runtime_dir_pick` falls back to the flat directory and the two
-# toolchains resume overwriting each other's archives there.
+# exactly the triple a build names its archive directories by (`.bin/<triple>/`
+# in stdlib/ and runtime/), so the directory named from it is the one the
+# compiler fills.  Guessing is SILENT when wrong: warnings-check would delete
+# another target's stdlib archives and then link the host's, already built.
 #
 # Asking means launching the pin, and the rules below name the triple in their
 # prerequisites, so it would be asked while the Makefile is read.  The goals in
@@ -163,6 +163,13 @@ TEST_CPP_HELPERS_O   := $(TEST_HELPERS_DIR)/cpp_link_helper-unix.o
 TEST_CPP_HELPERS_A   := $(TEST_HELPERS_DIR)/libcpplinkhelper-unix.a
 CXX                  ?= c++
 
+# C startup hooks (a .preinit_array entry, a constructor, a destructor) for the
+# linux_startup_runs_c_initializers_once project, which runs only on Linux.
+# Built only on unix, like the C++ helper.
+TEST_STARTUP_HELPERS_C := $(TEST_HELPERS_DIR)/startup_helpers.c
+TEST_STARTUP_HELPERS_O := $(TEST_HELPERS_DIR)/startup_helpers-unix.o
+TEST_STARTUP_HELPERS_A := $(TEST_HELPERS_DIR)/libstartuphelpers-unix.a
+
 # Python interpreter for the helper scripts, and the only spelling of it in
 # the recipes.  Windows ships `python.exe`, and its `python3` is an App
 # Execution Alias that exits 49; Linux/macOS use `python3`.  NOOP is a recipe
@@ -174,6 +181,15 @@ ifeq ($(HOST_OS),windows)
 else
     PYTHON := python3
     NOOP   := @:
+endif
+
+# The shell for a host-side bash script.  On Windows a bare `bash` resolves to
+# System32's WSL launcher, which runs the script inside the Linux guest; Git's
+# own bash sits three levels above its exec path.
+ifeq ($(HOST_OS),windows)
+    POSIX_SHELL := $(shell git --exec-path)/../../../bin/bash.exe
+else
+    POSIX_SHELL := bash
 endif
 
 # The LSP binary grows a `.exe` suffix on a Windows host (the self-hosted
@@ -193,7 +209,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-tiers runtime-tiers-win pin \
+.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-abi-check pin \
         pin-impl pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
         install uninstall clean lsp install-lsp cryogate release release-linux release-windows
 
@@ -208,13 +224,8 @@ Build
                          commit it was built from (`cryo stamp`, which is what
                          `cryo version` reports; the stamp rewrites a region
                          of the binary, so no object changes).
-  make runtime-tiers     Runtime tier archives for the host triple (every
-                         hosted link needs the panic tier).
-  make runtime-tiers-win The same tiers cross-built for the Windows triple
-                         (skipped without the mingw toolchain).
   make cryo-exe          Cross-build compiler/build/cryo.exe from Linux, and
                          stamp it.
-<<<<<<< HEAD
   make lsp               Build tools/CryoLSP from the current tree with the pin
                          and install it as bin/cryolsp.
   make install-lsp       lsp, the server's behavioural checks on the installed
@@ -252,14 +263,16 @@ Tests and gates
                          (into its own directory; installs nothing), and
                          the binary passes its behavioural checks
                          (tools/CryoLSP/tests/smoke.py).
-  make warnings-check    compiler/ and the stdlib build with -Werror under
-                         the compiler under test, the stdlib under both panic
-                         strategies and for both operating systems (the
+  make warnings-check    compiler/, the stdlib and the runtime build with
+                         -Werror under the compiler under test, the stdlib
+                         under both panic strategies and the runtime in each
+                         configuration, for both operating systems (the
                          other one by --target, objects only into
                          build-logs/); DELETES the host's prebuilt stdlib
                          archives first (into build-logs/).
-  make cross-check       runtime, stdlib, compiler and CryoLSP for the other
-                         OS's triple, objects only (ARGS=--triple=...).
+  make cross-check       runtime (each configuration), stdlib, compiler and
+                         CryoLSP for the other OS's triple, objects only
+                         (ARGS=--triple=...).
   make examples          Build every examples/ project.
   make examples-golden   Build every example, run the ones with an
                          expected.out and compare their output with it.
@@ -269,8 +282,12 @@ Tests and gates
   make incremental-instance-check  An edit asking a cached module for a new
                          generic instance still links.
   make vendor-check      Every constant shape survives `cryo vendor`.
-  make verify-freestanding  Runtime tiers' freestanding acceptance check
+  make verify-freestanding  The runtime's freestanding acceptance check
                          (POSIX only; refuses on Windows).
+  make runtime-abi-check The lang-item registry (runtime/abi/lang_items.def)
+                         against the runtime's three configurations, and the
+                         `__cryo_` names compiler/src and stdlib/ spell.
+                         Builds each configuration first; a verify gate.
   make selfhost-check    Byte-identity fixed point.  Linux host: the Linux
                          chain, then the Windows chain under wine (a skipped
                          arm fails unless ARGS=--allow-skipped-arm).  Windows
@@ -299,7 +316,7 @@ Pins and release
   make install           Symlink bin/cryo and the stdlib into a prefix (POSIX).
   make uninstall         Remove those symlinks.
   make clean             Remove every build output in the tree: compiler,
-                         stdlib, runtime tiers, LSP, test helpers, test and
+                         stdlib, runtime archives, LSP, test helpers, test and
                          example builds, .verify/, .cross-check/,
                          build-logs/ and dist/.
 
@@ -353,13 +370,10 @@ $(PIN):
 	@exit 1
 
 # ---- self-hosted compiler via the pin ---------------------------------
-# Depends on `runtime-tiers` because linking ANY hosted binary - including this
-# compiler - needs the panic tier to resolve `__cryo_panic`.  Harmless before the
-# pin emits that call; required the moment it does.
-#
-# The pin links the compiler against the stdlib archive it builds for its own
-# key under stdlib/.bin/<triple>/prebuilt/ the first time it needs one, so
-# nothing here builds the stdlib.
+# The pin links the compiler against the stdlib archive and the runtime
+# archive it builds for its own key, under stdlib/.bin/<triple>/prebuilt/ and
+# runtime/.bin/<triple>/, the first time it needs each, so nothing here builds
+# either.
 #
 # The linked compiler is then stamped (`cryo stamp`) with the checkout it was
 # built from, which is what `cryo version` reports.  The stamp is a region of
@@ -369,17 +383,14 @@ $(PIN):
 #
 # `cryo` names the binary, and the binary's rule runs only when a prerequisite
 # is newer than it - any .cryo under compiler/src or stdlib, the compiler's
-# cryoconfig and C headers, the runtime tiers, the pin -
+# cryoconfig and C headers, the runtime, the pin -
 # so a build with nothing changed launches no compiler.  `.git/index` is a
 # prerequisite too: a commit rewrites it, and the stamp then names the new
 # commit.  The binary is touched last: an up-to-date build or an unchanged
 # stamp leaves it as it was, older than what made the rule run.
 CRYO_PROFILE  := release
 STAMP_EXCLUDE := bin/cryo,bin/cryo.pin.txt,bin/cryo.exe,bin/cryo.exe.pin.txt
-# The runtime tiers' newest archive stands for them all (`runtime-tiers`).
-RUNTIME_SOURCES := $(call rwildcard,$(ROOT)/runtime,*.cryo) $(ROOT)/runtime/cryoconfig \
-                   $(ROOT)/runtime/hosted/cryoconfig
-RUNTIME_TIERS_A  = $(ROOT)/runtime/.bin/$(HOST_TRIPLE)/libcryort-panic-unwind-hosted.a
+RUNTIME_SOURCES := $(call rwildcard,$(ROOT)/runtime,*.cryo) $(ROOT)/runtime/cryoconfig
 ifeq ($(HOST_OS),windows)
 STAGE2_FILE := $(STAGE2_EXE)
 STAGE2_PIN  := $(PIN_EXE)
@@ -399,7 +410,7 @@ CRYOGATE_DIR    := $(ROOT)/tools/CryoGate
 CRYOGATE        := $(CRYOGATE_DIR)/build/cryogate$(EXE_SUFFIX)
 CRYOGATE_TESTS  := $(CRYOGATE_DIR)/build/cryogate-test$(EXE_SUFFIX)
 CRYOGATE_INPUTS := $(call rwildcard,$(CRYOGATE_DIR)/src,*.cryo) $(CRYOGATE_DIR)/cryoconfig \
-                   $(call rwildcard,$(ROOT)/stdlib,*.cryo) $(RUNTIME_TIERS_A) $(STAGE2_PIN)
+                   $(call rwildcard,$(ROOT)/stdlib,*.cryo) $(RUNTIME_SOURCES) $(STAGE2_PIN)
 ifeq ($(HOST_OS),windows)
 CRYOGATE_COMMAND := "$(subst /,\,$(CRYOGATE))"
 else
@@ -407,7 +418,7 @@ CRYOGATE_COMMAND := "$(CRYOGATE)"
 endif
 CRYOGATE_HEAVY  := $(CRYOGATE_COMMAND) heavy --
 STAGE2_INPUTS := $(CRYO_SOURCES) $(ROOT)/compiler/cryoconfig $(wildcard $(ROOT)/compiler/*.h) \
-                 $(RUNTIME_TIERS_A) $(STAGE2_PIN) $(wildcard $(ROOT)/.git/index)
+                 $(RUNTIME_SOURCES) $(STAGE2_PIN) $(wildcard $(ROOT)/.git/index)
 
 cryo: $(STAGE2_FILE)
 
@@ -456,9 +467,9 @@ endif
 # Cross-compile the self-hosted compiler to cryo.exe (mingw-w64 + the
 # .toolchains/llvm-win import lib).  Requires the cross toolchain + the
 # fetched windows libLLVM-C; prints an actionable hint and fails if absent.
-# Depends on `runtime-tiers-win`: this is a CROSS link, so it needs the tiers
-# built for the windows triple to resolve `__cryo_panic`, not the host ones.
-cryo-exe: cryo runtime-tiers-win
+# The self-hosted compiler builds the runtime for the windows triple itself,
+# on first use, as it does for any target it links.
+cryo-exe: cryo
 	@command -v $(MINGW_GCC) >/dev/null 2>&1 || { echo "ERROR: $(MINGW_GCC) not found (install gcc-mingw-w64-x86-64)."; exit 1; }
 	@command -v ld.lld-20 >/dev/null 2>&1 || { echo "ERROR: ld.lld-20 not found (install lld-20); WIN_LINK_CC links with it."; exit 1; }
 	@test -f "$(WIN_LLVM_LIB)" || { echo "ERROR: windows libLLVM-C import lib missing at"; echo "       $(WIN_LLVM_LIB)"; echo "       Run: scripts/fetch-windows-llvm.sh"; exit 1; }
@@ -563,7 +574,7 @@ endif
 # The gate runner (tools/CryoGate), built by the pin against the tree's
 # stdlib and linked against the stdlib only, so a compiler under test that
 # does not build or misbehaves cannot break the program that reports it.
-# Rebuilt when its sources, the stdlib, the runtime tiers or the pin are
+# Rebuilt when its sources, the stdlib, the runtime's sources or the pin are
 # newer than the binary.  Its variables are set beside the pin's, above,
 # because the heavy targets name it as a prerequisite.  Its unit tests are
 # built here too, by listing them (`cryo test --list` builds the test binary
@@ -642,12 +653,10 @@ ifeq ($(HOST_OS),windows)
 # The wrapper checks for python + wsl.exe, then drives selfhost-check.py.
 # Same single-line shape as `pin` so it Just Works whether you invoked
 # `make` from cmd / PowerShell or from MSYS2 / Git Bash.
-# `runtime-tiers` first: the check's stage-2 and stage-3 rounds are hosted links
-# that need libcryort-panic-abort-hosted.a to resolve `__cryo_panic`.
-selfhost-check: $(CRYOGATE) runtime-tiers
+selfhost-check: $(CRYOGATE)
 	$(CRYOGATE_HEAVY) cmd /c scripts\selfhost-check-windows.cmd $(ARGS)
 else
-selfhost-check: $(PIN) $(CRYOGATE) runtime-tiers
+selfhost-check: $(PIN) $(CRYOGATE)
 	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/selfhost-check.py $(ARGS)
 endif
 
@@ -701,6 +710,12 @@ $(TEST_CPP_HELPERS_A): $(TEST_CPP_HELPERS_CPP)
 	@$(CXX) -O0 -fPIC -c -o $(TEST_CPP_HELPERS_O) $<
 	@ar rcs $@ $(TEST_CPP_HELPERS_O)
 
+# C startup-hook archive for the linux_startup_runs_c_initializers_once project.
+$(TEST_STARTUP_HELPERS_A): $(TEST_STARTUP_HELPERS_C)
+	@echo "==> Building C startup-hook helper archive"
+	@cc -O0 -fPIC -c -o $(TEST_STARTUP_HELPERS_O) $<
+	@ar rcs $@ $(TEST_STARTUP_HELPERS_O)
+
 ifeq ($(HOST_OS),windows)
 # Native Windows host: recipes run under cmd, which can't execute a quoted
 # forward-slash path and needs the `.exe` the native build emits - so the
@@ -709,7 +724,7 @@ ifeq ($(HOST_OS),windows)
 # target, so the compiler is rebuilt only when an input is newer, matching the
 # Linux semantics.
 STAGE2_EXE_WIN := $(subst /,\,$(STAGE2_EXE))
-test: $(STAGE2_EXE) $(TEST_HELPERS_A) runtime-tiers
+test: $(STAGE2_EXE) $(TEST_HELPERS_A)
 	@cd tests && "$(STAGE2_EXE_WIN)" test $(ARGS)
 
 test-list: $(STAGE2_EXE) $(TEST_HELPERS_A)
@@ -718,20 +733,20 @@ test-list: $(STAGE2_EXE) $(TEST_HELPERS_A)
 roster-check: $(STAGE2_EXE) $(TEST_HELPERS_A) $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) roster --cryo "$(STAGE2_FILE)" $(ARGS)
 
-test-census: $(STAGE2_EXE) $(TEST_HELPERS_A) $(CRYOGATE) runtime-tiers
+test-census: $(STAGE2_EXE) $(TEST_HELPERS_A) $(CRYOGATE)
 	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) census --cryo "$(STAGE2_FILE)" -- $(ARGS)
 else
-test: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
+test: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A)
 	@cd tests && "$(STAGE2)" test $(ARGS)
 
-test-list: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
+test-list: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A)
 	@cd tests && "$(STAGE2)" test --list $(ARGS)
 
 # Golden-file gate on the DISCOVERED unit-test roster: a compiler change
 # that silently breaks `![test]` discovery would otherwise stay green
 # ("0 of 0 failed" is a pass).  Re-pin with ARGS=--merge when adding tests,
 # ARGS=--update when removing them.  `cryogate roster`.
-roster-check: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE)
+roster-check: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A) $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) roster --cryo "$(STAGE2_FILE)" $(ARGS)
 
 # `make test` with the counts asserted.  The runner reports a zero the same way
@@ -741,7 +756,7 @@ roster-check: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE)
 # ran against the roster golden.  Use it wherever the run is being taken as
 # evidence; `make test` stays for the working loop, where a pattern filter is
 # the point.  ARGS are passed to `cryo test`.  `cryogate census`.
-test-census: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE) runtime-tiers
+test-census: $(STAGE2) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A) $(CRYOGATE)
 	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) census --cryo "$(STAGE2_FILE)" -- $(ARGS)
 endif
 
@@ -756,7 +771,7 @@ endif
 # external library and no display, so unlike the raylib acceptance project this
 # runs everywhere.  Hermetic: the fixture registers under a throwaway
 # $CRYO_HOME and leaves nothing on the machine.  `cryogate vendor`.
-vendor-check: $(STAGE2_FILE) $(CRYOGATE) runtime-tiers
+vendor-check: $(STAGE2_FILE) $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) vendor --cryo "$(STAGE2_FILE)"
 
 # ---- one verification run ----------------------------------------------
@@ -768,14 +783,14 @@ vendor-check: $(STAGE2_FILE) $(CRYOGATE) runtime-tiers
 #
 # Everything it needs built is a prerequisite HERE, before any gate starts:
 # the gates run concurrently, and a phony prerequisite rebuilt by one of them
-# (the runtime tiers) would be rewritten while another is linking against it.
+# (a test helper archive) would be rewritten while another is linking against it.
 # cryogate's unit tests are one: check-fast runs them, and building them there
 # makes the pin's own stdlib archive among the archives verify hashes.
 ifeq ($(HOST_OS),windows)
 verify: cryo $(TEST_HELPERS_A) $(CRYOGATE) $(CRYOGATE_TESTS)
 	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/verify.py --cryo "$(STAGE2_EXE)" $(ARGS)
 else
-verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(CRYOGATE) $(CRYOGATE_TESTS)
+verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A) $(CRYOGATE) $(CRYOGATE_TESTS)
 	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/verify.py --cryo "$(STAGE2)" $(ARGS)
 endif
 
@@ -846,6 +861,8 @@ endif
 # the stdlib is built for that OS's triple under both strategies too - objects
 # only, as `cross-check` builds it - or a warning in `![target(unix)]` code is
 # never seen on a Windows host, nor one in `![target(windows)]` code on Linux.
+# The runtime is a program's archive the same way, its declarations gated on
+# its configuration, so it is built on its own in each, for both OSes.
 ifeq ($(HOST_OS),windows)
 warnings-check: $(STAGE2_EXE)
 	@if exist "stdlib\.bin\$(HOST_TRIPLE)\prebuilt" rmdir /s /q "stdlib\.bin\$(HOST_TRIPLE)\prebuilt"
@@ -853,7 +870,13 @@ warnings-check: $(STAGE2_EXE)
 	@"$(STAGE2_EXE)" build stdlib --build-dir=$(ROOT)/build-logs/warnings-check/stdlib-panic-abort --no-incremental --panic=abort -Werror
 	@"$(STAGE2_EXE)" build stdlib --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-panic-unwind --no-incremental --panic=unwind -Werror
 	@"$(STAGE2_EXE)" build stdlib --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-panic-abort --no-incremental --panic=abort -Werror
-	@echo warnings-check: OK -- compiler and stdlib built with -Werror, the stdlib under both panic strategies for both operating systems
+	@"$(STAGE2_EXE)" build runtime --build-dir=$(ROOT)/build-logs/warnings-check/runtime-freestanding --no-incremental --no-runtime -Werror
+	@"$(STAGE2_EXE)" build runtime --build-dir=$(ROOT)/build-logs/warnings-check/runtime-hosted-abort --no-incremental --panic=abort -Werror
+	@"$(STAGE2_EXE)" build runtime --build-dir=$(ROOT)/build-logs/warnings-check/runtime-hosted-unwind --no-incremental --panic=unwind -Werror
+	@"$(STAGE2_EXE)" build runtime --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-runtime-freestanding --no-incremental --no-runtime -Werror
+	@"$(STAGE2_EXE)" build runtime --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-runtime-hosted-abort --no-incremental --panic=abort -Werror
+	@"$(STAGE2_EXE)" build runtime --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-runtime-hosted-unwind --no-incremental --panic=unwind -Werror
+	@echo warnings-check: OK -- compiler, stdlib and runtime built with -Werror, the stdlib under both panic strategies and the runtime in each configuration, for both operating systems
 else
 warnings-check: $(STAGE2)
 	@rm -rf "stdlib/.bin/$(HOST_TRIPLE)/prebuilt"
@@ -861,14 +884,21 @@ warnings-check: $(STAGE2)
 	@"$(STAGE2)" build stdlib --build-dir=$(ROOT)/build-logs/warnings-check/stdlib-panic-abort --no-incremental --panic=abort -Werror
 	@"$(STAGE2)" build stdlib --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-panic-unwind --no-incremental --panic=unwind -Werror
 	@"$(STAGE2)" build stdlib --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-panic-abort --no-incremental --panic=abort -Werror
-	@echo "warnings-check: OK -- compiler and stdlib built with -Werror, the stdlib under both panic strategies for both operating systems"
+	@"$(STAGE2)" build runtime --build-dir=$(ROOT)/build-logs/warnings-check/runtime-freestanding --no-incremental --no-runtime -Werror
+	@"$(STAGE2)" build runtime --build-dir=$(ROOT)/build-logs/warnings-check/runtime-hosted-abort --no-incremental --panic=abort -Werror
+	@"$(STAGE2)" build runtime --build-dir=$(ROOT)/build-logs/warnings-check/runtime-hosted-unwind --no-incremental --panic=unwind -Werror
+	@"$(STAGE2)" build runtime --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-runtime-freestanding --no-incremental --no-runtime -Werror
+	@"$(STAGE2)" build runtime --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-runtime-hosted-abort --no-incremental --panic=abort -Werror
+	@"$(STAGE2)" build runtime --target=$(OTHER_OS_TRIPLE) --build-dir=$(ROOT)/build-logs/warnings-check/other-os-runtime-hosted-unwind --no-incremental --panic=unwind -Werror
+	@echo "warnings-check: OK -- compiler, stdlib and runtime built with -Werror, the stdlib under both panic strategies and the runtime in each configuration, for both operating systems"
 endif
 
 # ---- the other OS's config-gated half ----------------------------------
 # Config gating prunes `![config(linux)]` from a Windows build before name
 # resolution sees it, and `![config(windows)]` from a Linux one, so every
 # host-native gate measures a tree with the other OS's half cut out.  This
-# compiles runtime/, stdlib/, compiler/ and tools/CryoLSP for the other OS with
+# compiles runtime/ (as each configuration a link names), stdlib/, compiler/
+# and tools/CryoLSP for the other OS with
 # `--target`, which selects that OS's gates and stops at object files - no
 # cross toolchain, no link, no WSL.  A declaration that stops resolving on
 # the other OS is refused here, on this host, in about a minute.
@@ -954,88 +984,27 @@ valgrind-check: $(STAGE2_FILE) $(CRYOGATE)
 	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) examples --run --under=valgrind --cryo "$(STAGE2_FILE)"
 endif
 
-# ---- runtime tier archives --------------------------------------------
-# NOT optional, and not only for freestanding projects: codegen emits a call to
-# the external `__cryo_panic` for every panic, so a HOSTED link needs
-# libcryort-panic-abort-hosted.a on the line or it fails on an undefined symbol.
-# Built with the PIN, not the self-hosted compiler, and that is load bearing:
-# once the pin itself emits `__cryo_panic`, LINKING the self-hosted compiler
-# needs these archives, so making them depend on that compiler would be a
-# bootstrap cycle (tiers -> cryo -> tiers).  The pin is a known-good compiler
-# and the tier sources do not depend on any newer codegen.
-#
-# Two workspaces over the same sources: `runtime/` builds them freestanding,
-# `runtime/hosted/` rebuilds the abort tier with `no_runtime = false` so its
-# `__cryo_panic` exits through libc (flushing stdio) instead of a raw syscall.
-# Both write into `runtime/.bin/$(HOST_TRIPLE)`, one directory per target.
-#
-# The per-target directory is what keeps two toolchains apart.  A project's
-# artifacts hoist to the root of its `output_dir`, so while every target wrote
-# `runtime/.bin` flat, building for a second target OVERWROTE the first's
-# archives in place and the next link died on another architecture's objects
-# (`__ImageBase undefined` one way, `undefined reference to RtlAllocateHeap`
-# the other).  `runtime_dir_pick` prefers `<dir>/<triple>`, so naming the
-# directory for the triple the linker will search removes the collision rather
-# than scheduling a cleanup around it.
-#
-# `HOST_TRIPLE` is asked of the compiler because a native triple comes from a
-# toolchain probe; a wrong guess is silent, since the lookup falls back to the
-# flat directory.  Empty means the pinned compiler predates `version --triple`,
-# which is a hard error here: building flat is the bug this target exists to
-# prevent, so it must not be the fallback.
-#
-# The tiers build incrementally: the whole-build fingerprint folds the
-# resolved target triple and every code-shaping option, so a directory left
-# holding another target's archives is rebuilt rather than reported up to
-# date, and an unchanged tier module reuses its object.
-#
-# The tiers are rebuilt when a runtime source or the pin is newer than the
-# tier archive written last, so a build that changes nothing launches no
-# compiler for them.
-runtime-tiers: $(RUNTIME_TIERS_A)
+# ---- the runtime -------------------------------------------------------
+# Every program links the runtime (`runtime/`, one project), and the compiler
+# that links it builds it, on first use, under runtime/.bin/<triple>/; see
+# compiler/src/compiler/prebuilt_runtime.cryo.  Nothing here builds it - not
+# for the pin, and not for the compiler under test.
 
-ifeq ($(HOST_OS),windows)
-$(RUNTIME_TIERS_A): $(RUNTIME_SOURCES) $(PIN_EXE)
-	$(if $(strip $(HOST_TRIPLE)),,$(error runtime-tiers: `cryo version --triple` returned nothing; the pinned compiler is too old))
-	@echo "==> Building runtime tiers for $(HOST_TRIPLE) via bin/cryo.exe"
-	@cd runtime && "$(subst /,\,$(PIN_EXE))" build --build-dir=.bin/$(HOST_TRIPLE)
-	@cd runtime\hosted && "$(subst /,\,$(PIN_EXE))" build --build-dir=../.bin/$(HOST_TRIPLE)
-else
-$(RUNTIME_TIERS_A): $(RUNTIME_SOURCES) $(PIN)
-	$(if $(strip $(HOST_TRIPLE)),,$(error runtime-tiers: `cryo version --triple` returned nothing; the pinned compiler is too old))
-	@echo "==> Building runtime tiers for $(HOST_TRIPLE) via bin/cryo"
-	@cd runtime && "$(PIN)" build --build-dir=.bin/$(HOST_TRIPLE)
-	@cd runtime/hosted && "$(PIN)" build --build-dir=../.bin/$(HOST_TRIPLE)
-endif
-
-# The same tiers cross-built for the windows triple, for `cryo-exe`.  They land
-# in `runtime/.bin/$(WIN_TRIPLE)`, beside the host triple's directory, where
-# `runtime_dir_pick` (codegen/passes.cryo) looks first.  The triple is safe to
-# spell here because an explicit `--target=` is returned verbatim by
-# `resolve_effective_triple` - it is the same string the lookup will use; a
-# native build's triple comes from a toolchain probe, which is why
-# `runtime-tiers` asks the pin for it instead.  Skipped (not failed) without
-# the cross toolchain, matching how `pin-windows-impl` treats a Linux-only
-# checkout.
-runtime-tiers-win: $(PIN)
-	@if command -v $(MINGW_GCC) >/dev/null 2>&1; then \
-		echo "==> Building runtime tiers for $(WIN_TRIPLE) via bin/cryo"; \
-		( cd runtime && "$(PIN)" build --target=$(WIN_TRIPLE) --build-dir=.bin/$(WIN_TRIPLE) >/dev/null ); \
-		( cd runtime/hosted && "$(PIN)" build --target=$(WIN_TRIPLE) --build-dir=../.bin/$(WIN_TRIPLE) >/dev/null ); \
-	else \
-		echo "==> [skip] windows runtime tiers: $(MINGW_GCC) absent."; \
-	fi
+# The lang-item registry (runtime/abi/lang_items.def) against the runtime the
+# compiler under test builds in each configuration, and the `__cryo_` names
+# compiler/src and stdlib/ spell; see the script's header.  The script finds
+# the compiler under test in compiler/build.
+runtime-abi-check: $(STAGE2_FILE)
+	@"$(POSIX_SHELL)" scripts/runtime-abi-check.sh
 
 # ---- freestanding runtime gate ----------------------------------------
-# Build every `runtime/` tier and run its acceptance check on both supported
-# OSes.  `runtime/` is a SEPARATE freestanding workspace with its own
-# cryoconfig, so nothing else in this Makefile compiles it — which is exactly
-# how it silently rotted once: the tiers still built, but codegen had moved on
-# and the panic tier no longer linked.  This target is what makes that loud.
+# Build the runtime's freestanding configuration and run its acceptance check
+# on both supported OSes.  No hosted program reaches the freestanding entry,
+# allocator or backtrace, so nothing else exercises them.
 #
 # A skipped arm FAILS.  The Windows half needs mingw + wine, and where those
 # are absent the script used to return 0 having run half of itself and print
-# OK - so a bare Linux box could be quoted as evidence the Windows tiers link.
+# OK - so a bare Linux box could be quoted as evidence the Windows runtime links.
 # Accept that deliberately with `ARGS=--allow-skipped-arm` (the spelling
 # selfhost-check uses); `FREESTANDING_LINUX_ONLY=1` still selects the skip, it
 # just no longer hides it.
@@ -1079,7 +1048,7 @@ uninstall:
 
 # ---- clean ------------------------------------------------------------
 # Every output the targets above write inside the tree, for every triple:
-# the compiler, the stdlib and runtime tier archives, the LSP build and its
+# the compiler, the stdlib and runtime archives, the LSP build and its
 # installed copy, the test helper archives, the test suite's and the
 # examples' build directories, the namespace-index caches the compile-fail
 # suite's single-file checks keep in tests/tests/negative/.bin, the gates' state (.verify/ with its cached

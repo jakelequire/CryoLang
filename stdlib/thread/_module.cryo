@@ -3,13 +3,22 @@
 ///! Spawn a thread with `thread::spawn(body)`: `body` is a callable taking
 ///! no arguments - a `move` closure, a non-capturing lambda or a named
 ///! function - and it is moved into the new thread. The returned
-///! `JoinHandle<T>` hands back the body's `T` result via `join()`:
+///! `JoinHandle<T>` hands back the body's result via `join()`, `Ok` with the
+///! body's `T`, or `Err` with the panic that ended it:
 ///!
 ///!   ```cryo
 ///!   const n: i32 = 21;
 ///!   const h = thread::spawn(move () -> i32 { return n * 2; });
-///!   const r: i32 = h.join();   // 42
+///!   const r: i32 = h.join().unwrap();   // 42
 ///!   ```
+///!
+///! ## Panics
+///!
+///! Under the unwinding strategy a panic in a thread's body unwinds that
+///! thread only: the thread catches it, writes the panic report, and ends,
+///! and `join()` returns `Err(PanicInfo)` with its message and place. A
+///! scoped thread's panic makes the scope panic once it has joined every
+///! thread. Under `--panic=abort` a panic on any thread ends the process.
 ///!
 ///! Owned data (String, Box, Array, ...) can be moved across the thread
 ///! boundary in either direction - into the thread as a capture of a
@@ -33,7 +42,7 @@
 ///!
 ///! ## Lifecycle
 ///!
-///! A `JoinHandle<T>` must be `join()`ed (waits, returns `T`) or
+///! A `JoinHandle<T>` must be `join()`ed (waits, returns the result) or
 ///! `detach()`ed (fire-and-forget). Dropping a handle without either is
 ///! equivalent to `detach()`. `is_finished()` polls without consuming.
 ///! `try_spawn` is the fallible variant (returns `Result` instead of
@@ -42,7 +51,8 @@
 ///! ## Scoped threads
 ///!
 ///! `thread::scope(body)` runs `body` with a scope handle, `s`, and joins
-///! every thread spawned through `s.spawn(...)` before it returns. A scoped
+///! every thread spawned through `s.spawn(...)` before it returns; it panics
+///! after joining them when one of them panicked. A scoped
 ///! thread may therefore borrow the variables of the function that called
 ///! `scope`: a closure written without `move` is accepted by `s.spawn` when
 ///! everything it borrows is `Sync`.
@@ -67,6 +77,7 @@
 namespace std::thread;
 
 import std::core::intrinsics;
+import std::core::panic_unwind::{ catch_unwind, PanicInfo };
 import std::core::pointer::{ NonNull };
 import std::core::result::{ Result };
 import std::core::drop::{ Drop };
@@ -80,7 +91,7 @@ import std::fmt::error::{ FormatError };
 import std::ffi::libc::{
     pthread_attr_destroy, pthread_attr_init, pthread_attr_setstacksize,
     pthread_create, pthread_detach, pthread_equal, pthread_join, pthread_self,
-    pthread_setname_np, sched_yield
+    pthread_setname_np, sched_yield, memcpy, strlen
 };
 import std::time::clock;
 import std::time::duration::{ Duration };
@@ -104,16 +115,22 @@ module thread::local;
 // against a `JoinHandle::id()` is not meaningful on Windows (a known v1 gap).
 // ---------------------------------------------------------------------------
 
+/// Wait for the thread to end and return the value its entry returned: the
+/// `void*` on POSIX, the exit code on Windows, widened to u64.
 ![target(unix)]
-private function os_join(tid: u64) -> void {
+private function os_join(tid: u64) -> u64 {
     mut ret: mut u8* = null;
     pthread_join(tid, &ret);
+    return ret as u64;
 }
 ![target(windows)]
-private function os_join(tid: u64) -> void {
+private function os_join(tid: u64) -> u64 {
     const h: u8* = tid as u8*;
     syscall::WaitForSingleObject(h, syscall::INFINITE);
+    mut code: u32 = 0;
+    syscall::GetExitCodeThread(h, &code);
     syscall::CloseHandle(h);
+    return code as u64;
 }
 
 ![target(unix)]
@@ -174,14 +191,63 @@ private const STATE_THREAD_DONE: u8 = 1;
 private const STATE_DETACHED:    u8 = 2;
 
 
+/// The bytes a panic message keeps on its way from a panicked thread to the
+/// thread that joins it, the terminating NUL included: the runtime's own copy
+/// of a message is this long, so nothing is cut further.
+private const PANIC_MESSAGE_CAPACITY: u64 = 1024;
+
 /// Heap control block shared between the spawned thread and the
 /// `JoinHandle`. Outlives the thread so `join` can read the result after
 /// the thread exits. `result` storage is uninitialized until the thread
 /// writes it; the state machine guarantees no actor reads or drops it
-/// before the write happens-before.
+/// before the write happens-before. A panicked body's message is copied into
+/// `panic_message`, since the runtime's copy belongs to the thread and ends
+/// with it.
 private type struct Shared<T> {
-    private state:  Atomic<u8>;
-    private result: T;
+    private state:         Atomic<u8>;
+    private result:        Result<T, PanicInfo>;
+    private panic_message: [u8; 1024];
+}
+
+/// The message of the panicked thread this thread joined last, which the
+/// `PanicInfo` its `join` returned reads: valid until this thread joins
+/// another panicked thread.
+![thread_local]
+private mut joined_panic_message: [u8; 1024] = [0; 1024];
+
+/// Copy a panic's message into `into`, `PANIC_MESSAGE_CAPACITY` bytes, as a
+/// NUL-terminated string, and return the copy.
+private function copy_panic_message(message: string, into: mut u8*) -> string {
+    mut length: u64 = strlen(message as u8*);
+    if (length >= PANIC_MESSAGE_CAPACITY) { length = PANIC_MESSAGE_CAPACITY - 1; }
+    memcpy(into as mut void*, message as void*, length);
+    into[length] = 0;
+    return into as string;
+}
+
+/// The runtime's report of the panic this thread last caught, written as the
+/// root catch writes it, without ending the process. Defined under both panic
+/// strategies; reached only under the unwinding one.
+![config(panic_unwind)]
+private extern "C" {
+    function __cryo_panic_write_report() -> void;
+}
+
+/// Run a thread's body. Under the unwinding strategy a panic that unwinds
+/// out of it is caught here, on the thread, and reported; the `Err` reads the
+/// runtime's copy of the message, which lasts as long as the thread.
+![config(panic_unwind)]
+private function run_body<F, T>(body: F) -> Result<T, PanicInfo> where F: () -> T {
+    const outcome: Result<T, PanicInfo> = catch_unwind::<F, T>(body);
+    if (outcome.is_err()) { __cryo_panic_write_report(); }
+    return outcome;
+}
+
+/// Run a thread's body. Under `--panic=abort` a panic ends the process, so
+/// the body always returns.
+![config(not(panic_unwind))]
+private function run_body<F, T>(body: F) -> Result<T, PanicInfo> where F: () -> T {
+    return Result::Ok(body());
 }
 
 /// Heap input to the spawned thread: the body to run and a pointer to the
@@ -201,9 +267,9 @@ private type struct Payload<F, T> {
 private function thread_body<F, T>(arg: mut u8*) -> void where F: () -> T {
     const p: Payload<F, T>* = arg as Payload<F, T>*;
     const shared: mut Shared<T>* = (*p).shared;
-    // Writing the result through a raw `T*` avoids drop-synthesis on the
+    // Writing the result through a raw pointer avoids drop-synthesis on the
     // (uninitialized) destination.
-    const rptr: mut T* = &(*shared).result;
+    const rptr: mut Result<T, PanicInfo>* = &(*shared).result;
     mut alloc: GlobalAllocator = GlobalAllocator::new();
     // A take: the body is read out of the payload, and the payload box is
     // released raw right after, without dropping what it held, so `body` is
@@ -212,14 +278,20 @@ private function thread_body<F, T>(arg: mut u8*) -> void where F: () -> T {
     unsafe {
         const body: F = (*p).body;
         alloc.deallocate(NonNull::new(arg), Layout::of::<Payload<F, T>>());
-        *rptr = body();
+        match (run_body::<F, T>(body)) {
+            Result::Ok(value) => { *rptr = Result::Ok(value); }
+            Result::Err(info) => {
+                const message: string = copy_panic_message(info.msg, &(*shared).panic_message[0]);
+                *rptr = Result::Err(PanicInfo { msg: message, file: info.file, line: info.line });
+            }
+        }
     }
 
     // Handshake: announce completion. If the handle already detached, no
     // one will ever read the result, so we own teardown here.
     const prev: u8 = (*shared).state.swap(STATE_THREAD_DONE, MemoryOrder::AcqRel);
     if (prev == STATE_DETACHED) {
-        pointer::drop_in_place::<T>(rptr);
+        pointer::drop_in_place::<Result<T, PanicInfo>>(rptr);
         alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
     }
 }
@@ -289,8 +361,8 @@ private function reap_detached<T>(tid: u64, shared: mut Shared<T>*) -> void {
     const prev: u8 = (*shared).state.swap(STATE_DETACHED, MemoryOrder::AcqRel);
     if (prev == STATE_THREAD_DONE) {
         // Thread already finished and left the result for us; drop it.
-        const rptr: T* = &(*shared).result;
-        pointer::drop_in_place::<T>(rptr);
+        const rptr: Result<T, PanicInfo>* = &(*shared).result;
+        pointer::drop_in_place::<Result<T, PanicInfo>>(rptr);
         mut alloc: GlobalAllocator = GlobalAllocator::new();
         alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
     }
@@ -306,23 +378,36 @@ public type struct JoinHandle<T> {
     private tid:    u64;
     private shared: mut Shared<T>*;
 
-    /// Block until the thread finishes and return its result. Consumes
-    /// the handle; the control block is freed here.
-    public join(mut this) -> T {
+    /// Block until the thread finishes. Returns `Ok` with the body's result,
+    /// or `Err` with the panic that ended the body, which the thread reported
+    /// when it panicked. The `PanicInfo`'s message is this thread's copy,
+    /// valid until this thread joins another panicked thread: copy it to
+    /// keep it. Consumes the handle; the control block is freed here.
+    public join(mut this) -> Result<T, PanicInfo> {
         const { tid, shared }: JoinHandle<T> = this;
         os_join(tid);
         // Thread has exited and left the result (it observed STATE_LIVE,
         // so it did not tear down). Move the result out, then free the
         // block without dropping the (now-moved-from) result storage.
-        const rptr: T* = &(*shared).result;
+        const rptr: Result<T, PanicInfo>* = &(*shared).result;
         // Destructive read: `deallocate` releases the block as raw bytes and
         // runs no drop glue over `result`, so the value moved out here has
-        // exactly one owner.  The read and the free are a single sequence.
+        // exactly one owner.  The read and the free are a single sequence;
+        // a panic's message is copied out of the block before it is freed.
         unsafe {
-            const out: T = *rptr;
+            const outcome: Result<T, PanicInfo> = *rptr;
             mut alloc: GlobalAllocator = GlobalAllocator::new();
-            alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
-            return out;
+            match (outcome) {
+                Result::Ok(value) => {
+                    alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
+                    return Result::Ok(value);
+                }
+                Result::Err(info) => {
+                    const message: string = copy_panic_message(info.msg, &joined_panic_message[0]);
+                    alloc.deallocate(NonNull::new(shared as mut u8*), Layout::of::<Shared<T>>());
+                    return Result::Err(PanicInfo { msg: message, file: info.file, line: info.line });
+                }
+            }
         }
     }
 
@@ -365,7 +450,9 @@ implement<T> trait Drop for struct JoinHandle<T> {
 /// Spawn a thread that runs `body()` and returns a handle to its `T`
 /// result. `body` is moved into the new thread: a `move` closure, a
 /// non-capturing lambda or a named function. Panics on allocation or
-/// thread-creation failure; use `try_spawn` for a fallible spawn.
+/// thread-creation failure; use `try_spawn` for a fallible spawn. A panic in
+/// `body` ends the thread, not the process, under the unwinding strategy:
+/// `join` returns it as an `Err`.
 ///
 /// Thread-safety: `spawn` requires `F: Send` (the body and everything it
 /// owns) and `T: Send` (the result handed back through
@@ -468,7 +555,7 @@ implement trait Error for enum SpawnError { }
 ///
 ///   ```cryo
 ///   match (thread::try_spawn(move () -> i32 { return work(arg); })) {
-///       Result::Ok(h)  => { use(h.join()); }
+///       Result::Ok(h)  => { use(h.join().unwrap()); }
 ///       Result::Err(e) => { /* back off / report */ }
 ///   }
 ///   ```
@@ -502,7 +589,7 @@ public const MAX_THREAD_NAME: u64 = 15;
 ///       .stack_size(one_mebibyte)          // 1 MiB stack
 ///       .name(Str::new("worker"))
 ///       .spawn(move () -> i32 { return n * 2; });
-///   const r: i32 = h.join();               // 42
+///   const r: i32 = h.join().unwrap();      // 42
 ///   ```
 ///
 /// POD: a `Builder` owns no resources (the name lives in a fixed inline
@@ -635,34 +722,40 @@ public function sleep(duration: Duration) -> void {
 // ---------------------------------------------------------------------------
 
 /// Scoped-thread body: moves the body out of its box, frees the box, runs
-/// the body. Scoped bodies return no value, so there is no result/handshake
-/// machinery. The gated `scope_trampoline` wrappers adapt the C entry ABI.
-private function scope_body<F>(arg: mut u8*) -> void where F: () -> void {
+/// the body, and answers whether it panicked. Scoped bodies return no value,
+/// so there is no result/handshake machinery: the answer is the thread's
+/// exit value, which `Scope::join_all` reads. The gated `scope_trampoline`
+/// wrappers adapt the C entry ABI.
+private function scope_body<F>(arg: mut u8*) -> boolean where F: () -> void {
     // A take, as in `thread_body`: the box is released raw right after, so
     // `body` is the only owner of what it captured.
     unsafe {
         const body: F = *(arg as F*);
         mut alloc: GlobalAllocator = GlobalAllocator::new();
         alloc.deallocate(NonNull::new(arg), Layout::of::<F>());
-        body();
+        return run_body::<F, void>(body).is_err();
     }
 }
 
+/// A scoped thread's exit value when its body panicked; 0 when it returned.
+private const SCOPED_THREAD_PANICKED: u64 = 1;
+
 ![target(unix)]
 private function scope_trampoline<F>(arg: mut u8*) -> u8* where F: () -> void {
-    scope_body::<F>(arg);
+    if (scope_body::<F>(arg)) { return SCOPED_THREAD_PANICKED as u8*; }
     return null;
 }
 ![target(windows)]
 private function scope_trampoline<F>(arg: mut u8*) -> u32 where F: () -> void {
-    scope_body::<F>(arg);
+    if (scope_body::<F>(arg)) { return SCOPED_THREAD_PANICKED as u32; }
     return 0;
 }
 
 /// Run `body` with a thread scope and join every thread it spawned through
 /// the scope before returning `body`'s result. The threads may borrow the
 /// variables of the caller, which outlive them. A panic unwinding out of
-/// `body` still joins them, when the scope is released.
+/// `body` still joins them, when the scope is released. When a scoped
+/// thread panicked, `scope` panics once it has joined them all.
 public function scope<F, R>(body: F) -> R where F: (mut &Scope) -> R {
     mut s: Scope = Scope { tids: [] };
     const result: R = body(&s);
@@ -698,14 +791,19 @@ public type struct Scope {
     }
 
     /// Join every thread spawned so far, blocking until all have
-    /// finished. Idempotent: clears the recorded set, so a later
+    /// finished, then panic if any of them panicked; each reported its own
+    /// panic when it did. Idempotent: clears the recorded set, so a later
     /// drop/join is a no-op.
     public join_all(mut &this) -> void {
         const n: i64 = this.tids.length() as i64;
+        mut panicked: boolean = false;
         for (mut i: i64 = 0; i < n; i = i + 1) {
-            os_join(this.tids[i]);
+            if (os_join(this.tids[i]) == SCOPED_THREAD_PANICKED) { panicked = true; }
         }
         this.tids.clear();
+        if (panicked) {
+            core::panic("thread::scope: a scoped thread panicked", intrinsics::location());
+        }
     }
 }
 

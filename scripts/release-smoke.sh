@@ -10,20 +10,18 @@
 # it starts, not whether it works, and on `main` rather than on the tag.
 #
 # So the archive's own reason for existing was ungated.  It ships a stdlib and
-# the runtime tier archives because without them, in build-release.sh's own
-# words, the compiler "cannot link ANY program" - it fails on an undefined
-# `__cryo_panic` - and a missing hosted CORE tier is worse than that: the link
-# quietly omits `-Wl,-e,__cryo_entry` and the program goes back to starting at
-# crt0. Neither shows up in `--version`.
+# the runtime because without them, in build-release.sh's own words, the
+# compiler "cannot link ANY program" - it fails on an undefined `__cryo_panic`.
+# That does not show up in `--version`.
 #
 # This compiles a hello-world with the staged compiler, against the staged
-# stdlib and the staged tiers, runs it, and checks its output and exit code.
+# stdlib and the staged runtime, runs it, and checks its output and exit code.
 # It is the smallest program that needs every piece the archive ships.
 #
 # Usage:
 #   scripts/release-smoke.sh <staged-dir> <exe-name> [runner ...]
 #
-#   <staged-dir>  a staging tree: bin/<exe>, stdlib/, lib/cryo/<triple>/
+#   <staged-dir>  a staging tree: bin/<exe>, stdlib/, runtime/
 #   <exe-name>    `cryo` or `cryo.exe`
 #   [runner]      how to execute a foreign binary, e.g. `wine`.  Omit when the
 #                 artifact is native to this host.
@@ -48,8 +46,8 @@ fail() { echo "release-smoke: FAIL -- $*" >&2; exit 1; }
 CRYO="${STAGE}/bin/${EXE}"
 [ -f "$CRYO" ] || fail "no compiler at ${CRYO}"
 [ -d "${STAGE}/stdlib" ] || fail "the archive ships no stdlib/; nothing could compile"
-ls "${STAGE}"/lib/cryo/*/libcryort-*.a >/dev/null 2>&1 \
-    || fail "the archive ships no runtime tier archives; every link would fail on __cryo_panic"
+[ -f "${STAGE}/runtime/lib.cryo" ] \
+    || fail "the archive ships no runtime/; every link would fail on __cryo_panic"
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/app/src"
@@ -80,6 +78,8 @@ APP
 # staged compiler could resolve against the repository it was built in and the
 # smoke would pass on a machine where the shipped stdlib is missing entirely.
 export CRYO_STDLIB="${STAGE}/stdlib"
+# The runtime likewise.
+export CRYO_RUNTIME="${STAGE}/runtime"
 
 # Once per default profile, so the stdlib archive each links is exercised (and,
 # in a tree that ships none yet, built: build-release.sh ships what this makes).
@@ -108,7 +108,7 @@ for PROFILE in release dev; do
         *) fail "the program ran but printed [$OUT] (${PROFILE})" ;;
     esac
     # 7 rather than 0: an exit code the runtime has to carry back from `main`,
-    # so a core tier that dropped the entry shim cannot pass by exiting 0 for
+    # so a runtime that dropped the entry shim cannot pass by exiting 0 for
     # its own reasons.
     [ "$CODE" -eq 7 ] || fail "the program exited ${CODE}, expected 7 (the entry did not carry main's return) (${PROFILE})"
 done

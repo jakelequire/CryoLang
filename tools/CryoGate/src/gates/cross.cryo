@@ -39,20 +39,75 @@ import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::schedule::{ Cost, Scheduler };
 import cryogate::core::text::{ Text };
 
-/// What one project's build said it compiled.
+/// One build the gate runs: a project, the options it is built with and its
+/// name in the report.
+public type struct CrossBuild {
+    /// The project, named by its path from the repository root.
+    public project: String;
+    /// The options passed after the gate's own.
+    public options: Array<String>;
+    /// The build's name in the report, its log and its build directory.
+    public name: String;
+
+    static new(project: Str, option: Option<Str>, name: Str) -> CrossBuild {
+        mut options: Array<String> = Array::<String>::new();
+        match (option) {
+            Option::Some(text) => { options.push(String::from_str(text)); }
+            Option::None       => { }
+        }
+        return CrossBuild { project: String::from_str(project), options: options, name: String::from_str(name) };
+    }
+
+    /// Every build, in the order they are cheapest to fail: the runtime, the
+    /// stdlib, the compiler (the stdlib and its own modules), the LSP (the
+    /// compiler again and its own).  The runtime's declarations are gated on
+    /// the configuration it is built as, so it is built as each configuration
+    /// a link names.
+    public static all() -> Array<CrossBuild> {
+        mut builds: Array<CrossBuild> = Array::<CrossBuild>::new();
+        builds.push(CrossBuild::new(Str::new("runtime"), Option::Some(Str::new("--no-runtime")), Str::new("runtime freestanding")));
+        builds.push(CrossBuild::new(Str::new("runtime"), Option::Some(Str::new("--panic=abort")), Str::new("runtime hosted-abort")));
+        builds.push(CrossBuild::new(Str::new("runtime"), Option::Some(Str::new("--panic=unwind")), Str::new("runtime hosted-unwind")));
+        builds.push(CrossBuild::new(Str::new("stdlib"), Option::None, Str::new("stdlib")));
+        builds.push(CrossBuild::new(Str::new("compiler"), Option::None, Str::new("compiler")));
+        builds.push(CrossBuild::new(Str::new("tools/CryoLSP"), Option::None, Str::new("tools/CryoLSP")));
+        return builds;
+    }
+
+    /// The builds of the given projects, in the order of `all()`.
+    public static of_projects(projects: &Array<String>) -> Array<CrossBuild> {
+        mut builds: Array<CrossBuild> = CrossBuild::all();
+        mut index: i64 = 0;
+        while (index < builds.length()) {
+            if (projects.contains(&builds.get_reference(index).unwrap().project)) {
+                index++;
+            } else {
+                const _: CrossBuild = builds.remove(index);
+            }
+        }
+        return builds;
+    }
+
+    /// The name as a file or directory name: no `/` and no space.
+    public directory_name(&this) -> String {
+        return this.name.as_str().replace(&Str::new("/"), &Str::new("_")).as_str().replace(&Str::new(" "), &Str::new("_"));
+    }
+}
+
+/// What one build said it compiled.
 public type struct Population {
-    /// The number of `Building` lines (one per tier the project builds).
-    public tiers: i64;
+    /// The number of `Building` lines the build printed.
+    public stated: i64;
     /// The modules those lines count: local, std and dependency.
     public modules: i64;
 
     /// The population a build's output states.
     public static of(lines: &Array<String>) -> Population {
-        mut population: Population = Population { tiers: 0, modules: 0 };
+        mut population: Population = Population { stated: 0, modules: 0 };
         for (line in lines.iterate_references()) {
             match (Population::counted(line.as_str())) {
                 Option::Some(modules) => {
-                    population.tiers++;
+                    population.stated++;
                     population.modules += modules;
                 }
                 Option::None => { }
@@ -152,14 +207,15 @@ public type struct CrossCheck {
             }
         }
 
-        // The projects are independent builds into separate directories, so
-        // they run at once; each is judged in the order above, and the first
-        // to fail is the one reported.
+        // The builds are independent, each into its own directory, so they
+        // run at once; each is judged in the order of `CrossBuild::all()`, and
+        // the first to fail is the one reported.
+        const builds: Array<CrossBuild> = CrossBuild::of_projects(&projects);
         mut scheduler: Scheduler = Scheduler::new();
-        scheduler.set_slots(projects.length());
+        scheduler.set_slots(builds.length());
         const stdlib: String = Host::stdlib_directory(repository);
-        for (project in projects.iterate_references()) {
-            const build_directory: PathBuf = PathBuf::from(build_root.as_str()).join(triple.as_str()).join(project.as_str().replace(&Str::new("/"), &Str::new("_")).as_str());
+        for (build in builds.iterate_references()) {
+            const build_directory: PathBuf = PathBuf::from(build_root.as_str()).join(triple.as_str()).join(build.directory_name().as_str());
             if (build_directory.as_path().exists()) { const _: Result<(), IoError> = Directory::remove_all(build_directory.as_path()); }
             if (build_directory.as_path().exists()) {
                 return CrossCheck::fail(f"could not clear {build_directory.as_path().as_str()}; a warm build compiles nothing and reports success");
@@ -174,12 +230,13 @@ public type struct CrossCheck {
             job.argument(f"--target={triple.as_str()}".as_str());
             job.argument(f"--build-dir={build_directory.as_path().as_str()}".as_str());
             job.argument(Str::new("--no-incremental"));
-            job.directory(repository.join(project.as_str()).as_path().as_str());
+            for (option in build.options.iterate_references()) { job.argument(option.as_str()); }
+            job.directory(repository.join(build.project.as_str()).as_path().as_str());
             // The compiler under test cannot find the stdlib from runtime/ or
             // compiler/; pinning the tree's makes the result independent of
             // which binary runs.
             job.set_variable(Str::new("CRYO_STDLIB"), stdlib.as_str());
-            job.log_to(logs.file(f"cross-{project.as_str().replace(&Str::new("/"), &Str::new("_")).as_str()}".as_str()).as_str());
+            job.log_to(logs.file(f"cross-{build.directory_name().as_str()}".as_str()).as_str());
             scheduler.add(job, Cost::Compile);
         }
         const results: Array<Completion> = scheduler.run();
@@ -188,12 +245,12 @@ public type struct CrossCheck {
         mut summary: Array<String> = Array::<String>::new();
         mut index: i64 = 0;
         for (done in results.iterate_references()) {
-            const project: Str = projects.get_reference(index).unwrap().as_str();
+            const name: Str = builds.get_reference(index).unwrap().name.as_str();
             index++;
             const lines: Array<String> = Text::lines(done.output().as_str());
             const errors: Array<String> = CrossCheck::error_report(&lines);
             if (!done.outcome.succeeded()) {
-                fmt::println(f"cross-check: {project} does not compile for {triple.as_str()}");
+                fmt::println(f"cross-check: {name} does not compile for {triple.as_str()}");
                 const shown: Array<String> = if (errors.is_empty()) { CrossCheck::last(&lines, 25) } else { errors.clone() };
                 mut count: i64 = 0;
                 for (line in shown.iterate_references()) {
@@ -206,24 +263,20 @@ public type struct CrossCheck {
                     Outcome::Exited(code) => { f"exited {code}" }
                     _                     => { done.outcome.describe() }
                 };
-                return CrossCheck::fail(f"{project}: build {ended.as_str()} with {error_lines} error line(s)");
+                return CrossCheck::fail(f"{name}: build {ended.as_str()} with {error_lines} error line(s)");
             }
             const population: Population = Population::of(&lines);
-            if (population.tiers == 0) {
-                fmt::println(f"cross-check: {project} reported no population.  The first line was:");
+            if (population.stated == 0) {
+                fmt::println(f"cross-check: {name} reported no population.  The first line was:");
                 if (lines.is_empty()) {
                     fmt::println(String::from_str(Str::new("        | <no output>")));
                 } else {
                     fmt::println(f"        | {lines.get_reference(0).unwrap().as_str()}");
                 }
-                return CrossCheck::fail(f"{project}: nothing was compiled; a build that skipped the tree has not gated it");
+                return CrossCheck::fail(f"{name}: nothing was compiled; a build that skipped the tree has not gated it");
             }
             total += population.modules;
-            if (population.tiers > 1) {
-                summary.push(f"{project} {population.modules} module(s) in {population.tiers} tier(s)");
-            } else {
-                summary.push(f"{project} {population.modules} module(s)");
-            }
+            summary.push(f"{name} {population.modules} module(s)");
         }
         // The floor is a claim about the whole gate; a `--project` subset is a
         // way to reproduce one refusal, not a run of the gate.
@@ -273,10 +326,8 @@ public type struct CrossCheck {
         return 1;
     }
 
-    /// The projects, in the order they are cheapest to fail: the runtime
-    /// tiers, the stdlib, the compiler (the stdlib and its own modules), the
-    /// LSP (the compiler again and its own).  Each is named by its path from
-    /// the repository root.
+    /// The projects `--project` may name, each by its path from the
+    /// repository root, in the order of `CrossBuild::all()`.
     static projects() -> Array<String> {
         mut projects: Array<String> = Array::<String>::new();
         projects.push(String::from_str(Str::new("runtime")));

@@ -1,6 +1,7 @@
 ///! TlsStream: an encrypted byte stream over a `TcpStream`.
 ///!
-///! It is an `io::AsyncTransport` — see `net::tls::future` — so a
+///! It is an `io::AsyncTransport`, implemented here beside the type over the
+///! futures in `net::tls::future`, so wherever `TlsStream` is named a
 ///! `BufferedStream<TlsStream>` buffers a TLS session with exactly the code that
 ///! buffers a plaintext socket, and every protocol above it (HTTP/1.1,
 ///! WebSocket, HTTP/2) runs over either without changing a line. That shared
@@ -20,10 +21,12 @@ namespace std::net::tls::stream;
 import std::core::option;
 import std::core::result;
 import std::core::slice;
+import std::core::mem;
 import std::collections::str::{ Str };
-import std::io::traits;
+import std::io::traits::{ AsyncTransport, Transfer };
 import std::ffi::openssl;
 import std::net::socket::tcp::{ TcpStream };
+import std::net::tls::future::{ TlsIo, TlsRead, TlsWrite };
 
 /// Application-layer protocol negotiated during the handshake (ALPN).
 public type enum AlpnProtocol with [Eq, Clone] {
@@ -91,5 +94,40 @@ implement trait Drop for struct TlsStream {
             openssl::SSL_free(this.ssl);
             this.ssl = null;
         }
+    }
+}
+
+/// The raw async byte channel, so `BufferedStream<TlsStream>` is buffered by exactly
+/// the same code as a plaintext socket — the difference between the two is how
+/// bytes move, not how they are buffered.
+///
+/// The swap is inside these methods for the same reason as the TCP impl, and
+/// with an extra one: a placeholder `TlsStream` is a null `SSL*` over a closed
+/// socket, which only this layer should have to know how to spell.
+implement trait AsyncTransport for struct TlsStream {
+    async read_into(mut &this, buf: Array<u8>) -> Transfer {
+        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_file_descriptor(-1));
+        mem::swap::<TlsStream>(&s, this);
+
+        mut io: TlsIo = await TlsRead::start(s, buf);
+
+        // Put the stream back before anything else: every exit below must leave
+        // the receiver holding its real session rather than the placeholder.
+        mut spare: TlsStream = io.take_stream();
+        mem::swap::<TlsStream>(&spare, this);
+
+        return Transfer { buf: io.take_buffer(), result: io.outcome() };
+    }
+
+    async write_from(mut &this, buf: Array<u8>) -> Transfer {
+        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_file_descriptor(-1));
+        mem::swap::<TlsStream>(&s, this);
+
+        mut io: TlsIo = await TlsWrite::start(s, buf);
+
+        mut spare: TlsStream = io.take_stream();
+        mem::swap::<TlsStream>(&spare, this);
+
+        return Transfer { buf: io.take_buffer(), result: io.outcome() };
     }
 }

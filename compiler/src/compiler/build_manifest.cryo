@@ -191,21 +191,34 @@ type struct ModuleEntry {
 }
 
 
+/// What an earlier build recorded for one module: the key it emitted the
+/// module's object under, and the digest of the object it left.  The object
+/// lives in a directory every project building into the same output shares,
+/// while the record is the project's own, so another project may have
+/// replaced the object since: only an object that still has `object` is the
+/// one `key` describes.
+type struct PriorModule {
+    key:    u128;
+    object: u128;
+}
+
 /// Prior per-module cache keys, loaded from the `*.modkeys` sidecar. Parallel
-/// `names`/`keys` arrays; `lookup` answers the stored key of a namespace, none
-/// when absent (a never-before-seen module always rebuilds).
+/// `names`/`keys`/`objects` arrays; `lookup` answers what the last build
+/// recorded for a namespace, none when absent (a never-before-seen module
+/// always rebuilds).
 type struct ModuleKeyTable {
     names:      [String];
     keys:       [u128];
+    objects:    [u128];
 
     static empty() -> ModuleKeyTable {
-        return ModuleKeyTable { names: [], keys: [] };
+        return ModuleKeyTable { names: [], keys: [], objects: [] };
     }
 
-    lookup(&this, name: string) -> Option<u128> {
+    lookup(&this, name: string) -> Option<PriorModule> {
         for (mut i: i64 = 0; i < this.names.length(); i++) {
             if (this.names[i].as_str().equals(&Str::new(name))) {
-                return Option::Some(this.keys[i]);
+                return Option::Some(PriorModule { key: this.keys[i], object: this.objects[i] });
             }
         }
         return Option::None;
@@ -213,9 +226,9 @@ type struct ModuleKeyTable {
 
     /// Parse the `*.modkeys` sidecar into a `ModuleKeyTable`. A missing or
     /// unreadable file yields an empty table (every module then rebuilds, which
-    /// is the safe default). Lines without a TAB separator, or whose key is not
-    /// a digest `Manifest::hex128` wrote, are skipped; anything after a second
-    /// TAB is not part of the table.
+    /// is the safe default). A line is `namespace<TAB>key<TAB>object`, both
+    /// digests as `Manifest::hex128` writes them; any other line is skipped,
+    /// so its module rebuilds.
     static read_module_keys(path: Path) -> ModuleKeyTable {
         mut t: ModuleKeyTable = ModuleKeyTable::empty();
         if (!path.exists()) { return t; }
@@ -229,14 +242,21 @@ type struct ModuleKeyTable {
             match (line.split_once(&tab)) {
                 Option::Some(fields) => {
                     if (fields.first.is_empty()) { continue; }
-                    const key_text: Str = match (fields.second.split_once(&tab)) {
-                        Option::Some(rest) => { rest.first }
-                        Option::None       => { fields.second }
-                    };
-                    match (Manifest::parse_hex128(key_text)) {
-                        Option::Some(key) => {
-                            t.names.push(String::from_str(fields.first));
-                            t.keys.push(key);
+                    match (fields.second.split_once(&tab)) {
+                        Option::Some(digests) => {
+                            match (Manifest::parse_hex128(digests.first)) {
+                                Option::Some(key) => {
+                                    match (Manifest::parse_hex128(digests.second)) {
+                                        Option::Some(object) => {
+                                            t.names.push(String::from_str(fields.first));
+                                            t.keys.push(key);
+                                            t.objects.push(object);
+                                        }
+                                        Option::None => { }
+                                    }
+                                }
+                                Option::None => { }
+                            }
                         }
                         Option::None => { }
                     }
@@ -247,16 +267,20 @@ type struct ModuleKeyTable {
         return t;
     }
 
-    /// Write the `*.modkeys` sidecar (`namespace<TAB>keyhex` per line). The
-    /// caller must have created the incremental dir (e.g. via
+    /// Write the `*.modkeys` sidecar (`namespace<TAB>keyhex<TAB>objecthex` per
+    /// line), each object's digest taken from the file now. The caller must
+    /// have created the incremental dir (e.g. via
     /// `Manifest::write_fingerprint`, which always runs alongside this on the
     /// success path).
-    static write_module_keys(path: Path, names: &[string], keys: &[u128]) -> void {
+    static write_module_keys(path: Path, names: &[string], keys: &[u128],
+                             objects: &[string]) -> void {
         mut text: String = String::new();
         for (mut i: i64 = 0; i < names.length(); i++) {
             text.push(Str::new(names[i]));
             text.push_byte(9 as u8);     // TAB
             text.push(Str::new(Manifest::hex128(keys[i])));
+            text.push_byte(9 as u8);     // TAB
+            text.push(Str::new(Manifest::hex128(Manifest::file_digest(Path::from(objects[i])))));
             text.push_byte(10 as u8);    // LF
         }
         match (File::write_bytes(path, text.as_bytes())) {
@@ -280,13 +304,15 @@ type struct ModuleObjectCache {
     prior:     ModuleKeyTable;
     names:     [string];
     keys:      [u128];
+    /// The object each recorded module's key describes, by path.
+    objects:   [string];
     reused:    u32;
     emitted:   u32;
 
     static inactive() -> ModuleObjectCache {
         return ModuleObjectCache {
             active: false, toolchain: 0, prior: ModuleKeyTable::empty(),
-            names: [], keys: [], reused: 0, emitted: 0,
+            names: [], keys: [], objects: [], reused: 0, emitted: 0,
         };
     }
 
@@ -297,7 +323,7 @@ type struct ModuleObjectCache {
             active: true,
             toolchain: Manifest::toolchain_fingerprint(opt_level, target_triple),
             prior: ModuleKeyTable::read_module_keys(keys_path),
-            names: [], keys: [], reused: 0, emitted: 0,
+            names: [], keys: [], objects: [], reused: 0, emitted: 0,
         };
     }
 
@@ -309,11 +335,12 @@ type struct ModuleObjectCache {
         return hasher;
     }
 
-    /// Record `name`'s key in this build, and whether its earlier object
-    /// was reused under it.
-    record(mut &this, name: string, key: u128, reused: boolean) -> void {
+    /// Record `name`'s key in this build, the object at `object` it describes,
+    /// and whether its earlier object was reused under it.
+    record(mut &this, name: string, key: u128, object: string, reused: boolean) -> void {
         this.names.push(name);
         this.keys.push(key);
+        this.objects.push(object);
         if (reused) {
             this.reused += 1;
         } else {
@@ -323,7 +350,7 @@ type struct ModuleObjectCache {
 
     /// Write this build's keys to `keys_path` for the next build.
     write(&this, keys_path: Path) -> void {
-        ModuleKeyTable::write_module_keys(keys_path, &this.names, &this.keys);
+        ModuleKeyTable::write_module_keys(keys_path, &this.names, &this.keys, &this.objects);
     }
 }
 
@@ -364,9 +391,11 @@ type struct Manifest {
         };
     }
 
-    /// Combined fingerprint over every build input: the module sources, and
-    /// `headers`, the files the build's C imports read.
-    compute_fingerprint(&this, modules: &[ModuleEntry], headers: &[String]) -> u128 {
+    /// Combined fingerprint over every build input: the module sources,
+    /// `headers`, the files the build's C imports read, and
+    /// `runtime_archives`, the runtime archives its link names.
+    compute_fingerprint(&this, modules: &[ModuleEntry], headers: &[String],
+                        runtime_archives: &[PathBuf]) -> u128 {
         mut h: ContentHasher = ContentHasher::new();
         h.fold(Manifest::compiler_fingerprint());
         h.fold(this.build_shape);
@@ -393,6 +422,12 @@ type struct Manifest {
         for (mut i: i64 = 0; i < headers.length(); i++) {
             h.fold_text(headers[i].as_str());
             Manifest::fold_file(&h, Path::from(headers[i].as_str()));
+        }
+        // The runtime archives, by their bytes: the link reads them, and no
+        // module source says when one was rebuilt.
+        for (mut i: i64 = 0; i < runtime_archives.length(); i++) {
+            h.fold_text(runtime_archives[i].as_path().as_str());
+            Manifest::fold_file(&h, runtime_archives[i].as_path());
         }
         return h.finish128();
     }
@@ -580,6 +615,13 @@ type struct Manifest {
     static fold_file<H>(h: mut H*, path: Path) -> void
     where H: Hasher {
         Manifest::fold_file_contents::<H>(h, path, false);
+    }
+
+    /// The digest of a file's bytes, `fold_file`'s over a fresh hasher.
+    static file_digest(path: Path) -> u128 {
+        mut h: ContentHasher = ContentHasher::new();
+        Manifest::fold_file(&h, path);
+        return h.finish128();
     }
 
     /// `fold_file`, reading a binary's build stamp as zeros when

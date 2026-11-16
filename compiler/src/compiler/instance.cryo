@@ -49,6 +49,7 @@ import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import compiler::build_manifest::{ ContentHasher, ModuleObjectCache };
 import compiler::prebuilt_stdlib::{ PrebuiltStdlib };
+import compiler::prebuilt_runtime::{ PrebuiltRuntime, RuntimeConfiguration };
 import compiler::codegen::passes::{ LinkerConfig };
 import std::core::mem;
 import std::ffi::libc;
@@ -1385,6 +1386,26 @@ type struct CompilerInstance {
         }
         TimeTrace::span("stage", Str::new("open the stdlib archive"), Str::new(config.project_name), stage_start);
 
+        // A build that links an executable names the runtime archive of its
+        // configuration, opened - or built with this compiler - before the
+        // fingerprint below folds it.  The runtime's own build is a
+        // library's, so it never asks for itself.
+        const links_runtime: boolean = ctx.options.mode.codegen_enabled()
+            && config.requires_entry_point()
+            && !ctx.options.output.is_unlinked_artifact()
+            && LinkerConfig::linker_config_for_triple(ctx.options.target_triple).supported;
+        stage_start = TimeTrace::now();
+        if (links_runtime) {
+            const failure: String = CompilerInstance::open_runtime(ctx, stdlib_root);
+            if (failure.length() > 0) {
+                mut text: String = failure;
+                ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR, text.as_c_string() as string);
+                ctx.diagnostics.flush();
+                return CompilationResult::failed(ctx.diagnostics.error_count, 0);
+            }
+        }
+        TimeTrace::span("stage", Str::new("open the runtime archive"), Str::new(config.project_name), stage_start);
+
         // Incremental whole-build fingerprint + short-circuit.
         //
         // Build the input set (every discovered module, in topo order) and a
@@ -1457,7 +1478,9 @@ type struct CompilerInstance {
                 ctx.project_config, build_shape, ctx.options.opt_level, ctx.options.debug_info,
                 ctx.options.target_triple, manifest_stdlib_archive, manifest_stdlib_archive_key);
             const recorded_headers: [String] = manifest.recorded_headers();
-            const build_fp: u128 = manifest.compute_fingerprint(&mod_entries, &recorded_headers);
+            const runtime_archives: [PathBuf] = CodegenPasses::runtime_archives(ctx);
+            const build_fp: u128 = manifest.compute_fingerprint(&mod_entries, &recorded_headers,
+                                                                &runtime_archives);
             build_fp_hex = compiler::build_manifest::Manifest::hex128(build_fp);
 
             if (manifest.is_up_to_date(build_fp_hex, &manifest_artifacts)) {
@@ -2046,9 +2069,14 @@ type struct CompilerInstance {
                     cg_job.keyed = true;
                     cg_job.key_hasher = module_cache.key_hasher();
                     match (module_cache.prior.lookup(mod_name)) {
-                        Option::Some(prior_key) => {
-                            cg_job.prior_key = prior_key;
-                            cg_job.reusable = Path::from(tgt.emit_path).exists();
+                        Option::Some(prior) => {
+                            // The object at the path is the one the key
+                            // describes only while it has the digest the
+                            // last build recorded: a project sharing the
+                            // build directory may have written its own.
+                            cg_job.prior_key = prior.key;
+                            cg_job.reusable = compiler::build_manifest::Manifest::file_digest(
+                                Path::from(tgt.emit_path)) == prior.object;
                         }
                         Option::None => { }
                     }
@@ -2303,8 +2331,9 @@ type struct CompilerInstance {
             const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
                 ctx.project_config, build_shape, ctx.options.opt_level, ctx.options.debug_info,
                 ctx.options.target_triple, manifest_stdlib_archive, manifest_stdlib_archive_key);
+            const runtime_archives: [PathBuf] = CodegenPasses::runtime_archives(ctx);
             const built_fp_hex: string = compiler::build_manifest::Manifest::hex128(
-                manifest.compute_fingerprint(&mod_entries, &ctx.imported_headers));
+                manifest.compute_fingerprint(&mod_entries, &ctx.imported_headers, &runtime_archives));
             manifest.write_fingerprint(built_fp_hex, &ctx.imported_headers, ctx.diagnostics.has_warnings());
             manifest.write_manifest(&mod_entries, built_fp_hex, &manifest_artifacts);
             // Per-module cache keys for the NEXT build to consult: every
@@ -2903,6 +2932,31 @@ type struct CompilerInstance {
     }
 
 
+    /// Open the runtime archive this build's link names, building it first
+    /// when it does not exist, and record it on `ctx`.  Answers the failure,
+    /// or an empty String.
+    static open_runtime(ctx: mut CompilationContext*, stdlib_root: string) -> String {
+        mut root: String = match (PrebuiltRuntime::locate_root(stdlib_root)) {
+            Result::Ok(found)   => { found }
+            Result::Err(reason) => { return reason; }
+        };
+        if (root.length() == 0) {
+            return String::from_str(Str::new(
+                "cannot find the runtime's sources to link this program with: set CRYO_RUNTIME to the runtime directory of a Cryo installation"));
+        }
+        const configuration: RuntimeConfiguration =
+            RuntimeConfiguration::of(ctx.options.freestanding(), ctx.options.unwinds());
+        match (PrebuiltRuntime::ensure(root.as_c_string() as string, ctx.options.target_triple,
+                                       configuration, ctx.options.warnings_as_errors)) {
+            Result::Ok(found) => {
+                ctx.runtime_archive = String::from_str(found.archive().as_path().as_str());
+                Log::debug(LogArea::Driver, f"linking the runtime archive {ctx.runtime_archive}");
+                return String::new();
+            }
+            Result::Err(reason) => { return reason; }
+        }
+    }
+
     /// The standard library's root, as its canonical absolute path, or ""
     /// when no candidate holds a `lib.cryo`.  Every module path under it is
     /// spelled from this root, so a candidate written relative to the binary
@@ -3278,7 +3332,7 @@ type struct CompilerInstance {
             return;
         }
         if (job.keyed) {
-            (*cache).record(job.module_name, job.key, job.reused);
+            (*cache).record(job.module_name, job.key, job.emit_path, job.reused);
         }
         if (job.reused) {
             (*objects)[job.position as i64] = job.emit_path;

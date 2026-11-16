@@ -1164,17 +1164,17 @@ yet is recorded with the change that builds it, not here.
      `Ordering`, `min`, `max`, `clamp`, the conversion traits,
      `ConversionError`, the hashers, the FNV parameters and `digest`,
      `Iterator` with its adapters, `mem`'s calls, the operator traits,
-     `Range` and `RangeInclusive`, `Option`, `Result`, `PanicInformation`,
+     `Range` and `RangeInclusive`, `Option`, `Result`, `PanicInfo`,
      `catch_unwind`, `drop_in_place`, `NonNull`, `VariadicArgument` and `VariadicArguments` are
      public with their methods.  An adapter is named by the `Iterator`
      method that builds it, so it stays public, with its state private
      and its constructor public, since the trait's default bodies call it
-     from the implementing type's module.  `PanicInformation` and a range's
+     from the implementing type's module.  `PanicInfo` and a range's
      bounds stay public fields, as plain data.  A hasher's running state,
      a conversion error's reason, a pointer's address in `NonNull` and
      `VariadicArguments`, and an inclusive range's exhaustion flag are private behind
      accessors, and the unwinding catch's trampoline and its context are
-     private.  `taken_panic_information`, the executor's read of a panic its
+     private.  `taken_panic_info`, the executor's read of a panic its
      `try_catch` caught, is left with `intrinsics`.  (Jake; each split
      delegated)
 
@@ -1220,7 +1220,7 @@ yet is recorded with the change that builds it, not here.
 642. **The intrinsics and the primitives are marked.**  Every intrinsic is
      public: they are the language's primitive operations, the
      allocation, bit, atomic, float, trap, unwinding, directory-entry and
-     variadic ones alike.  `taken_panic_information` is public beside
+     variadic ones alike.  `taken_panic_info` is public beside
      `try_catch`, as the way a caller catching through it reads the
      payload.  The primitives' constants and methods are public, but for
      the digit-table step behind the integers' hex writers

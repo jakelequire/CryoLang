@@ -24,10 +24,12 @@ api-index-check` fails if it is stale.
 make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS and unit/project NAMES asserted
-make verify              # build once; census, examples, lsp, cross, incr, check-fast CONCURRENTLY
-                         # (ARGS="--sequential": one at a time, for a host short of memory),
-                         # objects hashed; ARGS="--baseline HEAD --require-identical" proves
-                         # a change moved no compiled output (baseline built in .verify/, cached;
+make verify              # build once; census, examples, lsp, cross, incr, abi, check-fast
+                         # CONCURRENTLY (ARGS="--sequential": one at a time, for a host short
+                         # of memory), objects hashed (tests, examples, stdlib archives,
+                         # runtime archive members); ARGS="--baseline HEAD --require-identical"
+                         # proves a change moved no compiled output (baseline = REV's
+                         # compiler/src AND runtime/, the rest from the tree; built in .verify/, cached;
                          # its results recorded per program, so a new test re-runs only itself);
                          # a change that makes a refused program compile DECLARES its project in
                          # tests/started-compiling (refused before, builds now); one that corrects
@@ -40,6 +42,9 @@ make check-fast          # verify's, selfhost-check's and cryogate's self-tests 
                          # builds only cryogate and its unit tests, with the pin. Run
                          # before committing.
 make lsp-check           # compile tools/CryoLSP with the compiler under test
+make runtime-abi-check   # runtime/abi/lang_items.def against every built runtime link set
+                         # (both kinds, both panic strategies) and the `__cryo_` names
+                         # compiler/src and stdlib/ spell; a verify gate (`abi`)
 make warnings-check      # compiler/ + stdlib archive built with -Werror by the compiler
                          # under test, the stdlib for both OSes and both panic strategies;
                          # DELETES the host's prebuilt stdlib archives first
@@ -55,7 +60,8 @@ make doc-coverage-check  # the stdlib's undocumented public declarations are EXA
                          # its own self-test first
 make verify-pin          # both pins match their sidecars (sha256 and stamped commit) AND
                          # each other
-make verify-freestanding # runtime/ tiers built by the compiler under test
+make verify-freestanding # the runtime's freestanding configuration, built by the compiler
+                         # under test, linked and run
 make examples            # smoke-build every examples/ project (refuses a sweep below
                          # the shipped count, `cryogate examples`' --min)
 make examples-golden     # build them AND run each with an expected.out, compare its
@@ -70,7 +76,7 @@ make help                # every target, and every side effect beyond its named 
 Every target that runs the compiler under test (`test`, `test-census`,
 `examples`, `lsp-check`, `verify`, ...) rebuilds `compiler/build/cryo` first
 when any `.cryo` under `compiler/src` or `stdlib` (or the compiler's
-cryoconfig and C headers, the runtime tiers, the pin, `.git/index`) is newer
+cryoconfig and C headers, the runtime sources, the pin, `.git/index`) is newer
 than it, so a manual `make cryo` before them is not needed; `make cryo` is the
 same check, and with nothing changed it launches no compiler. That is a timestamp check: after a
 branch switch, see the landmine below. `scripts/README.md` says what each
@@ -236,7 +242,10 @@ Follow this in order. Do not skip to step 5.
 
 2. **Check your instruments before your code.** A missing or half-built
    artifact reads exactly like a regression:
-   - `runtime/.bin/<triple>/` holding the tier archives? If not: `make runtime-tiers`.
+   - A runtime archive left half-built by a killed build? It opens only once
+     its manifest is there, so a directory under `runtime/.bin/<triple>/`
+     without `runtime.manifest` is rebuilt, not linked; deleting
+     `runtime/.bin` is always safe.
    - Anything rebuilding in another process right now? Wait for it.
    - Did you edit a source file while a long build was running? That reads as
      a broken fixed point. Re-run before believing it.
@@ -403,7 +412,10 @@ Cryo does and why, so the point stands without the reader knowing another
 language, and so the text does not go wrong when Cryo's rule and the other
 language's diverge. Naming C where it is the actual interface - the C ABI, an
 `extern "C"` declaration, a C header, libc - is a fact about the boundary, not
-a comparison, and stays.
+a comparison, and stays. The same holds for any other language's construct
+named where it actually crosses a language boundary - "a C++ throw" for a
+foreign exception unwinding into Cryo code - since that names what arrives,
+not what Cryo resembles.
 
 **Commit a generator with what it generated.** Work that exists only as a diff,
 produced by tooling that exists only in a scratch directory, is not reproducible
@@ -517,12 +529,15 @@ with no diff to check it against.
 
 ## Environment landmines
 
-- The runtime tiers build into `runtime/.bin/<triple>/`, one directory per
-  target, so a Windows and a Linux build no longer overwrite each other's
-  archives there and nothing needs cleaning between them. The directory is
-  named from `cryo version --triple`, asked of the compiler because a native
-  triple comes from a toolchain probe; an empty answer is a hard error, since
-  building flat is the failure this prevents.
+- **Every program links the runtime from
+  `runtime/.bin/<triple>/<configuration>/<key>/libcryort.a`**, built on first
+  use by the compiler that links it, like the stdlib archive: one project,
+  three configurations (freestanding, hosted-abort, hosted-unwind), the key
+  the compiler's bytes, the runtime sources, the target and the configuration.
+  So the TREE compiler builds the tree runtime, and a codegen change can move
+  runtime members in verify (declare them `moved-runtime:<configuration>/<member>`).
+  A runtime program's build reports no runtime warning; `cryo build runtime
+  --panic=unwind` (or `--panic=abort`, `--no-runtime`) does.
 - **`make selfhost-check`'s Linux arm runs inside WSL** from a copy of
   the sources it reads, in `~/.cache/cryo-selfhost/<checkout>/` on WSL's own
   filesystem, refused unless the copy's digest matches the working tree's; the
