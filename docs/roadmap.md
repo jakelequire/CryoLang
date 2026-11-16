@@ -135,6 +135,7 @@ manual dispatch.  As it stands:
 | `lsp-check` | yes | yes, both hosts |
 | `cross-check` | yes | windows native only: a Linux host links the windows-gnu build and needs mingw and the LLVM-C import lib, until `cryo build` can stop at objects (below) |
 | `incremental-instance-check` | yes | yes, both hosts |
+| `incremental-runtime-check` | yes | yes, both hosts |
 | `check-fast` (the two self-tests) | yes | yes, both hosts |
 | object comparison against a baseline | yes | no: a baseline from before a language feature's removal does not build with the current pin, so it is run locally (ruling 508) |
 | `roster-check` | no (the census reads the same golden) | yes |

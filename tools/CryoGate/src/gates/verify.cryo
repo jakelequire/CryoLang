@@ -17,6 +17,8 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::encoding::sha256::{ Sha256 };
 import std::fmt;
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
@@ -41,17 +43,21 @@ import cryogate::gates::roster::{ TestGates };
 ///   that run, with the declarations made against `rev`;
 /// - `--records <run> --programs <directory>`: each census-side record
 ///   verify stored in `directory`, derived again from the run's baseline
-///   census log and object list; every record that differs is named.
+///   census log and object list; every record that differs is named;
+/// - `--runtime-list <directory>`: the runtime population's rows of the
+///   archives one target's runtime directory (`runtime/.bin/<triple>`)
+///   holds, as verify lists them in `tree.runtime.sha256`.
 public type struct VerifyGate {
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
         mut options: Options = Options::new(Str::new(
-            "cryogate verify --declared-since <rev> | --compare <run> --against <rev> [--list-limit <n>] | --records <run> --programs <directory>"));
+            "cryogate verify --declared-since <rev> | --compare <run> --against <rev> [--list-limit <n>] | --records <run> --programs <directory> | --runtime-list <directory>"));
         options.valued(Str::new("--declared-since"));
         options.valued(Str::new("--compare"));
         options.valued(Str::new("--against"));
         options.valued(Str::new("--list-limit"));
         options.valued(Str::new("--records"));
         options.valued(Str::new("--programs"));
+        options.valued(Str::new("--runtime-list"));
         const parsed: Parsed = match (options.parse(arguments, first)) {
             Result::Ok(parsed)  => { parsed }
             Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 2; }
@@ -94,6 +100,15 @@ public type struct VerifyGate {
                     Option::None           => { fmt::eprintln(f"cryogate verify: --records needs --programs; usage: {options.usage()}"); return 2; }
                 };
                 return VerifyGate::rederive_records(repository, run, programs);
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--runtime-list"))) {
+            Option::Some(directory) => {
+                return match (RuntimeArchives::rows(repository.join(directory).as_path())) {
+                    Result::Ok(rows)    => { for (row in rows.iterate_references()) { fmt::println(row.clone()); } 0 }
+                    Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); 1 }
+                };
             }
             Option::None => { }
         }
@@ -240,6 +255,9 @@ public type struct VerifyGate {
 
 /// What a declaration line names, by its form.
 public type enum DeclarationKind {
+    /// `moved-runtime:<configuration>/<member>`: a member of one
+    /// configuration's runtime archive that moves.
+    MovedRuntime;
     /// `moved-archive:<module>`: a stdlib module whose archive objects move.
     MovedArchive;
     /// `archive:<file>`: a unit-test file the baseline fails through the archive.
@@ -267,6 +285,7 @@ public type struct DeclarationForm {
     /// row here.
     public static prefixed() -> Array<DeclarationForm> {
         mut forms: Array<DeclarationForm> = Array::<DeclarationForm>::new();
+        forms.push(DeclarationForm { prefix: Str::new("moved-runtime:"), kind: DeclarationKind::MovedRuntime });
         forms.push(DeclarationForm { prefix: Str::new("moved-archive:"), kind: DeclarationKind::MovedArchive });
         forms.push(DeclarationForm { prefix: Str::new("archive:"),       kind: DeclarationKind::Archive });
         forms.push(DeclarationForm { prefix: Str::new("moved:"),         kind: DeclarationKind::Moved });
@@ -440,6 +459,55 @@ public type struct Declarations {
     }
 }
 
+/// The runtime archive member a `moved-runtime:<configuration>/<member>`
+/// line names: one member of one configuration's archive.
+public type struct RuntimeMember {
+    public configuration: String;
+    public member:        String;
+
+    /// The configurations the runtime is built in, each archive in a
+    /// directory of its own name below `runtime/.bin/<triple>/`.
+    public static configurations() -> Array<Str> {
+        mut configurations: Array<Str> = Array::<Str>::new();
+        configurations.push(Str::new("freestanding"));
+        configurations.push(Str::new("hosted-abort"));
+        configurations.push(Str::new("hosted-unwind"));
+        return configurations;
+    }
+
+    /// The member the line `name` names; None unless its program is a
+    /// configuration, `/`, and a member name of word bytes, `.` and `-`
+    /// ending in `.o`.
+    public static of(name: Str) -> Option<RuntimeMember> {
+        const parts: Pair<Str, Str> = match (Declarations::program_of(name).split_once(&Str::new("/"))) {
+            Option::Some(parts) => { parts }
+            Option::None        => { return Option::None; }
+        };
+        if (!RuntimeMember::configurations().contains(&parts.first)) { return Option::None; }
+        const member: Str = parts.second;
+        if (member.length() < 3 || !member.ends_with(&Str::new(".o"))) { return Option::None; }
+        for (mut i: i64 = 0; i < member.length(); i++) {
+            const byte: u8 = member.byte_at(i).unwrap();
+            if (!(byte.is_alpha() || byte.is_digit() || byte == '_' || byte == '.' || byte == '-')) { return Option::None; }
+        }
+        return Option::Some(RuntimeMember { configuration: String::from_str(parts.first), member: String::from_str(member) });
+    }
+
+    /// Whether the runtime list path `path`, `runtime/<configuration>/<NN>-<member>`,
+    /// is this member: a member's place in its archive is not part of its name.
+    public matches(&this, path: Str) -> boolean {
+        const prefix: String = f"runtime/{this.configuration.as_str()}/";
+        const rest: Str = match (path.strip_prefix(&prefix.as_str())) {
+            Option::Some(rest) => { rest }
+            Option::None       => { return false; }
+        };
+        return match (rest.split_once(&Str::new("-"))) {
+            Option::Some(parts) => { Text::is_digits(parts.first) && parts.second == this.member.as_str() }
+            Option::None        => { false }
+        };
+    }
+}
+
 /// Which program the objects in verify's lists belong to.
 public type struct ObjectOwner {
     /// The program an object at `path` (relative to the checkout, `/`
@@ -556,7 +624,7 @@ public type struct VerifyJudges {
         for (name in declared.iterate_references()) { judged.push(name.clone()); }
         for (name in fixed.iterate_references()) {
             match (Declarations::kind(name.as_str())) {
-                DeclarationKind::Unit | DeclarationKind::Archive | DeclarationKind::Moved | DeclarationKind::MovedArchive => { }
+                DeclarationKind::Unit | DeclarationKind::Archive | DeclarationKind::Moved | DeclarationKind::MovedArchive | DeclarationKind::MovedRuntime => { }
                 _ => { judged.push(name.clone()); }
             }
         }
@@ -722,6 +790,32 @@ public type struct VerifyJudges {
         return problems;
     }
 
+    /// Problems with the runtime archive members `names` declared
+    /// `moved-runtime:` over the runtime hash maps `a` and `b`: each must be
+    /// in both, once, and must have moved.  The members are removed from
+    /// both.
+    public static runtime_moves(names: &Array<String>, a: mut &HashMap<String, String>,
+                                b: mut &HashMap<String, String>) -> Array<String> {
+        mut problems: Array<String> = Array::<String>::new();
+        for (name in Text::sorted_distinct(names.clone()).iterate_references()) {
+            const member: Option<RuntimeMember> = RuntimeMember::of(name.as_str());
+            const in_a: Array<String> = VerifyJudges::paths_where(a, (path: Str) -> boolean {
+                return match (&member) { Option::Some(wanted) => { wanted.matches(path) } Option::None => { false } };
+            });
+            const in_b: Array<String> = VerifyJudges::paths_where(b, (path: Str) -> boolean {
+                return match (&member) { Option::Some(wanted) => { wanted.matches(path) } Option::None => { false } };
+            });
+            if (in_a.length() != 1 || in_b.length() != 1) {
+                problems.push(f"{name.as_str()}: {in_a.length()} baseline and {in_b.length()} tree runtime members match it; a member declared as moving is in both runs' archives once");
+            } else if (VerifyJudges::same(a, b, &in_a[0], &in_b[0])) {
+                problems.push(f"{name.as_str()} is declared as moving, but {in_a[0].as_str()} did not move");
+            }
+            VerifyJudges::remove_all(a, &in_a);
+            VerifyJudges::remove_all(b, &in_b);
+        }
+        return problems;
+    }
+
     /// Problems with the unit-test files `names` declared as failing on the
     /// baseline through the stdlib archive: the archive is their cause, so
     /// some archive object (`archive_changed`, moved or in one run only)
@@ -786,6 +880,8 @@ public type struct DeclaredChanges {
     public moved_projects: Array<String>;
     /// The started-passing `moved-archive:` lines.
     public moved_modules: Array<String>;
+    /// The started-passing `moved-runtime:` lines.
+    public moved_members: Array<String>;
     /// The started-passing `archive:` lines, sorted.
     public archive_files: Array<String>;
     /// A started-passing unit-test file with no namespace: its object
@@ -798,7 +894,7 @@ public type struct DeclaredChanges {
         mut changes: DeclaredChanges = DeclaredChanges {
             names: Array::<String>::new(), units: Array::<Pair<String, String>>::new(),
             moved_projects: Array::<String>::new(), moved_modules: Array::<String>::new(),
-            archive_files: Array::<String>::new(), problems: Array::<String>::new(),
+            moved_members: Array::<String>::new(), archive_files: Array::<String>::new(), problems: Array::<String>::new(),
         };
         for (line in declared.iterate_references()) { changes.names.push(line.name.clone()); }
         mut archive_files: Array<String> = Array::<String>::new();
@@ -815,6 +911,7 @@ public type struct DeclaredChanges {
                 }
                 DeclarationKind::Moved        => { changes.moved_projects.push(line.name.clone()); }
                 DeclarationKind::MovedArchive => { changes.moved_modules.push(line.name.clone()); }
+                DeclarationKind::MovedRuntime => { changes.moved_members.push(line.name.clone()); }
                 DeclarationKind::Archive      => { archive_files.push(line.name.clone()); }
                 _                             => { }
             }
@@ -833,6 +930,9 @@ public type enum ObjectPopulation {
     Examples;
     /// The stdlib archives the two sweeps' programs link.
     Stdlib;
+    /// The members of the runtime archives every program links, one
+    /// archive per configuration.
+    Runtime;
 }
 
 implement enum ObjectPopulation {
@@ -842,6 +942,7 @@ implement enum ObjectPopulation {
         populations.push(ObjectPopulation::Tests);
         populations.push(ObjectPopulation::Examples);
         populations.push(ObjectPopulation::Stdlib);
+        populations.push(ObjectPopulation::Runtime);
         return populations;
     }
 
@@ -851,6 +952,7 @@ implement enum ObjectPopulation {
             ObjectPopulation::Tests    => { Str::new("tests") }
             ObjectPopulation::Examples => { Str::new("examples") }
             ObjectPopulation::Stdlib   => { Str::new("stdlib") }
+            ObjectPopulation::Runtime  => { Str::new("runtime") }
         };
     }
 
@@ -942,6 +1044,24 @@ public type struct ObjectComparison {
         mut b: HashMap<String, String> = tree;
         const tests: boolean = match (population) { ObjectPopulation::Tests => { true } _ => { false } };
         const stdlib: boolean = population.is_stdlib();
+        const runtime: boolean = match (population) { ObjectPopulation::Runtime => { true } _ => { false } };
+        if (runtime) {
+            const layout_a: String = ObjectComparison::runtime_layouts(&a);
+            const layout_b: String = ObjectComparison::runtime_layouts(&b);
+            if (layout_a.as_str() != layout_b.as_str()) {
+                // No member of a runtime built per tier has a counterpart in
+                // one built per configuration; the census links and runs
+                // every program against the tree's, and the `abi` gate reads
+                // its exports.
+                compared.lines.push(f"  {tag:<9} baseline {a.length():>5}  tree {b.length():>5}  NOT COMPARED: the baseline's runtime is laid out as {layout_a.as_str()}, the tree's as {layout_b.as_str()}");
+                return 0;
+            }
+            if (!changes.moved_members.is_empty()) {
+                const found: Array<String> = VerifyJudges::runtime_moves(&changes.moved_members, &a, &b);
+                compared.lines.push(f"  {tag:<9} declared moved runtime members left out: {changes.moved_members.length()}, {found.length()} problem(s)");
+                for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+            }
+        }
         if (tests && !changes.units.is_empty()) {
             const found: Array<String> = VerifyJudges::unit_moves(&changes.units, &a, &b);
             compared.lines.push(f"  {tag:<9} declared unit-test objects left out: {changes.units.length()}, {found.length()} problem(s)");
@@ -1064,11 +1184,150 @@ public type struct ObjectComparison {
         return archive;
     }
 
+    /// How the runtime archives the paths of `hashes` name are laid out,
+    /// each layout once, sorted and joined by `/`: "tiers" for a member of
+    /// a `libcryort-*.a` per tier, "configurations" for one of a
+    /// configuration's archive; empty for no member.
+    public static runtime_layouts(hashes: &HashMap<String, String>) -> String {
+        mut layouts: Array<String> = Array::<String>::new();
+        for (entry in hashes.entries()) {
+            const archive: Str = match (entry.first.as_str().split_once(&Str::new("/"))) {
+                Option::Some(parts) => { parts.second }
+                Option::None        => { Str::new("") }
+            };
+            layouts.push(String::from_str(if (archive.starts_with(&Str::new("libcryort"))) { Str::new("tiers") } else { Str::new("configurations") }));
+        }
+        return Text::joined(&Text::sorted_distinct(layouts), Str::new("/"));
+    }
+
     /// The archives the paths of `hashes` name.
     static archives(hashes: &HashMap<String, String>) -> Array<String> {
         mut archives: Array<String> = Array::<String>::new();
         for (entry in hashes.entries()) { archives.push(ObjectComparison::archive_of(entry.first.as_str())); }
         return Text::sorted_distinct(archives);
+    }
+}
+
+/// The runtime population's object list, read from the archives
+/// themselves: verify hashes each archive member, since the runtime's
+/// objects exist only inside its archives.
+public type struct RuntimeArchives {
+    /// Each member of the `!<arch>` archive `data`, in archive order, as
+    /// its name and the sha256 of its bytes in lowercase hex, without the
+    /// symbol index (derived from the members' offsets); None when `data`
+    /// is not an archive.  Reads the GNU long-name table and the BSD
+    /// `#1/<length>` names alike.
+    public static members(data: &Slice<u8>) -> Option<Array<Pair<String, String>>> {
+        if (data.length() < 8 || RuntimeArchives::text(data, 0, 8) != Str::new("!<arch>\n")) { return Option::None; }
+        mut members: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        mut names_start: i64 = 0;
+        mut names_end: i64 = 0;
+        mut position: i64 = 8;
+        while (position + 60 <= data.length()) {
+            const header: Str = RuntimeArchives::text(data, position, position + 60);
+            const field: Str = header.byte_substring(48, 58).trim();
+            const size: i64 = if (field.is_empty()) { 0 } else { i64::try_from(field).unwrap_or(-1) };
+            if (size < 0) { return Option::None; }
+            mut start: i64 = position + 60;
+            const end: i64 = if (start + size < data.length()) { start + size } else { data.length() };
+            position = position + 60 + size + (size & 1);
+            mut name: Str = header.byte_substring(0, 16).trim_end();
+            if (name == Str::new("/") || name == Str::new("/SYM64/") || name == Str::new("__.SYMDEF") || name == Str::new("__.SYMDEF SORTED")) {
+                continue;
+            }
+            if (name == Str::new("//")) {
+                names_start = start;
+                names_end = end;
+                continue;
+            }
+            match (name.strip_prefix(&Str::new("#1/"))) {
+                Option::Some(length) => {
+                    const name_end: i64 = start + i64::try_from(length).unwrap_or(0);
+                    name = RuntimeArchives::text(data, start, name_end);
+                    while (!name.is_empty() && name.byte_at(name.length() - 1).unwrap() == 0) { name = name.byte_substring(0, name.length() - 1); }
+                    start = if (name_end < end) { name_end } else { end };
+                }
+                Option::None => {
+                    const reference: Str = name.byte_substring(1, name.length());
+                    if (name.starts_with(&Str::new("/")) && Text::is_digits(reference)) {
+                        const table: Str = RuntimeArchives::text(data, names_start, names_end);
+                        const at: i64 = i64::try_from(reference).unwrap_or(0);
+                        const rest: Str = table.byte_substring(at, table.length());
+                        name = match (rest.find(&Str::new("\n"))) {
+                            Option::Some(line_end) => { rest.byte_substring(0, line_end) }
+                            Option::None           => { return Option::None; }
+                        };
+                    }
+                }
+            }
+            const digest: String = Sha256::digest(data.subslice(start, end)).to_hex();
+            while (name.ends_with(&Str::new("/"))) { name = name.byte_substring(0, name.length() - 1); }
+            members.push(Pair::new(String::from_str(name), digest));
+        }
+        return Option::Some(members);
+    }
+
+    /// `<digest>  runtime/<label>/<NN>-<member>` rows of every member of
+    /// the runtime archives one target's `directory` holds, sorted by path:
+    /// the archive of each configuration built there, labelled by the
+    /// configuration, or, for a runtime built as one archive per tier,
+    /// each `libcryort*.a`, labelled by its name.  `NN` is the member's
+    /// place in its archive, two digits at least.
+    public static rows(directory: Path) -> Result<Array<String>, String> {
+        mut archives: Array<Pair<String, PathBuf>> = Array::<Pair<String, PathBuf>>::new();
+        mut configurations: Array<Str> = Array::<Str>::new();
+        for (configuration in RuntimeMember::configurations().iterate_references()) {
+            if (directory.join(*configuration).as_path().is_directory()) { configurations.push(*configuration); }
+        }
+        if (configurations.is_empty()) {
+            for (name in Tree::names(directory, &Array::<String>::new())?.iterate_references()) {
+                if (name.as_str().starts_with(&Str::new("libcryort")) && name.as_str().ends_with(&Str::new(".a"))) {
+                    archives.push(Pair::new(name.clone(), directory.join(name.as_str())));
+                }
+            }
+        }
+        for (configuration in configurations.iterate_references()) {
+            const home: PathBuf = directory.join(*configuration);
+            mut built: Array<PathBuf> = Array::<PathBuf>::new();
+            for (key in Tree::names(home.as_path(), &Array::<String>::new())?.iterate_references()) {
+                const archive: PathBuf = home.join(key.as_str()).join(Str::new("libcryort.a"));
+                if (archive.as_path().is_file()) { built.push(archive); }
+            }
+            if (built.length() > 1) {
+                return Result::Err(f"{home.as_path().as_str()} holds {built.length()} runtime archives; a run's archives are its own only when none is left over");
+            }
+            if (built.length() == 1) { archives.push(Pair::new(String::from_str(*configuration), built.pop().unwrap())); }
+        }
+        mut digests: HashMap<String, String> = HashMap::<String, String>::new();
+        mut paths: Array<String> = Array::<String>::new();
+        for (archive in archives.iterate_references()) {
+            const data: Array<u8> = match (File::read_bytes(archive.second.as_path())) {
+                Result::Ok(data)   => { data }
+                Result::Err(error) => { return Result::Err(f"cannot read {archive.second.as_path().as_str()}: {error.describe()}"); }
+            };
+            const members: Array<Pair<String, String>> = match (RuntimeArchives::members(data.as_slice())) {
+                Option::Some(members) => { members }
+                Option::None          => { return Result::Err(f"{archive.second.as_path().as_str()} is not an archive"); }
+            };
+            for (mut index: i64 = 0; index < members.length(); index++) {
+                const path: String = f"runtime/{archive.first.as_str()}/{index:02}-{members[index].first.as_str()}";
+                paths.push(path.clone());
+                digests.insert(path, members[index].second.clone());
+            }
+        }
+        mut rows: Array<String> = Array::<String>::new();
+        for (path in Text::sorted_distinct(paths).iterate_references()) {
+            rows.push(f"{digests.get_reference(path).unwrap().as_str()}  {path.as_str()}");
+        }
+        return Result::Ok(rows);
+    }
+
+    /// The bytes `start` to `end` of `data`, cut at its end, as text; empty
+    /// when they are not UTF-8.
+    static text(data: &Slice<u8>, start: i64, end: i64) -> Str {
+        const last: i64 = if (end < data.length()) { end } else { data.length() };
+        if (start >= last) { return Str::new(""); }
+        return Str::from_utf8(data.subslice(start, last)).unwrap_or(Str::new(""));
     }
 }
 
