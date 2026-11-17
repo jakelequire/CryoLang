@@ -5,7 +5,7 @@ namespace cryosmith::emit::expressions;
 import std::collections::str::{ Str };
 
 import cryosmith::emit::printer::{ Printer };
-import cryosmith::model::{ ExpressionKind, ExpressionNode, Function, Program, TypeArgumentSpelling, ValueType };
+import cryosmith::model::{ ExpressionKind, ExpressionNode, Function, MatchArm, Program, TypeArgumentSpelling, ValueType };
 
 implement struct Printer {
     /// The expression at `index`.
@@ -47,15 +47,29 @@ implement struct Printer {
                 this.text.push(f" as {program.type_name(node.value_type).as_str()})");
             }
             ExpressionKind::Widen(operand) => { this.expression(program, operand); }
-            ExpressionKind::Variant(variant) => { this.text.push(f"{program.type_name(node.value_type).as_str()}::V{variant}"); }
+            ExpressionKind::Variant(variant, first, count) => {
+                this.text.push(f"{program.type_name(node.value_type).as_str()}::V{variant}");
+                if (count > 0) {
+                    this.text.push(Str::new("("));
+                    this.arguments(program, first, count);
+                }
+            }
+            ExpressionKind::Mix(state, value) => {
+                this.text.push(Str::new("mix("));
+                this.expression(program, state);
+                this.text.push(Str::new(", "));
+                this.as_hash_input(program, value);
+                this.text.push(Str::new(")"));
+            }
             ExpressionKind::Match(subject, first, count) => {
                 this.text.push(Str::new("(match ("));
                 this.expression(program, subject);
                 this.text.push(Str::new(") { "));
                 mut arm: i64 = first;
                 while (arm < first + count) {
-                    this.pattern(program, program.expression_at(subject).value_type, program.arm_at(arm).pattern);
+                    this.pattern(program, program.expression_at(subject).value_type, program.arm_at(arm));
                     this.text.push(Str::new(" => { "));
+                    this.inline_observations(program, program.arm_at(arm).observations);
                     this.expression(program, program.arm_at(arm).body);
                     this.text.push(Str::new(" } "));
                     arm = arm + 1;
@@ -131,14 +145,23 @@ implement struct Printer {
         this.text.push(Str::new(")"));
     }
 
-    /// A `match` arm's pattern over a value of `matched`: the variant
-    /// `pattern` (`E0::V1`), or `_` for -1.
-    internal pattern(mut &this, program: &Program, matched: ValueType, pattern: i64) -> void {
-        if (pattern < 0) {
+    /// A `match` arm's pattern over a value of `matched`: `_`, or the
+    /// arm's variant with its bindings, `E0::V0`, `E0::V1(b0, b1)`.
+    internal pattern(mut &this, program: &Program, matched: ValueType, arm: MatchArm) -> void {
+        if (arm.pattern < 0) {
             this.text.push(Str::new("_"));
             return;
         }
-        this.text.push(f"{program.type_name(matched).as_str()}::V{pattern}");
+        this.text.push(f"{program.type_name(matched).as_str()}::V{arm.pattern}");
+        if (arm.binding_count == 0) { return; }
+        this.text.push(Str::new("("));
+        mut index: i64 = 0;
+        while (index < arm.binding_count) {
+            if (index > 0) { this.text.push(Str::new(", ")); }
+            this.name(program, program.list_at(arm.first_binding + index));
+            index = index + 1;
+        }
+        this.text.push(Str::new(")"));
     }
 
     /// A method's receiver: a name, a field or a parenthesised expression

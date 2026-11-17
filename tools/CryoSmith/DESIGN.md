@@ -221,6 +221,21 @@ enum value is observed by passing `match (e) { E0::V0 => { 1 } E0::V1 => {
 2 } }`, its variant's number plus one, to `mix`, whose `u64` parameter
 types the literal arms.
 
+**Payload variants.** With `enum-payloads`, each variant carries none, one
+or two scalar values, `V1(u8, boolean)`, drawn from the enums' own stream;
+an enum stays `Copy`, as each of its payload's types is. A variant value
+gives a value of each payload type, `E0::V1(v2, (p0 > 3))`, generated as a
+call's argument is. A `match` arm over a payload variant binds every
+value, `E0::V1(b0, b1)`; the bindings `b<N>` are numbered per function,
+read only, and in scope in their arm alone. Every binding is observed: a
+statement's arm observes them at the end of its block, an expression's
+arm by observation statements before its value (`E0::V1(b0) => {
+observed = mix(observed, (b0 as u64)); v3 }`). Such an arm inside the
+value an outer observation folds runs before that observation assigns
+`observed`, so its own fold is overwritten; the binding is still read. The
+printer's observation folds a payload into its variant's number,
+`E0::V1(b0, b1) => { mix(mix(2, (b0 as u64)), if (b1) { 1 } else { 2 }) }`.
+
 **Inferred type arguments.** With `inferred-type-arguments`, a generic
 call or an instance's literal leaves its type argument to inference four
 times in ten (`g0(a, b)`, `B0 { f0: a }`) and writes the placeholder twice
@@ -407,7 +422,8 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. `default,no-enums` generates version 9's
+  generator's text, header aside. `default,no-enum-payloads` generates
+  version 12's text. `default,no-enums` generates version 9's
   text, `default,no-overloads,no-enums` version 8's, and with both added
   to each list,
   `default,no-structs,no-constants,no-generics,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
@@ -435,7 +451,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
 | 3 | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
-| 4 (this one) | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2). Still to come in this stage: payload variants and bindings, generic enums, nested patterns |
+| 4 (this one) | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each. Still to come in this stage: generic enums, nested patterns |
 | 5 | closures: capturing and not, passed to function-typed parameters and called |
 | 6 | traits, classes and dynamic dispatch: implementations, default methods, calls through a bound and through a trait object |
 | 7 | ownership: moves, drops (a drop log folded into the hash), references, `Box` and `Rc`, `Option` and `Result` |

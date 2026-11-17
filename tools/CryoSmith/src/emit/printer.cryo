@@ -9,7 +9,7 @@ import std::collections::string::{ String };
 
 import cryosmith::configuration::{ GENERATOR_VERSION, GenerationOptions, Plant };
 import cryosmith::guarantees::{ Observation };
-import cryosmith::model::{ Enumeration, Field, Function, Program, Receiver, Structure, Variable, VariableRole };
+import cryosmith::model::{ Enumeration, Field, Function, Program, Receiver, Structure, Variable, VariableRole, VariantDeclaration };
 
 /// Writes one program's text.
 public type struct Printer {
@@ -25,7 +25,7 @@ public type struct Printer {
         printer.prelude();
         mut index: i64 = 0;
         while (index < program.enumerations.length()) {
-            printer.enumeration(program.enumeration_at(index));
+            printer.enumeration(program, index);
             index = index + 1;
         }
         index = 0;
@@ -67,14 +67,28 @@ public type struct Printer {
         this.text.push(Str::new("}\n"));
     }
 
-    /// An enum's declaration: `type enum E<N>` and a line per variant.
-    private enumeration(mut &this, declared: Enumeration) -> void {
+    /// The declaration of the enum at `index`: `type enum E<N>` and a line
+    /// per variant, `V0;` or with its payload's types, `V1(u8, i32);`.
+    private enumeration(mut &this, program: &Program, index: i64) -> void {
+        const declared: Enumeration = program.enumeration_at(index);
         this.text.push(f"\ntype enum E{declared.number} ");
         this.text.push(Str::new("{\n"));
         mut variant: i64 = 0;
         while (variant < declared.variant_count) {
             this.indent(1);
-            this.text.push(f"V{variant};\n");
+            this.text.push(f"V{variant}");
+            const shape: VariantDeclaration = program.variant_of(index, variant);
+            if (shape.payload_count > 0) {
+                this.text.push(Str::new("("));
+                mut position: i64 = 0;
+                while (position < shape.payload_count) {
+                    if (position > 0) { this.text.push(Str::new(", ")); }
+                    this.text.push(program.type_name(program.payload_type(shape, position)).as_str());
+                    position = position + 1;
+                }
+                this.text.push(Str::new(")"));
+            }
+            this.text.push(Str::new(";\n"));
             variant = variant + 1;
         }
         this.text.push(Str::new("}\n"));
@@ -155,7 +169,8 @@ public type struct Printer {
         if (!compares && copies) { this.text.push(Str::new("where T: Copy ")); }
     }
 
-    /// A variable's name: `observed`, `p<N>`, `v<N>`, `n<N>` or `this`.
+    /// A variable's name: `observed`, `p<N>`, `v<N>`, `n<N>`, `this` or
+    /// `b<N>`.
     internal name(mut &this, program: &Program, variable: i64) -> void {
         const named: Variable = program.variable_at(variable);
         match (named.role) {
@@ -164,6 +179,7 @@ public type struct Printer {
             VariableRole::Local     => { this.text.push(f"v{named.number}"); }
             VariableRole::Counter   => { this.text.push(f"n{named.number}"); }
             VariableRole::Receiver  => { this.text.push(Str::new("this")); }
+            VariableRole::Binding   => { this.text.push(f"b{named.number}"); }
         }
     }
 
