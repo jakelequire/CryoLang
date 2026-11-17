@@ -7,6 +7,7 @@
 ///! Layout under `<cache_root>/`:
 ///!
 ///!   git/<short id>/                 - bare clone, refreshed by `git fetch`
+///!   git/<short id>.lock/            - held while a process changes either
 ///!   src/<short id>/<sha>/           - the files of the resolved commit, as
 ///!                                     git stores them (no working tree)
 ///!
@@ -25,7 +26,11 @@ import std::fmt;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::encoding::sha256::{ Sha256 };
+import compiler::utils::directory_lock::{ DirectoryLock };
 
+/// A repository's cache lock older than this was left by a process that
+/// died: an hour, longer than any fetch takes.
+const REPOSITORY_LOCK_EXPIRY_SECONDS: i64 = 3600;
 
 /// Stateless namespace for the per-machine dependency cache layout.
 /// All entry points are `static`; there is no instance state - the
@@ -122,6 +127,19 @@ type struct Cache {
     static git_dir_for(url: Str) -> PathBuf {
         const id: String = Cache::short_id(url);
         return Cache::cache_root().join("git").join(id.as_str());
+    }
+
+    /// The lock of the cache's entries for `url`, `<cache_root>/git/<short
+    /// id>.lock`: held while one process clones or fetches that repository
+    /// or extracts one of its commits, since builds and tests running at
+    /// once share the cache.  One left by a process that died is cleared
+    /// after an hour, longer than any fetch takes.
+    static repository_lock(url: Str) -> DirectoryLock {
+        const git: PathBuf = Cache::cache_root().join("git");
+        Cache::create_directory(git.as_path());
+        const id: String = Cache::short_id(url);
+        const path: PathBuf = git.join(f"{id}.lock".as_str());
+        return DirectoryLock::new(path.as_path().as_str(), f"to fetch {url}".as_str(), REPOSITORY_LOCK_EXPIRY_SECONDS);
     }
 
     /// `<cache_root>/src/<short id>/<sha>`: the files of one commit, as git

@@ -1,0 +1,97 @@
+///! A lock between processes that share a directory of the machine's: the
+///! archives the compiler builds for itself, and the package cache.
+
+namespace compiler::utils::directory_lock;
+
+import std::thread;
+import std::time::duration::{ Duration };
+import std::time::clock::{ SystemTime };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::fs::directory::{ Directory };
+import std::fs::path::{ Path };
+import std::io::error::{ IoErrorKind };
+
+/// Attempts refused with the lock absent (200 ms apart) before the
+/// refusal is reported rather than waited out.
+const REFUSALS_REPORTED: i64 = 25;
+
+/// A lock held by the existence of a directory: creating a directory is
+/// one step that succeeds for exactly one of the processes racing to do
+/// it, on every OS.  A lock older than `expiry_seconds` is taken to be left
+/// by a process that died, and is cleared.  Windows refuses to create a
+/// directory whose deletion is pending, so a lock another process is
+/// releasing can fail to be taken with access denied for a moment; only a
+/// refusal that outlasts that is reported.  The lock's parent directory
+/// must exist.
+type struct DirectoryLock {
+    path:           String;
+    /// What the lock is taken for, as the end of `cannot take the lock
+    /// <path> ...`: `"to build the stdlib archive"`.
+    purpose:        String;
+    expiry_seconds: i64;
+    /// Attempts refused in a row with the lock absent.
+    refusals:       i64;
+
+    static new(path: Str, purpose: Str, expiry_seconds: i64) -> DirectoryLock {
+        return DirectoryLock {
+            path: String::from_str(path), purpose: String::from_str(purpose),
+            expiry_seconds: expiry_seconds, refusals: 0,
+        };
+    }
+
+    /// Wait until the lock is taken.  `Err` says why it cannot be.
+    take(mut &this) -> Result<(), String> {
+        loop {
+            if (this.attempt()?) { return Result::Ok(()); }
+            this.pause();
+        }
+    }
+
+    /// One try at the lock: true holding it, false when another process
+    /// does.  `Err` when it has been refused, with no lock there, more
+    /// often in a row than a pending deletion explains.
+    attempt(mut &this) -> Result<boolean, String> {
+        match (Directory::create(Path::from(this.path.as_str()))) {
+            Result::Ok(_) => { return Result::Ok(true); }
+            Result::Err(error) => {
+                const held: boolean = match (error.kind) {
+                    IoErrorKind::AlreadyExists => { true }
+                    _                          => { Path::from(this.path.as_str()).exists() }
+                };
+                if (held) {
+                    this.refusals = 0;
+                } else {
+                    this.refusals = this.refusals + 1;
+                    if (this.refusals > REFUSALS_REPORTED) {
+                        return Result::Err(f"cannot take the lock {this.path} {this.purpose}: {error}");
+                    }
+                }
+                return Result::Ok(false);
+            }
+        }
+    }
+
+    /// Between two attempts: clear a lock that has expired, so the next
+    /// attempt can take it at once, or else wait a moment.
+    pause(&this) -> void {
+        const expired: boolean = match (Path::from(this.path.as_str()).metadata()) {
+            Result::Ok(m)  => { SystemTime::now().unix_seconds() - m.modified_seconds() > this.expiry_seconds }
+            Result::Err(_) => { false }
+        };
+        if (expired) {
+            this.release();
+            return;
+        }
+        thread::sleep(Duration::from_milliseconds(200));
+    }
+
+    /// Give up the lock.  One that cannot be removed is cleared once it
+    /// expires.
+    release(&this) -> void {
+        match (Directory::remove_all(Path::from(this.path.as_str()))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+    }
+}

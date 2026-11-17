@@ -36,6 +36,7 @@ import compiler::deps::git_url::{ GitUrl };
 import compiler::module_graph::{ PackageDeclaration };
 import compiler::deps::lockfile::{ LockedDep, LockedVendor, Lockfile };
 import compiler::deps::semver::{ Constraint };
+import compiler::utils::directory_lock::{ DirectoryLock };
 
 
 /// What the resolver is asked to do.
@@ -332,110 +333,22 @@ type struct DepResolver {
             }
         };
 
-        const url: str::Str = dep.git_url.as_str();
-        const ref_kind: str::Str = GitRefKind::key_name(dep.ref_kind);
-        match (mode) {
-            ResolveMode::Build => {
-                const locked: const LockedDep* = existing.find(url, ref_kind, dep.ref_val.as_str());
-                if (locked == null) {
-                    if (existing.pins_url(url)) {
-                        fmt::eprintln(f"error: lockfile entry for '{dep.name}' is stale (cryoconfig changed); run `cryo fetch`");
-                    } else {
-                        fmt::eprintln(f"error: dependency '{dep.name}' is not pinned; run `cryo fetch`");
-                    }
-                    outcome.failed = true;
-                    return;
-                }
-                sha = locked.commit.clone();
-                if (!GitUrl::is_commit_id(sha.as_str())) {
-                    fmt::eprintln(f"error: lockfile entry for '{dep.name}' holds `{sha}`, which is not a commit id; run `cryo fetch`");
-                    outcome.failed = true;
-                    return;
-                }
-                if (locked.content.length() == 0) {
-                    fmt::eprintln(f"error: lockfile entry for '{dep.name}' records no content hash; run `cryo fetch`");
-                    outcome.failed = true;
-                    return;
-                }
-                // A missing extraction is made again from the bare clone,
-                // which is local: a build starts no network fetch.
-                if (!Git::extract(dep.name.as_str(), url, sha.as_str(), false)) {
-                    outcome.failed = true;
-                    return;
-                }
-                // The files are checked on every build, so a cached file
-                // edited by hand, or made by another tool, is never compiled.
-                const extraction: PathBuf = Cache::extraction_dir_for(url, sha.as_str());
-                match (PackageContent::of_directory(extraction.as_path())) {
-                    Result::Ok(found) => {
-                        if (found != locked.content) {
-                            fmt::eprintln(f"error: the files of dependency '{dep.name}' in the cache are not those of commit {sha}, which cryoconfig.lock pins");
-                            fmt::eprintln(f"  note: {extraction.as_path().as_str()} hashes to {found}; the lock records {locked.content}");
-                            fmt::eprintln("  help: run `cryo fetch`, which extracts the commit's files again");
-                            outcome.failed = true;
-                            return;
-                        }
-                    }
-                    Result::Err(why) => {
-                        fmt::eprintln(f"error: cannot check the files of dependency '{dep.name}' in the cache: {why}");
-                        fmt::eprintln("  help: run `cryo fetch`, which extracts the commit's files again");
-                        outcome.failed = true;
-                        return;
-                    }
-                }
+        // Builds and tests running at once share the cache, so its entries
+        // for one repository are read and made under that repository's lock.
+        mut lock: DirectoryLock = Cache::repository_lock(dep.git_url.as_str());
+        match (lock.take()) {
+            Result::Ok(_)    => { }
+            Result::Err(why) => {
+                fmt::eprintln(f"error: dependency '{dep.name}': {why}");
+                outcome.failed = true;
+                return;
             }
-            _ => {
-                // Fetch/Update: reuse the locked commit if (Fetch only) the
-                // dep's ref is unchanged; otherwise resolve again.
-                mut reused: boolean = false;
-                mut recorded: String = String::new();
-                if (mode == ResolveMode::Fetch) {
-                    const locked: const LockedDep* = existing.find(url, ref_kind, dep.ref_val.as_str());
-                    if (locked != null && GitUrl::is_commit_id(locked.commit.as_str())) {
-                        sha      = locked.commit.clone();
-                        recorded = locked.content.clone();
-                        reused   = true;
-                    }
-                }
-                // An extraction whose files still hash to what the lock
-                // records is kept.  Any other is made again from the bare
-                // clone, so the content a lock records always comes from git
-                // and never from a cache that was changed.  A reused pin
-                // needs the bare clone then too (a committed lock on a fresh
-                // cache), but not its remote refs refreshed.
-                const kept: boolean = reused && recorded.length() > 0 && Git::is_extracted(url, sha.as_str())
-                    && PackageContent::of_directory(Cache::extraction_dir_for(url, sha.as_str()).as_path()).unwrap_or(String::new()) == recorded;
-                if (!kept && !Git::ensure_bare_clone(url, !reused)) {
-                    outcome.failed = true;
-                    return;
-                }
-                if (!reused) {
-                    sha = DepResolver::resolve_to_sha(dep);
-                    if (sha.length() == 0) {
-                        outcome.failed = true;
-                        return;
-                    }
-                }
-                if (!kept && !Git::extract(dep.name.as_str(), url, sha.as_str(), true)) {
-                    outcome.failed = true;
-                    return;
-                }
-                const content: String = match (PackageContent::of_directory(Cache::extraction_dir_for(url, sha.as_str()).as_path())) {
-                    Result::Ok(found) => { found }
-                    Result::Err(why)  => {
-                        fmt::eprintln(f"error: cannot hash the files of dependency '{dep.name}': {why}");
-                        outcome.failed = true;
-                        return;
-                    }
-                };
-                new_lock.packages.push(LockedDep {
-                    url:      dep.git_url.clone(),
-                    ref_kind: String::from_str(ref_kind),
-                    ref_val:  dep.ref_val.clone(),
-                    commit:   sha.clone(),
-                    content:  content,
-                });
-            }
+        }
+        const pinned: Option<String> = DepResolver::cached_commit(dep, mode, existing, new_lock);
+        lock.release();
+        match (pinned) {
+            Option::Some(commit) => { sha = commit; }
+            Option::None         => { outcome.failed = true; return; }
         }
 
         const checkout: PathBuf = Cache::extraction_dir_for(dep.git_url.as_str(), sha.as_str());
@@ -470,6 +383,114 @@ type struct DepResolver {
         // git deps.
         DepResolver::harvest_roots(&dep_cfg, dep_root.as_path(), dep.name.as_str(), key.val.as_str(), outcome);
         DepResolver::walk_deps(&dep_cfg, key.val.as_str(), dep_root.as_path(), local_repository, mode, existing, new_lock, visited, outcome);
+    }
+
+    /// The commit of git dependency `dep` whose files are extracted in the
+    /// cache, its repository's lock held.  A build takes it from the lock
+    /// file, re-extracts it from the bare clone when its files are missing,
+    /// and checks them against the recorded content hash; a fetch or update
+    /// resolves the ref when it must, extracts what no longer matches, and
+    /// records the entry in `new_lock`.  `None` once the failure is
+    /// reported.
+    static cached_commit(dep: const Dependency*, mode: ResolveMode, existing: Lockfile*,
+                         new_lock: mut Lockfile*) -> Option<String> {
+        mut sha: String = String::new();
+        const url: str::Str = dep.git_url.as_str();
+        const ref_kind: str::Str = GitRefKind::key_name(dep.ref_kind);
+        match (mode) {
+            ResolveMode::Build => {
+                const locked: const LockedDep* = existing.find(url, ref_kind, dep.ref_val.as_str());
+                if (locked == null) {
+                    if (existing.pins_url(url)) {
+                        fmt::eprintln(f"error: lockfile entry for '{dep.name}' is stale (cryoconfig changed); run `cryo fetch`");
+                    } else {
+                        fmt::eprintln(f"error: dependency '{dep.name}' is not pinned; run `cryo fetch`");
+                    }
+                    return Option::None;
+                }
+                sha = locked.commit.clone();
+                if (!GitUrl::is_commit_id(sha.as_str())) {
+                    fmt::eprintln(f"error: lockfile entry for '{dep.name}' holds `{sha}`, which is not a commit id; run `cryo fetch`");
+                    return Option::None;
+                }
+                if (locked.content.length() == 0) {
+                    fmt::eprintln(f"error: lockfile entry for '{dep.name}' records no content hash; run `cryo fetch`");
+                    return Option::None;
+                }
+                // A missing extraction is made again from the bare clone,
+                // which is local: a build starts no network fetch.
+                if (!Git::extract(dep.name.as_str(), url, sha.as_str(), false)) {
+                    return Option::None;
+                }
+                // The files are checked on every build, so a cached file
+                // edited by hand, or made by another tool, is never compiled.
+                const extraction: PathBuf = Cache::extraction_dir_for(url, sha.as_str());
+                match (PackageContent::of_directory(extraction.as_path())) {
+                    Result::Ok(found) => {
+                        if (found != locked.content) {
+                            fmt::eprintln(f"error: the files of dependency '{dep.name}' in the cache are not those of commit {sha}, which cryoconfig.lock pins");
+                            fmt::eprintln(f"  note: {extraction.as_path().as_str()} hashes to {found}; the lock records {locked.content}");
+                            fmt::eprintln("  help: run `cryo fetch`, which extracts the commit's files again");
+                            return Option::None;
+                        }
+                    }
+                    Result::Err(why) => {
+                        fmt::eprintln(f"error: cannot check the files of dependency '{dep.name}' in the cache: {why}");
+                        fmt::eprintln("  help: run `cryo fetch`, which extracts the commit's files again");
+                        return Option::None;
+                    }
+                }
+            }
+            _ => {
+                // Fetch/Update: reuse the locked commit if (Fetch only) the
+                // dep's ref is unchanged; otherwise resolve again.
+                mut reused: boolean = false;
+                mut recorded: String = String::new();
+                if (mode == ResolveMode::Fetch) {
+                    const locked: const LockedDep* = existing.find(url, ref_kind, dep.ref_val.as_str());
+                    if (locked != null && GitUrl::is_commit_id(locked.commit.as_str())) {
+                        sha      = locked.commit.clone();
+                        recorded = locked.content.clone();
+                        reused   = true;
+                    }
+                }
+                // An extraction whose files still hash to what the lock
+                // records is kept.  Any other is made again from the bare
+                // clone, so the content a lock records always comes from git
+                // and never from a cache that was changed.  A reused pin
+                // needs the bare clone then too (a committed lock on a fresh
+                // cache), but not its remote refs refreshed.
+                const kept: boolean = reused && recorded.length() > 0 && Git::is_extracted(url, sha.as_str())
+                    && PackageContent::of_directory(Cache::extraction_dir_for(url, sha.as_str()).as_path()).unwrap_or(String::new()) == recorded;
+                if (!kept && !Git::ensure_bare_clone(url, !reused)) {
+                    return Option::None;
+                }
+                if (!reused) {
+                    sha = DepResolver::resolve_to_sha(dep);
+                    if (sha.length() == 0) {
+                        return Option::None;
+                    }
+                }
+                if (!kept && !Git::extract(dep.name.as_str(), url, sha.as_str(), true)) {
+                    return Option::None;
+                }
+                const content: String = match (PackageContent::of_directory(Cache::extraction_dir_for(url, sha.as_str()).as_path())) {
+                    Result::Ok(found) => { found }
+                    Result::Err(why)  => {
+                        fmt::eprintln(f"error: cannot hash the files of dependency '{dep.name}': {why}");
+                        return Option::None;
+                    }
+                };
+                new_lock.packages.push(LockedDep {
+                    url:      dep.git_url.clone(),
+                    ref_kind: String::from_str(ref_kind),
+                    ref_val:  dep.ref_val.clone(),
+                    commit:   sha.clone(),
+                    content:  content,
+                });
+            }
+        }
+        return Option::Some(sha);
     }
 
 

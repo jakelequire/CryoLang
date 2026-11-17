@@ -1,0 +1,101 @@
+///! The cache lock, asked directly: who may take it, when a stale one is
+///! cleared, and that contending threads take turns.
+
+namespace CacheLock;
+
+import std::fmt;
+import std::env;
+import std::process;
+import std::thread;
+import std::time::duration::{ Duration };
+import std::sync::atomic::{ Atomic, MemoryOrder };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fs::path::{ PathBuf };
+import compiler::utils::directory_lock::{ DirectoryLock };
+
+mut g_failed: i32 = 0;
+
+function check(what: string, held: boolean) -> void {
+    if (!held) {
+        fmt::printf("FAIL %s\n", what);
+        g_failed = g_failed + 1;
+    }
+}
+
+/// A lock path of this process's own, in the temporary directory.
+function lock_path(name: string) -> String {
+    const path: PathBuf = env::temporary_directory().join(f"cryo_cache_lock_{process::id()}_{name}.lock".as_str());
+    return String::from_str(path.as_path().as_str());
+}
+
+/// One thread contending for the lock at `path`: each turn it takes the
+/// lock, counts itself among the holders, and counts a violation if anyone
+/// else held it then.
+type struct Contender {
+    path:       Str;
+    holders:    Atomic<u32>*;
+    violations: Atomic<u32>*;
+    failures:   Atomic<u32>*;
+
+    run(&this) -> void {
+        mut lock: DirectoryLock = DirectoryLock::new(this.path, Str::new("to test it"), 600);
+        for (mut turn: i32 = 0; turn < 20; turn++) {
+            match (lock.take()) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { (*this.failures).fetch_add(1, MemoryOrder::Relaxed); return; }
+            }
+            if ((*this.holders).fetch_add(1, MemoryOrder::AcqRel) != 0) {
+                (*this.violations).fetch_add(1, MemoryOrder::Relaxed);
+            }
+            thread::sleep(Duration::from_milliseconds(2));
+            (*this.holders).fetch_subtract(1, MemoryOrder::AcqRel);
+            lock.release();
+        }
+    }
+}
+
+function main() -> int {
+    // A held lock is refused to another taker, who gets it once released.
+    const held_path: String = lock_path("held");
+    mut first: DirectoryLock = DirectoryLock::new(held_path.as_str(), Str::new("to test it"), 600);
+    mut second: DirectoryLock = DirectoryLock::new(held_path.as_str(), Str::new("to test it"), 600);
+    check("the first taker gets a free lock", first.attempt().unwrap_or(false));
+    check("a second taker is refused a held lock", !second.attempt().unwrap_or(true));
+    first.release();
+    check("the second taker gets it once released", second.attempt().unwrap_or(false));
+    second.release();
+
+    // A lock older than its expiry was left by a process that died: the
+    // next taker clears it and takes it.
+    const stale_path: String = lock_path("stale");
+    mut dead: DirectoryLock = DirectoryLock::new(stale_path.as_str(), Str::new("to test it"), 600);
+    check("a lock is left behind", dead.attempt().unwrap_or(false));
+    mut fresh: DirectoryLock = DirectoryLock::new(stale_path.as_str(), Str::new("to test it"), 600);
+    check("a lock younger than its expiry is not cleared", !fresh.attempt().unwrap_or(true));
+    thread::sleep(Duration::from_milliseconds(1500));
+    mut late: DirectoryLock = DirectoryLock::new(stale_path.as_str(), Str::new("to test it"), 0);
+    late.pause();
+    check("a lock older than its expiry is cleared and taken", late.attempt().unwrap_or(false));
+    late.release();
+
+    // Threads contending for one lock hold it one at a time.
+    const shared_path: String = lock_path("shared");
+    const holders: Atomic<u32> = Atomic::<u32>::new(0);
+    const violations: Atomic<u32> = Atomic::<u32>::new(0);
+    const failures: Atomic<u32> = Atomic::<u32>::new(0);
+    const contender: Contender = Contender {
+        path: shared_path.as_str(), holders: &holders, violations: &violations, failures: &failures,
+    };
+    thread::scope((scope: mut &thread::Scope) -> i32 {
+        for (mut t: i32 = 0; t < 4; t++) {
+            scope.spawn(move () -> void { contender.run(); });
+        }
+        return 0;
+    });
+    check("contending threads never hold the lock at once", violations.load(MemoryOrder::Acquire) == 0);
+    check("every contending thread takes the lock", failures.load(MemoryOrder::Acquire) == 0);
+
+    fmt::printf("cache lock checks: %d failed\n", g_failed);
+    return g_failed;
+}
