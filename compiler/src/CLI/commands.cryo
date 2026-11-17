@@ -4,6 +4,8 @@ import std::fmt;
 import std::env;
 import std::fs::file::{ File };
 import std::fs::directory::{ Directory, DirectoryEntries };
+import std::io::error::{ IoError };
+import compiler::deps::cache::{ Cache };
 import std::io::stdio;
 import compiler::{ compilation_context, instance, project_config };
 import compiler::codegen::{ llvm_types };
@@ -210,9 +212,67 @@ type struct ProjSpec {
     }
 }
 
-/// One command of a project's `steps`: the compiler's arguments, verb first.
+/// One of a project's `steps`: a command of the compiler, its arguments
+/// verb first (test.json `["fetch"]`), or a file the runner writes itself,
+/// its missing parent directories made first (test.json `{"write": <path>,
+/// "text": <text>}`), which with `"fails": true` must be refused instead.
+/// In a project with git fixtures, `{cache:<fixture>@<tag>}` in either
+/// stands for the directory the project's package cache extracts that
+/// commit of that fixture to.
 type struct ProjStep {
+    /// The compiler's arguments; empty for a step that writes a file.
     arguments: [String];
+    /// The file a write step writes, relative to the project's directory
+    /// unless absolute, and what it writes there.
+    write: String;
+    text:  String;
+    /// The write must be refused: the step fails if it is not.
+    refused: boolean;
+}
+
+/// One action of a suite job, run in order until one fails: a shell
+/// command, or a file the runner writes itself between two of them.
+type enum SuiteAction {
+    Shell(String);
+    Write(StepWrite);
+}
+
+/// A write step as its job performs it: `path` absolute, and `log` the
+/// file its failure is reported in, after the steps before it.
+type struct StepWrite {
+    path:    String;
+    text:    String;
+    refused: boolean;
+    log:     String;
+}
+
+implement enum SuiteAction {
+    /// Perform the action; its status, 0 on success.  A write step's
+    /// failure says why in its log.
+    perform(&this) -> i32 {
+        match (this) {
+            SuiteAction::Shell(command) => { return Command::shell(command.as_str()); }
+            SuiteAction::Write(step) => {
+                const target: path::Path = path::Path::from(step.path.as_str());
+                match (target.parent()) {
+                    // A directory that cannot be made fails the write below.
+                    Option::Some(parent) => { mem::drop(Directory::create_all(parent)); }
+                    Option::None         => { }
+                }
+                const written: Result<(), IoError> = File::write_text(target, step.text.as_str());
+                if (written.is_ok() != step.refused) { return 0; }
+                mut log: String = Executor::read_file_or_empty(path::Path::from(step.log.as_str()));
+                match (written) {
+                    Result::Ok(_)      => { log.push(f"step: writing {step.path} succeeded; the step expects it refused\n"); }
+                    Result::Err(error) => { log.push(f"step: cannot write {step.path}: {error}\n"); }
+                }
+                // The step fails either way; a log that cannot be written
+                // loses only its explanation.
+                mem::drop(File::write_text(path::Path::from(step.log.as_str()), log.as_str()));
+                return 1;
+            }
+        }
+    }
 }
 
 /// One of a project's `git_fixtures`: a repository named `name`, whose
@@ -229,6 +289,8 @@ type struct ProjFixture {
 type struct ProjFixtureCommit {
     tree: String;
     tag:  String;
+    /// The commit's id, once the fixture is built.
+    commit: String;
 }
 
 /// Result of dispatching one project: did it meet its declared outcome, and
@@ -317,26 +379,31 @@ function shell_set_environment(setting: Str) -> String {
     return f"export \"{setting}\" && ";
 }
 
-/// One batch of shell commands for a suite's worker pool, copied into each
-/// worker.  The pointers alias arrays the suite owns and keeps alive
-/// until its scope has joined every worker.  A worker takes the next index off
-/// `cursor`, runs that command, stores its exit status, and only then
-/// publishes `done` for it (release); the suite reads a result only after
-/// seeing `done` (acquire), and reads them strictly in index order, so what it
+/// One batch of jobs for a suite's worker pool, copied into each worker;
+/// a job is its actions, run in order until one fails.  The pointers
+/// alias arrays the suite owns and keeps alive until its scope has joined
+/// every worker.  A worker takes the next index off `cursor`, runs that
+/// job, stores the status of its last action, and only then publishes
+/// `done` for it (release); the suite reads a result only after seeing
+/// `done` (acquire), and reads them strictly in index order, so what it
 /// prints does not depend on which worker finished first.
 type struct ShellJobs {
     cursor: Atomic<u64>*;
-    cmds:   String*;
+    jobs:   [SuiteAction]*;
     n:      u64;
     status: mut i32*;
     done:   Atomic<u32>*;
 
-    /// A pool worker's body: run commands off the cursor until none is left.
+    /// A pool worker's body: run jobs off the cursor until none is left.
     run(&this) -> void {
         loop {
             const k: u64 = (*this.cursor).fetch_add(1, MemoryOrder::Relaxed);
             if (k >= this.n) { break; }
-            this.status[k] = Command::shell(this.cmds[k].as_str());
+            mut code: i32 = 0;
+            for (mut a: i64 = 0; code == 0 && a < this.jobs[k].length(); a++) {
+                code = this.jobs[k][a].perform();
+            }
+            this.status[k] = code;
             this.done[k].store(1, MemoryOrder::Release);
         }
     }
@@ -2154,7 +2221,7 @@ type struct Executor {
         mut contents: [String] = [];
         mut expects:  [String] = [];
         mut job_of:   [i64]    = [];
-        mut cmds:     [String] = [];
+        mut cmds:     [[SuiteAction]] = [];
         match (Directory::entries(neg_dir)) {
             Result::Ok(entries) => {
                 for (entry in entries) {
@@ -2172,7 +2239,7 @@ type struct Executor {
                         mut command: String = f"{self_exe} check {full.as_path().as_str()}";
                         if (stdlib_abs.length() > 0) { command.push(f" --stdlib={stdlib_abs}"); }
                         command.push(f" > {out_path} 2>&1");
-                        cmds.push(command);
+                        cmds.push([SuiteAction::Shell(command)]);
                     }
                     names.push(String::from_str(name));
                     contents.push(content);
@@ -2214,7 +2281,7 @@ type struct Executor {
         // The workers share the job table through `batch`; `thread::scope`
         // joins them after the last verdict is read.
         const batch: ShellJobs = ShellJobs {
-            cursor: &cursor, cmds: cmds.as_pointer(), n: n_jobs,
+            cursor: &cursor, jobs: cmds.as_pointer(), n: n_jobs,
             status: status.as_mutable_pointer(), done: done.as_pointer()
         };
         const tally: NegSuiteResult = thread::scope((scope: mut &thread::Scope) -> NegSuiteResult {
@@ -2454,15 +2521,32 @@ type struct Executor {
         Executor::read_strings(&root, "environment", &spec.environment);
         Executor::read_strings(&root, "arguments", &spec.arguments);
         Executor::read_strings(&root, "command", &spec.command);
-        // A step is a list of strings, its verb first; anything else makes
-        // the file malformed rather than running a different command.
+        // A step is a list of strings, its verb first, or an object naming
+        // the file it writes and its text; anything else makes the file
+        // malformed rather than running a different command.
         mut malformed_step: boolean = false;
         match (root.get(str::Str::new("steps"))) {
             Option::Some(sp) => {
                 for (mut i: i64 = 0; i < sp.length(); i++) {
                     match (sp.at(i)) {
                         Option::Some(step) => {
-                            mut one: ProjStep = ProjStep { arguments: [] };
+                            mut one: ProjStep = ProjStep { arguments: [], write: String::new(), text: String::new(), refused: false };
+                            if (step.is_object()) {
+                                one.write = registry::VendorRegistry::text_field(step, str::Str::new("write"), str::Str::new(""));
+                                one.text = registry::VendorRegistry::text_field(step, str::Str::new("text"), str::Str::new(""));
+                                match (step.get(str::Str::new("fails"))) {
+                                    Option::Some(fp) => {
+                                        match (fp.as::<boolean>()) {
+                                            Option::Some(b) => { one.refused = b; }
+                                            Option::None    => { malformed_step = true; }
+                                        }
+                                    }
+                                    Option::None => { }
+                                }
+                                if (one.write.is_empty() || step.get(str::Str::new("text")).is_none()) { malformed_step = true; }
+                                spec.steps.push(one);
+                                continue;
+                            }
                             for (mut j: i64 = 0; j < step.length(); j++) {
                                 match (step.at(j)) {
                                     Option::Some(av) => {
@@ -2505,6 +2589,7 @@ type struct Executor {
                                                 const made: ProjFixtureCommit = ProjFixtureCommit {
                                                     tree: registry::VendorRegistry::text_field(commit, str::Str::new("tree"), str::Str::new("")),
                                                     tag:  registry::VendorRegistry::text_field(commit, str::Str::new("tag"), str::Str::new("")),
+                                                    commit: String::new(),
                                                 };
                                                 if (made.tree.is_empty() || made.tag.is_empty()) { malformed_step = true; }
                                                 one.commits.push(made);
@@ -2669,7 +2754,7 @@ type struct Executor {
         //                      fixes applied, or -1 when it has no `applied`
         mut applied_job_of: [i64]  = [];
         mut specs:      [ProjSpec] = [];
-        mut cmds:       [String]   = [];
+        mut cmds:       [[SuiteAction]] = [];
         //   run_dirs[i]: where project i's commands run - its own directory,
         //                or the copy that holds its git fixtures
         mut run_dirs:   [String]   = [];
@@ -2739,8 +2824,12 @@ type struct Executor {
                 const out_path: String = Executor::job_tmp_path(tmp.as_path(), cmds.length() as u64);
                 job_of.push(cmds.length() as i64);
                 // Whether the fixture's command ran is read off its capture
-                // being there, so none may be left from an earlier run.
-                if (spec.steps.length() > 0) { Executor::remove_capture(path::Path::from(out_path.as_str())); }
+                // being there, so none may be left from an earlier run; the
+                // steps add to their log, which starts empty.
+                if (spec.steps.length() > 0) {
+                    Executor::remove_capture(path::Path::from(out_path.as_str()));
+                    Executor::remove_capture(path::Path::from(Executor::steps_path(out_path.as_str()).as_str()));
+                }
                 cmds.push(Executor::project_command(self_exe, stdlib_abs, path::Path::from(run_dir.as_str()), &spec,
                     out_path.as_str(), build_flags));
                 // The fixes are made in a copy, never in the tree's own
@@ -2802,7 +2891,7 @@ type struct Executor {
         // The workers share the job table through `batch`; `thread::scope`
         // joins them after the last verdict is read.
         const batch: ShellJobs = ShellJobs {
-            cursor: &cursor, cmds: cmds.as_pointer(), n: n_jobs,
+            cursor: &cursor, jobs: cmds.as_pointer(), n: n_jobs,
             status: status.as_mutable_pointer(), done: done.as_pointer()
         };
         const tally: NegSuiteResult = thread::scope((scope: mut &thread::Scope) -> NegSuiteResult {
@@ -2870,7 +2959,7 @@ type struct Executor {
                 const steps_output: String = Executor::steps_path(out_path.as_str());
                 if (specs[i].steps.length() > 0 && !path::Path::from(out_path.as_str()).exists()) {
                     res = ProjOutcome { passed: false,
-                        detail: String::from_str(str::Str::new("a step exited non-zero; its output follows")) };
+                        detail: String::from_str(str::Str::new("a step failed; its output follows")) };
                 }
                 if (!Executor::remove_project_file(proj_dir.as_path(), &specs[i]) && res.passed) {
                     res = ProjOutcome { passed: false,
@@ -2994,33 +3083,44 @@ type struct Executor {
         }
     }
 
-    /// The shell command that drives one project to its declared outcome: this
-    /// compiler run in the project directory, its combined output captured in
-    /// `tmp`.  The directory is set inside the command's own shell, never by
-    /// `chdir`, because projects run concurrently and the process working
+    /// The actions that drive one project to its declared outcome: its steps,
+    /// then this compiler run in the project directory, its output captured
+    /// in `tmp`.  The directory is set inside each command's own shell, never
+    /// by `chdir`, because projects run concurrently and the process working
     /// directory is shared.  All paths handed to the subprocess (`self_exe`,
     /// `stdlib_abs`, `tmp`) are absolute so the changed cwd doesn't break them.
     static project_command(self_exe: Str, stdlib_abs: Str, proj_dir: path::Path,
-                           spec: &ProjSpec, tmp: Str, build_flags: str::Str) -> String {
+                           spec: &ProjSpec, tmp: Str, build_flags: str::Str) -> [SuiteAction] {
         // FIXTURE build (`cryo build`), run (`cryo run`) or collect (the
         // project's own `cryo test`).  Stdout and stderr are captured apart so
         // the ASSERTIONS in `project_outcome` can tell the streams apart.
-        mut command: String = String::new();
+        mut environment: String = String::new();
         for (mut i: i64 = 0; i < spec.environment.length(); i++) {
-            command.push(shell_set_environment(spec.environment[i].as_str()));
+            environment.push(shell_set_environment(spec.environment[i].as_str()));
         }
-        // Each step runs only once the one before it exited 0, and the
+        // Each step runs only once the one before it succeeded, and the
         // fixture's command only once every step has.
+        mut actions: [SuiteAction] = [];
         const steps_output: String = Executor::steps_path(tmp);
         for (mut s: i64 = 0; s < spec.steps.length(); s++) {
-            command.push(self_exe);
-            for (mut a: i64 = 0; a < spec.steps[s].arguments.length(); a++) {
-                command.push(f" \"{spec.steps[s].arguments[a]}\"");
+            if (spec.steps[s].arguments.length() == 0) {
+                const target: path::PathBuf = proj_dir.join(spec.steps[s].write.as_str());
+                actions.push(SuiteAction::Write(StepWrite {
+                    path: String::from_str(target.as_path().as_str()), text: spec.steps[s].text.clone(),
+                    refused: spec.steps[s].refused, log: steps_output.clone(),
+                }));
+                continue;
             }
-            if (stdlib_abs.length() > 0) { command.push(f" --stdlib={stdlib_abs}"); }
-            command.push(if (s == 0) { " > " } else { " >> " });
-            command.push(f"{steps_output} 2>&1 && ");
+            mut step: String = environment.clone();
+            step.push(self_exe);
+            for (mut a: i64 = 0; a < spec.steps[s].arguments.length(); a++) {
+                step.push(f" \"{spec.steps[s].arguments[a]}\"");
+            }
+            if (stdlib_abs.length() > 0) { step.push(f" --stdlib={stdlib_abs}"); }
+            step.push(f" >> {steps_output} 2>&1");
+            actions.push(SuiteAction::Shell(shell_in_dir(proj_dir.as_str(), step.as_str())));
         }
+        mut command: String = environment;
         // A `command` project's command is a step's, judged as the fixture:
         // its own arguments and the suite's `--stdlib`, none of the build's
         // flags.
@@ -3042,7 +3142,8 @@ type struct Executor {
         }
         command.push(f" > {tmp} 2> ");
         command.push(Executor::stderr_path(tmp));
-        return shell_in_dir(proj_dir.as_str(), command.as_str());
+        actions.push(SuiteAction::Shell(shell_in_dir(proj_dir.as_str(), command.as_str())));
+        return actions;
     }
 
     /// Remove the file a project's expectations read (`expect.file`), if any,
@@ -3089,8 +3190,57 @@ type struct Executor {
                 return Result::Err(f"cannot build the git fixture `{spec.fixtures[i].name}`");
             }
         }
-        spec.environment.push(f"CRYO_HOME={build.join(str::Str::new("cryo-home")).as_path().as_str()}");
+        const home: path::PathBuf = build.join(str::Str::new("cryo-home"));
+        const cache_root: path::PathBuf = Cache::root_in_home(home.as_path());
+        for (mut s: i64 = 0; s < spec.steps.length(); s++) {
+            for (mut a: i64 = 0; a < spec.steps[s].arguments.length(); a++) {
+                spec.steps[s].arguments[a] = Executor::resolve_cache_placeholders(spec.steps[s].arguments[a].as_str(),
+                    &spec.fixtures, &urls, cache_root.as_path())?;
+            }
+            spec.steps[s].write = Executor::resolve_cache_placeholders(spec.steps[s].write.as_str(),
+                &spec.fixtures, &urls, cache_root.as_path())?;
+        }
+        spec.environment.push(f"CRYO_HOME={home.as_path().as_str()}");
         return Result::Ok(());
+    }
+
+    /// `text` with each `{cache:<fixture>@<tag>}` written as the directory
+    /// the package cache at `cache_root` extracts that commit of that
+    /// fixture to (`urls` beside `fixtures`).  `Err` names a placeholder
+    /// that is not closed or names no fixture's tag.
+    static resolve_cache_placeholders(text: Str, fixtures: &[ProjFixture], urls: &[String],
+                                      cache_root: path::Path) -> Result<String, String> {
+        const open: str::Str = str::Str::new("{cache:");
+        mut out: String = String::new();
+        mut rest: str::Str = text;
+        loop {
+            const at: i64 = rest.find(&open).unwrap_or(-1);
+            if (at < 0) { break; }
+            out.push(rest.byte_substring(0, at));
+            const after: str::Str = rest.byte_substring(at + open.length(), rest.length());
+            const close: i64 = after.find(&str::Str::new("}")).unwrap_or(-1);
+            if (close < 0) { return Result::Err(f"a cache placeholder in `{text}` is not closed"); }
+            const named: str::Str = after.byte_substring(0, close);
+            const separator: i64 = named.find(&str::Str::new("@")).unwrap_or(-1);
+            mut directory: String = String::new();
+            for (mut i: i64 = 0; separator > 0 && directory.is_empty() && i < fixtures.length(); i++) {
+                if (fixtures[i].name.as_str() != named.byte_substring(0, separator)) { continue; }
+                for (mut c: i64 = 0; c < fixtures[i].commits.length(); c++) {
+                    if (fixtures[i].commits[c].tag.as_str() == named.byte_substring(separator + 1, named.length())) {
+                        const extracted: path::PathBuf = Cache::extraction_dir_in(cache_root, urls[i].as_str(),
+                            fixtures[i].commits[c].commit.as_str());
+                        directory = String::from_str(extracted.as_path().as_str());
+                    }
+                }
+            }
+            if (directory.is_empty()) {
+                return Result::Err(f"`{named}` in `{text}` names no tag of a git fixture (write `<fixture>@<tag>`)");
+            }
+            out.push(directory.as_str());
+            rest = after.byte_substring(close + 1, after.length());
+        }
+        out.push(rest);
+        return Result::Ok(out);
     }
 
     /// Write each fixture's URL (`urls`, beside `fixtures`) for its
@@ -3126,7 +3276,8 @@ type struct Executor {
     /// `<copy>/<from>/<tree>` and carrying its tag.  Every git command runs
     /// with a fixed author, committer and date and with no system or user
     /// configuration, so a fixture's commits do not depend on who runs it.
-    static build_git_fixture(repositories: path::Path, copy: path::Path, fixture: &ProjFixture) -> boolean {
+    /// Each commit's id is recorded in `fixture`.
+    static build_git_fixture(repositories: path::Path, copy: path::Path, fixture: mut &ProjFixture) -> boolean {
         const repository: path::PathBuf = repositories.join(f"{fixture.name}.git".as_str());
         if (Directory::create_all(repository.as_path()).is_err()) { return false; }
         const no_config: path::PathBuf = repositories.join(str::Str::new("no-user-config"));
@@ -3142,6 +3293,10 @@ type struct Executor {
             if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), work_tree.as_str(), str::Str::new("add"), str::Str::new("-A")])) { return false; }
             if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), work_tree.as_str(), str::Str::new("commit"), str::Str::new("-q"), str::Str::new("--allow-empty"), str::Str::new("-m"), tag])) { return false; }
             if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), str::Str::new("tag"), tag])) { return false; }
+            match (Executor::fixture_git_output(no_config.as_path(), [git_dir.as_str(), str::Str::new("rev-parse"), str::Str::new("HEAD")])) {
+                Option::Some(id) => { fixture.commits[c].commit = id; }
+                Option::None     => { return false; }
+            }
         }
         return true;
     }
@@ -3150,6 +3305,12 @@ type struct Executor {
     /// fixed identity and date and no configuration but `no_config`, a
     /// file that does not exist.  True when it exits 0.
     static fixture_git(no_config: path::Path, arguments: [str::Str]) -> boolean {
+        return Executor::fixture_git_output(no_config, arguments).is_some();
+    }
+
+    /// What `fixture_git` prints on stdout, without its line ending, or
+    /// `None` when git does not exit 0.
+    static fixture_git_output(no_config: path::Path, arguments: [str::Str]) -> Option<String> {
         mut git: Command = Command::new(str::Str::new("git"));
         for (mut i: i64 = 0; i < arguments.length(); i++) { git.argument(arguments[i]); }
         git.env(str::Str::new("GIT_CONFIG_NOSYSTEM"), str::Str::new("1"));
@@ -3160,10 +3321,16 @@ type struct Executor {
         git.env(str::Str::new("GIT_COMMITTER_NAME"), str::Str::new("cryo fixture"));
         git.env(str::Str::new("GIT_COMMITTER_EMAIL"), str::Str::new("fixture@cryo.invalid"));
         git.env(str::Str::new("GIT_COMMITTER_DATE"), str::Str::new("2026-01-01T00:00:00Z"));
-        return match (git.output()) {
-            Result::Ok(out) => { out.status().success() }
-            Result::Err(_)  => { false }
-        };
+        match (git.output()) {
+            Result::Ok(out) => {
+                if (!out.status().success()) { return Option::None; }
+                return match (str::Str::from_utf8(out.stdout())) {
+                    Result::Ok(text) => { Option::Some(String::from_str(text.trim())) }
+                    Result::Err(_)   => { Option::None }
+                };
+            }
+            Result::Err(_) => { return Option::None; }
+        }
     }
 
     /// Remove a project's `build/` folder, so what its steps write there is

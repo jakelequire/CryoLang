@@ -375,7 +375,7 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 | `"command"` | the compiler command a `"command"` project runs, verb first (below) |
 | `"ignore"` | `true` skips the project (reported as ignored) |
 | `"expect"` | per-outcome assertions (below) |
-| `"steps"` | commands of the compiler run before the outcome's own (below) |
+| `"steps"` | commands of the compiler, and files the runner writes, before the outcome's own command (below) |
 
 `make test-census` runs the suite with `-Werror=W0017`, which `cryo test`
 hands to every project's build too: a unit test or a project that discards a
@@ -482,8 +482,8 @@ kept apart, so `expect` can say which stream a line belongs on:
 
 `steps` runs other commands of the same compiler first, in order, in the
 project's directory: each is a list of arguments, its verb first, and each
-gets the suite's `--stdlib`. A step runs only once the one before it exited
-0, and the project's own command only once every step has; a failing step
+gets the suite's `--stdlib`. A step runs only once the one before it
+succeeded, and the project's own command only once every step has; a failing step
 fails the project and its output is shown. A project with steps starts from
 no `build/` folder, so a step that writes there (`cryo init build/lib ...`)
 leaves only this run's files for the build and the `file` assertions to
@@ -521,6 +521,23 @@ fetches (`["fetch"]`) before the outcome builds. Such a project
   "steps": [["fetch"]],
   "expect": { "exit_code": 0 }
 }
+```
+
+A step can also be a file the runner writes itself, between two commands:
+`{"write": <path>, "text": <text>}`, the path relative to the project
+unless absolute, its missing parent directories made first. With
+`"fails": true` the write must be refused instead, and the step fails if it
+is not. In a project with git fixtures, `{cache:<fixture>@<tag>}` in a
+step's arguments or in a write's path stands for the directory the copy's
+package cache extracts that commit of that fixture to, so a project can
+change the cache between a fetch and a build:
+
+```json
+"steps": [
+  ["fetch"],
+  { "write": "{cache:greeter@v1}/src/lib.cryo", "text": "...", "fails": true },
+  { "write": "{cache:greeter@v1}/src/extra.cryo", "text": "namespace Greeting;\n" }
+]
 ```
 
 A `.cryo` file named in `arguments` makes a `build` project a single-file

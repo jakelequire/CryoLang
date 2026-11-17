@@ -391,6 +391,46 @@ public type struct File {
         return Result::Ok(());
     }
 
+    /// Make the file at `path` read-only, so a write to it is refused, or
+    /// writable again. Making it read-only clears every write permission
+    /// bit; making it writable gives its owner write permission and leaves
+    /// the other bits as they are. Removing a read-only file still works:
+    /// see `File::remove`.
+    ![target(unix)]
+    public static set_read_only(path: Path, read_only: boolean) -> Result<(), IoError> {
+        const info: Metadata = match (Metadata::of(path)) {
+            Result::Ok(info)   => { info }
+            Result::Err(error) => { return Result::Err(error.with_context(IoOperation::SetPermissions, path)); }
+        };
+        // 0222 is the write bit of owner, group and others; 0200 the owner's.
+        const permissions: u32 = if (read_only) { info.permissions() & ~146 } else { info.permissions() | 128 };
+        mut c_path: String = String::with_null(path.as_str());
+        const rc: i32 = libc::chmod(c_path.as_pointer(), permissions);
+        const err: i32 = libc::errno();
+        mem::drop(c_path);
+        if (rc != 0) {
+            return Result::Err(IoError::from_errno(err).with_context(IoOperation::SetPermissions, path));
+        }
+        return Result::Ok(());
+    }
+    /// Set or clear the file's read-only attribute
+    /// (`SetFileAttributesW`), keeping its other attributes; as the copy
+    /// above.
+    ![target(windows)]
+    public static set_read_only(path: Path, read_only: boolean) -> Result<(), IoError> {
+        const wide: Array<u16> = Utf16::encode(path.as_str());
+        const attributes: u32 = syscall::GetFileAttributesW(wide.as_pointer());
+        if (attributes == syscall::INVALID_FILE_ATTRIBUTES) {
+            return Result::Err(IoError::last_os_error().with_context(IoOperation::SetPermissions, path));
+        }
+        const wanted: u32 = if (read_only) { attributes | syscall::FILE_ATTRIBUTE_READONLY }
+            else { attributes & ~syscall::FILE_ATTRIBUTE_READONLY };
+        if (syscall::SetFileAttributesW(wide.as_pointer(), wanted) == 0) {
+            return Result::Err(IoError::last_os_error().with_context(IoOperation::SetPermissions, path));
+        }
+        return Result::Ok(());
+    }
+
     /// What the open file is: its type, size and modification time.
     public metadata(&this) -> Result<Metadata, IoError> {
         return Metadata::of_descriptor(this.fd);
