@@ -72,6 +72,11 @@ public type struct Structure {
 
     /// Whether this is an instance of a generic struct.
     public is_instance(&this) -> boolean { return this.template >= 0; }
+
+    /// Whether this is a generic struct at its own parameter, `B0<T>`: the
+    /// type of `this` in the generic struct's methods, and of no other
+    /// value.
+    public is_own_instance(&this) -> boolean { return this.is_instance() && this.argument.same(ValueType::TypeParameter); }
 }
 
 /// How a function takes its receiver.
@@ -116,6 +121,10 @@ public type enum Genericity {
     /// `<T>` with `where T: Eq`: its `T` values are compared, so it is
     /// instantiated only at an integer type or `boolean`.
     Equatable;
+    /// `<T>` with `where T: Copy`: a `T` value is copied wherever it is
+    /// passed, stored or selected, rather than moved, so the body may use
+    /// one any number of times.  Every value type a program has is `Copy`.
+    Copyable;
 }
 
 implement enum Genericity {
@@ -135,12 +144,22 @@ implement enum Genericity {
         };
     }
 
+    /// Whether `T` is `Copy`.
+    public copies(&this) -> boolean {
+        return match (&this) {
+            Genericity::Copyable => { true }
+            _                    => { false }
+        };
+    }
+
     /// Whether the function may be instantiated at `argument`: a value
     /// type, or `T` itself inside a generic body whose own parameter
     /// `inside` satisfies this function's bound.
     public admits(&this, argument: ValueType, inside: Genericity) -> boolean {
         if (!this.is_generic()) { return false; }
-        if (argument.same(ValueType::TypeParameter)) { return !this.compares() || inside.compares(); }
+        if (argument.same(ValueType::TypeParameter)) {
+            return (!this.compares() || inside.compares()) && (!this.copies() || inside.copies());
+        }
         if (argument.same(ValueType::Void)) { return false; }
         if (this.compares()) { return argument.is_integer() || argument.same(ValueType::Boolean); }
         return true;
@@ -154,7 +173,8 @@ public type struct Function {
     public number: i64;
     /// Whether this is `main`.
     public is_main: boolean;
-    /// The struct that owns a method, or -1 for a free function.
+    /// The struct that owns a method, or -1 for a free function; a generic
+    /// struct's method is owned by its own instance, `B0<T>`.
     public owner: i64;
     /// How it takes its receiver.
     public receiver: Receiver;

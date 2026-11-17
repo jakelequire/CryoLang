@@ -56,8 +56,8 @@ generated as text.
   writes or observes a struct serves an instance unchanged. A type's name
   is the program's to spell, since an instance's names its argument.
 - **Functions** are free functions `h<N>`, generic functions `g<N><T>`,
-  `main`, and a struct's methods `m<N>`: static, or taking `&this` or
-  `mut &this`. Each has numbered
+  `main`, and a struct's or generic struct's methods `m<N>`: static, or
+  taking `&this` or `mut &this`. Each has numbered
   parameters, a return type, a body and a **cost**: the most work one call
   can do (section 3.3).
 - **The printer** walks the model once. Every binary expression is
@@ -154,7 +154,35 @@ may have, drawn as a declared struct is: a local, a parameter, a return
 type, a field of nothing (an instance is never a declared struct's field),
 a generic function's type argument. A literal writes the type argument,
 `B0::<u16> { f1: a, f0: b }`; a field of an instance is read, written and
-observed as any struct field is. A generic struct has no method.
+observed as any struct field is.
+
+**Generic methods.** With `generic-methods`, each generic struct has one
+to three methods written in its body, each static, taking `&this` or
+taking `mut &this`. They belong to the struct's **own instance**,
+`B<N><T>`, the struct at its own parameter, made after every other
+structure and the type of no value but `this`; so inside a method a `T`
+field of `this` is a `T` value, read, passed, returned and written as a
+generic function's are, and never observed. A static method takes a `T`
+first and returns `T`, and is called as a generic function is, its type
+argument written, a placeholder or left out: `B0::<u16>::m0(a)`,
+`B0::<_>::m0(a)`, `B0::m0(a)`. A method taking a receiver is called on a
+place of any instance of its struct, `T` standing for that instance's
+argument in its parameters and its result: `v1.m1(a)` with `v1: B0<u16>`
+takes and returns `u16` where `m1` says `T`. One taking `mut &this` returns
+nothing and is called as a statement on a writable place, as a declared
+struct's is. A method calls only earlier ones, its own struct's on `this`
+among them. Each method is bounded `where T: Copy`, so its body may pass,
+store and select a `T` value as often as it likes (a type parameter is
+otherwise not `Copy`, and each of those moves it); every type a value has
+is `Copy`, so any instance may call it, while a generic function, whose
+`T` has no such bound, calls one only at a type, never at its own `T`.
+
+**Kept off: a generic struct's own bare literal inside its methods.**
+Inside a generic struct's method, a literal of that same generic struct
+always writes its type argument. The compiler types such a literal that
+leaves it to inference as the body's own instance (`B0<T>`) whatever the
+call it is passed to expects, and refuses a valid program; lift this when
+that is fixed.
 
 **Inferred type arguments.** With `inferred-type-arguments`, a generic
 call or an instance's literal leaves its type argument to inference four
@@ -219,11 +247,19 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   static method is called through its struct (`S1::m0()`), never on a value.
   `this` is never assigned whole.
 - A struct literal writes every field that has no default.
-- **Generic bodies.** A `T` value is never observed, cast, combined by an
-  operator or assigned: nothing converts a `T` to a `u64`, and no `T` local
-  is declared. It is compared only under `where T: Eq`, and a generic
+- **Generic bodies.** A `T` value is never observed, cast or combined by
+  an operator: nothing converts a `T` to a `u64`, and no `T` local is
+  declared. The one `T` place assigned is a `T` field of a `mut &this`, and
+  only whole, never with a compound operator. It is compared only under `where T: Eq`, and a generic
   function is instantiated only at a type its bound admits - an `Eq`-bounded
   one never at a struct, which does not implement `Eq`.
+- **Moves.** A value of an unbounded or `Eq`-bounded `T` is not `Copy`,
+  so each pass, store or selection of one moves it. A generic struct's
+  methods are bounded by `Copy` and may use a `T` value freely. The
+  generic functions do not yet carry that bound, and pass a `T`
+  parameter more than once: the compiler accepts it only because it
+  checks a generic function's moves per instance, where every type is
+  `Copy`. Owed: bound them by `Copy` too.
 - **Inference is certain.** A call or literal that leaves its type
   argument to inference gives `T` only deciding values (section 2), so
   each of them has the type argument's type and they agree; nothing else
@@ -243,7 +279,8 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   (the increment comes first, so a `continue` cannot skip it) and
   `for (n2 in 0..5)`. Loops nest at most three deep.
 - **No recursion.** Functions are generated in one order - every struct's
-  methods, then `g0`, `g1`, ..., then `h0`, `h1`, ..., then `main` - and
+  methods, then every generic struct's, then `g0`, `g1`, ..., then `h0`,
+  `h1`, ..., then `main` - and
   each calls only functions generated before it: the call graph is acyclic.
 - **A cost model.** A statement costs its expressions' nodes (a store's
   target is written, not read, and costs nothing); a loop costs its trip
@@ -302,7 +339,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   seeded with its place among the methods. The generic functions' count
   comes from a stream of its own, and each generic function from one
   seeded with its number. The generic structs and their instances come
-  from one stream of their own.
+  from one stream of their own; how many methods each has and how each
+  takes its receiver from another, and each such method from one seeded
+  with its place among them.
 - **The function count shapes nothing before `main`**: a program generated
   with `--functions 3` is the same structs and methods and the first three
   helpers of the same seed's program with more, plus its own `main`.
@@ -310,10 +349,11 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
   generator's text, header aside: `--features
-  default,no-structs,no-constants,no-generics,no-generic-structs,no-inferred-type-arguments`
-  version 1's, `default,no-generics,no-generic-structs,no-inferred-type-arguments`
-  version 3's, `default,no-generic-structs,no-inferred-type-arguments`
-  version 4's, and `default,no-inferred-type-arguments` version 5's.
+  default,no-structs,no-constants,no-generics,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
+  version 1's, `default,no-generics,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
+  version 3's, `default,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
+  version 4's, `default,no-inferred-type-arguments,no-generic-methods`
+  version 5's, and `default,no-generic-methods` version 6's.
 - The header records the **generator version**, raised whenever one seed may
   produce different text, so a seed filed in a bug report names the
   generator that reproduces it.
@@ -327,7 +367,7 @@ every feature of the current stage; `no-<name>` removes one.
 |---|---|
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
-| 3 (this one) | `generics`: generic functions over one type parameter, unbounded or `where T: Eq`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference. Still to come in this stage: overload sets, methods of generic structs |
+| 3 (this one) | `generics`: generic functions over one type parameter, unbounded or `where T: Eq`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances. Still to come in this stage: overload sets |
 | 4 | `references`, `moves`: `&` / `mut &`, receivers, move-checked bindings |
 | 5 | `drop`: a drop log folded into the hash, the expected drop order |
 | 6 | `closures`: capturing and not, passed to function-typed slots |
@@ -422,7 +462,7 @@ layers, lowest first:
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
 | `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference` |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |
