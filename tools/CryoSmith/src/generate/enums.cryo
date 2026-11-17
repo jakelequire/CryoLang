@@ -27,7 +27,7 @@ import cryosmith::configuration::{ Feature };
 import cryosmith::generate::generator::{ Generator };
 import cryosmith::generate::structs::{ MethodCandidate };
 import cryosmith::guarantees::{ Exhaustiveness };
-import cryosmith::model::{ Enumeration, ExpressionKind, MatchArm, StatementKind, TypeArgumentSpelling, ValueType, VariantDeclaration };
+import cryosmith::model::{ Enumeration, ExpressionKind, MatchArm, PatternElement, StatementKind, TypeArgumentSpelling, ValueType, VariantDeclaration };
 import cryosmith::random::{ RandomStream };
 import cryosmith::typing::{ TypeChoice };
 
@@ -58,7 +58,12 @@ implement struct Generator {
                 const first_payload: i64 = this.program.payload_types.length();
                 const payload_count: i64 = if (this.options.features.has(Feature::EnumPayloads)) { declaring.below(MOST_PAYLOAD_VALUES + 1) } else { 0 };
                 while (this.program.payload_types.length() < first_payload + payload_count) {
-                    this.program.payload_types.push(TypeChoice::scalar(&declaring, this.options.features));
+                    // With `nested-patterns` a payload value may be of an
+                    // enum declared before this one, which a pattern can
+                    // match by its variant.
+                    const earlier: i64 = this.program.enumerations.length();
+                    const nested: boolean = this.options.features.has(Feature::NestedPatterns) && earlier > 0 && declaring.chance(50);
+                    this.program.payload_types.push(if (nested) { ValueType::Enumeration(declaring.below(earlier)) } else { TypeChoice::scalar(&declaring, this.options.features) });
                 }
                 this.program.variants.push(VariantDeclaration { first_payload: first_payload, payload_count: payload_count });
             }
@@ -198,19 +203,25 @@ implement struct Generator {
     internal match_expression(mut &this, wanted: ValueType, depth: i64) -> i64 {
         const subject: i64 = this.match_subject(depth);
         const matched: ValueType = this.program.expression_at(subject).value_type;
-        const patterns: Array<i64> = this.match_patterns(matched);
+        mut patterns: Array<i64> = this.match_patterns(matched);
         mut arms: Array<MatchArm> = Array::<MatchArm>::new();
-        for (pattern in patterns.iter()) {
+        mut position: i64 = 0;
+        while (position < patterns.length()) {
+            const pattern: i64 = patterns.get(position).unwrap();
             const scope: i64 = this.environment.mark();
-            const bindings: Array<i64> = this.payload_bindings(matched, pattern);
+            mut bindings: Array<i64> = Array::<i64>::new();
+            const elements: Array<i64> = this.payload_elements(matched, pattern, this.options.features.has(Feature::NestedPatterns), &bindings);
             mut observations: Array<i64> = Array::<i64>::new();
             for (binding in bindings.iter()) { this.observe_place(this.read(binding), &observations); }
             const body: i64 = this.expression(wanted, depth, true);
             this.environment.leave(scope);
+            const first_element: i64 = this.program.list_run(&elements);
+            if (this.program.elements_refutable(first_element, elements.length()) && patterns.get(patterns.length() - 1).unwrap() >= 0) { patterns.push(-1); }
             arms.push(MatchArm {
-                pattern: pattern, first_binding: this.program.list_run(&bindings), binding_count: bindings.length(),
+                pattern: pattern, first_element: first_element, element_count: elements.length(),
                 observations: this.program.block(&observations), body: body,
             });
+            position = position + 1;
         }
         const first: i64 = this.program.arm_run(&arms);
         return this.node(ExpressionKind::Match(subject, first, arms.length()), wanted);
@@ -221,17 +232,23 @@ implement struct Generator {
     internal match_statement(mut &this) -> i64 {
         const subject: i64 = this.match_subject(this.depth());
         const matched: ValueType = this.program.expression_at(subject).value_type;
-        const patterns: Array<i64> = this.match_patterns(matched);
+        mut patterns: Array<i64> = this.match_patterns(matched);
         mut arms: Array<MatchArm> = Array::<MatchArm>::new();
-        for (pattern in patterns.iter()) {
+        mut position: i64 = 0;
+        while (position < patterns.length()) {
+            const pattern: i64 = patterns.get(position).unwrap();
             const scope: i64 = this.environment.mark();
-            const bindings: Array<i64> = this.payload_bindings(matched, pattern);
+            mut bindings: Array<i64> = Array::<i64>::new();
+            const elements: Array<i64> = this.payload_elements(matched, pattern, this.options.features.has(Feature::NestedPatterns), &bindings);
             const body: i64 = this.block_observing(&bindings);
             this.environment.leave(scope);
+            const first_element: i64 = this.program.list_run(&elements);
+            if (this.program.elements_refutable(first_element, elements.length()) && patterns.get(patterns.length() - 1).unwrap() >= 0) { patterns.push(-1); }
             arms.push(MatchArm {
-                pattern: pattern, first_binding: this.program.list_run(&bindings), binding_count: bindings.length(),
+                pattern: pattern, first_element: first_element, element_count: elements.length(),
                 observations: -1, body: body,
             });
+            position = position + 1;
         }
         const first: i64 = this.program.arm_run(&arms);
         return this.program.statement(StatementKind::Match(subject, first, arms.length()));
@@ -253,12 +270,17 @@ implement struct Generator {
         mut arms: Array<MatchArm> = Array::<MatchArm>::new();
         while (arms.length() < this.program.enumeration_at(matched.enumeration()).variant_count) {
             const scope: i64 = this.environment.mark();
-            const bindings: Array<i64> = this.payload_bindings(matched, arms.length());
+            mut bindings: Array<i64> = Array::<i64>::new();
+            const elements: Array<i64> = this.payload_elements(matched, arms.length(), false, &bindings);
             mut folded: i64 = this.integer((arms.length() + 1) as u64, ValueType::U64);
-            for (binding in bindings.iter()) { folded = this.node(ExpressionKind::Mix(folded, this.read(binding)), ValueType::U64); }
+            for (binding in bindings.iter()) {
+                const place: i64 = this.read(binding);
+                const folding: i64 = if (this.program.variable_at(binding).value_type.is_enumeration()) { this.variant_number(place) } else { place };
+                folded = this.node(ExpressionKind::Mix(folded, folding), ValueType::U64);
+            }
             this.environment.leave(scope);
             arms.push(MatchArm {
-                pattern: arms.length(), first_binding: this.program.list_run(&bindings), binding_count: bindings.length(),
+                pattern: arms.length(), first_element: this.program.list_run(&elements), element_count: elements.length(),
                 observations: -1, body: folded,
             });
         }
@@ -266,16 +288,33 @@ implement struct Generator {
         return this.node(ExpressionKind::Match(value, first, arms.length()), ValueType::U64);
     }
 
-    /// A binding in scope for each value variant `pattern` of the enum type
-    /// `matched` carries; none for `_` or a unit variant.
-    private payload_bindings(mut &this, matched: ValueType, pattern: i64) -> Array<i64> {
-        mut bindings: Array<i64> = Array::<i64>::new();
-        if (pattern < 0) { return bindings; }
-        const shape: VariantDeclaration = this.program.variant_of(matched.enumeration(), pattern);
-        while (bindings.length() < shape.payload_count) {
-            bindings.push(this.environment.declare_binding(&this.program, this.program.payload_type(shape, bindings.length())));
+    /// The elements of a pattern over variant `variant` of the enum type
+    /// `matched`, one per payload value, as places among the program's
+    /// pattern elements; none for `_` (-1) or a unit variant.  A value is
+    /// bound, its binding in scope and added to `bindings`.  When `nests`
+    /// (`nested-patterns`), a value of an enum is instead matched by a
+    /// variant pattern of its own two times in five, which makes the arm
+    /// refutable, and any value by `_` a fifth of the time.
+    private payload_elements(mut &this, matched: ValueType, variant: i64, nests: boolean, bindings: mut &Array<i64>) -> Array<i64> {
+        mut elements: Array<i64> = Array::<i64>::new();
+        if (variant < 0) { return elements; }
+        const shape: VariantDeclaration = this.program.variant_of(matched.enumeration(), variant);
+        while (elements.length() < shape.payload_count) {
+            const payload: ValueType = this.program.payload_type(shape, elements.length());
+            if (nests && payload.is_enumeration() && this.random.chance(40)) {
+                const inner_variant: i64 = this.random.below(this.program.enumeration_at(payload.enumeration()).variant_count);
+                const inner: Array<i64> = this.payload_elements(payload, inner_variant, nests, bindings);
+                const inner_first: i64 = this.program.list_run(&inner);
+                elements.push(this.program.pattern_element(PatternElement::Variant(payload, inner_variant, inner_first, inner.length())));
+            } else if (nests && this.random.chance(20)) {
+                elements.push(this.program.pattern_element(PatternElement::Wildcard));
+            } else {
+                const binding: i64 = this.environment.declare_binding(&this.program, payload);
+                bindings.push(binding);
+                elements.push(this.program.pattern_element(PatternElement::Binding(binding)));
+            }
         }
-        return bindings;
+        return elements;
     }
 
     /// A `match`'s patterns over the enum type `matched`: one to all of its

@@ -252,6 +252,17 @@ giving a deciding value for each such payload when it is inferred; one
 with no such payload writes it, `G0::<u16>::V0`, since nothing in it says
 which instance.
 
+**Nested patterns.** With `nested-patterns`, a declared enum's payload
+value is of an enum declared before it half the time, `V2(E0, u8)`, and a
+`match` arm's pattern gives each payload value an element of its own: a
+binding, `_` a fifth of the time, or, for a value of an enum, a variant
+pattern of that enum two times in five, itself with elements,
+`E1::V2(E0::V1(b0, _), b1)`. A variant pattern matches only its variant,
+so an arm holding one is refutable, and its `match` then ends with `_`
+(section 3.2) even when every variant has an arm. The printer's
+observation folds a payload value of an enum through that value's own
+variant number. Every binding is still observed; a `_` binds nothing.
+
 **Inferred type arguments.** With `inferred-type-arguments`, a generic
 call or an instance's literal leaves its type argument to inference four
 times in ten (`g0(a, b)`, `B0 { f0: a }`) and writes the placeholder twice
@@ -333,7 +344,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **Every `match` is exhaustive and every arm reachable.** A `match`
   covers each variant once, by its own arm or by a `_` written last, and
   writes `_` only when a variant is left
-  (`guarantees/exhaustiveness.cryo`): no variant is uncovered, no arm
+  (`guarantees/exhaustiveness.cryo`) or an arm's pattern nests a variant
+  pattern, which leaves the rest of its variant to `_`
+  (`Program::elements_refutable`): no variant is uncovered, no arm
   follows `_`, and no variant has two arms.
 - **Overload resolution is certain.** A call of an overloaded name
   selects the member its arguments fit, and no implicit conversion makes
@@ -438,8 +451,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. `default,no-generic-enums` generates
-  version 13's text, and `default,no-enum-payloads` (which declares no
+  generator's text, header aside. `default,no-nested-patterns` generates
+  version 14's text, `default,no-nested-patterns,no-generic-enums`
+  version 13's, and `default,no-enum-payloads` (which declares no
   generic enum either) version 12's. `default,no-enums` generates version 9's
   text, `default,no-overloads,no-enums` version 8's, and with both added
   to each list,
@@ -468,7 +482,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
 | 3 | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
-| 4 (this one) | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments. Still to come in this stage: nested patterns |
+| 4 (this one) | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
 | 5 | closures: capturing and not, passed to function-typed parameters and called |
 | 6 | traits, classes and dynamic dispatch: implementations, default methods, calls through a bound and through a trait object |
 | 7 | ownership: moves, drops (a drop log folded into the hash), references, `Box` and `Rc`, `Option` and `Result` |

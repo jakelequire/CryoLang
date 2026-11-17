@@ -5,7 +5,7 @@ namespace cryosmith::emit::expressions;
 import std::collections::str::{ Str };
 
 import cryosmith::emit::printer::{ Printer };
-import cryosmith::model::{ ExpressionKind, ExpressionNode, Function, MatchArm, Program, TypeArgumentSpelling, ValueType };
+import cryosmith::model::{ ExpressionKind, ExpressionNode, Function, MatchArm, PatternElement, Program, TypeArgumentSpelling, ValueType };
 
 implement struct Printer {
     /// The expression at `index`.
@@ -146,19 +146,32 @@ implement struct Printer {
     }
 
     /// A `match` arm's pattern over a value of `matched`: `_`, or the
-    /// arm's variant with its bindings, `E0::V0`, `E0::V1(b0, b1)`.
+    /// arm's variant with its payload's elements, `E0::V0`,
+    /// `E0::V1(b0, _)`.
     internal pattern(mut &this, program: &Program, matched: ValueType, arm: MatchArm) -> void {
         if (arm.pattern < 0) {
             this.text.push(Str::new("_"));
             return;
         }
-        this.text.push(f"{program.enumeration_path(matched.enumeration()).as_str()}::V{arm.pattern}");
-        if (arm.binding_count == 0) { return; }
+        this.variant_pattern(program, matched, arm.pattern, arm.first_element, arm.element_count);
+    }
+
+    /// Variant `variant` of `matched` with `count` payload elements from
+    /// `first` in the index lists: `E0::V0`, `G0::V1(b0, E0::V2(_))`.
+    private variant_pattern(mut &this, program: &Program, matched: ValueType, variant: i64, first: i64, count: i64) -> void {
+        this.text.push(f"{program.enumeration_path(matched.enumeration()).as_str()}::V{variant}");
+        if (count == 0) { return; }
         this.text.push(Str::new("("));
         mut index: i64 = 0;
-        while (index < arm.binding_count) {
+        while (index < count) {
             if (index > 0) { this.text.push(Str::new(", ")); }
-            this.name(program, program.list_at(arm.first_binding + index));
+            match (program.pattern_element_at(program.list_at(first + index))) {
+                PatternElement::Binding(variable) => { this.name(program, variable); }
+                PatternElement::Wildcard => { this.text.push(Str::new("_")); }
+                PatternElement::Variant(inner, inner_variant, inner_first, inner_count) => {
+                    this.variant_pattern(program, inner, inner_variant, inner_first, inner_count);
+                }
+            }
             index = index + 1;
         }
         this.text.push(Str::new(")"));
