@@ -7,7 +7,7 @@ namespace cryosmith::emit::printer;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 
-import cryosmith::configuration::{ GENERATOR_VERSION, GenerationOptions };
+import cryosmith::configuration::{ GENERATOR_VERSION, GenerationOptions, Plant };
 import cryosmith::guarantees::{ Observation };
 import cryosmith::model::{ Field, Function, Program, Receiver, Structure, Variable, VariableRole };
 
@@ -15,10 +15,12 @@ import cryosmith::model::{ Field, Function, Program, Receiver, Structure, Variab
 public type struct Printer {
     /// The text written so far.
     internal text: String;
+    /// The deliberate defect the program is printed with, or none.
+    private plant: Plant;
 
     /// The source of `program`, generated with `options`.
     public static print(program: &Program, options: &GenerationOptions) -> String {
-        mut printer: Printer = Printer { text: String::new() };
+        mut printer: Printer = Printer { text: String::new(), plant: options.plant };
         if (options.header) { printer.header(options); }
         printer.prelude();
         mut index: i64 = 0;
@@ -56,7 +58,7 @@ public type struct Printer {
         this.text.push(Str::new("namespace Main;\n\nimport std::fmt;\n\n"));
         this.text.push(f"mut observed: u64 = {Observation::initial_state()};\n\n");
         this.text.push(Str::new("function mix(state: u64, value: u64) -> u64 {\n"));
-        this.text.push(f"    return (state ^ value).wrapping_multiply({Observation::multiplier()}).wrapping_add({Observation::increment()});\n");
+        this.text.push(f"    return (state.wrapping_multiply({Observation::multiplier()}) ^ value).wrapping_multiply({Observation::multiplier()}).wrapping_add({Observation::increment()});\n");
         this.text.push(Str::new("}\n"));
     }
 
@@ -117,13 +119,22 @@ public type struct Printer {
                 index = index + 1;
             }
             this.text.push(f") -> {program.type_name(defined.returns).as_str()} ");
-            if (defined.genericity.compares()) { this.text.push(Str::new("where T: Eq ")); }
-            if (defined.genericity.copies()) { this.text.push(Str::new("where T: Copy ")); }
+            if (defined.genericity.is_generic()) { this.bound(defined.genericity.compares()); }
             this.text.push(Str::new("{\n"));
         }
         this.block(program, defined.body, indent + 1);
         this.indent(indent);
         this.text.push(Str::new("}\n"));
+    }
+
+    /// A generic signature's bound on `T`: `where T: Copy`, or `where T: Eq
+    /// + Copy` when `compares`; the uncopied-type-parameter plant drops
+    /// `Copy`.
+    private bound(mut &this, compares: boolean) -> void {
+        const copies: boolean = this.plant.keeps_copy_bound();
+        if (compares && copies) { this.text.push(Str::new("where T: Eq + Copy ")); }
+        if (compares && !copies) { this.text.push(Str::new("where T: Eq ")); }
+        if (!compares && copies) { this.text.push(Str::new("where T: Copy ")); }
     }
 
     /// A variable's name: `observed`, `p<N>`, `v<N>`, `n<N>` or `this`.

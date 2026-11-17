@@ -135,9 +135,11 @@ range, so the argument is typed by the parameter and never refused.
 **Generics.** With `generics`, one to three generic functions
 `g<N><T>` are declared after the structs' methods and before `h0`: the
 first two parameters are `T`, the rest `T` or a value type, and the
-function returns `T`. Half are unbounded and half `where T: Eq`. In the
+function returns `T`. Half are bounded `where T: Copy` and half `where T:
+Eq + Copy`. In the
 body a `T` value is a read of a `T` name, an `if` expression over two, or a
-call of an earlier generic function at `T` (an `Eq`-bounded callee only
+call at `T` of an earlier generic function or generic struct's static
+method (an `Eq`-bounded callee only
 from an `Eq`-bounded body); under `Eq`, a boolean may compare two `T`
 values with `==` or `!=`. A call writes its type argument,
 `g0::<u16>(a, b)`: anywhere a value of that type is wanted, at an integer
@@ -171,11 +173,11 @@ argument in its parameters and its result: `v1.m1(a)` with `v1: B0<u16>`
 takes and returns `u16` where `m1` says `T`. One taking `mut &this` returns
 nothing and is called as a statement on a writable place, as a declared
 struct's is. A method calls only earlier ones, its own struct's on `this`
-among them. Each method is bounded `where T: Copy`, so its body may pass,
-store and select a `T` value as often as it likes (a type parameter is
-otherwise not `Copy`, and each of those moves it); every type a value has
-is `Copy`, so any instance may call it, while a generic function, whose
-`T` has no such bound, calls one only at a type, never at its own `T`.
+among them. Each method is bounded `where T: Copy`, as every generic
+function is, so its body may pass, store and select a `T` value as often
+as it likes (a type parameter is otherwise not `Copy`, and each of those
+moves it); every type a value has is `Copy`, so any instance may call it,
+and a generic function may call a static one at its own `T`.
 
 **Kept off: a generic struct's own bare literal inside its methods.**
 Inside a generic struct's method, a literal of that same generic struct
@@ -253,13 +255,15 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   only whole, never with a compound operator. It is compared only under `where T: Eq`, and a generic
   function is instantiated only at a type its bound admits - an `Eq`-bounded
   one never at a struct, which does not implement `Eq`.
-- **Moves.** A value of an unbounded or `Eq`-bounded `T` is not `Copy`,
-  so each pass, store or selection of one moves it. A generic struct's
-  methods are bounded by `Copy` and may use a `T` value freely. The
-  generic functions do not yet carry that bound, and pass a `T`
-  parameter more than once: the compiler accepts it only because it
-  checks a generic function's moves per instance, where every type is
-  `Copy`. Owed: bound them by `Copy` too.
+- **Moves.** A type parameter is not `Copy` unless a bound says so, and
+  each pass, store or selection of a value that is not `Copy` moves it.
+  Every generic function and generic struct method is bounded by `Copy`
+  (`where T: Copy`, or `where T: Eq + Copy`), so a body uses a `T` value
+  as often as it likes, and every type it is instantiated at is `Copy`.
+  The self-test's bound audit (section 7) refuses a generic definition
+  that names a `T` parameter twice, or once inside a loop, without the
+  bound; it reads the text, since the compiler accepts such a function
+  when every instance's type is `Copy` and so cannot be the check.
 - **Inference is certain.** A call or literal that leaves its type
   argument to inference gives `T` only deciding values (section 2), so
   each of them has the type argument's type and they agree; nothing else
@@ -293,9 +297,13 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - No input, no clock, no address, no environment, no thread: the only
   output is the final hash line.
 - `observed` is a global `u64`. An observation folds a value into it with
-  `mix`, defined in the program as FNV-1a's step plus a constant
-  (`(state ^ value).wrapping_multiply(1099511628211).wrapping_add(2654435769)`),
-  so folding the state into itself does not stick at zero. An integer is
+  `mix`, defined in the program as
+  `(state.wrapping_multiply(1099511628211) ^ value).wrapping_multiply(1099511628211).wrapping_add(2654435769)`.
+  For a fixed value it is a bijection of the state and for a fixed state
+  one of the value, and folding a value equal to the state still depends
+  on the state: a program that observes `observed` itself (a generic call
+  handed `observed` twice returns it) keeps every earlier observation,
+  where a plain exclusive-or of the two would cancel them. An integer is
   folded as `(e as u64)`; a boolean as `1` or `2`. `observed` is read as a
   value only where no other name of the wanted type is in scope.
 - A struct is observed field by field, nested structs through their own
@@ -353,7 +361,13 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   version 1's, `default,no-generics,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
   version 3's, `default,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
   version 4's, `default,no-inferred-type-arguments,no-generic-methods`
-  version 5's, and `default,no-generic-methods` version 6's.
+  version 5's, and `default,no-generic-methods` version 6's - for version
+  7 and earlier, once version 8's text is rewritten back in three places
+  it alone changed: `mix`'s body, and a generic function's bound, `where
+  T: Copy` (dropped) and `where T: Eq + Copy` (written `where T: Eq`).
+  Version 8 also lets a generic function call a generic struct's static
+  method at its own `T`, so with `generic-methods` on a seed's generic
+  functions may draw differently.
 - The header records the **generator version**, raised whenever one seed may
   produce different text, so a seed filed in a bug report names the
   generator that reproduces it.
@@ -367,12 +381,15 @@ every feature of the current stage; `no-<name>` removes one.
 |---|---|
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
-| 3 (this one) | `generics`: generic functions over one type parameter, unbounded or `where T: Eq`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances. Still to come in this stage: overload sets |
-| 4 | `references`, `moves`: `&` / `mut &`, receivers, move-checked bindings |
-| 5 | `drop`: a drop log folded into the hash, the expected drop order |
-| 6 | `closures`: capturing and not, passed to function-typed slots |
-| 7 | `traits`: default methods, implementations, calls through a bound |
-| 8 | `async` |
+| 3 (this one) | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances. Still to come in this stage: overload sets |
+| 4 | enums with unit and payload variants, generic enums, and `match`: qualified variants, payload bindings, nested patterns, wildcards, `match` as an expression |
+| 5 | closures: capturing and not, passed to function-typed parameters and called |
+| 6 | traits, classes and dynamic dispatch: implementations, default methods, calls through a bound and through a trait object |
+| 7 | ownership: moves, drops (a drop log folded into the hash), references, `Box` and `Rc`, `Option` and `Result` |
+| 8 | strings, arrays and collections |
+
+Section 9 places each stage among the rest of the work, the tools that
+run what the stages generate.
 
 A new stage adds features; it never changes what an existing seed and
 feature list generate without raising the generator version.
@@ -447,7 +464,14 @@ statement budget of one function, default 24), `--no-header`, and
 - **Plants prove the checks can refuse.** `--plant unguarded-division`
   generates `(a / (b & M))`, without the `| 1`. The static audit must refuse
   every planted program that divides, and the corpus check must report the
-  plant as a failure. A plant is never on by default and the header names it.
+  plant as a failure. `--plant uncopied-type-parameter` prints every
+  generic function and method without its `Copy` bound; the bound audit
+  must refuse such a program exactly when the same seed's unplanted text
+  has a generic definition that uses a `T` value more than once. A plant
+  is never on by default and the header names it.
+- **The bound audit** reads every generic signature's `T` parameters and
+  counts their uses in its body, a use inside a loop twice; one used more
+  than once needs `Copy` in the bound (section 3.2).
 
 ## 8. Architecture
 
@@ -518,3 +542,85 @@ no-structs,no-constants`, every feature named, and smaller ones), and the
 two corpora must be byte-identical. A one-character change to the printer
 must make that comparison fail, or the comparison is not reading what it
 claims to.
+
+## 9. Roadmap
+
+CryoSmith joins `main` when all twelve items below are done, in this
+order. Items 1 to 6 are generator stages (section 4): each adds features,
+their forms, the guarantees that keep the forms valid, a switch check in
+the self-test, an old-seed reproduction check and a corpus. Items 7 to 12
+are the tools that use what the stages generate; most of them belong to
+CryoGate, which runs compilers, while CryoSmith stays a generator.
+
+1. **Finish stage 3: overload sets.** Functions and methods of one name
+   that differ in their parameters, called where exactly one is chosen.
+   `model/`: a function's spelled name apart from its number, so two
+   functions share a name. `generate/overloads.cryo`: a set's members
+   differ in parameter count or in a parameter's type, and a call passes
+   arguments of exactly one member's types, never a value that would widen
+   to another's. `guarantees/`: the rule that keeps a call unambiguous,
+   stated once. `emit/`: the shared name.
+2. **Stage 4: enums and `match`.** `model/`: enums `E<N>` (and generic
+   `E<N><T>`) with unit and payload variants, an enum type in `ValueType`,
+   variant constructions, and a `match` node, both a statement and an
+   expression, holding arms of patterns. `generate/enums.cryo` and
+   `generate/matching.cryo`: values of an enum type, and matches over
+   them with qualified variants, payload bindings, nested patterns and
+   wildcards. `guarantees/`: every match is exhaustive (each variant
+   covered, or a wildcard last) and every binding is used as its type
+   allows (observed, or passed where its type is wanted). `typing/`:
+   bindings enter an arm's scope and leave with it. `emit/`: enum
+   declarations, constructions, patterns. Observation: an enum value is
+   observed by a `match` that folds its variant's number and its payload.
+3. **Stage 5: closures.** `model/`: function types and closure
+   expressions, captures. `generate/`: closures with and without captures,
+   passed to function-typed parameters and called. `guarantees/`: a
+   closure's cost is its body's, charged at each call; a capture is read,
+   never moved twice. `typing/`: a closure's own scope over its captures.
+4. **Stage 6: traits, classes and dynamic dispatch.** `model/`: traits
+   with required and default methods, implementations for structs and
+   enums, classes, trait objects. `generate/`: calls through a bound and
+   through a trait object. `guarantees/`: every call resolves to one
+   implementation; the hash is the same whichever way it is dispatched.
+5. **Stage 7: ownership.** `model/`: references (`&`, `mut &`) as values,
+   `Box`, `Rc`, `Option`, `Result`, types with a drop. `generate/`: moves,
+   borrows, early drops. `guarantees/`: no use after a move and no borrow
+   outliving its owner, decided by the generator's own ownership state in
+   `typing/`; a drop log folded into the hash, so the order of drops is
+   checked by both optimisation levels agreeing.
+6. **Stage 8: strings, arrays and collections.** `model/`: `Str`,
+   `String`, fixed arrays, `Array`, `HashMap`. `generate/`: building,
+   indexing within bounds, iterating. `guarantees/`: an index is in range
+   by construction (masked against a length the generator knows);
+   iteration order is observed only where the collection fixes it.
+7. **A differential driver** (CryoGate, `cryogate smith-diff`). Builds one
+   program under several configurations - `-O0` and `-O2`, the pin and
+   the compiler under test, Windows and Linux (through WSL) - runs each
+   under a time limit, and reports a mismatch, a crash, a refusal or a
+   hang, naming the seed and the configuration. CryoSmith adds nothing but
+   the output contract it already has.
+8. **A reducer** (CryoGate, `cryogate smith-reduce`). Shrinks a failing
+   program while the same failure reproduces: first by asking CryoSmith
+   for fewer functions and a smaller `--size` from the same seed (section
+   6), then by deleting lines and subtrees. It drafts the bug file: the
+   reduced repro, the configurations that disagree, the seed and header.
+   CryoSmith's part is section 6's reduction-friendliness, kept as the
+   stages grow.
+9. **A crash fuzzer.** Near-valid programs: CryoSmith's `--plant` grows
+   into mutations of a valid program (a deleted line, a swapped operand,
+   a wrong type), each expected to be refused with a diagnostic, never to
+   crash the compiler. CryoGate builds them and reports a crash, a hang or
+   an internal error, not a refusal.
+10. **A fuzz farm** (CryoGate, `cryogate smith-farm`). Overnight batches
+    of the differential driver over consecutive seeds, failures
+    deduplicated by their signature (the diagnostic code, the crash site,
+    the disagreeing configuration), reduced, and a summary written.
+11. **A corpus gate in `make verify`.** A small fixed set of seeds at a
+    pinned generator version, checked as `corpus-check` checks them, run
+    by verify beside its other gates; a seed that fails is a compiler
+    finding, and a new generator version re-pins the set.
+12. **The reference interpreter.** An evaluator over the program model
+    (section 1) that computes the hash without compiling: an oracle that
+    does not share the compiler's mistakes. CryoSmith gains an `evaluate`
+    command, or a library CryoGate links, and the corpus check compares
+    the compiled programs' hash with the evaluated one.

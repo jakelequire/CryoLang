@@ -1,0 +1,165 @@
+///! A static audit of a printed program's generic signatures: a generic
+///! function or method that names one of its `T` parameters more than
+///! once in its body, or once inside a loop, is bounded by `Copy`.
+///!
+///! A type parameter is not `Copy` unless a bound says so, and passing,
+///! storing or selecting a value that is not `Copy` moves it, so a second
+///! use is a use after a move.  The audit counts textual uses, so two
+///! exclusive arms of one `if` count twice: it asks for more bounds than
+///! the language needs, never fewer.  It reads the printed text, as the
+///! guard audit does, so a generator that drops a bound from the model or
+///! from the text is refused here.
+
+namespace cryosmith::selftest::copy_bounds;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+import cryosmith::configuration::{ GenerationOptions, Plant };
+import cryosmith::selftest::runner::{ SelfTest };
+
+/// How many programs, and as many planted ones, the audit reads.
+const BOUND_AUDITED_PROGRAMS: u64 = 200;
+
+/// The audit of one program's generic signatures.
+internal type struct CopyBoundAudit {
+    /// The number of generic definitions that use a `T` parameter more
+    /// than once, every one bounded by `Copy`; or the first that is not.
+    internal static check(text: Str) -> Result<i64, String> {
+        const lines: Array<Str> = text.lines().collect::<Array<Str>>();
+        mut reusing: i64 = 0;
+        mut in_generic_struct: boolean = false;
+        mut index: i64 = 0;
+        while (index < lines.length()) {
+            const line: Str = lines.get(index).unwrap();
+            if (line.starts_with(&Str::new("type struct ")) && line.contains(&Str::new("<T>"))) { in_generic_struct = true; }
+            if (line == Str::new("}")) { in_generic_struct = false; }
+            const trimmed: Str = line.trim_start();
+            const signature: boolean = line.ends_with(&Str::new(" {")) && trimmed.contains(&Str::new(") -> ")) && (
+                line.starts_with(&Str::new("function g")) || (in_generic_struct && line.length() - trimmed.length() == 4)
+            );
+            if (signature) {
+                const indent: i64 = line.length() - trimmed.length();
+                const parameters: Array<Str> = CopyBoundAudit::type_parameter_names(trimmed);
+                mut most: i64 = 0;
+                mut parameter: i64 = 0;
+                while (parameter < parameters.length()) {
+                    const uses: i64 = CopyBoundAudit::uses_in_body(&lines, index + 1, indent, parameters.get(parameter).unwrap());
+                    if (uses > most) { most = uses; }
+                    parameter = parameter + 1;
+                }
+                if (most > 1) {
+                    const bounds: Str = trimmed.split_once_from_end(&Str::new(") -> ")).unwrap().second;
+                    if (!bounds.contains(&Str::new("Copy"))) {
+                        return Result::Err(f"line {index + 1}: a `T` parameter is used {most} times with no `Copy` bound: `{trimmed}`");
+                    }
+                    reusing = reusing + 1;
+                }
+            }
+            index = index + 1;
+        }
+        return Result::Ok(reusing);
+    }
+
+    /// The names of a signature's parameters of type `T`.
+    private static type_parameter_names(signature: Str) -> Array<Str> {
+        mut names: Array<Str> = Array::<Str>::new();
+        const opened: i64 = match (signature.find(&Str::new("("))) {
+            Option::Some(position) => { position + 1 }
+            Option::None           => { return names; }
+        };
+        const closed: i64 = match (signature.find_last(&Str::new(") -> "))) {
+            Option::Some(position) => { position }
+            Option::None           => { return names; }
+        };
+        for (parameter in signature.byte_substring(opened, closed).split(&Str::new(", "))) {
+            match (parameter.split_once(&Str::new(": "))) {
+                Option::Some(parts) => { if (parts.second == Str::new("T")) { names.push(parts.first); } }
+                Option::None        => { }
+            }
+        }
+        return names;
+    }
+
+    /// How many times `name` is used in the body that starts at line
+    /// `first` and ends at the `}` written at `indent`, a use inside a loop
+    /// counting twice.
+    private static uses_in_body(lines: &Array<Str>, first: i64, indent: i64, name: Str) -> i64 {
+        mut uses: i64 = 0;
+        mut loop_indents: Array<i64> = Array::<i64>::new();
+        mut index: i64 = first;
+        while (index < lines.length()) {
+            const line: Str = lines.get(index).unwrap();
+            const trimmed: Str = line.trim_start();
+            const depth: i64 = line.length() - trimmed.length();
+            if (depth <= indent && trimmed.starts_with(&Str::new("}"))) { return uses; }
+            if (loop_indents.length() > 0 && trimmed.starts_with(&Str::new("}"))
+                    && depth == loop_indents.get(loop_indents.length() - 1).unwrap()) {
+                loop_indents.pop();
+            }
+            if (trimmed.starts_with(&Str::new("for (")) || trimmed.starts_with(&Str::new("while ("))) { loop_indents.push(depth); }
+            const found: i64 = CopyBoundAudit::occurrences(trimmed, name);
+            if (loop_indents.length() > 0) { uses = uses + found * 2; } else { uses = uses + found; }
+            index = index + 1;
+        }
+        return uses;
+    }
+
+    /// How many times `name` appears in `line` as a whole word.
+    private static occurrences(line: Str, name: Str) -> i64 {
+        mut count: i64 = 0;
+        mut position: i64 = 0;
+        while (position + name.length() <= line.length()) {
+            if (line.byte_substring(position, line.length()).starts_with(&name)
+                    && !CopyBoundAudit::is_word_byte(line, position - 1)
+                    && !CopyBoundAudit::is_word_byte(line, position + name.length())) {
+                count = count + 1;
+            }
+            position = position + 1;
+        }
+        return count;
+    }
+
+    /// Whether the byte at `position` continues a name.
+    private static is_word_byte(line: Str, position: i64) -> boolean {
+        if (position < 0) { return false; }
+        return match (line.byte_at(position)) {
+            Option::Some(byte) => { byte.is_alpha() || byte.is_digit() || byte == '_' as u8 || byte == '.' as u8 }
+            Option::None       => { false }
+        };
+    }
+}
+
+implement struct SelfTest {
+    /// The bound audit passes every program and finds generic definitions
+    /// that reuse a `T` value, and a program printed without its `Copy`
+    /// bounds is refused exactly when its unplanted text has one.
+    internal copy_bound_audit(mut &this) -> void {
+        mut reusing: i64 = 0;
+        mut refused: i64 = 0;
+        mut mismatched: i64 = 0;
+        mut seed: u64 = 1;
+        while (seed <= BOUND_AUDITED_PROGRAMS) {
+            const text: String = SelfTest::program(GenerationOptions::new(seed));
+            mut count: i64 = 0;
+            match (CopyBoundAudit::check(text.as_str())) {
+                Result::Ok(found)   => { count = found; }
+                Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }
+            }
+            reusing = reusing + count;
+            mut planted: GenerationOptions = GenerationOptions::new(seed);
+            planted.plant = Plant::UncopiedTypeParameter;
+            const planted_text: String = SelfTest::program(planted);
+            const planted_refused: boolean = CopyBoundAudit::check(planted_text.as_str()).is_err();
+            if (planted_refused) { refused = refused + 1; }
+            if (planted_refused != (count > 0)) { mismatched = mismatched + 1; }
+            seed = seed + 1;
+        }
+        this.expect(reusing > 0, String::from_str(Str::new("the bound audit found no generic definition reusing a `T` value")));
+        this.expect(refused > 0, String::from_str(Str::new("the bound audit refused no planted program")));
+        this.expect(mismatched == 0, f"{mismatched} planted programs were refused although their unplanted text reuses no `T` value, or the reverse");
+    }
+}
