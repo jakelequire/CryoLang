@@ -7,11 +7,7 @@ A script with no caller in the Makefile, CI or another script is deleted. A
 one-off codemod lands in the commit that ran it and is deleted in the next
 one; the history keeps it.
 
-## Gates
-
-| script | what it does | called by |
-|---|---|---|
-| `lsp-gate.py` | Builds `tools/CryoLSP` with the compiler under test into its own directory, then runs that binary through `tools/CryoLSP/tests/smoke.py` (protocol checks and every fixture's checks) | `make lsp-check`, `cryogate verify` (lsp), CI |
+Every gate is a `cryogate` subcommand (`tools/CryoGate`); none is a script.
 
 ## Release
 

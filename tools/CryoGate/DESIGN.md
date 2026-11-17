@@ -36,6 +36,8 @@ upward, and no two files of one layer import each other in a cycle.
 | `smith/` | CryoSmith's programs as checked: the hash line each must print, the two builds' agreement, a failed build quoted (CryoSmith generates; checking a corpus is cryogate's) | core |
 | `negative/` | the compile-fail suite's `//~` annotations: the diagnostics a run anchors in a file, the lines that pin them, and the two-way check | core |
 | `abi/` | the runtime's ABI: the lang-item registry's rows and what each configuration must define, the symbols an archive's members define, the `__cryo_` names the sources spell | core |
+| `lsp/` | the language server's checks: reading a message, the wire (framing, URIs, UTF-16 positions), a fixture's `checks.json` and markers, each kind of check's judgement of an answer, a server build's report | core |
+| `lsp/run/` | the language server run itself: one running server, its streams read by two threads, and the protocol and fixture checks against it | core, the lsp decisions |
 | `gates/` | one file per subcommand: its command line, the children it runs, the lines it prints, its exit code | every layer above; **never another gate** |
 | `main.cryo`, `selftest.cryo`, `probe.cryo`, `heavy.cryo` | the entry point and the subcommands that are not gates (`selftest`, its child `probe`, `heavy`) | everything |
 
@@ -48,7 +50,8 @@ compiler; `verify/run/` is where verify's children are started, so
 `gates/verify.cryo` stays the command line only.  `selfhost/` is ordered
 the same way: stages, trees, archives, digest, mirror, arms, judges, then
 its `run/` (arm, wsl); `incremental/` too: edits, snapshots, then its
-`run/` (matrix).
+`run/` (matrix); and `lsp/`: reading, wire, fixture, judges, build, then its
+`run/` (server, smoke).
 
 The test files under `tests/` import whichever layer they test.
 

@@ -170,16 +170,11 @@ TEST_STARTUP_HELPERS_C := $(TEST_HELPERS_DIR)/startup_helpers.c
 TEST_STARTUP_HELPERS_O := $(TEST_HELPERS_DIR)/startup_helpers-unix.o
 TEST_STARTUP_HELPERS_A := $(TEST_HELPERS_DIR)/libstartuphelpers-unix.a
 
-# Python interpreter for the helper scripts, and the only spelling of it in
-# the recipes.  Windows ships `python.exe`, and its `python3` is an App
-# Execution Alias that exits 49; Linux/macOS use `python3`.  NOOP is a recipe
-# line that does nothing in either shell, so a target that only prints through
-# `$(info)` does not also report "Nothing to be done".
+# NOOP is a recipe line that does nothing in either shell, so a target that
+# only prints through `$(info)` does not also report "Nothing to be done".
 ifeq ($(HOST_OS),windows)
-    PYTHON := python
     NOOP   := @rem
 else
-    PYTHON := python3
     NOOP   := @:
 endif
 
@@ -261,7 +256,7 @@ Tests and gates
   make lsp-check         tools/CryoLSP builds with the compiler under test
                          (into its own directory; installs nothing), and
                          the binary passes its behavioural checks
-                         (tools/CryoLSP/tests/smoke.py).
+                         (`cryogate lsp`).
   make warnings-check    compiler/, the stdlib and the runtime build with
                          -Werror under the compiler under test, the stdlib
                          under both panic strategies and the runtime in each
@@ -657,7 +652,7 @@ cryosmith-selftest: $(CRYOSMITH)
 # always reflects the current source.  The extension finds the server itself
 # (tools/CryoLSP/build/ in this workspace, bin/ through PATH elsewhere), and
 # `lsp` writes both, so neither can be left behind.
-install-lsp: lsp
+install-lsp: lsp $(CRYOGATE)
 ifeq ($(HOST_OS),windows)
 # Windows host: the POSIX recipe below (`command -v`, `{ ... }`, `[ -d ]`,
 # `rm`, `./node_modules/.bin/...`) is unparseable by cmd, so the whole job
@@ -665,11 +660,11 @@ ifeq ($(HOST_OS),windows)
 # `where`/`if exist`/`del` and the `.cmd` shims (`code.cmd`, `npm.cmd`,
 # `vsce.cmd`) that npm installs on Windows.
 install-lsp:
-	@$(PYTHON) tools/CryoLSP/tests/smoke.py "$(LSP_PIN)"
+	@$(CRYOGATE_COMMAND) lsp-smoke "$(LSP_PIN)"
 	scripts\install-lsp-windows.cmd
 else
 install-lsp:
-	@$(PYTHON) tools/CryoLSP/tests/smoke.py "$(LSP_PIN)"
+	@$(CRYOGATE_COMMAND) lsp-smoke "$(LSP_PIN)"
 	@command -v code >/dev/null 2>&1 || { echo "ERROR: 'code' CLI not found on PATH"; exit 1; }
 	@echo "==> Ensuring CryoAnalyzer node_modules are present"
 	@cd "$(EXT_DIR)" && [ -d node_modules ] || npm install
@@ -883,13 +878,8 @@ check-fast: verify-selftest verify-pin cryosmith-selftest
 #
 # This costs a stage-2 build when one is not already present.  That is the
 # price of the coverage, and CI pays nothing extra: `make cryo` runs first.
-ifeq ($(HOST_OS),windows)
-lsp-check: $(STAGE2_EXE)
-	@$(PYTHON) scripts/lsp-gate.py --cryo "$(STAGE2_EXE)" $(ARGS)
-else
-lsp-check: $(STAGE2)
-	@$(PYTHON) scripts/lsp-gate.py --cryo "$(STAGE2)" $(ARGS)
-endif
+lsp-check: $(STAGE2_FILE) $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) lsp --cryo "$(STAGE2_FILE)" $(ARGS)
 
 # The compiler's own source and the whole stdlib build with no warning.  A
 # stdlib warning is reported only by the build that MAKES the archive, so the

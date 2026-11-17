@@ -1,0 +1,163 @@
+///! The language server's wire: each message is a header block holding its
+///! `Content-Length`, a blank line, and that many bytes of JSON body.  What
+///! is written is framed here, and what is read is cut back into bodies here,
+///! as the bytes arrive in whatever pieces the pipe hands over.  A position
+///! in a document is a zero-based line and a column counted in UTF-16 units,
+///! and a document is named by a `file://` URI; both are spelled here too.
+
+namespace cryogate::lsp::wire;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::json::serializer;
+import std::json::value::{ JsonValue };
+
+import cryogate::core::host::{ Host };
+import cryogate::core::text::{ Text };
+import cryogate::lsp::reading::{ Reading };
+
+/// Writing a message.
+public type struct Frames {
+    /// `body` with the header block the protocol puts before it.
+    public static framed(body: Str) -> String {
+        return f"Content-Length: {body.length()}\r\n\r\n{body}";
+    }
+
+    /// `text` as a JSON string literal, quotes and escapes included, for a
+    /// message written as text.
+    public static quoted(text: Str) -> String {
+        const value: JsonValue = JsonValue::from(text);
+        return serializer::stringify(&value);
+    }
+}
+
+/// Bytes read from a server, cut into message bodies as each completes.
+public type struct FrameBuffer {
+    private pending: String;
+
+    /// An empty buffer.
+    public static new() -> FrameBuffer { return FrameBuffer { pending: String::new() }; }
+
+    /// Append the bytes just read.
+    public push(mut &this, bytes: &Slice<u8>) -> void {
+        this.pending.push(Str::from_raw(bytes.as_pointer(), bytes.length()));
+    }
+
+    /// The next whole body, `None` while the bytes so far hold none.  A
+    /// header block with no `Content-Length` (the name in any case) is an
+    /// error: nothing after it can be read as a message.
+    public next(mut &this) -> Result<Option<String>, String> {
+        const text: Str = this.pending.as_str();
+        const end: i64 = match (text.find(&Str::new("\r\n\r\n"))) {
+            Option::Some(at) => { at }
+            Option::None     => { return Result::Ok(Option::None); }
+        };
+        mut length: i64 = -1;
+        for (line in text.byte_substring(0, end).split(&Str::new("\r\n"))) {
+            match (line.split_once(&Str::new(":"))) {
+                Option::Some(parts) => {
+                    if (parts.first.trim().equals_case_insensitive(&Str::new("content-length")) && Text::is_digits(parts.second.trim())) {
+                        length = i64::try_from(parts.second.trim()).unwrap_or(-1);
+                    }
+                }
+                Option::None => { }
+            }
+        }
+        if (length < 0) {
+            return Result::Err(f"a header block without a Content-Length: {text.byte_substring(0, end)}");
+        }
+        const start: i64 = end + 4;
+        if (text.length() - start < length) { return Result::Ok(Option::None); }
+        const body: String = String::from_str(text.byte_substring(start, start + length));
+        this.pending = String::from_str(text.byte_substring(start + length, text.length()));
+        return Result::Ok(Option::Some(body));
+    }
+}
+
+/// A document's place: its URI, and positions in its text.
+public type struct Locations {
+    /// The `file://` URI of `path`, made absolute, with forward slashes and
+    /// a leading `/` before a drive letter.
+    public static uri_for(path: Str) -> String {
+        const absolute: String = Host::absolute(path).as_str().replace(&Str::new("\\"), &Str::new("/"));
+        if (absolute.as_str().starts_with(&Str::new("/"))) { return f"file://{absolute.as_str()}"; }
+        return f"file:///{absolute.as_str()}";
+    }
+
+    /// `uri` with an escaped drive colon written plainly and in lower case:
+    /// two spellings of one file compare equal after it.
+    public static plain(uri: Str) -> String {
+        const unescaped: String = uri.replace(&Str::new("%3A"), &Str::new(":")).as_str().replace(&Str::new("%3a"), &Str::new(":"));
+        return unescaped.as_str().to_ascii_lowercase();
+    }
+
+    /// Whether `a` and `b` name one file, however the drive colon is escaped
+    /// and whatever the letters' case.
+    public static same_uri(a: Str, b: Str) -> boolean {
+        return Locations::plain(a) == Locations::plain(b);
+    }
+
+    /// A location's file name and start, comparable whatever the URI's
+    /// escaping: `name:line:character`.
+    public static position_key(uri: Str, line: i64, character: i64) -> String {
+        const plain: String = Locations::plain(uri);
+        const name: Str = match (plain.as_str().split_once_from_end(&Str::new("/"))) {
+            Option::Some(parts) => { parts.second }
+            Option::None        => { plain.as_str() }
+        };
+        return f"{name}:{line}:{character}";
+    }
+
+    /// The position of byte `offset` in `text`: its zero-based line, and its
+    /// column counted in UTF-16 units from the line's start.
+    public static position_of(text: Str, offset: i64) -> Position {
+        mut line: i64 = 0;
+        mut line_start: i64 = 0;
+        const bytes: &Slice<u8> = text.as_bytes();
+        for (mut index: i64 = 0; index < offset; index++) {
+            if (bytes.get(index).unwrap() == '\n' as u8) {
+                line++;
+                line_start = index + 1;
+            }
+        }
+        mut column: i64 = 0;
+        for (code_point in text.byte_substring(line_start, offset).chars()) {
+            column = column + if (code_point > 0xFFFF) { 2 } else { 1 };
+        }
+        return Position { line: line, character: column };
+    }
+}
+
+/// A zero-based line and UTF-16 column.
+public type struct Position {
+    public line: i64;
+    public character: i64;
+
+    /// The position as a JSON object's text.
+    public json(&this) -> String {
+        return f"{{\"line\":{this.line},\"character\":{this.character}}}";
+    }
+
+    /// Whether `value` is a JSON position object naming this position.
+    public matches(&this, value: Option<JsonValue*>) -> boolean {
+        return match (Position::read(value)) {
+            Option::Some(other) => { other.line == this.line && other.character == this.character }
+            Option::None        => { false }
+        };
+    }
+
+    /// The position a JSON `{"line", "character"}` object names.
+    public static read(value: Option<JsonValue*>) -> Option<Position> {
+        const object: JsonValue* = value?;
+        const line: i64 = Reading::integer(object, Str::new("line"))?;
+        const character: i64 = Reading::integer(object, Str::new("character"))?;
+        return Option::Some(Position { line: line, character: character });
+    }
+
+    /// The position as `line:character`, one-based, for a failure's detail.
+    public shown(&this) -> String { return f"{this.line + 1}:{this.character + 1}"; }
+}

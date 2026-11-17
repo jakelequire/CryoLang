@@ -203,8 +203,8 @@ workspace symbols, completion, semantic tokens, the implementations lens,
 rename, signature help and inlay hints, and writes names as the cursor's
 scope writes them (ruling 346).  A standard library or dependency file is
 answered from the analysis of the project that holds it.  `make lsp-check`
-drives the server through `tools/CryoLSP/tests/smoke.py` over its fixtures
-and refuses below its floor of passing checks (`docs/testing.md` section
+(`cryogate lsp`) drives the server through its protocol checks and its
+fixtures, and refuses below its floor of passing checks (`docs/testing.md` section
 9).  Two open defects are in the bug log: memory that may grow across saves,
 and one unreproduced unanswered request.
 

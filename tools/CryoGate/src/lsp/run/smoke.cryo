@@ -1,0 +1,1217 @@
+///! The language server's behavioural checks, run against one built server.
+///!
+///! Two kinds of check.  Protocol checks, written here: the lifecycle, the
+///! error replies, requests behind one that starts an analysis, a file
+///! outside any project typed one character at a time, and a jump into the
+///! standard library followed the way an editor follows it (twice: with the
+///! library found from the project, and with its root spelled through
+///! `..`).  Fixture checks: every directory under
+///! `tools/CryoLSP/tests/fixtures/` holding a `checks.json` (`lsp/fixture`,
+///! `lsp/judges`).  Each fixture and each protocol group gets a server of
+///! its own, so one crash cannot hide the rest.
+///!
+///! Each check prints `  ok   <name>` or `  FAIL <name>  -- <detail>`; the
+///! run ends with `lsp-smoke: N passed, M failed (K fixtures)`, and passes
+///! only when nothing failed and something ran.
+
+namespace cryogate::lsp::run::smoke;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::fs::temporary::{ TemporaryDirectory };
+import std::io::error::{ IoError };
+import std::json::serializer;
+import std::json::value::{ JsonValue };
+import std::thread;
+import std::time::clock::{ Instant };
+import std::time::duration::{ Duration };
+
+import std::json::parser;
+
+import cryogate::core::host::{ Host };
+import cryogate::core::text::{ Text };
+import cryogate::core::tree::{ Tree };
+import cryogate::lsp::fixture::{ Fixture };
+import cryogate::lsp::judges::{ Judgement, Judges };
+import cryogate::lsp::reading::{ Reading };
+import cryogate::lsp::wire::{ Frames, Locations, Position };
+import cryogate::lsp::run::server::{ Server };
+
+/// The checks' running count, and the lines they print.
+public type struct Tally {
+    public passed: i64;
+    public failed: i64;
+    public fixtures: i64;
+    /// Every line printed, in order.
+    public lines: Array<String>;
+    private live: boolean;
+
+    /// A tally that prints each line as it is said when `live`, and keeps
+    /// them all either way.
+    public static new(live: boolean) -> Tally {
+        return Tally { passed: 0, failed: 0, fixtures: 0, lines: Array::<String>::new(), live: live };
+    }
+
+    /// Print `line`.
+    public say(mut &this, line: String) -> void {
+        if (this.live) { fmt::println(line.clone()); }
+        this.lines.push(line);
+    }
+
+    /// Count the check `label`, printing it as passed or failed.
+    public check(mut &this, passed: boolean, label: Str, detail: Str) -> void {
+        if (passed) {
+            this.passed = this.passed + 1;
+            this.say(f"  ok   {label}");
+            return;
+        }
+        this.failed = this.failed + 1;
+        if (detail.is_empty()) { this.say(f"  FAIL {label}"); } else { this.say(f"  FAIL {label}  -- {detail}"); }
+    }
+
+    /// Count `judgement` under `label`.
+    public judged(mut &this, judgement: Result<Judgement, String>, label: Str) -> void {
+        match (judgement) {
+            Result::Ok(verdict) => { this.check(verdict.passed, label, verdict.detail.as_str()); }
+            Result::Err(reason) => { this.check(false, label, reason.as_str()); }
+        }
+    }
+
+    /// The summary line.
+    public summary(&this) -> String {
+        return f"lsp-smoke: {this.passed} passed, {this.failed} failed ({this.fixtures} fixtures)";
+    }
+
+    /// Whether the run passes: nothing failed, and checks and fixtures ran.
+    public succeeded(&this) -> boolean { return this.failed == 0 && this.passed > 0 && this.fixtures > 0; }
+}
+
+/// The behavioural run.
+public type struct Smoke {
+    /// Run every check (or only the fixture `only`, with no protocol
+    /// checks) against the server `server`, below `repository`.
+    public static run(repository: Path, server: Str, only: Option<Str>, live: boolean) -> Tally {
+        mut tally: Tally = Tally::new(live);
+        const program: String = Host::absolute(server);
+        if (!Path::from(program.as_str()).is_file()) {
+            tally.say(f"cryolsp not found at {program.as_str()}");
+            tally.failed = 1;
+            tally.say(tally.summary());
+            return tally;
+        }
+        tally.say(String::from_str(Str::new("cryolsp behavioural tests")));
+        tally.say(f"  server: {program.as_str()}");
+        const fixtures: PathBuf = repository.join(Str::new("tools/CryoLSP/tests/fixtures"));
+        mut run: Smoke = Smoke {
+            repository: String::from_str(repository.as_str()),
+            program:    program,
+            fixtures:   String::from_str(fixtures.as_path().as_str()),
+            stdlib:     String::from_str(repository.join(Str::new("stdlib")).as_path().as_str()),
+        };
+        if (only.is_none()) {
+            run.protocol(&tally);
+            run.protocol_errors(&tally);
+            run.during_analysis(&tally);
+            run.outside_project(&tally);
+            const jump: PathBuf = fixtures.as_path().join(Str::new("stdlib_jump"));
+            run.stdlib_files(&tally, Str::new("stdlib files"), jump.as_path().as_str(), run.stdlib.as_str());
+            // A project outside the repository, so no search upward from its
+            // files reaches the library, with the library found by a root
+            // spelled through `..`, as one found beside the server's binary is.
+            match (TemporaryDirectory::create()) {
+                Result::Ok(outside) => {
+                    const copy: PathBuf = outside.path().join(Str::new("stdlib_jump"));
+                    match (Directory::copy_all(jump.as_path(), copy.as_path())) {
+                        Result::Ok(_) => {
+                            const spelled: String = f"{repository.join(Str::new("tools")).as_path().as_str()}/../stdlib";
+                            run.stdlib_files(&tally, Str::new("stdlib files, library root spelled through .."), copy.as_path().as_str(), spelled.as_str());
+                        }
+                        Result::Err(error) => { tally.check(false, Str::new("stdlib files, library root spelled through ..: the project is copied"), error.describe()); }
+                    }
+                }
+                Result::Err(error) => { tally.check(false, Str::new("stdlib files, library root spelled through ..: a scratch directory"), error.describe()); }
+            }
+        }
+        const nothing_excluded: Array<String> = Array::<String>::new();
+        const names: Array<String> = match (Tree::names(fixtures.as_path(), &nothing_excluded)) {
+            Result::Ok(names)   => { names }
+            Result::Err(reason) => { tally.check(false, Str::new("fixtures: the directory is listed"), reason.as_str()); Array::<String>::new() }
+        };
+        for (name in Judges::sorted(names).iterate_references()) {
+            match (only) {
+                Option::Some(wanted) => { if (name.as_str() != wanted) { continue; } }
+                Option::None         => { }
+            }
+            const root: PathBuf = fixtures.as_path().join(name.as_str());
+            if (!root.as_path().join(Str::new("checks.json")).as_path().is_file()) { continue; }
+            tally.fixtures = tally.fixtures + 1;
+            run.fixture(&tally, root.as_path().as_str());
+        }
+        tally.say(String::new());
+        tally.say(tally.summary());
+        return tally;
+    }
+
+    private repository: String;
+    private program: String;
+    private fixtures: String;
+    private stdlib: String;
+
+    /// A cold compile of a project is the project and the whole library.
+    const COLD_SECONDS: i64 = 180;
+
+    private start(&this, tally: mut &Tally, directory: Str, stdlib: Str, home: Option<Str>) -> Option<Server> {
+        return match (Server::start(Path::from(this.repository.as_str()), this.program.as_str(), directory, stdlib, home)) {
+            Result::Ok(server)  => { Option::Some(server) }
+            Result::Err(reason) => { tally.check(false, Str::new("the server starts"), reason.as_str()); Option::None }
+        };
+    }
+
+    // ---- protocol checks ----------------------------------------------------
+
+    /// Lifecycle and robustness, against the `two_modules` fixture's project.
+    private protocol(&this, tally: mut &Tally) -> void {
+        tally.say(String::from_str(Str::new("protocol")));
+        const failed_before: i64 = tally.failed;
+        const root: PathBuf = Path::from(this.fixtures.as_str()).join(Str::new("two_modules"));
+        mut server: Server = match (this.start(tally, root.as_path().as_str(), this.stdlib.as_str(), Option::None)) {
+            Option::Some(server) => { server }
+            Option::None         => { return; }
+        };
+        const capabilities: JsonValue = Smoke::initialize(&server, root.as_path().as_str(), tally, Str::new("protocol"));
+        for (name in Str::new("hoverProvider completionProvider definitionProvider semanticTokensProvider").split(&Str::new(" "))) {
+            tally.check(Reading::at(&capabilities, name).is_some(), f"protocol: advertises {name}".as_str(), Str::new(""));
+        }
+        const triggers: Array<String> = Reading::texts(&capabilities, Str::new("completionProvider.triggerCharacters"));
+        tally.check(Judges::holds(&triggers, Str::new(".")) && Judges::holds(&triggers, Str::new(":")) && Judges::holds(&triggers, Str::new("{")),
+                    Str::new("protocol: completion is triggered by `.`, `:` and an import's `{`"), f"got {Judges::listed(&triggers).as_str()}".as_str());
+
+        const main: PathBuf = root.as_path().join(Str::new("src/main.cryo"));
+        const text: String = File::read_text(main.as_path()).unwrap_or(String::new());
+        const uri: String = Locations::uri_for(main.as_path().as_str());
+        Smoke::open_document(&server, uri.as_str(), text.as_str());
+
+        const tokens: Option<JsonValue> = server.request(Str::new("textDocument/semanticTokens/full"), Smoke::document(uri.as_str()).as_str(), Smoke::COLD_SECONDS);
+        const count: i64 = match (&tokens) {
+            Option::Some(response) => {
+                match (Reading::at(response, Str::new("result.data"))) {
+                    Option::Some(data) => {
+                        const length: i64 = if (data.is_array()) { data.length() } else { -1 };
+                        length
+                    }
+                    Option::None       => { -1 }
+                }
+            }
+            Option::None => { -1 }
+        };
+        tally.check(count > 0 && count % 5 == 0, Str::new("protocol: semanticTokens/full returns whole tokens"), f"len {count}".as_str());
+
+        // A document outside the module graph answers cleanly.
+        const ghost: String = Locations::uri_for(root.as_path().join(Str::new("src/not_on_disk.cryo")).as_path().as_str());
+        Smoke::open_document(&server, ghost.as_str(), Str::new("namespace Ghost::Doc;\n"));
+        const ghost_tokens: Option<JsonValue> = server.request(Str::new("textDocument/semanticTokens/full"), Smoke::document(ghost.as_str()).as_str(), Smoke::COLD_SECONDS);
+        tally.check(Smoke::answered(&ghost_tokens) && Smoke::result_is_array(&ghost_tokens, Str::new("result.data")),
+                    Str::new("protocol: semanticTokens on a document outside the project answers"), Str::new(""));
+
+        // Closing documents must not take the server down.
+        server.notify(Str::new("textDocument/didClose"), f"{{\"textDocument\":{{\"uri\":{Frames::quoted(ghost.as_str()).as_str()}}}}}".as_str());
+        const after: Option<JsonValue> = server.request(Str::new("textDocument/hover"), Smoke::at_position(uri.as_str(), &Position { line: 0, character: 0 }).as_str(), Smoke::COLD_SECONDS);
+        tally.check(after.is_some(), Str::new("protocol: answers after a didClose"), Smoke::server_state(&server).as_str());
+
+        // A half-typed line is the normal state of a buffer.
+        const typed: String = text.as_str().replace(&Str::new("wb./*^after_dot*//*@get_call*/get();"), &Str::new("wb."));
+        Smoke::change(&server, uri.as_str(), 2, typed.as_str(), false);
+        const mid: Option<JsonValue> = server.request(Str::new("textDocument/hover"), Smoke::at_position(uri.as_str(), &Position { line: 0, character: 0 }).as_str(), Smoke::COLD_SECONDS);
+        tally.check(mid.is_some(), Str::new("protocol: survives a half-typed buffer"), Str::new(""));
+
+        if (server.alive()) { Smoke::shutdown(&server, tally, Str::new("protocol")); }
+        server.stop();
+        Smoke::report_errors(&server, tally, failed_before);
+    }
+
+    /// Every error reply is answered, and the server lives on after it.
+    private protocol_errors(&this, tally: mut &Tally) -> void {
+        tally.say(String::from_str(Str::new("protocol errors")));
+        const failed_before: i64 = tally.failed;
+        const root: PathBuf = Path::from(this.fixtures.as_str()).join(Str::new("two_modules"));
+        mut server: Server = match (this.start(tally, root.as_path().as_str(), this.stdlib.as_str(), Option::None)) {
+            Option::Some(server) => { server }
+            Option::None         => { return; }
+        };
+        const main: PathBuf = root.as_path().join(Str::new("src/main.cryo"));
+        const main_uri: String = Locations::uri_for(main.as_path().as_str());
+        const origin: Position = Position { line: 0, character: 0 };
+        const early: Option<JsonValue> = server.request(Str::new("textDocument/hover"), Smoke::at_position(main_uri.as_str(), &origin).as_str(), 30);
+        tally.check(Smoke::error_code(&early) == -32002, Str::new("protocol: a request before initialize is refused as not initialized"),
+                    f"got {Smoke::shown(&early).as_str()}".as_str());
+        const _: JsonValue = Smoke::initialize(&server, root.as_path().as_str(), tally, Str::new("protocol errors"));
+
+        mut number: i64 = 1;
+        for (method in Str::new("cryo/noSuchMethod textDocument/noSuchMethod").split(&Str::new(" "))) {
+            const answer: Option<JsonValue> = server.request(method, Str::new("{}"), 30);
+            tally.check(Smoke::error_code(&answer) == -32601, f"protocol: unknown method {number} is answered with method-not-found".as_str(),
+                        f"got {Smoke::shown(&answer).as_str()} ({Smoke::server_state(&server).as_str()})".as_str());
+            number++;
+        }
+
+        server.send_raw(Str::new("{\"jsonrpc\":\"2.0\",\"id\":\"bad-1\",\"params\":{}}"));
+        const bad: Option<JsonValue> = server.wait_response(Str::new("\"bad-1\""), 30);
+        tally.check(Smoke::error_code(&bad) == -32600, Str::new("protocol: a request with no method is answered as invalid, under its id"),
+                    f"got {Smoke::shown(&bad).as_str()}".as_str());
+
+        server.send_raw(Str::new("{ this is not json"));
+        const parse: Option<JsonValue> = server.wait_response(Str::new("null"), 30);
+        tally.check(Smoke::error_code(&parse) == -32700, Str::new("protocol: a body that is not JSON is answered with a parse error"),
+                    f"got {Smoke::shown(&parse).as_str()}".as_str());
+
+        const text: String = File::read_text(main.as_path()).unwrap_or(String::new());
+        Smoke::open_document(&server, main_uri.as_str(), text.as_str());
+        const after: Option<JsonValue> = server.request(Str::new("textDocument/hover"), Smoke::at_position(main_uri.as_str(), &origin).as_str(), Smoke::COLD_SECONDS);
+        tally.check(after.is_some() && Smoke::error_code(&after) == 0, Str::new("protocol: answers a real request after the error replies"),
+                    f"got {Smoke::shown(&after).as_str()} ({Smoke::server_state(&server).as_str()})".as_str());
+
+        const published: boolean = Smoke::wait_published(&server, main_uri.as_str(), Smoke::COLD_SECONDS).is_some();
+        const refresh: boolean = Smoke::newest(&server, Str::new("workspace/semanticTokens/refresh"), Str::new("")).is_some();
+        tally.check(published && !refresh, Str::new("protocol: no semantic-token refresh is sent to a client that did not declare it"),
+                    f"published {published}, refresh {refresh}".as_str());
+
+        const down: Option<JsonValue> = server.request(Str::new("shutdown"), Str::new("{}"), 60);
+        tally.check(Smoke::has_result(&down), Str::new("protocol errors: shutdown returns a result"), Str::new(""));
+        const late: Option<JsonValue> = server.request(Str::new("textDocument/hover"), Smoke::at_position(main_uri.as_str(), &origin).as_str(), 30);
+        tally.check(Smoke::error_code(&late) == -32600, Str::new("protocol: a request after shutdown is refused as invalid"),
+                    f"got {Smoke::shown(&late).as_str()}".as_str());
+        server.notify(Str::new("exit"), Str::new("{}"));
+        Smoke::exits_zero(&server, tally, Str::new("protocol errors"));
+        server.stop();
+        Smoke::report_errors(&server, tally, failed_before);
+    }
+
+    /// Requests sent behind one that starts an analysis.  The analysis stops
+    /// between modules to read them, so a request behind it is answered from
+    /// the last analysis before the first one's answer, and a cancellation of
+    /// the first one is honoured.  The order is decided by what is already in
+    /// the pipe when the analysis starts, not by time.
+    private during_analysis(&this, tally: mut &Tally) -> void {
+        const label: Str = Str::new("during analysis");
+        tally.say(String::from_str(label));
+        const root: PathBuf = Path::from(this.fixtures.as_str()).join(Str::new("two_modules"));
+        mut fixture: Fixture = match (Fixture::open(root.as_path().as_str())) {
+            Result::Ok(fixture) => { fixture }
+            Result::Err(reason) => { tally.check(false, f"{label}: the fixture opens".as_str(), reason.as_str()); return; }
+        };
+        mut server: Server = match (this.start(tally, root.as_path().as_str(), this.stdlib.as_str(), Option::None)) {
+            Option::Some(server) => { server }
+            Option::None         => { return; }
+        };
+        const _: JsonValue = Smoke::initialize(&server, root.as_path().as_str(), tally, label);
+        Smoke::open_fixture_documents(&server, &fixture);
+        const place: Pair<String, Position> = match (fixture.at(Str::new("src/main.cryo@local_x_use"))) {
+            Result::Ok(place)   => { place }
+            Result::Err(reason) => { tally.check(false, f"{label}: the marker".as_str(), reason.as_str()); server.stop(); return; }
+        };
+        const uri: String = fixture.uri(place.first.as_str());
+        const at: String = Smoke::at_position(uri.as_str(), &place.second);
+        const save: String = f"{{\"textDocument\":{{\"uri\":{Frames::quoted(uri.as_str()).as_str()}}}}}";
+        const declaration: Str = Str::new("src/main.cryo@local_x");
+
+        const first: Option<JsonValue> = server.request(Str::new("textDocument/definition"), at.as_str(), Smoke::COLD_SECONDS);
+        tally.check(Smoke::result_matches(&fixture, &first, declaration), f"{label}: the first analysis answers".as_str(), Str::new(""));
+
+        server.notify(Str::new("textDocument/didSave"), save.as_str());
+        const a: i64 = server.send_request(Str::new("textDocument/definition"), at.as_str()).unwrap_or(-1);
+        const b: i64 = server.send_request(Str::new("textDocument/hover"), at.as_str()).unwrap_or(-2);
+        const answer_a: Option<JsonValue> = server.wait_response(f"{a}".as_str(), Smoke::COLD_SECONDS);
+        const answer_b: Option<JsonValue> = server.wait_response(f"{b}".as_str(), Smoke::COLD_SECONDS);
+        const order_a: i64 = Smoke::index_of(&server.arrived, f"{a}".as_str());
+        const order_b: i64 = Smoke::index_of(&server.arrived, f"{b}".as_str());
+        tally.check(answer_a.is_some() && answer_b.is_some() && order_b < order_a,
+                    f"{label}: a request behind one that starts an analysis is answered first".as_str(),
+                    f"order {Judges::listed(&server.arrived).as_str()}, a={a} b={b}".as_str());
+        const hover: Option<String> = match (&answer_b) {
+            Option::Some(response) => {
+                match (Reading::at(response, Str::new("result"))) {
+                    Option::Some(result) => { Judges::hover_text(result) }
+                    Option::None         => { Option::None }
+                }
+            }
+            Option::None => { Option::None }
+        };
+        const named: boolean = match (&hover) {
+            Option::Some(text) => { text.as_str().contains(&Str::new("local_x")) }
+            Option::None       => { false }
+        };
+        tally.check(named, f"{label}: it is answered from the last analysis".as_str(), f"got {Smoke::shown(&answer_b).as_str()}".as_str());
+        tally.check(Smoke::result_matches(&fixture, &answer_a, declaration), f"{label}: the request that started the analysis is answered after it".as_str(), Str::new(""));
+
+        server.notify(Str::new("textDocument/didSave"), save.as_str());
+        const c: i64 = server.send_request(Str::new("textDocument/definition"), at.as_str()).unwrap_or(-3);
+        server.notify(Str::new("$/cancelRequest"), f"{{\"id\":{c}}}".as_str());
+        const cancelled: Option<JsonValue> = server.wait_response(f"{c}".as_str(), Smoke::COLD_SECONDS);
+        tally.check(Smoke::error_code(&cancelled) == -32800, f"{label}: a request cancelled while its analysis runs answers as cancelled".as_str(),
+                    f"got {Smoke::shown(&cancelled).as_str()}".as_str());
+        Smoke::shutdown(&server, tally, label);
+        server.stop();
+    }
+
+    /// A file under no cryoconfig, analysed as its own entry point, with an
+    /// import typed into it one character at a time as an editor sends it:
+    /// a change, then a completion for each character, `:` as a trigger.
+    /// The file lives in a temporary directory, since every fixture is
+    /// inside the server's own project.
+    private outside_project(&this, tally: mut &Tally) -> void {
+        const label: Str = Str::new("outside a project");
+        tally.say(String::from_str(label));
+        const failed_before: i64 = tally.failed;
+        const scratch: TemporaryDirectory = match (TemporaryDirectory::create()) {
+            Result::Ok(directory) => { directory }
+            Result::Err(error)    => { tally.check(false, f"{label}: a scratch directory".as_str(), error.describe()); return; }
+        };
+        const path: PathBuf = scratch.path().join(Str::new("scratch.cryo"));
+        const body: Str = Str::new("\nfunction main() -> i32 {\n    return 0;\n}\n");
+        match (File::write_text(path.as_path(), body)) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { tally.check(false, f"{label}: the file is written".as_str(), error.describe()); return; }
+        }
+        const uri: String = Locations::uri_for(path.as_path().as_str());
+        mut server: Server = match (this.start(tally, scratch.path().as_str(), this.stdlib.as_str(), Option::None)) {
+            Option::Some(server) => { server }
+            Option::None         => { return; }
+        };
+        const _: JsonValue = Smoke::initialize(&server, scratch.path().as_str(), tally, label);
+        Smoke::open_document(&server, uri.as_str(), body);
+        const published: Option<i64> = Smoke::wait_published(&server, uri.as_str(), Smoke::COLD_SECONDS);
+        const clean: boolean = match (published) {
+            Option::Some(index) => {
+                const params: JsonValue* = Reading::at(server.notifications.get_reference(index).unwrap(), Str::new("params")).unwrap();
+                Reading::at(params, Str::new("diagnostics")).is_some() && Reading::elements(params, Str::new("diagnostics")).is_empty()
+            }
+            Option::None => { false }
+        };
+        tally.check(clean, f"{label}: the file is analysed on open, with no diagnostics".as_str(),
+                    f"got {Smoke::notification_shown(&server, published).as_str()}".as_str());
+        mut answers: Array<Pair<String, Array<String>>> = Array::<Pair<String, Array<String>>>::new();
+        mut typed: String = String::new();
+        mut version: i64 = 1;
+        const import_line: Str = Str::new("import std::core::");
+        for (mut at: i64 = 0; at < import_line.length(); at++) {
+            const character: Str = import_line.byte_substring(at, at + 1);
+            typed.push(character);
+            version++;
+            Smoke::change(&server, uri.as_str(), version, f"{typed.as_str()}{body}".as_str(), false);
+            const trigger: Option<Str> = if (character == Str::new(".") || character == Str::new(":")) { Option::Some(character) } else { Option::None };
+            const position: Position = Position { line: 0, character: typed.length() };
+            const params: String = f"{{\"textDocument\":{{\"uri\":{Frames::quoted(uri.as_str()).as_str()}}},\"position\":{position.json().as_str()},\"context\":{Smoke::completion_context(trigger).as_str()}}}";
+            const answer: Option<JsonValue> = server.request(Str::new("textDocument/completion"), params.as_str(), Smoke::COLD_SECONDS);
+            const labels: Array<String> = match (&answer) {
+                Option::Some(response) => {
+                    match (Reading::at(response, Str::new("result"))) {
+                        Option::Some(result) => { Judges::completion_labels(result) }
+                        Option::None         => { Array::<String>::new() }
+                    }
+                }
+                Option::None => { Array::<String>::new() }
+            };
+            answers.push(Pair::new(typed.clone(), labels));
+        }
+        const first_colon: Array<String> = Smoke::answer_for(&answers, Str::new("import std:"));
+        tally.check(first_colon.is_empty(), f"{label}: the first `:` of a `::` offers nothing".as_str(),
+                    f"got {Judges::listed_first(&first_colon, 12).as_str()}".as_str());
+        const under_std: Array<String> = Smoke::answer_for(&answers, Str::new("import std::"));
+        mut scoped: boolean = false;
+        for (name in under_std.iterate_references()) { if (name.as_str().contains(&Str::new(":"))) { scoped = true; } }
+        tally.check(Judges::holds(&under_std, Str::new("core")) && Judges::holds(&under_std, Str::new("collections")) && !scoped,
+                    f"{label}: `import std::` lists the modules under `std`".as_str(), f"got {Judges::listed_first(&under_std, 20).as_str()}".as_str());
+        const under_core: Array<String> = Smoke::answer_for(&answers, Str::new("import std::core::"));
+        tally.check(Judges::holds(&under_core, Str::new("option")) && !Judges::holds(&under_core, Str::new("core")),
+                    f"{label}: `import std::core::` lists the modules under `std::core`".as_str(), f"got {Judges::listed_first(&under_core, 20).as_str()}".as_str());
+        Smoke::shutdown(&server, tally, label);
+        server.stop();
+        Smoke::report_errors(&server, tally, failed_before);
+    }
+
+    /// A jump from a project into the standard library, followed the way an
+    /// editor follows it: the library's file is opened, and questions are
+    /// asked in it.  The library is analysed as part of the project, so its
+    /// files are answered from that analysis and opening one starts no
+    /// analysis of its own.  The library's files carry no markers, so
+    /// positions are found by their text.  The editor opens a library file
+    /// by its plain path, however the server found the library.
+    private stdlib_files(&this, tally: mut &Tally, label: Str, root: Str, stdlib: Str) -> void {
+        tally.say(String::from_str(label));
+        const failed_before: i64 = tally.failed;
+        const main: PathBuf = Path::from(root).join(Str::new("src/main.cryo"));
+        const main_text: String = File::read_text(main.as_path()).unwrap_or(String::new());
+        const main_uri: String = Locations::uri_for(main.as_path().as_str());
+        mut server: Server = match (this.start(tally, root, stdlib, Option::None)) {
+            Option::Some(server) => { server }
+            Option::None         => { return; }
+        };
+        const _: JsonValue = Smoke::initialize(&server, root, tally, label);
+        Smoke::open_document(&server, main_uri.as_str(), main_text.as_str());
+        const _: Option<i64> = Smoke::wait_published(&server, main_uri.as_str(), Smoke::COLD_SECONDS);
+
+        const jumped: String = Smoke::first_uri(&server, Str::new("definition"), main_uri.as_str(), &Smoke::find_position(main_text.as_str(), Str::new("import std::io;"), 12), Str::new(""));
+        tally.check(jumped.as_str().ends_with(&Str::new("stdlib/io/_module.cryo")), f"{label}: definition of an imported library module is its file".as_str(),
+                    f"got '{jumped.as_str()}'".as_str());
+
+        // The editor opens the file the jump landed in.
+        const library: PathBuf = Path::from(this.repository.as_str()).join(Str::new("stdlib"));
+        server.take_waiting();
+        const before: i64 = server.notifications.length();
+        mut opened: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        for (relative in Str::new("io/_module.cryo io/error.cryo ffi/libc.cryo").split(&Str::new(" "))) {
+            const path: PathBuf = library.as_path().join(relative);
+            const text: String = File::read_text(path.as_path()).unwrap_or(String::new());
+            const uri: String = Locations::uri_for(path.as_path().as_str());
+            Smoke::open_document(&server, uri.as_str(), text.as_str());
+            opened.push(Pair::new(uri, text));
+        }
+        const module_uri: Str = opened.get_reference(0).unwrap().first.as_str();
+        const module_text: Str = opened.get_reference(0).unwrap().second.as_str();
+        const entry: String = Smoke::first_uri(&server, Str::new("definition"), module_uri, &Smoke::find_position(module_text, Str::new("    io::error;"), 8), Str::new(""));
+        tally.check(entry.as_str().ends_with(&Str::new("stdlib/io/error.cryo")), f"{label}: definition on an entry of a `module` group is that module's file".as_str(),
+                    f"got '{entry.as_str()}'".as_str());
+
+        const error_uri: Str = opened.get_reference(1).unwrap().first.as_str();
+        const error_text: Str = opened.get_reference(1).unwrap().second.as_str();
+        const declaration: Position = Smoke::find_position(error_text, Str::new("type enum IoErrorKind"), 10);
+        const hovered: Option<JsonValue> = server.request(Str::new("textDocument/hover"), Smoke::at_position(error_uri, &declaration).as_str(), 60);
+        const hover: Option<String> = match (&hovered) {
+            Option::Some(response) => {
+                match (Reading::at(response, Str::new("result"))) {
+                    Option::Some(result) => { Judges::hover_text(result) }
+                    Option::None         => { Option::None }
+                }
+            }
+            Option::None => { Option::None }
+        };
+        const names_it: boolean = match (&hover) {
+            Option::Some(text) => { text.as_str().contains(&Str::new("IoErrorKind")) }
+            Option::None       => { false }
+        };
+        tally.check(names_it, f"{label}: hover in a library file opened after a jump answers".as_str(), f"got {Smoke::shown(&hovered).as_str()}".as_str());
+
+        const use: Position = Smoke::find_position(error_text, Str::new("kind: IoErrorKind"), 6);
+        const defined: Option<JsonValue> = server.request(Str::new("textDocument/definition"), Smoke::at_position(error_uri, &use).as_str(), 60);
+        mut inside: boolean = false;
+        match (&defined) {
+            Option::Some(response) => {
+                match (Smoke::first_location(response)) {
+                    Option::Some(location) => {
+                        inside = Smoke::uri_tail(Reading::text(location, Str::new("uri"))).as_str().ends_with(&Str::new("stdlib/io/error.cryo"))
+                            && declaration.matches(Reading::at(location, Str::new("range.start")));
+                    }
+                    Option::None => { }
+                }
+            }
+            Option::None => { }
+        }
+        tally.check(inside, f"{label}: definition inside a library file is its declaration there".as_str(), f"got {Smoke::shown(&defined).as_str()}".as_str());
+
+        const references_params: String = f"{{\"textDocument\":{{\"uri\":{Frames::quoted(error_uri).as_str()}}},\"position\":{declaration.json().as_str()},\"context\":{{\"includeDeclaration\":false}}}}";
+        const references: Option<JsonValue> = server.request(Str::new("textDocument/references"), references_params.as_str(), 60);
+        mut own_use: boolean = false;
+        mut project_use: boolean = false;
+        mut seen: Array<String> = Array::<String>::new();
+        match (&references) {
+            Option::Some(response) => {
+                for (location in Reading::elements(response, Str::new("result")).iterate_references()) {
+                    const uri: Str = Reading::text(*location, Str::new("uri"));
+                    if (Locations::same_uri(uri, error_uri) && use.matches(Reading::at(*location, Str::new("range.start")))) { own_use = true; }
+                    if (Locations::same_uri(uri, main_uri.as_str())) { project_use = true; }
+                    seen.push(Locations::position_key(uri, Position::read(Reading::at(*location, Str::new("range.start"))).unwrap_or(Position { line: -1, character: -1 }).line,
+                                                      Position::read(Reading::at(*location, Str::new("range.start"))).unwrap_or(Position { line: -1, character: -1 }).character));
+                }
+            }
+            Option::None => { }
+        }
+        tally.check(own_use && project_use, f"{label}: references from a library file reach its own uses and the project's".as_str(),
+                    f"got {Judges::listed_first(&seen, 12).as_str()}".as_str());
+
+        // A library file opened after the analysis that holds it is dimmed
+        // where it is gated to the other OS, and only there.
+        const libc_uri: Str = opened.get_reference(2).unwrap().first.as_str();
+        const libc_text: Str = opened.get_reference(2).unwrap().second.as_str();
+        const regions: Option<i64> = Smoke::wait_notification(&server, Str::new("cryo/inactiveRegions"), libc_uri, 60);
+        const other: Str = if (Host::os() == Str::new("windows")) { Str::new("linux") } else { Str::new("windows") };
+        const this_os: Str = if (Host::os() == Str::new("windows")) { Str::new("windows") } else { Str::new("linux") };
+        const other_line: i64 = Smoke::find_position(libc_text, f"![target({other})]\npublic function errno".as_str(), 0).line + 1;
+        const this_line: i64 = Smoke::find_position(libc_text, f"![target({this_os})]\npublic function errno".as_str(), 0).line + 1;
+        tally.check(regions.is_some() && Smoke::dimmed(&server, regions, other_line) && !Smoke::dimmed(&server, regions, this_line),
+                    f"{label}: a library file is dimmed where it is gated to the other OS".as_str(), f"got {Smoke::notification_shown(&server, regions).as_str()}".as_str());
+
+        thread::sleep(Duration::from_milliseconds(1000));
+        server.take_waiting();
+        mut own: Array<String> = Array::<String>::new();
+        for (mut index: i64 = before; index < server.notifications.length(); index++) {
+            const message: JsonValue* = server.notifications.get_reference(index).unwrap();
+            if (Reading::text(message, Str::new("method")) != Str::new("textDocument/publishDiagnostics")) { continue; }
+            const uri: Str = Reading::text(message, Str::new("params.uri"));
+            for (document in opened.iterate_references()) {
+                if (Locations::same_uri(uri, document.first.as_str())) { own.push(String::from_str(uri)); }
+            }
+        }
+        tally.check(own.is_empty(), f"{label}: opening a library file starts no analysis of its own".as_str(),
+                    f"diagnostics were published for {Judges::listed_first(&own, 4).as_str()}".as_str());
+        Smoke::shutdown(&server, tally, label);
+        server.stop();
+        Smoke::report_errors(&server, tally, failed_before);
+    }
+
+    // ---- fixtures -----------------------------------------------------------
+
+    /// One fixture's checks, against a server of its own.
+    private fixture(&this, tally: mut &Tally, root: Str) -> void {
+        const name: Str = match (Path::from(root).file_name()) {
+            Option::Some(leaf) => { leaf }
+            Option::None       => { root }
+        };
+        tally.say(f"fixture {name}");
+        const failed_before: i64 = tally.failed;
+        mut fixture: Fixture = match (Fixture::open(root)) {
+            Result::Ok(fixture) => { fixture }
+            Result::Err(reason) => { tally.check(false, f"{name}: the fixture opens".as_str(), reason.as_str()); return; }
+        };
+        mut home: Option<TemporaryDirectory> = Option::None;
+        if (fixture.vendors()) {
+            const scratch: TemporaryDirectory = match (TemporaryDirectory::create()) {
+                Result::Ok(directory) => { directory }
+                Result::Err(error)    => { tally.check(false, f"{name}: a scratch home".as_str(), error.describe()); return; }
+            };
+            const copy: PathBuf = scratch.path().join(Str::new("project")).as_path().join(name);
+            const copied: Result<(), IoError> = Directory::copy_all(Path::from(root), copy.as_path());
+            if (copied.is_err()) { tally.check(false, f"{name}: the fixture is copied".as_str(), Str::new("")); return; }
+            fixture = match (Fixture::open(copy.as_path().as_str())) {
+                Result::Ok(opened)  => { opened }
+                Result::Err(reason) => { tally.check(false, f"{name}: the copy opens".as_str(), reason.as_str()); return; }
+            };
+            match (Smoke::register_vendor(scratch.path(), &fixture)) {
+                Result::Ok(_)       => { }
+                Result::Err(reason) => { tally.check(false, f"{name}: the vendor registry is written".as_str(), reason.as_str()); return; }
+            }
+            home = Option::Some(scratch);
+        }
+        const home_path: Option<String> = match (&home) {
+            Option::Some(scratch) => { Option::Some(String::from_str(scratch.path().as_str())) }
+            Option::None          => { Option::None }
+        };
+        const directory: String = match (&home_path) {
+            Option::Some(path) => { path.clone() }
+            Option::None       => { fixture.root.clone() }
+        };
+        const home_text: Option<Str> = match (&home_path) {
+            Option::Some(path) => { Option::Some(path.as_str()) }
+            Option::None       => { Option::None }
+        };
+        mut server: Server = match (this.start(tally, directory.as_str(), this.stdlib.as_str(), home_text)) {
+            Option::Some(server) => { server }
+            Option::None         => { return; }
+        };
+        const capabilities: JsonValue = Smoke::initialize(&server, fixture.root.as_str(), tally, fixture.name.as_str());
+        fixture.token_types = Reading::texts(&capabilities, Str::new("semanticTokensProvider.legend.tokenTypes"));
+        fixture.token_modifiers = Reading::texts(&capabilities, Str::new("semanticTokensProvider.legend.tokenModifiers"));
+        Smoke::open_fixture_documents(&server, &fixture);
+        mut version: i64 = 1;
+        const checks: Array<JsonValue*> = Reading::elements(&fixture.specification, Str::new("checks"));
+        for (check in checks.iterate_references()) {
+            const label: String = f"{fixture.name.as_str()}: {Reading::text(*check, Str::new("name"))}";
+            if (!server.alive()) {
+                tally.check(false, label.as_str(), Str::new("server is gone"));
+                continue;
+            }
+            if (!Reading::present(*check, Str::new("edit"))) {
+                Smoke::run_check(&server, &fixture, *check, tally, label.as_str());
+                continue;
+            }
+            // The check asks about a buffer being typed: change the document
+            // (unsaved), ask, and put it back.
+            const relative: Str = Reading::text(*check, Str::new("edit.file"));
+            const save: boolean = match (Reading::at(*check, Str::new("edit.save"))) {
+                Option::Some(flag) => { match (flag) { JsonValue::Bool(set) => { set } _ => { false } } }
+                Option::None       => { false }
+            };
+            const original: String = match (fixture.text(relative)) {
+                Result::Ok(text)    => { text }
+                Result::Err(reason) => { tally.check(false, label.as_str(), reason.as_str()); continue; }
+            };
+            const from: Str = Reading::text(*check, Str::new("edit.from"));
+            const at: i64 = match (original.as_str().find(&from)) {
+                Option::Some(at) => { at }
+                Option::None     => { tally.check(false, label.as_str(), f"edit text '{from}' not in {relative}".as_str()); continue; }
+            };
+            const changed: String = f"{original.as_str().byte_substring(0, at)}{Reading::text(*check, Str::new("edit.to"))}{original.as_str().byte_substring(at + from.length(), original.length())}";
+            const _: Result<(), String> = fixture.set_text(relative, changed.as_str());
+            version++;
+            Smoke::change(&server, fixture.uri(relative).as_str(), version, changed.as_str(), save);
+            Smoke::run_check(&server, &fixture, *check, tally, label.as_str());
+            const _: Result<(), String> = fixture.set_text(relative, original.as_str());
+            version++;
+            Smoke::change(&server, fixture.uri(relative).as_str(), version, original.as_str(), save);
+        }
+        if (server.alive()) { Smoke::shutdown(&server, tally, fixture.name.as_str()); }
+        server.stop();
+        Smoke::report_errors(&server, tally, failed_before);
+    }
+
+    /// One check of a fixture.
+    private static run_check(server: mut &Server, fixture: mut &Fixture, check: JsonValue*, tally: mut &Tally, label: Str) -> void {
+        const method: Str = Reading::text(check, Str::new("method"));
+        const empty: JsonValue = JsonValue::Null;
+        if (method == Str::new("diagnostics")) {
+            const uri: String = fixture.uri(Reading::text(check, Str::new("file")));
+            const expected: Pair<Array<String>, Array<Pair<String, String>>> = match (Judges::expected_diagnostics(fixture, check)) {
+                Result::Ok(expected) => { expected }
+                Result::Err(reason)  => { tally.check(false, label, reason.as_str()); return; }
+            };
+            const started: Instant = Instant::now();
+            loop {
+                server.take_waiting();
+                mut index: i64 = server.notifications.length() - 1;
+                while (index >= 0) {
+                    const message: JsonValue* = server.notifications.get_reference(index).unwrap();
+                    if (Reading::text(message, Str::new("method")) == Str::new("textDocument/publishDiagnostics")
+                            && Locations::same_uri(Reading::text(message, Str::new("params.uri")), uri.as_str())
+                            && Judges::diagnostics_hold(Reading::at(message, Str::new("params")).unwrap(), &expected.first, &expected.second)) {
+                        tally.check(true, label, Str::new(""));
+                        return;
+                    }
+                    index--;
+                }
+                if (server.ended()) { break; }
+                if (!server.receive_before(&started, Smoke::COLD_SECONDS * 1000)) { break; }
+            }
+            const last: Option<i64> = Smoke::newest(server, Str::new("textDocument/publishDiagnostics"), uri.as_str());
+            const last_params: Option<JsonValue*> = match (last) {
+                Option::Some(index) => { Reading::at(server.notifications.get_reference(index).unwrap(), Str::new("params")) }
+                Option::None        => { Option::None }
+            };
+            mut said: Array<String> = Array::<String>::new();
+            for (text in expected.second.iterate_references()) { said.push(text.second.clone()); }
+            tally.check(false, label, f"want {Judges::listed(&expected.first).as_str()} saying {Judges::listed(&said).as_str()}, last published {Judges::described_diagnostics(last_params).as_str()}".as_str());
+            return;
+        }
+        if (method == Str::new("codeAction")) { Smoke::run_code_action(server, fixture, check, tally, label); return; }
+        if (method == Str::new("semanticTokens")) {
+            const answer: Option<JsonValue> = server.request(Str::new("textDocument/semanticTokens/full"), Smoke::document(fixture.uri(Reading::text(check, Str::new("file"))).as_str()).as_str(), Smoke::COLD_SECONDS);
+            match (Smoke::result_object(&answer)) {
+                Option::Some(result) => { tally.judged(Judges::semantic_tokens(fixture, check, result), label); }
+                Option::None         => { tally.check(false, label, f"no result: {Smoke::shown(&answer).as_str()}".as_str()); }
+            }
+            return;
+        }
+        if (method == Str::new("documentSymbol") || method == Str::new("workspaceSymbol")) {
+            const document: boolean = method == Str::new("documentSymbol");
+            const answer: Option<JsonValue> = if (document) {
+                server.request(Str::new("textDocument/documentSymbol"), Smoke::document(fixture.uri(Reading::text(check, Str::new("file"))).as_str()).as_str(), Smoke::COLD_SECONDS)
+            } else {
+                server.request(Str::new("workspace/symbol"), f"{{\"query\":{Frames::quoted(Reading::text(check, Str::new("query"))).as_str()}}}".as_str(), Smoke::COLD_SECONDS)
+            };
+            if (!Smoke::answered(&answer)) { tally.check(false, label, f"no result: {Smoke::shown(&answer).as_str()}".as_str()); return; }
+            const response: JsonValue* = Smoke::response(&answer, &empty);
+            const result: JsonValue* = match (Reading::at(response, Str::new("result"))) {
+                Option::Some(found) => { found }
+                Option::None        => { &empty }
+            };
+            const verdict: Judgement = Judges::symbols(check, result, document);
+            tally.check(verdict.passed, label, verdict.detail.as_str());
+            return;
+        }
+        if (method == Str::new("prepareRename") || method == Str::new("rename")) { Smoke::run_rename(server, fixture, check, tally, label); return; }
+        if (method == Str::new("signatureHelp")) {
+            const place: Pair<String, Position> = match (fixture.at(Reading::text(check, Str::new("at")))) {
+                Result::Ok(place)   => { place }
+                Result::Err(reason) => { tally.check(false, label, reason.as_str()); return; }
+            };
+            const answer: Option<JsonValue> = server.request(Str::new("textDocument/signatureHelp"), Smoke::at_position(fixture.uri(place.first.as_str()).as_str(), &place.second).as_str(), Smoke::COLD_SECONDS);
+            match (Smoke::usable(server, &answer)) {
+                Option::Some(reason) => { tally.check(false, label, reason.as_str()); }
+                Option::None         => {
+                    const verdict: Judgement = Judges::signature_help(check, Smoke::result_of(&answer, &empty));
+                    tally.check(verdict.passed, label, verdict.detail.as_str());
+                }
+            }
+            return;
+        }
+        if (method == Str::new("inlayHints")) {
+            const uri: String = fixture.uri(Reading::text(check, Str::new("file")));
+            const params: String = f"{{\"textDocument\":{{\"uri\":{Frames::quoted(uri.as_str()).as_str()}}},\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":100000,\"character\":0}}}}}}";
+            const answer: Option<JsonValue> = server.request(Str::new("textDocument/inlayHint"), params.as_str(), Smoke::COLD_SECONDS);
+            if (!Smoke::answered(&answer)) { tally.check(false, label, f"no result: {Smoke::shown(&answer).as_str()}".as_str()); return; }
+            tally.judged(Judges::inlay_hints(fixture, check, Smoke::result_of(&answer, &empty)), label);
+            return;
+        }
+
+        const place: Pair<String, Position> = match (fixture.at(Reading::text(check, Str::new("at")))) {
+            Result::Ok(place)   => { place }
+            Result::Err(reason) => { tally.check(false, label, reason.as_str()); return; }
+        };
+        const uri: String = fixture.uri(place.first.as_str());
+        mut params: String = f"{{\"textDocument\":{{\"uri\":{Frames::quoted(uri.as_str()).as_str()}}},\"position\":{place.second.json().as_str()}";
+        if (method == Str::new("completion")) {
+            const trigger: Option<Str> = if (Reading::has_text(check, Str::new("trigger"))) { Option::Some(Reading::text(check, Str::new("trigger"))) } else { Option::None };
+            params.push(f",\"context\":{Smoke::completion_context(trigger).as_str()}".as_str());
+        }
+        if (method == Str::new("references")) {
+            const declaration: boolean = match (Reading::at(check, Str::new("declaration"))) {
+                Option::Some(flag) => { match (flag) { JsonValue::Bool(set) => { set } _ => { false } } }
+                Option::None       => { false }
+            };
+            params.push(f",\"context\":{{\"includeDeclaration\":{declaration}}}".as_str());
+        }
+        params.push(Str::new("}"));
+        const wire: String = if (method == Str::new("expandHover")) { String::from_str(Str::new("cryo/expandHover")) } else { f"textDocument/{method}" };
+        server.take_waiting();
+        const errors_before: i64 = server.errors.length();
+        const answer: Option<JsonValue> = server.request(wire.as_str(), params.as_str(), Smoke::COLD_SECONDS);
+        const quiet: boolean = match (Reading::at(check, Str::new("quiet_stderr"))) {
+            Option::Some(flag) => { match (flag) { JsonValue::Bool(set) => { set } _ => { false } } }
+            Option::None       => { false }
+        };
+        if (quiet) {
+            // The server writes nothing to stderr unless CRYO_LOG asks it to.
+            // The pause lets the reader catch a line written before the reply.
+            thread::sleep(Duration::from_milliseconds(500));
+            server.take_waiting();
+            if (server.errors.length() != errors_before) {
+                mut written: Array<String> = Array::<String>::new();
+                for (mut index: i64 = errors_before; index < server.errors.length() && index < errors_before + 5; index++) {
+                    written.push(server.errors.get_reference(index).unwrap().clone());
+                }
+                tally.check(false, label, f"the server wrote to stderr while answering: {Judges::listed(&written).as_str()}".as_str());
+                return;
+            }
+        }
+        match (Smoke::usable(server, &answer)) {
+            Option::Some(reason) => { tally.check(false, label, reason.as_str()); return; }
+            Option::None         => { }
+        }
+        const result: JsonValue* = Smoke::result_of(&answer, &empty);
+        if (method == Str::new("definition")) { tally.judged(Judges::definition(fixture, check, result), label); return; }
+        if (method == Str::new("hover") || method == Str::new("expandHover")) {
+            const verdict: Judgement = Judges::hover(check, result);
+            tally.check(verdict.passed, label, verdict.detail.as_str());
+            return;
+        }
+        if (method == Str::new("completion")) {
+            const verdict: Judgement = Judges::completion(check, result);
+            tally.check(verdict.passed, label, verdict.detail.as_str());
+            return;
+        }
+        if (method == Str::new("references") || method == Str::new("documentHighlight")) {
+            tally.judged(Judges::locations(fixture, check, result, place.first.as_str()), label);
+            return;
+        }
+        tally.check(false, label, f"unknown check method '{method}'".as_str());
+    }
+
+    /// A `prepareRename` or `rename` check; with `refused`, the answer must
+    /// be an error whose message holds that text.
+    private static run_rename(server: mut &Server, fixture: mut &Fixture, check: JsonValue*, tally: mut &Tally, label: Str) -> void {
+        const method: Str = Reading::text(check, Str::new("method"));
+        const place: Pair<String, Position> = match (fixture.at(Reading::text(check, Str::new("at")))) {
+            Result::Ok(place)   => { place }
+            Result::Err(reason) => { tally.check(false, label, reason.as_str()); return; }
+        };
+        mut params: String = f"{{\"textDocument\":{{\"uri\":{Frames::quoted(fixture.uri(place.first.as_str()).as_str()).as_str()}}},\"position\":{place.second.json().as_str()}";
+        if (method == Str::new("rename")) { params.push(f",\"newName\":{Frames::quoted(Reading::text(check, Str::new("new_name"))).as_str()}".as_str()); }
+        params.push(Str::new("}"));
+        const answer: Option<JsonValue> = server.request(f"textDocument/{method}".as_str(), params.as_str(), Smoke::COLD_SECONDS);
+        if (answer.is_none()) { tally.check(false, label, f"no response ({Smoke::server_state(server).as_str()})".as_str()); return; }
+        const empty: JsonValue = JsonValue::Null;
+        const response: JsonValue* = Smoke::response(&answer, &empty);
+        if (Reading::has_text(check, Str::new("refused"))) {
+            const refused: Str = Reading::text(check, Str::new("refused"));
+            const said: boolean = Reading::present(response, Str::new("error")) && Reading::text(response, Str::new("error.message")).contains(&refused);
+            tally.check(said, label, f"want a refusal saying '{refused}', got {Smoke::shown(&answer).as_str()}".as_str());
+            return;
+        }
+        if (Reading::present(response, Str::new("error"))) { tally.check(false, label, f"error {Reading::shown(Reading::at(response, Str::new("error"))).as_str()}".as_str()); return; }
+        const result: JsonValue* = match (Reading::at(response, Str::new("result"))) {
+            Option::Some(found) => { found }
+            Option::None        => { &empty }
+        };
+        if (method == Str::new("prepareRename")) { tally.judged(Judges::prepare_rename(fixture, check, result), label); return; }
+        tally.judged(Judges::rename(fixture, check, result), label);
+    }
+
+    /// A `codeAction` check: wait for a diagnostic of `code` underlining
+    /// `old` exactly at `at` (so one published for an earlier check's text
+    /// at the same place is not taken for it), ask for its actions, and
+    /// judge the quickfix.
+    private static run_code_action(server: mut &Server, fixture: mut &Fixture, check: JsonValue*, tally: mut &Tally, label: Str) -> void {
+        const place: Pair<String, Position> = match (fixture.at(Reading::text(check, Str::new("at")))) {
+            Result::Ok(place)   => { place }
+            Result::Err(reason) => { tally.check(false, label, reason.as_str()); return; }
+        };
+        const uri: String = fixture.uri(place.first.as_str());
+        const code: Str = Reading::text(check, Str::new("code"));
+        const old: Str = Reading::text(check, Str::new("old"));
+        const started: Instant = Instant::now();
+        mut diagnostic: Option<String> = Option::None;
+        mut range: String = String::new();
+        loop {
+            server.take_waiting();
+            mut index: i64 = server.notifications.length() - 1;
+            while (index >= 0 && diagnostic.is_none()) {
+                const message: JsonValue* = server.notifications.get_reference(index).unwrap();
+                if (Reading::text(message, Str::new("method")) == Str::new("textDocument/publishDiagnostics")
+                        && Locations::same_uri(Reading::text(message, Str::new("params.uri")), uri.as_str())) {
+                    for (each in Reading::elements(message, Str::new("params.diagnostics")).iterate_references()) {
+                        if (diagnostic.is_none() && Judges::underlines(*each, code, &place.second, old.char_count())) {
+                            diagnostic = Option::Some(serializer::stringify(*each));
+                            range = serializer::stringify(Reading::at(*each, Str::new("range")).unwrap());
+                        }
+                    }
+                }
+                index--;
+            }
+            if (diagnostic.is_some() || server.ended()) { break; }
+            if (!server.receive_before(&started, Smoke::COLD_SECONDS * 1000)) { break; }
+        }
+        const found: String = match (diagnostic) {
+            Option::Some(text) => { text }
+            Option::None       => { tally.check(false, label, f"no {code} published at {Reading::text(check, Str::new("at"))}".as_str()); return; }
+        };
+        const params: String = f"{{\"textDocument\":{{\"uri\":{Frames::quoted(uri.as_str()).as_str()}}},\"range\":{range.as_str()},\"context\":{{\"diagnostics\":[{found.as_str()}]}}}}";
+        const answer: Option<JsonValue> = server.request(Str::new("textDocument/codeAction"), params.as_str(), Smoke::COLD_SECONDS);
+        if (!Smoke::answered(&answer)) { tally.check(false, label, f"no answer: {Smoke::shown(&answer).as_str()}".as_str()); return; }
+        // A fix may edit somewhere other than the text it underlines.
+        mut fix_at: Position = Position { line: place.second.line, character: place.second.character };
+        mut replaced: Str = old;
+        if (Reading::has_text(check, Str::new("fix_at"))) {
+            match (fixture.at(Reading::text(check, Str::new("fix_at")))) {
+                Result::Ok(elsewhere) => { fix_at = Position { line: elsewhere.second.line, character: elsewhere.second.character }; }
+                Result::Err(reason)   => { tally.check(false, label, reason.as_str()); return; }
+            }
+            replaced = Reading::text(check, Str::new("fix_old"));
+        }
+        const empty: JsonValue = JsonValue::Null;
+        const verdict: Judgement = Judges::code_action(Smoke::result_of(&answer, &empty), uri.as_str(), &fix_at, replaced, Reading::text(check, Str::new("new_text")));
+        tally.check(verdict.passed, label, verdict.detail.as_str());
+    }
+
+    // ---- the lifecycle ------------------------------------------------------
+
+    /// `initialize` and `initialized`; the capabilities the server declared.
+    private static initialize(server: mut &Server, root: Str, tally: mut &Tally, label: Str) -> JsonValue {
+        const params: String = f"{{\"processId\":null,\"rootUri\":{Frames::quoted(Locations::uri_for(root).as_str()).as_str()},\"capabilities\":{{\"general\":{{\"positionEncodings\":[\"utf-16\"]}}}}}}";
+        const answer: Option<JsonValue> = server.request(Str::new("initialize"), params.as_str(), Smoke::COLD_SECONDS);
+        tally.check(Smoke::has_result(&answer), f"{label}: initialize returns a result".as_str(), Str::new(""));
+        server.notify(Str::new("initialized"), Str::new("{}"));
+        // The capabilities outlive the answer they arrived in, as a copy.
+        const text: String = match (&answer) {
+            Option::Some(response) => {
+                match (Reading::at(response, Str::new("result.capabilities"))) {
+                    Option::Some(found) => { serializer::stringify(found) }
+                    Option::None        => { String::from_str(Str::new("{}")) }
+                }
+            }
+            Option::None => { String::from_str(Str::new("{}")) }
+        };
+        return match (parser::parse(text.as_str())) {
+            Result::Ok(capabilities) => { capabilities }
+            Result::Err(_)           => { JsonValue::Null }
+        };
+    }
+
+    /// `shutdown`, `exit`, and the exit code 0.
+    private static shutdown(server: mut &Server, tally: mut &Tally, label: Str) -> void {
+        const down: Option<JsonValue> = server.request(Str::new("shutdown"), Str::new("{}"), 60);
+        tally.check(Smoke::has_result(&down), f"{label}: shutdown returns a result".as_str(), Str::new(""));
+        server.notify(Str::new("exit"), Str::new("{}"));
+        Smoke::exits_zero(server, tally, label);
+    }
+
+    private static exits_zero(server: mut &Server, tally: mut &Tally, label: Str) -> void {
+        match (server.exit_within(20)) {
+            Option::Some(code) => {
+                const shown: String = match (code) {
+                    Option::Some(value) => { f"{value}" }
+                    Option::None        => { String::from_str(Str::new("None")) }
+                };
+                tally.check(code == Option::Some(0), f"{label}: exits 0 after shutdown and exit".as_str(), f"rc={shown.as_str()}".as_str());
+            }
+            Option::None => {
+                server.stop();
+                tally.check(false, f"{label}: exits 0 after shutdown and exit".as_str(), Str::new("timed out"));
+            }
+        }
+    }
+
+    /// After a group with a failure: the server's exit code and the last 20
+    /// lines it wrote to its error stream.
+    private static report_errors(server: mut &Server, tally: mut &Tally, failed_before: i64) -> void {
+        if (tally.failed <= failed_before) { return; }
+        const shown: String = match (server.exit_code()) {
+            Option::Some(code) => { f"{code}" }
+            Option::None       => { String::from_str(Str::new("None")) }
+        };
+        tally.say(f"  server exit code {shown.as_str()}");
+        if (server.errors.is_empty()) { return; }
+        tally.say(String::from_str(Str::new("  --- server stderr (last 20 lines) ---")));
+        const first: i64 = if (server.errors.length() > 20) { server.errors.length() - 20 } else { 0 };
+        for (mut index: i64 = first; index < server.errors.length(); index++) {
+            tally.say(f"  | {server.errors.get_reference(index).unwrap().as_str()}");
+        }
+    }
+
+    /// Write the vendor registry under `home` holding the fixture's
+    /// vendored libraries, each with its bindings file cached for the host.
+    private static register_vendor(home: Path, fixture: &Fixture) -> Result<(), String> {
+        mut libraries: Array<String> = Array::<String>::new();
+        const names: Array<String> = Judges::sorted(Reading::keys(&fixture.specification, Str::new("vendor")));
+        for (name in names.iterate_references()) {
+            const bindings: Str = Reading::text(Reading::at(&fixture.specification, Str::new("vendor")).unwrap(), name.as_str());
+            const file: PathBuf = Path::from(fixture.root.as_str()).join(bindings);
+            libraries.push(f"{{\"key\":{Frames::quoted(name.as_str().to_ascii_lowercase().as_str()).as_str()},\"name\":{Frames::quoted(name.as_str()).as_str()},\"source_path\":{Frames::quoted(fixture.root.as_str()).as_str()},\"binding_source\":\"manual\",\"headers\":[],\"include_dirs\":[],\"defines\":[],\"language\":\"\",\"std\":\"\",\"link\":{{}},\"cache\":[{{\"triple\":\"host\",\"file\":{Frames::quoted(file.as_path().as_str()).as_str()},\"key\":\"\"}}]}}");
+        }
+        const vendor: PathBuf = home.join(Str::new("cache/vendor"));
+        match (Directory::create_all(vendor.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot create {vendor.as_path().as_str()}: {error.describe()}"); }
+        }
+        const registry: String = f"{{\"schema_version\":1,\"libraries\":[{Text::joined(&libraries, Str::new(",")).as_str()}]}}";
+        return match (File::write_text(vendor.as_path().join(Str::new("registry.json")).as_path(), registry.as_str())) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot write the registry: {error.describe()}") }
+        };
+    }
+
+    // ---- small parts --------------------------------------------------------
+
+    private static open_document(server: mut &Server, uri: Str, text: Str) -> void {
+        server.notify(Str::new("textDocument/didOpen"),
+                      f"{{\"textDocument\":{{\"uri\":{Frames::quoted(uri).as_str()},\"languageId\":\"cryo\",\"version\":1,\"text\":{Frames::quoted(text).as_str()}}}}}".as_str());
+    }
+
+    private static open_fixture_documents(server: mut &Server, fixture: mut &Fixture) -> void {
+        for (relative in Reading::texts(&fixture.specification, Str::new("open")).iterate_references()) {
+            const text: String = fixture.text(relative.as_str()).unwrap_or(String::new());
+            Smoke::open_document(server, fixture.uri(relative.as_str()).as_str(), text.as_str());
+        }
+    }
+
+    /// The whole text of the document `uri` changed to `text`, saved too
+    /// when `save` (the file on disk is never written: an open buffer is
+    /// what every analysis reads, so a save only says "analyse now").
+    private static change(server: mut &Server, uri: Str, version: i64, text: Str, save: boolean) -> void {
+        server.notify(Str::new("textDocument/didChange"),
+                      f"{{\"textDocument\":{{\"uri\":{Frames::quoted(uri).as_str()},\"version\":{version}}},\"contentChanges\":[{{\"text\":{Frames::quoted(text).as_str()}}}]}}".as_str());
+        if (save) { server.notify(Str::new("textDocument/didSave"), f"{{\"textDocument\":{{\"uri\":{Frames::quoted(uri).as_str()}}}}}".as_str()); }
+    }
+
+    private static document(uri: Str) -> String {
+        return f"{{\"textDocument\":{{\"uri\":{Frames::quoted(uri).as_str()}}}}}";
+    }
+
+    private static at_position(uri: Str, position: &Position) -> String {
+        return f"{{\"textDocument\":{{\"uri\":{Frames::quoted(uri).as_str()}}},\"position\":{position.json().as_str()}}}";
+    }
+
+    /// A completion's context as an editor sends it: invoked, or triggered
+    /// by the character just typed.
+    private static completion_context(trigger: Option<Str>) -> String {
+        return match (trigger) {
+            Option::Some(character) => { f"{{\"triggerKind\":2,\"triggerCharacter\":{Frames::quoted(character).as_str()}}}" }
+            Option::None            => { String::from_str(Str::new("{\"triggerKind\":1}")) }
+        };
+    }
+
+    /// The position `offset` characters into the first `needle` in `text`.
+    private static find_position(text: Str, needle: Str, offset: i64) -> Position {
+        return match (text.find(&needle)) {
+            Option::Some(at) => { Locations::position_of(text, at + offset) }
+            Option::None     => { Position { line: -1, character: -1 } }
+        };
+    }
+
+    /// The newest notification `method`, about the document `uri` when
+    /// `uri` is not empty, among those filed so far.
+    private static newest(server: mut &Server, method: Str, uri: Str) -> Option<i64> {
+        server.take_waiting();
+        mut index: i64 = server.notifications.length() - 1;
+        while (index >= 0) {
+            const message: JsonValue* = server.notifications.get_reference(index).unwrap();
+            if (Reading::text(message, Str::new("method")) == method
+                    && (uri.is_empty() || Locations::same_uri(Reading::text(message, Str::new("params.uri")), uri))) { return Option::Some(index); }
+            index--;
+        }
+        return Option::None;
+    }
+
+    /// The newest notification `method` about `uri`, waiting up to
+    /// `seconds` for one.
+    private static wait_notification(server: mut &Server, method: Str, uri: Str, seconds: i64) -> Option<i64> {
+        const started: Instant = Instant::now();
+        loop {
+            match (Smoke::newest(server, method, uri)) {
+                Option::Some(index) => { return Option::Some(index); }
+                Option::None        => { }
+            }
+            if (server.ended()) { return Option::None; }
+            if (!server.receive_before(&started, seconds * 1000)) { return Smoke::newest(server, method, uri); }
+        }
+    }
+
+    private static wait_published(server: mut &Server, uri: Str, seconds: i64) -> Option<i64> {
+        return Smoke::wait_notification(server, Str::new("textDocument/publishDiagnostics"), uri, seconds);
+    }
+
+    /// Whether the regions notification at `index` dims `line`.
+    private static dimmed(server: &Server, index: Option<i64>, line: i64) -> boolean {
+        const at: i64 = match (index) {
+            Option::Some(at) => { at }
+            Option::None     => { return false; }
+        };
+        for (region in Reading::elements(server.notifications.get_reference(at).unwrap(), Str::new("params.regions")).iterate_references()) {
+            const first: i64 = Reading::integer(*region, Str::new("start.line")).unwrap_or(-1);
+            const last: i64 = Reading::integer(*region, Str::new("end.line")).unwrap_or(-2);
+            if (first <= line && line <= last) { return true; }
+        }
+        return false;
+    }
+
+    /// The URI of the first location `method` answers at `position`,
+    /// written plainly; empty for none.
+    private static first_uri(server: mut &Server, method: Str, uri: Str, position: &Position, extra: Str) -> String {
+        const answer: Option<JsonValue> = server.request(f"textDocument/{method}".as_str(), Smoke::at_position(uri, position).as_str(), 60);
+        return match (&answer) {
+            Option::Some(response) => {
+                match (Smoke::first_location(response)) {
+                    Option::Some(location) => { Smoke::uri_tail(Reading::text(location, Str::new("uri"))) }
+                    Option::None           => { String::new() }
+                }
+            }
+            Option::None => { String::new() }
+        };
+    }
+
+    private static first_location(response: JsonValue*) -> Option<JsonValue*> {
+        const result: JsonValue* = Reading::at(response, Str::new("result"))?;
+        const location: JsonValue* = if (result.is_array()) { result.at(0)? } else { result };
+        if (!Reading::has_text(location, Str::new("uri"))) { return Option::None; }
+        return Option::Some(location);
+    }
+
+    /// `uri` with its drive colon unescaped, forward slashes and lower case.
+    private static uri_tail(uri: Str) -> String {
+        return Locations::plain(uri).as_str().replace(&Str::new("\\"), &Str::new("/"));
+    }
+
+    private static result_matches(fixture: mut &Fixture, answer: &Option<JsonValue>, expected: Str) -> boolean {
+        return match (answer) {
+            Option::Some(response) => {
+                match (Reading::at(response, Str::new("result"))) {
+                    Option::Some(result) => { Judges::location_matches(fixture, result, expected).unwrap_or(false) }
+                    Option::None         => { false }
+                }
+            }
+            Option::None => { false }
+        };
+    }
+
+    private static answer_for(answers: &Array<Pair<String, Array<String>>>, typed: Str) -> Array<String> {
+        for (answer in answers.iterate_references()) {
+            if (answer.first.as_str() == typed) { return answer.second.clone(); }
+        }
+        return Array::<String>::new();
+    }
+
+    private static index_of(items: &Array<String>, item: Str) -> i64 {
+        for (mut index: i64 = 0; index < items.length(); index++) {
+            if (items.get_reference(index).unwrap().as_str() == item) { return index; }
+        }
+        return 1 << 40;
+    }
+
+    /// An answer's error code, 0 when it is no error (or there is none).
+    private static error_code(answer: &Option<JsonValue>) -> i64 {
+        return match (answer) {
+            Option::Some(response) => { Reading::integer(response, Str::new("error.code")).unwrap_or(0) }
+            Option::None           => { 0 }
+        };
+    }
+
+    /// Whether an answer came and is no error.
+    private static answered(answer: &Option<JsonValue>) -> boolean {
+        return match (answer) {
+            Option::Some(response) => { !Reading::present(response, Str::new("error")) }
+            Option::None           => { false }
+        };
+    }
+
+    private static has_result(answer: &Option<JsonValue>) -> boolean {
+        return match (answer) {
+            Option::Some(response) => { Reading::at(response, Str::new("result")).is_some() }
+            Option::None           => { false }
+        };
+    }
+
+    private static result_is_array(answer: &Option<JsonValue>, path: Str) -> boolean {
+        return match (answer) {
+            Option::Some(response) => {
+                match (Reading::at(response, path)) {
+                    Option::Some(found) => { found.is_array() }
+                    Option::None        => { false }
+                }
+            }
+            Option::None => { false }
+        };
+    }
+
+    /// An answer's result when it is an object.
+    private static result_object(answer: &Option<JsonValue>) -> Option<JsonValue*> {
+        if (!Smoke::answered(answer)) { return Option::None; }
+        const result: JsonValue* = Reading::at(answer.as_reference()?, Str::new("result"))?;
+        if (!result.is_object()) { return Option::None; }
+        return Option::Some(result);
+    }
+
+    /// Why an answer cannot be judged: none came, or it is an error.
+    private static usable(server: mut &Server, answer: &Option<JsonValue>) -> Option<String> {
+        return match (answer) {
+            Option::Some(response) => {
+                const reason: Option<String> = if (Reading::present(response, Str::new("error"))) { Option::Some(f"error {Reading::shown(Reading::at(response, Str::new("error"))).as_str()}") } else { Option::None };
+                reason
+            }
+            Option::None => { Option::Some(f"no response ({Smoke::server_state(server).as_str()})") }
+        };
+    }
+
+    /// An answer, or `empty` when none came.
+    private static response(answer: &Option<JsonValue>, empty: JsonValue*) -> JsonValue* {
+        return answer.as_reference().unwrap_or(empty);
+    }
+
+    /// An answer's `result`, or `empty` when it has none.
+    private static result_of(answer: &Option<JsonValue>, empty: JsonValue*) -> JsonValue* {
+        return match (Reading::at(Smoke::response(answer, empty), Str::new("result"))) {
+            Option::Some(result) => { result }
+            Option::None         => { empty }
+        };
+    }
+
+    private static shown(answer: &Option<JsonValue>) -> String {
+        return Reading::shown(answer.as_reference());
+    }
+
+    private static notification_shown(server: &Server, index: Option<i64>) -> String {
+        return match (index) {
+            Option::Some(at) => { Reading::shown(Reading::at(server.notifications.get_reference(at).unwrap(), Str::new("params"))) }
+            Option::None     => { String::from_str(Str::new("None")) }
+        };
+    }
+
+    private static server_state(server: mut &Server) -> String {
+        return String::from_str(if (server.alive()) { Str::new("server alive") } else { Str::new("server dead") });
+    }
+
+}

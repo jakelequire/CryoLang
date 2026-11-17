@@ -1,0 +1,96 @@
+///! What a build of the language server reported, read from its output.
+///!
+///! The server links the compiler as a library, so it sees every change to
+///! the compiler's syntax tree and public signatures, and nothing else that
+///! runs during validation compiles it.  A build counts only when the
+///! compiler stated the population it built - `Building cryolsp [release]:
+///! 24 local, 81 std, 161 dep module(s)` - since a warm build prints `is up
+///! to date` and compiles nothing: an absence that reads as progress.
+
+namespace cryogate::lsp::build;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+
+import cryogate::core::text::{ Text };
+
+/// The lines of a server build that the gate reads.
+public type struct LspBuild {
+    /// Whether the build stated its population.
+    public counted: boolean;
+    /// The local, standard-library and dependency modules it compiled.
+    public local: i64;
+    public standard: i64;
+    public dependency: i64;
+    /// The warnings it reported.
+    public warnings: i64;
+    /// The binary it linked, as it spelled it; empty when it named none.
+    public binary: String;
+    /// The lines starting `error`.
+    public errors: Array<String>;
+    /// Every line, in order.
+    public lines: Array<String>;
+
+    /// The build that printed `output`.
+    public static read(output: Str) -> LspBuild {
+        mut build: LspBuild = LspBuild {
+            counted:    false,
+            local:      0,
+            standard:   0,
+            dependency: 0,
+            warnings:   0,
+            binary:     String::new(),
+            errors:     Array::<String>::new(),
+            lines:      Text::lines(output),
+        };
+        for (line in build.lines.iterate_references()) {
+            const text: Str = line.as_str();
+            if (text.starts_with(&Str::new("error"))) { build.errors.push(line.clone()); }
+            mut words: Array<Str> = Array::<Str>::new();
+            for (word in text.split_whitespace()) { words.push(word); }
+            if (text.starts_with(&Str::new("Building")) && LspBuild::population(&words)) {
+                build.counted = true;
+                build.local = i64::try_from(*words.get_reference(3).unwrap()).unwrap_or(0);
+                build.standard = i64::try_from(*words.get_reference(5).unwrap()).unwrap_or(0);
+                build.dependency = i64::try_from(*words.get_reference(7).unwrap()).unwrap_or(0);
+                continue;
+            }
+            if (words.length() >= 3 && text.starts_with(&*words.get_reference(0).unwrap()) && Text::is_digits(*words.get_reference(0).unwrap())
+                    && (*words.get_reference(1).unwrap() == Str::new("warning") || *words.get_reference(1).unwrap() == Str::new("warnings"))
+                    && words.get_reference(2).unwrap().starts_with(&Str::new("emitted"))) {
+                build.warnings = i64::try_from(*words.get_reference(0).unwrap()).unwrap_or(0);
+                continue;
+            }
+            if (words.length() >= 3 && *words.get_reference(0).unwrap() == Str::new("Compiled") && text.starts_with(&Str::new("Compiled"))
+                    && *words.get_reference(1).unwrap() == Str::new("->")) {
+                match (text.split_once(&Str::new("->"))) {
+                    Option::Some(parts) => { build.binary = String::from_str(parts.second.trim()); }
+                    Option::None        => { }
+                }
+            }
+        }
+        return build;
+    }
+
+    /// Whether `words`, a line's words, are `Building <name> [<profile>]:
+    /// <n> local, <n> std, <n> dep module...`.
+    private static population(words: &Array<Str>) -> boolean {
+        if (words.length() < 10) { return false; }
+        return *words.get_reference(0).unwrap() == Str::new("Building")
+            && words.get_reference(2).unwrap().starts_with(&Str::new("[")) && words.get_reference(2).unwrap().ends_with(&Str::new("]:"))
+            && Text::is_digits(*words.get_reference(3).unwrap()) && *words.get_reference(4).unwrap() == Str::new("local,")
+            && Text::is_digits(*words.get_reference(5).unwrap()) && *words.get_reference(6).unwrap() == Str::new("std,")
+            && Text::is_digits(*words.get_reference(7).unwrap()) && *words.get_reference(8).unwrap() == Str::new("dep")
+            && words.get_reference(9).unwrap().starts_with(&Str::new("module"));
+    }
+
+    /// Every module the build compiled.
+    public total(&this) -> i64 { return this.local + this.standard + this.dependency; }
+
+    /// What the build did, as the verdict line says it.
+    public described(&this) -> String {
+        return f"compiled {this.total()} module(s) ({this.local} local, {this.standard} std, {this.dependency} dep), 0 errors, {this.warnings} warning(s); linked {this.binary.as_str()}";
+    }
+}

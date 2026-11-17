@@ -204,7 +204,7 @@ compiler subcommand, because the compiler already holds the answer), **keep**
 | `scripts/examples-gate.py` | 110 | builds every `examples/*` with a floor (`--min`) | **ported** → `cryogate examples` (script deleted; the floor raised from 14 to the 15 shipped) | small; the absolute forward-slash stdlib spelling is kept, though the objects no longer move with it (stdlib files are named `stdlib/<path>`) |
 | `scripts/check-examples-output.sh` | 96 | builds and runs five examples, diffs stdout with the goldens (POSIX) | **ported** → `cryogate examples --run` (script deleted), then **replace** its comparison with `stdout_file` assertions (ruling 271) | runs on Windows too; the hard-coded list became "every example with an `expected.out`": a golden beside no project is refused, and a floor (`--min-goldens`, the 5 shipped) refuses a deleted one; an example must also exit 0, which the script never checked |
 | `scripts/valgrind-check.sh` | 73 | four examples under valgrind (Linux) | **ported** → `cryogate examples --run --under=valgrind` (script deleted) | the same build-and-run loop with a runner prefix; one loop, not two. It runs every golden (15-files too, which the script's list left out; its leak of the temporaries a borrowing call is made on has since been fixed, and it runs clean) and also compares their output |
-| `scripts/lsp-gate.py` + `tools/CryoLSP/tests/smoke.py` | 189 + 1285 | builds CryoLSP with the compiler under test; drives it over stdio through protocol checks and every fixture's `checks.json` | **port** → `cryogate lsp` (§4g) | the largest port by line count; the JSON-RPC driver is reused by the LSP fuzzing lanes later |
+| `scripts/lsp-gate.py` + `tools/CryoLSP/tests/smoke.py` | 189 + 1285 | builds CryoLSP with the compiler under test; drives it over stdio through protocol checks and every fixture's `checks.json` | **ported** → `cryogate lsp` and `cryogate lsp-smoke` (both scripts deleted; the checks.json reference moved to docs/testing.md §9) | the largest port by line count; the JSON-RPC driver is reused by the LSP fuzzing lanes later |
 | `scripts/cross-check.py` | 193 | the other OS's runtime, stdlib, compiler and CryoLSP, objects only, concurrently | **ported** → `cryogate cross` (script deleted), which also builds tools/CryoGate and tools/CryoSmith with the compiler under test | once `cryo build` can stop at objects (ruling 322) it also passes on a Linux host (bug 0035) |
 | `scripts/incremental-instance-check.py` | 90 | an edit asking a cached module for a new instance still links and reuses the cache | **ported** → `cryogate incr --instance` (script deleted) | small; part of verify |
 | `scripts/incremental-check.py` | 267 | incremental build == clean build over a three-file edit matrix (Linux; a PE carries a link timestamp) | **ported** → `cryogate incr --matrix` (script deleted); the edit-fuzz gate (question 3) grows from it | it compares every object, and the program where two clean links agree, which lifts the Windows refusal (the script never reached its matrix there: it looked for the program without `.exe`); its builds go to `.verify/incremental-check`, so the compiler under test in `compiler/build` survives the run |
@@ -605,6 +605,13 @@ case). It does not use row 2 yet: `group_descendants` takes the child out of
 the terminal's Ctrl-C group, so until row 7 gives cryogate an interrupt
 hook that kills its trees, a Ctrl-C would end cryogate and leave its
 children running.
+
+**Row 13 done on `test-infra`:** a running child's pipes are taken out of
+`Child` (`child.stdout.take()`), written and read while it runs, and
+finished with `Child.wait_with_output` (stdin closed, both outputs read
+together); a write to an exited child's stdin is `BrokenPipe` on both OSes;
+POSIX pipes are close-on-exec.  G6 (`cryogate lsp`, `cryogate lsp-smoke`)
+uses them, and `lsp-gate.py`, `smoke.py` and `$(PYTHON)` are deleted.
 
 **Missing or too weak, most important first:**
 
