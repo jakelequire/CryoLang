@@ -30,6 +30,22 @@ implement struct Generator {
         } else {
             RandomStream::for_method(this.options.seed, this.program.functions.length())
         };
+        mut parameter_types: Array<ValueType> = Array::<ValueType>::new();
+        if (!is_main) {
+            const parameter_count: i64 = if (owner < 0) { 1 + this.random.below(4) } else { this.random.below(4) };
+            while (parameter_types.length() < parameter_count) { parameter_types.push(this.any_type()); }
+        }
+        this.define_with(number, owner, receiver, &parameter_types);
+        if (!is_main && this.options.features.has(Feature::Overloads)) {
+            this.define_overloads(this.program.functions.length() - 1);
+        }
+    }
+
+    /// Generate the rest of a function whose parameters are
+    /// `parameter_types`, from the stream already chosen: its return type,
+    /// its body and its cost.
+    internal define_with(mut &this, number: i64, owner: i64, receiver: Receiver, parameter_types: &Array<ValueType>) -> void {
+        const is_main: boolean = owner < 0 && number == this.options.function_count();
         this.environment.enter_function();
         this.loop_depth = 0;
         this.block_depth = 0;
@@ -45,17 +61,15 @@ implement struct Generator {
             this.environment.bind(receiver_variable);
         }
         const first_parameter: i64 = this.program.lists.length();
-        mut parameter_count: i64 = 0;
-        if (!is_main) {
-            parameter_count = if (owner < 0) { 1 + this.random.below(4) } else { this.random.below(4) };
-            mut index: i64 = 0;
-            while (index < parameter_count) {
-                const value_type: ValueType = this.any_type();
-                const parameter: i64 = this.program.variable(Variable { role: VariableRole::Parameter, number: index, value_type: value_type, mutable: false });
-                this.program.lists.push(parameter);
-                this.environment.bind(parameter);
-                index = index + 1;
-            }
+        const parameter_count: i64 = parameter_types.length();
+        mut position: i64 = 0;
+        while (position < parameter_count) {
+            const parameter: i64 = this.program.variable(Variable {
+                role: VariableRole::Parameter, number: position, value_type: parameter_types.get(position).unwrap(), mutable: false,
+            });
+            this.program.lists.push(parameter);
+            this.environment.bind(parameter);
+            position = position + 1;
         }
         this.returns = match (receiver) {
             Receiver::Exclusive => { ValueType::Void }
@@ -115,15 +129,18 @@ implement struct Generator {
     /// `arguments` for a call of `called` at `type_argument`: a parameter of
     /// type `T` takes a value of `type_argument`, a deciding value when
     /// `inferred`, since then the call does not write the type argument.
+    /// Every argument of a call of an overloaded name is a deciding value
+    /// too, since it chooses the overload (`Overloading`).
     internal instantiated_arguments(mut &this, called: Function, type_argument: ValueType, inferred: boolean, depth: i64) -> i64 {
         this.budget.charge(called.cost);
+        const overloaded: boolean = this.program.overload_set(&called).length() > 1;
         mut arguments: Array<i64> = Array::<i64>::new();
         mut index: i64 = 0;
         while (index < called.parameter_count) {
             const parameter: Variable = this.program.variable_at(this.program.list_at(called.first_parameter + index));
             const decides: boolean = parameter.value_type.same(ValueType::TypeParameter);
             const wanted: ValueType = if (decides) { type_argument } else { parameter.value_type };
-            if (decides && inferred) {
+            if ((decides && inferred) || overloaded) {
                 arguments.push(this.deciding_value(wanted, if (depth < 0) { 0 } else { depth }));
             } else if (this.constant_wanted(wanted)) {
                 arguments.push(this.constant(wanted));
@@ -146,7 +163,7 @@ implement struct Generator {
         while (index < this.program.functions.length()) {
             const candidate: Function = this.program.function_at(index);
             if (candidate.receiver.is_called_by_name() && !candidate.genericity.is_generic()
-                    && candidate.returns.same(wanted) && this.budget.affordable(candidate.cost)) {
+                    && candidate.returns.same(wanted) && this.budget.affordable(candidate.cost) && this.may_call(&candidate)) {
                 found.push(index);
             }
             index = index + 1;

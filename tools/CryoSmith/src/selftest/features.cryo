@@ -3,6 +3,7 @@
 
 namespace cryosmith::selftest::features;
 
+import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::option::{ Option };
@@ -59,6 +60,51 @@ implement struct SelfTest {
         this.switch(Feature::GenericMethods, [Str::new("static m0(p0: T"), Str::new("static m1(p0: T")]);
         this.switch(Feature::GenericMethods, [Str::new(">::m0("), Str::new(">::m1(")]);
         this.constants_switch();
+        this.overloads_switch();
+    }
+
+    /// `overloads`: with it on, some program declares a free function and
+    /// some program a method twice under one name; with it off, none does.
+    private overloads_switch(mut &this) -> void {
+        mut functions_seen: boolean = false;
+        mut methods_seen: boolean = false;
+        mut leaked: boolean = false;
+        mut seed: u64 = 1;
+        while (seed <= SWITCH_PROGRAMS) {
+            const on: String = SelfTest::program(GenerationOptions::new(seed));
+            mut off_options: GenerationOptions = GenerationOptions::new(seed);
+            off_options.features = FeatureSet::parse(Str::new("default,no-overloads")).unwrap();
+            const off: String = SelfTest::program(off_options);
+            if (SelfTest::declares_twice(on.as_str(), 0)) { functions_seen = true; }
+            if (SelfTest::declares_twice(on.as_str(), 4)) { methods_seen = true; }
+            if (SelfTest::declares_twice(off.as_str(), 0) || SelfTest::declares_twice(off.as_str(), 4)) { leaked = true; }
+            seed = seed + 1;
+        }
+        this.expect(functions_seen, String::from_str(Str::new("`overloads` on: no program declares a free function's name twice")));
+        this.expect(methods_seen, String::from_str(Str::new("`overloads` on: no program declares a method's name twice")));
+        this.expect(!leaked, String::from_str(Str::new("`overloads` off: a program still declares a name twice")));
+    }
+
+    /// Whether `text` defines one name twice at `indent`: a free function
+    /// at 0, a method of one struct at 4.
+    private static declares_twice(text: Str, indent: i64) -> boolean {
+        mut names: Array<String> = Array::<String>::new();
+        mut scope: Str = Str::new("");
+        for (line in text.lines()) {
+            if (line.starts_with(&Str::new("type struct "))) { scope = line; }
+            const trimmed: Str = line.trim_start();
+            if (line.length() - trimmed.length() != indent || !line.ends_with(&Str::new(" {")) || !trimmed.contains(&Str::new(") -> "))) {
+                continue;
+            }
+            if (indent == 0 && !line.starts_with(&Str::new("function "))) { continue; }
+            const name: Str = trimmed.split_once(&Str::new("(")).unwrap().first;
+            const key: String = f"{scope} {name}";
+            for (seen in names.iterate_references()) {
+                if (seen.as_str() == key.as_str()) { return true; }
+            }
+            names.push(key);
+        }
+        return false;
     }
 
     /// `constants`: with it on, some program passes an argument made only of

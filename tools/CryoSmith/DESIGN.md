@@ -57,7 +57,8 @@ generated as text.
   is the program's to spell, since an instance's names its argument.
 - **Functions** are free functions `h<N>`, generic functions `g<N><T>`,
   `main`, and a struct's or generic struct's methods `m<N>`: static, or
-  taking `&this` or `mut &this`. Each has numbered
+  taking `&this` or `mut &this`. Functions of one owner and number are
+  one **overload set**, printed with one name. Each has numbered
   parameters, a return type, a body and a **cost**: the most work one call
   can do (section 3.3).
 - **The printer** walks the model once. Every binary expression is
@@ -186,6 +187,20 @@ leaves it to inference as the body's own instance (`B0<T>`) whatever the
 call it is passed to expects, and refuses a valid program; lift this when
 that is fixed.
 
+**Overload sets.** With `overloads`, four times in ten a free function
+`h<N>` or a declared struct's method `m<N>` is followed at once by one or
+two more functions spelled with its name and taking the same receiver,
+each with its first member's parameters with one added, one removed or one
+retyped, and a return type of its own; a member whose parameters some
+member already has is not made. A call of the name passes deciding
+values, exactly each parameter's type and reading a name, so its
+arguments' types are one member's parameter types and no other's (section
+3.2). A member's body never calls its own set, which is not whole while it
+is generated. A generic function and a generic struct's method are never
+overloaded: a call two generic overloads, or a generic and a plain one,
+both accept is ambiguous, and nothing generated would be certain to avoid
+that.
+
 **Inferred type arguments.** With `inferred-type-arguments`, a generic
 call or an instance's literal leaves its type argument to inference four
 times in ten (`g0(a, b)`, `B0 { f0: a }`) and writes the placeholder twice
@@ -264,6 +279,14 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   that names a `T` parameter twice, or once inside a loop, without the
   bound; it reads the text, since the compiler accepts such a function
   when every instance's type is `Copy` and so cannot be the check.
+- **Overload resolution is certain.** A call of an overloaded name
+  selects the member its arguments fit, and no implicit conversion makes
+  one fit: a narrower integer is not widened, and a literal where the
+  members' parameters differ is an `i32`. So the members of a set differ
+  in their parameter count or in some parameter's type
+  (`guarantees/overloading.cryo`), and every argument of a call of an
+  overloaded name is a deciding value, of exactly its parameter's type and
+  never a literal or made only of literals: one member fits, and no other.
 - **Inference is certain.** A call or literal that leaves its type
   argument to inference gives `T` only deciding values (section 2), so
   each of them has the type argument's type and they agree; nothing else
@@ -349,25 +372,28 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   seeded with its number. The generic structs and their instances come
   from one stream of their own; how many methods each has and how each
   takes its receiver from another, and each such method from one seeded
-  with its place among them.
+  with its place among them. Whether a function gains an overload set
+  comes from a stream keyed by its name, and each member from one keyed by
+  the name and the member's place in the set.
 - **The function count shapes nothing before `main`**: a program generated
   with `--functions 3` is the same structs and methods and the first three
   helpers of the same seed's program with more, plus its own `main`.
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside: `--features
-  default,no-structs,no-constants,no-generics,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
+  generator's text, header aside. `default,no-overloads` generates version
+  8's text, and with `no-overloads` added to each list,
+  `default,no-structs,no-constants,no-generics,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
   version 1's, `default,no-generics,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
   version 3's, `default,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
   version 4's, `default,no-inferred-type-arguments,no-generic-methods`
   version 5's, and `default,no-generic-methods` version 6's - for version
-  7 and earlier, once version 8's text is rewritten back in three places
-  it alone changed: `mix`'s body, and a generic function's bound, `where
-  T: Copy` (dropped) and `where T: Eq + Copy` (written `where T: Eq`).
-  Version 8 also lets a generic function call a generic struct's static
-  method at its own `T`, so with `generic-methods` on a seed's generic
-  functions may draw differently.
+  7 and earlier, once the text is rewritten back in the three places
+  version 8 alone changed: `mix`'s body, and a generic function's bound,
+  `where T: Copy` (dropped) and `where T: Eq + Copy` (written `where T:
+  Eq`). Version 8 also lets a generic function call a generic struct's
+  static method at its own `T`, so with `generic-methods` on a seed's
+  generic functions may draw differently.
 - The header records the **generator version**, raised whenever one seed may
   produce different text, so a seed filed in a bug report names the
   generator that reproduces it.
@@ -381,7 +407,7 @@ every feature of the current stage; `no-<name>` removes one.
 |---|---|
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
-| 3 (this one) | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances. Still to come in this stage: overload sets |
+| 3 (this one) | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
 | 4 | enums with unit and payload variants, generic enums, and `match`: qualified variants, payload bindings, nested patterns, wildcards, `match` as an expression |
 | 5 | closures: capturing and not, passed to function-typed parameters and called |
 | 6 | traits, classes and dynamic dispatch: implementations, default methods, calls through a bound and through a trait object |
@@ -485,8 +511,8 @@ layers, lowest first:
 | `random/` | `RandomStream`: every draw, and the seed of each part's stream (section 3.5) |
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
-| `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods` |
+| `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures (3.2) |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |
@@ -552,14 +578,12 @@ the self-test, an old-seed reproduction check and a corpus. Items 7 to 12
 are the tools that use what the stages generate; most of them belong to
 CryoGate, which runs compilers, while CryoSmith stays a generator.
 
-1. **Finish stage 3: overload sets.** Functions and methods of one name
-   that differ in their parameters, called where exactly one is chosen.
-   `model/`: a function's spelled name apart from its number, so two
-   functions share a name. `generate/overloads.cryo`: a set's members
-   differ in parameter count or in a parameter's type, and a call passes
-   arguments of exactly one member's types, never a value that would widen
-   to another's. `guarantees/`: the rule that keeps a call unambiguous,
-   stated once. `emit/`: the shared name.
+1. **Finish stage 3: overload sets** (done: `overloads`, section 2).
+   `model/`: functions of one owner and number share a name.
+   `generate/overloads.cryo`: a set's members differ in parameter count or
+   in a parameter's type, and a call passes arguments of exactly one
+   member's types, never a value that would widen to another's.
+   `guarantees/overloading.cryo`: the rule that keeps a call unambiguous.
 2. **Stage 4: enums and `match`.** `model/`: enums `E<N>` (and generic
    `E<N><T>`) with unit and payload variants, an enum type in `ValueType`,
    variant constructions, and a `match` node, both a statement and an

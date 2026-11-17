@@ -1,0 +1,86 @@
+///! Overload sets: a free function `h<N>` or a declared struct's method
+///! `m<N>` followed by one or two more functions spelled with its name,
+///! taking the same receiver and different parameters.
+///!
+///! A set is made right after its first member, before any later function
+///! is generated, so every call of the name is generated knowing the whole
+///! set, and its arguments are deciding values: exactly the parameter's
+///! type, reading a name (`Overloading`).  A member's body never calls its
+///! own set, which is not yet whole while the member is generated; that
+///! would also be the only way for a member to call itself.
+///!
+///! Whether a function gets a set, and each member's signature and body,
+///! come from streams of their own, keyed by the name, so with the feature
+///! off no draw is taken and every function's text is unchanged.
+
+namespace cryosmith::generate::overloads;
+
+import std::collections::array::{ Array };
+import std::core::option::{ Option };
+
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::guarantees::{ Overloading };
+import cryosmith::model::{ Function, ValueType };
+import cryosmith::random::{ RandomStream };
+
+/// The most members an overload set gains after its first.
+const MOST_OVERLOADS: i64 = 2;
+
+/// The most parameters an overload takes.
+const MOST_OVERLOAD_PARAMETERS: i64 = 4;
+
+implement struct Generator {
+    /// After function `first` is generated: four times in ten, one or two
+    /// more functions spelled with its name, each with parameters no
+    /// earlier member of the set has.
+    internal define_overloads(mut &this, first: i64) -> void {
+        const named: Function = this.program.function_at(first);
+        if (named.genericity.is_generic()) { return; }
+        mut deciding: RandomStream = RandomStream::for_overload(this.options.seed, named.owner, named.number, 0);
+        if (!deciding.chance(40)) { return; }
+        const members: i64 = 1 + deciding.below(MOST_OVERLOADS);
+        mut member: i64 = 1;
+        while (member <= members) {
+            this.random = RandomStream::for_overload(this.options.seed, named.owner, named.number, member);
+            match (this.overload_parameters(first)) {
+                Option::Some(parameter_types) => {
+                    this.joining_set = first;
+                    this.define_with(named.number, named.owner, named.receiver, &parameter_types);
+                    this.joining_set = -1;
+                }
+                Option::None => { }
+            }
+            member = member + 1;
+        }
+    }
+
+    /// Parameters for a new member of `first`'s set: its first member's,
+    /// with one added, one removed or one's type changed; none when they
+    /// match some member's.
+    private overload_parameters(mut &this, first: i64) -> Option<Array<ValueType>> {
+        const named: Function = this.program.function_at(first);
+        mut types: Array<ValueType> = this.program.parameter_types(first);
+        const fewest: i64 = if (named.owner < 0) { 1 } else { 0 };
+        const roll: i64 = this.random.below(3);
+        if (roll == 0 && types.length() < MOST_OVERLOAD_PARAMETERS) {
+            types.push(this.any_type());
+        } else if (roll == 1 && types.length() > fewest) {
+            types.pop();
+        } else if (types.length() > 0) {
+            types.set(this.random.below(types.length()), this.any_type());
+        } else {
+            types.push(this.any_type());
+        }
+        for (member in this.program.overload_set(&named).iter()) {
+            if (!Overloading::distinguishes(&types, &this.program.parameter_types(member))) { return Option::None; }
+        }
+        return Option::Some(types);
+    }
+
+    /// Whether the function being generated may call `candidate`: any
+    /// earlier function, except a member of the overload set it joins.
+    internal may_call(&this, candidate: &Function) -> boolean {
+        if (this.joining_set < 0) { return true; }
+        return !candidate.shares_name_with(&this.program.function_at(this.joining_set));
+    }
+}
