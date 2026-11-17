@@ -27,7 +27,7 @@ import cryosmith::configuration::{ Feature };
 import cryosmith::generate::generator::{ Generator };
 import cryosmith::generate::structs::{ MethodCandidate };
 import cryosmith::guarantees::{ Exhaustiveness };
-import cryosmith::model::{ Enumeration, ExpressionKind, MatchArm, StatementKind, ValueType, VariantDeclaration };
+import cryosmith::model::{ Enumeration, ExpressionKind, MatchArm, StatementKind, TypeArgumentSpelling, ValueType, VariantDeclaration };
 import cryosmith::random::{ RandomStream };
 import cryosmith::typing::{ TypeChoice };
 
@@ -39,6 +39,12 @@ const MOST_VARIANTS: i64 = 4;
 
 /// The most values a variant's payload holds.
 const MOST_PAYLOAD_VALUES: i64 = 2;
+
+/// The most generic enums a program declares.
+const MOST_GENERIC_ENUMERATIONS: i64 = 2;
+
+/// The most type arguments one generic enum is instantiated at.
+const MOST_ENUMERATION_INSTANCES: i64 = 2;
 
 implement struct Generator {
     /// Declare the program's enums, one or two, from their own stream.
@@ -56,10 +62,65 @@ implement struct Generator {
                 }
                 this.program.variants.push(VariantDeclaration { first_payload: first_payload, payload_count: payload_count });
             }
-            this.program.enumerations.push(Enumeration {
-                number: this.program.enumerations.length(), variant_count: variant_count, first_variant: first_variant,
-            });
+            this.program.enumerations.push(Enumeration::declared(this.program.enumerations.length(), variant_count, first_variant));
         }
+        // A generic enum's `T` is carried only by payloads, so it needs them.
+        if (this.options.features.has(Feature::GenericEnums) && this.options.features.has(Feature::EnumPayloads)) {
+            this.declare_generic_enumerations(&declaring);
+        }
+    }
+
+    /// Declare one or two generic enums `G<N><T>` from the enums' stream,
+    /// each with a payload of type `T` in variant 1 and in others half the
+    /// time, and instantiate each at one or two scalar type arguments.
+    private declare_generic_enumerations(mut &this, declaring: mut &RandomStream) -> void {
+        const count: i64 = 1 + declaring.below(MOST_GENERIC_ENUMERATIONS);
+        while (this.program.enumeration_templates.length() < count) {
+            const variant_count: i64 = 2 + declaring.below(MOST_VARIANTS - 1);
+            const first_variant: i64 = this.program.variants.length();
+            while (this.program.variants.length() < first_variant + variant_count) {
+                const variant: i64 = this.program.variants.length() - first_variant;
+                const first_payload: i64 = this.program.payload_types.length();
+                const payload_count: i64 = if (variant == 1) { 1 + declaring.below(MOST_PAYLOAD_VALUES) } else { declaring.below(MOST_PAYLOAD_VALUES + 1) };
+                while (this.program.payload_types.length() < first_payload + payload_count) {
+                    const forced: boolean = variant == 1 && this.program.payload_types.length() == first_payload;
+                    this.program.payload_types.push(if (forced || declaring.chance(50)) { ValueType::TypeParameter } else { TypeChoice::scalar(declaring, this.options.features) });
+                }
+                this.program.variants.push(VariantDeclaration { first_payload: first_payload, payload_count: payload_count });
+            }
+            const template: i64 = this.program.enumeration_templates.length();
+            this.program.enumeration_templates.push(Enumeration::declared(template, variant_count, first_variant));
+            const instance_count: i64 = 1 + declaring.below(MOST_ENUMERATION_INSTANCES);
+            mut made: i64 = 0;
+            while (made < instance_count) {
+                this.instantiate_enumeration(template, TypeChoice::scalar(declaring, this.options.features));
+                made = made + 1;
+            }
+        }
+    }
+
+    /// The instance of generic enum `template` at `argument`: its variants
+    /// the generic enum's, each payload of type `T` of type `argument`.
+    private instantiate_enumeration(mut &this, template: i64, argument: ValueType) -> void {
+        const generic: Enumeration = this.program.enumeration_templates.get(template).unwrap();
+        const first_variant: i64 = this.program.variants.length();
+        mut variant: i64 = 0;
+        while (variant < generic.variant_count) {
+            const declared: VariantDeclaration = this.program.variants.get(generic.first_variant + variant).unwrap();
+            const first_payload: i64 = this.program.payload_types.length();
+            mut position: i64 = 0;
+            while (position < declared.payload_count) {
+                const payload: ValueType = this.program.payload_type(declared, position);
+                this.program.payload_types.push(if (payload.same(ValueType::TypeParameter)) { argument } else { payload });
+                position = position + 1;
+            }
+            this.program.variants.push(VariantDeclaration { first_payload: first_payload, payload_count: declared.payload_count });
+            variant = variant + 1;
+        }
+        this.program.enumerations.push(Enumeration {
+            number: this.program.enumerations.length(), variant_count: generic.variant_count, first_variant: first_variant,
+            template: template, argument: argument,
+        });
     }
 
     /// A value of the enum type `wanted`: a variant, a variable, a call, a
@@ -96,17 +157,33 @@ implement struct Generator {
     }
 
     /// Variant `variant` of the enum type `wanted`, with a value of each of
-    /// its payload's types: `E0::V0`, `E0::V1(a, b)`.
+    /// its payload's types: `E0::V0`, `E0::V1(a, b)`.  An instance's
+    /// variant with a payload of type `T` may leave the type argument to
+    /// inference (`G0::V1(a)`, `G0::<_>::V1(a)`), and then gives a deciding
+    /// value for each such payload; one with none writes it,
+    /// `G0::<u16>::V0`, since nothing else would say which instance.
     private variant_value(mut &this, wanted: ValueType, variant: i64, depth: i64) -> i64 {
         const shape: VariantDeclaration = this.program.variant_of(wanted.enumeration(), variant);
-        mut values: Array<i64> = Array::<i64>::new();
+        mut decides: boolean = false;
         mut position: i64 = 0;
         while (position < shape.payload_count) {
-            values.push(this.typed_place(this.program.payload_type(shape, position), depth));
+            if (this.program.payload_is_type_argument(wanted.enumeration(), variant, position)) { decides = true; }
+            position = position + 1;
+        }
+        const spelling: TypeArgumentSpelling = if (decides) { this.type_argument_spelling() } else { TypeArgumentSpelling::Written };
+        mut values: Array<i64> = Array::<i64>::new();
+        position = 0;
+        while (position < shape.payload_count) {
+            const payload: ValueType = this.program.payload_type(shape, position);
+            if (spelling.is_inferred() && this.program.payload_is_type_argument(wanted.enumeration(), variant, position)) {
+                values.push(this.deciding_value(payload, depth));
+            } else {
+                values.push(this.typed_place(payload, depth));
+            }
             position = position + 1;
         }
         const first: i64 = this.program.list_run(&values);
-        return this.node(ExpressionKind::Variant(variant, first, shape.payload_count), wanted);
+        return this.node(ExpressionKind::Variant(variant, spelling, first, shape.payload_count), wanted);
     }
 
     /// Whether a `match` may be generated here: the feature is on and the

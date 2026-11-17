@@ -35,8 +35,11 @@ public type struct Program {
     /// free functions, `main` last.  A function calls only functions before
     /// it.
     public functions: Array<Function>;
-    /// Every enum, `E<N>`, in the order they are printed.
+    /// Every enum a value may have: the declared enums `E<N>`, in the order
+    /// they are printed, then the generic enums' instances.
     public enumerations: Array<Enumeration>;
+    /// Every generic enum, `G<N><T>`, in the order they are printed.
+    public enumeration_templates: Array<Enumeration>;
     /// Every `match` arm, each `match`'s a run.
     public arms: Array<MatchArm>;
     /// Every enum's variants, each enum's a run.
@@ -48,6 +51,7 @@ public type struct Program {
     public static new() -> Program {
         mut program: Program = Program {
             enumerations: Array::<Enumeration>::new(),
+            enumeration_templates: Array::<Enumeration>::new(),
             arms:        Array::<MatchArm>::new(),
             variants:    Array::<VariantDeclaration>::new(),
             payload_types: Array::<ValueType>::new(),
@@ -208,9 +212,47 @@ public type struct Program {
             ValueType::Boolean       => { String::from_str(Str::new("boolean")) }
             ValueType::Void          => { String::from_str(Str::new("void")) }
             ValueType::Record(index) => { this.structure_name(index, Str::new("<")) }
-            ValueType::Enumeration(index) => { f"E{this.enumeration_at(index).number}" }
+            ValueType::Enumeration(index) => { this.enumeration_name(index, Str::new("<")) }
             ValueType::TypeParameter => { String::from_str(Str::new("T")) }
         };
+    }
+
+    /// Enum `index`'s name, an instance's type argument opened by
+    /// `opening`: `E1`, `G0<u16>`, `G0::<u16>`.
+    private enumeration_name(&this, index: i64, opening: Str) -> String {
+        const named: Enumeration = this.enumeration_at(index);
+        if (!named.is_instance()) { return f"E{named.number}"; }
+        return f"{this.enumeration_path(index).as_str()}{opening}{this.type_name(named.argument).as_str()}>";
+    }
+
+    /// The path a pattern over enum `index` names its variants through:
+    /// the enum's own name, a generic enum's without its argument, `G0`.
+    public enumeration_path(&this, index: i64) -> String {
+        const named: Enumeration = this.enumeration_at(index);
+        if (!named.is_instance()) { return f"E{named.number}"; }
+        return f"G{this.enumeration_templates.get(named.template).unwrap().number}";
+    }
+
+    /// The path a variant value of enum `index` opens with: `E0`, or an
+    /// instance spelled as `spelling` says, `G0::<u16>`, `G0::<_>` or `G0`.
+    public variant_path(&this, index: i64, spelling: TypeArgumentSpelling) -> String {
+        if (!this.enumeration_at(index).is_instance()) { return this.enumeration_path(index); }
+        return match (spelling) {
+            TypeArgumentSpelling::Written     => { this.enumeration_name(index, Str::new("::<")) }
+            TypeArgumentSpelling::Placeholder => { f"{this.enumeration_path(index).as_str()}::<_>" }
+            TypeArgumentSpelling::Omitted     => { this.enumeration_path(index) }
+        };
+    }
+
+    /// Whether payload value `position` of variant `variant` of enum
+    /// `index` is of the type argument: one its generic enum declares of
+    /// type `T`.
+    public payload_is_type_argument(&this, index: i64, variant: i64, position: i64) -> boolean {
+        const named: Enumeration = this.enumeration_at(index);
+        if (!named.is_instance()) { return false; }
+        const generic: Enumeration = this.enumeration_templates.get(named.template).unwrap();
+        const declared: VariantDeclaration = this.variants.get(generic.first_variant + variant).unwrap();
+        return this.payload_type(declared, position).same(ValueType::TypeParameter);
     }
 
     /// The path a struct literal of struct `index` opens with: `S1`, or an
