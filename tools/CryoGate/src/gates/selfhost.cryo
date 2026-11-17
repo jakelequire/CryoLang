@@ -11,6 +11,13 @@
 ///! fetched Windows toolchain.  `--no-windows` declines the Windows arm: the
 ///! caller runs it itself.  An arm that cannot run here fails the run unless
 ///! `--allow-skipped-arm` says that this environment verifies fewer arms.
+///!
+///! On a Windows host both arms run at the same time: the Linux arm inside
+///! WSL (started first, since a rebooted host has it stopped), from a
+///! digest-checked copy of its sources on WSL's own filesystem, where
+///! cryogate is built by the copy's pin and runs `selfhost --no-windows`;
+///! the Windows arm natively from `bin/cryo.exe`.
+///!
 ///! The run ends with the arms table and a `selfhost-check: OK` or
 ///! `selfhost-check: FAIL` line; stage logs go to the run's log directory.
 ///!
@@ -33,9 +40,11 @@ import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::text::{ Text };
+import cryogate::core::wsl::{ Wsl };
 import cryogate::selfhost::arms::{ Arm, ArmStatus, ArmsVerdict };
 import cryogate::selfhost::digest::{ TreeDigest };
 import cryogate::selfhost::run::arm::{ ArmRun };
+import cryogate::selfhost::run::wsl::{ WslArm };
 import cryogate::selfhost::stages::{ ArmPlan };
 
 /// The selfhost gate.
@@ -63,11 +72,46 @@ public type struct SelfhostGate {
             fmt::eprintln(f"cryogate selfhost: usage: {options.usage()}");
             return 2;
         }
+        const allow_skipped: boolean = parsed.has(Str::new("--allow-skipped-arm"));
         if (Host::os() == Str::new("windows")) {
-            fmt::eprintln(String::from_str(Str::new("cryogate selfhost: on a Windows host the Linux arm runs inside WSL, which this port does not drive yet; `make selfhost-check` runs scripts/selfhost-check.py")));
+            if (parsed.has(Str::new("--no-windows"))) {
+                fmt::eprintln(String::from_str(Str::new("cryogate selfhost: --no-windows declines the Windows arm for a Linux host's caller; a Windows host runs that arm itself")));
+                return 2;
+            }
+            return SelfhostGate::windows_host(repository, logs, allow_skipped);
+        }
+        return SelfhostGate::linux_host(repository, logs, parsed.has(Str::new("--no-windows")), allow_skipped);
+    }
+
+    /// The Linux arm inside WSL and the Windows arm natively, at the same
+    /// time: the two share no directory.  This is the host that runs both
+    /// arms, so it is the one whose pass says the fixed point holds on both.
+    private static windows_host(repository: Path, logs: &RunLogs, allow_skipped: boolean) -> i32 {
+        fmt::println(String::from_str(Str::new("selfhost-check - byte-identity gate, both arms (boot: bin/cryo inside WSL, bin/cryo.exe natively)")));
+        fmt::println(f"  root: {repository.as_str()}");
+        fmt::println(f"  logs: {logs.directory().as_str()}");
+        const started: Completion = Wsl::start(logs);
+        if (!started.outcome.succeeded()) {
+            fmt::println(f"wsl.exe could not start WSL ({started.outcome.describe().as_str()}); see {started.log.as_str()}");
+            fmt::println(String::from_str(Str::new("  A Windows host runs the Linux arm inside WSL: install it with 'wsl --install' and a distribution with cryo's toolchain.")));
             return 2;
         }
-        return SelfhostGate::linux_host(repository, logs, parsed.has(Str::new("--no-windows")), parsed.has(Str::new("--allow-skipped-arm")));
+        const root: String = match (Wsl::path(repository.as_str(), logs)) {
+            Result::Ok(root) => { root }
+            Result::Err(done) => {
+                fmt::println(f"could not resolve a WSL path for {repository.as_str()} ({done.outcome.describe().as_str()}); is the checkout visible inside WSL?");
+                return 2;
+            }
+        };
+        mut linux: Result<WslArm, Arm> = WslArm::start(repository, root.as_str(), logs, allow_skipped);
+        const windows: Arm = ArmRun::run(repository, &ArmPlan::windows(repository, false), logs);
+        mut arms: Array<Arm> = Array::<Arm>::new();
+        arms.push(match (linux) {
+            Result::Ok(mut running) => { running.finish() }
+            Result::Err(arm)        => { arm }
+        });
+        arms.push(windows);
+        return SelfhostGate::finish(&arms, allow_skipped);
     }
 
     /// The Linux arm, then the Windows arm under wine unless declined.

@@ -61,6 +61,7 @@ import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::text::{ Text };
+import cryogate::core::wsl::{ Wsl };
 
 /// What checking one pin found: whether there was anything to check,
 /// whether it passed, and the lines that say so.
@@ -619,32 +620,26 @@ public type struct PinRefresh {
     /// Run `make pin-impl` in this checkout inside WSL, where both pins are
     /// built: a Windows host has no Linux toolchain for `bin/cryo`.
     private static through_wsl(repository: Path, logs: &RunLogs) -> i32 {
-        mut resolve: Job = Job::new(Str::new("wsl.exe"));
-        resolve.argument(Str::new("--"));
-        resolve.argument(Str::new("wslpath"));
-        resolve.argument(Str::new("-a"));
-        resolve.argument(repository.as_str());
-        resolve.log_to(logs.file(Str::new("wslpath")).as_str());
-        resolve.errors_to(logs.file(Str::new("wslpath-errors")).as_str());
-        const resolved: Completion = resolve.run();
-        match (&resolved.outcome) {
-            Outcome::CouldNotStart(_) => {
-                fmt::eprintln(String::from_str(Str::new(
-                    "ERROR: wsl.exe not found on PATH\n"
-                    "       'make pin' on a Windows host needs WSL to drive both the\n"
-                    "       Linux self-host build (bin/cryo) and the mingw cross-link\n"
-                    "       for bin/cryo.exe.  Install WSL with 'wsl --install' and a\n"
-                    "       Linux distro that has cryo's cross-build toolchain\n"
-                    "       (clang-20, x86_64-w64-mingw32-gcc), then retry.")));
+        const root: String = match (Wsl::path(repository.as_str(), logs)) {
+            Result::Ok(root) => { root }
+            Result::Err(resolved) => {
+                match (&resolved.outcome) {
+                    Outcome::CouldNotStart(_) => {
+                        fmt::eprintln(String::from_str(Str::new(
+                            "ERROR: wsl.exe not found on PATH\n"
+                            "       'make pin' on a Windows host needs WSL to drive both the\n"
+                            "       Linux self-host build (bin/cryo) and the mingw cross-link\n"
+                            "       for bin/cryo.exe.  Install WSL with 'wsl --install' and a\n"
+                            "       Linux distro that has cryo's cross-build toolchain\n"
+                            "       (clang-20, x86_64-w64-mingw32-gcc), then retry.")));
+                    }
+                    _ => {
+                        fmt::eprintln(f"ERROR: could not resolve a WSL path for {repository.as_str()}\n       Is the repo visible inside your WSL distro?");
+                    }
+                }
                 return 1;
             }
-            _ => { }
-        }
-        const root: String = String::from_str(resolved.output().as_str().trim());
-        if (!resolved.outcome.succeeded() || root.as_str().is_empty()) {
-            fmt::eprintln(f"ERROR: could not resolve a WSL path for {repository.as_str()}\n       Is the repo visible inside your WSL distro?");
-            return 1;
-        }
+        };
         fmt::println(f"==> [windows host] refreshing both pins via WSL ({root.as_str()})");
         // `pin-impl`, not `pin`: this host's `make pin` holds the heavy-run
         // lock for the whole refresh, and `pin` would wait for it.

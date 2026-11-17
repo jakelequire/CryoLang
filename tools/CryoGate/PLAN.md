@@ -485,8 +485,12 @@ Additions the port makes because it is the natural place:
      --digest` prints the working tree's digest, which must equal the
      script's.
   2. The Windows arm, run beside the `.cmd` on one tree: the same stage
-     list and the same verdicts.
-  3. The Linux arm through WSL.
+     list and the same verdicts.  (Built, with the Linux host's flow and
+     the wine arm: `selfhost/run/arm.cryo`; the live run is owed.)
+  3. The Linux arm through WSL.  (Built: `selfhost/mirror.cryo` and
+     `selfhost/run/wsl.cryo`; the copy also holds tools/CryoGate, built
+     there by the copy's pin, since cryogate finds its checkout above its
+     own binary.  The live run is owed.)
   4. The `.py` and `.cmd` deleted, and the Makefile calls `cryogate
      selfhost` on both hosts.
 

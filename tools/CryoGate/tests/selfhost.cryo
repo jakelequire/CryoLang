@@ -23,6 +23,7 @@ import cryogate::selfhost::archives::{ ArchiveComparison, StageArchives };
 import cryogate::selfhost::arms::{ Arm, ArmStatus, ArmsVerdict };
 import cryogate::selfhost::digest::{ TreeDigest };
 import cryogate::selfhost::judges::{ ArmJudge, ArmJudgement, LinkedIr };
+import cryogate::selfhost::mirror::{ MirrorPlan };
 import cryogate::selfhost::stages::{ ArmPlan };
 import cryogate::selfhost::trees::{ ModuleTrees, TreeComparison, TreeSize };
 import cryogate::core::child::{ Job };
@@ -336,4 +337,32 @@ function a_stage_compiler_is_asked_through_the_arms_runner() -> Result<(), TestE
     const direct: Job = native.compiler_job(Str::new("/r/s4/cryo"), &arguments);
     expect(direct.command_line().as_str().ends_with(&Str::new("cryo --version")) && !direct.command_line().as_str().contains(&Str::new("wine")), Str::new("natively it runs itself"))?;
     return expect(native.pin.as_str().ends_with(&Str::new("cryo")), Str::new("the Linux pin"));
+}
+
+![test]
+function the_wsl_copy_holds_the_mirrored_sources_less_their_build_outputs() -> Result<(), TestError> {
+    const plan: MirrorPlan = MirrorPlan::new(Path::from(Str::new("C:/apps/cryo")), Str::new("/mnt/c/apps/cryo"));
+    expect(plan.directory.as_str().starts_with(&Str::new("$HOME/.cache/cryo-selfhost/")) && plan.directory.length() == 39, Str::new("one copy per checkout, twelve hex digits"))?;
+    const other: MirrorPlan = MirrorPlan::new(Path::from(Str::new("C:/apps/other")), Str::new("/mnt/c/apps/other"));
+    expect(other.directory != plan.directory, Str::new("another checkout, another copy"))?;
+    const script: String = plan.preparation();
+    const text: Str = script.as_str();
+    const copy: Str = plan.directory.as_str();
+    expect(text.contains(&f"--exclude=/compiler/build/ --exclude=/stdlib/.bin/ --exclude=/runtime/.bin/ '/mnt/c/apps/cryo/compiler' '/mnt/c/apps/cryo/runtime' '/mnt/c/apps/cryo/stdlib' '/mnt/c/apps/cryo/scripts' {copy}/".as_str()), Str::new("the four trees, less their build outputs"))?;
+    expect(text.contains(&f"rsync -a '/mnt/c/apps/cryo/bin/cryo' {copy}/bin/cryo".as_str()), Str::new("the pin"))?;
+    expect(text.contains(&Str::new("--delete --delete-excluded --exclude=__pycache__/")), Str::new("whatever the checkout does not hold is deleted"))?;
+    expect(text.contains(&f"--exclude=/CryoGate/build/ --exclude=.bin/ '/mnt/c/apps/cryo/tools/CryoGate' {copy}/tools/".as_str()), Str::new("cryogate's sources, its build kept"))?;
+    expect(text.ends_with(&f"cd {copy}/tools/CryoGate && ../../bin/cryo build && cd {copy} && tools/CryoGate/build/cryogate selfhost --digest".as_str()), Str::new("built by the copy's pin, the digest printed last"))?;
+    expect(plan.arm(false) == f"cd {copy} && tools/CryoGate/build/cryogate selfhost --no-windows", Str::new("the arm declines the Windows arm"))?;
+    return expect(plan.arm(true).as_str().ends_with(&Str::new(" --no-windows --allow-skipped-arm")), Str::new("and passes the allowance on"));
+}
+
+![test]
+function the_copys_digest_is_its_last_digest_line() -> Result<(), TestError> {
+    const digest: Str = Str::new("4beb3ef409ba16bca4bc9af07b37891da0fabb0a40df32545bc32edcc3f2d69f");
+    const output: String = f"Building cryogate\n{digest}  (400 files)\r\n";
+    expect(MirrorPlan::reported(output.as_str()) == Option::Some(String::from_str(digest)), Str::new("the digest line, CRLF and all"))?;
+    const upper: String = f"{digest.byte_substring(0, 63)}F  (400 files)\nCompiled";
+    expect(MirrorPlan::reported(upper.as_str()).is_none(), Str::new("not lowercase hex, and the line is not the last"))?;
+    return expect(MirrorPlan::reported(Str::new("error: cannot build\n")).is_none(), Str::new("a copy that printed no digest"));
 }
