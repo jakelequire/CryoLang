@@ -27,7 +27,7 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::state::{ SemaState };
 import compiler::sema::helpers::{
     int_literal_exceeds, is_constant_numeric_expr, is_negative_numeric_literal_expr, is_numeric_literal_expr, sema_default_int_type,
-    sema_int_unsigned_bound, sema_numeric_suffix_type, try_fold_const_integer
+    sema_expr_has_numeric_suffix, sema_int_unsigned_bound, sema_numeric_suffix_type, try_fold_const_integer
 };
 import std::fmt;
 import compiler::diag::diagnostic::{ Diagnostic };
@@ -353,11 +353,16 @@ type struct LiteralResolver {
     /// place's width instead, an intermediate the type does not hold would
     /// change the result (`(200 + 100) / 2` in a `u8` was 22).  `expr` itself
     /// when it is already a literal or a negated literal, when it is not made
-    /// only of integer literals, or when no integer type holds its value.
+    /// only of integer literals, or when no integer type holds its value; and
+    /// when a literal in it carries a type suffix, since the suffix names the
+    /// expression's type (`1u64 << 40` is a `u64`) and the literal of its
+    /// value would name none, so a type parameter it binds would take the
+    /// default width instead.
     literal_of_value(&this, expr: mut ExpressionNode*) -> mut ExpressionNode* {
         if (expr == null) { return expr; }
         if (ExpressionNode::binary_of(expr) == null && ExpressionNode::unary_of(expr) == null) { return expr; }
         if (is_negative_numeric_literal_expr(expr) || !is_constant_numeric_expr(expr)) { return expr; }
+        if (sema_expr_has_numeric_suffix(expr)) { return expr; }
         match (ConstEval::literals_only().fold(expr)) {
             Option::Some(value) => {
                 const magnitude: mut ExpressionNode* = ExpressionNode::literal(
@@ -462,9 +467,10 @@ type struct LiteralResolver {
     /// not an integer type, and when the value is negative and `peer`
     /// unsigned: a complement of a literal there (`x & ~0xFF` with `x: u32`)
     /// is a bit pattern of `peer`'s width rather than a negative number, and
-    /// is typed as any other constant operand is.
+    /// is typed as any other constant operand is.  None as well when a
+    /// literal in `operand` carries a type suffix: the suffix types it.
     operand_type_of_literal_value(&this, operand: ExpressionNode*, peer: TypeRef) -> Option<TypeRef> {
-        if (!is_constant_numeric_expr(operand)) { return Option::None; }
+        if (!is_constant_numeric_expr(operand) || sema_expr_has_numeric_suffix(operand)) { return Option::None; }
         const folded: Option<i128> = try_fold_const_integer(operand);
         if (folded.is_none() || !peer.is_valid()) { return Option::None; }
         const t: Type* = this.arena.lookup(peer);
