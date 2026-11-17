@@ -183,14 +183,11 @@ as it likes (a type parameter is otherwise not `Copy`, and each of those
 moves it); every type a value has is `Copy`, so any instance may call it,
 and a generic function may call a static one at its own `T`.
 
-**Kept off: a generic struct's own bare literal inside its methods.**
-Inside a generic struct's method, a literal of that same generic struct
-always writes its type argument. Passed to a static call of that struct
-written without the owner's type arguments (`B0::m0(B0 { f0: x })`), the
-compiler types such a literal as the body's own instance (`B0<T>`) rather
-than inferring the owner from it, and refuses a valid program; a call that
-writes the owner's arguments types it correctly. Lift this when the
-inferred-owner form is fixed.
+Inside a generic struct's method, a literal of that same generic struct is
+spelled as any instance's literal is: written, with `_`, or left to
+inference. Left out, its type argument is the one its fields bind, which
+need not be the body's own, so `B0::m0(B0 { f0: x })` calls the static
+method of `B0<B0<u16>>` for an `x: u16`.
 
 **Overload sets.** With `overloads`, four times in ten a free function
 `h<N>` or a declared struct's method `m<N>` is followed at once by one or
