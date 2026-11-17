@@ -3,7 +3,8 @@
 ///!
 ///! An expression is generated for a wanted type, with a depth budget, from
 ///! the forms the enabled features allow.  Structs are declared first, then
-///! their methods, then the free functions and `main`, each function from
+///! their methods, then the generic functions, then the free functions and
+///! `main`, each function from
 ///! its own random stream; a function calls only functions generated before
 ///! it.  Every node is charged to the function's `CostBudget`.
 
@@ -13,7 +14,7 @@ import std::collections::array::{ Array };
 
 import cryosmith::configuration::{ Feature, GenerationOptions };
 import cryosmith::guarantees::{ CostBudget };
-import cryosmith::model::{ ExpressionKind, Program, Receiver, ValueType };
+import cryosmith::model::{ ExpressionKind, Genericity, Program, Receiver, ValueType };
 import cryosmith::random::{ RandomStream };
 import cryosmith::typing::{ Environment, TypeChoice };
 
@@ -39,15 +40,19 @@ public type struct Generator {
     internal in_main: boolean;
     /// What the function returns.
     internal returns: ValueType;
+    /// Whether the function is generic, and its bound: what its `T` values
+    /// may do.
+    internal genericity: Genericity;
 
     /// The program `options` describe.
     public static generate(options: GenerationOptions) -> Program {
         mut generator: Generator = Generator {
             program: Program::new(), options: options, random: RandomStream::for_program(options.seed),
             environment: Environment::new(), budget: CostBudget::for_function(false), loop_depth: 0, block_depth: 0,
-            statements_left: 0, in_main: false, returns: ValueType::I32,
+            statements_left: 0, in_main: false, returns: ValueType::I32, genericity: Genericity::Concrete,
         };
         if (options.features.has(Feature::Structs)) { generator.declare_structures(); }
+        if (options.features.has(Feature::Generics)) { generator.declare_generics(); }
         const count: i64 = options.function_count();
         mut number: i64 = 0;
         while (number < count) {
@@ -69,6 +74,7 @@ public type struct Generator {
         match (wanted) {
             ValueType::Boolean   => { return this.boolean_expression(depth, reads_name); }
             ValueType::Record(_) => { return this.record_expression(wanted, depth); }
+            ValueType::TypeParameter => { return this.type_parameter_expression(depth); }
             _                    => { return this.integer_expression(wanted, depth, reads_name); }
         }
     }

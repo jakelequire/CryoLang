@@ -29,8 +29,8 @@ generated as text.
   of statements, each naming the next (`-1` ends the chain), so no node owns
   another and the whole model is plain data.
 - **Types** are the eight integer types, `boolean`, `void` (what a method
-  that writes its receiver returns) and a generated struct, named by its
-  index.
+  that writes its receiver returns), a generated struct, named by its
+  index, and a generic function's type parameter `T`.
 - **Expression nodes** carry their type and one of: an integer or boolean
   literal; a type's named limit (`i8::MIN`, `u32::MAX`); a variable read; a
   unary operator; a binary operator; a wrapping method call
@@ -47,8 +47,9 @@ generated as text.
   final.
 - **Structs** `S<N>` have fields `f<N>` of an integer type, `boolean` or an
   earlier struct (so none contains itself), some with a literal default.
-- **Functions** are free functions `h<N>`, `main`, and a struct's methods
-  `m<N>`: static, or taking `&this` or `mut &this`. Each has numbered
+- **Functions** are free functions `h<N>`, generic functions `g<N><T>`,
+  `main`, and a struct's methods `m<N>`: static, or taking `&this` or
+  `mut &this`. Each has numbered
   parameters, a return type, a body and a **cost**: the most work one call
   can do (section 3.3).
 - **The printer** walks the model once. Every binary expression is
@@ -123,6 +124,18 @@ literals in `[0, M]` (`M` the type's largest literal), and for a signed type
 sometimes its negation, `(-(a & b))`. Every intermediate is in the type's
 range, so the argument is typed by the parameter and never refused.
 
+**Generics.** With `generics`, one to three generic functions
+`g<N><T>` are declared after the structs' methods and before `h0`: the
+first two parameters are `T`, the rest `T` or a value type, and the
+function returns `T`. Half are unbounded and half `where T: Eq`. In the
+body a `T` value is a read of a `T` name, an `if` expression over two, or a
+call of an earlier generic function at `T` (an `Eq`-bounded callee only
+from an `Eq`-bounded body); under `Eq`, a boolean may compare two `T`
+values with `==` or `!=`. A call writes its type argument,
+`g0::<u16>(a, b)`: anywhere a value of that type is wanted, at an integer
+type or `boolean` for an `Eq`-bounded function and at any value type for an
+unbounded one, and `main` observes one call of each.
+
 ## 3. Guarantees, and how each is enforced
 
 ### 3.1 Valid under either overflow rule
@@ -173,6 +186,13 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   static method is called through its struct (`S1::m0()`), never on a value.
   `this` is never assigned whole.
 - A struct literal writes every field that has no default.
+- **Generic bodies.** A `T` value is never observed, cast, combined by an
+  operator or assigned: nothing converts a `T` to a `u64`, and no `T` local
+  is declared. It is compared only under `where T: Eq`, and a generic
+  function is instantiated only at a type its bound admits - an `Eq`-bounded
+  one never at a struct, which does not implement `Eq`. Every call writes
+  its type argument, so no argument (a literal among them) is left to infer
+  it.
 - A function's body ends with a `return` of its type, or with nothing when
   it returns `void`; `main` never returns early, so its final print always
   runs.
@@ -187,8 +207,8 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   (the increment comes first, so a `continue` cannot skip it) and
   `for (n2 in 0..5)`. Loops nest at most three deep.
 - **No recursion.** Functions are generated in one order - every struct's
-  methods, then `h0`, `h1`, ..., then `main` - and each calls only functions
-  generated before it: the call graph is acyclic.
+  methods, then `g0`, `g1`, ..., then `h0`, `h1`, ..., then `main` - and
+  each calls only functions generated before it: the call graph is acyclic.
 - **A cost model.** A statement costs its expressions' nodes (a store's
   target is written, not read, and costs nothing); a loop costs its trip
   count times its body; an `if` the dearer arm; a call the callee's cost.
@@ -243,14 +263,17 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   not reshuffle the next function's choices (it still sees the earlier
   functions' signatures and costs, which its calls use). The structs and
   their fields come from a stream of their own, and each method from one
-  seeded with its place among the methods.
+  seeded with its place among the methods. The generic functions' count
+  comes from a stream of its own, and each generic function from one
+  seeded with its number.
 - **The function count shapes nothing before `main`**: a program generated
   with `--functions 3` is the same structs and methods and the first three
   helpers of the same seed's program with more, plus its own `main`.
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with `--features default,no-structs,no-constants` a seed generates the
-  text the version-1 generator did, header aside.
+  text the version-1 generator did, and with `default,no-generics` the text
+  the version-3 generator did, header aside.
 - The header records the **generator version**, raised whenever one seed may
   produce different text, so a seed filed in a bug report names the
   generator that reproduces it.
@@ -263,8 +286,8 @@ every feature of the current stage; `no-<name>` removes one.
 | stage | features |
 |---|---|
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
-| 2 (this one) | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
-| 3 | `generics`: generic functions and structs, `where` bounds, overload sets |
+| 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
+| 3 (this one) | `generics`: generic functions over one type parameter, unbounded or `where T: Eq`, called with the type argument written (section 2). Still to come in this stage: generic structs, inferred type arguments, overload sets |
 | 4 | `references`, `moves`: `&` / `mut &`, receivers, move-checked bindings |
 | 5 | `drop`: a drop log folded into the hash, the expected drop order |
 | 6 | `closures`: capturing and not, passed to function-typed slots |
@@ -302,7 +325,7 @@ statement budget of one function, default 24), `--no-header`, and
   seed and options wherever the file goes:
 
   ```
-  // cryosmith 3 seed 42 features booleans,wrapping,... functions 4 size 24
+  // cryosmith 4 seed 42 features booleans,wrapping,... functions 4 size 24
   ```
 
   Generating again from the header's fields reproduces the file.
@@ -360,7 +383,7 @@ layers, lowest first:
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
 | `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants` |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `corpus/` | `CorpusCheck`: building and running programs with a named compiler |
