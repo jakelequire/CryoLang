@@ -47,6 +47,11 @@ generated as text.
   final.
 - **Structs** `S<N>` have fields `f<N>` of an integer type, `boolean` or an
   earlier struct (so none contains itself), some with a literal default.
+  **Generic structs** `B<N><T>` are held apart from them; each **instance**
+  (`B0<u16>`) is a struct of its own in the structs' arena, its fields the
+  generic struct's with `T` replaced, so every form that makes, reads,
+  writes or observes a struct serves an instance unchanged. A type's name
+  is the program's to spell, since an instance's names its argument.
 - **Functions** are free functions `h<N>`, generic functions `g<N><T>`,
   `main`, and a struct's methods `m<N>`: static, or taking `&this` or
   `mut &this`. Each has numbered
@@ -136,6 +141,18 @@ values with `==` or `!=`. A call writes its type argument,
 type or `boolean` for an `Eq`-bounded function and at any value type for an
 unbounded one, and `main` observes one call of each.
 
+**Generic structs.** With `generic-structs`, one or two generic structs
+`B<N><T>` are declared after the structs' methods and before the generic
+functions: the first field is `T`, the rest `T` or a scalar, and a scalar
+field sometimes has a literal default. Each is instantiated at one to three
+type arguments - a scalar, a declared struct, or an earlier instance, so
+`B1<B0<u32>>` and `B0<S1>` both occur - and every instance is a type a value
+may have, drawn as a declared struct is: a local, a parameter, a return
+type, a field of nothing (an instance is never a declared struct's field),
+a generic function's type argument. A literal writes the type argument,
+`B0::<u16> { f1: a, f0: b }`; a field of an instance is read, written and
+observed as any struct field is. A generic struct has no method.
+
 ## 3. Guarantees, and how each is enforced
 
 ### 3.1 Valid under either overflow rule
@@ -175,8 +192,8 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   exactly that type: operands are of `T`, a different type is converted with
   `as`, and widening appears only at the implicit-conversion places.
 - Names are declared before use, in scope, unique per function (`v<N>`,
-  `p<N>`, counters `n<N>`, functions `h<N>`, structs `S<N>`, fields `f<N>`,
-  methods `m<N>`); only `mut` names are assigned, and no loop counter is. No
+  `p<N>`, counters `n<N>`, functions `h<N>` and `g<N>`, structs `S<N>` and
+  `B<N>`, fields `f<N>`, methods `m<N>`); only `mut` names are assigned, and no loop counter is. No
   name is spelled like a type: a local `i8` would stand in front of the type
   in `i8::MIN`, and a function `f32` in front of `f32`. A struct has at most
   four fields, so no field is `f32` either.
@@ -265,15 +282,18 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   their fields come from a stream of their own, and each method from one
   seeded with its place among the methods. The generic functions' count
   comes from a stream of its own, and each generic function from one
-  seeded with its number.
+  seeded with its number. The generic structs and their instances come
+  from one stream of their own.
 - **The function count shapes nothing before `main`**: a program generated
   with `--functions 3` is the same structs and methods and the first three
   helpers of the same seed's program with more, plus its own `main`.
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
-  so with `--features default,no-structs,no-constants` a seed generates the
-  text the version-1 generator did, and with `default,no-generics` the text
-  the version-3 generator did, header aside.
+  so with every later stage's features removed a seed generates an earlier
+  generator's text, header aside: `--features
+  default,no-structs,no-constants,no-generics,no-generic-structs` version
+  1's, `default,no-generics,no-generic-structs` version 3's, and
+  `default,no-generic-structs` version 4's.
 - The header records the **generator version**, raised whenever one seed may
   produce different text, so a seed filed in a bug report names the
   generator that reproduces it.
@@ -287,7 +307,7 @@ every feature of the current stage; `no-<name>` removes one.
 |---|---|
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
-| 3 (this one) | `generics`: generic functions over one type parameter, unbounded or `where T: Eq`, called with the type argument written (section 2). Still to come in this stage: generic structs, inferred type arguments, overload sets |
+| 3 (this one) | `generics`: generic functions over one type parameter, unbounded or `where T: Eq`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2). Still to come in this stage: inferred type arguments, overload sets, methods of generic structs |
 | 4 | `references`, `moves`: `&` / `mut &`, receivers, move-checked bindings |
 | 5 | `drop`: a drop log folded into the hash, the expected drop order |
 | 6 | `closures`: capturing and not, passed to function-typed slots |
@@ -325,7 +345,7 @@ statement budget of one function, default 24), `--no-header`, and
   seed and options wherever the file goes:
 
   ```
-  // cryosmith 4 seed 42 features booleans,wrapping,... functions 4 size 24
+  // cryosmith 5 seed 42 features booleans,wrapping,... functions 4 size 24
   ```
 
   Generating again from the header's fields reproduces the file.
@@ -378,12 +398,12 @@ layers, lowest first:
 
 | layer | owns |
 |---|---|
-| `model/` | the program tree: `ValueType`, the operators, expression and statement nodes, variables, fields, structs, functions, and `Program`'s arenas |
+| `model/` | the program tree: `ValueType`, the operators, expression and statement nodes, variables, fields, structs, functions, and `Program`'s arenas and its type names |
 | `random/` | `RandomStream`: every draw, and the seed of each part's stream (section 3.5) |
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
 | `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics` |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `corpus/` | `CorpusCheck`: building and running programs with a named compiler |

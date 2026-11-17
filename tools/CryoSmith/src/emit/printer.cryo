@@ -1,5 +1,6 @@
 ///! `Printer`: one program's text - the header, the prelude, the structs
-///! with their methods, and the free functions with `main` last.
+///! with their methods, the generic structs, and the free functions with
+///! `main` last.
 
 namespace cryosmith::emit::printer;
 
@@ -22,7 +23,14 @@ public type struct Printer {
         printer.prelude();
         mut index: i64 = 0;
         while (index < program.structures.length()) {
-            printer.structure(program, program.structure_at(index));
+            const declared: Structure = program.structure_at(index);
+            if (!declared.is_instance()) { printer.structure(program, declared, f"S{declared.number}", index); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.templates.length()) {
+            const declared: Structure = program.template_at(index);
+            printer.structure(program, declared, f"B{declared.number}<T>", -1);
             index = index + 1;
         }
         index = 0;
@@ -52,15 +60,16 @@ public type struct Printer {
         this.text.push(Str::new("}\n"));
     }
 
-    /// A struct's declaration: its fields, then its methods.
-    private structure(mut &this, program: &Program, declared: Structure) -> void {
-        this.text.push(f"\ntype struct S{declared.number} ");
+    /// A struct's declaration under `name`: its fields, then the methods of
+    /// the structure at `owner`; -1 for a generic struct, which owns none.
+    private structure(mut &this, program: &Program, declared: Structure, name: String, owner: i64) -> void {
+        this.text.push(f"\ntype struct {name.as_str()} ");
         this.text.push(Str::new("{\n"));
         mut index: i64 = declared.first_field;
         while (index < declared.first_field + declared.field_count) {
             const field: Field = program.field_at(index);
             this.indent(1);
-            this.text.push(f"f{field.number}: {field.value_type.name().as_str()}");
+            this.text.push(f"f{field.number}: {program.type_name(field.value_type).as_str()}");
             if (field.default_value >= 0) {
                 this.text.push(Str::new(" = "));
                 this.expression(program, field.default_value);
@@ -71,7 +80,7 @@ public type struct Printer {
         index = 0;
         while (index < program.functions.length()) {
             const defined: Function = program.function_at(index);
-            if (defined.owner == declared.number) { this.definition(program, defined, 1); }
+            if (owner >= 0 && defined.owner == owner) { this.definition(program, defined, 1); }
             index = index + 1;
         }
         this.text.push(Str::new("}\n"));
@@ -103,10 +112,10 @@ public type struct Printer {
                 separate = true;
                 const parameter: i64 = program.list_at(defined.first_parameter + index);
                 this.name(program, parameter);
-                this.text.push(f": {program.variable_at(parameter).value_type.name().as_str()}");
+                this.text.push(f": {program.type_name(program.variable_at(parameter).value_type).as_str()}");
                 index = index + 1;
             }
-            this.text.push(f") -> {defined.returns.name().as_str()} ");
+            this.text.push(f") -> {program.type_name(defined.returns).as_str()} ");
             if (defined.genericity.compares()) { this.text.push(Str::new("where T: Eq ")); }
             this.text.push(Str::new("{\n"));
         }
