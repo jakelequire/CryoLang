@@ -1,0 +1,161 @@
+///! Generic functions: `g<N><T>`, unbounded or `where T: Eq`, and their
+///! calls with the type argument written, `g0::<u16>(a, b)`.
+///!
+///! A generic function is declared after the structs and their methods and
+///! before the free functions, each from its own stream, so with the
+///! feature off no draw is taken and every other part's text is unchanged.
+///! Its first two parameters are `T`, the rest `T` or a value type.  A `T`
+///! value is only read, passed to a generic call, returned, selected between
+///! by an `if` expression and, under `Eq`, compared: it is never observed,
+///! since nothing converts a `T` to a `u64`.  Its value-typed parameters and
+///! locals are observed as any function's are, and every call is observed
+///! where its value is.
+
+namespace cryosmith::generate::generics;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::guarantees::{ CostBudget };
+import cryosmith::model::{
+    BinaryOperator, ExpressionKind, Function, Genericity, Receiver, StatementKind, ValueType, Variable, VariableRole
+};
+import cryosmith::random::{ RandomStream };
+import cryosmith::typing::{ TypeChoice };
+
+implement struct Generator {
+    /// Declare the program's generic functions, one to three, from a
+    /// stream of their own.
+    internal declare_generics(mut &this) -> void {
+        mut counting: RandomStream = RandomStream::for_generics(this.options.seed);
+        const count: i64 = 1 + counting.below(3);
+        mut number: i64 = 0;
+        while (number < count) {
+            this.define_generic(number);
+            number = number + 1;
+        }
+    }
+
+    /// Generate generic function `number` from its own stream.
+    private define_generic(mut &this, number: i64) -> void {
+        this.random = RandomStream::for_generic(this.options.seed, number);
+        this.environment.enter_function();
+        this.loop_depth = 0;
+        this.block_depth = 0;
+        this.budget = CostBudget::for_function(false);
+        this.statements_left = (this.options.size + 1) / 2;
+        this.in_main = false;
+        this.genericity = if (this.random.chance(50)) { Genericity::Equatable } else { Genericity::Unbounded };
+        this.returns = ValueType::TypeParameter;
+        const first_parameter: i64 = this.program.lists.length();
+        const parameter_count: i64 = 2 + this.random.below(3);
+        mut index: i64 = 0;
+        while (index < parameter_count) {
+            const value_type: ValueType = if (index < 2 || this.random.chance(30)) { ValueType::TypeParameter } else { this.any_type() };
+            const parameter: i64 = this.program.variable(Variable { role: VariableRole::Parameter, number: index, value_type: value_type, mutable: false });
+            this.program.lists.push(parameter);
+            this.environment.bind(parameter);
+            index = index + 1;
+        }
+        mut statements: Array<i64> = Array::<i64>::new();
+        const body_start: i64 = this.environment.mark();
+        this.fill(&statements, true);
+        this.observe_declared(body_start, &statements);
+        index = 0;
+        while (index < parameter_count) {
+            const parameter: i64 = this.program.list_at(first_parameter + index);
+            if (!this.program.variable_at(parameter).value_type.same(ValueType::TypeParameter)) {
+                this.observe_place(this.read(parameter), &statements);
+            }
+            index = index + 1;
+        }
+        const value: i64 = this.typed_place(ValueType::TypeParameter, this.depth());
+        statements.push(this.program.statement(StatementKind::Return(value)));
+        const body: i64 = this.program.block(&statements);
+        this.program.functions.push(Function {
+            number: number, is_main: false, owner: -1, receiver: Receiver::Free, first_parameter: first_parameter,
+            parameter_count: parameter_count, returns: ValueType::TypeParameter, body: body, cost: this.budget.spent(),
+            genericity: this.genericity,
+        });
+    }
+
+    /// An expression of the generic function's `T`: a read of a `T` name, an
+    /// `if` expression over two, or a call of an earlier generic function at
+    /// `T` whose bound `T` satisfies.
+    internal type_parameter_expression(mut &this, depth: i64) -> i64 {
+        const deeper: boolean = depth > 0;
+        const next: i64 = if (deeper) { depth - 1 } else { 0 };
+        const variables: Array<i64> = this.environment.variables_of(&this.program, ValueType::TypeParameter);
+        const generic_callees: Array<i64> = this.generic_callees(ValueType::TypeParameter);
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(10);
+        weights.push(if (this.options.features.has(Feature::IfExpressions) && deeper) { 3 } else { 0 });
+        weights.push(if (generic_callees.length() > 0 && deeper) { 3 } else { 0 });
+        const form: i64 = this.random.pick(&weights);
+        if (form == 0) { return this.read(variables.get(this.random.below(variables.length())).unwrap()); }
+        if (form == 1) {
+            const condition: i64 = this.condition(next);
+            const then_value: i64 = this.type_parameter_expression(next);
+            const else_value: i64 = this.type_parameter_expression(next);
+            return this.node(ExpressionKind::Conditional(condition, then_value, else_value), ValueType::TypeParameter);
+        }
+        return this.generic_call(generic_callees.get(this.random.below(generic_callees.length())).unwrap(), ValueType::TypeParameter, next);
+    }
+
+    /// The `T` names a comparison may read: those in scope in a generic
+    /// function bounded by `Eq`, and none anywhere else.
+    internal comparable_type_parameters(&this) -> Array<i64> {
+        if (!this.genericity.compares()) { return Array::<i64>::new(); }
+        return this.environment.variables_of(&this.program, ValueType::TypeParameter);
+    }
+
+    /// `(a == b)` or `(a != b)` over two `T` values, `T` bounded by `Eq`.
+    internal type_parameter_comparison(mut &this, depth: i64) -> i64 {
+        const operator: BinaryOperator = if (this.random.chance(50)) { BinaryOperator::Equal } else { BinaryOperator::NotEqual };
+        const left: i64 = this.type_parameter_expression(depth);
+        const right: i64 = this.type_parameter_expression(depth);
+        return this.node(ExpressionKind::Binary(operator, left, right), ValueType::Boolean);
+    }
+
+    /// The earlier generic functions that may be called at `wanted` from
+    /// the function being generated and that keep its work under its limit.
+    internal generic_callees(&this, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        mut index: i64 = 0;
+        while (index < this.program.functions.length()) {
+            const candidate: Function = this.program.function_at(index);
+            if (candidate.genericity.admits(wanted, this.genericity) && this.budget.affordable(candidate.cost)) {
+                found.push(index);
+            }
+            index = index + 1;
+        }
+        return found;
+    }
+
+    /// A call of generic function `callee` at `type_argument`, with
+    /// arguments for its parameters.
+    internal generic_call(mut &this, callee: i64, type_argument: ValueType, depth: i64) -> i64 {
+        const called: Function = this.program.function_at(callee);
+        const first: i64 = this.instantiated_arguments(called, type_argument, depth);
+        return this.node(ExpressionKind::GenericCall(callee, type_argument, first, called.parameter_count), type_argument);
+    }
+
+    /// In `main`: observe one call of each generic function the cost model
+    /// allows, at a type its bound admits.
+    internal observe_generic_calls(mut &this, statements: mut &Array<i64>) -> void {
+        mut index: i64 = 0;
+        while (index < this.program.functions.length()) {
+            const called: Function = this.program.function_at(index);
+            if (called.genericity.is_generic() && this.budget.affordable(called.cost)) {
+                const type_argument: ValueType = if (called.genericity.compares()) {
+                    (if (this.random.chance(20)) { ValueType::Boolean } else { TypeChoice::integer(&this.random) })
+                } else {
+                    this.any_type()
+                };
+                this.observe_value(this.generic_call(index, type_argument, 2), statements);
+            }
+            index = index + 1;
+        }
+    }
+}

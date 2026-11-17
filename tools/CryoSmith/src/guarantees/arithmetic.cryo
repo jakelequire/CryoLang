@@ -1,0 +1,67 @@
+///! `ArithmeticGuard`: the masks that keep every operation defined under
+///! both overflow rules - wrapping, and debug traps with release wrapping.
+///!
+///! With `W` a type's width:
+///!
+///!   `a + b`, signed `a - b`   both sides masked to `2^(W-2) - 1`
+///!   unsigned `a - b`           the left side has bit `W-2` set, the right
+///!                              is masked below it, so the left is larger
+///!   `a * b`                    both sides masked below the square root of
+///!                              the range
+///!   `-a`                       `a` masked to the type's maximum, so it is
+///!                              never the minimum
+///!   `a << b`, `a >> b`         `b` masked to `W - 1`
+///!   `a / b`, `a % b`           `b` is `((e & (2^(W-2) - 1)) | 1)`: in
+///!                              `[1, 2^(W-2) - 1]`, never zero, never
+///!                              negative
+///!
+///! Every mask is below `2^63`, so no literal meets the trap of a literal
+///! past `i64::MAX` used against a `u64`.
+
+namespace cryosmith::guarantees::arithmetic;
+
+import cryosmith::model::{ ValueType };
+
+/// The largest literal magnitude written: `i64::MAX`, so no unsigned
+/// literal is past it.
+const LARGEST_LITERAL: u64 = 9223372036854775807;
+
+/// The guards' masks, per type.
+public type struct ArithmeticGuard {
+    /// The mask of both sides of `+` and of signed `-`, of the right side
+    /// of unsigned `-`, and of a divisor before its `| 1`: `2^(W-2) - 1`.
+    public static operand_mask(value_type: ValueType) -> u64 {
+        return ArithmeticGuard::minuend_bit(value_type) - 1;
+    }
+
+    /// The bit set on the left side of an unsigned `-`: `2^(W-2)`, above
+    /// every value the right side can hold.
+    public static minuend_bit(value_type: ValueType) -> u64 {
+        return 1 << (value_type.width() - 2);
+    }
+
+    /// The mask of both sides of `*`: `2^((W-1)/2) - 1` for a signed type,
+    /// `2^(W/2) - 1` for an unsigned one, so the product fits.
+    public static product_mask(value_type: ValueType) -> u64 {
+        const width: u64 = value_type.width();
+        const root_bits: u64 = if (value_type.is_signed()) { (width - 1) / 2 } else { width / 2 };
+        return (1 << root_bits) - 1;
+    }
+
+    /// The mask of a negated operand: the type's maximum, so the operand
+    /// is never the minimum.
+    public static negation_mask(value_type: ValueType) -> u64 { return value_type.maximum(); }
+
+    /// The mask of a shift amount: `W - 1`, below the width.
+    public static shift_mask(value_type: ValueType) -> u64 { return value_type.width() - 1; }
+
+    /// The bit a divisor is or-ed with after its mask, so it is never zero.
+    public static divisor_floor() -> u64 { return 1; }
+
+    /// The largest literal magnitude of `value_type` a program writes: its
+    /// maximum, or `i64::MAX` for `u64`.
+    public static largest_literal(value_type: ValueType) -> u64 {
+        if (value_type.maximum() > LARGEST_LITERAL) { return LARGEST_LITERAL; }
+        return value_type.maximum();
+    }
+}

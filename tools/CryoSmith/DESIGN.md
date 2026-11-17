@@ -29,8 +29,8 @@ generated as text.
   of statements, each naming the next (`-1` ends the chain), so no node owns
   another and the whole model is plain data.
 - **Types** are the eight integer types, `boolean`, `void` (what a method
-  that writes its receiver returns) and a generated struct, named by its
-  index.
+  that writes its receiver returns), a generated struct, named by its
+  index, and a generic function's type parameter `T`.
 - **Expression nodes** carry their type and one of: an integer or boolean
   literal; a type's named limit (`i8::MIN`, `u32::MAX`); a variable read; a
   unary operator; a binary operator; a wrapping method call
@@ -47,8 +47,14 @@ generated as text.
   final.
 - **Structs** `S<N>` have fields `f<N>` of an integer type, `boolean` or an
   earlier struct (so none contains itself), some with a literal default.
-- **Functions** are free functions `h<N>`, `main`, and a struct's methods
-  `m<N>`: static, or taking `&this` or `mut &this`. Each has numbered
+  **Generic structs** `B<N><T>` are held apart from them; each **instance**
+  (`B0<u16>`) is a struct of its own in the structs' arena, its fields the
+  generic struct's with `T` replaced, so every form that makes, reads,
+  writes or observes a struct serves an instance unchanged. A type's name
+  is the program's to spell, since an instance's names its argument.
+- **Functions** are free functions `h<N>`, generic functions `g<N><T>`,
+  `main`, and a struct's methods `m<N>`: static, or taking `&this` or
+  `mut &this`. Each has numbered
   parameters, a return type, a body and a **cost**: the most work one call
   can do (section 3.3).
 - **The printer** walks the model once. Every binary expression is
@@ -103,16 +109,49 @@ is generated only where the language converts implicitly: an initializer, an
 assignment, a call's argument, a return value and a struct literal's field.
 
 **Literal-only expressions.** A bare literal beside a typed operand takes
-that operand's type, but literals combined with each other (`(12 & 63)`) are
-typed only by where the whole stands, and an operand gives them nothing: they
-are an `i32`, and `x + (12 & 63)` with `x: u32` is refused. So every
-composite expression the generator writes **reads a name**: its first operand
-does, and every masked operand does. Some places give even a bare literal no
-type (a method's receiver, a cast's operand, a shifted value, an operand of
-`~`, an `if` expression's arms, the left side of a comparison); there the
-expression reads a name too. Every scope has one: `observed`, the program's
+that operand's type, and so does an operand made only of literals
+(`x + (12 & 63)`), which is its exact value - but only where the operand's
+type holds that value; one it does not hold stays an `i32` or wider, and
+the operation widens. Some places give even a bare literal no type (a
+method's receiver, a cast's operand, a shifted value, an operand of `~`, an
+`if` expression's arms, the left side of a comparison). So every composite
+expression the generator writes **reads a name**: its first operand does,
+and every masked operand does, and its type is never decided by a value. Every scope has one: `observed`, the program's
 global hash state, is always readable, a named limit (`u8::MAX`) is a typed
 constant, and a function has at least one parameter.
+
+**Constants.** A parameter types literals combined with each other: an
+argument made only of literals is its exact value, and takes its
+parameter's type when the parameter holds that value. With `constants`, an
+integer argument - of a call, a method call or a wrapping method - is now
+and then such an expression: `(a & b)`, `(a | b)` or `(a ^ b)` of two
+literals in `[0, M]` (`M` the type's largest literal), and for a signed type
+sometimes its negation, `(-(a & b))`. Every intermediate is in the type's
+range, so the argument is typed by the parameter and never refused.
+
+**Generics.** With `generics`, one to three generic functions
+`g<N><T>` are declared after the structs' methods and before `h0`: the
+first two parameters are `T`, the rest `T` or a value type, and the
+function returns `T`. Half are unbounded and half `where T: Eq`. In the
+body a `T` value is a read of a `T` name, an `if` expression over two, or a
+call of an earlier generic function at `T` (an `Eq`-bounded callee only
+from an `Eq`-bounded body); under `Eq`, a boolean may compare two `T`
+values with `==` or `!=`. A call writes its type argument,
+`g0::<u16>(a, b)`: anywhere a value of that type is wanted, at an integer
+type or `boolean` for an `Eq`-bounded function and at any value type for an
+unbounded one, and `main` observes one call of each.
+
+**Generic structs.** With `generic-structs`, one or two generic structs
+`B<N><T>` are declared after the structs' methods and before the generic
+functions: the first field is `T`, the rest `T` or a scalar, and a scalar
+field sometimes has a literal default. Each is instantiated at one to three
+type arguments - a scalar, a declared struct, or an earlier instance, so
+`B1<B0<u32>>` and `B0<S1>` both occur - and every instance is a type a value
+may have, drawn as a declared struct is: a local, a parameter, a return
+type, a field of nothing (an instance is never a declared struct's field),
+a generic function's type argument. A literal writes the type argument,
+`B0::<u16> { f1: a, f0: b }`; a field of an instance is read, written and
+observed as any struct field is. A generic struct has no method.
 
 ## 3. Guarantees, and how each is enforced
 
@@ -153,8 +192,8 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   exactly that type: operands are of `T`, a different type is converted with
   `as`, and widening appears only at the implicit-conversion places.
 - Names are declared before use, in scope, unique per function (`v<N>`,
-  `p<N>`, counters `n<N>`, functions `h<N>`, structs `S<N>`, fields `f<N>`,
-  methods `m<N>`); only `mut` names are assigned, and no loop counter is. No
+  `p<N>`, counters `n<N>`, functions `h<N>` and `g<N>`, structs `S<N>` and
+  `B<N>`, fields `f<N>`, methods `m<N>`); only `mut` names are assigned, and no loop counter is. No
   name is spelled like a type: a local `i8` would stand in front of the type
   in `i8::MIN`, and a function `f32` in front of `f32`. A struct has at most
   four fields, so no field is `f32` either.
@@ -164,6 +203,13 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   static method is called through its struct (`S1::m0()`), never on a value.
   `this` is never assigned whole.
 - A struct literal writes every field that has no default.
+- **Generic bodies.** A `T` value is never observed, cast, combined by an
+  operator or assigned: nothing converts a `T` to a `u64`, and no `T` local
+  is declared. It is compared only under `where T: Eq`, and a generic
+  function is instantiated only at a type its bound admits - an `Eq`-bounded
+  one never at a struct, which does not implement `Eq`. Every call writes
+  its type argument, so no argument (a literal among them) is left to infer
+  it.
 - A function's body ends with a `return` of its type, or with nothing when
   it returns `void`; `main` never returns early, so its final print always
   runs.
@@ -178,8 +224,8 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   (the increment comes first, so a `continue` cannot skip it) and
   `for (n2 in 0..5)`. Loops nest at most three deep.
 - **No recursion.** Functions are generated in one order - every struct's
-  methods, then `h0`, `h1`, ..., then `main` - and each calls only functions
-  generated before it: the call graph is acyclic.
+  methods, then `g0`, `g1`, ..., then `h0`, `h1`, ..., then `main` - and
+  each calls only functions generated before it: the call graph is acyclic.
 - **A cost model.** A statement costs its expressions' nodes (a store's
   target is written, not read, and costs nothing); a loop costs its trip
   count times its body; an `if` the dearer arm; a call the callee's cost.
@@ -210,6 +256,18 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   decides a struct's value. (`observed` is the exception the stage-1 forms
   already make: a call inside `mix(observed, ...)` may observe, and so
   change `observed`, while the same statement reads it.)
+- **Operand evaluation order is guaranteed.** That exception's hash
+  depends on the order a call's arguments and an operator's operands are
+  evaluated in: `observed = mix(observed, (h1(v0) as u64))` reads
+  `observed` before `h1` changes it because the language evaluates
+  operands left to right - a binary operator's left operand first, a
+  call's arguments in the order written, a method call's receiver before
+  its arguments (docs/cryo.md section 5.8, "Evaluation Order"). So the
+  hash a program prints is fixed by the source, and these statements stay.
+  A compiler that changed the order would print a different hash at every
+  optimisation level alike, which the corpus check (comparing -O0 with
+  -O2) cannot see; the test project `evaluation_order_left_to_right` is
+  what refuses it.
 
 ### 3.5 Reproducible from the seed
 
@@ -222,14 +280,20 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   not reshuffle the next function's choices (it still sees the earlier
   functions' signatures and costs, which its calls use). The structs and
   their fields come from a stream of their own, and each method from one
-  seeded with its place among the methods.
+  seeded with its place among the methods. The generic functions' count
+  comes from a stream of its own, and each generic function from one
+  seeded with its number. The generic structs and their instances come
+  from one stream of their own.
 - **The function count shapes nothing before `main`**: a program generated
   with `--functions 3` is the same structs and methods and the first three
   helpers of the same seed's program with more, plus its own `main`.
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
-  so with `--features default,no-structs` a seed generates the text the
-  version-1 generator did, header aside.
+  so with every later stage's features removed a seed generates an earlier
+  generator's text, header aside: `--features
+  default,no-structs,no-constants,no-generics,no-generic-structs` version
+  1's, `default,no-generics,no-generic-structs` version 3's, and
+  `default,no-generic-structs` version 4's.
 - The header records the **generator version**, raised whenever one seed may
   produce different text, so a seed filed in a bug report names the
   generator that reproduces it.
@@ -242,8 +306,8 @@ every feature of the current stage; `no-<name>` removes one.
 | stage | features |
 |---|---|
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
-| 2 (this one) | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`) |
-| 3 | `generics`: generic functions and structs, `where` bounds, overload sets |
+| 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
+| 3 (this one) | `generics`: generic functions over one type parameter, unbounded or `where T: Eq`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2). Still to come in this stage: inferred type arguments, overload sets, methods of generic structs |
 | 4 | `references`, `moves`: `&` / `mut &`, receivers, move-checked bindings |
 | 5 | `drop`: a drop log folded into the hash, the expected drop order |
 | 6 | `closures`: capturing and not, passed to function-typed slots |
@@ -281,7 +345,7 @@ statement budget of one function, default 24), `--no-header`, and
   seed and options wherever the file goes:
 
   ```
-  // cryosmith 2 seed 42 features booleans,wrapping,... functions 4 size 24
+  // cryosmith 5 seed 42 features booleans,wrapping,... functions 4 size 24
   ```
 
   Generating again from the header's fields reproduces the file.
@@ -325,3 +389,74 @@ statement budget of one function, default 24), `--no-header`, and
   generates `(a / (b & M))`, without the `| 1`. The static audit must refuse
   every planted program that divides, and the corpus check must report the
   plant as a failure. A plant is never on by default and the header names it.
+
+## 8. Architecture
+
+The source is one directory per concern under `src/`, each with a
+`_module.cryo` that declares its files and exports the layer's surface. The
+layers, lowest first:
+
+| layer | owns |
+|---|---|
+| `model/` | the program tree: `ValueType`, the operators, expression and statement nodes, variables, fields, structs, functions, and `Program`'s arenas and its type names |
+| `random/` | `RandomStream`: every draw, and the seed of each part's stream (section 3.5) |
+| `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
+| `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
+| `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4) |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures` |
+| `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
+| `selftest/` | `SelfTest` and the static audit (section 7) |
+| `corpus/` | `CorpusCheck`: building and running programs with a named compiler |
+| `cli/` | `Cli`: the commands, the usage text, the exit codes |
+
+`main.cryo` only hands the command line to `Cli`.
+
+**Dependency rules.**
+
+- A layer imports only layers above it in the table, and the rank is strict
+  where it matters: `model` and `random` import only the standard library;
+  `configuration` imports `random`; `typing` imports `model`, `random` and
+  `configuration`; `guarantees` imports `model` alone; `generate` imports
+  the five layers above it; `emit` imports `model`, `configuration` and
+  `guarantees`, and never reads a random stream; `selftest` and `corpus`
+  import `generate`, `emit` and what those export; `cli` imports any layer,
+  and no layer imports `cli`.
+- Another layer is imported through its aggregator
+  (`import cryosmith::model::{ Program };`), never by one of its files'
+  paths, so a layer may move a declaration between its files without its
+  users noticing. Files of one layer import each other by path.
+- What an aggregator exports is the layer's surface and is `public`. A
+  member that only other files of its layer use is `internal` - the
+  `Generator`'s and `Printer`'s methods, split across files with
+  `implement struct` blocks, are - and one that only its own file uses is
+  `private`. Every public item carries a doc comment.
+- A rule stated in section 3 has one home in `guarantees/`. The static
+  audit is the exception on purpose: it spells the guards out itself, so a
+  wrong mask in `guarantees/` is refused rather than shared.
+
+**Adding a stage or a feature.**
+
+1. Name the feature in `configuration/features.cryo`: its variant, name,
+   stage and bit; `default` takes it from there.
+2. Give the model what it needs: a new `ExpressionKind` or `StatementKind`
+   variant, a new item. The printer must then print it (`emit/`), or the
+   build stops at the non-exhaustive `match`.
+3. Write the forms in a new `generate/<stage>.cryo`, an `implement struct
+   Generator` block listed in `generate/_module.cryo`. A form is a weight in
+   the dispatch of the type it produces (`scalars`, `structs`,
+   `control_flow`) that is 0, and so takes no draw, where the feature is off
+   or nothing it needs exists - which is what keeps every old seed's text
+   (section 3.5).
+4. A new safety rule goes in `guarantees/`, and section 3 says why it holds.
+5. `selftest/features.cryo` gets the feature's switch check: some program
+   spells it with the feature on, none with it off. Raise
+   `GENERATOR_VERSION` when an existing seed's text changes.
+
+**Proving a change preserves output.** A change meant to move no text is
+checked by generating the same seeds before and after and comparing the
+files' bytes: the binary before the change is copied aside, `cryosmith
+batch` writes 500 seeds under several feature lists (`default`, `default,
+no-structs,no-constants`, every feature named, and smaller ones), and the
+two corpora must be byte-identical. A one-character change to the printer
+must make that comparison fail, or the comparison is not reading what it
+claims to.

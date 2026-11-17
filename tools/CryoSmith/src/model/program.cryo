@@ -1,0 +1,160 @@
+///! `Program`: a whole generated program, as arenas of the model's nodes and
+///! items, with the accessors every other layer reads it through.
+
+namespace cryosmith::model::program;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+import cryosmith::model::expressions::{ ExpressionKind, ExpressionNode };
+import cryosmith::model::items::{ Field, Function, Structure, Variable, VariableRole };
+import cryosmith::model::statements::{ StatementKind, StatementNode };
+import cryosmith::model::types::{ ValueType };
+
+/// A whole generated program.
+public type struct Program {
+    /// Every struct a value may have: the declared structs, in the order
+    /// they are printed, then the generic structs' instances.
+    public structures: Array<Structure>;
+    /// Every generic struct, `B<N><T>`, in the order they are printed.
+    public templates: Array<Structure>;
+    /// Every struct's fields, each struct's a run.
+    public fields: Array<Field>;
+    /// Every variable, `observed` first.
+    public variables: Array<Variable>;
+    /// Every expression node.
+    public expressions: Array<ExpressionNode>;
+    /// Every statement node.
+    public statements: Array<StatementNode>;
+    /// Runs of indices: call arguments, function parameters and struct
+    /// literal entries.
+    public lists: Array<i64>;
+    /// The functions in the order they were generated: every struct's
+    /// methods, then the free functions, `main` last.  A function calls
+    /// only functions before it.
+    public functions: Array<Function>;
+
+    /// A program holding only `observed`.
+    public static new() -> Program {
+        mut program: Program = Program {
+            structures:  Array::<Structure>::new(),
+            templates:   Array::<Structure>::new(),
+            fields:     Array::<Field>::new(),
+            variables:   Array::<Variable>::new(),
+            expressions: Array::<ExpressionNode>::new(),
+            statements:  Array::<StatementNode>::new(),
+            lists:       Array::<i64>::new(),
+            functions:   Array::<Function>::new(),
+        };
+        program.variables.push(Variable { role: VariableRole::Observed, number: 0, value_type: ValueType::U64, mutable: true });
+        return program;
+    }
+
+    /// The index of `observed`.
+    public static observed() -> i64 { return 0; }
+
+    /// Add an expression node; its index.
+    public expression(mut &this, kind: ExpressionKind, value_type: ValueType) -> i64 {
+        this.expressions.push(ExpressionNode { kind: kind, value_type: value_type });
+        return this.expressions.length() - 1;
+    }
+
+    /// Add a statement node with no successor; its index.
+    public statement(mut &this, kind: StatementKind) -> i64 {
+        this.statements.push(StatementNode { kind: kind, next: -1 });
+        return this.statements.length() - 1;
+    }
+
+    /// Add a variable; its index.
+    public variable(mut &this, variable: Variable) -> i64 {
+        this.variables.push(variable);
+        return this.variables.length() - 1;
+    }
+
+    /// Chain `statements` into a block, in order; the block's first
+    /// statement, or -1 for none.
+    public block(mut &this, statements: &Array<i64>) -> i64 {
+        mut index: i64 = statements.length() - 1;
+        mut next: i64 = -1;
+        while (index >= 0) {
+            const current: i64 = statements.get(index).unwrap();
+            mut node: StatementNode = this.statements.get(current).unwrap();
+            node.next = next;
+            this.statements.set(current, node);
+            next = current;
+            index = index - 1;
+        }
+        return next;
+    }
+
+    /// The expression at `index`.
+    public expression_at(&this, index: i64) -> ExpressionNode { return this.expressions.get(index).unwrap(); }
+
+    /// The statement at `index`.
+    public statement_at(&this, index: i64) -> StatementNode { return this.statements.get(index).unwrap(); }
+
+    /// The variable at `index`.
+    public variable_at(&this, index: i64) -> Variable { return this.variables.get(index).unwrap(); }
+
+    /// The function at `index`.
+    public function_at(&this, index: i64) -> Function { return this.functions.get(index).unwrap(); }
+
+    /// The structure at `index`.
+    public structure_at(&this, index: i64) -> Structure { return this.structures.get(index).unwrap(); }
+
+    /// The generic struct at `index`.
+    public template_at(&this, index: i64) -> Structure { return this.templates.get(index).unwrap(); }
+
+    /// A type's name as a program spells it: `u16`, `S1`, `B0<u16>`,
+    /// `B1<B0<boolean>>`.
+    public type_name(&this, value_type: ValueType) -> String {
+        return match (value_type) {
+            ValueType::I8            => { String::from_str(Str::new("i8")) }
+            ValueType::I16           => { String::from_str(Str::new("i16")) }
+            ValueType::I32           => { String::from_str(Str::new("i32")) }
+            ValueType::I64           => { String::from_str(Str::new("i64")) }
+            ValueType::U8            => { String::from_str(Str::new("u8")) }
+            ValueType::U16           => { String::from_str(Str::new("u16")) }
+            ValueType::U32           => { String::from_str(Str::new("u32")) }
+            ValueType::U64           => { String::from_str(Str::new("u64")) }
+            ValueType::Boolean       => { String::from_str(Str::new("boolean")) }
+            ValueType::Void          => { String::from_str(Str::new("void")) }
+            ValueType::Record(index) => { this.structure_name(index, Str::new("<")) }
+            ValueType::TypeParameter => { String::from_str(Str::new("T")) }
+        };
+    }
+
+    /// The path a struct literal of struct `index` opens with: `S1`, or an
+    /// instance with its type argument written, `B0::<u16>`.
+    public literal_path(&this, index: i64) -> String { return this.structure_name(index, Str::new("::<")); }
+
+    /// Struct `index`'s name, an instance's type argument opened by
+    /// `opening`.
+    private structure_name(&this, index: i64, opening: Str) -> String {
+        const named: Structure = this.structure_at(index);
+        if (!named.is_instance()) { return f"S{named.number}"; }
+        return f"B{this.template_at(named.template).number}{opening}{this.type_name(named.argument).as_str()}>";
+    }
+
+    /// The field at `index`.
+    public field_at(&this, index: i64) -> Field { return this.fields.get(index).unwrap(); }
+
+    /// The index-list entry at `index`.
+    public list_at(&this, index: i64) -> i64 { return this.lists.get(index).unwrap(); }
+
+    /// Whether a value of type `from` holds a field, directly or through
+    /// a nested struct, of type `target`.
+    public reaches(&this, from: ValueType, target: ValueType) -> boolean {
+        const index: i64 = from.structure();
+        if (index < 0) { return false; }
+        const declared: Structure = this.structure_at(index);
+        mut field: i64 = declared.first_field;
+        while (field < declared.first_field + declared.field_count) {
+            const field_type: ValueType = this.field_at(field).value_type;
+            if (field_type.same(target) || this.reaches(field_type, target)) { return true; }
+            field = field + 1;
+        }
+        return false;
+    }
+}

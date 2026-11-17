@@ -1,0 +1,163 @@
+///! `Environment`: the names in scope where generation stands.
+///!
+///! A scope is a length of the environment's list; leaving it truncates the
+///! list.  Names are numbered per function and role (`v<N>` locals, `n<N>`
+///! counters), so a name is unique in its function and never spelled like
+///! a type.  The rules for what a name allows live here: only a `mut` local
+///! is assigned whole; a field is written only through a `mut` local or a
+///! `mut &this`; a parameter, a `const` local, a counter and a `&this` are
+///! read and never written.
+
+namespace cryosmith::typing::environment;
+
+import std::collections::array::{ Array };
+
+import cryosmith::model::{ Program, ValueType, Variable, VariableRole };
+
+/// The names in scope, and the numbering of the names still to come.
+public type struct Environment {
+    private names: Array<i64>;
+    private locals: i64;
+    private counters: i64;
+
+    /// An environment holding nothing; `enter_function` starts one.
+    public static new() -> Environment {
+        return Environment { names: Array::<i64>::new(), locals: 0, counters: 0 };
+    }
+
+    /// Start a function: only `observed` in scope, and every numbering
+    /// from zero.
+    public enter_function(mut &this) -> void {
+        this.names.clear();
+        this.names.push(Program::observed());
+        this.locals = 0;
+        this.counters = 0;
+    }
+
+    /// Bring `variable` into scope.
+    public bind(mut &this, variable: i64) -> void { this.names.push(variable); }
+
+    /// Where the current scope stands, for `leave` to return to.
+    public mark(&this) -> i64 { return this.names.length(); }
+
+    /// Leave every scope entered since `mark`.
+    public leave(mut &this, mark: i64) -> void { this.names.truncate(mark); }
+
+    /// Declare the next local, `v<N>`, and bring it into scope.
+    public declare_local(mut &this, program: mut &Program, value_type: ValueType, mutable: boolean) -> i64 {
+        const variable: i64 = program.variable(Variable { role: VariableRole::Local, number: this.locals, value_type: value_type, mutable: mutable });
+        this.locals = this.locals + 1;
+        this.names.push(variable);
+        return variable;
+    }
+
+    /// Declare the next loop counter, `n<N>`, and bring it into scope.
+    public declare_counter(mut &this, program: mut &Program, value_type: ValueType) -> i64 {
+        const variable: i64 = program.variable(Variable { role: VariableRole::Counter, number: this.counters, value_type: value_type, mutable: true });
+        this.counters = this.counters + 1;
+        this.names.push(variable);
+        return variable;
+    }
+
+    /// The locals declared since `mark`, in declaration order.
+    public locals_since(&this, program: &Program, mark: i64) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        mut index: i64 = mark;
+        while (index < this.names.length()) {
+            const variable: i64 = this.names.get(index).unwrap();
+            match (program.variable_at(variable).role) {
+                VariableRole::Local => { found.push(variable); }
+                _                   => { }
+            }
+            index = index + 1;
+        }
+        return found;
+    }
+
+    /// The variables in scope of type `wanted`.
+    public variables_of(&this, program: &Program, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.names.iter()) {
+            if (program.variable_at(variable).value_type.same(wanted)) { found.push(variable); }
+        }
+        return Environment::observed_last(found);
+    }
+
+    /// The integer variables in scope of a type other than `excluded`.
+    public integers_except(&this, program: &Program, excluded: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.names.iter()) {
+            const value_type: ValueType = program.variable_at(variable).value_type;
+            if (value_type.is_integer() && !value_type.same(excluded)) { found.push(variable); }
+        }
+        return Environment::observed_last(found);
+    }
+
+    /// The struct variables in scope with a field, directly or nested, of
+    /// type `wanted`.
+    public field_roots(&this, program: &Program, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.names.iter()) {
+            if (program.reaches(program.variable_at(variable).value_type, wanted)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// The variables in scope a receiver of type `owner` can be reached
+    /// from: one of that type or holding a field of it, and with
+    /// `writable`, only those whose fields may be written.
+    public receiver_roots(&this, program: &Program, owner: ValueType, writable: boolean) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.names.iter()) {
+            const declared: Variable = program.variable_at(variable);
+            if (writable && !Environment::fields_writable(declared)) { continue; }
+            if (declared.value_type.same(owner) || program.reaches(declared.value_type, owner)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// The `mut` locals in scope, which may be assigned whole.
+    public assignable(&this, program: &Program) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.names.iter()) {
+            const declared: Variable = program.variable_at(variable);
+            match (declared.role) {
+                VariableRole::Local => { if (declared.mutable) { found.push(variable); } }
+                _                   => { }
+            }
+        }
+        return found;
+    }
+
+    /// The structs in scope whose fields may be written: `mut` locals and
+    /// a `mut &this`.
+    public writable_records(&this, program: &Program) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.names.iter()) {
+            const declared: Variable = program.variable_at(variable);
+            if (declared.value_type.is_record() && Environment::fields_writable(declared)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// Whether `variable`'s fields may be written.
+    private static fields_writable(variable: Variable) -> boolean {
+        return match (variable.role) {
+            VariableRole::Local    => { variable.mutable }
+            VariableRole::Receiver => { variable.mutable }
+            _                      => { false }
+        };
+    }
+
+    /// `found` without `observed`, unless `observed` is all it holds: a
+    /// value read from the hash state and folded back into it cancels out
+    /// (`x ^ x`), so the state is read only where nothing else is in scope.
+    private static observed_last(found: Array<i64>) -> Array<i64> {
+        if (found.length() <= 1) { return found; }
+        mut others: Array<i64> = Array::<i64>::new();
+        for (variable in found.iter()) {
+            if (variable != Program::observed()) { others.push(variable); }
+        }
+        return others;
+    }
+}

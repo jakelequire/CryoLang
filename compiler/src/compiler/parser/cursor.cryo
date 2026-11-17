@@ -18,6 +18,7 @@ import std::collections::str::{ Str };
 import std::fmt;
 import std::fmt::display::{ Display };
 import compiler::diag::source_span::{ SourceSpan };
+import compiler::diag::diagnostic::{ Diagnostic };
 
 
 /// The recursive-descent parser over one file's tokens.
@@ -520,6 +521,24 @@ implement struct Parser {
         this.report_invalid_at(ErrorCode::E0100_EXPECTED_TOKEN,
             fmt::format("expected %s, found `%s`, which is a reserved word", what, tok.lexeme),
             this.span_from_token(tok));
+    }
+
+    /// Refuse a value - a variable, a global, a parameter, a pattern binding
+    /// or a destructured local - named by a keyword as a declaration's name
+    /// is refused, or by a scalar type's name: such a value would stand in
+    /// front of the type wherever the type is written bare, so `i8::MIN`
+    /// would look its path up in the value.
+    refuse_value_name(mut &this, tok: Token, what: string) -> void {
+        if (!tok.kind.names_scalar_type()) {
+            this.refuse_declaration_keyword_name(tok, what);
+            return;
+        }
+        this.error_count += 1;
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0100_EXPECTED_TOKEN,
+            fmt::format("expected %s, found `%s`, which names a primitive type", what, tok.lexeme));
+        diag = diag.at_with_label(this.span_from_token(tok), "a type's name");
+        diag = diag.help("a primitive type's name always means the type, so a path through it reaches the type's items and never a value; choose another name");
+        this.ctx.emit_diagnostic(diag);
     }
 
     /// Whether a token of `kind` opens a declaration.

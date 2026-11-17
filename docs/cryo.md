@@ -83,12 +83,13 @@ A member position is never a declaration or an operator, so the keyword is unamb
 
 The exceptions are the keywords a member position reads *first*: `public`, `internal` and `private` open a visibility label, `static` and `async` are member modifiers, and `protected`, `virtual` and `override` are read there to be refused (`E0117`). A field with one of those eight names cannot be declared, and a C struct carrying one still needs a `![repr(C)]` shadow struct.
 
-A **binding** is the other way round. A statement that begins with a keyword opening a declaration is parsed as that declaration, so a local named by one could never be assigned or called through: `module = q;` is not an assignment. The 20 keywords that open a declaration - `function`, `const`, `mut`, `type`, `struct`, `class`, `enum`, `trait`, `import`, `module`, `extern`, `implement`, `public`, `internal`, `private`, `protected`, `namespace`, `intrinsic`, `static`, `async` - therefore cannot name a variable, a parameter, a pattern binding or a destructured local (`E0100`): a keyword is never an identifier. The same holds for the 23 keywords a statement or an expression begins with - `if`, `while`, `do`, `loop`, `for`, `match`, `return`, `break`, `continue`, `unsafe`, `asm`, `true`, `false`, `null`, `this`, `new`, `sizeof`, `alignof`, `typeof`, `delete`, `await`, `yield`, `move` - since every bare use of such a name reads as the keyword: `delete()` is the delete operator and `match;` the head of a match. A **free function** is named bare too, so neither group names one; a method, reached only after `.` or `::`, may take any of them (`Router.delete`). `this` stays a parameter name: it is the by-value receiver. Keywords that open nothing (`default`, `string`) remain legal names, and a destructuring shorthand over a field named by one of these keywords needs a rename: `const { type: t }: S = s;`.
+A **binding** is the other way round. A statement that begins with a keyword opening a declaration is parsed as that declaration, so a local named by one could never be assigned or called through: `module = q;` is not an assignment. The 20 keywords that open a declaration - `function`, `const`, `mut`, `type`, `struct`, `class`, `enum`, `trait`, `import`, `module`, `extern`, `implement`, `public`, `internal`, `private`, `protected`, `namespace`, `intrinsic`, `static`, `async` - therefore cannot name a variable, a parameter, a pattern binding or a destructured local (`E0100`): a keyword is never an identifier. The same holds for the 23 keywords a statement or an expression begins with - `if`, `while`, `do`, `loop`, `for`, `match`, `return`, `break`, `continue`, `unsafe`, `asm`, `true`, `false`, `null`, `this`, `new`, `sizeof`, `alignof`, `typeof`, `delete`, `await`, `yield`, `move` - since every bare use of such a name reads as the keyword: `delete()` is the delete operator and `match;` the head of a match. A **free function** is named bare too, so neither group names one; a method, reached only after `.` or `::`, may take any of them (`Router.delete`). `this` stays a parameter name: it is the by-value receiver. A scalar type's name - `i8` through `i128`, `u8` through `u128`, `isize`, `usize`, `f32`, `f64`, `char`, `boolean` - names no variable, parameter, pattern binding or destructured local either (`E0100`): such a value would stand in front of the type wherever the type is written bare, so `i8::MIN` would look its path up in the value, and a type's name always means the type. Keywords that open nothing (`default`, `string`) remain legal names, and so do the alias keywords (`int`, `float`, ...), which also name modules; a destructuring shorthand over a field named by one of these keywords needs a rename: `const { type: t }: S = s;`.
 
 ```cryo
 const module: i32 = 42;                  // E0100: expected a variable name, found `module`, which is a reserved word
 match (r) { R::D(static) => { .. } }     // E0100: expected a binding name
 function delete() -> i32 { .. }          // E0100: expected a function name, found `delete`, which is a reserved word
+mut i8: i16 = 3;                         // E0100: expected a variable name, found `i8`, which names a primitive type
 router.delete(Str::new("/items"), on_delete);   // a method: named after `.`
 ```
 
@@ -161,7 +162,7 @@ Integer literals support four bases. Underscores are visual separators that the 
 
 **Type suffixes:** `u8` `u16` `u32` `u64` `u128` `i8` `i16` `i32` `i64` `i128` `usize` `isize` `f32` `f64`
 
-A literal stored where an integer of a written type is - a constant's or a variable's initializer, an assignment's value, a call's argument - takes that type, and must hold its value there.  So must an expression made only of literals: its value is what the arithmetic gives, and a type that does not hold it is refused (`E0010`) rather than wrapped.  A value is held up to the type's unsigned maximum (a bit pattern) and, for a signed type, down to its minimum. `usize` and `isize` are 32 bits on a 32-bit target, so they hold a literal only where it is the same value on every target: a `usize` up to `u32`'s maximum, an `isize` in `i32`'s range, with no bit pattern past it. A wider value is written in a 64-bit type and converted with `as`.
+A literal stored where an integer of a written type is - a constant's or a variable's initializer, an assignment's value, a call's argument, a returned value - takes that type, and must hold its value there.  So must an expression made only of literals: its value is what the arithmetic gives, computed exactly at compile time, so an intermediate value the type does not hold changes nothing (`(200 + 100) / 2` stored in a `u8` is 150, and `300 - 100` is 200), and a type that does not hold the value is refused (`E0010`) rather than wrapped.  A literal with a type suffix keeps that type inside such an expression, so the expression has it too: `1u64 << 40` passed to a generic parameter binds it to `u64`, and beside a `u8`, `(7u16 + 1u16)` is a `u16` operand.  A value is held up to the type's unsigned maximum (a bit pattern) and, for a signed type, down to its minimum. `usize` and `isize` are 32 bits on a 32-bit target, so they hold a literal only where it is the same value on every target: a `usize` up to `u32`'s maximum, an `isize` in `i32`'s range, with no bit pattern past it. A wider value is written in a 64-bit type and converted with `as`.
 
 ```cryo
 const a: u8 = 100 + 100;   // 200: held
@@ -169,7 +170,7 @@ const b: u8 = 200 + 100;   // error: 300 does not fit `u8`, and would silently t
 const c: i8 = 0 - 128;     // -128: held
 ```
 
-A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value. An argument is held to its parameter the same way, including a parameter whose type the call's expected type decides: `const h: Holder<i16> = Holder::make(-3);` passes `-3` as an `i16`, while `-129` for an `i8` or `-3` for a `u16` is refused (`E0214`).
+A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. An operand made only of literals beside one that is not - outside a shift - and a compound assignment's value made only of literals are their exact value, computed first, and take the other operand's type only where that type holds the value: with `x: i8`, `x + (200 / 2)` adds 100. Where the type does not hold it, the value keeps its default type and the operation widens the other operand to it, as an implicit conversion does: with `w: u8`, `w + (1 << 20)` is the `i32` 1048577, and `w + (200 + 100)` is an `i32` sum, which a `u8` place does not take (`E0200`). A negated literal is held the same way by a signed operand: beside an `i8`, `-129` keeps its default type rather than wrapping to 127, so `x + -129` is an `i32` sum. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value. An argument is held to its parameter the same way, including a parameter whose type the call's expected type decides: `const h: Holder<i16> = Holder::make(-3);` passes `-3` as an `i16`, while `-129` for an `i8` or `-3` for a `u16` is refused (`E0214`). An argument made only of literals passes its exact value and is held by its parameter as that value's literal would be: `take_i8(-(100 + 28))` passes -128, and `take_u8(200 + 100)` is refused (`E0214`).
 
 A shift's amount does not type the value shifted: a literal shifted by an amount not made only of literals takes the integer type expected of the result, where one is - an initializer's, an assignment's, an argument's or a return's - so `const p: u64 = 1 << (u64::BITS - 1);` shifts at 64 bits, not at the `u32` amount's 32.  A shift's result is always the shifted value's type, and the amount's type never changes it: `b << n` with `b: u8` and `n: u64` is a `u8`.  Where no integer type is expected, a shifted literal takes the amount's type.
 
@@ -1455,6 +1456,32 @@ From **lowest** to **highest**:
 `as` sits between multiplication and unary, so `x * y as i64` casts `y`, not the product. Use parentheses if you mean `(x * y) as i64`.
 
 The range operators `..` / `..=` bind looser than every arithmetic and comparison operator, so `a + 1 .. b * 2` is `(a + 1) .. (b * 2)`. They desugar at parse time to `Range::new` / `RangeInclusive::new` (see [section 6.3](#63-for-loops)). A range may leave an end open where the next token cannot start its operand - `]`, `)`, `,`, `;` or `}`: `a..` is `RangeFrom::new(a)`, `..b` is `RangeTo::new(b)` and a bare `..` is `RangeFull::new()`, the forms a slice takes ([section 10.6](#106-operator-overloading)). `RangeFrom` is an endless iterator over a `Step` type: `for (n in 5..)` counts up until the loop breaks. A range passed for a parameter whose type is the method's own type parameter, bound by a trait written with arguments, takes its element type from that bound: `map.range(10..20)` on a `BTreeMap<i64, V>`, whose `range<R>` requires `R: RangeBounds<K>`, passes a `Range<i64>`. The same holds for any static call written there without its owner's type arguments: the owner's implementation of the bound's trait at those arguments decides them (`Wrap::new(5000000000)` for `R: Measures<i64>` with `implement<T> Measures<T> for Wrap<T>` is a `Wrap<i64>`). An argument of a type of its own keeps it, and is checked against the bound.
+
+### 5.8 Evaluation Order
+
+**Operands are evaluated left to right.** Each operand is evaluated completely, its calls and their effects included, before the next one begins:
+
+- a binary operator's left operand before its right one; `&&`, `||` and `??` evaluate the right operand only when the left one does not decide the result;
+- an assignment's place before its value, for `=` and every compound assignment ([section 5.5](#55-assignment)): the calls and indexes that locate the place run first, so `slots[note(1)] = note(2)` and `pair_at(note(1)).second += note(2)` both run `note(1)` before `note(2)`;
+- a call's arguments in the order they are written, each before the function is entered;
+- a method call's receiver before its arguments.
+
+The order is part of a program's meaning, so it is the same at every optimisation level. Precedence decides only how operands group, not when they run: in `note(1) + note(2) * note(3)` the three calls run in the order written, and the product is formed before the sum.
+
+```cryo
+mut trace: u64 = 0;
+
+function note(digit: u64) -> u64 {
+    trace = trace * 10 + digit;
+    return digit;
+}
+
+function main() -> i32 {
+    const s: u64 = note(1) + note(2) * note(3);   // trace is 123
+    const c: u64 = combine(note(4), note(5));     // trace is 12345
+    return 0;
+}
+```
 
 ---
 
@@ -3703,7 +3730,19 @@ Two candidates are ambiguous only within one tier: two wildcards offering one na
 
 Nothing outside the tiers is reachable. A name declared exactly once in the whole program still does not resolve where nothing brings it into scope, and a path whose first segment no tier binds is not found, however fully it is spelled: `std::math::power(2.0, 3.0)` in a file that imports no `std::math` is E0203.
 
-A path resolves one segment at a time. Its first segment is a bare name, looked up as above; each later segment is looked up in what the segment before it named. A module is found only among those the file can see - its own and the ones it imports, spelled as [section 13.6](#136-modules-and-types-share-one-namespace) allows - never by searching the program for its spelling, so what a path means never depends on which other modules exist in the program. A path that does not resolve is an error, with a suggestion where one exists.
+A path resolves one segment at a time. Its first segment is a bare name, looked up as above in the type namespace, since it names what owns the rest of the path - a type or a module, never a function or a variable; each later segment is looked up in what the segment before it named. A first segment spelled like a primitive type (`u16`, `boolean`, `string`) names that type before any tier is asked, as it does in a type annotation, so a function named `u16` neither hides `u16::MAX` nor is reached by it, and a plain call `u16()` still names the function:
+
+```cryo
+function u16() -> i32 { return 7; }
+
+function main() -> i32 {
+    const top: u16 = u16::MAX;            // the primitive's constant
+    const next: u16 = u16::wrapping_add(top, 2);
+    return u16();                         // the function
+}
+```
+
+A function sharing its name with a type of the same scope leaves the path through the type: `Limits::make()` is the type's static method beside a `function Limits()`. A module is found only among those the file can see - its own and the ones it imports, spelled as [section 13.6](#136-modules-and-types-share-one-namespace) allows - never by searching the program for its spelling, so what a path means never depends on which other modules exist in the program. A path that does not resolve is an error, with a suggestion where one exists.
 
 ---
 

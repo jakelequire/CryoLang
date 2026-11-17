@@ -1,0 +1,141 @@
+///! `Printer`: one program's text - the header, the prelude, the structs
+///! with their methods, the generic structs, and the free functions with
+///! `main` last.
+
+namespace cryosmith::emit::printer;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+import cryosmith::configuration::{ GENERATOR_VERSION, GenerationOptions };
+import cryosmith::guarantees::{ Observation };
+import cryosmith::model::{ Field, Function, Program, Receiver, Structure, Variable, VariableRole };
+
+/// Writes one program's text.
+public type struct Printer {
+    /// The text written so far.
+    internal text: String;
+
+    /// The source of `program`, generated with `options`.
+    public static print(program: &Program, options: &GenerationOptions) -> String {
+        mut printer: Printer = Printer { text: String::new() };
+        if (options.header) { printer.header(options); }
+        printer.prelude();
+        mut index: i64 = 0;
+        while (index < program.structures.length()) {
+            const declared: Structure = program.structure_at(index);
+            if (!declared.is_instance()) { printer.structure(program, declared, f"S{declared.number}", index); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.templates.length()) {
+            const declared: Structure = program.template_at(index);
+            printer.structure(program, declared, f"B{declared.number}<T>", -1);
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.functions.length()) {
+            const defined: Function = program.function_at(index);
+            if (defined.owner < 0) { printer.definition(program, defined, 0); }
+            index = index + 1;
+        }
+        return printer.text;
+    }
+
+    /// The comment that reproduces the program: the generator version and
+    /// every option it was generated with.
+    private header(mut &this, options: &GenerationOptions) -> void {
+        this.text.push(f"// cryosmith {GENERATOR_VERSION} seed {options.seed} features {options.features.canonical().as_str()} functions {options.function_count()} size {options.size}");
+        if (options.plant.is_planted()) { this.text.push(f" plant {options.plant.name()}"); }
+        this.text.push(Str::new("\n\n"));
+    }
+
+    /// The namespace, the import of `fmt`, and the hash state `observed`
+    /// with the `mix` that folds a value into it.
+    private prelude(mut &this) -> void {
+        this.text.push(Str::new("namespace Main;\n\nimport std::fmt;\n\n"));
+        this.text.push(f"mut observed: u64 = {Observation::initial_state()};\n\n");
+        this.text.push(Str::new("function mix(state: u64, value: u64) -> u64 {\n"));
+        this.text.push(f"    return (state ^ value).wrapping_multiply({Observation::multiplier()}).wrapping_add({Observation::increment()});\n");
+        this.text.push(Str::new("}\n"));
+    }
+
+    /// A struct's declaration under `name`: its fields, then the methods of
+    /// the structure at `owner`; -1 for a generic struct, which owns none.
+    private structure(mut &this, program: &Program, declared: Structure, name: String, owner: i64) -> void {
+        this.text.push(f"\ntype struct {name.as_str()} ");
+        this.text.push(Str::new("{\n"));
+        mut index: i64 = declared.first_field;
+        while (index < declared.first_field + declared.field_count) {
+            const field: Field = program.field_at(index);
+            this.indent(1);
+            this.text.push(f"f{field.number}: {program.type_name(field.value_type).as_str()}");
+            if (field.default_value >= 0) {
+                this.text.push(Str::new(" = "));
+                this.expression(program, field.default_value);
+            }
+            this.text.push(Str::new(";\n"));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.functions.length()) {
+            const defined: Function = program.function_at(index);
+            if (owner >= 0 && defined.owner == owner) { this.definition(program, defined, 1); }
+            index = index + 1;
+        }
+        this.text.push(Str::new("}\n"));
+    }
+
+    /// A function or method's signature and body, at `indent`.
+    private definition(mut &this, program: &Program, defined: Function, indent: i64) -> void {
+        this.text.push(Str::new("\n"));
+        this.indent(indent);
+        if (defined.is_main) {
+            this.text.push(Str::new("function main() -> i32 {\n"));
+        } else {
+            mut separate: boolean = false;
+            match (defined.receiver) {
+                Receiver::Free      => {
+                    if (defined.genericity.is_generic()) {
+                        this.text.push(f"function g{defined.number}<T>(");
+                    } else {
+                        this.text.push(f"function h{defined.number}(");
+                    }
+                }
+                Receiver::Static    => { this.text.push(f"static m{defined.number}("); }
+                Receiver::Shared    => { this.text.push(f"m{defined.number}(&this"); separate = true; }
+                Receiver::Exclusive => { this.text.push(f"m{defined.number}(mut &this"); separate = true; }
+            }
+            mut index: i64 = 0;
+            while (index < defined.parameter_count) {
+                if (separate) { this.text.push(Str::new(", ")); }
+                separate = true;
+                const parameter: i64 = program.list_at(defined.first_parameter + index);
+                this.name(program, parameter);
+                this.text.push(f": {program.type_name(program.variable_at(parameter).value_type).as_str()}");
+                index = index + 1;
+            }
+            this.text.push(f") -> {program.type_name(defined.returns).as_str()} ");
+            if (defined.genericity.compares()) { this.text.push(Str::new("where T: Eq ")); }
+            this.text.push(Str::new("{\n"));
+        }
+        this.block(program, defined.body, indent + 1);
+        this.indent(indent);
+        this.text.push(Str::new("}\n"));
+    }
+
+    /// A variable's name: `observed`, `p<N>`, `v<N>`, `n<N>` or `this`.
+    internal name(mut &this, program: &Program, variable: i64) -> void {
+        const named: Variable = program.variable_at(variable);
+        match (named.role) {
+            VariableRole::Observed  => { this.text.push(Str::new("observed")); }
+            VariableRole::Parameter => { this.text.push(f"p{named.number}"); }
+            VariableRole::Local     => { this.text.push(f"v{named.number}"); }
+            VariableRole::Counter   => { this.text.push(f"n{named.number}"); }
+            VariableRole::Receiver  => { this.text.push(Str::new("this")); }
+        }
+    }
+
+    /// Four spaces per level of `depth`.
+    internal indent(mut &this, depth: i64) -> void { this.text.push_repeated(' ', depth * 4); }
+}
