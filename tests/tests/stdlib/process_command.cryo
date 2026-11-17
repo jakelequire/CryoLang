@@ -18,12 +18,12 @@ import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::io::error::{ IoError, IoErrorKind, IoOperation };
 import std::io::traits;
-import std::io::stdio::{ stdout, Stdout };
+import std::io::stdio::{ stderr, stdin, stdout, Stderr, Stdin, Stdout };
 import std::thread;
 import std::collections::string::{ String };
 import std::env;
 import std::process::command::{ Command, Output, Stdio };
-import std::process::child::{ Child, ChildStdout, ExitStatus };
+import std::process::child::{ Child, ChildStdin, ChildStdout, ExitStatus };
 import std::process::signal::{ Signal };
 import std::process::memory::{ SystemMemory };
 import std::fs::path::{ Path, PathBuf };
@@ -1017,4 +1017,123 @@ function a_child_gets_non_ascii_argument_variable_and_directory() -> Result<(), 
     expect(text.contains(&argument_line.as_str()), Str::new("the argument arrives intact"))?;
     expect(text.contains(&variable_line.as_str()), Str::new("the variable arrives, name and value intact"))?;
     return expect(text.contains(&Str::new(WIDE_DIRECTORY)), Str::new("the child starts in the directory named"));
+}
+
+/// Answers every line of its stdin at once with `echo: ` and the line, and
+/// returns when its stdin ends.
+![test_child]
+function echoes_each_line() -> Result<(), TestError> {
+    mut input: Stdin = stdin();
+    mut out: Stdout = stdout();
+    loop {
+        match (input.line()?) {
+            Option::Some(line) => {
+                out.write(Str::new("echo: "))?;
+                out.write(line.as_str())?;
+                out.write(Str::new("\n"))?;
+                out.flush()?;
+            }
+            Option::None => { return Result::Ok(()); }
+        }
+    }
+}
+
+/// A running child is written to and read from in turns: each answer
+/// arrives before the next line is sent, and closing its stdin ends it.
+![test]
+function a_running_child_answers_what_it_is_sent() -> Result<(), TestError> {
+    mut command: Command = TestChild::command(Str::new("CryoTests::Tests::Stdlib::ProcessCommand::echoes_each_line"))?;
+    command.stdin(Stdio::Piped).stdout(Stdio::Piped);
+    mut child: Child = command.spawn()?;
+    mut input: ChildStdin = child.stdin.take().unwrap();
+    mut output: ChildStdout = child.stdout.take().unwrap();
+    mut first: Array<u8> = Array::new();
+    input.write(Str::new("one\n"))?;
+    output.read_until('\n' as u8, &first)?;
+    const running: boolean = child.try_wait()?.is_none();
+    mut second: Array<u8> = Array::new();
+    input.write(Str::new("two\n"))?;
+    output.read_until('\n' as u8, &second)?;
+    mem::drop(input);
+    mut rest: Array<u8> = Array::new();
+    output.read_to_end(&rest)?;
+    const status: ExitStatus = child.wait()?;
+    expect(array_eq_str(&first, Str::new("echo: one\n")), Str::new("the first line is answered"))?;
+    expect(running, Str::new("the child is still running after its first answer"))?;
+    expect(array_eq_str(&second, Str::new("echo: two\n")), Str::new("the second line is answered"))?;
+    expect_equal(rest.length(), 0)?;
+    return expect_equal(status.exit_code(), Option::Some(0));
+}
+
+/// Ends at once, reading nothing.
+![test_child]
+function exits_without_reading() -> Result<(), TestError> {
+    return Result::Ok(());
+}
+
+/// A write to the stdin of a child that has exited fails with
+/// `BrokenPipe`, and the writing process carries on (on POSIX the write
+/// would otherwise raise SIGPIPE, which ends it).
+![test]
+function writing_to_an_exited_childs_stdin_is_a_broken_pipe() -> Result<(), TestError> {
+    mut command: Command = TestChild::command(Str::new("CryoTests::Tests::Stdlib::ProcessCommand::exits_without_reading"))?;
+    command.stdin(Stdio::Piped);
+    mut child: Child = command.spawn()?;
+    mut input: ChildStdin = child.stdin.take().unwrap();
+    const status: ExitStatus = child.wait()?;
+    expect_equal(status.exit_code(), Option::Some(0))?;
+    match (input.write(Str::new("too late\n"))) {
+        Result::Ok(_)  => { return bail(Str::new("a write to an exited child's stdin succeeds")); }
+        Result::Err(e) => { return expect(e.kind == IoErrorKind::BrokenPipe, Str::new("the write fails with BrokenPipe")); }
+    }
+}
+
+// How much the flooding child writes to each stream: far more than a pipe's
+// buffer holds, on every platform.
+const FLOOD_CHUNK: i64 = 4096;
+const FLOOD_CHUNKS: i64 = 256;
+
+/// Reads its stdin to the end, then writes `FLOOD_CHUNKS` chunks of
+/// `FLOOD_CHUNK` bytes to stdout and as many to stderr, alternating.
+![test_child]
+function floods_both_streams_after_its_input() -> Result<(), TestError> {
+    mut input: Stdin = stdin();
+    loop {
+        match (input.line()?) {
+            Option::Some(_) => { }
+            Option::None    => { break; }
+        }
+    }
+    mut to_stdout: [u8; 4096];
+    mut to_stderr: [u8; 4096];
+    for (mut i: i64 = 0; i < FLOOD_CHUNK; i++) {
+        to_stdout[i] = 'o' as u8;
+        to_stderr[i] = 'e' as u8;
+    }
+    mut out: Stdout = stdout();
+    mut err: Stderr = stderr();
+    for (mut chunk: i64 = 0; chunk < FLOOD_CHUNKS; chunk++) {
+        out.write(Slice::<u8>::from_raw(&to_stdout[0], FLOOD_CHUNK))?;
+        out.flush()?;
+        err.write(Slice::<u8>::from_raw(&to_stderr[0], FLOOD_CHUNK))?;
+        err.flush()?;
+    }
+    return Result::Ok(());
+}
+
+/// `wait_with_output` closes the child's stdin and reads its two full
+/// pipes together: a reader taking stdout to its end before stderr would
+/// stall with the child blocked on a full stderr.
+![test]
+function wait_with_output_reads_both_full_pipes_together() -> Result<(), TestError> {
+    mut command: Command = TestChild::command(Str::new("CryoTests::Tests::Stdlib::ProcessCommand::floods_both_streams_after_its_input"))?;
+    command.stdin(Stdio::Piped).stdout(Stdio::Piped).stderr(Stdio::Piped);
+    mut child: Child = command.spawn()?;
+    child.stdin.unwrap_pointer().write(Str::new("go\n"))?;
+    const output: Output = child.wait_with_output()?;
+    expect_equal(output.status().exit_code(), Option::Some(0))?;
+    expect_equal(output.stdout().length(), FLOOD_CHUNK * FLOOD_CHUNKS)?;
+    expect_equal(output.stderr().length(), FLOOD_CHUNK * FLOOD_CHUNKS)?;
+    expect_equal(output.stdout().get(0), Option::Some('o' as u8))?;
+    return expect_equal(output.stderr().get(FLOOD_CHUNK * FLOOD_CHUNKS - 1), Option::Some('e' as u8));
 }

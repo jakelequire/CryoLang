@@ -1,0 +1,107 @@
+///! The gates verify runs beside its object comparison, and how each one's
+///! run is judged: on its exit code AND its own verdict line, never on the
+///! exit code alone, since a gate that printed no verdict did not finish.
+
+namespace cryogate::verify::gates;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+
+import cryogate::core::text::{ Text };
+
+/// One gate verify runs: its name, its command line, and how its verdict
+/// line starts.
+public type struct GateCommand {
+    /// The gate's name in the report and in its log's file name.
+    public name: String;
+    /// The command line, with `{cryo}` and `{stdlib}` standing for the
+    /// compiler under test and the stdlib directory.
+    public arguments: Array<String>;
+    /// The text the gate's verdict line holds.
+    public verdict: String;
+    /// Whether the verdict text must open the line; otherwise it may stand
+    /// anywhere in it (`make` quotes check-fast's line).
+    public anchored: boolean;
+
+    /// Every gate, in the order verify reports them.  `cryogate` is the
+    /// gate runner's own path.
+    public static table(cryogate: Str) -> Array<GateCommand> {
+        mut gates: Array<GateCommand> = Array::<GateCommand>::new();
+        gates.push(GateCommand::of(Str::new("census"), cryogate, Str::new("census --cryo {cryo}"), Str::new("test-census: "), true));
+        gates.push(GateCommand::of(Str::new("examples"), cryogate, Str::new("examples --cryo {cryo} --stdlib {stdlib}"), Str::new("examples-gate: "), true));
+        gates.push(GateCommand::of(Str::new("lsp"), cryogate, Str::new("lsp --cryo {cryo}"), Str::new("lsp-gate: "), true));
+        gates.push(GateCommand::of(Str::new("cross"), cryogate, Str::new("cross --cryo {cryo}"), Str::new("cross-check: "), true));
+        gates.push(GateCommand::of(Str::new("incr"), cryogate, Str::new("incr --instance --cryo {cryo}"), Str::new("incremental-instance-check: "), true));
+        gates.push(GateCommand::of(Str::new("relink"), cryogate, Str::new("incr --runtime --cryo {cryo}"), Str::new("incremental-runtime-check: "), true));
+        gates.push(GateCommand::of(Str::new("abi"), cryogate, Str::new("abi --cryo {cryo}"), Str::new("runtime-abi-check: "), true));
+        // `ARGS=` on the command line: `make verify ARGS=...` exports ARGS
+        // to child makes, and no check-fast target is meant to receive
+        // verify's flags.
+        gates.push(GateCommand::of(Str::new("fast"), Str::new("make"), Str::new("--no-print-directory check-fast ARGS="), Str::new("check-fast: "), false));
+        return gates;
+    }
+
+    /// The gates whose objects are compared; a baseline run needs only
+    /// these.
+    public static population_gates() -> Array<Str> {
+        mut names: Array<Str> = Array::<Str>::new();
+        names.push(Str::new("census"));
+        names.push(Str::new("examples"));
+        return names;
+    }
+
+    /// The command line with its placeholders filled in.
+    public command(&this, cryo: Str, stdlib: Str) -> Array<String> {
+        mut command: Array<String> = Array::<String>::new();
+        for (argument in this.arguments.iterate_references()) {
+            const with_cryo: String = argument.as_str().replace(&Str::new("{cryo}"), &cryo);
+            command.push(with_cryo.as_str().replace(&Str::new("{stdlib}"), &stdlib));
+        }
+        return command;
+    }
+
+    /// A gate whose program is `program` and whose arguments are the words
+    /// of `arguments`.
+    private static of(name: Str, program: Str, arguments: Str, verdict: Str, anchored: boolean) -> GateCommand {
+        mut words: Array<String> = Array::<String>::new();
+        words.push(String::from_str(program));
+        for (word in arguments.split_whitespace()) { words.push(String::from_str(word)); }
+        return GateCommand { name: String::from_str(name), arguments: words, verdict: String::from_str(verdict), anchored: anchored };
+    }
+}
+
+/// What a gate's run came to: its verdict line and whether it passed.
+public type struct GateVerdict {
+    /// The last line of the log holding the gate's verdict, trimmed and
+    /// unquoted; empty when there is none.
+    public line: String;
+    /// Whether the gate exited 0 and its verdict line says ` OK`.
+    public ok: boolean;
+
+    /// The verdict of `gate`'s run, which exited `exit` and wrote `log`.
+    public static of(gate: &GateCommand, log: Str, exit: i32) -> GateVerdict {
+        mut line: String = String::new();
+        for (raw in Text::lines(log).iterate_references()) {
+            const text: Str = raw.as_str();
+            const holds: boolean = if (gate.anchored) { text.starts_with(&gate.verdict.as_str()) } else { text.contains(&gate.verdict.as_str()) };
+            if (!holds) { continue; }
+            mut unquoted: Str = text.trim();
+            while (unquoted.starts_with(&Str::new("\""))) { unquoted = unquoted.byte_substring(1, unquoted.length()); }
+            while (unquoted.ends_with(&Str::new("\""))) { unquoted = unquoted.byte_substring(0, unquoted.length() - 1); }
+            line = String::from_str(unquoted);
+        }
+        const ok: boolean = exit == 0 && !line.is_empty() && line.as_str().contains(&Str::new(" OK"));
+        return GateVerdict { line: line, ok: ok };
+    }
+
+    /// The gate's line in verify's report: its name, `ok` or `FAIL`, its
+    /// time to a tenth of a second, and its verdict line, or where its log
+    /// is when it printed none.
+    public report(&this, name: Str, seconds: f64, log: Str) -> String {
+        const status: Str = if (this.ok) { Str::new("ok") } else { Str::new("FAIL") };
+        const shown: String = if (this.line.is_empty()) { f"<no verdict line; see {log}>" } else { this.line.clone() };
+        return f"  {name:<9} {status:<4} {seconds:>6.1} s  {shown.as_str()}";
+    }
+}

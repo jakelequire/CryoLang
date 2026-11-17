@@ -1,0 +1,65 @@
+///! The annotation writer's decisions: the diagnostics a run anchors in a
+///! file, the lines that pin them, and the two-way check.
+![config(testing)]
+namespace cryogate::tests::negative;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect };
+
+import cryogate::negative::annotations::{ Annotations, Diagnostic };
+
+type struct Fixture {
+    /// A run's output: two diagnostics in `t.cryo` (one a warning), one in
+    /// the stdlib, and a header whose block never names a place.
+    private static output() -> Str {
+        return Str::new(
+            "error[E0200]: mismatched types\n"
+            "  --> C:\\work\\negative\\t.cryo:2:5\n"
+            "warning[W0001]: unused variable `x`\n"
+            " --> tests/negative/t.cryo:2:9\n"
+            "error[E0100]: in the stdlib\n"
+            " --> stdlib/core/ops.cryo:4:1\n"
+            "error[E0236]: no span\n"
+            "aborting due to 3 errors\n");
+    }
+}
+
+![test]
+function a_run_anchors_only_the_diagnostics_whose_place_names_the_file() -> Result<(), TestError> {
+    const found: Array<Diagnostic> = Annotations::diagnostics(Fixture::output(), Str::new("t.cryo"));
+    expect(found.length() == 2, f"two diagnostics, got {found.length()}".as_str())?;
+    expect(found.get_reference(0).unwrap().line == 2 && found.get_reference(0).unwrap().code.as_str() == Str::new("E0200"), Str::new("the error at its line, from a Windows path"))?;
+    return expect(found.get_reference(1).unwrap().severity.as_str() == Str::new("warning") && found.get_reference(1).unwrap().message.as_str() == Str::new("unused variable `x`"), Str::new("the warning and its message"));
+}
+
+![test]
+function annotations_go_below_their_line_with_one_more_caret_each() -> Result<(), TestError> {
+    const found: Array<Diagnostic> = Annotations::diagnostics(Fixture::output(), Str::new("t.cryo"));
+    const text: Str = Str::new("namespace T;\n    const x: i32 = \"a\";\n");
+    const written: String = Annotations::annotated(text, &found).unwrap();
+    const expected: Str = Str::new("namespace T;\n    const x: i32 = \"a\";\n    //~^ ERROR[E0200] mismatched types\n    //~^^ WARN[W0001] unused variable `x`\n");
+    expect(written.as_str() == expected, written.as_str())?;
+    expect(Annotations::verify(written.as_str(), &found).is_ok(), Str::new("the annotations verify against the run"))?;
+    const pinned: Array<Diagnostic> = Annotations::annotations(written.as_str());
+    return expect(pinned.length() == 2 && pinned.get_reference(1).unwrap().line == 2, Str::new("both pin line 2"));
+}
+
+![test]
+function a_diagnostic_past_the_last_line_is_not_annotated() -> Result<(), TestError> {
+    const found: Array<Diagnostic> = Annotations::diagnostics(Str::new("error[E0002]: unterminated\n --> t.cryo:9:1\n"), Str::new("t.cryo"));
+    return expect(Annotations::annotated(Str::new("one\ntwo"), &found).is_none(), Str::new("refused"));
+}
+
+![test]
+function an_annotation_without_a_diagnostic_or_a_diagnostic_without_one_does_not_verify() -> Result<(), TestError> {
+    const found: Array<Diagnostic> = Annotations::diagnostics(Fixture::output(), Str::new("t.cryo"));
+    const missing: Result<(), String> = Annotations::verify(Str::new("a\nb\n//~^ ERROR[E0200] mismatched\n"), &found);
+    expect(missing.is_err() && missing.unwrap_err() == String::from_str(Str::new("unannotated warning[W0001] at 2")), Str::new("the unannotated warning is named"))?;
+    const wrong: Result<(), String> = Annotations::verify(Str::new("a\nb\n//~^ ERROR[E0200] other text\n//~^^ WARN[W0001]\n"), &found);
+    return expect(wrong.is_err() && wrong.unwrap_err() == String::from_str(Str::new("annotation error[E0200] at 2 matches no diagnostic")), Str::new("a message the diagnostic does not hold is refused"));
+}

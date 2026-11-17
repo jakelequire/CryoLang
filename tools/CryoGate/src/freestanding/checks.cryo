@@ -1,0 +1,145 @@
+///! The freestanding check's judgements: what each program must exit with
+///! and print, and the run's verdict.  Pure over the exit statuses and error
+///! streams handed in.  An exit status is the shell's: the code, or 128 plus
+///! the signal that ended the program.  A Windows program runs under wine,
+///! and its lines say so.
+
+namespace cryogate::freestanding::checks;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+/// One check's report line, and whether it passed.
+public type struct CheckLine {
+    public passed: boolean;
+    public line: String;
+
+    private static of(passed: boolean, line: String) -> CheckLine { return CheckLine { passed: passed, line: line }; }
+}
+
+/// The run's verdict: its last lines and its exit code.
+public type struct FreestandingVerdict {
+    public lines: Array<String>;
+    public exit: i32;
+}
+
+/// The judgements, each for the arm `os` (`linux` or `windows`).
+public type struct FreestandingJudge {
+    /// A `main` returning `expected` exited `got`.
+    public static core(os: Str, expected: i32, got: i32) -> CheckLine {
+        const word: Str = if (expected == got) { Str::new("ok") } else { Str::new("FAIL") };
+        const wine: Str = FreestandingJudge::wine(os);
+        return CheckLine::of(expected == got, f"{os} core {word}: main {expected} -> exit {got}{wine}");
+    }
+
+    /// The panic funnel exited `got` and printed `message`: exit 101 and
+    /// the whole report, which on Linux is all it prints and under wine is
+    /// among what it prints.
+    public static panic(os: Str, got: i32, message: Str, expected: Str) -> Array<CheckLine> {
+        mut lines: Array<CheckLine> = Array::<CheckLine>::new();
+        const windows: boolean = os == Str::new("windows");
+        if (got != 101) { lines.push(CheckLine::of(false, f"{os} panic FAIL: exit {got} (want 101)")); }
+        if (windows) {
+            if (!message.contains(&expected)) {
+                lines.push(CheckLine::of(false, f"{os} panic FAIL: stderr missing [{expected}]; got [{message}]"));
+            } else if (got == 101) {
+                lines.push(CheckLine::of(true, f"{os} panic ok: exit 101 (wine), stderr contains message"));
+            }
+            return lines;
+        }
+        if (message != expected) { lines.push(CheckLine::of(false, f"{os} panic FAIL: stderr [{message}] (want [{expected}])")); }
+        if (got == 101 && message == expected) { lines.push(CheckLine::of(true, f"{os} panic ok: exit 101, stderr [{message}]")); }
+        return lines;
+    }
+
+    /// The check handler `label` exited `got` and printed `message`, which
+    /// must hold `want`.
+    public static handler(os: Str, label: Str, want: Str, got: i32, message: Str) -> CheckLine {
+        if (got == 101 && message.contains(&want)) {
+            const wine: Str = FreestandingJudge::wine(os);
+            return CheckLine::of(true, f"{os} {label} ok: [{message}]{wine}");
+        }
+        return CheckLine::of(false, f"{os} {label} FAIL: exit {got} stderr [{message}] (want 101 + *{want}*)");
+    }
+
+    /// The allocator's round trip exited `got`.
+    public static allocation(os: Str, got: i32) -> CheckLine {
+        if (got == 0) {
+            const how: Str = if (os == Str::new("windows")) { Str::new("VirtualAlloc/VirtualFree round-trip, bad requests refused (wine)") } else { Str::new("mmap alloc/free round-trip, bad requests refused") };
+            return CheckLine::of(true, f"{os} alloc ok: {how}");
+        }
+        return CheckLine::of(false, f"{os} alloc FAIL: exit {got} (0=ok; 1-9 = failure mode)");
+    }
+
+    /// The frame walk exited `got` and printed `message`: a header and at
+    /// least three frame addresses, the proof it unwound.
+    public static backtrace(os: Str, got: i32, message: Str) -> CheckLine {
+        mut frames: i64 = 0;
+        for (line in message.split(&Str::new("\n"))) {
+            if (line.contains(&Str::new("0x"))) { frames++; }
+        }
+        if (got == 0 && message.contains(&Str::new("stack backtrace:")) && frames >= 3) {
+            return CheckLine::of(true, f"{os} backtrace ok: {frames} frames");
+        }
+        return CheckLine::of(false, f"{os} backtrace FAIL: exit {got} frames {frames} [{message}]");
+    }
+
+    /// The argument check exited `got`: the count, with every argument
+    /// whole.
+    public static arguments(os: Str, got: i32) -> CheckLine {
+        const wine: Str = FreestandingJudge::wine(os);
+        if (got == 4) { return CheckLine::of(true, f"{os} args ok: argc 4 + argv contents match{wine}"); }
+        return CheckLine::of(false, f"{os} args FAIL: exit {got} (want 4; 90=argc 91-93=argv[n] 94=null)");
+    }
+
+    /// The program `cryo build` linked itself, run with two arguments,
+    /// exited `got`.
+    public static driver_link(os: Str, got: i32) -> CheckLine {
+        if (got == 3) {
+            const wine: Str = FreestandingJudge::wine(os);
+            return CheckLine::of(true, f"{os} driver-link ok: cryo build produced a running freestanding exe{wine}");
+        }
+        return CheckLine::of(false, f"{os} driver-link FAIL: exit {got} (want 3; 70=alloc)");
+    }
+
+    /// The verdict over a run in which some check `failed` (or not) and the
+    /// arms `skipped` did not run; a skipped arm fails the run unless
+    /// `allow_skipped`.
+    public static verdict(failed: boolean, skipped: &Array<String>, allow_skipped: boolean) -> FreestandingVerdict {
+        mut lines: Array<String> = Array::<String>::new();
+        mut failing: boolean = failed;
+        mut named: String = String::new();
+        for (arm in skipped.iterate_references()) {
+            named.push(' ');
+            named.push(arm.as_str());
+        }
+        if (!skipped.is_empty()) {
+            if (allow_skipped) {
+                lines.push(f"verify-freestanding: arm(s) NOT RUN:{named.as_str()} (--allow-skipped-arm)");
+            } else {
+                lines.push(f"verify-freestanding: arm(s) NOT RUN:{named.as_str()}");
+                lines.push(String::from_str(Str::new("verify-freestanding: this run covered less than the gate claims.")));
+                lines.push(String::from_str(Str::new("  Pass --allow-skipped-arm to accept that deliberately, or supply")));
+                lines.push(String::from_str(Str::new("  the toolchain the arm needs.")));
+                failing = true;
+            }
+        }
+        if (failing) {
+            lines.push(String::from_str(Str::new("verify-freestanding: FAILED")));
+            return FreestandingVerdict { lines: lines, exit: 1 };
+        }
+        if (!skipped.is_empty()) {
+            lines.push(f"verify-freestanding: OK for every arm that ran; NOT RUN:{named.as_str()}");
+        } else {
+            lines.push(String::from_str(Str::new("verify-freestanding: OK (linux + windows)")));
+        }
+        return FreestandingVerdict { lines: lines, exit: 0 };
+    }
+
+    /// ` (wine)` on the Windows arm, nothing on the Linux one.
+    private static wine(os: Str) -> Str {
+        if (os == Str::new("windows")) { return Str::new(" (wine)"); }
+        return Str::new("");
+    }
+}

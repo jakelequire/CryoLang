@@ -1643,8 +1643,9 @@ type struct NameResolver {
         //
         // Three disjoint ways a scope segment names a type, selected by a
         // property of the segment rather than tried in turn: it binds in the
-        // writer's scope, it spells a primitive (which is declared nowhere and
-        // so binds nowhere), or it is a module-rooted path whose own last
+        // writer's scope, it spells a primitive (which is declared nowhere, so
+        // the caller asks no rib for it and `scope_sym` is invalid), or it is
+        // a module-rooted path whose own last
         // segment names the type.  A segment in none of them is a segment
         // nothing in the program owns, and it is counted rather than guessed
         // at, because a base invented here is a claim the type layer cannot
@@ -3958,9 +3959,21 @@ implement trait Walk for struct NameResolver {
             return;
         }
         if (!this.stamp_this_scope(e, node)) {
-            // Look up the scope name (e.g., "Foo" in "Foo::Bar")
-            const scope_sym: SymbolID = this.resolver.lookup(
-                node.scope_name, this.resolver.current_scope);
+            // The scope segment names what owns the member: a type or a
+            // module, so it is a question in the type namespace.  A
+            // primitive's spelling names the primitive before any binding is
+            // asked, as a written type's does (`type_spelling_res`): a
+            // primitive binds in no rib, so a function of the same spelling
+            // would otherwise answer for it and `u16::MAX` would name
+            // nothing.  Any other segment is asked of the writer's ribs
+            // through the type door, so a same-leaf function in a rib that
+            // also binds the type does not hide it either.
+            const scope_sym: SymbolID =
+                if (ResBase::is_primitive_spelling(this.resolver.intern_table.resolve(node.scope_name))) {
+                    SymbolID::invalid()
+                } else {
+                    this.resolver.type_binding(node.scope_name, this.resolver.current_scope)
+                };
             if (scope_sym.is_valid()) {
                 this.resolver.record_resolution(e.span, scope_sym);
             }

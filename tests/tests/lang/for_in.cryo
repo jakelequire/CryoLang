@@ -28,6 +28,8 @@ import std::core::iter::{ Iterator };
 import std::core::ops::{ Range, RangeInclusive };
 import std::core::slice::{ Slice };
 import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect_equal };
 
@@ -352,4 +354,99 @@ function for_in_fixed_array_break_works() -> Result<(), TestError> {
     }
     // 1+2+3 = 6.
     return expect_equal(sum, 6);
+}
+
+
+// ============================================================================
+// A temporary in the iterable lives until the loop ends: the iterator
+// borrows it, so the body reads the temporary's elements, not freed memory.
+// Owning strings make a freed element read back empty or as garbage.
+// ============================================================================
+
+function make_words() -> Array<String> {
+    mut words: Array<String> = Array::<String>::new();
+    words.push(String::from_str(Str::new("hello")));
+    words.push(String::from_str(Str::new("world")));
+    words.push(String::from_str(Str::new("again")));
+    return words;
+}
+
+![test]
+function for_in_over_a_temporary_reads_its_elements() -> Result<(), TestError> {
+    mut joined: String = String::new();
+    for (word in make_words().iterate_references()) {
+        joined.push(word.as_str());
+        joined.push(Str::new(","));
+    }
+    return expect_equal(joined.as_str(), Str::new("hello,world,again,"));
+}
+
+![test]
+function match_on_a_temporarys_borrow_reads_it_in_the_arm() -> Result<(), TestError> {
+    // The `match` statement keeps its subject's temporaries until it ends,
+    // as the loop keeps its iterable's.
+    mut read: String = String::new();
+    match (make_words().get_reference(1)) {
+        Option::Some(word) => { read.push(word.as_str()); }
+        Option::None => {}
+    }
+    return expect_equal(read.as_str(), Str::new("world"));
+}
+
+![test]
+function for_in_over_a_temporary_survives_break() -> Result<(), TestError> {
+    mut joined: String = String::new();
+    for (word in make_words().iterate_references()) {
+        if (word.as_str() == Str::new("again")) { break; }
+        joined.push(word.as_str());
+    }
+    return expect_equal(joined.as_str(), Str::new("helloworld"));
+}
+
+function first_word_after(skip: Str) -> String {
+    for (word in make_words().iterate_references()) {
+        if (word.as_str() != skip) { return String::from_str(word.as_str()); }
+    }
+    return String::new();
+}
+
+![test]
+function for_in_over_a_temporary_survives_return() -> Result<(), TestError> {
+    const found: String = first_word_after(Str::new("hello"));
+    return expect_equal(found.as_str(), Str::new("world"));
+}
+
+![test]
+function for_in_over_a_temporary_inside_another_loop() -> Result<(), TestError> {
+    // The inner loop's temporary is made and released once per outer
+    // iteration.
+    mut joined: String = String::new();
+    for (round in Range::new(0, 2)) {
+        for (word in make_words().iterate_references()) {
+            if (word.as_str() == Str::new("world")) { continue; }
+            joined.push(word.as_str());
+        }
+    }
+    return expect_equal(joined.as_str(), Str::new("helloagainhelloagain"));
+}
+
+function rebuilt<T>(items: &Array<T>) -> Array<T> where T: Clone {
+    mut out: Array<T> = Array::<T>::new();
+    for (item in items.iterate_references()) { out.push(item.clone()); }
+    return out;
+}
+
+function last_of_rebuilt<T>(items: &Array<T>, fallback: T) -> T where T: Clone {
+    mut last: T = fallback;
+    for (item in rebuilt(items).iterate_references()) { last = item.clone(); }
+    return last;
+}
+
+![test]
+function for_in_over_a_temporary_in_a_generic_function() -> Result<(), TestError> {
+    // A generic function's body is copied for each instance; the copy keeps
+    // the loop's temporary alive too.
+    const words: Array<String> = make_words();
+    const last: String = last_of_rebuilt(&words, String::new());
+    return expect_equal(last.as_str(), Str::new("again"));
 }

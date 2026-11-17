@@ -1,0 +1,83 @@
+///! The ABI check's decisions: the registry's rows, what each configuration
+///! must define, the names no row accounts for, nm's listing and the names
+///! the sources spell.
+![config(testing)]
+namespace cryogate::tests::abi;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect };
+
+import cryogate::abi::registry::{ LangItems, RowScope };
+import cryogate::abi::symbols::{ ArchiveSymbols, SourceNames };
+import cryogate::core::text::{ Text };
+
+type struct Fixture {
+    private static registry() -> LangItems {
+        return LangItems::parse(Str::new(
+            "# Columns: SYMBOL | SIGNATURE | DEFINED-IN | STATUS\n"
+            "__cryo_entry   | ()    | freestanding:linux | DONE\n"
+            "__cryo_alloc   | (u64) | freestanding, hosted | DONE\r\n"
+            "__cryo_panic   | (msg) | hosted         | DONE\n"
+            "__cryo_panic   | (msg) | hosted         | twice\n"
+            "__cryo_winmain | ()    | freestanding:windows | DONE\n"
+            "__cryo_write   | ()    | import         | (system)\n"
+            "__cryo_try_*   | `?` temporaries | compiler | (compiler)\n"
+            "prose with no bar is not a row\n"));
+    }
+
+    private static names(words: Str) -> Array<String> {
+        mut names: Array<String> = Array::<String>::new();
+        for (word in words.split_whitespace()) { names.push(String::from_str(word)); }
+        return names;
+    }
+}
+
+![test]
+function the_registry_reads_each_rows_symbol_and_defined_in() -> Result<(), TestError> {
+    const registry: LangItems = Fixture::registry();
+    expect(registry.rows.length() == 7, Str::new("a comment and a line with no bar are not rows"))?;
+    expect(registry.rows.get_reference(1).unwrap().defined_in.as_str() == Str::new("freestanding,hosted"), Str::new("whitespace, a carriage return included, removed"))?;
+    expect(registry.rows.get_reference(6).unwrap().symbol.as_str() == Str::new("__cryo_try_*"), Str::new("the symbol, trimmed"))?;
+    const freestanding: Array<String> = registry.required(Str::new("freestanding"), Str::new("linux"));
+    expect(Text::joined(&freestanding, Str::new(" ")) == String::from_str(Str::new("__cryo_alloc __cryo_entry")), Str::new("listed, or narrowed to this OS; not another OS's"))?;
+    const hosted: Array<String> = registry.required(Str::new("hosted"), Str::new("windows"));
+    return expect(Text::joined(&hosted, Str::new(" ")) == String::from_str(Str::new("__cryo_alloc __cryo_panic")), Str::new("sorted, a symbol listed twice once, imports and the compiler's own left out"));
+}
+
+![test]
+function a_name_is_accounted_for_only_by_a_row_in_scope() -> Result<(), TestError> {
+    const registry: LangItems = Fixture::registry();
+    const exported: Array<String> = Fixture::names(Str::new("__cryo_alloc __cryo_write __cryo_try_1 __cryo_stray"));
+    const runtime: Array<String> = registry.unregistered(&exported, RowScope::Runtime);
+    expect(Text::joined(&runtime, Str::new(" ")) == String::from_str(Str::new("__cryo_write __cryo_try_1 __cryo_stray")), Str::new("an export needs a runtime row: an import or compiler row does not count"))?;
+    const any: Array<String> = registry.unregistered(&exported, RowScope::Any);
+    expect(Text::joined(&any, Str::new(" ")) == String::from_str(Str::new("__cryo_stray")), Str::new("any row accounts for a spelling, a prefix row by prefix"))?;
+    const calls: Array<String> = Fixture::names(Str::new("__cryo_panic __cryo_entry"));
+    const hosted: Array<String> = registry.unregistered(&calls, RowScope::Hosted);
+    return expect(Text::joined(&hosted, Str::new(" ")) == String::from_str(Str::new("__cryo_entry")), Str::new("a stdlib call must be a hosted symbol"));
+}
+
+![test]
+function nm_lists_definitions_by_an_upper_case_type_other_than_undefined() -> Result<(), TestError> {
+    const listing: Str = Str::new(
+        "\r\npanic.o:\r\n0000000000000000 T __cryo_panic\r\n                 U __cryo_write\r\n0000000000000000 U __cryo_read\r\n0000000000000010 t local_helper\r\n"
+        "alloc.o:\n0000000000000000 T __cryo_alloc\n0000000000000008 D __cryo_panic\n0000000000000000 W weak_one\n");
+    const defining: Array<String> = ArchiveSymbols::defining(listing);
+    expect(Text::joined(&defining, Str::new(" ")) == String::from_str(Str::new("__cryo_panic __cryo_alloc __cryo_panic weak_one")), Str::new("one per defining member; undefined, local and headings left out"))?;
+    const twice: Array<String> = ArchiveSymbols::duplicated(&defining);
+    return expect(Text::joined(&twice, Str::new(" ")) == String::from_str(Str::new("__cryo_panic")), Str::new("a runtime symbol two members define, once"));
+}
+
+![test]
+function the_sources_spell_quoted_names_and_calls() -> Result<(), TestError> {
+    mut quoted: Array<String> = Array::<String>::new();
+    SourceNames::quoted_in(Str::new("call(\"__cryo_panic\"); name(\"__cryo_try_\", x); \"__cryo_"), &quoted);
+    expect(Text::joined(&quoted, Str::new(" ")) == String::from_str(Str::new("__cryo_panic __cryo_try_ __cryo_")), Str::new("each quoted start, up to its last name character"))?;
+    mut called: Array<String> = Array::<String>::new();
+    SourceNames::called_in(Str::new("__cryo_alloc(8); __cryo_bad_(1); my__cryo_inner(2); __cryo_name; __cryo_x9("), &called);
+    return expect(Text::joined(&called, Str::new(" ")) == String::from_str(Str::new("__cryo_alloc __cryo_inner __cryo_x9")), Str::new("a call ends in a letter or digit before its parenthesis"));
+}

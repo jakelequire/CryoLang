@@ -1,0 +1,361 @@
+///! A running language server, driven over its standard streams.
+///!
+///! Two threads read what the server writes - one its output, cut into
+///! messages, one its error stream, cut into lines - and hand each to the
+///! driver through one channel, so the driver can write a request while a
+///! long answer is still arriving and wait for any message with a time
+///! limit.  Responses are filed by id (the id as JSON text: `3`, `"bad-1"`,
+///! `null`) and kept in the order they arrived; notifications are kept in
+///! order, for a check to wait for one.
+
+namespace cryogate::lsp::run::server;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::mem;
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::env;
+import std::fs::path::{ Path, PathBuf };
+import std::io::error::{ IoError };
+import std::io::file_descriptor;
+import std::io::file_descriptor::{ BorrowedFileDescriptor };
+import std::io::traits::{ Read, Write };
+import std::json::parser;
+import std::json::serializer;
+import std::json::value::{ JsonValue };
+import std::process::child::{ Child, ChildStdin, ExitStatus };
+import std::process::command::{ Command, Stdio };
+import std::sync::channel;
+import std::sync::channel::{ Receiver, ReceiveTimeoutError, Sender };
+import std::thread;
+import std::thread::{ JoinHandle };
+import std::time::clock::{ Instant };
+import std::time::duration::{ Duration };
+
+import cryogate::core::host::{ Host };
+import cryogate::lsp::reading::{ Reading };
+import cryogate::lsp::wire::{ FrameBuffer, Frames };
+
+/// What a reading thread hands the driver.
+private type enum Arrival {
+    /// One message body from the server's output.
+    Message(String);
+    /// One line of the server's error stream.
+    ErrorLine(String);
+    /// The server's output reached its end, or could no longer be read.
+    OutputEnded;
+}
+
+/// The thread reading the server's output into messages.  It owns the
+/// pipe's descriptor, taken out of its `ChildStdout`, and closes it at the
+/// end.
+private type struct OutputReader {
+    private descriptor: i32;
+    private arrivals: Sender<Arrival>;
+
+    private run(&this) -> i32 {
+        const ended: i32 = this.read_messages();
+        file_descriptor::close_file_descriptor(this.descriptor);
+        return ended;
+    }
+
+    private read_messages(&this) -> i32 {
+        mut pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(this.descriptor);
+        mut frames: FrameBuffer = FrameBuffer::new();
+        mut chunk: [u8; 65536];
+        loop {
+            const count: i64 = match (pipe.read(&chunk[0], 65536)) {
+                Result::Ok(count) => { count }
+                Result::Err(_)    => { 0 }
+            };
+            if (count == 0) { break; }
+            frames.push(Slice::<u8>::from_raw(&chunk[0], count));
+            mut readable: boolean = true;
+            while (readable) {
+                match (frames.next()) {
+                    Result::Ok(Option::Some(body)) => { const _: Result<(), channel::SendError<Arrival>> = this.arrivals.send(Arrival::Message(body)); }
+                    Result::Ok(Option::None)       => { readable = false; }
+                    Result::Err(_)                 => { const _: Result<(), channel::SendError<Arrival>> = this.arrivals.send(Arrival::OutputEnded); return 1; }
+                }
+            }
+        }
+        const _: Result<(), channel::SendError<Arrival>> = this.arrivals.send(Arrival::OutputEnded);
+        return 0;
+    }
+}
+
+/// The thread reading the server's error stream into lines.  It owns the
+/// pipe's descriptor, as `OutputReader` does.
+private type struct ErrorReader {
+    private descriptor: i32;
+    private arrivals: Sender<Arrival>;
+
+    private run(&this) -> i32 {
+        this.read_lines();
+        file_descriptor::close_file_descriptor(this.descriptor);
+        return 0;
+    }
+
+    private read_lines(&this) -> void {
+        mut pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(this.descriptor);
+        mut pending: String = String::new();
+        mut chunk: [u8; 4096];
+        loop {
+            const count: i64 = match (pipe.read(&chunk[0], 4096)) {
+                Result::Ok(count) => { count }
+                Result::Err(_)    => { 0 }
+            };
+            if (count == 0) { break; }
+            pending.push(Str::from_raw(&chunk[0], count));
+            loop {
+                const text: Str = pending.as_str();
+                const end: i64 = match (text.find_byte('\n' as u8)) {
+                    Option::Some(at) => { at }
+                    Option::None     => { break; }
+                };
+                const line: String = String::from_str(text.byte_substring(0, end).trim_end());
+                pending = String::from_str(text.byte_substring(end + 1, text.length()));
+                const _: Result<(), channel::SendError<Arrival>> = this.arrivals.send(Arrival::ErrorLine(line));
+            }
+        }
+        if (!pending.is_empty()) {
+            const _: Result<(), channel::SendError<Arrival>> = this.arrivals.send(Arrival::ErrorLine(String::from_str(pending.as_str().trim_end())));
+        }
+    }
+}
+
+/// A running server.
+public type struct Server {
+    private child: Child;
+    private input: Option<ChildStdin>;
+    private arrivals: Receiver<Arrival>;
+    private readers: Array<JoinHandle<i32>>;
+    private responses: Array<Pair<String, JsonValue>>;
+    private output_ended: boolean;
+    private next_id: i64;
+    /// The ids of the responses received so far, in arrival order.
+    public arrived: Array<String>;
+    /// Every notification received so far, in order.
+    public notifications: Array<JsonValue>;
+    /// Every line the server wrote to its error stream.
+    public errors: Array<String>;
+
+    /// Start the server `program` in `directory`, with `CRYO_STDLIB` set to
+    /// `stdlib`, `CRYO_HOME` to `home` when given, the compiler's logger
+    /// switched off (so a check that the server writes nothing to its
+    /// error stream holds whatever the caller's shell sets), and the
+    /// repository's LLVM directories first on `PATH` where they exist.
+    public static start(repository: Path, program: Str, directory: Str, stdlib: Str, home: Option<Str>) -> Result<Server, String> {
+        mut command: Command = Command::new(program);
+        command.current_directory(directory);
+        command.env_remove(Str::new("CRYO_LOG"));
+        command.env_remove(Str::new("CRYO_LOG_FILE"));
+        command.env(Str::new("CRYO_STDLIB"), stdlib);
+        match (home) {
+            Option::Some(path) => { command.env(Str::new("CRYO_HOME"), path); }
+            Option::None       => { }
+        }
+        command.env(Str::new("PATH"), Server::search_path(repository).as_str());
+        command.stdin(Stdio::Piped).stdout(Stdio::Piped).stderr(Stdio::Piped);
+        mut child: Child = match (command.spawn()) {
+            Result::Ok(child)  => { child }
+            Result::Err(error) => { return Result::Err(f"cannot start {program}: {error.describe()}"); }
+        };
+        const input: Option<ChildStdin> = child.stdin.take();
+        const output: i32 = child.stdout.unwrap_pointer().into_descriptor();
+        const error_stream: i32 = child.stderr.unwrap_pointer().into_descriptor();
+        const { first: sender, second: receiver }: Pair<Sender<Arrival>, Receiver<Arrival>> = channel::Channel::unbounded::<Arrival>();
+        const output_reader: OutputReader = OutputReader { descriptor: output, arrivals: sender.clone() };
+        const error_reader: ErrorReader = ErrorReader { descriptor: error_stream, arrivals: sender };
+        mut readers: Array<JoinHandle<i32>> = Array::<JoinHandle<i32>>::new();
+        readers.push(thread::spawn(move () -> i32 { return output_reader.run(); }));
+        readers.push(thread::spawn(move () -> i32 { return error_reader.run(); }));
+        return Result::Ok(Server {
+            child:         child,
+            input:         input,
+            arrivals:      receiver,
+            readers:       readers,
+            responses:     Array::<Pair<String, JsonValue>>::new(),
+            output_ended:  false,
+            next_id:       0,
+            arrived:       Array::<String>::new(),
+            notifications: Array::<JsonValue>::new(),
+            errors:        Array::<String>::new(),
+        });
+    }
+
+    /// `PATH` with the repository's `.toolchains/llvm-win/bin` and `bin`
+    /// first, each where it exists: the server links LLVM, whose Windows
+    /// library lives there.
+    private static search_path(repository: Path) -> String {
+        const separator: Str = if (Host::os() == Str::new("windows")) { Str::new(";") } else { Str::new(":") };
+        mut parts: Array<String> = Array::<String>::new();
+        const toolchain: PathBuf = repository.join(Str::new(".toolchains/llvm-win/bin"));
+        if (toolchain.as_path().is_directory()) { parts.push(String::from_str(toolchain.as_path().as_str())); }
+        const pins: PathBuf = repository.join(Str::new("bin"));
+        if (pins.as_path().is_directory()) { parts.push(String::from_str(pins.as_path().as_str())); }
+        parts.push(match (env::var(Str::new("PATH"))) {
+            Option::Some(value) => { value }
+            Option::None        => { String::new() }
+        });
+        mut joined: String = String::new();
+        for (mut index: i64 = 0; index < parts.length(); index++) {
+            if (index > 0) { joined.push(separator); }
+            joined.push(parts.get_reference(index).unwrap().as_str());
+        }
+        return joined;
+    }
+
+    /// Write `body` as one message; false when the server's input is gone.
+    public send_raw(mut &this, body: Str) -> boolean {
+        const framed: String = Frames::framed(body);
+        return match (&this.input) {
+            Option::Some(_) => { this.input.unwrap_pointer().write(framed.as_str()).is_ok() }
+            Option::None    => { false }
+        };
+    }
+
+    /// Send a request with `params` (JSON text) without waiting; its id, or
+    /// `None` when it could not be written.
+    public send_request(mut &this, method: Str, params: Str) -> Option<i64> {
+        this.next_id = this.next_id + 1;
+        const id: i64 = this.next_id;
+        if (!this.send_raw(f"{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":{Frames::quoted(method).as_str()},\"params\":{params}}}".as_str())) {
+            return Option::None;
+        }
+        return Option::Some(id);
+    }
+
+    /// Send a request and wait up to `seconds` for its response.
+    public request(mut &this, method: Str, params: Str, seconds: i64) -> Option<JsonValue> {
+        const id: i64 = this.send_request(method, params)?;
+        return this.wait_response(f"{id}".as_str(), seconds);
+    }
+
+    /// Send a notification with `params` (JSON text).
+    public notify(mut &this, method: Str, params: Str) -> boolean {
+        return this.send_raw(f"{{\"jsonrpc\":\"2.0\",\"method\":{Frames::quoted(method).as_str()},\"params\":{params}}}".as_str());
+    }
+
+    /// The response filed under `id` (its JSON text), waiting up to
+    /// `seconds` for it; `None` when none arrives in time or the server's
+    /// output ends first.
+    public wait_response(mut &this, id: Str, seconds: i64) -> Option<JsonValue> {
+        const started: Instant = Instant::now();
+        loop {
+            mut index: i64 = 0;
+            while (index < this.responses.length()) {
+                if (this.responses.get_reference(index).unwrap().first.as_str() == id) {
+                    // The pair runs its destructor whole, so the response is
+                    // swapped out of it rather than moved.
+                    mut taken: Pair<String, JsonValue> = this.responses.remove(index);
+                    mut response: JsonValue = JsonValue::Null;
+                    mem::swap::<JsonValue>(&response, &taken.second);
+                    return Option::Some(response);
+                }
+                index++;
+            }
+            if (this.output_ended) { return Option::None; }
+            if (!this.receive_before(&started, seconds * 1000)) { return Option::None; }
+        }
+    }
+
+    /// Take one arrival, waiting until `limit_milliseconds` after `started`
+    /// at most; false when the time is up or nothing more can arrive.
+    public receive_before(mut &this, started: &Instant, limit_milliseconds: i64) -> boolean {
+        const elapsed: i64 = started.elapsed().as_milliseconds() as i64;
+        if (elapsed >= limit_milliseconds) { return false; }
+        match (this.arrivals.receive_timeout(Duration::from_milliseconds((limit_milliseconds - elapsed) as u64))) {
+            Result::Ok(arrival) => { this.file(arrival); return true; }
+            Result::Err(ReceiveTimeoutError::Timeout) => { return false; }
+            Result::Err(ReceiveTimeoutError::Disconnected) => { this.output_ended = true; return false; }
+        }
+    }
+
+    /// File every arrival already waiting, without waiting for more.
+    public take_waiting(mut &this) -> void {
+        loop {
+            match (this.arrivals.try_receive()) {
+                Result::Ok(arrival) => { this.file(arrival); }
+                Result::Err(_)      => { return; }
+            }
+        }
+    }
+
+    private file(mut &this, arrival: Arrival) -> void {
+        match (arrival) {
+            Arrival::Message(body) => {
+                const message: JsonValue = match (parser::parse(body.as_str())) {
+                    Result::Ok(value) => { value }
+                    Result::Err(_)    => { return; }
+                };
+                const has_method: boolean = Reading::at(&message, Str::new("method")).is_some();
+                match (Reading::at(&message, Str::new("id"))) {
+                    Option::Some(id) => {
+                        if (!has_method) {
+                            const key: String = serializer::stringify(id);
+                            this.arrived.push(key.clone());
+                            this.responses.push(Pair::new(key, message));
+                            return;
+                        }
+                    }
+                    Option::None => { }
+                }
+                if (has_method) { this.notifications.push(message); }
+            }
+            Arrival::ErrorLine(line) => { this.errors.push(line); }
+            Arrival::OutputEnded     => { this.output_ended = true; }
+        }
+    }
+
+    /// Whether the server's output has ended: nothing more can be answered.
+    public ended(&this) -> boolean { return this.output_ended; }
+
+    /// Whether the server still runs and its output has not ended.
+    public alive(mut &this) -> boolean {
+        if (this.output_ended) { return false; }
+        return match (this.child.try_wait()) {
+            Result::Ok(Option::None) => { true }
+            _                        => { false }
+        };
+    }
+
+    /// The server's exit code once it exits within `seconds`; `None` when
+    /// it is still running then (it is left running) or ended otherwise.
+    public exit_within(mut &this, seconds: i64) -> Option<Option<i32>> {
+        return match (this.child.wait_timeout(Duration::from_seconds(seconds as u64))) {
+            Result::Ok(Option::Some(status)) => { Option::Some(status.exit_code()) }
+            _                                => { Option::None }
+        };
+    }
+
+    /// The server's exit code, when it has exited.
+    public exit_code(mut &this) -> Option<i32> {
+        return match (this.child.try_wait()) {
+            Result::Ok(Option::Some(status)) => { status.exit_code() }
+            _                                => { Option::None }
+        };
+    }
+
+    /// End the server if it still runs, close its input, and wait for the
+    /// reading threads, which end once its streams close.
+    public stop(mut &this) -> void {
+        match (this.child.try_wait()) {
+            Result::Ok(Option::None) => {
+                const _: Result<(), IoError> = this.child.kill();
+                const _: Result<ExitStatus, IoError> = this.child.wait();
+            }
+            _ => { }
+        }
+        mem::drop(this.input.take());
+        while (!this.readers.is_empty()) {
+            const reader: JoinHandle<i32> = this.readers.remove(0);
+            const _: boolean = reader.join().is_ok();
+        }
+        this.take_waiting();
+    }
+}

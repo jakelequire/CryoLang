@@ -1,0 +1,150 @@
+///! The children a verify run starts, and the gates it runs over one
+///! compiler: each child's environment, and one population run - wipe, the
+///! gates, the object lists.
+
+namespace cryogate::verify::run::children;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Completion, Job, Outcome };
+import cryogate::core::git::{ Git };
+import cryogate::core::host::{ Host };
+import cryogate::core::schedule::{ Cost, Scheduler };
+import cryogate::verify::gates::{ GateCommand, GateVerdict };
+import cryogate::verify::hashing::{ ObjectHashes };
+import cryogate::verify::objects::{ ObjectPopulation };
+
+/// The environment every child of a verify run gets.
+public type struct VerifyChild {
+    /// A job running `program` with verify's environment.  An inherited
+    /// `CRYO_STDLIB` is removed: a compiler may embed the stdlib's path as
+    /// it was spelled, so each gate names the stdlib the way its own flow
+    /// always has.  `CRYO_RUNTIME` is `runtime` when one is given (the
+    /// baseline's programs link the commit's runtime) and removed otherwise,
+    /// so each compiler links the runtime it builds; `CRYO_CC` defaults to
+    /// `gcc` on Windows.
+    public static job(program: Str, runtime: Str) -> Job {
+        mut job: Job = Job::new(program);
+        job.remove_variable(Str::new("CRYO_STDLIB"));
+        if (runtime.is_empty()) { job.remove_variable(Str::new("CRYO_RUNTIME")); } else { job.set_variable(Str::new("CRYO_RUNTIME"), runtime); }
+        job.default_c_compiler();
+        return job;
+    }
+}
+
+/// One gate's run: its name, its verdict, its time and its log.
+public type struct GateRun {
+    /// The gate's name.
+    public name: String;
+    /// What its run came to.
+    public verdict: GateVerdict;
+    /// How long it ran, in seconds.
+    public seconds: f64;
+    /// Its log file.
+    public log: String;
+
+    /// The gate's line in verify's report, its log named relative to
+    /// `repository`.
+    public report(&this, repository: Path) -> String {
+        return this.verdict.report(this.name.as_str(), this.seconds, PopulationRun::relative(repository, this.log.as_str()).as_str());
+    }
+}
+
+/// The gates of one run over one compiler, and the object lists left by
+/// them.
+public type struct PopulationRun {
+    /// Each gate's run, in the order the gates were given.
+    public gates: Array<GateRun>;
+    /// The rows each population held after the gates, in
+    /// `ObjectPopulation::all`'s order.
+    public counts: Array<i64>;
+
+    /// Wipe the build outputs, run the gates of `table` named in `names`
+    /// over the compiler `cryo` (all at once, or one at a time when
+    /// `sequential`), each logged to `<directory>/<gate>.log`, then list
+    /// every population to `<directory>/<tag>.<population>.sha256`,
+    /// whatever the gates were.  `runtime` is the directory of the target's
+    /// runtime archives the gates' programs linked.
+    public static run(repository: Path, table: &Array<GateCommand>, names: &Array<String>, cryo: Str,
+                      directory: Path, tag: Str, runtime: Path, sequential: boolean) -> Result<PopulationRun, String> {
+        ObjectHashes::wipe(repository)?;
+        const gate_runs: Array<GateRun> = PopulationRun::gates(repository, table, names, cryo, directory, Str::new(""), sequential);
+        mut counts: Array<i64> = Array::<i64>::new();
+        for (population in ObjectPopulation::all().iterate_references()) {
+            const rows: Array<String> = ObjectHashes::rows(repository, population, runtime)?;
+            PopulationRun::write_list(directory.join(f"{tag}.{population.name()}.sha256".as_str()).as_path(), &rows)?;
+            counts.push(rows.length());
+        }
+        return Result::Ok(PopulationRun { gates: gate_runs, counts: counts });
+    }
+
+    /// Run the gates of `table` named in `names`, in that order, over
+    /// `cryo` in the checkout `repository`, each logged to
+    /// `<directory>/<gate>.log`, with `runtime` as `VerifyChild::job` takes
+    /// it, and judge each run.  A name the table does not hold runs
+    /// nothing.
+    public static gates(repository: Path, table: &Array<GateCommand>, names: &Array<String>, cryo: Str,
+                        directory: Path, runtime: Str, sequential: boolean) -> Array<GateRun> {
+        const stdlib: String = Host::stdlib_directory(repository);
+        mut scheduler: Scheduler = Scheduler::new();
+        scheduler.set_slots(if (sequential) { 1 } else { names.length() });
+        mut logs: Array<String> = Array::<String>::new();
+        mut chosen: Array<i64> = Array::<i64>::new();
+        for (name in names.iterate_references()) {
+            for (index in 0..table.length()) { if (table[index].name.as_str() == name.as_str()) { chosen.push(index); } }
+        }
+        for (index in chosen.iterate_references()) {
+            const gate: &GateCommand = &table[*index];
+            const command: Array<String> = gate.command(cryo, stdlib.as_str());
+            mut job: Job = VerifyChild::job(command[0].as_str(), runtime);
+            for (index in 1..command.length()) { job.argument(command[index].as_str()); }
+            job.directory(repository.as_str());
+            const log: String = String::from_str(directory.join(f"{gate.name.as_str()}.log".as_str()).as_path().as_str());
+            job.log_to(log.as_str());
+            logs.push(log);
+            scheduler.add(job, if (gate.name.as_str() == Str::new("census")) { Cost::Suite } else { Cost::Compile });
+        }
+        const completions: Array<Completion> = scheduler.run();
+        mut runs: Array<GateRun> = Array::<GateRun>::new();
+        mut index: i64 = 0;
+        for (done in completions.iterate_references()) {
+            const output: String = done.output();
+            const exit: i32 = match (&done.outcome) {
+                Outcome::Exited(code) => { code }
+                _                     => { -1 }
+            };
+            const gate: &GateCommand = &table[chosen[index]];
+            runs.push(GateRun {
+                name: gate.name.clone(), verdict: GateVerdict::of(gate, output.as_str(), exit),
+                seconds: done.seconds, log: logs[index].clone(),
+            });
+            index++;
+        }
+        return runs;
+    }
+
+    /// `rows` written to `path` as a list file, sorted by path.
+    public static write_list(path: Path, rows: &Array<String>) -> Result<(), String> {
+        return match (File::write_text(path, ObjectHashes::text(&ObjectHashes::by_path(rows.clone())).as_str())) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot write {path.as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// `path` relative to `repository` when it lies below it, with `/`
+    /// separators.
+    public static relative(repository: Path, path: Str) -> String {
+        const root: String = repository.as_str().replace(&Str::new("\\"), &Str::new("/"));
+        const spelled: String = path.replace(&Str::new("\\"), &Str::new("/"));
+        return match (spelled.as_str().strip_prefix(&f"{root.as_str()}/".as_str())) {
+            Option::Some(rest) => { String::from_str(rest) }
+            Option::None       => { spelled.clone() }
+        };
+    }
+}

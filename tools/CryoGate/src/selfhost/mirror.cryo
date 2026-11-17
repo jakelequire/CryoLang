@@ -1,0 +1,115 @@
+///! The Linux arm's copy of its sources inside WSL, as a Windows host runs
+///! it: where the copy lives, the commands that bring it up to date and build
+///! cryogate in it, and the commands that run the arm, or the freestanding
+///! check, from it.
+///!
+///! Reading the working tree through WSL's `/mnt/c` costs the arm most of its
+///! time, so the arm runs from a copy on WSL's own filesystem, one per
+///! checkout, below the WSL user's `~/.cache/cryo-selfhost/`.  The copy holds
+///! the mirrored sources (`TreeDigest`), less their build outputs, and
+///! cryogate's own sources, built there by the copy's pin; it is trusted only
+///! when its digest is the working tree's.
+
+namespace cryogate::selfhost::mirror;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::encoding::sha256::{ Sha256 };
+import std::fs::path::{ Path };
+
+import cryogate::core::text::{ Text };
+import cryogate::selfhost::digest::{ TreeDigest };
+
+/// The copy one checkout's Linux arm runs from.
+public type struct MirrorPlan {
+    /// The checkout, as WSL sees it.
+    public root: String;
+    /// The copy's directory inside WSL: `$HOME/.cache/cryo-selfhost/` and
+    /// twelve hex digits of the sha256 of the checkout's own path.
+    public directory: String;
+
+    /// The copy of the checkout `repository`, which WSL sees at `root`.
+    public static new(repository: Path, root: Str) -> MirrorPlan {
+        const digest: String = Sha256::digest(repository.as_str().as_bytes()).to_hex();
+        const short: Str = digest.as_str().byte_substring(0, 12);
+        return MirrorPlan {
+            root:      String::from_str(root),
+            directory: f"$HOME/.cache/cryo-selfhost/{short}",
+        };
+    }
+
+    /// The shell command that brings the copy up to date, builds cryogate in
+    /// it with its pin, and prints the copy's digest last
+    /// (`cryogate selfhost --digest`): one line, its steps joined by `&&`.
+    /// The mirrored trees are copied without their skipped directories, and
+    /// what the copy holds beyond the checkout is deleted; cryogate's
+    /// sources are copied beside them, keeping the copy's own build.
+    public preparation(&this) -> String {
+        const copy: Str = this.directory.as_str();
+        mut steps: Array<String> = Array::<String>::new();
+        steps.push(f"mkdir -p {copy}/tools");
+        mut trees: String = String::from_str(Str::new("rsync -a --delete --delete-excluded --exclude=__pycache__/"));
+        const skipped: Array<String> = TreeDigest::skipped();
+        for (entry in skipped.iterate_references()) { trees.push(f" --exclude=/{entry.as_str()}/".as_str()); }
+        const tops: Array<String> = TreeDigest::trees();
+        for (top in tops.iterate_references()) { trees.push(f" '{this.root.as_str()}/{top.as_str()}'".as_str()); }
+        trees.push(f" {copy}/".as_str());
+        steps.push(trees);
+        const files: Array<String> = TreeDigest::files();
+        for (file in files.iterate_references()) {
+            const parent: Str = match (file.as_str().find_last(&Str::new("/"))) {
+                Option::Some(at) => { file.as_str().byte_substring(0, at) }
+                Option::None     => { Str::new(".") }
+            };
+            steps.push(f"mkdir -p {copy}/{parent}");
+            steps.push(f"rsync -a '{this.root.as_str()}/{file.as_str()}' {copy}/{file.as_str()}");
+        }
+        steps.push(f"rsync -a --delete --exclude=/CryoGate/build/ --exclude=.bin/ '{this.root.as_str()}/tools/CryoGate' {copy}/tools/");
+        steps.push(f"cd {copy}/tools/CryoGate");
+        steps.push(String::from_str(Str::new("../../bin/cryo build")));
+        steps.push(f"cd {copy}");
+        steps.push(String::from_str(Str::new("tools/CryoGate/build/cryogate selfhost --digest")));
+        return Text::joined(&steps, Str::new(" && "));
+    }
+
+    /// The shell command that runs the Linux arm from the copy, declining
+    /// the Windows arm, which the Windows host runs itself.
+    public arm(&this, allow_skipped: boolean) -> String {
+        const allowed: Str = if (allow_skipped) { Str::new(" --allow-skipped-arm") } else { Str::new("") };
+        return f"cd {this.directory.as_str()} && tools/CryoGate/build/cryogate selfhost --no-windows{allowed}";
+    }
+
+    /// The shell command that builds the tree's compiler in the copy with
+    /// the copy's pin and runs the freestanding check with it: the check a
+    /// Windows host cannot run itself, since its Linux arm links ELF objects.
+    public freestanding(&this, allow_skipped: boolean) -> String {
+        const allowed: Str = if (allow_skipped) { Str::new(" --allow-skipped-arm") } else { Str::new("") };
+        const copy: Str = this.directory.as_str();
+        return f"cd {copy}/compiler && ../bin/cryo build && cd {copy} && tools/CryoGate/build/cryogate freestanding --cryo compiler/build/cryo{allowed}";
+    }
+
+    /// The digest a preparation's output reports: its last line of the form
+    /// `<64 hex digits>  (<N> files)`.  `None` when no line is.
+    public static reported(output: Str) -> Option<String> {
+        const lines: Array<String> = Text::lines(output);
+        mut index: i64 = lines.length();
+        while (index > 0) {
+            index--;
+            const line: Str = lines.get_reference(index).unwrap().as_str().trim();
+            if (line.length() <= 64 || !line.byte_substring(64, line.length()).starts_with(&Str::new("  ("))
+                || !line.ends_with(&Str::new(" files)"))) {
+                continue;
+            }
+            const digest: Str = line.byte_substring(0, 64);
+            mut hex: boolean = true;
+            for (byte in digest.as_bytes().iter()) {
+                // Lowercase hex: a digit, or `a` (97) to `f` (102).
+                if (!byte.is_digit() && !(byte >= 97 && byte <= 102)) { hex = false; }
+            }
+            if (hex) { return Option::Some(String::from_str(digest)); }
+        }
+        return Option::None;
+    }
+}

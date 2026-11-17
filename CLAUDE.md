@@ -24,7 +24,7 @@ api-index-check` fails if it is stale.
 make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS and unit/project NAMES asserted
-make verify              # build once; census, examples, lsp, cross, incr, abi, check-fast
+make verify              # build once; census, examples, lsp, cross, incr, relink, abi, check-fast
                          # CONCURRENTLY (ARGS="--sequential": one at a time, for a host short
                          # of memory), objects hashed (tests, examples, stdlib archives,
                          # runtime archive members); ARGS="--baseline HEAD --require-identical"
@@ -33,11 +33,14 @@ make verify              # build once; census, examples, lsp, cross, incr, abi, 
                          # its results recorded per program, so a new test re-runs only itself);
                          # a change that makes a refused program compile DECLARES its project in
                          # tests/started-compiling (refused before, builds now); one that corrects
-                         # a program the baseline built, in tests/started-passing
+                         # a program the baseline built, in tests/started-passing; with a
+                         # baseline it also FAILS on a unit-suite build warning the baseline's
+                         # build did not print (code, file, line, compared as sets)
 make roster-check        # every unit test, project and negative file against the roster
                          # golden (tests/test-roster.txt); its OK line prints the current counts
-make check-fast          # verify's and verify-pin's self-tests + pin integrity, builds nothing.
-                         # Run before committing.
+make check-fast          # cryogate's and cryosmith's self-tests
+                         # + pin integrity; builds only cryogate, its unit tests and
+                         # cryosmith, with the pin. Run before committing.
 make lsp-check           # compile tools/CryoLSP with the compiler under test
 make runtime-abi-check   # runtime/abi/lang_items.def against every built runtime link set
                          # (both kinds, both panic strategies) and the `__cryo_` names
@@ -45,7 +48,7 @@ make runtime-abi-check   # runtime/abi/lang_items.def against every built runtim
 make warnings-check      # compiler/ + stdlib archive built with -Werror by the compiler
                          # under test, the stdlib for both OSes and both panic strategies;
                          # DELETES the host's prebuilt stdlib archives first
-make cross-check         # runtime/stdlib/compiler/LSP for the OTHER OS, objects only, ~80s;
+make cross-check         # runtime/stdlib/compiler/LSP/cryogate/cryosmith for the OTHER OS, objects only, ~80s;
                          # from WINDOWS only - a Linux host links the windows-gnu
                          # build and fails without mingw + the LLVM-C import lib
 make vendor-check        # every constant shape survives `cryo vendor`
@@ -60,11 +63,14 @@ make verify-pin          # both pins match their sidecars (sha256 and stamped co
 make verify-freestanding # the runtime's freestanding configuration, built by the compiler
                          # under test, linked and run
 make examples            # smoke-build every examples/ project (refuses a sweep below
-                         # scripts/examples-gate.py's --min)
-make examples-golden     # build AND run them, diff stdout (POSIX only)
+                         # the shipped count, `cryogate examples`' --min)
+make examples-golden     # build them AND run each with an expected.out, compare its
+                         # output (`cryogate examples --run`, both hosts, heavy)
 make incremental-check   # incremental build == clean build, per module
 make incremental-instance-check  # an edit asking a cached module for a new generic
                          # instance still links (a verify gate: `incr`)
+make incremental-runtime-check   # a program is linked again when its runtime is rebuilt
+                         # with nothing else changed (a verify gate: `relink`)
 make selfhost-check      # byte-identity fixed point, BOTH OS (arms run concurrently), ~2.5 min
 make help                # every target, and every side effect beyond its named output
 ```
@@ -87,9 +93,10 @@ only things that run are what a person or an agent runs.
 
 So:
 
-- **`make check-fast`** before committing: verify's and verify-pin's
-  self-tests and pin integrity. It builds nothing and takes seconds, so it is
-  no evidence about the compiler; `make verify` is.
+- **`make check-fast`** before committing: cryogate's (verify's and
+  selfhost's judges among them) and cryosmith's self-tests and pin integrity (`cryogate verify-pin`). It builds only
+  cryogate, its unit tests and cryosmith, with the pin, so it is no evidence about the compiler;
+  `make verify` is.
 - **No commit hook runs.** Nothing refuses a commit; the gates above are
   what a person or an agent runs.
 
@@ -130,8 +137,8 @@ not done. The remaining limits are here so nobody rediscovers them:
   golden marks these projects `outcome=collect`.
 - **A compile-fail file with no `//~` annotation asserts a code and nothing
   else** - not the line, not the symbol, not the absence of a cascade. Write
-  the annotations; `scripts/annotate-negative-tests.py` generates them from a
-  real run and refuses to keep one that does not verify.
+  the annotations; `cryogate annotate-negative --cryo <compiler>` generates
+  them from a real run and refuses to keep one that does not verify.
 - **A diagnostic emitted with no `-->` span cannot be pinned to anything.**
   E0236 is one; its negative test can assert the code alone.
 - **`doc-coverage-check` does not count the functions of an `extern`
@@ -145,12 +152,15 @@ not done. The remaining limits are here so nobody rediscovers them:
 - **`make lsp-check` builds with the stage-2 compiler**, which is what makes
   it a gate; `make lsp` builds with the pin and certifies nothing about the
   compiler being built.
-- **`incremental-check` compares BINARIES, so it needs a reproducible link.**
-  A Windows PE carries a link timestamp - two clean builds of one unchanged
-  source differ - so the gate refuses on this host rather than reporting a
-  matrix of failures that blame incremental compilation for the linker.
+- **`incremental-check` compares the program only where the link
+  reproduces.** It compares every object of each incremental build with a
+  clean build's, and the linked program too when two clean builds of
+  unchanged source link the same bytes. A Windows PE carries a link
+  timestamp, so on that host the programs are not compared, and the verdict
+  line says so: a defect that shows only at the link (a stale archive linked)
+  is not seen there.
 - **The release smoke runs the STAGED tree, and the Windows one under
-  wine.** `scripts/release-smoke.sh` compiles and runs a hello-world with
+  wine.** `cryogate release-smoke` compiles and runs a hello-world with
   the staged tree before it is zipped, not with the archive itself; the
   verify job exercises a different binary by a different link (`make cryo`
   is not `--release-static`).  The Windows tree is smoked under wine with

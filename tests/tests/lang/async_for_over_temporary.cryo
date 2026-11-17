@@ -1,0 +1,150 @@
+// A `for` loop's iterable temporaries live until the loop ends, in an
+// `async` function too. A loop whose body suspends runs across several
+// polls, so a temporary left in the poll that made it would be released
+// when that poll returns, while the next poll still reads through it.
+// Owning strings make a freed element read back empty or as garbage, and
+// the counted elements show each temporary is released once, after the
+// loop.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncForOverTemporary;
+
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::future;
+import std::future::ready::{ PendingThenReady };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_equal };
+
+/// Elements released so far. Reset by each test that reads it.
+mut TEMPORARY_ELEMENT_DROPS: i64 = 0;
+
+type struct Counted {
+    value: i64;
+}
+
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void {
+        TEMPORARY_ELEMENT_DROPS = TEMPORARY_ELEMENT_DROPS + 1;
+    }
+}
+
+type struct Holder {
+    words: Array<String>;
+}
+
+function make_words() -> Array<String> {
+    mut words: Array<String> = Array::<String>::new();
+    words.push(String::from_str(Str::new("hello")));
+    words.push(String::from_str(Str::new("world")));
+    words.push(String::from_str(Str::new("again")));
+    return words;
+}
+
+function make_holder() -> Holder {
+    return Holder { words: make_words() };
+}
+
+function make_counted() -> Array<Counted> {
+    mut values: Array<Counted> = Array::<Counted>::new();
+    values.push(Counted { value: 1 });
+    values.push(Counted { value: 2 });
+    values.push(Counted { value: 3 });
+    return values;
+}
+
+async function joined_across_awaits() -> String {
+    mut joined: String = String::new();
+    for (word in make_words().iterate_references()) {
+        const _step: i64 = await PendingThenReady::<i64>::new(1, 1);
+        joined.push(word.as_str());
+        joined.push(Str::new(","));
+    }
+    return joined;
+}
+
+![test]
+function async_for_over_a_temporary_reads_its_elements_across_awaits() -> Result<(), TestError> {
+    const joined: String = future::block_on(joined_across_awaits());
+    return expect_equal(joined.as_str(), Str::new("hello,world,again,"));
+}
+
+async function joined_until_break() -> String {
+    mut joined: String = String::new();
+    for (word in make_words().iterate_references()) {
+        const _step: i64 = await PendingThenReady::<i64>::new(1, 1);
+        if (word.as_str() == Str::new("again")) { break; }
+        joined.push(word.as_str());
+    }
+    return joined;
+}
+
+![test]
+function async_for_over_a_temporary_survives_break() -> Result<(), TestError> {
+    const joined: String = future::block_on(joined_until_break());
+    return expect_equal(joined.as_str(), Str::new("helloworld"));
+}
+
+async function first_word_after(skip: Str) -> String {
+    for (word in make_words().iterate_references()) {
+        const _step: i64 = await PendingThenReady::<i64>::new(1, 1);
+        if (word.as_str() != skip) { return String::from_str(word.as_str()); }
+    }
+    return String::new();
+}
+
+![test]
+function async_for_over_a_temporary_survives_return() -> Result<(), TestError> {
+    const found: String = future::block_on(first_word_after(Str::new("hello")));
+    return expect_equal(found.as_str(), Str::new("world"));
+}
+
+async function joined_from_a_field() -> String {
+    mut joined: String = String::new();
+    for (word in make_holder().words.iterate_references()) {
+        const _step: i64 = await PendingThenReady::<i64>::new(1, 1);
+        joined.push(word.as_str());
+    }
+    return joined;
+}
+
+![test]
+function async_for_over_a_temporarys_field_reads_its_elements() -> Result<(), TestError> {
+    const joined: String = future::block_on(joined_from_a_field());
+    return expect_equal(joined.as_str(), Str::new("helloworldagain"));
+}
+
+async function last_of_rebuilt<T>(items: &Array<T>, fallback: T) -> T where T: Clone {
+    mut last: T = fallback;
+    for (item in items.clone().iterate_references()) {
+        const _step: i64 = await PendingThenReady::<i64>::new(1, 1);
+        last = item.clone();
+    }
+    return last;
+}
+
+![test]
+function async_for_over_a_temporary_in_a_generic_function() -> Result<(), TestError> {
+    const words: Array<String> = make_words();
+    const last: String = future::block_on(last_of_rebuilt(&words, String::new()));
+    return expect_equal(last.as_str(), Str::new("again"));
+}
+
+async function summed_with_drops_seen() -> i64 {
+    mut total: i64 = 0;
+    for (counted in make_counted().iterate_references()) {
+        const _step: i64 = await PendingThenReady::<i64>::new(1, 1);
+        // Nothing is released while the loop still runs.
+        total = total + counted.value * 10 + TEMPORARY_ELEMENT_DROPS;
+    }
+    return total;
+}
+
+![test]
+function async_for_over_a_temporary_releases_it_once_after_the_loop() -> Result<(), TestError> {
+    TEMPORARY_ELEMENT_DROPS = 0;
+    const total: i64 = future::block_on(summed_with_drops_seen());
+    expect_equal(total, 60)?;
+    return expect_equal(TEMPORARY_ELEMENT_DROPS, 3);
+}

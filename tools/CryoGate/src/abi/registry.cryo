@@ -1,0 +1,112 @@
+///! `runtime/abi/lang_items.def`, read: one row per `__cryo_` symbol that
+///! crosses the boundary between generated code (or the stdlib) and the
+///! runtime, `SYMBOL | SIGNATURE | DEFINED-IN | STATUS`.
+///!
+///! DEFINED-IN lists the link kinds whose runtime must define the symbol -
+///! `freestanding`, `hosted` (both hosted configurations, abort and unwind),
+///! either narrowed to one OS as `kind:os` - or says the symbol is no
+///! runtime definition: `import` (a system symbol the runtime calls) or
+///! `compiler` (a name the compiler gives a symbol of its own).  A symbol
+///! ending in `*` is a prefix.  A line starting with `#` is a comment, and a
+///! line with no `|` is not a row.
+
+namespace cryogate::abi::registry;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+import cryogate::core::text::{ Text };
+
+/// One registry row.
+public type struct LangItem {
+    /// The symbol, or with a trailing `*` a prefix.
+    public symbol: String;
+    /// The DEFINED-IN column, with its whitespace removed.
+    public defined_in: String;
+}
+
+/// The rows a name may be accounted for by.
+public type enum RowScope {
+    /// Any row.
+    Any;
+    /// A row naming a runtime configuration: freestanding or hosted.
+    Runtime;
+    /// A row naming the hosted runtime.
+    Hosted;
+}
+
+/// The registry's rows.
+public type struct LangItems {
+    /// The rows, in the file's order.
+    public rows: Array<LangItem>;
+
+    /// The rows of the registry text `text`.
+    public static parse(text: Str) -> LangItems {
+        mut rows: Array<LangItem> = Array::<LangItem>::new();
+        const lines: Array<String> = Text::lines(text);
+        for (line in lines.iterate_references()) {
+            if (line.as_str().starts_with(&Str::new("#")) || !line.as_str().contains(&Str::new("|"))) { continue; }
+            mut index: i64 = 0;
+            mut symbol: String = String::new();
+            mut defined_in: String = String::new();
+            for (field in line.as_str().split(&Str::new("|"))) {
+                if (index == 0) { symbol = String::from_str(field.trim()); }
+                if (index == 2) {
+                    for (byte in field.as_bytes().iter()) {
+                        if (!byte.is_whitespace()) { defined_in.push_byte(byte); }
+                    }
+                }
+                index++;
+            }
+            rows.push(LangItem { symbol: symbol, defined_in: defined_in });
+        }
+        return LangItems { rows: rows };
+    }
+
+    /// The symbols the runtime of link kind `kind` (`freestanding` or
+    /// `hosted`) must define on `os`, sorted, each once: those whose
+    /// DEFINED-IN lists `kind`, or `kind:os`.
+    public required(&this, kind: Str, os: Str) -> Array<String> {
+        const plain: String = f",{kind},";
+        const narrowed: String = f",{kind}:{os},";
+        mut symbols: Array<String> = Array::<String>::new();
+        for (row in this.rows.iterate_references()) {
+            const listed: String = f",{row.defined_in.as_str()},";
+            if (listed.as_str().contains(&plain.as_str()) || listed.as_str().contains(&narrowed.as_str())) {
+                symbols.push(row.symbol.clone());
+            }
+        }
+        return Text::sorted_distinct(symbols);
+    }
+
+    /// The names in `names` that no row in `scope` accounts for, exactly or
+    /// as a prefix, in their given order.
+    public unregistered(&this, names: &Array<String>, scope: RowScope) -> Array<String> {
+        mut found: Array<String> = Array::<String>::new();
+        for (name in names.iterate_references()) {
+            if (name.is_empty()) { continue; }
+            mut accounted: boolean = false;
+            for (row in this.rows.iterate_references()) {
+                if (accounted || !LangItems::in_scope(row.defined_in.as_str(), &scope)) { continue; }
+                const symbol: Str = row.symbol.as_str();
+                if (symbol.ends_with(&Str::new("*"))) {
+                    accounted = name.as_str().starts_with(&symbol.byte_substring(0, symbol.length() - 1));
+                } else {
+                    accounted = name.as_str() == symbol;
+                }
+            }
+            if (!accounted) { found.push(name.clone()); }
+        }
+        return found;
+    }
+
+    /// Whether a row whose DEFINED-IN is `defined_in` is in `scope`.
+    private static in_scope(defined_in: Str, scope: &RowScope) -> boolean {
+        return match (scope) {
+            RowScope::Any     => { !defined_in.is_empty() }
+            RowScope::Runtime => { defined_in.contains(&Str::new("freestanding")) || defined_in.contains(&Str::new("hosted")) }
+            RowScope::Hosted  => { defined_in.contains(&Str::new("hosted")) }
+        };
+    }
+}

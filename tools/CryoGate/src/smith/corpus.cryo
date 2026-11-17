@@ -1,0 +1,60 @@
+///! A CryoSmith corpus as checked: what each generated program's run must
+///! print, and how a failed child is quoted.  Pure over the text handed in.
+///!
+///! CryoSmith's output contract is that a program prints exactly one line,
+///! `cryosmith-hash <u64>`, and exits 0; built at `-O0` and at `-O2` it
+///! must print the same line.
+
+namespace cryogate::smith::corpus;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+
+import cryogate::core::text::{ Text };
+
+/// The corpus check's judgements.
+public type struct CorpusJudge {
+    /// The hash line `printed` (a program's output stream) holds, with its
+    /// trailing whitespace dropped; why it is not one hash line otherwise.
+    /// `program` names the program in the reason.
+    public static hash_line(program: Str, printed: Str) -> Result<String, String> {
+        const line: Str = printed.trim_end();
+        if (!line.starts_with(&Str::new("cryosmith-hash ")) || line.contains(&Str::new("\n"))) {
+            return Result::Err(f"{program} printed `{line}`, not one hash line");
+        }
+        return Result::Ok(String::from_str(line));
+    }
+
+    /// Why the two builds' lines disagree, if they do.
+    public static agree(unoptimised: Str, optimised: Str) -> Result<(), String> {
+        if (unoptimised != optimised) { return Result::Err(f"-O0 printed `{unoptimised}`, -O2 printed `{optimised}`"); }
+        return Result::Ok(());
+    }
+
+    /// The first lines of a failed child's error stream then its output
+    /// stream, each non-blank line trimmed and led by ` | `, at most
+    /// `QUOTED_LINES` of them.
+    public static first_lines(errors: Str, output: Str) -> String {
+        mut text: String = String::new();
+        mut quoted: i64 = 0;
+        mut streams: Array<String> = Array::<String>::new();
+        streams.push(String::from_str(errors));
+        streams.push(String::from_str(output));
+        for (stream in streams.iterate_references()) {
+            const lines: Array<String> = Text::lines(stream.as_str());
+            for (line in lines.iterate_references()) {
+                if (quoted >= CorpusJudge::QUOTED_LINES) { break; }
+                if (line.as_str().trim().is_empty()) { continue; }
+                text.push(Str::new(" | "));
+                text.push(line.as_str().trim());
+                quoted++;
+            }
+        }
+        return text;
+    }
+
+    /// How many lines of a failed build's streams a report quotes.
+    const QUOTED_LINES: i64 = 6;
+}

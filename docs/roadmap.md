@@ -113,9 +113,10 @@ sweep.  Counted (`grep -E '^\s*implement(<[^>]*>)? (struct|union) '`):
 notes keep what the gates mean and what is still red or unexercised.
 
 **What the local gates mean.**  `make check-fast` runs verify's self-test,
-verify-pin's self-test and `make verify-pin` (each pin's sha256 and stamped
-commit match its sidecar, and both pins name one commit).  It builds
-nothing, so it says nothing about the compiler.  `make verify` is the
+cryogate's self-test (verify-pin's checks among its unit tests) and `make
+verify-pin` (each pin's sha256 and stamped commit match its sidecar, and
+both pins name one commit).  It builds only cryogate, with the pin, so it
+says nothing about the compiler.  `make verify` is the
 evidence: it builds the compiler once, then runs the census (every suite,
 counts against `tests/test-roster.txt`), every example's build, the LSP
 build with the compiler under test, the other OS's half (objects only), the
@@ -134,10 +135,12 @@ manual dispatch.  As it stands:
 | `lsp-check` | yes | yes, both hosts |
 | `cross-check` | yes | windows native only: a Linux host links the windows-gnu build and needs mingw and the LLVM-C import lib, until `cryo build` can stop at objects (below) |
 | `incremental-instance-check` | yes | yes, both hosts |
+| `incremental-runtime-check` | yes | yes, both hosts |
 | `check-fast` (the two self-tests) | yes | yes, both hosts |
 | object comparison against a baseline | yes | no: a baseline from before a language feature's removal does not build with the current pin, so it is run locally (ruling 508) |
 | `roster-check` | no (the census reads the same golden) | yes |
-| `examples-golden`, `valgrind-check`, `verify-freestanding` | no (POSIX only) | yes |
+| `examples-golden` | no | yes |
+| `valgrind-check`, `verify-freestanding` | no (POSIX only) | yes |
 | `incremental-check` | no | yes |
 | `vendor-check` | no | yes |
 | `api-index-check` | no | yes |
@@ -200,8 +203,8 @@ workspace symbols, completion, semantic tokens, the implementations lens,
 rename, signature help and inlay hints, and writes names as the cursor's
 scope writes them (ruling 346).  A standard library or dependency file is
 answered from the analysis of the project that holds it.  `make lsp-check`
-drives the server through `tools/CryoLSP/tests/smoke.py` over its fixtures
-and refuses below its floor of passing checks (`docs/testing.md` section
+(`cryogate lsp`) drives the server through its protocol checks and its
+fixtures, and refuses below its floor of passing checks (`docs/testing.md` section
 9).  Two open defects are in the bug log: memory that may grow across saves,
 and one unreproduced unanswered request.
 
@@ -290,14 +293,15 @@ whether branch pushes trigger anything at all.
 Not built: `cryo test` is to print a count for each of its three suites -
 zero included - and `--list` to list all three, not the unit suite alone
 (ruling 272: the runner prints each suite's count and lists every suite,
-retiring the census and roster scripts).  `test-census.py` then reduces to
-nothing, and `roster-check.py` to a diff of `--list` against the golden.
+retiring the census's and the roster's text reading).  `cryogate census` then
+reads the runner's own counts, and `cryogate roster` reduces to a diff of
+`--list` against the golden.
 
 A project's `test.json` gains `stdout_file`, which compares the program's
 whole output against a file (ruling 271: a `stdout_file` field compares a
 program's output against a file).  The examples' `expected.out` goldens move
-onto it, which retires `scripts/check-examples-output.sh` and makes the
-check run on Windows as well.
+onto it, so the comparison `cryogate examples --run` makes today (on both
+hosts) is the runner's own.
 
 Open: the summary line's exact format, and whether line endings are
 normalised before the comparison.

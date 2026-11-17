@@ -1,0 +1,43 @@
+///! WSL from a Windows host, as child processes of `wsl.exe`: starting it, and
+///! the path a Windows path has inside it.
+
+namespace cryogate::core::wsl;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::log::{ RunLogs };
+
+/// WSL, driven through `wsl.exe`.
+public type struct Wsl {
+    /// Start WSL's default distribution and wait for it: after a reboot it
+    /// is stopped, and the first command run in it starts it.  Its
+    /// completion, logged to `logs`.
+    public static start(logs: &RunLogs) -> Completion {
+        mut job: Job = Job::new(Str::new("wsl.exe"));
+        job.argument(Str::new("-e"));
+        job.argument(Str::new("true"));
+        job.log_to(logs.file(Str::new("wsl-start")).as_str());
+        return job.run();
+    }
+
+    /// The path `path` has inside WSL (`wslpath -a`).  Its separators are
+    /// made `/` first: wsl.exe rebuilds its arguments into a command line,
+    /// on which `C:\Programming` arrives as `C:Programming`.  The
+    /// completion of `wslpath` when it gave no path.
+    public static path(path: Str, logs: &RunLogs) -> Result<String, Completion> {
+        mut job: Job = Job::new(Str::new("wsl.exe"));
+        job.argument(Str::new("--"));
+        job.argument(Str::new("wslpath"));
+        job.argument(Str::new("-a"));
+        job.argument(path.replace(&Str::new("\\"), &Str::new("/")).as_str());
+        job.log_to(logs.file(Str::new("wslpath")).as_str());
+        job.errors_to(logs.file(Str::new("wslpath-errors")).as_str());
+        const done: Completion = job.run();
+        const answer: String = String::from_str(done.output().as_str().trim());
+        if (!done.outcome.succeeded() || answer.is_empty()) { return Result::Err(done); }
+        return Result::Ok(answer);
+    }
+}

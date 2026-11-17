@@ -1,0 +1,217 @@
+///! One fixture of the language server's behavioural checks: a project
+///! directory under `tools/CryoLSP/tests/fixtures/` that compiles, and its
+///! `checks.json`.
+///!
+///! Positions are named by markers, never by line and column.  A marker is a
+///! block comment `/*@name*/` written just before the token it names, the
+///! position being the first character after the comment; `/*^name*/` names
+///! the place the comment starts instead, where a cursor sits for a
+///! completion.  A check refers to either as `file@name`, and `file@name+N`
+///! is N columns further along, for a place inside a string where no comment
+///! can sit.  A marker that is missing, or written twice in one file, is an
+///! error: editing a fixture cannot silently move a check.
+///!
+///! A fixture that names vendored libraries (`"vendor": {"Widgets":
+///! "bindings/Widgets.cryo"}`) is checked from a copy, and a check naming the
+///! bindings file means the copy an analysis writes into the build folder.
+
+namespace cryogate::lsp::fixture;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::json::parser;
+import std::json::value::{ JsonValue };
+
+import cryogate::core::host::{ Host };
+import cryogate::lsp::reading::{ Reading };
+import cryogate::lsp::wire::{ Locations, Position };
+
+/// A named position in one of a fixture's files.
+public type struct Marker {
+    /// `file@name`.
+    public key: String;
+    public position: Position;
+}
+
+/// A fixture's specification, files and markers.
+public type struct Fixture {
+    /// The directory the fixture is checked in.
+    public root: String;
+    /// The directory's name.
+    public name: String;
+    /// `checks.json`, parsed.
+    public specification: JsonValue;
+    /// The semantic-token type names the server's legend declared.
+    public token_types: Array<String>;
+    /// The semantic-token modifier names, by bit.
+    public token_modifiers: Array<String>;
+    private texts: Array<Pair<String, String>>;
+    private markers: Array<Marker>;
+
+    /// The fixture in `root`, its `open` files read and their markers
+    /// found.
+    public static open(root: Str) -> Result<Fixture, String> {
+        const checks: PathBuf = Path::from(root).join(Str::new("checks.json"));
+        const text: String = match (File::read_text(checks.as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read {checks.as_path().as_str()}: {error.describe()}"); }
+        };
+        const specification: JsonValue = match (parser::parse(text.as_str())) {
+            Result::Ok(value)  => { value }
+            Result::Err(error) => { return Result::Err(f"{checks.as_path().as_str()} is not JSON: {error.describe()}"); }
+        };
+        const name: String = match (Path::from(root).file_name()) {
+            Option::Some(leaf) => { String::from_str(leaf) }
+            Option::None       => { String::from_str(root) }
+        };
+        mut fixture: Fixture = Fixture {
+            root:            String::from_str(root),
+            name:            name,
+            specification:   specification,
+            token_types:     Array::<String>::new(),
+            token_modifiers: Array::<String>::new(),
+            texts:           Array::<Pair<String, String>>::new(),
+            markers:         Array::<Marker>::new(),
+        };
+        for (relative in Reading::texts(&fixture.specification, Str::new("open")).iterate_references()) {
+            fixture.load(relative.as_str())?;
+        }
+        return Result::Ok(fixture);
+    }
+
+    /// Read the file `relative` below the root, a leading byte-order mark
+    /// dropped as an editor drops it, and find its markers.
+    public load(mut &this, relative: Str) -> Result<(), String> {
+        const path: PathBuf = Path::from(this.root.as_str()).join(relative);
+        const read: String = match (File::read_text(path.as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"{this.name.as_str()}: cannot read {relative}: {error.describe()}"); }
+        };
+        const text: Str = match (read.as_str().strip_prefix(&Str::new("\u{FEFF}"))) {
+            Option::Some(rest) => { rest }
+            Option::None       => { read.as_str() }
+        };
+        return this.set_text(relative, text);
+    }
+
+    /// Make `text` the content of `relative` and find its markers again.
+    public set_text(mut &this, relative: Str, text: Str) -> Result<(), String> {
+        mut index: i64 = 0;
+        mut replaced: boolean = false;
+        while (index < this.texts.length()) {
+            if (this.texts.get_reference(index).unwrap().first.as_str() == relative) {
+                this.texts.set(index, Pair::new(String::from_str(relative), String::from_str(text)));
+                replaced = true;
+            }
+            index++;
+        }
+        if (!replaced) { this.texts.push(Pair::new(String::from_str(relative), String::from_str(text))); }
+        const prefix: String = f"{relative}@";
+        this.markers.retain((marker: &Marker) -> boolean { return !marker.key.as_str().starts_with(&prefix.as_str()); });
+        for (found in Fixture::find_markers(text).iterate_references()) {
+            const key: String = f"{relative}@{found.first.as_str()}";
+            for (existing in this.markers.iterate_references()) {
+                if (existing.key == key) { return Result::Err(f"{this.name.as_str()}: marker {key.as_str()} appears twice"); }
+            }
+            this.markers.push(Marker { key: key, position: Locations::position_of(text, found.second) });
+        }
+        return Result::Ok(());
+    }
+
+    /// The text of `relative`, read on first use.
+    public text(mut &this, relative: Str) -> Result<String, String> {
+        for (entry in this.texts.iterate_references()) {
+            if (entry.first.as_str() == relative) { return Result::Ok(entry.second.clone()); }
+        }
+        this.load(relative)?;
+        return this.text(relative);
+    }
+
+    /// The position `reference` names: `file@marker`, or `file@marker+N`
+    /// for N columns further along, with the file it is in.
+    public at(mut &this, reference: Str) -> Result<Pair<String, Position>, String> {
+        mut name: Str = reference;
+        mut extra: i64 = 0;
+        match (reference.split_once_from_end(&Str::new("+"))) {
+            Option::Some(parts) => {
+                name = parts.first;
+                extra = i64::try_from(parts.second).unwrap_or(0);
+            }
+            Option::None => { }
+        }
+        const relative: Str = match (name.split_once(&Str::new("@"))) {
+            Option::Some(parts) => { parts.first }
+            Option::None        => { return Result::Err(f"{this.name.as_str()}: {reference} names no marker"); }
+        };
+        mut known: boolean = false;
+        for (entry in this.texts.iterate_references()) {
+            if (entry.first.as_str() == relative) { known = true; }
+        }
+        if (!known) { this.load(relative)?; }
+        for (marker in this.markers.iterate_references()) {
+            if (marker.key.as_str() == name) {
+                return Result::Ok(Pair::new(String::from_str(relative),
+                                            Position { line: marker.position.line, character: marker.position.character + extra }));
+            }
+        }
+        return Result::Err(f"{this.name.as_str()}: no marker {name}");
+    }
+
+    /// The URI of `relative` as the server names it: the build folder's
+    /// copy for a vendored library's bindings.
+    public uri(&this, relative: Str) -> String {
+        return Locations::uri_for(Path::from(this.root.as_str()).join(this.compiled_path(relative).as_str()).as_path().as_str());
+    }
+
+    /// The file an analysis reads `relative` as: for a vendored library's
+    /// bindings, the copy in the build folder's `vendor/<Name>/`.
+    public compiled_path(&this, relative: Str) -> String {
+        for (name in Reading::keys(&this.specification, Str::new("vendor")).iterate_references()) {
+            const bindings: Str = Reading::text(Reading::at(&this.specification, Str::new("vendor")).unwrap(), name.as_str());
+            if (bindings == relative) {
+                const host: Str = if (Host::os() == Str::new("windows")) { Str::new("host-windows") } else { Str::new("host") };
+                return f"build/target/release/{host}/vendor/{name.as_str()}/{name.as_str()}.cryo";
+            }
+        }
+        return String::from_str(relative);
+    }
+
+    /// Whether the fixture names vendored libraries.
+    public vendors(&this) -> boolean { return Reading::present(&this.specification, Str::new("vendor")); }
+
+    /// Every marker in `text`: its name and the byte offset it names.
+    public static find_markers(text: Str) -> Array<Pair<String, i64>> {
+        mut found: Array<Pair<String, i64>> = Array::<Pair<String, i64>>::new();
+        const bytes: &Slice<u8> = text.as_bytes();
+        const length: i64 = bytes.length();
+        mut index: i64 = 0;
+        while (index + 3 < length) {
+            const kind: u8 = bytes.get(index + 2).unwrap();
+            if (bytes.get(index).unwrap() == '/' as u8 && bytes.get(index + 1).unwrap() == '*' as u8
+                    && (kind == '@' as u8 || kind == '^' as u8)) {
+                mut end: i64 = index + 3;
+                while (end < length && Fixture::name_byte(bytes.get(end).unwrap())) { end++; }
+                if (end > index + 3 && end + 1 < length && bytes.get(end).unwrap() == '*' as u8 && bytes.get(end + 1).unwrap() == '/' as u8) {
+                    const offset: i64 = if (kind == '@' as u8) { end + 2 } else { index };
+                    found.push(Pair::new(String::from_str(text.byte_substring(index + 3, end)), offset));
+                    index = end + 2;
+                    continue;
+                }
+            }
+            index++;
+        }
+        return found;
+    }
+
+    private static name_byte(byte: u8) -> boolean {
+        return (byte >= 'a' as u8 && byte <= 'z' as u8) || (byte >= 'A' as u8 && byte <= 'Z' as u8)
+            || (byte >= '0' as u8 && byte <= '9' as u8) || byte == '_' as u8;
+    }
+}

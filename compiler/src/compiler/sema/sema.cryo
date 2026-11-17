@@ -1264,9 +1264,17 @@ type struct SemaVisitor {
             mut declared: TypeRef = this.symbolic.symbolic_narrowed(this.state.return_type);
             if (declared.is_valid()) {
                 this.state.expected_type = declared;
+                // A returned value made only of literals is its exact value,
+                // as an initializer's is; one the declared type does not
+                // hold is left as written, for `refuse_narrowing_constant`
+                // below to refuse.
+                node.expression = this.literals.held_literal_of_value(node.expression, declared);
             }
             const expr_type: TypeRef = this.resolve_expr(node.expression);
             this.state.expected_type = saved_expected;
+            if (declared.is_valid()) {
+                this.literals.refuse_narrowing_constant(node.expression, declared);
+            }
             // An opaque return a function's signature left undecided - a
             // generic struct's literal written without type arguments - is
             // the type of the first value its body returns, typed from the
@@ -1758,6 +1766,13 @@ type struct SemaVisitor {
             const vtype: TypeRef = this.ctx.type_resolver.resolve(var_node.type_annotation, &res_ctx);
             if (vtype.is_valid()) { var_node.resolved_type = vtype; }
             else { this.refuse_unresolved_body_annotation(var_node.type_annotation); }
+        }
+
+        // An initializer made only of literals stores its exact value; one
+        // the declared type does not hold is left as written, for
+        // `refuse_narrowing_constant` below to refuse.
+        if (var_node.has_initializer() && var_node.type_annotation != null && var_node.has_resolved_type()) {
+            var_node.set_initializer(this.literals.held_literal_of_value(var_node.initializer, var_node.resolved_type));
         }
 
         if (var_node.has_initializer()) {
@@ -2281,6 +2296,12 @@ type struct SemaVisitor {
             // Only the receiver itself is typed under the expectation, not
             // a call inside it.
             this.state.receiver_of = null;
+        }
+        // An argument made only of literals is the literal of its exact
+        // value, which adopts its parameter's type where that type holds it,
+        // whatever its intermediates are.
+        for (mut i: i64 = 0; i < call.arguments.length(); i++) {
+            call.arguments[i] = this.literals.literal_of_value(call.arguments[i]);
         }
         const typed: TypeRef = this.calls.resolve_call(this, expr, call);
         this.state.receiver_of = saved_receiver_of;
@@ -2965,8 +2986,24 @@ type struct SemaVisitor {
         if (bin.op.kind.is_assignment_op()) {
             lhs = this.resolve_expr(bin.left);
             if (lhs.is_valid()) {
+                // An assigned value made only of literals stores its exact
+                // value, as an initializer does.
+                if (bin.op.kind == TokenType::Equal) {
+                    bin.right = this.literals.held_literal_of_value(bin.right, lhs);
+                }
+                // A compound assignment's value is its operator's operand,
+                // typed as an operand made only of literals is (below).
                 const saved_exp: TypeRef = this.state.expected_type;
                 this.state.expected_type = lhs;
+                if (bin.op.kind != TokenType::Equal && !right_is_lit) {
+                    match (this.literals.operand_type_of_literal_value(bin.right, lhs)) {
+                        Option::Some(operand_type) => {
+                            bin.right = this.literals.literal_of_value(bin.right);
+                            this.state.expected_type = operand_type;
+                        }
+                        Option::None => { }
+                    }
+                }
                 rhs = this.resolve_expr(bin.right);
                 this.state.expected_type = saved_exp;
                 if (bin.op.kind == TokenType::Equal) {
@@ -3087,9 +3124,8 @@ type struct SemaVisitor {
         // integer type the result is expected to have instead of adopting the
         // amount's: `1 << (u64::BITS - 1)` stored into a `u64` shifts at 64
         // bits, where adopting the `u32` amount shifted at 32.
-        const shift_keeps_expected: boolean =
-            (bin.op.kind == TokenType::LessLess || bin.op.kind == TokenType::GreaterGreater)
-            && this.literals.expected_type_is_int_type();
+        const is_shift: boolean = bin.op.kind == TokenType::LessLess || bin.op.kind == TokenType::GreaterGreater;
+        const shift_keeps_expected: boolean = is_shift && this.literals.expected_type_is_int_type();
         if (force_wide.is_valid()) {
             const saved_fw: TypeRef = this.state.expected_type;
             this.state.expected_type = force_wide;
@@ -3116,42 +3152,60 @@ type struct SemaVisitor {
             } else {
                 lhs = this.resolve_expr(bin.left);
             }
-        // A constant numeric expression adopts its peer's type on exactly the
-        // slots the call path pushes a parameter type onto, and for the same
-        // two reasons.  A narrow FLOAT: the constant otherwise settles on the
-        // f64 default and the pair reaches codegen as `fadd double, float`,
-        // which fails module verification with no source location.  A WIDE int:
-        // `value < -128` against an `i64` otherwise computes the constant at
-        // the i32 default and then widens it, which is a conversion the source
-        // never asked for.  A SIGNED peer of a negated literal: `x != -128` with
-        // `x: i8` is a literal of `x`'s type, as `x != 127` is, and an unsigned
-        // peer is left out so that `-1` cannot adopt it and turn huge.  Other
-        // narrow int peers are excluded on purpose - pushing one onto `1 << 20`
-        // would truncate a constant that currently computes at the i32 default
-        // and is then widened correctly.
+        // An operand made only of integer literals beside an integer operand
+        // that is not - outside a shift, whose operands' types are
+        // independent - is the literal of its exact value, typed as
+        // `operand_type_of_literal_value` says: the peer's type where it
+        // holds the value, its default type otherwise.  Any other constant
+        // numeric operand adopts its peer's type on exactly the slots the
+        // call path pushes a parameter type onto, and for the same reasons.
+        // A narrow FLOAT: the constant otherwise settles on the f64 default
+        // and the pair reaches codegen as `fadd double, float`, which fails
+        // module verification with no source location.  A WIDE int: a
+        // constant otherwise computes at the i32 default and then widens,
+        // which is a conversion the source never asked for.  A SIGNED peer of
+        // a negated literal: a shifted literal takes the amount's type.  Other
+        // peers are left out on purpose, so that `-1` cannot adopt an
+        // unsigned one and turn huge.
         } else if (right_is_const_num && !left_is_const_num) {
             lhs = this.resolve_expr(bin.left);
-            if (is_narrow_float_type(this.arena, lhs) || is_wide_int_type(this.arena, lhs)
-                || (is_negative_numeric_literal_expr(bin.right) && this.literals.is_signed_int_type(lhs))) {
-                const saved_exp: TypeRef = this.state.expected_type;
-                this.state.expected_type = lhs;
-                rhs = this.resolve_expr(bin.right);
-                this.state.expected_type = saved_exp;
-            } else {
-                rhs = this.resolve_expr(bin.right);
+            const saved_exp: TypeRef = this.state.expected_type;
+            const right_literal_type: Option<TypeRef> = if (is_shift) { Option::None }
+                else { this.literals.operand_type_of_literal_value(bin.right, lhs) };
+            match (right_literal_type) {
+                Option::Some(operand_type) => {
+                    bin.right = this.literals.literal_of_value(bin.right);
+                    this.state.expected_type = operand_type;
+                }
+                Option::None => {
+                    if (is_narrow_float_type(this.arena, lhs) || is_wide_int_type(this.arena, lhs)
+                        || (is_negative_numeric_literal_expr(bin.right) && this.literals.is_signed_int_type(lhs))) {
+                        this.state.expected_type = lhs;
+                    }
+                }
             }
+            rhs = this.resolve_expr(bin.right);
+            this.state.expected_type = saved_exp;
         } else if (left_is_const_num && !right_is_const_num) {
             rhs = this.resolve_expr(bin.right);
-            if (!shift_keeps_expected
-                && (is_narrow_float_type(this.arena, rhs) || is_wide_int_type(this.arena, rhs)
-                    || (is_negative_numeric_literal_expr(bin.left) && this.literals.is_signed_int_type(rhs)))) {
-                const saved_exp: TypeRef = this.state.expected_type;
-                this.state.expected_type = rhs;
-                lhs = this.resolve_expr(bin.left);
-                this.state.expected_type = saved_exp;
-            } else {
-                lhs = this.resolve_expr(bin.left);
+            const saved_exp: TypeRef = this.state.expected_type;
+            const left_literal_type: Option<TypeRef> = if (is_shift) { Option::None }
+                else { this.literals.operand_type_of_literal_value(bin.left, rhs) };
+            match (left_literal_type) {
+                Option::Some(operand_type) => {
+                    bin.left = this.literals.literal_of_value(bin.left);
+                    this.state.expected_type = operand_type;
+                }
+                Option::None => {
+                    if (!shift_keeps_expected
+                        && (is_narrow_float_type(this.arena, rhs) || is_wide_int_type(this.arena, rhs)
+                            || (is_negative_numeric_literal_expr(bin.left) && this.literals.is_signed_int_type(rhs)))) {
+                        this.state.expected_type = rhs;
+                    }
+                }
             }
+            lhs = this.resolve_expr(bin.left);
+            this.state.expected_type = saved_exp;
         // `==` and `!=` compare two values of ONE type (`Eq.equals` takes
         // `&This`), so the left operand's type is the right operand's
         // expected type, as a declared type is an initializer's:

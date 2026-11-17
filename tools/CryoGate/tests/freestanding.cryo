@@ -1,0 +1,90 @@
+///! The freestanding check's judgements and the release smoke's judge: each
+///! line spelled as the report writes it, and every refusal.
+![config(testing)]
+namespace cryogate::tests::freestanding;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect };
+
+import cryogate::freestanding::checks::{ CheckLine, FreestandingJudge, FreestandingVerdict };
+import cryogate::freestanding::programs::{ FreestandingPrograms };
+import cryogate::release::smoke::{ ReleaseSmoke, SmokeRun };
+
+type struct Fixture {
+    private static run(build: Option<i32>, exists: boolean, exit: Option<i32>, printed: Str) -> SmokeRun {
+        return SmokeRun {
+            profile: String::from_str(Str::new("dev")), build_exit: build, program_exists: exists,
+            run_exit: exit, printed: String::from_str(printed),
+        };
+    }
+}
+
+![test]
+function a_core_check_passes_only_on_mains_return_and_names_wine_on_windows() -> Result<(), TestError> {
+    const ok: CheckLine = FreestandingJudge::core(Str::new("linux"), 42, 42);
+    expect(ok.passed && ok.line == String::from_str(Str::new("linux core ok: main 42 -> exit 42")), ok.line.as_str())?;
+    const wrong: CheckLine = FreestandingJudge::core(Str::new("windows"), 7, 0);
+    return expect(!wrong.passed && wrong.line == String::from_str(Str::new("windows core FAIL: main 7 -> exit 0 (wine)")), wrong.line.as_str());
+}
+
+![test]
+function the_panic_report_is_exact_on_linux_and_contained_under_wine() -> Result<(), TestError> {
+    const message: Str = FreestandingPrograms::panic_message();
+    const linux: Array<CheckLine> = FreestandingJudge::panic(Str::new("linux"), 101, message, message);
+    expect(linux.length() == 1 && linux.get_reference(0).unwrap().passed, Str::new("the exact report passes"))?;
+    const noisy: String = f"wine: noise\n{message}";
+    const extra: Array<CheckLine> = FreestandingJudge::panic(Str::new("linux"), 101, noisy.as_str(), message);
+    expect(extra.length() == 1 && !extra.get_reference(0).unwrap().passed, Str::new("on linux anything more fails"))?;
+    const windows: Array<CheckLine> = FreestandingJudge::panic(Str::new("windows"), 101, noisy.as_str(), message);
+    expect(windows.length() == 1 && windows.get_reference(0).unwrap().passed, Str::new("under wine the report is found among the rest"))?;
+    const exited: Array<CheckLine> = FreestandingJudge::panic(Str::new("linux"), 1, message, message);
+    return expect(exited.length() == 1 && exited.get_reference(0).unwrap().line == String::from_str(Str::new("linux panic FAIL: exit 1 (want 101)")), Str::new("a wrong exit is named"));
+}
+
+![test]
+function a_backtrace_needs_its_header_and_three_frames() -> Result<(), TestError> {
+    const three: CheckLine = FreestandingJudge::backtrace(Str::new("linux"), 0, Str::new("stack backtrace:\n  0x1\n  0x2\n  0x3"));
+    expect(three.passed && three.line == String::from_str(Str::new("linux backtrace ok: 3 frames")), three.line.as_str())?;
+    const two: CheckLine = FreestandingJudge::backtrace(Str::new("linux"), 0, Str::new("stack backtrace:\n  0x1\n  0x2"));
+    return expect(!two.passed, Str::new("two frames prove no walk"));
+}
+
+![test]
+function a_handler_and_the_driver_link_are_judged_by_exit_and_message() -> Result<(), TestError> {
+    const handler: CheckLine = FreestandingJudge::handler(Str::new("windows"), Str::new("bounds"), Str::new("index 5"), 101, Str::new("panicked: index 5 out"));
+    expect(handler.passed && handler.line == String::from_str(Str::new("windows bounds ok: [panicked: index 5 out] (wine)")), handler.line.as_str())?;
+    const missing: CheckLine = FreestandingJudge::handler(Str::new("linux"), Str::new("bounds"), Str::new("index 5"), 101, Str::new("other"));
+    expect(!missing.passed, Str::new("a message without the wanted text fails"))?;
+    expect(!FreestandingJudge::driver_link(Str::new("linux"), 70).passed && FreestandingJudge::driver_link(Str::new("linux"), 3).passed, Str::new("the driver link wants 3"))?;
+    expect(FreestandingJudge::allocation(Str::new("linux"), 0).passed && !FreestandingJudge::allocation(Str::new("linux"), 3).passed, Str::new("the allocator wants 0"))?;
+    return expect(FreestandingJudge::arguments(Str::new("linux"), 4).passed && !FreestandingJudge::arguments(Str::new("linux"), 92).passed, Str::new("the arguments want 4"));
+}
+
+![test]
+function a_skipped_arm_fails_the_run_unless_allowed() -> Result<(), TestError> {
+    mut skipped: Array<String> = Array::<String>::new();
+    skipped.push(String::from_str(Str::new("windows")));
+    const refused: FreestandingVerdict = FreestandingJudge::verdict(false, &skipped, false);
+    expect(refused.exit == 1 && refused.lines.get_reference(0).unwrap().as_str() == Str::new("verify-freestanding: arm(s) NOT RUN: windows"), Str::new("refused, naming the arm"))?;
+    const allowed: FreestandingVerdict = FreestandingJudge::verdict(false, &skipped, true);
+    expect(allowed.exit == 0 && allowed.lines.get_reference(1).unwrap().as_str() == Str::new("verify-freestanding: OK for every arm that ran; NOT RUN: windows"), Str::new("allowed, still named"))?;
+    const none: Array<String> = Array::<String>::new();
+    const both: FreestandingVerdict = FreestandingJudge::verdict(false, &none, false);
+    expect(both.exit == 0 && both.lines.get_reference(0).unwrap().as_str() == Str::new("verify-freestanding: OK (linux + windows)"), Str::new("both arms"))?;
+    const failed: FreestandingVerdict = FreestandingJudge::verdict(true, &none, false);
+    return expect(failed.exit == 1 && failed.lines.get_reference(0).unwrap().as_str() == Str::new("verify-freestanding: FAILED"), Str::new("a failed check fails"));
+}
+
+![test]
+function the_release_smoke_wants_a_build_a_program_its_line_and_exit_seven() -> Result<(), TestError> {
+    expect(ReleaseSmoke::judge(&Fixture::run(Option::Some(0), true, Option::Some(7), Str::new("release-smoke ok"))).is_none(), Str::new("the passing run"))?;
+    expect(ReleaseSmoke::judge(&Fixture::run(Option::Some(1), false, Option::None, Str::new(""))).unwrap() == String::from_str(Str::new("the staged compiler could not build a hello-world (dev)")), Str::new("a failed build"))?;
+    expect(ReleaseSmoke::judge(&Fixture::run(Option::Some(0), false, Option::None, Str::new(""))).unwrap() == String::from_str(Str::new("the build reported success but produced no binary (dev)")), Str::new("no program"))?;
+    expect(ReleaseSmoke::judge(&Fixture::run(Option::Some(0), true, Option::Some(7), Str::new("hello"))).unwrap() == String::from_str(Str::new("the program ran but printed [hello] (dev)")), Str::new("the wrong line"))?;
+    return expect(ReleaseSmoke::judge(&Fixture::run(Option::Some(0), true, Option::Some(0), Str::new("release-smoke ok"))).unwrap() == String::from_str(Str::new("the program exited 0, expected 7 (the entry did not carry main's return) (dev)")), Str::new("the wrong exit"));
+}

@@ -1,0 +1,46 @@
+///! `cryogate lsp-smoke [<server>] [--fixture NAME]`: run the language
+///! server's behavioural checks (`lsp/run/smoke`) against a server already
+///! built - `tools/CryoLSP/build/cryolsp` by default - printing each check
+///! as it runs.  `--fixture` runs that fixture's checks alone, with no
+///! protocol checks.  `make install-lsp` runs it on the installed server
+///! before it packages the editor extension; `cryogate lsp` runs the same
+///! checks on the server it has just built.
+///!
+///! Exit: 0 when nothing failed and something ran; 1 otherwise; 2 on a
+///! usage error.
+
+namespace cryogate::gates::lsp_smoke;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::host::{ Host };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::lsp::run::smoke::{ Smoke, Tally };
+
+/// The behavioural checks on their own.
+public type struct LspSmoke {
+    /// Run `cryogate lsp-smoke` with `arguments` from index `first`.
+    public static run(repository: Path, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate lsp-smoke [<server>] [--fixture NAME]"));
+        options.valued(Str::new("--fixture"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate lsp-smoke: {reason.as_str()}"); return 2; }
+        };
+        const positionals: &Array<String> = parsed.positionals();
+        if (positionals.length() > 1 || parsed.separated()) {
+            fmt::eprintln(f"cryogate lsp-smoke: usage: {options.usage()}");
+            return 2;
+        }
+        const built: PathBuf = repository.join(Str::new("tools/CryoLSP/build")).as_path().join(Host::executable_name(Str::new("cryolsp")).as_str());
+        const server: String = if (positionals.is_empty()) { String::from_str(built.as_path().as_str()) } else { positionals.get_reference(0).unwrap().clone() };
+        const tally: Tally = Smoke::run(repository, server.as_str(), parsed.value(Str::new("--fixture")), true);
+        return if (tally.succeeded()) { 0 } else { 1 };
+    }
+}

@@ -241,7 +241,7 @@ public type struct Command {
         configured.stderr_cfg = Stdio::Piped;
         const handle: Child = configured.spawn()?;
         mut c: Child = handle;
-        return collect_output(&c);
+        return c.wait_with_output();
     }
 
     /// spawn + wait. Stdin/out/err go wherever the caller configured
@@ -433,6 +433,24 @@ public type struct Output {
     }
 }
 
+implement struct Child {
+    /// Finish a running child: close its stdin, read everything it writes to
+    /// its piped stdout and stderr until both reach end of file, then wait
+    /// for it to exit. A stream that was not piped, or was taken out of the
+    /// child already, is empty in the result.
+    ///
+    /// The two pipes are read together, never one to its end before the
+    /// other: a child that fills the second pipe's buffer while the first is
+    /// being read would otherwise block in its write, never exit, and never
+    /// close the first. Bytes written to stdin before this call are the
+    /// caller's to have sent; a child that reads all of its stdin before it
+    /// writes anything sees end of file here.
+    public wait_with_output(mut &this) -> Result<Output, IoError> {
+        mem::drop(this.stdin.take());
+        return collect_output(&this);
+    }
+}
+
 // Implementation
 
 /// Pipe-pair struct. `read_end` is what the reader uses;
@@ -448,11 +466,14 @@ private function make_pipe_pair() -> PipePair {
     return PipePair { read_end: -1, write_end: -1 };
 }
 
-/// Call pipe(2) and populate `pair`. Returns an IoError on failure.
+/// Create a pipe for one child stream. Both ends are close-on-exec, so a
+/// child that another thread starts meanwhile does not hold them open past
+/// its exec, which would keep this pipe from reaching end of file; the
+/// `dup2` onto the child's own 0/1/2 makes a descriptor without the flag.
 ![target(unix)]
 private function create_pipe() -> Result<PipePair, IoError> {
     mut fds: [i32; 2];
-    if (libc::pipe(&fds[0]) < 0) {
+    if (libc::pipe2(&fds[0], libc::O_CLOEXEC) < 0) {
         return Result::Err(IoError::last_os_error());
     }
     return Result::Ok(PipePair { read_end: fds[0], write_end: fds[1] });
@@ -953,7 +974,7 @@ private function clone_command(cmd: &Command) -> Command {
 }
 
 /// Drain a `Child`'s captured stdout/stderr into buffers, then
-/// `wait()` for it. Used by `Command::output()`.
+/// `wait()` for it: the body of `Child.wait_with_output`.
 ///
 /// Reads both pipes interleaved via `poll(2)` over non-blocking fds.
 /// The previous serial "drain stdout fully, then stderr" implementation

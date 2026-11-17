@@ -1,0 +1,127 @@
+///! A static audit of a printed program: every `/` and `%` divides by a
+///! `((e & M) | 1)` guard, and every `<<` and `>>` shifts by an amount
+///! masked below the width.
+///!
+///! It reads the printed text, not the model, and spells the guards out
+///! itself rather than asking `guarantees` for them, so a generator that
+///! builds the wrong tree, prints the right one wrongly, or computes a
+///! wrong mask is refused here.
+
+namespace cryosmith::selftest::audit;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+import cryosmith::configuration::{ GenerationOptions, Plant };
+import cryosmith::selftest::runner::{ SelfTest };
+
+/// How many programs the audit reads.
+const AUDITED_PROGRAMS: u64 = 300;
+
+/// How many planted programs the audit must refuse.
+const PLANTED_PROGRAMS: u64 = 100;
+
+/// The audit of one program's text.
+internal type struct Audit {
+    /// The number of guarded sites in `text`, or the first unguarded one.
+    internal static check(text: Str) -> Result<i64, String> {
+        mut sites: i64 = 0;
+        mut line_number: i64 = 0;
+        for (line in text.lines()) {
+            line_number = line_number + 1;
+            if (line.trim_start().starts_with(&Str::new("//"))) { continue; }
+            mut position: i64 = 0;
+            while (position < line.length()) {
+                const division: i64 = Audit::operator_at(line, position, Str::new(" /"), Str::new(" %"));
+                const shift: i64 = Audit::operator_at(line, position, Str::new(" <<"), Str::new(" >>"));
+                if (division > 0 || shift > 0) {
+                    const after: i64 = position + division + shift;
+                    match (Audit::group(line, after)) {
+                        Option::Some(inner) => {
+                            const guarded: boolean = if (division > 0) {
+                                inner.starts_with(&Str::new("(")) && inner.ends_with(&Str::new(" | 1"))
+                            } else {
+                                inner.ends_with(&Str::new(" & 7")) || inner.ends_with(&Str::new(" & 15"))
+                                    || inner.ends_with(&Str::new(" & 31")) || inner.ends_with(&Str::new(" & 63"))
+                            };
+                            if (!guarded) { return Result::Err(f"line {line_number}: unguarded operand `({inner})`"); }
+                            sites = sites + 1;
+                        }
+                        Option::None => { return Result::Err(f"line {line_number}: an operator not followed by a parenthesised operand"); }
+                    }
+                }
+                position = position + 1;
+            }
+        }
+        return Result::Ok(sites);
+    }
+
+    /// The length of `first` or `second` at `position`, with an optional
+    /// `=` and the space after it; 0 when neither is there.
+    private static operator_at(line: Str, position: i64, first: Str, second: Str) -> i64 {
+        const rest: Str = line.byte_substring(position, line.length());
+        for (operator in [first, second]) {
+            match (rest.strip_prefix(&operator)) {
+                Option::Some(after) => {
+                    if (after.starts_with(&Str::new(" "))) { return operator.length() + 1; }
+                    if (after.starts_with(&Str::new("= "))) { return operator.length() + 2; }
+                }
+                Option::None => { }
+            }
+        }
+        return 0;
+    }
+
+    /// The text inside the parentheses that open at `position`, if they do.
+    private static group(line: Str, position: i64) -> Option<Str> {
+        if (line.byte_at(position) != Option::Some('(' as u8)) { return Option::None; }
+        mut depth: i64 = 0;
+        mut index: i64 = position;
+        while (index < line.length()) {
+            const byte: u8 = line.byte_at(index).unwrap();
+            if (byte == '(' as u8) { depth = depth + 1; }
+            if (byte == ')' as u8) {
+                depth = depth - 1;
+                if (depth == 0) { return Option::Some(line.byte_substring(position + 1, index)); }
+            }
+            index = index + 1;
+        }
+        return Option::None;
+    }
+}
+
+implement struct SelfTest {
+    /// The audit passes every program and finds sites to check, and
+    /// refuses every planted program that divides.
+    internal audit(mut &this) -> void {
+        mut sites: i64 = 0;
+        mut seed: u64 = 1;
+        while (seed <= AUDITED_PROGRAMS) {
+            const text: String = SelfTest::program(GenerationOptions::new(seed));
+            match (Audit::check(text.as_str())) {
+                Result::Ok(count)   => { sites = sites + count; }
+                Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }
+            }
+            seed = seed + 1;
+        }
+        this.expect(sites > 0, String::from_str(Str::new("the audit found no division or shift to check")));
+        mut dividing: i64 = 0;
+        mut refused: i64 = 0;
+        seed = 1;
+        while (seed <= PLANTED_PROGRAMS) {
+            mut planted: GenerationOptions = GenerationOptions::new(seed);
+            planted.plant = Plant::UnguardedDivision;
+            const text: String = SelfTest::program(planted);
+            const body: Str = SelfTest::body(text.as_str());
+            if (body.contains(&Str::new(" / ")) || body.contains(&Str::new(" % ")) || body.contains(&Str::new("/= ")) || body.contains(&Str::new("%= "))) {
+                dividing = dividing + 1;
+                if (Audit::check(text.as_str()).is_err()) { refused = refused + 1; }
+            }
+            seed = seed + 1;
+        }
+        this.expect(dividing > 0, String::from_str(Str::new("no planted program divides")));
+        this.expect(refused == dividing, f"the audit refused {refused} of {dividing} planted programs that divide");
+    }
+}

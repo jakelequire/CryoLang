@@ -133,6 +133,24 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-16
+
+709. **A path's scope segment is a type-namespace question, and a
+     primitive's spelling answers it first.**  In `T::NAME` the segment
+     `T` names what owns the member - a type or a module - so it is asked
+     through the `primitive` door and then the `scope-type` door, in that
+     order, exactly as a written type spelling is: a spelling in the fixed
+     primitive table names the primitive before any rib is asked, since a
+     primitive binds in no rib and a same-spelled function would
+     otherwise answer for it.  A function named `u16` therefore neither
+     hides `u16::MAX` nor is reached through it, and a plain call `u16()`
+     still names the function through `scope-value`.  Any other segment
+     is asked through `scope-type`, so a function and a type of one leaf
+     in one rib leave `Limits::make()` naming the type's method.  The
+     value refusal of a primitive spelling (E0100 on a variable,
+     parameter or pattern binding) stays, and a function may still be
+     named like a primitive (`std::random::boolean()`).  (Jake)
+
 ### 2026-11-14
 
 707. **An angle-bracketed import also binds the headers its header

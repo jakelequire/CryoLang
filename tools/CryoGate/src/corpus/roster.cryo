@@ -1,0 +1,535 @@
+///! The roster: what the three suites hold, as the golden
+///! `tests/test-roster.txt` pins it.  `cryo test --list` enumerates the unit
+///! suite only, so the other two are read off the filesystem by the rules
+///! their runners use:
+///!
+///! - projects: `tests/tests/projects/*/`, each pinned with a fingerprint of
+///!   its `test.json` (the fixture, the polarity, the requirements and how
+///!   many assertions it makes), so a project deleted, or an assertion
+///!   dropped from one, is roster drift rather than nothing at all;
+///! - negative: `tests/tests/negative/*.cryo`, flat as the runner reads it,
+///!   pinned with the code its `![config(negative, <code>)]` declares and its
+///!   count of `//~` annotations, so a file weakened from "this diagnostic,
+///!   on this line, and no others" to "this code appears somewhere" shows.
+///!
+///! Two states are refused outright instead of pinned, because pinning them
+///! would keep the silence they cause: a project directory with no
+///! `test.json` (the runner skips it without a word) and a negative file with
+///! no `![config(negative, <code>)]`.
+///!
+///! The golden is a union across hosts: `TestGates` reads which OS each
+///! `![test]` is gated to, so a golden unit entry gated to another OS is
+///! excused here, and `Roster::merge` keeps what this host cannot see.
+
+namespace cryogate::corpus::roster;
+
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+import std::collections::hashset::{ HashSet };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::json::parser;
+import std::json::value::{ JsonExtract, JsonValue };
+
+import cryogate::core::host::{ Host };
+import cryogate::core::text::{ Scanner, Text };
+import cryogate::core::tree::{ Tree };
+
+/// The operating system each `![test]` function is gated to, read from the
+/// `![target(<os>)]` directives in the contiguous run of directives directly
+/// above it; a comment or a blank line ends the run.  Two same-named tests
+/// gated to different systems would make "absent here" ambiguous, so
+/// neither is excused.
+public type struct TestGates {
+    /// Leaf name to target; an empty target marks an ambiguous name.
+    targets: HashMap<String, String>;
+
+    public static new() -> TestGates { return TestGates { targets: HashMap::<String, String>::new() }; }
+
+    /// The gates of every `.cryo` file below `source`.
+    public static read(source: Path) -> Result<TestGates, String> {
+        mut gates: TestGates = TestGates::new();
+        const files: Array<String> = match (Tree::files(source, &Array::<String>::new())) {
+            Result::Ok(files)   => { files }
+            Result::Err(reason) => { return Result::Err(reason); }
+        };
+        for (file in files.iterate_references()) {
+            if (!file.as_str().ends_with(&Str::new(".cryo"))) { continue; }
+            match (File::read_text(source.join(file.as_str()).as_path())) {
+                Result::Ok(text) => { gates.add_source(text.as_str()); }
+                Result::Err(_)   => { }
+            }
+        }
+        return Result::Ok(gates);
+    }
+
+    /// Read the gates of one source file's text.
+    public add_source(mut &this, text: Str) -> void {
+        const lines: Array<String> = Text::lines(text);
+        mut index: i64 = 0;
+        while (index < lines.length()) {
+            match (TestGates::function_name(lines.get_reference(index).unwrap().as_str())) {
+                Option::Some(leaf) => {
+                    mut is_test: boolean = false;
+                    mut target: String = String::new();
+                    mut above: i64 = index - 1;
+                    while (above >= 0) {
+                        match (TestGates::directive(lines.get_reference(above).unwrap().as_str())) {
+                            Option::Some(directive) => {
+                                if (directive.first == Str::new("test")) { is_test = true; }
+                                if (directive.first == Str::new("target") && !directive.second.is_empty()) {
+                                    target = String::from_str(TestGates::unquoted(directive.second.trim()));
+                                }
+                            }
+                            Option::None => { break; }
+                        }
+                        above--;
+                    }
+                    if (is_test && !target.is_empty()) { this.gate(leaf, target.as_str()); }
+                }
+                Option::None => { }
+            }
+            index++;
+        }
+    }
+
+    /// Record that the test `leaf` is gated to `target`.
+    public gate(mut &this, leaf: Str, target: Str) -> void {
+        const key: String = String::from_str(leaf);
+        const agrees: boolean = match (this.targets.get_reference(&key)) {
+            Option::Some(existing) => { existing.as_str() == target }
+            Option::None           => { true }
+        };
+        const recorded: String = if (agrees) { String::from_str(target) } else { String::new() };
+        this.targets.insert(key, recorded);
+    }
+
+    /// The OS the test `leaf` is gated to; `None` for an ungated or
+    /// ambiguous name.
+    public target_of(&this, leaf: Str) -> Option<Str> {
+        match (this.targets.get_reference(&String::from_str(leaf))) {
+            Option::Some(target) => {
+                if (target.is_empty()) { return Option::None; }
+                return Option::Some(target.as_str());
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// Whether the golden entry `entry` is a unit test this host does not
+    /// build.  The project and negative entries are read off the
+    /// filesystem, so every host has the same ones and an absence there is a
+    /// deletion, never a gate.
+    public elsewhere(&this, entry: Str) -> boolean {
+        if (!Roster::is_unit(entry)) { return false; }
+        return match (this.target_of(Roster::leaf_name(entry))) {
+            Option::Some(target) => { !Host::builds_target(target) }
+            Option::None         => { false }
+        };
+    }
+
+    /// The name and the parenthesised arguments (empty when there are
+    /// none) of a line that is one directive, `![name]` or `![name(...)]`.
+    public static directive(line: Str) -> Option<Pair<Str, Str>> {
+        mut scanner: Scanner = Scanner::new(line);
+        scanner.skip_whitespace();
+        if (!scanner.literal(Str::new("!["))) { return Option::None; }
+        scanner.skip_whitespace();
+        const name: Str = match (scanner.word()) {
+            Option::Some(name) => { name }
+            Option::None       => { return Option::None; }
+        };
+        scanner.skip_whitespace();
+        mut arguments: Str = Str::new("");
+        if (scanner.literal(Str::new("("))) {
+            arguments = match (scanner.until(Str::new(")"))) {
+                Option::Some(inside) => { inside }
+                Option::None         => { return Option::None; }
+            };
+            scanner.literal(Str::new(")"));
+            scanner.skip_whitespace();
+        }
+        if (!scanner.literal(Str::new("]"))) { return Option::None; }
+        scanner.skip_whitespace();
+        if (!scanner.at_end()) { return Option::None; }
+        return Option::Some(Pair::new(name, arguments));
+    }
+
+    /// The name a line declaring a function gives it:
+    /// `[public|private] function <name>(`.
+    public static function_name(line: Str) -> Option<Str> {
+        mut scanner: Scanner = Scanner::new(line);
+        scanner.skip_whitespace();
+        if (scanner.literal(Str::new("public")) || scanner.literal(Str::new("private"))) {
+            if (scanner.skip_whitespace() == 0) { return Option::None; }
+        }
+        if (!scanner.literal(Str::new("function"))) { return Option::None; }
+        if (scanner.skip_whitespace() == 0) { return Option::None; }
+        const name: Str = match (scanner.word()) {
+            Option::Some(name) => { name }
+            Option::None       => { return Option::None; }
+        };
+        scanner.skip_whitespace();
+        if (!scanner.literal(Str::new("("))) { return Option::None; }
+        return Option::Some(name);
+    }
+
+    /// `text` without the double and then the single quotes around it.
+    private static unquoted(text: Str) -> Str {
+        return TestGates::stripped(TestGates::stripped(text, '"'), '\'');
+    }
+
+    /// `text` without every `quote` at either end.
+    private static stripped(text: Str, quote: u8) -> Str {
+        mut start: i64 = 0;
+        mut end: i64 = text.length();
+        while (start < end && text.byte_at(start).unwrap() == quote) { start++; }
+        while (end > start && text.byte_at(end - 1).unwrap() == quote) { end--; }
+        return text.byte_substring(start, end);
+    }
+}
+
+/// The entries one suite read off the filesystem, and the states refused
+/// outright instead of pinned.
+public type struct Discovered {
+    public entries: Array<String>;
+    public errors: Array<String>;
+}
+
+/// The golden after a merge, and what the merge did to it.
+public type struct Merge {
+    public merged: Array<String>;
+    /// Discovered here and not pinned before.
+    public added: Array<String>;
+    /// (pinned, discovered) for each test discovered with another
+    /// fingerprint.
+    public replaced: Array<Pair<String, String>>;
+    /// Pinned, not found here, and gated to another OS.
+    public other_platform: Array<String>;
+    /// Pinned and not found here at all.
+    public absent: Array<String>;
+}
+
+/// The roster's entries: how each suite's are discovered and spelled, how
+/// the golden is read, and how a discovery merges into it.
+public type struct Roster {
+    /// Whether a roster entry is a unit test's.
+    public static is_unit(entry: Str) -> boolean { return entry.contains(&Str::new(": test")); }
+
+    /// `CryoTests::Tests::Stdlib::Foo::bar: test` -> `bar`.
+    public static leaf_name(entry: Str) -> Str {
+        const path: Str = match (entry.split_once_from_end(&Str::new(": test"))) {
+            Option::Some(pair) => { pair.first }
+            Option::None       => { entry }
+        };
+        const leaf: Str = match (path.split_once_from_end(&Str::new("::"))) {
+            Option::Some(pair) => { pair.second }
+            Option::None       => { path }
+        };
+        return leaf.trim();
+    }
+
+    /// What a pinned line is the line FOR, without what it says about it:
+    /// `project foo: outcome=run ... asserts=19` -> `project foo`.  A unit
+    /// entry is its own identity.
+    public static identity(entry: Str) -> Str {
+        return match (entry.split_once(&Str::new(": "))) {
+            Option::Some(pair) => { pair.first }
+            Option::None       => { entry }
+        };
+    }
+
+    /// The golden's entries, each trimmed, sorted, once; none when the file
+    /// does not exist.
+    public static golden(path: Path) -> Array<String> {
+        mut entries: Array<String> = Array::<String>::new();
+        match (File::read_text(path)) {
+            Result::Ok(text) => {
+                for (line in Text::lines(text.as_str()).iterate_references()) {
+                    if (!line.as_str().trim().is_empty()) { entries.push(String::from_str(line.as_str().trim())); }
+                }
+            }
+            Result::Err(_) => { }
+        }
+        return Text::sorted_distinct(entries);
+    }
+
+    /// One line per test project, fingerprinting its `test.json`.
+    public static projects(directory: Path) -> Discovered {
+        mut found: Discovered = Discovered { entries: Array::<String>::new(), errors: Array::<String>::new() };
+        if (!directory.is_directory()) {
+            found.errors.push(f"projects directory {directory.as_str()} does not exist");
+            return found;
+        }
+        const names: Array<String> = match (Tree::names(directory, &Array::<String>::new())) {
+            Result::Ok(names)   => { names }
+            Result::Err(reason) => { found.errors.push(reason); return found; }
+        };
+        for (name in names.iterate_references()) {
+            const project: PathBuf = directory.join(name.as_str());
+            if (!project.as_path().is_directory()) { continue; }
+            const marker: PathBuf = project.join(Str::new("test.json"));
+            if (!marker.as_path().is_file()) {
+                found.errors.push(f"project {name.as_str()} has no test.json; `cryo test` skips the whole directory without a word, reporting the same green and the same count as before it existed");
+                continue;
+            }
+            const text: String = match (File::read_text(marker.as_path())) {
+                Result::Ok(text)   => { text }
+                Result::Err(error) => { found.errors.push(f"project {name.as_str()} has an unreadable test.json ({error.describe()})"); continue; }
+            };
+            match (parser::parse(text.as_str())) {
+                Result::Ok(specification) => {
+                    const unread: Array<String> = Roster::unread_lists(&specification);
+                    for (problem in unread.iterate_references()) {
+                        found.errors.push(f"project {name.as_str()}'s test.json {problem.as_str()}; the runner reads a list of strings there and skips anything else without a word, so it checks nothing for it");
+                    }
+                    if (unread.is_empty()) { found.entries.push(Roster::project_line(name.as_str(), &specification)); }
+                }
+                Result::Err(error)        => { found.errors.push(f"project {name.as_str()} has a malformed test.json ({error.describe()})"); }
+            }
+        }
+        return found;
+    }
+
+    /// Every field of a `test.json` the runner reads as a list of strings
+    /// that holds something else: a string where the list belongs, or an
+    /// element that is not a string.  The runner skips both in silence, so
+    /// an assertion written that way is never made.
+    public static unread_lists(specification: &JsonValue) -> Array<String> {
+        mut problems: Array<String> = Array::<String>::new();
+        Roster::check_lists(specification, Str::new("requires environment arguments"), Str::new(""), &problems);
+        match (specification.get(Str::new("expect"))) {
+            Option::Some(expect) => {
+                Roster::check_lists(expect, Str::new("output_contains output_excludes output_in_order stderr_contains stderr_excludes stdout_line_prefixes stderr_line_prefixes file_contains file_excludes"), Str::new("expect."), &problems);
+            }
+            Option::None => { }
+        }
+        return problems;
+    }
+
+    /// The problems with each of the space-separated `keys` of `object`.
+    private static check_lists(object: JsonValue*, keys: Str, prefix: Str, problems: mut &Array<String>) -> void {
+        for (key in keys.split(&Str::new(" "))) {
+            match (object.get(key)) {
+                Option::Some(value) => {
+                    if (!value.is_array()) {
+                        problems.push(f"gives `{prefix}{key}` a value that is not a list");
+                        continue;
+                    }
+                    mut index: i64 = 0;
+                    while (index < value.length()) {
+                        if (!value.at(index).unwrap().is_string()) {
+                            problems.push(f"gives `{prefix}{key}` an element that is not a string");
+                            break;
+                        }
+                        index++;
+                    }
+                }
+                Option::None => { }
+            }
+        }
+    }
+
+    /// A project's pinned line: the fixture (`collect`/`build`/`run`),
+    /// whether the run must fail, how many assertions the `expect` block
+    /// makes, the requirements and whether it is ignored.  `compile_fail` is
+    /// the build fixture with the failing polarity, and a `diagnostic` is
+    /// `fails` with an `error[<code>]` marker, so what is counted is what
+    /// the runner checks, not how the file spells it.
+    public static project_line(name: Str, specification: &JsonValue) -> String {
+        const outcome: Str = Roster::text_field(specification, Str::new("outcome"), Str::new("collect"));
+        mut fails: boolean = outcome == Str::new("compile_fail");
+        mut asserts: i64 = 0;
+        match (specification.get(Str::new("expect"))) {
+            Option::Some(expect) => {
+                if (Roster::flag_field(expect, Str::new("fails"))) { fails = true; }
+                if (expect.get(Str::new("diagnostic")).is_some()) { fails = true; }
+                // One assertion each when present.
+                const single: Str = Str::new("exit_code stdout_contains diagnostic file");
+                for (key in single.split(&Str::new(" "))) {
+                    if (expect.get(key).is_some()) { asserts++; }
+                }
+                // A list, one assertion per element.
+                const listed: Str = Str::new("output_contains output_excludes stderr_contains stderr_excludes stdout_line_prefixes stderr_line_prefixes file_contains file_excludes");
+                for (key in listed.split(&Str::new(" "))) {
+                    match (expect.get(key)) {
+                        Option::Some(list) => { asserts = asserts + list.length(); }
+                        Option::None       => { }
+                    }
+                }
+            }
+            Option::None => { }
+        }
+        mut requirements: Array<String> = Array::<String>::new();
+        match (specification.get(Str::new("requires"))) {
+            Option::Some(list) => {
+                mut index: i64 = 0;
+                while (index < list.length()) {
+                    match (list.at(index).unwrap().as::<Str>()) {
+                        Option::Some(requirement) => { requirements.push(String::from_str(requirement)); }
+                        Option::None              => { }
+                    }
+                    index++;
+                }
+            }
+            Option::None => { }
+        }
+        const required: String = if (requirements.is_empty()) { String::from_str(Str::new("-")) } else { Text::joined(&requirements, Str::new(",")) };
+        const failing: i64 = if (fails) { 1 } else { 0 };
+        const ignored: i64 = if (Roster::flag_field(specification, Str::new("ignore"))) { 1 } else { 0 };
+        mut line: String = f"project {name}: outcome={outcome} fails={failing} asserts={asserts} requires={required.as_str()} ignore={ignored}";
+        // `applied` is a second run of the project with its
+        // machine-applicable fixes made; a test.json that drops it stops
+        // proving them, so the exit code that run must give (the runner's
+        // default 0 when it names none) is part of the line.
+        match (specification.get(Str::new("applied"))) {
+            Option::Some(applied) => {
+                if (applied.is_object()) {
+                    const exit: i64 = match (applied.get(Str::new("exit_code"))) {
+                        Option::Some(code) => { code.as::<i64>().unwrap_or(0) }
+                        Option::None       => { 0 }
+                    };
+                    line = f"{line.as_str()} applied={exit}";
+                }
+            }
+            Option::None => { }
+        }
+        // `rebuild` builds the project, changes it and builds it again into
+        // the same directory; a test.json that drops it, or a replacement
+        // from it, judges a single build instead, so the count of files it
+        // replaces is part of the line.
+        match (specification.get(Str::new("rebuild"))) {
+            Option::Some(rebuild) => {
+                const replaced: i64 = match (rebuild.get(Str::new("replace"))) {
+                    Option::Some(list) => { list.length() }
+                    Option::None       => { 0 }
+                };
+                line = f"{line.as_str()} rebuild={replaced}";
+            }
+            Option::None => { }
+        }
+        return line;
+    }
+
+    /// One line per compile-fail file: its code and its count of `//~`
+    /// annotations.  Flat, as the negative suite reads the directory.
+    public static negatives(directory: Path) -> Discovered {
+        mut found: Discovered = Discovered { entries: Array::<String>::new(), errors: Array::<String>::new() };
+        if (!directory.is_directory()) {
+            found.errors.push(f"negative directory {directory.as_str()} does not exist");
+            return found;
+        }
+        const names: Array<String> = match (Tree::names(directory, &Array::<String>::new())) {
+            Result::Ok(names)   => { names }
+            Result::Err(reason) => { found.errors.push(reason); return found; }
+        };
+        for (name in names.iterate_references()) {
+            const path: PathBuf = directory.join(name.as_str());
+            if (!path.as_path().is_file() || !name.as_str().ends_with(&Str::new(".cryo"))) { continue; }
+            const content: String = match (File::read_text(path.as_path())) {
+                Result::Ok(text)   => { text }
+                Result::Err(error) => { found.errors.push(f"negative {name.as_str()} cannot be read ({error.describe()})"); continue; }
+            };
+            const code: Str = Roster::negative_code(content.as_str());
+            if (code.is_empty()) {
+                found.errors.push(f"negative {name.as_str()} carries no ![config(negative, <code>)] directive; the suite counts it as a failure but nothing pins that it still exists");
+                continue;
+            }
+            mut annotations: i64 = 0;
+            for (line in Text::lines(content.as_str()).iterate_references()) {
+                if (line.as_str().contains(&Str::new("//~"))) { annotations++; }
+            }
+            found.entries.push(f"negative {name.as_str()}: {code} annotations={annotations}");
+        }
+        return found;
+    }
+
+    /// The code the negative suite reads out of a file, by the suite's own
+    /// rule: after the first `config(negative`, skip commas and spaces, then
+    /// take up to the next `)`, `,`, space or `]`, at most 23 bytes.
+    public static negative_code(content: Str) -> Str {
+        const marker: Str = Str::new("config(negative");
+        const found: i64 = match (content.find(&marker)) {
+            Option::Some(at) => { at }
+            Option::None     => { return Str::new(""); }
+        };
+        mut start: i64 = found + marker.length();
+        while (start < content.length() && (content.byte_at(start).unwrap() == ',' || content.byte_at(start).unwrap() == ' ')) { start++; }
+        mut end: i64 = start;
+        while (end < content.length() && end - start < 23) {
+            const byte: u8 = content.byte_at(end).unwrap();
+            if (byte == ')' || byte == ',' || byte == ' ' || byte == ']') { break; }
+            end++;
+        }
+        return content.byte_substring(start, end);
+    }
+
+    /// The golden after adding what this host discovered.  A golden line
+    /// whose identity was discovered with another fingerprint is replaced:
+    /// it is the same test, changed.  Every other golden-only line is kept,
+    /// split into the ones gated to another OS and the ones not found.
+    public static merge(entries: &Array<String>, golden: &Array<String>, gates: &TestGates) -> Merge {
+        mut found: HashSet<String> = HashSet::<String>::new();
+        mut discovered: HashMap<String, String> = HashMap::<String, String>::new();
+        for (entry in entries.iterate_references()) {
+            found.insert(entry.clone());
+            discovered.insert(String::from_str(Roster::identity(entry.as_str())), entry.clone());
+        }
+        mut pinned: HashSet<String> = HashSet::<String>::new();
+        for (line in golden.iterate_references()) { pinned.insert(line.clone()); }
+        mut result: Merge = Merge {
+            merged: Array::<String>::new(),
+            added: Array::<String>::new(),
+            replaced: Array::<Pair<String, String>>::new(),
+            other_platform: Array::<String>::new(),
+            absent: Array::<String>::new(),
+        };
+        mut renewed: HashSet<String> = HashSet::<String>::new();
+        for (line in golden.iterate_references()) {
+            if (found.contains(line)) { continue; }
+            match (discovered.get_reference(&String::from_str(Roster::identity(line.as_str())))) {
+                Option::Some(fresh) => {
+                    renewed.insert(fresh.clone());
+                    result.replaced.push(Pair::new(line.clone(), fresh.clone()));
+                }
+                Option::None => {
+                    if (gates.elsewhere(line.as_str())) { result.other_platform.push(line.clone()); } else { result.absent.push(line.clone()); }
+                }
+            }
+        }
+        mut merged: Array<String> = Array::<String>::new();
+        mut added: Array<String> = Array::<String>::new();
+        for (entry in entries.iterate_references()) {
+            merged.push(entry.clone());
+            if (!pinned.contains(entry) && !renewed.contains(entry)) { added.push(entry.clone()); }
+        }
+        for (line in result.other_platform.iterate_references()) { merged.push(line.clone()); }
+        for (line in result.absent.iterate_references()) { merged.push(line.clone()); }
+        result.merged = Text::sorted_distinct(merged);
+        result.added = Text::sorted_distinct(added);
+        return result;
+    }
+
+    /// A string field of a JSON object, or `fallback` when it is absent or
+    /// not a string.
+    private static text_field(object: JsonValue*, key: Str, fallback: Str) -> Str {
+        return match (object.get(key)) {
+            Option::Some(value) => { value.as::<Str>().unwrap_or(fallback) }
+            Option::None        => { fallback }
+        };
+    }
+
+    /// Whether a JSON object's field is `true`.
+    private static flag_field(object: JsonValue*, key: Str) -> boolean {
+        return match (object.get(key)) {
+            Option::Some(value) => { value.as::<boolean>().unwrap_or(false) }
+            Option::None        => { false }
+        };
+    }
+}
+

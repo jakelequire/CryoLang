@@ -1,0 +1,124 @@
+///! Expressions, every operator application parenthesised.
+
+namespace cryosmith::emit::expressions;
+
+import std::collections::str::{ Str };
+
+import cryosmith::emit::printer::{ Printer };
+import cryosmith::model::{ ExpressionKind, ExpressionNode, Function, Program };
+
+implement struct Printer {
+    /// The expression at `index`.
+    internal expression(mut &this, program: &Program, index: i64) -> void {
+        const node: ExpressionNode = program.expression_at(index);
+        match (node.kind) {
+            ExpressionKind::IntegerLiteral(magnitude, negative) => {
+                if (negative) { this.text.push(f"(-{magnitude})"); } else { this.text.push(f"{magnitude}"); }
+            }
+            ExpressionKind::BooleanLiteral(value) => {
+                this.text.push(if (value) { Str::new("true") } else { Str::new("false") });
+            }
+            ExpressionKind::Limit(is_maximum) => {
+                this.text.push(f"{program.type_name(node.value_type).as_str()}::");
+                this.text.push(if (is_maximum) { Str::new("MAX") } else { Str::new("MIN") });
+            }
+            ExpressionKind::Variable(variable) => { this.name(program, variable); }
+            ExpressionKind::Unary(operator, operand) => {
+                this.text.push(f"({operator.symbol()}");
+                this.expression(program, operand);
+                this.text.push(Str::new(")"));
+            }
+            ExpressionKind::Binary(operator, left, right) => {
+                this.text.push(Str::new("("));
+                this.expression(program, left);
+                this.text.push(f" {operator.symbol()} ");
+                this.expression(program, right);
+                this.text.push(Str::new(")"));
+            }
+            ExpressionKind::Wrapping(operator, receiver, argument) => {
+                this.receiver(program, receiver);
+                this.text.push(f".{operator.method()}(");
+                this.expression(program, argument);
+                this.text.push(Str::new(")"));
+            }
+            ExpressionKind::Cast(operand) => {
+                this.text.push(Str::new("("));
+                this.expression(program, operand);
+                this.text.push(f" as {program.type_name(node.value_type).as_str()})");
+            }
+            ExpressionKind::Widen(operand) => { this.expression(program, operand); }
+            ExpressionKind::Conditional(condition, then_value, else_value) => {
+                this.text.push(Str::new("(if ("));
+                this.expression(program, condition);
+                this.text.push(Str::new(") { "));
+                this.expression(program, then_value);
+                this.text.push(Str::new(" } else { "));
+                this.expression(program, else_value);
+                this.text.push(Str::new(" })"));
+            }
+            ExpressionKind::Call(callee, first, count) => {
+                const called: Function = program.function_at(callee);
+                if (called.owner < 0) {
+                    this.text.push(f"h{called.number}(");
+                } else {
+                    this.text.push(f"S{called.owner}::m{called.number}(");
+                }
+                this.arguments(program, first, count);
+            }
+            ExpressionKind::GenericCall(callee, type_argument, first, count) => {
+                this.text.push(f"g{program.function_at(callee).number}::<{program.type_name(type_argument).as_str()}>(");
+                this.arguments(program, first, count);
+            }
+            ExpressionKind::MethodCall(receiver, callee, first, count) => {
+                this.expression(program, receiver);
+                this.text.push(f".m{program.function_at(callee).number}(");
+                this.arguments(program, first, count);
+            }
+            ExpressionKind::Field(base, field) => {
+                this.expression(program, base);
+                this.text.push(f".f{program.field_at(field).number}");
+            }
+            ExpressionKind::StructureLiteral(structure, first, count) => {
+                this.text.push(f"{program.literal_path(structure).as_str()} ");
+                this.text.push(Str::new("{"));
+                mut entry: i64 = 0;
+                while (entry < count) {
+                    this.text.push(if (entry > 0) { Str::new(", ") } else { Str::new(" ") });
+                    this.text.push(f"f{program.field_at(program.list_at(first + 2 * entry)).number}: ");
+                    this.expression(program, program.list_at(first + 2 * entry + 1));
+                    entry = entry + 1;
+                }
+                this.text.push(if (count > 0) { Str::new(" }") } else { Str::new("}") });
+            }
+        }
+    }
+
+    /// A call's arguments and its closing parenthesis.
+    private arguments(mut &this, program: &Program, first: i64, count: i64) -> void {
+        mut index: i64 = 0;
+        while (index < count) {
+            if (index > 0) { this.text.push(Str::new(", ")); }
+            this.expression(program, program.list_at(first + index));
+            index = index + 1;
+        }
+        this.text.push(Str::new(")"));
+    }
+
+    /// A method's receiver: a name, a field or a parenthesised expression
+    /// as it prints, anything else in parentheses.
+    private receiver(mut &this, program: &Program, index: i64) -> void {
+        match (program.expression_at(index).kind) {
+            ExpressionKind::Variable(_) => { this.expression(program, index); }
+            ExpressionKind::Field(_, _) => { this.expression(program, index); }
+            ExpressionKind::Unary(_, _) => { this.expression(program, index); }
+            ExpressionKind::Binary(_, _, _) => { this.expression(program, index); }
+            ExpressionKind::Cast(_) => { this.expression(program, index); }
+            ExpressionKind::Conditional(_, _, _) => { this.expression(program, index); }
+            _ => {
+                this.text.push(Str::new("("));
+                this.expression(program, index);
+                this.text.push(Str::new(")"));
+            }
+        }
+    }
+}

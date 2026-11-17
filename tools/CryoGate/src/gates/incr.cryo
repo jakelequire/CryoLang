@@ -1,0 +1,316 @@
+///! `cryogate incr --instance | --runtime | --matrix --cryo <compiler>`: three
+///! checks of an incremental build over a change the per-module cache must
+///! notice.
+///!
+///! `--matrix [--project <directory>] [--bin <name>]`: the edit matrix
+///! (`incremental/run/matrix.cryo`) over a project, the compiler project
+///! and its `cryo` program by default, every incremental build judged
+///! against a clean one; scratch in `.verify/incremental-check`.
+///!
+///! `--instance`: an incremental build must link when an edit asks an
+///! unchanged module for a generic instance its cached object does not
+///! hold.  `tests/fixtures/incremental-new-instance` (see its README) is
+///! copied to `.verify/incremental-instance`, built incrementally and run
+///! (exit 3); then `src/main.cryo` is replaced by `edit/main.cryo` and the
+///! project is built again over the first build's cache and run (exit 4).
+///! The second build must also REUSE cached objects, or the per-module
+///! cache was off and the build linked for the wrong reason: a gate that
+///! passes with the cache disabled tests nothing.
+///!
+///! `--runtime`: a program built against one runtime must be linked again
+///! when the runtime is rebuilt with nothing else changed.  The runtime's
+///! sources are copied to `.verify/incremental-runtime/runtime`, and
+///! `CRYO_RUNTIME` names the copy for both builds of
+///! `tests/fixtures/incremental-runtime-change` (see its README), a
+///! program that divides by zero.  The first build's program reports the
+///! runtime's divide-by-zero message; then that message is changed in the
+///! copy's sources and the program is built again, which must link the
+///! rebuilt runtime: its program reports the changed message.  A whole-build
+///! fingerprint that leaves the runtime archives out calls the second build
+///! up to date, and its program still reports the old message.
+///!
+///! A failed build's output is printed, since the compiler's and the
+///! linker's report is the evidence.
+
+namespace cryogate::gates::incr;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::io::error::{ IoError };
+
+import cryogate::core::child::{ Completion, Job, Outcome };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::tree::{ Tree };
+import cryogate::incremental::run::matrix::{ IncrementalMatrix };
+
+/// One build's outcome and what it printed.
+type struct Build {
+    outcome: Outcome;
+    output: String;
+
+    /// The last `bytes` bytes of the output.
+    private tail(&this, bytes: i64) -> Str {
+        const all: Str = this.output.as_str();
+        if (all.length() <= bytes) { return all; }
+        return all.byte_substring(all.length() - bytes, all.length());
+    }
+}
+
+/// A fixture project copied to scratch and built there, again and again,
+/// over its own cache.
+public type struct IncrementalBuild {
+    /// The project's copy.
+    project: PathBuf;
+    /// The executable's name in the project's `build/`, without a suffix.
+    program: String;
+    compiler: String;
+    stdlib: String;
+    /// The runtime source tree `CRYO_RUNTIME` names to each build, when
+    /// the check gives one.
+    runtime: Option<String>;
+
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate incr --instance | --runtime | --matrix [--project <directory>] [--bin <name>] --cryo <compiler>"));
+        options.flag(Str::new("--instance"));
+        options.flag(Str::new("--runtime"));
+        options.flag(Str::new("--matrix"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--project"));
+        options.valued(Str::new("--bin"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate incr: {reason.as_str()}"); return 2; }
+        };
+        const compiler: Str = match (parsed.value(Str::new("--cryo"))) {
+            Option::Some(path) => { path }
+            Option::None       => { fmt::eprintln(f"cryogate incr: --cryo is required; usage: {options.usage()}"); return 2; }
+        };
+        const instance: boolean = parsed.has(Str::new("--instance"));
+        const runtime: boolean = parsed.has(Str::new("--runtime"));
+        const matrix: boolean = parsed.has(Str::new("--matrix"));
+        mut modes: i64 = 0;
+        if (instance) { modes++; }
+        if (runtime) { modes++; }
+        if (matrix) { modes++; }
+        const project_named: boolean = parsed.has(Str::new("--project")) || parsed.has(Str::new("--bin"));
+        if (modes != 1 || (project_named && !matrix) || !parsed.positionals().is_empty() || parsed.separated()) {
+            fmt::eprintln(f"cryogate incr: usage: {options.usage()}");
+            return 2;
+        }
+        const verify: PathBuf = repository.join(Str::new(".verify"));
+        if (matrix) {
+            const project: String = match (parsed.value(Str::new("--project"))) {
+                Option::Some(path) => { Host::absolute(path) }
+                Option::None       => { String::from_str(repository.join(Str::new("compiler")).as_path().as_str()) }
+            };
+            const binary: Str = parsed.value(Str::new("--bin")).unwrap_or(Str::new("cryo"));
+            return IncrementalMatrix::run(repository, logs, Host::absolute(compiler).as_str(), Path::from(project.as_str()),
+                                          binary, verify.join(Str::new("incremental-check")).as_path());
+        }
+        const fixtures: PathBuf = repository.join(Str::new("tests")).join(Str::new("fixtures"));
+        if (instance) {
+            const check: IncrementalBuild = IncrementalBuild {
+                project:  verify.join(Str::new("incremental-instance")),
+                program:  String::from_str(Str::new("incremental_new_instance")),
+                compiler: String::from_str(compiler),
+                stdlib:   Host::stdlib_directory(repository),
+                runtime:  Option::None,
+            };
+            return check.judge_instance(fixtures.join(Str::new("incremental-new-instance")).as_path(), logs);
+        }
+        const scratch: PathBuf = verify.join(Str::new("incremental-runtime"));
+        const copy: PathBuf = scratch.join(Str::new("runtime"));
+        const check: IncrementalBuild = IncrementalBuild {
+            project:  scratch.join(Str::new("program")),
+            program:  String::from_str(Str::new("incremental_runtime_change")),
+            compiler: String::from_str(compiler),
+            stdlib:   Host::stdlib_directory(repository),
+            runtime:  Option::Some(Host::stdlib_spelling(copy.as_path().as_str())),
+        };
+        // A scratch tree that could not be cleared fails the copies below.
+        if (scratch.as_path().exists()) { const _: Result<(), IoError> = Directory::remove_all(scratch.as_path()); }
+        const _: Result<(), IoError> = Directory::create_all(scratch.as_path());
+        mut excluded: Array<String> = Array::<String>::new();
+        excluded.push(String::from_str(Str::new(".bin")));
+        match (Tree::copy(repository.join(Str::new("runtime")).as_path(), copy.as_path(), &excluded)) {
+            Result::Ok(_) => { }
+            Result::Err(reason) => {
+                fmt::println(f"incremental-runtime-check: FAIL -- cannot copy the runtime: {reason.as_str()}");
+                return 1;
+            }
+        }
+        return check.judge_runtime(fixtures.join(Str::new("incremental-runtime-change")).as_path(), copy.as_path(), logs);
+    }
+
+    /// `--instance`: build, run (exit 3), apply the edit, build over the
+    /// cache, run (exit 4), and require the second build to reuse objects.
+    private judge_instance(&this, fixture: Path, logs: &RunLogs) -> i32 {
+        const verdict: Str = Str::new("incremental-instance-check");
+        if (!this.copy_fixture(fixture, verdict)) { return 1; }
+        const first: Build = this.build(logs.file(Str::new("incr-instance-first")).as_str());
+        const first_run: Build = this.run_after(&first, logs.file(Str::new("incr-instance-first-run")).as_str());
+        if (!first.outcome.succeeded() || first_run.outcome.describe().as_str() != Str::new("exit 3")) {
+            fmt::println(String::from_str(first.tail(4000)));
+            fmt::println(f"{verdict}: FAIL -- the first build: build {first.outcome.describe().as_str()}, run {first_run.outcome.describe().as_str()} (want 0 and 3)");
+            return 1;
+        }
+
+        const edit: PathBuf = this.project.join(Str::new("edit")).join(Str::new("main.cryo"));
+        const main: PathBuf = this.project.join(Str::new("src")).join(Str::new("main.cryo"));
+        match (File::copy(edit.as_path(), main.as_path())) {
+            Result::Ok(_) => { }
+            Result::Err(error) => {
+                fmt::println(f"{verdict}: FAIL -- cannot apply the edit: {error.describe()}");
+                return 1;
+            }
+        }
+        const second: Build = this.build(logs.file(Str::new("incr-instance-second")).as_str());
+        const second_run: Build = this.run_after(&second, logs.file(Str::new("incr-instance-second-run")).as_str());
+        if (!second.outcome.succeeded() || second_run.outcome.describe().as_str() != Str::new("exit 4")) {
+            fmt::println(String::from_str(second.tail(6000)));
+            fmt::println(f"{verdict}: FAIL -- the incremental build after the edit: build {second.outcome.describe().as_str()}, run {second_run.outcome.describe().as_str()} (want 0 and 4)");
+            return 1;
+        }
+        const reused: i64 = IncrementalBuild::reused(second.output.as_str());
+        if (reused == 0) {
+            fmt::println(String::from_str(second.tail(2000)));
+            fmt::println(f"{verdict}: FAIL -- the second build reused no cached object; the cache was not in effect, so the link proves nothing");
+            return 1;
+        }
+        fmt::println(f"{verdict}: OK -- first build ran 3; after the edit the incremental build reused {reused} cached object(s), linked and ran 4");
+        return 0;
+    }
+
+    /// `--runtime`: build against the runtime copy `runtime` and run (the
+    /// runtime's divide-by-zero message), change that message in the
+    /// copy's panic sources, build again, run, and require the changed
+    /// message.
+    private judge_runtime(&this, fixture: Path, runtime: Path, logs: &RunLogs) -> i32 {
+        const verdict: Str = Str::new("incremental-runtime-check");
+        const message: Str = Str::new("attempt to divide by zero");
+        const changed: Str = Str::new("attempt to divide by zero, reported by the rebuilt runtime");
+        if (!this.copy_fixture(fixture, verdict)) { return 1; }
+        const first: Build = this.build(logs.file(Str::new("incr-runtime-first")).as_str());
+        const first_run: Build = this.run_after(&first, logs.file(Str::new("incr-runtime-first-run")).as_str());
+        if (!first.outcome.succeeded() || !first_run.output.as_str().contains(&message) || first_run.output.as_str().contains(&changed)) {
+            fmt::println(String::from_str(first.tail(4000)));
+            fmt::println(String::from_str(first_run.tail(2000)));
+            fmt::println(f"{verdict}: FAIL -- the first build: build {first.outcome.describe().as_str()}, run {first_run.outcome.describe().as_str()}; want a build that succeeds and a program reporting \"{message}\"");
+            return 1;
+        }
+
+        // Each panic strategy's source carries the message; the edit must
+        // change every one, or a build linking the other strategy proves
+        // nothing.
+        mut sources: Array<String> = Array::<String>::new();
+        sources.push(String::from_str(Str::new("panic/unwind.cryo")));
+        sources.push(String::from_str(Str::new("panic/abort.cryo")));
+        const quoted: String = f"\"{message}\"";
+        const replacement: String = f"\"{changed}\"";
+        for (source in sources.iterate_references()) {
+            const path: PathBuf = runtime.join(source.as_str());
+            const text: String = match (File::read_text(path.as_path())) {
+                Result::Ok(text)   => { text }
+                Result::Err(error) => { fmt::println(f"{verdict}: FAIL -- cannot read the runtime copy's {source.as_str()}: {error.describe()}"); return 1; }
+            };
+            if (!text.as_str().contains(&quoted.as_str())) {
+                fmt::println(f"{verdict}: FAIL -- the runtime's {source.as_str()} no longer holds {quoted.as_str()}; the check changes nothing");
+                return 1;
+            }
+            match (File::write_text(path.as_path(), text.as_str().replace(&quoted.as_str(), &replacement.as_str()).as_str())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { fmt::println(f"{verdict}: FAIL -- cannot change the runtime copy's {source.as_str()}: {error.describe()}"); return 1; }
+            }
+        }
+
+        const second: Build = this.build(logs.file(Str::new("incr-runtime-second")).as_str());
+        const second_run: Build = this.run_after(&second, logs.file(Str::new("incr-runtime-second-run")).as_str());
+        if (!second.outcome.succeeded() || !second_run.output.as_str().contains(&changed)) {
+            fmt::println(String::from_str(second.tail(4000)));
+            fmt::println(String::from_str(second_run.tail(2000)));
+            fmt::println(f"{verdict}: FAIL -- after the runtime's divide-by-zero message changed: build {second.outcome.describe().as_str()}, run {second_run.outcome.describe().as_str()}, and the program does not report \"{changed}\": the build kept the old runtime linked");
+            return 1;
+        }
+        fmt::println(f"{verdict}: OK -- after the runtime's divide-by-zero message changed, the build linked the rebuilt runtime and the program reports the new message");
+        return 0;
+    }
+
+    /// Copy `fixture` over a cleared scratch copy; false, with the verdict
+    /// line printed, when it cannot be copied.
+    private copy_fixture(&this, fixture: Path, verdict: Str) -> boolean {
+        if (this.project.as_path().exists()) { const _: Result<(), IoError> = Directory::remove_all(this.project.as_path()); }
+        mut excluded: Array<String> = Array::<String>::new();
+        excluded.push(String::from_str(Str::new("build")));
+        return match (Tree::copy(fixture, this.project.as_path(), &excluded)) {
+            Result::Ok(_) => { true }
+            Result::Err(reason) => {
+                fmt::println(f"{verdict}: FAIL -- cannot copy the fixture: {reason.as_str()}");
+                false
+            }
+        };
+    }
+
+    private build(&this, log: Str) -> Build {
+        mut job: Job = Job::new(this.compiler.as_str());
+        job.argument(Str::new("build"));
+        job.argument(f"--stdlib={this.stdlib.as_str()}".as_str());
+        job.directory(this.project.as_path().as_str());
+        job.default_c_compiler();
+        match (&this.runtime) {
+            Option::Some(runtime) => { job.set_variable(Str::new("CRYO_RUNTIME"), runtime.as_str()); }
+            Option::None          => { }
+        }
+        job.log_to(log);
+        const done: Completion = job.run();
+        const output: String = done.output();
+        return Build { outcome: done.outcome, output: output };
+    }
+
+    /// How the project's executable ran after `build`, and what it
+    /// printed, written to `log`; not started when the build failed or
+    /// left no executable.
+    private run_after(&this, build: &Build, log: Str) -> Build {
+        const executable: String = Host::executable_name(this.project.join(Str::new("build")).join(this.program.as_str()).as_path().as_str());
+        if (!build.outcome.succeeded() || !Path::from(executable.as_str()).is_file()) {
+            return Build { outcome: Outcome::CouldNotStart(String::from_str(Str::new("the build left no executable"))), output: String::new() };
+        }
+        mut job: Job = Job::new(executable.as_str());
+        job.log_to(log);
+        const done: Completion = job.run();
+        const output: String = done.output();
+        return Build { outcome: done.outcome, output: output };
+    }
+
+    /// The count in the build's `reusing N cached object(s)` line, 0 when
+    /// there is none.
+    public static reused(output: Str) -> i64 {
+        const marker: Str = Str::new("reusing ");
+        mut rest: Str = output;
+        loop {
+            const at: i64 = match (rest.find(&marker)) {
+                Option::Some(at) => { at }
+                Option::None     => { return 0; }
+            };
+            rest = rest.byte_substring(at + marker.length(), rest.length());
+            mut digits: i64 = 0;
+            while (digits < rest.length() && rest.byte_at(digits).unwrap().is_digit()) {
+                digits++;
+            }
+            if (digits > 0 && rest.byte_substring(digits, rest.length()).starts_with(&Str::new(" cached object"))) {
+                return match (i64::try_from(rest.byte_substring(0, digits))) {
+                    Result::Ok(count) => { count }
+                    Result::Err(_)    => { 0 }
+                };
+            }
+        }
+    }
+}

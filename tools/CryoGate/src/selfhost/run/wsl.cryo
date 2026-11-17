@@ -1,0 +1,119 @@
+///! The Linux arm from a Windows host: run inside WSL from the copy
+///! `MirrorPlan` describes, at the same time as the Windows arm, which runs
+///! natively.  The copy is brought up to date and its digest compared with
+///! the working tree's before the arm starts (`WslCopy`, which the
+///! freestanding check from a Windows host uses too); a copy that does not
+///! hold the working tree fails the arm unrun.  The arm's output is written
+///! to `build-logs/selfhost-check/linux-arm.log` and printed once it ends: it
+///! prints its own stages and arms table, and is the authority on the Linux
+///! arm.
+
+namespace cryogate::selfhost::run::wsl;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Completion, Job, Running };
+import cryogate::core::log::{ RunLogs };
+import cryogate::selfhost::arms::{ Arm, ArmStatus };
+import cryogate::selfhost::digest::{ TreeDigest };
+import cryogate::selfhost::mirror::{ MirrorPlan };
+
+/// The copy of a checkout inside WSL, brought up to date and checked.
+public type struct WslCopy {
+    /// Bring the copy of the checkout `repository`, which WSL sees at
+    /// `root`, up to date and check its digest against the working tree's,
+    /// the preparation logged to `logs` under `label`.  The copy's plan, or
+    /// why it cannot be run from.
+    public static prepare(repository: Path, root: Str, logs: &RunLogs, label: Str) -> Result<MirrorPlan, String> {
+        const plan: MirrorPlan = MirrorPlan::new(repository, root);
+        const working: TreeDigest = match (TreeDigest::of(repository)) {
+            Result::Ok(digest)  => { digest }
+            Result::Err(reason) => { return Result::Err(f"cannot take the working tree's digest: {reason.as_str()}"); }
+        };
+        mut prepare: Job = WslCopy::shell(plan.preparation().as_str());
+        prepare.log_to(logs.file(label).as_str());
+        const prepared: Completion = prepare.run();
+        if (!prepared.outcome.succeeded()) {
+            return Result::Err(f"preparing the copy failed ({prepared.outcome.describe().as_str()}); see {prepared.log.as_str()}");
+        }
+        const copied: String = match (MirrorPlan::reported(prepared.output().as_str())) {
+            Option::Some(digest) => { digest }
+            Option::None         => { return Result::Err(f"the copy reported no digest; see {prepared.log.as_str()}"); }
+        };
+        fmt::println(f"  working tree: {working.digest.as_str()}  ({working.files} files)");
+        fmt::println(f"  copy:         {copied.as_str()}");
+        if (copied != working.digest) {
+            return Result::Err(String::from_str(Str::new("the copy does not hold the working tree; refusing to run from it")));
+        }
+        return Result::Ok(plan);
+    }
+
+    /// `command` run by a login shell inside WSL.
+    public static shell(command: Str) -> Job {
+        mut job: Job = Job::new(Str::new("wsl.exe"));
+        job.argument(Str::new("--"));
+        job.argument(Str::new("bash"));
+        job.argument(Str::new("-lc"));
+        job.argument(command);
+        return job;
+    }
+}
+
+/// The Linux arm, running inside WSL.
+public type struct WslArm {
+    running: Running;
+    /// Where its output goes.
+    log: String;
+
+    /// Bring the copy of the checkout `repository`, which WSL sees at
+    /// `root`, up to date, check its digest against the working tree's, and
+    /// start the Linux arm in it, its preparation logged to `logs`.  The
+    /// arm's result when it cannot be started.
+    public static start(repository: Path, root: Str, logs: &RunLogs, allow_skipped: boolean) -> Result<WslArm, Arm> {
+        fmt::println(String::new());
+        fmt::println(f"==> linux arm: inside WSL, from {MirrorPlan::new(repository, root).directory.as_str()}");
+        const plan: MirrorPlan = match (WslCopy::prepare(repository, root, logs, Str::new("selfhost-linux-copy"))) {
+            Result::Ok(plan)    => { plan }
+            Result::Err(reason) => { return Result::Err(WslArm::failed(reason)); }
+        };
+        const directory: PathBuf = repository.join(Str::new("build-logs/selfhost-check"));
+        match (Directory::create_all(directory.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(WslArm::failed(f"cannot create {directory.as_path().as_str()}: {error.describe()}")); }
+        }
+        const log: PathBuf = directory.as_path().join(Str::new("linux-arm.log"));
+        mut arm: Job = WslCopy::shell(plan.arm(allow_skipped).as_str());
+        arm.log_to(log.as_path().as_str());
+        return match (arm.start()) {
+            Result::Ok(running) => {
+                fmt::println(f"  running alongside the Windows arm; output: {log.as_path().as_str()}");
+                Result::Ok(WslArm { running: running, log: String::from_str(log.as_path().as_str()) })
+            }
+            Result::Err(done) => { Result::Err(WslArm::failed(f"the arm could not start: {done.outcome.describe().as_str()}")) }
+        };
+    }
+
+    /// Wait for the arm, print its output, and say what became of it.
+    public finish(mut &this) -> Arm {
+        const done: Completion = this.running.wait();
+        fmt::println(String::new());
+        fmt::println(String::from_str(Str::new("==> linux arm output")));
+        fmt::println(done.output());
+        if (done.outcome.succeeded()) {
+            return Arm::new(Str::new("linux"), ArmStatus::Verified, Str::new("verified in WSL (see above)"));
+        }
+        return Arm::new(Str::new("linux"), ArmStatus::Failed, f"{done.outcome.describe().as_str()} in WSL (see above)".as_str());
+    }
+
+    /// The Linux arm failed for `reason`, printed.
+    private static failed(reason: String) -> Arm {
+        fmt::println(f"  FAIL {reason.as_str()}");
+        return Arm::new(Str::new("linux"), ArmStatus::Failed, reason.as_str());
+    }
+}

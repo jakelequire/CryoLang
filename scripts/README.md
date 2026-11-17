@@ -7,45 +7,19 @@ A script with no caller in the Makefile, CI or another script is deleted. A
 one-off codemod lands in the commit that ran it and is deleted in the next
 one; the history keeps it.
 
-## Gates
-
-| script | what it does | called by |
-|---|---|---|
-| `verify.py` | Builds once, runs census, examples, lsp-check, cross-check, incremental-instance-check, runtime-abi-check and check-fast concurrently, hashes every object (and every runtime archive member), and with `--baseline REV` compares them against a compiler and runtime built from REV, whose objects and verdicts it records per program and runs again only for a program whose inputs changed; `--selftest` drives its judges | `make verify`, `make verify-selftest` (so `make check-fast` and CI) |
-| `runtime-abi-check.sh` | Builds the runtime in each configuration with the compiler under test and checks `runtime/abi/lang_items.def` against each archive (each registered symbol defined where its row says, by one member, no unregistered `__cryo_` export) and against the `__cryo_` names compiler/src and stdlib/ spell (bash; llvm-nm) | `make runtime-abi-check`, `verify.py` (abi) |
-| `test-census.py` | Runs `cryo test` and asserts each suite's count against `tests/test-roster.txt`, and the unit tests and projects that ran by name, and that each passing `collect` project ran at least one test; a unit test gated to another OS is excused by `roster-check.py`'s own reading of the `![target]` gates | `make test-census`, `verify.py` (census), CI |
-| `roster-check.py` | Checks the discovered unit tests, projects and negative files against `tests/test-roster.txt`; `--merge` / `--update` re-pin it (`--merge` replaces a changed project or negative line); `--selftest` drives the merge | `make roster-check`, `make verify-selftest` (so `make check-fast`), CI |
-| `examples-gate.py` | Builds every `examples/` project; refuses a sweep that found none, or fewer than `--min` | `make examples`, `verify.py` (examples), CI |
-| `check-examples-output.sh` | Builds and runs four examples and diffs their stdout against `examples/<name>/expected.out` (bash, POSIX only) | `make examples-golden`, CI |
-| `valgrind-check.sh` | Runs the same four examples under valgrind (Linux only) | `make valgrind-check`, CI |
-| `lsp-gate.py` | Builds `tools/CryoLSP` with the compiler under test into its own directory, then runs that binary through `tools/CryoLSP/tests/smoke.py` (protocol checks and every fixture's checks) | `make lsp-check`, `verify.py` (lsp), CI |
-| `cross-check.py` | Compiles the runtime (in each configuration), stdlib, compiler and CryoLSP for the other OS's triple, objects only from a Windows host (a Linux host links the windows-gnu build and needs mingw plus the LLVM-C import lib) | `make cross-check`, `verify.py` (cross), CI (windows native) |
-| `incremental-check.py` | An edit to an included C header is not reported up to date; incremental build == clean build, byte for byte, over an edit matrix (refuses on Windows after the header check) | `make incremental-check`, CI |
-| `incremental-instance-check.py` | An edit asking a cached module for a new generic instance still links and reuses the cache | `make incremental-instance-check`, `verify.py` (incr), CI |
-| `vendor-consts-gate.py` | Registers a fixture C header under a throwaway `$CRYO_HOME`, then builds and runs a consumer of every constant `cryo vendor` emitted | `make vendor-check`, CI |
-| `selfhost-check.py` | Byte-identity fixed point of the compiler and of the stdlib archives its stages build: the Linux chain, the Windows chain natively or under wine; on a Windows host both at once, the Linux one from a digest-checked copy of its sources on WSL's own filesystem (`--mirror`) | `make selfhost-check`, `selfhost-check-windows.cmd`, CI |
-| `selfhost-check-windows.cmd` | Windows host: checks for Python and WSL, then runs `selfhost-check.py` | `make selfhost-check` (Windows) |
-
-## Pins
-
-| script | what it does | called by |
-|---|---|---|
-| `cryo-pin.py` | Copies (and strips) a built compiler into `bin/` and writes its `.pin.txt` sidecar | `make pin` (Linux) |
-| `verify-pin.py` | Each pin's sha256 and stamped commit match its sidecar, both sidecars name one commit, and the Windows pin carries no 32-bit base relocation (one over a thread-local's offset faults at run time); `--require-clean` for a release; `--selftest` drives the checks through fixtures | `make verify-pin`, `make verify-pin-clean`, `make verify-selftest`, CI, release |
-| `pin-windows.cmd` | Windows host: re-enters this Makefile inside WSL to run `make pin` | `make pin` (Windows) |
+Every gate is a `cryogate` subcommand (`tools/CryoGate`); none is a script.
 
 ## Release
 
 | script | what it does | called by |
 |---|---|---|
-| `build-release.sh` | Builds and stages the Linux tarball (static, stamped `cryo`) or the Windows zip under `dist/`, then smokes it | `make release`, `make release-linux`, `make release-windows`, CI, release |
-| `release-smoke.sh` | Compiles and runs hello-world with the staged release tree | `build-release.sh` |
+| `build-release.sh` | Builds and stages the Linux tarball (static, stamped `cryo`) or the Windows zip under `dist/`, then smokes it with `cryogate release-smoke` | `make release`, `make release-linux`, `make release-windows`, CI, release |
 
 ## Toolchain
 
 | script | what it does | called by |
 |---|---|---|
-| `llvm-version.env` | The one place the LLVM version is pinned; CI cache keys hash it | CI, release, `ci/install-llvm.sh`, `fetch-windows-llvm.sh`, `selfhost-check.py` |
+| `llvm-version.env` | The one place the LLVM version is pinned; CI cache keys hash it | CI, release, `ci/install-llvm.sh`, `fetch-windows-llvm.sh` |
 | `ci/install-llvm.sh` | Installs and caches LLVM on the CI runner | CI, release |
 | `fetch-windows-llvm.sh` | Downloads the Windows LLVM-C and libclang import libraries and DLLs into `.toolchains/llvm-win` | CI, release, by hand before `make pin` |
 
@@ -53,5 +27,4 @@ one; the history keeps it.
 
 | script | what it does | called by |
 |---|---|---|
-| `annotate-negative-tests.py` | Writes `//~` annotations into compile-fail files from a real `cryo check` run, keeping only ones that verify | a person adding a negative test |
 | `install-lsp-windows.cmd` | Windows host: packages `tools/CryoAnalyzer` and installs it into VS Code, replacing the installed extension; the server itself is built, installed and checked by `make install-lsp` before it runs | `make install-lsp` (Windows) |

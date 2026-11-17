@@ -1,0 +1,112 @@
+// A declaration or an assignment whose value makes a temporary and borrows
+// it is refused when the local or place would keep the borrow (negative/
+// E0460_borrow_of_released_temporary.cryo, negative/E0460_assignment_of_
+// released_temporary.cryo, negative/E0460_place_assignment_of_released_
+// temporary.cryo). These are the shapes that keep nothing of the temporary
+// and compile: an owned result, a scalar, a borrow of a binding, a view of
+// a value that is not a temporary - into a local or a place - and a `for`
+// loop, which keeps its iterable's temporaries until it ends.
+![config(testing)]
+namespace CryoTests::Tests::Lang::BorrowedTemporaryBindings;
+
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_equal };
+
+function make_words() -> Array<String> {
+    mut words: Array<String> = Array::<String>::new();
+    words.push(String::from_str(Str::new("hello")));
+    words.push(String::from_str(Str::new("world")));
+    return words;
+}
+
+function make_string() -> String {
+    return String::from_str(Str::new("text"));
+}
+
+function first_of<T>(items: Array<T>) -> T where T: Clone {
+    return items.get_reference(0).unwrap().clone();
+}
+
+![test]
+function an_owned_result_of_a_temporary_is_kept() -> Result<(), TestError> {
+    const copied: String = make_string().clone();
+    return expect_equal(copied.as_str(), Str::new("text"));
+}
+
+![test]
+function a_scalar_read_off_a_temporary_is_kept() -> Result<(), TestError> {
+    const count: i64 = make_words().length();
+    return expect_equal(count, 2);
+}
+
+![test]
+function a_borrow_of_a_binding_is_kept() -> Result<(), TestError> {
+    const words: Array<String> = make_words();
+    const second: Str = words.get_reference(1).unwrap().as_str();
+    return expect_equal(second, Str::new("world"));
+}
+
+![test]
+function a_view_of_a_literal_is_kept() -> Result<(), TestError> {
+    const text: Str = Str::new("literal");
+    return expect_equal(text.length(), 7);
+}
+
+![test]
+function a_generic_result_of_a_temporary_is_kept() -> Result<(), TestError> {
+    const first: String = first_of(make_words());
+    return expect_equal(first.as_str(), Str::new("hello"));
+}
+
+![test]
+function a_for_loop_keeps_its_temporary() -> Result<(), TestError> {
+    mut joined: String = String::new();
+    for (word in make_words().iterate_references()) { joined.push(word.as_str()); }
+    return expect_equal(joined.as_str(), Str::new("helloworld"));
+}
+
+![test]
+function an_assigned_owned_result_of_a_temporary_is_kept() -> Result<(), TestError> {
+    mut copied: String = String::new();
+    copied = make_string().clone();
+    return expect_equal(copied.as_str(), Str::new("text"));
+}
+
+![test]
+function an_assigned_scalar_read_off_a_temporary_is_kept() -> Result<(), TestError> {
+    mut count: i64 = 0;
+    count = make_words().length();
+    return expect_equal(count, 2);
+}
+
+![test]
+function an_assigned_borrow_of_a_binding_is_kept() -> Result<(), TestError> {
+    const words: Array<String> = make_words();
+    mut second: Str;
+    second = words.get_reference(1).unwrap().as_str();
+    return expect_equal(second, Str::new("world"));
+}
+
+type struct Kept {
+    owned: String;
+    count: i64;
+    view:  Str;
+}
+
+![test]
+function a_place_assigned_from_a_temporary_keeps_nothing_of_it() -> Result<(), TestError> {
+    const words: Array<String> = make_words();
+    mut kept: Kept = Kept { owned: String::new(), count: 0, view: Str::new("") };
+    kept.owned = make_string().clone();
+    kept.count = make_words().length();
+    kept.view = words.get_reference(1).unwrap().as_str();
+    const through: mut Kept* = &kept;
+    through.view = words.get_reference(0).unwrap().as_str();
+    expect_equal(kept.owned.as_str(), Str::new("text"))?;
+    expect_equal(kept.count, 2)?;
+    return expect_equal(kept.view, Str::new("hello"));
+}

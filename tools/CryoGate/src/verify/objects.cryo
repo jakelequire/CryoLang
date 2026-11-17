@@ -1,0 +1,105 @@
+///! The objects verify hashes: the populations it lists them in, the list
+///! files each population is written to, and the program each object
+///! belongs to.
+
+namespace cryogate::verify::objects;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+
+/// Which program the objects in verify's lists belong to.
+public type struct ObjectOwner {
+    /// The program an object at `path` (relative to the checkout, `/`
+    /// separated) was built for: the unit suite for one under
+    /// `tests/build/`, a project for one under its directory in
+    /// `tests/tests/projects/`, an example for one under its directory in
+    /// `examples/`; none for any other object.
+    public static of(path: Str) -> Option<String> {
+        if (path.starts_with(&Str::new("tests/build/"))) {
+            return Option::Some(String::from_str(Str::new("unit suite")));
+        }
+        match (path.strip_prefix(&Str::new("tests/tests/projects/"))) {
+            Option::Some(rest) => {
+                return match (rest.split_once(&Str::new("/"))) {
+                    Option::Some(parts) => { Option::Some(String::from_str(parts.first)) }
+                    Option::None        => { Option::Some(String::from_str(rest)) }
+                };
+            }
+            Option::None => { }
+        }
+        match (path.strip_prefix(&Str::new("examples/"))) {
+            Option::Some(rest) => {
+                const project: Str = match (rest.split_once(&Str::new("/"))) {
+                    Option::Some(parts) => { parts.first }
+                    Option::None        => { rest }
+                };
+                return Option::Some(f"examples/{project}");
+            }
+            Option::None => { }
+        }
+        return Option::None;
+    }
+
+    /// Whether an object at `path` that only the baseline built is one the
+    /// tree takes from the stdlib archive instead: a stdlib module's object
+    /// in a program's build, when the tree's builds linked an archive
+    /// (`archive_linked`).  Such an object is not counted as missing.
+    public static replaced_by_archive(path: Str, archive_linked: boolean) -> boolean {
+        return archive_linked && path.contains(&Str::new("/std/deps/"));
+    }
+}
+
+/// The populations of objects verify hashes and compares, in the order it
+/// compares them.
+public type enum ObjectPopulation {
+    /// What the census builds: the unit suite and the test projects.
+    Tests;
+    /// What the examples sweep builds.
+    Examples;
+    /// The stdlib archives the two sweeps' programs link.
+    Stdlib;
+    /// The members of the runtime archives every program links, one
+    /// archive per configuration.
+    Runtime;
+}
+
+implement enum ObjectPopulation {
+    /// Every population, in the order compared.
+    public static all() -> Array<ObjectPopulation> {
+        mut populations: Array<ObjectPopulation> = Array::<ObjectPopulation>::new();
+        populations.push(ObjectPopulation::Tests);
+        populations.push(ObjectPopulation::Examples);
+        populations.push(ObjectPopulation::Stdlib);
+        populations.push(ObjectPopulation::Runtime);
+        return populations;
+    }
+
+    /// The population's name in the report and in its lists' file names.
+    public name(&this) -> Str {
+        return match (this) {
+            ObjectPopulation::Tests    => { Str::new("tests") }
+            ObjectPopulation::Examples => { Str::new("examples") }
+            ObjectPopulation::Stdlib   => { Str::new("stdlib") }
+            ObjectPopulation::Runtime  => { Str::new("runtime") }
+        };
+    }
+
+    /// Whether this is the stdlib archives' population.
+    public is_stdlib(&this) -> boolean {
+        return match (this) { ObjectPopulation::Stdlib => { true } _ => { false } };
+    }
+
+    /// The baseline's list of the population's objects in the run
+    /// directory `run`.
+    public baseline_list(&this, run: Str) -> String {
+        return f"{run}/baseline/base.{this.name()}.sha256";
+    }
+
+    /// The tree's list of the population's objects in the run directory
+    /// `run`.
+    public tree_list(&this, run: Str) -> String {
+        return f"{run}/tree.{this.name()}.sha256";
+    }
+}

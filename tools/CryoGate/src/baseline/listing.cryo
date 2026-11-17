@@ -1,0 +1,134 @@
+///! The files git lists in a checkout, and the files a project's cryoconfig
+///! reaches outside the project's own directory.
+
+namespace cryogate::baseline::listing;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Completion };
+import cryogate::core::git::{ Git };
+import cryogate::core::text::{ Text };
+
+/// The files git lists under some paths of a checkout.
+public type struct Listing {
+    /// The tracked files under `paths` and the untracked ones git does not
+    /// ignore, as `/`-separated paths from the checkout's root, sorted by
+    /// their bytes.  A tracked file is listed whether or not it is on disk.
+    public static of(git: &Git, paths: &Array<Str>) -> Result<Array<String>, String> {
+        mut arguments: Array<Str> = Array::<Str>::new();
+        arguments.push(Str::new("ls-files"));
+        arguments.push(Str::new("-co"));
+        arguments.push(Str::new("--exclude-standard"));
+        arguments.push(Str::new("-z"));
+        arguments.push(Str::new("--"));
+        mut named: Array<String> = Array::<String>::new();
+        for (path in paths.iterate_references()) {
+            arguments.push(*path);
+            named.push(String::from_str(*path));
+        }
+        const done: Completion = git.run(&arguments);
+        if (!done.outcome.succeeded()) {
+            return Result::Err(f"git ls-files -- {Text::joined(&named, Str::new(" ")).as_str()}: {done.outcome.describe().as_str()}");
+        }
+        mut files: Array<String> = Listing::entries(done.output().as_str());
+        files.sort();
+        return Result::Ok(files);
+    }
+
+    /// The non-empty entries of `text`, separated by NUL bytes.  The
+    /// separator is compared as a byte: a string literal ends at its first
+    /// NUL, so `"\0"` is the empty string and no separator at all.
+    public static entries(text: Str) -> Array<String> {
+        mut entries: Array<String> = Array::<String>::new();
+        mut start: i64 = 0;
+        mut index: i64 = 0;
+        while (index <= text.length()) {
+            if (index == text.length() || text.byte_at(index).unwrap_or(1) == 0) {
+                if (index > start) { entries.push(String::from_str(text.byte_substring(start, index))); }
+                start = index + 1;
+            }
+            index++;
+        }
+        return entries;
+    }
+
+    /// Every file a project's cryoconfig names outside the project's
+    /// directory - a `path` dependency, a static library - and, for a named
+    /// directory, what that directory's own cryoconfig names in turn.  Every
+    /// quoted value is read as a path from the project's directory, and one
+    /// that names nothing in the checkout is not a path.  `seen` holds what
+    /// was reached already: each file or directory is reached once.
+    public static reached_outside(repository: Path, git: &Git, project: Str, seen: mut &Array<String>) -> Result<Array<String>, String> {
+        mut reached: Array<String> = Array::<String>::new();
+        const config: PathBuf = repository.join(project).join(Str::new("cryoconfig"));
+        if (!config.as_path().is_file()) { return Result::Ok(reached); }
+        const text: String = match (File::read_text(config.as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read {config.as_path().as_str()}: {error.describe()}"); }
+        };
+        const inside: String = f"{project}/";
+        for (value in Listing::quoted(text.as_str()).iterate_references()) {
+            const resolved: Option<String> = Listing::within(project, value.as_str());
+            if (resolved.is_none()) { continue; }
+            const name: String = resolved.unwrap();
+            if (!repository.join(name.as_str()).as_path().exists()) { continue; }
+            if (name.as_str() == project || name.as_str().starts_with(&inside.as_str()) || seen.contains(&name)) { continue; }
+            seen.push(name.clone());
+            mut one: Array<Str> = Array::<Str>::new();
+            one.push(name.as_str());
+            for (file in Listing::of(git, &one)?.iterate_references()) { reached.push(file.clone()); }
+            if (repository.join(name.as_str()).as_path().is_directory()) {
+                for (file in Listing::reached_outside(repository, git, name.as_str(), seen)?.iterate_references()) {
+                    reached.push(file.clone());
+                }
+            }
+        }
+        return Result::Ok(reached);
+    }
+
+    /// Every non-empty run of characters between two double quotes, read
+    /// left to right: an empty pair `""` is no value, and its second quote
+    /// opens the next one.
+    public static quoted(text: Str) -> Array<String> {
+        mut values: Array<String> = Array::<String>::new();
+        mut index: i64 = 0;
+        while (index < text.length()) {
+            if (text.byte_at(index).unwrap_or(0) != 34) { index++; continue; }
+            mut end: i64 = index + 1;
+            while (end < text.length() && text.byte_at(end).unwrap_or(0) != 34) { end++; }
+            if (end < text.length() && end > index + 1) {
+                values.push(String::from_str(text.byte_substring(index + 1, end)));
+                index = end + 1;
+            } else {
+                index++;
+            }
+        }
+        return values;
+    }
+
+    /// `value`, a `/`-separated path read from the directory `project`, as a
+    /// path from the checkout's root with every `.` and `..` resolved; none
+    /// when it is absolute, names the root itself or climbs above it.
+    public static within(project: Str, value: Str) -> Option<String> {
+        if (value.starts_with(&Str::new("/")) || value.byte_at(1).unwrap_or(0) == 58) { return Option::None; }
+        mut parts: Array<String> = Array::<String>::new();
+        const joined: String = f"{project}/{value}";
+        for (part in joined.as_str().split(&Str::new("/"))) {
+            if (part.is_empty() || part == Str::new(".")) { continue; }
+            if (part == Str::new("..")) {
+                if (parts.is_empty()) { return Option::None; }
+                const _: Option<String> = parts.pop();
+                continue;
+            }
+            parts.push(String::from_str(part));
+        }
+        if (parts.is_empty()) { return Option::None; }
+        return Option::Some(Text::joined(&parts, Str::new("/")));
+    }
+}

@@ -512,6 +512,13 @@ type struct ModuleGraph {
     /// diagnostic; before this the cycle was reported to the debug channel
     /// only, so a plain build printed "1 errors" and nothing else.
     topo_unplaced:    [u32];
+    /// Each module's position in `topo_order`, by module index; -1 for a
+    /// module the order could not place.
+    topo_position:    [i64];
+    /// Each module's transitive dependencies, one bit per module index:
+    /// module `i`'s bits are words `i * topo_reach_words` onward.
+    topo_reach:       [u64];
+    topo_reach_words: i64;
 
     // Per-module AST storage: raw pointer array to avoid array[i]=x codegen bug
     module_ast_buf: mut void*;   // malloc'd buffer of ProgramNode* pointers
@@ -576,6 +583,9 @@ public:
             modules:          [],
             topo_order:       [],
             topo_unplaced:    [],
+            topo_position:    [],
+            topo_reach:       [],
+            topo_reach_words: 0,
             module_ast_buf:   ast_buf,
             module_ast_cap:   initial_cap,
             name_index:       HashMap::<ModuleKey, u32, GlobalAllocator, FnvHasher>::new(),
@@ -1361,14 +1371,64 @@ public:
                 }
                 this.topo_unplaced = unplaced;
                 this.topo_order = order;
+                this.record_positions();
                 return false;
             }
         }
 
         this.topo_order = order;
+        this.record_positions();
         // `order` was moved into `this.topo_order`; read its length back
         // through the new owner.
         return this.topo_order.length() == (n as i64);
+    }
+
+    /// Fill `topo_position` and `topo_reach` from `topo_order`.  A module's
+    /// dependencies are placed before it, so each module's reach is complete
+    /// by the time a module importing it is reached.
+    private record_positions(mut &this) -> void {
+        const n: i64 = this.modules.length();
+        const words: i64 = (n + 63) / 64;
+        mut positions: [i64] = [];
+        mut reach: [u64] = [];
+        for (mut i: i64 = 0; i < n; i++) { positions.push(-1); }
+        for (mut i: i64 = 0; i < n * words; i++) { reach.push(0); }
+        for (mut p: i64 = 0; p < this.topo_order.length(); p++) {
+            const at: i64 = this.topo_order[p] as i64;
+            positions[at] = p;
+            const deps: &[ModulePath] = &this.modules[at].dependencies;
+            for (mut d: i64 = 0; d < deps.length(); d++) {
+                const dep: i64 = this.find_module_index(deps[d]);
+                if (dep < 0 || dep == at) { continue; }
+                const bit: u64 = 1;
+                reach[at * words + dep / 64] = reach[at * words + dep / 64] | (bit << ((dep % 64) as u64));
+                for (mut w: i64 = 0; w < words; w++) {
+                    reach[at * words + w] = reach[at * words + w] | reach[dep * words + w];
+                }
+            }
+        }
+        this.topo_position = positions;
+        this.topo_reach = reach;
+        this.topo_reach_words = words;
+    }
+
+    /// Whether the module at index `a` imports the module at index `b`,
+    /// directly or through modules it imports.  False for an index out of
+    /// range, and for a module and itself.
+    depends_on(&this, a: i64, b: i64) -> boolean {
+        const n: i64 = this.modules.length();
+        if (a < 0 || b < 0 || a >= n || b >= n || a == b) { return false; }
+        if (this.topo_reach_words == 0) { return false; }
+        const word: u64 = this.topo_reach[a * this.topo_reach_words + b / 64];
+        return ((word >> ((b % 64) as u64)) & 1) == 1;
+    }
+
+    /// The position of the module at `index` in the build order: a module
+    /// comes after every module it depends on.  -1 for an index out of
+    /// range, or a module the order could not place.
+    order_position(&this, index: i64) -> i64 {
+        if (index < 0 || index >= this.topo_position.length()) { return -1; }
+        return this.topo_position[index];
     }
 
 

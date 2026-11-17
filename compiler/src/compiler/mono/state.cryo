@@ -99,6 +99,14 @@ implement trait Clone for struct MonomorphRequest {
 }
 
 
+/// Where one implementation block a specialization carries is emitted:
+/// the source file of its owner module, and whether the block has been
+/// placed into that module's root.
+type struct BlockPlacement {
+    owner_source: SymbolStr;
+    injected:     boolean;
+}
+
 // SpecializationEntry: a completed specialization
 //
 // Lives here (with `spec_entries` on `MonoState`) rather than on the orchestrator
@@ -116,6 +124,25 @@ type struct SpecializationEntry {
     injected:          boolean;        // True once placed into its owner module's AST root (Phase 6a-iii)
     owner_source:      SymbolStr;      // Resolved owner module's source-file path; drives BOTH DI
                                        // ownership and AST placement so they always agree.
+    /// For an instance of a method with type parameters of its own, held
+    /// alone in the one block of `impl_nodes`, which carries the method's
+    /// file: the method's type arguments, in its declaration order.  Empty
+    /// on every other entry.
+    method_arguments:  [TypeRef];
+    /// Where each block of `impl_nodes` is emitted, in their order; set
+    /// when the entry is registered.  A block written in the template's
+    /// module goes with the instantiation; one written in another module is
+    /// placed by the same rule with that module considered first, so a
+    /// program's implementation for a standard-library instantiation is
+    /// emitted in the program.
+    block_placements:  [BlockPlacement];
+
+    /// Whether this entry holds an instance of a method with type
+    /// parameters of its own: a method has at least one, so its arguments
+    /// are never empty.
+    is_method_instance(&this) -> boolean {
+        return this.method_arguments.length() > 0;
+    }
 }
 
 /// One instance of a method with type parameters of its own: its type
@@ -204,19 +231,11 @@ type struct MonoState {
     // interner rather than independently here.
     materialized_insts: HashMap<TypeKey, boolean, GlobalAllocator, FnvHasher>;
 
-    // Owner modules of generic-METHOD specs (those attached to an impl block or a
-    // fixed receiver's decl, NOT the `spec_entries` type/free-function specs).
-    // A method spec's definition is emitted into the module owning the impl block
-    // it is pushed onto, but that module is often an UPSTREAM dependency of the
-    // demanding call site (`Logger` demands `Stderr::write<Str>`, whose definition
-    // lands in `io::stdio`).  The per-module incremental cache keys such an owner
-    // module on the global source digest so a downstream module introducing a new
-    // spec invalidates the owner's `.o`; without this record the owner is misread
-    // as a leaf (keyed only on its own import closure) and a stale object - missing
-    // the spec's definition - is reused, yielding an undefined-symbol link error.
-    // One entry per newly-materialized method spec (may repeat an owner); the cache
-    // consumer folds them into a per-module boolean, so duplicates are harmless.
-    spec_owner_files: [SymbolStr];
+    // How many method instances have been made: a generic method's at its
+    // own type arguments, or a default instantiated per receiver.  A round of
+    // the monomorphizer that makes one has more calls to bind, even when it
+    // added no entry to `spec_entries`.
+    method_instance_count: i64;
 
     // The conversions to trait objects a generic body's type check left to
     // each copy, settled as the copies were walked: the table each one
@@ -239,7 +258,7 @@ type struct MonoState {
             method_instances: [],
             instance_keys:    HashMap::<InstanceKey, [i64], GlobalAllocator, FnvHasher>::new(),
             materialized_insts: HashMap::<TypeKey, boolean, GlobalAllocator, FnvHasher>::new(),
-            spec_owner_files: [],
+            method_instance_count: 0,
             settled_objects:  [],
         };
     }
@@ -314,13 +333,9 @@ type struct MonoState {
         this.materialized_insts.insert(inst.table_key(), true);
     }
 
-    /// Record the source file of the unit that owns a just-materialized
-    /// generic-method spec (the unit whose impl block / receiver decl the spec
-    /// method was pushed onto), so the per-module incremental cache treats it
-    /// as a spec owner.  Called once per new method spec at DI registration.
-    record_spec_owner_file(mut &this, file: SymbolStr) -> void {
-        if (!file.is_valid()) { return; }
-        this.spec_owner_files.push(file);
+    /// Count a method instance just made (`method_instance_count`).
+    note_method_instance(mut &this) -> void {
+        this.method_instance_count += 1;
     }
 
     wire(mut &this, arena: TypeArena*, generic_registry: GenericRegistry*,

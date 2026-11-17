@@ -495,7 +495,14 @@ type struct CallResolver {
             return this.binding.param_types_through_param_bounds(
                 base_t.as_generic_param(), member.member, arg_count);
         } else {
-            return [];
+            // A primitive's methods are its `implement` blocks', not a
+            // method list.  Left without them, an argument of
+            // `x.wrapping_subtract(-(19371 & 32767))` with `x: i16` is
+            // typed at its default width before its parameter is seen.
+            mut cands: ArgCandidates = ArgCandidates::new(arg_count);
+            this.collect_on_primitive(visitor, call, member, base_ref, &cands);
+            if (cands.count == 1) { *chosen = cands.declarations[0]; }
+            return this.agreed_candidate_params(&cands);
         }
 
         if (found.length() == 0) { return []; }
@@ -1218,20 +1225,22 @@ type struct CallResolver {
                 // literals - is width-polymorphic exactly like the bare literal
                 // handled below, so a concrete slot has to reach the whole
                 // expression before its operands settle on a default width.
-                // The int side is deliberately narrow: SIGNED for a negation, so
-                // `-1` cannot adopt an unsigned slot and turn huge; for the rest,
-                // a WIDE slot, or one that holds every value the expression
-                // computes on the way (`take_u32(8 * 10000 + 64 * 100)`), as a
-                // single literal adopts a slot it fits - one that does not
-                // keeps its default width and meets the narrowing check, so a
-                // genuine narrowing is still flagged.  Neither hazard
+                // The int side is deliberately narrow: a SIGNED slot holding the
+                // negation, so `-1` cannot adopt an unsigned slot and turn huge
+                // and `-129` cannot adopt an `i8` and pass 127; for the rest,
+                // a WIDE slot.  An expression made only of integer literals
+                // that folds reaches here as the literal of its value
+                // (`SemaVisitor::resolve_written_call`), so what is left is one
+                // holding a float or one no integer type holds, and a narrow
+                // integer slot keeps it at its default width, where it meets
+                // the narrowing check.  Neither hazard
                 // exists for a float slot, and a float that misses its slot is
                 // not merely imprecise: there is no float width coercion at the
                 // call boundary, so an f64-defaulted value reaches an `f32`
                 // parameter as a `double` against a `float` signature and the
                 // module fails verification with no source location.
                 } else if (is_negative_numeric_literal_expr(arg)
-                        && (this.literals.is_signed_int_type(slot)
+                        && (this.literals.holds_negated_literal(arg, slot)
                             || is_narrow_float_type(this.arena, slot))) {
                     push_expected = true;
                 } else if ((ExpressionNode::binary_of(arg_node) != null
@@ -1239,8 +1248,7 @@ type struct CallResolver {
                         && is_constant_numeric_expr(arg)
                         && !is_negative_numeric_literal_expr(arg)
                         && (is_wide_int_type(this.arena, slot)
-                            || is_narrow_float_type(this.arena, slot)
-                            || this.literals.const_expr_fits_target(arg, slot))) {
+                            || is_narrow_float_type(this.arena, slot))) {
                     push_expected = true;
                 } else if (is_shift_of_constant_numeric_expr(arg_node)
                         && !is_constant_numeric_expr(arg)
@@ -3729,6 +3737,29 @@ type struct CallResolver {
             this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), true, true, &sel);
         }
         return true;
+    }
+
+    /// Record in `found` the candidates the selection tries for `call` on
+    /// the primitive `receiver`: the methods of its inherent `implement`
+    /// blocks, then, when none has the member's name, those of the trait
+    /// impls selected for it.
+    collect_on_primitive(mut &this, visitor: SemaVisitor*, call: CallExpr*,
+                         member: MemberAccessExpr*, receiver: TypeRef, found: mut ArgCandidates*) -> void {
+        mut sel: Selection = Selection::none();
+        sel.recv = receiver;
+        sel.collect = found;
+        const no_args: [TypeRef] = [];
+        const inherent: [DeclarationNode*] = this.ctx.generic_registry.inherent_impl_blocks(receiver);
+        for (mut bi: i64 = 0; bi < inherent.length(); bi++) {
+            this.bind_on_impl_block(visitor, call, member, DeclarationNode::impl_of(inherent[bi]), &no_args, false, &sel);
+            this.bind_on_impl_block(visitor, call, member, DeclarationNode::impl_of(inherent[bi]), &no_args, true, &sel);
+        }
+        if (found.name_seen > 0) { return; }
+        const blocks: [ImplBlock*] = this.trait_checker().impls_of(receiver);
+        for (mut ti: i64 = 0; ti < blocks.length(); ti++) {
+            this.bind_on_impl_block(visitor, call, member, blocks[ti], &no_args, false, &sel);
+            this.bind_on_impl_block(visitor, call, member, blocks[ti], &no_args, true, &sel);
+        }
     }
 
     /// Record in `found` a candidate method the selection tried, with its

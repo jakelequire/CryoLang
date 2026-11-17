@@ -1,0 +1,90 @@
+///! The baseline homes, `.verify/baseline/<key>`, one per baseline compiler:
+///! each use is stamped, and only the most recently used are kept, so the
+///! cache stays bounded however many baselines a checkout is verified
+///! against.
+
+namespace cryogate::baseline::cache;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::tree::{ Tree };
+
+/// The directory of baseline homes.
+public type struct BaselineCache {
+    /// How many homes are kept.
+    public const KEPT: i64 = 6;
+
+    /// Stamp `home` as used now: its `last-use` file is written, and that
+    /// file's modification time is the stamp.
+    public static mark(home: Path) -> Result<(), String> {
+        const stamp: PathBuf = home.join(Str::new("last-use"));
+        return match (File::write_text(stamp.as_path(), Str::new(""))) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot write {stamp.as_path().as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// The `count` homes to keep, most recently used first: `current`, the
+    /// home in use, which is stamped before the cache is pruned, then those
+    /// whose stamps (`(name, seconds)`, 0 for a home never stamped) are
+    /// newest, a tie going to the name that sorts first.
+    public static kept(homes: &Array<Pair<String, i64>>, count: i64, current: Str) -> Array<String> {
+        mut kept: Array<String> = Array::<String>::new();
+        if (!current.is_empty()) { kept.push(String::from_str(current)); }
+        while (kept.length() < count) {
+            mut found: boolean = false;
+            mut best_name: String = String::new();
+            mut best_seconds: i64 = 0;
+            for (home in homes.iterate_references()) {
+                if (kept.contains(&home.first)) { continue; }
+                if (!found || home.second > best_seconds || (home.second == best_seconds && home.first < best_name)) {
+                    found = true;
+                    best_name = home.first.clone();
+                    best_seconds = home.second;
+                }
+            }
+            if (!found) { break; }
+            kept.push(best_name);
+        }
+        return kept;
+    }
+
+    /// The homes under `directory`, each with its stamp's modification
+    /// time in seconds, 0 for one never stamped.
+    public static homes(directory: Path) -> Result<Array<Pair<String, i64>>, String> {
+        mut homes: Array<Pair<String, i64>> = Array::<Pair<String, i64>>::new();
+        for (name in Tree::names(directory, &Array::<String>::new())?.iterate_references()) {
+            const stamp: PathBuf = directory.join(name.as_str()).join(Str::new("last-use"));
+            const seconds: i64 = match (stamp.as_path().metadata()) {
+                Result::Ok(metadata) => { metadata.modified_seconds() }
+                Result::Err(_)       => { 0 }
+            };
+            homes.push(Pair::new(name.clone(), seconds));
+        }
+        return Result::Ok(homes);
+    }
+
+    /// Delete every home under `directory` but the `KEPT` most recently
+    /// used and `current`; the names deleted.
+    public static prune(directory: Path, current: Str) -> Result<Array<String>, String> {
+        const homes: Array<Pair<String, i64>> = BaselineCache::homes(directory)?;
+        const kept: Array<String> = BaselineCache::kept(&homes, BaselineCache::KEPT, current);
+        mut deleted: Array<String> = Array::<String>::new();
+        for (home in homes.iterate_references()) {
+            if (kept.contains(&home.first)) { continue; }
+            const path: PathBuf = directory.join(home.first.as_str());
+            match (Directory::remove_all(path.as_path())) {
+                Result::Ok(_)      => { deleted.push(home.first.clone()); }
+                Result::Err(error) => { return Result::Err(f"cannot remove {path.as_path().as_str()}: {error.describe()}"); }
+            }
+        }
+        return Result::Ok(deleted);
+    }
+}

@@ -65,11 +65,14 @@ const VENDOR_BOX_WIDTH:   i64 = 76;   // '+' to '+' inclusive
 const VENDOR_LABEL_WIDTH: i64 = 12;
 const VENDOR_VALUE_WIDTH: i64 = 58;   // BOX_WIDTH - 2 bars - 4 padding - LABEL
 
-/// Tally returned by the compile-fail suite so `cmd_test`'s unified
-/// OVERALL footer can quote it alongside the unit-suite outcome.
+/// Tally returned by the compile-fail and project suites so `cmd_test`'s
+/// unified OVERALL footer can quote it alongside the unit-suite outcome.
 type struct NegSuiteResult {
     ran:      i32;
     failures: i32;
+    /// The build warnings the project suite listed; none for the
+    /// compile-fail suite, whose diagnostics are its subject.
+    warnings: i32;
 }
 
 /// One `//~` expectation parsed from a negative-test source file: the compiler
@@ -84,17 +87,19 @@ type struct NegExpect {
     msg:      String;
 }
 
-/// One diagnostic parsed back out of `cryo check`'s rendered output: `severity`
+/// One diagnostic parsed back out of a build's rendered output: `severity`
 /// and `code` from the `error[Exxxx]:` / `warning[Wxxxx]:` header, `message` the
-/// remainder of that header line, and `line` the source line from the following
-/// `--> file:line:col` arrow.  Only diagnostics anchored in the test file itself
-/// are collected (an arrow pointing elsewhere - e.g. into the stdlib - is not the
-/// test's concern), so `//~` exhaustiveness is scoped to the file under test.
+/// remainder of that header line, and `file` and `line` the place the following
+/// `--> file:line:col` arrow names.  A negative test collects only diagnostics
+/// anchored in the test file itself (an arrow pointing elsewhere - e.g. into the
+/// stdlib - is not the test's concern), so `//~` exhaustiveness is scoped to the
+/// file under test; a project's build warnings are collected wherever they are.
 type struct NegDiag {
     line:     i64;
     severity: string;
     code:     String;
     message:  String;
+    file:     String;
 }
 
 /// Parsed `test.json` for a multi-module test project (see
@@ -165,6 +170,18 @@ type struct ProjSpec {
     /// source and exit with `applied.exit_code` (default 0).
     applied: boolean;
     applied_exit_code: i64;
+    /// test.json `rebuild`: the project is built twice into one build
+    /// directory.  A copy of it is built once, which must succeed; then each
+    /// `rebuild_files[k]` in the copy is overwritten with the project's own
+    /// `rebuild_sources[k]`, and the copy is run again, with
+    /// `rebuild_arguments` instead of `arguments` when
+    /// `rebuild_sets_arguments`.  Everything else in the spec judges that
+    /// second run.
+    rebuild: boolean;
+    rebuild_files: [String];
+    rebuild_sources: [String];
+    rebuild_arguments: [String];
+    rebuild_sets_arguments: boolean;
 
     static empty() -> ProjSpec {
         return ProjSpec {
@@ -173,8 +190,26 @@ type struct ProjSpec {
             environment: [], arguments: [], stderr_contains: [], stderr_excludes: [],
             stdout_line_prefixes: [], stderr_line_prefixes: [],
             file: String::new(), file_contains: [], file_excludes: [],
-            applied: false, applied_exit_code: 0
+            applied: false, applied_exit_code: 0,
+            rebuild: false, rebuild_files: [], rebuild_sources: [], rebuild_arguments: [],
+            rebuild_sets_arguments: false
         };
+    }
+
+    /// What the first build of a `rebuild` project is held to: a build (a
+    /// run fixture's program is not run; a collect fixture builds through
+    /// its own `cryo test`), in this project's environment and with its
+    /// arguments, exiting 0 with nothing else asserted.
+    first_build(&this) -> ProjSpec {
+        mut first: ProjSpec = ProjSpec::empty();
+        first.outcome = if (this.outcome == 0) { 0 } else { 1 };
+        for (mut i: i64 = 0; i < this.environment.length(); i++) {
+            first.environment.push(this.environment[i].clone());
+        }
+        for (mut i: i64 = 0; i < this.arguments.length(); i++) {
+            first.arguments.push(this.arguments[i].clone());
+        }
+        return first;
     }
 
     /// What the copy with its fixes applied is held to: it runs, with
@@ -1755,19 +1790,23 @@ type struct Executor {
         return String::from_str(arguments.unwrap().first.trim());
     }
 
-    /// The source LINE of a `--> file:line:col` arrow line: the number between
-    /// its last two colons.  Read from the tail, so a drive-letter colon
-    /// (`C:\...`) sits earlier and never becomes one of the final two.  -1 if
+    /// The FILE and source LINE of a `--> file:line:col` arrow line: the line
+    /// is the number between its last two colons, the file what precedes them
+    /// after the arrow.  Read from the tail, so a drive-letter colon (`C:\...`)
+    /// sits earlier and never becomes one of the final two.  The line is -1 if
     /// unparseable.
-    static neg_arrow_line(arrow: str::Str) -> i64 {
+    static neg_arrow_site(arrow: str::Str) -> Pair<str::Str, i64> {
         const colon: str::Str = str::Str::new(":");
         const column: Option<Pair<str::Str, str::Str>> = arrow.split_once_from_end(&colon);
-        if (column.is_none()) { return -1; }
+        if (column.is_none()) { return Pair::new(str::Str::new(""), -1); }
         const line: Option<Pair<str::Str, str::Str>> = column.unwrap().first.split_once_from_end(&colon);
-        if (line.is_none()) { return -1; }
-        return match (u64::parse_radix(line.unwrap().second.as_bytes(), 10)) {
-            Option::Some(number) => { number as i64 }
-            Option::None         => { -1 }
+        if (line.is_none()) { return Pair::new(str::Str::new(""), -1); }
+        const place: Pair<str::Str, str::Str> = line.unwrap();
+        const after_arrow: str::Str = place.first.trim_start();
+        const file: str::Str = after_arrow.strip_prefix(&str::Str::new("-->")).unwrap_or(after_arrow).trim();
+        return match (u64::parse_radix(place.second.as_bytes(), 10)) {
+            Option::Some(number) => { Pair::new(file, number as i64) }
+            Option::None         => { Pair::new(file, -1) }
         };
     }
 
@@ -1835,10 +1874,11 @@ type struct Executor {
         return f"error[{expected}]";
     }
 
-    /// Enumerate the diagnostics `cryo check` rendered into `out` that are
-    /// anchored in the test file `fname` (its basename must appear in the `-->`
-    /// arrow line).  Scoping to the file keeps `//~` exhaustiveness from tripping
-    /// on stdlib-internal diagnostics.
+    /// Enumerate the diagnostics rendered into `out` that are anchored in the
+    /// file `file_name` (its basename must appear in the `-->` arrow line), or
+    /// in any file when `file_name` is empty.  Scoping to the file keeps `//~`
+    /// exhaustiveness from tripping on stdlib-internal diagnostics.  A
+    /// diagnostic with no arrow has no place, and is not enumerated.
     static parse_diagnostics(out: Str, file_name: Str) -> [NegDiag] {
         mut diags: [NegDiag] = [];
         const newline: str::Str = str::Str::new("\n");
@@ -1859,11 +1899,12 @@ type struct Executor {
             if (stacked.is_some()) {
                 if (line.trim_start().starts_with(&arrow)) {
                     const head: i64 = stacked.unwrap();
-                    const site_line: i64 = Executor::neg_arrow_line(line);
-                    if (line.contains(&file_name) && site_line >= 0) {
-                        const site: NegDiag = NegDiag { line: site_line, severity: diags[head].severity,
+                    const place: Pair<str::Str, i64> = Executor::neg_arrow_site(line);
+                    if ((file_name.is_empty() || line.contains(&file_name)) && place.second >= 0) {
+                        const site: NegDiag = NegDiag { line: place.second, severity: diags[head].severity,
                                                         code: diags[head].code.clone(),
-                                                        message: diags[head].message.clone() };
+                                                        message: diags[head].message.clone(),
+                                                        file: String::from_str(place.first) };
                         diags.push(site);
                     }
                     continue;
@@ -1884,15 +1925,18 @@ type struct Executor {
                 message = message.strip_prefix(&colon).unwrap_or(message);
                 pending = Option::Some(NegDiag { line: -1, severity: severity,
                                                  code: String::from_str(code),
-                                                 message: String::from_str(message.trim_start()) });
+                                                 message: String::from_str(message.trim_start()),
+                                                 file: String::new() });
                 continue;
             }
             // The diagnostic's first arrow places it, and binds it to the test
             // file only when that arrow's own line names the file.
             if (pending.is_none() || !line.trim_start().starts_with(&arrow)) { continue; }
             mut diagnostic: NegDiag = pending.take().unwrap();
-            if (!line.contains(&file_name)) { continue; }
-            diagnostic.line = Executor::neg_arrow_line(line);
+            if (!file_name.is_empty() && !line.contains(&file_name)) { continue; }
+            const place: Pair<str::Str, i64> = Executor::neg_arrow_site(line);
+            diagnostic.line = place.second;
+            diagnostic.file = String::from_str(place.first);
             if (diagnostic.line >= 0) {
                 stacked = Option::Some(diags.length());
                 diags.push(diagnostic);
@@ -2079,7 +2123,7 @@ type struct Executor {
             Result::Err(_) => { }
         }
         if (names.length() == 0) {
-            return NegSuiteResult { ran: 0, failures: 0 };
+            return NegSuiteResult { ran: 0, failures: 0, warnings: 0 };
         }
 
         const is_pretty:  boolean = fmt_choice == "pretty";
@@ -2191,7 +2235,7 @@ type struct Executor {
                 }
                 ran += 1;
             }
-            return NegSuiteResult { ran: ran, failures: failures };
+            return NegSuiteResult { ran: ran, failures: failures, warnings: 0 };
         });
         const failures: i32 = tally.failures;
         const ran: i32 = tally.ran;
@@ -2220,7 +2264,7 @@ type struct Executor {
             }
             fmt::printf("%s\n", TEST_RULE_HEAVY);
         }
-        return NegSuiteResult { ran: ran, failures: failures };
+        return NegSuiteResult { ran: ran, failures: failures, warnings: 0 };
     }
 
     /// The first `requires` token NOT satisfied in this environment, or "" when
@@ -2357,6 +2401,43 @@ type struct Executor {
             }
             Option::None => { }
         }
+        // A `rebuild` that replaces no file and changes no argument would
+        // build the same project twice and prove nothing about the second
+        // build, and a replacement missing either side names nothing to
+        // copy: both make the test.json malformed.
+        mut rebuild_malformed: boolean = false;
+        match (root.get(str::Str::new("rebuild"))) {
+            Option::Some(rp) => {
+                spec.rebuild = true;
+                if (!rp.is_object()) { rebuild_malformed = true; }
+                match (rp.get(str::Str::new("replace"))) {
+                    Option::Some(list) => {
+                        if (!list.is_array()) { rebuild_malformed = true; }
+                        for (mut i: i64 = 0; i < list.length(); i++) {
+                            const entry: value::JsonValue* = list.at(i).unwrap();
+                            const target: Option<str::Str> = match (entry.get(str::Str::new("file"))) {
+                                Option::Some(fp) => { fp.as::<str::Str>() }
+                                Option::None     => { Option::None }
+                            };
+                            const source: Option<str::Str> = match (entry.get(str::Str::new("with"))) {
+                                Option::Some(wp) => { wp.as::<str::Str>() }
+                                Option::None     => { Option::None }
+                            };
+                            if (target.is_none() || source.is_none()) { rebuild_malformed = true; continue; }
+                            spec.rebuild_files.push(String::from_str(target.unwrap()));
+                            spec.rebuild_sources.push(String::from_str(source.unwrap()));
+                        }
+                    }
+                    Option::None => { }
+                }
+                if (rp.get(str::Str::new("arguments")).is_some()) {
+                    spec.rebuild_sets_arguments = true;
+                    Executor::read_strings(rp, "arguments", &spec.rebuild_arguments);
+                }
+                if (spec.rebuild_files.length() == 0 && !spec.rebuild_sets_arguments) { rebuild_malformed = true; }
+            }
+            Option::None => { }
+        }
         match (root.get(str::Str::new("expect"))) {
             Option::Some(ep) => {
                 match (ep.get(str::Str::new("exit_code"))) {
@@ -2423,6 +2504,7 @@ type struct Executor {
             Option::None => { }
         }
         mem::drop(root);
+        if (rebuild_malformed) { return Option::None; }
         return Option::Some(spec);
     }
 
@@ -2470,7 +2552,8 @@ type struct Executor {
         //   verdict_of[i]: 0 run job_of[i], 1 malformed test.json, 2 ignored,
         //                  3 unknown requirement, 4 unmet requirement,
         //                  5 project directory missing, 6 an earlier run's
-        //                  `expect.file` that could not be removed
+        //                  `expect.file` that could not be removed, 7 a
+        //                  `rebuild` whose first build or replacement failed
         const tmp: path::PathBuf = neg_tmp_path();
         const filter: str::Str = str::Str::new(pattern);
         mut names:      [String]   = [];
@@ -2480,11 +2563,14 @@ type struct Executor {
         //   applied_job_of[i]: the job running the copy of project i with its
         //                      fixes applied, or -1 when it has no `applied`
         mut applied_job_of: [i64]  = [];
+        //   copy_of[i]: the copy a `rebuild` project was built twice in, or
+        //               empty
+        mut copy_of:    [String]   = [];
         mut specs:      [ProjSpec] = [];
         mut cmds:       [String]   = [];
         const entries: DirectoryEntries = match (Directory::entries(projects_dir)) {
             Result::Ok(listing) => { listing }
-            Result::Err(_)      => { return NegSuiteResult { ran: 0, failures: 0 }; }
+            Result::Err(_)      => { return NegSuiteResult { ran: 0, failures: 0, warnings: 0 }; }
         };
         for (entry in entries) {
             const name: str::Str = entry.name();
@@ -2528,13 +2614,32 @@ type struct Executor {
                     }
                 }
             }
+            // A `rebuild` project's job is its second build, in the copy its
+            // first build ran in; its project directory is that copy from
+            // here on.  A first build that failed fails the project (7).
+            mut copy_text: String = String::new();
+            if (verdict == 0 && spec.rebuild) {
+                copy_text = f"{tmp.as_path().as_str()}.rebuild.{cmds.length()}";
+                const failure: String = Executor::build_first(self_exe, stdlib_abs, proj_dir.as_path(),
+                    path::Path::from(copy_text.as_str()), &spec, build_flags);
+                if (failure.length() > 0) {
+                    verdict = 7; reason = failure;
+                } else if (spec.rebuild_sets_arguments) {
+                    spec.arguments = [];
+                    for (mut k: i64 = 0; k < spec.rebuild_arguments.length(); k++) {
+                        spec.arguments.push(spec.rebuild_arguments[k].clone());
+                    }
+                }
+            }
+            copy_of.push(copy_text.clone());
+            const run_dir: path::PathBuf = if (copy_text.length() > 0) { path::PathBuf::from(copy_text.as_str()) } else { path::PathBuf::from(proj_dir.as_path().as_str()) };
             names.push(String::from_str(name));
             verdict_of.push(verdict);
             reason_of.push(reason);
             if (verdict == 0) {
                 const out_path: String = Executor::job_tmp_path(tmp.as_path(), cmds.length() as u64);
                 job_of.push(cmds.length() as i64);
-                cmds.push(Executor::project_command(self_exe, stdlib_abs, proj_dir.as_path(), &spec,
+                cmds.push(Executor::project_command(self_exe, stdlib_abs, run_dir.as_path(), &spec,
                     out_path.as_str(), build_flags));
                 // The fixes are made in a copy, never in the tree's own
                 // sources; the copy's build output is left behind so its
@@ -2568,7 +2673,7 @@ type struct Executor {
         }
 
         if (names.length() == 0) {
-            return NegSuiteResult { ran: 0, failures: 0 };
+            return NegSuiteResult { ran: 0, failures: 0, warnings: 0 };
         }
         const is_pretty:  boolean = fmt_choice == "pretty";
         const is_compact: boolean = fmt_choice == "compact";
@@ -2601,6 +2706,7 @@ type struct Executor {
         const tally: NegSuiteResult = thread::scope((scope: mut &thread::Scope) -> NegSuiteResult {
             mut failures: i32 = 0;
             mut ran: i32 = 0;
+            mut warnings: i32 = 0;
             mut w: u32 = 0;
             while (w < jobs && (w as u64) < n_jobs) {
                 scope.spawn(move () -> void { batch.run(); });
@@ -2650,11 +2756,19 @@ type struct Executor {
                     Executor::proj_report(is_pretty, is_compact, color_on, false, stale.as_str());
                     failures += 1; ran += 1; continue;
                 }
+                // A copy left behind is removed before the next run copies
+                // the project there, or fails that project.
+                const copy_text: str::Str = copy_of[i].as_str();
+                if (verdict == 7) {
+                    Executor::proj_report(is_pretty, is_compact, color_on, false, reason);
+                    match (Directory::remove_all(path::Path::from(copy_text))) { Result::Ok(_) => { } Result::Err(_) => { } }
+                    failures += 1; ran += 1; continue;
+                }
 
                 const k: u64 = job_of[i] as u64;
                 Executor::wait_job(done.as_pointer(), k);
                 const out_path: String = Executor::job_tmp_path(tmp.as_path(), k);
-                const proj_dir: path::PathBuf = projects_dir.join(name);
+                const proj_dir: path::PathBuf = if (copy_text.length() > 0) { path::PathBuf::from(copy_text) } else { projects_dir.join(name) };
                 mut res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path.as_str(), proj_dir.as_path());
                 if (!Executor::remove_project_file(proj_dir.as_path(), &specs[i]) && res.passed) {
                     res = ProjOutcome { passed: false,
@@ -2703,9 +2817,13 @@ type struct Executor {
                         if (err.length() > 0) { fmt::printf("%.*s\n", err.length() as i32, err.as_str().as_pointer()); }
                     }
                 }
+                warnings += Executor::list_build_warnings(out_path.as_str(), !is_compact);
                 const out_error: String = Executor::stderr_path(out_path.as_str());
                 Executor::remove_capture(path::Path::from(out_path.as_str()));
                 Executor::remove_capture(path::Path::from(out_error.as_str()));
+                if (copy_text.length() > 0) {
+                    match (Directory::remove_all(path::Path::from(copy_text))) { Result::Ok(_) => { } Result::Err(_) => { } }
+                }
                 if (applied_out.length() > 0) {
                     const applied_error: String = Executor::stderr_path(applied_out.as_str());
                     Executor::remove_capture(path::Path::from(applied_out.as_str()));
@@ -2713,7 +2831,7 @@ type struct Executor {
                 }
                 ran += 1;
             }
-            return NegSuiteResult { ran: ran, failures: failures };
+            return NegSuiteResult { ran: ran, failures: failures, warnings: warnings };
         });
         const failures: i32 = tally.failures;
         const ran: i32 = tally.ran;
@@ -2730,6 +2848,9 @@ type struct Executor {
             fmt::printf("%s\n", TEST_RULE_THIN);
             fmt::printf("    %-9s%6d\n", "passed", ran - failures);
             fmt::printf("    %-9s%6d\n", "failed", failures);
+            // Printed whatever the count, so a reader can tell a runner that
+            // lists build warnings and found none from one that lists none.
+            fmt::printf("    %-9s%6d\n", "warnings", tally.warnings);
             fmt::printf("%s\n", TEST_RULE_THIN);
             if (color_on && failures == 0) {
                 fmt::printf("    result   %s%s%s\n", NEG_ANSI_GREEN, verdict, NEG_ANSI_RESET);
@@ -2740,7 +2861,37 @@ type struct Executor {
             }
             fmt::printf("%s\n", TEST_RULE_HEAVY);
         }
-        return NegSuiteResult { ran: ran, failures: failures };
+        return NegSuiteResult { ran: ran, failures: failures, warnings: tally.warnings };
+    }
+
+    /// The warnings a project's build reported in its captured output at
+    /// `capture` and the stderr captured beside it, each listed under the
+    /// project's verdict line when `shown`, as `    warning <code>
+    /// <file>:<line>`: a passing project's output is not echoed, and its
+    /// warnings are seen there or nowhere.  A warning with no span has no
+    /// place and is not listed.  Returns how many there were.
+    static list_build_warnings(capture: Str, shown: boolean) -> i32 {
+        const output: String = Executor::read_file_or_empty(path::Path::from(capture));
+        const error_path: String = Executor::stderr_path(capture);
+        const errors: String = Executor::read_file_or_empty(path::Path::from(error_path.as_str()));
+        const from_output: [NegDiag] = Executor::parse_diagnostics(output.as_str(), str::Str::new(""));
+        const from_errors: [NegDiag] = Executor::parse_diagnostics(errors.as_str(), str::Str::new(""));
+        return Executor::list_warnings_of(&from_output, shown) + Executor::list_warnings_of(&from_errors, shown);
+    }
+
+    /// The warnings among `diagnostics`, listed when `shown`; their count.
+    static list_warnings_of(diagnostics: &[NegDiag], shown: boolean) -> i32 {
+        mut count: i32 = 0;
+        for (mut d: i64 = 0; d < diagnostics.length(); d++) {
+            const found: const NegDiag* = &diagnostics[d];
+            if (found.severity != "warning") { continue; }
+            count += 1;
+            if (shown) {
+                const listed: String = f"    warning {found.code} {found.file}:{found.line}";
+                fmt::printf("%.*s\n", listed.length() as i32, listed.as_str().as_pointer());
+            }
+        }
+        return count;
     }
 
     /// Print one project's PASS/FAIL line in the active format. `detail` is
@@ -2793,6 +2944,43 @@ type struct Executor {
         command.push(f" > {tmp} 2> ");
         command.push(Executor::stderr_path(tmp));
         return shell_in_dir(proj_dir.as_str(), command.as_str());
+    }
+
+    /// A `rebuild` project's first build, in a fresh copy of it at
+    /// `copy_dir` without its `build/`, then its replacements made in the
+    /// copy, which its second build then reads.  Empty when the copy is ready
+    /// for the second build, else why it is not.  The first build runs here,
+    /// before the worker pool starts, since the second must follow it.
+    static build_first(self_exe: Str, stdlib_abs: Str, proj_dir: path::Path, copy_dir: path::Path,
+                       spec: &ProjSpec, build_flags: str::Str) -> String {
+        const fresh: boolean = !copy_dir.exists() || Directory::remove_all(copy_dir).is_ok();
+        if (!fresh || Directory::copy_all(proj_dir, copy_dir).is_err()) {
+            return String::from_str(str::Str::new("the project could not be copied to build it twice"));
+        }
+        const copied_build: path::PathBuf = copy_dir.join(str::Str::new("build"));
+        if (copied_build.as_path().exists() && Directory::remove_all(copied_build.as_path()).is_err()) {
+            return String::from_str(str::Str::new("the copy's build directory could not be cleared"));
+        }
+        const first: ProjSpec = spec.first_build();
+        const capture: String = f"{copy_dir.as_str()}.first";
+        const status: i32 = Command::shell(Executor::project_command(self_exe, stdlib_abs, copy_dir, &first,
+            capture.as_str(), build_flags).as_str());
+        const outcome: ProjOutcome = Executor::project_outcome(&first, status, capture.as_str(), copy_dir);
+        const capture_error: String = Executor::stderr_path(capture.as_str());
+        Executor::remove_capture(path::Path::from(capture.as_str()));
+        Executor::remove_capture(path::Path::from(capture_error.as_str()));
+        if (!outcome.passed) { return f"the first build: {outcome.detail}"; }
+        for (mut k: i64 = 0; k < spec.rebuild_files.length(); k++) {
+            const source: path::PathBuf = proj_dir.join(spec.rebuild_sources[k].as_str());
+            const target: path::PathBuf = copy_dir.join(spec.rebuild_files[k].as_str());
+            if (File::copy(source.as_path(), target.as_path()).is_err()) {
+                return f"cannot replace {spec.rebuild_files[k]} with {spec.rebuild_sources[k]}";
+            }
+        }
+        if (!Executor::remove_project_file(copy_dir, spec)) {
+            return f"cannot remove the {spec.file} the first build wrote";
+        }
+        return String::new();
     }
 
     /// Remove the file a project's expectations read (`expect.file`), if any,

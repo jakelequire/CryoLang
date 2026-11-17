@@ -1,0 +1,196 @@
+///! The gates' pure decisions, and the option parser every subcommand reads
+///! its command line with.
+![config(testing)]
+namespace cryogate::tests::gates;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_false };
+
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
+import cryogate::gates::cross::{ CrossBuild, CrossCheck, Population };
+import cryogate::gates::examples::{ ExamplesGate };
+import cryogate::gates::incr::{ IncrementalBuild };
+import cryogate::gates::vendor::{ VendorGate };
+
+type struct Fixture {
+    /// `cryogate` followed by the space-separated `words`.
+    private static command_line(words: Str) -> Array<String> {
+        mut arguments: Array<String> = Array::<String>::new();
+        arguments.push(String::from_str(Str::new("cryogate")));
+        for (word in words.split(&Str::new(" "))) { arguments.push(String::from_str(word)); }
+        return arguments;
+    }
+
+    private static gate_options() -> Options {
+        mut options: Options = Options::new(Str::new("cryogate gate --check --cryo <compiler> [names]"));
+        options.flag(Str::new("--check"));
+        options.valued(Str::new("--cryo"));
+        return options;
+    }
+}
+
+![test]
+function options_read_flags_values_and_positionals() -> Result<(), TestError> {
+    const arguments: Array<String> = Fixture::command_line(Str::new("--check --cryo a/cryo one --cryo=b/cryo two"));
+    const parsed: Parsed = match (Fixture::gate_options().parse(&arguments, 1)) {
+        Result::Ok(parsed) => { parsed }
+        Result::Err(_)     => { return expect(false, Str::new("a valid command line is accepted")); }
+    };
+    expect(parsed.has(Str::new("--check")), Str::new("the flag"))?;
+    expect(parsed.value(Str::new("--cryo")).unwrap() == Str::new("b/cryo"), Str::new("the last value given wins"))?;
+    expect(parsed.positionals().length() == 2, Str::new("two positionals"))?;
+    expect(parsed.positionals().get_reference(1).unwrap().as_str() == Str::new("two"), Str::new("in order"))?;
+    return expect_false(parsed.separated(), Str::new("no `--`"));
+}
+
+![test]
+function options_keep_everything_after_a_separator() -> Result<(), TestError> {
+    const arguments: Array<String> = Fixture::command_line(Str::new("--check -- python --check x"));
+    const parsed: Parsed = Fixture::gate_options().parse(&arguments, 1).unwrap();
+    expect(parsed.separated(), Str::new("`--` seen"))?;
+    expect(parsed.rest().length() == 3, Str::new("three words after it"))?;
+    return expect(parsed.rest().get_reference(1).unwrap().as_str() == Str::new("--check"), Str::new("an option after `--` is the program's"));
+}
+
+![test]
+function options_refuse_what_was_not_declared() -> Result<(), TestError> {
+    const unknown: Array<String> = Fixture::command_line(Str::new("--chekc"));
+    match (Fixture::gate_options().parse(&unknown, 1)) {
+        Result::Ok(_)       => { return expect(false, Str::new("a mistyped flag is refused")); }
+        Result::Err(reason) => { expect(reason.as_str().contains(&Str::new("`--chekc`")), Str::new("the refusal names it"))?; }
+    }
+    const missing: Array<String> = Fixture::command_line(Str::new("--cryo"));
+    match (Fixture::gate_options().parse(&missing, 1)) {
+        Result::Ok(_)       => { return expect(false, Str::new("a valued option with no value is refused")); }
+        Result::Err(reason) => { expect(reason.as_str().contains(&Str::new("needs a value")), Str::new("the refusal says why"))?; }
+    }
+    const flag_with_value: Array<String> = Fixture::command_line(Str::new("--check=yes"));
+    return expect(Fixture::gate_options().parse(&flag_with_value, 1).is_err(), Str::new("a flag given a value is refused"));
+}
+
+![test]
+function a_header_publishes_object_like_macros_and_static_constants() -> Result<(), TestError> {
+    const names: Array<String> = VendorGate::published(Str::new(
+        "#define VC_MAKE_VERSION(major, minor) (((major) << 8) | (minor))\n"
+        "#define VC_PLAIN_INT   4097\r\n"
+        "#define VC_TWO_STEP    VC_MAKE_VERSION(1, 3)\n"
+        "  #define VC_INDENTED 1\n"
+        "#defineVC_GLUED 2\n"
+        "static const unsigned long long VC_WIDE_FLAG = 0x100000000ull;\n"
+        "static const int\n    VC_SPLIT = 3;\n"
+        "static const int vc_declared_only;\n"
+        "static constant_folded VC_NOT_CONST = 4;\n"
+        "enum VcKind { VC_KIND_NONE = 0 };\n"));
+    expect(names.length() == 4, Str::new("four constants"))?;
+    expect(names.get_reference(0).unwrap().as_str() == Str::new("VC_PLAIN_INT"), Str::new("sorted, the literal first"))?;
+    expect(names.get_reference(1).unwrap().as_str() == Str::new("VC_SPLIT"), Str::new("a declaration over two lines"))?;
+    expect(names.get_reference(2).unwrap().as_str() == Str::new("VC_TWO_STEP"), Str::new("a macro invoking a macro"))?;
+    expect(names.get_reference(3).unwrap().as_str() == Str::new("VC_WIDE_FLAG"), Str::new("the static constant"))?;
+    return expect_false(names.contains(&String::from_str(Str::new("VC_MAKE_VERSIO"))), Str::new("a function-like macro is not read as a shorter name"));
+}
+
+![test]
+function a_build_states_its_population_on_its_building_lines() -> Result<(), TestError> {
+    expect(Population::counted(Str::new("Building cryo [release]: 164 local, 81 std module(s)")).unwrap() == 245, Str::new("local and std"))?;
+    expect(Population::counted(Str::new("Building cryolsp [release]: 33 local, 85 std, 169 dep module(s)")).unwrap() == 287, Str::new("with dependencies"))?;
+    expect(Population::counted(Str::new("Building cryort [release]: 9 local module(s)")).unwrap() == 9, Str::new("the runtime"))?;
+    expect(Population::counted(Str::new("cryo is up to date")).is_none(), Str::new("a warm build states none"))?;
+    expect(Population::counted(Str::new("Buildingcryo [release]: 3 local module(s)")).is_none(), Str::new("the name is separated"))?;
+    mut lines: Array<String> = Array::<String>::new();
+    lines.push(String::from_str(Str::new("Building cryort [release]: 9 local module(s)")));
+    lines.push(String::from_str(Str::new("Building cryolsp [release]: 2 local module(s)")));
+    lines.push(String::from_str(Str::new("Compiled -> build/x")));
+    const population: Population = Population::of(&lines);
+    expect(population.stated == 2, Str::new("two populations stated"))?;
+    return expect(population.modules == 11, Str::new("their modules summed"));
+}
+
+![test]
+function the_runtime_is_cross_built_as_each_configuration() -> Result<(), TestError> {
+    mut runtime: Array<String> = Array::<String>::new();
+    runtime.push(String::from_str(Str::new("runtime")));
+    const builds: Array<CrossBuild> = CrossBuild::of_projects(&runtime);
+    expect(builds.length() == 3, Str::new("one build per configuration"))?;
+    mut options: Array<String> = Array::<String>::new();
+    mut names: Array<String> = Array::<String>::new();
+    for (build in builds.iterate_references()) {
+        expect(build.project.as_str() == Str::new("runtime"), Str::new("every build is the runtime's"))?;
+        expect(build.options.length() == 1, Str::new("each names one configuration"))?;
+        options.push(build.options.get_reference(0).unwrap().clone());
+        names.push(build.directory_name());
+    }
+    expect(options.contains(&String::from_str(Str::new("--no-runtime"))), Str::new("freestanding"))?;
+    expect(options.contains(&String::from_str(Str::new("--panic=abort"))), Str::new("hosted, abort"))?;
+    expect(options.contains(&String::from_str(Str::new("--panic=unwind"))), Str::new("hosted, unwind"))?;
+    expect(names.contains(&String::from_str(Str::new("runtime_freestanding"))), Str::new("each build has its own directory"))?;
+    expect(CrossBuild::all().length() == 8, Str::new("the runtime three times, then the stdlib, the compiler, the LSP, cryogate and cryosmith"))?;
+    mut lsp: Array<String> = Array::<String>::new();
+    lsp.push(String::from_str(Str::new("tools/CryoLSP")));
+    const only: Array<CrossBuild> = CrossBuild::of_projects(&lsp);
+    expect(only.length() == 1, Str::new("another project is built once"))?;
+    return expect(only.get_reference(0).unwrap().directory_name() == String::from_str(Str::new("tools_CryoLSP")), Str::new("its directory has no slash"));
+}
+
+![test]
+function the_pinned_tools_are_cross_built_by_the_compiler_under_test() -> Result<(), TestError> {
+    mut tools: Array<String> = Array::<String>::new();
+    tools.push(String::from_str(Str::new("tools/CryoSmith")));
+    tools.push(String::from_str(Str::new("tools/CryoGate")));
+    const only: Array<CrossBuild> = CrossBuild::of_projects(&tools);
+    expect(only.length() == 2, Str::new("cryogate and cryosmith are one build each"))?;
+    expect(only.get_reference(0).unwrap().project.as_str() == Str::new("tools/CryoGate"), Str::new("in the table's order, not the request's"))?;
+    expect(only.get_reference(1).unwrap().options.is_empty(), Str::new("built as it is"))?;
+    // Every project the table builds is one `--project` accepts, once.
+    const projects: Array<String> = CrossCheck::projects();
+    expect(projects.length() == 6, Str::new("runtime, stdlib, compiler, the LSP, cryogate and cryosmith"))?;
+    expect(projects.get_reference(4).unwrap().as_str() == Str::new("tools/CryoGate"), Str::new("cryogate after the LSP"))?;
+    return expect(projects.get_reference(5).unwrap().as_str() == Str::new("tools/CryoSmith"), Str::new("cryosmith last"));
+}
+
+![test]
+function an_error_report_keeps_each_error_with_its_span() -> Result<(), TestError> {
+    mut lines: Array<String> = Array::<String>::new();
+    lines.push(String::from_str(Str::new("error[E0233]: cannot find `x`")));
+    lines.push(String::from_str(Str::new(" --> src/a.cryo:3:5")));
+    lines.push(String::from_str(Str::new("note: unrelated")));
+    lines.push(String::from_str(Str::new("error: linking failed")));
+    lines.push(String::from_str(Str::new("    |")));
+    lines.push(String::from_str(Str::new("    |")));
+    lines.push(String::from_str(Str::new(" --> too far away")));
+    const report: Array<String> = CrossCheck::error_report(&lines);
+    expect(report.length() == 3, Str::new("two errors and one span"))?;
+    expect(report.get_reference(1).unwrap().as_str().contains(&Str::new("src/a.cryo:3:5")), Str::new("the span follows its error"))?;
+    return expect(report.get_reference(2).unwrap().as_str() == Str::new("error: linking failed"), Str::new("a span three lines on is not its"));
+}
+
+![test]
+function the_reuse_count_is_read_off_the_build_line() -> Result<(), TestError> {
+    expect(IncrementalBuild::reused(Str::new("Building x [release]: 3 local\n  reusing 7 cached object(s), recompiling 13\n")) == 7, Str::new("the count"))?;
+    expect(IncrementalBuild::reused(Str::new("reusing the cache\n  reusing 12 cached object(s)")) == 12, Str::new("past a `reusing` that is not the line"))?;
+    expect(IncrementalBuild::reused(Str::new("Compiled -> build/x.exe\n")) == 0, Str::new("no line is zero"))?;
+    return expect(IncrementalBuild::reused(Str::new("  reusing 0 cached object(s), recompiling 3")) == 0, Str::new("an honest zero"));
+}
+
+![test]
+function a_golden_matches_whatever_its_line_endings() -> Result<(), TestError> {
+    const golden: Array<String> = Text::lines(Str::new("one\ntwo\n"));
+    expect(ExamplesGate::first_difference(&golden, &Text::lines(Str::new("one\r\ntwo\r\n"))).is_none(), Str::new("CRLF output"))?;
+    expect(ExamplesGate::first_difference(&golden, &Text::lines(Str::new("one\ntwo"))).is_none(), Str::new("no last line break"))?;
+    return expect(ExamplesGate::first_difference(&golden, &Text::lines(Str::new("one\ntwo\n\n\n"))).is_none(), Str::new("empty lines at the end"));
+}
+
+![test]
+function a_golden_names_the_first_line_that_differs() -> Result<(), TestError> {
+    const golden: Array<String> = Text::lines(Str::new("one\ntwo\nthree\n"));
+    expect(ExamplesGate::first_difference(&golden, &Text::lines(Str::new("one\nTWO\nthree\n"))).unwrap_or(-1) == 1, Str::new("a changed line"))?;
+    expect(ExamplesGate::first_difference(&golden, &Text::lines(Str::new("one\ntwo\n"))).unwrap_or(-1) == 2, Str::new("output cut short"))?;
+    expect(ExamplesGate::first_difference(&golden, &Text::lines(Str::new("one\ntwo\nthree\nfour\n"))).unwrap_or(-1) == 3, Str::new("output that goes on"))?;
+    expect(ExamplesGate::first_difference(&golden, &Text::lines(Str::new("one\n\ntwo\nthree\n"))).unwrap_or(-1) == 1, Str::new("an empty line inside is compared"))?;
+    return expect(ExamplesGate::first_difference(&golden, &Text::lines(Str::new("one \ntwo\nthree\n"))).unwrap_or(-1) == 0, Str::new("a trailing space is compared"));
+}

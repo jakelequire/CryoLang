@@ -1,0 +1,149 @@
+///! The `__cryo_` names the ABI check reads besides the registry: the symbols
+///! an archive's members define, as nm lists them, and the names the
+///! compiler's sources spell and the stdlib calls.
+
+namespace cryogate::abi::symbols;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::text::{ Text };
+import cryogate::core::tree::{ Tree };
+
+/// The symbols an archive's members define.
+public type struct ArchiveSymbols {
+    /// The symbols nm's `-g --defined-only` listing of an archive shows its
+    /// members defining, once per defining member, in the listing's order:
+    /// each line of three fields whose type is one upper-case letter other
+    /// than `U` (a lower-case type is local, `U` undefined).  A member's
+    /// heading and a blank line are not definitions.
+    public static defining(listing: Str) -> Array<String> {
+        mut symbols: Array<String> = Array::<String>::new();
+        const lines: Array<String> = Text::lines(listing);
+        for (line in lines.iterate_references()) {
+            mut fields: Array<Str> = Array::<Str>::new();
+            for (field in line.as_str().split_whitespace()) { fields.push(field); }
+            if (fields.length() != 3) { continue; }
+            const kind: Str = *fields.get_reference(1).unwrap();
+            if (kind.length() != 1) { continue; }
+            const letter: u8 = kind.byte_at(0).unwrap();
+            // `U` is 85.
+            if (letter.is_uppercase() && letter != 85) { symbols.push(String::from_str(*fields.get_reference(2).unwrap())); }
+        }
+        return symbols;
+    }
+
+    /// The `__cryo_` symbols of `defining` that more than one member
+    /// defines, sorted, each once: a link takes such a symbol from whichever
+    /// member it reaches first.
+    public static duplicated(defining: &Array<String>) -> Array<String> {
+        mut runtime: Array<String> = Array::<String>::new();
+        for (symbol in defining.iterate_references()) {
+            if (symbol.as_str().starts_with(&Str::new("__cryo_"))) { runtime.push(symbol.clone()); }
+        }
+        runtime.sort();
+        mut twice: Array<String> = Array::<String>::new();
+        mut index: i64 = 1;
+        while (index < runtime.length()) {
+            const symbol: Str = runtime.get_reference(index).unwrap().as_str();
+            const previous: Str = runtime.get_reference(index - 1).unwrap().as_str();
+            const listed: boolean = !twice.is_empty() && twice.get_reference(twice.length() - 1).unwrap().as_str() == symbol;
+            if (symbol == previous && !listed) { twice.push(String::from_str(symbol)); }
+            index++;
+        }
+        return twice;
+    }
+}
+
+/// The `__cryo_` names the sources spell.
+public type struct SourceNames {
+    /// Every name spelled as the start of a string, `"__cryo_...`, in the
+    /// `.cryo` files below `root`, without the quote: sorted, each once.
+    public static quoted(root: Path) -> Result<Array<String>, String> {
+        mut names: Array<String> = Array::<String>::new();
+        const texts: Array<String> = SourceNames::texts(root)?;
+        for (text in texts.iterate_references()) { SourceNames::quoted_in(text.as_str(), &names); }
+        return Result::Ok(Text::sorted_distinct(names));
+    }
+
+    /// Every name called, `__cryo_...(`, in the `.cryo` files below `root`:
+    /// sorted, each once.
+    public static called(root: Path) -> Result<Array<String>, String> {
+        mut names: Array<String> = Array::<String>::new();
+        const texts: Array<String> = SourceNames::texts(root)?;
+        for (text in texts.iterate_references()) { SourceNames::called_in(text.as_str(), &names); }
+        return Result::Ok(Text::sorted_distinct(names));
+    }
+
+    /// Add to `names` each `"__cryo_` in `text` with the name characters
+    /// (letters, digits, `_`) after it, without the quote.
+    public static quoted_in(text: Str, names: mut &Array<String>) -> void {
+        const marker: Str = Str::new("\"__cryo_");
+        mut from: i64 = 0;
+        loop {
+            const at: i64 = match (text.byte_substring(from, text.length()).find(&marker)) {
+                Option::Some(at) => { from + at }
+                Option::None     => { return; }
+            };
+            const end: i64 = SourceNames::name_end(text, at + marker.length());
+            names.push(String::from_str(text.byte_substring(at + 1, end)));
+            from = end;
+        }
+    }
+
+    /// Add to `names` each call in `text` of a `__cryo_` name: the name
+    /// characters after `__cryo_`, ending in a letter or a digit, then `(`.
+    public static called_in(text: Str, names: mut &Array<String>) -> void {
+        const marker: Str = Str::new("__cryo_");
+        mut from: i64 = 0;
+        loop {
+            const at: i64 = match (text.byte_substring(from, text.length()).find(&marker)) {
+                Option::Some(at) => { from + at }
+                Option::None     => { return; }
+            };
+            const end: i64 = SourceNames::name_end(text, at + marker.length());
+            const last: u8 = text.byte_at(end - 1).unwrap();
+            // `(` is 40.
+            const opens: boolean = end < text.length() && text.byte_at(end).unwrap() == 40;
+            if (opens && (last.is_alpha() || last.is_digit())) {
+                names.push(String::from_str(text.byte_substring(at, end)));
+                from = end + 1;
+            } else {
+                from = at + 1;
+            }
+        }
+    }
+
+    /// Where the run of name characters (letters, digits, `_`) starting at
+    /// `start` in `text` ends.
+    private static name_end(text: Str, start: i64) -> i64 {
+        mut end: i64 = start;
+        while (end < text.length()) {
+            const byte: u8 = text.byte_at(end).unwrap();
+            // `_` is 95.
+            if (!byte.is_alpha() && !byte.is_digit() && byte != 95) { break; }
+            end++;
+        }
+        return end;
+    }
+
+    /// The text of every `.cryo` file below `root`.
+    private static texts(root: Path) -> Result<Array<String>, String> {
+        mut texts: Array<String> = Array::<String>::new();
+        const files: Array<String> = Tree::files(root, &Array::<String>::new())?;
+        for (file in files.iterate_references()) {
+            if (!file.as_str().ends_with(&Str::new(".cryo"))) { continue; }
+            const path: PathBuf = root.join(file.as_str());
+            match (File::read_text(path.as_path())) {
+                Result::Ok(text)   => { texts.push(text); }
+                Result::Err(error) => { return Result::Err(f"cannot read {path.as_path().as_str()}: {error.describe()}"); }
+            }
+        }
+        return Result::Ok(texts);
+    }
+}

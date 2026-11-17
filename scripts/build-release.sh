@@ -131,14 +131,16 @@ smoke_stage() {
     # it rebuilt, or one more, is one every installed compiler would build
     # again.
     rm -rf "${stage}/stdlib/.bin" "${stage}/runtime/.bin"
-    env "${smoke_env[@]}" bash "${ROOT}/scripts/release-smoke.sh" "$stage" "$exe" "${runner[@]}"
+    make -C "$ROOT" cryogate >/dev/null
+    local cryogate="${ROOT}/tools/CryoGate/build/cryogate"
+    env "${smoke_env[@]}" "$cryogate" release-smoke "$stage" "$exe" "${runner[@]}"
     trim_stdlib_archives "$stage"
     trim_runtime_archives "$stage"
     local moved="${stage}.moved" shipped
     rm -rf "$moved"
     cp -R "$stage" "$moved"
     shipped="$(cd "$stage" && find stdlib/.bin runtime/.bin -type f | sort | xargs sha256sum)"
-    env "${smoke_env[@]}" bash "${ROOT}/scripts/release-smoke.sh" "$moved" "$exe" "${runner[@]}"
+    env "${smoke_env[@]}" "$cryogate" release-smoke "$moved" "$exe" "${runner[@]}"
     find "${moved}/stdlib/.bin" "${moved}/runtime/.bin" -name last-use -delete
     [ "$shipped" = "$(cd "$moved" && find stdlib/.bin runtime/.bin -type f | sort | xargs sha256sum)" ] \
         || { echo "error: a copy of the staged tree elsewhere did not link the shipped stdlib and runtime archives as they are" >&2; exit 1; }
