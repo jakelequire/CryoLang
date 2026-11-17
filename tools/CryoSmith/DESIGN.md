@@ -325,7 +325,6 @@ cryosmith batch --first-seed N --count K --out-dir DIR [options]
 cryosmith features
 cryosmith version
 cryosmith selftest
-cryosmith corpus-check --cryo COMPILER --work DIR [--first-seed N] [--count K] [options]
 ```
 
 Generation options: `--features LIST` (default `default`), `--functions N`
@@ -339,8 +338,8 @@ statement budget of one function, default 24), `--no-header`, and
   each path on its own line.
 - `features` prints every feature, its stage and whether `default` holds it;
   `version` prints the generator version.
-- **Exit codes:** 0 done; 1 an output could not be written, or
-  `corpus-check` found a failing program; 2 a usage error.
+- **Exit codes:** 0 done; 1 an output could not be written, or the
+  self-test failed; 2 a usage error.
 - **The header** (default on) is one comment line, the same for the same
   seed and options wherever the file goes:
 
@@ -377,14 +376,14 @@ statement budget of one function, default 24), `--no-header`, and
   `| 1)` guard and every `<<` / `>>` amount is masked. The audit reads the
   printed text, not the model, so it does not share the generator's
   mistakes about what it built.
-- **The corpus check**, `cryosmith corpus-check`: K seeds are generated,
-  each built at `--opt-level=0` and `--opt-level=2` with the compiler named,
-  and both run. A program passes when both builds succeed, both exit 0 and
-  both print the same single hash line; the summary counts the distinct
-  hashes, since a hash every program shares is a stuck one. It is
-  CryoSmith's acceptance test, not CryoGate's differential lane, and it is
-  the one place CryoSmith runs a compiler; it moves into CryoGate once
-  CryoGate's differential driver exists.
+- **The corpus check** is CryoGate's, `cryogate corpus-check`: CryoSmith
+  writes K seeds' programs (`batch`), each is built at `--opt-level=0` and
+  `--opt-level=2` with the compiler named, and both run. A program passes
+  when both builds succeed, both exit 0 and both print the same single hash
+  line; the summary counts the distinct hashes, since a hash every program
+  shares is a stuck one. CryoSmith generates and never runs a compiler;
+  checking what it generated is the gate runner's, and the output contract
+  of section 5 is what the two share.
 - **Plants prove the checks can refuse.** `--plant unguarded-division`
   generates `(a / (b & M))`, without the `| 1`. The static audit must refuse
   every planted program that divides, and the corpus check must report the
@@ -406,7 +405,6 @@ layers, lowest first:
 | `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
-| `corpus/` | `CorpusCheck`: building and running programs with a named compiler |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |
 
 `main.cryo` only hands the command line to `Cli`.
@@ -418,8 +416,8 @@ layers, lowest first:
   `configuration` imports `random`; `typing` imports `model`, `random` and
   `configuration`; `guarantees` imports `model` alone; `generate` imports
   the five layers above it; `emit` imports `model`, `configuration` and
-  `guarantees`, and never reads a random stream; `selftest` and `corpus`
-  import `generate`, `emit` and what those export; `cli` imports any layer,
+  `guarantees`, and never reads a random stream; `selftest` imports
+  `generate`, `emit` and what those export; `cli` imports any layer,
   and no layer imports `cli`.
 - Another layer is imported through its aggregator
   (`import cryosmith::model::{ Program };`), never by one of its files'
