@@ -255,8 +255,8 @@ Tests and gates
                          cryosmith's in-process checks: one seed, one
                          program; the feature switches; the static audit of
                          guarded division and shifts, and its plant.
-  make verify-selftest   verify's and selfhost-check's judges and cryogate's
-                         checks (verify-pin's among them), driven through
+  make verify-selftest   selfhost-check's judges and cryogate's checks
+                         (verify's and verify-pin's among them), driven through
                          fixtures they must accept and refuse.
   make lsp-check         tools/CryoLSP builds with the compiler under test
                          (into its own directory; installs nothing), and
@@ -827,7 +827,7 @@ vendor-check: $(STAGE2_FILE) $(CRYOGATE)
 # check-fast at the same time, and hash the objects the census and examples compiled.
 # ARGS="--baseline HEAD" also compares those objects against a compiler built
 # from HEAD's compiler/src (in a clone under .verify/, cached), which is the
-# evidence that a change moved no compiled output.  See scripts/verify.py.
+# evidence that a change moved no compiled output.  `cryogate verify`.
 #
 # Everything it needs built is a prerequisite HERE, before any gate starts:
 # the gates run concurrently, and a phony prerequisite rebuilt by one of them
@@ -837,10 +837,10 @@ vendor-check: $(STAGE2_FILE) $(CRYOGATE)
 # verify hashes.
 ifeq ($(HOST_OS),windows)
 verify: cryo $(TEST_HELPERS_A) $(CRYOGATE) $(CRYOGATE_TESTS) $(CRYOSMITH)
-	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/verify.py --cryo "$(STAGE2_EXE)" $(ARGS)
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) verify --cryo "$(STAGE2_EXE)" $(ARGS)
 else
 verify: cryo $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) $(TEST_STARTUP_HELPERS_A) $(CRYOGATE) $(CRYOGATE_TESTS) $(CRYOSMITH)
-	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/verify.py --cryo "$(STAGE2)" $(ARGS)
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) verify --cryo "$(STAGE2)" $(ARGS)
 endif
 
 # An incremental build after an edit that asks an unchanged module for a new
@@ -853,12 +853,11 @@ incremental-instance-check: cryo $(CRYOGATE)
 incremental-runtime-check: cryo $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) incr --runtime --cryo "$(STAGE2_FILE)"
 
-# The judges behind verify's tests/started-compiling declarations, and
-# selfhost-check's stage-archive comparison, and cryogate's own (the roster
-# merge, the census and verify-pin's checks among them), driven through
-# every case they must refuse and every case they must allow.
+# selfhost-check's stage-archive comparison, and cryogate's own checks (the
+# judges behind verify's declarations, the roster merge, the census and
+# verify-pin's checks among them), driven through every case they must
+# refuse and every case they must allow.
 verify-selftest: $(CRYOGATE) $(CRYOGATE_TESTS)
-	@$(PYTHON) scripts/verify.py --selftest
 	@$(PYTHON) scripts/selfhost-check.py --selftest
 	@$(CRYOGATE_COMMAND) selftest
 
@@ -869,7 +868,7 @@ verify-selftest: $(CRYOGATE) $(CRYOGATE_TESTS)
 # not.  A short gate everybody runs is worth more than a twenty-minute one
 # nobody does.
 check-fast: verify-selftest verify-pin cryosmith-selftest
-	@echo "check-fast: OK (verify's declared-program self-test, cryogate's self-test, selfhost archive-comparison self-test, pin integrity, cryosmith's self-test)"
+	@echo "check-fast: OK (cryogate's self-test, selfhost archive-comparison self-test, pin integrity, cryosmith's self-test)"
 
 # ---- language-server compile gate --------------------------------------
 # The LSP links the compiler as a LIBRARY (tools/CryoLSP/cryoconfig ->

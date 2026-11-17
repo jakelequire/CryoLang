@@ -11,8 +11,7 @@ one; the history keeps it.
 
 | script | what it does | called by |
 |---|---|---|
-| `verify.py` | Builds once (cryogate too, which runs the gates already ported to it), runs census, examples, lsp-check, cross-check, incremental-instance-check, incremental-runtime-check, runtime-abi-check and check-fast concurrently, hashes every object (and every runtime archive member), and with `--baseline REV` compares them against a compiler and runtime built from REV, whose objects and verdicts it records per program and runs again only for a program whose inputs changed, reading a baseline census run through `cryogate census --read`; `--selftest` drives its judges | `make verify`, `make verify-selftest` (so `make check-fast` and CI) |
-| `lsp-gate.py` | Builds `tools/CryoLSP` with the compiler under test into its own directory, then runs that binary through `tools/CryoLSP/tests/smoke.py` (protocol checks and every fixture's checks) | `make lsp-check`, `verify.py` (lsp), CI |
+| `lsp-gate.py` | Builds `tools/CryoLSP` with the compiler under test into its own directory, then runs that binary through `tools/CryoLSP/tests/smoke.py` (protocol checks and every fixture's checks) | `make lsp-check`, `cryogate verify` (lsp), CI |
 | `incremental-check.py` | An edit to an included C header is not reported up to date; incremental build == clean build, byte for byte, over an edit matrix (refuses on Windows after the header check) | `make incremental-check`, CI |
 | `selfhost-check.py` | Byte-identity fixed point of the compiler and of the stdlib archives its stages build: the Linux chain, the Windows chain natively or under wine; on a Windows host both at once, the Linux one from a digest-checked copy of its sources on WSL's own filesystem (`--mirror`) | `make selfhost-check`, `selfhost-check-windows.cmd`, CI |
 | `selfhost-check-windows.cmd` | Windows host: checks for Python and WSL, then runs `selfhost-check.py` | `make selfhost-check` (Windows) |
