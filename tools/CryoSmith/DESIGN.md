@@ -185,10 +185,12 @@ and a generic function may call a static one at its own `T`.
 
 **Kept off: a generic struct's own bare literal inside its methods.**
 Inside a generic struct's method, a literal of that same generic struct
-always writes its type argument. The compiler types such a literal that
-leaves it to inference as the body's own instance (`B0<T>`) whatever the
-call it is passed to expects, and refuses a valid program; lift this when
-that is fixed.
+always writes its type argument. Passed to a static call of that struct
+written without the owner's type arguments (`B0::m0(B0 { f0: x })`), the
+compiler types such a literal as the body's own instance (`B0<T>`) rather
+than inferring the owner from it, and refuses a valid program; a call that
+writes the owner's arguments types it correctly. Lift this when the
+inferred-owner form is fixed.
 
 **Overload sets.** With `overloads`, four times in ten a free function
 `h<N>` or a declared struct's method `m<N>` is followed at once by one or
@@ -215,27 +217,12 @@ one to all of its variants, in a shuffled order, then `_` when a variant
 is left (section 3.2). As a statement its arms are blocks. As an
 expression, of an integer, boolean or enum type, its arms are values of
 that type that read a name, since an arm, as an `if` expression's, gives a
-bare literal no type; it is written only where the place expects exactly
-its own type - an initializer, an assignment, an argument, a return value
-or a struct literal's field. An enum value is observed through a `u64` local initialised by
-`match (e) { E0::V0 => { 1 } E0::V1 => { 2 } }`, its variant's number plus
-one.
-
-**Kept off: a `match` expression where a different type is expected.**
-The compiler types a `match` expression with the type its context
-expects rather than with its arms' type: as an operand of a comparison
-initialising a `boolean` it is typed `boolean`, and as another `match`'s
-subject it takes the outer `match`'s type; the program is refused or fails
-at codegen. So a `match` expression is never an operand, a receiver, a
-subject or an arm, only the whole value of a place that expects its own
-type; lift this when that is fixed.
-
-**Kept off: a `match` expression with literal arms as an argument.** The
-compiler leaves such arms `i32` at an argument, while it types them by an
-initializer's type and types an `if` expression's arms at both, so the
-enum observation binds its `match` to a local rather than passing it to
-`mix`. Every other generated `match` expression's arms read a name, so the
-shape arises nowhere else; lift this when that is fixed.
+bare literal no type. A `match` expression is typed by its arms, so it
+stands wherever a value of its type that reads a name may: the whole value
+of a place, an operand, a receiver, another `match`'s arm or subject. An
+enum value is observed by passing `match (e) { E0::V0 => { 1 } E0::V1 => {
+2 } }`, its variant's number plus one, to `mix`, whose `u64` parameter
+types the literal arms.
 
 **Inferred type arguments.** With `inferred-type-arguments`, a generic
 call or an instance's literal leaves its type argument to inference four
@@ -620,6 +607,16 @@ their forms, the guarantees that keep the forms valid, a switch check in
 the self-test, an old-seed reproduction check and a corpus. Items 7 to 12
 are the tools that use what the stages generate; most of them belong to
 CryoGate, which runs compilers, while CryoSmith stays a generator.
+
+**A compiler bug the corpus finds is fixed, not avoided.** The fix lands on
+this branch as any compiler change does: a test of the shape, the pin as
+the control, a mutation the test refuses, and `make verify` with its
+declarations. The generator is then left generating the shape. A keep-off
+(a shape the generator avoids, written under "Kept off" in section 2 with
+the bug that needs it) is allowed only while that bug's fix is queued in
+the same session, or when the fix is clearly a large project of its own,
+which is then put to the maintainer as a question rather than left in
+place.
 
 1. **Finish stage 3: overload sets** (done: `overloads`, section 2).
    `model/`: functions of one owner and number share a name.
