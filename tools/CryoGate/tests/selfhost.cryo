@@ -22,8 +22,10 @@ import cryogate::core::text::{ Text };
 import cryogate::selfhost::archives::{ ArchiveComparison, StageArchives };
 import cryogate::selfhost::arms::{ Arm, ArmStatus, ArmsVerdict };
 import cryogate::selfhost::digest::{ TreeDigest };
+import cryogate::selfhost::judges::{ ArmJudge, ArmJudgement, LinkedIr };
 import cryogate::selfhost::stages::{ ArmPlan };
-import cryogate::selfhost::trees::{ ModuleTrees, TreeComparison };
+import cryogate::selfhost::trees::{ ModuleTrees, TreeComparison, TreeSize };
+import cryogate::core::child::{ Job };
 
 type struct Fixture {
     /// Write `text` to `relative` below `root`, creating its directories.
@@ -286,4 +288,52 @@ function an_arm_that_did_not_run_fails_the_run_unless_allowed() -> Result<(), Te
     failed.push(ArmStatus::Failed);
     failed.push(ArmStatus::Skipped);
     return expect(Fixture::verdict(&failed, true).exit == 1, Str::new("a failure fails the run whatever is allowed"));
+}
+
+![test]
+function the_fixed_point_needs_identical_ir_and_a_stage_four_that_answers_as_stage_three() -> Result<(), TestError> {
+    const same: TreeComparison = TreeComparison::Same(TreeSize { modules: 274, bytes: 9 });
+    const answer: Option<String> = Option::Some(String::from_str(Str::new("cryo version 1")));
+    const linked: LinkedIr = LinkedIr::Same(String::from_str(Str::new("ab")), 4);
+    const held: ArmJudgement = ArmJudge::fixed_point(Str::new("linux"), &linked, &same, &answer, &answer);
+    const text: String = Text::joined(&held.lines, Str::new("\n"));
+    expect(held.passed && held.reason == String::from_str(Str::new("274 modules byte-identical")), Str::new("identical IR, the same answer"))?;
+    expect(text.as_str().contains(&Str::new("  FIXED POINT OK  linux stage-3 and stage-4 produce byte-identical IR")), Str::new("the line a run is counted by"))?;
+    const nothing: Option<String> = Option::None;
+    const silent: ArmJudgement = ArmJudge::fixed_point(Str::new("linux"), &linked, &same, &answer, &nothing);
+    expect(!silent.passed && silent.reason == String::from_str(Str::new("linux stage-4 binary does not run")), Str::new("a stage 4 that does not run"))?;
+    const other: Option<String> = Option::Some(String::from_str(Str::new("cryo version 2")));
+    const disagree: ArmJudgement = ArmJudge::fixed_point(Str::new("windows"), &LinkedIr::NotCompared, &same, &answer, &other);
+    expect(!disagree.passed && Text::joined(&disagree.lines, Str::new("\n")).as_str().contains(&Str::new("stage-3 says 'cryo version 1', stage-4 says 'cryo version 2'")), Str::new("two answers"))?;
+    const differing: TreeComparison = TreeComparison::Differs(String::from_str(Str::new("std/io/error.ll")));
+    const tree: ArmJudgement = ArmJudge::fixed_point(Str::new("linux"), &linked, &differing, &answer, &answer);
+    expect(!tree.passed && Text::joined(&tree.lines, Str::new("\n")).as_str().contains(&Str::new("linked cryo.ll matches but per-module IR differs; first differing module: std/io/error.ll")), Str::new("the tree is compared whatever the linked file says"))?;
+    const broken: ArmJudgement = ArmJudge::fixed_point(Str::new("linux"), &LinkedIr::Differs, &same, &answer, &answer);
+    return expect(!broken.passed && broken.reason == String::from_str(Str::new("linux linked cryo.ll differs")), Str::new("a linked file that differs"));
+}
+
+![test]
+function the_stage_archives_pass_shared_or_byte_identical_only() -> Result<(), TestError> {
+    expect(ArmJudge::archives(Str::new("linux"), &ArchiveComparison::Shared).passed, Str::new("one archive, shared"))?;
+    const same: ArchiveComparison = ArchiveComparison::Compared(TreeComparison::Same(TreeSize { modules: 2, bytes: 6 }));
+    const held: ArmJudgement = ArmJudge::archives(Str::new("linux"), &same);
+    expect(held.passed && held.lines.get_reference(0).unwrap().as_str().contains(&Str::new("STDLIB ARCHIVES OK  linux stage-2 and stage-3 built byte-identical stdlib objects (2 modules, 6 bytes)")), Str::new("identical objects"))?;
+    const differs: ArchiveComparison = ArchiveComparison::Compared(TreeComparison::Differs(String::from_str(Str::new("std/io/error.o"))));
+    expect(!ArmJudge::archives(Str::new("linux"), &differs).passed, Str::new("an object differs"))?;
+    const missing: ArchiveComparison = ArchiveComparison::Compared(TreeComparison::NotComparable(String::from_str(Str::new("none"))));
+    return expect(!ArmJudge::archives(Str::new("linux"), &missing).passed, Str::new("nothing to compare"));
+}
+
+![test]
+function a_stage_compiler_is_asked_through_the_arms_runner() -> Result<(), TestError> {
+    const wine: ArmPlan = ArmPlan::windows(Path::from(Str::new("/r")), true);
+    mut arguments: Array<Str> = Array::<Str>::new();
+    arguments.push(Str::new("--version"));
+    const asked: Job = wine.compiler_job(Str::new("/r/s4/cryo.exe"), &arguments);
+    expect(asked.command_line() == String::from_str(Str::new("wine /r/s4/cryo.exe --version")), Str::new("wine runs it"))?;
+    expect(wine.pin.as_str().ends_with(&Str::new("cryo.exe")), Str::new("the Windows pin"))?;
+    const native: ArmPlan = ArmPlan::linux(Path::from(Str::new("/r")));
+    const direct: Job = native.compiler_job(Str::new("/r/s4/cryo"), &arguments);
+    expect(direct.command_line().as_str().ends_with(&Str::new("cryo --version")) && !direct.command_line().as_str().contains(&Str::new("wine")), Str::new("natively it runs itself"))?;
+    return expect(native.pin.as_str().ends_with(&Str::new("cryo")), Str::new("the Linux pin"));
 }

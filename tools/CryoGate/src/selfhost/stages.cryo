@@ -63,6 +63,8 @@ public type struct Stage {
 public type struct ArmPlan {
     /// `linux` or `windows`, as the arms table names it.
     public name: String;
+    /// The pin the first stage runs.
+    public pin: String;
     /// The three stages, in order.
     public stages: Array<Stage>;
     /// Removed before the first stage: what the stages write, and on the
@@ -106,15 +108,17 @@ public type struct ArmPlan {
         compilers.push(String::from_str(build.as_path().join(Str::new("self/s4/cryo")).as_path().as_str()));
         const variables: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
         const runner: Array<String> = Array::<String>::new();
+        const pin: PathBuf = repository.join(Str::new("bin/cryo"));
         mut stages: Array<Stage> = Array::<Stage>::new();
         stages.push(ArmPlan::stage(Str::new("pinned"), Str::new("build"), &runner,
-                                   repository.join(Str::new("bin/cryo")).as_path().as_str(), Str::new(""), false, &variables));
+                                   pin.as_path().as_str(), Str::new(""), false, &variables));
         stages.push(ArmPlan::stage(Str::new("stage-2"), Str::new("build/self/s3"), &runner,
                                    compilers.get_reference(0).unwrap().as_str(), Str::new("build/self/s3"), true, &variables));
         stages.push(ArmPlan::stage(Str::new("stage-3"), Str::new("build/self/s4"), &runner,
                                    compilers.get_reference(1).unwrap().as_str(), Str::new("build/self/s4"), true, &variables));
         return ArmPlan {
             name:             String::from_str(Str::new("linux")),
+            pin:              String::from_str(pin.as_path().as_str()),
             stages:           stages,
             wiped:            wiped,
             created:          created.clone(),
@@ -167,15 +171,17 @@ public type struct ArmPlan {
         } else {
             ArmPlan::variable(&variables, Str::new("CRYO_STDLIB"), repository.join(Str::new("stdlib")).as_path().as_str());
         }
+        const pin: PathBuf = repository.join(Str::new("bin/cryo.exe"));
         mut stages: Array<Stage> = Array::<Stage>::new();
         stages.push(ArmPlan::stage(Str::new("pinned"), Str::new("build/self/win-s2"), &runner,
-                                   repository.join(Str::new("bin/cryo.exe")).as_path().as_str(), Str::new("build/self/win-s2"), false, &variables));
+                                   pin.as_path().as_str(), Str::new("build/self/win-s2"), false, &variables));
         stages.push(ArmPlan::stage(Str::new("stage-2"), Str::new("build/self/win-s3"), &runner,
                                    compilers.get_reference(0).unwrap().as_str(), Str::new("build/self/win-s3"), true, &variables));
         stages.push(ArmPlan::stage(Str::new("stage-3"), Str::new("build/self/win-s4"), &runner,
                                    compilers.get_reference(1).unwrap().as_str(), Str::new("build/self/win-s4"), true, &variables));
         return ArmPlan {
             name:             String::from_str(Str::new("windows")),
+            pin:              String::from_str(pin.as_path().as_str()),
             stages:           stages,
             wiped:            created.clone(),
             created:          created.clone(),
@@ -232,17 +238,8 @@ public type struct ArmPlan {
     /// `--build-dir` when not the default, and `emit` asks for its IR.
     private static stage(via: Str, output: Str, runner: &Array<String>, compiler: Str, directory: Str, emit: boolean,
                          variables: &Array<Pair<String, String>>) -> Stage {
-        mut arguments: Array<String> = Array::<String>::new();
-        mut program: String = String::from_str(compiler);
-        if (!runner.is_empty()) {
-            program = runner.get_reference(0).unwrap().clone();
-            mut index: i64 = 1;
-            while (index < runner.length()) {
-                arguments.push(runner.get_reference(index).unwrap().clone());
-                index++;
-            }
-            arguments.push(String::from_str(compiler));
-        }
+        mut arguments: Array<String> = ArmPlan::invocation(runner, compiler);
+        const program: String = arguments.remove(0);
         arguments.push(String::from_str(Str::new("build")));
         arguments.push(String::from_str(Str::new("--no-incremental")));
         if (!directory.is_empty()) { arguments.push(f"--build-dir={directory}"); }
@@ -254,6 +251,26 @@ public type struct ArmPlan {
             arguments: arguments,
             variables: variables.clone(),
         };
+    }
+
+    /// The job that runs the stage compiler `compiler` with `arguments` as
+    /// this arm runs its stages: through its runner, with its variables.
+    public compiler_job(&this, compiler: Str, arguments: &Array<Str>) -> Job {
+        mut words: Array<String> = ArmPlan::invocation(&this.runner, compiler);
+        const program: String = words.remove(0);
+        mut job: Job = Job::new(program.as_str());
+        for (word in words.iterate_references()) { job.argument(word.as_str()); }
+        for (argument in arguments.iterate_references()) { job.argument(*argument); }
+        for (variable in this.variables.iterate_references()) { job.set_variable(variable.first.as_str(), variable.second.as_str()); }
+        return job;
+    }
+
+    /// The program and the leading arguments that start `compiler`: the
+    /// compiler itself, or the runner followed by the compiler.
+    private static invocation(runner: &Array<String>, compiler: Str) -> Array<String> {
+        mut words: Array<String> = runner.clone();
+        words.push(String::from_str(compiler));
+        return words;
     }
 
     private static windows_stage_names() -> Array<String> {

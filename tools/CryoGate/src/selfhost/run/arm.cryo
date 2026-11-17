@@ -1,0 +1,227 @@
+///! One arm of a selfhost run, from its plan: the stage outputs wiped, the
+///! three stages built in order, then the fixed point and the stage archives
+///! judged.  Each stage prints one line with its outcome and time; a stage
+///! that fails prints the end of its log.
+
+namespace cryogate::selfhost::run::arm;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::encoding::sha256::{ Sha256 };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::io::error::{ IoError };
+import std::time::clock::{ Instant };
+import std::time::duration::{ Duration };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::text::{ Text };
+import cryogate::selfhost::archives::{ StageArchives };
+import cryogate::selfhost::arms::{ Arm, ArmStatus };
+import cryogate::selfhost::judges::{ ArmJudge, ArmJudgement, LinkedIr };
+import cryogate::selfhost::stages::{ ArmPlan };
+import cryogate::selfhost::trees::{ ModuleTrees, TreeComparison };
+
+/// One arm's run.
+public type struct ArmRun {
+    /// Run the arm `plan` in the checkout `repository`, its logs in `logs`,
+    /// printing as it goes, and say what became of it.  An arm whose pin is
+    /// missing is skipped; one whose outputs cannot be cleared fails.
+    public static run(repository: Path, plan: &ArmPlan, logs: &RunLogs) -> Arm {
+        const name: Str = plan.name.as_str();
+        const how: Str = if (plan.runner.is_empty()) { Str::new("native") } else { Str::new("under wine") };
+        fmt::println(String::new());
+        fmt::println(f"==> {name} arm: byte-identity gate (boot: {plan.pin.as_str()}, {how})");
+        if (!Path::from(plan.pin.as_str()).is_file()) {
+            fmt::println(f"  skipped: {plan.pin.as_str()} is not present");
+            return Arm::new(name, ArmStatus::Skipped, f"{plan.pin.as_str()} not present".as_str());
+        }
+        for (wiped in plan.wiped.iterate_references()) {
+            const path: Path = Path::from(wiped.as_str());
+            if (!path.exists()) { continue; }
+            match (Directory::remove_all(path)) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { return ArmRun::failed(name, f"cannot remove {wiped.as_str()}: {error.describe()}"); }
+            }
+        }
+        // The compiler creates only the last directory of a --build-dir.
+        for (created in plan.created.iterate_references()) {
+            match (Directory::create_all(Path::from(created.as_str()))) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { return ArmRun::failed(name, f"cannot create {created.as_str()}: {error.describe()}"); }
+            }
+        }
+        const stdlib: PathBuf = repository.join(Str::new("stdlib"));
+        mut archives: StageArchives = match (StageArchives::start(stdlib.as_path())) {
+            Result::Ok(archives) => { archives }
+            Result::Err(reason)  => { return ArmRun::failed(name, reason); }
+        };
+        const started: Instant = Instant::now();
+        const compiler: PathBuf = repository.join(Str::new("compiler"));
+        const count: i64 = plan.stages.length();
+        mut index: i64 = 0;
+        while (index < count) {
+            const label: String = plan.stages.get_reference(index).unwrap().label();
+            const log: String = logs.file(f"selfhost-{name}-stage-{index + 1}".as_str());
+            const job: Job = plan.stages.get_reference(index).unwrap().job(compiler.as_path(), log.as_str());
+            const done: Completion = job.run();
+            const seconds: f64 = done.seconds;
+            if (!done.outcome.succeeded()) {
+                fmt::println(f"  [{index + 1}/{count}] {label.as_str()}  FAIL {done.outcome.describe().as_str()}  {seconds:.1} s");
+                ArmRun::print_tail(log.as_str());
+                ArmRun::print_total(&started);
+                return Arm::new(name, ArmStatus::Failed, f"stage {index + 1}/{count} did not build".as_str());
+            }
+            fmt::println(f"  [{index + 1}/{count}] {label.as_str()}  ok  {seconds:.1} s");
+            match (archives.record(plan.stages.get_reference(index).unwrap().via.as_str())) {
+                Result::Ok(_)       => { }
+                Result::Err(reason) => { return ArmRun::failed(name, reason); }
+            }
+            if (plan.libraries_beside) { ArmRun::place_libraries(repository, plan.compilers.get_reference(index).unwrap().as_str()); }
+            index++;
+        }
+
+        fmt::println(String::new());
+        fmt::println(f"==> Verifying {name} stage-3 == stage-4 IR byte identity");
+        const linked: LinkedIr = ArmRun::linked(plan);
+        const tree: TreeComparison = ModuleTrees::compare(Path::from(plan.third.as_str()), Path::from(plan.fourth.as_str()),
+                                                          Str::new("ir"), Str::new(".ll"));
+        // The compilers are asked only once their IR matches: the judgement
+        // reads their answers only then.
+        mut third: Option<String> = Option::None;
+        mut fourth: Option<String> = Option::None;
+        match (&tree) {
+            TreeComparison::Same(_) => {
+                third = ArmRun::answer(plan, plan.compilers.get_reference(1).unwrap().as_str(), logs, Str::new("stage-3"));
+                fourth = ArmRun::answer(plan, plan.compilers.get_reference(2).unwrap().as_str(), logs, Str::new("stage-4"));
+            }
+            _ => { }
+        }
+        const fixed: ArmJudgement = ArmJudge::fixed_point(name, &linked, &tree, &third, &fourth);
+        for (line in fixed.lines.iterate_references()) { fmt::println(line.clone()); }
+        match (&linked) {
+            LinkedIr::Differs => { ArmRun::print_difference(plan, logs); }
+            _                 => { }
+        }
+        const stored: ArmJudgement = ArmJudge::archives(name, &archives.compare(Path::from(plan.compilers.get_reference(0).unwrap().as_str()),
+                                                                                 Path::from(plan.compilers.get_reference(1).unwrap().as_str())));
+        for (line in stored.lines.iterate_references()) { fmt::println(line.clone()); }
+        ArmRun::print_total(&started);
+        if (!fixed.passed) { return Arm::new(name, ArmStatus::Failed, fixed.reason.as_str()); }
+        if (!stored.passed) { return Arm::new(name, ArmStatus::Failed, stored.reason.as_str()); }
+        return Arm::new(name, ArmStatus::Verified, fixed.reason.as_str());
+    }
+
+    /// The arm `name` failed for `reason`, printed.
+    private static failed(name: Str, reason: String) -> Arm {
+        fmt::println(f"  FAIL {reason.as_str()}");
+        return Arm::new(name, ArmStatus::Failed, reason.as_str());
+    }
+
+    /// The stages' linked `cryo.ll`, compared, when the arm writes one.
+    private static linked(plan: &ArmPlan) -> LinkedIr {
+        if (!plan.linked) { return LinkedIr::NotCompared; }
+        const third: PathBuf = Path::from(plan.third.as_str()).join(Str::new("cryo.ll"));
+        const fourth: PathBuf = Path::from(plan.fourth.as_str()).join(Str::new("cryo.ll"));
+        mut missing: Array<String> = Array::<String>::new();
+        if (!third.as_path().is_file()) { missing.push(String::from_str(third.as_path().as_str())); }
+        if (!fourth.as_path().is_file()) { missing.push(String::from_str(fourth.as_path().as_str())); }
+        if (!missing.is_empty()) { return LinkedIr::Missing(missing); }
+        const one: Array<u8> = match (File::read_bytes(third.as_path())) {
+            Result::Ok(bytes) => { bytes }
+            Result::Err(_)    => { return LinkedIr::Missing(missing); }
+        };
+        const other: Array<u8> = match (File::read_bytes(fourth.as_path())) {
+            Result::Ok(bytes) => { bytes }
+            Result::Err(_)    => { return LinkedIr::Missing(missing); }
+        };
+        if (one != other) { return LinkedIr::Differs; }
+        return LinkedIr::Same(Sha256::digest(one.as_slice()).to_hex(), one.length());
+    }
+
+    /// What the stage compiler `compiler` answers to `--version`, run as
+    /// the arm runs it; `None` when it is not there, does not start, fails
+    /// or runs past two minutes.
+    private static answer(plan: &ArmPlan, compiler: Str, logs: &RunLogs, label: Str) -> Option<String> {
+        if (!Path::from(compiler).is_file()) { return Option::None; }
+        mut arguments: Array<Str> = Array::<Str>::new();
+        arguments.push(Str::new("--version"));
+        mut job: Job = plan.compiler_job(compiler, &arguments);
+        job.log_to(logs.file(f"selfhost-{plan.name.as_str()}-{label}-version".as_str()).as_str());
+        job.errors_to(logs.file(f"selfhost-{plan.name.as_str()}-{label}-version-errors".as_str()).as_str());
+        job.limit(Duration::from_seconds(120));
+        const done: Completion = job.run();
+        if (!done.outcome.succeeded()) { return Option::None; }
+        return Option::Some(String::from_str(done.output().as_str().trim()));
+    }
+
+    /// Copy the libraries a Windows stage compiler loads from its own
+    /// directory beside `compiler`.  A copy that fails leaves a compiler the
+    /// next stage cannot start, which that stage reports.
+    private static place_libraries(repository: Path, compiler: Str) -> void {
+        const directory: Option<Path> = Path::from(compiler).parent();
+        match (directory) {
+            Option::Some(parent) => {
+                const libraries: Array<Pair<String, String>> = ArmPlan::libraries(repository);
+                for (library in libraries.iterate_references()) {
+                    const _: Result<i64, IoError> = File::copy(Path::from(library.second.as_str()), parent.join(library.first.as_str()).as_path());
+                }
+            }
+            Option::None => { }
+        }
+    }
+
+    /// The arm's time since `started`.
+    private static print_total(started: &Instant) -> void {
+        const seconds: f64 = started.elapsed().as_seconds_f64();
+        fmt::println(f"  total {seconds:.1} s");
+    }
+
+    /// The last lines of a failed stage's log.
+    private static print_tail(log: Str) -> void {
+        const text: String = match (File::read_text(Path::from(log))) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { String::new() }
+        };
+        const lines: Array<String> = Text::lines(text.as_str());
+        const first: i64 = if (lines.length() > ArmRun::TAIL_LINES) { lines.length() - ArmRun::TAIL_LINES } else { 0 };
+        fmt::println(f"     log: {log}");
+        fmt::println(f"     --- last {lines.length() - first} log lines ---");
+        mut index: i64 = first;
+        while (index < lines.length()) {
+            fmt::println(f"     | {lines.get_reference(index).unwrap().as_str()}");
+            index++;
+        }
+    }
+
+    /// The start of `diff -u` over the two linked files.
+    private static print_difference(plan: &ArmPlan, logs: &RunLogs) -> void {
+        mut job: Job = Job::new(Str::new("diff"));
+        job.argument(Str::new("-u"));
+        job.argument(Path::from(plan.third.as_str()).join(Str::new("cryo.ll")).as_path().as_str());
+        job.argument(Path::from(plan.fourth.as_str()).join(Str::new("cryo.ll")).as_path().as_str());
+        job.log_to(logs.file(f"selfhost-{plan.name.as_str()}-diff".as_str()).as_str());
+        const done: Completion = job.run();
+        const output: String = done.output();
+        const lines: Array<String> = Text::lines(output.as_str());
+        const shown: i64 = if (lines.length() > ArmRun::DIFF_LINES) { ArmRun::DIFF_LINES } else { lines.length() };
+        fmt::println(f"  showing the first {shown} of {lines.length()} diff lines (all in {done.log.as_str()}):");
+        mut index: i64 = 0;
+        while (index < shown) {
+            fmt::println(f"  | {lines.get_reference(index).unwrap().as_str()}");
+            index++;
+        }
+    }
+
+    /// How many lines of a failed stage's log are printed.
+    const TAIL_LINES: i64 = 30;
+    /// How many lines of the linked IR's difference are printed.
+    const DIFF_LINES: i64 = 60;
+}
