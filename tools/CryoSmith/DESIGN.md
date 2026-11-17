@@ -36,8 +36,11 @@ generated as text.
   unary operator; a binary operator; a wrapping method call
   (`a.wrapping_add(b)`); a cast (`a as T`); an implicit widening (a narrower
   value where its wider type is expected, printed bare); an `if` expression;
-  a call of a free function or a static method; a method call on a place
-  (`v2.f1.m0(a)`); a field (`v2.f1`); a struct literal (`S1 { f2: a, f0: b }`).
+  a call of a free function or a static method; a generic call, its type
+  argument written, a placeholder or left out (`g0::<u16>(a, b)`,
+  `g0::<_>(a, b)`, `g0(a, b)`); a method call on a place
+  (`v2.f1.m0(a)`); a field (`v2.f1`); a struct literal (`S1 { f2: a, f0: b }`),
+  an instance's spelling its type argument the same three ways.
 - **Statement nodes:** a declaration (`const` / `mut`), an assignment (plain
   or compound) to a place - a `mut` local, or a field reached from one or
   from a `mut &this` - an observation (`observed = mix(observed, ...)`), a
@@ -153,6 +156,19 @@ a generic function's type argument. A literal writes the type argument,
 `B0::<u16> { f1: a, f0: b }`; a field of an instance is read, written and
 observed as any struct field is. A generic struct has no method.
 
+**Inferred type arguments.** With `inferred-type-arguments`, a generic
+call or an instance's literal leaves its type argument to inference four
+times in ten (`g0(a, b)`, `B0 { f0: a }`) and writes the placeholder twice
+(`g0::<_>(a, b)`, `B0::<_> { f0: a }`). Inference reads the type argument
+off the values given for `T`, so there every such value is a **deciding
+value**: exactly the type argument, reading a name. A narrower value,
+widened where it is written, would bind `T` to its own narrower type,
+since inference never widens; a literal, or an expression made only of
+literals, decides no type parameter. An instance's first field is of type
+`T` and has no default, so its literal always gives one. The other
+parameters and fields are generated as before, widening and constants
+included.
+
 ## 3. Guarantees, and how each is enforced
 
 ### 3.1 Valid under either overflow rule
@@ -207,9 +223,12 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   operator or assigned: nothing converts a `T` to a `u64`, and no `T` local
   is declared. It is compared only under `where T: Eq`, and a generic
   function is instantiated only at a type its bound admits - an `Eq`-bounded
-  one never at a struct, which does not implement `Eq`. Every call writes
-  its type argument, so no argument (a literal among them) is left to infer
-  it.
+  one never at a struct, which does not implement `Eq`.
+- **Inference is certain.** A call or literal that leaves its type
+  argument to inference gives `T` only deciding values (section 2), so
+  each of them has the type argument's type and they agree; nothing else
+  the call or literal holds names a type parameter. One that writes its
+  type argument may pass anything that converts to it.
 - A function's body ends with a `return` of its type, or with nothing when
   it returns `void`; `main` never returns early, so its final print always
   runs.
@@ -291,9 +310,10 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
   generator's text, header aside: `--features
-  default,no-structs,no-constants,no-generics,no-generic-structs` version
-  1's, `default,no-generics,no-generic-structs` version 3's, and
-  `default,no-generic-structs` version 4's.
+  default,no-structs,no-constants,no-generics,no-generic-structs,no-inferred-type-arguments`
+  version 1's, `default,no-generics,no-generic-structs,no-inferred-type-arguments`
+  version 3's, `default,no-generic-structs,no-inferred-type-arguments`
+  version 4's, and `default,no-inferred-type-arguments` version 5's.
 - The header records the **generator version**, raised whenever one seed may
   produce different text, so a seed filed in a bug report names the
   generator that reproduces it.
@@ -307,7 +327,7 @@ every feature of the current stage; `no-<name>` removes one.
 |---|---|
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
-| 3 (this one) | `generics`: generic functions over one type parameter, unbounded or `where T: Eq`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2). Still to come in this stage: inferred type arguments, overload sets, methods of generic structs |
+| 3 (this one) | `generics`: generic functions over one type parameter, unbounded or `where T: Eq`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference. Still to come in this stage: overload sets, methods of generic structs |
 | 4 | `references`, `moves`: `&` / `mut &`, receivers, move-checked bindings |
 | 5 | `drop`: a drop log folded into the hash, the expected drop order |
 | 6 | `closures`: capturing and not, passed to function-typed slots |
@@ -402,7 +422,7 @@ layers, lowest first:
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
 | `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures` |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |

@@ -13,7 +13,7 @@ import std::collections::array::{ Array };
 
 import cryosmith::configuration::{ Feature };
 import cryosmith::generate::generator::{ Generator };
-import cryosmith::model::{ ExpressionKind, Field, Function, Receiver, Structure, ValueType };
+import cryosmith::model::{ ExpressionKind, Field, Function, Receiver, Structure, TypeArgumentSpelling, ValueType };
 import cryosmith::random::{ RandomStream };
 import cryosmith::typing::{ TypeChoice };
 
@@ -112,9 +112,12 @@ implement struct Generator {
     }
 
     /// `S { f: value, ... }`, its fields in a shuffled order; a field with a
-    /// default is left out half the time.
+    /// default is left out half the time.  An instance's literal that
+    /// leaves its type argument to inference gives a deciding value for
+    /// each field of type `T`; its first field is one, and has no default.
     private record_literal(mut &this, wanted: ValueType, depth: i64) -> i64 {
         const declared: Structure = this.program.structure_at(wanted.structure());
+        const spelling: TypeArgumentSpelling = if (declared.is_instance()) { this.type_argument_spelling() } else { TypeArgumentSpelling::Written };
         mut order: Array<i64> = Array::<i64>::new();
         mut field: i64 = declared.first_field;
         while (field < declared.first_field + declared.field_count) {
@@ -130,7 +133,14 @@ implement struct Generator {
             index = index - 1;
         }
         mut values: Array<i64> = Array::<i64>::new();
-        for (written in order.iter()) { values.push(this.typed_place(this.program.field_at(written).value_type, depth)); }
+        for (written in order.iter()) {
+            const field_type: ValueType = this.program.field_at(written).value_type;
+            if (spelling.is_inferred() && this.program.field_is_type_argument(wanted.structure(), written)) {
+                values.push(this.deciding_value(field_type, depth));
+            } else {
+                values.push(this.typed_place(field_type, depth));
+            }
+        }
         const first: i64 = this.program.lists.length();
         index = 0;
         while (index < order.length()) {
@@ -138,7 +148,7 @@ implement struct Generator {
             this.program.lists.push(values.get(index).unwrap());
             index = index + 1;
         }
-        return this.node(ExpressionKind::StructureLiteral(wanted.structure(), first, order.length()), wanted);
+        return this.node(ExpressionKind::StructureLiteral(wanted.structure(), spelling, first, order.length()), wanted);
     }
 
     /// A field reached from the writable struct `root`, for a store: a
