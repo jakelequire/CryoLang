@@ -1,0 +1,127 @@
+///! What one build of the matrix left, as digests, and how two such builds
+///! compare.  A build is the program it linked and every object below its
+///! build directory's `target/`, keyed by the path below `target/`, whose
+///! first segment is the profile.  Two builds are compared over the
+///! profiles the clean one wrote: an incremental build with another
+///! profile's objects still in its directory (the flag-change scenario's)
+///! is judged on the profile it built.
+
+namespace cryogate::incremental::snapshots;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::encoding::sha256::{ Sha256 };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::tree::{ Tree };
+
+/// One build's program and objects, as sha256 digests.
+public type struct BuildSnapshot {
+    /// The program's digest.
+    public program: String;
+    /// Each object's path below `target/` and its digest, in path order.
+    public objects: Array<Pair<String, String>>;
+
+    /// The snapshot of the build that wrote `build` and linked `program`;
+    /// an error naming what could not be read.
+    public static take(build: Path, program: Path) -> Result<BuildSnapshot, String> {
+        const program_digest: String = BuildSnapshot::digest_of(program)?;
+        const target: PathBuf = build.join(Str::new("target"));
+        const excluded: Array<String> = Array::<String>::new();
+        const files: Array<String> = Tree::files(target.as_path(), &excluded)?;
+        mut objects: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        for (file in files.iterate_references()) {
+            if (!file.as_str().ends_with(&Str::new(".o"))) { continue; }
+            const digest: String = BuildSnapshot::digest_of(target.as_path().join(file.as_str()).as_path())?;
+            objects.push(Pair::new(file.clone(), digest));
+        }
+        return Result::Ok(BuildSnapshot { program: program_digest, objects: objects });
+    }
+
+    private static digest_of(path: Path) -> Result<String, String> {
+        return match (File::read_bytes(path)) {
+            Result::Ok(bytes)  => { Result::Ok(Sha256::digest(bytes.as_slice()).to_hex()) }
+            Result::Err(error) => { Result::Err(f"cannot read {path.as_str()}: {error.describe()}") }
+        };
+    }
+}
+
+/// How an incremental build compared with a clean build of the same source.
+public type struct SnapshotComparison {
+    /// The clean build's objects compared.
+    public objects: i64;
+    /// Whether the two programs have different bytes.
+    public program_differs: boolean;
+    /// Each object that differs, or is in one build only, as a report line.
+    public object_problems: Array<String>;
+
+    /// `incremental` against `clean`, over the profiles `clean` wrote.  A
+    /// clean build that left no object is itself a problem: the comparison
+    /// would hold over nothing.
+    public static of(incremental: &BuildSnapshot, clean: &BuildSnapshot) -> SnapshotComparison {
+        mut problems: Array<String> = Array::<String>::new();
+        if (clean.objects.is_empty()) { problems.push(String::from_str(Str::new("the clean build left no object below target/"))); }
+        mut profiles: Array<String> = Array::<String>::new();
+        for (object in clean.objects.iterate_references()) {
+            const profile: String = SnapshotComparison::profile_of(object.first.as_str());
+            if (!profiles.contains(&profile)) { profiles.push(profile); }
+        }
+        mut compared: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        for (object in incremental.objects.iterate_references()) {
+            if (profiles.contains(&SnapshotComparison::profile_of(object.first.as_str()))) { compared.push(object.clone()); }
+        }
+        // Both lists are in path order: walk them together.
+        mut left: i64 = 0;
+        mut right: i64 = 0;
+        while (left < compared.length() || right < clean.objects.length()) {
+            if (right >= clean.objects.length()) {
+                problems.push(f"object {compared.get_reference(left).unwrap().first.as_str()} is in the incremental build only");
+                left++;
+                continue;
+            }
+            if (left >= compared.length()) {
+                problems.push(f"object {clean.objects.get_reference(right).unwrap().first.as_str()} is in the clean build only");
+                right++;
+                continue;
+            }
+            const ours: Pair<String, String>* = compared.get_reference(left).unwrap();
+            const theirs: Pair<String, String>* = clean.objects.get_reference(right).unwrap();
+            if (ours.first.as_str() < theirs.first.as_str()) {
+                problems.push(f"object {ours.first.as_str()} is in the incremental build only");
+                left++;
+            } else if (theirs.first.as_str() < ours.first.as_str()) {
+                problems.push(f"object {theirs.first.as_str()} is in the clean build only");
+                right++;
+            } else {
+                if (ours.second != theirs.second) { problems.push(f"object {ours.first.as_str()} differs"); }
+                left++;
+                right++;
+            }
+        }
+        return SnapshotComparison {
+            objects:         clean.objects.length(),
+            program_differs: incremental.program != clean.program,
+            object_problems: problems,
+        };
+    }
+
+    /// Whether the builds agree: on every object, and on the program too
+    /// when `programs` says the host links reproducibly.
+    public identical(&this, programs: boolean) -> boolean {
+        if (!this.object_problems.is_empty()) { return false; }
+        return !programs || !this.program_differs;
+    }
+
+    /// The first segment of `path`: the profile directory below `target/`.
+    private static profile_of(path: Str) -> String {
+        return match (path.split_once(&Str::new("/"))) {
+            Option::Some(parts) => { String::from_str(parts.first) }
+            Option::None        => { String::from_str(path) }
+        };
+    }
+}

@@ -1,5 +1,11 @@
-///! `cryogate incr --instance | --runtime --cryo <compiler>`: two checks of
-///! an incremental build over a change the per-module cache must notice.
+///! `cryogate incr --instance | --runtime | --matrix --cryo <compiler>`: three
+///! checks of an incremental build over a change the per-module cache must
+///! notice.
+///!
+///! `--matrix [--project <directory>] [--bin <name>]`: the edit matrix
+///! (`incremental/run/matrix.cryo`) over a project, the compiler project
+///! and its `cryo` program by default, every incremental build judged
+///! against a clean one; scratch in `.verify/incremental-check`.
 ///!
 ///! `--instance`: an incremental build must link when an edit asks an
 ///! unchanged module for a generic instance its cached object does not
@@ -44,6 +50,7 @@ import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::tree::{ Tree };
+import cryogate::incremental::run::matrix::{ IncrementalMatrix };
 
 /// One build's outcome and what it printed.
 type struct Build {
@@ -72,10 +79,13 @@ public type struct IncrementalBuild {
     runtime: Option<String>;
 
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
-        mut options: Options = Options::new(Str::new("cryogate incr --instance | --runtime --cryo <compiler>"));
+        mut options: Options = Options::new(Str::new("cryogate incr --instance | --runtime | --matrix [--project <directory>] [--bin <name>] --cryo <compiler>"));
         options.flag(Str::new("--instance"));
         options.flag(Str::new("--runtime"));
+        options.flag(Str::new("--matrix"));
         options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--project"));
+        options.valued(Str::new("--bin"));
         const parsed: Parsed = match (options.parse(arguments, first)) {
             Result::Ok(parsed)  => { parsed }
             Result::Err(reason) => { fmt::eprintln(f"cryogate incr: {reason.as_str()}"); return 2; }
@@ -86,12 +96,27 @@ public type struct IncrementalBuild {
         };
         const instance: boolean = parsed.has(Str::new("--instance"));
         const runtime: boolean = parsed.has(Str::new("--runtime"));
-        if (instance == runtime || !parsed.positionals().is_empty() || parsed.separated()) {
+        const matrix: boolean = parsed.has(Str::new("--matrix"));
+        mut modes: i64 = 0;
+        if (instance) { modes++; }
+        if (runtime) { modes++; }
+        if (matrix) { modes++; }
+        const project_named: boolean = parsed.has(Str::new("--project")) || parsed.has(Str::new("--bin"));
+        if (modes != 1 || (project_named && !matrix) || !parsed.positionals().is_empty() || parsed.separated()) {
             fmt::eprintln(f"cryogate incr: usage: {options.usage()}");
             return 2;
         }
-        const fixtures: PathBuf = repository.join(Str::new("tests")).join(Str::new("fixtures"));
         const verify: PathBuf = repository.join(Str::new(".verify"));
+        if (matrix) {
+            const project: String = match (parsed.value(Str::new("--project"))) {
+                Option::Some(path) => { Host::absolute(path) }
+                Option::None       => { String::from_str(repository.join(Str::new("compiler")).as_path().as_str()) }
+            };
+            const binary: Str = parsed.value(Str::new("--bin")).unwrap_or(Str::new("cryo"));
+            return IncrementalMatrix::run(repository, logs, Host::absolute(compiler).as_str(), Path::from(project.as_str()),
+                                          binary, verify.join(Str::new("incremental-check")).as_path());
+        }
+        const fixtures: PathBuf = repository.join(Str::new("tests")).join(Str::new("fixtures"));
         if (instance) {
             const check: IncrementalBuild = IncrementalBuild {
                 project:  verify.join(Str::new("incremental-instance")),

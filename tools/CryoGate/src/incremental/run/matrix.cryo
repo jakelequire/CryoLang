@@ -1,0 +1,392 @@
+///! The incremental-build matrix over a project: every incremental build
+///! must leave the same objects, and on a host that links reproducibly the
+///! same program, as a clean `--no-incremental` build of the same source.
+///! A false cache hit is a silent miscompile, so this is the check on the
+///! per-module object cache.
+///!
+///! Every build writes to one scratch build directory, never the project's
+///! own `build/`, so a compiler under test that lives there survives the
+///! run.  The edits are made to the project's sources in place - the build
+///! must read them where it always does - and each is reverted before the
+///! next scenario; while one is applied its original is kept beside the
+///! build directory, and a run that finds such a copy refuses to start.
+///!
+///! Scenarios, in order:
+///!   header edit  an edit to a C header the project's `extern "C"` block
+///!                includes must not be called up to date (after its own
+///!                control: an unchanged rebuild must be);
+///!   control      two clean builds of unchanged source agree on every
+///!                object, and on the program only where the link is
+///!                reproducible (a Windows PE carries a link timestamp), which
+///!                decides whether programs are compared below;
+///!   cold cache   the first incremental build equals the clean one;
+///!   no change    a second incremental build equals it too;
+///!   each edit    an incremental build over the warm cache equals a clean
+///!                build of the edited source;
+///!   flag change  `--dev` over a cache of release objects equals a clean
+///!                `--dev` build.
+
+namespace cryogate::incremental::run::matrix;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::io::error::{ IoError };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::text::{ Text };
+import cryogate::core::tree::{ Tree };
+import cryogate::incremental::edits::{ SourceEdit };
+import cryogate::incremental::snapshots::{ BuildSnapshot, SnapshotComparison };
+
+/// One run of the matrix over a project.
+public type struct IncrementalMatrix {
+    /// The project built.
+    project: PathBuf;
+    /// The scratch directory holding the build directory and the originals
+    /// of applied edits.
+    scratch: PathBuf;
+    /// The build directory every build writes.
+    build: PathBuf;
+    /// The program each build links.
+    program: PathBuf;
+    compiler: String;
+    stdlib: String;
+    /// The scenarios that failed, by name.
+    failures: Array<String>;
+
+    /// Run the matrix over `project`, whose builds link `binary`, with
+    /// `compiler`; scratch below `scratch`.  Prints each scenario and the
+    /// `incremental-check:` verdict line; 0 when every scenario held.
+    public static run(repository: Path, logs: &RunLogs, compiler: Str, project: Path, binary: Str, scratch: Path) -> i32 {
+        const build: PathBuf = scratch.join(Str::new("build"));
+        mut matrix: IncrementalMatrix = IncrementalMatrix {
+            project:  PathBuf::from(project.as_str()),
+            scratch:  PathBuf::from(scratch.as_str()),
+            build:    PathBuf::from(build.as_path().as_str()),
+            program:  PathBuf::from(Host::executable_name(build.as_path().join(binary).as_path().as_str()).as_str()),
+            compiler: String::from_str(compiler),
+            stdlib:   Host::stdlib_directory(repository),
+            failures: Array::<String>::new(),
+        };
+        return matrix.judge(logs);
+    }
+
+    private judge(mut &this, logs: &RunLogs) -> i32 {
+        fmt::println(f"== incremental-check: {this.project.as_path().as_str()} (cryo={this.compiler.as_str()}) ==");
+        if (!Path::from(this.compiler.as_str()).is_file()) {
+            fmt::println(f"incremental-check: FAIL -- the compiler under test is not at {this.compiler.as_str()}");
+            return 2;
+        }
+        const edits: Array<SourceEdit> = SourceEdit::compiler_matrix();
+        mut missing: Array<String> = Array::<String>::new();
+        const header: PathBuf = this.project.as_path().join(SourceEdit::compiler_header());
+        if (!header.as_path().is_file()) { missing.push(f"header-edit: {SourceEdit::compiler_header()}"); }
+        for (edit in edits.iterate_references()) {
+            if (!this.source(edit).as_path().is_file()) { missing.push(f"{edit.name.as_str()}: src/{edit.relative.as_str()}"); }
+        }
+        // A missing target is a refusal: a matrix that shrank in silence
+        // reports exactly what a full one reports.
+        if (!missing.is_empty()) {
+            const listed: String = Text::joined(&missing, Str::new("; "));
+            fmt::println(f"incremental-check: FAIL -- edit target(s) no longer exist: {listed.as_str()}");
+            fmt::println(String::from_str(Str::new("  Point the scenario at whatever file replaced it.")));
+            return 1;
+        }
+        match (this.prepare()) {
+            Result::Ok(_)       => { }
+            Result::Err(reason) => { fmt::println(f"incremental-check: FAIL -- {reason.as_str()}"); return 1; }
+        }
+
+        this.header_scenario(header.as_path(), logs);
+
+        fmt::println(String::from_str(Str::new("\n[control] two clean builds of unchanged source must agree")));
+        this.wipe();
+        const control: Option<BuildSnapshot> = this.snapshot(Str::new("control-clean"), Str::new("--no-incremental"), logs);
+        this.wipe();
+        const reference: Option<BuildSnapshot> = this.snapshot(Str::new("cold-clean"), Str::new("--no-incremental"), logs);
+        mut compared_control: Option<SnapshotComparison> = Option::None;
+        match (&control) {
+            Option::Some(one) => {
+                match (&reference) {
+                    Option::Some(other) => { compared_control = Option::Some(SnapshotComparison::of(one, other)); }
+                    Option::None        => { }
+                }
+            }
+            Option::None => { }
+        }
+        const agreement: SnapshotComparison = match (compared_control) {
+            Option::Some(comparison) => { comparison }
+            Option::None => {
+                fmt::println(String::from_str(Str::new("incremental-check: FAIL -- a control build left no program, so nothing below could be measured against anything")));
+                return 1;
+            }
+        };
+        if (!agreement.identical(false)) {
+            IncrementalMatrix::print_problems(&agreement);
+            fmt::println(String::from_str(Str::new("incremental-check: FAIL -- two clean builds of unchanged source left different objects: the compiler's output is not reproducible, so no scenario could be judged")));
+            return 1;
+        }
+        const programs: boolean = !agreement.program_differs;
+        if (programs) {
+            fmt::println(f"  control: BYTE-IDENTICAL ({agreement.objects} objects and the program)");
+        } else {
+            fmt::println(f"  control: {agreement.objects} objects BYTE-IDENTICAL; the programs DIFFER, so this host does not link reproducibly and programs are not compared below");
+        }
+
+        fmt::println(String::from_str(Str::new("\n[scenario] cold cache (first incremental build == clean)")));
+        this.wipe();
+        const cold: Option<BuildSnapshot> = this.snapshot(Str::new("cold-incr"), Str::new(""), logs);
+        this.judge_pair(&cold, &reference, Str::new("cold-cache"), programs);
+
+        fmt::println(String::from_str(Str::new("\n[scenario] no change (outer short-circuit)")));
+        const unchanged: Option<BuildSnapshot> = this.snapshot(Str::new("nochg-incr"), Str::new(""), logs);
+        this.judge_pair(&unchanged, &reference, Str::new("no-change"), programs);
+
+        for (edit in edits.iterate_references()) {
+            fmt::println(f"\n[scenario] edit: {edit.name.as_str()} ({edit.kind_name()})");
+            const path: PathBuf = this.source(edit);
+            const original: String = match (this.apply(path.as_path(), edit)) {
+                Result::Ok(original) => { original }
+                Result::Err(reason)  => {
+                    fmt::println(f"  edit:{edit.name.as_str()}: FAIL ({reason.as_str()})");
+                    this.failures.push(f"edit:{edit.name.as_str()}");
+                    continue;
+                }
+            };
+            const incremental: Option<BuildSnapshot> = this.snapshot(f"{edit.name.as_str()}-incr".as_str(), Str::new(""), logs);
+            this.wipe();
+            const clean: Option<BuildSnapshot> = this.snapshot(f"{edit.name.as_str()}-clean".as_str(), Str::new("--no-incremental"), logs);
+            const reverted: boolean = this.revert(path.as_path(), original.as_str());
+            this.judge_pair(&incremental, &clean, f"edit:{edit.name.as_str()}".as_str(), programs);
+            if (!reverted) {
+                fmt::println(f"incremental-check: FAIL -- could not restore {path.as_path().as_str()}; its original is in {this.scratch.as_path().as_str()}");
+                return 1;
+            }
+            // Warm the cache again from the reverted source.
+            const _: Option<BuildSnapshot> = this.snapshot(f"{edit.name.as_str()}-rewarm".as_str(), Str::new(""), logs);
+        }
+
+        fmt::println(String::from_str(Str::new("\n[scenario] flag change (--dev)")));
+        const development: Option<BuildSnapshot> = this.snapshot(Str::new("dev-incr"), Str::new("--dev"), logs);
+        this.wipe();
+        const development_clean: Option<BuildSnapshot> = this.snapshot(Str::new("dev-clean"), Str::new("--dev --no-incremental"), logs);
+        this.judge_pair(&development, &development_clean, Str::new("flag:--dev"), programs);
+
+        fmt::println(String::from_str(Str::new("\n== summary ==")));
+        if (!this.failures.is_empty()) {
+            const failed: String = Text::joined(&this.failures, Str::new(", "));
+            fmt::println(f"incremental-check: FAIL -- scenario(s) {failed.as_str()}");
+            return 1;
+        }
+        const compared: Str = if (programs) { Str::new("objects and programs compared") } else { Str::new("objects compared; programs not, this host does not link reproducibly") };
+        fmt::println(f"incremental-check: OK -- every scenario BYTE-IDENTICAL (header edit + cold cache + no change + {edits.length()} edit(s) + flag change; {agreement.objects} objects per build, {compared})");
+        return 0;
+    }
+
+    /// The header scenario: an unchanged rebuild is up to date (the
+    /// control), and a rebuild after the header's edit is not.
+    private header_scenario(mut &this, header: Path, logs: &RunLogs) -> void {
+        fmt::println(String::from_str(Str::new("\n[scenario] header edit (an input no module source names)")));
+        this.wipe();
+        const _: Completion = this.build(Str::new("header-first"), Str::new(""), logs);
+        const again: Completion = this.build(Str::new("header-control"), Str::new(""), logs);
+        if (!again.outcome.succeeded() || !again.output().as_str().contains(&Str::new("is up to date"))) {
+            fmt::println(String::from_str(Str::new("  header-edit: FAIL (control) -- an unchanged rebuild did not report \"is up to date\", so the edit below could not be told apart")));
+            this.failures.push(String::from_str(Str::new("header-edit")));
+            return;
+        }
+        const original: String = match (this.keep_original(header)) {
+            Result::Ok(original) => { original }
+            Result::Err(reason)  => {
+                fmt::println(f"  header-edit: FAIL ({reason.as_str()})");
+                this.failures.push(String::from_str(Str::new("header-edit")));
+                return;
+            }
+        };
+        const written: Result<(), IoError> = File::write_text(header, SourceEdit::appended(original.as_str()).as_str());
+        const edited: Completion = this.build(Str::new("header-edited"), Str::new(""), logs);
+        const reverted: boolean = this.revert(header, original.as_str());
+        if (written.is_err() || !reverted) {
+            fmt::println(f"  header-edit: FAIL (the header could not be edited and restored; its original is in {this.scratch.as_path().as_str()})");
+            this.failures.push(String::from_str(Str::new("header-edit")));
+            return;
+        }
+        if (edited.outcome.succeeded() && edited.output().as_str().contains(&Str::new("is up to date"))) {
+            fmt::println(String::from_str(Str::new("  header-edit: FAIL -- the build after the header edit reported \"is up to date\"")));
+            this.failures.push(String::from_str(Str::new("header-edit")));
+            return;
+        }
+        fmt::println(String::from_str(Str::new("  header-edit: rebuilt")));
+    }
+
+    /// Judge `incremental` against `clean` as the scenario `name`.
+    private judge_pair(mut &this, incremental: &Option<BuildSnapshot>, clean: &Option<BuildSnapshot>, name: Str, programs: boolean) -> void {
+        match (incremental) {
+            Option::Some(ours) => {
+                match (clean) {
+                    Option::Some(theirs) => {
+                        const comparison: SnapshotComparison = SnapshotComparison::of(ours, theirs);
+                        if (comparison.identical(programs)) {
+                            fmt::println(f"  {name}: BYTE-IDENTICAL");
+                            return;
+                        }
+                        fmt::println(f"  {name}: DIFFER");
+                        if (programs && comparison.program_differs) { fmt::println(String::from_str(Str::new("    the programs differ"))); }
+                        IncrementalMatrix::print_problems(&comparison);
+                        this.failures.push(String::from_str(name));
+                        return;
+                    }
+                    Option::None => { }
+                }
+            }
+            Option::None => { }
+        }
+        fmt::println(f"  {name}: FAIL (missing build)");
+        this.failures.push(String::from_str(name));
+    }
+
+    /// Build with the words of `flags`, and take the build's snapshot;
+    /// `None`, with the end of the build's output printed, when it failed
+    /// or left no program.
+    private snapshot(&this, label: Str, flags: Str, logs: &RunLogs) -> Option<BuildSnapshot> {
+        const done: Completion = this.build(label, flags, logs);
+        const output: String = done.output();
+        if (!done.outcome.succeeded()) {
+            fmt::println(f"  [{label}] BUILD FAILED ({done.outcome.describe().as_str()})");
+            const lines: Array<String> = Text::lines(output.as_str());
+            mut index: i64 = if (lines.length() > IncrementalMatrix::TAIL_LINES) { lines.length() - IncrementalMatrix::TAIL_LINES } else { 0 };
+            while (index < lines.length()) {
+                fmt::println(f"    {lines.get_reference(index).unwrap().as_str()}");
+                index++;
+            }
+            return Option::None;
+        }
+        const lines: Array<String> = Text::lines(output.as_str());
+        for (line in lines.iterate_references()) {
+            if (line.as_str().contains(&Str::new("reusing")) || line.as_str().contains(&Str::new("up to date"))) {
+                fmt::println(f"  [{label}] {line.as_str().trim()}");
+            }
+        }
+        if (!this.program.as_path().is_file()) {
+            fmt::println(f"  [{label}] no program produced at {this.program.as_path().as_str()}");
+            return Option::None;
+        }
+        return match (BuildSnapshot::take(this.build.as_path(), this.program.as_path())) {
+            Result::Ok(snapshot) => { Option::Some(snapshot) }
+            Result::Err(reason)  => { fmt::println(f"  [{label}] {reason.as_str()}"); Option::None }
+        };
+    }
+
+    /// One `cryo build` of the project into the scratch build directory,
+    /// with the words of `flags`, logged as `label`.
+    private build(&this, label: Str, flags: Str, logs: &RunLogs) -> Completion {
+        mut job: Job = Job::new(this.compiler.as_str());
+        job.argument(Str::new("build"));
+        job.argument(f"--build-dir={this.build.as_path().as_str()}".as_str());
+        for (flag in flags.split_whitespace()) { job.argument(flag); }
+        job.directory(this.project.as_path().as_str());
+        job.default_c_compiler();
+        job.default_variable(Str::new("CRYO_STDLIB"), this.stdlib.as_str());
+        job.log_to(logs.file(f"incremental-{label}".as_str()).as_str());
+        return job.run();
+    }
+
+    /// The scratch directory, refused when a previous run left an edit's
+    /// original in it (that run did not restore the file).
+    private prepare(&this) -> Result<(), String> {
+        if (this.scratch.as_path().exists()) {
+            const excluded: Array<String> = Array::<String>::new();
+            const names: Array<String> = Tree::names(this.scratch.as_path(), &excluded)?;
+            for (name in names.iterate_references()) {
+                if (name.as_str().ends_with(&Str::new(".original"))) {
+                    const left: PathBuf = this.scratch.as_path().join(name.as_str());
+                    return Result::Err(f"a previous run left {left.as_path().as_str()}: restore that file from it, then delete the copy");
+                }
+            }
+        }
+        return match (Directory::create_all(this.scratch.as_path())) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot create {this.scratch.as_path().as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// Apply `edit` to `path`; its original text, kept beside the build
+    /// directory until it is restored.
+    private apply(&this, path: Path, edit: &SourceEdit) -> Result<String, String> {
+        const original: String = this.keep_original(path)?;
+        return match (File::write_text(path, edit.applied(original.as_str()).as_str())) {
+            Result::Ok(_)      => { Result::Ok(original) }
+            Result::Err(error) => {
+                const _: boolean = this.revert(path, original.as_str());
+                Result::Err(f"cannot edit {path.as_str()}: {error.describe()}")
+            }
+        };
+    }
+
+    /// Read `path`, and keep a copy of it beside the build directory.
+    private keep_original(&this, path: Path) -> Result<String, String> {
+        const original: String = match (File::read_text(path)) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read {path.as_str()}: {error.describe()}"); }
+        };
+        return match (File::write_text(this.kept(path).as_path(), original.as_str())) {
+            Result::Ok(_)      => { Result::Ok(original) }
+            Result::Err(error) => { Result::Err(f"cannot keep a copy of {path.as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// Write `original` back to `path`, then drop the kept copy; false when
+    /// the file could not be restored (the copy then stays).
+    private revert(&this, path: Path, original: Str) -> boolean {
+        match (File::write_text(path, original)) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return false; }
+        }
+        const _: Result<(), IoError> = File::remove(this.kept(path).as_path());
+        return true;
+    }
+
+    /// Where the original of `path` is kept while it is edited.
+    private kept(&this, path: Path) -> PathBuf {
+        const name: Str = match (path.file_name()) {
+            Option::Some(name) => { name }
+            Option::None       => { Str::new("edited") }
+        };
+        return this.scratch.as_path().join(f"{name}.original".as_str());
+    }
+
+    /// The source file `edit` changes.
+    private source(&this, edit: &SourceEdit) -> PathBuf {
+        return this.project.as_path().join(Str::new("src")).as_path().join(edit.relative.as_str());
+    }
+
+    /// Clear the build directory, so the next build starts with no cache.
+    private wipe(&this) -> void {
+        if (this.build.as_path().exists()) { const _: Result<(), IoError> = Directory::remove_all(this.build.as_path()); }
+    }
+
+    private static print_problems(comparison: &SnapshotComparison) -> void {
+        const count: i64 = comparison.object_problems.length();
+        const shown: i64 = if (count > IncrementalMatrix::LISTED_PROBLEMS) { IncrementalMatrix::LISTED_PROBLEMS } else { count };
+        mut index: i64 = 0;
+        while (index < shown) {
+            fmt::println(f"    {comparison.object_problems.get_reference(index).unwrap().as_str()}");
+            index++;
+        }
+        if (count > shown) { fmt::println(f"    ... and {count - shown} more"); }
+    }
+
+    /// How many lines of a failed build's output are printed.
+    const TAIL_LINES: i64 = 12;
+    /// How many object problems a scenario lists.
+    const LISTED_PROBLEMS: i64 = 20;
+}

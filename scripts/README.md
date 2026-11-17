@@ -12,7 +12,6 @@ one; the history keeps it.
 | script | what it does | called by |
 |---|---|---|
 | `lsp-gate.py` | Builds `tools/CryoLSP` with the compiler under test into its own directory, then runs that binary through `tools/CryoLSP/tests/smoke.py` (protocol checks and every fixture's checks) | `make lsp-check`, `cryogate verify` (lsp), CI |
-| `incremental-check.py` | An edit to an included C header is not reported up to date; incremental build == clean build, byte for byte, over an edit matrix (refuses on Windows after the header check) | `make incremental-check`, CI |
 
 ## Release
 

@@ -1,0 +1,87 @@
+///! The incremental-build matrix's source edits: which files of the project
+///! are edited, how, and the text each edit makes of a file.  Pure: the run
+///! reads the file, asks for the edited text and writes it back.
+
+namespace cryogate::incremental::edits;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+
+/// How an edit changes a file.
+public type enum EditKind {
+    /// A comment appended after the last line: the module's text changes,
+    /// its code does not.
+    Append;
+    /// A comment inserted after the first line, which moves every later
+    /// line by one, so the module's emitted IR changes wherever it records
+    /// a line.
+    ShiftLines;
+}
+
+/// One edit of the matrix.
+public type struct SourceEdit {
+    /// The scenario's name in the report.
+    public name: String;
+    /// The edited file, relative to the project's `src/`.
+    public relative: String;
+    /// What the edit does.
+    public kind: EditKind;
+
+    /// The edit `name` of `relative` (below `src/`).
+    public static new(name: Str, relative: Str, kind: EditKind) -> SourceEdit {
+        return SourceEdit { name: String::from_str(name), relative: String::from_str(relative), kind: kind };
+    }
+
+    /// `kind` spelled as the report names it.
+    public kind_name(&this) -> Str {
+        return match (this.kind) {
+            EditKind::Append     => { Str::new("append") }
+            EditKind::ShiftLines => { Str::new("shift lines") }
+        };
+    }
+
+    /// The text this edit makes of `original`.
+    public applied(&this, original: Str) -> String {
+        return match (this.kind) {
+            EditKind::Append     => { SourceEdit::appended(original) }
+            EditKind::ShiftLines => { SourceEdit::shifted(original) }
+        };
+    }
+
+    /// `original` with a comment line inserted after its first line.
+    private static shifted(original: Str) -> String {
+        const end: i64 = match (original.find(&Str::new("\n"))) {
+            Option::Some(at) => { at + 1 }
+            Option::None     => { original.length() }
+        };
+        mut text: String = String::from_str(original.byte_substring(0, end));
+        text.push(Str::new("// incremental-check: inserted line (shifts line numbers)\n"));
+        text.push(original.byte_substring(end, original.length()));
+        return text;
+    }
+
+    /// `original` with the appended comment line, as the header edit makes
+    /// it too.
+    public static appended(original: Str) -> String {
+        mut text: String = String::from_str(original);
+        text.push(Str::new("\n// incremental-check: appended comment\n"));
+        return text;
+    }
+
+    /// The compiler project's matrix: a leaf module, a module most of the
+    /// compiler depends on (its lines shifted), and the module that owns
+    /// generic instances.
+    public static compiler_matrix() -> Array<SourceEdit> {
+        mut edits: Array<SourceEdit> = Array::<SourceEdit>::new();
+        edits.push(SourceEdit::new(Str::new("leaf-comment"), Str::new("CLI/commands.cryo"), EditKind::Append));
+        edits.push(SourceEdit::new(Str::new("type-lineshift"), Str::new("compiler/AST/node.cryo"), EditKind::ShiftLines));
+        edits.push(SourceEdit::new(Str::new("generic-comment"), Str::new("compiler/types/generic_registry.cryo"), EditKind::Append));
+        return edits;
+    }
+
+    /// The header an `extern "C"` block of the compiler project includes,
+    /// relative to the project: an input no module source names.
+    public static compiler_header() -> Str { return Str::new("llvm_bindings.h"); }
+}

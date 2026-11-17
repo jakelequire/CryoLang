@@ -152,10 +152,13 @@ not done. The remaining limits are here so nobody rediscovers them:
 - **`make lsp-check` builds with the stage-2 compiler**, which is what makes
   it a gate; `make lsp` builds with the pin and certifies nothing about the
   compiler being built.
-- **`incremental-check` compares BINARIES, so it needs a reproducible link.**
-  A Windows PE carries a link timestamp - two clean builds of one unchanged
-  source differ - so the gate refuses on this host rather than reporting a
-  matrix of failures that blame incremental compilation for the linker.
+- **`incremental-check` compares the program only where the link
+  reproduces.** It compares every object of each incremental build with a
+  clean build's, and the linked program too when two clean builds of
+  unchanged source link the same bytes. A Windows PE carries a link
+  timestamp, so on that host the programs are not compared, and the verdict
+  line says so: a defect that shows only at the link (a stale archive linked)
+  is not seen there.
 - **The release smoke runs the STAGED tree, and the Windows one under
   wine.** `scripts/release-smoke.sh` compiles and runs a hello-world with
   the staged tree before it is zipped, not with the archive itself; the

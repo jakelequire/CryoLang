@@ -277,8 +277,11 @@ Tests and gates
   make examples-golden   Build every example, run the ones with an
                          expected.out and compare their output with it.
   make valgrind-check    The same runs under valgrind (Linux only).
-  make incremental-check Incremental build == clean build, per module
-                         (refuses on Windows: a PE carries a link timestamp).
+  make incremental-check Incremental build == clean build, per module: the
+                         objects, and the program where the link reproduces
+                         (not on Windows: a PE carries a link timestamp);
+                         edits compiler/src while it runs and writes
+                         .verify/incremental-check.
   make incremental-instance-check  An edit asking a cached module for a new
                          generic instance still links.
   make incremental-runtime-check  A program is linked again when its runtime
@@ -717,15 +720,12 @@ verify-pin-clean: $(CRYOGATE)
 
 # ---- incremental-build soundness --------------------------------------
 # Run the per-module incremental byte-identity matrix: every incremental
-# build must equal a clean `--no-incremental` build of the same source.
-# Needs the stage-2 compiler (builds it first if absent).
-ifeq ($(HOST_OS),windows)
-incremental-check: $(STAGE2_EXE)
-	@$(PYTHON) scripts/incremental-check.py --cryo "$(STAGE2_EXE)"
-else
-incremental-check: $(STAGE2)
-	@$(PYTHON) scripts/incremental-check.py --cryo "$(STAGE2)"
-endif
+# build of the compiler project must leave the same objects as a clean
+# `--no-incremental` build of the same source, and the same program where the
+# host links reproducibly.  `cryogate incr --matrix`; its builds go to
+# .verify/incremental-check, and it edits compiler/src while it runs.
+incremental-check: cryo $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) incr --matrix --cryo "$(STAGE2_FILE)"
 
 # ---- test suite -------------------------------------------------------
 # Rebuilds the stage-2 compiler when it is missing or older than its sources
