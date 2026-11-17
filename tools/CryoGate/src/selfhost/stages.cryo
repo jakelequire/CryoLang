@@ -20,9 +20,12 @@ import std::collections::array::{ Array };
 import std::collections::pair::{ Pair };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::env;
 import std::fs::path::{ Path, PathBuf };
 
 import cryogate::core::child::{ Job };
+import cryogate::core::text::{ Text };
 
 /// One stage: a compiler building the next one, in `compiler/`.
 public type struct Stage {
@@ -170,6 +173,16 @@ public type struct ArmPlan {
             ArmPlan::variable(&variables, Str::new("CRYO_CLANG_RESOURCE_DIR"), ArmPlan::wine_path(llvm.as_path().join(Str::new("lib/clang/20")).as_path().as_str()).as_str());
         } else {
             ArmPlan::variable(&variables, Str::new("CRYO_STDLIB"), repository.join(Str::new("stdlib")).as_path().as_str());
+            // Windows looks for a library on PATH after the program's own
+            // directory, so a directory there holding LLVM-C.dll would let a
+            // stage compiler start without the copy beside it, which a
+            // release user's machine does not have.
+            const inherited: String = match (env::var(Str::new("PATH"))) {
+                Option::Some(value) => { value }
+                Option::None        => { String::new() }
+            };
+            ArmPlan::variable(&variables, Str::new("PATH"),
+                              ArmPlan::search_path_without(inherited.as_str(), Str::new(";"), Str::new("LLVM-C.dll")).as_str());
         }
         const pin: PathBuf = repository.join(Str::new("bin/cryo.exe"));
         mut stages: Array<Stage> = Array::<Stage>::new();
@@ -231,6 +244,18 @@ public type struct ArmPlan {
             }
         }
         return found;
+    }
+
+    /// The search path `search`, its directories separated by `separator`,
+    /// less every directory holding the file `library` and every empty
+    /// entry, in the order given.
+    public static search_path_without(search: Str, separator: Str, library: Str) -> String {
+        mut kept: Array<String> = Array::<String>::new();
+        for (entry in search.split_nonempty(&separator)) {
+            if (Path::from(entry).join(library).as_path().is_file()) { continue; }
+            kept.push(String::from_str(entry));
+        }
+        return Text::joined(&kept, separator);
     }
 
     /// The stage `via`, writing `output`, run by `runner` (or directly)

@@ -181,8 +181,35 @@ function the_windows_arm_runs_under_wine_with_the_fetched_toolchain_named() -> R
     expect(!plan.linked && plan.libraries_beside && plan.wiped.length() == 3, Str::new("per-module IR only, libraries beside, the three stage directories wiped"))?;
     const native: ArmPlan = ArmPlan::windows(Path::from(Str::new("/r")), false);
     expect(Fixture::field(&native, 0, Str::new("program")).as_str().ends_with(&Str::new("cryo.exe")), Str::new("natively the pin runs itself"))?;
-    expect(Fixture::field(&native, 0, Str::new("variables")).as_str().starts_with(&Str::new("CRYO_STDLIB=")) && !Fixture::field(&native, 0, Str::new("variables")).as_str().contains(&Str::new(";")), Str::new("with the stdlib named, and nothing else"))?;
+    expect(native.variables.length() == 2, Str::new("two variables natively"))?;
+    expect(native.variables.get_reference(0).unwrap().first.as_str() == Str::new("CRYO_STDLIB"), Str::new("the stdlib named"))?;
+    expect(native.variables.get_reference(1).unwrap().first.as_str() == Str::new("PATH"), Str::new("the search path given"))?;
+    for (entry in native.variables.get_reference(1).unwrap().second.as_str().split_nonempty(&Str::new(";"))) {
+        expect(!Path::from(entry).join(Str::new("LLVM-C.dll")).as_path().is_file(), f"{entry} supplies LLVM-C.dll".as_str())?;
+    }
+    for (variable in plan.variables.iterate_references()) {
+        expect(variable.first.as_str() != Str::new("PATH"), Str::new("under wine the host's search path is not the stage's"))?;
+    }
     return expect(Fixture::field(&native, 0, Str::new("arguments")) == String::from_str(Str::new("build --no-incremental --build-dir=build/self/win-s2")), Str::new("stage 2 goes below build/self"));
+}
+
+![test]
+function the_search_path_loses_every_directory_supplying_the_library() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = Fixture::scratch()?;
+    const root: Path = scratch.path();
+    Fixture::put(root, Str::new("llvm/LLVM-C.dll"), Str::new("library"))?;
+    Fixture::put(root, Str::new("other/LLVM-C.dll"), Str::new("library"))?;
+    Fixture::put(root, Str::new("compilers/gcc.exe"), Str::new("driver"))?;
+    Fixture::put(root, Str::new("near/LLVM-C.dll.txt"), Str::new("not the library"))?;
+    const llvm: PathBuf = root.join(Str::new("llvm"));
+    const other: PathBuf = root.join(Str::new("other"));
+    const compilers: PathBuf = root.join(Str::new("compilers"));
+    const near: PathBuf = root.join(Str::new("near"));
+    const missing: PathBuf = root.join(Str::new("missing"));
+    const search: String = f"{llvm.as_path().as_str()};{compilers.as_path().as_str()};;{other.as_path().as_str()};{near.as_path().as_str()};{missing.as_path().as_str()}";
+    const kept: String = ArmPlan::search_path_without(search.as_str(), Str::new(";"), Str::new("LLVM-C.dll"));
+    const expected: String = f"{compilers.as_path().as_str()};{near.as_path().as_str()};{missing.as_path().as_str()}";
+    return expect(kept == expected, f"kept {kept.as_str()}".as_str());
 }
 
 ![test]
