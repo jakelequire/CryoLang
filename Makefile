@@ -255,8 +255,8 @@ Tests and gates
                          cryosmith's in-process checks: one seed, one
                          program; the feature switches; the static audit of
                          guarded division and shifts, and its plant.
-  make verify-selftest   selfhost-check's judges and cryogate's checks
-                         (verify's and verify-pin's among them), driven through
+  make verify-selftest   cryogate's checks (verify's, selfhost's and
+                         verify-pin's among them), driven through
                          fixtures they must accept and refuse.
   make lsp-check         tools/CryoLSP builds with the compiler under test
                          (into its own directory; installs nothing), and
@@ -682,12 +682,10 @@ install-lsp:
 endif
 
 # ---- selfhost byte-identity check -------------------------------------
-# Implementation lives in scripts/selfhost-check.py - that gives us
-# per-stage progress + timings, per-stage logs in build-logs/, and a
-# tail-on-failure dump.  Run the script directly with --verbose for
-# streaming subprocess output.
+# `cryogate selfhost`: per-stage progress and timings, per-stage logs in
+# build-logs/cryogate/, and the tail of a stage that failed.
 #
-# The script is host-aware:
+# It is host-aware:
 #   Linux host:   runs the full Linux chain natively, then the
 #                 wine-based Windows chain.  Without the mingw toolchain,
 #                 wine and .toolchains that arm is skipped, and a skipped arm
@@ -696,16 +694,8 @@ endif
 #                 sources on WSL's own filesystem (refused unless its digest
 #                 is the working tree's), at the same time as the
 #                 Windows chain natively.  Requires wsl.exe on PATH.
-ifeq ($(HOST_OS),windows)
-# The wrapper checks for python + wsl.exe, then drives selfhost-check.py.
-# Same single-line shape as `pin` so it Just Works whether you invoked
-# `make` from cmd / PowerShell or from MSYS2 / Git Bash.
-selfhost-check: $(CRYOGATE)
-	$(CRYOGATE_HEAVY) cmd /c scripts\selfhost-check-windows.cmd $(ARGS)
-else
 selfhost-check: $(PIN) $(CRYOGATE)
-	@$(CRYOGATE_HEAVY) $(PYTHON) scripts/selfhost-check.py $(ARGS)
-endif
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) selfhost $(ARGS)
 
 # ---- pin self-verification --------------------------------------------
 # Assert each committed pin's bytes match its .pin.txt sidecar sha256
@@ -853,12 +843,11 @@ incremental-instance-check: cryo $(CRYOGATE)
 incremental-runtime-check: cryo $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) incr --runtime --cryo "$(STAGE2_FILE)"
 
-# selfhost-check's stage-archive comparison, and cryogate's own checks (the
-# judges behind verify's declarations, the roster merge, the census and
+# cryogate's own checks (the judges behind verify's declarations and
+# selfhost's stage-archive comparison, the roster merge, the census and
 # verify-pin's checks among them), driven through every case they must
 # refuse and every case they must allow.
 verify-selftest: $(CRYOGATE) $(CRYOGATE_TESTS)
-	@$(PYTHON) scripts/selfhost-check.py --selftest
 	@$(CRYOGATE_COMMAND) selftest
 
 # ---- the pre-commit sweep ----------------------------------------------
@@ -868,7 +857,7 @@ verify-selftest: $(CRYOGATE) $(CRYOGATE_TESTS)
 # not.  A short gate everybody runs is worth more than a twenty-minute one
 # nobody does.
 check-fast: verify-selftest verify-pin cryosmith-selftest
-	@echo "check-fast: OK (cryogate's self-test, selfhost archive-comparison self-test, pin integrity, cryosmith's self-test)"
+	@echo "check-fast: OK (cryogate's self-test, pin integrity, cryosmith's self-test)"
 
 # ---- language-server compile gate --------------------------------------
 # The LSP links the compiler as a LIBRARY (tools/CryoLSP/cryoconfig ->

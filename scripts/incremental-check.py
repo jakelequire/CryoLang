@@ -34,8 +34,8 @@ import sys
 # Windows console (PowerShell and cmd default to a legacy code page) the first
 # scenario result raises UnicodeEncodeError and takes the run down mid-matrix -
 # after the builds, before the verdict.  A gate that cannot finish on a host is
-# a gate that host does not have.  selfhost-check.py already does this; so does
-# this one now.  No-op on POSIX, where the streams are UTF-8 already.
+# a gate that host does not have.  No-op on POSIX, where the streams are UTF-8
+# already.
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")

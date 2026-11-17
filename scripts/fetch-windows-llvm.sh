@@ -38,7 +38,7 @@
 #     <llvm-mingw>/bin/clang.exe - CRYO_CC (preprocess + link driver)
 #     <llvm-mingw>/bin/llvm-ar.exe - CRYO_AR (archiver, wine-runnable)
 #
-# scripts/selfhost-check.py points CRYO_CC/CRYO_AR at the llvm-mingw bits and
+# `cryogate selfhost` points CRYO_CC/CRYO_AR at the llvm-mingw bits and
 # runs the full windows byte-identity self-host under wine.  Idempotent:
 # re-running with the artifacts already in place is a no-op unless --force.
 #

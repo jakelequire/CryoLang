@@ -13,8 +13,6 @@ one; the history keeps it.
 |---|---|---|
 | `lsp-gate.py` | Builds `tools/CryoLSP` with the compiler under test into its own directory, then runs that binary through `tools/CryoLSP/tests/smoke.py` (protocol checks and every fixture's checks) | `make lsp-check`, `cryogate verify` (lsp), CI |
 | `incremental-check.py` | An edit to an included C header is not reported up to date; incremental build == clean build, byte for byte, over an edit matrix (refuses on Windows after the header check) | `make incremental-check`, CI |
-| `selfhost-check.py` | Byte-identity fixed point of the compiler and of the stdlib archives its stages build: the Linux chain, the Windows chain natively or under wine; on a Windows host both at once, the Linux one from a digest-checked copy of its sources on WSL's own filesystem (`--mirror`) | `make selfhost-check`, `selfhost-check-windows.cmd`, CI |
-| `selfhost-check-windows.cmd` | Windows host: checks for Python and WSL, then runs `selfhost-check.py` | `make selfhost-check` (Windows) |
 
 ## Release
 
@@ -27,7 +25,7 @@ one; the history keeps it.
 
 | script | what it does | called by |
 |---|---|---|
-| `llvm-version.env` | The one place the LLVM version is pinned; CI cache keys hash it | CI, release, `ci/install-llvm.sh`, `fetch-windows-llvm.sh`, `selfhost-check.py` |
+| `llvm-version.env` | The one place the LLVM version is pinned; CI cache keys hash it | CI, release, `ci/install-llvm.sh`, `fetch-windows-llvm.sh` |
 | `ci/install-llvm.sh` | Installs and caches LLVM on the CI runner | CI, release |
 | `fetch-windows-llvm.sh` | Downloads the Windows LLVM-C and libclang import libraries and DLLs into `.toolchains/llvm-win` | CI, release, by hand before `make pin` |
 
