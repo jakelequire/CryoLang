@@ -646,8 +646,13 @@ type struct CallResolver {
     /// argument's move/borrow classification from them, so substituting in place
     /// would flip classifications for every call on a generic owner in the
     /// program.  Only a substitution the propagation consumes is recorded - an
-    /// adoptable numeric type, or an array type an array-literal argument lands
-    /// on - so no other consumer of the call's typing can observe this.
+    /// adoptable numeric type, an array type an array-literal argument lands
+    /// on, or the type a struct-literal argument lands on - so no other
+    /// consumer of the call's typing can observe this.  A generic struct's
+    /// literal written without type arguments is the instance its slot names,
+    /// and only the owner's arguments name it: inside the owner's own body the
+    /// parameter spelled alone is the body's own, so `Box::<Box<u8>>::make(
+    /// Box { f0: x })` there would build a `Box<T>`.
     ///
     /// Owner parameters are matched by NAME against the template's declared
     /// list, never by `param_index`: a METHOD-level parameter carries an index
@@ -723,7 +728,8 @@ type struct CallResolver {
                 // symbolic parameter, which is not numeric - so the body's own
                 // literals keep defaulting, exactly as before.
                 if (is_adoptable_numeric_type(this.arena, owner_args[p])
-                        || this.array_literal_into_array(call, i, owner_args[p])) {
+                        || this.array_literal_into_array(call, i, owner_args[p])
+                        || (i < call.arguments.length() && ExpressionNode::struct_of(call.arguments[i]) != null)) {
                     out[i] = owner_args[p];
                 }
                 break;
@@ -1275,12 +1281,14 @@ type struct CallResolver {
                     // specialization.
                     push_expected = true;
                 } else if ((ExpressionNode::if_of(arg_node) != null
-                            || ExpressionNode::ternary_of(arg_node) != null)
+                            || ExpressionNode::ternary_of(arg_node) != null
+                            || ExpressionNode::match_of(arg_node) != null)
                         && is_adoptable_numeric_type(this.arena, slot)) {
-                    // A two-branch expression's value is one of its arms', so
+                    // A branching expression's value is one of its arms', so
                     // the parameter's type reaches each arm as it reaches a
                     // literal argument: `take_u64(if (c) { 1 } else { 0 })`
-                    // computes a `u64`.
+                    // and `take_u64(match (e) { E::A => { 1 } _ => { 0 } })`
+                    // compute a `u64`.
                     push_expected = true;
                 } else if (this.sema_arg_is_null_literal(arg)
                         && this.types.is_function_type(slot)) {
@@ -2223,7 +2231,7 @@ type struct CallResolver {
 
     /// The path naming a variant when `arg` is one - `E::V` or `E::V(..)` -
     /// and null for any other argument.
-    static variant_scope_of(arg: ExpressionNode*) -> mut ExpressionNode* {
+    static variant_scope_of(arg: ExpressionNode*) -> ExpressionNode* {
         mut path: ExpressionNode* = null;
         if (ExpressionNode::scope_resolution_of(arg) != null) {
             path = arg;
@@ -2319,13 +2327,15 @@ type struct CallResolver {
     /// that the position it stands in names, once that is known: a generic
     /// call's parameter after the call's bindings, a generic literal's field
     /// after its instance.  A `want` of another type, or still over
-    /// parameters, leaves it as it is.
+    /// parameters, leaves it as it is.  A variant written with a payload is a
+    /// call whose callee is the variant's path, which takes the type too.
     retype_generic_variant(mut &this, arg: mut ExpressionNode*, want: TypeRef) -> void {
         if (!want.is_valid() || this.types.contains_generic_param(want)) { return; }
         if (!this.ctx.decl_index.def_of(want, this.ctx.type_arena)
                 .equals(this.ctx.decl_index.def_of(arg.resolved_type, this.ctx.type_arena))) { return; }
         arg.set_resolved_type(want);
-        CallResolver::variant_scope_of(arg).set_resolved_type(want);
+        const call: mut CallExpr* = ExpressionNode::call_of(arg);
+        if (call != null) { call.callee.set_resolved_type(want); }
     }
 
     /// When `call` is an EXPLICIT generic free call (`f<i32>(...)` on a bare
@@ -8866,26 +8876,17 @@ type struct CallResolver {
     }
 
     /// E0214 for a static call no entry of the family `entries` accepts
-    /// (`refuse_unmatched_family_call`).  A family with one entry of the
-    /// call's arity that is not generic is left to the argument check, which
-    /// compares the arguments with that one signature; a generic one's
-    /// parameters are its own type parameters there, which that check
-    /// cannot judge.
+    /// (`refuse_unmatched_family_call`), as for a free function's family.  An
+    /// argument of an overloaded name fits its parameter exactly, with no
+    /// conversion, so an argument that would only widen to the one entry of
+    /// the call's arity is refused here: the argument check, which compares
+    /// with one signature, widens, and would leave the call bound to no entry.
     refuse_unmatched_static_call(mut &this, call_e: ExpressionNode*, call: CallExpr*, entries: &[OverloadId],
                                  arg_types: &[TypeRef], leaf: SymbolStr) -> void {
         mut overloads: [TypeRef] = [];
-        mut same_arity: i64 = 0;
-        mut generic: boolean = false;
         for (mut i: i64 = 0; i < entries.length(); i++) {
-            const sig: TypeRef = this.ctx.decl_index.entry_signature(entries[i]);
-            overloads.push(sig);
-            const ft: Type* = this.arena.lookup(sig);
-            if (ft == null || ft.kind != TypeKind::Function) { continue; }
-            if (ft.as_function().param_types.length() != arg_types.length()) { continue; }
-            same_arity = same_arity + 1;
-            if (this.static_entry_template(entries[i]) != null) { generic = true; }
+            overloads.push(this.ctx.decl_index.entry_signature(entries[i]));
         }
-        if (same_arity == 1 && !generic) { return; }
         this.refuse_unmatched_family_call(call_e, call, this.intern.resolve(leaf), &overloads, arg_types);
     }
 

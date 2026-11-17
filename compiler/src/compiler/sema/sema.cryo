@@ -4852,13 +4852,21 @@ type struct SemaVisitor {
         pat.kind = PatternKind::Constant(c);
     }
 
+    /// A `match` expression's type is its arms', unified as an `if`
+    /// expression's branches are.  The type expected where it stands reaches
+    /// each arm's value, as it reaches an `if` expression's branches, so a
+    /// literal arm takes it; it never types the match itself, and the subject
+    /// is matched as the value it is, with nothing expected of it.
     resolve_match_expr(mut &this, e: ExpressionNode*, match_expr: MatchExpr*) -> TypeRef {
+        const outer_expected: TypeRef = this.state.expected_type;
+        this.state.expected_type = TypeRef::invalid();
         const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
+        this.state.expected_type = outer_expected;
         const caller_backed: boolean = this.subject_is_caller_backed(match_expr.subject);
         const writable: boolean = this.match_binds_writable(match_expr.subject);
         this.patterns.check_duplicate_default_arm(match_expr.arms);
-        const outer_expected: TypeRef = this.state.expected_type;
         mut result_type: TypeRef = TypeRef::invalid();
+        mut result_value: ExpressionNode* = null;
         mut result_span: SourceSpan = e.span;
         for (mut i: i64 = 0; i < match_expr.arms.length(); i++) {
             const arm: MatchArmNode* = match_expr.arms[i];
@@ -4874,11 +4882,18 @@ type struct SemaVisitor {
                         const arm_type: TypeRef = value.resolved_type;
                         if (!result_type.is_valid()) {
                             result_type = arm_type;
+                            result_value = value;
                             result_span = value.span;
                         } else {
                             this.check_branch_agreement(result_type, result_span,
                                 arm_type, value.span,
                                 "every arm of a `match` expression must produce the same type");
+                            const unified: TypeRef = this.branch_result_type(result_value, result_type, arm_type);
+                            if (!unified.equals(result_type)) {
+                                result_type = unified;
+                                result_value = value;
+                                result_span = value.span;
+                            }
                         }
                     }
                 }
@@ -4889,7 +4904,6 @@ type struct SemaVisitor {
         this.state.expected_type = outer_expected;
         this.patterns.check_match_exhaustive(match_expr.subject, subject_type, match_expr.arms, e.span);
         this.patterns.check_literal_patterns(match_expr.arms, subject_type);
-        if (outer_expected.is_valid()) { return outer_expected; }
         return result_type;
     }
 
@@ -5258,7 +5272,7 @@ type struct SemaVisitor {
         // takes its identity from the allocator and every use this builds
         // carries it: a later pass tracking the payload's move asks by it.
         const ok_sym: SymbolID = this.resolver.alloc_synthetic_binding();
-        const ok_pb: PatternBinding* = new PatternBinding {
+        const ok_pb: mut PatternBinding* = new PatternBinding {
             name: ok_bind, span: span, sym_id: ok_sym,
             resolved_type: TypeRef::invalid(), written_mut: false
         };
@@ -5277,7 +5291,7 @@ type struct SemaVisitor {
         err_pat.set_res(Res::Def(flow));
         const err_bind: SymbolStr = this.intern.intern(fmt::format("__cryo_try_residual_%u", this.state.try_counter).as_str());
         const err_sym: SymbolID = this.resolver.alloc_synthetic_binding();
-        const err_pb: PatternBinding* = new PatternBinding {
+        const err_pb: mut PatternBinding* = new PatternBinding {
             name: err_bind, span: span, sym_id: err_sym,
             resolved_type: TypeRef::invalid(), written_mut: false
         };

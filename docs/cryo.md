@@ -847,7 +847,7 @@ A path through an alias names what the same path through its target names, type 
 
 ### 2.9 Casting with `as`
 
-Cryo never inserts a conversion that can change a value, and never an implicit pointer conversion. A number converts implicitly - at an initializer, an assignment, a compound assignment, an argument, a return, a struct literal's field, an array or tuple literal's element (to the element type the literal is expected to have: `[x, x]` with `x: f32` written where a `[f64; 2]` is expected) and a two-branch expression's arm - only to a type that holds every value of its own:
+Cryo never inserts a conversion that can change a value, and never an implicit pointer conversion. A number converts implicitly - at an initializer, an assignment, a compound assignment, an argument, a return, a struct literal's field, an array or tuple literal's element (to the element type the literal is expected to have: `[x, x]` with `x: f32` written where a `[f64; 2]` is expected), a two-branch expression's arm and a `match` expression's arm - only to a type that holds every value of its own:
 
 - an integer to a wider integer of the same signedness, or an unsigned integer to a wider signed one (`u32` to `i64`);
 - `usize` and `isize`, which are as wide as a pointer - 32 or 64 bits by target - only where the conversion keeps every value on every target: into `usize` from an unsigned type of at most 32 bits, into `isize` from a signed type of at most 32 bits or an unsigned one of at most 16; out of `usize` into an unsigned type of at least 64 bits or a signed one wider than 64, out of `isize` into a signed type of at least 64. A `u64` is not a `usize`, nor an `isize` an `i64`;
@@ -1622,7 +1622,7 @@ There is no fallthrough between arms. See [section 7](#7-pattern-matching) for t
 
 ### 6.8 Match: Expression Form
 
-Used as an expression, `match` evaluates to the value of the matching arm. All arms must produce the same type.
+Used as an expression, `match` evaluates to the value of the matching arm. All arms must produce the same type, and that type is the expression's: its arms are unified as an `if` expression's branches are. The type expected where the `match` stands - an initializer's, an argument's parameter, a return's - reaches each arm's value as it reaches an `if` expression's branches, so a literal arm takes it (`take_u64(match (e) { E::A => { 4000000000 } _ => { 1 } })` passes `u64`s); it never types the `match` itself, which then converts where it stands as any value does. The subject is matched as the value it is: nothing is expected of it, so a `match` as another's subject is typed by its own arms.
 
 ```cryo
 const name: string = match (n) {
