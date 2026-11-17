@@ -29,8 +29,8 @@ generated as text.
   of statements, each naming the next (`-1` ends the chain), so no node owns
   another and the whole model is plain data.
 - **Types** are the eight integer types, `boolean`, `void` (what a method
-  that writes its receiver returns), a generated struct, named by its
-  index, and a generic function's type parameter `T`.
+  that writes its receiver returns), a generated struct or enum, named by
+  its index, and a generic function's type parameter `T`.
 - **Expression nodes** carry their type and one of: an integer or boolean
   literal; a type's named limit (`i8::MIN`, `u32::MAX`); a variable read; a
   unary operator; a binary operator; a wrapping method call
@@ -40,7 +40,10 @@ generated as text.
   argument written, a placeholder or left out (`g0::<u16>(a, b)`,
   `g0::<_>(a, b)`, `g0(a, b)`); a method call on a place
   (`v2.f1.m0(a)`); a field (`v2.f1`); a struct literal (`S1 { f2: a, f0: b }`),
-  an instance's spelling its type argument the same three ways.
+  an instance's spelling its type argument the same three ways; an enum's
+  variant (`E0::V1`); a `match` expression. A `match`, expression or
+  statement, names a run of **arms** in an arena of its own, each a
+  pattern (a variant, or `_`) and a body (an expression, or a block).
 - **Statement nodes:** a declaration (`const` / `mut`), an assignment (plain
   or compound) to a place - a `mut` local, or a field reached from one or
   from a `mut &this` - an observation (`observed = mix(observed, ...)`), a
@@ -201,6 +204,39 @@ overloaded: a call two generic overloads, or a generic and a plain one,
 both accept is ambiguous, and nothing generated would be certain to avoid
 that.
 
+**Enums and `match`.** With `enums`, one or two enums `E<N>` with two to
+four unit variants `V<N>` are declared first, before the structs, from a
+stream of their own. An enum is a type a value may have - a local, a
+parameter, a return type, a generic function's type argument - and every
+enum is `Copy`, its variants carrying nothing. A value of one is a variant
+(`E0::V1`), a variable, a call, a method call or an `if` expression, so it
+always reads a name. A `match` over a value of some enum writes an arm for
+one to all of its variants, in a shuffled order, then `_` when a variant
+is left (section 3.2). As a statement its arms are blocks. As an
+expression, of an integer, boolean or enum type, its arms are values of
+that type that read a name, since an arm, as an `if` expression's, gives a
+bare literal no type; it is written only where the place expects exactly
+its own type - an initializer, an assignment, an argument, a return value
+or a struct literal's field. An enum value is observed through a `u64` local initialised by
+`match (e) { E0::V0 => { 1 } E0::V1 => { 2 } }`, its variant's number plus
+one.
+
+**Kept off: a `match` expression where a different type is expected.**
+The compiler types a `match` expression with the type its context
+expects rather than with its arms' type: as an operand of a comparison
+initialising a `boolean` it is typed `boolean`, and as another `match`'s
+subject it takes the outer `match`'s type; the program is refused or fails
+at codegen. So a `match` expression is never an operand, a receiver, a
+subject or an arm, only the whole value of a place that expects its own
+type; lift this when that is fixed.
+
+**Kept off: a `match` expression with literal arms as an argument.** The
+compiler leaves such arms `i32` at an argument, while it types them by an
+initializer's type and types an `if` expression's arms at both, so the
+enum observation binds its `match` to a local rather than passing it to
+`mix`. Every other generated `match` expression's arms read a name, so the
+shape arises nowhere else; lift this when that is fixed.
+
 **Inferred type arguments.** With `inferred-type-arguments`, a generic
 call or an instance's literal leaves its type argument to inference four
 times in ten (`g0(a, b)`, `B0 { f0: a }`) and writes the placeholder twice
@@ -279,6 +315,11 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   that names a `T` parameter twice, or once inside a loop, without the
   bound; it reads the text, since the compiler accepts such a function
   when every instance's type is `Copy` and so cannot be the check.
+- **Every `match` is exhaustive and every arm reachable.** A `match`
+  covers each variant once, by its own arm or by a `_` written last, and
+  writes `_` only when a variant is left
+  (`guarantees/exhaustiveness.cryo`): no variant is uncovered, no arm
+  follows `_`, and no variant has two arms.
 - **Overload resolution is certain.** A call of an overloaded name
   selects the member its arguments fit, and no implicit conversion makes
   one fit: a narrower integer is not widened, and a literal where the
@@ -372,7 +413,8 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   seeded with its number. The generic structs and their instances come
   from one stream of their own; how many methods each has and how each
   takes its receiver from another, and each such method from one seeded
-  with its place among them. Whether a function gains an overload set
+  with its place among them. The enums come from one stream of their
+  own. Whether a function gains an overload set
   comes from a stream keyed by its name, and each member from one keyed by
   the name and the member's place in the set.
 - **The function count shapes nothing before `main`**: a program generated
@@ -381,8 +423,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. `default,no-overloads` generates version
-  8's text, and with `no-overloads` added to each list,
+  generator's text, header aside. `default,no-enums` generates version 9's
+  text, `default,no-overloads,no-enums` version 8's, and with both added
+  to each list,
   `default,no-structs,no-constants,no-generics,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
   version 1's, `default,no-generics,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
   version 3's, `default,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
@@ -407,8 +450,8 @@ every feature of the current stage; `no-<name>` removes one.
 |---|---|
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
-| 3 (this one) | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
-| 4 | enums with unit and payload variants, generic enums, and `match`: qualified variants, payload bindings, nested patterns, wildcards, `match` as an expression |
+| 3 | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
+| 4 (this one) | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2). Still to come in this stage: payload variants and bindings, generic enums, nested patterns |
 | 5 | closures: capturing and not, passed to function-typed parameters and called |
 | 6 | traits, classes and dynamic dispatch: implementations, default methods, calls through a bound and through a trait object |
 | 7 | ownership: moves, drops (a drop log folded into the hash), references, `Box` and `Rc`, `Option` and `Result` |
@@ -511,8 +554,8 @@ layers, lowest first:
 | `random/` | `RandomStream`: every draw, and the seed of each part's stream (section 3.5) |
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
-| `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures (3.2) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads` |
+| `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures and `Exhaustiveness`'s arms (3.2) |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |

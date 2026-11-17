@@ -5,7 +5,7 @@ namespace cryosmith::emit::expressions;
 import std::collections::str::{ Str };
 
 import cryosmith::emit::printer::{ Printer };
-import cryosmith::model::{ ExpressionKind, ExpressionNode, Function, Program, TypeArgumentSpelling };
+import cryosmith::model::{ ExpressionKind, ExpressionNode, Function, Program, TypeArgumentSpelling, ValueType };
 
 implement struct Printer {
     /// The expression at `index`.
@@ -47,6 +47,21 @@ implement struct Printer {
                 this.text.push(f" as {program.type_name(node.value_type).as_str()})");
             }
             ExpressionKind::Widen(operand) => { this.expression(program, operand); }
+            ExpressionKind::Variant(variant) => { this.text.push(f"{program.type_name(node.value_type).as_str()}::V{variant}"); }
+            ExpressionKind::Match(subject, first, count) => {
+                this.text.push(Str::new("(match ("));
+                this.expression(program, subject);
+                this.text.push(Str::new(") { "));
+                mut arm: i64 = first;
+                while (arm < first + count) {
+                    this.pattern(program, program.expression_at(subject).value_type, program.arm_at(arm).pattern);
+                    this.text.push(Str::new(" => { "));
+                    this.expression(program, program.arm_at(arm).body);
+                    this.text.push(Str::new(" } "));
+                    arm = arm + 1;
+                }
+                this.text.push(Str::new("})"));
+            }
             ExpressionKind::Conditional(condition, then_value, else_value) => {
                 this.text.push(Str::new("(if ("));
                 this.expression(program, condition);
@@ -116,6 +131,16 @@ implement struct Printer {
         this.text.push(Str::new(")"));
     }
 
+    /// A `match` arm's pattern over a value of `matched`: the variant
+    /// `pattern` (`E0::V1`), or `_` for -1.
+    internal pattern(mut &this, program: &Program, matched: ValueType, pattern: i64) -> void {
+        if (pattern < 0) {
+            this.text.push(Str::new("_"));
+            return;
+        }
+        this.text.push(f"{program.type_name(matched).as_str()}::V{pattern}");
+    }
+
     /// A method's receiver: a name, a field or a parenthesised expression
     /// as it prints, anything else in parentheses.
     private receiver(mut &this, program: &Program, index: i64) -> void {
@@ -126,6 +151,7 @@ implement struct Printer {
             ExpressionKind::Binary(_, _, _) => { this.expression(program, index); }
             ExpressionKind::Cast(_) => { this.expression(program, index); }
             ExpressionKind::Conditional(_, _, _) => { this.expression(program, index); }
+            ExpressionKind::Match(_, _, _) => { this.expression(program, index); }
             _ => {
                 this.text.push(Str::new("("));
                 this.expression(program, index);
