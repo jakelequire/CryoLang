@@ -1,0 +1,277 @@
+///! An arm's plan: the three stages that build the compiler, each with the
+///! compiler the one before left (the pin builds stage 2, stage 2 builds
+///! stage 3, stage 3 builds stage 4), the directories they write, and the
+///! compilers they leave.
+///!
+///! Stage 3 is the first compiler whose code comes wholly from the current
+///! source - stage 2 was built by the pin, which may be older - so stage 3
+///! building a stage 4 that emits the same code is the fixed point.  Stages
+///! 3 and 4 are built with `--emit-llvm`, so their per-module IR can be
+///! compared.
+///!
+///! The Linux arm runs the ELF pin `bin/cryo` and writes stage 2 to
+///! `compiler/build`, where `make cryo` puts it.  The Windows arm runs
+///! `bin/cryo.exe`, natively or under wine, and writes every stage below
+///! `compiler/build/self/win-sN`, so the two arms share no directory.
+
+namespace cryogate::selfhost::stages;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Job };
+
+/// One stage: a compiler building the next one, in `compiler/`.
+public type struct Stage {
+    /// The compiler that runs: `pinned`, `stage-2` or `stage-3`.
+    public via: String;
+    /// Where the stage writes, relative to `compiler/`.
+    public output: String;
+    /// The program started: the compiler, or wine running it.
+    public program: String;
+    /// The program's arguments.
+    public arguments: Array<String>;
+    /// Variables set in the stage's environment over the inherited ones.
+    public variables: Array<Pair<String, String>>;
+
+    /// The stage as its report line names it:
+    /// `compiler  via stage-2     ->  build/self/s3`.
+    public label(&this) -> String {
+        const source: Str = Str::new("compiler");
+        const via: Str = this.via.as_str();
+        return f"{source:<8}  via {via:<10}  ->  {this.output.as_str()}";
+    }
+
+    /// The stage's job, run in the directory `compiler`, writing both
+    /// output streams to `log`.
+    public job(&this, compiler: Path, log: Str) -> Job {
+        mut job: Job = Job::new(this.program.as_str());
+        for (argument in this.arguments.iterate_references()) { job.argument(argument.as_str()); }
+        job.default_c_compiler();
+        for (variable in this.variables.iterate_references()) { job.set_variable(variable.first.as_str(), variable.second.as_str()); }
+        job.directory(compiler.as_str());
+        job.log_to(log);
+        return job;
+    }
+}
+
+/// What one arm builds and compares.  Paths are absolute, built from the
+/// checkout the plan was made for.
+public type struct ArmPlan {
+    /// `linux` or `windows`, as the arms table names it.
+    public name: String;
+    /// The three stages, in order.
+    public stages: Array<Stage>;
+    /// Removed before the first stage: what the stages write, and on the
+    /// Linux arm the stdlib archives, so each stage compiler builds its own.
+    public wiped: Array<String>;
+    /// Created before the first stage: the compiler makes only the last
+    /// directory of a `--build-dir`.
+    public created: Array<String>;
+    /// The compilers the stages leave: stage 2, stage 3 and stage 4.
+    public compilers: Array<String>;
+    /// The build directory of stage 3, whose per-module IR is compared with
+    /// stage 4's.
+    public third: String;
+    /// The build directory of stage 4.
+    public fourth: String;
+    /// Whether the stages also write the linked `cryo.ll`, compared before
+    /// the per-module trees (the Linux arm's builds do; the Windows arm's
+    /// do not).
+    public linked: boolean;
+    /// What runs a stage compiler: nothing natively, `wine` under wine.
+    public runner: Array<String>;
+    /// The variables every stage, and every stage compiler run, is given.
+    public variables: Array<Pair<String, String>>;
+    /// Whether a stage compiler loads `LLVM-C.dll` and `libclang.dll` from
+    /// its own directory, so each one built must have them copied beside it
+    /// before it runs.
+    public libraries_beside: boolean;
+
+    /// The Linux arm, rooted at the ELF pin `bin/cryo`.
+    public static linux(repository: Path) -> ArmPlan {
+        const build: PathBuf = repository.join(Str::new("compiler/build"));
+        mut wiped: Array<String> = Array::<String>::new();
+        wiped.push(String::from_str(build.as_path().as_str()));
+        wiped.push(String::from_str(repository.join(Str::new("stdlib/.bin")).as_path().as_str()));
+        mut created: Array<String> = Array::<String>::new();
+        created.push(String::from_str(build.as_path().join(Str::new("self/s3")).as_path().as_str()));
+        created.push(String::from_str(build.as_path().join(Str::new("self/s4")).as_path().as_str()));
+        mut compilers: Array<String> = Array::<String>::new();
+        compilers.push(String::from_str(build.as_path().join(Str::new("cryo")).as_path().as_str()));
+        compilers.push(String::from_str(build.as_path().join(Str::new("self/s3/cryo")).as_path().as_str()));
+        compilers.push(String::from_str(build.as_path().join(Str::new("self/s4/cryo")).as_path().as_str()));
+        const variables: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        const runner: Array<String> = Array::<String>::new();
+        mut stages: Array<Stage> = Array::<Stage>::new();
+        stages.push(ArmPlan::stage(Str::new("pinned"), Str::new("build"), &runner,
+                                   repository.join(Str::new("bin/cryo")).as_path().as_str(), Str::new(""), false, &variables));
+        stages.push(ArmPlan::stage(Str::new("stage-2"), Str::new("build/self/s3"), &runner,
+                                   compilers.get_reference(0).unwrap().as_str(), Str::new("build/self/s3"), true, &variables));
+        stages.push(ArmPlan::stage(Str::new("stage-3"), Str::new("build/self/s4"), &runner,
+                                   compilers.get_reference(1).unwrap().as_str(), Str::new("build/self/s4"), true, &variables));
+        return ArmPlan {
+            name:             String::from_str(Str::new("linux")),
+            stages:           stages,
+            wiped:            wiped,
+            created:          created.clone(),
+            compilers:        compilers,
+            third:            created.get_reference(0).unwrap().clone(),
+            fourth:           created.get_reference(1).unwrap().clone(),
+            linked:           true,
+            runner:           runner,
+            variables:        variables,
+            libraries_beside: false,
+        };
+    }
+
+    /// The Windows arm, rooted at `bin/cryo.exe`: run natively on a Windows
+    /// host, or under wine on a Linux one with the fetched Windows
+    /// toolchain (`ArmPlan::wine_toolchain_missing`).
+    public static windows(repository: Path, under_wine: boolean) -> ArmPlan {
+        const nested: PathBuf = repository.join(Str::new("compiler/build/self"));
+        const names: Array<String> = ArmPlan::windows_stage_names();
+        mut created: Array<String> = Array::<String>::new();
+        mut compilers: Array<String> = Array::<String>::new();
+        for (name in names.iterate_references()) {
+            const directory: PathBuf = nested.as_path().join(name.as_str());
+            created.push(String::from_str(directory.as_path().as_str()));
+            compilers.push(String::from_str(directory.as_path().join(Str::new("cryo.exe")).as_path().as_str()));
+        }
+        mut runner: Array<String> = Array::<String>::new();
+        mut variables: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        if (under_wine) {
+            runner.push(String::from_str(Str::new("wine")));
+            const toolchain: PathBuf = repository.join(Str::new(".toolchains"));
+            const mingw: PathBuf = toolchain.as_path().join(Str::new("llvm-mingw/bin"));
+            const llvm: PathBuf = toolchain.as_path().join(Str::new("llvm-win"));
+            // bin/cryo.exe loads LLVM-C.dll and libclang.dll as it starts,
+            // and a checkout has neither beside it; without them wine exits
+            // 53 having printed nothing.  WINEPATH puts the fetched pair on
+            // every stage's library search path.
+            ArmPlan::variable(&variables, Str::new("WINEDEBUG"), Str::new("-all"));
+            ArmPlan::variable(&variables, Str::new("WINEPATH"), ArmPlan::wine_path(llvm.as_path().join(Str::new("bin")).as_path().as_str()).as_str());
+            const stdlib: PathBuf = repository.join(Str::new("stdlib"));
+            const forward: String = stdlib.as_path().as_str().replace(&Str::new("\\"), &Str::new("/"));
+            ArmPlan::variable(&variables, Str::new("CRYO_STDLIB"), f"Z:{forward.as_str()}".as_str());
+            ArmPlan::variable(&variables, Str::new("CRYO_CC"), ArmPlan::wine_path(mingw.as_path().join(Str::new("clang.exe")).as_path().as_str()).as_str());
+            ArmPlan::variable(&variables, Str::new("CRYO_AR"), ArmPlan::wine_path(mingw.as_path().join(Str::new("llvm-ar.exe")).as_path().as_str()).as_str());
+            // libclang finds the builtin headers (stddef.h, ...) through the
+            // resource directory of its major version; the walk from the
+            // library's own directory fails once it sits beside a stage
+            // compiler.
+            ArmPlan::variable(&variables, Str::new("CRYO_CLANG_RESOURCE_DIR"), ArmPlan::wine_path(llvm.as_path().join(Str::new("lib/clang/20")).as_path().as_str()).as_str());
+        } else {
+            ArmPlan::variable(&variables, Str::new("CRYO_STDLIB"), repository.join(Str::new("stdlib")).as_path().as_str());
+        }
+        mut stages: Array<Stage> = Array::<Stage>::new();
+        stages.push(ArmPlan::stage(Str::new("pinned"), Str::new("build/self/win-s2"), &runner,
+                                   repository.join(Str::new("bin/cryo.exe")).as_path().as_str(), Str::new("build/self/win-s2"), false, &variables));
+        stages.push(ArmPlan::stage(Str::new("stage-2"), Str::new("build/self/win-s3"), &runner,
+                                   compilers.get_reference(0).unwrap().as_str(), Str::new("build/self/win-s3"), true, &variables));
+        stages.push(ArmPlan::stage(Str::new("stage-3"), Str::new("build/self/win-s4"), &runner,
+                                   compilers.get_reference(1).unwrap().as_str(), Str::new("build/self/win-s4"), true, &variables));
+        return ArmPlan {
+            name:             String::from_str(Str::new("windows")),
+            stages:           stages,
+            wiped:            created.clone(),
+            created:          created.clone(),
+            compilers:        compilers,
+            third:            created.get_reference(1).unwrap().clone(),
+            fourth:           created.get_reference(2).unwrap().clone(),
+            linked:           false,
+            runner:           runner,
+            variables:        variables,
+            libraries_beside: true,
+        };
+    }
+
+    /// The parts of the fetched Windows toolchain (scripts/fetch-windows-llvm.sh)
+    /// the Windows arm needs under wine and the checkout lacks, by path
+    /// relative to it: a stage links a runnable cryo.exe, which takes a C
+    /// driver, an archiver and the two libraries it loads.
+    public static wine_toolchain_missing(repository: Path) -> Array<String> {
+        mut wanted: Array<Str> = Array::<Str>::new();
+        wanted.push(Str::new(".toolchains/llvm-mingw/bin/clang.exe"));
+        wanted.push(Str::new(".toolchains/llvm-mingw/bin/llvm-ar.exe"));
+        wanted.push(Str::new(".toolchains/llvm-win/bin/LLVM-C.dll"));
+        wanted.push(Str::new(".toolchains/llvm-win/bin/libclang.dll"));
+        mut missing: Array<String> = Array::<String>::new();
+        for (path in wanted.iterate_references()) {
+            if (!repository.join(*path).as_path().is_file()) { missing.push(String::from_str(*path)); }
+        }
+        return missing;
+    }
+
+    /// The libraries a Windows stage compiler loads from its own directory,
+    /// by file name, each with where it is copied from: the copy beside the
+    /// pin in `bin/` when there is one, the fetched toolchain's otherwise.
+    /// A library found in neither is left out.
+    public static libraries(repository: Path) -> Array<Pair<String, String>> {
+        mut names: Array<Str> = Array::<Str>::new();
+        names.push(Str::new("LLVM-C.dll"));
+        names.push(Str::new("libclang.dll"));
+        mut found: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        for (name in names.iterate_references()) {
+            const beside: PathBuf = repository.join(Str::new("bin")).as_path().join(*name);
+            const fetched: PathBuf = repository.join(Str::new(".toolchains/llvm-win/bin")).as_path().join(*name);
+            if (beside.as_path().is_file()) {
+                found.push(Pair::new(String::from_str(*name), String::from_str(beside.as_path().as_str())));
+            } else if (fetched.as_path().is_file()) {
+                found.push(Pair::new(String::from_str(*name), String::from_str(fetched.as_path().as_str())));
+            }
+        }
+        return found;
+    }
+
+    /// The stage `via`, writing `output`, run by `runner` (or directly)
+    /// with `compiler` and the given variables; `directory` names its
+    /// `--build-dir` when not the default, and `emit` asks for its IR.
+    private static stage(via: Str, output: Str, runner: &Array<String>, compiler: Str, directory: Str, emit: boolean,
+                         variables: &Array<Pair<String, String>>) -> Stage {
+        mut arguments: Array<String> = Array::<String>::new();
+        mut program: String = String::from_str(compiler);
+        if (!runner.is_empty()) {
+            program = runner.get_reference(0).unwrap().clone();
+            mut index: i64 = 1;
+            while (index < runner.length()) {
+                arguments.push(runner.get_reference(index).unwrap().clone());
+                index++;
+            }
+            arguments.push(String::from_str(compiler));
+        }
+        arguments.push(String::from_str(Str::new("build")));
+        arguments.push(String::from_str(Str::new("--no-incremental")));
+        if (!directory.is_empty()) { arguments.push(f"--build-dir={directory}"); }
+        if (emit) { arguments.push(String::from_str(Str::new("--emit-llvm"))); }
+        return Stage {
+            via:       String::from_str(via),
+            output:    String::from_str(output),
+            program:   program,
+            arguments: arguments,
+            variables: variables.clone(),
+        };
+    }
+
+    private static windows_stage_names() -> Array<String> {
+        mut names: Array<String> = Array::<String>::new();
+        names.push(String::from_str(Str::new("win-s2")));
+        names.push(String::from_str(Str::new("win-s3")));
+        names.push(String::from_str(Str::new("win-s4")));
+        return names;
+    }
+
+    private static variable(variables: mut &Array<Pair<String, String>>, name: Str, value: Str) -> void {
+        variables.push(Pair::new(String::from_str(name), String::from_str(value)));
+    }
+
+    /// `path` as a wine program sees it: on the `Z:` drive, with `\`
+    /// separators.
+    private static wine_path(path: Str) -> String {
+        const backward: String = path.replace(&Str::new("/"), &Str::new("\\"));
+        return f"Z:{backward.as_str()}";
+    }
+}

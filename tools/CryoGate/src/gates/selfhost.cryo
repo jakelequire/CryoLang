@@ -1,0 +1,47 @@
+///! `cryogate selfhost --digest [<root>]`: the digest of the sources the
+///! Linux arm reads (the pin and the compiler, runtime, stdlib and scripts
+///! trees, less their build outputs), below `<root>` or the checkout,
+///! printed as `<sha256>  (<N> files)`.  A Windows host compares it with the
+///! digest of the copy the Linux arm runs from inside WSL.
+
+namespace cryogate::gates::selfhost;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::path::{ Path };
+
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::selfhost::digest::{ TreeDigest };
+
+/// The selfhost gate.
+public type struct SelfhostGate {
+    /// Run `cryogate selfhost` with `arguments` from index `first`.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate selfhost --digest [<root>]"));
+        options.flag(Str::new("--digest"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate selfhost: {reason.as_str()}"); return 2; }
+        };
+        const positionals: &Array<String> = parsed.positionals();
+        if (!parsed.has(Str::new("--digest")) || positionals.length() > 1 || parsed.separated()) {
+            fmt::eprintln(f"cryogate selfhost: usage: {options.usage()}");
+            return 2;
+        }
+        const root: Path = if (positionals.is_empty()) { repository } else { Path::from(positionals.get_reference(0).unwrap().as_str()) };
+        return match (TreeDigest::of(root)) {
+            Result::Ok(digest) => {
+                fmt::println(f"{digest.digest.as_str()}  ({digest.files} files)");
+                0
+            }
+            Result::Err(reason) => {
+                fmt::eprintln(f"cryogate selfhost: {reason.as_str()}");
+                1
+            }
+        };
+    }
+}

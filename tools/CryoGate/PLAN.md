@@ -439,7 +439,9 @@ Additions the port makes because it is the natural place:
   builds its archive once, keyed by its own bytes); the stage table is the
   landed one.
 
-**Implementation (G10).**  One module, `gates/selfhost.cryo`, beside verify's:
+**Implementation (G10).**  The decisions are the layer `selfhost/`
+(DESIGN.md: `ArmPlan` is the stage table, `ModuleTrees`, `StageArchives`,
+`TreeDigest`, `ArmsVerdict`), the run is `gates/selfhost.cryo`:
 
 - **Pure parts, tested as `![test]`s first.**
   - `Stage { source, via, output, directory, arguments, environment }` and
@@ -477,8 +479,9 @@ Additions the port makes because it is the natural place:
     `FIXED POINT OK` and `STDLIB ARCHIVES OK` spelled exactly as today,
     since a run is accepted on those counts.
 - **Staging.**
-  1. The pure parts and their tests.  check-fast drops
-     `selfhost-check.py --selftest`.  Side by side, `cryogate selfhost
+  1. The pure parts and their tests.  check-fast keeps
+     `selfhost-check.py --selftest` while the script is the live gate, and
+     drops it with the script.  Side by side, `cryogate selfhost
      --digest` prints the working tree's digest, which must equal the
      script's.
   2. The Windows arm, run beside the `.cmd` on one tree: the same stage

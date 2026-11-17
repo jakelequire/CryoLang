@@ -1,0 +1,110 @@
+///! The digest of the sources the Linux arm reads.
+///!
+///! On a Windows host the Linux arm runs inside WSL from a copy of these
+///! sources on WSL's own filesystem (reading the working tree through
+///! `/mnt/c` costs the arm most of its time), and the copy is trusted only
+///! when its digest is the working tree's.  The two digests are computed by
+///! this one function, on each side.
+
+namespace cryogate::selfhost::digest;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+import std::encoding::sha256::{ Sha256 };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::tree::{ Tree };
+
+/// The digest of the mirrored sources below one root.
+public type struct TreeDigest {
+    /// The sha256, in lowercase hex.
+    public digest: String;
+    /// How many files it covers.
+    public files: i64;
+
+    /// The digest of the mirrored sources below `root`: a sha256 fed, for
+    /// each file in path order, its `/`-separated path relative to `root`,
+    /// a NUL and the sha256 of its bytes.  A mirrored entry that is not
+    /// there contributes nothing.
+    public static of(root: Path) -> Result<TreeDigest, String> {
+        const files: Array<String> = TreeDigest::listed(root)?;
+        mut whole: Sha256 = Sha256::new();
+        for (relative in files.iterate_references()) {
+            const path: PathBuf = root.join(relative.as_str());
+            const bytes: Array<u8> = match (File::read_bytes(path.as_path())) {
+                Result::Ok(bytes)  => { bytes }
+                Result::Err(error) => { return Result::Err(f"cannot read {path.as_path().as_str()}: {error.describe()}"); }
+            };
+            mut header: String = String::from_str(relative.as_str());
+            header.push_byte(0);
+            whole.update(header.as_str().as_bytes());
+            whole.update(Sha256::digest(bytes.as_slice()).as_bytes());
+        }
+        return Result::Ok(TreeDigest { digest: whole.finish().to_hex(), files: files.length() });
+    }
+
+    /// The mirrored entries, relative to the checkout: the pin and the four
+    /// source trees the Linux arm builds from.
+    public static mirrored() -> Array<String> {
+        mut entries: Array<String> = Array::<String>::new();
+        entries.push(String::from_str(Str::new("bin/cryo")));
+        entries.push(String::from_str(Str::new("compiler")));
+        entries.push(String::from_str(Str::new("runtime")));
+        entries.push(String::from_str(Str::new("stdlib")));
+        entries.push(String::from_str(Str::new("scripts")));
+        return entries;
+    }
+
+    /// The directories inside the mirrored trees that are left out: the
+    /// build outputs the arm wipes or rebuilds.  Each is a directory
+    /// directly inside a mirrored tree.
+    public static skipped() -> Array<String> {
+        mut entries: Array<String> = Array::<String>::new();
+        entries.push(String::from_str(Str::new("compiler/build")));
+        entries.push(String::from_str(Str::new("stdlib/.bin")));
+        entries.push(String::from_str(Str::new("runtime/.bin")));
+        return entries;
+    }
+
+    /// Every mirrored file below `root`, as a `/`-separated relative path,
+    /// sorted.  An interpreter's `__pycache__` is left out at any depth.
+    private static listed(root: Path) -> Result<Array<String>, String> {
+        mut files: Array<String> = Array::<String>::new();
+        mut cache: Array<String> = Array::<String>::new();
+        cache.push(String::from_str(Str::new("__pycache__")));
+        const tops: Array<String> = TreeDigest::mirrored();
+        const skipped: Array<String> = TreeDigest::skipped();
+        for (top in tops.iterate_references()) {
+            const path: PathBuf = root.join(top.as_str());
+            if (path.as_path().is_file()) {
+                files.push(top.clone());
+                continue;
+            }
+            if (!path.as_path().is_directory()) { continue; }
+            // The skipped directories of this tree, by name.
+            mut excluded: Array<String> = cache.clone();
+            const prefix: String = f"{top.as_str()}/";
+            for (entry in skipped.iterate_references()) {
+                if (entry.as_str().starts_with(&prefix.as_str())) {
+                    excluded.push(String::from_str(entry.as_str().byte_substring(prefix.length(), entry.length())));
+                }
+            }
+            const names: Array<String> = Tree::names(path.as_path(), &excluded)?;
+            for (name in names.iterate_references()) {
+                const child: PathBuf = path.as_path().join(name.as_str());
+                const relative: String = f"{top.as_str()}/{name.as_str()}";
+                if (!child.as_path().is_directory()) {
+                    files.push(relative);
+                    continue;
+                }
+                const below: Array<String> = Tree::files(child.as_path(), &cache)?;
+                for (file in below.iterate_references()) { files.push(f"{relative.as_str()}/{file.as_str()}"); }
+            }
+        }
+        files.sort();
+        return Result::Ok(files);
+    }
+}

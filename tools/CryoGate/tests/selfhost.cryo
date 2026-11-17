@@ -1,0 +1,289 @@
+///! selfhost's decisions: the arms' stage plans, the per-module tree
+///! comparison, the stage archives, the digest of the mirrored sources and
+///! the arms' verdict.
+![config(testing)]
+namespace cryogate::tests::selfhost;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::encoding::sha256::{ Sha256 };
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::fs::temporary::{ TemporaryDirectory };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect };
+
+import cryogate::core::text::{ Text };
+import cryogate::selfhost::archives::{ ArchiveComparison, StageArchives };
+import cryogate::selfhost::arms::{ Arm, ArmStatus, ArmsVerdict };
+import cryogate::selfhost::digest::{ TreeDigest };
+import cryogate::selfhost::stages::{ ArmPlan };
+import cryogate::selfhost::trees::{ ModuleTrees, TreeComparison };
+
+type struct Fixture {
+    /// Write `text` to `relative` below `root`, creating its directories.
+    private static put(root: Path, relative: Str, text: Str) -> Result<(), TestError> {
+        const path: PathBuf = root.join(relative);
+        match (path.as_path().parent()) {
+            Option::Some(parent) => {
+                match (Directory::create_all(parent)) {
+                    Result::Ok(_)      => { }
+                    Result::Err(error) => { return Result::Err(TestError::other(error.describe())); }
+                }
+            }
+            Option::None => { }
+        }
+        return match (File::write_text(path.as_path(), text)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(TestError::other(error.describe())) }
+        };
+    }
+
+    /// A field of the plan's stage `index` as text: its `program`, its
+    /// `arguments` joined by spaces, its `variables` as `NAME=value` joined
+    /// by `;`, or its `label`.
+    private static field(plan: &ArmPlan, index: i64, name: Str) -> String {
+        if (name == Str::new("program")) { return plan.stages.get_reference(index).unwrap().program.clone(); }
+        if (name == Str::new("label")) { return plan.stages.get_reference(index).unwrap().label(); }
+        if (name == Str::new("arguments")) { return Text::joined(&plan.stages.get_reference(index).unwrap().arguments, Str::new(" ")); }
+        mut variables: Array<String> = Array::<String>::new();
+        for (variable in plan.stages.get_reference(index).unwrap().variables.iterate_references()) {
+            variables.push(f"{variable.first.as_str()}={variable.second.as_str()}");
+        }
+        return Text::joined(&variables, Str::new(";"));
+    }
+
+    private static scratch() -> Result<TemporaryDirectory, TestError> {
+        return match (TemporaryDirectory::create()) {
+            Result::Ok(directory) => { Result::Ok(directory) }
+            Result::Err(error)    => { Result::Err(TestError::other(error.describe())) }
+        };
+    }
+
+    /// The comparison as one line: `same 2 8`, `differs <key>`,
+    /// `not comparable <reason>`.
+    private static described(comparison: &TreeComparison) -> String {
+        return match (comparison) {
+            TreeComparison::Same(size)            => { f"same {size.modules} {size.bytes}" }
+            TreeComparison::Differs(key)          => { f"differs {key.as_str()}" }
+            TreeComparison::NotComparable(reason) => { f"not comparable {reason.as_str()}" }
+        };
+    }
+
+    /// The archive comparison as one line: `shared`, or the tree's.
+    private static archives(comparison: &ArchiveComparison) -> String {
+        return match (comparison) {
+            ArchiveComparison::Shared            => { String::from_str(Str::new("shared")) }
+            ArchiveComparison::Compared(compared) => { Fixture::described(compared) }
+        };
+    }
+
+    /// A stdlib archive `key` below the scratch stdlib `stdlib`, holding
+    /// the objects `std/core/error.o` and `std/io/error.o` with the bytes
+    /// given (an empty one is left out), and the same IR whatever they are.
+    private static archive(stdlib: Path, key: Str, core: Str, io: Str) -> Result<(), TestError> {
+        const home: String = f".bin/t/prebuilt/{key}/target/release/t/local";
+        if (!core.is_empty()) { Fixture::put(stdlib, f"{home.as_str()}/deps/std/core/error.o".as_str(), core)?; }
+        if (!io.is_empty()) { Fixture::put(stdlib, f"{home.as_str()}/deps/std/io/error.o".as_str(), io)?; }
+        Fixture::put(stdlib, f"{home.as_str()}/ir/std/core/error.ll".as_str(), Str::new("ir"))?;
+        return Fixture::put(stdlib, f"{home.as_str()}/ir/std/io/error.ll".as_str(), Str::new("ir2"));
+    }
+
+    /// The archive comparison after the pin built nothing, stage 2 built
+    /// the archive `a` and stage 3 the archive `b` (none when `b` is
+    /// empty); the stage compilers hold `second` and `third`.
+    private static stage_archives(root: Path, a_core: Str, a_io: Str, b_core: Str, b_io: Str, second: Str, third: Str) -> Result<String, TestError> {
+        const stdlib: PathBuf = root.join(Str::new("stdlib"));
+        Fixture::archive(stdlib.as_path(), Str::new("old"), Str::new("x"), Str::new("y"))?;
+        mut watched: StageArchives = match (StageArchives::start(stdlib.as_path())) {
+            Result::Ok(watched) => { watched }
+            Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+        };
+        Fixture::recorded(&watched, Str::new("pinned"))?;
+        Fixture::archive(stdlib.as_path(), Str::new("a"), a_core, a_io)?;
+        Fixture::put(stdlib.as_path(), Str::new(".bin/t/prebuilt/a.lock"), Str::new("not an archive"))?;
+        Fixture::recorded(&watched, Str::new("stage-2"))?;
+        if (!b_core.is_empty() || !b_io.is_empty()) { Fixture::archive(stdlib.as_path(), Str::new("b"), b_core, b_io)?; }
+        Fixture::recorded(&watched, Str::new("stage-3"))?;
+        Fixture::put(root, Str::new("stage2"), second)?;
+        Fixture::put(root, Str::new("stage3"), third)?;
+        const compared: ArchiveComparison = watched.compare(root.join(Str::new("stage2")).as_path(), root.join(Str::new("stage3")).as_path());
+        return Result::Ok(Fixture::archives(&compared));
+    }
+
+    private static recorded(watched: mut &StageArchives, via: Str) -> Result<(), TestError> {
+        return match (watched.record(via)) {
+            Result::Ok(_)       => { Result::Ok(()) }
+            Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
+        };
+    }
+
+    private static digest(root: Path) -> Result<TreeDigest, TestError> {
+        return match (TreeDigest::of(root)) {
+            Result::Ok(digest)  => { Result::Ok(digest) }
+            Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
+        };
+    }
+
+    private static verdict(statuses: &Array<ArmStatus>, allow_skipped: boolean) -> ArmsVerdict {
+        mut arms: Array<Arm> = Array::<Arm>::new();
+        mut index: i64 = 0;
+        for (status in statuses.iterate_references()) {
+            const name: Str = if (index == 0) { Str::new("linux") } else { Str::new("windows") };
+            const copied: ArmStatus = match (status) {
+                ArmStatus::Verified => { ArmStatus::Verified }
+                ArmStatus::Skipped  => { ArmStatus::Skipped }
+                ArmStatus::Failed   => { ArmStatus::Failed }
+                ArmStatus::Declined => { ArmStatus::Declined }
+            };
+            arms.push(Arm::new(name, copied, Str::new("why")));
+            index++;
+        }
+        return ArmsVerdict::of(&arms, allow_skipped);
+    }
+}
+
+![test]
+function the_linux_arm_builds_three_stages_from_the_pin_and_emits_ir_for_the_last_two() -> Result<(), TestError> {
+    const plan: ArmPlan = ArmPlan::linux(Path::from(Str::new("/r")));
+    expect(plan.stages.length() == 3, Str::new("three stages"))?;
+    const pin: String = Fixture::field(&plan, 0, Str::new("program"));
+    expect(pin.as_str().ends_with(&Str::new("cryo")) && pin.as_str().contains(&Str::new("bin")), Str::new("the pin builds stage 2"))?;
+    expect(Fixture::field(&plan, 0, Str::new("arguments")) == String::from_str(Str::new("build --no-incremental")), Str::new("stage 2 goes to compiler/build, with no IR"))?;
+    expect(Fixture::field(&plan, 1, Str::new("program")).as_str() == plan.compilers.get_reference(0).unwrap().as_str(), Str::new("stage 2 builds stage 3"))?;
+    expect(Fixture::field(&plan, 1, Str::new("arguments")) == String::from_str(Str::new("build --no-incremental --build-dir=build/self/s3 --emit-llvm")), Str::new("stage 3's directory and IR"))?;
+    expect(Fixture::field(&plan, 2, Str::new("program")).as_str() == plan.compilers.get_reference(1).unwrap().as_str(), Str::new("stage 3 builds stage 4"))?;
+    expect(Fixture::field(&plan, 2, Str::new("arguments")) == String::from_str(Str::new("build --no-incremental --build-dir=build/self/s4 --emit-llvm")), Str::new("stage 4's directory and IR"))?;
+    expect(Fixture::field(&plan, 2, Str::new("label")) == String::from_str(Str::new("compiler  via stage-3     ->  build/self/s4")), Str::new("the report's label"))?;
+    expect(plan.linked && !plan.libraries_beside && plan.runner.is_empty(), Str::new("linked IR compared, run directly"))?;
+    expect(plan.wiped.length() == 2 && plan.wiped.get_reference(1).unwrap().as_str().ends_with(&Str::new(".bin")), Str::new("the stdlib archives are wiped, so each stage builds its own"))?;
+    return expect(plan.third.as_str() == plan.created.get_reference(0).unwrap().as_str() && plan.fourth.as_str() == plan.created.get_reference(1).unwrap().as_str(), Str::new("stages 3 and 4 are compared"));
+}
+
+![test]
+function the_windows_arm_runs_under_wine_with_the_fetched_toolchain_named() -> Result<(), TestError> {
+    const plan: ArmPlan = ArmPlan::windows(Path::from(Str::new("/r")), true);
+    expect(Fixture::field(&plan, 1, Str::new("program")) == String::from_str(Str::new("wine")), Str::new("wine runs the stage compiler"))?;
+    const expected: String = f"{plan.compilers.get_reference(0).unwrap().as_str()} build --no-incremental --build-dir=build/self/win-s3 --emit-llvm";
+    expect(Fixture::field(&plan, 1, Str::new("arguments")) == expected, Str::new("the stage-2 compiler is wine's argument, then the build"))?;
+    const joined: String = Fixture::field(&plan, 1, Str::new("variables"));
+    expect(joined.as_str().contains(&Str::new("CRYO_CC=Z:")) && joined.as_str().contains(&Str::new("llvm-mingw\\bin\\clang.exe")), Str::new("the C driver on the Z: drive, with backslashes"))?;
+    expect(joined.as_str().contains(&Str::new("CRYO_STDLIB=Z:/r/stdlib")), Str::new("the stdlib on the Z: drive, with forward slashes"))?;
+    expect(joined.as_str().contains(&Str::new("WINEDEBUG=-all")) && joined.as_str().contains(&Str::new("CRYO_CLANG_RESOURCE_DIR=Z:")), Str::new("wine quiet, libclang's headers named"))?;
+    expect(!plan.linked && plan.libraries_beside && plan.wiped.length() == 3, Str::new("per-module IR only, libraries beside, the three stage directories wiped"))?;
+    const native: ArmPlan = ArmPlan::windows(Path::from(Str::new("/r")), false);
+    expect(Fixture::field(&native, 0, Str::new("program")).as_str().ends_with(&Str::new("cryo.exe")), Str::new("natively the pin runs itself"))?;
+    expect(Fixture::field(&native, 0, Str::new("variables")).as_str().starts_with(&Str::new("CRYO_STDLIB=")) && !Fixture::field(&native, 0, Str::new("variables")).as_str().contains(&Str::new(";")), Str::new("with the stdlib named, and nothing else"))?;
+    return expect(Fixture::field(&native, 0, Str::new("arguments")) == String::from_str(Str::new("build --no-incremental --build-dir=build/self/win-s2")), Str::new("stage 2 goes below build/self"));
+}
+
+![test]
+function module_trees_compare_by_the_path_below_the_kind_directory() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = Fixture::scratch()?;
+    const root: Path = scratch.path();
+    Fixture::put(root, Str::new("a/target/release/host/local/ir/std/core/error.ll"), Str::new("one"))?;
+    Fixture::put(root, Str::new("a/target/release/host/local/ir/std/io/error.ll"), Str::new("two"))?;
+    Fixture::put(root, Str::new("a/target/release/host/local/obj/main.o"), Str::new("not compared"))?;
+    // The other build resolved to another bucket; the key ignores it.
+    Fixture::put(root, Str::new("b/target/release/triple/local/ir/std/core/error.ll"), Str::new("one"))?;
+    Fixture::put(root, Str::new("b/target/release/triple/local/ir/std/io/error.ll"), Str::new("two"))?;
+    const same: TreeComparison = ModuleTrees::compare(root.join(Str::new("a")).as_path(), root.join(Str::new("b")).as_path(), Str::new("ir"), Str::new(".ll"));
+    expect(Fixture::described(&same) == String::from_str(Str::new("same 2 6")), Str::new("two modules, six bytes"))?;
+    Fixture::put(root, Str::new("b/target/release/triple/local/ir/std/io/error.ll"), Str::new("TWO"))?;
+    const differs: TreeComparison = ModuleTrees::compare(root.join(Str::new("a")).as_path(), root.join(Str::new("b")).as_path(), Str::new("ir"), Str::new(".ll"));
+    expect(Fixture::described(&differs) == String::from_str(Str::new("differs std/io/error.ll")), Str::new("a shared file name, told apart by its path"))?;
+    Fixture::put(root, Str::new("b/target/release/triple/local/ir/std/extra.ll"), Str::new("three"))?;
+    const sets: TreeComparison = ModuleTrees::compare(root.join(Str::new("a")).as_path(), root.join(Str::new("b")).as_path(), Str::new("ir"), Str::new(".ll"));
+    expect(Fixture::described(&sets) == String::from_str(Str::new("not comparable module sets differ (2 vs 3)")), Str::new("a module on one side only"))?;
+    const missing: TreeComparison = ModuleTrees::compare(root.join(Str::new("a")).as_path(), root.join(Str::new("none")).as_path(), Str::new("ir"), Str::new(".ll"));
+    expect(Fixture::described(&missing) == String::from_str(Str::new("not comparable no per-module .ll files found under ir/")), Str::new("a tree with no module"))?;
+    Fixture::put(root, Str::new("a/target/release/other/local/ir/std/core/error.ll"), Str::new("one"))?;
+    const twice: String = Fixture::described(&ModuleTrees::compare(root.join(Str::new("a")).as_path(), root.join(Str::new("b")).as_path(), Str::new("ir"), Str::new(".ll")));
+    return expect(twice.as_str().starts_with(&Str::new("not comparable module std/core/error.ll is held twice")), Str::new("one key in two buckets is refused, not resolved by order"));
+}
+
+![test]
+function stage_archives_agree_only_when_every_object_agrees() -> Result<(), TestError> {
+    const equal: TemporaryDirectory = Fixture::scratch()?;
+    const same: String = Fixture::stage_archives(equal.path(), Str::new("one"), Str::new("two"), Str::new("one"), Str::new("two"), Str::new("c2"), Str::new("c3"))?;
+    expect(same == String::from_str(Str::new("same 2 6")), Str::new("equal objects"))?;
+    const differ: TemporaryDirectory = Fixture::scratch()?;
+    const differs: String = Fixture::stage_archives(differ.path(), Str::new("one"), Str::new("two"), Str::new("one"), Str::new("TWO"), Str::new("c2"), Str::new("c3"))?;
+    expect(differs == String::from_str(Str::new("differs std/io/error.o")), Str::new("an object differs under equal IR"))?;
+    const short: TemporaryDirectory = Fixture::scratch()?;
+    const missing: String = Fixture::stage_archives(short.path(), Str::new("one"), Str::new("two"), Str::new("one"), Str::new(""), Str::new("c2"), Str::new("c3"))?;
+    expect(missing.as_str().starts_with(&Str::new("not comparable module sets differ")), Str::new("an object missing"))?;
+    const none: TemporaryDirectory = Fixture::scratch()?;
+    const built_none: String = Fixture::stage_archives(none.path(), Str::new("one"), Str::new("two"), Str::new(""), Str::new(""), Str::new("c2"), Str::new("c3"))?;
+    expect(built_none == String::from_str(Str::new("not comparable stage-2 built 1 stdlib archive(s) and stage-3 0; each builds its own")), Str::new("stage 3 built none"))?;
+    const shared: TemporaryDirectory = Fixture::scratch()?;
+    const one: String = Fixture::stage_archives(shared.path(), Str::new("one"), Str::new("two"), Str::new(""), Str::new(""), Str::new("c2"), Str::new("c2"))?;
+    return expect(one == String::from_str(Str::new("shared")), Str::new("byte-identical stages share one archive"));
+}
+
+![test]
+function the_digest_covers_the_mirrored_sources_in_path_order() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = Fixture::scratch()?;
+    const root: Path = scratch.path();
+    Fixture::put(root, Str::new("bin/cryo"), Str::new("pin"))?;
+    Fixture::put(root, Str::new("compiler/a/b"), Str::new("1"))?;
+    Fixture::put(root, Str::new("compiler/a-b"), Str::new("2"))?;
+    // The fed order is the whole path's: `a-b` before `a/b`, where a
+    // walk visiting `a` before `a-b` would feed them the other way.
+    mut expected: Sha256 = Sha256::new();
+    mut paths: Array<Pair<Str, Str>> = Array::<Pair<Str, Str>>::new();
+    paths.push(Pair::new(Str::new("bin/cryo"), Str::new("pin")));
+    paths.push(Pair::new(Str::new("compiler/a-b"), Str::new("2")));
+    paths.push(Pair::new(Str::new("compiler/a/b"), Str::new("1")));
+    for (entry in paths.iterate_references()) {
+        mut header: String = String::from_str(entry.first);
+        header.push_byte(0);
+        expected.update(header.as_str().as_bytes());
+        expected.update(Sha256::digest(entry.second.as_bytes()).as_bytes());
+    }
+    const first: TreeDigest = Fixture::digest(root)?;
+    expect(first.files == 3, Str::new("three files"))?;
+    expect(first.digest == expected.finish().to_hex(), Str::new("path, NUL and the file's digest, in whole-path order"))?;
+    Fixture::put(root, Str::new("compiler/build/cryo"), Str::new("built"))?;
+    Fixture::put(root, Str::new("stdlib/.bin/t/x.a"), Str::new("archive"))?;
+    Fixture::put(root, Str::new("compiler/a/__pycache__/m.pyc"), Str::new("cache"))?;
+    Fixture::put(root, Str::new("tests/t.cryo"), Str::new("not mirrored"))?;
+    const skipped: TreeDigest = Fixture::digest(root)?;
+    expect(skipped.digest == first.digest && skipped.files == 3, Str::new("build outputs, caches and unmirrored trees move nothing"))?;
+    Fixture::put(root, Str::new("stdlib/build/kept.cryo"), Str::new("source"))?;
+    const kept: TreeDigest = Fixture::digest(root)?;
+    expect(kept.files == 4, Str::new("a skipped name is skipped only where it is listed"))?;
+    Fixture::put(root, Str::new("compiler/a/b"), Str::new("x"))?;
+    const changed: TreeDigest = Fixture::digest(root)?;
+    return expect(changed.digest != kept.digest, Str::new("one changed byte moves the digest"));
+}
+
+![test]
+function an_arm_that_did_not_run_fails_the_run_unless_allowed() -> Result<(), TestError> {
+    mut both: Array<ArmStatus> = Array::<ArmStatus>::new();
+    both.push(ArmStatus::Verified);
+    both.push(ArmStatus::Verified);
+    const passed: ArmsVerdict = Fixture::verdict(&both, false);
+    expect(passed.exit == 0, Str::new("both verified"))?;
+    expect(passed.lines.get_reference(passed.lines.length() - 1).unwrap().as_str() == Str::new("selfhost-check: OK -- 2 of 2 arms verified here"), Str::new("the verdict line"))?;
+    mut declined: Array<ArmStatus> = Array::<ArmStatus>::new();
+    declined.push(ArmStatus::Verified);
+    declined.push(ArmStatus::Declined);
+    expect(Fixture::verdict(&declined, false).exit == 0, Str::new("an arm another run answers for"))?;
+    mut skipped: Array<ArmStatus> = Array::<ArmStatus>::new();
+    skipped.push(ArmStatus::Verified);
+    skipped.push(ArmStatus::Skipped);
+    const refused: ArmsVerdict = Fixture::verdict(&skipped, false);
+    expect(refused.exit == 1, Str::new("a skipped arm fails the run"))?;
+    expect(Text::joined(&refused.lines, Str::new("\n")).as_str().contains(&Str::new("  windows: why")), Str::new("naming the arm and its reason"))?;
+    expect(Fixture::verdict(&skipped, true).exit == 0, Str::new("unless the caller allowed it"))?;
+    mut failed: Array<ArmStatus> = Array::<ArmStatus>::new();
+    failed.push(ArmStatus::Failed);
+    failed.push(ArmStatus::Skipped);
+    return expect(Fixture::verdict(&failed, true).exit == 1, Str::new("a failure fails the run whatever is allowed"));
+}

@@ -26,6 +26,7 @@ upward, and no two files of one layer import each other in a cycle.
 | `baseline/` | verify's baseline: what git lists, each program's record key, the baseline compiler's key, the clone it is built in, the bounded cache of homes | core |
 | `verify/` | verify's decisions: the declaration files, object populations and owners, the runtime archives' members, a program's baseline record, the judges, the object comparison | core, corpus |
 | `verify/run/` | a verify run itself: the children it starts, the baseline compiler, the baseline's per-program records, the declared projects' builds, the run from start to report | core, corpus, baseline, verify's decisions |
+| `selfhost/` | selfhost's decisions: each arm's stages and directories, the per-module tree comparison, the stage archives, the digest of the mirrored sources, the arms' verdict | core |
 | `gates/` | one file per subcommand: its command line, the children it runs, the lines it prints, its exit code | every layer above; **never another gate** |
 | `main.cryo`, `selftest.cryo`, `probe.cryo`, `heavy.cryo` | the entry point and the subcommands that are not gates (`selftest`, its child `probe`, `heavy`) | everything |
 
@@ -35,7 +36,8 @@ gates - each may use only those before it.  `verify/run/` comes after all
 of them, and its files are ordered the same way: children, compiler,
 programs, declared, session.  The decision files are pure and run no
 compiler; `verify/run/` is where verify's children are started, so
-`gates/verify.cryo` stays the command line only.
+`gates/verify.cryo` stays the command line only.  `selfhost/` is ordered
+the same way: stages, trees, archives, digest, arms.
 
 The test files under `tests/` import whichever layer they test.
 

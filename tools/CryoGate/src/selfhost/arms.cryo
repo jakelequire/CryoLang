@@ -1,0 +1,109 @@
+///! What each arm of a selfhost run did, and the run's exit status.
+///!
+///! A gate has two honest outcomes: it ran and passed, or it did not pass,
+///! and "it could not run here" is the second.  So an arm that was attempted
+///! and could not run (`Skipped`) fails the run unless the caller declared,
+///! with `--allow-skipped-arm`, that this environment verifies fewer arms.
+///! The declaration lives at the call site, where a reader of the Makefile or
+///! the workflow sees it.  An arm a flag put out of this invocation's scope,
+///! because something else answers for it (`Declined`), is a division of
+///! labour, not missing coverage.
+
+namespace cryogate::selfhost::arms;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+/// What became of one arm.
+public type enum ArmStatus {
+    /// It ran, and its fixed point and archives held.
+    Verified;
+    /// It was attempted and could not run here.
+    Skipped;
+    /// It ran and did not pass.
+    Failed;
+    /// It is not this invocation's job: another one runs it.
+    Declined;
+}
+
+/// One arm's result.
+public type struct Arm {
+    /// `linux` or `windows`.
+    public name: String;
+    /// What became of it.
+    public status: ArmStatus;
+    /// Why, readable on its own: the arms table is the run's summary.
+    public reason: String;
+
+    /// The arm `name`, with its status and reason.
+    public static new(name: Str, status: ArmStatus, reason: Str) -> Arm {
+        return Arm { name: String::from_str(name), status: status, reason: String::from_str(reason) };
+    }
+
+    /// How the arms table writes the status.
+    private mark(&this) -> Str {
+        return match (&this.status) {
+            ArmStatus::Verified => { Str::new("verified") }
+            ArmStatus::Skipped  => { Str::new("SKIPPED") }
+            ArmStatus::Failed   => { Str::new("FAILED") }
+            ArmStatus::Declined => { Str::new("not this run's job") }
+        };
+    }
+}
+
+/// The arms table, and the exit status it decides.
+public type struct ArmsVerdict {
+    /// The lines to print, ending with the verdict line
+    /// `selfhost-check: OK -- ...` or `selfhost-check: FAIL -- ...`.
+    public lines: Array<String>;
+    /// 1 when an arm failed, or one was skipped without
+    /// `--allow-skipped-arm`; 0 otherwise.
+    public exit: i32;
+
+    /// The verdict over `arms`.
+    public static of(arms: &Array<Arm>, allow_skipped: boolean) -> ArmsVerdict {
+        mut verified: i64 = 0;
+        mut skipped: i64 = 0;
+        mut failed: i64 = 0;
+        for (arm in arms.iterate_references()) {
+            match (&arm.status) {
+                ArmStatus::Verified => { verified++; }
+                ArmStatus::Skipped  => { skipped++; }
+                ArmStatus::Failed   => { failed++; }
+                ArmStatus::Declined => { }
+            }
+        }
+        mut lines: Array<String> = Array::<String>::new();
+        lines.push(String::new());
+        lines.push(f"==> selfhost-check arms  {verified} verified, {skipped} skipped, {failed} failed");
+        for (arm in arms.iterate_references()) {
+            const name: Str = arm.name.as_str();
+            lines.push(f"      {name:<9} {arm.mark()}  {arm.reason.as_str()}");
+        }
+        if (failed > 0) {
+            lines.push(f"selfhost-check: FAIL -- {failed} arm(s) failed");
+            return ArmsVerdict { lines: lines, exit: 1 };
+        }
+        if (skipped > 0 && !allow_skipped) {
+            lines.push(String::new());
+            lines.push(String::from_str(Str::new("selfhost-check: an arm did not run.")));
+            for (arm in arms.iterate_references()) {
+                match (&arm.status) {
+                    ArmStatus::Skipped => { lines.push(f"  {arm.name.as_str()}: {arm.reason.as_str()}"); }
+                    _                  => { }
+                }
+            }
+            lines.push(String::from_str(Str::new("  A gate that did not run has not passed.  Provide what the arm")));
+            lines.push(String::from_str(Str::new("  needs, or pass --allow-skipped-arm to record deliberately that this")));
+            lines.push(f"  environment verifies {verified} of {arms.length()} arms.");
+            lines.push(f"selfhost-check: FAIL -- {skipped} arm(s) did not run");
+            return ArmsVerdict { lines: lines, exit: 1 };
+        }
+        if (skipped > 0) {
+            lines.push(f"  accepted with --allow-skipped-arm: {verified} of {arms.length()} arms verified here.");
+        }
+        lines.push(f"selfhost-check: OK -- {verified} of {arms.length()} arms verified here");
+        return ArmsVerdict { lines: lines, exit: 0 };
+    }
+}
