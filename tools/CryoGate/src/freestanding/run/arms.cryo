@@ -1,0 +1,407 @@
+///! The freestanding check's two arms, on a Linux host.  Each builds the
+///! runtime's freestanding configuration into the run's own directory
+///! (`cryo build runtime --no-runtime`), then builds each program as a
+///! library object, links it to that archive by hand with no C library
+///! (`-nostartfiles -nostdlib`, entry `_start`), runs it and judges it; the
+///! arm's last check is `cryo build` linking a freestanding program itself.
+///!
+///!   linux    ELF, `-static -Wl,--gc-sections`, linked by `$CRYO_CC` (gcc
+///!            when unset), run natively
+///!   windows  PE, `-Wl,-e,_start -Wl,--gc-sections` with kernel32 and ntdll,
+///!            linked by x86_64-w64-mingw32-gcc, run under wine; skipped when
+///!            either is missing or FREESTANDING_LINUX_ONLY is set
+///!
+///! A program that cannot be built or linked fails its check by name, and
+///! the arm goes on.
+
+namespace cryogate::freestanding::run::arms;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env;
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::io::error::{ IoError };
+
+import cryogate::core::child::{ Completion, Job, Outcome };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::text::{ Text };
+import cryogate::core::tree::{ Tree };
+import cryogate::freestanding::checks::{ CheckLine, FreestandingJudge };
+import cryogate::freestanding::programs::{ FreestandingPrograms };
+
+/// A program's run: its exit status as the shell gives it, and its error
+/// stream with the trailing newlines dropped.
+type struct Execution {
+    status: i32;
+    errors: String;
+}
+
+/// One arm of the freestanding check.
+public type struct FreestandingArm {
+    /// `linux` or `windows`.
+    os: String;
+    repository: PathBuf;
+    /// The run's scratch directory: the programs, the archive, the links.
+    work: PathBuf;
+    compiler: String;
+    stdlib: String;
+    /// The C driver of the hand links.
+    driver: String;
+    /// The runtime archive the hand links read.
+    archive: String;
+    /// The run's log directory.
+    logs: PathBuf;
+    /// Whether a check of this arm failed.
+    failed: boolean;
+    /// How many builds, links and runs the arm has logged.
+    steps: i64;
+
+    /// The Linux arm; true when every check passed.
+    public static linux(repository: Path, work: Path, compiler: Str, stdlib: Str, logs: &RunLogs) -> boolean {
+        const driver: String = match (env::var(Str::new("CRYO_CC"))) {
+            Option::Some(value) => { value }
+            Option::None        => { String::from_str(Str::new("gcc")) }
+        };
+        mut arm: FreestandingArm = FreestandingArm::new(Str::new("linux"), repository, work, compiler, stdlib, driver.as_str(), logs);
+        if (!arm.build_runtime(Str::new(""))) { return false; }
+        arm.checks();
+        return !arm.failed;
+    }
+
+    /// The Windows arm under wine: whether every check passed, or the
+    /// reason the arm was skipped.
+    public static windows(repository: Path, work: Path, compiler: Str, stdlib: Str, logs: &RunLogs) -> Result<boolean, String> {
+        const driver: Str = Str::new("x86_64-w64-mingw32-gcc");
+        match (env::var(Str::new("FREESTANDING_LINUX_ONLY"))) {
+            Option::Some(value) => {
+                if (value.as_str() != Str::new("0")) { return Result::Err(String::from_str(Str::new("FREESTANDING_LINUX_ONLY set"))); }
+            }
+            Option::None => { }
+        }
+        if (!FreestandingArm::answers(driver, logs) || !FreestandingArm::answers(Str::new("wine"), logs)) {
+            return Result::Err(f"need {driver} and wine");
+        }
+        mut arm: FreestandingArm = FreestandingArm::new(Str::new("windows"), repository, work, compiler, stdlib, driver, logs);
+        if (!arm.build_runtime(FreestandingArm::windows_target())) { return Result::Ok(false); }
+        arm.checks();
+        return Result::Ok(!arm.failed);
+    }
+
+    private static new(os: Str, repository: Path, work: Path, compiler: Str, stdlib: Str, driver: Str, logs: &RunLogs) -> FreestandingArm {
+        return FreestandingArm {
+            os:         String::from_str(os),
+            repository: PathBuf::from(repository.as_str()),
+            work:       PathBuf::from(work.as_str()),
+            compiler:   String::from_str(compiler),
+            stdlib:     String::from_str(stdlib),
+            driver:     String::from_str(driver),
+            archive:    String::new(),
+            logs:       PathBuf::from(logs.directory().as_str()),
+            failed:     false,
+            steps:      0,
+        };
+    }
+
+    /// Every check of the arm, in the script's order: core, panic, the
+    /// check handlers (one on Windows), alloc, backtrace, args, the
+    /// driver's own link.
+    private checks(mut &this) -> void {
+        const os: Str = this.os.as_str();
+        const windows: boolean = os == Str::new("windows");
+        const codes: Array<i32> = FreestandingArm::exit_codes();
+        for (code in codes.iterate_references()) {
+            const label: String = f"core (main {*code})";
+            match (this.hand_linked(FreestandingPrograms::returning(*code).as_str(), Str::new(""), label.as_str())) {
+                Option::Some(program) => {
+                    const ran: Execution = this.execute(program.as_str(), false);
+                    this.report(&FreestandingJudge::core(os, *code, ran.status));
+                }
+                Option::None => { }
+            }
+        }
+        match (this.hand_linked(FreestandingPrograms::panicking(), Str::new(""), Str::new("panic"))) {
+            Option::Some(program) => {
+                const ran: Execution = this.execute(program.as_str(), false);
+                const lines: Array<CheckLine> = FreestandingJudge::panic(os, ran.status, ran.errors.as_str(), FreestandingPrograms::panic_message());
+                for (line in lines.iterate_references()) { this.report(line); }
+            }
+            Option::None => { }
+        }
+        // The Windows arm checks one handler, for the place passed by
+        // address under Win64's struct passing; the Linux arm all four.
+        const bounds: Str = if (windows) { Str::new("index 5 out of bounds for length 3") } else { Str::new("panicked at verify.cryo:7:3: index 5 out of bounds for length 3") };
+        this.handler(Str::new("bounds"), Str::new("__cryo_panic_bounds_check"), Str::new(", index: u64, len: u64"), Str::new(", 5, 3"), bounds);
+        if (!windows) {
+            this.handler(Str::new("div_zero"), Str::new("__cryo_panic_div_zero"), Str::new(""), Str::new(""),
+                         Str::new("panicked at verify.cryo:7:3: attempt to divide by zero"));
+            this.handler(Str::new("no_match"), Str::new("__cryo_panic_no_match"), Str::new(""), Str::new(""),
+                         Str::new("panicked at verify.cryo:7:3: no matching pattern"));
+            this.handler(Str::new("overflow"), Str::new("__cryo_panic_overflow"), Str::new(", op: u32, lhs: u64, rhs: u64"), Str::new(", 2, 4000000000, 4000000000"),
+                         Str::new("panicked at verify.cryo:7:3: arithmetic overflow (op 2): 4000000000, 4000000000"));
+        }
+        match (this.hand_linked(FreestandingPrograms::allocation(), Str::new(""), Str::new("alloc"))) {
+            Option::Some(program) => {
+                const ran: Execution = this.execute(program.as_str(), false);
+                this.report(&FreestandingJudge::allocation(os, ran.status));
+            }
+            Option::None => { }
+        }
+        match (this.hand_linked(FreestandingPrograms::backtrace(), Str::new("--dev"), Str::new("backtrace"))) {
+            Option::Some(program) => {
+                const ran: Execution = this.execute(program.as_str(), false);
+                this.report(&FreestandingJudge::backtrace(os, ran.status, ran.errors.as_str()));
+            }
+            Option::None => { }
+        }
+        match (this.hand_linked(FreestandingPrograms::arguments(), Str::new(""), Str::new("args"))) {
+            Option::Some(program) => {
+                const ran: Execution = this.execute(program.as_str(), true);
+                this.report(&FreestandingJudge::arguments(os, ran.status));
+            }
+            Option::None => { }
+        }
+        this.driver_link();
+    }
+
+    /// A check handler's program, linked, run and judged.
+    private handler(mut &this, label: Str, symbol: Str, parameters: Str, arguments: Str, want: Str) -> void {
+        match (this.hand_linked(FreestandingPrograms::handler(symbol, parameters, arguments).as_str(), Str::new(""), label)) {
+            Option::Some(program) => {
+                const ran: Execution = this.execute(program.as_str(), false);
+                this.report(&FreestandingJudge::handler(this.os.as_str(), label, want, ran.status, ran.errors.as_str()));
+            }
+            Option::None => { }
+        }
+    }
+
+    /// `cryo build` of the executable project, with no linker arguments
+    /// from the check, against the checkout's runtime; run with two
+    /// arguments.  On Windows the build chooses its own C driver, so
+    /// `CRYO_CC` is left out of its environment.
+    private driver_link(mut &this) -> void {
+        const project: PathBuf = this.work.as_path().join(Str::new("exeapp"));
+        const written: boolean = Directory::create_all(project.as_path().join(Str::new("src")).as_path()).is_ok()
+            && File::write_text(project.as_path().join(Str::new("cryoconfig")).as_path(), FreestandingPrograms::executable_configuration()).is_ok()
+            && File::write_text(project.as_path().join(Str::new("src/main.cryo")).as_path(), FreestandingPrograms::executable()).is_ok();
+        if (!written) { this.fail_step(Str::new("driver-link"), f"cannot write {project.as_path().as_str()}".as_str()); return; }
+        const output: PathBuf = project.as_path().join(Str::new(".bin"));
+        if (output.as_path().exists()) { const _: Result<(), IoError> = Directory::remove_all(output.as_path()); }
+        const windows: boolean = this.os.as_str() == Str::new("windows");
+        mut build: Job = this.compiler_job(!windows);
+        build.argument(Str::new("build"));
+        if (windows) {
+            build.argument(f"--target={FreestandingArm::windows_target()}".as_str());
+            build.argument(Str::new("--no-incremental"));
+        }
+        build.set_variable(Str::new("CRYO_RUNTIME"), this.repository.as_path().join(Str::new("runtime")).as_path().as_str());
+        build.directory(project.as_path().as_str());
+        build.log_to(this.next_log(Str::new("driver-link-build")).as_str());
+        const built: Completion = build.run();
+        const name: Str = if (windows) { Str::new(".bin/rt-verify-exe.exe") } else { Str::new(".bin/rt-verify-exe") };
+        const program: PathBuf = project.as_path().join(name);
+        mut status: i32 = 127;
+        if (program.as_path().is_file()) {
+            mut run: Job = this.program_job(program.as_path().as_str());
+            run.argument(Str::new("one"));
+            run.argument(Str::new("two"));
+            run.log_to(this.next_log(Str::new("driver-link-run")).as_str());
+            status = FreestandingArm::status(&run.run().outcome);
+        }
+        const line: CheckLine = FreestandingJudge::driver_link(this.os.as_str(), status);
+        this.report(&line);
+        if (!line.passed) {
+            const lines: Array<String> = Text::lines(built.output().as_str());
+            mut index: i64 = if (lines.length() > 15) { lines.length() - 15 } else { 0 };
+            while (index < lines.length()) {
+                fmt::println(f"    | {lines.get_reference(index).unwrap().as_str()}");
+                index++;
+            }
+        }
+    }
+
+    /// Build the runtime's freestanding configuration for `target` (the
+    /// host when empty) into the run's directory; false, reported, when it
+    /// did not build.
+    private build_runtime(mut &this, target: Str) -> boolean {
+        const built: PathBuf = this.work.as_path().join(f"runtime-{this.os.as_str()}".as_str());
+        mut job: Job = this.compiler_job(true);
+        job.argument(Str::new("build"));
+        if (!target.is_empty()) { job.argument(f"--target={target}".as_str()); }
+        job.argument(Str::new("--no-incremental"));
+        job.argument(Str::new("--no-runtime"));
+        job.argument(f"--build-dir={built.as_path().as_str()}".as_str());
+        job.directory(this.repository.as_path().join(Str::new("runtime")).as_path().as_str());
+        job.log_to(this.next_log(Str::new("runtime")).as_str());
+        const done: Completion = job.run();
+        const archive: PathBuf = built.as_path().join(Str::new("libcryort.a"));
+        if (!done.outcome.succeeded() || !archive.as_path().is_file()) {
+            this.fail_step(Str::new("runtime"), f"the freestanding runtime did not build ({done.outcome.describe().as_str()}; {done.log.as_str()})".as_str());
+            return false;
+        }
+        this.archive = String::from_str(archive.as_path().as_str());
+        return true;
+    }
+
+    /// `body` built as the library object of the scratch project with
+    /// `flags` (the Windows target added on that arm), then linked by hand
+    /// to the runtime archive; the program's path, or `None` with the check
+    /// `label` failed.
+    private hand_linked(mut &this, body: Str, flags: Str, label: Str) -> Option<String> {
+        const project: PathBuf = this.work.as_path().join(Str::new("app"));
+        const written: boolean = Directory::create_all(project.as_path().join(Str::new("src")).as_path()).is_ok()
+            && File::write_text(project.as_path().join(Str::new("cryoconfig")).as_path(), FreestandingPrograms::library_configuration()).is_ok()
+            && File::write_text(project.as_path().join(Str::new("src/lib.cryo")).as_path(), body).is_ok();
+        if (!written) { this.fail_step(label, f"cannot write {project.as_path().as_str()}".as_str()); return Option::None; }
+        const output: PathBuf = project.as_path().join(Str::new(".bin"));
+        if (output.as_path().exists()) { const _: Result<(), IoError> = Directory::remove_all(output.as_path()); }
+        mut build: Job = this.compiler_job(true);
+        build.argument(Str::new("build"));
+        for (flag in flags.split_whitespace()) { build.argument(flag); }
+        const windows: boolean = this.os.as_str() == Str::new("windows");
+        if (windows) {
+            build.argument(f"--target={FreestandingArm::windows_target()}".as_str());
+            build.argument(Str::new("--no-incremental"));
+        }
+        build.directory(project.as_path().as_str());
+        build.log_to(this.next_log(f"{label}-build".as_str()).as_str());
+        const built: Completion = build.run();
+        if (!built.outcome.succeeded()) {
+            this.fail_step(label, f"the program did not build ({built.outcome.describe().as_str()}; {built.log.as_str()})".as_str());
+            return Option::None;
+        }
+        const excluded: Array<String> = Array::<String>::new();
+        mut object: String = String::new();
+        match (Tree::files(output.as_path(), &excluded)) {
+            Result::Ok(files) => {
+                for (file in files.iterate_references()) {
+                    if (object.is_empty() && file.as_str().ends_with(&Str::new(".o"))) { object = String::from_str(output.as_path().join(file.as_str()).as_path().as_str()); }
+                }
+            }
+            Result::Err(_) => { }
+        }
+        if (object.is_empty()) { this.fail_step(label, f"the build left no object in {output.as_path().as_str()}".as_str()); return Option::None; }
+        const program_name: Str = if (windows) { Str::new("app.exe") } else { Str::new("exe") };
+        const program: PathBuf = this.work.as_path().join(program_name);
+        mut link: Job = Job::new(this.driver.as_str());
+        link.argument(Str::new("-nostartfiles"));
+        link.argument(Str::new("-nostdlib"));
+        if (windows) {
+            link.argument(Str::new("-Wl,-e,_start"));
+        } else {
+            link.argument(Str::new("-static"));
+        }
+        link.argument(Str::new("-Wl,--gc-sections"));
+        link.argument(object.as_str());
+        link.argument(this.archive.as_str());
+        if (windows) {
+            link.argument(Str::new("-lkernel32"));
+            link.argument(Str::new("-lntdll"));
+        }
+        link.argument(Str::new("-o"));
+        link.argument(program.as_path().as_str());
+        link.log_to(this.next_log(f"{label}-link".as_str()).as_str());
+        const linked: Completion = link.run();
+        if (!linked.outcome.succeeded()) {
+            this.fail_step(label, f"the link failed ({linked.outcome.describe().as_str()}; {linked.log.as_str()})".as_str());
+            return Option::None;
+        }
+        return Option::Some(String::from_str(program.as_path().as_str()));
+    }
+
+    /// Run `program` (under wine on the Windows arm), with the arguments
+    /// `one`, `two words` and `three` when `with_arguments`.
+    private execute(mut &this, program: Str, with_arguments: boolean) -> Execution {
+        mut job: Job = this.program_job(program);
+        if (with_arguments) {
+            job.argument(Str::new("one"));
+            job.argument(Str::new("two words"));
+            job.argument(Str::new("three"));
+        }
+        job.log_to(this.next_log(Str::new("run")).as_str());
+        const errors: String = this.next_log(Str::new("run-errors"));
+        job.errors_to(errors.as_str());
+        const done: Completion = job.run();
+        mut text: String = match (File::read_text(Path::from(errors.as_str()))) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { String::new() }
+        };
+        while (text.as_str().ends_with(&Str::new("\n"))) { text = String::from_str(text.as_str().byte_substring(0, text.length() - 1)); }
+        return Execution { status: FreestandingArm::status(&done.outcome), errors: text };
+    }
+
+    /// A job running `program`, under wine on the Windows arm.
+    private program_job(&this, program: Str) -> Job {
+        if (this.os.as_str() != Str::new("windows")) { return Job::new(program); }
+        mut job: Job = Job::new(Str::new("wine"));
+        job.argument(program);
+        job.set_variable(Str::new("WINEDEBUG"), Str::new("-all"));
+        return job;
+    }
+
+    /// A job running the compiler under test against the checkout's stdlib,
+    /// with `CRYO_CC` naming the hand links' C driver (gcc unless one was
+    /// inherited) when `named_driver`, and with none otherwise, so the
+    /// compiler chooses the target's own.
+    private compiler_job(&this, named_driver: boolean) -> Job {
+        mut job: Job = Job::new(this.compiler.as_str());
+        job.default_variable(Str::new("CRYO_STDLIB"), this.stdlib.as_str());
+        if (named_driver) {
+            job.default_variable(Str::new("CRYO_CC"), Str::new("gcc"));
+        } else {
+            job.remove_variable(Str::new("CRYO_CC"));
+        }
+        return job;
+    }
+
+    private report(mut &this, line: &CheckLine) -> void {
+        fmt::println(line.line.clone());
+        if (!line.passed) { this.failed = true; }
+    }
+
+    private fail_step(mut &this, label: Str, reason: Str) -> void {
+        fmt::println(f"{this.os.as_str()} {label} FAIL: {reason}");
+        this.failed = true;
+    }
+
+    /// A fresh log file for the step `name`, numbered in the order taken.
+    private next_log(mut &this, name: Str) -> String {
+        this.steps++;
+        return String::from_str(this.logs.as_path().join(f"freestanding-{this.os.as_str()}-{this.steps}-{name}.log".as_str()).as_path().as_str());
+    }
+
+    /// The exit status as the shell gives it: the code, 128 plus the
+    /// signal, or 127 when the program did not run.
+    private static status(outcome: &Outcome) -> i32 {
+        return match (outcome) {
+            Outcome::Exited(code)      => { code }
+            Outcome::Signalled(signal) => { 128 + signal }
+            _                          => { 127 }
+        };
+    }
+
+    /// Whether `program --version` runs.
+    private static answers(program: Str, logs: &RunLogs) -> boolean {
+        mut job: Job = Job::new(program);
+        job.argument(Str::new("--version"));
+        job.log_to(logs.file(f"freestanding-probe-{program}".as_str()).as_str());
+        return job.run().outcome.succeeded();
+    }
+
+    private static exit_codes() -> Array<i32> {
+        mut codes: Array<i32> = Array::<i32>::new();
+        codes.push(0);
+        codes.push(7);
+        codes.push(42);
+        codes.push(200);
+        return codes;
+    }
+
+    /// The Windows arm's target.
+    private static windows_target() -> Str { return Str::new("x86_64-pc-windows-gnu"); }
+}

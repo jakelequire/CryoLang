@@ -30,6 +30,9 @@ upward, and no two files of one layer import each other in a cycle.
 | `selfhost/run/` | a selfhost run itself: one arm's stages, comparisons and report; the Linux arm inside WSL from a Windows host | core, selfhost's decisions |
 | `incremental/` | the incremental-build matrix's decisions: the source edits and the text they make, a build's program and objects as digests, an incremental build judged against a clean one | core |
 | `incremental/run/` | the matrix run itself: the builds, the edits applied and restored, each scenario judged and reported | core, the incremental decisions |
+| `freestanding/` | the runtime's freestanding check: its programs and project files, and what each must exit with and print | core |
+| `freestanding/run/` | the freestanding run itself: the runtime built per arm, each program built, linked by hand and run, natively and under wine | core, the freestanding decisions |
+| `release/` | a release archive's smoke: its hello-world and its judge | the stdlib |
 | `abi/` | the runtime's ABI: the lang-item registry's rows and what each configuration must define, the symbols an archive's members define, the `__cryo_` names the sources spell | core |
 | `gates/` | one file per subcommand: its command line, the children it runs, the lines it prints, its exit code | every layer above; **never another gate** |
 | `main.cryo`, `selftest.cryo`, `probe.cryo`, `heavy.cryo` | the entry point and the subcommands that are not gates (`selftest`, its child `probe`, `heavy`) | everything |

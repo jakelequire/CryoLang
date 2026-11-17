@@ -1,0 +1,89 @@
+///! The release smoke's program and its judgement: the smallest program that
+///! needs every piece a release archive ships (the compiler, its stdlib and
+///! its runtime), what it must print, and the exit code it must carry back
+///! from `main`.
+
+namespace cryogate::release::smoke;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+
+/// One profile's build and run, as the smoke judges it.
+public type struct SmokeRun {
+    /// The profile's name in the report: `release` or `dev`.
+    public profile: String;
+    /// The build's exit code, `None` when it could not start or was killed.
+    public build_exit: Option<i32>;
+    /// Whether the build left the program.
+    public program_exists: boolean;
+    /// The program's exit code, `None` when it did not run to an exit.
+    public run_exit: Option<i32>;
+    /// Both of the program's output streams.
+    public printed: String;
+}
+
+/// The smoke program and its judge.
+public type struct ReleaseSmoke {
+    /// The program's project file.
+    public static configuration() -> Str {
+        return Str::new(
+            "[project]\n"
+            "project_name = \"release-smoke\"\n"
+            "output_dir = \"build\"\n"
+            "target_type = \"executable\"\n"
+            "source_dir = \"src\"\n"
+            "entry_point = \"src/main.cryo\"\n"
+            "\n"
+            "[compiler]\n"
+            "\n"
+            "[dependencies]\n");
+    }
+
+    /// The program's `src/main.cryo`.  It returns 7 rather than 0: an exit
+    /// code the runtime has to carry back from `main`, so a runtime that
+    /// dropped the entry cannot pass by exiting 0 for its own reasons.
+    public static source() -> Str {
+        return Str::new(
+            "namespace ReleaseSmoke;\n"
+            "\n"
+            "import std::ffi::libc;\n"
+            "\n"
+            "function main() -> int {\n"
+            "    libc::printf(\"release-smoke ok\\n\");\n"
+            "    return 7;\n"
+            "}\n");
+    }
+
+    /// The profiles the smoke builds, each with its `cryo build` flags, so
+    /// each default profile's stdlib archive is linked (and, in a tree that
+    /// ships none yet, built).
+    public static profiles() -> Array<String> {
+        mut profiles: Array<String> = Array::<String>::new();
+        profiles.push(String::from_str(Str::new("release")));
+        profiles.push(String::from_str(Str::new("dev")));
+        return profiles;
+    }
+
+    /// Why `run` fails the smoke, or `None` when it passed.
+    public static judge(run: &SmokeRun) -> Option<String> {
+        const profile: Str = run.profile.as_str();
+        match (run.build_exit) {
+            Option::Some(code) => {
+                if (code != 0) { return Option::Some(f"the staged compiler could not build a hello-world ({profile})"); }
+            }
+            Option::None => { return Option::Some(f"the staged compiler could not build a hello-world ({profile})"); }
+        }
+        if (!run.program_exists) { return Option::Some(f"the build reported success but produced no binary ({profile})"); }
+        if (!run.printed.as_str().contains(&Str::new("release-smoke ok"))) {
+            return Option::Some(f"the program ran but printed [{run.printed.as_str()}] ({profile})");
+        }
+        const exited: String = match (run.run_exit) {
+            Option::Some(code) => { f"{code}" }
+            Option::None       => { String::from_str(Str::new("without an exit code")) }
+        };
+        if (exited.as_str() == Str::new("7")) { return Option::None; }
+        return Option::Some(f"the program exited {exited.as_str()}, expected 7 (the entry did not carry main's return) ({profile})");
+    }
+}

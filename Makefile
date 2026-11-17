@@ -1047,25 +1047,20 @@ runtime-abi-check: $(STAGE2_FILE) $(CRYOGATE)
 # on both supported OSes.  No hosted program reaches the freestanding entry,
 # allocator or backtrace, so nothing else exercises them.
 #
-# A skipped arm FAILS.  The Windows half needs mingw + wine, and where those
-# are absent the script used to return 0 having run half of itself and print
-# OK - so a bare Linux box could be quoted as evidence the Windows runtime links.
-# Accept that deliberately with `ARGS=--allow-skipped-arm` (the spelling
-# selfhost-check uses); `FREESTANDING_LINUX_ONLY=1` still selects the skip, it
-# just no longer hides it.
+# A skipped arm FAILS.  The Windows half needs mingw + wine; where those are
+# absent, accept running half of the gate deliberately with
+# `ARGS=--allow-skipped-arm` (the spelling selfhost-check uses), and the run
+# names the arm it did not run; `FREESTANDING_LINUX_ONLY=1` selects the skip.
 #
-# Not host-branched until now, and on a Windows host that meant it could not be
-# invoked at all: it depended on `compiler/build/cryo`, which a Windows build
-# never produces, and its recipe is sh syntax under a cmd shell.  A gate with no
-# local invocation on half the supported hosts is a gate only CI runs - and CI
-# fires on `main` alone.  It now refuses out loud there instead, the same way
-# valgrind-check does.
+# The Linux arm links ELF objects natively, so a Windows host refuses out
+# loud, the same way valgrind-check does: run it from WSL.  `cryogate
+# freestanding`.
 ifeq ($(HOST_OS),windows)
 verify-freestanding:
-	$(error verify-freestanding: UNAVAILABLE on this host -- the acceptance script is bash and links ELF objects natively; run it from WSL)
+	$(error verify-freestanding: UNAVAILABLE on this host -- the Linux arm links ELF objects natively; run it from WSL)
 else
-verify-freestanding: $(STAGE2)
-	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash runtime/verify-freestanding.sh $(ARGS)
+verify-freestanding: cryo $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) freestanding --cryo "$(STAGE2)" $(ARGS)
 endif
 
 # ---- release packaging -------------------------------------------------

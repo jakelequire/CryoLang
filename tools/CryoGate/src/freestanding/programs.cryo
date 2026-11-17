@@ -1,0 +1,194 @@
+///! The freestanding check's programs: each is a `main` linked against the
+///! runtime's freestanding configuration with no C library, written as the
+///! check builds it.  Every program but the last is a library object the
+///! check links by hand, so it proves the archive on its own; the last is an
+///! executable `cryo build` links itself.
+
+namespace cryogate::freestanding::programs;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+/// The programs and their project files.
+public type struct FreestandingPrograms {
+    /// The project of every hand-linked program: a library object built
+    /// with neither the stdlib nor the runtime.
+    public static library_configuration() -> Str {
+        return Str::new(
+            "[project]\n"
+            "project_name = \"rt-verify-app\"\n"
+            "output_dir = \".bin\"\n"
+            "target_type = \"library\"\n"
+            "source_dir = \"src\"\n"
+            "[compiler]\n"
+            "no_std = true\n"
+            "no_runtime = true\n");
+    }
+
+    /// The project `cryo build` links itself.
+    public static executable_configuration() -> Str {
+        return Str::new(
+            "[project]\n"
+            "project_name = \"rt-verify-exe\"\n"
+            "output_dir = \".bin\"\n"
+            "\n"
+            "[[bin]]\n"
+            "name = \"rt-verify-exe\"\n"
+            "entry_point = \"src/main.cryo\"\n"
+            "\n"
+            "[compiler]\n"
+            "no_std = true\n"
+            "no_runtime = true\n");
+    }
+
+    /// A `main` returning `code`: the entry carries main's return out as
+    /// the process's exit code.
+    public static returning(code: i32) -> String {
+        return f"namespace RtVerifyApp;\nfunction main() -> int {{ return {code}; }}\n";
+    }
+
+    /// The panic report `panicking` must print.
+    public static panic_message() -> Str { return Str::new("panicked at verify.cryo:42:5 in RtVerifyApp::main: boom"); }
+
+    /// A `main` calling the panic funnel by its unmangled symbol with a
+    /// whole place, so the report carries the column and the function.
+    public static panicking() -> Str {
+        return Str::new(
+            "namespace RtVerifyApp;\n"
+            "type struct Location { file: string; line: u32; column: u32; function: string; }\n"
+            "extern \"C\" {\n"
+            "    function __cryo_panic(msg: string, loc: Location*) -> never;\n"
+            "}\n"
+            "function main() -> int {\n"
+            "    mut loc: Location = Location { file: \"verify.cryo\", line: 42, column: 5, function: \"RtVerifyApp::main\" };\n"
+            "    __cryo_panic(\"boom\", &loc);\n"
+            "    return 0;\n"
+            "}\n");
+    }
+
+    /// A `main` calling the check handler `handler` by its unmangled symbol
+    /// with a place and no function, passing the place by ADDRESS as the
+    /// lang-item registry specifies; `parameters` are the handler's
+    /// parameters after the place and `arguments` the values passed.
+    /// Passed by value the place would agree with the runtime only on
+    /// Windows, where a 16-byte struct goes by hidden pointer.
+    public static handler(handler: Str, parameters: Str, arguments: Str) -> String {
+        mut text: String = String::from_str(Str::new(
+            "namespace RtVerifyApp;\n"
+            "type struct Location { file: string; line: u32; column: u32; function: string; }\n"));
+        text.push(f"extern \"C\" {{ function {handler}(loc: Location*{parameters}) -> never; }}\n".as_str());
+        text.push(Str::new(
+            "function main() -> int {\n"
+            "    mut loc: Location = Location { file: \"verify.cryo\", line: 7, column: 3, function: null };\n"));
+        text.push(f"    {handler}(&loc{arguments});\n".as_str());
+        text.push(Str::new("    return 0;\n}\n"));
+        return text;
+    }
+
+    /// A `main` returning its argument count after checking the arguments
+    /// `one`, `two words` and `three` arrived whole; a distinct exit code
+    /// names each way they can be wrong (90 the count, 91-93 an argument,
+    /// 94 no vector, 95 no null slot after the last).
+    public static arguments() -> Str {
+        return Str::new(
+            "namespace RtVerifyApp;\n"
+            "extern \"C\" {\n"
+            "    function __cryo_argc() -> i64;\n"
+            "    function __cryo_argv() -> i8**;\n"
+            "}\n"
+            "function streq(a: i8*, b: string) -> boolean {\n"
+            "    mut i: i64 = 0;\n"
+            "    while (a[i] == b[i]) {\n"
+            "        if (a[i] == 0) { return true; }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    return false;\n"
+            "}\n"
+            "function main() -> int {\n"
+            "    const n: i64 = __cryo_argc();\n"
+            "    const v: i8** = __cryo_argv();\n"
+            "    if (n != 4) { return 90; }\n"
+            "    if (v == null) { return 94; }\n"
+            "    if (!streq(v[1], \"one\")) { return 91; }\n"
+            "    if (!streq(v[2], \"two words\")) { return 92; }\n"
+            "    if (!streq(v[3], \"three\")) { return 93; }\n"
+            "    if (v[n] != null) { return 95; }\n"
+            "    return n as int;\n"
+            "}\n");
+    }
+
+    /// A three-deep call chain into the frame walk; built unoptimised so
+    /// the frames are there to walk.
+    public static backtrace() -> Str {
+        return Str::new(
+            "namespace RtVerifyApp;\n"
+            "extern \"C\" { function __cryo_backtrace() -> void; }\n"
+            "function bt_level1() -> void { __cryo_backtrace(); }\n"
+            "function bt_level2() -> void { bt_level1(); }\n"
+            "function bt_level3() -> void { bt_level2(); }\n"
+            "function main() -> int { bt_level3(); return 0; }\n");
+    }
+
+    /// The allocator's round trip: aligned memory written and read back,
+    /// freed and allocated again, and a wrapping size and a
+    /// non-power-of-two alignment refused.  0 when all held, 1-9 naming
+    /// the failure.
+    public static allocation() -> Str {
+        return Str::new(
+            "namespace RtVerifyApp;\n"
+            "extern \"C\" {\n"
+            "    function __cryo_alloc(size: u64, align: u64) -> mut u8*;\n"
+            "    function __cryo_dealloc(ptr: u8*, size: u64, align: u64) -> void;\n"
+            "}\n"
+            "function main() -> int {\n"
+            "    const n: u64 = 4096;\n"
+            "    const p: mut u8* = __cryo_alloc(n, 64);\n"
+            "    if (p == null) { return 1; }\n"
+            "    if ((p as u64) % 64 != 0) { return 2; }\n"
+            "    for (mut i: u64 = 0; i < n; i++) { p[i] = (i % 251) as u8; }\n"
+            "    for (mut i: u64 = 0; i < n; i++) { if (p[i] != (i % 251) as u8) { return 3; } }\n"
+            "    __cryo_dealloc(p, n, 64);\n"
+            "    const q: mut u8* = __cryo_alloc(64, 8);\n"
+            "    if (q == null) { return 4; }\n"
+            "    if ((q as u64) % 8 != 0) { return 5; }\n"
+            "    q[0] = 42;\n"
+            "    q[63] = 99;\n"
+            "    if (q[0] != 42 || q[63] != 99) { return 6; }\n"
+            "    __cryo_dealloc(q, 64, 8);\n"
+            "    const most: u64 = (0 as u64) - (1 as u64);\n"
+            "    if (__cryo_alloc(most - 8, 8) != null) { return 7; }\n"
+            "    if (__cryo_alloc(64, 24) != null) { return 8; }\n"
+            "    const z: mut u8* = __cryo_alloc(64, 0);\n"
+            "    if (z == null) { return 9; }\n"
+            "    __cryo_dealloc(z, 64, 0);\n"
+            "    return 0;\n"
+            "}\n");
+    }
+
+    /// The executable `cryo build` links with no linker arguments from the
+    /// check: the frame walk, the allocator through an extern call and
+    /// through the language's own `new`, and the argument count as its
+    /// exit (70 or 71 when allocation failed).
+    public static executable() -> Str {
+        return Str::new(
+            "namespace RtVerifyExe;\n"
+            "type struct Box { v: i64; }\n"
+            "extern \"C\" {\n"
+            "    function __cryo_argc() -> i64;\n"
+            "    function __cryo_backtrace() -> void;\n"
+            "    function __cryo_alloc(size: u64, align: u64) -> mut u8*;\n"
+            "    function __cryo_dealloc(ptr: u8*, size: u64, align: u64) -> void;\n"
+            "}\n"
+            "function main() -> int {\n"
+            "    __cryo_backtrace();\n"
+            "    const p: mut u8* = __cryo_alloc(256, 16);\n"
+            "    if (p == null) { return 70; }\n"
+            "    p[0] = 9;\n"
+            "    __cryo_dealloc(p, 256, 16);\n"
+            "    mut b: Box* = new Box { v: 41 };\n"
+            "    if (b.v != 41) { return 71; }\n"
+            "    delete b;\n"
+            "    return __cryo_argc() as int;\n"
+            "}\n");
+    }
+}

@@ -1,0 +1,73 @@
+///! `cryogate freestanding --cryo <compiler> [--allow-skipped-arm]`: the
+///! runtime's freestanding configuration, built by the compiler under test,
+///! linked with no C library and run, on both supported OSes from a Linux
+///! host: the Linux arm natively, the Windows arm under wine
+///! (`freestanding/run/arms.cryo`).  A skipped arm fails the run unless
+///! `--allow-skipped-arm` says this environment checks fewer arms.  The
+///! programs and their builds go to a scratch directory removed at the end.
+///!
+///! A Windows host cannot run the Linux arm's ELF links; the gate refuses
+///! there and names WSL.
+
+namespace cryogate::gates::freestanding;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::path::{ Path };
+import std::fs::temporary::{ TemporaryDirectory };
+
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::freestanding::checks::{ FreestandingJudge, FreestandingVerdict };
+import cryogate::freestanding::run::arms::{ FreestandingArm };
+
+/// The freestanding gate.
+public type struct FreestandingGate {
+    /// Run `cryogate freestanding` with `arguments` from index `first`.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate freestanding --cryo <compiler> [--allow-skipped-arm]"));
+        options.valued(Str::new("--cryo"));
+        options.flag(Str::new("--allow-skipped-arm"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate freestanding: {reason.as_str()}"); return 2; }
+        };
+        const named: Option<Str> = parsed.value(Str::new("--cryo"));
+        if (named.is_none() || !parsed.positionals().is_empty() || parsed.separated()) {
+            fmt::eprintln(f"cryogate freestanding: usage: {options.usage()}");
+            return 2;
+        }
+        if (Host::os() == Str::new("windows")) {
+            fmt::println(String::from_str(Str::new("verify-freestanding: UNAVAILABLE on this host -- the Linux arm links ELF objects natively; run it from WSL")));
+            return 2;
+        }
+        const compiler: String = Host::absolute(named.unwrap());
+        if (!Path::from(compiler.as_str()).is_file()) {
+            fmt::println(f"no compiler at {compiler.as_str()} (run 'make cryo')");
+            return 1;
+        }
+        const work: TemporaryDirectory = match (TemporaryDirectory::create()) {
+            Result::Ok(directory) => { directory }
+            Result::Err(error)    => { fmt::println(f"verify-freestanding: FAIL -- cannot create a scratch directory: {error.describe()}"); return 1; }
+        };
+        const stdlib: String = Host::stdlib_directory(repository);
+        const linux: boolean = FreestandingArm::linux(repository, work.path(), compiler.as_str(), stdlib.as_str(), logs);
+        mut failed: boolean = !linux;
+        mut skipped: Array<String> = Array::<String>::new();
+        match (FreestandingArm::windows(repository, work.path(), compiler.as_str(), stdlib.as_str(), logs)) {
+            Result::Ok(passed)  => { if (!passed) { failed = true; } }
+            Result::Err(reason) => {
+                fmt::println(f"windows: SKIPPED ({reason.as_str()})");
+                skipped.push(String::from_str(Str::new("windows")));
+            }
+        }
+        const verdict: FreestandingVerdict = FreestandingJudge::verdict(failed, &skipped, parsed.has(Str::new("--allow-skipped-arm")));
+        for (line in verdict.lines.iterate_references()) { fmt::println(line.clone()); }
+        return verdict.exit;
+    }
+}

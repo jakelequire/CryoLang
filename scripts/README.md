@@ -17,8 +17,7 @@ one; the history keeps it.
 
 | script | what it does | called by |
 |---|---|---|
-| `build-release.sh` | Builds and stages the Linux tarball (static, stamped `cryo`) or the Windows zip under `dist/`, then smokes it | `make release`, `make release-linux`, `make release-windows`, CI, release |
-| `release-smoke.sh` | Compiles and runs hello-world with the staged release tree | `build-release.sh` |
+| `build-release.sh` | Builds and stages the Linux tarball (static, stamped `cryo`) or the Windows zip under `dist/`, then smokes it with `cryogate release-smoke` | `make release`, `make release-linux`, `make release-windows`, CI, release |
 
 ## Toolchain
 

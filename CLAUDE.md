@@ -160,7 +160,7 @@ not done. The remaining limits are here so nobody rediscovers them:
   line says so: a defect that shows only at the link (a stale archive linked)
   is not seen there.
 - **The release smoke runs the STAGED tree, and the Windows one under
-  wine.** `scripts/release-smoke.sh` compiles and runs a hello-world with
+  wine.** `cryogate release-smoke` compiles and runs a hello-world with
   the staged tree before it is zipped, not with the archive itself; the
   verify job exercises a different binary by a different link (`make cryo`
   is not `--release-static`).  The Windows tree is smoked under wine with
