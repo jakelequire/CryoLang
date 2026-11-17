@@ -28,6 +28,7 @@ upward, and no two files of one layer import each other in a cycle.
 | `verify/run/` | a verify run itself: the children it starts, the baseline compiler, the baseline's per-program records, the declared projects' builds, the run from start to report | core, corpus, baseline, verify's decisions |
 | `selfhost/` | selfhost's decisions: each arm's stages and directories, the per-module tree comparison, the stage archives, the digest of the mirrored sources, the arms' verdict, the fixed point and archives judged | core |
 | `selfhost/run/` | a selfhost run itself: one arm's stages, comparisons and report; the Linux arm inside WSL from a Windows host | core, selfhost's decisions |
+| `abi/` | the runtime's ABI: the lang-item registry's rows and what each configuration must define, the symbols an archive's members define, the `__cryo_` names the sources spell | core |
 | `gates/` | one file per subcommand: its command line, the children it runs, the lines it prints, its exit code | every layer above; **never another gate** |
 | `main.cryo`, `selftest.cryo`, `probe.cryo`, `heavy.cryo` | the entry point and the subcommands that are not gates (`selftest`, its child `probe`, `heavy`) | everything |
 

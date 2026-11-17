@@ -1,7 +1,7 @@
 ///! The children a verify run starts, and the gates it runs over one
-///! compiler: each child's environment, the programs a gate names by
-///! placeholder (a POSIX shell, a Python interpreter), and one population
-///! run - wipe, the gates, the object lists.
+///! compiler: each child's environment, the Python interpreter the gates
+///! not yet ported run under, and one population run - wipe, the gates, the
+///! object lists.
 
 namespace cryogate::verify::run::children;
 
@@ -37,32 +37,6 @@ public type struct VerifyChild {
         job.default_c_compiler();
         return job;
     }
-
-    /// The shell a host-side bash script runs under.  On Windows a bare
-    /// `bash` is the system's WSL launcher, which would run the script in
-    /// the Linux guest; Git's own bash sits three directories above its
-    /// exec path.
-    ![target(windows)]
-    public static posix_shell(git: &Git) -> Result<String, String> {
-        mut arguments: Array<Str> = Array::<Str>::new();
-        arguments.push(Str::new("--exec-path"));
-        const done: Completion = git.run(&arguments);
-        if (!done.outcome.succeeded()) { return Result::Err(f"git --exec-path: {done.outcome.describe().as_str()}"); }
-        const output: String = done.output();
-        const exec_path: PathBuf = PathBuf::from(output.as_str().trim());
-        mut root: Path = exec_path.as_path();
-        mut climbed: i64 = 0;
-        while (climbed < 3) {
-            climbed++;
-            root = match (root.parent()) {
-                Option::Some(parent) => { parent }
-                Option::None         => { return Result::Err(f"git's exec path {exec_path.as_path().as_str()} has no installation three directories above it"); }
-            };
-        }
-        return Result::Ok(String::from_str(root.join(Str::new("bin")).join(Str::new("bash.exe")).as_path().as_str()));
-    }
-    ![target(unix)]
-    public static posix_shell(git: &Git) -> Result<String, String> { return Result::Ok(String::from_str(Str::new("bash"))); }
 
     /// The Python interpreter the gates not yet ported run under: the
     /// first of `python3` and `python` that runs and reports a version 3.
@@ -119,12 +93,11 @@ public type struct PopulationRun {
     /// `sequential`), each logged to `<directory>/<gate>.log`, then list
     /// every population to `<directory>/<tag>.<population>.sha256`,
     /// whatever the gates were.  `runtime` is the directory of the target's
-    /// runtime archives the gates' programs linked; `bash` the POSIX shell
-    /// for a shell gate.
-    public static run(repository: Path, table: &Array<GateCommand>, names: &Array<String>, cryo: Str, bash: Str,
+    /// runtime archives the gates' programs linked.
+    public static run(repository: Path, table: &Array<GateCommand>, names: &Array<String>, cryo: Str,
                       directory: Path, tag: Str, runtime: Path, sequential: boolean) -> Result<PopulationRun, String> {
         ObjectHashes::wipe(repository)?;
-        const gate_runs: Array<GateRun> = PopulationRun::gates(repository, table, names, cryo, bash, directory, Str::new(""), sequential);
+        const gate_runs: Array<GateRun> = PopulationRun::gates(repository, table, names, cryo, directory, Str::new(""), sequential);
         mut counts: Array<i64> = Array::<i64>::new();
         for (population in ObjectPopulation::all().iterate_references()) {
             const rows: Array<String> = ObjectHashes::rows(repository, population, runtime)?;
@@ -139,7 +112,7 @@ public type struct PopulationRun {
     /// `<directory>/<gate>.log`, with `runtime` as `VerifyChild::job` takes
     /// it, and judge each run.  A name the table does not hold runs
     /// nothing.
-    public static gates(repository: Path, table: &Array<GateCommand>, names: &Array<String>, cryo: Str, bash: Str,
+    public static gates(repository: Path, table: &Array<GateCommand>, names: &Array<String>, cryo: Str,
                         directory: Path, runtime: Str, sequential: boolean) -> Array<GateRun> {
         const stdlib: String = Host::stdlib_directory(repository);
         mut scheduler: Scheduler = Scheduler::new();
@@ -151,7 +124,7 @@ public type struct PopulationRun {
         }
         for (index in chosen.iterate_references()) {
             const gate: &GateCommand = &table[*index];
-            const command: Array<String> = gate.command(cryo, stdlib.as_str(), bash);
+            const command: Array<String> = gate.command(cryo, stdlib.as_str());
             mut job: Job = VerifyChild::job(command[0].as_str(), runtime);
             for (index in 1..command.length()) { job.argument(command[index].as_str()); }
             job.directory(repository.as_str());

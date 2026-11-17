@@ -1,0 +1,220 @@
+///! `cryogate abi --cryo <compiler> [--nm <nm>]`: the lang-item registry
+///! `runtime/abi/lang_items.def` against what is built and emitted.
+///!
+///! The registry names every `__cryo_` symbol that crosses the boundary
+///! between generated code (or the stdlib) and the runtime, and the link
+///! kinds whose runtime must define it.  Nothing else ties the three
+///! together, so a renamed handler, a configuration that stopped exporting
+///! one, or a new call emitted by codegen links or fails only in the
+///! configuration that happens to reach it.  This builds the runtime in
+///! every configuration a link names - freestanding, hosted under abort,
+///! hosted under unwind - for the compiler's own target, with the compiler
+///! under test, into `runtime/.bin/<triple>/abi-check/<configuration>/`, and
+///! refuses:
+///!
+///! - a registry symbol missing from a configuration that must define it;
+///! - a `__cryo_` symbol two members of one configuration's archive define;
+///! - a `__cryo_` symbol a configuration exports that no registry row names;
+///! - a `"__cryo_...` name spelled in compiler/src that no row names (a
+///!   runtime symbol, or one of the compiler's own, possibly by prefix);
+///! - a `__cryo_...(` call in stdlib/ that is not a hosted runtime symbol.
+///!
+///! Every OS's objects are read by one tool when it is there: llvm-nm reads
+///! ELF and COFF alike, a binutils nm only its own host's format.  `--nm`
+///! names the tool; otherwise the first of `llvm-nm`, `llvm-nm-20` and `nm`
+///! that runs is used.  The verdict is the last line:
+///! `runtime-abi-check: OK (...)` or `runtime-abi-check: FAIL (...)`.
+
+namespace cryogate::gates::abi;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::abi::registry::{ LangItems, RowScope };
+import cryogate::abi::symbols::{ ArchiveSymbols, SourceNames };
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
+
+/// The ABI gate.
+public type struct AbiGate {
+    /// Run `cryogate abi` with `arguments` from index `first`.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate abi --cryo <compiler> [--nm <nm>]"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--nm"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate abi: {reason.as_str()}"); return 2; }
+        };
+        const compiler: Str = match (parsed.value(Str::new("--cryo"))) {
+            Option::Some(path) => { path }
+            Option::None       => { fmt::eprintln(f"cryogate abi: --cryo is required; usage: {options.usage()}"); return 2; }
+        };
+        if (!parsed.positionals().is_empty() || parsed.separated()) {
+            fmt::eprintln(f"cryogate abi: usage: {options.usage()}");
+            return 2;
+        }
+        const registry_path: PathBuf = repository.join(Str::new("runtime/abi/lang_items.def"));
+        const registry: LangItems = match (File::read_text(registry_path.as_path())) {
+            Result::Ok(text)   => { LangItems::parse(text.as_str()) }
+            Result::Err(error) => { return AbiGate::refused(f"cannot read {registry_path.as_path().as_str()}: {error.describe()}"); }
+        };
+        if (registry.rows.length() < AbiGate::FEWEST_ROWS) {
+            return AbiGate::refused(f"read {registry.rows.length()} registry rows from {registry_path.as_path().as_str()}; its format moved");
+        }
+        const nm: String = match (AbiGate::nm(&parsed, logs)) {
+            Option::Some(nm) => { nm }
+            Option::None     => { return AbiGate::refused(String::from_str(Str::new("no nm found; name one with --nm"))); }
+        };
+        mut version: Job = Job::new(compiler);
+        version.argument(Str::new("version"));
+        version.argument(Str::new("--triple"));
+        version.log_to(logs.file(Str::new("abi-triple")).as_str());
+        const answered: Completion = version.run();
+        const triple: String = String::from_str(answered.output().as_str().trim());
+        const os: Str = if (triple.as_str().contains(&Str::new("windows"))) { Str::new("windows") } else { Str::new("linux") };
+        if (!answered.outcome.succeeded() || (!triple.as_str().contains(&Str::new("windows")) && !triple.as_str().contains(&Str::new("linux")))) {
+            return AbiGate::refused(f"{compiler} names its target \"{triple.as_str()}\" ({answered.outcome.describe().as_str()})");
+        }
+
+        mut problems: Array<String> = Array::<String>::new();
+        mut sets: i64 = 0;
+        mut symbols: i64 = 0;
+        mut configurations: Array<Str> = Array::<Str>::new();
+        configurations.push(Str::new("freestanding"));
+        configurations.push(Str::new("hosted-abort"));
+        configurations.push(Str::new("hosted-unwind"));
+        for (configuration in configurations.iterate_references()) {
+            const name: Str = *configuration;
+            const kind: Str = if (name == Str::new("freestanding")) { Str::new("freestanding") } else { Str::new("hosted") };
+            const archive: PathBuf = match (AbiGate::build(repository, compiler, triple.as_str(), name, logs)) {
+                Result::Ok(archive) => { archive }
+                Result::Err(reason) => { AbiGate::problem(&problems, f"{triple.as_str()} {name}: {reason.as_str()}"); continue; }
+            };
+            sets++;
+            mut listing: Job = Job::new(nm.as_str());
+            listing.argument(Str::new("-g"));
+            listing.argument(Str::new("--defined-only"));
+            listing.argument(archive.as_path().as_str());
+            listing.log_to(logs.file(f"abi-nm-{name}".as_str()).as_str());
+            listing.errors_to(logs.file(f"abi-nm-{name}-errors".as_str()).as_str());
+            const listed: Completion = listing.run();
+            if (!listed.outcome.succeeded()) {
+                AbiGate::problem(&problems, f"{triple.as_str()} {name}: {nm.as_str()} cannot list {archive.as_path().as_str()} ({listed.outcome.describe().as_str()})");
+                continue;
+            }
+            const defining: Array<String> = ArchiveSymbols::defining(listed.output().as_str());
+            const defined: Array<String> = Text::sorted_distinct(defining.clone());
+            const twice: Array<String> = ArchiveSymbols::duplicated(&defining);
+            for (symbol in twice.iterate_references()) {
+                AbiGate::problem(&problems, f"{triple.as_str()} {name}: {symbol.as_str()} is defined by more than one member of the archive");
+            }
+            const required: Array<String> = registry.required(kind, os);
+            symbols = symbols + required.length();
+            for (symbol in required.iterate_references()) {
+                if (!defined.contains(symbol)) {
+                    AbiGate::problem(&problems, f"{triple.as_str()} {name}: {symbol.as_str()} is registered as defined here, and the archive does not define it");
+                }
+            }
+            mut exported: Array<String> = Array::<String>::new();
+            for (symbol in defined.iterate_references()) {
+                if (symbol.as_str().starts_with(&Str::new("__cryo_"))) { exported.push(symbol.clone()); }
+            }
+            const unnamed: Array<String> = registry.unregistered(&exported, RowScope::Runtime);
+            for (symbol in unnamed.iterate_references()) {
+                AbiGate::problem(&problems, f"{triple.as_str()} {name}: exports {symbol.as_str()}, which no registry row names");
+            }
+        }
+
+        const compiler_names: Array<String> = match (SourceNames::quoted(repository.join(Str::new("compiler/src")).as_path())) {
+            Result::Ok(names)   => { names }
+            Result::Err(reason) => { return AbiGate::refused(reason); }
+        };
+        const spelled: Array<String> = registry.unregistered(&compiler_names, RowScope::Any);
+        for (name in spelled.iterate_references()) {
+            AbiGate::problem(&problems, f"compiler/src spells \"{name.as_str()}\", which no registry row names");
+        }
+        const stdlib_calls: Array<String> = match (SourceNames::called(repository.join(Str::new("stdlib")).as_path())) {
+            Result::Ok(names)   => { names }
+            Result::Err(reason) => { return AbiGate::refused(reason); }
+        };
+        const called: Array<String> = registry.unregistered(&stdlib_calls, RowScope::Hosted);
+        for (name in called.iterate_references()) {
+            AbiGate::problem(&problems, f"stdlib/ calls {name.as_str()}, which is not a hosted runtime symbol in the registry");
+        }
+
+        const summary: String = f"{sets} configuration(s) on {triple.as_str()}, {symbols} registered definition(s), {compiler_names.length()} compiler name(s), {stdlib_calls.length()} stdlib call(s), {nm.as_str()}";
+        if (!problems.is_empty()) {
+            fmt::println(f"runtime-abi-check: FAIL ({problems.length()} problem(s); {summary.as_str()})");
+            return 1;
+        }
+        fmt::println(f"runtime-abi-check: OK ({summary.as_str()})");
+        return 0;
+    }
+
+    /// Build the runtime in `configuration` with `compiler` into its own
+    /// directory, and return its archive; why not, when it cannot.
+    private static build(repository: Path, compiler: Str, triple: Str, configuration: Str, logs: &RunLogs) -> Result<PathBuf, String> {
+        const option: Str = if (configuration == Str::new("freestanding")) { Str::new("--no-runtime") }
+                            else { if (configuration == Str::new("hosted-abort")) { Str::new("--panic=abort") } else { Str::new("--panic=unwind") } };
+        const directory: PathBuf = repository.join(f"runtime/.bin/{triple}/abi-check/{configuration}".as_str());
+        mut job: Job = Job::new(compiler);
+        job.argument(Str::new("build"));
+        job.argument(repository.join(Str::new("runtime")).as_path().as_str());
+        job.argument(f"--build-dir={directory.as_path().as_str()}".as_str());
+        job.argument(Str::new("--no-incremental"));
+        job.argument(option);
+        job.default_c_compiler();
+        job.log_to(logs.file(f"abi-build-{configuration}".as_str()).as_str());
+        const done: Completion = job.run();
+        if (!done.outcome.succeeded()) {
+            return Result::Err(f"the runtime does not build ({done.outcome.describe().as_str()}; see {done.log.as_str()})");
+        }
+        const archive: PathBuf = directory.as_path().join(Str::new("libcryort.a"));
+        if (!archive.as_path().is_file()) { return Result::Err(f"the build wrote no {archive.as_path().as_str()}"); }
+        return Result::Ok(archive);
+    }
+
+    /// The nm named by `--nm`, or the first of the usual names that runs.
+    private static nm(parsed: &Parsed, logs: &RunLogs) -> Option<String> {
+        match (parsed.value(Str::new("--nm"))) {
+            Option::Some(named) => { return Option::Some(String::from_str(named)); }
+            Option::None        => { }
+        }
+        mut candidates: Array<Str> = Array::<Str>::new();
+        candidates.push(Str::new("llvm-nm"));
+        candidates.push(Str::new("llvm-nm-20"));
+        candidates.push(Str::new("nm"));
+        for (candidate in candidates.iterate_references()) {
+            const name: Str = *candidate;
+            mut probe: Job = Job::new(name);
+            probe.argument(Str::new("--version"));
+            probe.log_to(logs.file(f"abi-probe-{name}".as_str()).as_str());
+            if (probe.run().outcome.succeeded()) { return Option::Some(String::from_str(name)); }
+        }
+        return Option::None;
+    }
+
+    private static problem(problems: mut &Array<String>, text: String) -> void {
+        fmt::println(f"  FAIL  {text.as_str()}");
+        problems.push(text);
+    }
+
+    /// The run cannot be judged: `reason`, as the verdict line.
+    private static refused(reason: String) -> i32 {
+        fmt::println(f"runtime-abi-check: FAIL ({reason.as_str()})");
+        return 1;
+    }
+
+    /// Fewer registry rows than this means the file's format moved under
+    /// the parser, not that the runtime shrank.
+    const FEWEST_ROWS: i64 = 10;
+}

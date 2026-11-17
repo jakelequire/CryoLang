@@ -183,15 +183,6 @@ else
     NOOP   := @:
 endif
 
-# The shell for a host-side bash script.  On Windows a bare `bash` resolves to
-# System32's WSL launcher, which runs the script inside the Linux guest; Git's
-# own bash sits three levels above its exec path.
-ifeq ($(HOST_OS),windows)
-    POSIX_SHELL := $(shell git --exec-path)/../../../bin/bash.exe
-else
-    POSIX_SHELL := bash
-endif
-
 # The LSP binary grows a `.exe` suffix on a Windows host (the self-hosted
 # compiler appends it for windows targets), so the build output and its pin
 # both carry it there; empty elsewhere.
@@ -1058,10 +1049,10 @@ endif
 
 # The lang-item registry (runtime/abi/lang_items.def) against the runtime the
 # compiler under test builds in each configuration, and the `__cryo_` names
-# compiler/src and stdlib/ spell; see the script's header.  The script finds
-# the compiler under test in compiler/build.
-runtime-abi-check: $(STAGE2_FILE)
-	@"$(POSIX_SHELL)" scripts/runtime-abi-check.sh
+# compiler/src and stdlib/ spell; `cryogate abi`, whose gate file's header
+# says what it refuses.
+runtime-abi-check: $(STAGE2_FILE) $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) abi --cryo "$(STAGE2_FILE)"
 
 # ---- freestanding runtime gate ----------------------------------------
 # Build the runtime's freestanding configuration and run its acceptance check

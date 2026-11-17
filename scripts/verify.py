@@ -13,8 +13,7 @@ build:
                                          new generic instance still links
     relink     cryogate incr --runtime   a rebuilt runtime is linked again
                                          with nothing else changed
-    abi        scripts/runtime-abi-check.sh
-                                         the lang-item registry against the
+    abi        cryogate abi              the lang-item registry against the
                                          runtime archives and the names the
                                          compiler and stdlib spell
     fast       make check-fast           verify's self-test, pin integrity
@@ -139,7 +138,7 @@ GATES = {
                  r"^incremental-instance-check: "),
     "relink":   ([CRYOGATE, "incr", "--runtime", "--cryo", "{cryo}"],
                  r"^incremental-runtime-check: "),
-    "abi":      (["{bash}", "scripts/runtime-abi-check.sh"], r"^runtime-abi-check: "),
+    "abi":      ([CRYOGATE, "abi", "--cryo", "{cryo}"], r"^runtime-abi-check: "),
     # `ARGS=` on the command line: `make verify ARGS=...` exports ARGS to
     # child makes, and no check-fast target is meant to receive verify's flags.
     "fast":     (["make", "--no-print-directory", "check-fast", "ARGS="], r"check-fast: "),
@@ -379,20 +378,9 @@ def read_hashes(path):
 
 # ---- running gates ---------------------------------------------------------
 
-def posix_shell():
-    """The shell for a host-side bash script.  On Windows a bare `bash`
-    resolves to System32's WSL launcher, which would run the script inside
-    the Linux guest; Git's own bash sits three levels above its exec path."""
-    if os.name != "nt":
-        return "bash"
-    return os.path.normpath(os.path.join(git("--exec-path").strip(), "..", "..", "..",
-                                         "bin", "bash.exe"))
-
-
 def run_gate(name, cryo, logdir, env):
     argv, verdict = GATES[name]
-    argv = [a.replace("{cryo}", cryo).replace("{stdlib}", STDLIB).replace("{bash}", posix_shell())
-            for a in argv]
+    argv = [a.replace("{cryo}", cryo).replace("{stdlib}", STDLIB) for a in argv]
     log = os.path.join(logdir, name + ".log")
     t0 = time.monotonic()
     with open(log, "wb") as fh:
