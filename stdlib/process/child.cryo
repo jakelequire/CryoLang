@@ -9,7 +9,11 @@
 ///! refuses the rest as `Unsupported`; `kill_tree` ends the child
 ///! with everything it started, when it was spawned after
 ///! `Command.group_descendants`. `ChildStdin` /
-///! `ChildStdout` / `ChildStderr` implement `Write` / `Read` over a fd.
+///! `ChildStdout` / `ChildStderr` implement `Write` / `Read` over a fd;
+///! take one out of a running child (`child.stdout.take()`) to talk to it
+///! while it runs, and finish with `wait_with_output` (declared beside
+///! `Command`, whose `Output` it returns) to read what is left of both
+///! output pipes without the deadlock described below.
 ///!
 ///! Ownership: call `wait` (or `kill` then `wait`) before a `Child`
 ///! drops. `Child::drop` closes the pipe file descriptors and reaps the
@@ -417,7 +421,53 @@ private const MAXRSS_UNIT: u64 = 1;
 
 // ChildStdin / Stdout / Stderr: fd wrappers with Write / Read
 
-/// Write end of a pipe whose read end is the child's stdin.
+// A write to a pipe nobody reads any more raises SIGPIPE, whose default action
+// ends the writing process.  The write is made with SIGPIPE blocked in this
+// thread, so it fails with EPIPE instead, and the SIGPIPE it left pending is
+// taken off again before the thread's own mask returns - unless one was
+// already pending before the write, which is then left for its owner.
+![target(unix)]
+private function os_pipe_write(fd: i32, bytes: &Slice<u8>) -> Result<i64, IoError> {
+    mut pipe_signal: [u8; 128];
+    mut previous_mask: [u8; 128];
+    mut pending: [u8; 128];
+    libc::sigemptyset(&pipe_signal[0]);
+    libc::sigaddset(&pipe_signal[0], libc::SIGPIPE);
+    libc::pthread_sigmask(libc::SigprocmaskHow::SIG_BLOCK, &pipe_signal[0], &previous_mask[0]);
+    libc::sigemptyset(&pending[0]);
+    libc::sigpending(&pending[0]);
+    const already_pending: boolean = libc::sigismember(&pending[0], libc::SIGPIPE) == 1;
+    const written: Result<i64, IoError> = file_descriptor::write_file_descriptor(fd, bytes);
+    if (!already_pending) {
+        libc::sigpending(&pending[0]);
+        if (libc::sigismember(&pending[0], libc::SIGPIPE) == 1) {
+            mut taken: i32 = 0;
+            libc::sigwait(&pipe_signal[0], &taken);
+        }
+    }
+    libc::pthread_sigmask(libc::SigprocmaskHow::SIG_SETMASK, &previous_mask[0], null);
+    return written;
+}
+// Windows has no SIGPIPE: a write to a pipe whose reader has closed fails
+// with ERROR_NO_DATA.  The write goes to the pipe's own HANDLE, so that is the
+// error reported; the C runtime's `_write` folds it into a generic `errno`.
+![target(windows)]
+private function os_pipe_write(fd: i32, bytes: &Slice<u8>) -> Result<i64, IoError> {
+    const handle: i64 = libc::_get_osfhandle(fd);
+    if (handle == -1) {
+        return Result::Err(IoError::from_errno(libc::errno()));
+    }
+    const length: u32 = min(bytes.length(), 0x7FFFFFFF) as u32;
+    mut written: u32 = 0;
+    if (syscall::WriteFile(handle as u8*, bytes.as_pointer(), length, &written, null) == 0) {
+        return Result::Err(IoError::last_os_error());
+    }
+    return Result::Ok(written as i64);
+}
+
+/// Write end of a pipe whose read end is the child's stdin. A write after
+/// the child has closed its stdin, or exited, fails with `BrokenPipe`; it
+/// never ends the writing process.
 public type struct ChildStdin {
     private fd: i32;
 
@@ -439,7 +489,7 @@ public type struct ChildStdin {
 
 implement trait Write for struct ChildStdin {
     write_some(mut &this, bytes: &Slice<u8>) -> Result<i64, IoError> {
-        return file_descriptor::write_file_descriptor(this.fd, bytes);
+        return os_pipe_write(this.fd, bytes);
     }
 
     flush(mut &this) -> Result<(), IoError> {
