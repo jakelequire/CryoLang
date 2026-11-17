@@ -284,7 +284,7 @@ Tests and gates
                          .verify/incremental-runtime.
   make vendor-check      Every constant shape survives `cryo vendor`.
   make verify-freestanding  The runtime's freestanding acceptance check
-                         (POSIX only; refuses on Windows).
+                         (from a Windows host, run inside WSL).
   make runtime-abi-check The lang-item registry (runtime/abi/lang_items.def)
                          against the runtime's three configurations, and the
                          `__cryo_` names compiler/src and stdlib/ spell.
@@ -1042,12 +1042,13 @@ runtime-abi-check: $(STAGE2_FILE) $(CRYOGATE)
 # `ARGS=--allow-skipped-arm` (the spelling selfhost-check uses), and the run
 # names the arm it did not run; `FREESTANDING_LINUX_ONLY=1` selects the skip.
 #
-# The Linux arm links ELF objects natively, so a Windows host refuses out
-# loud, the same way valgrind-check does: run it from WSL.  `cryogate
-# freestanding`.
+# The Linux arm links ELF objects natively, so a Windows host runs the whole
+# check inside WSL, from the digest-checked copy of the tree selfhost-check
+# uses, with the tree's compiler built there by the copy's pin (`--cryo` is
+# not used there).  `cryogate freestanding`.
 ifeq ($(HOST_OS),windows)
-verify-freestanding:
-	$(error verify-freestanding: UNAVAILABLE on this host -- the Linux arm links ELF objects natively; run it from WSL)
+verify-freestanding: $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) freestanding --cryo "$(STAGE2_FILE)" $(ARGS)
 else
 verify-freestanding: cryo $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) freestanding --cryo "$(STAGE2)" $(ARGS)
