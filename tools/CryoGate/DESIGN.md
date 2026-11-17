@@ -33,6 +33,7 @@ upward, and no two files of one layer import each other in a cycle.
 | `freestanding/` | the runtime's freestanding check: its programs and project files, and what each must exit with and print | core |
 | `freestanding/run/` | the freestanding run itself: the runtime built per arm, each program built, linked by hand and run, natively and under wine | core, the freestanding decisions |
 | `release/` | a release archive's smoke: its hello-world and its judge | the stdlib |
+| `negative/` | the compile-fail suite's `//~` annotations: the diagnostics a run anchors in a file, the lines that pin them, and the two-way check | core |
 | `abi/` | the runtime's ABI: the lang-item registry's rows and what each configuration must define, the symbols an archive's members define, the `__cryo_` names the sources spell | core |
 | `gates/` | one file per subcommand: its command line, the children it runs, the lines it prints, its exit code | every layer above; **never another gate** |
 | `main.cryo`, `selftest.cryo`, `probe.cryo`, `heavy.cryo` | the entry point and the subcommands that are not gates (`selftest`, its child `probe`, `heavy`) | everything |

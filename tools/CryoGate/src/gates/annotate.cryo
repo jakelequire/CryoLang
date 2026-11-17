@@ -1,0 +1,119 @@
+///! `cryogate annotate-negative --cryo <compiler> [--only NAME]... [--dry-run]`:
+///! give every compile-fail file under tests/tests/negative that holds no
+///! `//~` annotation one per diagnostic it provokes, from what the compiler
+///! actually reports (`negative/annotations.cryo`).
+///!
+///! Without annotations the suite asserts one thing of a file: that its
+///! code appears somewhere in the output.  With them it asserts each
+///! diagnostic's severity, code, line and message, and that no diagnostic
+///! anchored in the file is unannotated.
+///!
+///! Each file is checked with `cryo check <file> --stdlib=<stdlib>`, its
+///! annotations written, and checked again: a file whose annotations do not
+///! verify on the second run is put back as it was and left alone, since an
+///! annotation that does not hold is worse than none.  `--dry-run` writes
+///! nothing and lists what would be annotated.
+
+namespace cryogate::gates::annotate;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::tree::{ Tree };
+import cryogate::negative::annotations::{ Annotations, Diagnostic };
+
+/// The annotation writer.
+public type struct AnnotateNegative {
+    /// Run `cryogate annotate-negative` with `arguments` from index `first`.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate annotate-negative --cryo <compiler> [--only NAME]... [--dry-run]"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--only"));
+        options.flag(Str::new("--dry-run"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate annotate-negative: {reason.as_str()}"); return 2; }
+        };
+        const named: Option<Str> = parsed.value(Str::new("--cryo"));
+        if (named.is_none() || !parsed.positionals().is_empty() || parsed.separated()) {
+            fmt::eprintln(f"cryogate annotate-negative: usage: {options.usage()}");
+            return 2;
+        }
+        const compiler: String = Host::absolute(named.unwrap());
+        const only: Array<String> = parsed.values_of(Str::new("--only"));
+        const dry_run: boolean = parsed.has(Str::new("--dry-run"));
+        const negative: PathBuf = repository.join(Str::new("tests/tests/negative"));
+        const excluded: Array<String> = Array::<String>::new();
+        const names: Array<String> = match (Tree::names(negative.as_path(), &excluded)) {
+            Result::Ok(names)   => { names }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate annotate-negative: {reason.as_str()}"); return 1; }
+        };
+        mut sorted: Array<String> = names;
+        sorted.sort();
+        mut wrote: Array<Pair<String, i64>> = Array::<Pair<String, i64>>::new();
+        mut skipped: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        for (name in sorted.iterate_references()) {
+            if (!name.as_str().ends_with(&Str::new(".cryo"))) { continue; }
+            if (!only.is_empty() && !only.contains(name)) { continue; }
+            const path: PathBuf = negative.as_path().join(name.as_str());
+            const original: String = match (File::read_text(path.as_path())) {
+                Result::Ok(text)   => { text }
+                Result::Err(error) => { skipped.push(Pair::new(name.clone(), f"cannot read it: {error.describe()}")); continue; }
+            };
+            if (original.as_str().contains(&Str::new("//~"))) { continue; }
+            const diagnostics: Array<Diagnostic> = AnnotateNegative::diagnose(repository, logs, compiler.as_str(), path.as_path(), name.as_str());
+            if (diagnostics.is_empty()) { skipped.push(Pair::new(name.clone(), String::from_str(Str::new("no diagnostic is anchored in the file")))); continue; }
+            const annotated: String = match (Annotations::annotated(original.as_str(), &diagnostics)) {
+                Option::Some(text) => { text }
+                Option::None       => { skipped.push(Pair::new(name.clone(), String::from_str(Str::new("a diagnostic is anchored past the last line")))); continue; }
+            };
+            if (dry_run) { wrote.push(Pair::new(name.clone(), diagnostics.length())); continue; }
+            if (File::write_text(path.as_path(), annotated.as_str()).is_err()) {
+                skipped.push(Pair::new(name.clone(), String::from_str(Str::new("cannot write it"))));
+                continue;
+            }
+            const again: Array<Diagnostic> = AnnotateNegative::diagnose(repository, logs, compiler.as_str(), path.as_path(), name.as_str());
+            match (Annotations::verify(annotated.as_str(), &again)) {
+                Result::Ok(_) => { wrote.push(Pair::new(name.clone(), diagnostics.length())); }
+                Result::Err(reason) => {
+                    const _: boolean = File::write_text(path.as_path(), original.as_str()).is_ok();
+                    skipped.push(Pair::new(name.clone(), reason));
+                }
+            }
+        }
+        for (entry in wrote.iterate_references()) {
+            fmt::println(f"  annotated  {entry.first.as_str():<52} {entry.second} diagnostic(s)");
+        }
+        for (entry in skipped.iterate_references()) {
+            fmt::println(f"  LEFT ALONE {entry.first.as_str():<52} {entry.second.as_str()}");
+        }
+        fmt::println(f"annotate-negative-tests: {wrote.length()} annotated, {skipped.length()} left alone");
+        return 0;
+    }
+
+    /// The diagnostics `cryo check` anchors in the file `name` at `path`,
+    /// run from the checkout against its stdlib.
+    private static diagnose(repository: Path, logs: &RunLogs, compiler: Str, path: Path, name: Str) -> Array<Diagnostic> {
+        mut job: Job = Job::new(compiler);
+        job.argument(Str::new("check"));
+        job.argument(path.as_str());
+        const stdlib: PathBuf = repository.join(Str::new("stdlib"));
+        job.argument(f"--stdlib={stdlib.as_path().as_str()}".as_str());
+        job.directory(repository.as_str());
+        job.default_c_compiler();
+        job.log_to(logs.file(f"annotate-{name}".as_str()).as_str());
+        const done: Completion = job.run();
+        return Annotations::diagnostics(done.output().as_str(), name);
+    }
+}

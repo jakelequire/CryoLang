@@ -1,0 +1,243 @@
+///! A compile-fail file's `//~` annotations: the diagnostics `cryo check`
+///! anchors in the file, the annotation lines that pin them, and whether a
+///! file's annotations and a run's diagnostics agree both ways.  Pure over
+///! the text handed in.
+///!
+///! A diagnostic is a block opened by an `error[CODE]: message` or
+///! `warning[CODE]: message` line; its anchor is the first `-->` line after
+///! it, `--> path:line:column`, and it belongs to the file whose name the
+///! path ends in - a block anchored in another file (the stdlib, say) is not
+///! this file's to annotate, as the test runner scopes it.
+///!
+///! An annotation is written on its own line directly BELOW the line it
+///! pins - a line inside an unterminated literal cannot take a comment tail -
+///! as `<indent>//~^ ERROR[CODE] message`, one more `^` for each further
+///! diagnostic on the same line.
+
+namespace cryogate::negative::annotations;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+import cryogate::core::text::{ Text };
+
+/// One diagnostic anchored in a file, or one annotation pinning one.
+public type struct Diagnostic {
+    /// The line it is anchored at (an annotation: the line it pins).
+    public line: i64;
+    /// `error` or `warning`.
+    public severity: String;
+    public code: String;
+    public message: String;
+}
+
+/// The diagnostics, the annotations and the agreement between them.
+public type struct Annotations {
+    /// Every diagnostic `output` (a `cryo check` run's) anchors in the file
+    /// named `file_name`, in the order reported.
+    public static diagnostics(output: Str, file_name: Str) -> Array<Diagnostic> {
+        mut found: Array<Diagnostic> = Array::<Diagnostic>::new();
+        mut open: Option<Diagnostic> = Option::None;
+        const lines: Array<String> = Text::lines(output);
+        for (raw in lines.iterate_references()) {
+            match (Annotations::header(raw.as_str().trim())) {
+                Option::Some(header) => { open = Option::Some(header); continue; }
+                Option::None         => { }
+            }
+            if (open.is_none()) { continue; }
+            match (Annotations::anchor(raw.as_str())) {
+                Option::Some(anchor) => {
+                    if (Annotations::base_name(anchor.first.as_str()) == file_name) {
+                        mut diagnostic: Diagnostic = open.unwrap();
+                        diagnostic.line = anchor.second;
+                        found.push(diagnostic);
+                    }
+                    open = Option::None;
+                }
+                Option::None => { }
+            }
+        }
+        return found;
+    }
+
+    /// `text` with an annotation line below each diagnostic's line; `None`
+    /// when a diagnostic is anchored past the file's last line.
+    public static annotated(text: Str, diagnostics: &Array<Diagnostic>) -> Option<String> {
+        mut lines: Array<String> = Array::<String>::new();
+        for (line in text.split(&Str::new("\n"))) { lines.push(String::from_str(line)); }
+        // The anchored lines, from the bottom up, so a line number measured
+        // before an insertion still names the same line during it.
+        mut anchored: Array<i64> = Array::<i64>::new();
+        for (diagnostic in diagnostics.iterate_references()) {
+            if (!anchored.contains(&diagnostic.line)) { anchored.push(diagnostic.line); }
+        }
+        anchored.sort();
+        mut position: i64 = anchored.length();
+        while (position > 0) {
+            position--;
+            const line: i64 = *anchored.get_reference(position).unwrap();
+            if (line < 1 || line > lines.length()) { return Option::None; }
+            const indent: String = Annotations::indent_of(lines.get_reference(line - 1).unwrap().as_str());
+            mut block: Array<String> = Array::<String>::new();
+            mut carets: String = String::new();
+            for (diagnostic in diagnostics.iterate_references()) {
+                if (diagnostic.line != line) { continue; }
+                carets.push('^');
+                const word: Str = if (diagnostic.severity.as_str() == Str::new("error")) { Str::new("ERROR") } else { Str::new("WARN") };
+                block.push(f"{indent.as_str()}//~{carets.as_str()} {word}[{diagnostic.code.as_str()}] {diagnostic.message.as_str()}");
+            }
+            mut offset: i64 = 0;
+            for (entry in block.iterate_references()) {
+                lines.insert(line + offset, entry.clone());
+                offset++;
+            }
+        }
+        return Option::Some(Text::joined(&lines, Str::new("\n")));
+    }
+
+    /// The annotations `text` holds, each at the line it pins.
+    public static annotations(text: Str) -> Array<Diagnostic> {
+        mut found: Array<Diagnostic> = Array::<Diagnostic>::new();
+        mut number: i64 = 0;
+        for (raw in text.split(&Str::new("\n"))) {
+            number++;
+            const at: i64 = match (raw.find(&Str::new("//~"))) {
+                Option::Some(at) => { at }
+                Option::None     => { continue; }
+            };
+            mut rest: Str = raw.byte_substring(at + 3, raw.length());
+            mut carets: i64 = 0;
+            while (rest.starts_with(&Str::new("^"))) { carets++; rest = rest.byte_substring(1, rest.length()); }
+            rest = rest.trim_start();
+            mut severity: Str = Str::new("");
+            mut word: Str = Str::new("");
+            if (rest.starts_with(&Str::new("ERROR["))) { severity = Str::new("error"); word = Str::new("ERROR"); }
+            if (rest.starts_with(&Str::new("WARN["))) { severity = Str::new("warning"); word = Str::new("WARN"); }
+            if (rest.starts_with(&Str::new("WARNING["))) { severity = Str::new("warning"); word = Str::new("WARNING"); }
+            if (severity.is_empty()) { continue; }
+            const after: Str = rest.byte_substring(word.length() + 1, rest.length());
+            match (after.split_once(&Str::new("]"))) {
+                Option::Some(parts) => {
+                    if (parts.first.is_empty()) { continue; }
+                    found.push(Diagnostic {
+                        line: number - carets, severity: String::from_str(severity),
+                        code: String::from_str(parts.first), message: String::from_str(parts.second.trim()),
+                    });
+                }
+                Option::None => { }
+            }
+        }
+        return found;
+    }
+
+    /// Whether `text`'s annotations and the `diagnostics` a run reported
+    /// agree both ways: each annotation matches a diagnostic at its line
+    /// (severity, code, and the message holding the annotation's text), and
+    /// each diagnostic has an annotation at its line (severity and code).
+    /// The reason they do not, otherwise.
+    public static verify(text: Str, diagnostics: &Array<Diagnostic>) -> Result<(), String> {
+        const annotations: Array<Diagnostic> = Annotations::annotations(text);
+        for (annotation in annotations.iterate_references()) {
+            mut matched: boolean = false;
+            for (diagnostic in diagnostics.iterate_references()) {
+                if (Annotations::same_place(annotation, diagnostic)
+                    && (annotation.message.is_empty() || diagnostic.message.as_str().contains(&annotation.message.as_str()))) { matched = true; }
+            }
+            if (!matched) {
+                return Result::Err(f"annotation {annotation.severity.as_str()}[{annotation.code.as_str()}] at {annotation.line} matches no diagnostic");
+            }
+        }
+        for (diagnostic in diagnostics.iterate_references()) {
+            mut matched: boolean = false;
+            for (annotation in annotations.iterate_references()) {
+                if (Annotations::same_place(annotation, diagnostic)) { matched = true; }
+            }
+            if (!matched) {
+                return Result::Err(f"unannotated {diagnostic.severity.as_str()}[{diagnostic.code.as_str()}] at {diagnostic.line}");
+            }
+        }
+        return Result::Ok(());
+    }
+
+    private static same_place(one: &Diagnostic, other: &Diagnostic) -> boolean {
+        return one.line == other.line && one.severity == other.severity && one.code == other.code;
+    }
+
+    /// A header line's diagnostic, its line not yet known.
+    private static header(line: Str) -> Option<Diagnostic> {
+        mut severity: Str = Str::new("");
+        if (line.starts_with(&Str::new("error["))) { severity = Str::new("error"); }
+        if (line.starts_with(&Str::new("warning["))) { severity = Str::new("warning"); }
+        if (severity.is_empty()) { return Option::None; }
+        const after: Str = line.byte_substring(severity.length() + 1, line.length());
+        const parts: Pair<Str, Str> = match (after.split_once(&Str::new("]:"))) {
+            Option::Some(parts) => { parts }
+            Option::None        => { return Option::None; }
+        };
+        if (parts.first.is_empty() || parts.first.contains(&Str::new("]"))) { return Option::None; }
+        return Option::Some(Diagnostic {
+            line: 0, severity: String::from_str(severity),
+            code: String::from_str(parts.first), message: String::from_str(parts.second.trim()),
+        });
+    }
+
+    /// The path and line of a `--> path:line:column` anywhere in `line`:
+    /// the path is everything up to the first `:<digits>:<digits>`.
+    private static anchor(line: Str) -> Option<Pair<String, i64>> {
+        const at: i64 = match (line.find(&Str::new("-->"))) {
+            Option::Some(at) => { at }
+            Option::None     => { return Option::None; }
+        };
+        const rest: Str = line.byte_substring(at + 3, line.length()).trim_start();
+        mut index: i64 = 1;
+        while (index < rest.length()) {
+            if (rest.byte_substring(index, index + 1) == Str::new(":")) {
+                const tail: Str = rest.byte_substring(index + 1, rest.length());
+                const number: Str = Annotations::digits(tail);
+                if (!number.is_empty() && tail.byte_substring(number.length(), tail.length()).starts_with(&Str::new(":"))
+                    && !Annotations::digits(tail.byte_substring(number.length() + 1, tail.length())).is_empty()) {
+                    return match (i64::try_from(number)) {
+                        Result::Ok(value) => { Option::Some(Pair::new(String::from_str(rest.byte_substring(0, index)), value)) }
+                        Result::Err(_)    => { Option::None }
+                    };
+                }
+            }
+            index++;
+        }
+        return Option::None;
+    }
+
+    /// The run of ASCII digits `text` starts with.
+    private static digits(text: Str) -> Str {
+        mut count: i64 = 0;
+        while (count < text.length() && text.byte_at(count).unwrap().is_digit()) { count++; }
+        return text.byte_substring(0, count);
+    }
+
+    /// The last component of `path`, whichever separator it uses.
+    private static base_name(path: Str) -> Str {
+        mut start: i64 = 0;
+        mut index: i64 = 0;
+        while (index < path.length()) {
+            const character: Str = path.byte_substring(index, index + 1);
+            if (character == Str::new("/") || character == Str::new("\\")) { start = index + 1; }
+            index++;
+        }
+        return path.byte_substring(start, path.length());
+    }
+
+    /// The spaces and tabs `line` starts with.
+    private static indent_of(line: Str) -> String {
+        mut count: i64 = 0;
+        while (count < line.length()) {
+            const character: Str = line.byte_substring(count, count + 1);
+            if (character != Str::new(" ") && character != Str::new("\t")) { break; }
+            count++;
+        }
+        return String::from_str(line.byte_substring(0, count));
+    }
+}

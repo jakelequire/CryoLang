@@ -137,8 +137,8 @@ not done. The remaining limits are here so nobody rediscovers them:
   golden marks these projects `outcome=collect`.
 - **A compile-fail file with no `//~` annotation asserts a code and nothing
   else** - not the line, not the symbol, not the absence of a cascade. Write
-  the annotations; `scripts/annotate-negative-tests.py` generates them from a
-  real run and refuses to keep one that does not verify.
+  the annotations; `cryogate annotate-negative --cryo <compiler>` generates
+  them from a real run and refuses to keep one that does not verify.
 - **A diagnostic emitted with no `-->` span cannot be pinned to anything.**
   E0236 is one; its negative test can assert the code alone.
 - **`doc-coverage-check` does not count the functions of an `extern`
