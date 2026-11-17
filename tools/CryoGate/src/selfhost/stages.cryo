@@ -174,15 +174,32 @@ public type struct ArmPlan {
         } else {
             ArmPlan::variable(&variables, Str::new("CRYO_STDLIB"), repository.join(Str::new("stdlib")).as_path().as_str());
             // Windows looks for a library on PATH after the program's own
-            // directory, so a directory there holding LLVM-C.dll would let a
-            // stage compiler start without the copy beside it, which a
-            // release user's machine does not have.
+            // directory, so a directory there holding LLVM-C.dll or
+            // libclang.dll would let a stage compiler start without the copy
+            // beside it, which a release user's machine does not have.  The
+            // C driver and the archiver a stage would look up by name may
+            // live in such a directory (msys's mingw64\bin holds gcc, ar and
+            // libclang.dll), so each is named by the absolute path the
+            // inherited PATH gives it.
             const inherited: String = match (env::var(Str::new("PATH"))) {
                 Option::Some(value) => { value }
                 Option::None        => { String::new() }
             };
+            mut drivers: Array<Str> = Array::<Str>::new();
+            drivers.push(Str::new("gcc"));
+            ArmPlan::variable(&variables, Str::new("CRYO_CC"),
+                              ArmPlan::named_program(inherited.as_str(), Str::new("CRYO_CC"), &drivers).as_str());
+            mut archivers: Array<Str> = Array::<Str>::new();
+            archivers.push(Str::new("ar"));
+            archivers.push(Str::new("llvm-ar"));
+            archivers.push(Str::new("llvm-ar-20"));
+            ArmPlan::variable(&variables, Str::new("CRYO_AR"),
+                              ArmPlan::named_program(inherited.as_str(), Str::new("CRYO_AR"), &archivers).as_str());
+            mut libraries: Array<Str> = Array::<Str>::new();
+            libraries.push(Str::new("LLVM-C.dll"));
+            libraries.push(Str::new("libclang.dll"));
             ArmPlan::variable(&variables, Str::new("PATH"),
-                              ArmPlan::search_path_without(inherited.as_str(), Str::new(";"), Str::new("LLVM-C.dll")).as_str());
+                              ArmPlan::search_path_without(inherited.as_str(), Str::new(";"), &libraries).as_str());
         }
         const pin: PathBuf = repository.join(Str::new("bin/cryo.exe"));
         mut stages: Array<Stage> = Array::<Stage>::new();
@@ -247,15 +264,54 @@ public type struct ArmPlan {
     }
 
     /// The search path `search`, its directories separated by `separator`,
-    /// less every directory holding the file `library` and every empty
-    /// entry, in the order given.
-    public static search_path_without(search: Str, separator: Str, library: Str) -> String {
+    /// less every directory holding a file named in `libraries` and every
+    /// empty entry, in the order given.
+    public static search_path_without(search: Str, separator: Str, libraries: &Array<Str>) -> String {
         mut kept: Array<String> = Array::<String>::new();
         for (entry in search.split_nonempty(&separator)) {
-            if (Path::from(entry).join(library).as_path().is_file()) { continue; }
-            kept.push(String::from_str(entry));
+            mut supplies: boolean = false;
+            for (library in libraries.iterate_references()) {
+                if (Path::from(entry).join(*library).as_path().is_file()) { supplies = true; }
+            }
+            if (!supplies) { kept.push(String::from_str(entry)); }
         }
         return Text::joined(&kept, separator);
+    }
+
+    /// The program a Windows stage runs for the role the variable
+    /// `variable` names (`CRYO_CC`, `CRYO_AR`): the variable's own value
+    /// when it is set, else the first of `defaults` found, as the compiler
+    /// tries them. A bare name is given the absolute path of the first
+    /// `;`-separated directory of `search` holding it (with `.exe` when it
+    /// names no extension); a path, or a name found nowhere, is kept as it
+    /// is, and the stage that cannot start it says so.
+    public static named_program(search: Str, variable: Str, defaults: &Array<Str>) -> String {
+        mut names: Array<String> = Array::<String>::new();
+        match (env::var(variable)) {
+            Option::Some(value) => { names.push(value); }
+            Option::None        => { for (name in defaults.iterate_references()) { names.push(String::from_str(*name)); } }
+        }
+        for (name in names.iterate_references()) {
+            match (ArmPlan::located(search, name.as_str())) {
+                Option::Some(found) => { return found; }
+                Option::None        => { }
+            }
+        }
+        return names.get_reference(0).unwrap().clone();
+    }
+
+    /// The absolute path of the program `name` in the first `;`-separated
+    /// directory of `search` holding it, trying `name.exe` when `name` has
+    /// no extension; `None` for a name that is already a path, or one no
+    /// directory holds.
+    public static located(search: Str, name: Str) -> Option<String> {
+        if (name.contains(&Str::new("/")) || name.contains(&Str::new("\\"))) { return Option::None; }
+        const file: String = if (Path::from(name).extension().is_some()) { String::from_str(name) } else { f"{name}.exe" };
+        for (entry in search.split_nonempty(&Str::new(";"))) {
+            const candidate: PathBuf = Path::from(entry).join(file.as_str());
+            if (candidate.as_path().is_file()) { return Option::Some(String::from_str(candidate.as_path().as_str())); }
+        }
+        return Option::None;
     }
 
     /// The stage `via`, writing `output`, run by `runner` (or directly)
