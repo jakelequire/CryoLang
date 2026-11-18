@@ -39,6 +39,8 @@ public type struct Environment {
     private moved: Array<i64>;
     /// Where each enclosing loop's body starts in `names`, innermost last.
     private loop_floors: Array<i64>;
+    /// The variables kept to be borrowed, which are never moved.
+    private kept: Array<i64>;
     /// The variables the statement being generated lends shared.
     private shared_loans: Array<i64>;
     /// The variables the statement being generated lends exclusively.
@@ -48,8 +50,8 @@ public type struct Environment {
     public static new() -> Environment {
         return Environment {
             names: Array::<i64>::new(), floor: 0, locals: 0, counters: 0, bindings: 0, closure_parameters: 0,
-            moved: Array::<i64>::new(), loop_floors: Array::<i64>::new(), shared_loans: Array::<i64>::new(),
-            exclusive_loans: Array::<i64>::new(),
+            moved: Array::<i64>::new(), loop_floors: Array::<i64>::new(), kept: Array::<i64>::new(),
+            shared_loans: Array::<i64>::new(), exclusive_loans: Array::<i64>::new(),
         };
     }
 
@@ -60,6 +62,7 @@ public type struct Environment {
         this.names.push(Program::observed());
         this.moved.clear();
         this.loop_floors.clear();
+        this.kept.clear();
         this.begin_statement();
         this.floor = 0;
         this.locals = 0;
@@ -124,6 +127,10 @@ public type struct Environment {
 
     /// Leave the innermost loop's body.
     public leave_loop(mut &this) -> void { this.loop_floors.truncate(this.loop_floors.length() - 1); }
+
+    /// Keep `variable` to be borrowed: it is never moved, so it holds its
+    /// value until its scope ends.
+    public keep(mut &this, variable: i64) -> void { this.kept.push(variable); }
 
     /// Start a statement: the borrows of the one before it have ended.
     public begin_statement(mut &this) -> void {
@@ -196,7 +203,7 @@ public type struct Environment {
                 VariableRole::Local     => { true }
                 _                       => { false }
             };
-            if (named && declared.value_type.same(wanted) && !this.is_lent(variable)) { found.push(variable); }
+            if (named && declared.value_type.same(wanted) && !this.is_lent(variable) && !this.kept.contains(&variable)) { found.push(variable); }
         }
         return found;
     }

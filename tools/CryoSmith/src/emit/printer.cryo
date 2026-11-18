@@ -10,8 +10,8 @@ import std::collections::string::{ String };
 import cryosmith::configuration::{ GENERATOR_VERSION, GenerationOptions, Plant };
 import cryosmith::guarantees::{ Observation };
 import cryosmith::model::{
-    Enumeration, Field, Function, OwnedStructure, Program, Receiver, Signature, Structure, TraitDeclaration, TraitMethod, Variable,
-    VariableRole, VariantDeclaration
+    Enumeration, Field, Function, OwnedStructure, Program, Receiver, Signature, StatementKind, Structure, TraitDeclaration, TraitMethod,
+    Variable, VariableRole, VariantDeclaration
 };
 
 /// Writes one program's text.
@@ -27,7 +27,7 @@ public type struct Printer {
     public static print(program: &Program, options: &GenerationOptions) -> String {
         mut printer: Printer = Printer { text: String::new(), plant: options.plant, observation_locals: 0 };
         if (options.header) { printer.header(options); }
-        printer.prelude();
+        printer.prelude(program);
         mut index: i64 = 0;
         while (index < program.enumerations.length()) {
             const declared: Enumeration = program.enumeration_at(index);
@@ -151,10 +151,22 @@ public type struct Printer {
         this.text.push(Str::new("\n\n"));
     }
 
-    /// The namespace, the import of `fmt`, and the hash state `observed`
-    /// with the `mix` that folds a value into it.
-    private prelude(mut &this) -> void {
-        this.text.push(Str::new("namespace Main;\n\nimport std::fmt;\n\n"));
+    /// The namespace, the import of `fmt` - and of `mem` where a value is
+    /// released by `mem::drop` - and the hash state `observed` with the
+    /// `mix` that folds a value into it.
+    private prelude(mut &this, program: &Program) -> void {
+        this.text.push(Str::new("namespace Main;\n\nimport std::fmt;\n"));
+        for (node in program.statements.iter()) {
+            const releases: boolean = match (node.kind) {
+                StatementKind::Release(_) => { true }
+                _                         => { false }
+            };
+            if (releases) {
+                this.text.push(Str::new("import std::core::mem;\n"));
+                break;
+            }
+        }
+        this.text.push(Str::new("\n"));
         this.text.push(f"mut observed: u64 = {Observation::initial_state()};\n\n");
         this.text.push(Str::new("function mix(state: u64, value: u64) -> u64 {\n"));
         this.text.push(f"    return (state.wrapping_multiply({Observation::multiplier()}) ^ value).wrapping_multiply({Observation::multiplier()}).wrapping_add({Observation::increment()});\n");

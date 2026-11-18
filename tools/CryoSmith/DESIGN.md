@@ -506,6 +506,25 @@ helper takes a reference to, as it does for trait objects. The loan audit
 the return of a local's address, so the audit is the one check of shared
 and exclusive until the memory-safety plan's checker lands.
 
+**Drops.** With `drops` (and `moves`), owned values are also released
+before the scope holding them ends, each release running `drop` and so
+reaching the hash where it runs (docs/cryo.md section 15.2):
+`mem::drop(v);` releases a variable that may be moved here (it is then
+moved out, so the move audit holds every later use to the rule, and the
+program imports `std::core::mem` only when it releases one); a statement
+calling a function that returns an owned value discards the result,
+`h3(..);`, released when the statement ends; a shared reference argument
+is a borrowed temporary two times in ten, `&(D0 { .. })` or `&(h3(..))`,
+released when its statement ends, after the call borrowing it returns -
+never in an `if` expression's branch, where a call making one could lend
+exclusively what the other branch borrows, and never in a returned
+reference, which would outlive it (the loan audit refuses both); and a
+store through a `mut &D0` parameter writes the whole value three times in
+ten, `*p0 = D0 { .. };`, releasing the value it replaces. `main`'s locals
+for references to borrow are kept (`Environment::keep`): never moved or
+released, so its calls of the helpers taking references always have a
+value to borrow.
+
 A `match` statement's arm may assign the local its subject reads. Its
 bindings are never written `mut` and their payloads are `Copy`, so each is
 a copy taken when the arm is entered (docs/cryo.md, enum destructuring)
@@ -736,8 +755,10 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. Any list removing `references`
-  generates version 29's text for that list; one removing
+  generator's text, header aside. Any list removing `drops` generates
+  version 30's text for that list, but for `main` with `references` on,
+  whose locals for references to borrow are no longer moved; any list
+  removing `references` generates version 29's text for that list; one removing
   `subject-assignments` too, version 28's, and `moves` as well, version
   27's. Any list removing `trait-objects`
   generates version 26's text for that list, version 27 adding only
@@ -782,7 +803,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
 | 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
 | 6 | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods. Still to come: implementations for enums |
-| 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings; `references`: `&D0` and `mut &D0` parameters, `&D0` returns, kept shared or exclusive per statement. Still to come: early drops, `Box` and `Rc`, `Option` and `Result` |
+| 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings; `references`: `&D0` and `mut &D0` parameters, `&D0` returns, kept shared or exclusive per statement; `drops`: `mem::drop`, discarded results, borrowed temporaries and whole stores through `mut &D0`. Still to come: `Box` and `Rc`, `Option` and `Result` |
 | 8 | strings, arrays and collections |
 
 Section 9 places each stage among the rest of the work, the tools that
@@ -1050,8 +1071,8 @@ place.
    locals, into calls and out of returns, each dropped into the hash,
    `subject-assignments`, arms assigning their subject another variant,
    and `references`, borrows given to reference parameters and references
-   returned from them, are done; early drops, `Box` and `Rc`, and `Option`
-   and `Result` remain.)
+   returned from them, and `drops`, releases before scope exit, are done;
+   `Box` and `Rc`, and `Option` and `Result` remain.)
 6. **Stage 8: strings, arrays and collections.** `model/`: `Str`,
    `String`, fixed arrays, `Array`, `HashMap`. `generate/`: building,
    indexing within bounds, iterating. `guarantees/`: an index is in range

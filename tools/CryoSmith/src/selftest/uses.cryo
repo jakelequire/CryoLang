@@ -30,6 +30,8 @@ internal type enum UseKind {
     SharedBorrow;
     /// `&v` given where an exclusive reference is wanted.
     ExclusiveBorrow;
+    /// `&(value)`, a temporary borrowed, released when its statement ends.
+    TemporaryBorrow;
     /// A shared reference parameter passed on.
     SharedPass;
     /// An exclusive reference parameter passed on, or written through.
@@ -91,6 +93,7 @@ internal type struct UseWalk {
                 }
                 StatementKind::Observe(value) => { this.walk(program, value); }
                 StatementKind::Evaluate(value) => { this.walk(program, value); }
+                StatementKind::Release(variable) => { this.add(UseKind::Moved, variable); }
                 StatementKind::Branch(condition, then_block, else_block) => {
                     this.walk(program, condition);
                     this.walk_block(program, then_block, marking);
@@ -128,6 +131,7 @@ internal type struct UseWalk {
         return match (program.expression_at(place).kind) {
             ExpressionKind::Variable(variable) => { variable }
             ExpressionKind::Field(base, _) => { UseWalk::root(program, base) }
+            ExpressionKind::Dereference(operand) => { UseWalk::root(program, operand) }
             _ => { -1 }
         };
     }
@@ -170,6 +174,11 @@ internal type struct UseWalk {
                 this.add(if (value_type.is_exclusive()) { UseKind::ExclusiveBorrow } else { UseKind::SharedBorrow }, variable);
             }
             ExpressionKind::Move(variable) => { this.add(UseKind::Moved, variable); }
+            ExpressionKind::BorrowTemporary(operand) => {
+                this.add(UseKind::TemporaryBorrow, -1);
+                this.walk(program, operand);
+            }
+            ExpressionKind::Dereference(operand) => { this.walk(program, operand); }
             ExpressionKind::Unary(_, operand) => { this.walk(program, operand); }
             ExpressionKind::Cast(operand) => { this.walk(program, operand); }
             ExpressionKind::Widen(operand) => { this.walk(program, operand); }
