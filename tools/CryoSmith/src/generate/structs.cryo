@@ -211,7 +211,9 @@ implement struct Generator {
     /// `mut &this` when `writes` (they return nothing), `&this` otherwise.
     /// A generic struct's method is a candidate once for each of its
     /// instances, its own among them, that has a receiver in scope and on
-    /// which it returns `wanted`.
+    /// which it returns `wanted`.  A trait method's default body is a
+    /// candidate once for each struct that runs it, implementing the trait
+    /// and writing no method of its own for the default.
     internal method_calls(&this, wanted: ValueType, writes: boolean) -> Array<MethodCandidate> {
         mut found: Array<MethodCandidate> = Array::<MethodCandidate>::new();
         if (!this.options.features.has(Feature::Calls)) { return found; }
@@ -219,7 +221,16 @@ implement struct Generator {
         while (index < this.program.functions.length()) {
             const candidate: Function = this.program.function_at(index);
             const matches: boolean = !candidate.receiver.is_called_by_name() && candidate.receiver.writes_receiver() == writes;
-            if (matches && this.budget.affordable(candidate.cost) && this.may_call(&candidate)) {
+            if (matches && candidate.is_default() && candidate.returns.same(wanted) && this.budget.affordable(candidate.cost)) {
+                mut structure: i64 = 0;
+                while (structure < this.program.structures.length()) {
+                    if (this.program.runs_default(structure, candidate.implements)
+                        && this.environment.receiver_roots(&this.program, ValueType::Record(structure), writes).length() > 0) {
+                        found.push(MethodCandidate { method: index, receiver: ValueType::Record(structure) });
+                    }
+                    structure = structure + 1;
+                }
+            } else if (matches && !candidate.is_default() && this.budget.affordable(candidate.cost) && this.may_call(&candidate)) {
                 const owner: Structure = this.program.structure_at(candidate.owner);
                 mut receiver: i64 = if (owner.is_own_instance()) { 0 } else { candidate.owner };
                 const last: i64 = if (owner.is_own_instance()) { this.program.structures.length() - 1 } else { candidate.owner };

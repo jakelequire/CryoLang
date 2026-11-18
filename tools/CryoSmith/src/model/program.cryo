@@ -155,12 +155,14 @@ public type struct Program {
     /// `argument`: a value type its bound admits - an integer or `boolean`
     /// under `Eq`, a struct implementing the trait under a trait bound - or
     /// `T` itself inside a generic body whose own parameter, bounded by
-    /// `inside`, satisfies the bound.
+    /// `inside`, satisfies the bound: a trait bound by being bounded by the
+    /// trait or by one declared over it.
     public admits(&this, genericity: Genericity, argument: ValueType, inside: Genericity) -> boolean {
         if (!genericity.is_generic()) { return false; }
         const bounding: i64 = genericity.bounding_trait();
         if (argument.same(ValueType::TypeParameter)) {
-            if (bounding >= 0) { return inside.bounding_trait() == bounding; }
+            if (!inside.is_generic()) { return false; }
+            if (bounding >= 0) { return this.inherits(inside.bounding_trait(), bounding); }
             return !genericity.compares() || inside.compares();
         }
         if (argument.same(ValueType::Void)) { return false; }
@@ -180,8 +182,62 @@ public type struct Program {
         return found;
     }
 
+    /// Whether trait `derived` is trait `base` or declared over it, directly
+    /// or through its supertrait; false for -1, no trait.
+    public inherits(&this, derived: i64, base: i64) -> boolean {
+        mut index: i64 = derived;
+        while (index >= 0) {
+            if (index == base) { return true; }
+            index = this.trait_at(index).supertrait;
+        }
+        return false;
+    }
+
+    /// The trait methods a value bounded by trait `index` has: its own,
+    /// then its supertrait's and theirs.  Each is named alone, `t<N>`,
+    /// since no two traits share a method's name.
+    public methods_through(&this, index: i64) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        mut declaring: i64 = index;
+        while (declaring >= 0) {
+            const declared: TraitDeclaration = this.trait_at(declaring);
+            mut method: i64 = declared.first_method;
+            while (method < declared.first_method + declared.method_count) {
+                found.push(method);
+                method = method + 1;
+            }
+            declaring = declared.supertrait;
+        }
+        return found;
+    }
+
+    /// The default body of trait method `method`, by its place among the
+    /// functions; -1 while it has none.
+    public default_of(&this, method: i64) -> i64 {
+        mut index: i64 = 0;
+        while (index < this.functions.length()) {
+            const defined: Function = this.function_at(index);
+            if (defined.is_default() && defined.implements == method) { return index; }
+            index = index + 1;
+        }
+        return -1;
+    }
+
+    /// Whether a value of the struct at `structure` runs trait method
+    /// `method`'s default body when the method is called on it: the struct
+    /// implements the declaring trait and writes no method of its own for
+    /// it.
+    public runs_default(&this, structure: i64, method: i64) -> boolean {
+        if (!this.implements(structure, this.trait_method_at(method).declared_by)) { return false; }
+        for (defined in this.functions.iter()) {
+            if (defined.owner == structure && defined.implements == method) { return false; }
+        }
+        return true;
+    }
+
     /// The most work a call of trait method `method` through a bound or an
-    /// object can do: the costliest implementation's.
+    /// object can do: the costliest implementation's, its default body's
+    /// among them.
     public trait_method_cost(&this, method: i64) -> u64 {
         mut most: u64 = 0;
         for (defined in this.functions.iter()) {
@@ -191,7 +247,9 @@ public type struct Program {
     }
 
     /// Whether the struct at `structure` implements trait `index`: some
-    /// method of that struct implements one of the trait's methods.
+    /// method of that struct implements one of the trait's methods, as
+    /// every implementation does, a trait's first method having no
+    /// default.
     public implements(&this, structure: i64, index: i64) -> boolean {
         const declared: TraitDeclaration = this.trait_at(index);
         for (defined in this.functions.iter()) {

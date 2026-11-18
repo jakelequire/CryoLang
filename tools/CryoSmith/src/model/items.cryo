@@ -172,14 +172,29 @@ public type enum Genericity {
     /// the program's traits: its `T` values' methods of that trait are
     /// called, so it is instantiated only at a struct implementing it.
     Implementing(i64);
+    /// The default body of a trait's method, the trait and the method by
+    /// their places: `this` is the implementing type, `T` in the model,
+    /// bounded by the trait alone and not `Copy`.  It has no type parameter
+    /// to write, and calls only methods declared before its own on `this`.
+    Defaulting(i64, i64);
 }
 
 implement enum Genericity {
     /// Whether the function has a type parameter.
     public is_generic(&this) -> boolean {
         return match (&this) {
-            Genericity::Concrete => { false }
-            _                    => { true }
+            Genericity::Concrete         => { false }
+            Genericity::Defaulting(_, _) => { false }
+            _                            => { true }
+        };
+    }
+
+    /// The trait method whose default body is being generated, or -1
+    /// anywhere else.
+    public defaulted_method(&this) -> i64 {
+        return match (&this) {
+            Genericity::Defaulting(_, method) => { method }
+            _                                 => { -1 }
         };
     }
 
@@ -194,8 +209,9 @@ implement enum Genericity {
     /// The trait `T` is bounded by, or -1 for none.
     public bounding_trait(&this) -> i64 {
         return match (&this) {
-            Genericity::Implementing(index) => { index }
-            _                               => { -1 }
+            Genericity::Implementing(index)  => { index }
+            Genericity::Defaulting(index, _) => { index }
+            _                                => { -1 }
         };
     }
 }
@@ -243,8 +259,9 @@ public type struct Function {
     public number: i64;
     /// Whether this is `main`.
     public is_main: boolean;
-    /// The struct that owns a method, or -1 for a free function; a generic
-    /// struct's method is owned by its own instance, `B0<T>`.
+    /// The struct that owns a method, or -1 for a free function and a
+    /// trait method's default body; a generic struct's method is owned by
+    /// its own instance, `B0<T>`.
     public owner: i64;
     /// How it takes its receiver.
     public receiver: Receiver;
@@ -266,13 +283,17 @@ public type struct Function {
     /// function type.
     public callable: ValueType;
 
-    /// For a method of a trait's implementation, the trait method it
-    /// implements, by its place among the program's trait methods, and
-    /// whose number it is named by, `t<N>`; -1 for any other function.
+    /// For a method of a trait's implementation, or a trait method's
+    /// default body, the trait method it implements, by its place among the
+    /// program's trait methods, and whose number it is named by, `t<N>`; -1
+    /// for any other function.
     public implements: i64;
 
     /// Whether its last parameter is of a callable-bounded type parameter.
     public takes_callable(&this) -> boolean { return this.callable.is_function(); }
+
+    /// Whether it is a trait method's default body, written in the trait.
+    public is_default(&this) -> boolean { return this.owner < 0 && this.implements >= 0; }
 
     /// Whether `other` is spelled with the same name: the same owner and
     /// number, both `main` or neither, both generic or neither, both a
@@ -292,16 +313,24 @@ public type struct TraitDeclaration {
     public first_method: i64;
     /// How many methods it declares, at least one.
     public method_count: i64;
+    /// The trait it is declared over, `type trait Tr1 : Tr0`, by its place
+    /// among the traits, always an earlier one; -1 for none.
+    public supertrait: i64;
 }
 
-/// A method a trait declares, `t<N>(&this, p0: u8) -> i32;`, with no body:
-/// every implementation writes one.  Numbered across the program, so no
-/// two traits declare one name and a struct implementing both has one
-/// method of each name.
+/// A method a trait declares, `t<N>(&this, p0: u8) -> i32;`, with no body,
+/// so every implementation writes one, or with a default body, which an
+/// implementation may leave out.  Numbered across the program, so no two
+/// traits declare one name and a struct implementing both has one method
+/// of each name.
 public type struct TraitMethod {
     /// The number in its name.
     public number: i64;
     /// Its parameters after the receiver and its return type, as a
     /// function type.
     public function_type: ValueType;
+    /// The trait declaring it, by its place among the traits.
+    public declared_by: i64;
+    /// Whether it has a default body.  A trait's first method never has.
+    public defaulted: boolean;
 }
