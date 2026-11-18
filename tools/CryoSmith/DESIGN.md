@@ -902,6 +902,17 @@ statement budget of one function, default 24), `--no-header`, and
   parse and print canonically; a disabled feature's forms never appear; and
   the static audit below passes over a few hundred programs and refuses
   every planted one. It counts its checks and fails if it ran none.
+  The default program of each seed is generated once and shared by every
+  check that reads it, as its model and its text; the checks only read
+  them, and the determinism check compares each of the first twenty with
+  the seed generated afresh. A run is a sequence of units, each check and
+  each feature switch on its own, numbered in the order they run;
+  `selftest --part I/N` runs the units whose number leaves I divided by N
+  and says how many it ran of how many there are. `make
+  cryosmith-selftest` is `cryogate smith-selftest`, which runs N parts at
+  once (`CRYOGATE_JOBS`, default the logical CPUs) and prints the whole
+  run's verdict line, the same for any N; it refuses parts that do not
+  run every unit exactly once between them.
 - **A static audit** of printed programs: every `/` and `%` divides by a
   `| 1)` guard and every `<<` / `>>` amount is masked. The audit reads the
   printed text, not the model, so it does not share the generator's
@@ -913,7 +924,13 @@ statement budget of one function, default 24), `--no-header`, and
   line; the summary counts the distinct hashes, since a hash every program
   shares is a stuck one. CryoSmith generates and never runs a compiler;
   checking what it generated is the gate runner's, and the output contract
-  of section 5 is what the two share.
+  of section 5 is what the two share. The builds run `--jobs` at once
+  (default `CRYOGATE_JOBS`, else the logical CPUs), each with a build
+  directory of its own (`--build-dir`), since two builds sharing one write
+  the same objects and one program then reports another's hash; a build
+  that writes no build directory is a failure. The report is printed in
+  seed order once every program has run, so it is the same bytes for any
+  job count.
 - **Plants prove the checks can refuse.** `--plant unguarded-division`
   generates `(a / (b & M))`, without the `| 1`. The static audit must refuse
   every planted program that divides, and the corpus check must report the
@@ -1052,6 +1069,29 @@ the bug that needs it) is allowed only while that bug's fix is queued in
 the same session, or when the fix is clearly a large project of its own,
 which is then put to the maintainer as a question rather than left in
 place.
+
+**What proves a change.**
+
+- Each unit of work: its build, its own tests with an inversion or a
+  mutation, `make check-fast`, the self-test, the reproduction check of
+  section 8, and a corpus of 50 seeds (a mutation pair's corpus keeps its
+  own size). A change to the compiler, the standard library, the runtime
+  or CryoGate also passes `make verify` before it is pushed, with its
+  declarations in the same commit.
+- The end of a session: the 200-seed corpus, once. When the session
+  changed only `tools/CryoSmith`, that and `cryogate verify --only
+  cross,fast` are the whole batch: every population the full verify
+  hashes is built by the compiler, the standard library and the runtime,
+  so it cannot move, and the only gates that read CryoSmith's code are
+  `fast` (the self-test) and `cross` (CryoSmith built for the other OS).
+  When the compiler, the standard library or the runtime changed, the full
+  batch runs: `verify --baseline <session start> --require-identical`,
+  `warnings-check` with its planted control, the selfhost check on both
+  arms when compiled output moved, and the 200-seed corpus.
+
+**Pending elsewhere.** `Rc` gains a safe read (`Deref`, or `get(&this) ->
+&T`) with the memory-safety work, not on this branch; until then the
+generator never reads through an `Rc`.
 
 1. **Finish stage 3: overload sets** (done: `overloads`, section 2).
    `model/`: functions of one owner and number share a name.

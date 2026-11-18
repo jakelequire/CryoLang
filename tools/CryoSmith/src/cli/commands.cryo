@@ -35,7 +35,7 @@ public type struct Cli {
         if (command == Str::new("batch")) { return Cli::batch(&rest); }
         if (command == Str::new("features")) { return Cli::features(); }
         if (command == Str::new("version")) { fmt::println(f"cryosmith {GENERATOR_VERSION}"); return 0; }
-        if (command == Str::new("selftest")) { return SelfTest::run(); }
+        if (command == Str::new("selftest")) { return Cli::selftest(&rest); }
         if (command == Str::new("help")) { Cli::usage(); return 0; }
         fmt::eprintln(f"cryosmith: unknown command `{command}`");
         Cli::usage();
@@ -54,13 +54,48 @@ public type struct Cli {
             "  features            every feature, its stage, and whether `default`\n"
             "                      holds it\n"
             "  version             the generator version\n"
-            "  selftest            determinism, the feature switches and the static\n"
-            "                      audit, in process; builds nothing\n\n"
+            "  selftest [--part I/N]\n"
+            "                      determinism, the feature switches and the static\n"
+            "                      audit, in process; builds nothing; --part runs\n"
+            "                      part I (0 to N-1) of N, which together run every\n"
+            "                      check once\n\n"
             "Checking the programs against a compiler is `cryogate corpus-check`.\n\n"
             "generation options: --features LIST (default `default`; `no-<name>`\n"
             "removes one), --functions N, --size N, --no-header, --plant NAME\n\n"
             "exit codes: 0 done, 1 a file could not be written or the self-test failed,\n"
             "2 a usage error")));
+    }
+
+    /// `selftest`: every check, or with `--part I/N` part I of N.
+    private static selftest(arguments: &Array<String>) -> i32 {
+        mut parser: ArgumentParser = ArgumentParser::new(Str::new("cryosmith selftest"));
+        parser.option(Str::new("part"), Option::None, Str::new("I/N"), Str::new("run part I (0 to N-1) of N"));
+        const parsed: ParsedArguments = match (Cli::parse(&parser, arguments)) {
+            Option::Some(parsed) => { parsed }
+            Option::None         => { return 2; }
+        };
+        const text: Str = match (parsed.value(Str::new("part"))) {
+            Option::Some(text) => { text }
+            Option::None       => { return SelfTest::run(0, 1); }
+        };
+        match (text.split_once(&Str::new("/"))) {
+            Option::Some(split) => {
+                match (i64::try_from(split.first)) {
+                    Result::Ok(index) => {
+                        match (i64::try_from(split.second)) {
+                            Result::Ok(count) => {
+                                if (count >= 1 && index >= 0 && index < count) { return SelfTest::run(index, count); }
+                            }
+                            Result::Err(_) => { }
+                        }
+                    }
+                    Result::Err(_) => { }
+                }
+            }
+            Option::None => { }
+        }
+        fmt::eprintln(f"cryosmith selftest: --part takes I/N with I from 0 to N-1, not `{text}`");
+        return 2;
     }
 
     /// The arguments after the command's name.

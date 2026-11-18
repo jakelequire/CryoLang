@@ -249,7 +249,9 @@ Tests and gates
   make cryosmith-selftest
                          cryosmith's in-process checks: one seed, one
                          program; the feature switches; the static audit of
-                         guarded division and shifts, and its plant.
+                         guarded division and shifts, and its plant; split
+                         into parts run at once (`cryogate smith-selftest`,
+                         CRYOGATE_JOBS of them, default the logical CPUs).
   make verify-selftest   cryogate's checks (verify's, selfhost's and
                          verify-pin's among them), driven through
                          fixtures they must accept and refuse.
@@ -641,8 +643,8 @@ $(CRYOSMITH): $(CRYOSMITH_INPUTS)
 	@touch "$(CRYOSMITH)"
 endif
 
-cryosmith-selftest: $(CRYOSMITH)
-	@$(CRYOSMITH_COMMAND) selftest
+cryosmith-selftest: $(CRYOSMITH) $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) smith-selftest --smith "$(CRYOSMITH)"
 
 # ---- CryoAnalyzer VS Code extension -----------------------------------
 # Builds and installs the server from the current tree (`lsp`), runs its

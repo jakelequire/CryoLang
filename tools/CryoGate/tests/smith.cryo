@@ -1,14 +1,92 @@
-///! The corpus check's judgements over CryoSmith's output contract.
+///! The corpus check's judgements over CryoSmith's output contract, and the
+///! verdict of CryoSmith's self-test run in parts.
 ![config(testing)]
 namespace cryogate::tests::smith;
 
+import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::result::{ Result };
+import std::fs::path::{ Path, PathBuf };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect };
 
-import cryogate::smith::corpus::{ CorpusJudge };
+import cryogate::smith::corpus::{ CorpusJudge, CorpusLayout };
+import cryogate::smith::selftest::{ PartReport, SelfTestParts };
+
+/// Two parts' reports: part 0 ran `first` units, part 1 `second`, of `total`.
+function two_parts(first: i64, second: i64, total: i64, checks: Str) -> Array<PartReport> {
+    mut reports: Array<PartReport> = Array::<PartReport>::new();
+    reports.push(PartReport::new(0, f"cryosmith selftest: part 0/2 ran {first} of {total} units\ncryosmith selftest: OK (7 checks)\n".as_str(), Str::new("")));
+    reports.push(PartReport::new(1, f"cryosmith selftest: part 1/2 ran {second} of {total} units\n{checks}\n".as_str(), Str::new("")));
+    return reports;
+}
+
+![test]
+function parts_covering_every_unit_once_pass_with_their_checks_summed() -> Result<(), TestError> {
+    const verdict: Result<String, String> = SelfTestParts::verdict(&two_parts(3, 2, 5, Str::new("cryosmith selftest: OK (5 checks)")));
+    return expect(verdict.is_ok() && verdict.unwrap() == String::from_str(Str::new("cryosmith selftest: OK (12 checks)")), Str::new("the whole run's line"));
+}
+
+![test]
+function parts_missing_a_unit_are_no_whole_run() -> Result<(), TestError> {
+    const verdict: Result<String, String> = SelfTestParts::verdict(&two_parts(3, 1, 5, Str::new("cryosmith selftest: OK (5 checks)")));
+    return expect(verdict.is_err() && verdict.unwrap_err() == String::from_str(Str::new("the parts ran 4 of 5 units")), Str::new("a unit no part ran"));
+}
+
+![test]
+function parts_counting_different_totals_are_no_whole_run() -> Result<(), TestError> {
+    mut reports: Array<PartReport> = two_parts(3, 2, 5, Str::new("cryosmith selftest: OK (5 checks)"));
+    reports.push(PartReport::new(2, Str::new("cryosmith selftest: part 2/3 ran 0 of 6 units\ncryosmith selftest: OK (0 checks)\n"), Str::new("")));
+    const verdict: Result<String, String> = SelfTestParts::verdict(&reports);
+    return expect(verdict.is_err() && verdict.unwrap_err() == String::from_str(Str::new("part 2 counted 6 units, part 0 counted 5")), Str::new("totals disagree"));
+}
+
+![test]
+function a_failed_part_fails_the_whole_run_with_every_check_counted() -> Result<(), TestError> {
+    mut reports: Array<PartReport> = Array::<PartReport>::new();
+    reports.push(PartReport::new(0, Str::new("cryosmith selftest: part 0/2 ran 3 of 5 units\ncryosmith selftest: OK (7 checks)\n"), Str::new("")));
+    reports.push(PartReport::new(1, Str::new("cryosmith selftest: part 1/2 ran 2 of 5 units\n"), Str::new("cryosmith selftest: FAIL seed 4: no\ncryosmith selftest: FAIL (1 of 5 checks)\n")));
+    const verdict: Result<String, String> = SelfTestParts::verdict(&reports);
+    return expect(verdict.is_ok() && verdict.unwrap() == String::from_str(Str::new("cryosmith selftest: FAIL (1 of 12 checks)")), Str::new("the whole run's failure line"));
+}
+
+![test]
+function a_part_that_printed_no_part_line_is_no_whole_run() -> Result<(), TestError> {
+    mut reports: Array<PartReport> = Array::<PartReport>::new();
+    reports.push(PartReport::new(0, Str::new("cryosmith selftest: OK (7 checks)\n"), Str::new("")));
+    const verdict: Result<String, String> = SelfTestParts::verdict(&reports);
+    return expect(verdict.is_err() && verdict.unwrap_err() == String::from_str(Str::new("part 0 printed no part line")), Str::new("a crashed or old part"));
+}
+
+![test]
+function every_build_of_a_corpus_has_a_build_directory_of_its_own() -> Result<(), TestError> {
+    const layout: CorpusLayout = CorpusLayout::new(Path::from(Str::new("work")));
+    mut levels: Array<String> = Array::<String>::new();
+    levels.push(String::from_str(Str::new("0")));
+    levels.push(String::from_str(Str::new("2")));
+    mut seen: Array<String> = Array::<String>::new();
+    mut seed: u64 = 1;
+    while (seed <= 12) {
+        for (level in levels.iterate_references()) {
+            const directory: String = String::from_str(layout.build_directory(seed, level.as_str()).as_path().as_str());
+            expect(!seen.contains(&directory), directory.as_str())?;
+            seen.push(directory);
+        }
+        seed = seed + 1;
+    }
+    return expect(seen.length() == 24, Str::new("two builds a seed"));
+}
+
+![test]
+function a_build_writes_its_executable_outside_its_build_directory() -> Result<(), TestError> {
+    const layout: CorpusLayout = CorpusLayout::new(Path::from(Str::new("work")));
+    const executable: PathBuf = layout.executable(7, Str::new("2"));
+    const directory: PathBuf = layout.build_directory(7, Str::new("2"));
+    expect(executable.as_path().as_str() == Str::new("work/smith-7-O2.exe"), executable.as_path().as_str())?;
+    expect(layout.source(7).as_path().as_str() == Str::new("work/smith-7.cryo"), Str::new("the program CryoSmith wrote"))?;
+    return expect(!executable.as_path().as_str().starts_with(&directory.as_path().as_str()), directory.as_path().as_str());
+}
 
 ![test]
 function a_program_must_print_exactly_one_hash_line() -> Result<(), TestError> {

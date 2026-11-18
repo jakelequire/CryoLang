@@ -1,16 +1,20 @@
 ///! `cryogate corpus-check --cryo <compiler> --work <directory> [--smith
 ///! <cryosmith>] [--stdlib <directory>] [--first-seed N] [--count K]
-///! [-- <generation options>...]`: CryoSmith's acceptance check, and the
-///! check of a compiler against generated programs.
+///! [--jobs N] [-- <generation options>...]`: CryoSmith's acceptance check,
+///! and the check of a compiler against generated programs.
 ///!
 ///! CryoSmith writes the programs (`cryosmith batch`, the generation options
 ///! passed through); each is built at `--opt-level=0` and at
 ///! `--opt-level=2` and both are run.  A program passes when both builds
 ///! succeed, both runs exit 0, and both print the same single hash line
-///! (`smith/corpus.cryo`).  A failing program and its builds stay in the
-///! work directory; a passing program's executables are removed.  Every
-///! program terminates by construction, so a run has no time limit: one
-///! that does not end is itself a finding.
+///! (`smith/corpus.cryo`).  The builds run `--jobs` at once (default: the
+///! scheduler's, `CRYOGATE_JOBS` or the logical CPUs), each in a build
+///! directory of its own, then the runs; the report is printed in seed
+///! order, so it is the same bytes whatever the count.  A failing program,
+///! its executables and a failed build's directory stay in the work
+///! directory; a passing program's are removed.  Every program terminates
+///! by construction, so a run has no time limit: one that does not end is
+///! itself a finding.
 
 namespace cryogate::gates::corpus_check;
 
@@ -28,24 +32,27 @@ import cryogate::core::child::{ Completion, Job };
 import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
-import cryogate::smith::corpus::{ CorpusJudge };
+import cryogate::core::schedule::{ Cost, Scheduler };
+import cryogate::smith::corpus::{ CorpusJudge, CorpusLayout };
 
 /// The corpus check's settings.
 public type struct CorpusCheck {
     compiler: String;
     work: PathBuf;
+    layout: CorpusLayout;
     stdlib: Option<String>;
 
     /// Run `cryogate corpus-check` with `arguments` from index `first`; 0
     /// when every program passed, 1 when one failed, 2 on a usage error.
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
-        mut options: Options = Options::new(Str::new("cryogate corpus-check --cryo <compiler> --work <directory> [--smith <cryosmith>] [--stdlib <directory>] [--first-seed N] [--count K] [-- <generation options>...]"));
+        mut options: Options = Options::new(Str::new("cryogate corpus-check --cryo <compiler> --work <directory> [--smith <cryosmith>] [--stdlib <directory>] [--first-seed N] [--count K] [--jobs N] [-- <generation options>...]"));
         options.valued(Str::new("--cryo"));
         options.valued(Str::new("--work"));
         options.valued(Str::new("--smith"));
         options.valued(Str::new("--stdlib"));
         options.valued(Str::new("--first-seed"));
         options.valued(Str::new("--count"));
+        options.valued(Str::new("--jobs"));
         const parsed: Parsed = match (options.parse(arguments, first)) {
             Result::Ok(parsed)  => { parsed }
             Result::Err(reason) => { fmt::eprintln(f"cryogate corpus-check: {reason.as_str()}"); return 2; }
@@ -64,14 +71,29 @@ public type struct CorpusCheck {
             Result::Ok(value) => { value }
             Result::Err(_)    => { fmt::eprintln(String::from_str(Str::new("cryogate corpus-check: --count takes a number"))); return 2; }
         };
+        // 0 leaves the scheduler's own count.
+        const jobs: i64 = match (parsed.value(Str::new("--jobs"))) {
+            Option::Some(text) => {
+                match (i64::try_from(text)) {
+                    Result::Ok(value) => {
+                        if (value < 1) { fmt::eprintln(f"cryogate corpus-check: --jobs takes a count of at least 1, not `{text}`"); return 2; }
+                        value
+                    }
+                    Result::Err(_) => { fmt::eprintln(f"cryogate corpus-check: --jobs takes a number, not `{text}`"); return 2; }
+                }
+            }
+            Option::None => { 0 }
+        };
         const default_smith: PathBuf = repository.join(Str::new("tools/CryoSmith/build"));
         const smith: String = match (parsed.value(Str::new("--smith"))) {
             Option::Some(path) => { Host::absolute(path) }
             Option::None       => { Host::executable_name(default_smith.as_path().join(Str::new("cryosmith")).as_path().as_str()) }
         };
+        const work_path: PathBuf = PathBuf::from(Host::absolute(work.unwrap()).as_str());
         const check: CorpusCheck = CorpusCheck {
             compiler: Host::absolute(compiler.unwrap()),
-            work:     PathBuf::from(Host::absolute(work.unwrap()).as_str()),
+            layout:   CorpusLayout::new(work_path.as_path()),
+            work:     work_path,
             stdlib:   match (parsed.value(Str::new("--stdlib"))) {
                 Option::Some(stdlib) => { Option::Some(String::from_str(stdlib)) }
                 Option::None         => { Option::None }
@@ -97,12 +119,48 @@ public type struct CorpusCheck {
             fmt::println(f"corpus-check: FAIL (cryosmith could not write the programs: {generated.outcome.describe().as_str()}; {generated.log.as_str()})");
             return 1;
         }
-        mut failed: u64 = 0;
-        mut hashes: Array<String> = Array::<String>::new();
+        // Every build, a seed's two levels together, then every run of a
+        // seed whose builds both succeeded; completions come back in the
+        // order the jobs were added, so the verdicts are in seed order.
+        mut builds: Scheduler = Scheduler::new();
+        builds.set_slots(jobs);
         mut offset: u64 = 0;
         while (offset < count) {
             const seed: u64 = first_seed.wrapping_add(offset);
-            match (check.program(seed, logs)) {
+            builds.add(check.build(seed, Str::new("0"), logs), Cost::Compile);
+            builds.add(check.build(seed, Str::new("2"), logs), Cost::Compile);
+            offset = offset + 1;
+        }
+        const built: Array<Completion> = builds.run();
+        mut runs: Scheduler = Scheduler::new();
+        runs.set_slots(jobs);
+        mut verdicts: Array<Result<i64, String>> = Array::<Result<i64, String>>::new();
+        offset = 0;
+        while (offset < count) {
+            const seed: u64 = first_seed.wrapping_add(offset);
+            const index: i64 = (offset * 2) as i64;
+            mut both: Result<(), String> = check.built(seed, Str::new("0"), &built[index], logs);
+            if (both.is_ok()) { both = check.built(seed, Str::new("2"), &built[index + 1], logs); }
+            match (both) {
+                Result::Ok(_) => {
+                    verdicts.push(Result::Ok(runs.add(check.execute(seed, Str::new("0"), logs), Cost::Light)));
+                    runs.add(check.execute(seed, Str::new("2"), logs), Cost::Light);
+                }
+                Result::Err(reason) => { verdicts.push(Result::Err(reason)); }
+            }
+            offset = offset + 1;
+        }
+        const ran: Array<Completion> = runs.run();
+        mut failed: u64 = 0;
+        mut hashes: Array<String> = Array::<String>::new();
+        offset = 0;
+        while (offset < count) {
+            const seed: u64 = first_seed.wrapping_add(offset);
+            const verdict: Result<String, String> = match (&verdicts[offset as i64]) {
+                Result::Ok(at)      => { check.judge(seed, &ran[at], &ran[at + 1]) }
+                Result::Err(reason) => { Result::Err(reason.clone()) }
+            };
+            match (verdict) {
                 Result::Ok(hash) => {
                     fmt::println(f"ok    seed {seed} {hash.as_str()}");
                     if (!hashes.contains(&hash)) { hashes.push(hash); }
@@ -119,56 +177,75 @@ public type struct CorpusCheck {
         return 0;
     }
 
-    /// Build the program of `seed` twice and run both builds; its hash
-    /// line, or why it failed.
-    private program(&this, seed: u64, logs: &RunLogs) -> Result<String, String> {
-        const source: PathBuf = this.work.as_path().join(f"smith-{seed}.cryo".as_str());
-        const unoptimised: PathBuf = this.work.as_path().join(f"smith-{seed}-O0.exe".as_str());
-        const optimised: PathBuf = this.work.as_path().join(f"smith-{seed}-O2.exe".as_str());
-        this.build(source.as_path(), unoptimised.as_path(), Str::new("--opt-level=0"), logs)?;
-        this.build(source.as_path(), optimised.as_path(), Str::new("--opt-level=2"), logs)?;
-        const first: String = this.execute(unoptimised.as_path(), logs)?;
-        const second: String = this.execute(optimised.as_path(), logs)?;
-        CorpusJudge::agree(first.as_str(), second.as_str())?;
-        CorpusCheck::remove(unoptimised.as_path())?;
-        CorpusCheck::remove(optimised.as_path())?;
-        return Result::Ok(first);
-    }
-
-    /// Build `source` into `output` at `level`.
-    private build(&this, source: Path, output: Path, level: Str, logs: &RunLogs) -> Result<(), String> {
+    /// The build of `seed`'s program at `level`, in its own build directory.
+    private build(&this, seed: u64, level: Str, logs: &RunLogs) -> Job {
         mut job: Job = Job::new(this.compiler.as_str());
         job.argument(Str::new("build"));
-        job.argument(source.as_str());
-        job.argument(level);
+        job.argument(this.layout.source(seed).as_path().as_str());
+        job.argument(f"--opt-level={level}".as_str());
+        job.argument(f"--build-dir={this.layout.build_directory(seed, level).as_path().as_str()}".as_str());
         job.argument(Str::new("-o"));
-        job.argument(output.as_str());
+        job.argument(this.layout.executable(seed, level).as_path().as_str());
         match (&this.stdlib) {
             Option::Some(stdlib) => { job.argument(f"--stdlib={stdlib.as_str()}".as_str()); }
             Option::None         => { }
         }
         job.directory(this.work.as_path().as_str());
         job.default_c_compiler();
-        const name: Str = output.file_name().unwrap_or(Str::new("build"));
-        job.log_to(logs.file(f"corpus-{name}".as_str()).as_str());
-        const errors: String = logs.file(f"corpus-{name}-errors".as_str());
-        job.errors_to(errors.as_str());
-        const done: Completion = job.run();
-        if (done.outcome.succeeded()) { return Result::Ok(()); }
-        const quoted: String = CorpusJudge::first_lines(CorpusCheck::read(errors.as_str()).as_str(), done.output().as_str());
-        return Result::Err(f"{level} build failed ({done.outcome.describe().as_str()}): {quoted.as_str()}");
+        const name: String = CorpusCheck::name(seed, level);
+        job.log_to(logs.file(f"corpus-{name.as_str()}".as_str()).as_str());
+        job.errors_to(logs.file(f"corpus-{name.as_str()}-errors".as_str()).as_str());
+        return job;
     }
 
-    /// Run `program`; the one line it printed, which must be the hash line.
-    private execute(&this, program: Path, logs: &RunLogs) -> Result<String, String> {
-        mut job: Job = Job::new(program.as_str());
+    /// Whether the build of `seed` at `level` succeeded in its own build
+    /// directory, which a successful build's check then removes.  A
+    /// compiler that wrote no build directory ignored `--build-dir`, and
+    /// builds running at once would have shared one.
+    private built(&this, seed: u64, level: Str, done: &Completion, logs: &RunLogs) -> Result<(), String> {
+        if (!done.outcome.succeeded()) {
+            const errors: String = logs.file(f"corpus-{CorpusCheck::name(seed, level).as_str()}-errors".as_str());
+            const quoted: String = CorpusJudge::first_lines(CorpusCheck::read(errors.as_str()).as_str(), done.output().as_str());
+            return Result::Err(f"--opt-level={level} build failed ({done.outcome.describe().as_str()}): {quoted.as_str()}");
+        }
+        const directory: PathBuf = this.layout.build_directory(seed, level);
+        if (!directory.as_path().is_directory()) {
+            return Result::Err(f"--opt-level={level} build wrote no {directory.as_path().as_str()}: the compiler does not take `--build-dir` for a single file");
+        }
+        return match (Directory::remove_all(directory.as_path())) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot remove {directory.as_path().as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// The run of `seed`'s build at `level`.
+    private execute(&this, seed: u64, level: Str, logs: &RunLogs) -> Job {
+        mut job: Job = Job::new(this.layout.executable(seed, level).as_path().as_str());
         job.directory(this.work.as_path().as_str());
-        const name: Str = program.file_name().unwrap_or(Str::new("program"));
-        job.log_to(logs.file(f"corpus-run-{name}".as_str()).as_str());
-        job.errors_to(logs.file(f"corpus-run-{name}-errors".as_str()).as_str());
-        const done: Completion = job.run();
-        if (!done.outcome.succeeded()) { return Result::Err(f"{program.as_str()} ended with {done.outcome.describe().as_str()}"); }
-        return CorpusJudge::hash_line(program.as_str(), done.output().as_str());
+        const name: String = CorpusCheck::name(seed, level);
+        job.log_to(logs.file(f"corpus-run-{name.as_str()}".as_str()).as_str());
+        job.errors_to(logs.file(f"corpus-run-{name.as_str()}-errors".as_str()).as_str());
+        return job;
+    }
+
+    /// The hash line both runs of `seed` printed, or why they fail; a
+    /// passing program's executables are removed.
+    private judge(&this, seed: u64, unoptimised: &Completion, optimised: &Completion) -> Result<String, String> {
+        const first: PathBuf = this.layout.executable(seed, Str::new("0"));
+        const second: PathBuf = this.layout.executable(seed, Str::new("2"));
+        if (!unoptimised.outcome.succeeded()) { return Result::Err(f"{first.as_path().as_str()} ended with {unoptimised.outcome.describe().as_str()}"); }
+        if (!optimised.outcome.succeeded()) { return Result::Err(f"{second.as_path().as_str()} ended with {optimised.outcome.describe().as_str()}"); }
+        const one: String = CorpusJudge::hash_line(first.as_path().as_str(), unoptimised.output().as_str())?;
+        const two: String = CorpusJudge::hash_line(second.as_path().as_str(), optimised.output().as_str())?;
+        CorpusJudge::agree(one.as_str(), two.as_str())?;
+        CorpusCheck::remove(first.as_path())?;
+        CorpusCheck::remove(second.as_path())?;
+        return Result::Ok(one);
+    }
+
+    /// The name the logs of `seed`'s build and run at `level` carry.
+    private static name(seed: u64, level: Str) -> String {
+        return f"smith-{seed}-O{level}.exe";
     }
 
     private static read(path: Str) -> String {
