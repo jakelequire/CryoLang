@@ -1,22 +1,21 @@
 ///! Move Check Pass.
 ///!
-///! Walks function bodies after sema and rejects a non-Copy local that
-///! is used after a `let`-RHS or call-arg move. Diagnostics are
-///! `fatal_on_failure`, so the pipeline aborts before codegen and an
-///! unsound binary is never emitted.
+///! Walks function bodies after sema and rejects a non-Copy local that is
+///! used after a move, and a local of any type that is read before it holds
+///! a value on every path. Diagnostics are `fatal_on_failure`, so the
+///! pipeline aborts before codegen and an unsound binary is never emitted.
 ///!
-///! Scope: bare-identifier moves at let initializers and at function-call
-///! arguments. `if`/`else` and `match` branches ARE merged at their join
-///! (`merge_branches`): a binding moved on any branch that can fall through
-///! to the join is possibly-moved afterwards and - because Cryo has no
-///! partial-move tracking - is conservatively treated as Moved, so a reuse
-///! past the join is reported. Branches that diverge (`return`/`break`/
-///! `continue`, or all sub-branches diverge) never reach the join, so their
-///! moves are dropped - that is what keeps the `if (c) { consume(x); return; }
-///! use(x);` guard pattern false-positive-free.
-///! Every diagnostic is an unambiguous (or, across a branch join, a possible)
-///! double-free; within-iteration, across-branch, and loop-carried
-///! use-after-move are all hard errors.
+///! The moved-set is one flow fact for both questions: a binding declared
+///! without a value enters it at its declaration, as a moved one does, and
+///! leaves it when it is assigned. `if`/`else` and `match` branches are
+///! merged at their join (`merge_branches`): a binding moved on any branch
+///! that can fall through to the join is possibly moved afterwards and is
+///! treated as moved, so a reuse past the join is reported. Branches that
+///! diverge (`return`/`break`/`continue`, or all sub-branches diverge) never
+///! reach the join, so their moves are dropped - that is what keeps the
+///! `if (c) { consume(x); return; } use(x);` guard pattern accepted.
+///! A field moved out of a local is tracked on its own (the partial-move
+///! set) where the move is unconditional, and refused where it is not.
 
 namespace compiler::passes::move_check;
 
@@ -1678,8 +1677,10 @@ type struct MoveChecker {
         if (!vd.is_global) {
             this.register_binding(vd.sym_id, vd.resolved_type, vd.name, d.span);
         }
+        // A value made of no members - an empty array, a struct with no
+        // fields - is whole with nothing written to it.
         if (vd.initializer == null && !vd.is_global && vd.sym_id.is_valid()
-            && !this.is_copy(vd.resolved_type)) {
+            && this.member_count_of(vd.resolved_type) != 0) {
             this.mark_moved(vd.sym_id, d.span, false);
             this.uninitialised_keys.push(vd.sym_id.key());
             this.uninitialised_spans.push(d.span);
@@ -1838,23 +1839,33 @@ type struct MoveChecker {
 
     /// E0219: `name`, declared without a value at `declared`, is used at
     /// `span` - borrowed by a reference when `by_reference` - on a path that
-    /// has not given it one.
+    /// has not given it one.  For a local of a `Copy` type it is W0018, the
+    /// same rule as a warning: such a local owns nothing a read could release
+    /// twice, and the buffers existing code fills slot by slot read as
+    /// unset to an analysis that cannot follow a run-time index.
     emit_uninitialised_use(mut &this, name: SymbolStr, span: SourceSpan,
-                           declared: SourceSpan, by_reference: boolean) -> void {
+                           declared: SourceSpan, by_reference: boolean, copy: boolean) -> void {
         const spelled: string = this.intern.resolve(name);
         const what: string = if (by_reference) { "reference to" } else { "use of" };
-        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0219_UNINITIALIZED_VAR,
-            fmt::format("%s `%s`, which is not initialised on every path here", what, spelled));
+        const headline: String =
+            fmt::format("%s `%s`, which is not initialised on every path here", what, spelled);
+        mut diag: Diagnostic = if (copy) {
+            Diagnostic::warning(ErrorCode::W0018_UNINITIALIZED_VAR, headline)
+        } else {
+            Diagnostic::error(ErrorCode::E0219_UNINITIALIZED_VAR, headline)
+        };
         diag = diag.at_with_label(span, if (by_reference) { "borrowed here" } else { "used here" });
         diag = diag.also_at(declared, "declared here without a value");
         diag = diag.help(if (by_reference) {
             "a reference always names a value; give the variable one on every path first, or pass a raw pointer (`T*`) to a function that fills it"
+        } else { if (copy) {
+            "give the variable a value on every path before this use; a buffer filled slot by slot is declared with one (`[0; N]`)"
         } else {
             "give the variable a value on every path before this use"
-        });
+        } });
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
-        this.fatal += 1;
+        if (!copy) { this.fatal += 1; }
     }
 
     /// True when `place` is a member of a binding that has not been given a
@@ -1894,6 +1905,35 @@ type struct MoveChecker {
         if (assigned == this.member_count_of(this.lookup_type(root))) {
             this.unmark_moved(root);
         }
+    }
+
+    /// The place a store writes, walked for what the store reads: the
+    /// run-time indices on the way to it, and any pointer or reference it is
+    /// reached through.  A field or element of a local's own storage
+    /// (`buffer[i] = v`, `p.x = v`) writes into the local and reads nothing
+    /// of it, so a local that holds no value yet is not used by the store.
+    walk_store_place(mut &this, place: ExpressionNode*) -> void {
+        const element: ArrayAccessExpr* = ExpressionNode::array_access_of(place);
+        if (element != null && element.array != null && this.is_fixed_array(element.array.resolved_type)) {
+            this.walk_store_place(element.array);
+            this.walk_expr_read(element.index);
+            return;
+        }
+        const field: MemberAccessExpr* = ExpressionNode::member_access_of(place);
+        if (field != null && field.object != null && this.aggregate_type_of(field.object.resolved_type) != null) {
+            this.walk_store_place(field.object);
+            return;
+        }
+        const id: IdentifierExpr* = ExpressionNode::identifier_of(place);
+        if (id != null && this.uninitialised_at(id.res.local_sym()).has_location()) { return; }
+        this.walk_expr_read(place);
+    }
+
+    /// Whether `ty` is a fixed-size array (`[T; N]`), whose elements are the
+    /// array's own storage.
+    is_fixed_array(&this, ty: TypeRef) -> boolean {
+        const t: Type* = if (ty.is_valid()) { this.arena.lookup(ty) } else { null as Type* };
+        return t != null && t.kind == TypeKind::Array && t.as_array().size >= 0;
     }
 
     /// How many members a value of `ty` is made of for `initialise_member`:
@@ -2344,7 +2384,7 @@ type struct MoveChecker {
             // A member of a binding declared without a value is written, not
             // read (`initialise_member`).
             const fills_member: boolean = this.fills_unset_member(b.left);
-            if (b.left != null && !fills_member) { this.walk_expr_read(b.left); }
+            if (b.left != null && !fills_member) { this.walk_store_place(b.left); }
             if (b.right != null) { this.walk_expr_move(b.right, false); }
             if (fills_member) { this.initialise_member(b.left); }
             this.reinitialise_moved_field(b.left);
@@ -2382,7 +2422,8 @@ type struct MoveChecker {
                 if (u.borrowed_as_pointer) {
                     this.unmark_moved(sym);
                 } else if (!this.suppress_emit) {
-                    this.emit_uninitialised_use(id.name, u.operand.span, declared, true);
+                    this.emit_uninitialised_use(id.name, u.operand.span, declared, true,
+                        this.is_copy(this.lookup_type(sym)));
                 }
                 return;
             }
@@ -3193,7 +3234,16 @@ type struct MoveChecker {
         if (Log::enabled(LogArea::Drop, LogLevel::Trace)) {
             Log::trace(LogArea::Drop, f"identifier '{this.intern.resolve(name)}': type {ty.key()}, copy {_is_copy}, moved {this.is_moved(sym)}, in move context {in_move_context}");
         }
-        if (_is_copy) { return; }
+        if (_is_copy) {
+            // A `Copy` value is never moved, so the moved-set holds one only
+            // from a declaration without a value: reading it reads storage
+            // nothing wrote.
+            const unset: SourceSpan = this.uninitialised_at(sym);
+            if (unset.has_location() && !this.suppress_emit) {
+                this.emit_uninitialised_use(name, e.span, unset, false, true);
+            }
+            return;
+        }
 
         // A closure's capture stays the closure's, or its owner's, for every
         // call.
@@ -3238,7 +3288,7 @@ type struct MoveChecker {
             if (this.suppress_emit) { return; }
             const declared: SourceSpan = this.uninitialised_at(sym);
             if (declared.has_location()) {
-                this.emit_uninitialised_use(name, e.span, declared, false);
+                this.emit_uninitialised_use(name, e.span, declared, false, false);
                 return;
             }
             if (this.is_carried(sym)) {

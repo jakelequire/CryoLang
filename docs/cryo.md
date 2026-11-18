@@ -9,7 +9,7 @@ Cryo is a statically-typed, compiled systems language. It targets native machine
 
 2. **One toolchain.** Build, run, test, fetch, init, and check are subcommands of a single `cryo` binary. The package manager, the test runner, and the dependency resolver ship with the compiler.
 
-3. **Ownership without lifetimes.** Cryo tracks ownership statically - `Copy` and `Drop` are inferred structurally, destructors are synthesised at every scope exit, and using a value after it has moved is a hard error - but there is no borrow checker, no lifetime annotations, and no garbage collector. Raw pointers stay unchecked and aliasing stays the programmer's responsibility. The model buys deterministic destruction and use-after-move rejection without asking you to prove your program correct to the compiler.
+3. **Memory safety without lifetime annotations.** A program that writes no `unsafe` cannot read freed, dangling or uninitialised memory, release a value twice, or race on data. Cryo tracks ownership statically - `Copy` and `Drop` are inferred structurally, destructors are synthesised at every scope exit, and using a value after it has moved is a hard error - and tracks borrows with a small set of rules that need no annotations: a reference is a *view*, kept only by locals, parameters, return values and other views; a returned reference borrows from every reference the call was given; and while a borrow of a place is in use the place is neither released, moved, reassigned nor written, and a writable borrow excludes every other use. There is no garbage collector. Raw pointers, `extern` calls and the other unchecked operations are allowed only inside `unsafe`, where the program, not the compiler, keeps them sound ([section 15.5](#155-memory-safety)).
 
 The rest of this document is organised by feature area. Examples are runnable against the current compiler; anything aspirational is marked.
 
@@ -383,7 +383,7 @@ const v:  void* = malloc(64);  // type-erased
 
 A pointer converts to another pointer type without a cast only when the pointee is the same type (`mut T*` to `T*`, never back), or when either side is `void*`. A read-only level is made only at the outermost pointer: `mut (mut u8*)*` converts to `(mut u8*)*`, but not to `mut (u8*)*`, since through a `mut (u8*)*` a read-only pointer could be stored where the `mut (mut u8*)*` reads back a writable one. Below the outermost level every mark stays as written, in both directions, and only `as` converts across it. A pointer to any other type is written with `as`, including a pointee that converts to the wanted one: an `i32` converts to an `i64`, but an `i32*` addresses four bytes, so it is not an `i64*` (nor is an `i32**` an `i64**` or a `void**`). A value passed where a pointer parameter wants its address must be of the pointee type itself. The rule is the same wherever a value meets a declared type: an initializer, an assignment, a `return`, a struct field, and an argument of every kind of call - a method, a free or static function, a function reached by its path and a generic one (`E0214` at an argument, `E0200` elsewhere). It holds the same where a pointee is a type parameter: a generic body is checked once, against its own parameters, so a `T*` does not fill a `mut T*` field, variable or parameter there either. A borrow converts to a pointer to its referent: a `mut &T` to a `mut T*` or a `T*`, a `&T` to a `T*` only ([section 2.3](#23-references)).
 
-Raw pointers are unchecked. Validity, aliasing, and lifetime are the programmer's responsibility. For a pointer that is statically guaranteed non-null, see `core::pointer::NonNull<T>`. For owned heap allocations, prefer `Box<T>`. See [section 14](#14-pointers-and-memory).
+Raw pointers are unchecked: the compiler does not know what a `T*` points at, whether that is still alive, or who else writes it. So making one is safe - `&x` where a `T*` is wanted, copying it, comparing it, `null` - and every operation that reads or writes through one, or makes one from an integer, is an unsafe operation, allowed only inside `unsafe` ([section 6.11](#611-unsafe-blocks)). For a pointer that is statically guaranteed non-null, see `core::pointer::NonNull<T>`. For owned heap allocations, prefer `Box<T>`. See [section 14](#14-pointers-and-memory).
 
 ### 2.3 References
 
@@ -402,6 +402,8 @@ The receiver shape on a method is part of its signature: a `&this` method may no
 **Read-only places.** A place reached through a read-only borrow - a `&T`, a `virtual &Trait`, or `this` in a `&this` method - or through a read-only pointer `T*` is not written: assigning it, giving it a compound assignment (`+=` and the rest) and calling a `mut &this` method on it are each refused (`E0250`). The last indirection on the way to a place decides, so `r.x = 1` with `r: &(mut Foo*)` writes through the writable pointer, and `r.scale(2)` with `r: &virtual mut &Shape` through the writable object, while `p.x = 1` with `p: Foo*` is refused. A `*` strips one level, so the place `*p` is decided by the outermost indirection of `p` alone: `*p = q` with `p: &(mut Foo*)` writes the borrowed pointer and is refused, and with `p: mut (&Foo)*` writes the borrow the pointer points at. Indexing a pointer is the same, since `p[i]` is `*(p + i)`: `p[0] = q` with `p: mut (u8*)*` writes the writable outer level, and with `p: (mut u8*)*` is refused. A `mut &this` method is not called on a `const` binding either. A binding a `match` makes follows the value it matched: a match on a writable value, a `mut &T`, a `mut T*` or `&x` of a writable `x` binds writable names, and a match on a `&T`, a `T*` or a `const` binding read-only ones; a `mut` written before the name does not change that.
 
 **Write access is not made from read access.** `&x` takes its mutability from what is wanted of it and from `x`: where a value that writes is wanted - a `mut &T`, a `virtual mut &Trait`, or a `mut T*`, as a parameter, a declared type, a `return` or an assigned place - `&x` is a writable borrow, and is refused (`E0251`) when `x` is a read-only place (held by a `const` binding, or reached through a `&T`, a `virtual &Trait`, a `T*` or a `&this` receiver). With nothing such wanted, `&x` is exactly as writable as `x`. So a writable borrow is written `&x` too, and `&mut x` is refused at the `mut` (`E0101`). A `&T` value converts to a `T*` and never to a `mut T*` or a `mut &T`: passing one where those are wanted is refused (`E0251`), and `as` is the one way to a writable pointer from it. `mut &T` converts to `&T`, and to `mut T*` and `T*`. `&a[i]` and `&*b` borrowed for writing go through `index_mutable` and `deref_mutable` ([section 10.6](#106-operator-overloading)).
+
+**A reference is a view.** A reference names a value some other binding owns, so it may be kept only where the compiler can see it end before that owner does: a local, a parameter, a return value, or a field of another view. A *view type* is a reference (`&T`, `mut &T`, `&Slice<T>`), a closure that borrows ([section 2.5](#25-function-types)), an aggregate holding one, or a type declared `![view]` - a type built on raw pointers whose values point into storage they do not own, such as `Str` and the collections' iterators. A view is not kept by a type that is not one, a global, a `Box`, `Rc` or `Arc`, a `move` closure or another thread's body. A function that returns a view borrows from every reference argument it is given and from `this` when the receiver is `&this` or `mut &this`, so its result keeps all of them borrowed for as long as it is used; a view rooted in the function's own locals, by-value parameters or by-value receiver is never returned (`E0455`). How long a borrow lasts, and what it forbids, is [section 15.5](#155-memory-safety).
 
 Reading the value a reference refers to is explicit in arithmetic and comparison: `*x == 7`, `*x % 2`. Writing `x == 7` or `x % 2` with `x: &int` is an error, never a comparison of the reference itself ([section 5.2](#52-comparison)). Member access reads through the reference: `h.tag` with `h: &Heap`.
 
@@ -1016,9 +1018,13 @@ mut it         = arr.iter();   // inferred: the concrete iterator type
 mut y: int;                     // declared without an initialiser; assigned later
 ```
 
-**A value before every use.** A local whose type is not `Copy` and that is declared without an initialiser holds nothing until it is given a value: by an assignment to the whole local, or by an assignment to each of its fields - each slot, for a fixed-size array - outside any branch or loop. Storing to a member is not a use. Until every path to a use has given it one, the use is refused (`E0219`) - reading it, calling a method on it, and borrowing it with `&` alike, since a reference always names a value and a store through one releases what it displaces. The one exception is `&x` taken where a raw pointer (`T*`) is wanted: a pointer may address storage that holds nothing yet, which is how a function is handed a place to fill, and the local is taken to hold a value from there on. A `Copy` local holds no resource for an unset value to corrupt, and is not checked.
+**A value before every use.** A local whose type is not `Copy` and that is declared without an initialiser holds nothing until it is given a value: by an assignment to the whole local, or by an assignment to each of its fields - each slot, for a fixed-size array - outside any branch or loop. Storing to a member is not a use. Until every path to a use has given it one, the use is refused (`E0219`) - reading it, calling a method on it, and borrowing it with `&` alike, since a reference always names a value and a store through one releases what it displaces. The one exception is `&x` taken where a raw pointer (`T*`) is wanted: a pointer may address storage that holds nothing yet, which is how a function is handed a place to fill, and the local is taken to hold a value from there on. The rule holds for a local of every type - a number, a `Copy` struct, a reference and a pointer as much as an owning value - since reading storage that was never written reads whatever the stack held, and a reference or pointer read that way points anywhere. For a local of a `Copy` type the use is reported as a warning (`W0018`) while existing code gives such locals their values, and becomes `E0219` after that ([section 15.5](#155-memory-safety)). A buffer that is filled slot by slot at run-time positions is not followed slot by slot: give it a value where it is declared (`mut digits: [u8; 20] = [0; 20];`).
 
 ```cryo
+mut count: i64;
+if (ready) { count = 1; }
+print(count);                   // W0018: not given a value when `ready` is false
+
 mut owned: Buffer;
 if (ready) { owned = Buffer::new(); }
 use(&owned);                    // E0219: not given a value when `ready` is false
@@ -1291,7 +1297,7 @@ x = x + 1;                 // wraps to -2147483648 (i32::MIN), no trap
 
 This is a defined deterministic result, not undefined behavior, but it is *silent*: the language does not insert checks. Code that must detect overflow has to compare against the type's bounds before the operation. (Unsigned wrap is the usual `mod 2`<sup>`N`</sup>; e.g. `0u8 - 1u8 == 255`.)
 
-**Division and modulo by zero** are *not* checked by the compiler and fault at runtime (on typical targets the CPU raises `SIGFPE`); the signed `i32::MIN / -1` / `i32::MIN % -1` cases overflow the result and fault the same way. Guard the divisor when it can be zero.
+**Division and modulo by zero panic.** Every integer `/` and `%` is checked before it divides: a zero divisor panics with `attempt to divide by zero`, and the signed `MIN / -1` and `MIN % -1`, whose result does not fit the type, panic too. The message for the second case is being corrected to `attempt to divide with overflow`; until it is, it reads as the first. A divisor the compiler can see is neither zero nor `-1` costs nothing at run time. Floating-point division is never checked: it gives an infinity or a NaN.
 
 ### 5.2 Comparison
 
@@ -1338,6 +1344,8 @@ The alternative - quietly dereferencing - was rejected because the comparison di
 | `&` `\|` `^` | AND / OR / XOR                                                 |
 | `~`          | Bitwise NOT (unary)                                            |
 | `<<` `>>`    | Left / right shift (arithmetic on signed, logical on unsigned) |
+
+**A shift amount must be less than the width.** `x << n` and `x >> n` with `n` at or above the bit width of `x`'s type (or negative, which reads as a very large amount) panic, in every build, with `shift amount <n> is not less than the width <w>`; such a shift has no meaningful result. An amount the compiler can see is in range costs nothing at run time, and a constant amount out of range is refused at compile time (`E0464`). *Not yet enforced; see the rollout in [section 15.5](#155-memory-safety): today such a shift gives an unspecified value.*
 
 ### 5.5 Assignment
 
@@ -1654,18 +1662,33 @@ function add(a: int, b: int) -> int {
 
 ### 6.11 Unsafe Blocks
 
-`unsafe { ... }` is recognised at parse time and lowers identically to a plain block. It serves as a **documentation marker**: a visible signal that the enclosed code performs raw pointer arithmetic, calls `extern` functions, or otherwise sits at the edge of the language's safety story. The compiler does not currently impose any extra restriction outside an `unsafe` block, and does not relax any check inside one - every operation Cryo permits today is permitted everywhere.
+`unsafe { ... }` is the boundary of the checked language. Outside it the compiler guarantees memory safety ([section 15.5](#155-memory-safety)); inside it a small, fixed set of **unsafe operations** is allowed, whose soundness the compiler cannot see and the program keeps instead:
+
+- reading or writing through a raw pointer: `*p`, `p[i]`, `p.f` where the last step is a raw pointer, and pointer arithmetic (`p + i`);
+- `delete`, and the allocator intrinsics that hand out or take back raw memory (`malloc`, `free`, `realloc`);
+- `as` from an integer to a pointer, and `mem::transmute`;
+- reading a field of a `union`;
+- calling an `extern` function, or a function declared `![unsafe]` - one whose contract its caller keeps, such as `Slice::from_raw` (a length the pointer's storage really has) and `pointer::read` (a value taken out of storage that will not release it again);
+- inline `asm`;
+- declaring a type `![send]` or `![sync]` ([section 15.4](#154-the-send-and-sync-traits)).
 
 ```cryo
-import std::core::intrinsics::{ malloc };
+import std::core::intrinsics::{ malloc, free };
 
-unsafe {
-    const raw: void* = malloc(64);
-    // raw pointer manipulation here
+function fill(count: u64) -> u8 {
+    unsafe {
+        const raw: mut u8* = malloc(count);
+        raw[0] = 7;
+        const first: u8 = raw[0];
+        free(raw);
+        return first;
+    }
 }
 ```
 
-This is the committed 1.0 behavior: `unsafe` is a documentation marker and nothing more. It is **not** reserved to silently become enforcing - 1.0 code will not break under a future release on account of `unsafe`. Should later versions add safety checks around raw pointer dereference, raw-to-pointer `as`-casts, or `extern` calls, they would arrive compatibly (as an opt-in lint/warning first), not as a breaking change to code that already compiles.
+**`unsafe` relaxes nothing else.** Every other check stays in force inside the block - use after a move, a value released twice, a reference outliving what it names, the borrow rules, bounds, initialisation. An operation that is refused outside `unsafe` for any reason but being unsafe is refused inside it too, so wrapping code in `unsafe` never silences a diagnostic it did not name. Making a raw pointer, copying one and comparing one are safe and need no block; so is `null` as a value.
+
+An unsafe operation outside `unsafe` is reported as a warning (`W0019`) while existing code moves its operations into blocks, and becomes an error (`E0462`) when the standard library, the compiler and the tools build with none. *Not yet enforced; see the rollout in [section 15.5](#155-memory-safety).*
 
 ### 6.12 Inline Assembly
 
@@ -3748,7 +3771,7 @@ A function sharing its name with a type of the same scope leaves the path throug
 
 ## 14. Pointers and Memory
 
-Cryo is a systems language. There is no garbage collector. Memory is managed manually through explicit allocation and deallocation, or, preferably, through RAII patterns: a type that owns memory implements `Drop`, and its destructor releases what its constructor acquired.
+Cryo is a systems language. There is no garbage collector. Memory is managed through owning types: a type that owns memory implements `Drop`, and its destructor releases what its constructor acquired. Below them sit raw pointers and explicit allocation, which are unsafe operations ([section 6.11](#611-unsafe-blocks)): the examples in this section that read or write through a pointer, allocate or `delete` are written inside `unsafe` in a program.
 
 ### 14.1 Address-of and Dereference
 
@@ -3882,7 +3905,7 @@ const non_null: NonNull<u8> = NonNull::new(buf).unwrap();
 
 ## 15. Ownership, Copy, and Drop
 
-Cryo implements a static ownership model that is enforced at compile time. The model is **deliberately small**: it is built around three notions (`Copy`, `Drop`, and a flow-sensitive move check). It has no borrow checker, no lifetimes, and does not track aliasing of raw pointers - but the move check is a *hard error*, not a warning: using a value after it has been moved is rejected at compile time (`E0452`, see [section 15.3](#153-move-checking)).
+Cryo implements a static ownership model that is enforced at compile time. It is built around `Copy`, `Drop`, and a flow-sensitive check of every function body that follows moves, initialisation and borrows. Using a value after it has been moved is a hard error (`E0452`, see [section 15.3](#153-move-checking)). Borrows are checked by the rules of [section 15.5](#155-memory-safety), which need no lifetime annotations. Raw pointers are not tracked: what is done through them is unsafe ([section 6.11](#611-unsafe-blocks)).
 
 ### 15.1 The `Copy` Trait
 
@@ -3945,7 +3968,7 @@ The destinations below do *not* release what they overwrite, because nothing vis
 | `xs[i] = v` with a run-time `i` | no single member for the compiler to track |
 | a module-level global | globals are never auto-dropped |
 
-A store through a reference also releases nothing when the function moved a value out from behind the same binding earlier, or the store's own right-hand side does (`this.f = wrap(this.f)` inside an `unsafe` block, where such a move is not refused): the place still holds the bits of a value its new owner releases.
+A store through a reference also releases nothing when the function moved a value out from behind the same binding earlier, or the store's own right-hand side does (`this.f = wrap(pointer::read(&this.f))`): the place still holds the bits of a value its new owner releases.
 
 A local or by-value parameter of an `async function` is a local for these rules even when it is carried in a field of the generated future: reassigning it releases the displaced value, and it is released at its scope's exits, exactly as in a function that never suspends (see [section 18.4](#184-how-an-async-function-is-compiled)).
 
@@ -4062,19 +4085,19 @@ use(a);                // error E0452: use of moved value `a`
 Two move/ownership hazards that are unambiguous memory errors, called out as their own hard-error classes for clearer diagnostics, are:
 
 - **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.  A loop's condition, and a `for`'s update, run again at every back edge, so a value or field moved in them is refused, even when the body assigns it a new one, unless the body always leaves the loop with `break` or `return`.
-- **Returning the address of a local** (`E0455`) - `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine - those are caller-backed.)
+- **Returning the address of a local** (`E0455`) - `return &local;` hands back a pointer into the stack frame that is freed when the function returns. The same holds for every value the function owns: a by-value parameter and a by-value receiver (`this`, `mut this`) are released when it returns too, so `return &param;` is refused for a by-value parameter and `return &this.name;` for a by-value receiver, and so is a reference to one of them carried out through a local (`const r: &i64 = &x; return r;`) or a field of one. A reference parameter, a `&this` or `mut &this` receiver and what they reach are the caller's, and are returned freely. *A reference carried out through a local, a by-value parameter and a by-value receiver are not yet refused; see the rollout in [section 15.5](#155-memory-safety).*
 - **A field moved out on some paths only** (`E0453`) - a field moved out of a local runs its owner's release without that field at scope exit, which is sound only when the move certainly happened.  So a field may be moved out of a local of a struct with no destructor in straight-line code, and is refused inside an `if`, `match` or loop body, on the right of `&&` or `||`, and in an arm of `?:` or of an `if` expression - each runs on some paths only.  The refusal names the local and the field ("cannot move field 'a' out of `h` on only some paths"); a field moved out of a value whose type implements `Drop` is refused as owning a destructor, and one out of any other value the partial move does not track (a tuple, a pattern binding, a field of a field) as a value that drops it at scope exit.
 - **A reference to a value with a field moved out** (`E0452`) - a reference names the whole value, and a store through it releases what it displaces, so `&p`, `p` passed where a reference is taken, and a method called on `p` are refused once a field has been moved out of `p`, until that field is given a new value.  The fields that remain may still be read and borrowed (`&p.b`).
 - **A field moved out of a value no binding owns** (`E0453` with a destructor) - `const n: String = make().name;` moves `name` out of the call's result, and the result's other fields are released, each once, when the statement ends; the same holds through fields of fields (`make().inner.name`) and for a tuple's element (`pair().1`).  Read only as a borrow (`make().name.length()`, `&make().name`), the field is released with the rest of the value then.  A value with a destructor is never taken apart: when the value, or any value the field is read out of, has a type that implements `Drop`, moving the field out is refused ("cannot move field `inner` out of a value that owns a destructor"), and borrowing it is allowed - the destructor runs over the whole value when the statement ends.
 - **An owning array read by value through a pointer or reference** (`E0453`) - `const xs: [T] = p.items;` or `xs = p.items;`, with `p` a pointer or reference, copies the array's handle while the struct `p` names still owns the same buffer, so the buffer is released twice.  `[T]` and `[T; N]` alike; borrow the field (`&p.items`) or clone it.  A take that is sound - the old value is meant to leave - swaps it out with `mem::swap`.
 - **A by-value method called through a pointer or reference** (`E0453`) - `p.unwrap()` or `p.into_id()`, where the method takes `this` by value and `p` is a pointer or reference to a value that owns a destructor, moves the value out of storage that still releases it, exactly as the written `(*p).unwrap()` does.  A value without a destructor is copied and is accepted.  Call a method that borrows its receiver, clone the value first, or empty the storage with a method that leaves a value behind (`Option::take`).
 - **A field matched by value through a pointer or reference** (`E0453`) - `match (p.slot)`, with `p` a pointer or reference (including `this` in a `&this` or `mut &this` method) and the field's type owning a destructor, gives the match's subject its own copy of the field's owning handle, released when the match ends whether or not an arm binds the payload, while the storage `p` names still holds the field.  Match on a borrow instead - `match (&p.slot)` - and the arms read the payload without owning it.  A take swaps a replacement in with `mem::swap` first.
-- **A field read by value through a pointer or reference** (`E0453`) - the same holds wherever such a field is read into a second owner: `const x: T = p.slot;`, `x = p.slot;`, `return this.slot;` from a `&this` or `mut &this` method, `take(p.slot)` for a by-value parameter, and `Other { slot: p.slot }`.  Each copies the field's owning handle while the storage `p` names still releases it.  Borrow the field (`&p.slot`), swap it out with `mem::swap`, or read it from a receiver the method owns: `outcome(mut this) -> T { return this.slot; }` consumes the value it is called on, so the field has one owner.  Inside an `unsafe` block the read is allowed, for a take whose storage is overwritten or freed without being released.  A closure reading what it captured is not such a read: its captures are fields of the closure itself.
+- **A field read by value through a pointer or reference** (`E0453`) - the same holds wherever such a field is read into a second owner: `const x: T = p.slot;`, `x = p.slot;`, `return this.slot;` from a `&this` or `mut &this` method, `take(p.slot)` for a by-value parameter, and `Other { slot: p.slot }`.  Each copies the field's owning handle while the storage `p` names still releases it.  Borrow the field (`&p.slot`), swap it out with `mem::swap`, or read it from a receiver the method owns: `outcome(mut this) -> T { return this.slot; }` consumes the value it is called on, so the field has one owner.  A take whose storage is then overwritten or freed without being released is written `pointer::read(&p.slot)`, an unsafe operation; `unsafe` does not make the plain read legal.  *Inside an `unsafe` block the plain read is still accepted; see the rollout in [section 15.5](#155-memory-safety).*  A closure reading what it captured is not such a read: its captures are fields of the closure itself.
 - **A capture moved out of a closure's body** (`E0453`) - the closure keeps what it captures for every call, and releases it once with itself (a `move` closure) or leaves it to the value's owner (any other closure), so a captured value, or a field of one, given away by the body would be released again.  Clone it (`take(name.clone())`); `unsafe` does not change this.
 - **A borrowed variable moved while a closure borrows it** (`E0457`) - a closure written without `move` holds a reference to each captured value that is not `Copy`, so the variable may not be moved until the end of the statement that made the closure, nor while a binding in scope holds the closure; nor may the closure, or a value holding it, be returned from the function that made it.  Write `move` before the closure to give it the value instead.
-- **A whole value read by value through a reference** (`E0453`) - `return this;` in a `&this` or `mut &this` method, with the type owning a destructor, reads the receiver by its implicit dereference and hands the caller a second owner of the storage the receiver names, so it is released twice.  Clone it, or take the receiver by value (`this` or `mut this`) when the method is meant to consume what it is called on; a by-value receiver is not a reference, and its `return this;` is an ordinary move.  Inside an `unsafe` block the read is allowed, as for a field.
+- **A whole value read by value through a reference** (`E0453`) - `return this;` in a `&this` or `mut &this` method, with the type owning a destructor, reads the receiver by its implicit dereference and hands the caller a second owner of the storage the receiver names, so it is released twice.  Clone it, or take the receiver by value (`this` or `mut this`) when the method is meant to consume what it is called on; a by-value receiver is not a reference, and its `return this;` is an ordinary move.  As for a field, the take is `pointer::read(this)`, and `unsafe` does not make the plain read legal.  *Inside an `unsafe` block the plain read is still accepted; see the rollout in [section 15.5](#155-memory-safety).*
 
-Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility (see [section 2](#2-type-system) and [section 14](#14-pointers-and-memory)). Move tracking enforces the moved-set above and nothing more: it does not prove that a reference or pointer outlives what it points to.  The one borrow it does follow is a closure's borrow of what it captures, which no written reference stands for: E0457 above.
+Whether a reference outlives what it names, and what may be done to a place while it is borrowed, is the subject of [section 15.5](#155-memory-safety). E0457 above is the part of it already enforced: a closure's borrow of what it captures.
 
 ---
 
@@ -4186,12 +4209,14 @@ panicked thread). `thread::scope` joins every scoped thread and then panics,
 
 What the rule does **not** do is make `Send` a safety guarantee:
 
-- **Raw pointers are unconditionally `Send + Sync`.** This is deliberate -
-  Cryo has no borrow checker, and the containers built on raw pointers
-  (`Box`, `Arc`, `Array`, `String`, `channel::Sender`) are structurally `Send`
-  because of it. A struct that hides a `T*` and reasons about it correctly
-  does not have to fight the type system; a struct that hides a `T*` and
-  reasons about it *incorrectly* is `Send` all the same.
+- **Raw pointers are `Send + Sync` today.** The rule is that they are
+  neither: the compiler cannot see who else writes what a `T*` points at, so a
+  pointer handed to another thread is a data race waiting for its other end. A
+  type built on raw pointers that shares them soundly - `Box`, `Arc`, `Array`,
+  `String`, `channel::Sender` - says so by `![send]` and `![sync]` on its
+  declaration, which are unsafe declarations ([section 6.11](#611-unsafe-blocks)):
+  the type's own `unsafe` code is what keeps the promise. *Not yet enforced; see
+  the rollout in [section 15.5](#155-memory-safety).*
 - **The deny-list is a fixed list, not a derivation.** A new thread-unsafe
   type is `Send` until someone adds it.
 - **Lock constructors do not yet carry `T: Send` bounds**, so a
@@ -4200,6 +4225,91 @@ What the rule does **not** do is make `Send` a safety guarantee:
 Treat a `Send` bound as "the compiler checked the parts it can see", not as
 proof that a value is safe to move across a thread. Where a type wraps a raw
 pointer whose target is not thread-safe, the obligation is the author's.
+
+### 15.5 Memory safety
+
+**The guarantee.** A program in which no `unsafe` block, `![unsafe]` function or
+`![send]`/`![sync]` declaration is written - its own code; the standard library's
+`unsafe` code is the library's promise - does not read or write memory that is
+released, was never written, or lies outside the value it was reached from; does not
+release a value twice; and does not let two threads write, or one write and another
+read, the same memory without synchronisation. Every rule that buys this is checked
+at compile time, except four that are checked when the program runs and panic: an
+index out of bounds, a division by zero or `MIN / -1`, a shift by the width or more,
+and a collection changed while an iterator over it is in use. None needs a lifetime
+or any other annotation.
+
+The rules, each with where it is stated:
+
+1. **Ownership.** Every value has one owner; a move transfers it; use after a move,
+   and a value released twice, are refused ([section 15.3](#153-move-checking)).
+2. **Initialisation.** Every local holds a value on every path before it is read
+   (`E0219`, [section 3](#3-variables-and-constants)).
+3. **Views.** A reference, and any type holding one, is a view, kept only by a local,
+   a parameter, a return value or another view ([section 2.3](#23-references)). A view
+   in a field of a type that is not one, a global, a `Box`, `Rc` or `Arc`, a `move`
+   closure or a thread's body is refused (`E0461`).
+4. **Returns borrow their arguments.** A view a function returns borrows from every
+   reference argument and from a borrowed `this`. One rooted in the function's own
+   locals, by-value parameters or by-value receiver is refused (`E0455`).
+5. **Loans.** Taking a reference to a place - `&x`, `&x.f`, `&xs[i]`, a `&this` or
+   `mut &this` call whose result is a view - makes a *loan* on that place, which lasts
+   while the reference, or any view made from it, is still used later in the function.
+   A place is a local and a path of fields and constant indices below it: `x.a` and
+   `x.b` are different places, `x` contains both, and `xs[i]` with a run-time `i` is a
+   loan on the whole of `xs`. While a loan on a place is live, the place, and anything
+   containing it, is not moved, released (by `mem::drop`, by its scope ending, or as a
+   temporary at its statement's end), or assigned (`E0450`):
+
+   ```cryo
+   const r: &String = &name;
+   mem::drop(name);            // E0450: `name` is released while a borrow of it is used
+   print(r);                   // the borrow is used here
+   ```
+
+   This includes a `match` subject while a binding the match made into it is used:
+   `o = Option::None;` in an arm that later reads the payload it bound is refused.
+6. **Shared or writable, never both.** A loan for writing - a `mut &x`, a `mut &this`
+   call, an assignment to a place - excludes every other loan of the same place while
+   either is live, and a loan for reading excludes writing (`E0451`). This is what makes
+   a reference into a collection safe: `push` takes the collection for writing, so it
+   is refused while a reference to an element, a slice of it or an iterator over it
+   is still used. The arguments of a call are evaluated before the call takes its
+   receiver for writing, so `xs.push(xs.length())` is allowed. At one call, a writable
+   reference argument does not overlap any other reference argument.
+7. **Unsafe operations** are allowed only inside `unsafe`, and `unsafe` relaxes no
+   other rule ([section 6.11](#611-unsafe-blocks)).
+8. **Threads.** A value reaches another thread only if it is `Send`, and is shared
+   with one only if it is `Sync`; a raw pointer is neither unless the type holding it
+   is declared so ([section 15.4](#154-the-send-and-sync-traits)).
+9. **Run-time checks.** Indexing, division, shifts, and iteration over the standard
+   collections are checked as described above; a collection counts its changes, and
+   an iterator or element reference that finds the count moved panics with
+   `Array modified while it is being iterated` (and the same for the other
+   collections).
+
+**What the rules give up.** A view cannot be kept in a long-lived owning structure: a
+structure that needs to remember a place keeps an index, a key or an `Rc` instead, or
+is itself a view held as a local. A function returning a view keeps every reference
+argument borrowed, even one the result does not point into; bind what it returns
+before borrowing those arguments for writing. Types that refer to themselves are
+built with raw pointers inside `unsafe`.
+
+**The rollout.** These rules arrive in phases, and each new refusal arrives first as a
+warning, so that existing code can move to them, and becomes an error once the
+standard library, the compiler and the tools build with none:
+
+| phase | rules | today |
+|---|---|---|
+| 1 | initialisation of every local (rule 2: `E0219`, and warning `W0018` for a `Copy` local until it becomes `E0219`); a reference carried out of its function through a local, a by-value parameter or a by-value receiver (rule 4, `E0455`); generic bodies checked once against their own type parameters; the shift check; `unsafe` no longer accepting the reads of [section 15.3](#153-move-checking) that release a value twice | initialisation enforced (`W0018` for `Copy` locals); the rest not yet |
+| 2 | unsafe operations (rule 7): warning `W0019`, then `E0462` | not yet |
+| 3 | views (rule 3): warning `W0020`, then `E0461`; collections hand out `&T` instead of `T*` | not yet |
+| 4 | loans and shared-or-writable (rules 5 and 6): warnings `W0021` and `W0022`, then `E0450` and `E0451` | not yet |
+| 5 | threads (rule 8) | not yet |
+| 6 | the collections' change counters (rule 9) | not yet |
+
+Until a phase's rules are enforced, the operations they refuse compile; the guarantee
+above holds in full once phase 4 has.
 
 ## 16. Directives and Attributes
 
