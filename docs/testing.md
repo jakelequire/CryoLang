@@ -587,10 +587,12 @@ the comparison reads:
   what the runtime compiles to.  Each compiler builds the runtime it links -
   the baseline's from the baseline's `runtime/`, the tree's from the tree's -
   so a runtime edit moves its members, and so can a codegen change.  The
-  member is left out of the runtime comparison and must have moved; a declared
-  member that is unchanged fails, and so does a name that matches no member
-  of that archive in both runs, and any member that moved in an archive
-  nothing declares.  Every configuration compiles every module, so a change to
+  member is left out of the runtime comparison and must have moved, or be in
+  the tree's archive alone - a member the change adds; a declared member that
+  is unchanged fails, and so does a name that matches no member of the tree's
+  archive, and any member that moved in an archive nothing declares.  Members
+  are compared by name, not by their place in the archive, so a member added
+  ahead of another does not move that one.  Every configuration compiles every module, so a change to
   one declares its member once per configuration whose archive it moved in.
   Against a baseline whose runtime is laid out as one archive per tier, the
   runtime population is reported as not compared: no member pairs with one.

@@ -1,0 +1,144 @@
+///! runtime/memory - the freestanding memory functions and stack probe.
+///!
+///! A freestanding link has no C library, yet the backend lowers a large
+///! copy, a fill or an aggregate compare to calls to `memcpy`, `memmove`,
+///! `memset` and `memcmp`, and on Windows a function whose frame is a page
+///! or more probes its stack through `___chkstk_ms` before using it. This
+///! module defines all five for the freestanding configuration (see
+///! `abi/lang_items.def`).
+///!
+///! Each memory function's work is one x86-64 string instruction in `asm`:
+///! written as a loop, the optimiser would recognise the very idiom the
+///! function implements and lower it to a call to the function itself. Each
+///! is `![weak]`, so a user object's strong definition replaces it.
+
+namespace CryoRt::Memory;
+
+/// Copies `count` bytes from `source` to `destination`, which must not
+/// overlap, and returns `destination`.
+![weak] ![no_mangle] ![config(no_runtime)]
+function memcpy(destination: mut u8*, source: u8*, count: u64) -> mut u8* {
+    mut to: mut u8* = destination;
+    mut from: u8* = source;
+    mut remaining: u64 = count;
+    ![arch(x86_64, intel)]
+    ![clobber(memory)]
+    asm {
+        mov rdi, ${+to:"rdi"}
+        mov rsi, ${+from:"rsi"}
+        mov rcx, ${+remaining:"rcx"}
+        rep movsb
+    }
+    return destination;
+}
+
+/// Copies `count` bytes from `source` to `destination`, which may overlap,
+/// and returns `destination`. A destination that starts inside the source
+/// is copied from the last byte down, so no byte is overwritten before it
+/// is read.
+![weak] ![no_mangle] ![config(no_runtime)]
+function memmove(destination: mut u8*, source: u8*, count: u64) -> mut u8* {
+    mut to: mut u8* = destination;
+    mut from: u8* = source;
+    mut remaining: u64 = count;
+    const start: u64 = source as u64;
+    const target: u64 = destination as u64;
+    if (target <= start || target >= start + count) {
+        ![arch(x86_64, intel)]
+        ![clobber(memory)]
+        asm {
+            mov rdi, ${+to:"rdi"}
+            mov rsi, ${+from:"rsi"}
+            mov rcx, ${+remaining:"rcx"}
+            rep movsb
+        }
+    } else {
+        ![arch(x86_64, intel)]
+        ![clobber(memory)]
+        asm {
+            mov rdi, ${+to:"rdi"}
+            mov rsi, ${+from:"rsi"}
+            mov rcx, ${+remaining:"rcx"}
+            lea rdi, [rdi + rcx - 1]
+            lea rsi, [rsi + rcx - 1]
+            std
+            rep movsb
+            cld
+        }
+    }
+    return destination;
+}
+
+/// Sets `count` bytes at `destination` to the low byte of `value`, and
+/// returns `destination`.
+![weak] ![no_mangle] ![config(no_runtime)]
+function memset(destination: mut u8*, value: i32, count: u64) -> mut u8* {
+    mut to: mut u8* = destination;
+    mut remaining: u64 = count;
+    const fill: u64 = (value & 255) as u64;
+    ![arch(x86_64, intel)]
+    ![clobber(memory)]
+    asm {
+        mov rdi, ${+to:"rdi"}
+        mov rcx, ${+remaining:"rcx"}
+        mov rax, ${fill:"rax"}
+        rep stosb
+    }
+    return destination;
+}
+
+/// Compares `count` bytes at `left` and `right` as unsigned bytes: zero
+/// when they are equal, otherwise the difference of the first pair that
+/// differs, negative when `left`'s byte is the smaller.
+![weak] ![no_mangle] ![config(no_runtime)]
+function memcmp(left: u8*, right: u8*, count: u64) -> i32 {
+    if (count == 0) { return 0; }
+    mut from_left: u8* = left;
+    mut from_right: u8* = right;
+    mut remaining: u64 = count;
+    mut difference: i64 = 0;
+    // `repe cmpsb` stops one past the first pair that differs, or one past
+    // the last pair when none does, and that last pair is then equal.
+    ![arch(x86_64, intel)]
+    ![clobber(rdx, flags)]
+    asm {
+        mov rsi, ${+from_left:"rsi"}
+        mov rdi, ${+from_right:"rdi"}
+        mov rcx, ${+remaining:"rcx"}
+        repe cmpsb
+        movzx eax, byte ptr [rsi - 1]
+        movzx edx, byte ptr [rdi - 1]
+        sub rax, rdx
+        mov ${=difference:"rax"}, rax
+    }
+    return difference as i32;
+}
+
+/// The Windows stack probe: a function whose frame is `rax` bytes, a page
+/// or more, calls it before moving `rsp`, and it touches each page of that
+/// frame from the top down, so the guard page below the stack moves down one
+/// page at a time instead of being skipped. It runs before its caller's
+/// frame exists, so it preserves every register.
+![naked] ![no_mangle] ![config(no_runtime)] ![config(windows)]
+function ___chkstk_ms() {
+    ![arch(x86_64, att)]
+    asm {
+        pushq %rcx
+        pushq %rax
+        cmpq $0x1000, %rax
+        leaq 24(%rsp), %rcx
+        jb .Lcryo_chkstk_last
+    .Lcryo_chkstk_page:
+        subq $0x1000, %rcx
+        orq $0, (%rcx)
+        subq $0x1000, %rax
+        cmpq $0x1000, %rax
+        ja .Lcryo_chkstk_page
+    .Lcryo_chkstk_last:
+        subq %rax, %rcx
+        orq $0, (%rcx)
+        popq %rax
+        popq %rcx
+        retq
+    }
+}

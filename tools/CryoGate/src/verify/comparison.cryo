@@ -12,7 +12,7 @@ import std::collections::string::{ String };
 import std::core::option::{ Option };
 
 import cryogate::core::text::{ Text };
-import cryogate::verify::declarations::{ DeclarationKind, Declarations, DeclaredChanges };
+import cryogate::verify::declarations::{ DeclarationKind, Declarations, DeclaredChanges, RuntimeMember };
 import cryogate::verify::judges::{ VerifyJudges };
 import cryogate::verify::objects::{ ObjectOwner, ObjectPopulation };
 
@@ -105,6 +105,8 @@ public type struct ObjectComparison {
                 compared.lines.push(f"  {tag:<9} baseline {a.length():>5}  tree {b.length():>5}  NOT COMPARED: the baseline's runtime is laid out as {layout_a.as_str()}, the tree's as {layout_b.as_str()}");
                 return 0;
             }
+            a = ObjectComparison::runtime_members_by_name(&a);
+            b = ObjectComparison::runtime_members_by_name(&b);
             if (!changes.moved_members.is_empty()) {
                 const found: Array<String> = VerifyJudges::runtime_moves(&changes.moved_members, &a, &b);
                 compared.lines.push(f"  {tag:<9} declared moved runtime members left out: {changes.moved_members.length()}, {found.length()} problem(s)");
@@ -252,6 +254,25 @@ public type struct ObjectComparison {
             layouts.push(String::from_str(if (archive.starts_with(&Str::new("libcryort"))) { Str::new("tiers") } else { Str::new("configurations") }));
         }
         return Text::joined(&Text::sorted_distinct(layouts), Str::new("/"));
+    }
+
+    /// The runtime hash map `hashes` keyed by each member's name,
+    /// `runtime/<archive>/<member>`, without its place in its archive: a
+    /// member added or removed ahead of another moves that one's place, not
+    /// its code.  Members of one archive that share a name keep their
+    /// places, so neither is lost.
+    public static runtime_members_by_name(hashes: &HashMap<String, String>) -> HashMap<String, String> {
+        mut names: Array<String> = Array::<String>::new();
+        for (entry in hashes.entries()) { names.push(RuntimeMember::unplaced(entry.first.as_str())); }
+        mut keyed: HashMap<String, String> = HashMap::<String, String>::new();
+        for (entry in hashes.entries()) {
+            const name: String = RuntimeMember::unplaced(entry.first.as_str());
+            mut sharing: i64 = 0;
+            for (other in names.iterate_references()) { if (other.as_str() == name.as_str()) { sharing++; } }
+            if (sharing == 1) { keyed.insert(name, entry.second.clone()); }
+            else { keyed.insert(entry.first.clone(), entry.second.clone()); }
+        }
+        return keyed;
     }
 
     /// The archives the paths of `hashes` name.

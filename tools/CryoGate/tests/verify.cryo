@@ -314,7 +314,7 @@ function the_comparison_reports_each_population_as_verify_does() -> Result<(), T
         "  stdlib    archive objects of a stdlib root only one run used, left out: 1\n"
         "  stdlib    baseline     1  tree     1  moved 0  only-baseline 0  only-tree 0  replaced by the archive 0\n"
         "  runtime   baseline     1  tree     1  moved 1  only-baseline 0  only-tree 0  replaced by the archive 0\n"
-        "      moved         runtime/freestanding/00-Sys.o"))?;
+        "      moved         runtime/freestanding/Sys.o"))?;
     return expect_equal(compared.changed, 4);
 }
 
@@ -487,6 +487,41 @@ function a_declared_runtime_member_must_move_in_its_own_configuration() -> Resul
     expect_equal(VerifyJudges::runtime_moves(&Judged::list(sys), &left, &right).length(), 0)?;
     return expect(left.length() == 1 && right.length() == 1
         && right.contains_key(&String::from_str(Str::new("runtime/hosted-unwind/01-Entry.o"))), Str::new("only the declared member is removed"));
+}
+
+![test]
+function a_runtime_member_the_change_adds_is_declared_by_the_tree_alone() -> Result<(), TestError> {
+    const memory: Str = Str::new("moved-runtime:freestanding/Memory.o");
+    expect_equal(Judged::runtime_moves(memory, Str::new(""), Str::new("runtime/freestanding/08-Memory.o=1")), 0)?;
+    // Gone from the tree, or twice in it, is refused.
+    expect_equal(Judged::runtime_moves(memory, Str::new("runtime/freestanding/08-Memory.o=1"), Str::new("")), 1)?;
+    return expect_equal(Judged::runtime_moves(memory, Str::new(""),
+        Str::new("runtime/freestanding/08-Memory.o=1;runtime/freestanding/09-Memory.o=1")), 1);
+}
+
+![test]
+function a_runtime_member_is_compared_by_its_name_not_its_place() -> Result<(), TestError> {
+    // A member added ahead of another moves that one's place, not its
+    // code: only the added member differs, and declared, nothing does.
+    const baseline: Str = Str::new("runtime/freestanding/00-Sys.o=1;runtime/freestanding/01-CryoRt.o=1");
+    const tree: Str = Str::new("runtime/freestanding/00-Sys.o=1;runtime/freestanding/01-Memory.o=1;runtime/freestanding/02-CryoRt.o=1");
+    const undeclared: Compared = Comparing::of(&Comparing::nothing_declared(),
+        Comparing::populations(Str::new(""), Str::new(""), Str::new(""), baseline),
+        Comparing::populations(Str::new(""), Str::new(""), Str::new(""), tree), 40);
+    expect_equal(undeclared.changed, 1)?;
+    expect_equal(undeclared.lines[undeclared.lines.length() - 1].as_str(), Str::new("      only-tree     runtime/freestanding/Memory.o"))?;
+    mut changes: DeclaredChanges = Comparing::nothing_declared();
+    changes.moved_members.push(String::from_str(Str::new("moved-runtime:freestanding/Memory.o")));
+    const declared: Compared = Comparing::of(&changes,
+        Comparing::populations(Str::new(""), Str::new(""), Str::new(""), baseline),
+        Comparing::populations(Str::new(""), Str::new(""), Str::new(""), tree), 40);
+    expect_equal(declared.problems.length(), 0)?;
+    expect_equal(declared.changed, 0)?;
+    // Two members of one archive sharing a name keep their places.
+    const shared: HashMap<String, String> = ObjectComparison::runtime_members_by_name(
+        &Judged::map(Str::new("runtime/freestanding/00-Sys.o=1;runtime/freestanding/01-Sys.o=2;runtime/hosted-abort/00-Sys.o=3")));
+    return expect(shared.length() == 3 && shared.contains_key(&String::from_str(Str::new("runtime/freestanding/01-Sys.o")))
+        && shared.contains_key(&String::from_str(Str::new("runtime/hosted-abort/Sys.o"))), Str::new("a shared name keeps its places"));
 }
 
 ![test]
