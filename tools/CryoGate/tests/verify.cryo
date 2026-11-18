@@ -76,7 +76,7 @@ type struct Judged {
     private static archive_module_moves(names: Str, a: Str, b: Str) -> i64 {
         mut left: HashMap<String, String> = Judged::map(a);
         mut right: HashMap<String, String> = Judged::map(b);
-        return VerifyJudges::archive_module_moves(&Judged::list(names), &left, &right).length();
+        return VerifyJudges::archive_module_moves(&Judged::list(names), &Array::<String>::new(), &left, &right).length();
     }
 
     private static runtime_moves(names: Str, a: Str, b: Str) -> i64 {
@@ -417,9 +417,40 @@ function a_module_declared_moved_archive_must_move_an_archive_object() -> Result
     // Another module's moved object stays in both maps, to be compared.
     mut left: HashMap<String, String> = Judged::map(Str::new("s/x/deps/std/m.o=1;s/x/deps/std/n.o=1"));
     mut right: HashMap<String, String> = Judged::map(Str::new("s/x/deps/std/m.o=2;s/x/deps/std/n.o=2"));
-    expect_equal(VerifyJudges::archive_module_moves(&Judged::list(Str::new("moved-archive:std::m")), &left, &right).length(), 0)?;
+    expect_equal(VerifyJudges::archive_module_moves(&Judged::list(Str::new("moved-archive:std::m")), &Array::<String>::new(), &left, &right).length(), 0)?;
     return expect(left.length() == 1 && right.length() == 1
         && left.contains_key(&String::from_str(Str::new("s/x/deps/std/n.o"))), Str::new("only the declared module's objects are removed"));
+}
+
+![test]
+function a_module_declared_moved_archive_may_move_only_its_unit_build_object() -> Result<(), TestError> {
+    const unit: Str = Str::new("tests/build/target/release/host/std/deps/std/m.o");
+    const other: Str = Str::new("tests/build/target/release/host/std/deps/std/n.o");
+    const project: Str = Str::new("tests/tests/projects/p/build/std/deps/std/m.o");
+    const archive: Str = Str::new("stdlib-archive/w/O2/x/deps/std/m.o");
+    mut changes: DeclaredChanges = Comparing::nothing_declared();
+    changes.moved_modules.push(String::from_str(Str::new("moved-archive:std::m")));
+    // The archive's object is unchanged and the unit build's moved: the
+    // declaration holds, and only the other module's and the project's
+    // objects are left to compare.
+    const held: Compared = Comparing::of(&changes,
+        Comparing::populations(f"{unit}=1;{other}=1;{project}=1".as_str(), Str::new(""), f"{archive}=1".as_str(), Str::new("")),
+        Comparing::populations(f"{unit}=2;{other}=2;{project}=2".as_str(), Str::new(""), f"{archive}=1".as_str(), Str::new("")), 5);
+    expect_equal(held.problems.length(), 0)?;
+    expect_equal(held.changed, 2)?;
+    // Built by one run only, it moved too.
+    const once: Compared = Comparing::of(&changes,
+        Comparing::populations(f"{unit}=1".as_str(), Str::new(""), f"{archive}=1".as_str(), Str::new("")),
+        Comparing::populations(Str::new(""), Str::new(""), f"{archive}=1".as_str(), Str::new("")), 5);
+    expect_equal(once.problems.length(), 0)?;
+    expect_equal(once.changed, 0)?;
+    // Neither moved: the declaration is refused.
+    const neither: Compared = Comparing::of(&changes,
+        Comparing::populations(f"{unit}=1".as_str(), Str::new(""), f"{archive}=1".as_str(), Str::new("")),
+        Comparing::populations(f"{unit}=1".as_str(), Str::new(""), f"{archive}=1".as_str(), Str::new("")), 5);
+    expect_equal(neither.problems.length(), 1)?;
+    return expect_equal(neither.problems[0].as_str(),
+        Str::new("moved-archive:std::m is declared as moving its objects, but none of its 1 archive objects moved, nor its object in the unit build"));
 }
 
 ![test]

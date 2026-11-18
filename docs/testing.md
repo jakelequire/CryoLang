@@ -568,9 +568,14 @@ the comparison reads:
   objects in the stdlib archives the change moves on purpose: a compiler
   change that alters what the library's own source compiles to.  The
   module's object in every archive both runs built is left out of the
-  archive comparison, and at least one of them must have moved; a declared
-  module whose archive objects are all unchanged fails, and so does a name
-  that is no module of the standard library.  A change to the library's
+  archive comparison.  The unit suite's build also compiles the module's
+  object itself when the archive lacks a generic instance the tests need
+  (`tests/build/.../std/deps/std/time/clock.o`); that object, in either run
+  or neither, is left out of the tests comparison.  One of these objects must
+  have moved - an archive's, or the unit build's alone, since a change can
+  move only the instances the unit build compiles; a declared module none of
+  whose objects moved fails, and so does a name that is no module of the
+  standard library.  A change to the library's
   SOURCE never needs it: verify builds this tree's stdlib with both
   compilers, so a source edit moves nothing there by construction - prove one
   by building the library before and after at one path.

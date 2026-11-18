@@ -236,10 +236,11 @@ public type struct VerifyJudges {
     /// Problems with the standard-library modules `names` declared
     /// `moved-archive:` over the archive hash maps `a` and `b`: each must
     /// have objects in both - one per archive built - and one of them must
-    /// differ (moved, or in one run only).  Their objects are removed from
-    /// both.
-    public static archive_module_moves(names: &Array<String>, a: mut &HashMap<String, String>,
-                                       b: mut &HashMap<String, String>) -> Array<String> {
+    /// differ (moved, or in one run only), unless the module is among
+    /// `unit_build_moved`, whose unit-build object moved instead.  Their
+    /// objects are removed from both.
+    public static archive_module_moves(names: &Array<String>, unit_build_moved: &Array<String>,
+                                       a: mut &HashMap<String, String>, b: mut &HashMap<String, String>) -> Array<String> {
         mut problems: Array<String> = Array::<String>::new();
         for (name in Text::sorted_distinct(names.clone()).iterate_references()) {
             const suffix: String = Declarations::archive_module_suffix(name.as_str());
@@ -247,13 +248,38 @@ public type struct VerifyJudges {
             const in_b: Array<String> = VerifyJudges::paths_where(b, (path: Str) -> boolean { return path.ends_with(&suffix.as_str()); });
             if (in_a.is_empty() || in_b.is_empty()) {
                 problems.push(f"{name.as_str()}: {in_a.length()} baseline and {in_b.length()} tree archive objects end in {suffix.as_str()}; a module declared as moving its objects is in both runs' archives");
-            } else if (VerifyJudges::unchanged(a, b, &in_a, &in_b)) {
-                problems.push(f"{name.as_str()} is declared as moving its archive objects, but none of its {in_a.length()} moved");
+            } else if (VerifyJudges::unchanged(a, b, &in_a, &in_b) && !unit_build_moved.contains(name)) {
+                problems.push(f"{name.as_str()} is declared as moving its objects, but none of its {in_a.length()} archive objects moved, nor its object in the unit build");
             }
             VerifyJudges::remove_all(a, &in_a);
             VerifyJudges::remove_all(b, &in_b);
         }
         return problems;
+    }
+
+    /// The unit build's objects of the standard-library modules `names`
+    /// declared `moved-archive:`, over the tests hash maps `a` and `b`: the
+    /// unit build compiles a module's object itself when the archive lacks
+    /// a generic instance the tests need, and that object moves with the
+    /// module.  Its objects (`tests/build/.../std/deps/<module>.o`, in
+    /// either run or neither) are removed from both; the names of the
+    /// modules whose unit-build object differs (moved, or in one run only).
+    public static unit_build_module_moves(names: &Array<String>, a: mut &HashMap<String, String>,
+                                          b: mut &HashMap<String, String>) -> Array<String> {
+        mut moved: Array<String> = Array::<String>::new();
+        for (name in Text::sorted_distinct(names.clone()).iterate_references()) {
+            const suffix: String = f"/std{Declarations::archive_module_suffix(name.as_str()).as_str()}";
+            const in_a: Array<String> = VerifyJudges::paths_where(a, (path: Str) -> boolean {
+                return path.starts_with(&Str::new("tests/build/")) && path.ends_with(&suffix.as_str());
+            });
+            const in_b: Array<String> = VerifyJudges::paths_where(b, (path: Str) -> boolean {
+                return path.starts_with(&Str::new("tests/build/")) && path.ends_with(&suffix.as_str());
+            });
+            if (!VerifyJudges::unchanged(a, b, &in_a, &in_b)) { moved.push(name.clone()); }
+            VerifyJudges::remove_all(a, &in_a);
+            VerifyJudges::remove_all(b, &in_b);
+        }
+        return moved;
     }
 
     /// Problems with the runtime archive members `names` declared
