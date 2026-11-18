@@ -703,7 +703,11 @@ closure - a non-generic free function's, when the function is declared in the
 same module: that function is copied for each closure type passed to it, with
 the parameter retyped to the closure. In the copy the parameter holds the
 closure, so passing it on to another such function passes the closure, and
-that function is copied for it in turn. Everything else is refused at compile
+that function is copied for it in turn. The call's other arguments are
+checked against the copy's parameters as any call's are against its
+callee's: a value given for a trait object parameter becomes the object
+there, and an argument of a type its parameter does not take is refused
+(**E0214**). Everything else is refused at compile
 time with **E0458** rather than compiled to a call through a pointer that is
 not one:
 

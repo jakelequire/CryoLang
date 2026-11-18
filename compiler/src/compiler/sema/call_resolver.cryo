@@ -1366,7 +1366,25 @@ type struct CallResolver {
 
         const ident: IdentifierExpr* = ExpressionNode::identifier_of(callee_node);
         if (ident != null) {
+            const pinned_before: boolean = call.resolved_callee.is_some();
             this.lambda.try_specialize_for_closure_args(call, ident, this.closure_call_entry(call, ident));
+            // A call the closure specialization pins here has had its
+            // arguments resolved and nothing more, and the pinned call's
+            // return below converts none of them: they are checked against
+            // the copy's parameters now, as an unpinned call's are against
+            // its callee's, so an argument for a trait object becomes the
+            // object and one of another type is refused.
+            if (!pinned_before) {
+                match (&call.resolved_callee) {
+                    CalleePin::Decl(entry) => {
+                        const copy_signature: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entry));
+                        if (copy_signature != null && copy_signature.kind == TypeKind::Function) {
+                            this.check_args_against_params(visitor, &call.arguments, copy_signature.as_function().param_types.as_slice());
+                        }
+                    }
+                    _ => { }
+                }
+            }
 
             mut type_arguments_refused: boolean = false;
             const inferred_generic_ret: TypeRef = this.check_generic_free_call(call_e, call, ident, &type_arguments_refused);
