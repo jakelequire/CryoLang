@@ -1,0 +1,110 @@
+// E0455: a returned reference may not point into storage the function owns -
+// a local, a by-value parameter or a by-value receiver - however it reaches the
+// `return`: directly, through a reference local, through a branch or a loop
+// that assigns one, or through a field of one.  A reference into what the
+// caller owns - a reference parameter, a `&this` receiver, a reference a call
+// returns - is returned freely, and a reference local assigned one of those
+// last is too.
+![config(testing)]
+![config(negative, E0455)]
+namespace CryoTests::Negative::E0455ReturnedReferenceRootedInFrame;
+
+type struct Pair { a: i64; b: i64; }
+
+type struct Named {
+    tag: i64;
+
+    tag_of_consumed(this) -> &i64 {
+        return &this.tag;   //~ ERROR[E0455] cannot return a reference to `this`, which is released when this function returns
+    }
+
+    tag_of_borrowed(&this) -> &i64 {
+        return &this.tag;
+    }
+}
+
+function through_a_local() -> &i64 {
+    const x: i64 = 42;
+    const r: &i64 = &x;
+    return r;   //~ ERROR[E0455] cannot return a reference to `x`, which is released when this function returns
+}
+
+function by_value_parameter(x: i64) -> &i64 {
+    return &x;   //~ ERROR[E0455] cannot return a reference to `x`, which is released when this function returns
+}
+
+function by_value_parameter_through_a_local(x: i64) -> &i64 {
+    const r: &i64 = &x;
+    return r;   //~ ERROR[E0455] cannot return a reference to `x`, which is released when this function returns
+}
+
+function field_of_a_local() -> &i64 {
+    const p: Pair = Pair { a: 1, b: 2 };
+    return &p.b;   //~ ERROR[E0455] cannot return a reference to `p`, which is released when this function returns
+}
+
+function assigned_on_one_branch(keep: &i64, flag: boolean) -> &i64 {
+    const x: i64 = 1;
+    mut r: &i64 = keep;
+    if (flag) { r = &x; }
+    return r;   //~ ERROR[E0455] cannot return a reference to `x`, which is released when this function returns
+}
+
+function assigned_in_a_loop(keep: &i64, n: i64) -> &i64 {
+    const x: i64 = 1;
+    mut r: &i64 = keep;
+    for (mut i: i64 = 0; i < n; i++) {
+        if (i == 3) { r = &x; }
+    }
+    return r;   //~ ERROR[E0455] cannot return a reference to `x`, which is released when this function returns
+}
+
+function returned_inside_the_loop_after_an_earlier_iteration(keep: &i64, n: i64) -> &i64 {
+    const x: i64 = 1;
+    mut r: &i64 = keep;
+    for (mut i: i64 = 0; i < n; i++) {
+        if (i == 3) { return r; }   //~ ERROR[E0455] cannot return a reference to `x`, which is released when this function returns
+        r = &x;
+    }
+    return keep;
+}
+
+function reborrowed_through_a_dereference() -> &i64 {
+    const x: i64 = 1;
+    const r: &i64 = &x;
+    return &*r;   //~ ERROR[E0455] cannot return a reference to `x`, which is released when this function returns
+}
+
+function one_arm_of_an_if_expression(keep: &i64, flag: boolean) -> &i64 {
+    const x: i64 = 1;
+    return if (flag) { keep } else { &x };   //~ ERROR[E0455] cannot return a reference to `x`, which is released when this function returns
+}
+
+function inside_a_closure_that_captures_nothing() -> i64 {
+    const f = () -> i32* { mut y: i32 = 1; return &y; };   //~ ERROR[E0455] cannot return a reference to `y`, which is released when this function returns
+    if (f() == null) { return 1; }
+    return 0;
+}
+
+function field_of_a_reference_parameter(p: &Pair) -> &i64 {
+    return &p.a;
+}
+
+function from_a_call(p: &Pair) -> &i64 {
+    const r: &i64 = field_of_a_reference_parameter(p);
+    return r;
+}
+
+function reference_parameter_through_a_local(keep: &i64) -> &i64 {
+    const r: &i64 = keep;
+    return r;
+}
+
+function assigned_the_caller_reference_last(keep: &i64) -> &i64 {
+    const x: i64 = 1;
+    mut r: &i64 = &x;
+    r = keep;
+    return r;
+}
+
+function main() -> int { return 0; }

@@ -110,8 +110,9 @@ type struct PatternResolver {
             match (pat.kind) {
                 PatternKind::Binding(b) => {
                     b.binding_type = subject_type;
+                    b.aliases_caller = caller_backed;
                     if (subject_type.is_valid()) {
-                        this.bind_arm_name(b.binding_sym, subject_type, caller_backed, writable);
+                        this.bind_arm_name(b.binding_sym, subject_type, writable);
                     }
                 }
                 PatternKind::Enum(e) => { this.bind_enum_pattern(e, subject_type, caller_backed, writable); }
@@ -228,20 +229,15 @@ type struct PatternResolver {
     }
 
     /// Bind a pattern's name `sym` to `ty`, the whole subject it matched.
-    /// When the subject was reached through a by-reference parameter the
-    /// binding aliases the caller's storage, so `return &name` is not a
-    /// dangling return.
-    bind_arm_name(mut &this, sym: SymbolID, ty: TypeRef, caller_backed: boolean, writable: boolean) -> void {
+    bind_arm_name(mut &this, sym: SymbolID, ty: TypeRef, writable: boolean) -> void {
         this.scopes.declare(sym, ty, writable);
-        if (caller_backed && sym.is_valid()) { this.state.alias_bindings.insert(sym.table_key()); }
     }
 
     /// Bind a variant payload's name `sym` to `ty`, and remember it as a
-    /// payload: over a by-value subject it is a copy in this frame, and a
-    /// `return &payload` dangles (E0455).
-    bind_payload(mut &this, sym: SymbolID, ty: TypeRef, caller_backed: boolean, writable: boolean) -> void {
+    /// payload, which `check_return_payload_escape` asks about.
+    bind_payload(mut &this, sym: SymbolID, ty: TypeRef, writable: boolean) -> void {
         if (sym.is_valid()) { this.state.payload_bindings.insert(sym.table_key()); }
-        this.bind_arm_name(sym, ty, caller_backed, writable);
+        this.bind_arm_name(sym, ty, writable);
     }
 
     /// Resolve the positional payload types of `enum_pat`'s variant against a value
@@ -455,8 +451,8 @@ type struct PatternResolver {
             mut pb: mut PatternBinding* = enum_pat.binding_at(j);
             if (pb != null) {
                 pb.resolved_type = elem_ty;
-                // Remember the binding so a `return &payload` is caught (E0455).
-                this.bind_payload(pb.sym_id, elem_ty, caller_backed, writable);
+                pb.aliases_caller = caller_backed;
+                this.bind_payload(pb.sym_id, elem_ty, writable);
                 continue;
             }
             const sub: Pattern* = enum_pat.sub_at(j);
@@ -570,8 +566,9 @@ type struct PatternResolver {
         match (pat.kind) {
             PatternKind::Binding(b) => {
                 b.binding_type = value_type;
+                b.aliases_caller = caller_backed;
                 if (value_type.is_valid()) {
-                    this.bind_arm_name(b.binding_sym, value_type, caller_backed, writable);
+                    this.bind_arm_name(b.binding_sym, value_type, writable);
                 }
             }
             PatternKind::Enum(e) => { this.bind_enum_pattern(e, value_type, caller_backed, writable); }

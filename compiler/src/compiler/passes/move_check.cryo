@@ -16,6 +16,10 @@
 ///! `if (c) { consume(x); return; } use(x);` guard pattern accepted.
 ///! A field moved out of a local is tracked on its own (the partial-move
 ///! set) where the move is unconditional, and refused where it is not.
+///!
+///! A second flow fact, joined at the same places, records which of the
+///! function's own bindings each reference local may point into
+///! (`ReferenceRoots`); a `return` of a reference into one is refused (E0455).
 
 namespace compiler::passes::move_check;
 
@@ -131,6 +135,98 @@ type enum LoopExits {
 type struct LoopExitMove {
     key:  u64;
     span: SourceSpan;
+}
+
+
+/// A binding of the function being walked that a reference may point into,
+/// and where that reference was made.  The binding is released when the
+/// function returns: a local, a by-value parameter, a by-value receiver, or
+/// a pattern binding over one of them.
+type struct FrameRoot {
+    owner: u64;
+    name:  SymbolStr;
+    site:  SourceSpan;
+}
+
+/// The frame roots each reference local may point into, as parallel arrays:
+/// the local's key and one root.  A flow fact beside the moved-set, with the
+/// same meet: an assignment replaces a local's roots, and where paths join a
+/// local may point into the roots it has on any of them.
+type struct ReferenceRoots {
+    references: [u64];
+    roots:      [FrameRoot];
+
+    static empty() -> ReferenceRoots {
+        return ReferenceRoots { references: [], roots: [] };
+    }
+
+    /// An element-wise copy, for a branch or a loop to start from.
+    copy(&this) -> ReferenceRoots {
+        mut out: ReferenceRoots = ReferenceRoots::empty();
+        out.append(this, 0);
+        return out;
+    }
+
+    length(&this) -> i64 {
+        return this.references.length();
+    }
+
+    /// `reference` now points into exactly `roots`.
+    assign(mut &this, reference: u64, roots: &[FrameRoot]) -> void {
+        mut kept_references: [u64]       = [];
+        mut kept_roots:      [FrameRoot] = [];
+        for (mut i: i64 = 0; i < this.references.length(); i++) {
+            if (this.references[i] == reference) { continue; }
+            kept_references.push(this.references[i]);
+            kept_roots.push(this.roots[i]);
+        }
+        for (mut i: i64 = 0; i < roots.length(); i++) {
+            kept_references.push(reference);
+            kept_roots.push(roots[i]);
+        }
+        this.references = kept_references;
+        this.roots      = kept_roots;
+    }
+
+    /// Add every entry of `other` from position `from` on that this does
+    /// not hold: the join of the paths each describes.
+    join(mut &this, other: &ReferenceRoots, from: i64) -> void {
+        for (mut i: i64 = from; i < other.references.length(); i++) {
+            if (!this.holds(other.references[i], other.roots[i].owner)) {
+                this.references.push(other.references[i]);
+                this.roots.push(other.roots[i]);
+            }
+        }
+    }
+
+    /// Add every entry of `other` from position `from` on, held or not.
+    append(mut &this, other: &ReferenceRoots, from: i64) -> void {
+        for (mut i: i64 = from; i < other.references.length(); i++) {
+            this.references.push(other.references[i]);
+            this.roots.push(other.roots[i]);
+        }
+    }
+
+    truncate(mut &this, length: i64) -> void {
+        while (this.references.length() > length) {
+            this.references.pop();
+            this.roots.pop();
+        }
+    }
+
+    holds(&this, reference: u64, owner: u64) -> boolean {
+        for (mut i: i64 = 0; i < this.references.length(); i++) {
+            if (this.references[i] == reference && this.roots[i].owner == owner) { return true; }
+        }
+        return false;
+    }
+
+    /// Add the roots `reference` may point into to `out`.
+    collect(&this, reference: u64, out: mut &[FrameRoot]) -> void {
+        for (mut i: i64 = 0; i < this.references.length(); i++) {
+            if (this.references[i] == reference) { out.push(this.roots[i]); }
+        }
+    }
 }
 
 
@@ -359,6 +455,19 @@ type struct MoveChecker {
     closure_move_sites:    [SourceSpan];
     closure_move_closures: [SourceSpan];
 
+    /// The frame roots each reference local of the function being walked may
+    /// point into here; a `return` of a reference rooted in one is refused
+    /// (E0455).
+    reference_roots: ReferenceRoots;
+    /// The reference roots the `break`s and `continue`s of the loops being
+    /// walked left with, the innermost loop's last.
+    loop_exit_roots: ReferenceRoots;
+    /// The pattern bindings of this function that are the caller's storage
+    /// (`aliases_caller`), and its parameters: a reference to the first is
+    /// the caller's, and the second say so in the refusal's help.
+    caller_alias_keys: [u64];
+    parameter_keys:    [u64];
+
     fired: i64;
     /// Count of fatal (loop-carried) use-after-move errors.  Non-zero
     /// fails the pass, which (MoveCheck being fatal_on_failure) aborts
@@ -411,6 +520,10 @@ type struct MoveChecker {
             statement_serial:      0,
             closure_move_sites:    [],
             closure_move_closures: [],
+            reference_roots:       ReferenceRoots::empty(),
+            loop_exit_roots:       ReferenceRoots::empty(),
+            caller_alias_keys:     [],
+            parameter_keys:        [],
             fired: 0,
             fatal: 0,
         };
@@ -462,15 +575,43 @@ type struct MoveChecker {
         this.open_statements       = [];
         this.closure_move_sites    = [];
         this.closure_move_closures = [];
+        this.reference_roots       = ReferenceRoots::empty();
+        this.loop_exit_roots       = ReferenceRoots::empty();
+        this.caller_alias_keys     = [];
+        this.parameter_keys        = [];
         const drop_trait: DefId = this.registry.wellknown(LangItem::Drop);
         const is_destructor: boolean = drop_trait.is_valid() && func.origin_trait.equals(drop_trait);
-        for (mut i: i64 = 0; i < func.parameters.length(); i++) {
-            const param_decl: DeclarationNode* = func.parameters[i];
+        this.register_parameters(&func.parameters, is_destructor);
+    }
+
+    /// Register a function's parameters; a destructor's receiver is
+    /// `drop_receiver`.
+    register_parameters(mut &this, parameters: &[DeclarationNode*], is_destructor: boolean) -> void {
+        for (mut i: i64 = 0; i < parameters.length(); i++) {
+            const param_decl: DeclarationNode* = parameters[i];
             const param: VarDecl* = DeclarationNode::var_of(param_decl);
             if (param == null) { continue; }
             this.register_binding(param.sym_id, param.resolved_type, param.name, param_decl.span);
+            this.parameter_keys.push(param.sym_id.key());
             if (is_destructor && param.is_receiver()) { this.drop_receiver = param.sym_id; }
         }
+    }
+
+    /// Walk the body of `lam`, a closure that captures nothing.  It is
+    /// compiled as a function of its own and no synthesised method stands
+    /// for it, so it is walked as one, by a checker of its own, under the
+    /// bounds in scope here.  Walked once: a loop's silent discovery walk
+    /// leaves it to the walk that reports.
+    walk_closure_body(mut &this, lam: LambdaExpr*) -> void {
+        if (lam.body == null || this.suppress_emit) { return; }
+        mut nested: MoveChecker = MoveChecker::new(this.ctx);
+        for (mut i: i64 = 0; i < this.copy_params.length(); i++) {
+            nested.copy_params.push(this.copy_params[i]);
+        }
+        nested.register_parameters(&lam.parameters, false);
+        nested.walk_stmt(lam.body);
+        this.fired += nested.fired;
+        this.fatal += nested.fatal;
     }
 
 
@@ -526,6 +667,7 @@ type struct MoveChecker {
                     if (this.require_identity(b.binding_sym, b.name, pat.span)) {
                         this.pat_binding_keys.push(b.binding_sym.key());
                         this.register_binding(b.binding_sym, b.binding_type, b.name, pat.span);
+                        if (b.aliases_caller) { this.caller_alias_keys.push(b.binding_sym.key()); }
                     }
                 }
                 PatternKind::Enum(e) => { this.register_enum_pat_bindings(e); }
@@ -545,6 +687,7 @@ type struct MoveChecker {
                     // the subject: giving it away twice releases it twice,
                     // exactly as for a declared local.
                     this.register_binding(pb.sym_id, pb.resolved_type, pb.name, pb.span);
+                    if (pb.aliases_caller) { this.caller_alias_keys.push(pb.sym_id.key()); }
                 }
                 continue;
             }
@@ -966,6 +1109,11 @@ type struct MoveChecker {
             pre_real.push(this.moved_real[i]);
         }
         const pre_len: i64 = pre_keys.length();
+        // The reference roots join as the moves do: each branch starts from
+        // the pre-branch roots, and after the join a reference may point
+        // into what it does on any path that falls through.
+        const pre_roots: ReferenceRoots = this.reference_roots.copy();
+        mut joined_roots: ReferenceRoots = ReferenceRoots::empty();
 
         // Branches are separate scopes. A binding DECLARED inside a branch
         // (e.g. `Ok(handle) => { mut f = handle; ... }`) is dead at the join,
@@ -1013,6 +1161,7 @@ type struct MoveChecker {
                         u_real.push(real);
                     }
                 }
+                joined_roots.join(&pre_roots, 0);
                 continue;
             }
             const branch_cap_start: i64 = this.captured_decl_keys.length();
@@ -1048,10 +1197,12 @@ type struct MoveChecker {
                         u_real.push(real);
                     }
                 }
+                joined_roots.join(&this.reference_roots, 0);
             }
             // Restore the FULL pre-branch state for the next branch (a plain
             // truncate cannot undo an in-branch revival).
             this.restore_full(pre_keys, pre_spans, pre_real);
+            this.reference_roots = pre_roots.copy();
             // Outside a loop-discovery walk, the captured branch-locals are
             // only needed for the exclusion above - drop them so the stack
             // doesn't grow. Inside one (prev_capture true), leave them: they
@@ -1065,6 +1216,7 @@ type struct MoveChecker {
         for (mut i: i64 = 0; i < u_keys.length(); i++) {
             this.mark_moved_key(u_keys[i], u_spans[i], u_real[i]);
         }
+        this.reference_roots = joined_roots;
         this.branch_depth -= 1;
     }
 
@@ -1388,6 +1540,7 @@ type struct MoveChecker {
             }
             StmtKind::Return(r) => {
                 if (r.expression != null) {
+                    this.refuse_returned_frame_reference(r.expression);
                     this.walk_expr_move(r.expression, true);
                 }
             }
@@ -1494,6 +1647,7 @@ type struct MoveChecker {
     /// (`is_break`) or the `continue`.
     record_loop_exit(mut &this, is_break: boolean) -> void {
         if (this.loop_walks.length() == 0) { return; }
+        this.loop_exit_roots.append(&this.reference_roots, 0);
         const walk: LoopWalk = this.loop_walks[this.loop_walks.length() - 1];
         // A `continue` reaches the back edge, where only the body's own
         // moves matter; a `break` leaves the loop, after which everything
@@ -1562,6 +1716,12 @@ type struct MoveChecker {
             pre_spans.push(this.moved_spans[i]);
             pre_real.push(this.moved_real[i]);
         }
+        // A reference assigned in the body points there on the next
+        // iteration, after a `break` or a `continue`, and after the loop: the
+        // real walk starts from what the discovery walk reached, and the
+        // loop ends with that joined with every exit's.
+        const pre_roots: ReferenceRoots = this.reference_roots.copy();
+        const exit_roots_start: i64 = this.loop_exit_roots.length();
         const walk: LoopWalk = LoopWalk {
             moves_start:        snap,
             declarations_start: cap_snap,
@@ -1605,6 +1765,11 @@ type struct MoveChecker {
         }
         this.truncate_loop_exits(walk);
         this.restore_full(pre_keys, pre_spans, pre_real);
+        mut seed_roots: ReferenceRoots = pre_roots.copy();
+        seed_roots.join(&this.reference_roots, 0);
+        seed_roots.join(&this.loop_exit_roots, exit_roots_start);
+        this.loop_exit_roots.truncate(exit_roots_start);
+        this.reference_roots = seed_roots.copy();
 
         // real walk: carried bindings are moved-on-entry, so the
         // re-move at the top of the body reports use-after-move.
@@ -1640,6 +1805,9 @@ type struct MoveChecker {
             const exit: LoopExitMove = this.break_moves[i];
             this.mark_moved_key(exit.key, exit.span, true);
         }
+        this.reference_roots.join(&seed_roots, 0);
+        this.reference_roots.join(&this.loop_exit_roots, exit_roots_start);
+        this.loop_exit_roots.truncate(exit_roots_start);
         this.truncate_loop_exits(walk);
         this.truncate_captured(cap_snap);
         this.loop_walks.pop();
@@ -1676,6 +1844,9 @@ type struct MoveChecker {
         }
         if (!vd.is_global) {
             this.register_binding(vd.sym_id, vd.resolved_type, vd.name, d.span);
+            if (vd.initializer != null && !vd.is_capture_alias && this.is_reference(vd.resolved_type)) {
+                this.reference_roots.assign(vd.sym_id.key(), &this.roots_of(vd.initializer));
+            }
         }
         // A value made of no members - an empty array, a struct with no
         // fields - is whole with nothing written to it.
@@ -1825,6 +1996,140 @@ type struct MoveChecker {
     /// Where `sym` was declared without a value, when the moved-set still
     /// holds that declaration's own entry for it - it has not been given a
     /// value on every path to here.  None otherwise.
+    is_reference(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(ty);
+        return t != null && t.kind == TypeKind::Reference;
+    }
+
+    /// The frame roots the reference `e` evaluates to may point into.
+    roots_of(&this, e: ExpressionNode*) -> [FrameRoot] {
+        mut out: [FrameRoot] = [];
+        this.collect_value_roots(e, &out);
+        return out;
+    }
+
+    /// Add to `out` the frame roots of the reference `e` is: a reference
+    /// local's, those of the place a `&` borrows, and those of every branch
+    /// a branching expression may yield.  A reference a call returns is not
+    /// followed into its arguments.
+    collect_value_roots(&this, e: ExpressionNode*, out: mut &[FrameRoot]) -> void {
+        if (e == null) { return; }
+        match (e.kind) {
+            ExprKind::Identifier(id) => {
+                this.reference_roots.collect(id.res.local_sym().key(), out);
+            }
+            ExprKind::Unary(u) => {
+                if (u.desugared_call == null && u.operand != null && u.op.kind == TokenType::Amp) {
+                    this.collect_place_roots(u.operand, e.span, out);
+                }
+            }
+            // A cast to a number keeps no reference, to a pointer or a
+            // reference the one it converts.
+            ExprKind::Cast(cv) => {
+                if (this.is_ptr_or_ref(e.resolved_type)) { this.collect_value_roots(cv.expression, out); }
+            }
+            ExprKind::ObjectConversion(oc) => { this.collect_value_roots(oc.operand, out); }
+            ExprKind::If(ie) => {
+                this.collect_value_roots(ie.then_expr, out);
+                this.collect_value_roots(ie.else_expr, out);
+            }
+            ExprKind::Ternary(t) => {
+                this.collect_value_roots(t.true_expr, out);
+                this.collect_value_roots(t.false_expr, out);
+            }
+            ExprKind::Match(m) => {
+                for (mut i: i64 = 0; i < m.arms.length(); i++) {
+                    const arm: MatchArmNode* = m.arms[i];
+                    if (arm == null || arm.body == null) { continue; }
+                    this.collect_value_roots(arm.body.tail_expression(), out);
+                }
+            }
+            _ => { }
+        }
+    }
+
+    /// Add to `out` the frame roots of the place `place`, borrowed at
+    /// `site`.  A binding of this function is one, unless it holds a
+    /// reference, which a borrow of reborrows, or is the caller's storage
+    /// (a pattern binding over it, a closure's capture).  A field or element
+    /// is its value's, and what a reference points at is the reference's;
+    /// what a raw pointer points at is no binding's this pass can see.
+    collect_place_roots(&this, place: ExpressionNode*, site: SourceSpan, out: mut &[FrameRoot]) -> void {
+        if (place == null) { return; }
+        match (place.kind) {
+            ExprKind::Identifier(id) => {
+                const sym: SymbolID = id.res.local_sym();
+                const ty: TypeRef = this.lookup_type(sym);
+                if (!ty.is_valid()) { return; }
+                if (this.is_reference(ty)) {
+                    this.reference_roots.collect(sym.key(), out);
+                    return;
+                }
+                if (this.is_caller_alias(sym.key()) || this.is_capture_alias(sym.key())) { return; }
+                out.push(FrameRoot { owner: sym.key(), name: id.name, site: site });
+            }
+            ExprKind::MemberAccess(ma) => { this.collect_roots_below(ma.object, site, out); }
+            ExprKind::ArrayAccess(aa)  => { this.collect_roots_below(aa.array, site, out); }
+            ExprKind::Unary(u) => {
+                if (u.desugared_call == null && u.op.kind == TokenType::Star && this.is_reference(u.operand.resolved_type)) {
+                    this.collect_value_roots(u.operand, out);
+                }
+            }
+            _ => { }
+        }
+    }
+
+    /// The roots of a place inside `object`: `object`'s own when it is a
+    /// value, those of the reference when it is one.
+    collect_roots_below(&this, object: ExpressionNode*, site: SourceSpan, out: mut &[FrameRoot]) -> void {
+        if (object == null) { return; }
+        if (this.is_reference(object.resolved_type)) {
+            this.collect_value_roots(object, out);
+            return;
+        }
+        if (this.is_ptr_or_ref(object.resolved_type)) { return; }
+        this.collect_place_roots(object, site, out);
+    }
+
+    is_caller_alias(&this, key: u64) -> boolean {
+        for (mut i: i64 = 0; i < this.caller_alias_keys.length(); i++) {
+            if (this.caller_alias_keys[i] == key) { return true; }
+        }
+        return false;
+    }
+
+    is_parameter(&this, key: u64) -> boolean {
+        for (mut i: i64 = 0; i < this.parameter_keys.length(); i++) {
+            if (this.parameter_keys[i] == key) { return true; }
+        }
+        return false;
+    }
+
+    /// E0455: `returned` evaluates to a reference into a binding this
+    /// function owns, which is released when it returns.
+    refuse_returned_frame_reference(mut &this, returned: ExpressionNode*) -> void {
+        if (this.suppress_emit) { return; }
+        const roots: [FrameRoot] = this.roots_of(returned);
+        if (roots.length() == 0) { return; }
+        const root: FrameRoot = roots[0];
+        const name: string = this.intern.resolve(root.name);
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0455_DANGLING_POINTER,
+            fmt::format("cannot return a reference to `%s`, which is released when this function returns", name));
+        diag = diag.at_with_label(returned.span, fmt::format("`%s` is owned by this function", name));
+        if (root.site.start_line != returned.span.start_line || root.site.start_col != returned.span.start_col) {
+            diag = diag.also_at(root.site, "the reference is made here");
+        }
+        if (this.is_parameter(root.owner)) {
+            diag = diag.help(fmt::format("return the value itself, or take `%s` by reference, so that the caller owns what is returned", name));
+        } else {
+            diag = diag.help("return the value itself, or a reference into storage the caller owns");
+        }
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
     uninitialised_at(&this, sym: SymbolID) -> SourceSpan {
         if (!sym.is_valid() || !this.is_moved(sym)) { return SourceSpan::none(); }
         const moved_span: SourceSpan = this.moved_at_span(sym);
@@ -2132,13 +2437,18 @@ type struct MoveChecker {
     /// (`borrow_closures`).  A capture of a value holding a borrowing closure
     /// carries that closure's borrows into this one.
     ///
-    /// Bodies aren't walked here: sema synthesises a closure struct +
-    /// `__call__` method for capturing lambdas and injects them into the
-    /// program, so MoveCheck visits the body when it walks the
-    /// synthesised method.  Non-capturing lambdas have no outer-state
-    /// effect at the construction site.
+    /// A capturing closure's body is not walked here: sema synthesises a
+    /// closure struct + `__call__` method for it and injects them into the
+    /// program, so MoveCheck visits the body when it walks the synthesised
+    /// method.  A closure that captures nothing has no outer-state effect at
+    /// the construction site, and its body is walked as the function it is
+    /// (`walk_closure_body`).
     read_lambda(mut &this, e: ExpressionNode*, lam: LambdaExpr*) -> void {
         if (lam == null) { return; }
+        if (lam.captured_names.length() == 0) {
+            this.walk_closure_body(lam);
+            return;
+        }
         const closure: TypeRef = e.resolved_type;
         const statement: i64 = if (this.open_statements.length() > 0) {
             this.open_statements[this.open_statements.length() - 1]
@@ -2376,6 +2686,9 @@ type struct MoveChecker {
                 // binding).
                 if (b.right != null) { this.walk_expr_move(b.right, false); }
                 this.unmark_moved(left_id.res.local_sym());
+                if (this.is_reference(this.lookup_type(left_id.res.local_sym()))) {
+                    this.reference_roots.assign(left_id.res.local_sym().key(), &this.roots_of(b.right));
+                }
                 this.refuse_assigned_borrow_of_released_temporary(left_id, b.left.span, b.right, b.left.resolved_type);
                 return;
             }

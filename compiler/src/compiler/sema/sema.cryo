@@ -1329,7 +1329,6 @@ type struct SemaVisitor {
             if (this.state.return_type.is_valid()) {
                 this.check_return_payload_escape(node.expression, this.state.return_type);
             }
-            this.check_return_stack_address(node.expression);
         }
     }
 
@@ -5254,7 +5253,7 @@ type struct SemaVisitor {
         const ok_sym: SymbolID = this.resolver.alloc_synthetic_binding();
         const ok_pb: PatternBinding* = new PatternBinding {
             name: ok_bind, span: span, sym_id: ok_sym,
-            resolved_type: TypeRef::invalid(), written_mut: false
+            resolved_type: TypeRef::invalid(), written_mut: false, aliases_caller: false
         };
         ok_pat.add_element(PatternElement::Binding(ok_pb));
         mut ok_arm: mut MatchArmNode* = MatchArmNode::new(span);
@@ -5273,7 +5272,7 @@ type struct SemaVisitor {
         const err_sym: SymbolID = this.resolver.alloc_synthetic_binding();
         const err_pb: PatternBinding* = new PatternBinding {
             name: err_bind, span: span, sym_id: err_sym,
-            resolved_type: TypeRef::invalid(), written_mut: false
+            resolved_type: TypeRef::invalid(), written_mut: false, aliases_caller: false
         };
         err_pat.add_element(PatternElement::Binding(err_pb));
         const err_ident: mut ExpressionNode* = ExpressionNode::identifier_expr(err_bind, span);
@@ -6826,54 +6825,6 @@ type struct SemaVisitor {
         return t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference;
     }
 
-    check_return_stack_address(mut &this, e: ExpressionNode*) -> void {
-        if (e == null) { return; }
-        // An object holds its operand's address as its data word.
-        const oc: ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
-        if (oc != null) {
-            this.check_return_stack_address(oc.operand);
-            return;
-        }
-        const ie: IfExpr* = ExpressionNode::if_of(e);
-        if (ie != null) {
-            this.check_return_stack_address(ie.then_expr);
-            this.check_return_stack_address(ie.else_expr);
-            return;
-        }
-        const me: MatchExpr* = ExpressionNode::match_of(e);
-        if (me != null) {
-            for (mut i: i64 = 0; i < me.arms.length(); i++) {
-                const arm: MatchArmNode* = me.arms[i];
-                if (arm == null || arm.body == null) { continue; }
-                this.check_return_stack_address(arm.body.tail_expression());
-            }
-            return;
-        }
-        const sme: StaticMatchExpr* = ExpressionNode::static_match_of(e);
-        if (sme != null) {
-            for (mut i: i64 = 0; i < sme.arms.length(); i++) {
-                const arm: StaticMatchArmNode* = sme.arms[i];
-                if (arm == null || arm.body == null) { continue; }
-                this.check_return_stack_address(arm.body.tail_expression());
-            }
-            return;
-        }
-        const u: UnaryExpr* = ExpressionNode::unary_of(e);
-        if (u != null) {
-            const id: IdentifierExpr* = ExpressionNode::identifier_of(u.operand);
-            if (u.op.kind == TokenType::Amp && id != null) {
-                // A payload binding over a caller-backed subject names the
-                // caller's storage, not a copy in this frame, so its address
-                // survives the return — that is exactly an in-place accessor.
-                if (this.scopes.names_alias(id.res.local_sym())) { return; }
-                if (this.scopes.binds(id.res.local_sym()) && !this.scopes.names_param(id.res.local_sym())) {
-                    this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
-                        "cannot return the address of a local variable: it lives on this function's stack frame and is freed when the function returns. Return the value by move, or a heap allocation, instead.",
-                        e.span);
-                }
-            }
-        }
-    }
 
 
     // -- impl-trait (opaque type) checks --
