@@ -204,6 +204,44 @@ public type struct Program {
         return false;
     }
 
+    /// Whether evaluating the expression at `value` runs code of the
+    /// program's own, which may fold into `observed` while it runs: a call
+    /// of any kind or a `match`, anywhere inside it.  A closure written as a
+    /// value runs nothing until it is called, and `mix` is the prelude's.
+    public runs_code(&this, value: i64) -> boolean {
+        return match (this.expression_at(value).kind) {
+            ExpressionKind::Call(_, _, _) => { true }
+            ExpressionKind::GenericCall(_, _, _, _, _) => { true }
+            ExpressionKind::MethodCall(_, _, _, _) => { true }
+            ExpressionKind::Invoke(_, _, _) => { true }
+            ExpressionKind::Match(_, _, _) => { true }
+            ExpressionKind::Unary(_, operand) => { this.runs_code(operand) }
+            ExpressionKind::Cast(operand) => { this.runs_code(operand) }
+            ExpressionKind::Widen(operand) => { this.runs_code(operand) }
+            ExpressionKind::Field(base, _) => { this.runs_code(base) }
+            ExpressionKind::Binary(_, left, right) => { this.runs_code(left) || this.runs_code(right) }
+            ExpressionKind::Wrapping(_, left, right) => { this.runs_code(left) || this.runs_code(right) }
+            ExpressionKind::Mix(state, folded) => { this.runs_code(state) || this.runs_code(folded) }
+            ExpressionKind::Conditional(condition, then_value, else_value) => {
+                this.runs_code(condition) || this.runs_code(then_value) || this.runs_code(else_value)
+            }
+            ExpressionKind::StructureLiteral(_, _, first, count) => { this.any_runs_code(first + 1, count, 2) }
+            ExpressionKind::Variant(_, _, first, count) => { this.any_runs_code(first, count, 1) }
+            _ => { false }
+        };
+    }
+
+    /// Whether any of `count` expressions in the index lists, from `first`
+    /// every `stride` places, runs code (`runs_code`).
+    private any_runs_code(&this, first: i64, count: i64, stride: i64) -> boolean {
+        mut index: i64 = 0;
+        while (index < count) {
+            if (this.runs_code(this.list_at(first + index * stride))) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
     /// Add `indices` to the index lists as one run; the first one's place.
     public list_run(mut &this, indices: &Array<i64>) -> i64 {
         const first: i64 = this.lists.length();

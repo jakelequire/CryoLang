@@ -232,14 +232,13 @@ hash: a statement's arm observes them at the end of its block; an integer
 expression's arm folds its value and then its bindings by `mix`, from its
 position plus one, and converts the fold back to its type
 (`E0::V1(b0, b1) => { (mix(mix(mix(2, (v3 as u64)), (b0 as u64)), if (b1)
-{ 1 } else { 2 }) as i32) }`; no operator, so no feature, is needed), since
-an observation there would run inside the value an outer
-observation folds, `observed = mix(observed, h0(..))`, after that
-observation read `observed`, and be overwritten; any other expression's arm
-(a boolean's or an enum's) observes them by statements before its value
-(`E0::V1(b0) => { observed = mix(observed, (b0 as u64)); v3 }`), which the
-same overwrite can lose. The self-test's binding audit holds every binding
-to one of these. The
+{ 1 } else { 2 }) as i32) }`; no operator, so no feature, is needed); any
+other expression's arm (a boolean's or an enum's) observes them by
+statements before its value (`E0::V1(b0) => { observed = mix(observed, (b0
+as u64)); v3 }`). An observation of a value holding such a `match` binds
+the value to a local before reading `observed` (section 3.4), so what an
+arm observes is kept. The self-test's binding audit holds every binding to
+one of these. The
 printer's observation folds a payload into its variant's number,
 `E0::V1(b0, b1) => { mix(mix(2, (b0 as u64)), if (b1) { 1 } else { 2 }) }`.
 
@@ -442,17 +441,21 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **No expression both writes a struct and reads it.** A method taking
   `mut &this` returns `void` and is called only as a statement of its own,
   so the order in which an expression's operands are evaluated never
-  decides a struct's value. (`observed` is the exception the stage-1 forms
-  already make: a call inside `mix(observed, ...)` may observe, and so
-  change `observed`, while the same statement reads it.)
-- **Operand evaluation order is guaranteed.** That exception's hash
-  depends on the order a call's arguments and an operator's operands are
-  evaluated in: `observed = mix(observed, (h1(v0) as u64))` reads
-  `observed` before `h1` changes it because the language evaluates
-  operands left to right - a binary operator's left operand first, a
-  call's arguments in the order written, a method call's receiver before
-  its arguments (docs/cryo.md section 5.8, "Evaluation Order"). So the
-  hash a program prints is fixed by the source, and these statements stay.
+  decides a struct's value.
+- **An observation folds in a value that runs nothing.** In
+  `observed = mix(observed, h1(v0))` the statement reads `observed` before
+  the call, so whatever `h1` observes while it runs would be overwritten. A
+  value holding a call of any kind or a `match` (whose arms may observe)
+  is bound to a fresh local first and the local folded in:
+  `const o0: u64 = (h1(v0) as u64); observed = mix(observed, o0);`
+  (`Program::runs_code`, the printer's `bind_observed`). The self-test
+  reads every printed `mix(observed, ..)` for a call.
+- **Operand evaluation order is guaranteed.** Two calls in one expression
+  that each observe, `h0(h1(v0), h2(v1))`, change `observed` in the order
+  they run, which the language fixes: operands left to right - a binary
+  operator's left operand first, a call's arguments in the order written,
+  a method call's receiver before its arguments (docs/cryo.md section 5.8,
+  "Evaluation Order"). So the hash a program prints is fixed by the source.
   A compiler that changed the order would print a different hash at every
   optimisation level alike, which the corpus check (comparing -O0 with
   -O2) cannot see; the test project `evaluation_order_left_to_right` is

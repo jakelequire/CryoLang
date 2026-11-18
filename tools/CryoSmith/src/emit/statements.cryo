@@ -29,9 +29,14 @@ implement struct Printer {
             const node: StatementNode = program.statement_at(current);
             match (node.kind) {
                 StatementKind::Observe(value) => {
-                    this.text.push(Str::new("observed = mix(observed, "));
-                    this.as_hash_input(program, value);
-                    this.text.push(Str::new("); "));
+                    if (program.runs_code(value)) {
+                        const local: String = this.bind_observed(program, value);
+                        this.text.push(f" observed = mix(observed, {local.as_str()}); ");
+                    } else {
+                        this.text.push(Str::new("observed = mix(observed, "));
+                        this.as_hash_input(program, value);
+                        this.text.push(Str::new("); "));
+                    }
                 }
                 _ => { }
             }
@@ -72,9 +77,16 @@ implement struct Printer {
                 this.text.push(Str::new(";\n"));
             }
             StatementKind::Observe(value) => {
-                this.text.push(Str::new("observed = mix(observed, "));
-                this.as_hash_input(program, value);
-                this.text.push(Str::new(");\n"));
+                if (program.runs_code(value)) {
+                    const local: String = this.bind_observed(program, value);
+                    this.text.push(Str::new("\n"));
+                    this.indent(indent);
+                    this.text.push(f"observed = mix(observed, {local.as_str()});\n");
+                } else {
+                    this.text.push(Str::new("observed = mix(observed, "));
+                    this.as_hash_input(program, value);
+                    this.text.push(Str::new(");\n"));
+                }
             }
             StatementKind::Evaluate(value) => {
                 this.expression(program, value);
@@ -183,6 +195,19 @@ implement struct Printer {
     /// A value as `mix` takes it: an integer converted to `u64`, a boolean
     /// as 1 or 2.  A `u64` `match`, an enum's variant number, is passed as
     /// it is, so its literal arms are typed by `mix`'s parameter.
+    /// `const o<N>: u64 = <value as a hash input>;`, a fresh local the
+    /// observation then folds in: `observed = mix(observed, h0(..))` would
+    /// read `observed` before the call and overwrite whatever the call folds
+    /// in while it runs.  The local's name, unique in the program.
+    private bind_observed(mut &this, program: &Program, value: i64) -> String {
+        const local: String = f"o{this.observation_locals}";
+        this.observation_locals = this.observation_locals + 1;
+        this.text.push(f"const {local.as_str()}: u64 = ");
+        this.as_hash_input(program, value);
+        this.text.push(Str::new(";"));
+        return local;
+    }
+
     internal as_hash_input(mut &this, program: &Program, value: i64) -> void {
         const observed: ExpressionNode = program.expression_at(value);
         match (observed.kind) {

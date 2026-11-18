@@ -1,0 +1,116 @@
+///! An audit of the printed text: the value an observation folds into
+///! `observed` runs no code of the program's own.  `observed = mix(observed,
+///! h0(..))` reads `observed` before the call, so whatever `h0` folds in
+///! during the call is overwritten; the same holds for a `match` whose arms
+///! observe.  Such a value is bound to a local first and the local folded in.
+///!
+///! A call is a word directly before `(` - other than `if`, the prelude's
+///! `mix` and an operator method `wrapping_<op>`, which run nothing of the
+///! program's - or a generic call's `>(`.
+
+namespace cryosmith::selftest::observations;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+import cryosmith::configuration::{ GenerationOptions };
+import cryosmith::selftest::runner::{ SelfTest };
+
+/// How many programs the observation audit reads.
+const OBSERVATION_AUDITED_PROGRAMS: u64 = 200;
+
+const OPEN_PARENTHESIS: u8 = 40;
+const CLOSE_PARENTHESIS: u8 = 41;
+const GREATER_THAN: u8 = 62;
+const UNDERSCORE: u8 = 95;
+
+/// The audit of one program's observations.
+internal type struct ObservationAudit {
+    /// The number of observations in `text`, none folding in a value that
+    /// runs code; or the first that does.
+    internal static check(text: Str) -> Result<i64, String> {
+        const opening: Str = Str::new("mix(observed, ");
+        mut checked: i64 = 0;
+        mut rest: Str = text;
+        loop {
+            const found: i64 = match (rest.find(&opening)) {
+                Option::Some(position) => { position }
+                Option::None           => { return Result::Ok(checked); }
+            };
+            const start: i64 = found + opening.length() as i64;
+            const end: i64 = ObservationAudit::closing(rest, start);
+            const argument: Str = rest.byte_substring(start, end);
+            if (ObservationAudit::runs_code(argument)) {
+                return Result::Err(f"`mix(observed, {argument})` folds in a value that runs code");
+            }
+            checked = checked + 1;
+            rest = rest.byte_substring(end, rest.length() as i64);
+        }
+    }
+
+    /// The position of the `)` closing the parenthesis open before `start`.
+    private static closing(text: Str, start: i64) -> i64 {
+        mut depth: i64 = 1;
+        mut position: i64 = start;
+        while (position < text.length() as i64) {
+            const byte: u8 = text.byte_at(position).unwrap();
+            if (byte == OPEN_PARENTHESIS) { depth = depth + 1; }
+            if (byte == CLOSE_PARENTHESIS) {
+                depth = depth - 1;
+                if (depth == 0) { return position; }
+            }
+            position = position + 1;
+        }
+        return position;
+    }
+
+    /// Whether evaluating `argument` calls something or runs a `match`.
+    private static runs_code(argument: Str) -> boolean {
+        if (argument.contains(&Str::new("match ("))) { return true; }
+        mut position: i64 = 0;
+        while (position < argument.length() as i64) {
+            if (argument.byte_at(position).unwrap() == OPEN_PARENTHESIS && position > 0) {
+                mut word_start: i64 = position;
+                while (word_start > 0 && ObservationAudit::in_word(argument.byte_at(word_start - 1).unwrap())) {
+                    word_start = word_start - 1;
+                }
+                const word: Str = argument.byte_substring(word_start, position);
+                if (word.length() == 0) {
+                    if (argument.byte_at(position - 1).unwrap() == GREATER_THAN) { return true; }
+                } else if (word != Str::new("if") && word != Str::new("mix") && !word.starts_with(&Str::new("wrapping_"))) {
+                    return true;
+                }
+            }
+            position = position + 1;
+        }
+        return false;
+    }
+
+    /// Whether `byte` may be part of a name.
+    private static in_word(byte: u8) -> boolean {
+        return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == UNDERSCORE;
+    }
+}
+
+implement struct SelfTest {
+    /// No observation folds in a value that runs code, and the printer binds
+    /// such values to locals in the programs read.
+    internal observation_audit(mut &this) -> void {
+        mut checked: i64 = 0;
+        mut bound: i64 = 0;
+        mut seed: u64 = 1;
+        while (seed <= OBSERVATION_AUDITED_PROGRAMS) {
+            const text: String = SelfTest::program(GenerationOptions::new(seed));
+            match (ObservationAudit::check(text.as_str())) {
+                Result::Ok(count)   => { checked = checked + count; }
+                Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }
+            }
+            if (text.as_str().contains(&Str::new("const o0: u64 = "))) { bound = bound + 1; }
+            seed = seed + 1;
+        }
+        this.expect(checked > 0, String::from_str(Str::new("the observation audit found no observation")));
+        this.expect(bound > 0, String::from_str(Str::new("no program bound an observed value to a local")));
+    }
+}
