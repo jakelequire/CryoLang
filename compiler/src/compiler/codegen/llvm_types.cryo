@@ -17,6 +17,7 @@ import std::core::slice::{ Slice };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::const_table::{ FoldedInteger };
 import compiler::toolchain::{ ExecutablePath };
+import compiler::codegen::passes::{ LinkerConfig };
 import utils::log::{ Log, LogArea, LogLevel };
 
 
@@ -1762,8 +1763,9 @@ type struct LTargetMachine {
         // Never return null: the result is cached and re-measured via strlen.
         if (raw == null) { return "x86_64-pc-windows-gnu"; }
         if (!raw.contains("windows-msvc")) { return raw; }
-        // Prefer mingw (the only link path the port supports) when present.
-        if (ExecutablePath::find("x86_64-w64-mingw32-gcc").length() > 0) {
+        // The host build links with a mingw driver, so when that driver is
+        // there the objects must have its ABI, whatever else is on `PATH`.
+        if (LinkerConfig::host_driver_present()) {
             return "x86_64-pc-windows-gnu";
         }
         // Otherwise honour an installed MSVC linker so codegen emits MSVC-ABI
@@ -1800,9 +1802,12 @@ type struct LTargetMachine {
     /// symbol: MSVC emits `__chkstk` while mingw provides `___chkstk_ms`, so a
     /// mingw `cryo build` of MSVC-ABI code fails with `undefined reference to
     /// __chkstk`.  So when LLVM reports msvc we pick the ABI from the linker
-    /// that is actually on `PATH`, rather than assuming one:
-    ///   - an mingw `gcc` present -> `x86_64-pc-windows-gnu` (the only link path
-    ///     the port supports today; preferred when both are installed);
+    /// that is actually there, rather than assuming one:
+    ///   - the driver the host link runs (`LinkerConfig::link_driver`: `CRYO_CC`,
+    ///     else `cc`/`gcc`/`clang` on `PATH`) present -> `x86_64-pc-windows-gnu`
+    ///     (the only link path the port supports today; preferred when both are
+    ///     installed, so an unrelated `link` on `PATH` cannot turn the objects
+    ///     into ones that driver cannot link);
     ///   - else an MSVC linker (`lld-link`/`link.exe`) present -> keep the
     ///     `windows-msvc` triple, so codegen emits MSVC-ABI objects for the
     ///     user's own toolchain to link;
