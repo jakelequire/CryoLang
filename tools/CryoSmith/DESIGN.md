@@ -317,6 +317,28 @@ a closure local is never captured, and `observed`, a global, is written
 where it stands. So no closure holds a reference, and none outlives what
 it was made from; the closure stays in its local, called in its scope.
 
+**Function values.** With `function-values` (and `closures`), a free
+function `h<N>` takes a parameter of a scalar function type last, a
+quarter of the time, `h2(p0: u8, p1: (u8) -> i32)`, and returns a function
+type instead of a value type, 15 times in a hundred, `h3(p0: boolean) ->
+(u8) -> i32`. A value given to a function-typed parameter is a closure
+written there (`h2(v1, (q0: u8) -> i32 { return .. })`), which may capture
+as a closure local does, a closure local, or a function-typed parameter of
+the caller passed on (the callee is copied for a capturing closure's type,
+and so is every function its copy passes the parameter on to, docs/cryo.md
+section 2.5). A value returned is a closure written there or a closure
+local, and captures nothing: a function type holds only a function
+pointer, so a capturing closure is never returned, and a parameter, which
+may hold one in a copy made for it, is never returned either. A
+function-typed parameter is called wherever a value of its return type is
+wanted, `p1(a)`, and so is a call returning a function type, `h3(b)(a)`;
+the parameter is observed by one call of it where the body observes its
+parameters, and `main` observes a call returning a function type by calling
+what it returns. A function with a function-typed parameter starts no
+overload set. Free functions named as values are not generated: a helper
+is almost never cheap enough to be a function value, or typed exactly as
+the scalar signature wanted.
+
 A `match` statement's arm may assign the local its subject reads. Its
 bindings are never written `mut` and their payloads are `Copy`, so each is
 a copy taken when the arm is entered (docs/cryo.md, enum destructuring)
@@ -437,7 +459,12 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   target is written, not read, and costs nothing); a loop costs its trip
   count times its body; an `if` the dearer arm; a call the callee's cost;
   a closure's body is measured on a budget of its own when it is made,
-  and that cost is charged at every call of it.
+  and that cost is charged at every call of it. A function value costs at
+  most `FUNCTION_VALUE_COST_LIMIT`: a closure local is passed only when it
+  does, and a closure written where it is passed or returned is generated
+  at depth 1 on a budget whose calls stay under half the limit. A call
+  through a parameter or through a returned value is charged the limit;
+  the self-test's function-value audit holds every value to it.
   A call is generated only while the caller's cost stays under its limit, so
   every program does a bounded amount of work, known at generation time.
 
@@ -513,8 +540,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. `default,no-closure-captures` generates
-version 19's text, and `default,no-nested-patterns` generates
+  generator's text, header aside. `default,no-function-values` generates
+version 20's text, `default,no-function-values,no-closure-captures`
+version 19's, and `default,no-nested-patterns` generates
   version 14's text, `default,no-nested-patterns,no-generic-enums`
   version 13's, and `default,no-enum-payloads` (which declares no
   generic enum either) version 12's. `default,no-enums` generates version 9's
@@ -546,7 +574,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
 | 3 | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
 | 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
-| 5 (this one) | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type. Still to come: closures passed to function-typed parameters and returned, closures in generic bodies |
+| 5 (this one) | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them. Still to come: closures in generic bodies |
 | 6 | traits and dynamic dispatch: implementations, default methods, calls through a bound and through a trait object |
 | 7 | ownership: moves, drops (a drop log folded into the hash), references, `Box` and `Rc`, `Option` and `Result` |
 | 8 | strings, arrays and collections |
@@ -640,6 +668,10 @@ statement budget of one function, default 24), `--no-header`, and
   a binding of a `match` inside it, and each capture is read by one of the
   body's observations - the capture, a field of it, or the `match` giving
   its variant number (section 3.2).
+- **The function-value audit** reads every argument given to a
+  function-typed parameter and every function value returned in 200
+  programs: each costs at most `FUNCTION_VALUE_COST_LIMIT`, and each one
+  returned captures nothing and is no parameter (sections 2 and 3.3).
 
 ## 8. Architecture
 
@@ -753,9 +785,10 @@ place.
    passed to function-typed parameters and called. `guarantees/`: a
    closure's cost is its body's, charged at each call; a capture is read,
    never moved twice. `typing/`: a closure's own scope over its captures.
-   (In progress: `closures`, closures capturing nothing, and
+   (In progress: `closures`, closures capturing nothing,
    `closure-captures`, closures copying the enclosing function's values,
-   are done.) Every closure generated is valid under the memory-safety
+   and `function-values`, closures passed to function-typed parameters
+   and returned, are done; closures in generic bodies remain.) Every closure generated is valid under the memory-safety
    plan as well as today's rules: it captures only `Copy` values, by copy,
    and none holding a reference is stored in a struct or a global or
    returned past what it refers to.

@@ -46,44 +46,60 @@ implement struct Generator {
     /// zero to two scalar parameters returning a scalar; one that captures
     /// is held by `const v<N> = ..`.
     internal closure_declaration(mut &this) -> i64 {
+        const function_type: ValueType = this.scalar_signature();
+        const captures: Array<i64> = this.captures();
+        const depth: i64 = this.depth();
+        mut closure: Closure = this.closure_body(function_type, &captures, CostBudget::for_function(false), depth);
+        closure.local = this.environment.declare_local(&this.program, function_type, false);
+        this.program.closures.push(closure);
+        const value: i64 = this.node(ExpressionKind::Closure(this.program.closures.length() - 1), function_type);
+        return this.program.statement(StatementKind::Declare(closure.local, value));
+    }
+
+    /// A function type of zero to two scalar parameters returning a scalar.
+    internal scalar_signature(mut &this) -> ValueType {
         const count: i64 = this.random.below(MOST_CLOSURE_PARAMETERS + 1);
         mut parameter_types: Array<ValueType> = Array::<ValueType>::new();
         while (parameter_types.length() < count) {
             parameter_types.push(TypeChoice::scalar(&this.random, this.options.features));
         }
         const returns: ValueType = TypeChoice::scalar(&this.random, this.options.features);
-        const function_type: ValueType = this.program.function_type(&parameter_types, returns);
-        const captures: Array<i64> = this.captures();
+        return this.program.function_type(&parameter_types, returns);
+    }
+
+    /// A closure of `function_type` capturing `captures`, its body's value
+    /// generated at `depth` on `budget` in a scope of its own, and its
+    /// captures observed before it; held by no local yet.
+    internal closure_body(mut &this, function_type: ValueType, captures: &Array<i64>, budget: CostBudget, depth: i64) -> Closure {
+        const signature: Signature = this.program.signature_of(function_type);
         const outer_floor: i64 = this.environment.enter_closure();
         for (captured in captures.iter()) { this.environment.bind(captured); }
         mut parameters: Array<i64> = Array::<i64>::new();
-        for (parameter_type in parameter_types.iter()) {
+        while (parameters.length() < signature.parameter_count) {
+            const parameter_type: ValueType = this.program.signature_parameter(signature, parameters.length());
             parameters.push(this.environment.declare_closure_parameter(&this.program, parameter_type));
         }
         const first_parameter: i64 = this.program.list_run(&parameters);
         const outer_budget: CostBudget = this.budget;
-        this.budget = CostBudget::for_function(false);
-        const body: i64 = this.typed_place(returns, this.depth());
+        this.budget = budget;
+        const body: i64 = this.typed_place(signature.returns, depth);
         mut observations: Array<i64> = Array::<i64>::new();
         for (captured in captures.iter()) { this.observe_place(this.read(captured), &observations); }
         const cost: u64 = this.budget.spent();
         this.budget = outer_budget;
         this.environment.leave_closure(outer_floor);
-        const local: i64 = this.environment.declare_local(&this.program, function_type, false);
-        this.program.closures.push(Closure {
-            function_type: function_type, first_parameter: first_parameter, parameter_count: count,
-            first_capture: this.program.list_run(&captures), capture_count: captures.length(),
-            observations: this.program.block(&observations), body: body, cost: cost, local: local,
-        });
-        const value: i64 = this.node(ExpressionKind::Closure(this.program.closures.length() - 1), function_type);
-        return this.program.statement(StatementKind::Declare(local, value));
+        return Closure {
+            function_type: function_type, first_parameter: first_parameter, parameter_count: signature.parameter_count,
+            first_capture: this.program.list_run(captures), capture_count: captures.length(),
+            observations: this.program.block(&observations), body: body, cost: cost, local: -1,
+        };
     }
 
     /// The values a closure made here captures: none without
     /// `closure-captures`, and with it, one or two distinct names in scope
     /// that `Capture::admits`, `CAPTURE_CHANCE` times in a hundred.  No draw
     /// is taken without the feature or with nothing to capture.
-    private captures(mut &this) -> Array<i64> {
+    internal captures(mut &this) -> Array<i64> {
         mut chosen: Array<i64> = Array::<i64>::new();
         if (!this.options.features.has(Feature::ClosureCaptures)) { return chosen; }
         mut candidates: Array<i64> = Array::<i64>::new();

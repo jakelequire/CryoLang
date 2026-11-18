@@ -1,0 +1,139 @@
+///! Function values: a free function taking a function-typed parameter,
+///! `h2(p0: u8, p1: (u8) -> i32)`, or returning a function type, `h3(p0:
+///! boolean) -> (u8) -> i32`, and the values given for one.
+///!
+///! A value of a function type is a closure written where it is wanted, a
+///! closure local or a function-typed parameter.  One given to a parameter
+///! may capture: the callee is a
+///! non-generic free function of the program's one module, which is copied
+///! for the closure's type.  One returned never captures and never reads a
+///! parameter, which may hold a capturing closure in such a copy: a
+///! function type holds only a function pointer, so a closure that
+///! captures is never returned.  Every function value costs at most
+///! `FUNCTION_VALUE_COST_LIMIT`, and a call through a parameter or through a
+///! returned value is charged that much.
+
+namespace cryosmith::generate::function_values;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::guarantees::{ CostBudget, FUNCTION_VALUE_COST_LIMIT };
+import cryosmith::model::{ Closure, ExpressionKind, Function, Signature, ValueType, Variable, VariableRole };
+
+/// How often, in a hundred, a free function takes a function-typed
+/// parameter last.
+const FUNCTION_PARAMETER_CHANCE: i64 = 25;
+
+/// How often, in a hundred, a free function returns a function type.
+const FUNCTION_RETURN_CHANCE: i64 = 15;
+
+implement struct Generator {
+    /// Whether function values are generated: the feature is on, and so is
+    /// `closures`, since a closure written where it is wanted is the one
+    /// value of a function type there always is.
+    internal makes_function_values(&this) -> boolean {
+        return this.options.features.has(Feature::FunctionValues) && this.options.features.has(Feature::Closures);
+    }
+
+    /// A function-typed parameter for a free function, sometimes: one
+    /// type to add to `parameter_types`, with no draw when the feature is
+    /// off.  Whether one was added.
+    internal add_function_parameter(mut &this, parameter_types: mut &Array<ValueType>) -> boolean {
+        if (!this.makes_function_values() || !this.random.chance(FUNCTION_PARAMETER_CHANCE)) { return false; }
+        parameter_types.push(this.scalar_signature());
+        return true;
+    }
+
+    /// What a free function other than `main` returns: sometimes a
+    /// function type, otherwise any value type.
+    internal free_return_type(mut &this) -> ValueType {
+        if (this.makes_function_values() && this.random.chance(FUNCTION_RETURN_CHANCE)) { return this.scalar_signature(); }
+        return this.any_type();
+    }
+
+    /// A value of function type `wanted`: a closure written here, a closure
+    /// local or a function-typed parameter.  With `capturing` (a call's
+    /// argument) the closure may capture and a parameter may be passed on;
+    /// without it (a returned value) neither.
+    internal function_value(mut &this, wanted: ValueType, capturing: boolean) -> i64 {
+        const variables: Array<i64> = this.function_variables(wanted, capturing);
+        if (variables.length() > 0 && this.random.chance(50)) {
+            return this.read(variables.get(this.random.below(variables.length())).unwrap());
+        }
+        const captures: Array<i64> = if (capturing) { this.captures() } else { Array::<i64>::new() };
+        const closure: Closure = this.closure_body(wanted, &captures, CostBudget::for_function_value(), 1);
+        this.program.closures.push(closure);
+        return this.node(ExpressionKind::Closure(this.program.closures.length() - 1), wanted);
+    }
+
+    /// The variables in scope holding a value of `wanted` that may be given
+    /// as one: a closure local costing at most the limit, capturing only
+    /// when `capturing`; and with `capturing`, a function-typed parameter.
+    private function_variables(&this, wanted: ValueType, capturing: boolean) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.variables_of(&this.program, wanted).iter()) {
+            const declared: Variable = this.program.variable_at(variable);
+            match (declared.role) {
+                VariableRole::Local => {
+                    const closure: Closure = this.program.closure_at(this.closure_held_by(variable));
+                    if (closure.cost <= FUNCTION_VALUE_COST_LIMIT && (capturing || closure.capture_count == 0)) { found.push(variable); }
+                }
+                VariableRole::Parameter => { if (capturing) { found.push(variable); } }
+                _ => { }
+            }
+        }
+        return found;
+    }
+
+    /// What a value of `wanted` may be computed by calling: a
+    /// function-typed parameter (its variable) or a free function returning
+    /// a function type (`-1 - ` its place), whose value returns `wanted`,
+    /// that one more call of keeps this function's work under its limit.
+    internal invocable_values(&this, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        if (!this.makes_function_values() || !this.budget.affordable(FUNCTION_VALUE_COST_LIMIT)) { return found; }
+        for (variable in this.environment.in_scope().iter()) {
+            const declared: Variable = this.program.variable_at(variable);
+            match (declared.role) {
+                VariableRole::Parameter => {
+                    if (declared.value_type.is_function() && this.program.signature_of(declared.value_type).returns.same(wanted)) {
+                        found.push(variable);
+                    }
+                }
+                _ => { }
+            }
+        }
+        mut index: i64 = 0;
+        while (index < this.program.functions.length()) {
+            const candidate: Function = this.program.function_at(index);
+            if (candidate.returns.is_function() && this.program.signature_of(candidate.returns).returns.same(wanted)
+                    && this.callees(candidate.returns).contains(&index)
+                    && this.budget.affordable(candidate.cost + FUNCTION_VALUE_COST_LIMIT)) {
+                found.push(-1 - index);
+            }
+            index = index + 1;
+        }
+        return found;
+    }
+
+    /// A call of what `invocable` names (`invocable_values`).
+    internal invocation(mut &this, invocable: i64, depth: i64) -> i64 {
+        const callee: i64 = if (invocable >= 0) { this.read(invocable) } else { this.call(-1 - invocable, depth) };
+        return this.invoke_value(callee, depth);
+    }
+
+    /// A call of the function value `callee` with an argument for each
+    /// parameter, charged the function-value limit.
+    internal invoke_value(mut &this, callee: i64, depth: i64) -> i64 {
+        const signature: Signature = this.program.signature_of(this.program.expression_at(callee).value_type);
+        this.budget.charge(FUNCTION_VALUE_COST_LIMIT);
+        mut arguments: Array<i64> = Array::<i64>::new();
+        while (arguments.length() < signature.parameter_count) {
+            arguments.push(this.typed_place(this.program.signature_parameter(signature, arguments.length()), depth));
+        }
+        const first: i64 = this.program.list_run(&arguments);
+        return this.node(ExpressionKind::Invoke(callee, first, signature.parameter_count), signature.returns);
+    }
+}

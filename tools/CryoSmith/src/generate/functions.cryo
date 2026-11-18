@@ -31,12 +31,14 @@ implement struct Generator {
             RandomStream::for_method(this.options.seed, this.program.functions.length())
         };
         mut parameter_types: Array<ValueType> = Array::<ValueType>::new();
+        mut takes_function: boolean = false;
         if (!is_main) {
             const parameter_count: i64 = if (owner < 0) { 1 + this.random.below(4) } else { this.random.below(4) };
             while (parameter_types.length() < parameter_count) { parameter_types.push(this.any_type()); }
+            if (owner < 0) { takes_function = this.add_function_parameter(&parameter_types); }
         }
         this.define_with(number, owner, receiver, &parameter_types);
-        if (!is_main && this.options.features.has(Feature::Overloads)) {
+        if (!is_main && !takes_function && this.options.features.has(Feature::Overloads)) {
             this.define_overloads(this.program.functions.length() - 1);
         }
     }
@@ -74,7 +76,8 @@ implement struct Generator {
         this.returns = match (receiver) {
             Receiver::Exclusive => { ValueType::Void }
             Receiver::Static    => { (if (this.random.chance(50)) { ValueType::Record(owner) } else { this.any_type() }) }
-            _                   => { (if (is_main) { ValueType::I32 } else { this.any_type() }) }
+            Receiver::Free      => { (if (is_main) { ValueType::I32 } else { this.free_return_type() }) }
+            _                   => { this.any_type() }
         };
         mut statements: Array<i64> = Array::<i64>::new();
         const body_start: i64 = this.environment.mark();
@@ -140,7 +143,9 @@ implement struct Generator {
             const parameter: Variable = this.program.variable_at(this.program.list_at(called.first_parameter + index));
             const decides: boolean = parameter.value_type.same(ValueType::TypeParameter);
             const wanted: ValueType = if (decides) { type_argument } else { parameter.value_type };
-            if ((decides && inferred) || overloaded) {
+            if (wanted.is_function()) {
+                arguments.push(this.function_value(wanted, true));
+            } else if ((decides && inferred) || overloaded) {
                 arguments.push(this.deciding_value(wanted, if (depth < 0) { 0 } else { depth }));
             } else if (this.constant_wanted(wanted)) {
                 arguments.push(this.constant(wanted));

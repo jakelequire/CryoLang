@@ -1,0 +1,114 @@
+///! An audit of the model's function values: every value given to a
+///! function-typed parameter costs at most `FUNCTION_VALUE_COST_LIMIT`, and
+///! every function value returned also captures nothing and reads no
+///! parameter, which may hold a capturing closure in a copy of the function
+///! made for one.
+
+namespace cryosmith::selftest::function_values;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+
+import cryosmith::configuration::{ GenerationOptions };
+import cryosmith::generate::{ Generator };
+import cryosmith::guarantees::{ FUNCTION_VALUE_COST_LIMIT };
+import cryosmith::model::{ Closure, ExpressionKind, Function, Program, StatementKind, ValueType, VariableRole };
+import cryosmith::selftest::runner::{ SelfTest };
+
+/// How many programs the function-value audit reads.
+const FUNCTION_VALUE_AUDITED_PROGRAMS: u64 = 200;
+
+/// The audit of one program's function values.
+internal type struct FunctionValueAudit {
+    /// The number of function values the program passes and returns, each
+    /// within the rules; or the first that is not.
+    internal static check(program: &Program) -> Result<i64, String> {
+        mut checked: i64 = 0;
+        mut index: i64 = 0;
+        while (index < program.expressions.length()) {
+            match (program.expression_at(index).kind) {
+                ExpressionKind::Call(callee, first, count) => {
+                    const parameters: Function = program.function_at(callee);
+                    mut position: i64 = 0;
+                    while (position < count) {
+                        const parameter_type: ValueType = program.variable_at(program.list_at(parameters.first_parameter + position)).value_type;
+                        if (parameter_type.is_function()) {
+                            const value: i64 = program.list_at(first + position);
+                            if (!FunctionValueAudit::passable(program, value, true)) {
+                                return Result::Err(f"expression {value} is passed to a function-typed parameter and breaks its rule");
+                            }
+                            checked = checked + 1;
+                        }
+                        position = position + 1;
+                    }
+                }
+                _ => { }
+            }
+            index = index + 1;
+        }
+        mut statement: i64 = 0;
+        while (statement < program.statements.length()) {
+            const returned: i64 = match (program.statement_at(statement).kind) {
+                StatementKind::Return(value) => { value }
+                StatementKind::ReturnIf(_, value) => { value }
+                _ => { -1 }
+            };
+            if (returned >= 0 && program.expression_at(returned).value_type.is_function()) {
+                if (!FunctionValueAudit::passable(program, returned, false)) {
+                    return Result::Err(f"expression {returned} is returned as a function value and breaks its rule");
+                }
+                checked = checked + 1;
+            }
+            statement = statement + 1;
+        }
+        return Result::Ok(checked);
+    }
+
+    /// Whether the function value at `value` costs at most the limit and,
+    /// unless `capturing`, captures nothing and is no parameter.
+    private static passable(program: &Program, value: i64, capturing: boolean) -> boolean {
+        return match (program.expression_at(value).kind) {
+            ExpressionKind::Closure(index) => { FunctionValueAudit::closure_passable(program.closure_at(index), capturing) }
+            ExpressionKind::Variable(variable) => {
+                match (program.variable_at(variable).role) {
+                    VariableRole::Parameter => { capturing }
+                    VariableRole::Local => { FunctionValueAudit::closure_passable(FunctionValueAudit::held_by(program, variable), capturing) }
+                    _ => { false }
+                }
+            }
+            _ => { false }
+        };
+    }
+
+    /// Whether `closure` costs at most the limit and, unless `capturing`,
+    /// captures nothing.
+    private static closure_passable(closure: Closure, capturing: boolean) -> boolean {
+        return closure.cost <= FUNCTION_VALUE_COST_LIMIT && (capturing || closure.capture_count == 0);
+    }
+
+    /// The closure the local `variable` holds.
+    private static held_by(program: &Program, variable: i64) -> Closure {
+        mut index: i64 = 0;
+        while (program.closure_at(index).local != variable) { index = index + 1; }
+        return program.closure_at(index);
+    }
+}
+
+implement struct SelfTest {
+    /// Every function value passed or returned keeps its rule, and the
+    /// audit finds function values to check.
+    internal function_value_audit(mut &this) -> void {
+        mut checked: i64 = 0;
+        mut seed: u64 = 1;
+        while (seed <= FUNCTION_VALUE_AUDITED_PROGRAMS) {
+            const program: Program = Generator::generate(GenerationOptions::new(seed));
+            match (FunctionValueAudit::check(&program)) {
+                Result::Ok(count)   => { checked = checked + count; }
+                Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }
+            }
+            seed = seed + 1;
+        }
+        this.expect(checked > 0, String::from_str(Str::new("the function-value audit found no function value passed or returned")));
+    }
+}
