@@ -562,7 +562,8 @@ the comparison reads:
   must pass it, its objects are left out of the comparison, and at least one
   of them must have moved; a declared project whose objects are all
   unchanged fails, and so does any object that moved in a project nothing
-  declares.
+  declares.  `moved:examples/<name>` says the same of an example both
+  compilers build, judged in the examples' comparison.
 - `moved-archive:<module>` in `tests/started-passing` - a standard-library
   module, written by its full name (`moved-archive:std::time::clock`), whose
   objects in the stdlib archives the change moves on purpose: a compiler

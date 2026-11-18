@@ -399,7 +399,7 @@ const &int         // the same type as &int
 
 The receiver shape on a method is part of its signature: a `&this` method may not modify the receiver; a `mut &this` method may. Callers see this distinction without reading the body.
 
-**Read-only places.** A place reached through a read-only borrow - a `&T`, a `virtual &Trait`, or `this` in a `&this` method - or through a read-only pointer `T*` is not written: assigning it, giving it a compound assignment (`+=` and the rest) and calling a `mut &this` method on it are each refused (`E0250`). The last indirection on the way to a place decides, so `r.x = 1` with `r: &(mut Foo*)` writes through the writable pointer, and `r.scale(2)` with `r: &virtual mut &Shape` through the writable object, while `p.x = 1` with `p: Foo*` is refused. A `*` strips one level, so the place `*p` is decided by the outermost indirection of `p` alone: `*p = q` with `p: &(mut Foo*)` writes the borrowed pointer and is refused, and with `p: mut (&Foo)*` writes the borrow the pointer points at. Indexing a pointer is the same, since `p[i]` is `*(p + i)`: `p[0] = q` with `p: mut (u8*)*` writes the writable outer level, and with `p: (mut u8*)*` is refused. A `mut &this` method is not called on a `const` binding either. A binding a `match` makes follows the value it matched: a match on a writable value, a `mut &T`, a `mut T*` or `&x` of a writable `x` binds writable names, and a match on a `&T`, a `T*` or a `const` binding read-only ones; a `mut` written before the name does not change that.
+**Read-only places.** A place reached through a read-only borrow - a `&T`, a `virtual &Trait`, or `this` in a `&this` method - or through a read-only pointer `T*` is not written: assigning it, giving it a compound assignment (`+=` and the rest) and calling a `mut &this` method on it are each refused (`E0250`). The last indirection on the way to a place decides, so `r.x = 1` with `r: &(mut Foo*)` writes through the writable pointer, and `r.scale(2)` with `r: &virtual mut &Shape` through the writable object, while `p.x = 1` with `p: Foo*` is refused. A `*` strips one level, so the place `*p` is decided by the outermost indirection of `p` alone: `*p = q` with `p: &(mut Foo*)` writes the borrowed pointer and is refused, and with `p: mut (&Foo)*` writes the borrow the pointer points at. Indexing a pointer is the same, since `p[i]` is `*(p + i)`: `p[0] = q` with `p: mut (u8*)*` writes the writable outer level, and with `p: (mut u8*)*` is refused. A `mut &this` method is not called on a `const` binding either. A binding a `match` makes follows the value it matched: a match on a writable value, a `mut &T`, a `mut T*` or `&x` of a writable `x` binds writable names, and a match on a `&T`, a `T*` or a `const` binding read-only ones; a `mut` written before the name does not change that. What a write to a binding reaches - the matched value or a copy of its own - is said in [section 7.2](#72-enum-destructuring).
 
 **Write access is not made from read access.** `&x` takes its mutability from what is wanted of it and from `x`: where a value that writes is wanted - a `mut &T`, a `virtual mut &Trait`, or a `mut T*`, as a parameter, a declared type, a `return` or an assigned place - `&x` is a writable borrow, and is refused (`E0251`) when `x` is a read-only place (held by a `const` binding, or reached through a `&T`, a `virtual &Trait`, a `T*` or a `&this` receiver). With nothing such wanted, `&x` is exactly as writable as `x`. So a writable borrow is written `&x` too, and `&mut x` is refused at the `mut` (`E0101`). A `&T` value converts to a `T*` and never to a `mut T*` or a `mut &T`: passing one where those are wanted is refused (`E0251`), and `as` is the one way to a writable pointer from it. `mut &T` converts to `&T`, and to `mut T*` and `T*`. `&a[i]` and `&*b` borrowed for writing go through `index_mutable` and `deref_mutable` ([section 10.6](#106-operator-overloading)).
 
@@ -1798,6 +1798,23 @@ function describe(s: Shape) -> void {
 ```
 
 In each arm, the variables are introduced for the payload of that variant. The compiler enforces that the count and types match the variant's declaration.
+
+**A binding of a `Copy` value is a copy taken when the arm is entered.** In a `match` on a variable by value, a binding not written `mut` whose payload is `Copy` holds the payload as it was when the arm was chosen: assigning the variable inside the arm does not change the binding, and writing the binding (where the variable is writable) does not change the variable. A name binding the whole subject (`whole => ..`) is the same. A binding written `mut`, and a binding of a payload that is not `Copy`, names the payload where it lies in the variable: a write to it writes the variable, and assigning the variable is seen through it. A `match` through a borrow or a pointer (`match (&x)`, `match (&this)`, `match (p)` with `p: T*`) binds every name inside the value it reaches, so `&value` of a binding points into that value.
+
+```cryo
+mut v: Outer = Outer::X(7, Inner::A(11, 13));
+match (v) {
+    Outer::X(a, b) => {
+        v = Outer::Y(1);
+        // `a` is still 7 and `b` still Inner::A(11, 13)
+    }
+    Outer::Y(_) => { }
+}
+match (v) {
+    Outer::Y(mut n) => { n = 5; }   // writes v: it is now Outer::Y(5)
+    Outer::X(_, _) => { }
+}
+```
 
 If you don't need a payload, use `_`: `Option::Some(_) => { ... }`.
 
