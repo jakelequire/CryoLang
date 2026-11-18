@@ -562,6 +562,27 @@ type struct ExprOps {
 
         const alloca: LValue = this.flow.create_entry_alloca(current_fn, var_name, llvm_ty);
 
+        // Drop-flag slot: default it to false in the entry block so the
+        // conditional drop's read is defined on every path, even ones that
+        // skip this declaration (see ValueTable::set_persistent and
+        // FlowEmitter::zero_init_in_entry).
+        if (persistent_name) {
+            this.flow.zero_init_in_entry(current_fn, alloca, llvm_ty);
+        }
+
+        if (has_init && init_val.is_valid()) {
+            this.builder.build_store(this.convert_number(init_val, init_type, llvm_ty), alloca);
+        }
+        this.bind_local_storage(sym, ty, alloca, persistent_name);
+    }
+
+    /// Make `storage`, an entry-block slot of `ty`'s type, the local `sym`.
+    /// A local declared with an array literal is given the literal's own
+    /// slot, which nothing else names, rather than a second slot the
+    /// literal is copied into: the copy doubles the frame and becomes a
+    /// `memcpy` call, which a freestanding link has no C library to satisfy.
+    bind_local_storage(mut &this, sym: SymbolID, ty: TypeRef, storage: LValue,
+                       persistent_name: boolean) -> void {
         // `![align(N)]` raises a type's alignment, but LLVM sizes an alloca
         // from the ABI alignment of the MAPPED type, which carries no record
         // of the attribute - the padding that makes the type N bytes wide does
@@ -574,30 +595,18 @@ type struct ExprOps {
         const decl_ty: Type* = this.arena_type(ty);
         if (decl_ty != null) {
             const want_align: u64 = decl_ty.alignment();
-            if (want_align > 0 && want_align > alloca.alignment() as u64) {
-                alloca.set_alignment(want_align as u32);
+            if (want_align > 0 && want_align > storage.alignment() as u64) {
+                storage.set_alignment(want_align as u32);
             }
-        }
-
-        // Drop-flag slot: default it to false in the entry block so the
-        // conditional drop's read is defined on every path, even ones that
-        // skip this declaration (see ValueTable::set_persistent and
-        // FlowEmitter::zero_init_in_entry).
-        if (persistent_name) {
-            this.flow.zero_init_in_entry(current_fn, alloca, llvm_ty);
-        }
-
-        if (has_init && init_val.is_valid()) {
-            this.builder.build_store(this.convert_number(init_val, init_type, llvm_ty), alloca);
         }
 
         // Drop-flag locals register persistently: the conditional drop that
         // reads the flag can execute in an enclosing scope, after the block
         // that declared it has popped (the alloca itself is function-scoped).
         if (persistent_name) {
-            this.values.set_persistent(sym, alloca);
+            this.values.set_persistent(sym, storage);
         } else {
-            this.values.set(sym, alloca);
+            this.values.set(sym, storage);
         }
     }
 

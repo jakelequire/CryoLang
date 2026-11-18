@@ -403,7 +403,7 @@ The receiver shape on a method is part of its signature: a `&this` method may no
 
 **Write access is not made from read access.** `&x` takes its mutability from what is wanted of it and from `x`: where a value that writes is wanted - a `mut &T`, a `virtual mut &Trait`, or a `mut T*`, as a parameter, a declared type, a `return` or an assigned place - `&x` is a writable borrow, and is refused (`E0251`) when `x` is a read-only place (held by a `const` binding, or reached through a `&T`, a `virtual &Trait`, a `T*` or a `&this` receiver). With nothing such wanted, `&x` is exactly as writable as `x`. So a writable borrow is written `&x` too, and `&mut x` is refused at the `mut` (`E0101`). A `&T` value converts to a `T*` and never to a `mut T*` or a `mut &T`: passing one where those are wanted is refused (`E0251`), and `as` is the one way to a writable pointer from it. `mut &T` converts to `&T`, and to `mut T*` and `T*`. `&a[i]` and `&*b` borrowed for writing go through `index_mutable` and `deref_mutable` ([section 10.6](#106-operator-overloading)).
 
-**A reference is a view.** A reference names a value some other binding owns, so it may be kept only where the compiler can see it end before that owner does: a local, a parameter, a return value, or a field of another view. A *view type* is a reference (`&T`, `mut &T`, `&Slice<T>`), a closure that borrows ([section 2.5](#25-function-types)), an aggregate holding one, or a type declared `![view]` - a type built on raw pointers whose values point into storage they do not own, such as `Str` and the collections' iterators. A view is not kept by a type that is not one, a global, a `Box`, `Rc` or `Arc`, a `move` closure or another thread's body. A function that returns a view borrows from every reference argument it is given and from `this` when the receiver is `&this` or `mut &this`, so its result keeps all of them borrowed for as long as it is used; a view rooted in the function's own locals, by-value parameters or by-value receiver is never returned (`E0455`). How long a borrow lasts, and what it forbids, is [section 15.5](#155-memory-safety).
+**A reference is a view.** A reference names a value some other binding owns, so it may be kept only where the compiler can see it end before that owner does: a local, a parameter, a return value, or a field of another view. A *view type* is a reference (`&T`, `mut &T`, `&Slice<T>`), a closure that borrows ([section 2.5](#25-function-types)), an aggregate holding one, or a type that implements the marker trait `View` - which a type built on raw pointers whose values point into storage they do not own, such as `Str` and the collections' iterators, does by an empty implementation (`implement trait View for struct Str { }`, [section 15.5](#155-memory-safety)). A view is not kept by a type that is not one, a global, a `Box`, `Rc` or `Arc`, a `move` closure or another thread's body. A function that returns a view borrows from every reference argument it is given and from `this` when the receiver is `&this` or `mut &this`, so its result keeps all of them borrowed for as long as it is used; a view rooted in the function's own locals, by-value parameters or by-value receiver is never returned (`E0455`). How long a borrow lasts, and what it forbids, is [section 15.5](#155-memory-safety).
 
 Reading the value a reference refers to is explicit in arithmetic and comparison: `*x == 7`, `*x % 2`. Writing `x == 7` or `x % 2` with `x: &int` is an error, never a comparison of the reference itself ([section 5.2](#52-comparison)). Member access reads through the reference: `h.tag` with `h: &Heap`.
 
@@ -1668,9 +1668,10 @@ function add(a: int, b: int) -> int {
 - `delete`, and the allocator intrinsics that hand out or take back raw memory (`malloc`, `free`, `realloc`);
 - `as` from an integer to a pointer, and `mem::transmute`;
 - reading a field of a `union`;
-- calling an `extern` function, or a function declared `![unsafe]` - one whose contract its caller keeps, such as `Slice::from_raw` (a length the pointer's storage really has) and `pointer::read` (a value taken out of storage that will not release it again);
-- inline `asm`;
-- declaring a type `![send]` or `![sync]` ([section 15.4](#154-the-send-and-sync-traits)).
+- calling an `extern` function, or a function declared `unsafe function` - one whose contract its caller keeps, such as `Slice::from_raw` (a length the pointer's storage really has) and `pointer::read` (a value taken out of storage that will not release it again);
+- inline `asm`.
+
+`unsafe` is written in two more places, each a keyword before the declaration whose promise the program keeps, as `async` is written before a function. `unsafe function name(...)` declares a function whose caller keeps its contract, so a call to it is an unsafe operation; its body is checked as any other, and the unsafe operations it performs are each written in an `unsafe { }` block of their own. `unsafe implement trait Send for struct Box<T> where T: Send { }` declares that a type built on raw pointers may be moved to another thread (`Sync`: shared with one), which the compiler cannot see from its fields ([section 15.4](#154-the-send-and-sync-traits)); `Send` and `Sync` are implemented only so.
 
 ```cryo
 import std::core::intrinsics::{ malloc, free };
@@ -1688,7 +1689,7 @@ function fill(count: u64) -> u8 {
 
 **`unsafe` relaxes nothing else.** Every other check stays in force inside the block - use after a move, a value released twice, a reference outliving what it names, the borrow rules, bounds, initialisation. An operation that is refused outside `unsafe` for any reason but being unsafe is refused inside it too, so wrapping code in `unsafe` never silences a diagnostic it did not name. Making a raw pointer, copying one and comparing one are safe and need no block; so is `null` as a value.
 
-An unsafe operation outside `unsafe` is reported as a warning (`W0019`) while existing code moves its operations into blocks, and becomes an error (`E0462`) when the standard library, the compiler and the tools build with none. *Not yet enforced; see the rollout in [section 15.5](#155-memory-safety).*
+An unsafe operation outside `unsafe` is reported as a warning (`W0019`) while existing code moves its operations into blocks, and becomes an error (`E0462`) when the standard library, the compiler and the tools build with none. *Not yet enforced, and `unsafe function` and `unsafe implement` are not yet accepted; see the rollout in [section 15.5](#155-memory-safety).*
 
 ### 6.12 Inline Assembly
 
@@ -4213,10 +4214,16 @@ What the rule does **not** do is make `Send` a safety guarantee:
   neither: the compiler cannot see who else writes what a `T*` points at, so a
   pointer handed to another thread is a data race waiting for its other end. A
   type built on raw pointers that shares them soundly - `Box`, `Arc`, `Array`,
-  `String`, `channel::Sender` - says so by `![send]` and `![sync]` on its
-  declaration, which are unsafe declarations ([section 6.11](#611-unsafe-blocks)):
-  the type's own `unsafe` code is what keeps the promise. *Not yet enforced; see
-  the rollout in [section 15.5](#155-memory-safety).*
+  `String`, `channel::Sender` - says so by implementing the marker traits, an
+  unsafe declaration ([section 6.11](#611-unsafe-blocks)) with an empty body:
+  `unsafe implement trait Send for struct Array<T> where T: Send { }`. The
+  type's own `unsafe` code is what keeps the promise, and the bound limits it to
+  the instances whose parts keep it too. Written without `unsafe`, an
+  implementation of `Send` or `Sync` is refused. The structural rule then
+  answers for every other type, and a type built on raw pointers that implements
+  neither trait - `Rc`, the lock guards - is neither. *Not yet enforced (today a
+  written implementation has no effect, as above); see the rollout in
+  [section 15.5](#155-memory-safety).*
 - **The deny-list is a fixed list, not a derivation.** A new thread-unsafe
   type is `Send` until someone adds it.
 - **Lock constructors do not yet carry `T: Send` bounds**, so a
@@ -4228,8 +4235,8 @@ pointer whose target is not thread-safe, the obligation is the author's.
 
 ### 15.5 Memory safety
 
-**The guarantee.** A program in which no `unsafe` block, `![unsafe]` function or
-`![send]`/`![sync]` declaration is written - its own code; the standard library's
+**The guarantee.** A program in which no `unsafe` block, `unsafe function` or
+`unsafe implement` is written - its own code; the standard library's
 `unsafe` code is the library's promise - does not read or write memory that is
 released, was never written, or lies outside the value it was reached from; does not
 release a value twice; and does not let two threads write, or one write and another
@@ -4248,7 +4255,13 @@ The rules, each with where it is stated:
 3. **Views.** A reference, and any type holding one, is a view, kept only by a local,
    a parameter, a return value or another view ([section 2.3](#23-references)). A view
    in a field of a type that is not one, a global, a `Box`, `Rc` or `Arc`, a `move`
-   closure or a thread's body is refused (`E0461`).
+   closure or a thread's body is refused (`E0461`). Being a view is the marker trait
+   `View` (`std::core::marker`), decided from a type's parts as `Copy` is: a
+   reference, a borrowing closure and an aggregate with a view among its parts are
+   views. A type built on raw pointers whose values point into storage they do not
+   own is a view by an empty implementation, `implement trait View for struct Str { }`,
+   which needs no `unsafe`, since it only narrows where the type's values may be kept.
+   No declaration makes a type with a view among its parts anything else.
 4. **Returns borrow their arguments.** A view a function returns borrows from every
    reference argument and from a borrowed `this`. One rooted in the function's own
    locals, by-value parameters or by-value receiver is refused (`E0455`).
@@ -4280,8 +4293,9 @@ The rules, each with where it is stated:
 7. **Unsafe operations** are allowed only inside `unsafe`, and `unsafe` relaxes no
    other rule ([section 6.11](#611-unsafe-blocks)).
 8. **Threads.** A value reaches another thread only if it is `Send`, and is shared
-   with one only if it is `Sync`; a raw pointer is neither unless the type holding it
-   is declared so ([section 15.4](#154-the-send-and-sync-traits)).
+   with one only if it is `Sync`; a raw pointer is neither, and a type holding one is
+   either only by an `unsafe implement` of the trait
+   ([section 15.4](#154-the-send-and-sync-traits)).
 9. **Run-time checks.** Indexing, division, shifts, and iteration over the standard
    collections are checked as described above; a collection counts its changes, and
    an iterator or element reference that finds the count moved panics with
@@ -4301,7 +4315,7 @@ standard library, the compiler and the tools build with none:
 
 | phase | rules | today |
 |---|---|---|
-| 1 | initialisation of every local (rule 2: `E0219`, and warning `W0018` for a `Copy` local until it becomes `E0219`); a reference carried out of its function through a local, a by-value parameter or a by-value receiver (rule 4, `E0455`); generic bodies checked once against their own type parameters; the shift check; `unsafe` no longer accepting the reads of [section 15.3](#153-move-checking) that release a value twice | initialisation enforced (`W0018` for `Copy` locals); the rest not yet |
+| 1 | initialisation of every local (rule 2: `E0219`, and warning `W0018` for a `Copy` local until it becomes `E0219`); a reference carried out of its function through a local, a by-value parameter or a by-value receiver (rule 4, `E0455`); generic bodies checked once against their own type parameters; the shift check; `unsafe` no longer accepting the reads of [section 15.3](#153-move-checking) that release a value twice | initialisation enforced (`W0018` for `Copy` locals, which becomes `E0219` after one merge to the main line has carried it with none reported); the rest not yet |
 | 2 | unsafe operations (rule 7): warning `W0019`, then `E0462` | not yet |
 | 3 | views (rule 3): warning `W0020`, then `E0461`; collections hand out `&T` instead of `T*` | not yet |
 | 4 | loans and shared-or-writable (rules 5 and 6): warnings `W0021` and `W0022`, then `E0450` and `E0451` | not yet |
