@@ -298,6 +298,25 @@ parameter's type generated as a call's argument is, and is observed by one
 such call where its block observes its locals. It is never `mut`, so it is
 never assigned.
 
+**Captures.** With `closure-captures`, six closures in ten capture one or
+two values the enclosing function names where the closure is made: a
+parameter, a local, a loop counter or a `match` binding holding a scalar, a
+struct or an enum (`guarantees/capture.cryo`). Every such value is `Copy`,
+so it is copied into the closure where the closure is made, whether or not
+it is written `move` (docs/cryo.md section 2.5), and a later assignment of
+a `mut` local it was taken from does not reach it. The captured names are
+bound in the closure's scope above its floor, so the body may read them as
+it reads its parameters, and the body observes each before its value,
+`const v4 = (q0: u8) -> u16 { observed = mix(observed, (v2 as u64));
+return .. };`, so every captured value reaches the hash at every call. A
+closure that captures is a value of its own type, which a variable of
+function type cannot hold (E0458), so its local is declared with no type.
+Nothing is captured by reference: `this` is never captured (a closure
+holding the receiver would hold a view of it while the method writes it),
+a closure local is never captured, and `observed`, a global, is written
+where it stands. So no closure holds a reference, and none outlives what
+it was made from; the closure stays in its local, called in its scope.
+
 A `match` statement's arm may assign the local its subject reads. Its
 bindings are never written `mut` and their payloads are `Copy`, so each is
 a copy taken when the arm is entered (docs/cryo.md, enum destructuring)
@@ -391,6 +410,12 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   each of them has the type argument's type and they agree; nothing else
   the call or literal holds names a type parameter. One that writes its
   type argument may pass anything that converts to it.
+- **Captures are copies.** A closure captures only what `Capture::admits`:
+  a parameter, local, counter or binding of a `Copy` value type, in scope
+  where the closure is made. Its body reads only what it captures, its own
+  parameters and the bindings its own `match`es make; the self-test's
+  capture audit walks every closure's body to hold it to that, and finds
+  every capture observed (section 3.4).
 - A function's body ends with a `return` of its type, or with nothing when
   it returns `void`; `main` never returns early, so its final print always
   runs.
@@ -434,7 +459,8 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   fields (`v2.f1.f0`); a struct a call returns is bound to a local first, so
   the call runs once.
 - Each block ends by observing every name it declared, a function body ends
-  by observing its parameters (and a method's, its receiver), and `main` ends
+  by observing its parameters (and a method's, its receiver), a closure's
+  body by observing what it captures before its value, and `main` ends
   by observing one call of each helper the cost model allows, so every value
   a program computes reaches the hash. A nested block spends at most half the
   statements left, so no function is one untaken branch.
@@ -487,7 +513,8 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. `default,no-nested-patterns` generates
+  generator's text, header aside. `default,no-closure-captures` generates
+version 19's text, and `default,no-nested-patterns` generates
   version 14's text, `default,no-nested-patterns,no-generic-enums`
   version 13's, and `default,no-enum-payloads` (which declares no
   generic enum either) version 12's. `default,no-enums` generates version 9's
@@ -519,8 +546,8 @@ every feature of the current stage; `no-<name>` removes one.
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
 | 3 | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
 | 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
-| 5 (this one) | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2). Still to come: closures capturing locals, closures passed to function-typed parameters and returned, closures in generic bodies |
-| 6 | traits, classes and dynamic dispatch: implementations, default methods, calls through a bound and through a trait object |
+| 5 (this one) | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type. Still to come: closures passed to function-typed parameters and returned, closures in generic bodies |
+| 6 | traits and dynamic dispatch: implementations, default methods, calls through a bound and through a trait object |
 | 7 | ownership: moves, drops (a drop log folded into the hash), references, `Box` and `Rc`, `Option` and `Result` |
 | 8 | strings, arrays and collections |
 
@@ -608,6 +635,11 @@ statement budget of one function, default 24), `--no-header`, and
 - **The bound audit** reads every generic signature's `T` parameters and
   counts their uses in its body, a use inside a loop twice; one used more
   than once needs `Copy` in the bound (section 3.2).
+- **The capture audit** walks every closure of 200 programs in the model:
+  each variable its body reads is one it captures, one of its parameters or
+  a binding of a `match` inside it, and each capture is read by one of the
+  body's observations - the capture, a field of it, or the `match` giving
+  its variant number (section 3.2).
 
 ## 8. Architecture
 
@@ -621,7 +653,7 @@ layers, lowest first:
 | `random/` | `RandomStream`: every draw, and the seed of each part's stream (section 3.5) |
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
-| `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures and `Exhaustiveness`'s arms (3.2) |
+| `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures, `Exhaustiveness`'s arms and `Capture`'s captured values (3.2) |
 | `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
@@ -721,18 +753,29 @@ place.
    passed to function-typed parameters and called. `guarantees/`: a
    closure's cost is its body's, charged at each call; a capture is read,
    never moved twice. `typing/`: a closure's own scope over its captures.
-   (In progress: `closures`, closures capturing nothing, is done.)
-4. **Stage 6: traits, classes and dynamic dispatch.** `model/`: traits
-   with required and default methods, implementations for structs and
-   enums, classes, trait objects. `generate/`: calls through a bound and
-   through a trait object. `guarantees/`: every call resolves to one
-   implementation; the hash is the same whichever way it is dispatched.
+   (In progress: `closures`, closures capturing nothing, and
+   `closure-captures`, closures copying the enclosing function's values,
+   are done.) Every closure generated is valid under the memory-safety
+   plan as well as today's rules: it captures only `Copy` values, by copy,
+   and none holding a reference is stored in a struct or a global or
+   returned past what it refers to.
+4. **Stage 6: traits and dynamic dispatch.** Classes were removed from
+   the language, so this stage has none. `model/`: traits with required
+   and default methods, implementations for structs and enums, trait
+   objects. `generate/`: calls through a bound and through a trait object.
+   `guarantees/`: every call resolves to one implementation; the hash is
+   the same whichever way it is dispatched.
 5. **Stage 7: ownership.** `model/`: references (`&`, `mut &`) as values,
    `Box`, `Rc`, `Option`, `Result`, types with a drop. `generate/`: moves,
    borrows, early drops. `guarantees/`: no use after a move and no borrow
    outliving its owner, decided by the generator's own ownership state in
    `typing/`; a drop log folded into the hash, so the order of drops is
-   checked by both optimisation levels agreeing.
+   checked by both optimisation levels agreeing. This stage also generates
+   `match` arms that assign the subject a value different from the one
+   matched (`match (v) { E::X(a) => { v = E::Y(1); .. a .. } }` with the
+   new value drawn apart from the old), so the rule that a binding is a
+   copy taken on entering its arm is exercised; most assignments generated
+   today write the subject's own value back.
 6. **Stage 8: strings, arrays and collections.** `model/`: `Str`,
    `String`, fixed arrays, `Array`, `HashMap`. `generate/`: building,
    indexing within bounds, iterating. `guarantees/`: an index is in range

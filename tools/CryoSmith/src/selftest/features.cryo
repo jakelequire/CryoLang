@@ -72,6 +72,45 @@ implement struct SelfTest {
         this.switch(Feature::Closures, [Str::new("(q0: "), Str::new(" = () -> ")]);
         this.constants_switch();
         this.overloads_switch();
+        this.captures_switch();
+    }
+
+    /// `closure-captures`: with it on, some program declares a local with
+    /// no type, `const v3 = (q0: u8) -> ..`, which only a capturing closure
+    /// is held by; with it off, none does.
+    private captures_switch(mut &this) -> void {
+        mut seen: boolean = false;
+        mut leaked: boolean = false;
+        mut seed: u64 = 1;
+        while (seed <= SWITCH_PROGRAMS) {
+            const on: String = SelfTest::program(GenerationOptions::new(seed));
+            mut off_options: GenerationOptions = GenerationOptions::new(seed);
+            off_options.features = FeatureSet::parse(Str::new("default,no-closure-captures")).unwrap();
+            const off: String = SelfTest::program(off_options);
+            if (SelfTest::declares_untyped(SelfTest::body(on.as_str()))) { seen = true; }
+            if (SelfTest::declares_untyped(SelfTest::body(off.as_str()))) { leaked = true; }
+            seed = seed + 1;
+        }
+        this.expect(seen, String::from_str(Str::new("`closure-captures` on: no program declares a local with no type")));
+        this.expect(!leaked, String::from_str(Str::new("`closure-captures` off: a program still declares a local with no type")));
+    }
+
+    /// Whether `text` declares a local with no type: `const v`, digits,
+    /// then ` = `.
+    private static declares_untyped(text: Str) -> boolean {
+        const opening: Str = Str::new("const v");
+        mut rest: Str = text;
+        mut at: Option<i64> = rest.find(&opening);
+        while (at.is_some()) {
+            mut end: i64 = at.unwrap() + opening.length();
+            while (end < rest.length() && rest.byte_at(end).unwrap() >= '0' as u8 && rest.byte_at(end).unwrap() <= '9' as u8) {
+                end = end + 1;
+            }
+            rest = rest.byte_substring(end, rest.length());
+            if (rest.starts_with(&Str::new(" = "))) { return true; }
+            at = rest.find(&opening);
+        }
+        return false;
     }
 
     /// `overloads`: with it on, some program declares a free function and

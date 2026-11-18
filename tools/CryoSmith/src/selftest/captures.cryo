@@ -1,0 +1,192 @@
+///! An audit of the model's closures: a closure's body reads only what it
+///! captures, its own parameters and the bindings its own `match`es make,
+///! and it observes every value it captures before its value, so each
+///! reaches the hash at every call.
+///!
+///! A capture counts as observed only where an observation's value is read
+///! from it - the capture itself, a field of it, or the `match` over it that
+///! gives an enum's variant number - not wherever the body's value happens
+///! to read it.
+
+namespace cryosmith::selftest::captures;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+
+import cryosmith::configuration::{ GenerationOptions };
+import cryosmith::generate::{ Generator };
+import cryosmith::model::{ Closure, ExpressionKind, MatchArm, Program, StatementKind };
+import cryosmith::selftest::bindings::{ BindingAudit };
+import cryosmith::selftest::runner::{ SelfTest };
+
+/// How many programs the capture audit reads.
+const CAPTURE_AUDITED_PROGRAMS: u64 = 200;
+
+/// The audit of one program's closures.
+internal type struct CaptureAudit {
+    /// The number of values the program's closures capture, each observed
+    /// by its closure; or the first closure that reads a name it does not
+    /// hold or leaves a capture unobserved.
+    internal static check(program: &Program) -> Result<i64, String> {
+        mut observed: i64 = 0;
+        mut index: i64 = 0;
+        while (index < program.closures.length()) {
+            const closure: Closure = program.closure_at(index);
+            mut reads: Array<i64> = Array::<i64>::new();
+            mut held: Array<i64> = Array::<i64>::new();
+            CaptureAudit::run(program, closure.first_capture, closure.capture_count, &held);
+            CaptureAudit::run(program, closure.first_parameter, closure.parameter_count, &held);
+            CaptureAudit::walk(program, closure.body, &reads, &held);
+            CaptureAudit::walk_block(program, closure.observations, &reads, &held);
+            for (variable in reads.iter()) {
+                if (!held.contains(&variable)) {
+                    return Result::Err(f"closure {index} reads variable {variable}, which it neither captures nor declares");
+                }
+            }
+            mut position: i64 = 0;
+            while (position < closure.capture_count) {
+                const captured: i64 = program.list_at(closure.first_capture + position);
+                if (!CaptureAudit::observes(program, closure.observations, captured)) {
+                    return Result::Err(f"closure {index} does not observe its capture, variable {captured}");
+                }
+                observed = observed + 1;
+                position = position + 1;
+            }
+            index = index + 1;
+        }
+        return Result::Ok(observed);
+    }
+
+    /// Add the `count` entries from `first` in the index lists to `found`.
+    private static run(program: &Program, first: i64, count: i64, found: mut &Array<i64>) -> void {
+        mut position: i64 = 0;
+        while (position < count) {
+            found.push(program.list_at(first + position));
+            position = position + 1;
+        }
+    }
+
+    /// Add the variables read by the observations of the block from
+    /// `first` to `reads`, and the bindings they make to `held`.
+    private static walk_block(program: &Program, first: i64, reads: mut &Array<i64>, held: mut &Array<i64>) -> void {
+        mut current: i64 = first;
+        while (current >= 0) {
+            match (program.statement_at(current).kind) {
+                StatementKind::Observe(value) => { CaptureAudit::walk(program, value, reads, held); }
+                _ => { }
+            }
+            current = program.statement_at(current).next;
+        }
+    }
+
+    /// Add the `count` expressions from `first` in the index lists, every
+    /// `stride` places from `offset`, to the walk.
+    private static walk_run(program: &Program, first: i64, count: i64, stride: i64, offset: i64, reads: mut &Array<i64>, held: mut &Array<i64>) -> void {
+        mut position: i64 = 0;
+        while (position < count) {
+            CaptureAudit::walk(program, program.list_at(first + position * stride + offset), reads, held);
+            position = position + 1;
+        }
+    }
+
+    /// Add every variable the expression at `value` reads to `reads`, and
+    /// every binding a `match` inside it makes to `held`.
+    private static walk(program: &Program, value: i64, reads: mut &Array<i64>, held: mut &Array<i64>) -> void {
+        match (program.expression_at(value).kind) {
+            ExpressionKind::Variable(variable) => { reads.push(variable); }
+            ExpressionKind::Unary(_, operand) => { CaptureAudit::walk(program, operand, reads, held); }
+            ExpressionKind::Cast(operand) => { CaptureAudit::walk(program, operand, reads, held); }
+            ExpressionKind::Widen(operand) => { CaptureAudit::walk(program, operand, reads, held); }
+            ExpressionKind::Field(base, _) => { CaptureAudit::walk(program, base, reads, held); }
+            ExpressionKind::Binary(_, left, right) => {
+                CaptureAudit::walk(program, left, reads, held);
+                CaptureAudit::walk(program, right, reads, held);
+            }
+            ExpressionKind::Wrapping(_, left, right) => {
+                CaptureAudit::walk(program, left, reads, held);
+                CaptureAudit::walk(program, right, reads, held);
+            }
+            ExpressionKind::Mix(state, folded) => {
+                CaptureAudit::walk(program, state, reads, held);
+                CaptureAudit::walk(program, folded, reads, held);
+            }
+            ExpressionKind::Conditional(condition, then_value, else_value) => {
+                CaptureAudit::walk(program, condition, reads, held);
+                CaptureAudit::walk(program, then_value, reads, held);
+                CaptureAudit::walk(program, else_value, reads, held);
+            }
+            ExpressionKind::Call(_, first, count) => { CaptureAudit::walk_run(program, first, count, 1, 0, reads, held); }
+            ExpressionKind::GenericCall(_, _, _, first, count) => { CaptureAudit::walk_run(program, first, count, 1, 0, reads, held); }
+            ExpressionKind::MethodCall(receiver, _, first, count) => {
+                CaptureAudit::walk(program, receiver, reads, held);
+                CaptureAudit::walk_run(program, first, count, 1, 0, reads, held);
+            }
+            ExpressionKind::Invoke(callee, first, count) => {
+                CaptureAudit::walk(program, callee, reads, held);
+                CaptureAudit::walk_run(program, first, count, 1, 0, reads, held);
+            }
+            ExpressionKind::StructureLiteral(_, _, first, count) => { CaptureAudit::walk_run(program, first, count, 2, 1, reads, held); }
+            ExpressionKind::Variant(_, _, first, count) => { CaptureAudit::walk_run(program, first, count, 1, 0, reads, held); }
+            ExpressionKind::Match(subject, first, count) => {
+                CaptureAudit::walk(program, subject, reads, held);
+                mut arm: i64 = first;
+                while (arm < first + count) {
+                    const taken: MatchArm = program.arm_at(arm);
+                    BindingAudit::bound(program, taken.first_element, taken.element_count, held);
+                    CaptureAudit::walk_block(program, taken.observations, reads, held);
+                    CaptureAudit::walk(program, taken.body, reads, held);
+                    arm = arm + 1;
+                }
+            }
+            _ => { }
+        }
+    }
+
+    /// Whether the block from `first` observes a value read from
+    /// `variable`.
+    private static observes(program: &Program, first: i64, variable: i64) -> boolean {
+        mut current: i64 = first;
+        while (current >= 0) {
+            match (program.statement_at(current).kind) {
+                StatementKind::Observe(value) => {
+                    if (CaptureAudit::root(program, value) == variable) { return true; }
+                }
+                _ => { }
+            }
+            current = program.statement_at(current).next;
+        }
+        return false;
+    }
+
+    /// The variable the expression at `value` is read from - itself, a
+    /// field chain over it, or the `match` over it giving a variant
+    /// number - or -1.
+    private static root(program: &Program, value: i64) -> i64 {
+        return match (program.expression_at(value).kind) {
+            ExpressionKind::Variable(variable) => { variable }
+            ExpressionKind::Field(base, _) => { CaptureAudit::root(program, base) }
+            ExpressionKind::Match(subject, _, _) => { CaptureAudit::root(program, subject) }
+            _ => { -1 }
+        };
+    }
+}
+
+implement struct SelfTest {
+    /// Every closure reads only what it holds and observes every value it
+    /// captures, and the audit finds captures to check.
+    internal capture_audit(mut &this) -> void {
+        mut observed: i64 = 0;
+        mut seed: u64 = 1;
+        while (seed <= CAPTURE_AUDITED_PROGRAMS) {
+            const program: Program = Generator::generate(GenerationOptions::new(seed));
+            match (CaptureAudit::check(&program)) {
+                Result::Ok(count)   => { observed = observed + count; }
+                Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }
+            }
+            seed = seed + 1;
+        }
+        this.expect(observed > 0, String::from_str(Str::new("the capture audit found no closure that captures")));
+    }
+}
