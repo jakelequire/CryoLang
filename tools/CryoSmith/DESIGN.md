@@ -525,6 +525,39 @@ for references to borrow are kept (`Environment::keep`): never moved or
 released, so its calls of the helpers taking references always have a
 value to borrow.
 
+**Boxes.** With `boxes` (and `moves`), a type whose values move - a
+parameter's, a return's or a local's - is sometimes a holder of an owned
+struct rather than the struct itself (`drawn_moving`): `Box<D0>` or
+`Rc<D0>`, both in the prelude. A box is `Box::new(v)` around an owned
+value (moved in), a variable moved out of, a call, or an `if` choosing
+one; its value's fields are read through it by the dereference the box
+implements (`b.f0`, docs/cryo.md section 10.6), and through a `mut` local
+written (`b.f1 = ..;`), and dropping the box drops the value once. A
+shared owner is `Rc::new(v)` or `v.clone()` of a variable holding one -
+the variable borrowed for the statement, never moved there - and is
+observed by `v.strong_count()`, so the count each owner sees reaches the
+hash; the value is dropped with its last owner, so a count off by one
+shows as a drop missing or doubled. A shared owner is never read through:
+the standard library reaches its value only by a raw pointer, which the
+memory-safety plan puts behind `unsafe`.
+
+**Options.** With `options` (and `moves`, `enums` and `enum-payloads`),
+the holder is also `Option<D0>` or `Result<D0, u32>`: built holding a value
+(`Option::Some(v)`, `Result::Ok(v)`), empty (`Option::None`,
+`Result::Err(code)`, the code a `u32`), moved, returned by a call or chosen
+by an `if`. One is observed by a `match` on it in place, folding its
+value's fields or its error code; the subject is a variable, not consumed
+by the match (docs/cryo.md section 7.2), so it is dropped where its scope
+ends. An owned value is taken out of one in two ways. `v.unwrap()` moves
+`v` and is written only where `v` certainly holds a value: a `const` local
+declared with one built holding it (`Environment::mark_present`), so no
+unwrap panics. `(x)?` (docs/cryo.md section 5.6) stands only in a function
+returning an option where `x` is an option, or a result where `x` is a
+result, never in `main` or a closure's body; `x` is a variable moved out
+of, a call, or an `if` choosing between a value built holding one and
+none, so the function returns early on one path only and drops what it
+holds there. The holder audit (section 7) holds the model to these rules.
+
 A `match` statement's arm may assign the local its subject reads. Its
 bindings are never written `mut` and their payloads are `Copy`, so each is
 a copy taken when the arm is entered (docs/cryo.md, enum destructuring)
@@ -755,7 +788,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. Any list removing `drops` generates
+  generator's text, header aside. Any list removing `boxes` and
+  `options` (or `options`' `enums` or `enum-payloads`) generates version
+  31's text for that list. Any list removing `drops` generates
   version 30's text for that list, but for `main` with `references` on,
   whose locals for references to borrow are no longer moved; any list
   removing `references` generates version 29's text for that list; one removing
@@ -803,7 +838,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
 | 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
 | 6 | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods. Still to come: implementations for enums |
-| 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings; `references`: `&D0` and `mut &D0` parameters, `&D0` returns, kept shared or exclusive per statement; `drops`: `mem::drop`, discarded results, borrowed temporaries and whole stores through `mut &D0`. Still to come: `Box` and `Rc`, `Option` and `Result` |
+| 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings; `references`: `&D0` and `mut &D0` parameters, `&D0` returns, kept shared or exclusive per statement; `drops`: `mem::drop`, discarded results, borrowed temporaries and whole stores through `mut &D0`; `boxes`: `Box<D0>` read and written through, `Rc<D0>` cloned and counted; `options`: `Option<D0>` and `Result<D0, u32>` matched, unwrapped where certainly holding a value, and propagated with `?` |
 | 8 | strings, arrays and collections |
 
 Section 9 places each stage among the rest of the work, the tools that
@@ -918,6 +953,13 @@ statement budget of one function, default 24), `--no-header`, and
   exclusively, an exclusive reference passed on or a variable moved has
   no other use but an assignment to it; and no value a function returns
   as a reference borrows a variable of the function.
+- **The holder audit** reads the model of 200 programs: each `unwrap` is
+  of a `const` local declared with an option or a result built holding a
+  value; each `?` applies to an option or a result, yields the owned value
+  it holds, and stands in a function other than `main` that returns an
+  option or a result; each clone is of a shared owner; and the audit finds
+  some of each, and some box. The move audit counts an `unwrap` as a move,
+  and the loan audit a clone as a shared borrow.
 - **Borrow coverage**: of 40 programs, at least half of those declaring a
   trait object parameter pass `&v` to one, and likewise for a reference
   parameter.
@@ -935,7 +977,7 @@ layers, lowest first:
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
 | `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures, `Exhaustiveness`'s arms and `Capture`'s captured values (3.2) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits`, `moves` |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits`, `moves`, `references`, `drops`, `holders` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |
@@ -1067,12 +1109,13 @@ place.
    valid under the memory-safety plan's rules as well as today's: a
    reference lives only in a local, parameter or return, never outlives
    what it borrows, and is never shared and mutable at once, and nothing
-   needs `unsafe`. (In progress: `moves`, owned values moved between
-   locals, into calls and out of returns, each dropped into the hash,
+   needs `unsafe`. (Done: `moves`, owned values moved between locals,
+   into calls and out of returns, each dropped into the hash,
    `subject-assignments`, arms assigning their subject another variant,
-   and `references`, borrows given to reference parameters and references
-   returned from them, and `drops`, releases before scope exit, are done;
-   `Box` and `Rc`, and `Option` and `Result` remain.)
+   `references`, borrows given to reference parameters and references
+   returned from them, `drops`, releases before scope exit, `boxes`,
+   `Box` and `Rc`, and `options`, `Option` and `Result` with `unwrap`
+   and `?`.)
 6. **Stage 8: strings, arrays and collections.** `model/`: `Str`,
    `String`, fixed arrays, `Array`, `HashMap`. `generate/`: building,
    indexing within bounds, iterating. `guarantees/`: an index is in range
@@ -1103,7 +1146,11 @@ place.
 11. **A corpus gate in `make verify`.** A small fixed set of seeds at a
     pinned generator version, checked as `corpus-check` checks them, run
     by verify beside its other gates; a seed that fails is a compiler
-    finding, and a new generator version re-pins the set.
+    finding, and a new generator version re-pins the set. Once the
+    memory-safety plan's checker is on `main`, the corpus is also run
+    under it as a gate: every generated program must pass it unchanged,
+    with no `unsafe`, since the generator promises validity under that
+    plan's rules as well as today's.
 12. **The reference interpreter.** An evaluator over the program model
     (section 1) that computes the hash without compiling: an oracle that
     does not share the compiler's mistakes. CryoSmith gains an `evaluate`

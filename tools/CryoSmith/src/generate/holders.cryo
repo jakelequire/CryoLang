@@ -1,0 +1,280 @@
+///! Holders (stage 7): values that own an owned struct's value - a box
+///! (`Box<D0>`), a shared owner (`Rc<D0>`), an option (`Option<D0>`) and a
+///! result (`Result<D0, u32>`) - each moved as the owned value is, and the
+///! owned value dropped through it.
+///!
+///! With `boxes`, a box is built around an owned value and its fields read
+///! and written through it, and a shared owner is built around one and
+///! cloned from a variable holding another; the value is dropped once,
+///! with the box or with the last of its shared owners, and every shared
+///! owner is observed by how many owners share its value, so a count that
+///! is off shows in the hash.  With `options`, an option holds an owned
+///! value or none, and a result one or an error code; an owned value is
+///! taken out of one by `unwrap` only where it certainly holds one - a
+///! `const` local declared with a value built holding one - so no unwrap
+///! panics, and by `?` in a function returning an option (a result) from
+///! an option (a result) of any owned struct, returning early with the
+///! none or the error.  An option or a result is observed by a `match` on
+///! it, in place, folding its value's fields or its error code.
+
+namespace cryosmith::generate::holders;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature, FeatureSet };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::model::{ ExpressionKind, OwnedStructure, TypeArgumentSpelling, ValueType };
+
+/// How often, against a bare owned struct's 4, a holder of each kind the
+/// features allow is drawn where a type whose values move is.
+const HOLDER_WEIGHT: i64 = 2;
+
+implement struct Generator {
+    /// Whether options and results are generated: `options` is on, and so
+    /// are `enums` and `enum-payloads`, since one is observed by a `match`
+    /// binding the value it holds.
+    internal makes_options(&this) -> boolean {
+        const features: FeatureSet = this.options.features;
+        return features.has(Feature::Options) && features.has(Feature::Enums) && features.has(Feature::EnumPayloads);
+    }
+
+    /// A type whose values move, for a parameter, a return or a local: an
+    /// owned struct's, drawn, and with `boxes` or `options` sometimes a
+    /// holder of it.  Without either, the draws `moves` made alone.
+    internal drawn_moving(mut &this) -> ValueType {
+        const index: i64 = this.random.below(this.program.owned_structures.length());
+        const boxes: boolean = this.options.features.has(Feature::Boxes);
+        const options: boolean = this.makes_options();
+        if (!boxes && !options) { return ValueType::Owned(index); }
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(4);
+        weights.push(if (boxes) { HOLDER_WEIGHT } else { 0 });
+        weights.push(if (boxes) { HOLDER_WEIGHT } else { 0 });
+        weights.push(if (options) { HOLDER_WEIGHT } else { 0 });
+        weights.push(if (options) { HOLDER_WEIGHT } else { 0 });
+        return match (this.random.pick(&weights)) {
+            0 => { ValueType::Owned(index) }
+            1 => { ValueType::Boxed(index) }
+            2 => { ValueType::Counted(index) }
+            3 => { ValueType::Optional(index) }
+            _ => { ValueType::Fallible(index) }
+        };
+    }
+
+    /// Every type whose values move that the program makes: each owned
+    /// struct's, then with `boxes` and `options` each holder of one.
+    internal moving_types(&this) -> Array<ValueType> {
+        mut found: Array<ValueType> = Array::<ValueType>::new();
+        const count: i64 = this.program.owned_structures.length();
+        mut index: i64 = 0;
+        while (index < count) {
+            found.push(ValueType::Owned(index));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < count) {
+            if (this.options.features.has(Feature::Boxes)) {
+                found.push(ValueType::Boxed(index));
+                found.push(ValueType::Counted(index));
+            }
+            if (this.makes_options()) {
+                found.push(ValueType::Optional(index));
+                found.push(ValueType::Fallible(index));
+            }
+            index = index + 1;
+        }
+        return found;
+    }
+
+    /// A value of a type whose values move, `wanted`, moved to where it
+    /// stands.
+    internal moving_expression(mut &this, wanted: ValueType, depth: i64) -> i64 {
+        if (wanted.is_holder()) { return this.holder_expression(wanted, depth); }
+        return this.owned_expression(wanted, depth);
+    }
+
+    /// A value of the holder type `wanted`: one built around an owned
+    /// value, a variable moved out of, a call returning one, an `if`
+    /// expression each of whose branches is one of these, a clone of a
+    /// shared owner in scope, or an option's none or a result's error.
+    internal holder_expression(mut &this, wanted: ValueType, depth: i64) -> i64 {
+        const deeper: boolean = depth > 0;
+        const next: i64 = if (deeper) { depth - 1 } else { 0 };
+        const movable: Array<i64> = this.environment.movable(&this.program, wanted);
+        const callees: Array<i64> = this.callees(wanted);
+        const shared: boolean = match (wanted) {
+            ValueType::Counted(_) => { true }
+            _                     => { false }
+        };
+        const shareable: Array<i64> = if (shared) { this.environment.shareable(&this.program, wanted) } else { Array::<i64>::new() };
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(6);
+        weights.push(if (movable.length() > 0) { 10 } else { 0 });
+        weights.push(if (callees.length() > 0 && deeper) { 5 } else { 0 });
+        weights.push(if (this.options.features.has(Feature::IfExpressions) && deeper) { 2 } else { 0 });
+        weights.push(if (shareable.length() > 0) { 6 } else { 0 });
+        weights.push(if (wanted.may_be_absent()) { 3 } else { 0 });
+        const form: i64 = this.random.pick(&weights);
+        if (form == 0) { return this.held_value(wanted, next, TypeArgumentSpelling::Omitted); }
+        if (form == 1) {
+            const variable: i64 = movable.get(this.random.below(movable.length())).unwrap();
+            this.environment.move_out(variable);
+            return this.node(ExpressionKind::Move(variable), wanted);
+        }
+        if (form == 2) { return this.call(callees.get(this.random.below(callees.length())).unwrap(), next); }
+        if (form == 3) {
+            const condition: i64 = this.condition(next);
+            const then_value: i64 = this.holder_expression(wanted, next);
+            const else_value: i64 = this.holder_expression(wanted, next);
+            return this.node(ExpressionKind::Conditional(condition, then_value, else_value), wanted);
+        }
+        if (form == 4) {
+            const variable: i64 = shareable.get(this.random.below(shareable.length())).unwrap();
+            this.environment.lend(variable, false);
+            return this.node(ExpressionKind::Share(variable), wanted);
+        }
+        const code: i64 = match (wanted) {
+            ValueType::Fallible(_) => { this.typed_place(ValueType::U32, next) }
+            _                      => { -1 }
+        };
+        return this.node(ExpressionKind::Absent(code, TypeArgumentSpelling::Omitted), wanted);
+    }
+
+    /// `Box::new(v)`, `Rc::new(v)`, `Option::Some(v)` or `Result::Ok(v)`:
+    /// a holder of `wanted`'s type built around an owned value, an
+    /// option's or a result's variant spelling its type arguments as
+    /// `spelling` says.
+    private held_value(mut &this, wanted: ValueType, depth: i64, spelling: TypeArgumentSpelling) -> i64 {
+        const value: i64 = this.owned_expression(ValueType::Owned(wanted.held()), depth);
+        return this.node(ExpressionKind::Hold(value, spelling), wanted);
+    }
+
+    /// The variables holding an option or a result of owned struct
+    /// `owned` that certainly holds a value and may be moved here, to
+    /// unwrap; none without `options`.
+    internal unwrappable(&this, owned: i64) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        if (!this.makes_options()) { return found; }
+        for (variable in this.environment.present_movable(&this.program, ValueType::Optional(owned)).iter()) { found.push(variable); }
+        for (variable in this.environment.present_movable(&this.program, ValueType::Fallible(owned)).iter()) { found.push(variable); }
+        return found;
+    }
+
+    /// `v.unwrap()` of one of `variables`, which is moved out.
+    internal unwrapped(mut &this, variables: &Array<i64>, wanted: ValueType) -> i64 {
+        const variable: i64 = variables.get(this.random.below(variables.length())).unwrap();
+        this.environment.move_out(variable);
+        return this.node(ExpressionKind::Unwrap(variable), wanted);
+    }
+
+    /// The holder type a `?` producing a value of owned struct `owned`
+    /// applies to here: an option of it where the function returns an
+    /// option, a result of it where it returns a result; `void` where no
+    /// `?` may stand - outside a function returning either, in a closure's
+    /// body, or without `options`.
+    internal propagated_type(&this, owned: i64) -> ValueType {
+        if (!this.makes_options() || this.environment.in_closure()) { return ValueType::Void; }
+        return match (this.returns) {
+            ValueType::Optional(_) => { ValueType::Optional(owned) }
+            ValueType::Fallible(_) => { ValueType::Fallible(owned) }
+            _                      => { ValueType::Void }
+        };
+    }
+
+    /// Whether a `?` of the holder type `operand` may stand here: one of
+    /// `movable` or `callees` gives it a value, or an `if` expression may
+    /// choose between a value built holding one and none.
+    internal propagates(&this, operand: ValueType, movable: &Array<i64>, callees: &Array<i64>) -> boolean {
+        if (!operand.is_holder()) { return false; }
+        return movable.length() + callees.length() > 0 || this.options.features.has(Feature::IfExpressions);
+    }
+
+    /// `(v)?`, `(h3(..))?` or `(if (c) { Option::Some(..) } else {
+    /// Option::None })?` of the holder type `operand`: a variable moved out
+    /// of, a call returning one, or a choice between one built holding a
+    /// value and none, in either order, so the function returns early on
+    /// one path only.  A `?`'s operand has no expected type, so the two
+    /// variants write their type arguments (`Option::<D0>::None`): no rule
+    /// gives one arm the other's type.
+    internal propagated(mut &this, operand: ValueType, movable: &Array<i64>, callees: &Array<i64>, depth: i64, wanted: ValueType) -> i64 {
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(if (movable.length() > 0) { 4 } else { 0 });
+        weights.push(if (callees.length() > 0) { 4 } else { 0 });
+        weights.push(if (this.options.features.has(Feature::IfExpressions)) { 4 } else { 0 });
+        const form: i64 = this.random.pick(&weights);
+        if (form == 0) {
+            const variable: i64 = movable.get(this.random.below(movable.length())).unwrap();
+            this.environment.move_out(variable);
+            return this.node(ExpressionKind::Propagate(this.node(ExpressionKind::Move(variable), operand)), wanted);
+        }
+        if (form == 1) {
+            const value: i64 = this.call(callees.get(this.random.below(callees.length())).unwrap(), depth);
+            return this.node(ExpressionKind::Propagate(value), wanted);
+        }
+        const condition: i64 = this.condition(depth);
+        const holding: i64 = this.held_value(operand, depth, TypeArgumentSpelling::Written);
+        const code: i64 = match (operand) {
+            ValueType::Fallible(_) => { this.typed_place(ValueType::U32, depth) }
+            _                      => { -1 }
+        };
+        const absent: i64 = this.node(ExpressionKind::Absent(code, TypeArgumentSpelling::Written), operand);
+        const chosen: i64 = if (this.random.chance(50)) {
+            this.node(ExpressionKind::Conditional(condition, holding, absent), operand)
+        } else {
+            this.node(ExpressionKind::Conditional(condition, absent, holding), operand)
+        };
+        return this.node(ExpressionKind::Propagate(chosen), wanted);
+    }
+
+    /// Observe a holder in place: a box by its value's fields, read
+    /// through it; a shared owner by how many owners share its value; an
+    /// option or a result by a `match` folding its value's fields or its
+    /// error code, binding names that leave scope with it.
+    internal observe_holder(mut &this, place: i64, statements: mut &Array<i64>) -> void {
+        const holder: ValueType = this.program.expression_at(place).value_type;
+        const owned: OwnedStructure = this.program.owned_at(holder.held());
+        match (holder) {
+            ValueType::Boxed(_) => {
+                mut field: i64 = owned.first_field;
+                while (field < owned.first_field + owned.field_count) {
+                    this.observe_place(this.node(ExpressionKind::Field(place, field), this.program.field_at(field).value_type), statements);
+                    field = field + 1;
+                }
+                return;
+            }
+            ValueType::Counted(_) => {
+                statements.push(this.observation(this.node(ExpressionKind::Count(place), ValueType::U64)));
+                return;
+            }
+            _ => { }
+        }
+        const mark: i64 = this.environment.mark();
+        const binding: i64 = this.environment.declare_binding(&this.program, ValueType::Owned(holder.held()));
+        mut present: i64 = this.integer(2, ValueType::U64);
+        mut field: i64 = owned.first_field;
+        while (field < owned.first_field + owned.field_count) {
+            const read: i64 = this.node(ExpressionKind::Field(this.read(binding), field), this.program.field_at(field).value_type);
+            present = this.node(ExpressionKind::Mix(present, read), ValueType::U64);
+            field = field + 1;
+        }
+        mut error_binding: i64 = -1;
+        mut absent: i64 = -1;
+        match (holder) {
+            ValueType::Fallible(_) => {
+                error_binding = this.environment.declare_binding(&this.program, ValueType::U32);
+                absent = this.node(ExpressionKind::Mix(this.integer(3, ValueType::U64), this.read(error_binding)), ValueType::U64);
+            }
+            _ => { absent = this.integer(1, ValueType::U64); }
+        }
+        this.environment.leave(mark);
+        statements.push(this.observation(this.node(ExpressionKind::Presence(place, binding, present, error_binding, absent), ValueType::U64)));
+    }
+
+    /// `v.f1 = ..;`, a field of the value a `mut` local's box holds,
+    /// written through the box.
+    internal box_store(mut &this, variable: i64) -> i64 {
+        const owned: OwnedStructure = this.program.owned_at(this.program.variable_at(variable).value_type.held());
+        const field: i64 = owned.first_field + this.random.below(owned.field_count);
+        return this.store(this.program.expression(ExpressionKind::Field(this.target(variable), field), this.program.field_at(field).value_type));
+    }
+}

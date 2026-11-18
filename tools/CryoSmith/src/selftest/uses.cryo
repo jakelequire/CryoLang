@@ -42,6 +42,8 @@ internal type enum UseKind {
     ReturnStarted;
     /// A value the function returns ends.
     ReturnEnded;
+    /// A `?` returns from the function where its operand holds no value.
+    Propagated;
 }
 
 /// One use: what it does, and the variable it names, or -1.
@@ -174,6 +176,20 @@ internal type struct UseWalk {
                 this.add(if (value_type.is_exclusive()) { UseKind::ExclusiveBorrow } else { UseKind::SharedBorrow }, variable);
             }
             ExpressionKind::Move(variable) => { this.add(UseKind::Moved, variable); }
+            ExpressionKind::Unwrap(variable) => { this.add(UseKind::Moved, variable); }
+            ExpressionKind::Share(variable) => { this.add(UseKind::SharedBorrow, variable); }
+            ExpressionKind::Hold(held, _) => { this.walk(program, held); }
+            ExpressionKind::Absent(code, _) => { if (code >= 0) { this.walk(program, code); } }
+            ExpressionKind::Count(owner) => { this.walk(program, owner); }
+            ExpressionKind::Propagate(operand) => {
+                this.walk(program, operand);
+                this.add(UseKind::Propagated, -1);
+            }
+            ExpressionKind::Presence(subject, _, present, _, absent) => {
+                this.walk(program, subject);
+                this.walk(program, present);
+                this.walk(program, absent);
+            }
             ExpressionKind::BorrowTemporary(operand) => {
                 this.add(UseKind::TemporaryBorrow, -1);
                 this.walk(program, operand);

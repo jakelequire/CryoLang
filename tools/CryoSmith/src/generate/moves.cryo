@@ -88,53 +88,63 @@ implement struct Generator {
         return this.options.features.has(Feature::Moves) && this.program.owned_structures.length() > 0;
     }
 
-    /// An owned struct's type, drawn.
-    private drawn_owned(mut &this) -> ValueType {
-        return ValueType::Owned(this.random.below(this.program.owned_structures.length()));
-    }
-
     /// An owned parameter for a free function, sometimes: with `moves`,
-    /// `OWNED_PARAMETER_CHANCE` times in a hundred, an owned struct's type
-    /// added to `parameter_types`.  No draw without the feature.  Whether
-    /// one was added.
+    /// `OWNED_PARAMETER_CHANCE` times in a hundred, a type whose values
+    /// move added to `parameter_types`.  No draw without the feature.
+    /// Whether one was added.
     internal add_owned_parameter(mut &this, parameter_types: mut &Array<ValueType>) -> boolean {
         if (!this.makes_owned() || !this.random.chance(OWNED_PARAMETER_CHANCE)) { return false; }
-        parameter_types.push(this.drawn_owned());
+        parameter_types.push(this.drawn_moving());
         return true;
     }
 
-    /// An owned struct's type for a free function to return, sometimes:
+    /// A type whose values move for a free function to return, sometimes:
     /// with `moves`, `OWNED_RETURN_CHANCE` times in a hundred; `void`
     /// otherwise.  No draw without the feature.
     internal owned_return_type(mut &this) -> ValueType {
         if (!this.makes_owned() || !this.random.chance(OWNED_RETURN_CHANCE)) { return ValueType::Void; }
-        return this.drawn_owned();
+        return this.drawn_moving();
     }
 
-    /// `const v<N>: D<M> = ..;`, a local holding an owned value, or with
-    /// references on sometimes `mut v<N>`.
+    /// `const v<N>: D<M> = ..;`, a local holding an owned value or a
+    /// holder of one, or with references on sometimes `mut v<N>`.  A
+    /// `const` option or result declared with a value built holding one
+    /// certainly holds it.
     internal owned_declaration(mut &this) -> i64 {
-        const value_type: ValueType = this.drawn_owned();
-        const value: i64 = this.owned_expression(value_type, this.depth());
+        const value_type: ValueType = this.drawn_moving();
+        const value: i64 = this.moving_expression(value_type, this.depth());
         const mutable: boolean = this.mutable_owned();
         const variable: i64 = this.environment.declare_local(&this.program, value_type, mutable);
+        const built_holding: boolean = match (this.program.expression_at(value).kind) {
+            ExpressionKind::Hold(_, _) => { true }
+            _                          => { false }
+        };
+        if (value_type.may_be_absent() && built_holding && !mutable) { this.environment.mark_present(variable); }
         return this.program.statement(StatementKind::Declare(variable, value));
     }
 
     /// A value of the owned type `wanted`, moved to where it stands: a
     /// literal, a parameter or local moved out of, a call returning one,
-    /// or an `if` expression each of whose branches is one of these.  A
-    /// variable moved out of holds nothing from here on.
+    /// an `if` expression each of whose branches is one of these, and with
+    /// `options` the value of an option or a result certainly holding one,
+    /// unwrapped, or one a `?` takes out.  A variable moved out of holds
+    /// nothing from here on.
     internal owned_expression(mut &this, wanted: ValueType, depth: i64) -> i64 {
         const deeper: boolean = depth > 0;
         const next: i64 = if (deeper) { depth - 1 } else { 0 };
         const movable: Array<i64> = this.environment.movable(&this.program, wanted);
         const callees: Array<i64> = this.callees(wanted);
+        const unwrappable: Array<i64> = this.unwrappable(wanted.owned());
+        const propagated: ValueType = this.propagated_type(wanted.owned());
+        const absent_sources: Array<i64> = if (propagated.is_holder()) { this.environment.movable(&this.program, propagated) } else { Array::<i64>::new() };
+        const absent_callees: Array<i64> = if (propagated.is_holder() && deeper) { this.callees(propagated) } else { Array::<i64>::new() };
         mut weights: Array<i64> = Array::<i64>::new();
         weights.push(6);
         weights.push(if (movable.length() > 0) { 10 } else { 0 });
         weights.push(if (callees.length() > 0 && deeper) { 5 } else { 0 });
         weights.push(if (this.options.features.has(Feature::IfExpressions) && deeper) { 2 } else { 0 });
+        weights.push(if (unwrappable.length() > 0) { 6 } else { 0 });
+        weights.push(if (deeper && this.propagates(propagated, &absent_sources, &absent_callees)) { 4 } else { 0 });
         const form: i64 = this.random.pick(&weights);
         if (form == 0) { return this.owned_literal(wanted, next); }
         if (form == 1) {
@@ -143,6 +153,8 @@ implement struct Generator {
             return this.node(ExpressionKind::Move(variable), wanted);
         }
         if (form == 2) { return this.call(callees.get(this.random.below(callees.length())).unwrap(), next); }
+        if (form == 4) { return this.unwrapped(&unwrappable, wanted); }
+        if (form == 5) { return this.propagated(propagated, &absent_sources, &absent_callees, next, wanted); }
         const condition: i64 = this.condition(next);
         const then_value: i64 = this.owned_expression(wanted, next);
         const else_value: i64 = this.owned_expression(wanted, next);

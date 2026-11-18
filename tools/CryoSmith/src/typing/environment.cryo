@@ -45,13 +45,16 @@ public type struct Environment {
     private shared_loans: Array<i64>;
     /// The variables the statement being generated lends exclusively.
     private exclusive_loans: Array<i64>;
+    /// The `const` locals holding an option or a result that certainly
+    /// holds a value: each was declared with one built holding it.
+    private present: Array<i64>;
 
     /// An environment holding nothing; `enter_function` starts one.
     public static new() -> Environment {
         return Environment {
             names: Array::<i64>::new(), floor: 0, locals: 0, counters: 0, bindings: 0, closure_parameters: 0,
             moved: Array::<i64>::new(), loop_floors: Array::<i64>::new(), kept: Array::<i64>::new(),
-            shared_loans: Array::<i64>::new(), exclusive_loans: Array::<i64>::new(),
+            shared_loans: Array::<i64>::new(), exclusive_loans: Array::<i64>::new(), present: Array::<i64>::new(),
         };
     }
 
@@ -63,6 +66,7 @@ public type struct Environment {
         this.moved.clear();
         this.loop_floors.clear();
         this.kept.clear();
+        this.present.clear();
         this.begin_statement();
         this.floor = 0;
         this.locals = 0;
@@ -79,6 +83,56 @@ public type struct Environment {
         const outer: i64 = this.floor;
         this.floor = this.names.length();
         return outer;
+    }
+
+    /// Whether generation stands in a closure's body, where a `?` would
+    /// return from the closure rather than the function.
+    public in_closure(&this) -> boolean { return this.floor > 0; }
+
+    /// Record that the `const` local `variable` holds an option or a
+    /// result certainly holding a value.
+    public mark_present(mut &this, variable: i64) -> void { this.present.push(variable); }
+
+    /// The variables holding a value of `wanted`, an option or a result,
+    /// that certainly holds a value and may be moved here.
+    public present_movable(&this, program: &Program, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.movable(program, wanted).iter()) {
+            if (this.present.contains(&variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// The parameters and locals in scope holding a shared owner of
+    /// `wanted`'s type that may be borrowed to clone it here: any not lent
+    /// exclusively.
+    public shareable(&this, program: &Program, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.in_scope().iter()) {
+            const declared: Variable = program.variable_at(variable);
+            const named: boolean = match (declared.role) {
+                VariableRole::Parameter => { true }
+                VariableRole::Local     => { true }
+                _                       => { false }
+            };
+            if (named && declared.value_type.same(wanted) && !this.exclusive_loans.contains(&variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// The `mut` locals in scope holding a box, whose value's fields may
+    /// be written through it here: any not lent by the statement.
+    public writable_boxes(&this, program: &Program) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.in_scope().iter()) {
+            const declared: Variable = program.variable_at(variable);
+            const boxed: boolean = match (declared.value_type) {
+                ValueType::Boxed(_) => { true }
+                _                   => { false }
+            };
+            if (boxed && Environment::fields_writable(declared) && !this.is_lent(variable)) { found.push(variable); }
+        }
+        return found;
     }
 
     /// Leave a closure's body, back to the scope `enter_closure` left.

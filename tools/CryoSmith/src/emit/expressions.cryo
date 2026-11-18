@@ -3,6 +3,7 @@
 namespace cryosmith::emit::expressions;
 
 import std::collections::str::{ Str };
+import std::collections::string::{ String };
 
 import cryosmith::emit::printer::{ Printer };
 import cryosmith::model::{ Closure, ExpressionKind, ExpressionNode, Function, MatchArm, PatternElement, Program, TypeArgumentSpelling, ValueType };
@@ -171,7 +172,87 @@ implement struct Printer {
                 this.text.push(Str::new("*"));
                 this.expression(program, operand);
             }
+            ExpressionKind::Hold(value, spelling) => {
+                this.text.push(Printer::holder_path(program, node.value_type, spelling).as_str());
+                this.text.push(Printer::holding_variant(node.value_type));
+                this.text.push(Str::new("("));
+                this.expression(program, value);
+                this.text.push(Str::new(")"));
+            }
+            ExpressionKind::Absent(code, spelling) => {
+                this.text.push(Printer::holder_path(program, node.value_type, spelling).as_str());
+                if (code < 0) {
+                    this.text.push(Str::new("::None"));
+                } else {
+                    this.text.push(Str::new("::Err("));
+                    this.expression(program, code);
+                    this.text.push(Str::new(")"));
+                }
+            }
+            ExpressionKind::Share(variable) => {
+                this.name(program, variable);
+                this.text.push(Str::new(".clone()"));
+            }
+            ExpressionKind::Count(owner) => {
+                this.receiver(program, owner);
+                this.text.push(Str::new(".strong_count()"));
+            }
+            ExpressionKind::Unwrap(variable) => {
+                this.name(program, variable);
+                this.text.push(Str::new(".unwrap()"));
+            }
+            ExpressionKind::Propagate(value) => {
+                this.text.push(Str::new("("));
+                this.expression(program, value);
+                this.text.push(Str::new(")?"));
+            }
+            ExpressionKind::Presence(subject, binding, present, error_binding, absent) => {
+                const fallible: boolean = error_binding >= 0;
+                this.text.push(Str::new("(match ("));
+                this.expression(program, subject);
+                this.text.push(if (fallible) { Str::new(") { Result::Ok(") } else { Str::new(") { Option::Some(") });
+                this.name(program, binding);
+                this.text.push(Str::new(") => { "));
+                this.expression(program, present);
+                if (fallible) {
+                    this.text.push(Str::new(" } Result::Err("));
+                    this.name(program, error_binding);
+                    this.text.push(Str::new(") => { "));
+                } else {
+                    this.text.push(Str::new(" } Option::None => { "));
+                }
+                this.expression(program, absent);
+                this.text.push(Str::new(" } })"));
+            }
         }
+    }
+
+    /// A holder type's path before its member: `Box`, `Rc`, `Option`,
+    /// `Result`, or with `Written` its type spelled as a path,
+    /// `Option::<D0>`, `Result::<D0, u32>`.
+    private static holder_path(program: &Program, holder: ValueType, spelling: TypeArgumentSpelling) -> String {
+        const name: String = program.type_name(holder);
+        const opening: i64 = name.as_str().find(&Str::new("<")).unwrap_or(name.length());
+        mut path: String = String::from_str(name.as_str().byte_substring(0, opening));
+        match (spelling) {
+            TypeArgumentSpelling::Written => {
+                path.push(Str::new("::"));
+                path.push(name.as_str().byte_substring(opening, name.length()));
+            }
+            _ => { }
+        }
+        return path;
+    }
+
+    /// The member a holder's value is built with: `::new` for a box or a
+    /// shared owner, `::Some` for an option, `::Ok` for a result.
+    private static holding_variant(holder: ValueType) -> Str {
+        return match (holder) {
+            ValueType::Boxed(_)    => { Str::new("::new") }
+            ValueType::Counted(_)  => { Str::new("::new") }
+            ValueType::Optional(_) => { Str::new("::Some") }
+            _                      => { Str::new("::Ok") }
+        };
     }
 
     /// A literal's braces and its `count` entries from `first` in the index
