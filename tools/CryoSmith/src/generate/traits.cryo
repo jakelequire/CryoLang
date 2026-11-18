@@ -12,6 +12,13 @@
 ///! is, from a stream of its own, and is called on the struct's values as
 ///! one is (`v1.t0(a)`), the call naming the one implementation the
 ///! receiver's type has.
+///!
+///! With `trait-bounds`, a trait some struct implements bounds a generic
+///! function `k<N><T>` seven times in ten, `where T: Tr0 + Copy`, generated
+///! as a generic function `g<N>` is.  Its body calls the trait's methods on
+///! its `T` values, `p0.t0(a)`, each call charged the costliest
+///! implementation's work, and it is called only at a struct implementing
+///! the trait, whose implementation each such call then runs.
 
 namespace cryosmith::generate::traits;
 
@@ -19,7 +26,7 @@ import std::collections::array::{ Array };
 
 import cryosmith::configuration::{ Feature };
 import cryosmith::generate::generator::{ Generator };
-import cryosmith::model::{ Genericity, Receiver, Signature, Structure, TraitDeclaration, TraitMethod, ValueType };
+import cryosmith::model::{ ExpressionKind, Genericity, Receiver, Signature, Structure, TraitDeclaration, TraitMethod, ValueType };
 import cryosmith::random::{ RandomStream };
 
 /// The most traits a program declares.
@@ -30,6 +37,10 @@ const MOST_TRAIT_METHODS: i64 = 2;
 
 /// How often, in a hundred, a declared struct implements a trait.
 const IMPLEMENTATION_CHANCE: i64 = 60;
+
+/// How often, in a hundred, a trait some struct implements bounds a
+/// generic function.
+const BOUNDED_CHANCE: i64 = 70;
 
 implement struct Generator {
     /// Declare the traits and generate their implementations: none without
@@ -67,6 +78,66 @@ implement struct Generator {
             this.implement(implementations.get(entry).unwrap(), implementations.get(entry + 1).unwrap());
             entry = entry + 2;
         }
+        if (this.options.features.has(Feature::TraitBounds) && this.options.features.has(Feature::Generics)) {
+            this.declare_bounded_functions();
+        }
+    }
+
+    /// With `trait-bounds` (and `generics`, whose functions these are): for
+    /// each trait some struct implements, seven
+    /// times in ten, a generic function `k<N><T>` bounded by it, generated
+    /// as a generic function `g<N>` is, from a stream of its own.
+    private declare_bounded_functions(mut &this) -> void {
+        mut deciding: RandomStream = RandomStream::for_bounded(this.options.seed, -1);
+        mut number: i64 = 0;
+        mut index: i64 = 0;
+        while (index < this.program.traits.length()) {
+            if (this.program.implementors(index).length() > 0 && deciding.chance(BOUNDED_CHANCE)) {
+                this.random = RandomStream::for_bounded(this.options.seed, number);
+                this.generic_function(number, Genericity::Implementing(index));
+                number = number + 1;
+            }
+            index = index + 1;
+        }
+    }
+
+    /// The methods of the trait bounding this function's `T` that return
+    /// `wanted` and that one more call of keeps its work under its limit,
+    /// when a `T` value is in scope to call one on; none outside a body
+    /// bounded by a trait.
+    internal bound_calls(&this, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        const bounding: i64 = this.genericity.bounding_trait();
+        if (bounding < 0 || this.environment.variables_of(&this.program, ValueType::TypeParameter).length() == 0) { return found; }
+        const declared: TraitDeclaration = this.program.trait_at(bounding);
+        mut method: i64 = declared.first_method;
+        while (method < declared.first_method + declared.method_count) {
+            const signature: Signature = this.program.signature_of(this.program.trait_method_at(method).function_type);
+            if (signature.returns.same(wanted) && this.budget.affordable(this.program.trait_method_cost(method))) { found.push(method); }
+            method = method + 1;
+        }
+        return found;
+    }
+
+    /// `p0.t<N>(..)`: trait method `method` called through the bound on a
+    /// `T` value, charged its costliest implementation's work.
+    internal bound_call(mut &this, method: i64, depth: i64) -> i64 {
+        const values: Array<i64> = this.environment.variables_of(&this.program, ValueType::TypeParameter);
+        const receiver: i64 = this.read(values.get(this.random.below(values.length())).unwrap());
+        return this.trait_call(receiver, method, depth);
+    }
+
+    /// `receiver.t<N>(..)` with an argument for each of trait method
+    /// `method`'s parameters, charged its costliest implementation's work.
+    internal trait_call(mut &this, receiver: i64, method: i64, depth: i64) -> i64 {
+        const signature: Signature = this.program.signature_of(this.program.trait_method_at(method).function_type);
+        this.budget.charge(this.program.trait_method_cost(method));
+        mut arguments: Array<i64> = Array::<i64>::new();
+        while (arguments.length() < signature.parameter_count) {
+            arguments.push(this.typed_place(this.program.signature_parameter(signature, arguments.length()), depth));
+        }
+        const first: i64 = this.program.list_run(&arguments);
+        return this.node(ExpressionKind::TraitCall(receiver, method, first, signature.parameter_count), signature.returns);
     }
 
     /// Generate the methods of trait `index`'s implementation for the struct

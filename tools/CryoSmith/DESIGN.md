@@ -385,6 +385,22 @@ value of the struct the caller can reach (`v1.t0(a)`, `this.f2.t0(a)`).
 Such a call names the one implementation its receiver's type has, so it is
 resolved at compile time. A generic struct's instance implements no trait.
 
+**Trait bounds.** With `trait-bounds` (and `traits`, `generics`), each
+trait some struct implements bounds a generic function seven times in
+ten, `function k0<T>(p0: T, p1: T, p2: u8) -> T where T: Tr0 + Copy`,
+generated as a generic function `g<N>` is from a stream of its own after
+the implementations (`Genericity::Implementing`). Its body calls the
+trait's methods on its `T` values wherever a value of a method's return
+type is wanted, `p0.t0(a)`, one form in four where one may be called, each
+call charged the costliest implementation's work, and observes each `T`
+parameter by a call of the trait's first method. It is called only at a
+struct implementing the trait (`Program::admits`), written, `_` or left
+to inference as any generic call, and `main` observes one call of each at
+an implementing struct drawn for it. Each instance's bound calls run that
+struct's implementation, chosen at compile time per instance; a `k` body
+calls a `g` at `T`, since `Copy` is in its bound, and another `k` only of
+its own trait.
+
 A `match` statement's arm may assign the local its subject reads. Its
 bindings are never written `mut` and their payloads are `Copy`, so each is
 a copy taken when the arm is entered (docs/cryo.md, enum destructuring)
@@ -432,8 +448,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   exactly that type: operands are of `T`, a different type is converted with
   `as`, and widening appears only at the implicit-conversion places.
 - Names are declared before use, in scope, unique per function (`v<N>`,
-  `p<N>`, counters `n<N>`, functions `h<N>` and `g<N>`, structs `S<N>` and
-  `B<N>`, fields `f<N>`, methods `m<N>`); only `mut` names are assigned, and no loop counter is. No
+  `p<N>`, counters `n<N>`, functions `h<N>`, `g<N>` and `k<N>`, structs
+  `S<N>` and `B<N>`, fields `f<N>`, methods `m<N>`, traits `Tr<N>` and
+  their methods `t<N>`); only `mut` names are assigned, and no loop counter is. No
   name is spelled like a type: a local `i8` would stand in front of the type
   in `i8::MIN`, and a function `f32` in front of `f32`. A struct has at most
   four fields, so no field is `f32` either.
@@ -443,9 +460,10 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   static method is called through its struct (`S1::m0()`), never on a value.
   `this` is never assigned whole.
 - A struct literal writes every field that has no default.
-- **Generic bodies.** A `T` value is never observed, cast or combined by
-  an operator: nothing converts a `T` to a `u64`, and no `T` local is
-  declared. The one `T` place assigned is a `T` field of a `mut &this`, and
+- **Generic bodies.** A `T` value is never cast or combined by an
+  operator, and is observed only under a trait bound, by a call of the
+  trait's first method (which returns a scalar): nothing else converts a
+  `T` to a `u64`. No `T` local is declared. The one `T` place assigned is a `T` field of a `mut &this`, and
   only whole, never with a compound operator. It is compared only under `where T: Eq`, and a generic
   function is instantiated only at a type its bound admits - an `Eq`-bounded
   one never at a struct, which does not implement `Eq`.
@@ -592,8 +610,8 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. `default,no-traits` generates version
-  22's text, `default,no-traits,no-generic-closures,no-callable-bounds`
+  generator's text, header aside. `default,no-trait-bounds` generates
+  version 23's text, `default,no-traits` version 22's, `default,no-traits,no-generic-closures,no-callable-bounds`
   version 21's; with those three also removed, `default,no-function-values`
   gives version 20's and `default,no-function-values,no-closure-captures`
   version 19's; and `default,no-nested-patterns` generates
@@ -629,7 +647,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 3 | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
 | 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
 | 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
-| 6 (this one) | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2). Still to come: calls through a bound and through a trait object, default methods |
+| 6 (this one) | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values. Still to come: calls through a trait object, default methods |
 | 7 | ownership: moves, drops (a drop log folded into the hash), references, `Box` and `Rc`, `Option` and `Result` |
 | 8 | strings, arrays and collections |
 
@@ -855,7 +873,7 @@ place.
    `guarantees/`: every call resolves to one implementation; the hash is
    the same whichever way it is dispatched. (In progress: `traits`,
    declarations and implementations called on the implementing struct's
-   values, is done.)
+   values, and `trait-bounds`, calls through a bound, are done.)
 5. **Stage 7: ownership.** `model/`: references (`&`, `mut &`) as values,
    `Box`, `Rc`, `Option`, `Result`, types with a drop. `generate/`: moves,
    borrows, early drops. `guarantees/`: no use after a move and no borrow

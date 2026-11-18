@@ -9,7 +9,8 @@
 ///! Its first two parameters are `T`, the rest `T` or a value type.  A `T`
 ///! value is only read, passed to a generic call, returned, selected between
 ///! by an `if` expression and, under `Eq`, compared: it is never observed,
-///! since nothing converts a `T` to a `u64`.  Its value-typed parameters and
+///! since nothing converts a `T` to a `u64` - except under a trait bound,
+///! where a call of the trait's first method observes it.  Its value-typed parameters and
 ///! locals are observed as any function's are, and every call is observed
 ///! where its value is.
 ///!
@@ -53,16 +54,26 @@ implement struct Generator {
         }
     }
 
-    /// Generate generic function `number` from its own stream.
+    /// Generate generic function `number` from its own stream, bounded by
+    /// `Copy` or by `Eq + Copy`.
     private define_generic(mut &this, number: i64) -> void {
         this.random = RandomStream::for_generic(this.options.seed, number);
+        const genericity: Genericity = if (this.random.chance(50)) { Genericity::Equatable } else { Genericity::Copyable };
+        this.generic_function(number, genericity);
+    }
+
+    /// Generate a generic function numbered `number` whose `T` is bounded
+    /// by `genericity`, from the stream already chosen: two to four
+    /// parameters, the first two `T`, sometimes a callable-bounded one
+    /// last, and `T` returned.
+    internal generic_function(mut &this, number: i64, genericity: Genericity) -> void {
         this.environment.enter_function();
         this.loop_depth = 0;
         this.block_depth = 0;
         this.budget = CostBudget::for_function(false);
         this.statements_left = (this.options.size + 1) / 2;
         this.in_main = false;
-        this.genericity = if (this.random.chance(50)) { Genericity::Equatable } else { Genericity::Copyable };
+        this.genericity = genericity;
         this.returns = ValueType::TypeParameter;
         const first_parameter: i64 = this.program.lists.length();
         const value_count: i64 = 2 + this.random.below(3);
@@ -82,9 +93,9 @@ implement struct Generator {
         index = 0;
         while (index < parameter_count) {
             const parameter: i64 = this.program.list_at(first_parameter + index);
-            if (!this.program.variable_at(parameter).value_type.same(ValueType::TypeParameter)) {
-                this.observe_place(this.read(parameter), &statements);
-            }
+            const observable: boolean = !this.program.variable_at(parameter).value_type.same(ValueType::TypeParameter)
+                || this.genericity.bounding_trait() >= 0;
+            if (observable) { this.observe_place(this.read(parameter), &statements); }
             index = index + 1;
         }
         const value: i64 = this.typed_place(ValueType::TypeParameter, this.depth());
@@ -167,7 +178,8 @@ implement struct Generator {
         mut index: i64 = 0;
         while (index < this.program.functions.length()) {
             const candidate: Function = this.program.function_at(index);
-            if (candidate.receiver.is_called_by_name() && candidate.genericity.admits(wanted, this.genericity)                    && this.budget.affordable(candidate.cost)) {
+            if (candidate.receiver.is_called_by_name() && this.program.admits(candidate.genericity, wanted, this.genericity)
+                    && this.budget.affordable(candidate.cost)) {
                 found.push(index);
             }
             index = index + 1;
@@ -189,6 +201,21 @@ implement struct Generator {
         return this.node(ExpressionKind::GenericCall(callee, type_argument, spelling, first, called.parameter_count), type_argument);
     }
 
+    /// A type argument a function of `genericity` admits: an integer or
+    /// `boolean` under `Eq`, one of the structs implementing the trait
+    /// under a trait bound, and otherwise any value type.
+    private drawn_type_argument(mut &this, genericity: Genericity) -> ValueType {
+        const bounding: i64 = genericity.bounding_trait();
+        if (bounding >= 0) {
+            const implementors: Array<i64> = this.program.implementors(bounding);
+            return ValueType::Record(implementors.get(this.random.below(implementors.length())).unwrap());
+        }
+        if (genericity.compares()) {
+            return if (this.random.chance(20)) { ValueType::Boolean } else { TypeChoice::integer(&this.random) };
+        }
+        return this.any_type();
+    }
+
     /// In `main`: observe one call of each generic function and generic
     /// struct's static method the cost model allows, at a type its bound
     /// admits.
@@ -197,12 +224,7 @@ implement struct Generator {
         while (index < this.program.functions.length()) {
             const called: Function = this.program.function_at(index);
             if (called.receiver.is_called_by_name() && called.genericity.is_generic() && this.budget.affordable(called.cost)) {
-                const type_argument: ValueType = if (called.genericity.compares()) {
-                    (if (this.random.chance(20)) { ValueType::Boolean } else { TypeChoice::integer(&this.random) })
-                } else {
-                    this.any_type()
-                };
-                this.observe_value(this.generic_call(index, type_argument, 2), statements);
+                this.observe_value(this.generic_call(index, this.drawn_type_argument(called.genericity), 2), statements);
             }
             index = index + 1;
         }

@@ -196,9 +196,9 @@ public type struct Printer {
             match (defined.receiver) {
                 Receiver::Free      => {
                     if (defined.takes_callable()) {
-                        this.text.push(f"function g{defined.number}<T, F>(");
+                        this.text.push(f"function {Printer::generic_prefix(&defined)}{defined.number}<T, F>(");
                     } else if (defined.genericity.is_generic()) {
-                        this.text.push(f"function g{defined.number}<T>(");
+                        this.text.push(f"function {Printer::generic_prefix(&defined)}{defined.number}<T>(");
                     } else {
                         this.text.push(f"function h{defined.number}(");
                     }
@@ -233,19 +233,30 @@ public type struct Printer {
     /// Eq + Copy` when it compares, the uncopied-type-parameter plant
     /// dropping `Copy`; then on `F`, its function type, `F: (u8, T) -> T`.
     private bound(mut &this, program: &Program, defined: Function) -> void {
+        const bounding: i64 = defined.genericity.bounding_trait();
         const compares: boolean = defined.genericity.compares();
         const copies: boolean = this.plant.keeps_copy_bound();
         mut written: boolean = true;
-        if (compares && copies) { this.text.push(Str::new("where T: Eq + Copy")); }
-        if (compares && !copies) { this.text.push(Str::new("where T: Eq")); }
-        if (!compares && copies) { this.text.push(Str::new("where T: Copy")); }
-        if (!compares && !copies) { written = false; }
+        if (bounding >= 0) {
+            this.text.push(f"where T: Tr{program.trait_at(bounding).number}");
+            if (copies) { this.text.push(Str::new(" + Copy")); }
+        }
+        if (bounding < 0 && compares && copies) { this.text.push(Str::new("where T: Eq + Copy")); }
+        if (bounding < 0 && compares && !copies) { this.text.push(Str::new("where T: Eq")); }
+        if (bounding < 0 && !compares && copies) { this.text.push(Str::new("where T: Copy")); }
+        if (bounding < 0 && !compares && !copies) { written = false; }
         if (defined.takes_callable()) {
             this.text.push(if (written) { Str::new(", F: ") } else { Str::new("where F: ") });
             this.text.push(program.type_name(defined.callable).as_str());
             written = true;
         }
         if (written) { this.text.push(Str::new(" ")); }
+    }
+
+    /// The letter a generic free function's name starts with: `k` for one
+    /// bounded by a trait, `g` for any other.
+    internal static generic_prefix(defined: &Function) -> Str {
+        return if (defined.genericity.bounding_trait() >= 0) { Str::new("k") } else { Str::new("g") };
     }
 
     /// The letter a method's name starts with: `t` for a trait's method,

@@ -9,7 +9,7 @@ import std::collections::string::{ String };
 
 import cryosmith::model::expressions::{ ExpressionKind, ExpressionNode, MatchArm, PatternElement, TypeArgumentSpelling };
 import cryosmith::model::items::{
-    Closure, Enumeration, Field, Function, Signature, Structure, TraitDeclaration, TraitMethod, Variable, VariableRole, VariantDeclaration
+    Closure, Enumeration, Field, Function, Genericity, Signature, Structure, TraitDeclaration, TraitMethod, Variable, VariableRole, VariantDeclaration
 };
 import cryosmith::model::statements::{ StatementKind, StatementNode };
 import cryosmith::model::types::{ ValueType };
@@ -151,6 +151,45 @@ public type struct Program {
     /// Trait method `index`.
     public trait_method_at(&this, index: i64) -> TraitMethod { return this.trait_methods.get(index).unwrap(); }
 
+    /// Whether a function of `genericity` may be instantiated at
+    /// `argument`: a value type its bound admits - an integer or `boolean`
+    /// under `Eq`, a struct implementing the trait under a trait bound - or
+    /// `T` itself inside a generic body whose own parameter, bounded by
+    /// `inside`, satisfies the bound.
+    public admits(&this, genericity: Genericity, argument: ValueType, inside: Genericity) -> boolean {
+        if (!genericity.is_generic()) { return false; }
+        const bounding: i64 = genericity.bounding_trait();
+        if (argument.same(ValueType::TypeParameter)) {
+            if (bounding >= 0) { return inside.bounding_trait() == bounding; }
+            return !genericity.compares() || inside.compares();
+        }
+        if (argument.same(ValueType::Void)) { return false; }
+        if (bounding >= 0) { return argument.is_record() && this.implements(argument.structure(), bounding); }
+        if (genericity.compares()) { return argument.is_integer() || argument.same(ValueType::Boolean); }
+        return true;
+    }
+
+    /// The structs implementing trait `index`, by their places.
+    public implementors(&this, index: i64) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        mut structure: i64 = 0;
+        while (structure < this.structures.length()) {
+            if (this.implements(structure, index)) { found.push(structure); }
+            structure = structure + 1;
+        }
+        return found;
+    }
+
+    /// The most work a call of trait method `method` through a bound or an
+    /// object can do: the costliest implementation's.
+    public trait_method_cost(&this, method: i64) -> u64 {
+        mut most: u64 = 0;
+        for (defined in this.functions.iter()) {
+            if (defined.implements == method && defined.cost > most) { most = defined.cost; }
+        }
+        return most;
+    }
+
     /// Whether the struct at `structure` implements trait `index`: some
     /// method of that struct implements one of the trait's methods.
     public implements(&this, structure: i64, index: i64) -> boolean {
@@ -269,6 +308,7 @@ public type struct Program {
             ExpressionKind::Call(_, _, _) => { true }
             ExpressionKind::GenericCall(_, _, _, _, _) => { true }
             ExpressionKind::MethodCall(_, _, _, _) => { true }
+            ExpressionKind::TraitCall(_, _, _, _) => { true }
             ExpressionKind::Invoke(_, _, _) => { true }
             ExpressionKind::Match(_, _, _) => { true }
             ExpressionKind::Unary(_, operand) => { this.runs_code(operand) }
