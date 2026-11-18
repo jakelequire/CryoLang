@@ -1,0 +1,88 @@
+///! Traits (stage 6): declarations, `type trait Tr0 { t0(&this, p0: u8) ->
+///! i32; }`, and their implementations for the declared structs, `implement
+///! trait Tr0 for struct S1 { t0(&this, p0: u8) -> i32 { .. } }`.
+///!
+///! One or two traits of one or two methods each are declared from their
+///! own stream after the generic functions, and each declared struct
+///! implements each trait six times in ten.  A trait method takes `&this`
+///! and zero to two scalar parameters and returns a scalar; it is named
+///! `t<N>`, numbered across the program, so no two traits share a method's
+///! name and none shares one with a struct's own methods, `m<N>`.  An
+///! implementation's method is generated as a `&this` method of its struct
+///! is, from a stream of its own, and is called on the struct's values as
+///! one is (`v1.t0(a)`), the call naming the one implementation the
+///! receiver's type has.
+
+namespace cryosmith::generate::traits;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::model::{ Genericity, Receiver, Signature, Structure, TraitDeclaration, TraitMethod, ValueType };
+import cryosmith::random::{ RandomStream };
+
+/// The most traits a program declares.
+const MOST_TRAITS: i64 = 2;
+
+/// The most methods a trait declares.
+const MOST_TRAIT_METHODS: i64 = 2;
+
+/// How often, in a hundred, a declared struct implements a trait.
+const IMPLEMENTATION_CHANCE: i64 = 60;
+
+implement struct Generator {
+    /// Declare the traits and generate their implementations: none without
+    /// `traits` or without `structs`, since only a struct implements one.
+    internal declare_traits(mut &this) -> void {
+        if (!this.options.features.has(Feature::Traits) ||!this.options.features.has(Feature::Structs)) { return; }
+        this.random = RandomStream::for_traits(this.options.seed);
+        this.genericity = Genericity::Concrete;
+        const count: i64 = 1 + this.random.below(MOST_TRAITS);
+        while (this.program.traits.length() < count) {
+            const first_method: i64 = this.program.trait_methods.length();
+            const method_count: i64 = 1 + this.random.below(MOST_TRAIT_METHODS);
+            while (this.program.trait_methods.length() < first_method + method_count) {
+                const number: i64 = this.program.trait_methods.length();
+                this.program.trait_methods.push(TraitMethod { number: number, function_type: this.closure_signature() });
+            }
+            this.program.traits.push(TraitDeclaration { number: this.program.traits.length(), first_method: first_method, method_count: method_count });
+        }
+        mut implementations: Array<i64> = Array::<i64>::new();
+        mut structure: i64 = 0;
+        while (structure < this.program.structures.length()) {
+            const declared: Structure = this.program.structure_at(structure);
+            mut index: i64 = 0;
+            while (!declared.is_instance() && index < count) {
+                if (this.random.chance(IMPLEMENTATION_CHANCE)) {
+                    implementations.push(structure);
+                    implementations.push(index);
+                }
+                index = index + 1;
+            }
+            structure = structure + 1;
+        }
+        mut entry: i64 = 0;
+        while (entry < implementations.length()) {
+            this.implement(implementations.get(entry).unwrap(), implementations.get(entry + 1).unwrap());
+            entry = entry + 2;
+        }
+    }
+
+    /// Generate the methods of trait `index`'s implementation for the struct
+    /// at `owner`, each from the stream of its place among the functions.
+    private implement(mut &this, owner: i64, index: i64) -> void {
+        const declared: TraitDeclaration = this.program.trait_at(index);
+        mut method: i64 = declared.first_method;
+        while (method < declared.first_method + declared.method_count) {
+            const signature: Signature = this.program.signature_of(this.program.trait_method_at(method).function_type);
+            mut parameter_types: Array<ValueType> = Array::<ValueType>::new();
+            while (parameter_types.length() < signature.parameter_count) {
+                parameter_types.push(this.program.signature_parameter(signature, parameter_types.length()));
+            }
+            this.random = RandomStream::for_method(this.options.seed, this.program.functions.length());
+            this.define_with(this.program.trait_method_at(method).number, owner, Receiver::Shared, &parameter_types, signature.returns, method);
+            method = method + 1;
+        }
+    }
+}

@@ -370,6 +370,21 @@ the closure. A closure local or a parameter is never given to `F`, since
 passing one moves it and its later call or observation would be a use
 after a move.
 
+**Traits.** With `traits` (and `structs`), one or two traits `Tr<N>` are
+declared from a stream of their own after the generic functions, each
+with one or two methods that take `&this` and zero to two scalar
+parameters and return a scalar, `type trait Tr0 { t0(&this, p0: u8) ->
+i32; }`. A trait method's name `t<N>` is numbered across the program, so
+no two traits declare one name and none is a struct's own method's name
+(`m<N>`): a call names one method whatever traits its receiver's type
+implements. Each declared struct implements each trait six times in ten,
+`implement trait Tr0 for struct S1 { t0(&this, p0: u8) -> i32 { .. } }`,
+each method generated as a `&this` method of the struct is, from the
+stream of its place among the functions, and called as one is, on any
+value of the struct the caller can reach (`v1.t0(a)`, `this.f2.t0(a)`).
+Such a call names the one implementation its receiver's type has, so it is
+resolved at compile time. A generic struct's instance implements no trait.
+
 A `match` statement's arm may assign the local its subject reads. Its
 bindings are never written `mut` and their payloads are `Copy`, so each is
 a copy taken when the arm is entered (docs/cryo.md, enum destructuring)
@@ -577,10 +592,11 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. `default,no-generic-closures,no-callable-bounds`
-  generates version 21's text, `default,no-function-values` (with those two)
-  version 20's, `default,no-function-values,no-closure-captures`
-version 19's, and `default,no-nested-patterns` generates
+  generator's text, header aside. `default,no-traits` generates version
+  22's text, `default,no-traits,no-generic-closures,no-callable-bounds`
+  version 21's; with those three also removed, `default,no-function-values`
+  gives version 20's and `default,no-function-values,no-closure-captures`
+  version 19's; and `default,no-nested-patterns` generates
   version 14's text, `default,no-nested-patterns,no-generic-enums`
   version 13's, and `default,no-enum-payloads` (which declares no
   generic enum either) version 12's. `default,no-enums` generates version 9's
@@ -612,8 +628,8 @@ every feature of the current stage; `no-<name>` removes one.
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
 | 3 | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
 | 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
-| 5 (this one) | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
-| 6 | traits and dynamic dispatch: implementations, default methods, calls through a bound and through a trait object |
+| 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
+| 6 (this one) | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2). Still to come: calls through a bound and through a trait object, default methods |
 | 7 | ownership: moves, drops (a drop log folded into the hash), references, `Box` and `Rc`, `Option` and `Result` |
 | 8 | strings, arrays and collections |
 
@@ -725,7 +741,7 @@ layers, lowest first:
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
 | `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures, `Exhaustiveness`'s arms and `Capture`'s captured values (3.2) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures` |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |
@@ -837,7 +853,9 @@ place.
    and default methods, implementations for structs and enums, trait
    objects. `generate/`: calls through a bound and through a trait object.
    `guarantees/`: every call resolves to one implementation; the hash is
-   the same whichever way it is dispatched.
+   the same whichever way it is dispatched. (In progress: `traits`,
+   declarations and implementations called on the implementing struct's
+   values, is done.)
 5. **Stage 7: ownership.** `model/`: references (`&`, `mut &`) as values,
    `Box`, `Rc`, `Option`, `Result`, types with a drop. `generate/`: moves,
    borrows, early drops. `guarantees/`: no use after a move and no borrow

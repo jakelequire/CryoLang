@@ -38,16 +38,30 @@ implement struct Generator {
             while (parameter_types.length() < parameter_count) { parameter_types.push(this.any_type()); }
             if (owner < 0) { takes_function = this.add_function_parameter(&parameter_types); }
         }
-        this.define_with(number, owner, receiver, &parameter_types);
+        const returns: ValueType = this.drawn_return_type(owner, receiver, is_main);
+        this.define_with(number, owner, receiver, &parameter_types, returns, -1);
         if (!is_main && !takes_function && this.options.features.has(Feature::Overloads)) {
             this.define_overloads(this.program.functions.length() - 1);
         }
     }
 
+    /// What a function generated from the stream already chosen returns:
+    /// nothing for a `mut &this` method, sometimes its own struct for a
+    /// static method, `i32` for `main`, and otherwise a drawn type.
+    internal drawn_return_type(mut &this, owner: i64, receiver: Receiver, is_main: boolean) -> ValueType {
+        return match (receiver) {
+            Receiver::Exclusive => { ValueType::Void }
+            Receiver::Static    => { (if (this.random.chance(50)) { ValueType::Record(owner) } else { this.any_type() }) }
+            Receiver::Free      => { (if (is_main) { ValueType::I32 } else { this.free_return_type() }) }
+            _                   => { this.any_type() }
+        };
+    }
+
     /// Generate the rest of a function whose parameters are
-    /// `parameter_types`, from the stream already chosen: its return type,
-    /// its body and its cost.
-    internal define_with(mut &this, number: i64, owner: i64, receiver: Receiver, parameter_types: &Array<ValueType>) -> void {
+    /// `parameter_types` and which returns `returns`, from the stream
+    /// already chosen: its body and its cost.  `implements` is the trait
+    /// method a trait's implementation's method implements, or -1.
+    internal define_with(mut &this, number: i64, owner: i64, receiver: Receiver, parameter_types: &Array<ValueType>, returns: ValueType, implements: i64) -> void {
         const is_main: boolean = owner < 0 && number == this.options.function_count();
         this.environment.enter_function();
         this.loop_depth = 0;
@@ -73,12 +87,7 @@ implement struct Generator {
             this.environment.bind(parameter);
             position = position + 1;
         }
-        this.returns = match (receiver) {
-            Receiver::Exclusive => { ValueType::Void }
-            Receiver::Static    => { (if (this.random.chance(50)) { ValueType::Record(owner) } else { this.any_type() }) }
-            Receiver::Free      => { (if (is_main) { ValueType::I32 } else { this.free_return_type() }) }
-            _                   => { this.any_type() }
-        };
+        this.returns = returns;
         mut statements: Array<i64> = Array::<i64>::new();
         const body_start: i64 = this.environment.mark();
         this.fill(&statements, true);
@@ -111,7 +120,7 @@ implement struct Generator {
         this.program.functions.push(Function {
             number: number, is_main: is_main, owner: owner, receiver: receiver, first_parameter: first_parameter,
             parameter_count: parameter_count, returns: this.returns, body: body, cost: this.budget.spent(),
-            genericity: Genericity::Concrete, callable: ValueType::Void,
+            genericity: Genericity::Concrete, callable: ValueType::Void, implements: implements,
         });
     }
 

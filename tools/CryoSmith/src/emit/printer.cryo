@@ -9,7 +9,10 @@ import std::collections::string::{ String };
 
 import cryosmith::configuration::{ GENERATOR_VERSION, GenerationOptions, Plant };
 import cryosmith::guarantees::{ Observation };
-import cryosmith::model::{ Enumeration, Field, Function, Program, Receiver, Structure, Variable, VariableRole, VariantDeclaration };
+import cryosmith::model::{
+    Enumeration, Field, Function, Program, Receiver, Signature, Structure, TraitDeclaration, TraitMethod, Variable, VariableRole,
+    VariantDeclaration
+};
 
 /// Writes one program's text.
 public type struct Printer {
@@ -51,12 +54,63 @@ public type struct Printer {
             index = index + 1;
         }
         index = 0;
+        while (index < program.traits.length()) {
+            printer.trait_declaration(program, program.trait_at(index));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.traits.length()) {
+            mut structure: i64 = 0;
+            while (structure < program.structures.length()) {
+                if (program.implements(structure, index)) { printer.implementation(program, index, structure); }
+                structure = structure + 1;
+            }
+            index = index + 1;
+        }
+        index = 0;
         while (index < program.functions.length()) {
             const defined: Function = program.function_at(index);
             if (defined.owner < 0) { printer.definition(program, defined, 0); }
             index = index + 1;
         }
         return printer.text;
+    }
+
+    /// `type trait Tr<N> { .. }`: a line per method, its signature with no
+    /// body.
+    private trait_declaration(mut &this, program: &Program, declared: TraitDeclaration) -> void {
+        this.text.push(f"\ntype trait Tr{declared.number} ");
+        this.text.push(Str::new("{\n"));
+        mut method: i64 = declared.first_method;
+        while (method < declared.first_method + declared.method_count) {
+            const named: TraitMethod = program.trait_method_at(method);
+            const signature: Signature = program.signature_of(named.function_type);
+            this.indent(1);
+            this.text.push(f"t{named.number}(&this");
+            mut position: i64 = 0;
+            while (position < signature.parameter_count) {
+                this.text.push(f", p{position}: {program.type_name(program.signature_parameter(signature, position)).as_str()}");
+                position = position + 1;
+            }
+            this.text.push(f") -> {program.type_name(signature.returns).as_str()};\n");
+            method = method + 1;
+        }
+        this.text.push(Str::new("}\n"));
+    }
+
+    /// `implement trait Tr<N> for struct S<M> { .. }`: the methods of the
+    /// struct at `structure` that implement trait `index`'s.
+    private implementation(mut &this, program: &Program, index: i64, structure: i64) -> void {
+        const declared: TraitDeclaration = program.trait_at(index);
+        this.text.push(f"\nimplement trait Tr{declared.number} for struct S{program.structure_at(structure).number} ");
+        this.text.push(Str::new("{\n"));
+        for (defined in program.functions.iter()) {
+            if (defined.owner == structure && defined.implements >= declared.first_method
+                    && defined.implements < declared.first_method + declared.method_count) {
+                this.definition(program, defined, 1);
+            }
+        }
+        this.text.push(Str::new("}\n"));
     }
 
     /// The comment that reproduces the program: the generator version and
@@ -125,7 +179,7 @@ public type struct Printer {
         index = 0;
         while (index < program.functions.length()) {
             const defined: Function = program.function_at(index);
-            if (owner >= 0 && defined.owner == owner) { this.definition(program, defined, 1); }
+            if (owner >= 0 && defined.owner == owner && defined.implements < 0) { this.definition(program, defined, 1); }
             index = index + 1;
         }
         this.text.push(Str::new("}\n"));
@@ -150,7 +204,7 @@ public type struct Printer {
                     }
                 }
                 Receiver::Static    => { this.text.push(f"static m{defined.number}("); }
-                Receiver::Shared    => { this.text.push(f"m{defined.number}(&this"); separate = true; }
+                Receiver::Shared    => { this.text.push(f"{Printer::method_prefix(&defined)}{defined.number}(&this"); separate = true; }
                 Receiver::Exclusive => { this.text.push(f"m{defined.number}(mut &this"); separate = true; }
             }
             mut index: i64 = 0;
@@ -192,6 +246,12 @@ public type struct Printer {
             written = true;
         }
         if (written) { this.text.push(Str::new(" ")); }
+    }
+
+    /// The letter a method's name starts with: `t` for a trait's method,
+    /// `m` for a struct's own.
+    internal static method_prefix(defined: &Function) -> Str {
+        return if (defined.implements >= 0) { Str::new("t") } else { Str::new("m") };
     }
 
     /// A variable's name: `observed`, `p<N>`, `v<N>`, `n<N>`, `this`,
