@@ -452,6 +452,32 @@ whose implementation is printed first. A `T` bounded by `Tr1`, an object of
 two traits share one, and a body bounded by `Tr1` calls a generic function
 bounded by `Tr0` at its own `T` (`Program::inherits`).
 
+**Moves.** With `moves`, one or two owned structs `D<N>` of one to three
+scalar fields are declared from a stream of their own after the traits,
+each implementing `Drop` (docs/cryo.md section 15.2): `drop(mut &this) ->
+void` folds the struct's tag (7001 plus its number) and then each field
+into `observed`, so every drop reaches the hash, in the order and the
+number the program makes them. Implementing `Drop` is what makes the
+struct not `Copy` (section 15.1), so each pass, store and return of a value
+moves it. A value of `D<N>` is a literal writing every field, a parameter
+or local moved out of (`ExpressionKind::Move`), a call of a function
+returning one, or an `if` expression each of whose branches is one of these
+- the branch that runs is moved. Owned values are held by `const` locals
+(`const v3: D0 = v1;` moves `v1`), taken by a free function's by-value
+parameter three times in ten and returned by one about one time in seven;
+such a function starts no overload set. A variable moved out of holds
+nothing: `Environment::move_out` takes it out of every query, so nothing
+reads, borrows or moves it again and no block observes it when it ends;
+the move audit (section 7) holds the model to that. A variable is moved
+only inside the loop it was declared in (`Environment::movable`), so no
+loop's next trip moves it again (E0452). Every value made is dropped once:
+where its last owner's scope ends, at an early `return`, or when the call
+it was moved into returns, and a value moved on one branch only is dropped
+at the end of its scope on the paths that kept it. `main`'s own owned
+locals are dropped after its hash line is printed, so their drops are not
+in the hash. Under the memory-safety plan these programs are valid as
+they are: no reference is taken to an owned value.
+
 A `match` statement's arm may assign the local its subject reads. Its
 bindings are never written `mut` and their payloads are `Copy`, so each is
 a copy taken when the arm is entered (docs/cryo.md, enum destructuring)
@@ -522,7 +548,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   each pass, store or selection of a value that is not `Copy` moves it.
   Every generic function and generic struct method is bounded by `Copy`
   (`where T: Copy`, or `where T: Eq + Copy`), so a body uses a `T` value
-  as often as it likes, and every type it is instantiated at is `Copy`.
+  as often as it likes, and every type it is instantiated at is `Copy`:
+  an owned struct (`moves`), the one value type that is not, is never a
+  type argument, a field, a closure's parameter or a capture.
   The self-test's bound audit (section 7) refuses a generic definition
   that names a `T` parameter twice, or once inside a loop, without the
   bound; it reads the text, since the compiler accepts such a function
@@ -590,7 +618,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   does, and a closure written where it is passed or returned is generated
   at depth 1 on a budget whose calls stay under half the limit. A call
   through a parameter or through a returned value is charged the limit;
-  the self-test's function-value audit holds every value to it.
+  the self-test's function-value audit holds every value to it. An owned
+  value's `drop` is charged to no function: it does a fixed amount of
+  work, once per value made, and every value made is a charged node.
   A call is generated only while the caller's cost stays under its limit, so
   every program does a bounded amount of work, known at generation time.
 
@@ -666,7 +696,8 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. Any list removing `trait-objects`
+  generator's text, header aside. Any list removing `moves` generates
+  version 27's text for that list. Any list removing `trait-objects`
   generates version 26's text for that list, version 27 adding only
   `main`'s locals for objects to borrow; in version 26,
   `default,no-trait-defaults,no-supertraits` generated version 25's text,
@@ -708,8 +739,8 @@ every feature of the current stage; `no-<name>` removes one.
 | 3 | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
 | 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
 | 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
-| 6 (this one) | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods. Still to come: implementations for enums |
-| 7 | ownership: moves, drops (a drop log folded into the hash), references, `Box` and `Rc`, `Option` and `Result` |
+| 6 | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods. Still to come: implementations for enums |
+| 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2). Still to come: references, early drops, `Box` and `Rc`, `Option` and `Result`, match arms assigning their subject a new value |
 | 8 | strings, arrays and collections |
 
 Section 9 places each stage among the rest of the work, the tools that
@@ -809,6 +840,10 @@ statement budget of one function, default 24), `--no-header`, and
 - **The default audit** reads every trait's default bodies in 200
   programs' text: each call on `this` names a method numbered below the
   default's own (section 3.3).
+- **The move audit** walks every function of 200 programs in the model, in
+  the order the text is printed: each move is out of a variable of an
+  owned type, nothing names the variable afterwards, and no variable is
+  moved inside a loop it was declared outside (section 2).
 
 ## 8. Architecture
 
@@ -823,7 +858,7 @@ layers, lowest first:
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
 | `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures, `Exhaustiveness`'s arms and `Capture`'s captured values (3.2) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits` |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits`, `moves` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |
@@ -951,7 +986,13 @@ place.
    matched (`match (v) { E::X(a) => { v = E::Y(1); .. a .. } }` with the
    new value drawn apart from the old), so the rule that a binding is a
    copy taken on entering its arm is exercised; most assignments generated
-   today write the subject's own value back.
+   today write the subject's own value back. Every program it generates is
+   valid under the memory-safety plan's rules as well as today's: a
+   reference lives only in a local, parameter or return, never outlives
+   what it borrows, and is never shared and mutable at once, and nothing
+   needs `unsafe`. (In progress: `moves`, owned values moved between
+   locals, into calls and out of returns, each dropped into the hash, is
+   done.)
 6. **Stage 8: strings, arrays and collections.** `model/`: `Str`,
    `String`, fixed arrays, `Array`, `HashMap`. `generate/`: building,
    indexing within bounds, iterating. `guarantees/`: an index is in range

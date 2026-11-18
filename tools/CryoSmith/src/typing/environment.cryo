@@ -7,6 +7,12 @@
 ///! is assigned whole; a field is written only through a `mut` local or a
 ///! `mut &this`; a parameter, a `const` local, a counter and a `&this` are
 ///! read and never written.
+///!
+///! An owned value moved out of a variable leaves the variable holding
+///! nothing: it is out of every query from then on, so nothing reads it
+///! after the move, nor is it observed when its scope ends.  A variable is
+///! moved only inside the loop it was declared in: one declared outside an
+///! enclosing loop would be moved again on the next trip.
 
 namespace cryosmith::typing::environment;
 
@@ -24,19 +30,26 @@ public type struct Environment {
     private counters: i64;
     private bindings: i64;
     private closure_parameters: i64;
+    /// The variables whose owned values were moved out.
+    private moved: Array<i64>;
+    /// Where each enclosing loop's body starts in `names`, innermost last.
+    private loop_floors: Array<i64>;
 
     /// An environment holding nothing; `enter_function` starts one.
     public static new() -> Environment {
         return Environment {
             names: Array::<i64>::new(), floor: 0, locals: 0, counters: 0, bindings: 0, closure_parameters: 0,
+            moved: Array::<i64>::new(), loop_floors: Array::<i64>::new(),
         };
     }
 
-    /// Start a function: only `observed` in scope, and every numbering
-    /// from zero.
+    /// Start a function: only `observed` in scope, nothing moved, and every
+    /// numbering from zero.
     public enter_function(mut &this) -> void {
         this.names.clear();
         this.names.push(Program::observed());
+        this.moved.clear();
+        this.loop_floors.clear();
         this.floor = 0;
         this.locals = 0;
         this.counters = 0;
@@ -71,13 +84,53 @@ public type struct Environment {
     /// Whether `variable` is in scope.
     public holds(&this, variable: i64) -> boolean { return this.in_scope().contains(&variable); }
 
-    /// The names in scope: those since the innermost closure's floor.
-    public in_scope(&this) -> Array<i64> {
+    /// The names in scope: those since the innermost closure's floor that
+    /// still hold a value.
+    public in_scope(&this) -> Array<i64> { return this.holding_since(this.floor); }
+
+    /// The names from `start` in `names` on that were not moved out of.
+    private holding_since(&this, start: i64) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        mut index: i64 = this.floor;
+        mut index: i64 = start;
         while (index < this.names.length()) {
-            found.push(this.names.get(index).unwrap());
+            const variable: i64 = this.names.get(index).unwrap();
+            if (!this.moved.contains(&variable)) { found.push(variable); }
             index = index + 1;
+        }
+        return found;
+    }
+
+    /// Record that `variable`'s value was moved out: it holds nothing from
+    /// here on.
+    public move_out(mut &this, variable: i64) -> void { this.moved.push(variable); }
+
+    /// Whether `variable`'s value was moved out.
+    public is_moved(&this, variable: i64) -> boolean { return this.moved.contains(&variable); }
+
+    /// Enter a loop's body: what it declares from here on may be moved in
+    /// it.
+    public enter_loop(mut &this) -> void { this.loop_floors.push(this.names.length()); }
+
+    /// Leave the innermost loop's body.
+    public leave_loop(mut &this) -> void { this.loop_floors.truncate(this.loop_floors.length() - 1); }
+
+    /// The parameters and locals in scope holding a value of `wanted` that
+    /// may be moved here: declared inside the innermost enclosing loop, or
+    /// anywhere outside every loop.
+    public movable(&this, program: &Program, wanted: ValueType) -> Array<i64> {
+        mut start: i64 = this.floor;
+        if (this.loop_floors.length() > 0 &&this.loop_floors.get(this.loop_floors.length() - 1).unwrap() > start) {
+            start = this.loop_floors.get(this.loop_floors.length() - 1).unwrap();
+        }
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.holding_since(start).iter()) {
+            const declared: Variable = program.variable_at(variable);
+            const named: boolean = match (declared.role) {
+                VariableRole::Parameter => { true }
+                VariableRole::Local     => { true }
+                _                       => { false }
+            };
+            if (named && declared.value_type.same(wanted)) { found.push(variable); }
         }
         return found;
     }
@@ -116,17 +169,15 @@ public type struct Environment {
         return variable;
     }
 
-    /// The locals declared since `mark`, in declaration order.
+    /// The locals declared since `mark` that still hold a value, in
+    /// declaration order.
     public locals_since(&this, program: &Program, mark: i64) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        mut index: i64 = mark;
-        while (index < this.names.length()) {
-            const variable: i64 = this.names.get(index).unwrap();
+        for (variable in this.holding_since(mark).iter()) {
             match (program.variable_at(variable).role) {
                 VariableRole::Local => { found.push(variable); }
                 _                   => { }
             }
-            index = index + 1;
         }
         return found;
     }
