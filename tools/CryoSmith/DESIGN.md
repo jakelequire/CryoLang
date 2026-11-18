@@ -299,12 +299,13 @@ parameter's type generated as a call's argument is, and is observed by one
 such call where its block observes its locals. It is never `mut`, so it is
 never assigned.
 
-**Kept off.** A `match` statement's arms never assign the local its subject
-reads (`Environment::withhold`): the compiler reads an arm's bindings from
-the subject's storage, so `match (v) { E::X(a) => { v = E::Y(1); .. a .. } }`
-reads `a` from `E::Y(1)` (bug 0345). Whether a binding is a value of its
-own or names the payload's place is open in the language; the keep-off
-lifts when that is answered and the compiler follows it.
+A `match` statement's arm may assign the local its subject reads. Its
+bindings are never written `mut` and their payloads are `Copy`, so each is
+a copy taken when the arm is entered (docs/cryo.md, enum destructuring)
+and keeps the value the arm was chosen with; `match (v) { E::X(a) => { v =
+E::Y(1); .. a .. } }` observes the `a` of `E::X`.
+
+**Kept off.** Nothing.
 
 ## 3. Guarantees, and how each is enforced
 
