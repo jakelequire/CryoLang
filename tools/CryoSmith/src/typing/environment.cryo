@@ -17,23 +17,79 @@ import cryosmith::model::{ Program, ValueType, Variable, VariableRole };
 /// The names in scope, and the numbering of the names still to come.
 public type struct Environment {
     private names: Array<i64>;
+    /// Where the innermost closure's body starts in `names`: the names
+    /// before it are the enclosing function's, out of the body's scope.
+    private floor: i64;
     private locals: i64;
     private counters: i64;
     private bindings: i64;
+    private closure_parameters: i64;
+    /// Locals that may not be assigned for now: the subject of each
+    /// enclosing `match` statement, whose arms' bindings read the subject's
+    /// storage (a keep-off; DESIGN.md section 2, "Kept off").
+    private withheld: Array<i64>;
 
     /// An environment holding nothing; `enter_function` starts one.
     public static new() -> Environment {
-        return Environment { names: Array::<i64>::new(), locals: 0, counters: 0, bindings: 0 };
+        return Environment {
+            names: Array::<i64>::new(), floor: 0, locals: 0, counters: 0, bindings: 0, closure_parameters: 0,
+            withheld: Array::<i64>::new(),
+        };
     }
+
+    /// Keep `variable` from being assigned until `release`.
+    public withhold(mut &this, variable: i64) -> void { this.withheld.push(variable); }
+
+    /// Undo the latest `withhold`.
+    public release(mut &this) -> void { this.withheld.pop(); }
 
     /// Start a function: only `observed` in scope, and every numbering
     /// from zero.
     public enter_function(mut &this) -> void {
         this.names.clear();
         this.names.push(Program::observed());
+        this.floor = 0;
         this.locals = 0;
         this.counters = 0;
         this.bindings = 0;
+        this.closure_parameters = 0;
+    }
+
+    /// Enter a closure's body: nothing in scope, not even `observed`, until
+    /// its parameters are declared; the numbering goes on, so a name stays
+    /// unique in its function.  The floor to give `leave_closure`.
+    public enter_closure(mut &this) -> i64 {
+        const outer: i64 = this.floor;
+        this.floor = this.names.length();
+        return outer;
+    }
+
+    /// Leave a closure's body, back to the scope `enter_closure` left.
+    public leave_closure(mut &this, outer: i64) -> void {
+        this.names.truncate(this.floor);
+        this.floor = outer;
+    }
+
+    /// Declare the next closure parameter, `q<N>`, and bring it into scope.
+    public declare_closure_parameter(mut &this, program: mut &Program, value_type: ValueType) -> i64 {
+        const variable: i64 = program.variable(Variable { role: VariableRole::ClosureParameter, number: this.closure_parameters, value_type: value_type, mutable: false });
+        this.closure_parameters = this.closure_parameters + 1;
+        this.names.push(variable);
+        return variable;
+    }
+
+    /// Whether `variable` is in scope.
+    public holds(&this, variable: i64) -> boolean { return this.in_scope().contains(&variable); }
+
+    /// The names in scope: those since the innermost closure's floor.
+    private in_scope(&this) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        mut index: i64 = this.floor;
+        while (index < this.names.length()) {
+            found.push(this.names.get(index).unwrap());
+            index = index + 1;
+        }
+        return found;
     }
 
     /// Bring `variable` into scope.
@@ -88,7 +144,7 @@ public type struct Environment {
     /// The variables in scope of type `wanted`.
     public variables_of(&this, program: &Program, wanted: ValueType) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        for (variable in this.names.iter()) {
+        for (variable in this.in_scope().iter()) {
             if (program.variable_at(variable).value_type.same(wanted)) { found.push(variable); }
         }
         return Environment::observed_last(found);
@@ -97,7 +153,7 @@ public type struct Environment {
     /// The integer variables in scope of a type other than `excluded`.
     public integers_except(&this, program: &Program, excluded: ValueType) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        for (variable in this.names.iter()) {
+        for (variable in this.in_scope().iter()) {
             const value_type: ValueType = program.variable_at(variable).value_type;
             if (value_type.is_integer() && !value_type.same(excluded)) { found.push(variable); }
         }
@@ -108,7 +164,7 @@ public type struct Environment {
     /// type `wanted`.
     public field_roots(&this, program: &Program, wanted: ValueType) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        for (variable in this.names.iter()) {
+        for (variable in this.in_scope().iter()) {
             if (program.reaches(program.variable_at(variable).value_type, wanted)) { found.push(variable); }
         }
         return found;
@@ -119,7 +175,7 @@ public type struct Environment {
     /// `writable`, only those whose fields may be written.
     public receiver_roots(&this, program: &Program, owner: ValueType, writable: boolean) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        for (variable in this.names.iter()) {
+        for (variable in this.in_scope().iter()) {
             const declared: Variable = program.variable_at(variable);
             if (writable && !Environment::fields_writable(declared)) { continue; }
             if (declared.value_type.same(owner) || program.reaches(declared.value_type, owner)) { found.push(variable); }
@@ -130,10 +186,10 @@ public type struct Environment {
     /// The `mut` locals in scope, which may be assigned whole.
     public assignable(&this, program: &Program) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        for (variable in this.names.iter()) {
+        for (variable in this.in_scope().iter()) {
             const declared: Variable = program.variable_at(variable);
             match (declared.role) {
-                VariableRole::Local => { if (declared.mutable) { found.push(variable); } }
+                VariableRole::Local => { if (declared.mutable && !this.withheld.contains(&variable)) { found.push(variable); } }
                 _                   => { }
             }
         }
@@ -144,7 +200,7 @@ public type struct Environment {
     /// a `mut &this`.
     public writable_records(&this, program: &Program) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        for (variable in this.names.iter()) {
+        for (variable in this.in_scope().iter()) {
             const declared: Variable = program.variable_at(variable);
             if (declared.value_type.is_record() && Environment::fields_writable(declared)) { found.push(variable); }
         }

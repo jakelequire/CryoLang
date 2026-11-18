@@ -8,7 +8,7 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 
 import cryosmith::model::expressions::{ ExpressionKind, ExpressionNode, MatchArm, PatternElement, TypeArgumentSpelling };
-import cryosmith::model::items::{ Enumeration, Field, Function, Structure, Variable, VariableRole, VariantDeclaration };
+import cryosmith::model::items::{ Closure, Enumeration, Field, Function, Signature, Structure, Variable, VariableRole, VariantDeclaration };
 import cryosmith::model::statements::{ StatementKind, StatementNode };
 import cryosmith::model::types::{ ValueType };
 
@@ -48,11 +48,20 @@ public type struct Program {
     public payload_types: Array<ValueType>;
     /// Every element of a pattern's payload.
     public pattern_elements: Array<PatternElement>;
+    /// Every function type, each written once.
+    public signatures: Array<Signature>;
+    /// The parameter types of every signature, each signature's a run.
+    public signature_types: Array<ValueType>;
+    /// Every closure.
+    public closures: Array<Closure>;
 
     /// A program holding only `observed`.
     public static new() -> Program {
         mut program: Program = Program {
             pattern_elements: Array::<PatternElement>::new(),
+            signatures:  Array::<Signature>::new(),
+            signature_types: Array::<ValueType>::new(),
+            closures:    Array::<Closure>::new(),
             enumerations: Array::<Enumeration>::new(),
             enumeration_templates: Array::<Enumeration>::new(),
             arms:        Array::<MatchArm>::new(),
@@ -73,6 +82,41 @@ public type struct Program {
 
     /// The index of `observed`.
     public static observed() -> i64 { return 0; }
+
+    /// The function type taking `parameters` and returning `returns`: the
+    /// signature written before when there is one, so equal function types
+    /// are the same type.
+    public function_type(mut &this, parameters: &Array<ValueType>, returns: ValueType) -> ValueType {
+        mut index: i64 = 0;
+        while (index < this.signatures.length()) {
+            const held: Signature = this.signatures.get(index).unwrap();
+            mut equal: boolean = held.returns.same(returns) && held.parameter_count == parameters.length();
+            mut position: i64 = 0;
+            while (equal && position < held.parameter_count) {
+                equal = this.signature_types.get(held.first_parameter + position).unwrap().same(parameters.get(position).unwrap());
+                position = position + 1;
+            }
+            if (equal) { return ValueType::Function(index); }
+            index = index + 1;
+        }
+        const first: i64 = this.signature_types.length();
+        for (parameter in parameters.iter()) { this.signature_types.push(parameter); }
+        this.signatures.push(Signature { first_parameter: first, parameter_count: parameters.length(), returns: returns });
+        return ValueType::Function(this.signatures.length() - 1);
+    }
+
+    /// The signature function type `function_type` names.
+    public signature_of(&this, function_type: ValueType) -> Signature {
+        return this.signatures.get(function_type.signature()).unwrap();
+    }
+
+    /// Parameter `position`'s type in `signature`.
+    public signature_parameter(&this, signature: Signature, position: i64) -> ValueType {
+        return this.signature_types.get(signature.first_parameter + position).unwrap();
+    }
+
+    /// Closure `index`.
+    public closure_at(&this, index: i64) -> Closure { return this.closures.get(index).unwrap(); }
 
     /// Add an expression node; its index.
     public expression(mut &this, kind: ExpressionKind, value_type: ValueType) -> i64 {
@@ -241,6 +285,18 @@ public type struct Program {
             ValueType::Record(index) => { this.structure_name(index, Str::new("<")) }
             ValueType::Enumeration(index) => { this.enumeration_name(index, Str::new("<")) }
             ValueType::TypeParameter => { String::from_str(Str::new("T")) }
+            ValueType::Function(index) => {
+                const signature: Signature = this.signatures.get(index).unwrap();
+                mut name: String = String::from_str(Str::new("("));
+                mut position: i64 = 0;
+                while (position < signature.parameter_count) {
+                    if (position > 0) { name.push(Str::new(", ")); }
+                    name.push(this.type_name(this.signature_parameter(signature, position)).as_str());
+                    position = position + 1;
+                }
+                name.push(f") -> {this.type_name(signature.returns).as_str()}".as_str());
+                name
+            }
         };
     }
 

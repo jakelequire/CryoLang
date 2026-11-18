@@ -283,6 +283,29 @@ literals, decides no type parameter. An instance's first field is of type
 parameters and fields are generated as before, widening and constants
 included.
 
+**Closures.** With `closures`, a statement of a function that is not
+generic may declare a `const` local holding a closure of its function
+type, `const v3: (u8, i32) -> boolean = (q0: u8, q1: i32) -> boolean {
+return .. };`: zero to two scalar parameters `q<N>`, numbered per
+function, and a scalar return type. A function type is a `ValueType` of
+its own, each signature written once in the program (`Program::function_type`),
+so two closures of one signature have one type. The body returns one value,
+generated in a scope of its own (`Environment::enter_closure`) that holds
+its parameters and nothing of the enclosing function, not even `observed`,
+so it captures nothing and its function type may hold it; it may call the
+functions generated before it. A closure local is called wherever a value
+of its return type is wanted, `v3(a, b)`, with an argument of each
+parameter's type generated as a call's argument is, and is observed by one
+such call where its block observes its locals. It is never `mut`, so it is
+never assigned.
+
+**Kept off.** A `match` statement's arms never assign the local its subject
+reads (`Environment::withhold`): the compiler reads an arm's bindings from
+the subject's storage, so `match (v) { E::X(a) => { v = E::Y(1); .. a .. } }`
+reads `a` from `E::Y(1)` (bug 0345). Whether a binding is a value of its
+own or names the payload's place is open in the language; the keep-off
+lifts when that is answered and the compiler follows it.
+
 ## 3. Guarantees, and how each is enforced
 
 ### 3.1 Valid under either overflow rule
@@ -387,7 +410,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   each calls only functions generated before it: the call graph is acyclic.
 - **A cost model.** A statement costs its expressions' nodes (a store's
   target is written, not read, and costs nothing); a loop costs its trip
-  count times its body; an `if` the dearer arm; a call the callee's cost.
+  count times its body; an `if` the dearer arm; a call the callee's cost;
+  a closure's body is measured on a budget of its own when it is made,
+  and that cost is charged at every call of it.
   A call is generated only while the caller's cost stays under its limit, so
   every program does a bounded amount of work, known at generation time.
 
@@ -489,8 +514,8 @@ every feature of the current stage; `no-<name>` removes one.
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
 | 3 | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
-| 4 (this one) | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
-| 5 | closures: capturing and not, passed to function-typed parameters and called |
+| 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
+| 5 (this one) | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2). Still to come: closures capturing locals, closures passed to function-typed parameters and returned, closures in generic bodies |
 | 6 | traits, classes and dynamic dispatch: implementations, default methods, calls through a bound and through a trait object |
 | 7 | ownership: moves, drops (a drop log folded into the hash), references, `Box` and `Rc`, `Option` and `Result` |
 | 8 | strings, arrays and collections |
@@ -593,7 +618,7 @@ layers, lowest first:
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
 | `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures and `Exhaustiveness`'s arms (3.2) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums` |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |
@@ -692,6 +717,7 @@ place.
    passed to function-typed parameters and called. `guarantees/`: a
    closure's cost is its body's, charged at each call; a capture is read,
    never moved twice. `typing/`: a closure's own scope over its captures.
+   (In progress: `closures`, closures capturing nothing, is done.)
 4. **Stage 6: traits, classes and dynamic dispatch.** `model/`: traits
    with required and default methods, implementations for structs and
    enums, classes, trait objects. `generate/`: calls through a bound and
