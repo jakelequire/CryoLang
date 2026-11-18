@@ -4,6 +4,7 @@
 
 namespace cryosmith::emit::printer;
 
+import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 
@@ -11,7 +12,7 @@ import cryosmith::configuration::{ GENERATOR_VERSION, GenerationOptions, Plant }
 import cryosmith::guarantees::{ Observation };
 import cryosmith::model::{
     Enumeration, Field, Function, OwnedStructure, Program, Receiver, Signature, StatementKind, Structure, TraitDeclaration, TraitMethod,
-    Variable, VariableRole, VariantDeclaration
+    ValueType, Variable, VariableRole, VariantDeclaration
 };
 
 /// Writes one program's text.
@@ -61,17 +62,14 @@ public type struct Printer {
         }
         index = 0;
         while (index < program.traits.length()) {
-            mut structure: i64 = 0;
-            while (structure < program.structures.length()) {
-                if (program.implements(structure, index)) { printer.implementation(program, index, structure); }
-                structure = structure + 1;
-            }
+            const implementors: Array<ValueType> = program.implementors(index);
+            for (implementor in implementors.iter()) { printer.implementation(program, index, implementor); }
             index = index + 1;
         }
         index = 0;
         while (index < program.functions.length()) {
             const defined: Function = program.function_at(index);
-            if (defined.owner < 0 && !defined.is_default()) { printer.definition(program, defined, 0); }
+            if (defined.is_unowned() && !defined.is_default()) { printer.definition(program, defined, 0); }
             index = index + 1;
         }
         return printer.text;
@@ -128,14 +126,16 @@ public type struct Printer {
         this.text.push(Str::new("}\n"));
     }
 
-    /// `implement trait Tr<N> for struct S<M> { .. }`: the methods of the
-    /// struct at `structure` that implement trait `index`'s.
-    private implementation(mut &this, program: &Program, index: i64, structure: i64) -> void {
+    /// `implement trait Tr<N> for struct S<M> { .. }`, or `for enum E<M>`:
+    /// the methods belonging to `implementor` that implement trait
+    /// `index`'s.
+    private implementation(mut &this, program: &Program, index: i64, implementor: ValueType) -> void {
         const declared: TraitDeclaration = program.trait_at(index);
-        this.text.push(f"\nimplement trait Tr{declared.number} for struct S{program.structure_at(structure).number} ");
+        const kind: Str = if (implementor.is_record()) { Str::new("struct") } else { Str::new("enum") };
+        this.text.push(f"\nimplement trait Tr{declared.number} for {kind} {program.type_name(implementor).as_str()} ");
         this.text.push(Str::new("{\n"));
         for (defined in program.functions.iter()) {
-            if (defined.owner == structure && defined.implements >= declared.first_method
+            if (defined.owner.same(implementor) && defined.implements >= declared.first_method
                     && defined.implements < declared.first_method + declared.method_count) {
                 this.definition(program, defined, 1);
             }
@@ -221,7 +221,7 @@ public type struct Printer {
         index = 0;
         while (index < program.functions.length()) {
             const defined: Function = program.function_at(index);
-            if (owner >= 0 && defined.owner == owner && defined.implements < 0) { this.definition(program, defined, 1); }
+            if (owner >= 0 && defined.owner.structure() == owner && defined.implements < 0) { this.definition(program, defined, 1); }
             index = index + 1;
         }
         this.text.push(Str::new("}\n"));

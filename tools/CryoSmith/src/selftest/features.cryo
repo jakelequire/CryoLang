@@ -10,6 +10,7 @@ import std::core::option::{ Option };
 import std::core::result::{ Result };
 
 import cryosmith::configuration::{ Feature, FeatureSet, GenerationOptions };
+import cryosmith::model::{ ExpressionKind, Program };
 import cryosmith::selftest::runner::{ SelfTest };
 
 /// How many programs each feature switch is checked over.
@@ -79,6 +80,7 @@ implement struct SelfTest {
         this.switch(Feature::TraitObjects, [Str::new(": virtual &Tr0"), Str::new(": virtual &Tr1")]);
         this.switch(Feature::TraitDefaults, [Str::new(";\n\n    t"), Str::new(";\n\n    t")]);
         this.switch(Feature::Supertraits, [Str::new("type trait Tr1 : Tr0 {"), Str::new("type trait Tr1 : Tr0 {")]);
+        this.switch(Feature::EnumImplementations, [Str::new(" for enum E"), Str::new("match (this) {")]);
         this.switch(Feature::Drops, [Str::new("mem::drop(v"), Str::new("&(D")]);
         this.switch(Feature::References, [Str::new("(p0: &D"), Str::new("(p0: mut &D")]);
         this.switch(Feature::Moves, [Str::new("implement trait Drop for struct D0 {"), Str::new(": D0 = D0 {")]);
@@ -99,6 +101,45 @@ implement struct SelfTest {
     internal borrow_coverage(mut &this) -> void {
         this.borrow_coverage_of(Str::new("trait-objects"), [Str::new(": virtual &Tr"), Str::new(": virtual &Tr")], [Str::new(", &v"), Str::new(", &p")], Str::new(", &("));
         this.borrow_coverage_of(Str::new("references"), [Str::new("(p0: &D"), Str::new("(p0: mut &D")], [Str::new("(&v"), Str::new("(&p")], Str::new("(&("));
+    }
+
+    /// `enum-implementations` reaches an enum all three ways a struct's
+    /// implementation is reached, read from the model of the default
+    /// programs: some call a trait method on an enum value, some
+    /// instantiate a trait-bounded function at an enum, and some borrow an
+    /// enum variable for a trait object.
+    internal enum_implementation_coverage(mut &this) -> void {
+        mut calls: i64 = 0;
+        mut bounds: i64 = 0;
+        mut objects: i64 = 0;
+        mut seed: u64 = 1;
+        while (seed <= SWITCH_PROGRAMS) {
+            const program: &Program = this.default_model(seed);
+            mut called: boolean = false;
+            mut bounded: boolean = false;
+            mut borrowed: boolean = false;
+            for (node in program.expressions.iter()) {
+                match (node.kind) {
+                    ExpressionKind::MethodCall(receiver, _, _, _) => {
+                        if (program.expression_at(receiver).value_type.is_enumeration()) { called = true; }
+                    }
+                    ExpressionKind::GenericCall(callee, type_argument, _, _, _) => {
+                        if (type_argument.is_enumeration() && program.function_at(callee).genericity.bounding_trait() >= 0) { bounded = true; }
+                    }
+                    ExpressionKind::Borrow(variable) => {
+                        if (node.value_type.object_trait() >= 0 && program.variable_at(variable).value_type.is_enumeration()) { borrowed = true; }
+                    }
+                    _ => { }
+                }
+            }
+            if (called) { calls = calls + 1; }
+            if (bounded) { bounds = bounds + 1; }
+            if (borrowed) { objects = objects + 1; }
+            seed = seed + 1;
+        }
+        this.expect(calls > 0, f"`enum-implementations`: no program of {SWITCH_PROGRAMS} calls a trait method on an enum value");
+        this.expect(bounds > 0, f"`enum-implementations`: no program of {SWITCH_PROGRAMS} instantiates a trait bound at an enum");
+        this.expect(objects > 0, f"`enum-implementations`: no program of {SWITCH_PROGRAMS} borrows an enum for a trait object");
     }
 
     /// Of the programs spelling either of `declarations`, at least half

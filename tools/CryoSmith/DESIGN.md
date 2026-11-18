@@ -385,6 +385,23 @@ value of the struct the caller can reach (`v1.t0(a)`, `this.f2.t0(a)`).
 Such a call names the one implementation its receiver's type has, so it is
 resolved at compile time. A generic struct's instance implements no trait.
 
+**Enum implementations.** With `enum-implementations` (and `traits`,
+`enums`), each declared enum - no generic enum's instance - implements
+each trait six times in ten as a struct does, drawn after the structs from
+the same stream, `implement trait Tr0 for enum E0 { t0(&this, p0: u8) ->
+i32 { .. } }`. Its methods are generated as a struct's are, with `this` of
+the enum; the body observes `this` as any enum value is observed, by a
+`match` on it giving its variant's number, and may match it elsewhere,
+binding its payloads read-only through the reference. Wherever a struct
+implementing a trait is used, an implementing enum is too: its values are
+receivers of the methods (`v2.t0(a)`), the type argument of a bound it
+satisfies (`k0::<E0>(..)`), the variable an object borrows (`&v2`), and
+runners of a default it does not override. A function belongs to its
+owner as a type (`Function.owner`: `void`, a struct or an enum), so the
+lookups `implements`, `implementors` and `runs_default` read one owner for
+both kinds. Enum values are `Copy`, so nothing here moves, and a borrow of
+one for an object is the same view a struct's is.
+
 **Trait bounds.** With `trait-bounds` (and `traits`, `generics`), each
 trait some struct implements bounds a generic function seven times in
 ten, `function k0<T>(p0: T, p1: T, p2: u8) -> T where T: Tr0 + Copy`,
@@ -394,7 +411,7 @@ trait's methods on its `T` values wherever a value of a method's return
 type is wanted, `p0.t0(a)`, one form in four where one may be called, each
 call charged the costliest implementation's work, and observes each `T`
 parameter by a call of the trait's first method. It is called only at a
-struct implementing the trait (`Program::admits`), written, `_` or left
+struct or enum implementing the trait (`Program::admits`), written, `_` or left
 to inference as any generic call, and `main` observes one call of each at
 an implementing struct drawn for it. Each instance's bound calls run that
 struct's implementation, chosen at compile time per instance; a `k` body
@@ -409,7 +426,7 @@ it, `p1.t0(a)`, one form in four where one may be called, each run from
 the table of the value the object borrows and charged the costliest
 implementation's work, and observes it by a call of the trait's first
 method. A call of the function passes `&v`, a parameter or local of the
-caller holding a struct that implements the trait, and the function is
+caller holding a struct or enum that implements the trait, and the function is
 called only where such a variable is in scope (`passes_objects`). `main`
 declares one first, a local of a struct implementing each trait some
 helper takes an object of, so its calls of those helpers pass one and an
@@ -837,7 +854,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 3 | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
 | 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
 | 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
-| 6 | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods. Still to come: implementations for enums |
+| 6 | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods; `enum-implementations`: traits implemented for the declared enums, their methods matching on `this`, called on the enums' values, through bounds at an enum and through objects borrowing one. The stage is complete |
 | 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings; `references`: `&D0` and `mut &D0` parameters, `&D0` returns, kept shared or exclusive per statement; `drops`: `mem::drop`, discarded results, borrowed temporaries and whole stores through `mut &D0`; `boxes`: `Box<D0>` read and written through, `Rc<D0>` cloned and counted; `options`: `Option<D0>` and `Result<D0, u32>` matched, unwrapped where certainly holding a value, and propagated with `?` |
 | 8 | strings, arrays and collections |
 
@@ -983,6 +1000,11 @@ statement budget of one function, default 24), `--no-header`, and
 - **Borrow coverage**: of 40 programs, at least half of those declaring a
   trait object parameter pass `&v` to one, and likewise for a reference
   parameter.
+- **Enum implementation coverage**: of the same 40 programs' models, some
+  call a trait method on an enum value, some instantiate a trait-bounded
+  function at an enum, and some borrow an enum variable for a trait
+  object, so each way a struct's implementation is reached is reached
+  through an enum too.
 
 ## 8. Architecture
 
@@ -1135,9 +1157,9 @@ generator never reads through an `Rc`.
    the same whichever way it is dispatched. (Done: `traits`, declarations
    and implementations called on the implementing struct's values,
    `trait-bounds`, calls through a bound, `trait-objects`, calls through a
-   trait object, `trait-defaults`, default bodies, and `supertraits`;
-   implementations for enums, whose values a bound and an object reach
-   by a layout of their own, remain.)
+   trait object, `trait-defaults`, default bodies, `supertraits`, and
+   `enum-implementations`, the same reached through an enum's values. The
+   stage is complete.)
 5. **Stage 7: ownership.** `model/`: references (`&`, `mut &`) as values,
    `Box`, `Rc`, `Option`, `Result`, types with a drop. `generate/`: moves,
    borrows, early drops. `guarantees/`: no use after a move and no borrow

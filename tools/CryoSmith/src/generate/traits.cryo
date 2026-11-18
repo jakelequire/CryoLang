@@ -40,6 +40,15 @@
 ///! time, `type trait Tr1 : Tr0`: only a struct implementing `Tr0`
 ///! implements `Tr1`, and a `T` bounded by `Tr1`, an object of `Tr1` and
 ///! `Tr1`'s default bodies call `Tr0`'s methods too.
+///!
+///! With `enum-implementations`, each declared enum (no generic enum's
+///! instance) implements each trait six times in ten too, after the
+///! structs, `implement trait Tr0 for enum E0 { .. }`.  Its methods are
+///! generated as a struct's are, with `this` of the enum, observed by a
+///! `match` on it like any enum value; the enum's values are receivers of
+///! its methods, type arguments of a bound it satisfies and the values an
+///! object of the trait borrows, as a struct's are.  A struct implements a
+///! supertrait's subtrait only after the supertrait, and so does an enum.
 
 namespace cryosmith::generate::traits;
 
@@ -48,7 +57,7 @@ import std::collections::array::{ Array };
 import cryosmith::configuration::{ Feature };
 import cryosmith::generate::generator::{ Generator };
 import cryosmith::model::{
-    ExpressionKind, Function, Genericity, Receiver, Signature, StatementKind, Structure, TraitDeclaration, TraitMethod, ValueType,
+    ExpressionKind, Function, Genericity, Receiver, Signature, StatementKind, TraitDeclaration, TraitMethod, ValueType,
     Variable, VariableRole
 };
 import cryosmith::random::{ RandomStream };
@@ -82,10 +91,11 @@ const SUPERTRAIT_CHANCE: i64 = 50;
 
 implement struct Generator {
     /// Declare the traits and generate their implementations, then their
-    /// methods' default bodies: none without `traits` or without `structs`,
-    /// since only a struct implements one.
+    /// methods' default bodies: none without `traits`, or with nothing to
+    /// implement one - no `structs`, and no enum under
+    /// `enum-implementations`.
     internal declare_traits(mut &this) -> void {
-        if (!this.options.features.has(Feature::Traits) ||!this.options.features.has(Feature::Structs)) { return; }
+        if (!this.options.features.has(Feature::Traits) || !this.has_implementing_types()) { return; }
         this.random = RandomStream::for_traits(this.options.seed);
         this.genericity = Genericity::Concrete;
         const defaults: boolean = this.options.features.has(Feature::TraitDefaults);
@@ -105,17 +115,16 @@ implement struct Generator {
             this.program.traits.push(TraitDeclaration { number: index, first_method: first_method, method_count: method_count, supertrait: supertrait });
         }
         mut implementations: Array<Implementation> = Array::<Implementation>::new();
-        mut structure: i64 = 0;
-        while (structure < this.program.structures.length()) {
-            const declared: Structure = this.program.structure_at(structure);
+        const candidates: Array<ValueType> = this.program.implementing_types();
+        for (implementor in candidates.iter()) {
+            if (!this.may_implement(implementor)) { continue; }
             mut index: i64 = 0;
-            while (!declared.is_instance() && index < count) {
-                if (this.random.chance(IMPLEMENTATION_CHANCE) && this.chosen_supertrait(&implementations, structure, index)) {
-                    implementations.push(Implementation { structure: structure, index: index, overridden: this.drawn_overrides(index) });
+            while (index < count) {
+                if (this.random.chance(IMPLEMENTATION_CHANCE) && this.chosen_supertrait(&implementations, implementor, index)) {
+                    implementations.push(Implementation { implementor: implementor, index: index, overridden: this.drawn_overrides(index) });
                 }
                 index = index + 1;
             }
-            structure = structure + 1;
         }
         for (chosen in implementations.iter()) { this.implement(chosen); }
         mut method: i64 = 0;
@@ -129,14 +138,33 @@ implement struct Generator {
         }
     }
 
-    /// Whether the struct at `structure` may implement trait `index`: the
-    /// trait has no supertrait, or the struct implements it, chosen
-    /// earlier in `chosen`.
-    private chosen_supertrait(&this, chosen: &Array<Implementation>, structure: i64, index: i64) -> boolean {
+    /// Whether some type may implement a trait: a declared struct, or with
+    /// `enum-implementations`, a declared enum.
+    private has_implementing_types(&this) -> boolean {
+        const candidates: Array<ValueType> = this.program.implementing_types();
+        for (implementor in candidates.iter()) {
+            if (this.may_implement(implementor)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether `implementor` may implement a trait: a struct no generic
+    /// struct's instance is, under `structs`; an enum, under
+    /// `enum-implementations`.  No draw is taken for one that may not.
+    private may_implement(&this, implementor: ValueType) -> boolean {
+        if (implementor.is_record()) {
+            return this.options.features.has(Feature::Structs) && !this.program.structure_at(implementor.structure()).is_instance();
+        }
+        return implementor.is_enumeration() && this.options.features.has(Feature::EnumImplementations);
+    }
+
+    /// Whether `implementor` may implement trait `index`: the trait has no
+    /// supertrait, or the type implements it, chosen earlier in `chosen`.
+    private chosen_supertrait(&this, chosen: &Array<Implementation>, implementor: ValueType, index: i64) -> boolean {
         const supertrait: i64 = this.program.trait_at(index).supertrait;
         if (supertrait < 0) { return true; }
         for (implementation in chosen.iter()) {
-            if (implementation.structure == structure && implementation.index == supertrait) { return true; }
+            if (implementation.implementor.same(implementor) && implementation.index == supertrait) { return true; }
         }
         return false;
     }
@@ -223,8 +251,8 @@ implement struct Generator {
     }
 
     /// The variables in scope a trait object of trait `index` may borrow:
-    /// a parameter or local holding a struct that implements it.  A
-    /// receiver is a reference already, and is never borrowed again.
+    /// a parameter or local holding a struct or an enum that implements
+    /// it.  A receiver is a reference already, and is never borrowed again.
     private object_sources(&this, index: i64) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
         for (variable in this.environment.in_scope().iter()) {
@@ -234,7 +262,7 @@ implement struct Generator {
                 VariableRole::Local     => { true }
                 _                       => { false }
             };
-            if (named && declared.value_type.is_record() && this.program.implements(declared.value_type.structure(), index)) {
+            if (named && this.program.implements(declared.value_type, index)) {
                 found.push(variable);
             }
         }
@@ -242,17 +270,17 @@ implement struct Generator {
     }
 
     /// In `main`, with `trait-objects`: for each trait some helper takes an
-    /// object of, a local of a struct implementing it, declared first, so
-    /// main's calls of those helpers have a value to pass `&v` of.  No draw
-    /// where no helper takes an object.
+    /// object of, a local of a struct or an enum implementing it, declared
+    /// first, so main's calls of those helpers have a value to pass `&v`
+    /// of.  No draw where no helper takes an object.
     internal declare_object_sources(mut &this, statements: mut &Array<i64>) -> void {
         if (!this.options.features.has(Feature::TraitObjects)) { return; }
         mut index: i64 = 0;
         while (index < this.program.traits.length()) {
             if (this.takes_object_of(index)) {
-                const implementors: Array<i64> = this.program.implementors(index);
-                const source: ValueType = ValueType::Record(implementors.get(this.random.below(implementors.length())).unwrap());
-                const value: i64 = this.record_expression(source, this.depth());
+                const implementors: Array<ValueType> = this.program.implementors(index);
+                const source: ValueType = implementors.get(this.random.below(implementors.length())).unwrap();
+                const value: i64 = if (source.is_record()) { this.record_expression(source, this.depth()) } else { this.enumeration_expression(source, this.depth()) };
                 const variable: i64 = this.environment.declare_local(&this.program, source, false);
                 statements.push(this.program.statement(StatementKind::Declare(variable, value)));
             }
@@ -344,7 +372,7 @@ implement struct Generator {
         while (method < declared.first_method + declared.method_count) {
             if (!this.program.trait_method_at(method).defaulted || (chosen.overridden & bit) != 0) {
                 this.random = RandomStream::for_method(this.options.seed, this.program.functions.length());
-                this.define_trait_method(method, chosen.structure);
+                this.define_trait_method(method, chosen.implementor);
             }
             bit = bit << 1;
             method = method + 1;
@@ -357,12 +385,13 @@ implement struct Generator {
     private define_default(mut &this, method: i64) -> void {
         this.random = RandomStream::for_method(this.options.seed, this.program.functions.length());
         this.genericity = Genericity::Defaulting(this.program.trait_method_at(method).declared_by, method);
-        this.define_trait_method(method, -1);
+        this.define_trait_method(method, ValueType::Void);
     }
 
     /// Generate a method implementing trait method `method` with its
-    /// signature, for the struct at `owner`, or for -1 its default body.
-    private define_trait_method(mut &this, method: i64, owner: i64) -> void {
+    /// signature, for the struct or enum `owner`, or for `void` its default
+    /// body.
+    private define_trait_method(mut &this, method: i64, owner: ValueType) -> void {
         const signature: Signature = this.program.signature_of(this.program.trait_method_at(method).function_type);
         mut parameter_types: Array<ValueType> = Array::<ValueType>::new();
         while (parameter_types.length() < signature.parameter_count) {
@@ -372,13 +401,13 @@ implement struct Generator {
     }
 }
 
-/// A struct's implementation of a trait, as drawn: the struct and the trait
-/// by their places, and a bit per method of the trait, by its place in the
-/// trait, for each defaulted method the implementation writes its own
-/// method for.
+/// A struct's or an enum's implementation of a trait, as drawn: the
+/// implementing type, the trait by its place, and a bit per method of the
+/// trait, by its place in the trait, for each defaulted method the
+/// implementation writes its own method for.
 private type struct Implementation {
-    /// The implementing struct.
-    private structure: i64;
+    /// The implementing struct or enum.
+    private implementor: ValueType;
     /// The trait.
     private index: i64;
     /// The defaulted methods it overrides.

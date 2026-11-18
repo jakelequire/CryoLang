@@ -173,18 +173,36 @@ public type struct Program {
             return !genericity.compares() || inside.compares();
         }
         if (argument.same(ValueType::Void)) { return false; }
-        if (bounding >= 0) { return argument.is_record() && this.implements(argument.structure(), bounding); }
+        if (bounding >= 0) { return this.implements(argument, bounding); }
         if (genericity.compares()) { return argument.is_integer() || argument.same(ValueType::Boolean); }
         return true;
     }
 
-    /// The structs implementing trait `index`, by their places.
-    public implementors(&this, index: i64) -> Array<i64> {
-        mut found: Array<i64> = Array::<i64>::new();
+    /// The types that may implement a trait, in the order implementations
+    /// are drawn and printed: the declared structs, then the enums that are
+    /// no generic enum's instance.
+    public implementing_types(&this) -> Array<ValueType> {
+        mut found: Array<ValueType> = Array::<ValueType>::new();
         mut structure: i64 = 0;
         while (structure < this.structures.length()) {
-            if (this.implements(structure, index)) { found.push(structure); }
+            found.push(ValueType::Record(structure));
             structure = structure + 1;
+        }
+        mut enumeration: i64 = 0;
+        while (enumeration < this.enumerations.length()) {
+            if (!this.enumeration_at(enumeration).is_instance()) { found.push(ValueType::Enumeration(enumeration)); }
+            enumeration = enumeration + 1;
+        }
+        return found;
+    }
+
+    /// The types implementing trait `index`, in `implementing_types`'
+    /// order.
+    public implementors(&this, index: i64) -> Array<ValueType> {
+        mut found: Array<ValueType> = Array::<ValueType>::new();
+        const candidates: Array<ValueType> = this.implementing_types();
+        for (implementor in candidates.iter()) {
+            if (this.implements(implementor, index)) { found.push(implementor); }
         }
         return found;
     }
@@ -230,14 +248,13 @@ public type struct Program {
         return -1;
     }
 
-    /// Whether a value of the struct at `structure` runs trait method
-    /// `method`'s default body when the method is called on it: the struct
-    /// implements the declaring trait and writes no method of its own for
-    /// it.
-    public runs_default(&this, structure: i64, method: i64) -> boolean {
-        if (!this.implements(structure, this.trait_method_at(method).declared_by)) { return false; }
+    /// Whether a value of `implementor` runs trait method `method`'s
+    /// default body when the method is called on it: the type implements
+    /// the declaring trait and writes no method of its own for it.
+    public runs_default(&this, implementor: ValueType, method: i64) -> boolean {
+        if (!this.implements(implementor, this.trait_method_at(method).declared_by)) { return false; }
         for (defined in this.functions.iter()) {
-            if (defined.owner == structure && defined.implements == method) { return false; }
+            if (defined.owner.same(implementor) && defined.implements == method) { return false; }
         }
         return true;
     }
@@ -253,14 +270,14 @@ public type struct Program {
         return most;
     }
 
-    /// Whether the struct at `structure` implements trait `index`: some
-    /// method of that struct implements one of the trait's methods, as
-    /// every implementation does, a trait's first method having no
-    /// default.
-    public implements(&this, structure: i64, index: i64) -> boolean {
+    /// Whether `implementor` implements trait `index`: some method belonging
+    /// to that type implements one of the trait's methods, as every
+    /// implementation does, a trait's first method having no default.  A
+    /// type no method belongs to - a scalar, `T`, `void` - implements none.
+    public implements(&this, implementor: ValueType, index: i64) -> boolean {
         const declared: TraitDeclaration = this.trait_at(index);
         for (defined in this.functions.iter()) {
-            if (defined.owner == structure && defined.implements >= declared.first_method
+            if (!defined.is_unowned() && defined.owner.same(implementor) && defined.implements >= declared.first_method
                     && defined.implements < declared.first_method + declared.method_count) {
                 return true;
             }
