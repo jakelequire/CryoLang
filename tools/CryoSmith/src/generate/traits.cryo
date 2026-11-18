@@ -48,8 +48,8 @@ import std::collections::array::{ Array };
 import cryosmith::configuration::{ Feature };
 import cryosmith::generate::generator::{ Generator };
 import cryosmith::model::{
-    ExpressionKind, Function, Genericity, Receiver, Signature, Structure, TraitDeclaration, TraitMethod, ValueType, Variable,
-    VariableRole
+    ExpressionKind, Function, Genericity, Receiver, Signature, StatementKind, Structure, TraitDeclaration, TraitMethod, ValueType,
+    Variable, VariableRole
 };
 import cryosmith::random::{ RandomStream };
 
@@ -239,6 +239,38 @@ implement struct Generator {
             }
         }
         return found;
+    }
+
+    /// In `main`, with `trait-objects`: for each trait some helper takes an
+    /// object of, a local of a struct implementing it, declared first, so
+    /// main's calls of those helpers have a value to pass `&v` of.  No draw
+    /// where no helper takes an object.
+    internal declare_object_sources(mut &this, statements: mut &Array<i64>) -> void {
+        if (!this.options.features.has(Feature::TraitObjects)) { return; }
+        mut index: i64 = 0;
+        while (index < this.program.traits.length()) {
+            if (this.takes_object_of(index)) {
+                const implementors: Array<i64> = this.program.implementors(index);
+                const source: ValueType = ValueType::Record(implementors.get(this.random.below(implementors.length())).unwrap());
+                const value: i64 = this.record_expression(source, this.depth());
+                const variable: i64 = this.environment.declare_local(&this.program, source, false);
+                statements.push(this.program.statement(StatementKind::Declare(variable, value)));
+            }
+            index = index + 1;
+        }
+    }
+
+    /// Whether some function generated so far takes an object of trait
+    /// `index`.
+    private takes_object_of(&this, index: i64) -> boolean {
+        for (defined in this.program.functions.iter()) {
+            mut position: i64 = 0;
+            while (position < defined.parameter_count) {
+                if (this.program.variable_at(this.program.list_at(defined.first_parameter + position)).value_type.object_trait() == index) { return true; }
+                position = position + 1;
+            }
+        }
+        return false;
     }
 
     /// Whether every trait object parameter of `candidate` has a variable

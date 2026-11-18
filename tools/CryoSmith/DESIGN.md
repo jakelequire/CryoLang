@@ -410,7 +410,11 @@ the table of the value the object borrows and charged the costliest
 implementation's work, and observes it by a call of the trait's first
 method. A call of the function passes `&v`, a parameter or local of the
 caller holding a struct that implements the trait, and the function is
-called only where such a variable is in scope (`passes_objects`); so one
+called only where such a variable is in scope (`passes_objects`). `main`
+declares one first, a local of a struct implementing each trait some
+helper takes an object of, so its calls of those helpers pass one and an
+object is exercised wherever it is declared; the self-test holds at least
+half the programs declaring an object parameter to passing `&v`. So one
 function runs different structs' implementations from different callers,
 chosen at run time. The object exists only as a parameter, borrowing the
 caller's variable for the call: it is never stored, returned, captured by
@@ -662,9 +666,12 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. `default,no-trait-defaults,no-supertraits`
-  generates version 25's text; with those two also removed,
-  `default,no-trait-objects` generates version 24's text, `default,no-trait-objects,no-trait-bounds` version
+  generator's text, header aside. Any list removing `trait-objects`
+  generates version 26's text for that list, version 27 adding only
+  `main`'s locals for objects to borrow; in version 26,
+  `default,no-trait-defaults,no-supertraits` generated version 25's text,
+  and with those two also removed, `default,no-trait-objects` generates
+  version 24's text, `default,no-trait-objects,no-trait-bounds` version
   23's, `default,no-traits` version 22's, `default,no-traits,no-generic-closures,no-callable-bounds`
   version 21's; with those three also removed, `default,no-function-values`
   gives version 20's and `default,no-function-values,no-closure-captures`
