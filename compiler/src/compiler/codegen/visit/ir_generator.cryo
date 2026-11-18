@@ -229,8 +229,8 @@ type struct IRGeneratorVisitor {
                     ExprKind::Alignof(a) => { return this.visit_alignof(e, a); }
                     ExprKind::Sizeof(s)  => { return this.visit_sizeof(e, s); }
                     ExprKind::Typeof(_)  => { return this.visit_typeof(e); }
-                    ExprKind::Delete(d)  => { return this.new_delete.emit_delete(this, e, d); }
-                    ExprKind::New(ne)    => { return this.new_delete.emit_new(this, e, ne); }
+                    ExprKind::Delete(d)  => { return this.new_delete.emit_delete(&this, e, d); }
+                    ExprKind::New(ne)    => { return this.new_delete.emit_new(&this, e, ne); }
                     ExprKind::Yield(_)   => { return this.visit_yield(e); }
                     ExprKind::Try(t)     => { return this.visit_try(e, t); }
                     ExprKind::Tuple(t)   => { return this.visit_tuple_literal(e, t); }
@@ -257,7 +257,7 @@ type struct IRGeneratorVisitor {
                         return this.emit_conditional(e, i.condition, i.then_expr, i.else_expr,
                             &i.then_flag_writes, &i.else_flag_writes);
                     }
-                    ExprKind::Call(c) => { return this.calls.emit(this, e, c); }
+                    ExprKind::Call(c) => { return this.calls.emit(&this, e, c); }
                 }
             }
         }
@@ -441,11 +441,11 @@ type struct IRGeneratorVisitor {
         }
 
         this.emit_inline_copies();
-        this.decl_visit.emit_global_initializers(this);
+        this.decl_visit.emit_global_initializers(&this);
         // Drop glue last: every release site is written by now.  A glue body
         // may call a destructor whose inline copy is not yet queued, and an
         // inline copy may release a type whose glue is not yet declared.
-        while (this.calls.emit_drop_glue_bodies(this)) {
+        while (this.calls.emit_drop_glue_bodies(&this)) {
             this.emit_inline_copies();
         }
         return true;
@@ -466,10 +466,10 @@ type struct IRGeneratorVisitor {
                     const d: DeclarationNode* = di.entry_decl(id);
                     if (d != null && DeclarationNode::method_of(d) != null) {
                         this.state.current_impl_target = body.owner;
-                        this.decl_visit.generate_method_body(this, d);
+                        this.decl_visit.generate_method_body(&this, d);
                         this.state.current_impl_target = TypeRef::invalid();
                     } else if (d != null && DeclarationNode::fn_of(d) != null) {
-                        this.decl_visit.generate_function_body(this, d);
+                        this.decl_visit.generate_function_body(&this, d);
                     }
                     const fn_val: LValue = this.cg.functions.get(di.entry_symbol(id).spelling());
                     fn_val.set_linkage(LLinkage::AvailableExternally);
@@ -489,38 +489,38 @@ type struct IRGeneratorVisitor {
 
     visit_function(mut &this, node_decl: DeclarationNode*) -> Emitted {
         mut out: Emitted = Emitted::none();
-        this.decl_visit.emit_function_decl(this, node_decl);
+        this.decl_visit.emit_function_decl(&this, node_decl);
         return out;
     }
 
     visit_impl(mut &this, node: ImplBlock*) -> Emitted {
         mut out: Emitted = Emitted::none();
-        this.decl_visit.emit_impl_block_visit(this, node);
+        this.decl_visit.emit_impl_block_visit(&this, node);
         return out;
     }
 
     visit_struct(mut &this, node: StructDecl*) -> Emitted {
         mut out: Emitted = Emitted::none();
-        this.decl_visit.emit_struct_decl(this, node);
+        this.decl_visit.emit_struct_decl(&this, node);
         return out;
     }
 
     visit_union(mut &this, node: UnionDecl*) -> Emitted {
         mut out: Emitted = Emitted::none();
-        this.decl_visit.emit_union_decl(this, node);
+        this.decl_visit.emit_union_decl(&this, node);
         return out;
     }
 
 
     // `generate_block` / `generate_statement` live on `this.dispatch`
     // (see `expr_dispatch.cryo`); call sites use
-    // `this.dispatch.generate_block(this, ...)` etc.
+    // `this.dispatch.generate_block(&this, ...)` etc.
 
 
     // Statement visit overrides
 
     visit_block(mut &this, stmt: Stmt*, node: BlockStmt*) -> Emitted {
-        return this.dispatch.generate_block(this, stmt);
+        return this.dispatch.generate_block(&this, stmt);
     }
 
     visit_break(mut &this, stmt: Stmt*) -> Emitted {
@@ -543,11 +543,11 @@ type struct IRGeneratorVisitor {
     /// value a block-bodied match arm yields.
     visit_expr_stmt(mut &this, stmt: Stmt*, node: ExprStmt*) -> Emitted {
         if (node.expression == null) { return Emitted::none(); }
-        return Emitted::rvalue(this.dispatch.codegen_rvalue(this,node.expression));
+        return Emitted::rvalue(this.dispatch.codegen_rvalue(&this,node.expression));
     }
 
     visit_unsafe_block(mut &this, stmt: Stmt*, node: UnsafeBlockStmt*) -> Emitted {
-        return this.dispatch.generate_block(this,node.block);
+        return this.dispatch.generate_block(&this,node.block);
     }
 
     /// Comma-join two constraint fragments (skipping the leading comma when
@@ -683,7 +683,7 @@ type struct IRGeneratorVisitor {
             if (op.constraint == AsmConstraintKind::Memory) {
                 mem_arg_idx.push(arg_vals.length());
                 mem_arg_pointee.push(this.cg.type_mapper.map_type(op.expr.resolved_type));
-                arg_vals.push(this.dispatch.codegen_lvalue(this, op.expr));
+                arg_vals.push(this.dispatch.codegen_lvalue(&this, op.expr));
             }
         }
         for (mut p: i64 = 0; p < in_idx.length(); p++) {
@@ -691,14 +691,14 @@ type struct IRGeneratorVisitor {
             if (op.constraint == AsmConstraintKind::Memory) {
                 mem_arg_idx.push(arg_vals.length());
                 mem_arg_pointee.push(this.cg.type_mapper.map_type(op.expr.resolved_type));
-                arg_vals.push(this.dispatch.codegen_lvalue(this, op.expr));
+                arg_vals.push(this.dispatch.codegen_lvalue(&this, op.expr));
             } else {
-                arg_vals.push(this.dispatch.codegen_rvalue(this, op.expr));
+                arg_vals.push(this.dispatch.codegen_rvalue(&this, op.expr));
             }
         }
         for (mut p: i64 = 0; p < tied_idx.length(); p++) {
             const op: AsmOperand = node.operands[tied_idx[p]];
-            arg_vals.push(this.dispatch.codegen_rvalue(this, op.expr));
+            arg_vals.push(this.dispatch.codegen_rvalue(&this, op.expr));
         }
 
         // Marshal args + their LLVM types into raw buffers for LLVMBuildCall2
@@ -768,7 +768,7 @@ type struct IRGeneratorVisitor {
         // Store direct outputs back into their variables.
         if (direct_out.length() == 1) {
             const op: AsmOperand = node.operands[out_idx[direct_out[0]]];
-            const addr: LValue = this.dispatch.codegen_lvalue(this, op.expr);
+            const addr: LValue = this.dispatch.codegen_lvalue(&this, op.expr);
             if (addr.is_valid() && result.is_valid()) {
                 this.cg.builder.build_store(result, addr);
             }
@@ -776,7 +776,7 @@ type struct IRGeneratorVisitor {
             for (mut i: i64 = 0; i < direct_out.length(); i++) {
                 const op: AsmOperand = node.operands[out_idx[direct_out[i]]];
                 const ev: LValue = this.cg.builder.build_extract_value(result, i as u32, "asmout");
-                const addr: LValue = this.dispatch.codegen_lvalue(this, op.expr);
+                const addr: LValue = this.dispatch.codegen_lvalue(&this, op.expr);
                 if (addr.is_valid() && ev.is_valid()) {
                     this.cg.builder.build_store(ev, addr);
                 }
@@ -802,7 +802,7 @@ type struct IRGeneratorVisitor {
         const left: i64 = this.cg.temporaries.first_of_scope(
             this.cg.temporaries.function_depth(this.get_current_function()));
         if (node.expression != null) {
-            const val: LValue = this.dispatch.codegen_rvalue(this,node.expression);
+            const val: LValue = this.dispatch.codegen_rvalue(&this,node.expression);
             this.release_temporaries_from(left);
             for (mut i: i64 = 0; i < node.synth_drops.length(); i++) {
                 const d: Stmt* = node.synth_drops[i];
@@ -822,19 +822,19 @@ type struct IRGeneratorVisitor {
 
     visit_if(mut &this, stmt: Stmt*, node: IfStmt*) -> Emitted {
         mut out: Emitted = Emitted::none();
-        const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
+        const cond: LValue = this.dispatch.codegen_rvalue(&this,node.condition);
         this.release_condition_temporaries();
         const current_fn: LValue = this.get_current_function();
         const blocks: IfBlocks = this.cg.flow.codegen_if(cond, current_fn,
                                              node.else_stmt != null);
         this.cg.builder.position_at_end(blocks.then_bb);
         if (node.then_stmt != null) {
-            this.dispatch.generate_statement(this,node.then_stmt);
+            this.dispatch.generate_statement(&this,node.then_stmt);
         }
         this.cg.flow.branch_if_not_terminated(blocks.merge_bb);
         if (node.else_stmt != null) {
             this.cg.builder.position_at_end(blocks.else_bb);
-            this.dispatch.generate_statement(this,node.else_stmt);
+            this.dispatch.generate_statement(&this,node.else_stmt);
             this.cg.flow.branch_if_not_terminated(blocks.merge_bb);
         }
         this.cg.builder.position_at_end(blocks.merge_bb);
@@ -846,13 +846,13 @@ type struct IRGeneratorVisitor {
         const current_fn: LValue = this.get_current_function();
         const blocks: LoopBlocks = this.cg.flow.codegen_while_header(current_fn);
         this.cg.builder.position_at_end(blocks.cond_bb);
-        const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
+        const cond: LValue = this.dispatch.codegen_rvalue(&this,node.condition);
         this.release_condition_temporaries();
         this.cg.builder.build_cond_br(cond, blocks.body_bb, blocks.merge_bb);
         this.cg.builder.position_at_end(blocks.body_bb);
         this.cg.temporaries.enter_loop();
         if (node.body != null) {
-            this.dispatch.generate_statement(this,node.body);
+            this.dispatch.generate_statement(&this,node.body);
         }
         this.cg.temporaries.leave_loop();
         this.cg.flow.branch_if_not_terminated(blocks.cond_bb);
@@ -872,7 +872,7 @@ type struct IRGeneratorVisitor {
         this.cg.builder.build_br(blocks.cond_bb);
         this.cg.builder.position_at_end(blocks.cond_bb);
         if (node.condition != null) {
-            const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
+            const cond: LValue = this.dispatch.codegen_rvalue(&this,node.condition);
             this.release_condition_temporaries();
             this.cg.builder.build_cond_br(cond, blocks.body_bb, blocks.merge_bb);
         } else {
@@ -881,13 +881,13 @@ type struct IRGeneratorVisitor {
         this.cg.builder.position_at_end(blocks.body_bb);
         this.cg.temporaries.enter_loop();
         if (node.body != null) {
-            this.dispatch.generate_statement(this,node.body);
+            this.dispatch.generate_statement(&this,node.body);
         }
         this.cg.temporaries.leave_loop();
         this.cg.flow.branch_if_not_terminated(blocks.update_bb);
         this.cg.builder.position_at_end(blocks.update_bb);
         if (node.update != null) {
-            this.dispatch.generate_statement(this,node.update);
+            this.dispatch.generate_statement(&this,node.update);
         }
         this.cg.flow.branch_if_not_terminated(blocks.cond_bb);
         this.cg.loops.pop();
@@ -903,7 +903,7 @@ type struct IRGeneratorVisitor {
         this.cg.builder.position_at_end(blocks.body_bb);
         this.cg.temporaries.enter_loop();
         if (node.body != null) {
-            this.dispatch.generate_statement(this,node.body);
+            this.dispatch.generate_statement(&this,node.body);
         }
         this.cg.temporaries.leave_loop();
         this.cg.flow.branch_if_not_terminated(blocks.body_bb);
@@ -925,7 +925,7 @@ type struct IRGeneratorVisitor {
         if (ExpressionNode::identifier_of(subject_node) == null) {
             return LValue::null();
         }
-        return this.dispatch.codegen_lvalue(this, subject_node);
+        return this.dispatch.codegen_lvalue(&this, subject_node);
     }
 
     /// Emit the failure of a match no arm took, through the runtime's
@@ -934,7 +934,7 @@ type struct IRGeneratorVisitor {
     /// call). Shared by the statement and expression match forms.
     emit_no_match_failure(mut &this, span: SourceSpan, sched: [Stmt*]*) -> void {
         mut no_operands: [LValue] = [];
-        this.cg.expr_ops.emit_check_failure(this, sched, span,
+        this.cg.expr_ops.emit_check_failure(&this, sched, span,
             MangledName::new("__cryo_panic_no_match"), &no_operands);
     }
 
@@ -946,7 +946,7 @@ type struct IRGeneratorVisitor {
         if (!current_fn.is_valid()) { return out; }
 
         // Evaluate the subject expression.
-        const subject: LValue = this.dispatch.codegen_rvalue(this,node.subject);
+        const subject: LValue = this.dispatch.codegen_rvalue(&this,node.subject);
         if (!subject.is_valid()) { return out; }
 
         // Resolve the enum type (if subject is an enum), normalize to ptr, and
@@ -996,7 +996,7 @@ type struct IRGeneratorVisitor {
             this.patterns.bind_arm_value_bindings(arm, minfo);
 
             if (arm.body != null) {
-                this.dispatch.generate_statement(this,arm.body);
+                this.dispatch.generate_statement(&this,arm.body);
             }
             const cur_after: LBasicBlock = this.cg.builder.get_insert_block();
             const arm_falls: boolean = cur_after.is_valid() && !cur_after.has_terminator();
@@ -1177,7 +1177,7 @@ type struct IRGeneratorVisitor {
         this.cg.values.push_scope();
         this.patterns.bind_arm_enum_payloads(arm, minfo);
         this.patterns.bind_arm_value_bindings(arm, minfo);
-        const cond: LValue = this.dispatch.codegen_rvalue(this, arm.guard);
+        const cond: LValue = this.dispatch.codegen_rvalue(&this, arm.guard);
         this.cg.values.pop_scope();
         if (cond.is_valid()) {
             this.cg.builder.build_cond_br(cond, body_bb, next_bb);
@@ -1213,7 +1213,7 @@ type struct IRGeneratorVisitor {
         // the body borrowing `x`, must reach the binding the closure
         // captured, which a copy in this frame is not.
         if (node.is_capture_alias) {
-            const place: Emitted = this.dispatch.generate_expression(this, node.initializer);
+            const place: Emitted = this.dispatch.generate_expression(&this, node.initializer);
             if (!place.is_lvalue || !place.value.is_valid()) {
                 this.cg.ctx.ice_at("a closure capture's shadow was initialized from something that is not a place", decl.span);
                 return out;
@@ -1228,7 +1228,7 @@ type struct IRGeneratorVisitor {
             && node.initializer.resolved_type.equals(node.resolved_type)
             && this.cg.arena_type(node.resolved_type) != null
             && this.cg.arena_type(node.resolved_type).kind == TypeKind::Array) {
-            const built: Emitted = this.dispatch.generate_expression(this, node.initializer);
+            const built: Emitted = this.dispatch.generate_expression(&this, node.initializer);
             if (built.is_lvalue && built.value.is_valid()) {
                 this.cg.expr_ops.bind_local_storage(node.sym_id, node.resolved_type, built.value, false);
                 return out;
@@ -1240,7 +1240,7 @@ type struct IRGeneratorVisitor {
         mut init_type: TypeRef = TypeRef::invalid();
         const has_init: boolean = node.initializer != null;
         if (has_init) {
-            init_val = this.dispatch.codegen_rvalue(this,node.initializer);
+            init_val = this.dispatch.codegen_rvalue(&this,node.initializer);
             init_type = node.initializer.resolved_type;
         }
         this.cg.expr_ops.codegen_local_var(node.name, node.sym_id, node.resolved_type,
@@ -1279,7 +1279,7 @@ type struct IRGeneratorVisitor {
         // defensive recheck that codegen_member_access does; under opaque
         // pointers an alloca address is `ptr` (kind 12), so a kind-10
         // (struct) means the value is already in SSA form, place or not.
-        const src_val: LValue = this.dispatch.generate_expression(this,node.initializer).value;
+        const src_val: LValue = this.dispatch.generate_expression(&this,node.initializer).value;
         if (!src_val.is_valid()) { return out; }
 
         const src_llvm_ty: mut void* = llvm::LLVMTypeOf(src_val.raw);
@@ -1320,7 +1320,7 @@ type struct IRGeneratorVisitor {
     // `codegen_expr` / `codegen_rvalue` / `codegen_lvalue` /
     // `generate_expression` live on `this.dispatch`
     // (see `expr_dispatch.cryo`).  Call sites use
-    // `this.dispatch.codegen_rvalue(this, expr)` etc.
+    // `this.dispatch.codegen_rvalue(&this, expr)` etc.
 
     /// Generate a constant value from a literal node.
     codegen_literal(mut &this, e: ExpressionNode*, node: LiteralExpr*) -> Emitted {
@@ -1650,7 +1650,7 @@ type struct IRGeneratorVisitor {
         const borrowed: boolean = !copied && !moved_out && OwnershipQuery::temporary_field_root(
             this.cg.get_arena(), this.cg.ctx.generic_registry, this.cg.get_intern(), e) != null;
         if (copied || moved_out || borrowed) {
-            const root_e: Emitted = this.dispatch.generate_expression(this, root);
+            const root_e: Emitted = this.dispatch.generate_expression(&this, root);
             // A value returned in registers is stored to a slot; one the
             // call wrote through a hidden result pointer is that pointer.
             mut place: LValue = root_e.value;
@@ -1696,7 +1696,7 @@ type struct IRGeneratorVisitor {
         // The receiver as it was emitted, place or value: `f().field` gives
         // a value, so the autoderef inside member-access codegen knows not
         // to over-load the call's pointer rvalue.
-        const obj_e: Emitted = this.dispatch.generate_expression(this, node.object);
+        const obj_e: Emitted = this.dispatch.generate_expression(&this, node.object);
         const obj: LValue = obj_e.value;
         const obj_is_lvalue: boolean = obj_e.is_lvalue;
         return this.places.codegen_member_access(obj, node.object.resolved_type,
@@ -1715,24 +1715,24 @@ type struct IRGeneratorVisitor {
         // single delegation covers reads (`v = a[i]`), writes (`a[i] = x`), and
         // compound assignment (`a[i] += x`), calling `index` exactly once.
         if (node.desugared_call != null) {
-            return this.dispatch.generate_expression(this, node.desugared_call);
+            return this.dispatch.generate_expression(&this, node.desugared_call);
         }
         // Tuple bracket indexing is a struct GEP. Sema validated the
         // index at compile time, so we can read the literal value
         // here and skip codegen_array_access entirely (which is sized
         // around dynamic-index arrays/strings/pointers).
-        match (this.places.try_codegen_tuple_index(this, node)) {
+        match (this.places.try_codegen_tuple_index(&this, node)) {
             Option::Some(tuple_e) => { return tuple_e; }
             Option::None          => { }
         }
         // The array as it was emitted, a place or a value: `f()[i]` gives a
         // value, telling the array access to skip the load it does for a
         // stored pointer.
-        const arr_e: Emitted = this.dispatch.generate_expression(this, node.array);
-        const idx: LValue = this.dispatch.codegen_rvalue(this,node.index);
+        const arr_e: Emitted = this.dispatch.generate_expression(&this, node.array);
+        const idx: LValue = this.dispatch.codegen_rvalue(&this,node.index);
         return this.places.codegen_array_access(arr_e.value, node.array.resolved_type,
                                          arr_e.is_lvalue, idx,
-                                         e.span, this, &node.unwind_cleanup);
+                                         e.span, &this, &node.unwind_cleanup);
     }
 
     /// A value converted to a trait object: the pair of its address and its
@@ -1740,7 +1740,7 @@ type struct IRGeneratorVisitor {
     /// for the value's type.
     visit_object_conversion(mut &this, e: ExpressionNode*, node: ObjectConversionExpr*) -> Emitted {
         mut out: Emitted = Emitted::none();
-        const data: LValue = this.dispatch.codegen_rvalue(this, node.operand);
+        const data: LValue = this.dispatch.codegen_rvalue(&this, node.operand);
         // A conversion no copy settled names no implementation.
         const block: ImplBlock* = if (node.implementation == null || node.implementation.object_table_symbol.is_valid()) {
             node.implementation
@@ -1778,7 +1778,7 @@ type struct IRGeneratorVisitor {
             // pointer-cast it to the target pointer type.  Avoids
             // the illegal `bitcast %struct to ptr` that would
             // otherwise come out of the generic cast path.
-            const addr: LValue = this.dispatch.codegen_lvalue(this,node.expression);
+            const addr: LValue = this.dispatch.codegen_lvalue(&this,node.expression);
             const dst_lty: LType = this.cg.type_mapper.map_type(node.resolved_target);
             if (addr.is_valid() && dst_lty.is_valid()) {
                 out.value = this.cg.builder.build_pointer_cast(
@@ -1793,7 +1793,7 @@ type struct IRGeneratorVisitor {
             // lvalue is already a pointer to the storage, so pointer-cast
             // that.
             const dst_lty: LType = this.cg.type_mapper.map_type(node.resolved_target);
-            const addr: LValue = this.dispatch.codegen_lvalue(this,node.expression);
+            const addr: LValue = this.dispatch.codegen_lvalue(&this,node.expression);
             if (addr.is_valid() && dst_lty.is_valid()) {
                 out.value = this.cg.builder.build_pointer_cast(
                     addr, dst_lty, "arrcast");
@@ -1802,7 +1802,7 @@ type struct IRGeneratorVisitor {
             }
             out.is_lvalue = false;
         } else {
-            const val: LValue = this.dispatch.codegen_rvalue(this,node.expression);
+            const val: LValue = this.dispatch.codegen_rvalue(&this,node.expression);
             out.value = this.cg.expr_ops.codegen_cast(val, node.expression.resolved_type,
                                                    node.resolved_target);
             out.is_lvalue = false;
@@ -1848,14 +1848,14 @@ type struct IRGeneratorVisitor {
     /// `bin_un.short_circuit`), and all arithmetic / bitwise / shift /
     /// comparison ops.
     visit_binary(mut &this, e: ExpressionNode*, node: BinaryExpr*) -> Emitted {
-        return this.bin_un.emit_binary(this, e, node);
+        return this.bin_un.emit_binary(&this, e, node);
     }
 
     /// Unary expression: delegate to BinaryUnaryEmitter.  Handles
     /// negate / not / bitnot / address-of / dereference / pre & post
     /// inc & dec.
     visit_unary(mut &this, e: ExpressionNode*, node: UnaryExpr*) -> Emitted {
-        return this.bin_un.emit_unary(this, e, node);
+        return this.bin_un.emit_unary(&this, e, node);
     }
 
     /// Call expression: delegate to CallEmitter.  Handles all call shapes
@@ -1870,7 +1870,7 @@ type struct IRGeneratorVisitor {
         mut element_values: [LValue] = [];
         mut element_types: [TypeRef] = [];
         for (mut i: i64 = 0; i < node.elements.length(); i++) {
-            element_values.push(this.dispatch.codegen_rvalue(this,node.elements[i]));
+            element_values.push(this.dispatch.codegen_rvalue(&this,node.elements[i]));
             element_types.push(node.elements[i].resolved_type);
         }
         return this.codegen_tuple_literal(type_ref, element_values, element_types, e.span);
@@ -1889,7 +1889,7 @@ type struct IRGeneratorVisitor {
             const init: FieldInit = node.field_inits[i];
             field_names.push(init.field_name);
             field_pins.push(init.pin);
-            field_values.push(this.dispatch.codegen_rvalue(this,init.value));
+            field_values.push(this.dispatch.codegen_rvalue(&this,init.value));
             value_types.push(init.value.resolved_type);
         }
         return this.codegen_struct_literal(type_ref, field_names, field_pins, field_values, value_types, e.span);
@@ -1899,14 +1899,14 @@ type struct IRGeneratorVisitor {
     /// shapes (fixed `[a,b,c]`, dynamic `[a,b,c]: [T]`, fill `[v; N]`).
     /// Element recursion flows through `dispatch.codegen_rvalue`.
     visit_array_literal(mut &this, e: ExpressionNode*, node: ArrayExpr*) -> Emitted {
-        return this.array_lit.emit(this, e, node);
+        return this.array_lit.emit(&this, e, node);
     }
 
     /// Lambda expression: delegate to LambdaEmitter (anonymous-function
     /// name minting, parameter / return type resolution, body emission via
     /// the visitor's dispatch).
     visit_lambda(mut &this, e: ExpressionNode*, node: LambdaExpr*) -> Emitted {
-        return this.lambda.emit(this, e, node);
+        return this.lambda.emit(&this, e, node);
     }
 
     /// A qualified path in VALUE position: a function taken as a value, an
@@ -2004,7 +2004,7 @@ type struct IRGeneratorVisitor {
             out.is_lvalue = false;
             return out;
         }
-        mut v: LValue = this.dispatch.generate_statement(this, node.arms[0].body).value;
+        mut v: LValue = this.dispatch.generate_statement(&this, node.arms[0].body).value;
         const result_ty: LType = this.cg.type_mapper.map_type(e.resolved_type);
         if (v.is_valid() && result_ty.is_valid()) {
             v = IRGeneratorVisitor::coerce_to_phi_type(this.cg, v, result_ty,
@@ -2021,7 +2021,7 @@ type struct IRGeneratorVisitor {
         mut out: Emitted = Emitted::none();
         if (node.arms.length() == 0 || node.arms[0] == null ||
             node.arms[0].body == null) { return out; }
-        return this.dispatch.generate_statement(this, node.arms[0].body);
+        return this.dispatch.generate_statement(&this, node.arms[0].body);
     }
 
     visit_match_expr(mut &this, e: ExpressionNode*, node: MatchExpr*) -> Emitted {
@@ -2039,7 +2039,7 @@ type struct IRGeneratorVisitor {
             return out;
         }
 
-        const subject: LValue = this.dispatch.codegen_rvalue(this,node.subject);
+        const subject: LValue = this.dispatch.codegen_rvalue(&this,node.subject);
         if (!subject.is_valid()) {
             out.value = LValue::null();
             out.is_lvalue = false;
@@ -2097,7 +2097,7 @@ type struct IRGeneratorVisitor {
             // a block with a trailing expression or a single expression statement.
             mut arm_val: LValue = LValue::null();
             if (arm.body != null) {
-                arm_val = this.dispatch.generate_statement(this,arm.body).value;
+                arm_val = this.dispatch.generate_statement(&this,arm.body).value;
             }
 
             const arm_end: LBasicBlock = this.cg.builder.get_insert_block();
@@ -2170,7 +2170,7 @@ type struct IRGeneratorVisitor {
                      then_expr: mut ExpressionNode*, else_expr: mut ExpressionNode*,
                      then_writes: &[Stmt*], else_writes: &[Stmt*]) -> Emitted {
         mut out: Emitted = Emitted::none();
-        const cond: LValue = this.dispatch.codegen_rvalue(this,condition);
+        const cond: LValue = this.dispatch.codegen_rvalue(&this,condition);
         const current_fn: LValue = this.get_current_function();
         const then_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.then");
         const else_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.else");
@@ -2200,7 +2200,7 @@ type struct IRGeneratorVisitor {
         mut n: u32 = 0;
 
         this.cg.builder.position_at_end(then_bb);
-        mut then_val: LValue = this.dispatch.codegen_rvalue(this,then_expr);
+        mut then_val: LValue = this.dispatch.codegen_rvalue(&this,then_expr);
         const then_end: LBasicBlock = this.cg.builder.get_insert_block();
         const then_live: boolean = then_end.is_valid() && !then_end.has_terminator();
         if (then_live && then_val.is_valid()) {
@@ -2221,7 +2221,7 @@ type struct IRGeneratorVisitor {
         }
 
         this.cg.builder.position_at_end(else_bb);
-        mut else_val: LValue = this.dispatch.codegen_rvalue(this,else_expr);
+        mut else_val: LValue = this.dispatch.codegen_rvalue(&this,else_expr);
         const else_end: LBasicBlock = this.cg.builder.get_insert_block();
         const else_live: boolean = else_end.is_valid() && !else_end.has_terminator();
         if (else_live && else_val.is_valid()) {
@@ -2324,13 +2324,13 @@ type struct IRGeneratorVisitor {
         this.cg.builder.position_at_end(blocks.body_bb);
         this.cg.temporaries.enter_loop();
         if (node.body != null) {
-            this.dispatch.generate_statement(this,node.body);
+            this.dispatch.generate_statement(&this,node.body);
         }
         this.cg.temporaries.leave_loop();
         this.cg.flow.branch_if_not_terminated(blocks.cond_bb);
         // Then the condition: loop back to the body while it holds.
         this.cg.builder.position_at_end(blocks.cond_bb);
-        const cond: LValue = this.dispatch.codegen_rvalue(this,node.condition);
+        const cond: LValue = this.dispatch.codegen_rvalue(&this,node.condition);
         this.release_condition_temporaries();
         this.cg.builder.build_cond_br(cond, blocks.body_bb, blocks.merge_bb);
         this.cg.loops.pop();

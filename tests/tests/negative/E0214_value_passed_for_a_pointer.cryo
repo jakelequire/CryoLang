@@ -1,0 +1,73 @@
+// A pointer parameter takes an address, and nothing takes one for the
+// argument: a value is passed for a `T*` as `&x`.  A value written where
+// a `T*` is expected is refused, at a plain call, as an enum constructor's
+// payload (where it would be held as the value itself, the payload being
+// the pointer), as a borrowed receiver's `this` (which reads as the value
+// it refers to), in a generic body whatever `T` becomes, and as a match
+// binding into a borrowed value.  The `&` forms are accepted.
+![config(testing)]
+![config(negative, E0214)]
+namespace CryoTests::Negative::ValuePassedForAPointer;
+
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::core::mem;
+
+function length_of(text: String*) -> i64 { return text.length(); }
+function read_number(n: i64*) -> i64 { return *n; }
+function shown(value: Option<String*>) -> i64 {
+    return match (value) {
+        Option::Some(p) => { p.length() }
+        Option::None    => { -1 }
+    };
+}
+function given<T>(p: T*) -> void { }
+
+function plain_call() -> i64 {
+    const owned: String = String::from_str(Str::new("owned"));
+    const n: i64 = 4;
+    const refused: i64 = length_of(owned) + read_number(n);
+    //~^ ERROR[E0214] mismatched types
+    //~^^ ERROR[E0214] mismatched types
+    return refused + length_of(&owned) + read_number(&n);
+}
+
+function constructor_payload() -> i64 {
+    const owned: String = String::from_str(Str::new("fresh"));
+    const held: Option<String*> = Option::Some(owned);
+    //~^ ERROR[E0214] mismatched types
+    return shown(Option::Some(owned)) + shown(held) + shown(Option::Some(&owned));
+    //~^ ERROR[E0214] mismatched types
+}
+
+function generic_body<T>(x: T) -> void {
+    given::<T>(x);
+    //~^ ERROR[E0214] mismatched types
+    given::<T>(&x);
+}
+
+function rewrapped_binding(answer: &Option<String>) -> i64 {
+    return match (answer) {
+        Option::Some(response) => { shown(Option::Some(response)) + shown(Option::Some(&response)) }
+        //~^ ERROR[E0214] mismatched types
+        Option::None           => { -2 }
+    };
+}
+
+type struct Holder {
+    name: String;
+
+    exchanged(mut &this, other: String) -> String {
+        mut incoming: Holder = Holder { name: other };
+        mem::swap::<Holder>(&incoming, this);
+        //~^ ERROR[E0214] mismatched types
+        mem::swap::<Holder>(&incoming, &this);
+        return incoming.name.clone();
+    }
+}
+
+function main() -> int {
+    generic_body::<i64>(3);
+    const a: Option<String> = Option::Some(String::from_str(Str::new("eleven-char")));
+    return (plain_call() + constructor_payload() + rewrapped_binding(&a)) as int;
+}

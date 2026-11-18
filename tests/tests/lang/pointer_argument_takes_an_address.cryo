@@ -1,0 +1,70 @@
+///! A value is passed for a `T*` parameter as `&x`: at a plain call, as an
+///! enum constructor's payload where an `Option<T*>` is expected, as a
+///! borrowed receiver (`&this`), and as a match binding into a borrowed
+///! value.  Each callee reads the value the address names.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::PointerArgumentTakesAnAddress;
+
+import std::core::result::{ Result };
+import std::core::mem;
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_equal };
+
+function length_of(text: String*) -> i64 { return text.length(); }
+
+function shown(value: Option<String*>) -> i64 {
+    return match (value) {
+        Option::Some(p) => { p.length() }
+        Option::None    => { -1 }
+    };
+}
+
+function rewrapped(answer: &Option<String>) -> i64 {
+    return match (answer) {
+        Option::Some(response) => { shown(Option::Some(&response)) }
+        Option::None           => { -2 }
+    };
+}
+
+type struct Holder {
+    name: String;
+
+    exchanged(mut &this, other: String) -> String {
+        mut incoming: Holder = Holder { name: other };
+        mem::swap::<Holder>(&incoming, &this);
+        return incoming.name.clone();
+    }
+}
+
+![test]
+function a_call_reads_the_value_its_address_names() -> Result<(), TestError> {
+    const owned: String = String::from_str(Str::new("owned"));
+    return expect_equal(length_of(&owned), 5 as i64);
+}
+
+![test]
+function a_constructor_payload_holds_the_address() -> Result<(), TestError> {
+    const owned: String = String::from_str(Str::new("fresh"));
+    const held: Option<String*> = Option::Some(&owned);
+    return expect_equal(shown(held), 5 as i64);
+}
+
+![test]
+function a_binding_into_a_borrowed_option_rewraps_by_address() -> Result<(), TestError> {
+    const answer: Option<String> = Option::Some(String::from_str(Str::new("eleven-char")));
+    return expect_equal(rewrapped(&answer), 11 as i64);
+}
+
+![test]
+function a_borrowed_receiver_is_exchanged_through_its_address() -> Result<(), TestError> {
+    mut holder: Holder = Holder { name: String::from_str(Str::new("first")) };
+    const previous: String = holder.exchanged(String::from_str(Str::new("second")));
+    match (expect_equal(previous.length(), 5 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_equal(holder.name.length(), 6 as i64);
+}

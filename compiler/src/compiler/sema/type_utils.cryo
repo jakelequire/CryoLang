@@ -614,18 +614,18 @@ type struct TypeUtils {
     }
 
     /// True when `arg` and `param` describe the same underlying type up to one
-    /// level of pointer/reference spelling - `&T`<->`&mut T`, `&T`<->`T*`, and
-    /// value<->`&T`/`T*` (call-site auto-ref).  At least one side must be an
-    /// indirection, and the underlying types must be the SAME type: an
-    /// indirection is spelled differently, never converted, so a pointee that
-    /// only converts (`i32` for `i64`) leaves the callee reading memory as a
-    /// type it does not hold.
+    /// level of pointer/reference spelling - `&T`<->`&mut T`, `&T`<->`T*`,
+    /// value->`&T` (call-site auto-ref) and `T*`->value.  At least one side
+    /// must be an indirection, and the underlying types must be the SAME
+    /// type: an indirection is spelled differently, never converted, so a
+    /// pointee that only converts (`i32` for `i64`) leaves the callee reading
+    /// memory as a type it does not hold.
     ///
-    /// The auto-ref clause below is why a value whose type ALREADY equals the
-    /// pointee still binds a pointer parameter: `f(42)` against `i32*` matches
-    /// on `equals` and the call site materializes a temporary.  That is this
-    /// predicate's purpose at a CALL; a plain `=` must not ask it, and asks
-    /// `indirection_spelling_compatible` instead.
+    /// Auto-ref is something a CALL does, so a plain `=` asks
+    /// `indirection_spelling_compatible` instead.  A value is never passed
+    /// for a `T*` parameter (`value_for_pointer`): the argument is written
+    /// `&x`, since nothing takes an address for it, and an enum constructor
+    /// given one would hold the value where its payload is the pointer.
     ///
     /// A reference parameter borrows a value of its referent's type whatever
     /// that type is, a pointer among them: `T*` binds `&T*`.  Peeling both
@@ -635,6 +635,7 @@ type struct TypeUtils {
     indirection_compatible(&this, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
         if (this.widens_read_only(arg_ty, param_ty)) { return false; }
         if (this.pairs_slice_reference_with_pointer(arg_ty, param_ty)) { return false; }
+        if (this.value_for_pointer(arg_ty, param_ty)) { return false; }
         const a_peeled: TypeRef = this.peel_indirection(arg_ty);
         const p_peeled: TypeRef = this.peel_indirection(param_ty);
         if (!a_peeled.is_valid() && !p_peeled.is_valid()) { return false; }
@@ -666,6 +667,16 @@ type struct TypeUtils {
         const t_peeled: TypeRef = this.peel_indirection(to_ty);
         if (!f_peeled.is_valid() || !t_peeled.is_valid()) { return false; }
         return this.checker.is_same_type(f_peeled, t_peeled);
+    }
+
+    /// Whether `arg_ty` is a value (no indirection) and `param_ty` a pointer
+    /// to it: the argument a call is passed as `&x`, which nothing writes
+    /// for it.
+    value_for_pointer(&this, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
+        const param_t: Type* = this.arena.lookup(param_ty);
+        if (param_t == null || param_t.kind != TypeKind::Pointer) { return false; }
+        if (this.peel_indirection(arg_ty).is_valid()) { return false; }
+        return this.checker.is_same_type(arg_ty, param_t.as_pointer().pointee);
     }
 
     /// Whether one side is a slice reference and the other a pointer: a
