@@ -52,7 +52,7 @@ internal type struct CopyBoundAudit {
                     parameter = parameter + 1;
                 }
                 if (most > 1) {
-                    const bounds: Str = trimmed.split_once_from_end(&Str::new(") -> ")).unwrap().second;
+                    const bounds: Str = trimmed.byte_substring(CopyBoundAudit::parameters_end(trimmed), trimmed.length());
                     if (!bounds.contains(&Str::new("Copy"))) {
                         return Result::Err(f"line {index + 1}: a `T` parameter is used {most} times with no `Copy` bound: `{trimmed}`");
                     }
@@ -64,6 +64,24 @@ internal type struct CopyBoundAudit {
         return Result::Ok(reusing);
     }
 
+    /// The place of the `)` closing a signature's parameter list, the one
+    /// matching its first `(`: a bound after it, `F: (u8, T) -> T`, has
+    /// parentheses of its own.  The signature's length when there is none.
+    private static parameters_end(signature: Str) -> i64 {
+        mut depth: i64 = 0;
+        mut position: i64 = 0;
+        while (position < signature.length()) {
+            const byte: u8 = signature.byte_at(position).unwrap();
+            if (byte == '(' as u8) { depth = depth + 1; }
+            if (byte == ')' as u8) {
+                depth = depth - 1;
+                if (depth == 0) { return position; }
+            }
+            position = position + 1;
+        }
+        return signature.length();
+    }
+
     /// The names of a signature's parameters of type `T`.
     private static type_parameter_names(signature: Str) -> Array<Str> {
         mut names: Array<Str> = Array::<Str>::new();
@@ -71,10 +89,7 @@ internal type struct CopyBoundAudit {
             Option::Some(position) => { position + 1 }
             Option::None           => { return names; }
         };
-        const closed: i64 = match (signature.find_last(&Str::new(") -> "))) {
-            Option::Some(position) => { position }
-            Option::None           => { return names; }
-        };
+        const closed: i64 = CopyBoundAudit::parameters_end(signature);
         for (parameter in signature.byte_substring(opened, closed).split(&Str::new(", "))) {
             match (parameter.split_once(&Str::new(": "))) {
                 Option::Some(parts) => { if (parts.second == Str::new("T")) { names.push(parts.first); } }

@@ -12,6 +12,15 @@
 ///! since nothing converts a `T` to a `u64`.  Its value-typed parameters and
 ///! locals are observed as any function's are, and every call is observed
 ///! where its value is.
+///!
+///! With `callable-bounds` a generic function sometimes takes one more
+///! parameter last, of a second type parameter bounded by a function type
+///! over the scalars and `T`, `g1<T, F>(p0: T, p1: T, p2: F) -> T where T:
+///! Copy, F: (u8, T) -> T`.  The body calls it wherever a value of its
+///! return type is wanted, as it calls a function-typed parameter, and
+///! observes it by one call; each call of the function gives it a closure
+///! written there, at the call's type argument, which may capture.  A
+///! closure local or a parameter is never given, since passing one moves it.
 
 namespace cryosmith::generate::generics;
 
@@ -26,6 +35,10 @@ import cryosmith::model::{
 };
 import cryosmith::random::{ RandomStream };
 import cryosmith::typing::{ TypeChoice };
+
+/// How often, in a hundred, a generic function takes a callable-bounded
+/// parameter last.
+const CALLABLE_CHANCE: i64 = 40;
 
 implement struct Generator {
     /// Declare the program's generic functions, one to three, from a
@@ -52,15 +65,16 @@ implement struct Generator {
         this.genericity = if (this.random.chance(50)) { Genericity::Equatable } else { Genericity::Copyable };
         this.returns = ValueType::TypeParameter;
         const first_parameter: i64 = this.program.lists.length();
-        const parameter_count: i64 = 2 + this.random.below(3);
+        const value_count: i64 = 2 + this.random.below(3);
         mut index: i64 = 0;
-        while (index < parameter_count) {
+        while (index < value_count) {
             const value_type: ValueType = if (index < 2 || this.random.chance(30)) { ValueType::TypeParameter } else { this.any_type() };
-            const parameter: i64 = this.program.variable(Variable { role: VariableRole::Parameter, number: index, value_type: value_type, mutable: false });
-            this.program.lists.push(parameter);
-            this.environment.bind(parameter);
+            this.bind_parameter(index, value_type);
             index = index + 1;
         }
+        const callable: ValueType = if (this.makes_callable_bounds() && this.random.chance(CALLABLE_CHANCE)) { this.closure_signature() } else { ValueType::Void };
+        if (callable.is_function()) { this.bind_parameter(value_count, callable); }
+        const parameter_count: i64 = if (callable.is_function()) { value_count + 1 } else { value_count };
         mut statements: Array<i64> = Array::<i64>::new();
         const body_start: i64 = this.environment.mark();
         this.fill(&statements, true);
@@ -79,8 +93,24 @@ implement struct Generator {
         this.program.functions.push(Function {
             number: number, is_main: false, owner: -1, receiver: Receiver::Free, first_parameter: first_parameter,
             parameter_count: parameter_count, returns: ValueType::TypeParameter, body: body, cost: this.budget.spent(),
-            genericity: this.genericity,
+            genericity: this.genericity, callable: callable,
         });
+    }
+
+    /// Declare parameter `p<number>` of `value_type` and bring it into scope.
+    private bind_parameter(mut &this, number: i64, value_type: ValueType) -> void {
+        const parameter: i64 = this.program.variable(Variable { role: VariableRole::Parameter, number: number, value_type: value_type, mutable: false });
+        this.program.lists.push(parameter);
+        this.environment.bind(parameter);
+    }
+
+    /// Whether generic functions take callable-bounded parameters: the
+    /// feature is on, and so are `closures` and `generic-closures`, since
+    /// each call gives such a parameter a closure written there, generic
+    /// over `T` where the caller is a generic body.
+    internal makes_callable_bounds(&this) -> boolean {
+        return this.options.features.has(Feature::CallableBounds) && this.options.features.has(Feature::Closures)
+            && this.options.features.has(Feature::GenericClosures);
     }
 
     /// An expression of the generic function's or generic struct's `T`: a
@@ -147,11 +177,15 @@ implement struct Generator {
 
     /// A call of generic function `callee` at `type_argument`, with
     /// arguments for its parameters; where the type argument is left to
-    /// inference, the arguments for `T` decide it.
+    /// inference, the arguments for `T` decide it.  A callable-bounded `F`
+    /// is always left to inference, `g1::<u8, _>(..)`, and a list with a
+    /// `_` in it is inferred with the written arguments already bound, so a
+    /// narrower argument for `T` conflicts there rather than widening: the
+    /// arguments for `T` are deciding values however `T` is spelled.
     internal generic_call(mut &this, callee: i64, type_argument: ValueType, depth: i64) -> i64 {
         const called: Function = this.program.function_at(callee);
         const spelling: TypeArgumentSpelling = this.type_argument_spelling();
-        const first: i64 = this.instantiated_arguments(called, type_argument, spelling.is_inferred(), depth);
+        const first: i64 = this.instantiated_arguments(called, type_argument, spelling.is_inferred() || called.takes_callable(), depth);
         return this.node(ExpressionKind::GenericCall(callee, type_argument, spelling, first, called.parameter_count), type_argument);
     }
 

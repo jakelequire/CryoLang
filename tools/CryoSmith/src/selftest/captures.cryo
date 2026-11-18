@@ -6,7 +6,9 @@
 ///! A capture counts as observed only where an observation's value is read
 ///! from it - the capture itself, a field of it, or the `match` over it that
 ///! gives an enum's variant number - not wherever the body's value happens
-///! to read it.
+///! to read it.  A `T` capture, which nothing converts to a `u64`, counts
+///! only where the closure's value is an `if` choosing it, down the chain of
+///! `else` arms.
 
 namespace cryosmith::selftest::captures;
 
@@ -17,7 +19,7 @@ import std::core::result::{ Result };
 
 import cryosmith::configuration::{ GenerationOptions };
 import cryosmith::generate::{ Generator };
-import cryosmith::model::{ Closure, ExpressionKind, MatchArm, Program, StatementKind };
+import cryosmith::model::{ Closure, ExpressionKind, MatchArm, Program, StatementKind, ValueType };
 import cryosmith::selftest::bindings::{ BindingAudit };
 import cryosmith::selftest::runner::{ SelfTest };
 
@@ -48,7 +50,12 @@ internal type struct CaptureAudit {
             mut position: i64 = 0;
             while (position < closure.capture_count) {
                 const captured: i64 = program.list_at(closure.first_capture + position);
-                if (!CaptureAudit::observes(program, closure.observations, captured)) {
+                const read: boolean = if (program.variable_at(captured).value_type.same(ValueType::TypeParameter)) {
+                    CaptureAudit::selects(program, closure.body, captured)
+                } else {
+                    CaptureAudit::observes(program, closure.observations, captured)
+                };
+                if (!read) {
                     return Result::Err(f"closure {index} does not observe its capture, variable {captured}");
                 }
                 observed = observed + 1;
@@ -158,6 +165,17 @@ internal type struct CaptureAudit {
             current = program.statement_at(current).next;
         }
         return false;
+    }
+
+    /// Whether the value at `value` is an `if` choosing `variable` itself in
+    /// one of its `then` arms, down the chain of its `else` arms.
+    private static selects(program: &Program, value: i64, variable: i64) -> boolean {
+        return match (program.expression_at(value).kind) {
+            ExpressionKind::Conditional(_, then_value, else_value) => {
+                CaptureAudit::root(program, then_value) == variable || CaptureAudit::selects(program, else_value, variable)
+            }
+            _ => { false }
+        };
     }
 
     /// The variable the expression at `value` is read from - itself, a

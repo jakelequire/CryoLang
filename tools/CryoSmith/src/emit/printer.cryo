@@ -141,7 +141,9 @@ public type struct Printer {
             mut separate: boolean = false;
             match (defined.receiver) {
                 Receiver::Free      => {
-                    if (defined.genericity.is_generic()) {
+                    if (defined.takes_callable()) {
+                        this.text.push(f"function g{defined.number}<T, F>(");
+                    } else if (defined.genericity.is_generic()) {
                         this.text.push(f"function g{defined.number}<T>(");
                     } else {
                         this.text.push(f"function h{defined.number}(");
@@ -157,11 +159,15 @@ public type struct Printer {
                 separate = true;
                 const parameter: i64 = program.list_at(defined.first_parameter + index);
                 this.name(program, parameter);
-                this.text.push(f": {program.type_name(program.variable_at(parameter).value_type).as_str()}");
+                if (defined.takes_callable() && index == defined.parameter_count - 1) {
+                    this.text.push(Str::new(": F"));
+                } else {
+                    this.text.push(f": {program.type_name(program.variable_at(parameter).value_type).as_str()}");
+                }
                 index = index + 1;
             }
             this.text.push(f") -> {program.type_name(defined.returns).as_str()} ");
-            if (defined.genericity.is_generic()) { this.bound(defined.genericity.compares()); }
+            if (defined.genericity.is_generic()) { this.bound(program, defined); }
             this.text.push(Str::new("{\n"));
         }
         this.block(program, defined.body, indent + 1);
@@ -169,14 +175,23 @@ public type struct Printer {
         this.text.push(Str::new("}\n"));
     }
 
-    /// A generic signature's bound on `T`: `where T: Copy`, or `where T: Eq
-    /// + Copy` when `compares`; the uncopied-type-parameter plant drops
-    /// `Copy`.
-    private bound(mut &this, compares: boolean) -> void {
+    /// A generic signature's bounds: on `T`, `where T: Copy`, or `where T:
+    /// Eq + Copy` when it compares, the uncopied-type-parameter plant
+    /// dropping `Copy`; then on `F`, its function type, `F: (u8, T) -> T`.
+    private bound(mut &this, program: &Program, defined: Function) -> void {
+        const compares: boolean = defined.genericity.compares();
         const copies: boolean = this.plant.keeps_copy_bound();
-        if (compares && copies) { this.text.push(Str::new("where T: Eq + Copy ")); }
-        if (compares && !copies) { this.text.push(Str::new("where T: Eq ")); }
-        if (!compares && copies) { this.text.push(Str::new("where T: Copy ")); }
+        mut written: boolean = true;
+        if (compares && copies) { this.text.push(Str::new("where T: Eq + Copy")); }
+        if (compares && !copies) { this.text.push(Str::new("where T: Eq")); }
+        if (!compares && copies) { this.text.push(Str::new("where T: Copy")); }
+        if (!compares && !copies) { written = false; }
+        if (defined.takes_callable()) {
+            this.text.push(if (written) { Str::new(", F: ") } else { Str::new("where F: ") });
+            this.text.push(program.type_name(defined.callable).as_str());
+            written = true;
+        }
+        if (written) { this.text.push(Str::new(" ")); }
     }
 
     /// A variable's name: `observed`, `p<N>`, `v<N>`, `n<N>`, `this`,

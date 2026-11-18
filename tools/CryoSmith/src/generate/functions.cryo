@@ -30,6 +30,7 @@ implement struct Generator {
         } else {
             RandomStream::for_method(this.options.seed, this.program.functions.length())
         };
+        this.genericity = Genericity::Concrete;
         mut parameter_types: Array<ValueType> = Array::<ValueType>::new();
         mut takes_function: boolean = false;
         if (!is_main) {
@@ -54,7 +55,6 @@ implement struct Generator {
         this.budget = CostBudget::for_function(is_main);
         this.statements_left = if (owner < 0) { this.options.size } else { (this.options.size + 1) / 2 };
         this.in_main = is_main;
-        this.genericity = Genericity::Concrete;
         mut receiver_variable: i64 = -1;
         if (!receiver.is_called_by_name()) {
             receiver_variable = this.program.variable(Variable {
@@ -111,7 +111,7 @@ implement struct Generator {
         this.program.functions.push(Function {
             number: number, is_main: is_main, owner: owner, receiver: receiver, first_parameter: first_parameter,
             parameter_count: parameter_count, returns: this.returns, body: body, cost: this.budget.spent(),
-            genericity: Genericity::Concrete,
+            genericity: Genericity::Concrete, callable: ValueType::Void,
         });
     }
 
@@ -133,7 +133,9 @@ implement struct Generator {
     /// type `T` takes a value of `type_argument`, a deciding value when
     /// `inferred`, since then the call does not write the type argument.
     /// Every argument of a call of an overloaded name is a deciding value
-    /// too, since it chooses the overload (`Overloading`).
+    /// too, since it chooses the overload (`Overloading`).  A
+    /// callable-bounded parameter takes a closure written here, of its bound
+    /// at `type_argument`.
     internal instantiated_arguments(mut &this, called: Function, type_argument: ValueType, inferred: boolean, depth: i64) -> i64 {
         this.budget.charge(called.cost);
         const overloaded: boolean = this.program.overload_set(&called).length() > 1;
@@ -143,7 +145,9 @@ implement struct Generator {
             const parameter: Variable = this.program.variable_at(this.program.list_at(called.first_parameter + index));
             const decides: boolean = parameter.value_type.same(ValueType::TypeParameter);
             const wanted: ValueType = if (decides) { type_argument } else { parameter.value_type };
-            if (wanted.is_function()) {
+            if (called.takes_callable() && index == called.parameter_count - 1) {
+                arguments.push(this.written_closure(this.program.instantiated_function_type(called.callable, type_argument), true));
+            } else if (wanted.is_function()) {
                 arguments.push(this.function_value(wanted, true));
             } else if ((decides && inferred) || overloaded) {
                 arguments.push(this.deciding_value(wanted, if (depth < 0) { 0 } else { depth }));
