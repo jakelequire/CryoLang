@@ -475,8 +475,36 @@ where its last owner's scope ends, at an early `return`, or when the call
 it was moved into returns, and a value moved on one branch only is dropped
 at the end of its scope on the paths that kept it. `main`'s own owned
 locals are dropped after its hash line is printed, so their drops are not
-in the hash. Under the memory-safety plan these programs are valid as
-they are: no reference is taken to an owned value.
+in the hash.
+
+**References.** With `references` (and `moves`), a free function takes a
+reference to an owned struct first three times in ten, `p0: &D0`, or four
+times in ten of those `p0: mut &D0`, and one taking a shared reference
+returns that type three times in ten (docs/cryo.md section 2.3). A
+reference is a parameter's or a return's type only, never a local's,
+field's or capture's, so every borrow ends with the statement that makes
+it, and `Environment`'s loans keep shared and exclusive apart within one:
+a variable lent exclusively is used nowhere else in the statement, and
+one lent at all is neither moved nor lent exclusively there. A reference
+given where one is wanted is `&v` of a parameter or local holding the
+value - for an exclusive one, a `mut` local - a reference parameter passed
+on, a call returning one, or an `if` expression choosing between two
+borrows or parameters, made before its condition. A reference returned
+borrows from the function's reference parameters only: a parameter passed
+on, or a call given only those (`returning_reference`), so it never
+refers to a local or a by-value parameter (E0455); under the
+memory-safety plan's rule that a returned reference borrows from every
+reference argument, its caller uses it within the statement that made it.
+Fields are written through a `mut &D0` parameter (`p0.f1 = ..`) and read
+through any reference when the function observes its parameters; a
+reference a call returns is observed by its first field where the call
+stands. With references on, an owned local is `mut` four times in ten, so
+it may be lent exclusively and assigned whole, which drops the value it
+held, and `main` first declares a `mut` local of each owned struct some
+helper takes a reference to, as it does for trait objects. The loan audit
+(section 7) holds the model to these rules; today's compiler checks only
+the return of a local's address, so the audit is the one check of shared
+and exclusive until the memory-safety plan's checker lands.
 
 A `match` statement's arm may assign the local its subject reads. Its
 bindings are never written `mut` and their payloads are `Copy`, so each is
@@ -708,9 +736,10 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. Any list removing
-  `subject-assignments` generates version 28's text for that list, and one
-  removing `moves` too, version 27's. Any list removing `trait-objects`
+  generator's text, header aside. Any list removing `references`
+  generates version 29's text for that list; one removing
+  `subject-assignments` too, version 28's, and `moves` as well, version
+  27's. Any list removing `trait-objects`
   generates version 26's text for that list, version 27 adding only
   `main`'s locals for objects to borrow; in version 26,
   `default,no-trait-defaults,no-supertraits` generated version 25's text,
@@ -753,7 +782,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
 | 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
 | 6 | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods. Still to come: implementations for enums |
-| 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings. Still to come: references, early drops, `Box` and `Rc`, `Option` and `Result` |
+| 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings; `references`: `&D0` and `mut &D0` parameters, `&D0` returns, kept shared or exclusive per statement. Still to come: early drops, `Box` and `Rc`, `Option` and `Result` |
 | 8 | strings, arrays and collections |
 
 Section 9 places each stage among the rest of the work, the tools that
@@ -862,6 +891,15 @@ statement budget of one function, default 24), `--no-header`, and
   opens its body with that assignment, gives the `mut` local it matches on
   another variant, and observes each of its bindings after it; with the
   feature off, no arm assigns its subject.
+- **The loan audit** reads every function of 200 programs as the move
+  audit does, from the same list of uses in printed order (`UseWalk`): no
+  local holds a reference; within one statement a variable borrowed
+  exclusively, an exclusive reference passed on or a variable moved has
+  no other use but an assignment to it; and no value a function returns
+  as a reference borrows a variable of the function.
+- **Borrow coverage**: of 40 programs, at least half of those declaring a
+  trait object parameter pass `&v` to one, and likewise for a reference
+  parameter.
 
 ## 8. Architecture
 
@@ -1009,9 +1047,11 @@ place.
    reference lives only in a local, parameter or return, never outlives
    what it borrows, and is never shared and mutable at once, and nothing
    needs `unsafe`. (In progress: `moves`, owned values moved between
-   locals, into calls and out of returns, each dropped into the hash, and
+   locals, into calls and out of returns, each dropped into the hash,
    `subject-assignments`, arms assigning their subject another variant,
-   are done.)
+   and `references`, borrows given to reference parameters and references
+   returned from them, are done; early drops, `Box` and `Rc`, and `Option`
+   and `Result` remain.)
 6. **Stage 8: strings, arrays and collections.** `model/`: `Str`,
    `String`, fixed arrays, `Array`, `HashMap`. `generate/`: building,
    indexing within bounds, iterating. `guarantees/`: an index is in range

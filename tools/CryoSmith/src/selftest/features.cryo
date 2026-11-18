@@ -79,34 +79,44 @@ implement struct SelfTest {
         this.switch(Feature::TraitObjects, [Str::new(": virtual &Tr0"), Str::new(": virtual &Tr1")]);
         this.switch(Feature::TraitDefaults, [Str::new(";\n\n    t"), Str::new(";\n\n    t")]);
         this.switch(Feature::Supertraits, [Str::new("type trait Tr1 : Tr0 {"), Str::new("type trait Tr1 : Tr0 {")]);
+        this.switch(Feature::References, [Str::new("(p0: &D"), Str::new("(p0: mut &D")]);
         this.switch(Feature::Moves, [Str::new("implement trait Drop for struct D0 {"), Str::new(": D0 = D0 {")]);
         this.constants_switch();
         this.overloads_switch();
         this.captures_switch();
     }
 
-    /// `trait-objects` is exercised, not only declared: of the programs
-    /// declaring a trait object parameter, at least half pass `&v` to one.
-    internal object_call_coverage(mut &this) -> void {
+    /// `trait-objects` and `references` are exercised, not only declared:
+    /// of the programs declaring a trait object parameter, at least half
+    /// pass `&v` to one, an object being a last argument, and likewise for
+    /// a reference parameter, a reference being a first one.
+    internal borrow_coverage(mut &this) -> void {
+        this.borrow_coverage_of(Str::new("trait-objects"), [Str::new(": virtual &Tr"), Str::new(": virtual &Tr")], [Str::new(", &v"), Str::new(", &p")]);
+        this.borrow_coverage_of(Str::new("references"), [Str::new("(p0: &D"), Str::new("(p0: mut &D")], [Str::new("(&v"), Str::new("(&p")]);
+    }
+
+    /// Of the programs spelling either of `declarations`, at least half
+    /// spell either of `borrows` followed by a digit.
+    private borrow_coverage_of(mut &this, feature: Str, declarations: [Str; 2], borrows: [Str; 2]) -> void {
         mut declaring: i64 = 0;
         mut passing: i64 = 0;
         mut seed: u64 = 1;
         while (seed <= SWITCH_PROGRAMS) {
             const text: String = SelfTest::program(GenerationOptions::new(seed));
             const body: Str = SelfTest::body(text.as_str());
-            if (body.contains(&Str::new(": virtual &Tr"))) {
+            if (body.contains(&declarations[0]) || body.contains(&declarations[1])) {
                 declaring = declaring + 1;
-                if (SelfTest::passes_borrow(body)) { passing = passing + 1; }
+                if (SelfTest::passes_borrow(body, borrows)) { passing = passing + 1; }
             }
             seed = seed + 1;
         }
-        this.expect(declaring > 0 && 2 * passing >= declaring, f"`trait-objects`: {passing} of the {declaring} programs declaring a trait object parameter pass `&v` to one");
+        this.expect(declaring > 0 && 2 * passing >= declaring, f"`{feature}`: {passing} of the {declaring} programs declaring its parameter pass `&v` to one");
     }
 
-    /// Whether `text` borrows a parameter or local as an argument: `(&` or
-    /// `, &`, then `v` or `p` and a digit.
-    private static passes_borrow(text: Str) -> boolean {
-        for (opening in [Str::new("(&v"), Str::new(", &v"), Str::new("(&p"), Str::new(", &p")]) {
+    /// Whether `text` borrows a parameter or local as an argument: one of
+    /// `openings`, then a digit.
+    private static passes_borrow(text: Str, openings: [Str; 2]) -> boolean {
+        for (opening in openings) {
             mut rest: Str = text;
             mut at: Option<i64> = rest.find(&opening);
             while (at.is_some()) {

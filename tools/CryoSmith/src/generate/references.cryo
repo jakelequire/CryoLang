@@ -1,0 +1,193 @@
+///! References (stage 7): `&D0` and `mut &D0`, references to owned
+///! structs' values, as free functions' parameters and returns.
+///!
+///! A free function takes a reference first three times in ten, an
+///! exclusive one four times in ten of those, and one taking a shared
+///! reference returns that type three times in ten.  A reference is a
+///! parameter's or a return's type only, never a local's, so every borrow
+///! ends with the statement that makes it, and the environment's loans
+///! keep shared and exclusive apart within one: a variable lent
+///! exclusively is used nowhere else in the statement, and one lent at all
+///! is neither moved nor lent exclusively there.  A reference given where
+///! one is wanted is `&v` of a parameter or local holding the value - for
+///! an exclusive reference, a `mut` local - a reference parameter passed
+///! on, a call returning one, or an `if` expression choosing between two
+///! borrows or parameters.  A reference returned borrows from the function's
+///! reference parameters only: a parameter passed on, or a call given only
+///! those, so it never refers to a local or a by-value parameter of the
+///! function returning it.  Fields are written through an exclusive
+///! reference parameter, and read through any reference when the function
+///! observes its parameters; with references on, an owned local is `mut`
+///! four times in ten, so it may be lent exclusively and assigned whole,
+///! which drops the value it held.
+
+namespace cryosmith::generate::references;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::model::{ ExpressionKind, Function, OwnedStructure, StatementKind, ValueType };
+
+/// How often, in a hundred, a free function takes a reference first.
+const REFERENCE_PARAMETER_CHANCE: i64 = 30;
+
+/// How often, in a hundred, a reference parameter is exclusive.
+const EXCLUSIVE_CHANCE: i64 = 40;
+
+/// How often, in a hundred, a function taking a shared reference returns
+/// one.
+const REFERENCE_RETURN_CHANCE: i64 = 30;
+
+/// How often, in a hundred, an owned local is `mut` with references on.
+const MUTABLE_OWNED_CHANCE: i64 = 40;
+
+implement struct Generator {
+    /// Whether references are generated: `references` and `moves` are on,
+    /// so the program has owned structs to refer to.
+    internal makes_references(&this) -> boolean {
+        return this.options.features.has(Feature::References) && this.makes_owned();
+    }
+
+    /// A reference parameter for a free function, sometimes, put first in
+    /// `parameter_types`: `REFERENCE_PARAMETER_CHANCE` times in a hundred
+    /// with references on, exclusive `EXCLUSIVE_CHANCE` times in a hundred
+    /// of those.  No draw without the feature.  Whether one was added.
+    internal add_reference_parameter(mut &this, parameter_types: mut &Array<ValueType>) -> boolean {
+        if (!this.makes_references() || !this.random.chance(REFERENCE_PARAMETER_CHANCE)) { return false; }
+        const referent: i64 = this.random.below(this.program.owned_structures.length());
+        const reference: ValueType = if (this.random.chance(EXCLUSIVE_CHANCE)) { ValueType::ExclusiveReference(referent) } else { ValueType::SharedReference(referent) };
+        parameter_types.insert(0, reference);
+        return true;
+    }
+
+    /// What a function taking `parameter_types`, a reference first,
+    /// returns when it returns a reference: its first parameter's type, a
+    /// shared reference, `REFERENCE_RETURN_CHANCE` times in a hundred;
+    /// `void` otherwise, and with no draw after an exclusive one.
+    internal reference_return_type(mut &this, parameter_types: &Array<ValueType>) -> ValueType {
+        const first: ValueType = parameter_types.get(0).unwrap();
+        if (first.is_exclusive() || !this.random.chance(REFERENCE_RETURN_CHANCE)) { return ValueType::Void; }
+        return first;
+    }
+
+    /// Whether a new owned local is `mut`: `MUTABLE_OWNED_CHANCE` times in
+    /// a hundred with references on.  No draw without the feature.
+    internal mutable_owned(mut &this) -> boolean {
+        return this.makes_references() && this.random.chance(MUTABLE_OWNED_CHANCE);
+    }
+
+    /// Whether a call of `candidate` can be written here: its reference
+    /// parameter, if it takes one, has a value to borrow or a parameter to
+    /// pass on.
+    internal passes_references(&this, candidate: &Function) -> boolean {
+        if (candidate.parameter_count == 0) { return true; }
+        const first: ValueType = this.program.variable_at(this.program.list_at(candidate.first_parameter)).value_type;
+        return !first.is_reference() || this.reference_leaves(first) > 0;
+    }
+
+    /// How many borrows and parameters to pass on there are for a reference
+    /// of `wanted` here: no borrow where a returned reference is being made.
+    private reference_leaves(&this, wanted: ValueType) -> i64 {
+        const passable: i64 = this.environment.passable(&this.program, wanted.referent(), wanted.is_exclusive()).length();
+        if (this.returning_reference) { return passable; }
+        return passable + this.environment.borrowable(&this.program, wanted.referent(), wanted.is_exclusive()).length();
+    }
+
+    /// A reference of `wanted`: `&v` of a variable holding the value, a
+    /// reference parameter passed on, a call returning one, or an `if`
+    /// expression choosing between two of the first two - offered only where
+    /// a shared reference may be taken again for its second branch, and its
+    /// branches made before its condition, which then cannot lend what they
+    /// borrow exclusively.  Each lends what it names to the statement.
+    internal reference_expression(mut &this, wanted: ValueType, depth: i64) -> i64 {
+        const exclusive: boolean = wanted.is_exclusive();
+        const deeper: boolean = depth > 0;
+        const callees: Array<i64> = if (exclusive || !deeper) { Array::<i64>::new() } else { this.callees(wanted) };
+        mut repeatable: boolean = false;
+        if (!exclusive) {
+            for (variable in this.environment.passable(&this.program, wanted.referent(), false).iter()) {
+                if (!this.program.variable_at(variable).value_type.is_exclusive()) { repeatable = true; }
+            }
+            if (!this.returning_reference && this.environment.borrowable(&this.program, wanted.referent(), false).length() > 0) { repeatable = true; }
+        }
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(if (this.reference_leaves(wanted) > 0) { 10 } else { 0 });
+        weights.push(if (callees.length() > 0) { 4 } else { 0 });
+        weights.push(if (repeatable && deeper && this.options.features.has(Feature::IfExpressions)) { 2 } else { 0 });
+        const form: i64 = this.random.pick(&weights);
+        if (form == 0) { return this.reference_leaf(wanted); }
+        if (form == 1) { return this.call(callees.get(this.random.below(callees.length())).unwrap(), depth - 1); }
+        const then_value: i64 = this.reference_leaf(wanted);
+        const else_value: i64 = this.reference_leaf(wanted);
+        const condition: i64 = this.condition(depth - 1);
+        return this.node(ExpressionKind::Conditional(condition, then_value, else_value), wanted);
+    }
+
+    /// `&v` of a variable holding the value, or a reference parameter
+    /// passed on, lent to the statement; no borrow where a returned
+    /// reference is being made.
+    private reference_leaf(mut &this, wanted: ValueType) -> i64 {
+        const exclusive: boolean = wanted.is_exclusive();
+        const passable: Array<i64> = this.environment.passable(&this.program, wanted.referent(), exclusive);
+        const borrowable: Array<i64> = if (this.returning_reference) { Array::<i64>::new() } else { this.environment.borrowable(&this.program, wanted.referent(), exclusive) };
+        const chosen: i64 = this.random.below(passable.length() + borrowable.length());
+        if (chosen < passable.length()) {
+            const parameter: i64 = passable.get(chosen).unwrap();
+            this.environment.lend(parameter, this.program.variable_at(parameter).value_type.is_exclusive());
+            return this.node(ExpressionKind::Variable(parameter), wanted);
+        }
+        const holder: i64 = borrowable.get(chosen - passable.length()).unwrap();
+        this.environment.lend(holder, exclusive);
+        return this.node(ExpressionKind::Borrow(holder), wanted);
+    }
+
+    /// In `main`, with references on: for each owned struct some helper
+    /// takes a reference to, a `mut` local holding a value of it, declared
+    /// first, so main's calls of those helpers have a value to borrow,
+    /// shared or exclusive.  No draw where no helper takes a reference.
+    internal declare_reference_holders(mut &this, statements: mut &Array<i64>) -> void {
+        if (!this.makes_references()) { return; }
+        mut referent: i64 = 0;
+        while (referent < this.program.owned_structures.length()) {
+            if (this.takes_reference_to(referent)) {
+                const value: i64 = this.owned_expression(ValueType::Owned(referent), this.depth());
+                const holder: i64 = this.environment.declare_local(&this.program, ValueType::Owned(referent), true);
+                statements.push(this.program.statement(StatementKind::Declare(holder, value)));
+            }
+            referent = referent + 1;
+        }
+    }
+
+    /// Whether some function generated so far takes a reference to a value
+    /// of owned struct `referent`.
+    private takes_reference_to(&this, referent: i64) -> boolean {
+        for (defined in this.program.functions.iter()) {
+            if (defined.parameter_count > 0
+                    && this.program.variable_at(this.program.list_at(defined.first_parameter)).value_type.referent() == referent) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The exclusive reference parameters in scope a field may be written
+    /// through.
+    internal writable_references(&this) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.in_scope().iter()) {
+            if (this.program.variable_at(variable).value_type.is_exclusive()) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// `p0.f1 = ..;` through the exclusive reference parameter `parameter`,
+    /// which the value may not name: it is lent to the statement first.
+    internal reference_store(mut &this, parameter: i64) -> i64 {
+        this.environment.lend(parameter, true);
+        const declared: OwnedStructure = this.program.owned_at(this.program.variable_at(parameter).value_type.referent());
+        const field: i64 = declared.first_field + this.random.below(declared.field_count);
+        const place: i64 = this.program.expression(ExpressionKind::Field(this.target(parameter), field), this.program.field_at(field).value_type);
+        return this.store(place);
+    }
+}

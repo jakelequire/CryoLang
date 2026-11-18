@@ -13,6 +13,11 @@
 ///! after the move, nor is it observed when its scope ends.  A variable is
 ///! moved only inside the loop it was declared in: one declared outside an
 ///! enclosing loop would be moved again on the next trip.
+///!
+///! A borrow lends its variable until the statement making it ends, since
+///! no reference outlives one: a variable lent exclusively is used nowhere
+///! else in that statement, one lent at all is not moved or lent
+///! exclusively there.
 
 namespace cryosmith::typing::environment;
 
@@ -34,22 +39,28 @@ public type struct Environment {
     private moved: Array<i64>;
     /// Where each enclosing loop's body starts in `names`, innermost last.
     private loop_floors: Array<i64>;
+    /// The variables the statement being generated lends shared.
+    private shared_loans: Array<i64>;
+    /// The variables the statement being generated lends exclusively.
+    private exclusive_loans: Array<i64>;
 
     /// An environment holding nothing; `enter_function` starts one.
     public static new() -> Environment {
         return Environment {
             names: Array::<i64>::new(), floor: 0, locals: 0, counters: 0, bindings: 0, closure_parameters: 0,
-            moved: Array::<i64>::new(), loop_floors: Array::<i64>::new(),
+            moved: Array::<i64>::new(), loop_floors: Array::<i64>::new(), shared_loans: Array::<i64>::new(),
+            exclusive_loans: Array::<i64>::new(),
         };
     }
 
-    /// Start a function: only `observed` in scope, nothing moved, and every
-    /// numbering from zero.
+    /// Start a function: only `observed` in scope, nothing moved or lent,
+    /// and every numbering from zero.
     public enter_function(mut &this) -> void {
         this.names.clear();
         this.names.push(Program::observed());
         this.moved.clear();
         this.loop_floors.clear();
+        this.begin_statement();
         this.floor = 0;
         this.locals = 0;
         this.counters = 0;
@@ -114,9 +125,64 @@ public type struct Environment {
     /// Leave the innermost loop's body.
     public leave_loop(mut &this) -> void { this.loop_floors.truncate(this.loop_floors.length() - 1); }
 
+    /// Start a statement: the borrows of the one before it have ended.
+    public begin_statement(mut &this) -> void {
+        this.shared_loans.clear();
+        this.exclusive_loans.clear();
+    }
+
+    /// Record that the statement being generated lends `variable`, shared
+    /// or `exclusive`.
+    public lend(mut &this, variable: i64, exclusive: boolean) -> void {
+        if (exclusive) { this.exclusive_loans.push(variable); } else { this.shared_loans.push(variable); }
+    }
+
+    /// Whether the statement being generated lends `variable` at all.
+    public is_lent(&this, variable: i64) -> boolean {
+        return this.shared_loans.contains(&variable) || this.exclusive_loans.contains(&variable);
+    }
+
+    /// The parameters and locals in scope a reference to a value of owned
+    /// struct `referent` may borrow here: one holding such a value and not
+    /// lent exclusively for a shared reference, a `mut` local holding one
+    /// and not lent at all for an exclusive one.
+    public borrowable(&this, program: &Program, referent: i64, exclusive: boolean) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.in_scope().iter()) {
+            const declared: Variable = program.variable_at(variable);
+            const holds: boolean = match (declared.role) {
+                VariableRole::Local     => { !exclusive || declared.mutable }
+                VariableRole::Parameter => { !exclusive }
+                _                       => { false }
+            };
+            if (!holds || !declared.value_type.same(ValueType::Owned(referent))) { continue; }
+            if (exclusive && this.is_lent(variable)) { continue; }
+            if (this.exclusive_loans.contains(&variable)) { continue; }
+            found.push(variable);
+        }
+        return found;
+    }
+
+    /// The reference parameters in scope that may be passed on where a
+    /// reference to owned struct `referent` is wanted: an exclusive one
+    /// wherever it is not lent, and for a shared reference, a shared one
+    /// not lent exclusively.  Passing an exclusive reference on lends it
+    /// exclusively, whichever reference is wanted.
+    public passable(&this, program: &Program, referent: i64, exclusive: boolean) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.in_scope().iter()) {
+            const value_type: ValueType = program.variable_at(variable).value_type;
+            if (value_type.referent() != referent) { continue; }
+            if (value_type.is_exclusive() && !this.is_lent(variable)) { found.push(variable); }
+            if (!value_type.is_exclusive() && !exclusive && !this.exclusive_loans.contains(&variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
     /// The parameters and locals in scope holding a value of `wanted` that
     /// may be moved here: declared inside the innermost enclosing loop, or
-    /// anywhere outside every loop.
+    /// anywhere outside every loop, and not lent by the statement being
+    /// generated.
     public movable(&this, program: &Program, wanted: ValueType) -> Array<i64> {
         mut start: i64 = this.floor;
         if (this.loop_floors.length() > 0 &&this.loop_floors.get(this.loop_floors.length() - 1).unwrap() > start) {
@@ -130,7 +196,7 @@ public type struct Environment {
                 VariableRole::Local     => { true }
                 _                       => { false }
             };
-            if (named && declared.value_type.same(wanted)) { found.push(variable); }
+            if (named && declared.value_type.same(wanted) && !this.is_lent(variable)) { found.push(variable); }
         }
         return found;
     }

@@ -4,8 +4,11 @@
 ///! by observing its parameters and a method's receiver.  A scalar is folded
 ///! directly; a struct field by field, nested structs through their own
 ///! fields; a struct a call returns is bound to a local first, so the call
-///! runs once.  An owned struct is observed field by field as a struct is;
-///! one moved out of is no longer in scope, and is not observed.
+///! runs once.  An owned struct is observed field by field as a struct is,
+///! and through a reference parameter alike; one moved out of is no longer
+///! in scope, and is not observed.  A reference a call returns is observed
+///! by its first field, read where the call stands, since no local holds a
+///! reference.
 
 namespace cryosmith::generate::observations;
 
@@ -56,14 +59,14 @@ implement struct Generator {
             }
             return;
         }
-        if (!value_type.is_record() && !value_type.is_owned()) {
+        if (!value_type.is_record() && !value_type.is_owned() && !value_type.is_reference()) {
             statements.push(this.observation(place));
             return;
         }
         mut first_field: i64 = 0;
         mut field_count: i64 = 0;
-        if (value_type.is_owned()) {
-            const owned: OwnedStructure = this.program.owned_at(value_type.owned());
+        if (value_type.is_owned() || value_type.is_reference()) {
+            const owned: OwnedStructure = this.program.owned_at(if (value_type.is_owned()) { value_type.owned() } else { value_type.referent() });
             first_field = owned.first_field;
             field_count = owned.field_count;
         } else {
@@ -95,6 +98,11 @@ implement struct Generator {
         }
         if (value_type.is_function()) {
             this.observe_value(this.invoke_value(value, 0), statements);
+            return;
+        }
+        if (value_type.is_reference()) {
+            const first_field: i64 = this.program.owned_at(value_type.referent()).first_field;
+            statements.push(this.observation(this.node(ExpressionKind::Field(value, first_field), this.program.field_at(first_field).value_type)));
             return;
         }
         if (!value_type.is_record() && !value_type.is_owned()) {

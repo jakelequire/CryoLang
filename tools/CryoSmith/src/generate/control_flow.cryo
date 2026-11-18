@@ -65,6 +65,7 @@ implement struct Generator {
 
     /// One statement, chosen by weight from those allowed here.
     private statement(mut &this) -> i64 {
+        this.environment.begin_statement();
         const features: FeatureSet = this.options.features;
         const nested: boolean = this.block_depth < MOST_BLOCKS;
         const writable: Array<i64> = this.environment.writable_records(&this.program);
@@ -82,6 +83,8 @@ implement struct Generator {
         weights.push(if (this.matches_enumerations() && nested) { 8 } else { 0 });
         weights.push(if (this.declares_closures()) { 6 } else { 0 });
         weights.push(if (this.makes_owned()) { 10 } else { 0 });
+        const references: Array<i64> = this.writable_references();
+        weights.push(if (references.length() > 0) { 8 } else { 0 });
         const form: i64 = this.random.pick(&weights);
         this.budget.charge(1);
         if (form == 0) { return this.declaration(); }
@@ -106,13 +109,14 @@ implement struct Generator {
         }
         if (form == 6) {
             const condition: i64 = this.condition(this.depth());
-            const value: i64 = if (this.returns.same(ValueType::Void)) { -1 } else { this.typed_place(this.returns, this.depth()) };
+            const value: i64 = if (this.returns.same(ValueType::Void)) { -1 } else { this.returned_value() };
             return this.program.statement(StatementKind::ReturnIf(condition, value));
         }
         if (form == 7) { return this.store(this.field_place(writable.get(this.random.below(writable.length())).unwrap())); }
         if (form == 9) { return this.match_statement(); }
         if (form == 10) { return this.closure_declaration(); }
         if (form == 11) { return this.owned_declaration(); }
+        if (form == 12) { return this.reference_store(references.get(this.random.below(references.length())).unwrap()); }
         const method: MethodCandidate = mutators.get(this.random.below(mutators.length())).unwrap();
         return this.program.statement(StatementKind::Evaluate(this.method_call(method, this.depth())));
     }
@@ -129,7 +133,7 @@ implement struct Generator {
 
     /// A store to `place`, a `mut` local or a field reached from a
     /// writable struct: plain, or a compound operator that cannot overflow.
-    private store(mut &this, place: i64) -> i64 {
+    internal store(mut &this, place: i64) -> i64 {
         const value_type: ValueType = this.program.expression_at(place).value_type;
         const features: FeatureSet = this.options.features;
         if (value_type.is_integer() && this.random.chance(35)) {

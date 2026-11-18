@@ -35,16 +35,19 @@ implement struct Generator {
         mut takes_function: boolean = false;
         mut takes_object: boolean = false;
         mut takes_owned: boolean = false;
+        mut takes_reference: boolean = false;
         if (!is_main) {
             const parameter_count: i64 = if (owner < 0) { 1 + this.random.below(4) } else { this.random.below(4) };
             while (parameter_types.length() < parameter_count) { parameter_types.push(this.any_type()); }
             if (owner < 0) { takes_function = this.add_function_parameter(&parameter_types); }
             if (owner < 0) { takes_object = this.add_object_parameter(&parameter_types); }
             if (owner < 0) { takes_owned = this.add_owned_parameter(&parameter_types); }
+            if (owner < 0) { takes_reference = this.add_reference_parameter(&parameter_types); }
         }
-        const returns: ValueType = this.drawn_return_type(owner, receiver, is_main);
+        const reference: ValueType = if (takes_reference) { this.reference_return_type(&parameter_types) } else { ValueType::Void };
+        const returns: ValueType = if (reference.is_reference()) { reference } else { this.drawn_return_type(owner, receiver, is_main) };
         this.define_with(number, owner, receiver, &parameter_types, returns, -1);
-        if (!is_main && !takes_function && !takes_object && !takes_owned && this.options.features.has(Feature::Overloads)) {
+        if (!is_main && !takes_function && !takes_object && !takes_owned && !takes_reference && this.options.features.has(Feature::Overloads)) {
             this.define_overloads(this.program.functions.length() - 1);
         }
     }
@@ -99,13 +102,17 @@ implement struct Generator {
         this.returns = returns;
         mut statements: Array<i64> = Array::<i64>::new();
         const body_start: i64 = this.environment.mark();
-        if (is_main) { this.declare_object_sources(&statements); }
+        if (is_main) {
+            this.declare_object_sources(&statements);
+            this.declare_reference_holders(&statements);
+        }
         this.fill(&statements, true);
         this.observe_declared(body_start, &statements);
         if (is_main) {
             mut helper: i64 = 0;
             while (helper < this.program.functions.length()) {
                 const called: Function = this.program.function_at(helper);
+                this.environment.begin_statement();
                 if (called.owner < 0 && this.callees(called.returns).contains(&helper)) {
                     this.observe_value(this.call(helper, 2), &statements);
                 }
@@ -122,7 +129,8 @@ implement struct Generator {
             }
             if (receiver_variable >= 0) { this.observe_place(this.read(receiver_variable), &statements); }
             if (!this.returns.same(ValueType::Void)) {
-                const value: i64 = this.typed_place(this.returns, this.depth());
+                this.environment.begin_statement();
+                const value: i64 = this.returned_value();
                 statements.push(this.program.statement(StatementKind::Return(value)));
             }
         }
@@ -132,6 +140,15 @@ implement struct Generator {
             parameter_count: parameter_count, returns: this.returns, body: body, cost: this.budget.spent(),
             genericity: this.genericity, callable: ValueType::Void, implements: implements,
         });
+    }
+
+    /// A value for the function to return: a reference it returns borrows
+    /// from its reference parameters only.
+    internal returned_value(mut &this) -> i64 {
+        this.returning_reference = this.returns.is_reference();
+        const value: i64 = this.typed_place(this.returns, this.depth());
+        this.returning_reference = false;
+        return value;
     }
 
     /// A call of the free function or static method `callee`, with
@@ -194,7 +211,7 @@ implement struct Generator {
             const candidate: Function = this.program.function_at(index);
             if (candidate.receiver.is_called_by_name() && !candidate.genericity.is_generic()
                     && candidate.returns.same(wanted) && this.budget.affordable(candidate.cost) && this.may_call(&candidate)
-                    && this.passes_objects(&candidate)) {
+                    && this.passes_objects(&candidate) && this.passes_references(&candidate)) {
                 found.push(index);
             }
             index = index + 1;

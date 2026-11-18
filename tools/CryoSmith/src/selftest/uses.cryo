@@ -1,0 +1,224 @@
+///! The uses a function makes of its variables, in the order its text is
+///! printed: each declaration, read, borrow, reference passed on and move,
+///! with where each statement, loop and returned value begins and ends.
+///! The move and loan audits read their rules off this list.  A closure's
+///! body is not walked: it reads only what it captures, and it captures no
+///! owned value and no reference.
+
+namespace cryosmith::selftest::uses;
+
+import std::collections::array::{ Array };
+
+import cryosmith::model::{ ExpressionKind, Function, MatchArm, Program, StatementKind, ValueType };
+
+/// What a use does.
+internal type enum UseKind {
+    /// The variable is declared.
+    Declared;
+    /// A loop's body begins.
+    LoopEntered;
+    /// A loop's body ends.
+    LoopLeft;
+    /// A statement of a block begins.
+    StatementStarted;
+    /// The variable is read, or a place in it is.
+    Named;
+    /// The variable, or a place in it, is an assignment's target, which is
+    /// written once the value is made.
+    Assigned;
+    /// `&v` given where a shared reference or an object is wanted.
+    SharedBorrow;
+    /// `&v` given where an exclusive reference is wanted.
+    ExclusiveBorrow;
+    /// A shared reference parameter passed on.
+    SharedPass;
+    /// An exclusive reference parameter passed on, or written through.
+    ExclusivePass;
+    /// The variable's owned value is moved out.
+    Moved;
+    /// A value the function returns begins.
+    ReturnStarted;
+    /// A value the function returns ends.
+    ReturnEnded;
+}
+
+/// One use: what it does, and the variable it names, or -1.
+internal type struct Use {
+    /// What it does.
+    internal kind: UseKind;
+    /// The variable, or -1 for a statement's, loop's or return's mark.
+    internal variable: i64;
+}
+
+/// The walk of one function's body.
+internal type struct UseWalk {
+    private uses: Array<Use>;
+
+    /// The uses `defined` makes, its parameters declared first.
+    internal static of(program: &Program, defined: Function) -> Array<Use> {
+        mut walk: UseWalk = UseWalk { uses: Array::<Use>::new() };
+        mut position: i64 = 0;
+        while (position < defined.parameter_count) {
+            walk.add(UseKind::Declared, program.list_at(defined.first_parameter + position));
+            position = position + 1;
+        }
+        walk.walk_block(program, defined.body, true);
+        return walk.uses;
+    }
+
+    /// Record a use.
+    private add(mut &this, kind: UseKind, variable: i64) -> void { this.uses.push(Use { kind: kind, variable: variable }); }
+
+    /// Walk the block from `first`; with `marking`, each statement begins
+    /// with a mark - a block an expression runs, a `match` arm's
+    /// observations, belongs to the statement holding the expression.
+    private walk_block(mut &this, program: &Program, first: i64, marking: boolean) -> void {
+        mut current: i64 = first;
+        while (current >= 0) {
+            if (marking) { this.add(UseKind::StatementStarted, -1); }
+            match (program.statement_at(current).kind) {
+                StatementKind::Declare(variable, value) => {
+                    this.walk(program, value);
+                    this.add(UseKind::Declared, variable);
+                }
+                StatementKind::Assign(place, value) => {
+                    this.add(UseKind::Assigned, UseWalk::root(program, place));
+                    this.walk(program, value);
+                }
+                StatementKind::Compound(_, place, value) => {
+                    this.add(UseKind::Assigned, UseWalk::root(program, place));
+                    this.walk(program, value);
+                }
+                StatementKind::Observe(value) => { this.walk(program, value); }
+                StatementKind::Evaluate(value) => { this.walk(program, value); }
+                StatementKind::Branch(condition, then_block, else_block) => {
+                    this.walk(program, condition);
+                    this.walk_block(program, then_block, marking);
+                    if (else_block >= 0) { this.walk_block(program, else_block, marking); }
+                }
+                StatementKind::Loop(_, counter, _, body) => {
+                    this.add(UseKind::LoopEntered, -1);
+                    this.add(UseKind::Declared, counter);
+                    this.walk_block(program, body, marking);
+                    this.add(UseKind::LoopLeft, -1);
+                }
+                StatementKind::Exit(_, condition) => { this.walk(program, condition); }
+                StatementKind::ReturnIf(condition, value) => {
+                    this.walk(program, condition);
+                    if (value >= 0) { this.returned(program, value); }
+                }
+                StatementKind::Return(value) => { this.returned(program, value); }
+                StatementKind::Match(subject, first_arm, count) => {
+                    this.walk(program, subject);
+                    mut arm: i64 = first_arm;
+                    while (arm < first_arm + count) {
+                        this.walk_block(program, program.arm_at(arm).body, marking);
+                        arm = arm + 1;
+                    }
+                }
+                StatementKind::Finish => { }
+            }
+            current = program.statement_at(current).next;
+        }
+    }
+
+    /// The variable a place is in: the place itself, or the base its
+    /// fields are read from.
+    private static root(program: &Program, place: i64) -> i64 {
+        return match (program.expression_at(place).kind) {
+            ExpressionKind::Variable(variable) => { variable }
+            ExpressionKind::Field(base, _) => { UseWalk::root(program, base) }
+            _ => { -1 }
+        };
+    }
+
+    /// Walk a value the function returns, between its marks.
+    private returned(mut &this, program: &Program, value: i64) -> void {
+        this.add(UseKind::ReturnStarted, -1);
+        this.walk(program, value);
+        this.add(UseKind::ReturnEnded, -1);
+    }
+
+    /// Walk the `count` expressions from `first` in the index lists, every
+    /// `stride` places from `offset`.
+    private walk_run(mut &this, program: &Program, first: i64, count: i64, stride: i64, offset: i64) -> void {
+        mut position: i64 = 0;
+        while (position < count) {
+            this.walk(program, program.list_at(first + position * stride + offset));
+            position = position + 1;
+        }
+    }
+
+    /// Walk the expression at `value`, its operands in the order they are
+    /// printed.  A reference variable read is a reference passed on, and
+    /// `&v` a borrow, each as exclusive as the reference the node is or the
+    /// variable holds.
+    private walk(mut &this, program: &Program, value: i64) -> void {
+        const value_type: ValueType = program.expression_at(value).value_type;
+        match (program.expression_at(value).kind) {
+            ExpressionKind::Variable(variable) => {
+                const held: ValueType = program.variable_at(variable).value_type;
+                if (held.is_exclusive()) {
+                    this.add(UseKind::ExclusivePass, variable);
+                } else if (held.is_reference()) {
+                    this.add(UseKind::SharedPass, variable);
+                } else {
+                    this.add(UseKind::Named, variable);
+                }
+            }
+            ExpressionKind::Borrow(variable) => {
+                this.add(if (value_type.is_exclusive()) { UseKind::ExclusiveBorrow } else { UseKind::SharedBorrow }, variable);
+            }
+            ExpressionKind::Move(variable) => { this.add(UseKind::Moved, variable); }
+            ExpressionKind::Unary(_, operand) => { this.walk(program, operand); }
+            ExpressionKind::Cast(operand) => { this.walk(program, operand); }
+            ExpressionKind::Widen(operand) => { this.walk(program, operand); }
+            ExpressionKind::Field(base, _) => { this.walk(program, base); }
+            ExpressionKind::Binary(_, left, right) => {
+                this.walk(program, left);
+                this.walk(program, right);
+            }
+            ExpressionKind::Wrapping(_, left, right) => {
+                this.walk(program, left);
+                this.walk(program, right);
+            }
+            ExpressionKind::Mix(state, folded) => {
+                this.walk(program, state);
+                this.walk(program, folded);
+            }
+            ExpressionKind::Conditional(condition, then_value, else_value) => {
+                this.walk(program, condition);
+                this.walk(program, then_value);
+                this.walk(program, else_value);
+            }
+            ExpressionKind::Call(_, first, count) => { this.walk_run(program, first, count, 1, 0); }
+            ExpressionKind::GenericCall(_, _, _, first, count) => { this.walk_run(program, first, count, 1, 0); }
+            ExpressionKind::MethodCall(receiver, _, first, count) => {
+                this.walk(program, receiver);
+                this.walk_run(program, first, count, 1, 0);
+            }
+            ExpressionKind::TraitCall(receiver, _, first, count) => {
+                this.walk(program, receiver);
+                this.walk_run(program, first, count, 1, 0);
+            }
+            ExpressionKind::Invoke(callee, first, count) => {
+                this.walk(program, callee);
+                this.walk_run(program, first, count, 1, 0);
+            }
+            ExpressionKind::StructureLiteral(_, _, first, count) => { this.walk_run(program, first, count, 2, 1); }
+            ExpressionKind::OwnedLiteral(_, first, count) => { this.walk_run(program, first, count, 2, 1); }
+            ExpressionKind::Variant(_, _, first, count) => { this.walk_run(program, first, count, 1, 0); }
+            ExpressionKind::Match(subject, first, count) => {
+                this.walk(program, subject);
+                mut arm: i64 = first;
+                while (arm < first + count) {
+                    const taken: MatchArm = program.arm_at(arm);
+                    if (taken.observations >= 0) { this.walk_block(program, taken.observations, false); }
+                    this.walk(program, taken.body);
+                    arm = arm + 1;
+                }
+            }
+            _ => { }
+        }
+    }
+}

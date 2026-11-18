@@ -1,10 +1,10 @@
-///! An audit of the model's moves, walking every function's body in the
-///! order it is printed: a value is moved only out of a variable of an
-///! owned type, nothing names the variable after the move - not a read, a
-///! field, a borrow or a second move - and no variable is moved inside a
-///! loop it was declared outside, which would move it again on the next
-///! trip.  The order the text is printed in is stricter than the order the
-///! program runs in: a move in an `if`'s first branch and a read in its
+///! An audit of the model's moves, reading every function's uses in the
+///! order its text is printed (`UseWalk`): a value is moved only out of a
+///! variable of an owned type, nothing names the variable after the move -
+///! not a read, an assignment, a borrow or a second move - and no variable
+///! is moved inside a loop it was declared outside, which would move it
+///! again on the next trip.  The printed order is stricter than the order
+///! the program runs in: a move in an `if`'s first branch and a read in its
 ///! second are refused here, as the generator never writes them.
 
 namespace cryosmith::selftest::moves;
@@ -16,186 +16,65 @@ import std::core::result::{ Result };
 
 import cryosmith::configuration::{ GenerationOptions };
 import cryosmith::generate::{ Generator };
-import cryosmith::model::{ ExpressionKind, Function, MatchArm, Program, StatementKind };
+import cryosmith::model::{ Program };
 import cryosmith::selftest::runner::{ SelfTest };
+import cryosmith::selftest::uses::{ Use, UseKind, UseWalk };
 
 /// How many programs the move audit reads.
 const MOVE_AUDITED_PROGRAMS: u64 = 200;
 
-/// The walk of one function's body: what it declared, where each loop it
-/// is inside began, what it moved, and the first rule broken.
+/// The audit of one program's moves.
 internal type struct MoveAudit {
-    private declared: Array<i64>;
-    private loop_marks: Array<i64>;
-    private moved: Array<i64>;
-    private moves: i64;
-    private problem: String;
-
     /// The number of moves the program makes, each within the rules; or
     /// the first that breaks one.
     internal static check(program: &Program) -> Result<i64, String> {
         mut moves: i64 = 0;
         mut index: i64 = 0;
         while (index < program.functions.length()) {
-            const defined: Function = program.function_at(index);
-            mut audit: MoveAudit = MoveAudit {
-                declared: Array::<i64>::new(), loop_marks: Array::<i64>::new(), moved: Array::<i64>::new(), moves: 0,
-                problem: String::new(),
-            };
-            mut position: i64 = 0;
-            while (position < defined.parameter_count) {
-                audit.declared.push(program.list_at(defined.first_parameter + position));
-                position = position + 1;
+            match (MoveAudit::function(program, UseWalk::of(program, program.function_at(index)))) {
+                Result::Ok(count)   => { moves = moves + count; }
+                Result::Err(reason) => { return Result::Err(f"function {index}: {reason.as_str()}"); }
             }
-            audit.walk_block(program, defined.body);
-            if (audit.problem.length() > 0) { return Result::Err(f"function {index}: {audit.problem.as_str()}"); }
-            moves = moves + audit.moves;
             index = index + 1;
         }
         return Result::Ok(moves);
     }
 
-    /// Walk the block from `first`, each statement in order.
-    private walk_block(mut &this, program: &Program, first: i64) -> void {
-        mut current: i64 = first;
-        while (current >= 0) {
-            match (program.statement_at(current).kind) {
-                StatementKind::Declare(variable, value) => {
-                    this.walk(program, value);
-                    this.declared.push(variable);
-                }
-                StatementKind::Assign(place, value) => {
-                    this.walk(program, value);
-                    this.walk(program, place);
-                }
-                StatementKind::Compound(_, place, value) => {
-                    this.walk(program, value);
-                    this.walk(program, place);
-                }
-                StatementKind::Observe(value) => { this.walk(program, value); }
-                StatementKind::Evaluate(value) => { this.walk(program, value); }
-                StatementKind::Branch(condition, then_block, else_block) => {
-                    this.walk(program, condition);
-                    this.walk_block(program, then_block);
-                    if (else_block >= 0) { this.walk_block(program, else_block); }
-                }
-                StatementKind::Loop(_, counter, _, body) => {
-                    this.loop_marks.push(this.declared.length());
-                    this.declared.push(counter);
-                    this.walk_block(program, body);
-                    this.loop_marks.truncate(this.loop_marks.length() - 1);
-                }
-                StatementKind::Exit(_, condition) => { this.walk(program, condition); }
-                StatementKind::ReturnIf(condition, value) => {
-                    this.walk(program, condition);
-                    if (value >= 0) { this.walk(program, value); }
-                }
-                StatementKind::Return(value) => { this.walk(program, value); }
-                StatementKind::Match(subject, first_arm, count) => {
-                    this.walk(program, subject);
-                    mut arm: i64 = first_arm;
-                    while (arm < first_arm + count) {
-                        this.walk_block(program, program.arm_at(arm).body);
-                        arm = arm + 1;
+    /// The moves in one function's `uses`, or the first rule broken.
+    private static function(program: &Program, uses: Array<Use>) -> Result<i64, String> {
+        mut declared: Array<i64> = Array::<i64>::new();
+        mut loop_marks: Array<i64> = Array::<i64>::new();
+        mut moved: Array<i64> = Array::<i64>::new();
+        for (used in uses.iter()) {
+            const variable: i64 = used.variable;
+            match (used.kind) {
+                UseKind::Declared => { declared.push(variable); }
+                UseKind::LoopEntered => { loop_marks.push(declared.length()); }
+                UseKind::LoopLeft => { loop_marks.truncate(loop_marks.length() - 1); }
+                UseKind::Moved => {
+                    if (moved.contains(&variable)) { return Result::Err(f"variable {variable} is moved twice"); }
+                    if (!program.variable_at(variable).value_type.is_owned()) { return Result::Err(f"variable {variable} is moved but holds no owned value"); }
+                    if (loop_marks.length() > 0) {
+                        const mark: i64 = loop_marks.get(loop_marks.length() - 1).unwrap();
+                        mut position: i64 = 0;
+                        while (position < mark) {
+                            if (declared.get(position).unwrap() == variable) {
+                                return Result::Err(f"variable {variable} is moved inside a loop it was declared outside");
+                            }
+                            position = position + 1;
+                        }
                     }
+                    moved.push(variable);
                 }
-                StatementKind::Finish => { }
-            }
-            current = program.statement_at(current).next;
-        }
-    }
-
-    /// Walk the `count` expressions from `first` in the index lists, every
-    /// `stride` places from `offset`.
-    private walk_run(mut &this, program: &Program, first: i64, count: i64, stride: i64, offset: i64) -> void {
-        mut position: i64 = 0;
-        while (position < count) {
-            this.walk(program, program.list_at(first + position * stride + offset));
-            position = position + 1;
-        }
-    }
-
-    /// Walk the expression at `value`, its operands in the order they are
-    /// printed.  A closure's body is not walked: it reads only what it
-    /// captures, and it captures no owned value.
-    private walk(mut &this, program: &Program, value: i64) -> void {
-        match (program.expression_at(value).kind) {
-            ExpressionKind::Variable(variable) => { this.named(variable); }
-            ExpressionKind::Borrow(variable) => { this.named(variable); }
-            ExpressionKind::Move(variable) => {
-                this.named(variable);
-                if (!program.variable_at(variable).value_type.is_owned()) { this.refuse(f"variable {variable} is moved but holds no owned value"); }
-                if (this.loop_marks.length() > 0) {
-                    const mark: i64 = this.loop_marks.get(this.loop_marks.length() - 1).unwrap();
-                    mut position: i64 = 0;
-                    while (position < mark) {
-                        if (this.declared.get(position).unwrap() == variable) { this.refuse(f"variable {variable} is moved inside a loop it was declared outside"); }
-                        position = position + 1;
-                    }
-                }
-                this.moved.push(variable);
-                this.moves = this.moves + 1;
-            }
-            ExpressionKind::Unary(_, operand) => { this.walk(program, operand); }
-            ExpressionKind::Cast(operand) => { this.walk(program, operand); }
-            ExpressionKind::Widen(operand) => { this.walk(program, operand); }
-            ExpressionKind::Field(base, _) => { this.walk(program, base); }
-            ExpressionKind::Binary(_, left, right) => {
-                this.walk(program, left);
-                this.walk(program, right);
-            }
-            ExpressionKind::Wrapping(_, left, right) => {
-                this.walk(program, left);
-                this.walk(program, right);
-            }
-            ExpressionKind::Mix(state, folded) => {
-                this.walk(program, state);
-                this.walk(program, folded);
-            }
-            ExpressionKind::Conditional(condition, then_value, else_value) => {
-                this.walk(program, condition);
-                this.walk(program, then_value);
-                this.walk(program, else_value);
-            }
-            ExpressionKind::Call(_, first, count) => { this.walk_run(program, first, count, 1, 0); }
-            ExpressionKind::GenericCall(_, _, _, first, count) => { this.walk_run(program, first, count, 1, 0); }
-            ExpressionKind::MethodCall(receiver, _, first, count) => {
-                this.walk(program, receiver);
-                this.walk_run(program, first, count, 1, 0);
-            }
-            ExpressionKind::TraitCall(receiver, _, first, count) => {
-                this.walk(program, receiver);
-                this.walk_run(program, first, count, 1, 0);
-            }
-            ExpressionKind::Invoke(callee, first, count) => {
-                this.walk(program, callee);
-                this.walk_run(program, first, count, 1, 0);
-            }
-            ExpressionKind::StructureLiteral(_, _, first, count) => { this.walk_run(program, first, count, 2, 1); }
-            ExpressionKind::OwnedLiteral(_, first, count) => { this.walk_run(program, first, count, 2, 1); }
-            ExpressionKind::Variant(_, _, first, count) => { this.walk_run(program, first, count, 1, 0); }
-            ExpressionKind::Match(subject, first, count) => {
-                this.walk(program, subject);
-                mut arm: i64 = first;
-                while (arm < first + count) {
-                    const taken: MatchArm = program.arm_at(arm);
-                    if (taken.observations >= 0) { this.walk_block(program, taken.observations); }
-                    this.walk(program, taken.body);
-                    arm = arm + 1;
+                UseKind::StatementStarted => { }
+                UseKind::ReturnStarted => { }
+                UseKind::ReturnEnded => { }
+                _ => {
+                    if (moved.contains(&variable)) { return Result::Err(f"variable {variable} is named after its value was moved out"); }
                 }
             }
-            _ => { }
         }
-    }
-
-    /// `variable` is named here: refused when its value was moved out.
-    private named(mut &this, variable: i64) -> void {
-        if (this.moved.contains(&variable)) { this.refuse(f"variable {variable} is named after its value was moved out"); }
-    }
-
-    /// Record the first rule broken.
-    private refuse(mut &this, reason: String) -> void {
-        if (this.problem.length() == 0) { this.problem = reason; }
+        return Result::Ok(moved.length());
     }
 }
 
