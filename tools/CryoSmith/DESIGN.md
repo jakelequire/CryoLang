@@ -484,6 +484,18 @@ a copy taken when the arm is entered (docs/cryo.md, enum destructuring)
 and keeps the value the arm was chosen with; `match (v) { E::X(a) => { v =
 E::Y(1); .. a .. } }` observes the `a` of `E::X`.
 
+**Subject assignments.** With `subject-assignments` (and `enums`), a
+`match` statement matches on a `mut` local of an enum type half the time
+one is in scope, and each arm over a variant opens, six times in ten, by
+assigning the local a variant other than its own (`MatchArm`'s
+`subject_assignment`): `G0::V1(b10, b11) => { v2 = G0::V2((!b11)); .. }`.
+The arm observes its bindings at its end, after the assignment, so a
+binding that named the subject's storage instead of holding a copy would
+fold the new variant's payload into the hash. The subject-assignment
+audit (section 7) holds each such arm to opening its body with the
+assignment, of the subject, of another variant, and to observing every
+binding after it.
+
 **Kept off.** Nothing.
 
 ## 3. Guarantees, and how each is enforced
@@ -696,8 +708,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. Any list removing `moves` generates
-  version 27's text for that list. Any list removing `trait-objects`
+  generator's text, header aside. Any list removing
+  `subject-assignments` generates version 28's text for that list, and one
+  removing `moves` too, version 27's. Any list removing `trait-objects`
   generates version 26's text for that list, version 27 adding only
   `main`'s locals for objects to borrow; in version 26,
   `default,no-trait-defaults,no-supertraits` generated version 25's text,
@@ -740,7 +753,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
 | 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
 | 6 | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods. Still to come: implementations for enums |
-| 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2). Still to come: references, early drops, `Box` and `Rc`, `Option` and `Result`, match arms assigning their subject a new value |
+| 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings. Still to come: references, early drops, `Box` and `Rc`, `Option` and `Result` |
 | 8 | strings, arrays and collections |
 
 Section 9 places each stage among the rest of the work, the tools that
@@ -844,6 +857,11 @@ statement budget of one function, default 24), `--no-header`, and
   the order the text is printed: each move is out of a variable of an
   owned type, nothing names the variable afterwards, and no variable is
   moved inside a loop it was declared outside (section 2).
+- **The subject-assignment audit** walks every `match` statement of 200
+  programs in the model: each arm assigning its subject matches a variant,
+  opens its body with that assignment, gives the `mut` local it matches on
+  another variant, and observes each of its bindings after it; with the
+  feature off, no arm assigns its subject.
 
 ## 8. Architecture
 
@@ -991,8 +1009,9 @@ place.
    reference lives only in a local, parameter or return, never outlives
    what it borrows, and is never shared and mutable at once, and nothing
    needs `unsafe`. (In progress: `moves`, owned values moved between
-   locals, into calls and out of returns, each dropped into the hash, is
-   done.)
+   locals, into calls and out of returns, each dropped into the hash, and
+   `subject-assignments`, arms assigning their subject another variant,
+   are done.)
 6. **Stage 8: strings, arrays and collections.** `model/`: `Str`,
    `String`, fixed arrays, `Array`, `HashMap`. `generate/`: building,
    indexing within bounds, iterating. `guarantees/`: an index is in range

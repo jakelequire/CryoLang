@@ -48,6 +48,14 @@ const MOST_GENERIC_ENUMERATIONS: i64 = 2;
 /// The most type arguments one generic enum is instantiated at.
 const MOST_ENUMERATION_INSTANCES: i64 = 2;
 
+/// How often, in a hundred, a `match` statement with `subject-assignments`
+/// matches on a `mut` enum local, when one is in scope.
+const SUBJECT_CHANCE: i64 = 50;
+
+/// How often, in a hundred, an arm of a `match` statement on a `mut` local
+/// opens by assigning the local another variant.
+const SUBJECT_ASSIGNMENT_CHANCE: i64 = 60;
+
 implement struct Generator {
     /// Declare the program's enums, one or two, from their own stream.
     internal declare_enumerations(mut &this) -> void {
@@ -232,7 +240,7 @@ implement struct Generator {
             if (this.program.elements_refutable(first_element, elements.length()) && patterns.get(patterns.length() - 1).unwrap() >= 0) { patterns.push(-1); }
             arms.push(MatchArm {
                 pattern: pattern, first_element: first_element, element_count: elements.length(),
-                observations: this.program.block(&observations), body: body,
+                observations: this.program.block(&observations), body: body, subject_assignment: -1,
             });
             position = position + 1;
         }
@@ -243,7 +251,8 @@ implement struct Generator {
     /// `match (subject) { .. }` whose arms are blocks, each observing its
     /// arm's bindings last.
     internal match_statement(mut &this) -> i64 {
-        const subject: i64 = this.match_subject(this.depth());
+        const assigned: i64 = this.assignable_subject();
+        const subject: i64 = if (assigned >= 0) { this.read(assigned) } else { this.match_subject(this.depth()) };
         const matched: ValueType = this.program.expression_at(subject).value_type;
         mut patterns: Array<i64> = this.match_patterns(matched);
         mut arms: Array<MatchArm> = Array::<MatchArm>::new();
@@ -253,18 +262,47 @@ implement struct Generator {
             const scope: i64 = this.environment.mark();
             mut bindings: Array<i64> = Array::<i64>::new();
             const elements: Array<i64> = this.payload_elements(matched, pattern, this.options.features.has(Feature::NestedPatterns), &bindings);
-            const body: i64 = this.block_observing(&bindings);
+            mut opening: Array<i64> = Array::<i64>::new();
+            if (assigned >= 0 && pattern >= 0 && this.random.chance(SUBJECT_ASSIGNMENT_CHANCE)) {
+                opening.push(this.subject_assignment(assigned, pattern));
+            }
+            const body: i64 = this.block_opening(&opening, &bindings);
             this.environment.leave(scope);
             const first_element: i64 = this.program.list_run(&elements);
             if (this.program.elements_refutable(first_element, elements.length()) && patterns.get(patterns.length() - 1).unwrap() >= 0) { patterns.push(-1); }
             arms.push(MatchArm {
                 pattern: pattern, first_element: first_element, element_count: elements.length(),
-                observations: -1, body: body,
+                observations: -1, body: body, subject_assignment: if (opening.length() > 0) { opening.get(0).unwrap() } else { -1 },
             });
             position = position + 1;
         }
         const first: i64 = this.program.arm_run(&arms);
         return this.program.statement(StatementKind::Match(subject, first, arms.length()));
+    }
+
+    /// With `subject-assignments`, sometimes a `mut` local of an enum type
+    /// for a `match` statement to match on, whose arms may then assign it;
+    /// -1 otherwise.  No draw without the feature.
+    private assignable_subject(mut &this) -> i64 {
+        if (!this.options.features.has(Feature::SubjectAssignments)) { return -1; }
+        mut candidates: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.assignable(&this.program).iter()) {
+            if (this.program.variable_at(variable).value_type.is_enumeration()) { candidates.push(variable); }
+        }
+        if (candidates.length() == 0 || !this.random.chance(SUBJECT_CHANCE)) { return -1; }
+        return candidates.get(this.random.below(candidates.length())).unwrap();
+    }
+
+    /// `v<N> = E<M>::V<K>(..);` opening an arm matching variant `pattern`
+    /// of the local `subject`: a variant other than `pattern`, so the value
+    /// the arm was entered with is gone from the local, and the arm's
+    /// bindings, which it observes at its end, must hold their own copies.
+    private subject_assignment(mut &this, subject: i64, pattern: i64) -> i64 {
+        const matched: ValueType = this.program.variable_at(subject).value_type;
+        mut other: i64 = this.random.below(this.program.enumeration_at(matched.enumeration()).variant_count - 1);
+        if (other >= pattern) { other = other + 1; }
+        const value: i64 = this.variant_value(matched, other, this.depth());
+        return this.program.statement(StatementKind::Assign(this.target(subject), value));
     }
 
     /// A value of one of the program's enums to match on, itself sometimes
@@ -289,7 +327,7 @@ implement struct Generator {
             this.environment.leave(scope);
             arms.push(MatchArm {
                 pattern: arms.length(), first_element: this.program.list_run(&elements), element_count: elements.length(),
-                observations: -1, body: folded,
+                observations: -1, body: folded, subject_assignment: -1,
             });
         }
         const first: i64 = this.program.arm_run(&arms);
