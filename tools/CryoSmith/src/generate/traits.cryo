@@ -19,6 +19,12 @@
 ///! its `T` values, `p0.t0(a)`, each call charged the costliest
 ///! implementation's work, and it is called only at a struct implementing
 ///! the trait, whose implementation each such call then runs.
+///!
+///! With `trait-objects`, a free function sometimes takes `virtual &Tr<N>`
+///! last, calls the trait's methods on it through the table of the value
+///! it borrows, and is called with `&v` of a parameter or local whose
+///! struct implements the trait.  The object lives only as that parameter,
+///! for the call.
 
 namespace cryosmith::generate::traits;
 
@@ -26,7 +32,10 @@ import std::collections::array::{ Array };
 
 import cryosmith::configuration::{ Feature };
 import cryosmith::generate::generator::{ Generator };
-import cryosmith::model::{ ExpressionKind, Genericity, Receiver, Signature, Structure, TraitDeclaration, TraitMethod, ValueType };
+import cryosmith::model::{
+    ExpressionKind, Function, Genericity, Receiver, Signature, Structure, TraitDeclaration, TraitMethod, ValueType, Variable,
+    VariableRole
+};
 import cryosmith::random::{ RandomStream };
 
 /// The most traits a program declares.
@@ -41,6 +50,9 @@ const IMPLEMENTATION_CHANCE: i64 = 60;
 /// How often, in a hundred, a trait some struct implements bounds a
 /// generic function.
 const BOUNDED_CHANCE: i64 = 70;
+
+/// How often, in a hundred, a free function takes a trait object.
+const OBJECT_CHANCE: i64 = 30;
 
 implement struct Generator {
     /// Declare the traits and generate their implementations: none without
@@ -125,6 +137,94 @@ implement struct Generator {
         const values: Array<i64> = this.environment.variables_of(&this.program, ValueType::TypeParameter);
         const receiver: i64 = this.read(values.get(this.random.below(values.length())).unwrap());
         return this.trait_call(receiver, method, depth);
+    }
+
+    /// A trait object parameter for a free function, sometimes: with
+    /// `trait-objects`, `OBJECT_CHANCE` times in a hundred when some struct
+    /// implements a trait, `virtual &Tr<N>` of one such trait added to
+    /// `parameter_types`.  No draw is taken without the feature or such a
+    /// trait.  Whether one was added.
+    internal add_object_parameter(mut &this, parameter_types: mut &Array<ValueType>) -> boolean {
+        if (!this.options.features.has(Feature::TraitObjects)) { return false; }
+        mut implemented: Array<i64> = Array::<i64>::new();
+        mut index: i64 = 0;
+        while (index < this.program.traits.length()) {
+            if (this.program.implementors(index).length() > 0) { implemented.push(index); }
+            index = index + 1;
+        }
+        if (implemented.length() == 0 || !this.random.chance(OBJECT_CHANCE)) { return false; }
+        parameter_types.push(ValueType::TraitObject(implemented.get(this.random.below(implemented.length())).unwrap()));
+        return true;
+    }
+
+    /// The variables in scope a trait object of trait `index` may borrow:
+    /// a parameter or local holding a struct that implements it.  A
+    /// receiver is a reference already, and is never borrowed again.
+    private object_sources(&this, index: i64) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.in_scope().iter()) {
+            const declared: Variable = this.program.variable_at(variable);
+            const named: boolean = match (declared.role) {
+                VariableRole::Parameter => { true }
+                VariableRole::Local     => { true }
+                _                       => { false }
+            };
+            if (named && declared.value_type.is_record() && this.program.implements(declared.value_type.structure(), index)) {
+                found.push(variable);
+            }
+        }
+        return found;
+    }
+
+    /// Whether every trait object parameter of `candidate` has a variable
+    /// in scope to borrow, so a call of it can be written here.
+    internal passes_objects(&this, candidate: &Function) -> boolean {
+        mut index: i64 = 0;
+        while (index < candidate.parameter_count) {
+            const object: i64 = this.program.variable_at(this.program.list_at(candidate.first_parameter + index)).value_type.object_trait();
+            if (object >= 0 && this.object_sources(object).length() == 0) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    /// `&v` for a trait object parameter of type `wanted`: a variable in
+    /// scope whose struct implements the object's trait, borrowed for the
+    /// call alone.
+    internal object_argument(mut &this, wanted: ValueType) -> i64 {
+        const sources: Array<i64> = this.object_sources(wanted.object_trait());
+        return this.node(ExpressionKind::Borrow(sources.get(this.random.below(sources.length())).unwrap()), wanted);
+    }
+
+    /// The calls through a trait object parameter in scope that return
+    /// `wanted` and keep this function's work under its limit, as pairs of
+    /// the parameter and the trait method.
+    internal object_calls(&this, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.in_scope().iter()) {
+            const object: i64 = this.program.variable_at(variable).value_type.object_trait();
+            if (object >= 0) {
+                const declared: TraitDeclaration = this.program.trait_at(object);
+                mut method: i64 = declared.first_method;
+                while (method < declared.first_method + declared.method_count) {
+                    const signature: Signature = this.program.signature_of(this.program.trait_method_at(method).function_type);
+                    if (signature.returns.same(wanted) && this.budget.affordable(this.program.trait_method_cost(method))) {
+                        found.push(variable);
+                        found.push(method);
+                    }
+                    method = method + 1;
+                }
+            }
+        }
+        return found;
+    }
+
+    /// `p1.t<N>(..)` through a trait object: one of `calls`, the pairs
+    /// `object_calls` found, its method run from the table of the value
+    /// the object borrows.
+    internal object_call(mut &this, calls: &Array<i64>, depth: i64) -> i64 {
+        const chosen: i64 = 2 * this.random.below(calls.length() / 2);
+        return this.trait_call(this.read(calls.get(chosen).unwrap()), calls.get(chosen + 1).unwrap(), depth);
     }
 
     /// `receiver.t<N>(..)` with an argument for each of trait method

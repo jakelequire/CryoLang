@@ -33,14 +33,16 @@ implement struct Generator {
         this.genericity = Genericity::Concrete;
         mut parameter_types: Array<ValueType> = Array::<ValueType>::new();
         mut takes_function: boolean = false;
+        mut takes_object: boolean = false;
         if (!is_main) {
             const parameter_count: i64 = if (owner < 0) { 1 + this.random.below(4) } else { this.random.below(4) };
             while (parameter_types.length() < parameter_count) { parameter_types.push(this.any_type()); }
             if (owner < 0) { takes_function = this.add_function_parameter(&parameter_types); }
+            if (owner < 0) { takes_object = this.add_object_parameter(&parameter_types); }
         }
         const returns: ValueType = this.drawn_return_type(owner, receiver, is_main);
         this.define_with(number, owner, receiver, &parameter_types, returns, -1);
-        if (!is_main && !takes_function && this.options.features.has(Feature::Overloads)) {
+        if (!is_main && !takes_function && !takes_object && this.options.features.has(Feature::Overloads)) {
             this.define_overloads(this.program.functions.length() - 1);
         }
     }
@@ -156,6 +158,8 @@ implement struct Generator {
             const wanted: ValueType = if (decides) { type_argument } else { parameter.value_type };
             if (called.takes_callable() && index == called.parameter_count - 1) {
                 arguments.push(this.written_closure(this.program.instantiated_function_type(called.callable, type_argument), true));
+            } else if (wanted.object_trait() >= 0) {
+                arguments.push(this.object_argument(wanted));
             } else if (wanted.is_function()) {
                 arguments.push(this.function_value(wanted, true));
             } else if ((decides && inferred) || overloaded) {
@@ -181,7 +185,8 @@ implement struct Generator {
         while (index < this.program.functions.length()) {
             const candidate: Function = this.program.function_at(index);
             if (candidate.receiver.is_called_by_name() && !candidate.genericity.is_generic()
-                    && candidate.returns.same(wanted) && this.budget.affordable(candidate.cost) && this.may_call(&candidate)) {
+                    && candidate.returns.same(wanted) && this.budget.affordable(candidate.cost) && this.may_call(&candidate)
+                    && this.passes_objects(&candidate)) {
                 found.push(index);
             }
             index = index + 1;

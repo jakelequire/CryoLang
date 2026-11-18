@@ -401,6 +401,24 @@ struct's implementation, chosen at compile time per instance; a `k` body
 calls a `g` at `T`, since `Copy` is in its bound, and another `k` only of
 its own trait.
 
+**Trait objects.** With `trait-objects` (and `traits`), a free function
+takes a trait object parameter after its others three times in ten, when
+some struct implements a trait, `function h2(p0: u8, p1: virtual &Tr0) ->
+i32` (docs/cryo.md section 10.7). Its body calls the trait's methods on
+it, `p1.t0(a)`, one form in four where one may be called, each run from
+the table of the value the object borrows and charged the costliest
+implementation's work, and observes it by a call of the trait's first
+method. A call of the function passes `&v`, a parameter or local of the
+caller holding a struct that implements the trait, and the function is
+called only where such a variable is in scope (`passes_objects`); so one
+function runs different structs' implementations from different callers,
+chosen at run time. The object exists only as a parameter, borrowing the
+caller's variable for the call: it is never stored, returned, captured by
+a closure (`Capture::admits` takes no reference) or held past the call,
+so it is a valid view under the memory-safety plan's rules too. A
+function taking an object starts no overload set, since a struct
+implementing two traits would convert to either object.
+
 A `match` statement's arm may assign the local its subject reads. Its
 bindings are never written `mut` and their payloads are `Copy`, so each is
 a copy taken when the arm is entered (docs/cryo.md, enum destructuring)
@@ -610,8 +628,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside. `default,no-trait-bounds` generates
-  version 23's text, `default,no-traits` version 22's, `default,no-traits,no-generic-closures,no-callable-bounds`
+  generator's text, header aside. `default,no-trait-objects` generates
+  version 24's text, `default,no-trait-objects,no-trait-bounds` version
+  23's, `default,no-traits` version 22's, `default,no-traits,no-generic-closures,no-callable-bounds`
   version 21's; with those three also removed, `default,no-function-values`
   gives version 20's and `default,no-function-values,no-closure-captures`
   version 19's; and `default,no-nested-patterns` generates
@@ -647,7 +666,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 3 | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
 | 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
 | 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
-| 6 (this one) | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values. Still to come: calls through a trait object, default methods |
+| 6 (this one) | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table. Still to come: default methods, supertraits |
 | 7 | ownership: moves, drops (a drop log folded into the hash), references, `Box` and `Rc`, `Option` and `Result` |
 | 8 | strings, arrays and collections |
 
@@ -873,7 +892,9 @@ place.
    `guarantees/`: every call resolves to one implementation; the hash is
    the same whichever way it is dispatched. (In progress: `traits`,
    declarations and implementations called on the implementing struct's
-   values, and `trait-bounds`, calls through a bound, are done.)
+   values, `trait-bounds`, calls through a bound, and `trait-objects`,
+   calls through a trait object, are done; default methods and supertraits
+   remain.)
 5. **Stage 7: ownership.** `model/`: references (`&`, `mut &`) as values,
    `Box`, `Rc`, `Option`, `Result`, types with a drop. `generate/`: moves,
    borrows, early drops. `guarantees/`: no use after a move and no borrow
