@@ -14,8 +14,10 @@
 ///! arms in a shuffled order; an expression's arms read a name, since an
 ///! arm, as an `if` expression's, gives a bare literal no type.  An arm
 ///! over a payload variant binds each value, `E0::V2(b0, b1)`, and every
-///! binding is observed: a statement's arm at the end of its block, an
-///! expression's arm by statements before its value.  An enum value is
+///! binding reaches the hash: a statement's arm observes them at the end of
+///! its block, an integer expression's arm folds its value and them by
+///! `mix`, and any other expression's arm observes them by statements
+///! before its value.  An enum value is
 ///! observed by the `match` the printer folds it with, which folds a
 ///! payload into its variant's number.
 
@@ -211,9 +213,20 @@ implement struct Generator {
             const scope: i64 = this.environment.mark();
             mut bindings: Array<i64> = Array::<i64>::new();
             const elements: Array<i64> = this.payload_elements(matched, pattern, this.options.features.has(Feature::NestedPatterns), &bindings);
+            // An integer arm folds its value and then its bindings by `mix`,
+            // converted back to its type: an observation in the arm is
+            // overwritten when the `match` is part of a value being
+            // observed, `observed = mix(observed, h0(..))` having read
+            // `observed` before the arm ran.
             mut observations: Array<i64> = Array::<i64>::new();
-            for (binding in bindings.iter()) { this.observe_place(this.read(binding), &observations); }
-            const body: i64 = this.expression(wanted, depth, true);
+            if (!wanted.is_integer()) {
+                for (binding in bindings.iter()) { this.observe_place(this.read(binding), &observations); }
+            }
+            mut body: i64 = this.expression(wanted, depth, true);
+            if (wanted.is_integer() && bindings.length() > 0) {
+                const start: i64 = this.node(ExpressionKind::Mix(this.integer((position + 1) as u64, ValueType::U64), body), ValueType::U64);
+                body = this.node(ExpressionKind::Cast(this.folded_bindings(&bindings, start)), wanted);
+            }
             this.environment.leave(scope);
             const first_element: i64 = this.program.list_run(&elements);
             if (this.program.elements_refutable(first_element, elements.length()) && patterns.get(patterns.length() - 1).unwrap() >= 0) { patterns.push(-1); }
@@ -272,12 +285,7 @@ implement struct Generator {
             const scope: i64 = this.environment.mark();
             mut bindings: Array<i64> = Array::<i64>::new();
             const elements: Array<i64> = this.payload_elements(matched, arms.length(), false, &bindings);
-            mut folded: i64 = this.integer((arms.length() + 1) as u64, ValueType::U64);
-            for (binding in bindings.iter()) {
-                const place: i64 = this.read(binding);
-                const folding: i64 = if (this.program.variable_at(binding).value_type.is_enumeration()) { this.variant_number(place) } else { place };
-                folded = this.node(ExpressionKind::Mix(folded, folding), ValueType::U64);
-            }
+            const folded: i64 = this.folded_bindings(&bindings, this.integer((arms.length() + 1) as u64, ValueType::U64));
             this.environment.leave(scope);
             arms.push(MatchArm {
                 pattern: arms.length(), first_element: this.program.list_run(&elements), element_count: elements.length(),
@@ -286,6 +294,19 @@ implement struct Generator {
         }
         const first: i64 = this.program.arm_run(&arms);
         return this.node(ExpressionKind::Match(value, first, arms.length()), ValueType::U64);
+    }
+
+    /// `mix(.. mix(state, b0) .., bN)`, a `u64` the `u64` `state` and every
+    /// binding's value reach: a scalar directly, an enum through its
+    /// variant number.
+    private folded_bindings(mut &this, bindings: &Array<i64>, state: i64) -> i64 {
+        mut folded: i64 = state;
+        for (binding in bindings.iter()) {
+            const place: i64 = this.read(binding);
+            const folding: i64 = if (this.program.variable_at(binding).value_type.is_enumeration()) { this.variant_number(place) } else { place };
+            folded = this.node(ExpressionKind::Mix(folded, folding), ValueType::U64);
+        }
+        return folded;
     }
 
     /// The elements of a pattern over variant `variant` of the enum type

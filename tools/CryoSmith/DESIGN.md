@@ -227,12 +227,19 @@ an enum stays `Copy`, as each of its payload's types is. A variant value
 gives a value of each payload type, `E0::V1(v2, (p0 > 3))`, generated as a
 call's argument is. A `match` arm over a payload variant binds every
 value, `E0::V1(b0, b1)`; the bindings `b<N>` are numbered per function,
-read only, and in scope in their arm alone. Every binding is observed: a
-statement's arm observes them at the end of its block, an expression's
-arm by observation statements before its value (`E0::V1(b0) => {
-observed = mix(observed, (b0 as u64)); v3 }`). Such an arm inside the
-value an outer observation folds runs before that observation assigns
-`observed`, so its own fold is overwritten; the binding is still read. The
+read only, and in scope in their arm alone. Every binding reaches the
+hash: a statement's arm observes them at the end of its block; an integer
+expression's arm folds its value and then its bindings by `mix`, from its
+position plus one, and converts the fold back to its type
+(`E0::V1(b0, b1) => { (mix(mix(mix(2, (v3 as u64)), (b0 as u64)), if (b1)
+{ 1 } else { 2 }) as i32) }`; no operator, so no feature, is needed), since
+an observation there would run inside the value an outer
+observation folds, `observed = mix(observed, h0(..))`, after that
+observation read `observed`, and be overwritten; any other expression's arm
+(a boolean's or an enum's) observes them by statements before its value
+(`E0::V1(b0) => { observed = mix(observed, (b0 as u64)); v3 }`), which the
+same overwrite can lose. The self-test's binding audit holds every binding
+to one of these. The
 printer's observation folds a payload into its variant's number,
 `E0::V1(b0, b1) => { mix(mix(2, (b0 as u64)), if (b1) { 1 } else { 2 }) }`.
 

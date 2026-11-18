@@ -1,0 +1,150 @@
+///! An audit of the model: every binding a `match` expression's arm makes
+///! reaches the hash.  An integer arm's value is its bindings folded by
+///! `mix` and converted to its type, and it observes nothing, since an
+///! observation in it is lost
+///! when the `match` is part of a value being observed; an enum's variant
+///! number is that fold itself.  Any other arm observes each binding
+///! before its value.
+///!
+///! A binding counts only where the fold or the observation names it, not
+///! wherever the arm's value happens to read it, so an arm that drops a
+///! binding from its fold is refused even when its value reads the name.
+
+namespace cryosmith::selftest::bindings;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+
+import cryosmith::configuration::{ GenerationOptions };
+import cryosmith::generate::{ Generator };
+import cryosmith::model::{ ExpressionKind, MatchArm, PatternElement, Program, StatementKind };
+import cryosmith::selftest::runner::{ SelfTest };
+
+/// How many programs the binding audit reads.
+const BINDING_AUDITED_PROGRAMS: u64 = 200;
+
+/// The audit of one program's `match` expressions.
+internal type struct BindingAudit {
+    /// The number of bindings the program's `match` expressions make, each
+    /// reaching the hash; or the first that does not.
+    internal static check(program: &Program) -> Result<i64, String> {
+        mut reached: i64 = 0;
+        mut index: i64 = 0;
+        while (index < program.expressions.length()) {
+            match (program.expression_at(index).kind) {
+                ExpressionKind::Match(_, first, count) => {
+                    const integer: boolean = program.expression_at(index).value_type.is_integer();
+                    mut arm: i64 = first;
+                    while (arm < first + count) {
+                        const held: MatchArm = program.arm_at(arm);
+                        mut bound: Array<i64> = Array::<i64>::new();
+                        BindingAudit::bound(program, held.first_element, held.element_count, &bound);
+                        for (variable in bound.iter()) {
+                            const reaches: boolean = if (integer) {
+                                held.observations < 0 && BindingAudit::folded_into_value(program, held.body, variable)
+                            } else {
+                                BindingAudit::observed(program, held.observations, variable)
+                            };
+                            if (!reaches) {
+                                return Result::Err(f"expression {index}, arm {arm - first}: binding b{program.variable_at(variable).number} does not reach the hash");
+                            }
+                            reached = reached + 1;
+                        }
+                        arm = arm + 1;
+                    }
+                }
+                _ => { }
+            }
+            index = index + 1;
+        }
+        return Result::Ok(reached);
+    }
+
+    /// Add the variables bound by `count` pattern elements from `first` in
+    /// the index lists, nested patterns included, to `bound`.
+    private static bound(program: &Program, first: i64, count: i64, bound: mut &Array<i64>) -> void {
+        mut position: i64 = 0;
+        while (position < count) {
+            match (program.pattern_element_at(program.list_at(first + position))) {
+                PatternElement::Binding(variable) => { bound.push(variable); }
+                PatternElement::Wildcard => { }
+                PatternElement::Variant(_, _, inner_first, inner_count) => {
+                    BindingAudit::bound(program, inner_first, inner_count, bound);
+                }
+            }
+            position = position + 1;
+        }
+    }
+
+    /// Whether an integer arm's value `body` folds `variable` in: a `mix`
+    /// chain itself (an enum's variant number), or one converted to the
+    /// arm's type.
+    private static folded_into_value(program: &Program, body: i64, variable: i64) -> boolean {
+        return match (program.expression_at(body).kind) {
+            ExpressionKind::Mix(_, _) => { BindingAudit::folds(program, body, variable) }
+            ExpressionKind::Cast(converted) => { BindingAudit::folds(program, converted, variable) }
+            _ => { false }
+        };
+    }
+
+    /// Whether the `mix` chain at `chain` folds `variable` in, as a scalar
+    /// or through its variant number.
+    private static folds(program: &Program, chain: i64, variable: i64) -> boolean {
+        return match (program.expression_at(chain).kind) {
+            ExpressionKind::Mix(state, value) => {
+                BindingAudit::names(program, value, variable) || BindingAudit::folds(program, state, variable)
+            }
+            _ => { false }
+        };
+    }
+
+    /// Whether the block from `first` observes `variable`.
+    private static observed(program: &Program, first: i64, variable: i64) -> boolean {
+        mut current: i64 = first;
+        while (current >= 0) {
+            match (program.statement_at(current).kind) {
+                StatementKind::Observe(value) => {
+                    if (BindingAudit::names(program, value, variable)) { return true; }
+                }
+                _ => { }
+            }
+            current = program.statement_at(current).next;
+        }
+        return false;
+    }
+
+    /// Whether `value` is `variable` read, or the `match` over it that
+    /// gives an enum's variant number.
+    private static names(program: &Program, value: i64, variable: i64) -> boolean {
+        return match (program.expression_at(value).kind) {
+            ExpressionKind::Variable(read) => { read == variable }
+            ExpressionKind::Match(subject, _, _) => {
+                match (program.expression_at(subject).kind) {
+                    ExpressionKind::Variable(read) => { read == variable }
+                    _ => { false }
+                }
+            }
+            _ => { false }
+        };
+    }
+}
+
+implement struct SelfTest {
+    /// Every binding of every `match` expression reaches the hash, and the
+    /// audit finds bindings to check.
+    internal binding_audit(mut &this) -> void {
+        mut reached: i64 = 0;
+        mut seed: u64 = 1;
+        while (seed <= BINDING_AUDITED_PROGRAMS) {
+            const program: Program = Generator::generate(GenerationOptions::new(seed));
+            match (BindingAudit::check(&program)) {
+                Result::Ok(count)   => { reached = reached + count; }
+                Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }
+            }
+            seed = seed + 1;
+        }
+        this.expect(reached > 0, String::from_str(Str::new("the binding audit found no binding in a `match` expression")));
+    }
+}
