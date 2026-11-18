@@ -701,7 +701,9 @@ parameter or slot is different: it holds a function pointer, which has no room
 for the closure's captures. One function-typed parameter takes a capturing
 closure - a non-generic free function's, when the function is declared in the
 same module: that function is copied for each closure type passed to it, with
-the parameter retyped to the closure. Everything else is refused at compile
+the parameter retyped to the closure. In the copy the parameter holds the
+closure, so passing it on to another such function passes the closure, and
+that function is copied for it in turn. Everything else is refused at compile
 time with **E0458** rather than compiled to a call through a pointer that is
 not one:
 

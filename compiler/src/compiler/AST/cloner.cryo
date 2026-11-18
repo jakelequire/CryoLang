@@ -61,12 +61,30 @@ type struct ASTCloner {
     /// over what is typed.
     carries_types: boolean;
 
+    /// When false, the copy carries nothing the type check decided about
+    /// the original's names and calls: no identifier's type, and no callee
+    /// chosen for a call or for a function named as a value.  A
+    /// copy whose parameters take other types is checked from scratch,
+    /// since an argument reading a retyped parameter may select another
+    /// callee than the original's call did.
+    carries_analysis: boolean;
+
     static new() -> ASTCloner {
         return ASTCloner {
             spec_name:     SymbolStr::empty(),
             skip_generics: false,
             carries_types: false,
+            carries_analysis: true,
         };
+    }
+
+    /// A cloner for a copy of a function whose parameters are given other
+    /// types (a function copied for the closure passed to it), which the
+    /// type check walks as if it were new.
+    static for_retyped_copy() -> ASTCloner {
+        mut c: ASTCloner = ASTCloner::new();
+        c.carries_analysis = false;
+        return c;
     }
 
     /// A cloner for a copy monomorphization makes: its expressions carry
@@ -228,7 +246,7 @@ type struct ASTCloner {
             c.add_argument(this.clone_expr(node.arguments[i]));
         }
         c.generic_args = this.clone_type_annotations(node.generic_args);
-        c.resolved_callee = node.resolved_callee;
+        if (this.carries_analysis) { c.resolved_callee = node.resolved_callee; }
         c.named_method = node.named_method;
         c.template_method = node.template_method;
         c.template_recv = node.template_recv;
@@ -406,7 +424,7 @@ type struct ASTCloner {
                 ci.is_this_keyword      = n.is_this_keyword;
                 ci.is_this_type_keyword = n.is_this_type_keyword;
                 ci.generic_args         = this.clone_type_annotations(n.generic_args);
-                ci.resolved_callee      = n.resolved_callee;
+                if (this.carries_analysis) { ci.resolved_callee = n.resolved_callee; }
                 ci.res                  = n.res;
                 mut vta: [TypeRef] = [];
                 for (mut i: i64 = 0; i < n.value_type_args.length(); i++) { vta.push(n.value_type_args[i]); }
@@ -419,7 +437,7 @@ type struct ASTCloner {
                 // `raw` is a `match`-bound local).  Codegen re-resolves identifier types
                 // from their declaration, so carrying a still-generic type here is safe;
                 // the monomorphizer applies the active substitution at its walk.
-                c.set_resolved_type(node.resolved_type);
+                if (this.carries_analysis) { c.set_resolved_type(node.resolved_type); }
             }
             ExprKind::Lambda(n) => {
                 c = ExpressionNode::lambda_expr(node.span);
