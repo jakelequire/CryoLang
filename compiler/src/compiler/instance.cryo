@@ -807,34 +807,10 @@ type struct CompilerInstance {
             config.profile = this.config.profile_override;
         }
 
-        // Priority: CLI -> $CRYO_STDLIB -> $CRYO_HOME -> binary-relative ->
-        // cryoconfig stdlib_root -> legacy fallbacks.
         mut stdlib_root: string = "";
         if (!config.no_std) {
-            mut tried: [String] = [];
-            stdlib_root = CompilerInstance::resolve_stdlib_root(
-                this.config.stdlib_path_override,
-                config.stdlib_root,
-                config.project_root,
-                &tried);
-            if (stdlib_root.length() > 0) {
-                Log::debug(LogArea::Driver, f"standard library root {stdlib_root}");
-            } else {
-                // No prelude available: hard-fail rather than silently
-                // compile a project that can't see `Result`, `String`,
-                // etc.  Pass `--no-std` (or set `no_std = true` in
-                // cryoconfig) for genuinely freestanding builds.
-                fmt::eprintf("error: cannot locate the Cryo standard library\n");
-                fmt::eprintf("  none of the candidate paths contained a 'lib.cryo':\n");
-                for (mut ti: i64 = 0; ti < tried.length(); ti++) {
-                    fmt::eprintln(f"    {tried[ti].as_str()}");
-                }
-                fmt::eprintf("  fix one of:\n");
-                fmt::eprintf("    --stdlib=PATH                            (one-off override)\n");
-                fmt::eprintf("    export CRYO_STDLIB=/path/to/stdlib       (explicit env)\n");
-                fmt::eprintf("    export CRYO_HOME=/path/to/install        (install root; stdlib at $CRYO_HOME/stdlib)\n");
-                fmt::eprintf("    [project] stdlib_root = \"...\"            (in cryoconfig; relative to project_root)\n");
-                fmt::eprintf("    --no-std                                 (build without the standard library)\n");
+            stdlib_root = this.locate_stdlib(&config);
+            if (stdlib_root.length() == 0) {
                 return ProjectBuild { result: CompilationResult::failed(1, 0), ctx: null };
             }
         }
@@ -2960,6 +2936,38 @@ type struct CompilerInstance {
             }
             Result::Err(reason) => { return reason; }
         }
+    }
+
+    /// The standard library root a build of the project `config` reads,
+    /// first found of: `--stdlib`, `$CRYO_STDLIB`, `$CRYO_HOME`, beside the
+    /// binary, the cryoconfig's `stdlib_root`.  When none holds a
+    /// `lib.cryo` it prints every candidate tried and the ways to name one,
+    /// and returns "": a project that cannot see `Result` or `String` is
+    /// refused rather than compiled.  `--no-std` (or `no_std = true` in the
+    /// cryoconfig) is how a freestanding build says it needs none.
+    locate_stdlib(&this, config: &ProjectConfig) -> string {
+        mut tried: [String] = [];
+        const root: string = CompilerInstance::resolve_stdlib_root(
+            this.config.stdlib_path_override,
+            config.stdlib_root,
+            config.project_root,
+            &tried);
+        if (root.length() > 0) {
+            Log::debug(LogArea::Driver, f"standard library root {root}");
+            return root;
+        }
+        fmt::eprintf("error: cannot locate the Cryo standard library\n");
+        fmt::eprintf("  none of the candidate paths contained a 'lib.cryo':\n");
+        for (mut ti: i64 = 0; ti < tried.length(); ti++) {
+            fmt::eprintln(f"    {tried[ti].as_str()}");
+        }
+        fmt::eprintf("  fix one of:\n");
+        fmt::eprintf("    --stdlib=PATH                            (one-off override)\n");
+        fmt::eprintf("    export CRYO_STDLIB=/path/to/stdlib       (explicit env)\n");
+        fmt::eprintf("    export CRYO_HOME=/path/to/install        (install root; stdlib at $CRYO_HOME/stdlib)\n");
+        fmt::eprintf("    [project] stdlib_root = \"...\"            (in cryoconfig; relative to project_root)\n");
+        fmt::eprintf("    --no-std                                 (build without the standard library)\n");
+        return "";
     }
 
     /// The standard library's root, as its canonical absolute path, or ""

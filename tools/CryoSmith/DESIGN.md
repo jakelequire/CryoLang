@@ -928,7 +928,10 @@ statement budget of one function, default 24), `--no-header`, and
   (default `CRYOGATE_JOBS`, else the logical CPUs), each with a build
   directory of its own (`--build-dir`), since two builds sharing one write
   the same objects and one program then reports another's hash; a build
-  that writes no build directory is a failure. The report is printed in
+  that writes no build directory is a failure. So a compiler from before a
+  single-file build honoured `--build-dir` is refused rather than worked
+  around: the check gives each build no copy of its source and no
+  directory of its own to stand in for the flag. The report is printed in
   seed order once every program has run, so it is the same bytes for any
   job count.
 - **Plants prove the checks can refuse.** `--plant unguarded-division`

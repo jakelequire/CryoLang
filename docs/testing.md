@@ -234,7 +234,8 @@ cryo test [PATTERN] [FLAGS]
 
 | Flag | Effect |
 | --- | --- |
-| `--list` | List matching tests without running them |
+| `--suite=unit\|compile-fail\|projects` | Run one suite alone; without it all three run, in that order |
+| `--list` | List matching unit tests without running them (refused beside `--suite=compile-fail` or `--suite=projects`) |
 | `--ignored` | Run only the `![ignore]`-marked tests |
 | `--exact` | Treat `PATTERN` as an exact name, not a substring |
 | `-q`, `--quiet` | Terse output |

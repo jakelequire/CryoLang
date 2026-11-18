@@ -5092,7 +5092,14 @@ cryo test --list                   # discover only; print and exit
 cryo test --ignored                # also run ![ignore]-marked tests
 cryo test --exact                  # treat the filter as an exact match
 cryo test -q, --quiet              # suppress per-test ok / ignored lines
+cryo test --suite=projects         # one suite alone: unit, compile-fail or projects
 ```
+
+A project's `cryo test` runs three suites in order: its unit tests, the
+compile-fail files under `tests/negative/`, and the projects under
+`tests/projects/`. `--suite=` runs one of them alone, so separate runs can
+proceed side by side; a run of the compile-fail or project suite builds no unit
+test binary and finds the standard library the way that build would.
 
 ### Output format
 
@@ -5554,7 +5561,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--apply-fixes`       | Make every machine-applicable suggestion the build reports in the project's own files (never the stdlib's or a vendor binding's), then build again once; a suggestion overlapping one already made is left for the next build. |
 | `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable).           |
 
-Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
+Test-only flags: `--suite=NAME`, `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
 
 **Compiler logging.** The compiler logs what it does, for whoever is working on the compiler; it is off unless switched on, by `CRYO_LOG=SPEC` in the environment or `--log=SPEC` (or `--debug`, meaning `--log=debug`), or by `debug = true` in cryoconfig. `--debug` switches logging on and does nothing else: the AST is `--ast`'s and the IR `--emit-llvm`'s. The command line is applied after the environment, so a flag wins; `debug = true` sets `debug` only in the areas neither of them set, so `--log=off` or `CRYO_LOG=off` silences a project that asks for logging, and `debug = false` switches nothing off. A spec is a comma-separated list of items: an area, `driver`, which logs that area at `debug`; `area=level`; or a level alone, which sets every area. A later item overrides an earlier one, so `CRYO_LOG=sema,codegen` logs two areas and `--log=debug,parse=off` logs all but one. The areas are `driver`, `loader`, `lex`, `parse`, `resolve`, `types`, `sema`, `mono`, `drop`, `codegen`, `link`, `bindgen`, `deps`, `diag`, `lsp` and `time`; the levels, from least to most said, `off`, `error`, `warn`, `info`, `debug` and `trace`. An item naming neither is reported on stderr and the rest of the spec still applies. Lines go to stderr, or appended to the file `CRYO_LOG_FILE` or `--log-file` names, each as `[level area] file:line function: message`, the place being where in the compiler's source the line was written. The `time` area at `info` reports how long each stage of a build took, at its end. The language server takes no flags, so it reads `CRYO_LOG` and `CRYO_LOG_FILE` alone, and with them unset it logs nothing.
 
