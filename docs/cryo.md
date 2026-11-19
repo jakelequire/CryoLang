@@ -5518,6 +5518,7 @@ color  = "auto"                     # auto | always | never
 | `cryo run`               | Build the project and run the resulting executable.                                                                 |
 | `cryo test [pattern]`    | Build and run the project's `![test]` functions.                                                                    |
 | `cryo check <file>`      | Front-end + semantic analysis only; no codegen.                                                                     |
+| `cryo interpret <file>`  | Analyse the file as `check` does, then run its `main` by interpreting the typed program, checking memory and ownership as it goes (`tools/CryoSmith/INTERPRETER.md`). |
 | `cryo init [dir]`        | Scaffold a new project (`cryoconfig` + `main.cryo`).                                                                |
 | `cryo demangle <sym>`    | Decode a mangled symbol to its source form.                                                                         |
 | `cryo api-index write\|check <root> <file>` | Write, or check that `<file>` already holds, the one-line-per-declaration index of the standard library under `<root>`. |

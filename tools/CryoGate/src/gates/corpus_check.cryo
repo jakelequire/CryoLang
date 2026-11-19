@@ -15,6 +15,14 @@
 ///! directory; a passing program's are removed.  Every program terminates
 ///! by construction, so a run has no time limit: one that does not end is
 ///! itself a finding.
+///!
+///! With `--interpret`, every program both builds agree on is also run by
+///! `cryo interpret` (tools/CryoSmith/INTERPRETER.md): it passes when the
+///! interpreter prints the same line and exits 0, fails on any other line
+///! or ending, and is reported `not covered`, neither passing nor failing,
+///! when the interpreter does not run a construct it uses.  The summary
+///! counts the programs interpreted and those not covered, so a corpus the
+///! interpreter skipped entirely reads `0 interpreted`.
 
 namespace cryogate::gates::corpus_check;
 
@@ -33,7 +41,7 @@ import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::schedule::{ Cost, Scheduler };
-import cryogate::smith::corpus::{ CorpusJudge, CorpusLayout };
+import cryogate::smith::corpus::{ CorpusJudge, CorpusLayout, Interpretation };
 
 /// The corpus check's settings.
 public type struct CorpusCheck {
@@ -45,7 +53,8 @@ public type struct CorpusCheck {
     /// Run `cryogate corpus-check` with `arguments` from index `first`; 0
     /// when every program passed, 1 when one failed, 2 on a usage error.
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
-        mut options: Options = Options::new(Str::new("cryogate corpus-check --cryo <compiler> --work <directory> [--smith <cryosmith>] [--stdlib <directory>] [--first-seed N] [--count K] [--jobs N] [-- <generation options>...]"));
+        mut options: Options = Options::new(Str::new("cryogate corpus-check --cryo <compiler> --work <directory> [--smith <cryosmith>] [--stdlib <directory>] [--first-seed N] [--count K] [--jobs N] [--interpret] [-- <generation options>...]"));
+        options.flag(Str::new("--interpret"));
         options.valued(Str::new("--cryo"));
         options.valued(Str::new("--work"));
         options.valued(Str::new("--smith"));
@@ -151,8 +160,7 @@ public type struct CorpusCheck {
             offset = offset + 1;
         }
         const ran: Array<Completion> = runs.run();
-        mut failed: u64 = 0;
-        mut hashes: Array<String> = Array::<String>::new();
+        mut judged: Array<Result<String, String>> = Array::<Result<String, String>>::new();
         offset = 0;
         while (offset < count) {
             const seed: u64 = first_seed.wrapping_add(offset);
@@ -160,14 +168,62 @@ public type struct CorpusCheck {
                 Result::Ok(at)      => { check.judge(seed, &ran[at], &ran[at + 1]) }
                 Result::Err(reason) => { Result::Err(reason.clone()) }
             };
-            match (verdict) {
+            judged.push(verdict);
+            offset = offset + 1;
+        }
+        // With `--interpret`, each program the builds agreed on is run by
+        // the interpreter too, in seed order.
+        const interpreting: boolean = parsed.has(Str::new("--interpret"));
+        mut interpretations: Scheduler = Scheduler::new();
+        interpretations.set_slots(jobs);
+        mut interpreted_at: Array<i64> = Array::<i64>::new();
+        offset = 0;
+        while (offset < count) {
+            const seed: u64 = first_seed.wrapping_add(offset);
+            if (interpreting && judged[offset as i64].is_ok()) {
+                interpreted_at.push(interpretations.add(check.interpret(seed, logs), Cost::Compile));
+            } else {
+                interpreted_at.push(-1);
+            }
+            offset = offset + 1;
+        }
+        const interpreted: Array<Completion> = interpretations.run();
+        mut failed: u64 = 0;
+        mut agreed: u64 = 0;
+        mut uncovered: Array<String> = Array::<String>::new();
+        mut hashes: Array<String> = Array::<String>::new();
+        offset = 0;
+        while (offset < count) {
+            const seed: u64 = first_seed.wrapping_add(offset);
+            match (&judged[offset as i64]) {
                 Result::Ok(hash) => {
-                    fmt::println(f"ok    seed {seed} {hash.as_str()}");
-                    if (!hashes.contains(&hash)) { hashes.push(hash); }
+                    const at: i64 = interpreted_at[offset as i64];
+                    if (at < 0) {
+                        fmt::println(f"ok    seed {seed} {hash.as_str()}");
+                    } else {
+                        match (check.interpretation(seed, &interpreted[at], hash.as_str(), logs)) {
+                            Interpretation::Agrees => {
+                                fmt::println(f"ok    seed {seed} {hash.as_str()} (interpreted)");
+                                agreed = agreed + 1;
+                            }
+                            Interpretation::NotCovered(construct) => {
+                                fmt::println(f"ok    seed {seed} {hash.as_str()} (not covered: {construct.as_str()})");
+                                uncovered.push(construct);
+                            }
+                            Interpretation::Fails(reason) => {
+                                fmt::println(f"FAIL  seed {seed}: {reason.as_str()}");
+                                failed = failed + 1;
+                            }
+                        }
+                    }
+                    if (!hashes.contains(hash)) { hashes.push(hash.clone()); }
                 }
                 Result::Err(reason) => { fmt::println(f"FAIL  seed {seed}: {reason.as_str()}"); failed = failed + 1; }
             }
             offset = offset + 1;
+        }
+        if (interpreting) {
+            fmt::println(f"corpus-check: {agreed} interpreted and agreeing, {uncovered.length()} not covered");
         }
         if (failed > 0) {
             fmt::println(f"corpus-check: FAIL ({failed} of {count} programs)");
@@ -175,6 +231,29 @@ public type struct CorpusCheck {
         }
         fmt::println(f"corpus-check: OK ({count} programs, -O0 and -O2 agree, {hashes.length()} distinct hashes)");
         return 0;
+    }
+
+    /// The interpreter's run of `seed`'s program.
+    private interpret(&this, seed: u64, logs: &RunLogs) -> Job {
+        mut job: Job = Job::new(this.compiler.as_str());
+        job.argument(Str::new("interpret"));
+        job.argument(this.layout.source(seed).as_path().as_str());
+        match (&this.stdlib) {
+            Option::Some(stdlib) => { job.argument(f"--stdlib={stdlib.as_str()}".as_str()); }
+            Option::None         => { }
+        }
+        job.directory(this.work.as_path().as_str());
+        const name: String = CorpusCheck::name(seed, Str::new("I"));
+        job.log_to(logs.file(f"corpus-run-{name.as_str()}".as_str()).as_str());
+        job.errors_to(logs.file(f"corpus-run-{name.as_str()}-errors".as_str()).as_str());
+        return job;
+    }
+
+    /// What the interpreter's run `done` of `seed` made of the program its
+    /// builds agreed printed `compiled`.
+    private interpretation(&this, seed: u64, done: &Completion, compiled: Str, logs: &RunLogs) -> Interpretation {
+        const errors: String = CorpusCheck::read(logs.file(f"corpus-run-{CorpusCheck::name(seed, Str::new("I")).as_str()}-errors".as_str()).as_str());
+        return CorpusJudge::interpreted(done.outcome.exit_code(), errors.as_str(), done.output().as_str(), compiled);
     }
 
     /// The build of `seed`'s program at `level`, in its own build directory.

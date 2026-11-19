@@ -1,0 +1,307 @@
+/// The machine: the declarations with no body to interpret.  An intrinsic
+/// is identified by the kind the compiler registered on its declaration-
+/// index entry; a foreign function by the C symbol it binds, a fact of the
+/// boundary.  Each rule is written against the C or LLVM definition of the
+/// operation, never against the compiler's lowering of it
+/// (tools/CryoSmith/INTERPRETER.md section 6).
+
+namespace compiler::interpret::machine;
+
+import compiler::ast::expression::{ ExpressionNode };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::interpret::calls::{ Callee };
+import compiler::interpret::integer::{ IntegerKind, TrueValue };
+import compiler::interpret::interpreter::{ Interpreter, Operand };
+import compiler::interpret::memory::{ AccessFault, Address, AllocationKind, Scalar };
+import compiler::interpret::outcome::{ Stop };
+import compiler::intrinsic_kind::{ IntrinsicKind };
+import compiler::types::type_ref::{ TypeRef };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+/// A machine rule's argument: its value and its type as written at the call.
+type struct MachineArgument {
+    value:         Scalar;
+    argument_type: TypeRef;
+}
+
+implement struct Interpreter {
+    /// Run the machine rule for `callee`, its arguments evaluated left to
+    /// right first.
+    machine(mut &this, callee: Callee, receiver: ExpressionNode*, arguments: &[mut ExpressionNode*],
+            result: TypeRef, span: SourceSpan) -> Result<Operand, Stop> {
+        if (receiver != null) { return Result::Err(Interpreter::not_covered("a method with no body to interpret", span)); }
+        mut values: [MachineArgument] = [];
+        for (mut i: i64 = 0; i < arguments.length(); i++) {
+            const operand: Operand = this.evaluate(arguments[i])?;
+            match (operand) {
+                Operand::Value(value) => { values.push(MachineArgument { value: value, argument_type: arguments[i].resolved_type }); }
+                Operand::Place(place) => { values.push(MachineArgument { value: Scalar::Pointer(place), argument_type: arguments[i].resolved_type }); }
+                Operand::Nothing => { }
+            }
+        }
+        return match (callee.intrinsic) {
+            IntrinsicKind::Call        => { this.foreign(callee, &values, result, span) }
+            IntrinsicKind::Panic       => {
+                const message: String = this.c_string(this.address_argument(&values, 0, span)?, span)?;
+                Result::Err(Stop::panic(message, span))
+            }
+            IntrinsicKind::Location    => { this.location(result, span) }
+            IntrinsicKind::DropInPlace => {
+                const element: TypeRef = this.layout.pointee(values[0].argument_type);
+                const target: Address = this.reach(this.address_argument(&values, 0, span)?, element, span)?;
+                this.drop_place(target, element, span)?;
+                Result::Ok(Operand::Nothing)
+            }
+            IntrinsicKind::Trap        => { Result::Err(Stop::panic(String::from_str(Str::new("trap")), span)) }
+            _ => { Result::Err(Interpreter::not_covered("this intrinsic", span)) }
+        };
+    }
+
+    /// A foreign function, by the C symbol it binds.
+    foreign(mut &this, callee: Callee, values: &[MachineArgument], result: TypeRef, span: SourceSpan) -> Result<Operand, Stop> {
+        const symbol: Str = Str::new(this.ctx.intern_table.shown(this.ctx.decl_index.entry_symbol(callee.entry)));
+        if (symbol == Str::new("malloc")) {
+            const bytes: i64 = this.count_argument(values, 0, span)?;
+            return Result::Ok(Operand::Value(Scalar::Pointer(Address::at(this.memory.allocate_heap(bytes), 0))));
+        }
+        if (symbol == Str::new("free")) {
+            this.free(this.address_argument(values, 0, span)?, span)?;
+            return Result::Ok(Operand::Nothing);
+        }
+        if (symbol == Str::new("realloc")) {
+            return Result::Ok(Operand::Value(Scalar::Pointer(this.reallocate(this.address_argument(values, 0, span)?, this.count_argument(values, 1, span)?, span)?)));
+        }
+        if (symbol == Str::new("memcpy") || symbol == Str::new("memmove")) {
+            const target: Address = this.address_argument(values, 0, span)?;
+            this.copy_bytes(target, values[0].argument_type, this.address_argument(values, 1, span)?, values[1].argument_type,
+                this.count_argument(values, 2, span)?, span)?;
+            return Result::Ok(Operand::Value(Scalar::Pointer(target)));
+        }
+        if (symbol == Str::new("strlen")) {
+            const text: String = this.c_string(this.address_argument(values, 0, span)?, span)?;
+            return this.integer_result(text.length() as u64, result, span);
+        }
+        if (symbol == Str::new("printf")) {
+            const written: i64 = this.print_formatted(values, span)?;
+            return this.integer_result(written as u64, result, span);
+        }
+        if (symbol == Str::new("putchar")) {
+            const byte: i64 = this.count_argument(values, 0, span)?;
+            this.output.push_byte(byte as u8);
+            return this.integer_result(byte as u64, result, span);
+        }
+        if (symbol == Str::new("fflush")) { return this.integer_result(0, result, span); }
+        // The host's console queries: a run's standard output is never a
+        // console, so it is the same bytes on every host.
+        if (symbol == Str::new("_get_osfhandle")) { return this.integer_result(0, result, span); }
+        if (symbol == Str::new("GetConsoleMode")) { return this.integer_result(0, result, span); }
+        return Result::Err(Stop::not_covered(f"the foreign function `{symbol}`", span));
+    }
+
+    /// `value` as the integer result of type `t`.
+    integer_result(&this, value: u64, t: TypeRef, span: SourceSpan) -> Result<Operand, Stop> {
+        match (this.layout.integer_kind(t)) {
+            Option::Some(kind) => { return Result::Ok(Operand::Value(Scalar::Integer(kind.reduce(value), kind))); }
+            Option::None => { }
+        }
+        if (this.layout.cells(t) == 0) { return Result::Ok(Operand::Nothing); }
+        return Result::Err(Interpreter::violation("a foreign function whose result is no integer", span));
+    }
+
+    address_argument(&this, values: &[MachineArgument], index: i64, span: SourceSpan) -> Result<Address, Stop> {
+        if (index >= values.length()) { return Result::Err(Interpreter::violation("a foreign call missing an argument", span)); }
+        return match (values[index].value) {
+            Scalar::Pointer(address) => { Result::Ok(address) }
+            _ => { Result::Err(Interpreter::violation("a foreign call given no address where one is taken", span)) }
+        };
+    }
+
+    count_argument(&this, values: &[MachineArgument], index: i64, span: SourceSpan) -> Result<i64, Stop> {
+        if (index >= values.length()) { return Result::Err(Interpreter::violation("a foreign call missing an argument", span)); }
+        return match (values[index].value) {
+            Scalar::Integer(bits, kind) => { Result::Ok(TrueValue::of(kind, bits).signed_value()) }
+            _ => { Result::Err(Interpreter::violation("a foreign call given no integer where one is taken", span)) }
+        };
+    }
+
+    // ---- The allocator ----
+
+    /// `free`: the start of a live heap block, or null.
+    free(mut &this, address: Address, span: SourceSpan) -> Result<(), Stop> {
+        if (address.is_null()) { return Result::Ok(()); }
+        const allocation: i64 = address.allocation;
+        match (this.memory.allocations[allocation].kind) {
+            AllocationKind::Heap => { }
+            _ => { return Result::Err(Interpreter::violation("`free` of storage the allocator did not give", span)); }
+        }
+        if (!this.memory.allocations[allocation].live) {
+            return Result::Err(Interpreter::violation("`free` of a heap block already freed", span));
+        }
+        if (address.offset != 0) {
+            return Result::Err(Interpreter::violation("`free` of an address inside a heap block", span));
+        }
+        this.memory.end(allocation);
+        return Result::Ok(());
+    }
+
+    /// `realloc`: a new block of `bytes` holding the old one's elements as
+    /// far as both reach, the old one freed.
+    reallocate(mut &this, address: Address, bytes: i64, span: SourceSpan) -> Result<Address, Stop> {
+        const block: i64 = this.memory.allocate_heap(bytes);
+        if (address.is_null()) { return Result::Ok(Address::at(block, 0)); }
+        const old: i64 = address.allocation;
+        const element_bytes: i64 = this.memory.allocations[old].element_bytes;
+        const element_cells: i64 = this.memory.allocations[old].element_cells;
+        if (element_cells > 0) {
+            this.memory.shape(block, element_bytes, element_cells);
+            mut cells: i64 = this.memory.allocations[old].length;
+            if (this.memory.allocations[block].length < cells) { cells = this.memory.allocations[block].length; }
+            const fault: AccessFault = this.memory.copy(Address::at(block, 0), Address::at(old, 0), cells);
+            if (!fault.is_none()) { return Result::Err(this.fault(fault, span)); }
+        }
+        this.free(address, span)?;
+        return Result::Ok(Address::at(block, 0));
+    }
+
+    /// `memcpy` and `memmove`: `bytes` bytes, as elements of the type the
+    /// addresses point at, or of the type the source block holds.
+    copy_bytes(mut &this, target: Address, target_type: TypeRef, source: Address, source_type: TypeRef,
+               bytes: i64, span: SourceSpan) -> Result<(), Stop> {
+        if (bytes == 0) { return Result::Ok(()); }
+        mut element: TypeRef = this.layout.pointee(source_type);
+        if (!element.is_valid() || this.layout.cells(element) == 0) { element = this.layout.pointee(target_type); }
+        mut element_bytes: i64 = 0;
+        mut element_cells: i64 = 0;
+        if (element.is_valid() && this.layout.cells(element) > 0) {
+            element_bytes = this.layout.bytes(element);
+            element_cells = this.layout.cells(element);
+        } else if (!source.is_null() && this.memory.allocations[source.allocation].element_cells > 0) {
+            element_bytes = this.memory.allocations[source.allocation].element_bytes;
+            element_cells = this.memory.allocations[source.allocation].element_cells;
+        } else {
+            return Result::Err(Interpreter::not_covered("a byte copy between untyped addresses", span));
+        }
+        if (bytes % element_bytes != 0) { return Result::Err(Interpreter::not_covered("a byte copy of part of an element", span)); }
+        if (!target.is_null()) { this.memory.shape(target.allocation, element_bytes, element_cells); }
+        if (!source.is_null()) { this.memory.shape(source.allocation, element_bytes, element_cells); }
+        const fault: AccessFault = this.memory.copy(target, source, (bytes / element_bytes) * element_cells);
+        if (!fault.is_none()) { return Result::Err(this.fault(fault, span)); }
+        return Result::Ok(());
+    }
+
+    // ---- Text ----
+
+    /// The bytes from `address` up to the first zero byte.
+    c_string(&this, address: Address, span: SourceSpan) -> Result<String, Stop> {
+        mut text: String = String::new();
+        for (mut i: i64 = 0; i < Interpreter::LONGEST_C_STRING; i++) {
+            match (this.load(address.plus(i), span)?) {
+                Scalar::Integer(bits, _) => {
+                    if (bits == 0) { return Result::Ok(text); }
+                    text.push_byte(bits as u8);
+                }
+                _ => { return Result::Err(Interpreter::violation("a C string holding a value that is no byte", span)); }
+            }
+        }
+        return Result::Err(Interpreter::violation("a C string with no terminating zero byte", span));
+    }
+
+    /// `count` bytes from `address`.
+    byte_run(&this, address: Address, count: i64, span: SourceSpan) -> Result<String, Stop> {
+        mut text: String = String::new();
+        for (mut i: i64 = 0; i < count; i++) {
+            match (this.load(address.plus(i), span)?) {
+                Scalar::Integer(bits, _) => { text.push_byte(bits as u8); }
+                _ => { return Result::Err(Interpreter::violation("a byte run holding a value that is no byte", span)); }
+            }
+        }
+        return Result::Ok(text);
+    }
+
+    /// `printf`: the format's text, each conversion the standard library's
+    /// print path writes replaced by its argument; how many bytes it wrote.
+    print_formatted(mut &this, values: &[MachineArgument], span: SourceSpan) -> Result<i64, Stop> {
+        const format: String = this.c_string(this.address_argument(values, 0, span)?, span)?;
+        const bytes: Str = format.as_str();
+        mut next: i64 = 1;
+        mut written: i64 = 0;
+        mut i: i64 = 0;
+        while (i < bytes.length()) {
+            const c: u8 = bytes.byte_at(i).unwrap_or(0);
+            if (c != 37) {
+                this.output.push_byte(c);
+                written = written + 1;
+                i = i + 1;
+                continue;
+            }
+            // A conversion: `%%`, `%c`, `%s`, `%.*s`, or a decimal integer
+            // with any length modifier.
+            i = i + 1;
+            mut precision: i64 = -1;
+            if (i + 1 < bytes.length() && bytes.byte_at(i).unwrap_or(0) == 46 && bytes.byte_at(i + 1).unwrap_or(0) == 42) {
+                precision = this.count_argument(values, next, span)?;
+                next = next + 1;
+                i = i + 2;
+            }
+            while (i < bytes.length() && (bytes.byte_at(i).unwrap_or(0) == 108 || bytes.byte_at(i).unwrap_or(0) == 122)) { i = i + 1; }
+            if (i >= bytes.length()) { break; }
+            const conversion: u8 = bytes.byte_at(i).unwrap_or(0);
+            i = i + 1;
+            if (conversion == 37) {
+                this.output.push_byte(37);
+                written = written + 1;
+            } else if (conversion == 99) {
+                this.output.push_byte(this.count_argument(values, next, span)? as u8);
+                next = next + 1;
+                written = written + 1;
+            } else if (conversion == 115) {
+                const address: Address = this.address_argument(values, next, span)?;
+                next = next + 1;
+                const text: String = if (precision >= 0) { this.byte_run(address, precision, span)? } else { this.c_string(address, span)? };
+                written = written + text.length();
+                this.output.push(text.as_str());
+            } else if (conversion == 100 || conversion == 105 || conversion == 117) {
+                if (next >= values.length()) { return Result::Err(Interpreter::violation("a `printf` conversion with no argument", span)); }
+                const value: TrueValue = match (values[next].value) {
+                    Scalar::Integer(bits, kind) => { TrueValue::of(kind, bits) }
+                    _ => { return Result::Err(Interpreter::violation("a `printf` integer conversion given no integer", span)); }
+                };
+                const text: String = if (value.negative) { f"-{value.magnitude}" } else { f"{value.magnitude}" };
+                next = next + 1;
+                written = written + text.length();
+                this.output.push(text.as_str());
+            } else {
+                return Result::Err(Interpreter::not_covered("this `printf` conversion", span));
+            }
+        }
+        return Result::Ok(written);
+    }
+
+    /// The `Location` the call at `span` builds: its file, line and column,
+    /// and an empty function name.
+    location(mut &this, t: TypeRef, span: SourceSpan) -> Result<Operand, Stop> {
+        const place: Address = this.temporary(t);
+        this.store(place.plus(this.layout.field_offset(t, 0)), Scalar::Pointer(this.text_bytes(Str::new(span.file))), span)?;
+        this.store(place.plus(this.layout.field_offset(t, 1)), Scalar::Integer(span.start_line as u64, IntegerKind::new(32, false)), span)?;
+        this.store(place.plus(this.layout.field_offset(t, 2)), Scalar::Integer(span.start_col as u64, IntegerKind::new(32, false)), span)?;
+        this.store(place.plus(this.layout.field_offset(t, 3)), Scalar::Pointer(this.text_bytes(Str::new(""))), span)?;
+        return Result::Ok(Operand::Place(place));
+    }
+
+    /// A read-only allocation holding `text` and a terminating zero byte.
+    text_bytes(mut &this, text: Str) -> Address {
+        const allocation: i64 = this.memory.allocate(text.length() + 1, AllocationKind::Stack);
+        const byte: IntegerKind = IntegerKind::new(8, false);
+        for (mut i: i64 = 0; i < text.length(); i++) {
+            this.memory.write(Address::at(allocation, i), Scalar::Integer(text.byte_at(i).unwrap_or(0) as u64, byte));
+        }
+        this.memory.write(Address::at(allocation, text.length()), Scalar::Integer(0, byte));
+        this.memory.seal(allocation);
+        return Address::at(allocation, 0);
+    }
+
+    /// The longest C string the machine reads before it judges the bytes
+    /// unterminated.
+    const LONGEST_C_STRING: i64 = 1 << 24;
+}

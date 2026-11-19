@@ -6,12 +6,13 @@ namespace cryogate::tests::smith;
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::fs::path::{ Path, PathBuf };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect };
 
-import cryogate::smith::corpus::{ CorpusJudge, CorpusLayout };
+import cryogate::smith::corpus::{ CorpusJudge, CorpusLayout, Interpretation };
 import cryogate::smith::selftest::{ PartReport, SelfTestParts };
 
 /// Two parts' reports: part 0 ran `first` units, part 1 `second`, of `total`.
@@ -102,6 +103,43 @@ function the_two_builds_must_print_the_same_line() -> Result<(), TestError> {
     expect(CorpusJudge::agree(Str::new("cryosmith-hash 1"), Str::new("cryosmith-hash 1")).is_ok(), Str::new("agreeing builds"))?;
     const differ: Result<(), String> = CorpusJudge::agree(Str::new("cryosmith-hash 1"), Str::new("cryosmith-hash 2"));
     return expect(differ.is_err() && differ.unwrap_err() == String::from_str(Str::new("-O0 printed `cryosmith-hash 1`, -O2 printed `cryosmith-hash 2`")), Str::new("named"));
+}
+
+/// Whether `seen` is a failure whose reason is `reason`.
+function fails_with(seen: Interpretation, reason: Str) -> boolean {
+    return match (seen) {
+        Interpretation::Fails(text) => { text.as_str() == reason }
+        _                           => { false }
+    };
+}
+
+![test]
+function the_interpreter_agrees_only_by_printing_the_builds_line_and_exiting_zero() -> Result<(), TestError> {
+    const line: Str = Str::new("cryosmith-hash 42");
+    const agrees: boolean = match (CorpusJudge::interpreted(Option::Some(0), Str::new(""), Str::new("cryosmith-hash 42\n"), line)) {
+        Interpretation::Agrees => { true }
+        _                      => { false }
+    };
+    expect(agrees, Str::new("the same line, exit 0"))?;
+    expect(fails_with(CorpusJudge::interpreted(Option::Some(0), Str::new(""), Str::new("cryosmith-hash 43\n"), line),
+        Str::new("the builds printed `cryosmith-hash 42`, the interpreter printed `cryosmith-hash 43`")), Str::new("another hash"))?;
+    expect(fails_with(CorpusJudge::interpreted(Option::Some(70), Str::new("interpret: violation: a read of a value that was moved out at p.cryo:3:5\n"), Str::new("cryosmith-hash 42\n"), line),
+        Str::new("the interpreter exited 70: | interpret: violation: a read of a value that was moved out at p.cryo:3:5 | cryosmith-hash 42")), Str::new("a violation fails even beside the right line"))?;
+    expect(fails_with(CorpusJudge::interpreted(Option::Some(101), Str::new(""), Str::new(""), line),
+        Str::new("the interpreter exited 101:")), Str::new("a panic"))?;
+    return expect(fails_with(CorpusJudge::interpreted(Option::None, Str::new(""), Str::new(""), line),
+        Str::new("the interpreter did not exit:")), Str::new("no exit"));
+}
+
+![test]
+function a_program_the_interpreter_does_not_cover_is_named_and_never_agrees() -> Result<(), TestError> {
+    const named: boolean = match (CorpusJudge::interpreted(Option::Some(71), Str::new("interpret: not covered: a closure at p.cryo:9:13\n"), Str::new(""), Str::new("cryosmith-hash 42"))) {
+        Interpretation::NotCovered(construct) => { construct.as_str() == Str::new("a closure at p.cryo:9:13") }
+        _                                     => { false }
+    };
+    expect(named, Str::new("the construct named"))?;
+    return expect(fails_with(CorpusJudge::interpreted(Option::Some(71), Str::new(""), Str::new(""), Str::new("cryosmith-hash 42")),
+        Str::new("the interpreter exited 71 without naming what it does not cover:")), Str::new("an unnamed 71 fails"));
 }
 
 ![test]

@@ -1223,8 +1223,11 @@ generator never reads through an `Rc`.
     under it as a gate: every generated program must pass it unchanged,
     with no `unsafe`, since the generator promises validity under that
     plan's rules as well as today's.
-12. **The reference interpreter.** An evaluator over the program model
-    (section 1) that computes the hash without compiling: an oracle that
-    does not share the compiler's mistakes. CryoSmith gains an `evaluate`
-    command, or a library CryoGate links, and the corpus check compares
-    the compiled programs' hash with the evaluated one.
+12. **The reference interpreter.** `cryo interpret`, a module of the
+    compiler that runs the typed program the front end leaves - not
+    CryoSmith's own model, which would check the generator against itself
+    - by the language reference, with an explicit memory model and its own
+    account of moves and drops: an oracle that does not share code
+    generation's mistakes. `cryogate corpus-check --interpret` compares
+    its hash with the compiled programs'. Its design, its coverage by
+    stage and the comparison are in INTERPRETER.md.

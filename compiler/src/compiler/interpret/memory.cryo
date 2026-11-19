@@ -1,0 +1,289 @@
+/// The interpreter's memory: every value lives in a cell of an allocation,
+/// and every access is checked against the allocation's life, its bounds
+/// and the cell's state.
+
+namespace compiler::interpret::memory;
+
+import compiler::interpret::integer::{ IntegerKind };
+import compiler::decl_index::{ OverloadId };
+import compiler::ast::expression::{ LambdaExpr };
+import compiler::ast::declaration::{ ImplBlock };
+
+/// Where an address points: an allocation, and the cell within it, counted
+/// in cells from the allocation's start.
+type struct Address {
+    allocation: i64;
+    offset:     i64;
+
+    static at(allocation: i64, offset: i64) -> Address {
+        return Address { allocation: allocation, offset: offset };
+    }
+
+    /// The null address, which names no allocation.
+    static null() -> Address {
+        return Address { allocation: -1, offset: 0 };
+    }
+
+    is_null(&this) -> boolean { return this.allocation < 0; }
+
+    /// The address `cells` cells on from this one.
+    plus(&this, cells: i64) -> Address {
+        return Address { allocation: this.allocation, offset: this.offset + cells };
+    }
+
+    same(&this, other: Address) -> boolean {
+        return this.allocation == other.allocation && this.offset == other.offset;
+    }
+}
+
+/// A value small enough to live in one cell.  An aggregate is not a scalar:
+/// it is a run of cells, one per scalar it holds.
+type enum Scalar {
+    /// An integer's bits, stored as its kind reduces them.
+    Integer(u64, IntegerKind);
+    Boolean(boolean);
+    /// A pointer or reference, the null pointer among them.
+    Pointer(Address);
+    /// A named function used as a value: the declaration-index entry.
+    Function(OverloadId);
+    /// A closure: its lambda, and the allocation holding its captures.
+    Closure(LambdaExpr*, i64);
+    /// A trait object: the address it borrows and the implementation
+    /// whose methods its table holds.
+    Object(Address, ImplBlock*);
+}
+
+/// What a cell holds.
+type enum CellState {
+    Uninitialised;
+    Holding;
+    /// A value was moved out and nothing written since.
+    Moved;
+}
+
+type struct Cell {
+    state: CellState;
+    value: Scalar;
+}
+
+/// What kind of storage an allocation is, which decides how it ends.
+type enum AllocationKind {
+    /// A local, a parameter or a temporary: ended when its scope or frame
+    /// ends.
+    Stack;
+    /// A module-level variable: never ended.
+    Global;
+    /// The bytes of a string literal: never ended, never written.
+    Literal;
+    /// A block from the allocator: ended by `free`.
+    Heap;
+}
+
+/// One allocation: a run of cells in the memory's table.
+type struct Allocation {
+    start:  i64;
+    length: i64;
+    live:   boolean;
+    kind:   AllocationKind;
+    /// A heap block's size in bytes, as the allocator was asked for it.
+    bytes:  i64;
+    /// How many cells and bytes one of a heap block's elements takes,
+    /// fixed by its first typed access; zero until then.
+    element_cells: i64;
+    element_bytes: i64;
+}
+
+/// Why an access was refused.
+type enum AccessFault {
+    None;
+    NullAddress;
+    Ended;
+    OutOfBounds;
+    Uninitialised;
+    Moved;
+    ReadOnly;
+}
+
+implement enum AccessFault {
+    is_none(&this) -> boolean {
+        return match (this) {
+            AccessFault::None => { true }
+            _                 => { false }
+        };
+    }
+
+    /// What the fault is, for a violation report.
+    describe(&this) -> string {
+        return match (this) {
+            AccessFault::None          => { "no fault" }
+            AccessFault::NullAddress   => { "an access through the null pointer" }
+            AccessFault::Ended         => { "an access to storage that has ended (a dangling reference or pointer, or a use after free)" }
+            AccessFault::OutOfBounds   => { "an access outside its allocation" }
+            AccessFault::Uninitialised => { "a read of an uninitialised value" }
+            AccessFault::Moved         => { "a read of a value that was moved out" }
+            AccessFault::ReadOnly      => { "a write to read-only storage" }
+        };
+    }
+}
+
+/// The cells and allocations of one run.
+type struct Memory {
+    cells:       [Cell];
+    allocations: [Allocation];
+
+    static new() -> Memory {
+        return Memory { cells: [], allocations: [] };
+    }
+
+    /// A new allocation of `length` uninitialised cells.
+    allocate(mut &this, length: i64, kind: AllocationKind) -> i64 {
+        const start: i64 = this.cells.length();
+        for (mut i: i64 = 0; i < length; i++) {
+            this.cells.push(Cell { state: CellState::Uninitialised, value: Scalar::Boolean(false) });
+        }
+        this.allocations.push(Allocation {
+            start: start, length: length, live: true, kind: kind,
+            bytes: 0, element_cells: 0, element_bytes: 0,
+        });
+        return this.allocations.length() - 1;
+    }
+
+    /// A heap block of `bytes` bytes.  It holds no cells until its first
+    /// typed access gives it an element type (`shape`).
+    allocate_heap(mut &this, bytes: i64) -> i64 {
+        this.allocations.push(Allocation {
+            start: this.cells.length(), length: 0, live: true, kind: AllocationKind::Heap,
+            bytes: bytes, element_cells: 0, element_bytes: 0,
+        });
+        return this.allocations.length() - 1;
+    }
+
+    /// Give the heap block `allocation`, if it has no element type yet,
+    /// elements of `element_bytes` bytes and `element_cells` cells each: as
+    /// many as its size holds, uninitialised.  Any other allocation, and a
+    /// block already shaped, is left as it is.
+    shape(mut &this, allocation: i64, element_bytes: i64, element_cells: i64) -> void {
+        if (allocation < 0 || element_cells <= 0 || element_bytes <= 0) { return; }
+        match (this.allocations[allocation].kind) {
+            AllocationKind::Heap => { }
+            _ => { return; }
+        }
+        if (this.allocations[allocation].element_cells > 0 || !this.allocations[allocation].live) { return; }
+        const count: i64 = this.allocations[allocation].bytes / element_bytes;
+        const start: i64 = this.cells.length();
+        for (mut i: i64 = 0; i < count * element_cells; i++) {
+            this.cells.push(Cell { state: CellState::Uninitialised, value: Scalar::Boolean(false) });
+        }
+        this.allocations[allocation].start = start;
+        this.allocations[allocation].length = count * element_cells;
+        this.allocations[allocation].element_cells = element_cells;
+        this.allocations[allocation].element_bytes = element_bytes;
+    }
+
+    /// Make `allocation` read-only, as a string literal's bytes are.
+    seal(mut &this, allocation: i64) -> void {
+        this.allocations[allocation].kind = AllocationKind::Literal;
+    }
+
+    /// End `allocation`: every later access through an address into it is
+    /// refused.  The cells of the newest allocations are given back when
+    /// they are the table's last, so a run's stack does not grow without
+    /// bound.
+    end(mut &this, allocation: i64) -> void {
+        this.allocations[allocation].live = false;
+        mut last: i64 = this.allocations.length() - 1;
+        while (last >= 0 && !this.allocations[last].live
+                && this.allocations[last].start + this.allocations[last].length == this.cells.length()) {
+            const keep: i64 = this.allocations[last].start;
+            while (this.cells.length() > keep) { this.cells.pop(); }
+            last = last - 1;
+        }
+    }
+
+    /// Why `address` cannot be accessed for `cells` cells, if it cannot.
+    check(&this, address: Address, cells: i64) -> AccessFault {
+        if (address.is_null()) { return AccessFault::NullAddress; }
+        const a: &Allocation = &this.allocations[address.allocation];
+        if (!a.live) { return AccessFault::Ended; }
+        if (address.offset < 0 || address.offset + cells > a.length) { return AccessFault::OutOfBounds; }
+        return AccessFault::None;
+    }
+
+    /// The scalar the cell at `address` holds, or why it cannot be read.
+    read(&this, address: Address) -> Result<Scalar, AccessFault> {
+        const fault: AccessFault = this.check(address, 1);
+        if (!fault.is_none()) { return Result::Err(fault); }
+        const cell: &Cell = &this.cells[this.allocations[address.allocation].start + address.offset];
+        return match (cell.state) {
+            CellState::Uninitialised => { Result::Err(AccessFault::Uninitialised) }
+            CellState::Moved         => { Result::Err(AccessFault::Moved) }
+            CellState::Holding       => { Result::Ok(cell.value) }
+        };
+    }
+
+    /// Store `value` in the cell at `address`.
+    write(mut &this, address: Address, value: Scalar) -> AccessFault {
+        const fault: AccessFault = this.check(address, 1);
+        if (!fault.is_none()) { return fault; }
+        const allocation: &Allocation = &this.allocations[address.allocation];
+        match (allocation.kind) {
+            AllocationKind::Literal => { return AccessFault::ReadOnly; }
+            _ => { }
+        }
+        const index: i64 = allocation.start + address.offset;
+        this.cells[index] = Cell { state: CellState::Holding, value: value };
+        return AccessFault::None;
+    }
+
+    /// The state of the cell at `address`, which must be accessible.
+    state(&this, address: Address) -> CellState {
+        return this.cells[this.allocations[address.allocation].start + address.offset].state;
+    }
+
+    /// Mark `cells` cells from `address` as moved out.
+    mark_moved(mut &this, address: Address, cells: i64) -> void {
+        const start: i64 = this.allocations[address.allocation].start + address.offset;
+        for (mut i: i64 = 0; i < cells; i++) {
+            if (this.cells[start + i].state == CellState::Holding) {
+                this.cells[start + i].state = CellState::Moved;
+            }
+        }
+    }
+
+    /// Copy `cells` cells from `source` to `target`, states and all: an
+    /// uninitialised or moved cell is copied as what it is, so a partly
+    /// initialised aggregate moves as it stands and a read of the hole
+    /// is still refused where it happens.
+    copy(mut &this, target: Address, source: Address, cells: i64) -> AccessFault {
+        const from_fault: AccessFault = this.check(source, cells);
+        if (!from_fault.is_none()) { return from_fault; }
+        const to_fault: AccessFault = this.check(target, cells);
+        if (!to_fault.is_none()) { return to_fault; }
+        match (this.allocations[target.allocation].kind) {
+            AllocationKind::Literal => { return AccessFault::ReadOnly; }
+            _ => { }
+        }
+        const from: i64 = this.allocations[source.allocation].start + source.offset;
+        const to: i64 = this.allocations[target.allocation].start + target.offset;
+        // Overlapping runs copy in the direction that reads each cell
+        // before it is overwritten.
+        if (to > from) {
+            for (mut i: i64 = cells - 1; i >= 0; i--) { this.cells[to + i] = this.cells[from + i]; }
+        } else {
+            for (mut i: i64 = 0; i < cells; i++) { this.cells[to + i] = this.cells[from + i]; }
+        }
+        return AccessFault::None;
+    }
+
+    /// Every heap block still live: what a run leaked.
+    leaked(&this) -> i64 {
+        mut count: i64 = 0;
+        for (mut i: i64 = 0; i < this.allocations.length(); i++) {
+            match (this.allocations[i].kind) {
+                AllocationKind::Heap => { if (this.allocations[i].live) { count = count + 1; } }
+                _ => { }
+            }
+        }
+        return count;
+    }
+}

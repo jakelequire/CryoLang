@@ -1,0 +1,344 @@
+/// How the interpreter lays a type out in cells, and how many bytes the
+/// language says it takes.
+///
+/// A value takes one cell per scalar it holds: a struct its fields' cells
+/// in declaration order, a fixed array its element's cells times its
+/// length, a tuple its elements', an enum one cell for its variant then the
+/// largest payload's cells.  Bytes are what `sizeof` answers and what the
+/// allocator is asked for; the interpreter computes them by the layout
+/// rules of docs/cryo.md section 16.3 (each member at the next multiple of
+/// its alignment, the whole padded to the largest alignment), since type
+/// lowering, which records them for code generation, has not run.
+
+namespace compiler::interpret::layout;
+
+import compiler::interpret::integer::{ IntegerKind };
+import compiler::types::{ TypeKind };
+import compiler::types::arena::{ TypeArena };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import compiler::types::user_defined::{ EnumType, StructType };
+import compiler::types::compound::{ ArrayType, TupleType };
+
+type struct Layout {
+    arena: TypeArena*;
+
+    static new(arena: TypeArena*) -> Layout {
+        return Layout { arena: arena };
+    }
+
+    /// `t` with every instantiation and alias followed to the type it
+    /// stands for.
+    concrete(&this, t: TypeRef) -> TypeRef {
+        mut current: TypeRef = t;
+        for (mut guard: i32 = 0; guard < 64; guard++) {
+            if (!current.is_valid()) { return current; }
+            const ty: Type* = this.arena.lookup(current);
+            if (ty == null) { return current; }
+            match (ty.kind) {
+                TypeKind::InstantiatedType => {
+                    const next: TypeRef = ty.as_instantiated().resolved_type;
+                    if (!next.is_valid() || next.equals(current)) { return current; }
+                    current = next;
+                }
+                TypeKind::TypeAlias => {
+                    const next: TypeRef = ty.as_alias().target;
+                    if (!next.is_valid() || next.equals(current)) { return current; }
+                    current = next;
+                }
+                _ => { return current; }
+            }
+        }
+        return current;
+    }
+
+    /// The arena's type for `t`, followed to what it stands for; null for
+    /// an invalid reference.
+    type_of(&this, t: TypeRef) -> Type* {
+        const c: TypeRef = this.concrete(t);
+        if (!c.is_valid()) { return null; }
+        return this.arena.lookup(c);
+    }
+
+    kind_of(&this, t: TypeRef) -> TypeKind {
+        const ty: Type* = this.type_of(t);
+        if (ty == null) { return TypeKind::Error; }
+        return ty.kind;
+    }
+
+    /// The integer kind of `t`, when `t` is an integer of at most 64 bits.
+    /// `char` computes as the 32-bit unsigned scalar it is.
+    integer_kind(&this, t: TypeRef) -> Option<IntegerKind> {
+        const ty: Type* = this.type_of(t);
+        if (ty == null) { return Option::None; }
+        match (ty.kind) {
+            TypeKind::Int => {
+                const k: compiler::types::IntegerKind = ty.int_kind();
+                const width: u64 = k.bit_width();
+                if (width > 64) { return Option::None; }
+                return Option::Some(IntegerKind::new(width as u32, k.is_signed()));
+            }
+            TypeKind::Char => { return Option::Some(IntegerKind::new(32, false)); }
+            _ => { return Option::None; }
+        }
+    }
+
+    /// The type a reference or pointer type `t` reaches; invalid for any
+    /// other type.
+    pointee(&this, t: TypeRef) -> TypeRef {
+        const ty: Type* = this.type_of(t);
+        if (ty == null) { return TypeRef::invalid(); }
+        return match (ty.kind) {
+            TypeKind::Reference => { ty.as_reference().referent }
+            TypeKind::Pointer   => { ty.as_pointer().pointee }
+            _                   => { TypeRef::invalid() }
+        };
+    }
+
+    /// Whether a value of `t` is an address: a pointer, a reference, a
+    /// `string` or a function.
+    is_address(&this, t: TypeRef) -> boolean {
+        return match (this.kind_of(t)) {
+            TypeKind::Pointer   => { true }
+            TypeKind::Reference => { true }
+            TypeKind::String    => { true }
+            TypeKind::Function  => { true }
+            _                   => { false }
+        };
+    }
+
+    /// Whether a value of `t` takes cells of its own rather than one scalar.
+    is_aggregate(&this, t: TypeRef) -> boolean {
+        return match (this.kind_of(t)) {
+            TypeKind::Struct => { true }
+            TypeKind::Enum   => { true }
+            TypeKind::Tuple  => { true }
+            TypeKind::Array  => { true }
+            TypeKind::Optional => { true }
+            _                => { false }
+        };
+    }
+
+    /// How many cells a value of `t` takes.
+    cells(&this, t: TypeRef) -> i64 {
+        const ty: Type* = this.type_of(t);
+        if (ty == null) { return 0; }
+        return match (ty.kind) {
+            TypeKind::Void   => { 0 }
+            TypeKind::Unit   => { 0 }
+            TypeKind::Never  => { 0 }
+            TypeKind::Struct => { this.struct_cells(ty.as_struct()) }
+            TypeKind::Enum   => { this.enum_cells(ty.as_enum()) }
+            TypeKind::Tuple  => { this.tuple_cells(ty.as_tuple()) }
+            TypeKind::Array  => {
+                const a: ArrayType* = ty.as_array();
+                a.size * this.cells(a.element)
+            }
+            TypeKind::Optional => { 1 + this.cells(ty.as_optional().wrapped) }
+            _ => { 1 }
+        };
+    }
+
+    struct_cells(&this, s: StructType*) -> i64 {
+        mut total: i64 = 0;
+        for (mut i: i64 = 0; i < s.fields.length(); i++) {
+            const n: i64 = this.cells(s.fields[i].field_type);
+            if (s.is_union) {
+                if (n > total) { total = n; }
+            } else {
+                total = total + n;
+            }
+        }
+        return total;
+    }
+
+    enum_cells(&this, e: EnumType*) -> i64 {
+        mut largest: i64 = 0;
+        for (mut v: i64 = 0; v < e.variants.length(); v++) {
+            mut n: i64 = 0;
+            for (mut i: i64 = 0; i < e.variants[v].payload_types.length(); i++) {
+                n = n + this.cells(e.variants[v].payload_types[i]);
+            }
+            if (n > largest) { largest = n; }
+        }
+        return 1 + largest;
+    }
+
+    tuple_cells(&this, t: TupleType*) -> i64 {
+        mut total: i64 = 0;
+        for (mut i: i64 = 0; i < t.elements.length(); i++) { total = total + this.cells(t.elements[i]); }
+        return total;
+    }
+
+    /// The cell offset of field `index` within a value of the struct type
+    /// `t`; 0 for every field of a union.
+    field_offset(&this, t: TypeRef, index: i64) -> i64 {
+        const ty: Type* = this.type_of(t);
+        if (ty == null) { return 0; }
+        match (ty.kind) {
+            TypeKind::Struct => {
+                const s: StructType* = ty.as_struct();
+                if (s.is_union) { return 0; }
+                mut offset: i64 = 0;
+                for (mut i: i64 = 0; i < index; i++) { offset = offset + this.cells(s.fields[i].field_type); }
+                return offset;
+            }
+            TypeKind::Tuple => {
+                const tuple: TupleType* = ty.as_tuple();
+                mut offset: i64 = 0;
+                for (mut i: i64 = 0; i < index; i++) { offset = offset + this.cells(tuple.elements[i]); }
+                return offset;
+            }
+            _ => { return 0; }
+        }
+    }
+
+    /// The type of field `index` of the struct or tuple type `t`.
+    field_type(&this, t: TypeRef, index: i64) -> TypeRef {
+        const ty: Type* = this.type_of(t);
+        if (ty == null) { return TypeRef::invalid(); }
+        return match (ty.kind) {
+            TypeKind::Struct => { ty.as_struct().fields[index].field_type }
+            TypeKind::Tuple  => { ty.as_tuple().elements[index] }
+            _                => { TypeRef::invalid() }
+        };
+    }
+
+    /// How many fields the struct or tuple type `t` has.
+    field_count(&this, t: TypeRef) -> i64 {
+        const ty: Type* = this.type_of(t);
+        if (ty == null) { return 0; }
+        return match (ty.kind) {
+            TypeKind::Struct => { ty.as_struct().fields.length() }
+            TypeKind::Tuple  => { ty.as_tuple().elements.length() }
+            _                => { 0 }
+        };
+    }
+
+    /// The cell offset of payload element `element` of variant `variant`
+    /// within a value of the enum type `t`: after the variant's cell and the
+    /// elements before it.
+    payload_offset(&this, t: TypeRef, variant: i64, element: i64) -> i64 {
+        const e: EnumType* = this.type_of(t).as_enum();
+        mut offset: i64 = 1;
+        for (mut i: i64 = 0; i < element; i++) { offset = offset + this.cells(e.variants[variant].payload_types[i]); }
+        return offset;
+    }
+
+    /// The type of payload element `element` of variant `variant` of `t`.
+    payload_type(&this, t: TypeRef, variant: i64, element: i64) -> TypeRef {
+        return this.type_of(t).as_enum().variants[variant].payload_types[element];
+    }
+
+    /// How many payload elements variant `variant` of the enum `t` has.
+    payload_count(&this, t: TypeRef, variant: i64) -> i64 {
+        return this.type_of(t).as_enum().variants[variant].payload_types.length();
+    }
+
+    /// How many bytes a value of `t` takes.
+    bytes(&this, t: TypeRef) -> i64 {
+        const ty: Type* = this.type_of(t);
+        if (ty == null) { return 0; }
+        return match (ty.kind) {
+            TypeKind::Void  => { 0 }
+            TypeKind::Unit  => { 0 }
+            TypeKind::Never => { 0 }
+            TypeKind::Bool  => { 1 }
+            TypeKind::Char  => { 4 }
+            TypeKind::Int   => { (ty.int_kind().bit_width() / 8) as i64 }
+            TypeKind::Float => { (ty.float_kind().bit_width() / 8) as i64 }
+            TypeKind::Array => {
+                const a: ArrayType* = ty.as_array();
+                a.size * this.bytes(a.element)
+            }
+            TypeKind::Struct => { this.struct_bytes(ty.as_struct()) }
+            TypeKind::Tuple => { this.members_bytes(&ty.as_tuple().elements) }
+            TypeKind::Enum => { this.enum_bytes(ty.as_enum()) }
+            TypeKind::Reference => {
+                const size: i64 = if (ty.as_reference().wide) { 16 } else { 8 };
+                size
+            }
+            TypeKind::Object => { 16 }
+            _ => { 8 }
+        };
+    }
+
+    /// The alignment of a value of `t`, in bytes.
+    alignment(&this, t: TypeRef) -> i64 {
+        const ty: Type* = this.type_of(t);
+        if (ty == null) { return 1; }
+        return match (ty.kind) {
+            TypeKind::Array => { this.alignment(ty.as_array().element) }
+            TypeKind::Struct => {
+                const s: StructType* = ty.as_struct();
+                mut largest: i64 = 1;
+                for (mut i: i64 = 0; i < s.fields.length(); i++) {
+                    const a: i64 = this.alignment(s.fields[i].field_type);
+                    if (a > largest) { largest = a; }
+                }
+                largest
+            }
+            TypeKind::Tuple => {
+                const tuple: TupleType* = ty.as_tuple();
+                mut largest: i64 = 1;
+                for (mut i: i64 = 0; i < tuple.elements.length(); i++) {
+                    const a: i64 = this.alignment(tuple.elements[i]);
+                    if (a > largest) { largest = a; }
+                }
+                largest
+            }
+            TypeKind::Enum => { 8 }
+            TypeKind::Reference => { 8 }
+            TypeKind::Object => { 8 }
+            _ => {
+                const b: i64 = this.bytes(t);
+                const size: i64 = if (b <= 0) { 1 } else { b };
+                size
+            }
+        };
+    }
+
+    struct_bytes(&this, s: StructType*) -> i64 {
+        if (s.is_union) {
+            mut largest: i64 = 0;
+            mut align: i64 = 1;
+            for (mut i: i64 = 0; i < s.fields.length(); i++) {
+                const b: i64 = this.bytes(s.fields[i].field_type);
+                const a: i64 = this.alignment(s.fields[i].field_type);
+                if (b > largest) { largest = b; }
+                if (a > align) { align = a; }
+            }
+            return Layout::round_up(largest, align);
+        }
+        mut types: [TypeRef] = [];
+        for (mut i: i64 = 0; i < s.fields.length(); i++) { types.push(s.fields[i].field_type); }
+        return this.members_bytes(&types);
+    }
+
+    /// The bytes of members laid out in order, each at the next multiple
+    /// of its alignment, the whole padded to the largest alignment.
+    members_bytes(&this, members: &[TypeRef]) -> i64 {
+        mut offset: i64 = 0;
+        mut align: i64 = 1;
+        for (mut i: i64 = 0; i < members.length(); i++) {
+            const a: i64 = this.alignment(members[i]);
+            offset = Layout::round_up(offset, a) + this.bytes(members[i]);
+            if (a > align) { align = a; }
+        }
+        return Layout::round_up(offset, align);
+    }
+
+    enum_bytes(&this, e: EnumType*) -> i64 {
+        mut largest: i64 = 0;
+        for (mut v: i64 = 0; v < e.variants.length(); v++) {
+            const b: i64 = this.members_bytes(&e.variants[v].payload_types);
+            if (b > largest) { largest = b; }
+        }
+        return Layout::round_up(8 + largest, 8);
+    }
+
+    static round_up(value: i64, align: i64) -> i64 {
+        if (align <= 1) { return value; }
+        return ((value + align - 1) / align) * align;
+    }
+}

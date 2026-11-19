@@ -9,6 +9,8 @@ import compiler::{ compilation_context, instance, project_config };
 import compiler::codegen::{ llvm_types };
 import compiler::deps::dep_resolver;
 import compiler::resolver::demangler;
+import compiler::interpret::interpreter::{ Interpreter };
+import compiler::interpret::outcome::{ Stop };
 import cli::api_index;
 import compiler::vendor::registry;
 import compiler::bindgen::generator;
@@ -111,7 +113,8 @@ type struct NegDiag {
 /// `output_contains`.
 type struct ProjSpec {
     /// FIXTURE: 0 = collect (run the project's own `cryo test`), 1 = build
-    /// (`cryo build`), 2 = run (`cryo run`).  The fixture (what is set up) and
+    /// (`cryo build`), 2 = run (`cryo run`), 3 = interpret (`cryo
+    /// interpret`, given the file `arguments` names).  The fixture (what is set up) and
     /// the ASSERTION (what is checked, via the `expect` fields below) are
     /// orthogonal: `compile_fail` is simply `build` + `expect.fails`.
     outcome:    i32;
@@ -354,6 +357,7 @@ type enum CommandKind {
     Run;
     Test;
     Check;
+    Interpret;
     Demangle;
     ApiIndex;
     Fetch;
@@ -373,6 +377,7 @@ implement enum CommandKind {
             CommandKind::Run     => { "run"     }
             CommandKind::Test    => { "test"    }
             CommandKind::Check   => { "check"   }
+            CommandKind::Interpret => { "interpret" }
             CommandKind::Demangle => { "demangle" }
             CommandKind::ApiIndex => { "api-index" }
             CommandKind::Fetch    => { "fetch"    }
@@ -392,6 +397,7 @@ implement enum CommandKind {
             CommandKind::Run      => { "Build the project and run the resulting binary" }
             CommandKind::Test     => { "Build and run the project's tests"             }
             CommandKind::Check    => { "Check a file for errors (no codegen)"         }
+            CommandKind::Interpret => { "Run a file by interpreting it (no codegen)"  }
             CommandKind::Demangle => { "Decode a mangled symbol to its source form"   }
             CommandKind::ApiIndex => { "Write or check the standard library's one-line-per-declaration index" }
             CommandKind::Fetch    => { "Fetch dependencies and write cryoconfig.lock" }
@@ -411,6 +417,7 @@ implement enum CommandKind {
             CommandKind::Run      => { "cryo run [flags]"                 }
             CommandKind::Test     => { "cryo test [pattern] [flags]"       }
             CommandKind::Check    => { "cryo check <file> [flags]"       }
+            CommandKind::Interpret => { "cryo interpret <file> [flags]"  }
             CommandKind::Demangle => { "cryo demangle <mangled-symbol>"  }
             CommandKind::ApiIndex => { "cryo api-index write|check <stdlib root> <index file>" }
             CommandKind::Fetch    => { "cryo fetch"                        }
@@ -536,6 +543,22 @@ implement enum CommandKind {
                 fmt::printf("  --ast            Dump the AST after parsing\n");
                 fmt::printf("  --stdlib=PATH    Standard library root for this run\n");
                 fmt::printf("  --target=TRIPLE  Cross-compile for the given LLVM target triple\n");
+            }
+            CommandKind::Interpret => {
+                fmt::printf("Analyses <file> as `check` does, then runs its `main` by walking\n");
+                fmt::printf("the typed program instead of generating code.  The program's\n");
+                fmt::printf("output is written as a build of it would write it, and the exit\n");
+                fmt::printf("code is what `main` returns.  The interpreter keeps its own\n");
+                fmt::printf("account of every value's place, and reports a read of an\n");
+                fmt::printf("uninitialised or moved value, an access out of bounds or to\n");
+                fmt::printf("freed memory, a division by zero, an over-wide shift, or a leak\n");
+                fmt::printf("at exit, as a violation (exit 70).  A construct it does not run\n");
+                fmt::printf("yet is reported as not covered (exit 71), a program panic exits\n");
+                fmt::printf("101, and a run past the step limit exits 72.\n\n");
+                fmt::printf("Flags:\n");
+                fmt::printf("  --stdlib=PATH      Standard library root for this run\n");
+                fmt::printf("  --target=TRIPLE    Interpret as for the given LLVM target triple\n");
+                fmt::printf("  --step-limit=N     Stop after N steps (default 200000000)\n");
             }
             CommandKind::Demangle => {
                 fmt::printf("Decodes a mangled symbol back to its source-level form.\n");
@@ -719,7 +742,7 @@ implement enum FlagKind {
                 fmt::printf("source.  This is the highest-priority entry in the stdlib lookup\n");
                 fmt::printf("order, ahead of $CRYO_STDLIB, $CRYO_HOME/stdlib, the\n");
                 fmt::printf("binary-relative path and any cryoconfig setting.\n\n");
-                fmt::printf("Accepted by: build, run, test, check\n");
+                fmt::printf("Accepted by: build, run, test, check, interpret\n");
             }
             FlagKind::BuildDir => {
                 fmt::printf("--build-dir=PATH - Override cryoconfig's output_dir\n\n");
@@ -732,7 +755,7 @@ implement enum FlagKind {
                 fmt::printf("Cross-compiles for the given LLVM target triple (for example\n");
                 fmt::printf("x86_64-pc-windows-gnu), overriding cryoconfig's `target` setting.\n");
                 fmt::printf("Produces object files only - link them manually.\n\n");
-                fmt::printf("Accepted by: build, run, test, check\n");
+                fmt::printf("Accepted by: build, run, test, check, interpret\n");
             }
             FlagKind::Output => {
                 fmt::printf("-o, --output PATH - Redirect single-file build output\n\n");
@@ -795,6 +818,9 @@ type struct Executor {
 
         const check: CommandKind = CommandKind::Check;
         runner.add_command(cli::Command::new(check.name(), check.description(), check.usage()));
+
+        const interpret: CommandKind = CommandKind::Interpret;
+        runner.add_command(cli::Command::new(interpret.name(), interpret.description(), interpret.usage()));
 
         const demangle: CommandKind = CommandKind::Demangle;
         runner.add_command(cli::Command::new(demangle.name(), demangle.description(), demangle.usage()));
@@ -961,6 +987,7 @@ type struct Executor {
             "run"      => { CommandKind::Run }
             "test"     => { CommandKind::Test }
             "check"    => { CommandKind::Check }
+            "interpret" => { CommandKind::Interpret }
             "demangle" => { CommandKind::Demangle }
             "api-index" => { CommandKind::ApiIndex }
             "fetch"    => { CommandKind::Fetch }
@@ -1005,6 +1032,7 @@ type struct Executor {
             CommandKind::Run     => { return Executor::cmd_run(args); }
             CommandKind::Test    => { return Executor::cmd_test(args); }
             CommandKind::Check   => { return Executor::cmd_check(args); }
+            CommandKind::Interpret => { return Executor::cmd_interpret(args); }
             CommandKind::Demangle => { return Executor::cmd_demangle(args); }
             CommandKind::ApiIndex => {
                 if (args.positional_count() != 3) {
@@ -2407,6 +2435,7 @@ type struct Executor {
         const build_str: str::Str = str::Str::new("build");
         const cf_str:    str::Str = str::Str::new("compile_fail");
         const run_str:   str::Str = str::Str::new("run");
+        const interpret_str: str::Str = str::Str::new("interpret");
         match (root.get(str::Str::new("outcome"))) {
             Option::Some(vp) => {
                 match (vp.as::<str::Str>()) {
@@ -2414,6 +2443,7 @@ type struct Executor {
                         if (os.equals(&build_str))    { spec.outcome = 1; }
                         else if (os.equals(&cf_str))  { spec.outcome = 1; spec.fails = true; }
                         else if (os.equals(&run_str)) { spec.outcome = 2; }
+                        else if (os.equals(&interpret_str)) { spec.outcome = 3; }
                     }
                     Option::None => { }
                 }
@@ -2964,6 +2994,14 @@ type struct Executor {
         }
     }
 
+    /// The `cryo` command a project's fixture runs.
+    static fixture_verb(outcome: i32) -> string {
+        if (outcome == 1) { return "build"; }
+        if (outcome == 2) { return "run"; }
+        if (outcome == 3) { return "interpret"; }
+        return "test --format=plain";
+    }
+
     /// The shell command that drives one project to its declared outcome: this
     /// compiler run in the project directory, its combined output captured in
     /// `tmp`.  The directory is set inside the command's own shell, never by
@@ -2972,11 +3010,11 @@ type struct Executor {
     /// `stdlib_abs`, `tmp`) are absolute so the changed cwd doesn't break them.
     static project_command(self_exe: Str, stdlib_abs: Str, proj_dir: path::Path,
                            spec: &ProjSpec, tmp: Str, build_flags: str::Str) -> String {
-        // FIXTURE build (`cryo build`), run (`cryo run`) or collect (the
-        // project's own `cryo test`).  Stdout and stderr are captured apart so
-        // the ASSERTIONS in `project_outcome` can tell the streams apart.
-        const verb: string = if (spec.outcome == 1) { "build" }
-            else { if (spec.outcome == 2) { "run" } else { "test --format=plain" } };
+        // FIXTURE build (`cryo build`), run (`cryo run`), interpret (`cryo
+        // interpret`) or collect (the project's own `cryo test`).  Stdout and
+        // stderr are captured apart so the ASSERTIONS in `project_outcome` can
+        // tell the streams apart.
+        const verb: string = Executor::fixture_verb(spec.outcome);
         mut command: String = String::new();
         for (mut i: i64 = 0; i < spec.environment.length(); i++) {
             command.push(shell_set_environment(spec.environment[i].as_str()));
@@ -3081,9 +3119,7 @@ type struct Executor {
         // runner exit codes that converts failures into passes flips the
         // canary's exit to 0 and fails the canary project (and the suite)
         // instead of shipping silently.
-        const verb: string = if (spec.outcome == 1) { "build" } else {
-            if (spec.outcome == 2) { "run" } else { "project tests" }
-        };
+        const verb: string = if (spec.outcome == 0) { "project tests" } else { Executor::fixture_verb(spec.outcome) };
         const ec: i64 = st as i64;
         if (spec.fails) {
             passed = ec != 0;
@@ -3243,6 +3279,50 @@ type struct Executor {
         fmt::eprintf("Check failed (%u errors, %u warnings)\n",
             result.error_count, result.warning_count);
         return 1;
+    }
+
+    /// `cryo interpret <file>`: the `check` front end, then the program's
+    /// `main` run by the interpreter.  The program's output is written as
+    /// it would write it; the exit code is `main`'s, the front end's
+    /// refusal's (1), or the interpreter's for a stop (one line on stderr).
+    static cmd_interpret(args: cli::ParsedArgs) -> int {
+        const file: string = args.input_file();
+        if (file == "") {
+            fmt::eprintf("Error: No input file specified.\nUsage: cryo interpret <file> [flags]\n");
+            return 1;
+        }
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
+        if (args.has_arg("stdlib")) {
+            config.stdlib_path_override = args.get_value("stdlib");
+        }
+        if (args.has_arg("target")) {
+            config.target_triple_override = args.get_value("target");
+        }
+        mut step_limit: u64 = Interpreter::DEFAULT_STEP_LIMIT;
+        if (args.has_arg("step-limit")) {
+            match (u64::try_from(str::Str::new(args.get_value("step-limit")))) {
+                Result::Ok(limit) => { step_limit = limit; }
+                Result::Err(_) => {
+                    fmt::eprintf("Error: --step-limit takes a count of steps\n");
+                    return 1;
+                }
+            }
+        }
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        const build: instance::ProjectBuild = compiler.compile_for_interpret(file);
+        if (!build.result.success || build.ctx == null) {
+            return 1;
+        }
+        mut interpreter: Interpreter = Interpreter::new(build.ctx, step_limit);
+        const ending: Result<i32, Stop> = interpreter.run();
+        fmt::print(interpreter.output.clone());
+        return match (ending) {
+            Result::Ok(code) => { code as int }
+            Result::Err(stop) => {
+                stop.report();
+                stop.exit_code() as int
+            }
+        };
     }
 
     /// `cryo demangle <symbol>`: decode a mangled symbol to its

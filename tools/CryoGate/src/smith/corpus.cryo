@@ -11,6 +11,7 @@ namespace cryogate::smith::corpus;
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::fs::path::{ Path, PathBuf };
 
@@ -86,6 +87,55 @@ public type struct CorpusJudge {
         return text;
     }
 
+    /// What `cryo interpret` made of a program the compiled builds agreed
+    /// printed `compiled`: it `exit`ed with that code (none when it did not
+    /// exit), writing `output` and `errors`.  It agrees only by printing the
+    /// same line and exiting 0; a program it does not cover is named as
+    /// such, never counted as agreeing; anything else fails.
+    public static interpreted(exit: Option<i32>, errors: Str, output: Str, compiled: Str) -> Interpretation {
+        match (exit) {
+            Option::Some(code) => {
+                if (code == 0) {
+                    const line: String = match (CorpusJudge::hash_line(Str::new("the interpreter"), output)) {
+                        Result::Ok(line)    => { line }
+                        Result::Err(reason) => { return Interpretation::Fails(reason); }
+                    };
+                    if (line.as_str() == compiled) { return Interpretation::Agrees; }
+                    return Interpretation::Fails(f"the builds printed `{compiled}`, the interpreter printed `{line.as_str()}`");
+                }
+                if (code == CorpusJudge::NOT_COVERED) {
+                    for (line in Text::lines(errors).iterate_references()) {
+                        match (line.as_str().strip_prefix(&Str::new("interpret: not covered: "))) {
+                            Option::Some(construct) => { return Interpretation::NotCovered(String::from_str(construct)); }
+                            Option::None => { }
+                        }
+                    }
+                    return Interpretation::Fails(f"the interpreter exited {code} without naming what it does not cover:{CorpusJudge::first_lines(errors, output).as_str()}");
+                }
+                return Interpretation::Fails(f"the interpreter exited {code}:{CorpusJudge::first_lines(errors, output).as_str()}");
+            }
+            Option::None => {
+                return Interpretation::Fails(f"the interpreter did not exit:{CorpusJudge::first_lines(errors, output).as_str()}");
+            }
+        }
+    }
+
     /// How many lines of a failed build's streams a report quotes.
     const QUOTED_LINES: i64 = 6;
+
+    /// The exit code of a `cryo interpret` run that met a construct it does
+    /// not run yet.
+    const NOT_COVERED: i32 = 71;
+}
+
+/// What the interpreter made of one program, against its compiled builds.
+public type enum Interpretation {
+    /// It printed the builds' hash line and exited 0.
+    Agrees;
+    /// It does not run a construct the program uses; the construct and
+    /// where it is written.
+    NotCovered(String);
+    /// It printed another line, stopped on a violation, a panic or its
+    /// step limit, or failed otherwise; why.
+    Fails(String);
 }

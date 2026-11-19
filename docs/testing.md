@@ -372,7 +372,7 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 
 | `test.json` field | Meaning |
 | --- | --- |
-| `"outcome"` | `"collect"` (default) / `"build"` / `"compile_fail"` / `"run"` |
+| `"outcome"` | `"collect"` (default) / `"build"` / `"compile_fail"` / `"run"` / `"interpret"` |
 | `"ignore"` | `true` skips the project (reported as ignored) |
 | `"expect"` | per-outcome assertions (below) |
 
@@ -428,6 +428,17 @@ row, printed whatever the count.
 
   ```json
   { "outcome": "run", "expect": { "exit_code": 0, "stdout_contains": "ready" } }
+  ```
+
+- **`interpret`** - run the file `arguments` names with `cryo interpret`
+  (tools/CryoSmith/INTERPRETER.md); the assertions judge the interpreter's
+  exit and its streams, as `run`'s judge the program's.  The interpreter's
+  own tests are these: what a program prints when interpreted, and the
+  line and exit code of each ending it reports (a violation, a construct
+  not covered, a panic).
+
+  ```json
+  { "outcome": "interpret", "arguments": ["main.cryo"], "expect": { "exit_code": 70 } }
   ```
 
 A project whose report carries a machine-applicable suggestion proves the

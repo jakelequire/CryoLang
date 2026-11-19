@@ -1,0 +1,241 @@
+/// Statements: blocks and their scopes, declarations, the loops, `if`,
+/// `match` and the jumps, each by the language reference's rule.
+
+namespace compiler::interpret::statements;
+
+import compiler::ast::declaration::{ DeclarationNode, VarDecl };
+import compiler::ast::expression::{ ExpressionNode };
+import compiler::ast::node::{ Node };
+import compiler::ast::pattern::{ MatchArmNode };
+import compiler::ast::statement::{
+    BlockStmt, DeclStmt, DoWhileStmt, ExprStmt, ForStmt, IfStmt, LoopStmt, MatchStmt,
+    ReturnStmt, StaticMatchStmt, Stmt, StmtKind, UnsafeBlockStmt, WhileStmt
+};
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::interpret::interpreter::{ Flow, Frame, Interpreter, Operand };
+import compiler::interpret::memory::{ Address };
+import compiler::interpret::outcome::{ Stop };
+import compiler::interpret::patterns::{ Subject };
+
+implement struct Interpreter {
+    /// Run `statement`, and say how it ended.
+    execute(mut &this, statement: Stmt*) -> Result<Flow, Stop> {
+        if (statement == null) { return Result::Ok(Flow::Normal); }
+        this.step(statement.span)?;
+        return match (statement.kind) {
+            StmtKind::Block(block)        => { this.execute_block(block, statement.span) }
+            StmtKind::UnsafeBlock(inner)  => { this.execute(inner.block) }
+            StmtKind::Decl(declaration)   => { this.execute_declaration(declaration, statement.span) }
+            StmtKind::Expr(expression)    => { this.execute_expression(expression.expression) }
+            StmtKind::Return(r)           => { this.execute_return(r, statement.span) }
+            StmtKind::If(i)               => { this.execute_if(i) }
+            StmtKind::While(w)            => { this.execute_while(w) }
+            StmtKind::DoWhile(d)          => { this.execute_do_while(d) }
+            StmtKind::For(f)              => { this.execute_for(f, statement.span) }
+            StmtKind::Loop(l)             => { this.execute_loop(l) }
+            StmtKind::Match(m)            => { this.execute_match(m, statement.span) }
+            StmtKind::StaticMatch(s)      => { this.execute_static_match(s, statement.span) }
+            StmtKind::Break               => { Result::Ok(Flow::Break) }
+            StmtKind::Continue            => { Result::Ok(Flow::Continue) }
+            StmtKind::Asm(_)              => { Result::Err(Interpreter::not_covered("inline assembly", statement.span)) }
+        };
+    }
+
+    /// A block: its statements in order in a scope of their own, stopping
+    /// at the first that jumps.
+    execute_block(mut &this, block: BlockStmt*, span: SourceSpan) -> Result<Flow, Stop> {
+        this.push_scope();
+        for (mut i: i64 = 0; i < block.statements.length(); i++) {
+            const flow: Flow = this.execute(block.statements[i])?;
+            match (flow) {
+                Flow::Normal => { }
+                _ => {
+                    this.pop_scope(span)?;
+                    return Result::Ok(flow);
+                }
+            }
+        }
+        this.pop_scope(span)?;
+        return Result::Ok(Flow::Normal);
+    }
+
+    /// A declaration statement: a local, made and initialised; the
+    /// statement's temporaries released after it.
+    execute_declaration(mut &this, statement: DeclStmt*, span: SourceSpan) -> Result<Flow, Stop> {
+        const variable: VarDecl* = DeclarationNode::var_of(statement.declaration);
+        if (variable == null) {
+            return Result::Err(Interpreter::not_covered("a declaration statement that declares no single local", span));
+        }
+        const mark: i64 = this.temporaries.length();
+        const place: Address = this.declare(variable.sym_id, variable.resolved_type);
+        if (variable.initializer != null) {
+            match (this.initialize(place, variable.resolved_type, variable.initializer)) {
+                Result::Ok(_) => { }
+                Result::Err(stop) => { return Interpreter::flow_of(stop); }
+            }
+        }
+        this.release_temporaries(mark, span)?;
+        return Result::Ok(Flow::Normal);
+    }
+
+    /// An expression statement: the value made and discarded; a discarded
+    /// owning value is a temporary, released with the statement's others.
+    execute_expression(mut &this, expression: ExpressionNode*) -> Result<Flow, Stop> {
+        const mark: i64 = this.temporaries.length();
+        match (this.evaluate(expression)) {
+            Result::Ok(_) => { }
+            Result::Err(stop) => { return Interpreter::flow_of(stop); }
+        }
+        this.release_temporaries(mark, expression.span)?;
+        return Result::Ok(Flow::Normal);
+    }
+
+    /// A stop met inside a statement's expression: a `return` there (the
+    /// failure arm of a `?`) ends the statement as a `return` statement
+    /// would; anything else stops the run.  The statement's temporaries
+    /// are released with its frame's.
+    static flow_of(stop: Stop) -> Result<Flow, Stop> {
+        if (stop.is_return()) { return Result::Ok(Flow::Return); }
+        return Result::Err(stop);
+    }
+
+    execute_return(mut &this, statement: ReturnStmt*, span: SourceSpan) -> Result<Flow, Stop> {
+        if (statement.expression != null) {
+            const mark: i64 = this.temporaries.length();
+            const frame: Frame = this.frames[this.frames.length() - 1];
+            if (!frame.return_slot.is_null()) {
+                this.initialize(frame.return_slot, frame.return_type, statement.expression)?;
+            } else {
+                match (this.evaluate(statement.expression)?) {
+                    Operand::Value(value) => {
+                        this.returned = this.converted(value, statement.expression.resolved_type, frame.return_type, statement.expression.span)?;
+                    }
+                    _ => { }
+                }
+            }
+            this.release_temporaries(mark, span)?;
+        }
+        return Result::Ok(Flow::Return);
+    }
+
+    /// A condition: evaluated as a statement of its own, so its temporaries
+    /// are released before the branch.
+    condition(mut &this, expression: ExpressionNode*) -> Result<boolean, Stop> {
+        const mark: i64 = this.temporaries.length();
+        const value: boolean = this.boolean_of(expression)?;
+        this.release_temporaries(mark, expression.span)?;
+        return Result::Ok(value);
+    }
+
+    execute_if(mut &this, statement: IfStmt*) -> Result<Flow, Stop> {
+        if (this.condition(statement.condition)?) { return this.execute(statement.then_stmt); }
+        if (statement.else_stmt != null) { return this.execute(statement.else_stmt); }
+        return Result::Ok(Flow::Normal);
+    }
+
+    execute_while(mut &this, statement: WhileStmt*) -> Result<Flow, Stop> {
+        loop {
+            if (!this.condition(statement.condition)?) { break; }
+            const flow: Flow = this.execute(statement.body)?;
+            match (flow) {
+                Flow::Break  => { return Result::Ok(Flow::Normal); }
+                Flow::Return => { return Result::Ok(Flow::Return); }
+                _ => { }
+            }
+        }
+        return Result::Ok(Flow::Normal);
+    }
+
+    execute_do_while(mut &this, statement: DoWhileStmt*) -> Result<Flow, Stop> {
+        loop {
+            const flow: Flow = this.execute(statement.body)?;
+            match (flow) {
+                Flow::Break  => { return Result::Ok(Flow::Normal); }
+                Flow::Return => { return Result::Ok(Flow::Return); }
+                _ => { }
+            }
+            if (!this.condition(statement.condition)?) { return Result::Ok(Flow::Normal); }
+        }
+    }
+
+    execute_loop(mut &this, statement: LoopStmt*) -> Result<Flow, Stop> {
+        loop {
+            const flow: Flow = this.execute(statement.body)?;
+            match (flow) {
+                Flow::Break  => { return Result::Ok(Flow::Normal); }
+                Flow::Return => { return Result::Ok(Flow::Return); }
+                _ => { }
+            }
+        }
+    }
+
+    /// A C-style `for`: its initializer in a scope of its own around the
+    /// loop, the condition before each pass (none is true), the update
+    /// after each pass a `continue` ends too.
+    execute_for(mut &this, statement: ForStmt*, span: SourceSpan) -> Result<Flow, Stop> {
+        this.push_scope();
+        match (statement.init) {
+            Node::Decl(declaration) => {
+                const variable: VarDecl* = DeclarationNode::var_of(declaration);
+                if (variable == null) {
+                    return Result::Err(Interpreter::not_covered("a `for` initializer that declares no single local", span));
+                }
+                const mark: i64 = this.temporaries.length();
+                const place: Address = this.declare(variable.sym_id, variable.resolved_type);
+                if (variable.initializer != null) { this.initialize(place, variable.resolved_type, variable.initializer)?; }
+                this.release_temporaries(mark, span)?;
+            }
+            Node::Expr(expression) => {
+                if (expression != null) { this.execute_expression(expression)?; }
+            }
+            _ => { }
+        }
+        loop {
+            if (statement.condition != null && !this.condition(statement.condition)?) { break; }
+            const flow: Flow = this.execute(statement.body)?;
+            match (flow) {
+                Flow::Break  => { break; }
+                Flow::Return => {
+                    this.pop_scope(span)?;
+                    return Result::Ok(Flow::Return);
+                }
+                _ => { }
+            }
+            if (statement.update != null) { this.execute(statement.update)?; }
+        }
+        this.pop_scope(span)?;
+        return Result::Ok(Flow::Normal);
+    }
+
+    /// A `match` statement: the subject once, kept with its temporaries
+    /// until the statement ends; the first arm whose pattern matches runs.
+    execute_match(mut &this, statement: MatchStmt*, span: SourceSpan) -> Result<Flow, Stop> {
+        const mark: i64 = this.temporaries.length();
+        const subject: Subject = this.subject(statement.subject)?;
+        for (mut a: i64 = 0; a < statement.arms.length(); a++) {
+            const arm: MatchArmNode* = statement.arms[a];
+            const chosen: i64 = this.matching_pattern(arm, &subject)?;
+            if (chosen < 0) { continue; }
+            this.push_scope();
+            this.bind_pattern(arm.patterns[chosen], subject.place, subject.subject_type, &subject)?;
+            if (arm.guard != null && !this.condition(arm.guard)?) {
+                this.pop_scope(span)?;
+                continue;
+            }
+            const flow: Flow = this.execute(arm.body)?;
+            this.pop_scope(span)?;
+            this.release_temporaries(mark, span)?;
+            return Result::Ok(flow);
+        }
+        return Result::Err(Interpreter::violation("a `match` no arm of which matches its subject", span));
+    }
+
+    /// A `static match` the monomorphiser pruned to the arm its type
+    /// chose.
+    execute_static_match(mut &this, statement: StaticMatchStmt*, span: SourceSpan) -> Result<Flow, Stop> {
+        if (statement.arms.length() != 1) {
+            return Result::Err(Interpreter::violation("a `static match` the monomorphiser left unpruned", span));
+        }
+        return this.execute(statement.arms[0].body);
+    }
+}
