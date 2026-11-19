@@ -7,7 +7,8 @@ namespace compiler::interpret::calls;
 
 import compiler::ast::{ ArgBinding, MemberPin };
 import compiler::ast::declaration::{ DeclarationNode, DeclKind, FunctionDecl, ImplBlock, MethodDecl, VarDecl };
-import compiler::ast::expression::{ CallExpr, ExpressionNode, ExprKind, MemberAccessExpr, ScopeResolutionExpr };
+import compiler::ast::expression::{ CallExpr, ExpressionNode, ExprKind, LambdaExpr, MemberAccessExpr, ScopeResolutionExpr };
+import compiler::ast::statement::{ Stmt };
 import compiler::decl_index::{ OverloadId };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::interpret::integer::{ IntegerKind };
@@ -61,7 +62,7 @@ implement struct Interpreter {
         // A function value the program computed.
         return match (this.scalar_of(callee)?) {
             Scalar::Function(entry) => { this.call_entry(entry, null, &call.arguments, expression.resolved_type, span) }
-            Scalar::Closure(_, _)   => { Result::Err(Interpreter::not_covered("a call of a closure", span)) }
+            Scalar::Lambda(lambda)  => { this.call_lambda(lambda, &call.arguments, expression.resolved_type, span) }
             _ => { Result::Err(Interpreter::violation("a call of a value that is no function", span)) }
         };
     }
@@ -124,7 +125,21 @@ implement struct Interpreter {
             const parameter: VarDecl* = DeclarationNode::var_of(routine.parameters[first + i]);
             staged.push(this.bind_argument(parameter, arguments[i], span)?);
         }
-        return this.call_body(routine, staged, this.result_slot(result), result, span);
+        return this.call_body(routine.body, staged, this.result_slot(result), result, span);
+    }
+
+    /// Call the closure `lambda`, which captures nothing, with `arguments`
+    /// bound to its parameters.
+    call_lambda(mut &this, lambda: LambdaExpr*, arguments: &[mut ExpressionNode*], result: TypeRef,
+                span: SourceSpan) -> Result<Operand, Stop> {
+        if (arguments.length() != lambda.parameters.length()) {
+            return Result::Err(Interpreter::violation("a closure called with another number of arguments than it declares", span));
+        }
+        mut staged: [Binding] = [];
+        for (mut i: i64 = 0; i < arguments.length(); i++) {
+            staged.push(this.bind_argument(DeclarationNode::var_of(lambda.parameters[i]), arguments[i], span)?);
+        }
+        return this.call_body(lambda.body, staged, this.result_slot(result), result, span);
     }
 
     /// Where an aggregate result of type `t` goes: a temporary of the
@@ -199,10 +214,11 @@ implement struct Interpreter {
         return Result::Ok(place);
     }
 
-    /// Run `function`'s body in a new frame whose parameters are `staged`,
-    /// an aggregate result written to `slot`.  The frame's temporaries,
-    /// scopes and bindings are released when it ends, however it ends.
-    call_body(mut &this, routine: FunctionDecl*, staged: [Binding], slot: Address, result: TypeRef,
+    /// Run a function's or a closure's `body` in a new frame whose
+    /// parameters are `staged`, an aggregate result written to `slot`.  The
+    /// frame's temporaries, scopes and bindings are released when it ends,
+    /// however it ends.
+    call_body(mut &this, body: Stmt*, staged: [Binding], slot: Address, result: TypeRef,
               span: SourceSpan) -> Result<Operand, Stop> {
         if (this.frames.length() >= Interpreter::DEEPEST_CALL) {
             return Result::Err(Interpreter::violation("calls nested deeper than the interpreter's limit", span));
@@ -214,7 +230,7 @@ implement struct Interpreter {
         this.frames.push(frame);
         for (mut i: i64 = 0; i < staged.length(); i++) { this.bindings.push(staged[i]); }
         mut returned: boolean = false;
-        match (this.execute(routine.body)) {
+        match (this.execute(body)) {
             Result::Ok(flow) => {
                 match (flow) { Flow::Return => { returned = true; } _ => { } }
             }
@@ -262,7 +278,7 @@ implement struct Interpreter {
             staged.push(this.bind_argument(DeclarationNode::var_of(routine.parameters[i + 1]), arguments[i], span)?);
         }
         const result: TypeRef = expression.resolved_type;
-        return this.call_body(routine, staged, this.result_slot(result), result, span);
+        return this.call_body(routine.body, staged, this.result_slot(result), result, span);
     }
 
     /// The trait object `object` evaluates to, through any references to
@@ -298,7 +314,7 @@ implement struct Interpreter {
             // the scope being left; the destructor's own calls leave it as
             // it was.
             const pending: Scalar = this.returned;
-            this.call_body(destructor, staged, Address::null(), destructor.resolved_return_type, span)?;
+            this.call_body(destructor.body, staged, Address::null(), destructor.resolved_return_type, span)?;
             this.returned = pending;
         }
         const ty: Type* = this.layout.type_of(t);

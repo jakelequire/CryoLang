@@ -104,8 +104,10 @@ A value is one of:
   reference's validity is checked where it is read;
 - **a function** - a declaration-index entry, for a named function used as
   a value;
-- **a closure** - its lambda node and the values it captured (by copy, or
-  an address for a capture by reference);
+- **a closure that captures nothing** - its lambda node, a function value
+  whose body a call runs; a closure that captures is an aggregate, the
+  struct the type checker made for it, holding each capture by copy or, for
+  a capture by reference, its address;
 - **a trait object** - an address and the implementation its table is.
 
 The width of `usize` and `isize` is the target's, read from the target the
@@ -186,7 +188,7 @@ first.
 | struct literal | each field's value in the order written, then defaults for the fields not written, stored in declaration order |
 | `&x`, `mut &x` | the address of `x`'s place |
 | `*p` | the cell `p` addresses, checked as section 4 says |
-| closure | its captures, copied (or borrowed) when the closure is made |
+| closure | one that captures: the value of its struct, each field initialized in capture order from the capture's value where the closure is made (the type checker's `capture_values`: the binding, or `&binding` for a capture by reference); a call is the struct's `__call__` method, by the call's pin. One that captures nothing: a function value naming the lambda; a call binds its parameters and runs its body |
 | trait object call | the method in the object's implementation at the call's slot |
 | `?` | the type checker's desugaring (`Try::branch` and `FromResidual::from_residual`), interpreted |
 
@@ -301,11 +303,11 @@ Generics are interpreted as the monomorphiser instantiated them: each call
 runs the copy its pin names. The interpreter checks the language's rules on
 the instance it runs, which is what the compiled program runs too.
 
-**Status.** I1, I2 and I3 are done: one core runs stages 1 to 4, since the
+**Status.** I1 to I4 are done: one core runs stages 1 to 4, since the
 standard library's print path already needs structs, generic instances,
-`match` and trait objects. A closure (stage 5), and anything else the
-interpreter meets that it does not run, stops the run as not covered; the
-corpus check reports such a program as not covered, never as agreeing.
+`match` and trait objects, and closures run as section 5.1 says. Anything
+the interpreter meets that it does not run stops the run as not covered;
+the corpus check reports such a program as not covered, never as agreeing.
 
 ## 9. The corpus check's third comparison
 

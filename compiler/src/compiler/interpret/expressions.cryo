@@ -7,7 +7,7 @@ namespace compiler::interpret::expressions;
 import compiler::ast::{ LiteralKind, MemberPin };
 import compiler::ast::expression::{
     ArrayAccessExpr, ArrayExpr, BinaryExpr, CastExpr, ExpressionNode, ExprKind, IdentifierExpr,
-    LiteralExpr, MemberAccessExpr, ObjectConversionExpr, ScopeResolutionExpr, StructExpr,
+    LambdaExpr, LiteralExpr, MemberAccessExpr, ObjectConversionExpr, ScopeResolutionExpr, StructExpr,
     TupleExpr, UnaryExpr
 };
 import compiler::ast::declaration::{ DeclarationNode, VarDecl };
@@ -69,7 +69,7 @@ implement struct Interpreter {
                 Result::Ok(Operand::Value(Scalar::Integer(this.layout.alignment(a.operand_type) as u64, IntegerKind::new(64, false))))
             }
             ExprKind::ObjectConversion(conversion) => { this.evaluate_object(conversion, span) }
-            ExprKind::Lambda(_)  => { Result::Err(Interpreter::not_covered("a closure", span)) }
+            ExprKind::Lambda(lambda) => { this.evaluate_lambda(expression, lambda) }
             ExprKind::New(_)     => { Result::Err(Interpreter::not_covered("`new`", span)) }
             ExprKind::Delete(_)  => { Result::Err(Interpreter::not_covered("`delete`", span)) }
             ExprKind::Await(_)   => { Result::Err(Interpreter::not_covered("`await`", span)) }
@@ -742,6 +742,22 @@ implement struct Interpreter {
                 _ => { return Result::Err(Interpreter::violation("a struct literal field the type checker did not pin", expression.span)); }
             };
             this.initialize(place.plus(this.layout.field_offset(t, index)), this.layout.field_type(t, index), literal.field_inits[i].value)?;
+        }
+        return Result::Ok(Operand::Place(place));
+    }
+
+    /// A closure.  One that captures is a value of the struct the type
+    /// checker made for it, each field initialized, in the order of the
+    /// captures, from the capture's value where the closure is made: the
+    /// captured binding's value, or its address for a capture by
+    /// reference.  Calling it calls that struct's method, by the call's
+    /// pin.  One that captures nothing is a function value, its lambda.
+    evaluate_lambda(mut &this, expression: ExpressionNode*, lambda: LambdaExpr*) -> Result<Operand, Stop> {
+        const t: TypeRef = expression.resolved_type;
+        if (!this.layout.is_aggregate(t)) { return Result::Ok(Operand::Value(Scalar::Lambda(lambda))); }
+        const place: Address = this.temporary(t);
+        for (mut i: i64 = 0; i < lambda.capture_values.length(); i++) {
+            this.initialize(place.plus(this.layout.field_offset(t, i)), this.layout.field_type(t, i), lambda.capture_values[i])?;
         }
         return Result::Ok(Operand::Place(place));
     }
