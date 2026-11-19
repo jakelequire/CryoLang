@@ -319,6 +319,12 @@ type struct MoveChecker {
     /// loop-carried rather than tracked.
     loop_repeat: boolean;
 
+    /// While `loop_repeat` holds, where the bindings the repeated
+    /// expressions declare begin in `captured_decl_keys`.  Such a binding -
+    /// a `?`'s residual, a `match` arm's payload inside the condition - is
+    /// made afresh at every test, so moving it is not carried to the next.
+    repeat_declarations_start: i64;
+
     /// The receiver of the function being walked when that function is a
     /// `Drop` implementation's `drop`, invalid otherwise.  Its fields are
     /// released by field glue when the destructor returns, so moving one out
@@ -398,6 +404,7 @@ type struct MoveChecker {
             assigned_members:     [],
             branch_depth:       0,
             loop_repeat:        false,
+            repeat_declarations_start: 0,
             unsafe_depth:        0,
             arg_binding_unknown: false,
             drop_receiver:       SymbolID::invalid(),
@@ -450,6 +457,7 @@ type struct MoveChecker {
         this.assigned_members     = [];
         this.branch_depth       = 0;
         this.loop_repeat        = false;
+        this.repeat_declarations_start = 0;
         this.unsafe_depth       = 0;
         this.arg_binding_unknown = false;
         this.drop_receiver       = SymbolID::invalid();
@@ -1655,13 +1663,30 @@ type struct MoveChecker {
 
     /// Walk what the back edge evaluates: a `for`'s update, then the
     /// condition.  Either may be null.  Every value or field moved there is
-    /// refused as loop-carried (`handle_ident`, `check_field_move_out`).
+    /// refused as loop-carried (`handle_ident`, `check_field_move_out`),
+    /// unless the binding moved is one they declare themselves
+    /// (`repeats_move_of`).  Their declarations stay recorded until the
+    /// loop's walk ends, so the discovery walk does not stage them as
+    /// carried either.
     walk_back_edge(mut &this, update: Stmt*, condition: ExpressionNode*) -> void {
         const prev: boolean = this.loop_repeat;
+        const prev_start: i64 = this.repeat_declarations_start;
+        const prev_capture: boolean = this.capture_decls;
         this.loop_repeat = true;
+        this.repeat_declarations_start = this.captured_decl_keys.length();
+        this.capture_decls = true;
         this.walk_stmt(update);
         this.walk_condition(condition);
         this.loop_repeat = prev;
+        this.repeat_declarations_start = prev_start;
+        this.capture_decls = prev_capture;
+    }
+
+    /// Whether moving the binding `key` here is a move the loop makes again
+    /// at every back edge: the walk is in its repeated expressions and the
+    /// binding was declared before them.
+    repeats_move_of(&this, key: u64) -> boolean {
+        return this.loop_repeat && !this.is_body_local(key, this.repeat_declarations_start);
     }
 
     walk_var_decl(mut &this, d: DeclarationNode*) -> void {
@@ -2796,7 +2821,8 @@ type struct MoveChecker {
         // binding, non-droppable non-Copy field - keeps the hard E0453.
         // A loop's condition or update moves the field again on every
         // iteration: the same double free as a carried whole value.
-        if (this.loop_repeat && this.type_needs_drop(field_ty) && this.partial_move_shape(ma)) {
+        if (this.type_needs_drop(field_ty) && this.partial_move_shape(ma)
+            && this.repeats_move_of(ExpressionNode::identifier_of(ma.object).res.local_sym().key())) {
             if (!this.suppress_emit) {
                 const owner: string = this.intern.resolve(ExpressionNode::identifier_of(ma.object).name);
                 this.emit_loop_carried_text(
@@ -3205,7 +3231,7 @@ type struct MoveChecker {
         // A move in a loop's condition or update is made again at every back
         // edge.  Refused even when the body gave the value a new one: the
         // value the last test moved is still the one the scope releases.
-        if (this.loop_repeat && in_move_context && real) {
+        if (in_move_context && real && this.repeats_move_of(sym.key())) {
             if (!this.suppress_emit) { this.emit_loop_carried(name, e.span); }
             return;
         }
