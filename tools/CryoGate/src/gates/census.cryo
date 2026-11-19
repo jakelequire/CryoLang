@@ -19,15 +19,9 @@
 ///!     projects      every collect project that passed ran at least one test
 ///!
 ///! A suite whose summary block never printed is refused: that is the zero
-///! this exists to see.  The three suites run at once, each a `cryo test
-///! --suite=` of its own (`CRYOGATE_JOBS=1` runs them one after another),
-///! and the census log is their outputs joined in the order one run of all
-///! three prints them, so the report is the same at any number of slots.
-///! A compiler that has no `--suite` is refused: its unit test binary
-///! rejects the option, and the unit suite prints no summary.  The log is
-///! printed with `--verbose`, and its tail when a suite or the census
-///! fails.  Exit: the first failing suite's own, in suite order, unless the
-///! census fails (then 1).
+///! this exists to see.  The suite's output goes to the run's log; the log
+///! is printed with `--verbose`, and its tail when the suite or the census
+///! fails.  Exit: the suite's own, unless the census fails (then 1).
 ///!
 ///! `cryogate census --read <log>` reads a log the runner wrote and prints
 ///! the parse as one JSON record (the line the first summary opens on, the
@@ -54,9 +48,8 @@ import cryogate::core::child::{ Completion, Job, Outcome };
 import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
-import cryogate::core::schedule::{ Cost, Scheduler };
 import cryogate::core::text::{ Text };
-import cryogate::corpus::census::{ CensusReading, CensusSuites, Pinned };
+import cryogate::corpus::census::{ CensusReading, Pinned };
 import cryogate::corpus::roster::{ TestGates };
 
 /// `cryogate census`: the suite run, and its reading reconciled with what
@@ -188,50 +181,26 @@ public type struct Census {
             }
         }
 
-        // Each suite is its own `cryo test --suite=` run, side by side on
-        // the scheduler; its output goes to its own log.  The census log is
-        // their outputs joined in suite order, which is the order one run
-        // of all three prints them in, so the reading and every verdict
-        // drawn from it are the same at any number of slots.
         const log: String = logs.file(Str::new("census"));
-        const suites: Array<Str> = CensusSuites::names();
-        mut scheduler: Scheduler = Scheduler::new();
-        for (entry in suites.iterate_references()) {
-            const suite: Str = *entry;
-            mut job: Job = Job::new(compiler.as_str());
-            job.argument(Str::new("test"));
-            job.argument(Str::new("--format=plain"));
-            job.argument(f"--suite={suite}".as_str());
-            // A discarded result fails the unit suite's build and every
-            // project's (the runner hands `-Werror=` to each project's own
-            // build): the corpus is held to handling what it is given.  The
-            // compile-fail files are checked without it, since one of them
-            // asserts the warning itself.  verify's baseline census runs with
-            // the same flags.
-            job.argument(Str::new("-Werror=W0017"));
-            for (argument in forwarded.iterate_references()) { job.argument(argument.as_str()); }
-            job.directory(tests.as_path().as_str());
-            job.log_to(logs.file(f"census-{suite}".as_str()).as_str());
-            scheduler.add(job, Cost::Suite);
-        }
-        const completions: Array<Completion> = scheduler.run();
-        mut outputs: Array<String> = Array::<String>::new();
-        // The run's exit is the first suite's that failed, in suite order.
-        mut exit: i32 = 0;
-        for (done in completions.iterate_references()) {
-            outputs.push(done.output());
-            const code: i32 = match (&done.outcome) {
-                Outcome::Exited(code) => { code }
-                _                     => { 1 }
-            };
-            if (exit == 0) { exit = code; }
-        }
-        const output: String = CensusSuites::joined(&outputs);
-        match (File::write_text(Path::from(log.as_str()), output.as_str())) {
-            Result::Ok(_)      => { }
-            Result::Err(error) => { fmt::eprintln(f"test-census: cannot write {log.as_str()}: {error.describe()}"); return 1; }
-        }
-        const lines: Array<String> = Text::lines(output.as_str());
+        mut job: Job = Job::new(compiler.as_str());
+        job.argument(Str::new("test"));
+        job.argument(Str::new("--format=plain"));
+        // A discarded result fails the unit suite's build and every
+        // project's (the runner hands `-Werror=` to each project's own
+        // build): the corpus is held to handling what it is given.  The
+        // compile-fail files are checked without it, since one of them
+        // asserts the warning itself.  verify's baseline census runs with
+        // the same flags.
+        job.argument(Str::new("-Werror=W0017"));
+        for (argument in forwarded.iterate_references()) { job.argument(argument.as_str()); }
+        job.directory(tests.as_path().as_str());
+        job.log_to(log.as_str());
+        const done: Completion = job.run();
+        const exit: i32 = match (&done.outcome) {
+            Outcome::Exited(code) => { code }
+            _                     => { 1 }
+        };
+        const lines: Array<String> = Text::lines(done.output().as_str());
         if (parsed.has(Str::new("--verbose"))) {
             for (line in lines.iterate_references()) { fmt::println(line.clone()); }
         }
@@ -239,7 +208,7 @@ public type struct Census {
         const reading: CensusReading = CensusReading::of(&lines);
         const problems: Array<String> = Census::judge(&pinned, &reading);
 
-        if (!problems.is_empty() || exit != 0) { Census::print_tail(&lines, &completions); }
+        if (!problems.is_empty() || exit != 0) { Census::print_tail(&lines, &done); }
         fmt::println(String::new());
         fmt::println(f"test-census: roster pins {pinned.unit.length()} unit, {pinned.negatives} compile-fail, {pinned.projects.length()} project(s)");
         for (line in pinned.elsewhere.iterate_references()) {
@@ -269,12 +238,12 @@ public type struct Census {
         return exit;
     }
 
-    /// Every line of the suites' output that gives a failing verdict (a
+    /// Every line of the suite's output that gives a failing verdict (a
     /// unit test's `FAIL  <name>`, a negative file's or a project's
-    /// `... FAILED`), then its last lines, or why there are none.
-    private static print_tail(lines: &Array<String>, completions: &Array<Completion>) -> void {
+    /// `... FAILED`), then its last lines, or why there is none.
+    private static print_tail(lines: &Array<String>, done: &Completion) -> void {
         if (lines.is_empty()) {
-            for (done in completions.iterate_references()) { fmt::println(f"  | {done.outcome.describe().as_str()}"); }
+            fmt::println(f"  | {done.outcome.describe().as_str()}");
             return;
         }
         for (line in lines.iterate_references()) {
