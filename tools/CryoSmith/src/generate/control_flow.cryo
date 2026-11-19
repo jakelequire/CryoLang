@@ -49,6 +49,7 @@ implement struct Generator {
     /// already made.
     internal block_opening(mut &this, opening: &Array<i64>, entering: &Array<i64>) -> i64 {
         const start: i64 = this.environment.mark();
+        const lengths: Array<i64> = this.environment.known_lengths();
         const reserved: i64 = this.statements_left / 2;
         this.statements_left = this.statements_left - reserved;
         this.block_depth = this.block_depth + 1;
@@ -58,6 +59,7 @@ implement struct Generator {
         this.observe_declared(start, &statements);
         for (variable in entering.iter()) { this.observe_place(this.read(variable), &statements); }
         this.environment.leave(start);
+        this.environment.keep_fewest(&lengths);
         this.block_depth = this.block_depth - 1;
         this.statements_left = this.statements_left + reserved;
         return this.program.block(&statements);
@@ -70,9 +72,10 @@ implement struct Generator {
         const nested: boolean = this.block_depth < MOST_BLOCKS;
         const writable: Array<i64> = this.environment.writable_records(&this.program);
         const mutators: Array<MethodCandidate> = this.method_calls(ValueType::Void, true);
+        const assignable: Array<i64> = this.whole_stores();
         mut weights: Array<i64> = Array::<i64>::new();
         weights.push(30);
-        weights.push(if (this.environment.assignable(&this.program).length() > 0) { 20 } else { 0 });
+        weights.push(if (assignable.length() > 0) { 20 } else { 0 });
         weights.push(12);
         weights.push(if (features.has(Feature::Branches) && nested) { 10 } else { 0 });
         weights.push(if (features.has(Feature::Loops) && nested && this.loop_depth < MOST_LOOPS) { 10 } else { 0 });
@@ -97,12 +100,18 @@ implement struct Generator {
         weights.push(if (this.makes_strings()) { 6 } else { 0 });
         const texts: Array<i64> = this.writable_texts();
         weights.push(if (texts.length() > 0) { 10 } else { 0 });
+        weights.push(if (this.makes_dynamic_arrays()) { 8 } else { 0 });
+        const appendable: Array<i64> = this.appendable();
+        weights.push(if (appendable.length() > 0) { 10 } else { 0 });
+        const poppable: Array<i64> = this.shrinkable(&appendable, true);
+        weights.push(if (poppable.length() > 0) { 6 } else { 0 });
+        const reassignable: Array<i64> = this.shrinkable(&appendable, false);
+        weights.push(if (reassignable.length() > 0) { 3 } else { 0 });
         const form: i64 = this.random.pick(&weights);
         this.budget.charge(1);
         if (form == 0) { return this.declaration(); }
         if (form == 1) {
-            const candidates: Array<i64> = this.environment.assignable(&this.program);
-            const chosen: i64 = candidates.get(this.random.below(candidates.length())).unwrap();
+            const chosen: i64 = assignable.get(this.random.below(assignable.length())).unwrap();
             if (this.program.variable_at(chosen).value_type.is_array()) { this.environment.lend(chosen, true); }
             return this.store(this.target(chosen));
         }
@@ -138,8 +147,23 @@ implement struct Generator {
         if (form == 17) { return this.element_store(&arrays); }
         if (form == 18) { return this.text_declaration(); }
         if (form == 19) { return this.text_push(&texts); }
+        if (form == 20) { return this.dynamic_declaration(); }
+        if (form == 21) { return this.append(&appendable); }
+        if (form == 22) { return this.pop(&poppable); }
+        if (form == 23) { return this.dynamic_assignment(&reassignable); }
         const method: MethodCandidate = mutators.get(this.random.below(mutators.length())).unwrap();
         return this.program.statement(StatementKind::Evaluate(this.method_call(method, this.depth())));
+    }
+
+    /// The `mut` locals in scope a store may assign whole: any but a dynamic
+    /// array, which only its own statements assign, since they know the
+    /// fewest elements it holds afterwards.
+    private whole_stores(&this) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.assignable(&this.program).iter()) {
+            if (!this.program.variable_at(variable).value_type.is_dynamic_array()) { found.push(variable); }
+        }
+        return found;
     }
 
     /// `const` or `mut` local with its initial value; the name is in scope

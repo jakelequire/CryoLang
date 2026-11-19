@@ -71,23 +71,28 @@ implement struct Generator {
         return this.node(ExpressionKind::ArrayLiteral(first, elements.length()), wanted);
     }
 
-    /// The parameters and locals in scope whose elements are of `wanted`:
-    /// fixed arrays and slices.
+    /// The parameters and locals in scope whose elements of `wanted` may be
+    /// read here (`indexable`).
     internal element_sources(&this, wanted: ValueType) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
         for (variable in this.environment.in_scope().iter()) {
-            const declared: Variable = this.program.variable_at(variable);
-            if (Generator::names_collection(declared) && declared.value_type.element().same(wanted)) { found.push(variable); }
+            if (this.indexable(variable) && this.program.variable_at(variable).value_type.element().same(wanted)) { found.push(variable); }
         }
         return found;
     }
 
-    /// The slice parameters and `String` locals in scope, whose length is
-    /// an `i64` value.
+    /// The slice parameters, dynamic array locals and `String` locals in
+    /// scope whose length is an `i64` value here: a local not lent
+    /// exclusively.
     internal measurable(&this) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
         for (variable in this.environment.in_scope().iter()) {
-            if (this.program.variable_at(variable).value_type.is_slice()) { found.push(variable); }
+            const declared: Variable = this.program.variable_at(variable);
+            const dynamic: boolean = match (declared.role) {
+                VariableRole::Local => { declared.value_type.is_dynamic_array() && !this.environment.is_lent_exclusively(variable) }
+                _                   => { false }
+            };
+            if (declared.value_type.is_slice() || dynamic) { found.push(variable); }
         }
         for (variable in this.texts().iter()) { found.push(variable); }
         return found;
@@ -105,26 +110,31 @@ implement struct Generator {
         return this.node(ExpressionKind::Length(slices.get(this.random.below(slices.length())).unwrap()), ValueType::I64);
     }
 
-    /// An index into the array or the slice `variable` holds, reduced into
-    /// its length: `(e % N)` for an array of `N`, `(e % (v.length() as
-    /// u64))` for a slice, `e` a `u64` that reads a name.
+    /// An index into the array, the slice or the dynamic array `variable`
+    /// holds, reduced into its length: `(e % N)` for an array of `N`, `(e %
+    /// (v.length() as u64))` for a slice, `(e % K)` for a dynamic array
+    /// holding at least `K` elements, `e` a `u64` that reads a name.
     private in_range(mut &this, variable: i64, depth: i64) -> i64 {
         const held: ValueType = this.program.variable_at(variable).value_type;
         const operand: i64 = this.expression(ValueType::U64, depth, true);
+        const known: i64 = if (held.is_dynamic_array()) { this.environment.fewest_elements(variable) } else { held.array_length() };
         const length: i64 = if (held.is_slice()) {
             this.node(ExpressionKind::Cast(this.node(ExpressionKind::Length(variable), ValueType::I64)), ValueType::U64)
         } else {
-            this.integer(held.array_length() as u64, ValueType::U64)
+            this.integer(known as u64, ValueType::U64)
         };
         return this.node(ExpressionKind::Binary(BinaryOperator::Remainder, operand, length), ValueType::U64);
     }
 
-    /// The `mut` array locals in scope whose elements may be written here:
-    /// any not lent by the statement.
+    /// The `mut` fixed and dynamic array locals in scope whose elements may
+    /// be written here: any not lent by the statement, and a dynamic one
+    /// only while it holds an element.
     internal writable_arrays(&this) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
         for (variable in this.environment.assignable(&this.program).iter()) {
-            if (this.program.variable_at(variable).value_type.is_array() && !this.environment.is_lent(variable)) { found.push(variable); }
+            const held: ValueType = this.program.variable_at(variable).value_type;
+            const holding: boolean = held.is_array() || (held.is_dynamic_array() && this.environment.fewest_elements(variable) > 0);
+            if (holding && !this.environment.is_lent(variable)) { found.push(variable); }
         }
         return found;
     }
@@ -151,8 +161,10 @@ implement struct Generator {
     }
 
     /// The variables in scope a slice of type `wanted` may be given from:
-    /// an array local of its element not lent exclusively, borrowed, or a
-    /// slice parameter of it, passed on.
+    /// an array local of its element not lent exclusively, or a dynamic
+    /// array local holding one, borrowed, or a slice parameter of it,
+    /// passed on.  A slice is indexed below its length, so none given is
+    /// empty.
     private slice_sources(&this, wanted: ValueType) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
         for (variable in this.element_sources(wanted.element()).iter()) {
@@ -215,12 +227,13 @@ implement struct Generator {
         return false;
     }
 
-    /// Observe the array or the slice `variable` holds: `for (n in v) {
-    /// observe n }`, every element in order, the loop's variable named as
-    /// a counter is, and a slice's length.
+    /// Observe the array, the slice or the dynamic array `variable` holds:
+    /// `for (n in v) { observe n }`, every element in order, the loop's
+    /// variable named as a counter is, and a slice's or a dynamic array's
+    /// length first.
     internal observe_elements(mut &this, variable: i64, statements: mut &Array<i64>) -> void {
         const held: ValueType = this.program.variable_at(variable).value_type;
-        if (held.is_slice()) {
+        if (held.is_slice() || held.is_dynamic_array()) {
             statements.push(this.observation(this.node(ExpressionKind::Length(variable), ValueType::I64)));
         }
         const mark: i64 = this.environment.mark();
@@ -231,11 +244,17 @@ implement struct Generator {
         statements.push(this.program.statement(StatementKind::Each(variable, binding, this.program.block(&body))));
     }
 
-    /// Whether `declared` names an array or a slice whose elements may be
-    /// read: an array local or a slice parameter.
-    private static names_collection(declared: Variable) -> boolean {
+    /// Whether the elements of what `variable` names may be read here: an
+    /// array local, a slice parameter, or a dynamic array local holding at
+    /// least one element and not lent exclusively, since the statement
+    /// lending it changes it.
+    private indexable(&this, variable: i64) -> boolean {
+        const declared: Variable = this.program.variable_at(variable);
         return match (declared.role) {
-            VariableRole::Local     => { declared.value_type.is_array() }
+            VariableRole::Local => {
+                declared.value_type.is_array() || (declared.value_type.is_dynamic_array()
+                    && this.environment.fewest_elements(variable) > 0 && !this.environment.is_lent_exclusively(variable))
+            }
             VariableRole::Parameter => { declared.value_type.is_slice() }
             _                       => { false }
         };

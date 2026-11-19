@@ -57,7 +57,8 @@ internal type struct ArrayAudit {
                             VariableRole::Local => { true }
                             _                   => { false }
                         };
-                        if (!local || !lent.value_type.is_array() || !lent.value_type.element().same(node.value_type.element())) {
+                        const array: boolean = lent.value_type.is_array() || lent.value_type.is_dynamic_array();
+                        if (!local || !array || !lent.value_type.element().same(node.value_type.element())) {
                             return Result::Err(f"a slice borrows variable {variable}, which is no array local of its element");
                         }
                         counts.borrows = counts.borrows + 1;
@@ -93,8 +94,10 @@ internal type struct ArrayAudit {
     }
 
     /// Whether `index` reduces into the length of what `variable` holds:
-    /// `(e % N)` with `N` the array's length written as a literal, or `(e %
-    /// (v.length() as u64))` of the slice `variable` itself.
+    /// `(e % N)` with `N` the array's length written as a literal, `(e %
+    /// (v.length() as u64))` of the slice `variable` itself, or `(e % K)` of
+    /// a dynamic array, `K` a positive literal (the dynamic array audit
+    /// checks it against the elements the array holds).
     private static in_range(program: &Program, variable: i64, index: i64) -> boolean {
         const held: ValueType = program.variable_at(variable).value_type;
         return match (program.expression_at(index).kind) {
@@ -102,7 +105,8 @@ internal type struct ArrayAudit {
                 if (operator != BinaryOperator::Remainder) { return false; }
                 match (program.expression_at(divisor).kind) {
                     ExpressionKind::IntegerLiteral(length, negative) => {
-                        held.is_array() && !negative && length > 0 && length as i64 == held.array_length()
+                        const fixed: boolean = held.is_array() && length as i64 == held.array_length();
+                        !negative && length > 0 && (fixed || held.is_dynamic_array())
                     }
                     ExpressionKind::Cast(measured) => {
                         match (program.expression_at(measured).kind) {
@@ -131,7 +135,8 @@ internal type struct ArrayAudit {
             VariableRole::Local => { true }
             _                   => { false }
         };
-        return if (local && declared.mutable && declared.value_type.is_array()) { variable } else { -2 };
+        const array: boolean = declared.value_type.is_array() || declared.value_type.is_dynamic_array();
+        return if (local && declared.mutable && array) { variable } else { -2 };
     }
 
     /// Whether no statement of `uses` both writes an array and borrows it.

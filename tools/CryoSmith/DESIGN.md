@@ -641,7 +641,45 @@ order. The text audit (section 7) holds the model to these rules, and
 the loan audit sees an append as an exclusive borrow and a view as a
 shared one.
 
-**Kept off.** Nothing.
+**Dynamic arrays.** With `dynamic-arrays` (and `division` and `loops`), a
+function declares dynamic array locals of an integer element
+(`ValueType::DynamicArray`, spelled `[i16]`, the standard library's
+`Array<i16>`), each given a new array whenever it is declared or assigned:
+a literal of one to eight elements, `[a, b, c]`, a repeat, `[a; 3]`, an
+empty one, `Array::new()`, or a clone of another in scope, `v1.clone()`.
+A `mut` one is appended to, `v2.push(e)`, popped, `const o4: u64 =
+(v2.pop().unwrap() as u64);`, written element by element, and assigned a
+new array whole. The environment carries the fewest elements each holds
+where generation stands (`Environment::fewest_elements`): the count its
+value made, one more after a push, one fewer after a pop; a block that
+ends leaves each the fewer of what it held entering and what it holds at
+the block's end, since the block may not have run or may have left
+early. An element is read or written, `v2[(e % K)]` with `K` that count,
+and a pop or a borrow for a slice made (`&v2` for a helper's `&Slice<i16>`,
+converted by the standard library's `AsSlice`), only where `K` is at
+least one, so no index is out of range and no `unwrap` finds none; and a
+pop or a whole assignment, which may leave an array fewer elements,
+stands only in the loop the array was declared in or outside every loop,
+or a second trip would find fewer than the first left. A dynamic array
+is never read by value, so it needs no ownership state; a statement
+changing one - an element store, a push, a pop, a whole assignment -
+lends it exclusively, so nothing else in that statement names it, and an
+element read copies an integer out, holding no reference, so no
+reference to an element is ever held across a change of its array,
+under the memory-safety plan's rules as well as today's. One is observed
+by its length and by `for (n3 in v2)` over its elements, in order. The
+dynamic array audit (section 7) follows the counts through each function
+apart from the generator and holds the model to these rules.
+
+**Kept off.** A `match` arm assigning its subject inside a generic body
+(a generic function or a generic struct's method): the compiler's copy of
+a generic function names a `Copy` payload binding in the subject's
+storage instead of copying it on entering the arm, so the arm's
+assignment changes the binding (`-O0` then reads what the new, shorter
+payload left behind, and `-O2` another value). Found by the 8c corpus
+(seed 28). The fix exists on the interpreter lane's branch (`Copy a match
+binding in a generic function's copy as everywhere else`) and is not on
+this branch; the keep-off goes when it arrives.
 
 ## 3. Guarantees, and how each is enforced
 
@@ -904,7 +942,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
 | 6 | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods; `enum-implementations`: traits implemented for the declared enums, their methods matching on `this`, called on the enums' values, through bounds at an enum and through objects borrowing one. The stage is complete |
 | 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings; `references`: `&D0` and `mut &D0` parameters, `&D0` returns, kept shared or exclusive per statement; `drops`: `mem::drop`, discarded results, borrowed temporaries and whole stores through `mut &D0`; `boxes`: `Box<D0>` read and written through, `Rc<D0>` cloned and counted; `options`: `Option<D0>` and `Result<D0, u32>` matched, unwrapped where certainly holding a value, and propagated with `?`; `sibling-variants`: a `?`'s `if` operand leaving a variant's type arguments to its sibling arm (section 2) |
-| 8 | `arrays`: fixed arrays of integers built by a literal, a repeat or a copy, their elements read and written at an index reduced into the length, and `&Slice<E>` parameters given `&v` of one, each observed by a `for` over its elements (section 2); `strings`: `String` locals built from a literal, an integer's digits or nothing, appended to, compared and measured, observed by their length and bytes; collections to come |
+| 8 | `arrays`: fixed arrays of integers built by a literal, a repeat or a copy, their elements read and written at an index reduced into the length, and `&Slice<E>` parameters given `&v` of one, each observed by a `for` over its elements (section 2); `strings`: `String` locals built from a literal, an integer's digits or nothing, appended to, compared and measured, observed by their length and bytes; `dynamic-arrays`: `[E]` locals built by a literal, a repeat, empty or as a clone, pushed, popped, indexed below the fewest elements they hold and given `&v` for a slice, observed by their length and elements; maps to come |
 
 Section 9 places each stage among the rest of the work, the tools that
 run what the stages generate.
@@ -1062,6 +1100,20 @@ statement budget of one function, default 24), `--no-header`, and
   `String` local and never of its own view; and each operator over a
   `String` compares two `String` variables. It finds some of each, and
   some append of another `String`'s view.
+- **The dynamic array audit** reads every function of 200 programs from
+  `UseWalk`'s list, which marks where each nested block begins and ends
+  and names the expression each element access, push, pop, clone, borrow
+  and assigned value is made by. Apart from the generator it follows the
+  fewest elements each dynamic array holds - a value's count, one more
+  per push, one fewer per pop, the fewer of entering and leaving where a
+  block ends - and refuses an index `(e % K)` with `K` below 1 or above
+  it, a pop or a borrow for a slice where it may be 0, a pop or a whole
+  assignment inside a loop the array was declared outside, a change of a
+  `const` one, and a change inside a `for` over its own elements. It finds
+  some element reads and stores, pushes, pops, clones, slice borrows and
+  whole assignments. The loan audit reads the same list: a push, a pop
+  and an element store of a dynamic array are exclusive borrows, a clone
+  a shared one, so nothing else in their statement names the array.
 - **Borrow coverage**: of 40 programs, at least half of those declaring a
   trait object parameter pass `&v` to one, and likewise for a reference
   parameter.
@@ -1084,7 +1136,7 @@ layers, lowest first:
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
 | `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures, `Exhaustiveness`'s arms and `Capture`'s captured values (3.2) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits`, `moves`, `references`, `drops`, `holders`, `arrays`, `texts` |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits`, `moves`, `references`, `drops`, `holders`, `arrays`, `texts`, `dynamic_arrays` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |
@@ -1261,8 +1313,9 @@ generator never reads through an `Rc`.
    indexing within bounds, iterating. `guarantees/`: an index is in range
    by construction (reduced against a length the generator knows);
    iteration order is observed only where the collection fixes it. (Done:
-   `arrays`, fixed arrays and the slices viewing them, and `strings`,
-   `String` locals. To come: `Array` and `HashMap`.)
+   `arrays`, fixed arrays and the slices viewing them, `strings`,
+   `String` locals, and `dynamic-arrays`, `Array` locals with the fewest
+   elements each holds tracked. To come: `HashMap`.)
 7. **A differential driver** (CryoGate, `cryogate smith-diff`). Builds one
    program under several configurations - `-O0` and `-O2`, the pin and
    the compiler under test, Windows and Linux (through WSL) - runs each
