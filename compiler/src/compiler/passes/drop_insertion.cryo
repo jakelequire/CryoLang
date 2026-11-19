@@ -2906,16 +2906,21 @@ type struct DropInserter {
         // Moved out on some paths: the binding's move flag says, at run time,
         // whether the destination still holds its value, and every statement
         // that moves the binding sets it (`append_move_flag_writes`) - so the
-        // displaced value is released where the flag is clear.  A move by
-        // THIS statement's right-hand side (`t = takes_it(t)`) has not written
-        // the flag yet, and is known here to have taken the value.  A member
-        // destination, or a binding that is also conditionally initialized,
-        // is not described by the one flag, and declines.
+        // displaced value is released where the flag is clear.  A move THIS
+        // statement's right-hand side makes on every path through it
+        // (`t = takes_it(t)`) has not written the flag yet - the statement
+        // writes it once it ends - and is known here to have taken the value.
+        // A move in a branch of a branching expression in it
+        // (`t = if (c) { t } else { make() }`) writes the flag where it is
+        // made, so after the right-hand side the flag says whether the value
+        // was taken, and the release reads it.  A member destination, or a
+        // binding that is also conditionally initialized, is not described by
+        // the one flag, and declines.
         const move_flag: PassLocal = this.binding_dropflags[slot];
         if (move_flag.is_valid()) {
             if (kind.length() != 0 || this.slot_has_members(slot)) { return; }
             if (this.binding_definit[slot] != (1 as u8)) { return; }
-            if (this.moved_since(this.stmt_move_snap, root.key())) { return; }
+            if (this.statement_writes_flag_of(root.key())) { return; }
             this.pend_assign_guard_moved = true;
             this.pend_assign(e, slot, move_flag, place_ty, kind, key);
             return;
@@ -3095,6 +3100,16 @@ type struct DropInserter {
 
     /// Whether `key` entered the moved-set after `snapshot` and is still
     /// there (a revive tombstones its entry).
+    /// Whether the simple statement being walked moves the flagged binding
+    /// `key` on every path through it, so that it writes the binding's
+    /// flag only once it ends (`statement_flag_writes`).
+    statement_writes_flag_of(&this, key: u64) -> boolean {
+        for (mut i: i64 = this.statement_flag_writes_start; i < this.statement_flag_writes.length(); i++) {
+            if (this.statement_flag_writes[i] == key) { return true; }
+        }
+        return false;
+    }
+
     moved_since(&this, snapshot: i64, key: u64) -> boolean {
         if (key == 0) { return false; }
         for (mut i: i64 = snapshot; i < this.moved_keys.length(); i++) {
