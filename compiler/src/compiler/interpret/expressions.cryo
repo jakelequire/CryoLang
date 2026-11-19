@@ -594,19 +594,33 @@ implement struct Interpreter {
         return Result::Ok(Scalar::Integer(((p.offset - q.offset) / element) as u64, IntegerKind::new(64, true)));
     }
 
-    /// `left = right`: the place first, then the value; what the place
-    /// held is released when the language says the store releases it.
-    /// The value is taken before the release: a right side naming the
-    /// place itself (`v = if (c) { v } else { .. }`) has moved its value
-    /// out, and the release then finds nothing to drop.
+    /// `left = right`: the place first, then the value.  When the store
+    /// releases what the place held (docs/cryo.md section 15.2), that value
+    /// is the oldest in play and is released last: the right side's value
+    /// is complete and the statement's temporaries are released, then the
+    /// value is stored, then the displaced one is dropped.  What the place
+    /// holds is read only after the right side has run: a right side
+    /// naming the place itself (`v = if (c) { v } else { .. }`) has moved
+    /// its value out, and the release then finds nothing to drop.
     assign(mut &this, binary: BinaryExpr*, span: SourceSpan) -> Result<Operand, Stop> {
         const t: TypeRef = binary.left.resolved_type;
+        const mark: i64 = this.temporaries.length();
         const place: Address = this.place_of(binary.left)?;
         const value: Operand = this.taken(this.evaluate(binary.right)?, binary.right.resolved_type, span)?;
-        if (this.assignment_releases(binary.left) && this.needs_drop(t)) {
-            this.drop_place(place, t, span)?;
+        if (!this.assignment_releases(binary.left) || !this.needs_drop(t)) {
+            this.store_operand(place, t, value, binary.right.resolved_type, span)?;
+            return Result::Ok(Operand::Nothing);
         }
-        this.store_operand(place, t, value, binary.right.resolved_type, span)?;
+        const cells: i64 = this.layout.cells(t);
+        const staged: Address = Address::at(this.memory.allocate(cells, AllocationKind::Stack), 0);
+        this.store_operand(staged, t, value, binary.right.resolved_type, span)?;
+        this.release_temporaries(mark, span)?;
+        const displaced: Address = Address::at(this.memory.allocate(cells, AllocationKind::Stack), 0);
+        this.copy_value(displaced, place, t, span)?;
+        this.move_value(place, staged, t, span)?;
+        this.memory.end(staged.allocation);
+        this.drop_place(displaced, t, span)?;
+        this.memory.end(displaced.allocation);
         return Result::Ok(Operand::Nothing);
     }
 

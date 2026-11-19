@@ -217,9 +217,12 @@ section 15, and reads nothing the compiler's ownership passes decided:
 
 - a read of a place whose type is not `Copy` moves it: the cell becomes
   moved-from, and a later read of it is a violation;
-- assigning a place drops the value it held, if any, before storing; the
-  right side's value is taken first, so a right side that moves the place
-  itself out (`v = if (c) { v } else { .. }`) leaves nothing to drop;
+- assigning a place releases the value it held, if any, and that value is
+  the oldest in play, so it is released last: the right side's value is
+  completed, the statement's temporaries are released, the value is
+  stored, and then the displaced one is dropped; what the place holds is
+  read only after the right side has run, so a right side that moves the
+  place itself out (`v = if (c) { v } else { .. }`) leaves nothing to drop;
 - a statement's temporaries are released when it ends, the newest first,
   and a result the statement discards is the newest of them, so it is
   released before any temporary it borrows (docs/cryo.md section 15); a
