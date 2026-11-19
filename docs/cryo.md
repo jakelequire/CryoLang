@@ -1509,7 +1509,7 @@ if (x > 0) {
 }
 ```
 
-`if` may also be used as an **expression** that evaluates to the value of the chosen branch. When used this way, both arms are required and must produce the same type. An arm that is `null` converts to any pointer, so the expression has the other arm's type, whichever arm the `null` is in: `if (c) { null } else { b }` is a `B*` for `b: B*`, and is refused where an unrelated pointer type is declared. The conditional form `c ? x : y` follows the same rule.
+`if` may also be used as an **expression** that evaluates to the value of the chosen branch. When used this way, both arms are required and must produce the same type. An arm that is `null` converts to any pointer, so the expression has the other arm's type, whichever arm the `null` is in: `if (c) { null } else { b }` is a `B*` for `b: B*`, and is refused where an unrelated pointer type is declared. Likewise, an arm that constructs a variant of a generic enum without naming its instance, `Option::None` or a `Result::Ok(x)` whose payload binds only some of the enum's parameters, takes the instance of that enum another arm has, so `if (c) { Option::None } else { Option::Some(4) }` is an `Option<i32>` where no type is expected of it. An arm of another type names no instance for it, and a variant no arm, payload or expected type names one for is refused (E0307). The conditional form `c ? x : y` follows the same rules, and so do the arms of a `match` expression.
 
 ```cryo
 const is_even: boolean = if (n % 2 == 0) { true } else { false };

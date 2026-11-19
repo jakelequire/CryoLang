@@ -4750,8 +4750,10 @@ type struct SemaVisitor {
 
     resolve_if_expr(mut &this, if_expr: IfExpr*) -> TypeRef {
         this.resolve_condition(if_expr.condition);
-        const then_type: TypeRef = this.resolve_expr(if_expr.then_expr);
-        const else_type: TypeRef = this.resolve_expr(if_expr.else_expr);
+        const then_resolved: TypeRef = this.resolve_expr(if_expr.then_expr);
+        const else_resolved: TypeRef = this.resolve_expr(if_expr.else_expr);
+        const then_type: TypeRef = this.settle_variant_by_sibling(if_expr.then_expr, then_resolved, else_resolved);
+        const else_type: TypeRef = this.settle_variant_by_sibling(if_expr.else_expr, else_resolved, then_type);
         this.check_branch_agreement(then_type, if_expr.then_expr.span,
             else_type, if_expr.else_expr.span,
             "both branches of an `if` expression must produce the same type");
@@ -4768,10 +4770,26 @@ type struct SemaVisitor {
         return first;
     }
 
+    /// The type of a branch's value `value`, typed `own`, beside a sibling
+    /// branch typed `sibling`.  A variant of a generic enum constructed with
+    /// no instance named, and none its payload or an expected type decides,
+    /// takes the sibling's instance of that enum, as `null` takes a
+    /// sibling's pointer type: the branches produce one value.  A sibling of
+    /// another type, or itself still generic, decides nothing
+    /// (`retype_generic_variant`), and the variant is refused when the walk
+    /// ends as before.
+    settle_variant_by_sibling(mut &this, value: mut ExpressionNode*, own: TypeRef, sibling: TypeRef) -> TypeRef {
+        if (!this.calls.is_generic_variant(value)) { return own; }
+        this.calls.retype_generic_variant(value, sibling);
+        return value.resolved_type;
+    }
+
     resolve_ternary(mut &this, ternary: TernaryExpr*) -> TypeRef {
         this.resolve_condition(ternary.condition);
-        const true_type: TypeRef = this.resolve_expr(ternary.true_expr);
-        const false_type: TypeRef = this.resolve_expr(ternary.false_expr);
+        const true_resolved: TypeRef = this.resolve_expr(ternary.true_expr);
+        const false_resolved: TypeRef = this.resolve_expr(ternary.false_expr);
+        const true_type: TypeRef = this.settle_variant_by_sibling(ternary.true_expr, true_resolved, false_resolved);
+        const false_type: TypeRef = this.settle_variant_by_sibling(ternary.false_expr, false_resolved, true_type);
         this.check_branch_agreement(true_type, ternary.true_expr.span,
             false_type, ternary.false_expr.span,
             "both arms of a conditional expression must produce the same type");
@@ -4866,8 +4884,9 @@ type struct SemaVisitor {
         const writable: boolean = this.match_binds_writable(match_expr.subject);
         this.patterns.check_duplicate_default_arm(match_expr.arms);
         mut result_type: TypeRef = TypeRef::invalid();
-        mut result_value: ExpressionNode* = null;
+        mut result_value: mut ExpressionNode* = null;
         mut result_span: SourceSpan = e.span;
+        mut values: [mut ExpressionNode*] = [];
         for (mut i: i64 = 0; i < match_expr.arms.length(); i++) {
             const arm: MatchArmNode* = match_expr.arms[i];
             if (arm == null || arm.body == null) { continue; }
@@ -4877,8 +4896,9 @@ type struct SemaVisitor {
             if (arm.guard != null) { this.resolve_condition(arm.guard); }
             match (arm.body.kind) {
                 StmtKind::Block(block) => {
-                    const value: ExpressionNode* = this.resolve_value_block(block, outer_expected);
+                    const value: mut ExpressionNode* = this.resolve_value_block(block, outer_expected);
                     if (value != null && value.has_resolved_type()) {
+                        values.push(value);
                         const arm_type: TypeRef = value.resolved_type;
                         if (!result_type.is_valid()) {
                             result_type = arm_type;
@@ -4901,6 +4921,17 @@ type struct SemaVisitor {
             }
             this.scopes.restore_scope(save);
         }
+        // An arm constructing a variant with no instance named takes the
+        // instance the first arm that has one does, whichever arm that is.
+        mut decided: TypeRef = TypeRef::invalid();
+        for (mut i: i64 = 0; i < values.length(); i++) {
+            if (!decided.is_valid() && !this.calls.is_generic_variant(values[i])) { decided = values[i].resolved_type; }
+        }
+        const result_was_generic: boolean = result_value != null && this.calls.is_generic_variant(result_value);
+        for (mut i: i64 = 0; i < values.length(); i++) {
+            this.settle_variant_by_sibling(values[i], values[i].resolved_type, decided);
+        }
+        if (result_was_generic) { result_type = result_value.resolved_type; }
         this.state.expected_type = outer_expected;
         this.patterns.check_match_exhaustive(match_expr.subject, subject_type, match_expr.arms, e.span);
         this.patterns.check_literal_patterns(match_expr.arms, subject_type);
@@ -4913,7 +4944,7 @@ type struct SemaVisitor {
     /// expression is read by whatever holds the block, so it is typed as a
     /// value rather than visited as a statement, which would report it
     /// discarded.
-    resolve_value_block(mut &this, block: BlockStmt*, expected: TypeRef) -> ExpressionNode* {
+    resolve_value_block(mut &this, block: BlockStmt*, expected: TypeRef) -> mut ExpressionNode* {
         const last_index: i64 = block.statements.length() - 1;
         for (mut j: i64 = 0; j < last_index; j++) {
             this.dispatch_stmt(block.statements[j]);
@@ -4921,7 +4952,7 @@ type struct SemaVisitor {
         if (last_index < 0) { return null; }
         if (expected.is_valid()) { this.state.expected_type = expected; }
         const last: Stmt* = block.statements[last_index];
-        mut value: ExpressionNode* = null;
+        mut value: mut ExpressionNode* = null;
         match (last.kind) {
             StmtKind::Expr(statement) => {
                 value = statement.expression;
