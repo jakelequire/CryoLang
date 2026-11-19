@@ -587,6 +587,15 @@ the comparison reads:
   SOURCE never needs it: verify builds this tree's stdlib with both
   compilers, so a source edit moves nothing there by construction - prove one
   by building the library before and after at one path.
+- `moved-instances:<module>` in `tests/started-passing` - a standard-library
+  module, by its full name, whose object in the unit suite's own build the
+  change moves on purpose.  That object holds the generic instances of the
+  module the unit tests use and no archive holds, so a compiler change to how
+  generic code compiles moves it whether or not it moves the module's archive
+  objects.  The unit suite's object of the module is left out of the tests'
+  comparison and must have moved; a declared module the unit suite built no
+  object of, or whose object is unchanged, fails.  A project's object of the
+  same module is the project's, declared with `moved:<project>`.
 - `moved-runtime:<configuration>/<member>` in `tests/started-passing` - a
   member of the runtime archive of one configuration (`freestanding`,
   `hosted-abort` or `hosted-unwind`), written by the configuration and the

@@ -14,6 +14,7 @@ import std::core::option::{ Option };
 
 import cryogate::core::text::{ Text };
 import cryogate::verify::declarations::{ DeclarationKind, Declarations, RuntimeMember };
+import cryogate::verify::objects::{ ObjectOwner };
 import cryogate::verify::record::{ BaselineRecord };
 
 /// A baseline census's verdicts, as the judges read them.
@@ -90,7 +91,8 @@ public type struct VerifyJudges {
         for (name in declared.iterate_references()) { judged.push(name.clone()); }
         for (name in fixed.iterate_references()) {
             match (Declarations::kind(name.as_str())) {
-                DeclarationKind::Unit | DeclarationKind::Archive | DeclarationKind::Moved | DeclarationKind::MovedArchive | DeclarationKind::MovedRuntime => { }
+                DeclarationKind::Unit | DeclarationKind::Archive | DeclarationKind::Moved | DeclarationKind::MovedArchive
+                    | DeclarationKind::MovedInstances | DeclarationKind::MovedRuntime => { }
                 _ => { judged.push(name.clone()); }
             }
         }
@@ -249,6 +251,33 @@ public type struct VerifyJudges {
                 problems.push(f"{name.as_str()}: {in_a.length()} baseline and {in_b.length()} tree archive objects end in {suffix.as_str()}; a module declared as moving its objects is in both runs' archives");
             } else if (VerifyJudges::unchanged(a, b, &in_a, &in_b)) {
                 problems.push(f"{name.as_str()} is declared as moving its archive objects, but none of its {in_a.length()} moved");
+            }
+            VerifyJudges::remove_all(a, &in_a);
+            VerifyJudges::remove_all(b, &in_b);
+        }
+        return problems;
+    }
+
+    /// Problems with the standard-library modules `names` declared
+    /// `moved-instances:` over the test objects' hash maps `a` and `b`: the
+    /// unit suite's object of each module must be in both, one each, and
+    /// must have moved.  It is removed from both; a project's object of the
+    /// same module is not the unit suite's, and stays.
+    public static instance_moves(names: &Array<String>, a: mut &HashMap<String, String>,
+                                 b: mut &HashMap<String, String>) -> Array<String> {
+        mut problems: Array<String> = Array::<String>::new();
+        for (name in Text::sorted_distinct(names.clone()).iterate_references()) {
+            const suffix: String = Declarations::archive_module_suffix(name.as_str());
+            const in_a: Array<String> = VerifyJudges::paths_where(a, (path: Str) -> boolean {
+                return ObjectOwner::in_unit_suite(path) && path.ends_with(&suffix.as_str());
+            });
+            const in_b: Array<String> = VerifyJudges::paths_where(b, (path: Str) -> boolean {
+                return ObjectOwner::in_unit_suite(path) && path.ends_with(&suffix.as_str());
+            });
+            if (in_a.length() != 1 || in_b.length() != 1) {
+                problems.push(f"{name.as_str()}: {in_a.length()} baseline and {in_b.length()} tree unit-suite objects end in {suffix.as_str()}; one each is declared");
+            } else if (VerifyJudges::same(a, b, &in_a[0], &in_b[0])) {
+                problems.push(f"{name.as_str()} is declared as moving the unit suite's object, but {in_a[0].as_str()} did not move");
             }
             VerifyJudges::remove_all(a, &in_a);
             VerifyJudges::remove_all(b, &in_b);

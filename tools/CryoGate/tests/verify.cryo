@@ -79,6 +79,12 @@ type struct Judged {
         return VerifyJudges::archive_module_moves(&Judged::list(names), &left, &right).length();
     }
 
+    private static instance_moves(names: Str, a: Str, b: Str) -> i64 {
+        mut left: HashMap<String, String> = Judged::map(a);
+        mut right: HashMap<String, String> = Judged::map(b);
+        return VerifyJudges::instance_moves(&Judged::list(names), &left, &right).length();
+    }
+
     private static runtime_moves(names: Str, a: Str, b: Str) -> i64 {
         mut left: HashMap<String, String> = Judged::map(a);
         mut right: HashMap<String, String> = Judged::map(b);
@@ -281,7 +287,8 @@ type struct Comparing {
         return DeclaredChanges {
             names: Array::<String>::new(), units: Array::<Pair<String, String>>::new(),
             moved_projects: Array::<String>::new(), moved_examples: Array::<String>::new(),
-            moved_modules: Array::<String>::new(), moved_members: Array::<String>::new(),
+            moved_modules: Array::<String>::new(), moved_instances: Array::<String>::new(),
+            moved_members: Array::<String>::new(),
             archive_files: Array::<String>::new(), problems: Array::<String>::new(),
         };
     }
@@ -431,6 +438,26 @@ function a_module_declared_moved_archive_must_move_an_archive_object() -> Result
     expect_equal(VerifyJudges::archive_module_moves(&Judged::list(Str::new("moved-archive:std::m")), &left, &right).length(), 0)?;
     return expect(left.length() == 1 && right.length() == 1
         && left.contains_key(&String::from_str(Str::new("s/x/deps/std/n.o"))), Str::new("only the declared module's objects are removed"));
+}
+
+![test]
+function a_module_declared_moved_instances_must_move_the_unit_suite_object() -> Result<(), TestError> {
+    const declared: Str = Str::new("moved-instances:std::m");
+    const unit: Str = Str::new("tests/build/target/release/h/std/deps/std/m.o");
+    expect_equal(Judged::instance_moves(declared, f"{unit}=1".as_str(), f"{unit}=2".as_str()), 0)?;
+    expect_equal(Judged::instance_moves(declared, f"{unit}=1".as_str(), f"{unit}=1".as_str()), 1)?;
+    expect_equal(Judged::instance_moves(declared, Str::new(""), Str::new("")), 1)?;
+    // A project's object of the module is not the unit suite's.
+    const project: Str = Str::new("tests/tests/projects/p/build/target/release/h/std/deps/std/m.o");
+    expect_equal(Judged::instance_moves(declared, f"{project}=1".as_str(), f"{project}=2".as_str()), 1)?;
+    // Another module's moved object, and the project's, stay in both maps.
+    const other: Str = Str::new("tests/build/target/release/h/std/deps/std/n.o");
+    mut left: HashMap<String, String> = Judged::map(f"{unit}=1;{other}=1;{project}=1".as_str());
+    mut right: HashMap<String, String> = Judged::map(f"{unit}=2;{other}=2;{project}=2".as_str());
+    expect_equal(VerifyJudges::instance_moves(&Judged::list(declared), &left, &right).length(), 0)?;
+    return expect(left.length() == 2 && right.length() == 2
+        && left.contains_key(&String::from_str(other)) && left.contains_key(&String::from_str(project)),
+        Str::new("only the unit suite's object of the declared module is removed"));
 }
 
 ![test]
@@ -734,6 +761,8 @@ function the_moved_archive_form_is_its_own_kind_naming_the_module() -> Result<()
 function each_form_names_its_kind() -> Result<(), TestError> {
     expect(match (Declarations::kind(Str::new("archive:lang/u.cryo"))) { DeclarationKind::Archive => { true } _ => { false } }, Str::new("archive"))?;
     expect(match (Declarations::kind(Str::new("moved:p"))) { DeclarationKind::Moved => { true } _ => { false } }, Str::new("moved"))?;
+    expect(match (Declarations::kind(Str::new("moved-instances:std::a"))) { DeclarationKind::MovedInstances => { true } _ => { false } }, Str::new("moved-instances"))?;
+    expect_equal(Declarations::program_of(Str::new("moved-instances:std::a")), Str::new("std::a"))?;
     expect(match (Declarations::kind(Str::new("negative/E1_x.cryo"))) { DeclarationKind::Negative => { true } _ => { false } }, Str::new("negative before unit"))?;
     expect(match (Declarations::kind(Str::new("examples/01-hello"))) { DeclarationKind::Example => { true } _ => { false } }, Str::new("example"))?;
     expect(match (Declarations::kind(Str::new("lang/u.cryo"))) { DeclarationKind::Unit => { true } _ => { false } }, Str::new("unit"))?;
