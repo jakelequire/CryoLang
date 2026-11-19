@@ -37,6 +37,7 @@ implement struct Generator {
         mut takes_object: boolean = false;
         mut takes_owned: boolean = false;
         mut takes_reference: boolean = false;
+        mut takes_slice: boolean = false;
         if (!is_main) {
             const parameter_count: i64 = if (free) { 1 + this.random.below(4) } else { this.random.below(4) };
             while (parameter_types.length() < parameter_count) { parameter_types.push(this.any_type()); }
@@ -44,11 +45,12 @@ implement struct Generator {
             if (free) { takes_object = this.add_object_parameter(&parameter_types); }
             if (free) { takes_owned = this.add_owned_parameter(&parameter_types); }
             if (free) { takes_reference = this.add_reference_parameter(&parameter_types); }
+            if (free) { takes_slice = this.add_slice_parameter(&parameter_types); }
         }
         const reference: ValueType = if (takes_reference) { this.reference_return_type(&parameter_types) } else { ValueType::Void };
         const returns: ValueType = if (reference.is_reference()) { reference } else { this.drawn_return_type(owner, receiver, is_main) };
         this.define_with(number, owner, receiver, &parameter_types, returns, -1);
-        if (!is_main && !takes_function && !takes_object && !takes_owned && !takes_reference && this.options.features.has(Feature::Overloads)) {
+        if (!is_main && !takes_function && !takes_object && !takes_owned && !takes_reference && !takes_slice && this.options.features.has(Feature::Overloads)) {
             this.define_overloads(this.program.functions.length() - 1);
         }
     }
@@ -106,6 +108,7 @@ implement struct Generator {
         if (is_main) {
             this.declare_object_sources(&statements);
             this.declare_reference_holders(&statements);
+            this.declare_array_sources(&statements);
         }
         this.fill(&statements, true);
         this.observe_declared(body_start, &statements);
@@ -186,6 +189,8 @@ implement struct Generator {
                 arguments.push(this.written_closure(this.program.instantiated_function_type(called.callable, type_argument), true));
             } else if (wanted.object_trait() >= 0) {
                 arguments.push(this.object_argument(wanted));
+            } else if (wanted.is_slice()) {
+                arguments.push(this.slice_argument(wanted));
             } else if (wanted.is_function()) {
                 arguments.push(this.function_value(wanted, true));
             } else if ((decides && inferred) || overloaded) {
@@ -212,7 +217,8 @@ implement struct Generator {
             const candidate: Function = this.program.function_at(index);
             if (candidate.receiver.is_called_by_name() && !candidate.genericity.is_generic()
                     && candidate.returns.same(wanted) && this.budget.affordable(candidate.cost) && this.may_call(&candidate)
-                    && this.passes_objects(&candidate) && this.passes_references(&candidate)) {
+                    && this.passes_objects(&candidate) && this.passes_references(&candidate)
+                    && this.passes_slices(candidate.first_parameter, candidate.parameter_count)) {
                 found.push(index);
             }
             index = index + 1;

@@ -87,10 +87,12 @@ internal type struct UseWalk {
                 }
                 StatementKind::Assign(place, value) => {
                     this.add(UseKind::Assigned, UseWalk::root(program, place));
+                    this.walk_index(program, place);
                     this.walk(program, value);
                 }
                 StatementKind::Compound(_, place, value) => {
                     this.add(UseKind::Assigned, UseWalk::root(program, place));
+                    this.walk_index(program, place);
                     this.walk(program, value);
                 }
                 StatementKind::Observe(value) => { this.walk(program, value); }
@@ -122,6 +124,11 @@ internal type struct UseWalk {
                     }
                 }
                 StatementKind::Finish => { }
+                StatementKind::Each(variable, binding, body) => {
+                    this.add(UseKind::Named, variable);
+                    this.add(UseKind::Declared, binding);
+                    this.walk_block(program, body, marking);
+                }
             }
             current = program.statement_at(current).next;
         }
@@ -134,8 +141,19 @@ internal type struct UseWalk {
             ExpressionKind::Variable(variable) => { variable }
             ExpressionKind::Field(base, _) => { UseWalk::root(program, base) }
             ExpressionKind::Dereference(operand) => { UseWalk::root(program, operand) }
+            ExpressionKind::Element(variable, _) => { variable }
             _ => { -1 }
         };
+    }
+
+    /// Walk the index of a store's target that is an element, `v[index]`,
+    /// which is evaluated with the statement; a place of any other kind
+    /// holds no expression evaluated there.
+    private walk_index(mut &this, program: &Program, place: i64) -> void {
+        match (program.expression_at(place).kind) {
+            ExpressionKind::Element(_, index) => { this.walk(program, index); }
+            _ => { }
+        }
     }
 
     /// Walk a value the function returns, between its marks.
@@ -242,6 +260,19 @@ internal type struct UseWalk {
                     this.walk(program, taken.body);
                     arm = arm + 1;
                 }
+            }
+            ExpressionKind::ArrayLiteral(first, count) => { this.walk_run(program, first, count, 1, 0); }
+            ExpressionKind::ArrayRepeat(repeated) => { this.walk(program, repeated); }
+            ExpressionKind::Element(variable, index) => {
+                this.add(UseKind::Named, variable);
+                this.walk(program, index);
+            }
+            ExpressionKind::Length(variable) => { this.add(UseKind::Named, variable); }
+            ExpressionKind::TextOf(operand) => { this.walk(program, operand); }
+            ExpressionKind::AsStr(variable) => { this.add(UseKind::SharedBorrow, variable); }
+            ExpressionKind::Push(variable, operand) => {
+                this.add(UseKind::ExclusiveBorrow, variable);
+                this.walk(program, operand);
             }
             _ => { }
         }

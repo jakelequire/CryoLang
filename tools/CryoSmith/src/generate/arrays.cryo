@@ -1,0 +1,243 @@
+///! Arrays (stage 8): fixed arrays of integers, `[i16; 3]`, and the slices
+///! viewing them, `&Slice<i16>`.
+///!
+///! With `arrays`, a function declares array locals, built by a literal or
+///! a repeat or copied from another of the same type, reads their elements
+///! as integer values and writes them through a `mut` one, and a free
+///! function sometimes takes a slice, given `&v` of an array local or a
+///! slice parameter passed on, and reads its elements and its length.
+///! Every index is reduced into the length where it is written, `(e % N)`
+///! for an array and `(e % (s.length() as u64))` for a slice, and every
+///! array holds at least one element, so no index is ever out of range.
+///! A slice is a parameter only and never outlives the call that borrows
+///! it, and a statement writing an array lends it exclusively, so nothing
+///! borrows it there.  An array or a slice is observed by a `for` over its
+///! elements, in order.
+
+namespace cryosmith::generate::arrays;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature, FeatureSet };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::model::{ BinaryOperator, ExpressionKind, MOST_ELEMENTS, StatementKind, ValueType, Variable, VariableRole };
+import cryosmith::typing::{ TypeChoice };
+
+/// How often in a hundred a free function takes a slice, when `arrays` is
+/// on.
+const SLICE_CHANCE: i64 = 30;
+
+implement struct Generator {
+    /// Whether arrays and slices are generated: `arrays` is on, and so are
+    /// `division`, since every index is reduced by `%`, and `loops`, since
+    /// one is observed by a `for` over its elements.
+    internal makes_arrays(&this) -> boolean {
+        const features: FeatureSet = this.options.features;
+        return features.has(Feature::Arrays) && features.has(Feature::Division) && features.has(Feature::Loops);
+    }
+
+    /// A fixed array type: a drawn integer element and 1 to
+    /// `MOST_ELEMENTS` elements.
+    private array_type(mut &this) -> ValueType {
+        const element: ValueType = TypeChoice::integer(&this.random);
+        return ValueType::fixed_array(element, 1 + this.random.below(MOST_ELEMENTS));
+    }
+
+    /// `const` or `mut` local of a drawn fixed array type with its initial
+    /// value.
+    internal array_declaration(mut &this) -> i64 {
+        const value_type: ValueType = this.array_type();
+        const value: i64 = this.array_value(value_type, this.depth());
+        const mutable: boolean = this.random.chance(50);
+        const variable: i64 = this.environment.declare_local(&this.program, value_type, mutable);
+        return this.program.statement(StatementKind::Declare(variable, value));
+    }
+
+    /// A value of the fixed array type `wanted`: a literal of its elements,
+    /// a repeat of one value, or a copy of an array variable in scope.
+    internal array_value(mut &this, wanted: ValueType, depth: i64) -> i64 {
+        const next: i64 = if (depth > 0) { depth - 1 } else { 0 };
+        const copies: Array<i64> = this.environment.variables_of(&this.program, wanted);
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(6);
+        weights.push(3);
+        weights.push(if (copies.length() > 0) { 3 } else { 0 });
+        const form: i64 = this.random.pick(&weights);
+        if (form == 2) { return this.read(copies.get(this.random.below(copies.length())).unwrap()); }
+        if (form == 1) { return this.node(ExpressionKind::ArrayRepeat(this.typed_place(wanted.element(), next)), wanted); }
+        mut elements: Array<i64> = Array::<i64>::new();
+        while (elements.length() < wanted.array_length()) { elements.push(this.typed_place(wanted.element(), next)); }
+        const first: i64 = this.program.list_run(&elements);
+        return this.node(ExpressionKind::ArrayLiteral(first, elements.length()), wanted);
+    }
+
+    /// The parameters and locals in scope whose elements are of `wanted`:
+    /// fixed arrays and slices.
+    internal element_sources(&this, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.in_scope().iter()) {
+            const declared: Variable = this.program.variable_at(variable);
+            if (Generator::names_collection(declared) && declared.value_type.element().same(wanted)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// The slice parameters and `String` locals in scope, whose length is
+    /// an `i64` value.
+    internal measurable(&this) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.in_scope().iter()) {
+            if (this.program.variable_at(variable).value_type.is_slice()) { found.push(variable); }
+        }
+        for (variable in this.texts().iter()) { found.push(variable); }
+        return found;
+    }
+
+    /// `v[index]`, an element of one of `sources`, at an index in range.
+    internal element_read(mut &this, sources: &Array<i64>, depth: i64) -> i64 {
+        const variable: i64 = sources.get(this.random.below(sources.length())).unwrap();
+        const index: i64 = this.in_range(variable, depth);
+        return this.node(ExpressionKind::Element(variable, index), this.program.variable_at(variable).value_type.element());
+    }
+
+    /// `v.length()` of one of `slices`.
+    internal slice_length(mut &this, slices: &Array<i64>) -> i64 {
+        return this.node(ExpressionKind::Length(slices.get(this.random.below(slices.length())).unwrap()), ValueType::I64);
+    }
+
+    /// An index into the array or the slice `variable` holds, reduced into
+    /// its length: `(e % N)` for an array of `N`, `(e % (v.length() as
+    /// u64))` for a slice, `e` a `u64` that reads a name.
+    private in_range(mut &this, variable: i64, depth: i64) -> i64 {
+        const held: ValueType = this.program.variable_at(variable).value_type;
+        const operand: i64 = this.expression(ValueType::U64, depth, true);
+        const length: i64 = if (held.is_slice()) {
+            this.node(ExpressionKind::Cast(this.node(ExpressionKind::Length(variable), ValueType::I64)), ValueType::U64)
+        } else {
+            this.integer(held.array_length() as u64, ValueType::U64)
+        };
+        return this.node(ExpressionKind::Binary(BinaryOperator::Remainder, operand, length), ValueType::U64);
+    }
+
+    /// The `mut` array locals in scope whose elements may be written here:
+    /// any not lent by the statement.
+    internal writable_arrays(&this) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.assignable(&this.program).iter()) {
+            if (this.program.variable_at(variable).value_type.is_array() && !this.environment.is_lent(variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// `v[index] = ..;` or a compound store to an element of one of
+    /// `writable`, lent exclusively first, so neither the index nor the
+    /// value borrows it.
+    internal element_store(mut &this, writable: &Array<i64>) -> i64 {
+        const variable: i64 = writable.get(this.random.below(writable.length())).unwrap();
+        this.environment.lend(variable, true);
+        const index: i64 = this.in_range(variable, this.depth());
+        const place: i64 = this.program.expression(ExpressionKind::Element(variable, index), this.program.variable_at(variable).value_type.element());
+        return this.store(place);
+    }
+
+    /// A slice parameter for a free function, sometimes: with `arrays`,
+    /// `SLICE_CHANCE` times in a hundred, `&Slice<E>` of a drawn integer
+    /// `E` added to `parameter_types`.  No draw is taken without the
+    /// feature.  Whether one was added.
+    internal add_slice_parameter(mut &this, parameter_types: mut &Array<ValueType>) -> boolean {
+        if (!this.makes_arrays() || !this.random.chance(SLICE_CHANCE)) { return false; }
+        parameter_types.push(ValueType::SliceReference(TypeChoice::integer(&this.random).integer_place()));
+        return true;
+    }
+
+    /// The variables in scope a slice of type `wanted` may be given from:
+    /// an array local of its element not lent exclusively, borrowed, or a
+    /// slice parameter of it, passed on.
+    private slice_sources(&this, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.element_sources(wanted.element()).iter()) {
+            const held: ValueType = this.program.variable_at(variable).value_type;
+            if (held.is_slice() || !this.environment.is_lent_exclusively(variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// Whether every slice parameter of the `parameter_count` parameters
+    /// from `first_parameter` in the index lists has a variable in scope
+    /// to be given from, so a call of it can be written here.
+    internal passes_slices(&this, first_parameter: i64, parameter_count: i64) -> boolean {
+        mut index: i64 = 0;
+        while (index < parameter_count) {
+            const wanted: ValueType = this.program.variable_at(this.program.list_at(first_parameter + index)).value_type;
+            if (wanted.is_slice() && this.slice_sources(wanted).length() == 0) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    /// The argument for a slice parameter of type `wanted`: `&v` of an
+    /// array local, lent for the statement, or a slice parameter passed
+    /// on.
+    internal slice_argument(mut &this, wanted: ValueType) -> i64 {
+        const sources: Array<i64> = this.slice_sources(wanted);
+        const variable: i64 = sources.get(this.random.below(sources.length())).unwrap();
+        if (this.program.variable_at(variable).value_type.is_slice()) { return this.read(variable); }
+        this.environment.lend(variable, false);
+        return this.node(ExpressionKind::Borrow(variable), wanted);
+    }
+
+    /// In `main`, with `arrays`: for each element type some helper takes a
+    /// slice of, an array local of that element, declared first, so
+    /// main's calls of those helpers have an array to borrow.  No draw
+    /// where no helper takes a slice.
+    internal declare_array_sources(mut &this, statements: mut &Array<i64>) -> void {
+        if (!this.makes_arrays()) { return; }
+        for (element in ValueType::integers().iter()) {
+            if (this.takes_slice_of(element)) {
+                const value_type: ValueType = ValueType::fixed_array(element, 1 + this.random.below(MOST_ELEMENTS));
+                const value: i64 = this.array_value(value_type, this.depth());
+                const variable: i64 = this.environment.declare_local(&this.program, value_type, false);
+                statements.push(this.program.statement(StatementKind::Declare(variable, value)));
+            }
+        }
+    }
+
+    /// Whether some function generated so far takes a slice of `element`.
+    private takes_slice_of(&this, element: ValueType) -> boolean {
+        for (defined in this.program.functions.iter()) {
+            mut position: i64 = 0;
+            while (position < defined.parameter_count) {
+                const held: ValueType = this.program.variable_at(this.program.list_at(defined.first_parameter + position)).value_type;
+                if (held.is_slice() && held.element().same(element)) { return true; }
+                position = position + 1;
+            }
+        }
+        return false;
+    }
+
+    /// Observe the array or the slice `variable` holds: `for (n in v) {
+    /// observe n }`, every element in order, the loop's variable named as
+    /// a counter is, and a slice's length.
+    internal observe_elements(mut &this, variable: i64, statements: mut &Array<i64>) -> void {
+        const held: ValueType = this.program.variable_at(variable).value_type;
+        if (held.is_slice()) {
+            statements.push(this.observation(this.node(ExpressionKind::Length(variable), ValueType::I64)));
+        }
+        const mark: i64 = this.environment.mark();
+        const binding: i64 = this.environment.declare_counter(&this.program, held.element());
+        mut body: Array<i64> = Array::<i64>::new();
+        body.push(this.observation(this.read(binding)));
+        this.environment.leave(mark);
+        statements.push(this.program.statement(StatementKind::Each(variable, binding, this.program.block(&body))));
+    }
+
+    /// Whether `declared` names an array or a slice whose elements may be
+    /// read: an array local or a slice parameter.
+    private static names_collection(declared: Variable) -> boolean {
+        return match (declared.role) {
+            VariableRole::Local     => { declared.value_type.is_array() }
+            VariableRole::Parameter => { declared.value_type.is_slice() }
+            _                       => { false }
+        };
+    }
+}

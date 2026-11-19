@@ -3367,6 +3367,8 @@ A bound of one says, in the signature, which types a generic accepts - a call wi
 
 The type a head names may be written after a kind keyword, `struct`, `enum` or `union` (`implement struct Point`, `implement trait Eq for enum Color`). The keyword is optional, and when written it names the kind of that type: `struct` a struct, `enum` an enum, `union` a union, and an alias the type it names. A keyword naming another kind is refused (E0319), with the type's own keyword as the fix; a type that is none of the three, such as a primitive, takes no keyword, and the fix removes it.
 
+A head may name the type through an alias, since an alias is the type it names: with `type PointAlias = Point;`, `implement trait Measure for PointAlias` implements `Measure` for `Point`, and `implement PointAlias { .. }` gives `Point` its methods. They are reached through either name - on a `Point` value, on a `PointAlias` value, as `Point::at(..)` or `PointAlias::at(..)`, through a bound and through a trait object - and an alias of an alias reaches the same type. The alias must reach a type a head names by its declaration, a struct, an enum, a union or a primitive; one naming a generic instance (`type WideWrapper = Wrapper<i64>;`), a pointer, an array or a function type is refused (E0320). A generic instance is implemented for by writing it after `for` (`implement trait Widen for Wrapper<i64>`).
+
 ### 12.1 Inherent Implementation
 
 Adds methods to a type. For a struct, an inherent block is interchangeable with declaring the methods inline:
