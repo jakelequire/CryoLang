@@ -600,6 +600,30 @@ audit (section 7) holds each such arm to opening its body with the
 assignment, of the subject, of another variant, and to observing every
 binding after it.
 
+**Arrays.** With `arrays` (and `division` and `loops`), a function
+declares fixed array locals of an integer element and one to eight
+elements, `const v2: [i16; 3] = [a, b, c];` or `[a; 3]`, or a copy of an
+array in scope; reads an element wherever an integer of its type is
+wanted, `v2[(e % 3)]`; writes one through a `mut` array, `v2[(e % 3)] =
+..;` or a compound store; and assigns a `mut` array whole. A free
+function sometimes takes `&Slice<E>` as its last parameter
+(`ValueType::SliceReference`), given `&v` of an array local of its
+element or a slice parameter passed on, and reads its elements,
+`p3[(e % (p3.length() as u64))]`, and its length, an `i64`; `main`
+declares an array of each element some helper takes a slice of, first,
+so it can call them. Every index is reduced into the length where it is
+written, `e` a `u64` that reads a name, and no array is empty, so a
+slice of one never is and no index is out of range under either overflow
+rule. An array or a slice is observed by `for (n4 in v2) { observed =
+mix(observed, n4); }`, every element in order (`StatementKind::Each`),
+and a slice by its length too. Under the memory-safety plan's rules as
+well as today's: a slice is a parameter only, so no reference to an
+array outlives the call borrowing it; a statement writing an array, an
+element or the whole, lends it exclusively first, so neither its index
+nor its value borrows it; and an element read copies an integer out,
+holding no reference. The array audit (section 7) holds the model to
+these rules.
+
 **Kept off.** Nothing.
 
 ## 3. Guarantees, and how each is enforced
@@ -863,7 +887,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
 | 6 | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods; `enum-implementations`: traits implemented for the declared enums, their methods matching on `this`, called on the enums' values, through bounds at an enum and through objects borrowing one. The stage is complete |
 | 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings; `references`: `&D0` and `mut &D0` parameters, `&D0` returns, kept shared or exclusive per statement; `drops`: `mem::drop`, discarded results, borrowed temporaries and whole stores through `mut &D0`; `boxes`: `Box<D0>` read and written through, `Rc<D0>` cloned and counted; `options`: `Option<D0>` and `Result<D0, u32>` matched, unwrapped where certainly holding a value, and propagated with `?`; `sibling-variants`: a `?`'s `if` operand leaving a variant's type arguments to its sibling arm (section 2) |
-| 8 | strings, arrays and collections |
+| 8 | `arrays`: fixed arrays of integers built by a literal, a repeat or a copy, their elements read and written at an index reduced into the length, and `&Slice<E>` parameters given `&v` of one, each observed by a `for` over its elements (section 2); strings and collections to come |
 
 Section 9 places each stage among the rest of the work, the tools that
 run what the stages generate.
@@ -938,9 +962,10 @@ statement budget of one function, default 24), `--no-header`, and
   run's verdict line, the same for any N; it refuses parts that do not
   run every unit exactly once between them.
 - **A static audit** of printed programs: every `/` and `%` divides by a
-  `| 1)` guard and every `<<` / `>>` amount is masked. The audit reads the
-  printed text, not the model, so it does not share the generator's
-  mistakes about what it built.
+  `| 1)` guard, a positive literal or a slice's `(v.length() as u64)`, no
+  fixed array is written with no elements, and every `<<` / `>>` amount is
+  masked. The audit reads the printed text, not the model, so it does not
+  share the generator's mistakes about what it built.
 - **The corpus check** is CryoGate's, `cryogate corpus-check`: CryoSmith
   writes K seeds' programs (`batch`), each is built at `--opt-level=0` and
   `--opt-level=2` with the compiler named, and both run. A program passes
@@ -1004,6 +1029,15 @@ statement budget of one function, default 24), `--no-header`, and
   option or a result; each clone is of a shared owner; and the audit finds
   some of each, and some box. The move audit counts an `unwrap` as a move,
   and the loan audit a clone as a shared borrow.
+- **The array audit** reads the model of 200 programs: each element read
+  or written has its index reduced into the length of what it indexes, `(e
+  % N)` with `N` the array's own length or `(e % (v.length() as u64))` of
+  the same slice; only a parameter holds a slice, and each `&v` given for
+  one borrows an array local of its element; an element is written only in
+  a `mut` array local; and no statement both writes an array and borrows
+  it (from `UseWalk`, which walks an element target's index with its
+  statement). It finds some element reads, stores, borrowed arrays and
+  loops over elements.
 - **Borrow coverage**: of 40 programs, at least half of those declaring a
   trait object parameter pass `&v` to one, and likewise for a reference
   parameter.
@@ -1026,7 +1060,7 @@ layers, lowest first:
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
 | `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures, `Exhaustiveness`'s arms and `Capture`'s captured values (3.2) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits`, `moves`, `references`, `drops`, `holders` |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits`, `moves`, `references`, `drops`, `holders`, `arrays` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |
@@ -1201,8 +1235,10 @@ generator never reads through an `Rc`.
 6. **Stage 8: strings, arrays and collections.** `model/`: `Str`,
    `String`, fixed arrays, `Array`, `HashMap`. `generate/`: building,
    indexing within bounds, iterating. `guarantees/`: an index is in range
-   by construction (masked against a length the generator knows);
-   iteration order is observed only where the collection fixes it.
+   by construction (reduced against a length the generator knows);
+   iteration order is observed only where the collection fixes it. (Done:
+   `arrays`, fixed arrays and the slices viewing them. To come: `String`,
+   `Array` and `HashMap`.)
 7. **A differential driver** (CryoGate, `cryogate smith-diff`). Builds one
    program under several configurations - `-O0` and `-O2`, the pin and
    the compiler under test, Windows and Linux (through WSL) - runs each
