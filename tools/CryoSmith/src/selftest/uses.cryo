@@ -1,7 +1,8 @@
 ///! The uses a function makes of its variables, in the order its text is
 ///! printed: each declaration, read, borrow, reference passed on and move,
-///! with where each statement, loop and returned value begins and ends.
-///! The move and loan audits read their rules off this list.  A closure's
+///! with where each statement, loop, nested block and returned value
+///! begins and ends.  The move, loan and dynamic array audits read their
+///! rules off this list.  A closure's
 ///! body is not walked: it reads only what it captures, and it captures no
 ///! owned value and no reference.
 
@@ -44,14 +45,28 @@ internal type enum UseKind {
     ReturnEnded;
     /// A `?` returns from the function where its operand holds no value.
     Propagated;
+    /// A nested block begins: a branch's, a loop's or an element loop's
+    /// body, or a `match` statement's arm.
+    BlockEntered;
+    /// A nested block ends.
+    BlockLeft;
+    /// The variable's elements are iterated by a `for`, whose body follows
+    /// as a nested block.
+    Iterated;
 }
 
-/// One use: what it does, and the variable it names, or -1.
+/// One use: what it does, the variable it names, or -1, and the expression
+/// it is made by where an audit reads more than the variable.
 internal type struct Use {
     /// What it does.
     internal kind: UseKind;
-    /// The variable, or -1 for a statement's, loop's or return's mark.
+    /// The variable, or -1 for a statement's, loop's, block's or return's
+    /// mark.
     internal variable: i64;
+    /// The expression making the use: an element read or written, `v[i]`;
+    /// a push, a pop, a clone or a borrow; the value a declaration or an
+    /// assignment gives its variable.  -1 for any other use.
+    internal node: i64;
 }
 
 /// The walk of one function's body.
@@ -70,8 +85,20 @@ internal type struct UseWalk {
         return walk.uses;
     }
 
-    /// Record a use.
-    private add(mut &this, kind: UseKind, variable: i64) -> void { this.uses.push(Use { kind: kind, variable: variable }); }
+    /// Record a use made by no expression an audit reads.
+    private add(mut &this, kind: UseKind, variable: i64) -> void { this.add_made(kind, variable, -1); }
+
+    /// Record a use made by the expression `node`.
+    private add_made(mut &this, kind: UseKind, variable: i64, node: i64) -> void {
+        this.uses.push(Use { kind: kind, variable: variable, node: node });
+    }
+
+    /// Walk the nested block from `first` between its marks.
+    private walk_nested(mut &this, program: &Program, first: i64, marking: boolean) -> void {
+        this.add(UseKind::BlockEntered, -1);
+        this.walk_block(program, first, marking);
+        this.add(UseKind::BlockLeft, -1);
+    }
 
     /// Walk the block from `first`; with `marking`, each statement begins
     /// with a mark - a block an expression runs, a `match` arm's
@@ -83,15 +110,15 @@ internal type struct UseWalk {
             match (program.statement_at(current).kind) {
                 StatementKind::Declare(variable, value) => {
                     this.walk(program, value);
-                    this.add(UseKind::Declared, variable);
+                    this.add_made(UseKind::Declared, variable, value);
                 }
                 StatementKind::Assign(place, value) => {
-                    this.add(UseKind::Assigned, UseWalk::root(program, place));
+                    this.add_made(UseKind::Assigned, UseWalk::root(program, place), value);
                     this.walk_index(program, place);
                     this.walk(program, value);
                 }
                 StatementKind::Compound(_, place, value) => {
-                    this.add(UseKind::Assigned, UseWalk::root(program, place));
+                    this.add_made(UseKind::Assigned, UseWalk::root(program, place), value);
                     this.walk_index(program, place);
                     this.walk(program, value);
                 }
@@ -100,13 +127,13 @@ internal type struct UseWalk {
                 StatementKind::Release(variable) => { this.add(UseKind::Moved, variable); }
                 StatementKind::Branch(condition, then_block, else_block) => {
                     this.walk(program, condition);
-                    this.walk_block(program, then_block, marking);
-                    if (else_block >= 0) { this.walk_block(program, else_block, marking); }
+                    this.walk_nested(program, then_block, marking);
+                    if (else_block >= 0) { this.walk_nested(program, else_block, marking); }
                 }
                 StatementKind::Loop(_, counter, _, body) => {
                     this.add(UseKind::LoopEntered, -1);
                     this.add(UseKind::Declared, counter);
-                    this.walk_block(program, body, marking);
+                    this.walk_nested(program, body, marking);
                     this.add(UseKind::LoopLeft, -1);
                 }
                 StatementKind::Exit(_, condition) => { this.walk(program, condition); }
@@ -119,15 +146,15 @@ internal type struct UseWalk {
                     this.walk(program, subject);
                     mut arm: i64 = first_arm;
                     while (arm < first_arm + count) {
-                        this.walk_block(program, program.arm_at(arm).body, marking);
+                        this.walk_nested(program, program.arm_at(arm).body, marking);
                         arm = arm + 1;
                     }
                 }
                 StatementKind::Finish => { }
                 StatementKind::Each(variable, binding, body) => {
-                    this.add(UseKind::Named, variable);
+                    this.add(UseKind::Iterated, variable);
                     this.add(UseKind::Declared, binding);
-                    this.walk_block(program, body, marking);
+                    this.walk_nested(program, body, marking);
                 }
             }
             current = program.statement_at(current).next;
@@ -147,11 +174,15 @@ internal type struct UseWalk {
     }
 
     /// Walk the index of a store's target that is an element, `v[index]`,
-    /// which is evaluated with the statement; a place of any other kind
-    /// holds no expression evaluated there.
+    /// which is evaluated with the statement, and the exclusive borrow a
+    /// dynamic array's element is written through, `index_mutable(mut
+    /// &v)`; a place of any other kind holds no expression evaluated there.
     private walk_index(mut &this, program: &Program, place: i64) -> void {
         match (program.expression_at(place).kind) {
-            ExpressionKind::Element(_, index) => { this.walk(program, index); }
+            ExpressionKind::Element(variable, index) => {
+                if (program.variable_at(variable).value_type.is_dynamic_array()) { this.add_made(UseKind::ExclusiveBorrow, variable, place); }
+                this.walk(program, index);
+            }
             _ => { }
         }
     }
@@ -191,7 +222,7 @@ internal type struct UseWalk {
                 }
             }
             ExpressionKind::Borrow(variable) => {
-                this.add(if (value_type.is_exclusive()) { UseKind::ExclusiveBorrow } else { UseKind::SharedBorrow }, variable);
+                this.add_made(if (value_type.is_exclusive()) { UseKind::ExclusiveBorrow } else { UseKind::SharedBorrow }, variable, value);
             }
             ExpressionKind::Move(variable) => { this.add(UseKind::Moved, variable); }
             ExpressionKind::Unwrap(variable) => { this.add(UseKind::Moved, variable); }
@@ -264,7 +295,7 @@ internal type struct UseWalk {
             ExpressionKind::ArrayLiteral(first, count) => { this.walk_run(program, first, count, 1, 0); }
             ExpressionKind::ArrayRepeat(repeated) => { this.walk(program, repeated); }
             ExpressionKind::Element(variable, index) => {
-                this.add(UseKind::Named, variable);
+                this.add_made(UseKind::Named, variable, value);
                 this.walk(program, index);
             }
             ExpressionKind::Length(variable) => { this.add(UseKind::Named, variable); }
@@ -273,6 +304,33 @@ internal type struct UseWalk {
             ExpressionKind::Push(variable, operand) => {
                 this.add(UseKind::ExclusiveBorrow, variable);
                 this.walk(program, operand);
+            }
+            ExpressionKind::DynamicRepeat(repeated, _) => { this.walk(program, repeated); }
+            ExpressionKind::Duplicate(variable) => { this.add_made(UseKind::SharedBorrow, variable, value); }
+            ExpressionKind::Append(variable, operand) => {
+                this.add_made(UseKind::ExclusiveBorrow, variable, value);
+                this.walk(program, operand);
+            }
+            ExpressionKind::Pop(variable) => { this.add_made(UseKind::ExclusiveBorrow, variable, value); }
+            ExpressionKind::Insert(map, key, inserted, default_value) => {
+                this.add_made(UseKind::ExclusiveBorrow, map, value);
+                this.walk(program, key);
+                this.walk(program, inserted);
+                this.walk(program, default_value);
+            }
+            ExpressionKind::Removal(map, key, default_value) => {
+                this.add_made(UseKind::ExclusiveBorrow, map, value);
+                this.walk(program, key);
+                this.walk(program, default_value);
+            }
+            ExpressionKind::Lookup(map, key, default_value) => {
+                this.add_made(UseKind::SharedBorrow, map, value);
+                this.walk(program, key);
+                this.walk(program, default_value);
+            }
+            ExpressionKind::Contains(map, key) => {
+                this.add_made(UseKind::SharedBorrow, map, value);
+                this.walk(program, key);
             }
             _ => { }
         }
