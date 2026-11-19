@@ -101,7 +101,11 @@ A value is one of:
 - **a variant** - an enum's variant number and its payload's values;
 - **an address** - an allocation, a path into it, and the type it points
   at (section 4); references and raw pointers are both addresses, and a
-  reference's validity is checked where it is read;
+  reference's validity is checked where it is read - except a reference
+  to the slice item (`&Slice<T>`), which holds the slice's own two words,
+  its first element's address and its length (docs/cryo.md section 2.3):
+  it is laid out and read as the slice itself, `&` of a slice gives those
+  two words where they lie, and a slice method's receiver is them;
 - **a function** - a declaration-index entry, for a named function used as
   a value;
 - **a closure that captures nothing** - its lambda node, a function value
@@ -212,7 +216,12 @@ section 15, and reads nothing the compiler's ownership passes decided:
 
 - a read of a place whose type is not `Copy` moves it: the cell becomes
   moved-from, and a later read of it is a violation;
-- assigning a place drops the value it held, if any, before storing;
+- assigning a place drops the value it held, if any, before storing; the
+  right side's value is taken first, so a right side that moves the place
+  itself out (`v = if (c) { v } else { .. }`) leaves nothing to drop;
+- a statement's temporaries are released when it ends, the newest first; a
+  declaration the language marks as keeping them (a `for` loop's iterable)
+  keeps them until its block ends, after the block's bindings are dropped;
 - at the end of a scope, every live binding the scope declared that is not
   moved-from and whose type has a destructor is dropped, in reverse order
   of declaration; a struct's members are dropped after its own `drop`, in
@@ -303,11 +312,22 @@ Generics are interpreted as the monomorphiser instantiated them: each call
 runs the copy its pin names. The interpreter checks the language's rules on
 the instance it runs, which is what the compiled program runs too.
 
-**Status.** I1 to I4 are done: one core runs stages 1 to 4, since the
-standard library's print path already needs structs, generic instances,
-`match` and trait objects, and closures run as section 5.1 says. Anything
-the interpreter meets that it does not run stops the run as not covered;
-the corpus check reports such a program as not covered, never as agreeing.
+**Status.** I1 to I5 are done, and I6 to I8 run: closures as section 5.1
+says; a call through a trait object, a supertrait's method included, by
+the implementations the type checker recorded with the object's table
+(the conversion's implementation, or its copy for the value's type); moves,
+drops and the release rules of section 5.3; `Box`, `Rc`, `Option`, `Result`
+and `?`, strings and slices through the standard library's own bodies.
+Every construct the default features generate runs: a 200-seed default
+corpus reports nothing not covered.  Anything the interpreter meets that it
+does not run stops the run as not covered; the corpus check reports such a
+program as not covered, never as agreeing.
+
+**Open.** The order of the releases at the end of one statement - a
+discarded result and a borrowed temporary - is not stated by the language
+reference: the interpreter releases the newest first (the result before
+the temporary it was made from), code generation the borrowed temporaries
+first.  Seeds that observe both disagree until the reference decides.
 
 ## 9. The corpus check's third comparison
 

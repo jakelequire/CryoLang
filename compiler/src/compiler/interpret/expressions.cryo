@@ -10,7 +10,7 @@ import compiler::ast::expression::{
     LambdaExpr, LiteralExpr, MemberAccessExpr, ObjectConversionExpr, ScopeResolutionExpr, StructExpr,
     TupleExpr, UnaryExpr
 };
-import compiler::ast::declaration::{ DeclarationNode, VarDecl };
+import compiler::ast::declaration::{ DeclarationNode, ImplBlock, VarDecl };
 import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
 import compiler::ast::pattern::{ StaticMatchArmNode };
 import compiler::diag::source_span::{ SourceSpan };
@@ -153,6 +153,21 @@ implement struct Interpreter {
             Operand::Place(source) => { this.move_value(place, source, t, span) }
             Operand::Nothing => { Result::Ok(()) }
         };
+    }
+
+    /// `operand`, of type `t`, with a value that is not `Copy` moved out of
+    /// the place it names into a temporary, so its source is moved-from
+    /// before anything else happens to it.
+    taken(mut &this, operand: Operand, t: TypeRef, span: SourceSpan) -> Result<Operand, Stop> {
+        match (operand) {
+            Operand::Place(source) => {
+                if (this.is_copy(t)) { return Result::Ok(operand); }
+                const held: Address = this.temporary(t);
+                this.move_value(held, source, t, span)?;
+                return Result::Ok(Operand::Place(held));
+            }
+            _ => { return Result::Ok(operand); }
+        }
     }
 
     /// Copy the value of type `t` at `source` to `target`; the source is
@@ -319,7 +334,17 @@ implement struct Interpreter {
                 const index: i64 = this.index_of(access.index)?;
                 return Result::Ok(base.plus(index));
             }
-            _ => { return Result::Err(Interpreter::not_covered("an index into a value that is no array or pointer", span)); }
+            // A tuple's element, at the index the type checker required to
+            // be a constant in range.
+            TypeKind::Tuple => {
+                const base: Address = this.place_of(access.array)?;
+                const index: i64 = this.index_of(access.index)?;
+                if (index < 0 || index >= ty.as_tuple().elements.length()) {
+                    return Result::Err(Interpreter::violation("an index out of a tuple's elements", span));
+                }
+                return Result::Ok(base.plus(this.layout.field_offset(array_type, index)));
+            }
+            _ => { return Result::Err(Interpreter::not_covered("an index into a value that is no array, tuple or pointer", span)); }
         }
     }
 
@@ -571,10 +596,13 @@ implement struct Interpreter {
 
     /// `left = right`: the place first, then the value; what the place
     /// held is released when the language says the store releases it.
+    /// The value is taken before the release: a right side naming the
+    /// place itself (`v = if (c) { v } else { .. }`) has moved its value
+    /// out, and the release then finds nothing to drop.
     assign(mut &this, binary: BinaryExpr*, span: SourceSpan) -> Result<Operand, Stop> {
         const t: TypeRef = binary.left.resolved_type;
         const place: Address = this.place_of(binary.left)?;
-        const value: Operand = this.evaluate(binary.right)?;
+        const value: Operand = this.taken(this.evaluate(binary.right)?, binary.right.resolved_type, span)?;
         if (this.assignment_releases(binary.left) && this.needs_drop(t)) {
             this.drop_place(place, t, span)?;
         }
@@ -632,6 +660,10 @@ implement struct Interpreter {
         if (unary.desugared_call != null) { return this.evaluate(unary.desugared_call); }
         const op: TokenType = unary.op.kind;
         if (op == TokenType::Amp) {
+            // A slice reference is the slice's two words, where they lie.
+            if (this.layout.is_slice_reference(expression.resolved_type)) {
+                return Result::Ok(Operand::Place(this.place_of(unary.operand)?));
+            }
             return Result::Ok(Operand::Value(Scalar::Pointer(this.place_of(unary.operand)?)));
         }
         if (op == TokenType::Star) {
@@ -793,13 +825,23 @@ implement struct Interpreter {
     }
 
     /// A trait object: the address of the value it borrows and the
-    /// implementation whose methods it calls.
+    /// implementation whose table it is - the conversion's implementation
+    /// when that holds a table, else its copy for the value's type, which
+    /// monomorphization settled (`ImplBlock::object_instance`).
     evaluate_object(mut &this, conversion: ObjectConversionExpr*, span: SourceSpan) -> Result<Operand, Stop> {
         if (conversion.implementation == null) {
             return Result::Err(Interpreter::not_covered("a trait object made in a generic body", span));
         }
+        const table: ImplBlock* = if (conversion.implementation.object_table_symbol.is_valid()) {
+            conversion.implementation
+        } else {
+            conversion.implementation.object_instance(conversion.source)
+        };
+        if (table == null) {
+            return Result::Err(Interpreter::violation("a trait object whose implementation has no table for the value's type", span));
+        }
         const target: Address = this.pointer_of(conversion.operand)?;
-        return Result::Ok(Operand::Value(Scalar::Object(target, conversion.implementation)));
+        return Result::Ok(Operand::Value(Scalar::Object(target, table)));
     }
 
     // ---- Blocks as values ----

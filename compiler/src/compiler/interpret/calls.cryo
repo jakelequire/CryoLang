@@ -252,18 +252,29 @@ implement struct Interpreter {
     }
 
     /// A method called through a trait object: the method at the call's
-    /// slot of the implementation the object's table is.
+    /// slot of the call's declaring trait - the object's own or a
+    /// supertrait - in that trait's implementation among those the
+    /// object's table holds (`object_table_traits`, and the implementations
+    /// the type checker recorded with the table).
     call_through_object(mut &this, expression: ExpressionNode*, access: MemberAccessExpr*,
                         arguments: &[mut ExpressionNode*]) -> Result<Operand, Stop> {
         const span: SourceSpan = expression.span;
         const object: Scalar = this.object_value(access.object)?;
         const target: Address = match (object) { Scalar::Object(address, _) => { address } _ => { Address::null() } };
-        const implementation: mut ImplBlock* = match (object) {
+        const table: mut ImplBlock* = match (object) {
             Scalar::Object(_, block) => { block as mut ImplBlock* }
             _ => { return Result::Err(Interpreter::violation("a trait method called on a value that is no trait object", span)); }
         };
-        if (!implementation.trait_def.equals(access.resolved_trait)) {
-            return Result::Err(Interpreter::not_covered("a supertrait's method called through a trait object", span));
+        const traits: [DefId] = this.ctx.generic_registry.object_table_traits(table.trait_def);
+        if (traits.length() != table.object_table_blocks.length()) {
+            return Result::Err(Interpreter::violation("a trait object whose table records another number of implementations than it has traits", span));
+        }
+        mut implementation: mut ImplBlock* = null;
+        for (mut k: i64 = 0; k < traits.length(); k++) {
+            if (traits[k].equals(access.resolved_trait)) { implementation = table.object_table_blocks[k]; }
+        }
+        if (implementation == null) {
+            return Result::Err(Interpreter::violation("a trait object call naming a trait its table does not hold", span));
         }
         const method_decl: DeclarationNode* = this.ctx.generic_registry.trait_item_method(implementation, access.resolved_trait_slot);
         const method: MethodDecl* = if (method_decl == null) { null } else { DeclarationNode::method_of(method_decl) };

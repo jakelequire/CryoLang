@@ -42,8 +42,12 @@ implement struct Interpreter {
     }
 
     /// A block: its statements in order in a scope of their own, stopping
-    /// at the first that jumps.
+    /// at the first that jumps.  Leaving it drops its bindings, then
+    /// releases the temporaries a declaration in it kept past its own
+    /// statement (`DeclStmt.temporaries_outlive_statement`), which a
+    /// binding may borrow.
     execute_block(mut &this, block: BlockStmt*, span: SourceSpan) -> Result<Flow, Stop> {
+        const kept: i64 = this.temporaries.length();
         this.push_scope();
         for (mut i: i64 = 0; i < block.statements.length(); i++) {
             const flow: Flow = this.execute(block.statements[i])?;
@@ -51,16 +55,19 @@ implement struct Interpreter {
                 Flow::Normal => { }
                 _ => {
                     this.pop_scope(span)?;
+                    this.release_temporaries(kept, span)?;
                     return Result::Ok(flow);
                 }
             }
         }
         this.pop_scope(span)?;
+        this.release_temporaries(kept, span)?;
         return Result::Ok(Flow::Normal);
     }
 
     /// A declaration statement: a local, made and initialised; the
-    /// statement's temporaries released after it.
+    /// statement's temporaries released after it, unless the declaration
+    /// keeps them until its block ends.
     execute_declaration(mut &this, statement: DeclStmt*, span: SourceSpan) -> Result<Flow, Stop> {
         const variable: VarDecl* = DeclarationNode::var_of(statement.declaration);
         if (variable == null) {
@@ -74,7 +81,7 @@ implement struct Interpreter {
                 Result::Err(stop) => { return Interpreter::flow_of(stop); }
             }
         }
-        this.release_temporaries(mark, span)?;
+        if (!statement.temporaries_outlive_statement) { this.release_temporaries(mark, span)?; }
         return Result::Ok(Flow::Normal);
     }
 

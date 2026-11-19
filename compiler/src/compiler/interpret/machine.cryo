@@ -78,6 +78,11 @@ implement struct Interpreter {
                 this.count_argument(values, 2, span)?, span)?;
             return Result::Ok(Operand::Value(Scalar::Pointer(target)));
         }
+        if (symbol == Str::new("memcmp")) {
+            const order: i64 = this.compare_bytes(this.address_argument(values, 0, span)?, this.address_argument(values, 1, span)?,
+                this.count_argument(values, 2, span)?, span)?;
+            return this.integer_result(order as u64, result, span);
+        }
         if (symbol == Str::new("strlen")) {
             const text: String = this.c_string(this.address_argument(values, 0, span)?, span)?;
             return this.integer_result(text.length() as u64, result, span);
@@ -188,6 +193,30 @@ implement struct Interpreter {
         const fault: AccessFault = this.memory.copy(target, source, (bytes / element_bytes) * element_cells);
         if (!fault.is_none()) { return Result::Err(this.fault(fault, span)); }
         return Result::Ok(());
+    }
+
+    /// `memcmp`: the first `count` bytes at `left` and `right`, compared as
+    /// unsigned bytes in order; the difference of the first pair that
+    /// differs, or 0.  Each cell read must hold a byte: comparing the bytes
+    /// of wider values is not run.
+    compare_bytes(&this, left: Address, right: Address, count: i64, span: SourceSpan) -> Result<i64, Stop> {
+        for (mut i: i64 = 0; i < count; i++) {
+            const first: i64 = this.byte_at(left.plus(i), span)?;
+            const second: i64 = this.byte_at(right.plus(i), span)?;
+            if (first != second) { return Result::Ok(first - second); }
+        }
+        return Result::Ok(0);
+    }
+
+    /// The unsigned byte the cell at `address` holds.
+    byte_at(&this, address: Address, span: SourceSpan) -> Result<i64, Stop> {
+        return match (this.load(address, span)?) {
+            Scalar::Integer(bits, kind) => {
+                if (kind.width != 8) { return Result::Err(Interpreter::not_covered("a byte comparison of values wider than a byte", span)); }
+                Result::Ok((bits & 255) as i64)
+            }
+            _ => { Result::Err(Interpreter::violation("a byte comparison reading a value that is no byte", span)) }
+        };
     }
 
     // ---- Text ----
