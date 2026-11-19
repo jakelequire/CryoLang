@@ -304,6 +304,9 @@ ImplBlock          ::= "implement" ( Generics | "<" ">" )?
                        TargetType
                        "{" MethodImpl* "}"
 TargetType         ::= QualName GenericArgs?
+                       (* a QualName naming an alias names its target,
+                          which must be a struct, an enum, a union or a
+                          primitive (E0320) *)
                      | Primitive
                      | "()"                              (* unit type *)
 

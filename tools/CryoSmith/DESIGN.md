@@ -1107,9 +1107,19 @@ place.
 - Each unit of work: its build, its own tests with an inversion or a
   mutation, `make check-fast`, the self-test, the reproduction check of
   section 8, and a corpus of 50 seeds (a mutation pair's corpus keeps its
-  own size). A change to the compiler, the standard library, the runtime
-  or CryoGate also passes `make verify` before it is pushed, with its
-  declarations in the same commit.
+  own size). A unit changing only `tools/CryoSmith` is pushed after that
+  proof.
+- A unit changing the compiler, the standard library, the runtime or
+  CryoGate (a trial the maintainer set, to be judged on how it works for
+  agents): its own tests, the pin as their control, a mutation they
+  refuse, `make check-fast` and a `-Werror` build of `compiler/` by the
+  compiler under test, with its declarations in the same commit; then it
+  is committed locally and not pushed. One `make verify ARGS="--baseline
+  <last pushed tip> --require-identical"` at the end of the session
+  covers every local unit, and nothing is pushed until it passes. When it
+  fails, the culprit is found by running verify with `--baseline` set to
+  each local commit in turn, and the session's handoff records how hard
+  that was and how long it took.
 - The end of a session: the 200-seed corpus, once. When the session
   changed only `tools/CryoSmith`, that and `cryogate verify --only
   cross,fast` are the whole batch: every population the full verify
