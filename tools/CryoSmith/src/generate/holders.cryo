@@ -193,9 +193,12 @@ implement struct Generator {
     /// Option::None })?` of the holder type `operand`: a variable moved out
     /// of, a call returning one, or a choice between one built holding a
     /// value and none, in either order, so the function returns early on
-    /// one path only.  A `?`'s operand has no expected type, so the two
-    /// variants write their type arguments (`Option::<D0>::None`): no rule
-    /// gives one arm the other's type.
+    /// one path only.  A `?`'s operand has no expected type, so an arm
+    /// takes its instance from its payload or from its sibling arm: with
+    /// `sibling-variants`, `Option::Some(D0 { .. })` decides `Option<D0>`
+    /// and `Option::None` leaves its type arguments out, and of a result's
+    /// two arms, whose payloads each decide one argument, one is written
+    /// in full and the other left out; without it both arms write them.
     internal propagated(mut &this, operand: ValueType, movable: &Array<i64>, callees: &Array<i64>, depth: i64, wanted: ValueType) -> i64 {
         mut weights: Array<i64> = Array::<i64>::new();
         weights.push(if (movable.length() > 0) { 4 } else { 0 });
@@ -212,12 +215,26 @@ implement struct Generator {
             return this.node(ExpressionKind::Propagate(value), wanted);
         }
         const condition: i64 = this.condition(depth);
-        const holding: i64 = this.held_value(operand, depth, TypeArgumentSpelling::Written);
+        mut holding_spelling: TypeArgumentSpelling = TypeArgumentSpelling::Written;
+        mut absent_spelling: TypeArgumentSpelling = TypeArgumentSpelling::Written;
+        if (this.options.features.has(Feature::SiblingVariants)) {
+            absent_spelling = TypeArgumentSpelling::Omitted;
+            match (operand) {
+                ValueType::Fallible(_) => {
+                    if (this.random.chance(50)) {
+                        holding_spelling = TypeArgumentSpelling::Omitted;
+                        absent_spelling = TypeArgumentSpelling::Written;
+                    }
+                }
+                _ => { holding_spelling = TypeArgumentSpelling::Omitted; }
+            }
+        }
+        const holding: i64 = this.held_value(operand, depth, holding_spelling);
         const code: i64 = match (operand) {
             ValueType::Fallible(_) => { this.typed_place(ValueType::U32, depth) }
             _                      => { -1 }
         };
-        const absent: i64 = this.node(ExpressionKind::Absent(code, TypeArgumentSpelling::Written), operand);
+        const absent: i64 = this.node(ExpressionKind::Absent(code, absent_spelling), operand);
         const chosen: i64 = if (this.random.chance(50)) {
             this.node(ExpressionKind::Conditional(condition, holding, absent), operand)
         } else {
