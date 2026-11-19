@@ -92,7 +92,7 @@ end's owners.
 
 A value is one of:
 
-- **an integer** - its bits and its type (width 8 to 64, signed or not);
+- **an integer** - its bits and its type (width 8 to 128, signed or not);
   every arithmetic result is reduced to its type's width at the operation
   that produced it, never later;
 - **a boolean**;
