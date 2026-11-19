@@ -3164,44 +3164,47 @@ type struct DropInserter {
         return this.get_drop_flag(sym.key());
     }
 
-    /// Rewrite `<place> = <rhs>;` so the value `<place>` held is released:
+    /// Rewrite `<place> = <rhs>;` so the value `<place>` holds when the store
+    /// is made is released:
     ///
+    ///     const __assign_newN: T = <rhs>;
     ///     const __assign_oldN: T = <place>;
-    ///     <place> = <rhs>;
+    ///     <place> = __assign_newN;
     ///     if (<flag>) { __assign_oldN.drop(); }
     ///
-    /// The copy has to be taken BEFORE the store (which overwrites the only
-    /// reference to the old value) and released AFTER it, because the RHS may
-    /// read the destination: `s = s.concat(x)` builds the new value out of the
-    /// old one, so releasing first would hand `concat` freed memory.  Copying
+    /// The right side runs first and may change the destination: it may
+    /// build the new value out of the old one (`s = s.concat(x)`), or store
+    /// through a reference to it (`v = D { f: set(&v) }`), which releases and
+    /// replaces what the destination held.  So the displaced value is read
+    /// only once the right side has run - a copy taken before it would be
+    /// a value the destination no longer holds, released while the one it
+    /// does hold leaks.  The copy is taken BEFORE the store, which
+    /// overwrites the only reference to it, and released AFTER it.  Copying
     /// a not-yet-live destination is harmless - the bytes are only ever read
     /// again under the guard that says they were live.
     ///
-    /// The temporary is deliberately NOT registered as a binding: its release
-    /// is emitted right here, and a scope-exit drop would be a second one.
+    /// Neither temporary is registered as a binding: the store moves the new
+    /// value into the place, and the old one's release is emitted right here,
+    /// so a scope-exit drop of either would be a second one.
     emit_assign_drop(mut &this, stmt: Stmt*,
                      out: mut [Stmt*]*) -> void {
         const span: SourceSpan = stmt.span;
         const ty: TypeRef = this.pend_assign_ty;
+        const assignment: mut BinaryExpr* = ExpressionNode::binary_of(this.pend_assign_node);
         const place: mut ExpressionNode* = this.build_place_expr(
             this.pend_assign_base, this.pend_assign_base_ty,
             &this.pend_assign_kind, &this.pend_assign_key,
             0, this.pend_assign_kind.length(), span);
-        if (place == null) { out.push(stmt); return; }
+        if (place == null || assignment == null) { out.push(stmt); return; }
+        const fresh: PassLocal = this.mint_local(this.intern.intern(
+            fmt::format("__assign_new%lld", this.assign_seq).as_str()));
         const old: PassLocal = this.mint_local(this.intern.intern(
             fmt::format("__assign_old%lld", this.assign_seq).as_str()));
         this.assign_seq = this.assign_seq + 1;
 
-        const vd: mut VarDecl* = VarDecl::new(old.name);
-        const vd_decl: mut DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vd), span);
-        vd.set_sym_id(old.binding);
-        vd.set_resolved_type(ty);
-        vd.set_initializer(place);
-        const ds: mut Stmt* = Stmt::decl_stmt(vd_decl, span);
-        vd_decl.generated = true;
-        ds.generated = true;
-        out.push(ds);
-
+        out.push(this.hidden_local_declaration(fresh, ty, assignment.right, span));
+        assignment.right = this.local_ident(fresh, ty, span);
+        out.push(this.hidden_local_declaration(old, ty, place, span));
         out.push(stmt);
 
         const drop_stmt: Stmt* = this.make_drop_call(old, ty, span);
@@ -3219,6 +3222,21 @@ type struct DropInserter {
             }
         }
         this.inserted += 1;
+    }
+
+    /// `const <local>: <ty> = <initializer>;`, declaring a temporary this
+    /// pass made and does not track as a binding.
+    hidden_local_declaration(&this, local: PassLocal, ty: TypeRef, initializer: mut ExpressionNode*,
+                             span: SourceSpan) -> Stmt* {
+        const vd: mut VarDecl* = VarDecl::new(local.name);
+        const vd_decl: mut DeclarationNode* = DeclarationNode::of(DeclKind::Variable(vd), span);
+        vd.set_sym_id(local.binding);
+        vd.set_resolved_type(ty);
+        vd.set_initializer(initializer);
+        const ds: mut Stmt* = Stmt::decl_stmt(vd_decl, span);
+        vd_decl.generated = true;
+        ds.generated = true;
+        return ds;
     }
 
     /// An expression-statement whose result is a freshly-produced owning

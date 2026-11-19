@@ -3976,6 +3976,8 @@ The destinations below do *not* release what they overwrite, because nothing vis
 
 A local whose value the assignment's own right-hand side takes holds nothing to release: `t = takes_it(t)` releases nothing, and `t = if (c) { t } else { make() }` releases the old value exactly when `c` is false, the branch that left it in place.
 
+What is released is what the destination holds once the right-hand side has run. A right-hand side may change the destination through a reference first - `v = D { f: set(&v) }`, where `set` assigns a member of what it is given - and the assignment then releases the value `set` left there, not the one `v` held before the statement began.
+
 A store through a reference also releases nothing when the function moved a value out from behind the same binding earlier, or the store's own right-hand side does (`this.f = wrap(this.f)` inside an `unsafe` block, where such a move is not refused): the place still holds the bits of a value its new owner releases.
 
 A local or by-value parameter of an `async function` is a local for these rules even when it is carried in a field of the generated future: reassigning it releases the displaced value, and it is released at its scope's exits, exactly as in a function that never suspends (see [section 18.4](#184-how-an-async-function-is-compiled)).
