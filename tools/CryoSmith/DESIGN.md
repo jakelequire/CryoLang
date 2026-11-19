@@ -624,6 +624,23 @@ nor its value borrows it; and an element read copies an integer out,
 holding no reference. The array audit (section 7) holds the model to
 these rules.
 
+**Strings.** With `strings` (and `loops`), a function declares `String`
+locals (`ValueType::Text`), each given a new `String` whenever it is
+declared or assigned: `String::from("q7k")` of a literal whose text a
+number spells (`Program::text_of`, base 36), `String::from(e)` of an
+integer value's digits, or `String::new()`. A `mut` one is appended to,
+`v3.push(e)` of an integer, of a string literal or of another `String`'s
+view, `v3.push(v1.as_str())`; two are compared where a boolean is wanted
+(`==`, `!=`, `<`, `<=`, `>`, `>=`); and one's length is an `i64` value. A
+`String` is never read by value - never copied, moved, passed or returned
+- so it needs no ownership state, and a `String` being appended to is
+lent exclusively for its statement, so neither its own view nor its
+length or a comparison of it appears in what is appended. It is observed
+by its length and by `for (n3 in v2.as_bytes())` over its bytes, in
+order. The text audit (section 7) holds the model to these rules, and
+the loan audit sees an append as an exclusive borrow and a view as a
+shared one.
+
 **Kept off.** Nothing.
 
 ## 3. Guarantees, and how each is enforced
@@ -887,7 +904,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
 | 6 | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods; `enum-implementations`: traits implemented for the declared enums, their methods matching on `this`, called on the enums' values, through bounds at an enum and through objects borrowing one. The stage is complete |
 | 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings; `references`: `&D0` and `mut &D0` parameters, `&D0` returns, kept shared or exclusive per statement; `drops`: `mem::drop`, discarded results, borrowed temporaries and whole stores through `mut &D0`; `boxes`: `Box<D0>` read and written through, `Rc<D0>` cloned and counted; `options`: `Option<D0>` and `Result<D0, u32>` matched, unwrapped where certainly holding a value, and propagated with `?`; `sibling-variants`: a `?`'s `if` operand leaving a variant's type arguments to its sibling arm (section 2) |
-| 8 | `arrays`: fixed arrays of integers built by a literal, a repeat or a copy, their elements read and written at an index reduced into the length, and `&Slice<E>` parameters given `&v` of one, each observed by a `for` over its elements (section 2); strings and collections to come |
+| 8 | `arrays`: fixed arrays of integers built by a literal, a repeat or a copy, their elements read and written at an index reduced into the length, and `&Slice<E>` parameters given `&v` of one, each observed by a `for` over its elements (section 2); `strings`: `String` locals built from a literal, an integer's digits or nothing, appended to, compared and measured, observed by their length and bytes; collections to come |
 
 Section 9 places each stage among the rest of the work, the tools that
 run what the stages generate.
@@ -947,8 +964,9 @@ statement budget of one function, default 24), `--no-header`, and
 - **`cryosmith selftest`** runs in process and builds nothing, so
   `make check-fast` runs it: the same seed gives the same bytes; different
   seeds differ; the function prefix property of section 3.5; feature lists
-  parse and print canonically; a disabled feature's forms never appear; and
-  the static audit below passes over a few hundred programs and refuses
+  parse and print canonically; a disabled feature's forms never appear
+  (over 40 programs, and 200 for a form drawn rarely, a `?` choosing
+  between a variant and its sibling); and the static audit below passes over a few hundred programs and refuses
   every planted one. It counts its checks and fails if it ran none.
   The default program of each seed is generated once and shared by every
   check that reads it, as its model and its text; the checks only read
@@ -1038,6 +1056,12 @@ statement budget of one function, default 24), `--no-header`, and
   it (from `UseWalk`, which walks an element target's index with its
   statement). It finds some element reads, stores, borrowed arrays and
   loops over elements.
+- **The text audit** reads the model of 200 programs: each `String` local
+  declared or assigned is given a new `String` (a literal's, an integer's
+  digits, or empty), never a variable's; each append is to a `mut`
+  `String` local and never of its own view; and each operator over a
+  `String` compares two `String` variables. It finds some of each, and
+  some append of another `String`'s view.
 - **Borrow coverage**: of 40 programs, at least half of those declaring a
   trait object parameter pass `&v` to one, and likewise for a reference
   parameter.
@@ -1060,7 +1084,7 @@ layers, lowest first:
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
 | `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures, `Exhaustiveness`'s arms and `Capture`'s captured values (3.2) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits`, `moves`, `references`, `drops`, `holders`, `arrays` |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits`, `moves`, `references`, `drops`, `holders`, `arrays`, `texts` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |
@@ -1237,8 +1261,8 @@ generator never reads through an `Rc`.
    indexing within bounds, iterating. `guarantees/`: an index is in range
    by construction (reduced against a length the generator knows);
    iteration order is observed only where the collection fixes it. (Done:
-   `arrays`, fixed arrays and the slices viewing them. To come: `String`,
-   `Array` and `HashMap`.)
+   `arrays`, fixed arrays and the slices viewing them, and `strings`,
+   `String` locals. To come: `Array` and `HashMap`.)
 7. **A differential driver** (CryoGate, `cryogate smith-diff`). Builds one
    program under several configurations - `-O0` and `-O2`, the pin and
    the compiler under test, Windows and Linux (through WSL) - runs each
