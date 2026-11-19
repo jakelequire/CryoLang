@@ -253,8 +253,9 @@ the machine is exactly two kinds of declaration:
 - **intrinsics**, identified by the `IntrinsicKind` the compiler registered
   on the declaration-index entry: `malloc`, `realloc` and `free` act on
   heap allocations (section 4); `size_of`/`align_of` answer from the
-  interpreter's own layout of the type; the bit operations compute their
-  result; the atomics act on the cell as a plain read and write (a run has
+  interpreter's own layout of the type; the bit operations (byte swaps,
+  population and zero counts, rotations) compute their result by the
+  definitions `stdlib/core/intrinsics.cryo` gives them; the atomics act on the cell as a plain read and write (a run has
   one thread); `panic` ends the run as a program panic (section 7);
   `location` builds the `Location` the call site's span gives;
 - **foreign functions**, the declarations of an `extern` block, identified

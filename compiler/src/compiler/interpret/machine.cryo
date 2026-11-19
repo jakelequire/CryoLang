@@ -54,8 +54,31 @@ implement struct Interpreter {
                 Result::Ok(Operand::Nothing)
             }
             IntrinsicKind::Trap        => { Result::Err(Stop::panic(String::from_str(Str::new("trap")), span)) }
+            IntrinsicKind::Bswap16     => { this.integer_result(IntegerKind::new(16, false).byte_swapped(this.integer_argument(&values, 0, span)?), result, span) }
+            IntrinsicKind::Bswap32     => { this.integer_result(IntegerKind::new(32, false).byte_swapped(this.integer_argument(&values, 0, span)?), result, span) }
+            IntrinsicKind::Bswap64     => { this.integer_result(IntegerKind::new(64, false).byte_swapped(this.integer_argument(&values, 0, span)?), result, span) }
+            IntrinsicKind::Popcount32  => { this.integer_result(IntegerKind::new(32, false).set_bits(this.integer_argument(&values, 0, span)?), result, span) }
+            IntrinsicKind::Popcount64  => { this.integer_result(IntegerKind::new(64, false).set_bits(this.integer_argument(&values, 0, span)?), result, span) }
+            IntrinsicKind::Clz32       => { this.integer_result(IntegerKind::new(32, false).leading_zero_bits(this.integer_argument(&values, 0, span)?), result, span) }
+            IntrinsicKind::Clz64       => { this.integer_result(IntegerKind::new(64, false).leading_zero_bits(this.integer_argument(&values, 0, span)?), result, span) }
+            IntrinsicKind::Ctz32       => { this.integer_result(IntegerKind::new(32, false).trailing_zero_bits(this.integer_argument(&values, 0, span)?), result, span) }
+            IntrinsicKind::Ctz64       => { this.integer_result(IntegerKind::new(64, false).trailing_zero_bits(this.integer_argument(&values, 0, span)?), result, span) }
+            IntrinsicKind::Rotl32      => { this.rotation(IntegerKind::new(32, false), &values, true, result, span) }
+            IntrinsicKind::Rotl64      => { this.rotation(IntegerKind::new(64, false), &values, true, result, span) }
+            IntrinsicKind::Rotr32      => { this.rotation(IntegerKind::new(32, false), &values, false, result, span) }
+            IntrinsicKind::Rotr64      => { this.rotation(IntegerKind::new(64, false), &values, false, result, span) }
             _ => { Result::Err(Interpreter::not_covered("this intrinsic", span)) }
         };
+    }
+
+    /// `rotlN(value, n)` and `rotrN(value, n)`: `value` at `kind`'s width
+    /// rotated by `n` modulo the width (stdlib/core/intrinsics.cryo); a
+    /// rotation right is the rotation left by the rest of the width.
+    rotation(&this, kind: IntegerKind, values: &[MachineArgument], left: boolean, result: TypeRef, span: SourceSpan) -> Result<Operand, Stop> {
+        const value: u128 = this.integer_argument(values, 0, span)?;
+        const amount: u32 = (this.count_argument(values, 1, span)? as u32) % kind.width;
+        const by: u32 = if (left) { amount } else { kind.width - amount };
+        return this.integer_result(kind.rotated_left(value, by), result, span);
     }
 
     /// A foreign function, by the C symbol it binds.
@@ -123,13 +146,22 @@ implement struct Interpreter {
     }
 
     /// `value` as the integer result of type `t`.
-    integer_result(&this, value: u64, t: TypeRef, span: SourceSpan) -> Result<Operand, Stop> {
+    integer_result(&this, value: u128, t: TypeRef, span: SourceSpan) -> Result<Operand, Stop> {
         match (this.layout.integer_kind(t)) {
             Option::Some(kind) => { return Result::Ok(Operand::Value(Scalar::Integer(kind.reduce(value), kind))); }
             Option::None => { }
         }
         if (this.layout.cells(t) == 0) { return Result::Ok(Operand::Nothing); }
-        return Result::Err(Interpreter::violation("a foreign function whose result is no integer", span));
+        return Result::Err(Interpreter::violation("a machine rule whose result is no integer", span));
+    }
+
+    /// The bits of the integer argument at `index`, as its type stores them.
+    integer_argument(&this, values: &[MachineArgument], index: i64, span: SourceSpan) -> Result<u128, Stop> {
+        if (index >= values.length()) { return Result::Err(Interpreter::violation("a machine call missing an argument", span)); }
+        return match (values[index].value) {
+            Scalar::Integer(bits, _) => { Result::Ok(bits) }
+            _ => { Result::Err(Interpreter::violation("a machine call given no integer where one is taken", span)) }
+        };
     }
 
     address_argument(&this, values: &[MachineArgument], index: i64, span: SourceSpan) -> Result<Address, Stop> {
