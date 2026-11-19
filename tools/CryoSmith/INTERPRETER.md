@@ -223,7 +223,9 @@ section 15, and reads nothing the compiler's ownership passes decided:
 - a statement's temporaries are released when it ends, the newest first,
   and a result the statement discards is the newest of them, so it is
   released before any temporary it borrows (docs/cryo.md section 15); a
-  declaration the language marks as keeping them (a `for` loop's iterable)
+  temporary is made when its value is complete, so a struct, tuple, array,
+  variant or closure built while its members made temporaries of their own
+  is newer than all of them; a declaration the language marks as keeping them (a `for` loop's iterable)
   keeps them until its block ends, after the block's bindings are dropped;
 - at the end of a scope, every live binding the scope declared that is not
   moved-from and whose type has a destructor is dropped, in reverse order
