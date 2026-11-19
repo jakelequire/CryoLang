@@ -197,7 +197,7 @@ EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 .DEFAULT_GOAL := help
 .PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check incremental-runtime-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-abi-check pin \
         pin-impl pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
-        install uninstall clean lsp install-lsp cryogate cryosmith cryosmith-selftest release release-linux release-windows
+        install uninstall clean lsp install-lsp cryogate cryosmith cryosmith-selftest smith-corpus-pin release release-linux release-windows
 
 # The help text is printed by make itself (`$(info)`), not by a shell, so it
 # reads the same under cmd and sh.  A target added to this Makefile is added
@@ -239,7 +239,9 @@ Tests and gates
                          (ARGS=--merge after adding, --update after removing).
   make verify            Build once; census, examples, lsp-check, cross-check,
                          incremental-instance-check, incremental-runtime-check,
-                         runtime-abi-check and check-fast run
+                         runtime-abi-check, CryoSmith's pinned corpus
+                         (tests/smith-corpus, built in .verify/smith-corpus)
+                         and check-fast run
                          concurrently and their objects are hashed
                          (ARGS="--baseline HEAD --require-identical";
                          --sequential runs them one at a time).
@@ -252,6 +254,11 @@ Tests and gates
                          guarded division and shifts, and its plant; split
                          into parts run at once (`cryogate smith-selftest`,
                          CRYOGATE_JOBS of them, default the logical CPUs).
+  make smith-corpus-pin  Re-pin tests/smith-corpus (verify's `smith` gate)
+                         after a CryoSmith generator version change: seeds 1
+                         to 24 built at -O0 and -O2 by the compiler under
+                         test, each one's hash written beside it.  Writes in
+                         .verify/smith-corpus.
   make verify-selftest   cryogate's checks (verify's, selfhost's and
                          verify-pin's among them), driven through
                          fixtures they must accept and refuse.
@@ -646,6 +653,13 @@ endif
 cryosmith-selftest: $(CRYOSMITH) $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) smith-selftest --smith "$(CRYOSMITH)"
 
+# Re-pin tests/smith-corpus, the corpus verify's `smith` gate checks, after
+# the generator version changes: seeds 1 to 24 at the default features, each
+# built at -O0 and -O2 by the compiler under test, and each hash written
+# beside its seed once every program passes.  `cryogate corpus-check --pin`.
+smith-corpus-pin: cryo $(CRYOGATE) $(CRYOSMITH)
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) corpus-check --cryo "$(STAGE2_FILE)" --stdlib "$(ROOT)/stdlib" --work .verify/smith-corpus --pin tests/smith-corpus --first-seed 1 --count 24
+
 # ---- CryoAnalyzer VS Code extension -----------------------------------
 # Builds and installs the server from the current tree (`lsp`), runs its
 # behavioural checks on the installed binary, then packages
@@ -810,8 +824,9 @@ vendor-check: $(STAGE2_FILE) $(CRYOGATE)
 
 # ---- one verification run ----------------------------------------------
 # Build once, then run census, examples, lsp-check, cross-check,
-# incremental-instance-check, incremental-runtime-check, runtime-abi-check and
-# check-fast at the same time, and hash the objects the census and examples compiled.
+# incremental-instance-check, incremental-runtime-check, runtime-abi-check,
+# CryoSmith's pinned corpus (tests/smith-corpus) and check-fast at the same
+# time, and hash the objects the census and examples compiled.
 # ARGS="--baseline HEAD" also compares those objects against a compiler built
 # from HEAD's compiler/src (in a clone under .verify/, cached), which is the
 # evidence that a change moved no compiled output.  `cryogate verify`.

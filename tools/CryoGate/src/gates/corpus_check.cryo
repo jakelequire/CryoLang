@@ -15,6 +15,12 @@
 ///! directory; a passing program's are removed.  Every program terminates
 ///! by construction, so a run has no time limit: one that does not end is
 ///! itself a finding.
+///!
+///! `--expect <file>` checks a pinned corpus (`smith/pinned.cryo`): the
+///! seeds and generation options are the file's, cryosmith must be the
+///! generator version it was pinned at, and each program must also print
+///! the hash line pinned beside its seed.  `--pin <file>` writes that file
+///! from a run in which every program passed.
 
 namespace cryogate::gates::corpus_check;
 
@@ -34,6 +40,7 @@ import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::schedule::{ Cost, Scheduler };
 import cryogate::smith::corpus::{ CorpusJudge, CorpusLayout };
+import cryogate::smith::pinned::{ PinnedCorpus };
 
 /// The corpus check's settings.
 public type struct CorpusCheck {
@@ -45,7 +52,7 @@ public type struct CorpusCheck {
     /// Run `cryogate corpus-check` with `arguments` from index `first`; 0
     /// when every program passed, 1 when one failed, 2 on a usage error.
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
-        mut options: Options = Options::new(Str::new("cryogate corpus-check --cryo <compiler> --work <directory> [--smith <cryosmith>] [--stdlib <directory>] [--first-seed N] [--count K] [--jobs N] [-- <generation options>...]"));
+        mut options: Options = Options::new(Str::new("cryogate corpus-check --cryo <compiler> --work <directory> [--smith <cryosmith>] [--stdlib <directory>] [--jobs N] (--expect <file> | [--first-seed N] [--count K] [--pin <file>] [-- <generation options>...])"));
         options.valued(Str::new("--cryo"));
         options.valued(Str::new("--work"));
         options.valued(Str::new("--smith"));
@@ -53,23 +60,57 @@ public type struct CorpusCheck {
         options.valued(Str::new("--first-seed"));
         options.valued(Str::new("--count"));
         options.valued(Str::new("--jobs"));
+        options.valued(Str::new("--expect"));
+        options.valued(Str::new("--pin"));
         const parsed: Parsed = match (options.parse(arguments, first)) {
             Result::Ok(parsed)  => { parsed }
             Result::Err(reason) => { fmt::eprintln(f"cryogate corpus-check: {reason.as_str()}"); return 2; }
         };
         const compiler: Option<Str> = parsed.value(Str::new("--cryo"));
         const work: Option<Str> = parsed.value(Str::new("--work"));
-        if (compiler.is_none() || work.is_none() || !parsed.positionals().is_empty()) {
+        const expect: Option<Str> = parsed.value(Str::new("--expect"));
+        const pin: Option<Str> = parsed.value(Str::new("--pin"));
+        // A pinned corpus names its own seeds and options.
+        const chosen: boolean = parsed.value(Str::new("--first-seed")).is_some() || parsed.value(Str::new("--count")).is_some()
+            || !parsed.rest().is_empty() || pin.is_some();
+        if (compiler.is_none() || work.is_none() || !parsed.positionals().is_empty() || (expect.is_some() && chosen)) {
             fmt::eprintln(f"cryogate corpus-check: usage: {options.usage()}");
             return 2;
         }
-        const first_seed: u64 = match (u64::try_from(parsed.value(Str::new("--first-seed")).unwrap_or(Str::new("1")))) {
-            Result::Ok(value) => { value }
-            Result::Err(_)    => { fmt::eprintln(String::from_str(Str::new("cryogate corpus-check: --first-seed takes a number"))); return 2; }
+        const pinned: Option<PinnedCorpus> = match (expect) {
+            Option::Some(path) => {
+                const text: String = match (File::read_text(Path::from(Host::absolute(path).as_str()))) {
+                    Result::Ok(text)   => { text }
+                    Result::Err(error) => { fmt::println(f"corpus-check: FAIL (cannot read the pinned corpus {path}: {error.describe()})"); return 1; }
+                };
+                match (PinnedCorpus::parse(text.as_str())) {
+                    Result::Ok(corpus)  => { Option::Some(corpus) }
+                    Result::Err(reason) => { fmt::println(f"corpus-check: FAIL (the pinned corpus {path}: {reason.as_str()})"); return 1; }
+                }
+            }
+            Option::None => { Option::None }
         };
-        const count: u64 = match (u64::try_from(parsed.value(Str::new("--count")).unwrap_or(Str::new("200")))) {
-            Result::Ok(value) => { value }
-            Result::Err(_)    => { fmt::eprintln(String::from_str(Str::new("cryogate corpus-check: --count takes a number"))); return 2; }
+        const first_seed: u64 = match (&pinned) {
+            Option::Some(corpus) => { corpus.first_seed }
+            Option::None => {
+                match (u64::try_from(parsed.value(Str::new("--first-seed")).unwrap_or(Str::new("1")))) {
+                    Result::Ok(value) => { value }
+                    Result::Err(_)    => { fmt::eprintln(String::from_str(Str::new("cryogate corpus-check: --first-seed takes a number"))); return 2; }
+                }
+            }
+        };
+        const count: u64 = match (&pinned) {
+            Option::Some(corpus) => { corpus.count() }
+            Option::None => {
+                match (u64::try_from(parsed.value(Str::new("--count")).unwrap_or(Str::new("200")))) {
+                    Result::Ok(value) => { value }
+                    Result::Err(_)    => { fmt::eprintln(String::from_str(Str::new("cryogate corpus-check: --count takes a number"))); return 2; }
+                }
+            }
+        };
+        const generation: Array<String> = match (&pinned) {
+            Option::Some(corpus) => { corpus.options.clone() }
+            Option::None         => { parsed.rest().clone() }
         };
         // 0 leaves the scheduler's own count.
         const jobs: i64 = match (parsed.value(Str::new("--jobs"))) {
@@ -103,6 +144,28 @@ public type struct CorpusCheck {
             Result::Ok(_)      => { }
             Result::Err(error) => { fmt::eprintln(f"cryogate corpus-check: cannot create {check.work.as_path().as_str()}: {error.describe()}"); return 1; }
         }
+        // The generator version a pinned corpus is checked at, or pinned at.
+        mut generator: i64 = 0;
+        if (pinned.is_some() || pin.is_some()) {
+            mut version: Job = Job::new(smith.as_str());
+            version.argument(Str::new("version"));
+            version.log_to(logs.file(Str::new("corpus-version")).as_str());
+            const asked: Completion = version.run();
+            const printed: String = asked.output();
+            const problem: Option<String> = match (&pinned) {
+                Option::Some(corpus) => { corpus.version_problem(printed.as_str()) }
+                Option::None => {
+                    match (PinnedCorpus::generator_of(printed.as_str())) {
+                        Result::Ok(found)   => { generator = found; Option::None }
+                        Result::Err(reason) => { Option::Some(reason) }
+                    }
+                }
+            };
+            match (problem) {
+                Option::Some(reason) => { fmt::println(f"corpus-check: FAIL ({reason.as_str()})"); return 1; }
+                Option::None         => { }
+            }
+        }
         // CryoSmith writes the programs.
         mut batch: Job = Job::new(smith.as_str());
         batch.argument(Str::new("batch"));
@@ -112,7 +175,7 @@ public type struct CorpusCheck {
         batch.argument(f"{count}".as_str());
         batch.argument(Str::new("--out-dir"));
         batch.argument(check.work.as_path().as_str());
-        for (option in parsed.rest().iterate_references()) { batch.argument(option.as_str()); }
+        for (option in generation.iterate_references()) { batch.argument(option.as_str()); }
         batch.log_to(logs.file(Str::new("corpus-generate")).as_str());
         const generated: Completion = batch.run();
         if (!generated.outcome.succeeded()) {
@@ -153,16 +216,31 @@ public type struct CorpusCheck {
         const ran: Array<Completion> = runs.run();
         mut failed: u64 = 0;
         mut hashes: Array<String> = Array::<String>::new();
+        mut each: Array<String> = Array::<String>::new();
         offset = 0;
         while (offset < count) {
             const seed: u64 = first_seed.wrapping_add(offset);
-            const verdict: Result<String, String> = match (&verdicts[offset as i64]) {
+            mut verdict: Result<String, String> = match (&verdicts[offset as i64]) {
                 Result::Ok(at)      => { check.judge(seed, &ran[at], &ran[at + 1]) }
                 Result::Err(reason) => { Result::Err(reason.clone()) }
             };
+            match (&pinned) {
+                Option::Some(corpus) => {
+                    const mismatch: Option<String> = match (&verdict) {
+                        Result::Ok(hash) => { corpus.mismatch(seed, hash.as_str()) }
+                        Result::Err(_)   => { Option::None }
+                    };
+                    match (mismatch) {
+                        Option::Some(reason) => { verdict = Result::Err(reason); }
+                        Option::None         => { }
+                    }
+                }
+                Option::None => { }
+            }
             match (verdict) {
                 Result::Ok(hash) => {
                     fmt::println(f"ok    seed {seed} {hash.as_str()}");
+                    each.push(hash.clone());
                     if (!hashes.contains(&hash)) { hashes.push(hash); }
                 }
                 Result::Err(reason) => { fmt::println(f"FAIL  seed {seed}: {reason.as_str()}"); failed = failed + 1; }
@@ -172,6 +250,22 @@ public type struct CorpusCheck {
         if (failed > 0) {
             fmt::println(f"corpus-check: FAIL ({failed} of {count} programs)");
             return 1;
+        }
+        match (pin) {
+            Option::Some(path) => {
+                const corpus: PinnedCorpus = PinnedCorpus { generator: generator, options: generation, first_seed: first_seed, hashes: each };
+                match (File::write_text(Path::from(Host::absolute(path).as_str()), corpus.text().as_str())) {
+                    Result::Ok(_)      => { }
+                    Result::Err(error) => { fmt::println(f"corpus-check: FAIL (cannot write {path}: {error.describe()})"); return 1; }
+                }
+                fmt::println(f"corpus-check: OK ({count} programs, -O0 and -O2 agree, {hashes.length()} distinct hashes; pinned at generator version {generator} to {path})");
+                return 0;
+            }
+            Option::None => { }
+        }
+        if (pinned.is_some()) {
+            fmt::println(f"corpus-check: OK ({count} programs, -O0 and -O2 agree and print their pinned hashes, {hashes.length()} distinct hashes)");
+            return 0;
         }
         fmt::println(f"corpus-check: OK ({count} programs, -O0 and -O2 agree, {hashes.length()} distinct hashes)");
         return 0;

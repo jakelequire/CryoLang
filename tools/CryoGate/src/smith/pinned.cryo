@@ -1,0 +1,140 @@
+///! The corpus `make verify` checks: consecutive CryoSmith seeds at one
+///! generator version and options, each with the hash line its program must
+///! print.  Read from and written as the pin file; pure over the text
+///! handed in.
+///!
+///! A generated program's hash is fixed by its text alone, so a compiler
+///! that builds it into a program printing another hash miscompiles it,
+///! whether or not its two optimisation levels agree.  The file:
+///!
+///!     # comments
+///!     generator 39
+///!     options --features default
+///!     seed 1 cryosmith-hash 1234
+///!
+///! `options` holds the generation options, and may hold none; the seeds
+///! are consecutive from the first written, each once.
+
+namespace cryogate::smith::pinned;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+import cryogate::core::text::{ Text };
+
+/// A pinned corpus: the generator version and options its programs were
+/// generated at, and each seed's hash line.
+public type struct PinnedCorpus {
+    /// The generator version the hashes were pinned at.
+    public generator: i64;
+    /// The generation options, each word as `cryosmith batch` takes it.
+    public options: Array<String>;
+    /// The first seed.
+    public first_seed: u64;
+    /// The hash line of seed `first_seed + i` at index `i`.
+    public hashes: Array<String>;
+
+    /// The corpus the pin file's `text` holds; why it is not one otherwise.
+    public static parse(text: Str) -> Result<PinnedCorpus, String> {
+        mut generator: Option<i64> = Option::None;
+        mut options: Option<Array<String>> = Option::None;
+        mut first_seed: u64 = 0;
+        mut hashes: Array<String> = Array::<String>::new();
+        mut number: i64 = 0;
+        for (raw in Text::lines(text).iterate_references()) {
+            number++;
+            const line: Str = raw.as_str().trim();
+            if (line.is_empty() || line.starts_with(&Str::new("#"))) { continue; }
+            mut words: Array<Str> = Array::<Str>::new();
+            for (word in line.split_whitespace()) { words.push(word); }
+            if (words[0] == Str::new("generator")) {
+                if (words.length() != 2 || generator.is_some()) { return Result::Err(f"line {number}: one `generator <version>` line"); }
+                generator = match (i64::try_from(words[1])) {
+                    Result::Ok(version) => { Option::Some(version) }
+                    Result::Err(_)      => { return Result::Err(f"line {number}: `{words[1]}` is no generator version"); }
+                };
+                continue;
+            }
+            if (words[0] == Str::new("options")) {
+                if (options.is_some()) { return Result::Err(f"line {number}: a second `options` line"); }
+                mut given: Array<String> = Array::<String>::new();
+                for (index in 1..words.length()) { given.push(String::from_str(words[index])); }
+                options = Option::Some(given);
+                continue;
+            }
+            if (words[0] != Str::new("seed") || words.length() != 4 || words[2] != Str::new("cryosmith-hash")) {
+                return Result::Err(f"line {number}: `{line}` is no `seed <N> cryosmith-hash <u64>` line");
+            }
+            const seed: u64 = match (u64::try_from(words[1])) {
+                Result::Ok(seed) => { seed }
+                Result::Err(_)   => { return Result::Err(f"line {number}: `{words[1]}` is no seed"); }
+            };
+            if (hashes.is_empty()) { first_seed = seed; }
+            const expected: u64 = first_seed.wrapping_add(hashes.length() as u64);
+            if (seed != expected) { return Result::Err(f"line {number}: seed {seed} where seed {expected} comes next"); }
+            hashes.push(f"cryosmith-hash {words[3]}");
+        }
+        if (generator.is_none()) { return Result::Err(String::from_str(Str::new("no `generator` line"))); }
+        if (options.is_none()) { return Result::Err(String::from_str(Str::new("no `options` line"))); }
+        if (hashes.is_empty()) { return Result::Err(String::from_str(Str::new("no seed"))); }
+        return Result::Ok(PinnedCorpus { generator: generator.unwrap(), options: options.unwrap(), first_seed: first_seed, hashes: hashes });
+    }
+
+    /// The pin file's text for this corpus.
+    public text(&this) -> String {
+        mut text: String = String::new();
+        text.push(Str::new("# CryoSmith's corpus as `make verify` checks it (`cryogate corpus-check --expect`):\n"));
+        text.push(Str::new("# each seed's program, generated at this generator version with these\n"));
+        text.push(Str::new("# options, must build at -O0 and -O2 and print the hash written beside it.\n"));
+        text.push(Str::new("# A new generator version is re-pinned with `make smith-corpus-pin`.\n"));
+        text.push(f"generator {this.generator}\n".as_str());
+        text.push(Str::new("options"));
+        for (option in this.options.iterate_references()) { text.push(f" {option.as_str()}".as_str()); }
+        text.push(Str::new("\n"));
+        for (index in 0..this.hashes.length()) {
+            text.push(f"seed {this.first_seed.wrapping_add(index as u64)} {this.hashes[index].as_str()}\n".as_str());
+        }
+        return text;
+    }
+
+    /// The number of seeds.
+    public count(&this) -> u64 {
+        return this.hashes.length() as u64;
+    }
+
+    /// Why the generator `cryosmith version` reports as `printed` is not the
+    /// one the corpus was pinned at, if it is not.
+    public version_problem(&this, printed: Str) -> Option<String> {
+        const version: i64 = match (PinnedCorpus::generator_of(printed)) {
+            Result::Ok(version) => { version }
+            Result::Err(reason) => { return Option::Some(reason); }
+        };
+        if (version == this.generator) { return Option::None; }
+        return Option::Some(f"cryosmith is generator version {version} and the corpus was pinned at version {this.generator}: re-pin it with `make smith-corpus-pin`");
+    }
+
+    /// Why `seed`'s hash line `printed` is not its pinned one, if it is not.
+    public mismatch(&this, seed: u64, printed: Str) -> Option<String> {
+        if (seed < this.first_seed || (seed - this.first_seed) >= this.count()) { return Option::Some(f"seed {seed} is not pinned"); }
+        const index: i64 = (seed - this.first_seed) as i64;
+        if (this.hashes[index].as_str() == printed) { return Option::None; }
+        return Option::Some(f"printed `{printed}`, pinned `{this.hashes[index].as_str()}`");
+    }
+
+    /// The generator version `cryosmith version`'s output `printed` names.
+    public static generator_of(printed: Str) -> Result<i64, String> {
+        const line: Str = printed.trim();
+        return match (line.strip_prefix(&Str::new("cryosmith "))) {
+            Option::Some(rest) => {
+                match (i64::try_from(rest)) {
+                    Result::Ok(version) => { Result::Ok(version) }
+                    Result::Err(_)      => { Result::Err(f"cryosmith version printed `{line}`") }
+                }
+            }
+            Option::None => { Result::Err(f"cryosmith version printed `{line}`") }
+        };
+    }
+}

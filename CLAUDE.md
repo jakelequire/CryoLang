@@ -24,7 +24,8 @@ api-index-check` fails if it is stale.
 make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS and unit/project NAMES asserted
-make verify              # build once; census, examples, lsp, cross, incr, relink, abi, check-fast
+make verify              # build once; census, examples, lsp, cross, incr, relink, abi, smith
+                         # (CryoSmith's pinned corpus, tests/smith-corpus), check-fast
                          # CONCURRENTLY (ARGS="--sequential": one at a time, for a host short
                          # of memory), objects hashed (tests, examples, stdlib archives,
                          # runtime archive members); ARGS="--baseline HEAD --require-identical"
@@ -36,6 +37,9 @@ make verify              # build once; census, examples, lsp, cross, incr, relin
                          # a program the baseline built, in tests/started-passing; with a
                          # baseline it also FAILS on a unit-suite build warning the baseline's
                          # build did not print (code, file, line, compared as sets)
+make smith-corpus-pin    # re-pin tests/smith-corpus (verify's `smith` gate: seeds 1-24, each
+                         # with the hash its program prints) after a CryoSmith generator
+                         # version change; verify refuses a cryosmith of another version
 make roster-check        # every unit test, project and negative file against the roster
                          # golden (tests/test-roster.txt); its OK line prints the current counts
 make check-fast          # cryogate's and cryosmith's self-tests

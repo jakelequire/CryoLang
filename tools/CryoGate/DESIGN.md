@@ -33,7 +33,7 @@ upward, and no two files of one layer import each other in a cycle.
 | `freestanding/` | the runtime's freestanding check: its programs and project files, and what each must exit with and print | core |
 | `freestanding/run/` | the freestanding run itself: the runtime built per arm, each program built, linked by hand and run, natively and under wine | core, the freestanding decisions |
 | `release/` | a release archive's smoke: its hello-world and its judge | the stdlib |
-| `smith/` | CryoSmith's programs as checked: the hash line each must print, the two builds' agreement, a failed build quoted (CryoSmith generates; checking a corpus is cryogate's) | core |
+| `smith/` | CryoSmith's programs as checked: the hash line each must print, the two builds' agreement, a failed build quoted, the pinned corpus verify checks (CryoSmith generates; checking a corpus is cryogate's) | core |
 | `negative/` | the compile-fail suite's `//~` annotations: the diagnostics a run anchors in a file, the lines that pin them, and the two-way check | core |
 | `abi/` | the runtime's ABI: the lang-item registry's rows and what each configuration must define, the symbols an archive's members define, the `__cryo_` names the sources spell | core |
 | `lsp/` | the language server's checks: reading a message, the wire (framing, URIs, UTF-16 positions), a fixture's `checks.json` and markers, each kind of check's judgement of an answer, a server build's report | core |
