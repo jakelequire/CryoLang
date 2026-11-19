@@ -3365,6 +3365,8 @@ A bound of one says, in the signature, which types a generic accepts - a call wi
 
 `implement` adds methods to a type without modifying its original declaration. There are three forms.
 
+The type a head names may be written after a kind keyword, `struct`, `enum` or `union` (`implement struct Point`, `implement trait Eq for enum Color`). The keyword is optional, and when written it names the kind of that type: `struct` a struct, `enum` an enum, `union` a union, and an alias the type it names. A keyword naming another kind is refused (E0319), with the type's own keyword as the fix; a type that is none of the three, such as a primitive, takes no keyword, and the fix removes it.
+
 ### 12.1 Inherent Implementation
 
 Adds methods to a type. For a struct, an inherent block is interchangeable with declaring the methods inline:

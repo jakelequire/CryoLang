@@ -299,6 +299,8 @@ ImplBlock          ::= "implement" ( Generics | "<" ">" )?
                           one an inherent head declares them *)
                        ( "trait" Type "for" )?
                        ("enum" | "struct" | "union")?
+                       (* the kind of the type named after it; any
+                          other is refused (E0319) *)
                        TargetType
                        "{" MethodImpl* "}"
 TargetType         ::= QualName GenericArgs?

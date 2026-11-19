@@ -32,7 +32,7 @@ import compiler::ast::declaration::{
     AssocTypeDeclNode, DeclarationNode, DeclKind, DestructureBinding,
     DestructureDecl, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
     FunctionDecl, GenericParamDecl, ImplBlock, ImportDecl,
-    IntrinsicDecl, MethodDecl, ModuleDecl, ReceiverForm,
+    IntrinsicDecl, KindKeyword, MethodDecl, ModuleDecl, ReceiverForm,
     StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
@@ -2364,8 +2364,11 @@ implement struct Parser {
             target_reference = true;
         }
 
-        // Optional type keyword (enum, struct, union); `class` is refused
-        // and the head read on as `struct`'s.
+        // Optional kind keyword (enum, struct, union), kept for the check
+        // that the target is of that kind; `class` is refused and the head
+        // read on as `struct`'s.
+        mut kind_keyword: Option<KindKeyword> = Option::None;
+        mut kind_keyword_span: SourceSpan = SourceSpan::none();
         if (this.check(TokenType::KwClass)) {
             const tag: Token = this.advance();
             if (trait_ann == null) {
@@ -2377,7 +2380,13 @@ implement struct Parser {
             }
         } else if (this.check(TokenType::KwEnum) || this.check(TokenType::KwStruct)
             || this.check(TokenType::KwUnion)) {
-            this.advance();
+            const tag: Token = this.advance();
+            kind_keyword_span = this.span_from_token(tag);
+            kind_keyword = Option::Some(match (tag.kind) {
+                TokenType::KwEnum  => { KindKeyword::Enum }
+                TokenType::KwUnion => { KindKeyword::Union }
+                _                  => { KindKeyword::Struct }
+            });
         }
 
         // Accept identifier, primitive type keyword, or the empty tuple
@@ -2415,6 +2424,8 @@ implement struct Parser {
         const node: mut ImplBlock* = ImplBlock::new(type_name);
         const decl: mut DeclarationNode* = DeclarationNode::of(DeclKind::Impl(node), this.span_from_token(start));
         node.target_type_span = this.span_from_token(type_tok);
+        node.kind_keyword = kind_keyword;
+        node.kind_keyword_span = kind_keyword_span;
         // References are implemented for through a parameter of the head's
         // own, so that the head covers every type of the referent's kind;
         // a reference to one named type is not a target.
