@@ -704,15 +704,6 @@ payload left behind, and `-O2` another value). Found by the 8c corpus
 binding in a generic function's copy as everywhere else`) and is not on
 this branch; the keep-off goes when it arrives.
 
-A map declared in a generic body (bug 0360): a `HashMap` local in a
-method of a generic struct that is never instantiated fails the build
-with an internal error, an unresolved `Entry<i32, i16>` after
-monomorphization; the instance is minted outside the symbolic walk of the
-method's body and is neither marked as the walk's nor monomorphized.
-Found by the 8d corpus (seed 13). Pre-existing; the fix is not started,
-and the keep-off is wider than the defect (it covers generic functions,
-which build) so that it is one condition to remove.
-
 ## 3. Guarantees, and how each is enforced
 
 ### 3.1 Valid under either overflow rule
