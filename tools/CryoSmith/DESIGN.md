@@ -1408,13 +1408,63 @@ generator never reads through an `Rc`.
      (the compiler under test at both levels), keeping its own verdict
      line and `--expect`/`--pin`, and its report proven byte-identical
      before and after over the same seeds.
+   - **Each build compiles its own copy of the program**, placed in its
+     build directory: an older compiler (the pin) writes a single file's
+     build beside the file whatever `--build-dir` says, and builds running
+     at once would then link each other's objects.
+   - (Done, but for Windows against Linux: `cryogate smith-diff`,
+     `smith/difference.cryo` for the decisions, `smith/run/programs.cryo`
+     for the builds and runs both commands share.)
 8. **A reducer** (CryoGate, `cryogate smith-reduce`). Shrinks a failing
-   program while the same failure reproduces: first by asking CryoSmith
-   for fewer functions and a smaller `--size` from the same seed (section
-   6), then by deleting lines and subtrees. It drafts the bug file: the
-   reduced repro, the configurations that disagree, the seed and header.
+   program while the same failure reproduces, and drafts its bug file.
    CryoSmith's part is section 6's reduction-friendliness, kept as the
    stages grow.
+
+   *Design.* `cryogate smith-reduce --seed N --cryo <compiler>
+   [--reference <compiler>]... [--interpret] --work <directory> --out
+   <directory> [--signature S] [--smith <cryosmith>] [--stdlib <directory>]
+   [--build-limit S] [--run-limit S] [-- <generation options>...]`.
+   - **The failure kept** is a smith-diff signature (item 7): its class,
+     the configurations involved and the first code or how the child
+     ended, never a hash. `--signature` names it; without one it is the
+     signature of the seed as given, and a seed that passes is a usage
+     error. A candidate is kept only when smith-diff's verdict over it,
+     under the same configurations, has exactly that signature: a
+     candidate failing differently is not the same bug.
+   - **Every candidate is a CryoSmith program**, so it is valid, well
+     typed and terminates by construction, and a refusal or a mismatch it
+     shows is still the compiler's. The reducer never edits text: a
+     deleted line that leaves a use behind is a refusal of the reducer's
+     making, which under a refusal signature would be kept as the bug.
+   - **Unit 1: the generation knobs**, from the program's own header (the
+     features list, `functions`, `size`), each tried smallest first and
+     kept when the signature persists, the whole repeated until a round
+     changes nothing: `--functions` from 0 up to the current count;
+     `--size` over 1, 2, 3, 4, 6, 8, 12, 16 and so on below the current
+     size; then each feature of the list turned off in turn (written out
+     as the list without it; a list CryoSmith refuses is not a
+     candidate). Functions are independent of the count (section 3.5),
+     so dropping the later ones keeps the earlier ones' text. (Done:
+     `smith/reduction.cryo` and `gates/smith_reduce.cryo`.)
+   - **Unit 2: the model's own edits**, in CryoSmith (`cryosmith generate
+     ... --omit <path>...`): a statement, a whole function, a struct's or
+     enum's member, or an expression replaced by a literal of its type,
+     each named by its path in the program tree and removed by the
+     generator before printing, which re-checks what depends on it
+     (a local's later uses become literals, a removed variant's arms go)
+     so the result keeps every section 3 guarantee. The reducer then
+     drives `--omit` paths as it drives the knobs, one at a time and in
+     tree order, keeping each that leaves the signature.
+   - **Output**, in `--out`: the reduced program `smith-<seed>-reduced.cryo`
+     (its header names the options that rebuild it), and
+     `bug-draft-<seed>.md`, a bug file drafted for review and never
+     committed: the title from the class, the signature, each
+     configuration's observation, the seed, the generation options before
+     and after, the line counts before and after, the reduced source and
+     the command that reproduces it. The report prints each step kept and
+     ends `smith-reduce: OK (<lines before> -> <lines after> lines, <steps>
+     steps kept, signature <S>)`; exit 0, 1 when the seed does not fail or
+     the reduction could not run, 2 on a usage error.
 9. **A crash fuzzer.** Near-valid programs: CryoSmith's `--plant` grows
    into mutations of a valid program (a deleted line, a swapped operand,
    a wrong type), each expected to be refused with a diagnostic, never to

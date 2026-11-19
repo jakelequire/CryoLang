@@ -1,0 +1,177 @@
+///! smith-reduce's decisions: a program's header read back into the
+///! generation options that rebuild it, the candidates tried from those
+///! options, and the bug file drafted from a reduction.  Pure over the text
+///! handed in.
+///!
+///! Every candidate is a set of generation options, so every program tried
+///! is one CryoSmith generated: valid, well typed and terminating by
+///! construction.  The reducer never edits a program's text.
+
+namespace cryogate::smith::reduction;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+import cryogate::core::text::{ Text };
+
+/// The generation options a program's header names: the first line of a
+/// file CryoSmith wrote, `// cryosmith <version> seed <N> features <list>
+/// functions <F> size <S>`.
+public type struct ProgramHeader {
+    /// The generator version that wrote it.
+    public generator: u64;
+    /// The seed.
+    public seed: u64;
+    /// Every feature it was generated with, in the header's order.
+    public features: Array<String>;
+    /// The number of helper functions.
+    public functions: u64;
+    /// The statement budget of one function.
+    public size: u64;
+
+    /// The header `program` (a whole file) opens with; why it is not one.
+    public static parse(program: Str) -> Result<ProgramHeader, String> {
+        const lines: Array<String> = Text::lines(program);
+        if (lines.is_empty()) { return Result::Err(String::from_str(Str::new("the program is empty"))); }
+        const words: Array<String> = ProgramHeader::words(lines[0].as_str());
+        if (words.length() != 11 || words[0].as_str() != Str::new("//") || words[1].as_str() != Str::new("cryosmith")
+            || words[3].as_str() != Str::new("seed") || words[5].as_str() != Str::new("features")
+            || words[7].as_str() != Str::new("functions") || words[9].as_str() != Str::new("size")) {
+            return Result::Err(f"`{lines[0].as_str()}` is not a CryoSmith header");
+        }
+        mut features: Array<String> = Array::<String>::new();
+        for (feature in words[6].as_str().split(&Str::new(","))) {
+            if (!feature.is_empty()) { features.push(String::from_str(feature)); }
+        }
+        return Result::Ok(ProgramHeader {
+            generator: ProgramHeader::number(words[2].as_str())?,
+            seed:      ProgramHeader::number(words[4].as_str())?,
+            features:  features,
+            functions: ProgramHeader::number(words[8].as_str())?,
+            size:      ProgramHeader::number(words[10].as_str())?,
+        });
+    }
+
+    /// The generation options that rebuild the program: `--features`,
+    /// `--functions` and `--size`, each written out.
+    public options(&this) -> Array<String> {
+        mut options: Array<String> = Array::<String>::new();
+        options.push(String::from_str(Str::new("--features")));
+        options.push(Text::joined(&this.features, Str::new(",")));
+        options.push(String::from_str(Str::new("--functions")));
+        options.push(f"{this.functions}");
+        options.push(String::from_str(Str::new("--size")));
+        options.push(f"{this.size}");
+        return options;
+    }
+
+    /// This header with fewer functions, from none up.
+    public fewer_functions(&this) -> Array<ProgramHeader> {
+        mut candidates: Array<ProgramHeader> = Array::<ProgramHeader>::new();
+        mut functions: u64 = 0;
+        while (functions < this.functions) {
+            candidates.push(this.with(functions, this.size, -1));
+            functions = functions + 1;
+        }
+        return candidates;
+    }
+
+    /// This header with a smaller size, from 1 up: one step at a time to
+    /// 4, then a half or a third again each time, so a budget of hundreds
+    /// takes a dozen tries.
+    public smaller_sizes(&this) -> Array<ProgramHeader> {
+        mut candidates: Array<ProgramHeader> = Array::<ProgramHeader>::new();
+        mut size: u64 = 1;
+        while (size < this.size) {
+            candidates.push(this.with(this.functions, size, -1));
+            if (size < 4) { size = size + 1; } else if (size % 3 == 0) { size = size + size / 3; } else { size = size + size / 2; }
+        }
+        return candidates;
+    }
+
+    /// This header without `feature`; none when it does not hold it.
+    public without(&this, feature: Str) -> Option<ProgramHeader> {
+        mut index: i64 = 0;
+        while (index < this.features.length()) {
+            if (this.features[index].as_str() == feature) { return Option::Some(this.with(this.functions, this.size, index)); }
+            index++;
+        }
+        return Option::None;
+    }
+
+    /// What this candidate changed from `before`, as a report says it.
+    public change_from(&this, before: &ProgramHeader) -> String {
+        if (this.functions != before.functions) { return f"functions {before.functions} -> {this.functions}"; }
+        if (this.size != before.size) { return f"size {before.size} -> {this.size}"; }
+        for (feature in before.features.iterate_references()) {
+            if (!this.features.contains(feature)) { return f"feature {feature.as_str()} off"; }
+        }
+        return String::from_str(Str::new("nothing"));
+    }
+
+    /// This header with `functions` and `size`, and without the feature at
+    /// `left_out` (none when negative).
+    private with(&this, functions: u64, size: u64, left_out: i64) -> ProgramHeader {
+        mut features: Array<String> = Array::<String>::new();
+        mut index: i64 = 0;
+        while (index < this.features.length()) {
+            if (index != left_out) { features.push(this.features[index].clone()); }
+            index++;
+        }
+        return ProgramHeader { generator: this.generator, seed: this.seed, features: features, functions: functions, size: size };
+    }
+
+    private static words(line: Str) -> Array<String> {
+        mut words: Array<String> = Array::<String>::new();
+        for (word in line.split(&Str::new(" "))) {
+            if (!word.is_empty()) { words.push(String::from_str(word)); }
+        }
+        return words;
+    }
+
+    private static number(text: Str) -> Result<u64, String> {
+        return match (u64::try_from(text)) {
+            Result::Ok(value) => { Result::Ok(value) }
+            Result::Err(_)    => { Result::Err(f"`{text}` in a CryoSmith header is not a number") }
+        };
+    }
+}
+
+/// The bug file a reduction drafts, for review: never committed.
+public type struct BugDraft {
+    /// The finding's kind, as its title names it.
+    public kind: String;
+    /// The signature that persisted.
+    public signature: String;
+    /// The finding as the report states it, for the reduced program.
+    public detail: String;
+    /// The generation options the reduction started from.
+    public before: ProgramHeader;
+    /// Those of the reduced program.
+    public after: ProgramHeader;
+    /// The lines of the program before and after.
+    public lines_before: i64;
+    public lines_after: i64;
+    /// The reduced program.
+    public source: String;
+    /// The command that shows the finding on the reduced program.
+    public command: String;
+
+    /// The draft as a markdown file.
+    public text(&this) -> String {
+        mut text: String = String::new();
+        text.push(f"# {this.kind.as_str()} found by smith-diff (seed {this.after.seed})\n\n".as_str());
+        text.push(f"**Signature:** `{this.signature.as_str()}`\n\n".as_str());
+        text.push(f"**Observed:** {this.detail.as_str()}\n\n".as_str());
+        text.push(f"**Generation options:** `{Text::joined(&this.after.options(), Str::new(" ")).as_str()}` (CryoSmith {this.after.generator}, seed {this.after.seed}); reduced from `{Text::joined(&this.before.options(), Str::new(" ")).as_str()}`, {this.lines_before} lines to {this.lines_after}.\n\n".as_str());
+        text.push(f"**Reproduce:** `{this.command.as_str()}`\n\n".as_str());
+        text.push(Str::new("**Severity:** to be decided on review.\n\n**Cause:** not yet known.\n\n## Repro\n\n```\n"));
+        text.push(this.source.as_str());
+        if (!this.source.as_str().ends_with(&Str::new("\n"))) { text.push(Str::new("\n")); }
+        text.push(Str::new("```\n"));
+        return text;
+    }
+}

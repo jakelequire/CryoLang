@@ -104,6 +104,26 @@ So:
 - **No commit hook runs.** Nothing refuses a commit; the gates above are
   what a person or an agent runs.
 
+### One verify per session, at the end
+
+A unit that changes the compiler, the stdlib, the runtime or CryoGate is
+proved on its own, then committed **locally**:
+
+- its own tests, with the pin as their control (the pin fails them, or
+  prints the old answer) and a mutation they refuse;
+- `make check-fast`, and a `-Werror` build of `compiler/` by the compiler
+  under test;
+- the objects it moves declared in **its own commit**, each with the
+  reason: `moved:`, `moved-instances:`, `moved-archive:`, `moved-runtime:`.
+
+Then **one** `make verify ARGS="--baseline <last pushed tip>
+--require-identical"` at the end of the session covers every local
+commit, and **nothing is pushed until it passes**. Run one mid-session too
+once more than about four compiler units have piled up, so a failure still
+has few suspects. When it fails, find the culprit by re-running it with
+`--baseline` set to each local commit in turn; the handoff records what
+the bisect cost.
+
 ### What a green gate does NOT tell you
 
 Most of these were, at some point, reporting success for work they had
