@@ -78,6 +78,7 @@ finder, and never branches on a name.
 | which field a member access reads | the access's `MemberPin` |
 | which implementation a trait object calls | the conversion's `ObjectConversionExpr.implementation` and the call's `resolved_trait_slot` |
 | which language item a lowering calls | the slot's `ResSlot::Lang` item, through the declaration that claims it |
+| whether a call runs a language item's method | the receiver's entry for the claimed definition (`DeclarationIndex::method_entry_on`), compared with the call's pinned function |
 | what type a value has | the expression's `resolved_type` in the type arena |
 | how a generic body runs at a type | the monomorphiser's copy, which the pin names: generics are interpreted as the compiler instantiated them |
 | whether a callee is an intrinsic | `CalleePin::intrinsic_kind`, the kind registration put on the entry |
@@ -239,7 +240,8 @@ interpreted like any other.
 Every function with a body is interpreted, the standard library's included:
 `wrapping_add` runs its body (`this + other` at its type), `fmt::println`
 runs its body down to the C library call that writes the bytes, and `Rc`
-counts with its own code. A function with no body is the **machine**, and
+counts with its own code, held to the interpreter's own count of its
+handles (below). A function with no body is the **machine**, and
 the machine is exactly two kinds of declaration:
 
 - **intrinsics**, identified by the `IntrinsicKind` the compiler registered
@@ -263,20 +265,45 @@ operation, never against the compiler's lowering of it. A foreign function
 with no rule is not covered (section 7).
 
 **Why the library is interpreted rather than given rules.** A rule per
-library function would need an identity for each - `println`, `Box::new`,
-`Rc::clone` - and the only identities the compiler has for declarations it
-reasons about are language items, which `println` and `Rc::clone` are not;
-recognising them any other way is looking a spelling up. Interpreting the
-library needs no identity beyond the C boundary, keeps one set of rules
-(the language's), and checks the library as strictly as the program: a
-`clone` that counts twice leaves the block alive at exit (a leak), and one
-that forgets to count frees it while a handle still points at it (a read of
-an ended allocation). What it does not check is a library function whose
-every result is wrong in the same way at every call, such as a
-`strong_count` that answers one more than the count: the hash agrees with
-the compiled program's because both ran the same code. That is the cost of
-the choice, and the reason the agreement on `Rc` is backed by the leak check
-rather than by the hash.
+library function would need an identity for each - `println`, `Box::new` -
+and the only identities the compiler has for declarations it reasons about
+are language items, which `println` is not; recognising one any other way
+is looking a spelling up. Interpreting the library needs no identity beyond
+the C boundary, keeps one set of rules (the language's), and checks the
+library as strictly as the program: a `clone` that counts twice leaves the
+block alive at exit (a leak), and one that forgets to count frees it while
+a handle still points at it (a read of an ended allocation). What that
+alone does not check is a library function whose every result is wrong in
+the same way at every call, such as a `strong_count` that answers one more
+than the count: the hash agrees with the compiled program's because both
+ran the same code.
+
+**`Rc`'s count, checked against the interpreter's own.** So `Rc`'s three
+count-keeping functions claim language items - `rc_clone` (its `clone`),
+`rc_strong_count` (its `strong_count`) and `rc_release` (its `Drop`
+implementation's `drop`) - and the interpreter, still running their
+bodies, holds them to a count it keeps itself
+(`compiler/src/compiler/interpret/shared_handles.cryo`). A handle is a
+value of the type the `rc` item claims, and the block it points at is the
+heap allocation its one member addresses. A struct literal of that type
+makes a handle, the only construct that makes one; `rc_release` on a live
+handle ends one; a move keeps the same handle, and a copy by bytes makes
+none. Which function a call runs is read off its pin and compared with the
+receiver's entry for the claimed definition (`method_entry_on`), never off
+a name. The rules:
+
+- `rc_clone` makes exactly one handle, to its receiver's block;
+- `rc_strong_count` answers the number of live handles pointing at its
+  receiver's block;
+- `rc_release` of the last handle drops the shared value (the block's
+  value of the type `Rc`'s first argument names, when that type has a
+  destructor) before it returns; a release of any other handle drops
+  nothing there and leaves the block allocated;
+- a release of a handle whose block no live handle points at, and a call
+  on a handle already released, is a violation.
+
+Each broken rule is a violation (section 7). The leak check still judges
+whether the block is freed once nothing points at it.
 
 ## 7. What it reports
 

@@ -1,0 +1,194 @@
+/// The interpreter's own count of the `Rc` handles that point at each
+/// block, and the rules the three functions keeping `Rc`'s strong count are
+/// held to: `rc_clone`, `rc_strong_count` and `rc_release`, each known by
+/// the language item its declaration claims (tools/CryoSmith/INTERPRETER.md
+/// section 6).
+///
+/// A handle is a value of the type the `rc` item claims, and the block it
+/// points at is the heap allocation its one member addresses.  A handle is
+/// made by a struct literal of that type, the only construct that makes
+/// one, and ends when `rc_release` runs on it.  A handle moved from place to
+/// place stays one handle, and one copied by bytes (`memcpy`, a pointer
+/// read) is not a new one.  So the count is what the library's strong count
+/// must be, kept without reading the library's own.
+
+namespace compiler::interpret::shared_handles;
+
+import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, MethodDecl };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::interpret::interpreter::{ Binding, HandleCount, Interpreter, Operand, Release };
+import compiler::interpret::memory::{ Address, Scalar };
+import compiler::interpret::outcome::{ Stop };
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::resolver::res::{ DefId };
+import compiler::types::type_ref::{ TypeRef };
+
+/// A call of one of the count-keeping functions on a handle: which item it
+/// is, the block the handle points at (-1 for a handle already released),
+/// and the block's count when the call began.
+type struct CountedCall {
+    item:   LangItem;
+    block:  i64;
+    before: i64;
+    handle_type: TypeRef;
+}
+
+implement struct Interpreter {
+    /// The type of the value a handle of type `t` shares - the first
+    /// argument of the type the `rc` item claims - or an invalid type when
+    /// `t` is no handle.
+    shared_value_type(&this, t: TypeRef) -> TypeRef {
+        const rc: DefId = this.ctx.generic_registry.wellknown(LangItem::Rc);
+        if (!rc.is_valid() || !t.is_valid()) { return TypeRef::invalid(); }
+        if (!this.ctx.decl_index.def_of(t, this.ctx.type_arena).equals(rc)) { return TypeRef::invalid(); }
+        return this.ctx.type_arena.inst_type_arg_at(t, 0);
+    }
+
+    /// The block the handle of type `t` at `place` points at, or -1 when
+    /// its address is null (a handle `rc_release` has already run on).
+    handle_block(&this, place: Address, t: TypeRef, span: SourceSpan) -> Result<i64, Stop> {
+        if (this.layout.cells(t) != 1) {
+            return Result::Err(Interpreter::not_covered("an `Rc` handle that is not one address", span));
+        }
+        return match (this.load(place, span)?) {
+            Scalar::Pointer(address) => { Result::Ok(if (address.is_null()) { -1 } else { address.allocation }) }
+            _ => { Result::Err(Interpreter::violation("an `Rc` handle that holds no address", span)) }
+        };
+    }
+
+    /// How many live handles point at `block`.
+    handles_at(&this, block: i64) -> i64 {
+        for (mut i: i64 = 0; i < this.handle_counts.length(); i++) {
+            if (this.handle_counts[i].block == block) { return this.handle_counts[i].handles; }
+        }
+        return 0;
+    }
+
+    /// Change the count of handles pointing at `block` by `change`.
+    count_handles(mut &this, block: i64, change: i64) -> void {
+        for (mut i: i64 = 0; i < this.handle_counts.length(); i++) {
+            if (this.handle_counts[i].block == block) {
+                this.handle_counts[i].handles = this.handle_counts[i].handles + change;
+                return;
+            }
+        }
+        this.handle_counts.push(HandleCount { block: block, handles: change });
+    }
+
+    /// A struct literal of type `t` was made at `place`: when it is a
+    /// handle, one more handle points at its block.
+    count_made_handle(mut &this, place: Address, t: TypeRef, span: SourceSpan) -> Result<(), Stop> {
+        if (!this.shared_value_type(t).is_valid()) { return Result::Ok(()); }
+        const block: i64 = this.handle_block(place, t, span)?;
+        if (block >= 0) { this.count_handles(block, 1); }
+        return Result::Ok(());
+    }
+
+    /// Which count-keeping item `routine` is, called on a handle of type
+    /// `owner`: the item whose claimed definition `owner`'s entry is
+    /// `routine` - the definition itself, or the copy of it `owner`'s
+    /// instance holds.  None for any other routine.
+    counted_item(&this, routine: FunctionDecl*, owner: TypeRef) -> Option<LangItem> {
+        if (!this.shared_value_type(owner).is_valid()) { return Option::None; }
+        const items: [LangItem] = [LangItem::RcClone, LangItem::RcStrongCount, LangItem::RcRelease];
+        for (mut i: i64 = 0; i < items.length(); i++) {
+            const d: DefId = this.ctx.generic_registry.wellknown(items[i]);
+            if (!d.is_valid()) { continue; }
+            const method: MethodDecl* = DeclarationNode::method_of(
+                this.ctx.decl_index.entry_method(this.ctx.decl_index.method_entry_on(owner, d)));
+            if (method != null && DeclarationNode::fn_of(method.func) == routine) { return Option::Some(items[i]); }
+        }
+        return Option::None;
+    }
+
+    /// Begin a call of `routine` whose receiver is `receiver`: when it is
+    /// a count-keeping item, check what holds before it runs and record
+    /// what its end is checked against.  A release of a live handle ends
+    /// that handle here.
+    begin_counted(mut &this, routine: FunctionDecl*, receiver: Binding, span: SourceSpan) -> Result<Option<CountedCall>, Stop> {
+        const owner: TypeRef = receiver.binding_type;
+        const item: LangItem = match (this.counted_item(routine, owner)) {
+            Option::Some(found) => { found }
+            Option::None        => { return Result::Ok(Option::None); }
+        };
+        const block: i64 = this.handle_block(Address::at(receiver.allocation, receiver.offset), owner, span)?;
+        match (item) {
+            LangItem::RcRelease => {
+                if (block >= 0) {
+                    if (this.handles_at(block) < 1) {
+                        return Result::Err(Interpreter::violation("an `Rc` handle released whose block no live handle points at", span));
+                    }
+                    this.count_handles(block, -1);
+                    this.releases.push(Release { block: block, value_type: this.shared_value_type(owner), dropped: false });
+                }
+            }
+            _ => {
+                if (block < 0) {
+                    return Result::Err(Interpreter::violation("an `Rc` handle used after it was released", span));
+                }
+            }
+        }
+        return Result::Ok(Option::Some(CountedCall { item: item, block: block, before: this.handles_at(block), handle_type: owner }));
+    }
+
+    /// End the counted call `call`, which gave `result`: `rc_clone` made
+    /// exactly one handle, to the receiver's block; `rc_strong_count`
+    /// answered the number of live handles; `rc_release` dropped the shared
+    /// value exactly when it released the last handle, and freed nothing
+    /// other handles still point at.
+    end_counted(mut &this, call: CountedCall, result: Operand, span: SourceSpan) -> Result<(), Stop> {
+        const now: i64 = this.handles_at(call.block);
+        match (call.item) {
+            LangItem::RcClone => {
+                const made: i64 = match (result) {
+                    Operand::Place(place) => { this.handle_block(place, call.handle_type, span)? }
+                    _ => { return Result::Err(Interpreter::violation("`Rc`'s `clone` gave no handle", span)); }
+                };
+                if (made != call.block) {
+                    return Result::Err(Interpreter::violation("`Rc`'s `clone` made a handle to another block", span));
+                }
+                if (now != call.before + 1) {
+                    return Result::Err(Stop::violation(f"`Rc`'s `clone` made {now - call.before} handles where it makes one", span));
+                }
+            }
+            LangItem::RcStrongCount => {
+                const answered: u64 = match (result) {
+                    Operand::Value(Scalar::Integer(bits, _)) => { bits }
+                    _ => { return Result::Err(Interpreter::violation("`Rc`'s strong count gave no integer", span)); }
+                };
+                if (answered != now as u64) {
+                    return Result::Err(Stop::violation(f"`Rc`'s strong count answered {answered} where {now} handles point at its block", span));
+                }
+            }
+            _ => {
+                if (call.block < 0) { return Result::Ok(()); }
+                const release: Release = match (this.releases.pop()) {
+                    Option::Some(running) => { running }
+                    Option::None => { return Result::Err(Interpreter::violation("an `Rc` release ended that never began", span)); }
+                };
+                const dropped: boolean = release.dropped;
+                if (now == 0 && !dropped && this.needs_drop(release.value_type)) {
+                    return Result::Err(Interpreter::violation("the last `Rc` handle was released without dropping the value it shared", span));
+                }
+                if (now > 0 && dropped) {
+                    return Result::Err(Stop::violation(f"an `Rc` handle's release dropped the shared value while {now} handles still point at it", span));
+                }
+                if (now > 0 && !this.memory.is_live(call.block)) {
+                    return Result::Err(Stop::violation(f"an `Rc` handle's release freed the block while {now} handles still point at it", span));
+                }
+            }
+        }
+        return Result::Ok(());
+    }
+
+    /// The value of type `t` at `place` is being dropped: a running
+    /// release whose shared value it is records the drop.
+    note_shared_drop(mut &this, place: Address, t: TypeRef) -> void {
+        for (mut i: i64 = 0; i < this.releases.length(); i++) {
+            if (this.releases[i].block == place.allocation
+                    && this.layout.concrete(this.releases[i].value_type).equals(this.layout.concrete(t))) {
+                this.releases[i].dropped = true;
+            }
+        }
+    }
+}

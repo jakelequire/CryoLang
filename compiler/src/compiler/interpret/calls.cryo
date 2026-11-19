@@ -15,6 +15,7 @@ import compiler::interpret::integer::{ IntegerKind };
 import compiler::interpret::interpreter::{ Binding, Flow, Frame, Interpreter, Operand };
 import compiler::interpret::memory::{ Address, AllocationKind, Scalar };
 import compiler::interpret::outcome::{ Stop };
+import compiler::interpret::shared_handles::{ CountedCall };
 import compiler::intrinsic_kind::{ IntrinsicKind };
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::resolver::res::{ DefId };
@@ -125,7 +126,14 @@ implement struct Interpreter {
             const parameter: VarDecl* = DeclarationNode::var_of(routine.parameters[first + i]);
             staged.push(this.bind_argument(parameter, arguments[i], span)?);
         }
-        return this.call_body(routine.body, staged, this.result_slot(result), result, span);
+        mut counted: Option<CountedCall> = Option::None;
+        if (first == 1) { counted = this.begin_counted(routine, staged[0], span)?; }
+        const returned: Operand = this.call_body(routine.body, staged, this.result_slot(result), result, span)?;
+        match (counted) {
+            Option::Some(call) => { this.end_counted(call, returned, span)?; }
+            Option::None => { }
+        }
+        return Result::Ok(returned);
     }
 
     /// Call the closure `lambda`, which captures nothing, with `arguments`
@@ -316,17 +324,24 @@ implement struct Interpreter {
         if (place.is_null() || !this.needs_drop(t)) { return Result::Ok(()); }
         const cells: i64 = this.layout.cells(t);
         if (cells == 0 || !this.holds_any(place, cells)) { return Result::Ok(()); }
+        this.note_shared_drop(place, t);
         const destructor: FunctionDecl* = this.destructor_of(t);
         if (destructor != null) {
             const receiver: VarDecl* = DeclarationNode::var_of(destructor.parameters[0]);
+            const binding: Binding = Interpreter::receiver_in_place(receiver, place, t);
             mut staged: [Binding] = [];
-            staged.push(Interpreter::receiver_in_place(receiver, place, t));
+            staged.push(binding);
+            const counted: Option<CountedCall> = this.begin_counted(destructor, binding, span)?;
             // A drop runs while a `return`'s value may be on its way out of
             // the scope being left; the destructor's own calls leave it as
             // it was.
             const pending: Scalar = this.returned;
             this.call_body(destructor.body, staged, Address::null(), destructor.resolved_return_type, span)?;
             this.returned = pending;
+            match (counted) {
+                Option::Some(call) => { this.end_counted(call, Operand::Nothing, span)?; }
+                Option::None => { }
+            }
         }
         const ty: Type* = this.layout.type_of(t);
         match (ty.kind) {

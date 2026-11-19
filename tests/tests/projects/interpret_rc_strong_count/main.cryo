@@ -1,0 +1,49 @@
+// `cryo interpret` keeps its own count of the `Rc` handles pointing at a
+// block - one per struct literal of `Rc`'s type, ended by `Rc`'s release -
+// and holds the functions claiming `rc_clone`, `rc_strong_count` and
+// `rc_release` to it: a clone makes one handle to the same block, the
+// strong count answers the number of live handles, and a release drops the
+// shared value exactly when it releases the last one.  A correct library
+// passes every check, here through clones, moves, early drops and a handle
+// held inside another `Rc`.
+
+namespace Main;
+
+import std::fmt;
+import std::core::mem;
+import std::alloc::rc::{ Rc };
+
+mut log: u64 = 0;
+
+function note(code: u64) -> void { log = log * 10 + code; }
+
+type struct Tracked {
+    code: u64;
+}
+
+implement trait Drop for struct Tracked {
+    drop(mut &this) -> void { note(this.code); }
+}
+
+function passed_through(handle: Rc<Tracked>) -> Rc<Tracked> { return handle; }
+
+function main() -> i32 {
+    const first: Rc<Tracked> = Rc::new(Tracked { code: 1 });
+    const second: Rc<Tracked> = first.clone();
+    const third: Rc<Tracked> = passed_through(second.clone());
+    const counted: u64 = first.strong_count();
+    mem::drop(second);
+    const after_one: u64 = third.strong_count();
+    mem::drop(first);
+    mem::drop(third);
+    const released: u64 = log;
+    log = 0;
+    const outer: Rc<Rc<Tracked>> = Rc::new(Rc::new(Tracked { code: 2 }));
+    const inner: Rc<Tracked> = outer.get_reference().clone();
+    const shared: u64 = inner.strong_count() * 10 + outer.strong_count();
+    mem::drop(outer);
+    const before_inner: u64 = log;
+    mem::drop(inner);
+    fmt::println(f"rc: {counted} {after_one} {released} {shared} {before_inner} {log}");
+    return 0;
+}
