@@ -219,7 +219,9 @@ section 15, and reads nothing the compiler's ownership passes decided:
 - assigning a place drops the value it held, if any, before storing; the
   right side's value is taken first, so a right side that moves the place
   itself out (`v = if (c) { v } else { .. }`) leaves nothing to drop;
-- a statement's temporaries are released when it ends, the newest first; a
+- a statement's temporaries are released when it ends, the newest first,
+  and a result the statement discards is the newest of them, so it is
+  released before any temporary it borrows (docs/cryo.md section 15); a
   declaration the language marks as keeping them (a `for` loop's iterable)
   keeps them until its block ends, after the block's bindings are dropped;
 - at the end of a scope, every live binding the scope declared that is not
@@ -323,11 +325,6 @@ corpus reports nothing not covered.  Anything the interpreter meets that it
 does not run stops the run as not covered; the corpus check reports such a
 program as not covered, never as agreeing.
 
-**Open.** The order of the releases at the end of one statement - a
-discarded result and a borrowed temporary - is not stated by the language
-reference: the interpreter releases the newest first (the result before
-the temporary it was made from), code generation the borrowed temporaries
-first.  Seeds that observe both disagree until the reference decides.
 
 ## 9. The corpus check's third comparison
 
