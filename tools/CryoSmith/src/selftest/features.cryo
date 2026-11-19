@@ -99,6 +99,8 @@ implement struct SelfTest {
         this.switch(Feature::Strings, [Str::new(".push(\""), Str::new(".as_str())")]);
         this.switch(Feature::DynamicArrays, [Str::new(".pop().unwrap()"), Str::new("Array::new()")]);
         this.switch(Feature::DynamicArrays, [Str::new(": [u8] = "), Str::new(": [i32] = ")]);
+        this.switch(Feature::Maps, [Str::new("HashMap::new()"), Str::new(".contains_key(&")]);
+        this.switch(Feature::Maps, [Str::new(".insert("), Str::new(".keys()) {")]);
         this.constants_switch();
         this.overloads_switch();
         this.captures_switch();
@@ -107,11 +109,47 @@ implement struct SelfTest {
     /// `trait-objects` and `references` are exercised, not only declared:
     /// of the programs declaring a trait object parameter, at least half
     /// pass `&v` to one, an object being a last argument, and likewise for
-    /// a reference parameter, a reference being a first one, where a
-    /// borrowed temporary, `(&(D0 ..`, counts too.
+    /// a reference parameter, read from the model, where a borrowed
+    /// temporary counts too.  A map's lookup borrows its key, `.get(&v1)`,
+    /// so a reference's borrow is told apart by its type, not its text.
     internal borrow_coverage(mut &this) -> void {
         this.borrow_coverage_of(Str::new("trait-objects"), [Str::new(": virtual &Tr"), Str::new(": virtual &Tr")], [Str::new(", &v"), Str::new(", &p")], Str::new(", &("));
-        this.borrow_coverage_of(Str::new("references"), [Str::new("(p0: &D"), Str::new("(p0: mut &D")], [Str::new("(&v"), Str::new("(&p")], Str::new("(&("));
+        this.reference_coverage();
+    }
+
+    /// Of the programs declaring a reference parameter, at least half
+    /// borrow a variable or a temporary for one.
+    private reference_coverage(mut &this) -> void {
+        if (!this.owns()) { return; }
+        mut declaring: i64 = 0;
+        mut passing: i64 = 0;
+        mut seed: u64 = 1;
+        while (seed <= SWITCH_PROGRAMS) {
+            const program: &Program = this.default_model(seed);
+            mut declares: boolean = false;
+            for (defined in program.functions.iter()) {
+                mut position: i64 = 0;
+                while (position < defined.parameter_count) {
+                    if (program.variable_at(program.list_at(defined.first_parameter + position)).value_type.is_reference()) { declares = true; }
+                    position = position + 1;
+                }
+            }
+            mut borrows: boolean = false;
+            for (node in program.expressions.iter()) {
+                const borrowing: boolean = match (node.kind) {
+                    ExpressionKind::Borrow(_)          => { true }
+                    ExpressionKind::BorrowTemporary(_) => { true }
+                    _                                  => { false }
+                };
+                if (borrowing && node.value_type.is_reference()) { borrows = true; }
+            }
+            if (declares) {
+                declaring = declaring + 1;
+                if (borrows) { passing = passing + 1; }
+            }
+            seed = seed + 1;
+        }
+        this.expect(declaring > 0 && 2 * passing >= declaring, f"`references`: {passing} of the {declaring} programs declaring its parameter pass `&v` to one");
     }
 
     /// `enum-implementations` reaches an enum all three ways a struct's

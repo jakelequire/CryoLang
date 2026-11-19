@@ -107,6 +107,14 @@ implement struct Generator {
         weights.push(if (poppable.length() > 0) { 6 } else { 0 });
         const reassignable: Array<i64> = this.shrinkable(&appendable, false);
         weights.push(if (reassignable.length() > 0) { 3 } else { 0 });
+        // Maps are kept off in a generic body, a keep-off DESIGN.md lists:
+        // one in a method of a generic struct never instantiated fails the
+        // build with an internal error.
+        weights.push(if (this.makes_maps() && !this.genericity.is_generic()) { 6 } else { 0 });
+        const maps: Array<i64> = this.writable_maps();
+        weights.push(if (maps.length() > 0) { 10 } else { 0 });
+        weights.push(if (maps.length() > 0) { 5 } else { 0 });
+        weights.push(if (maps.length() > 0) { 1 } else { 0 });
         const form: i64 = this.random.pick(&weights);
         this.budget.charge(1);
         if (form == 0) { return this.declaration(); }
@@ -151,17 +159,23 @@ implement struct Generator {
         if (form == 21) { return this.append(&appendable); }
         if (form == 22) { return this.pop(&poppable); }
         if (form == 23) { return this.dynamic_assignment(&reassignable); }
+        if (form == 24) { return this.map_declaration(); }
+        if (form == 25) { return this.map_change(&maps, false); }
+        if (form == 26) { return this.map_change(&maps, true); }
+        if (form == 27) { return this.map_reset(&maps); }
         const method: MethodCandidate = mutators.get(this.random.below(mutators.length())).unwrap();
         return this.program.statement(StatementKind::Evaluate(this.method_call(method, this.depth())));
     }
 
     /// The `mut` locals in scope a store may assign whole: any but a dynamic
     /// array, which only its own statements assign, since they know the
-    /// fewest elements it holds afterwards.
+    /// fewest elements it holds afterwards, and a map, which is only ever
+    /// given a new empty one.
     private whole_stores(&this) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
         for (variable in this.environment.assignable(&this.program).iter()) {
-            if (!this.program.variable_at(variable).value_type.is_dynamic_array()) { found.push(variable); }
+            const held: ValueType = this.program.variable_at(variable).value_type;
+            if (!held.is_dynamic_array() && !held.is_map()) { found.push(variable); }
         }
         return found;
     }

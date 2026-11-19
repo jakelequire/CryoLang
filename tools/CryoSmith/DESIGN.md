@@ -671,6 +671,29 @@ by its length and by `for (n3 in v2)` over its elements, in order. The
 dynamic array audit (section 7) follows the counts through each function
 apart from the generator and holds the model to these rules.
 
+**Maps.** With `maps` (and `loops`), a function declares `mut` map locals
+of an integer key and an integer value (`ValueType::Map`, spelled
+`HashMap<u8, i32>`), built empty, `HashMap::new()`. One is inserted into
+and removed from in a statement of its own that observes what the call
+gives back, `const o3: u64 = (v2.insert((e & 7), x).unwrap_or(d) as
+u64);` and `v2.remove(&(e & 7)).unwrap_or(d)`; looked up wherever a value
+of its value type is wanted, `v2.get(&(e & 7)).unwrap_or(d)`; asked
+`v2.contains_key(&(e & 7))` wherever a boolean is; measured wherever an
+`i64` is; and given a new empty map whole. Every key is reduced to eight
+values, `(e & 7)`, so operations meet keys already there, and every
+`Option` a call gives is read with a default, so nothing panics. A map is
+never read by value, so it needs no ownership state; a statement changing
+one lends it exclusively, and a lookup or a `contains_key` shared, so no
+value is held by reference across a change. The standard library promises
+no iteration order - the default hasher is keyed per map from a
+per-process random seed - so a map is observed by its length and by a sum
+over its keys, each key mixed with its value looked up, added modulo
+2^62: `for (n3 in v2.keys()) { v9 = (((v9 & M) + (mix(mix(9, n3), v2.get(&n3).unwrap_or(0)) & M)) & M); }`,
+`M` = 2^62 - 1, two terms below 2^62 adding without overflow under either
+overflow rule. Addition modulo 2^62 is commutative and associative, so the
+sum, and the hash, is the same in any order. The map audit (section 7)
+holds the model to these rules.
+
 **Kept off.** A `match` arm assigning its subject inside a generic body
 (a generic function or a generic struct's method): the compiler's copy of
 a generic function names a `Copy` payload binding in the subject's
@@ -680,6 +703,15 @@ payload left behind, and `-O2` another value). Found by the 8c corpus
 (seed 28). The fix exists on the interpreter lane's branch (`Copy a match
 binding in a generic function's copy as everywhere else`) and is not on
 this branch; the keep-off goes when it arrives.
+
+A map declared in a generic body (bug 0360): a `HashMap` local in a
+method of a generic struct that is never instantiated fails the build
+with an internal error, an unresolved `Entry<i32, i16>` after
+monomorphization; the instance is minted outside the symbolic walk of the
+method's body and is neither marked as the walk's nor monomorphized.
+Found by the 8d corpus (seed 13). Pre-existing; the fix is not started,
+and the keep-off is wider than the defect (it covers generic functions,
+which build) so that it is one condition to remove.
 
 ## 3. Guarantees, and how each is enforced
 
@@ -942,7 +974,7 @@ every feature of the current stage; `no-<name>` removes one.
 | 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
 | 6 | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods; `enum-implementations`: traits implemented for the declared enums, their methods matching on `this`, called on the enums' values, through bounds at an enum and through objects borrowing one. The stage is complete |
 | 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings; `references`: `&D0` and `mut &D0` parameters, `&D0` returns, kept shared or exclusive per statement; `drops`: `mem::drop`, discarded results, borrowed temporaries and whole stores through `mut &D0`; `boxes`: `Box<D0>` read and written through, `Rc<D0>` cloned and counted; `options`: `Option<D0>` and `Result<D0, u32>` matched, unwrapped where certainly holding a value, and propagated with `?`; `sibling-variants`: a `?`'s `if` operand leaving a variant's type arguments to its sibling arm (section 2) |
-| 8 | `arrays`: fixed arrays of integers built by a literal, a repeat or a copy, their elements read and written at an index reduced into the length, and `&Slice<E>` parameters given `&v` of one, each observed by a `for` over its elements (section 2); `strings`: `String` locals built from a literal, an integer's digits or nothing, appended to, compared and measured, observed by their length and bytes; `dynamic-arrays`: `[E]` locals built by a literal, a repeat, empty or as a clone, pushed, popped, indexed below the fewest elements they hold and given `&v` for a slice, observed by their length and elements; maps to come |
+| 8 | `arrays`: fixed arrays of integers built by a literal, a repeat or a copy, their elements read and written at an index reduced into the length, and `&Slice<E>` parameters given `&v` of one, each observed by a `for` over its elements (section 2); `strings`: `String` locals built from a literal, an integer's digits or nothing, appended to, compared and measured, observed by their length and bytes; `dynamic-arrays`: `[E]` locals built by a literal, a repeat, empty or as a clone, pushed, popped, indexed below the fewest elements they hold and given `&v` for a slice, observed by their length and elements; `maps`: `HashMap<K, V>` locals inserted into, removed from, looked up and asked for keys below 8, measured, and observed by their length and a sum over their entries that no iteration order changes. The stage is complete |
 
 Section 9 places each stage among the rest of the work, the tools that
 run what the stages generate.
@@ -1114,9 +1146,19 @@ statement budget of one function, default 24), `--no-header`, and
   whole assignments. The loan audit reads the same list: a push, a pop
   and an element store of a dynamic array are exclusive borrows, a clone
   a shared one, so nothing else in their statement names the array.
+- **The map audit** reads the model of 200 programs: each map is a `mut`
+  local; each insert and removal is the whole value of an observation, a
+  statement of its own; each key an operation is given is `(e & 7)`, but
+  in a `for` over the map's own keys; each such `for` is one assignment
+  adding the entry's mix of its key and its looked-up value into one sum
+  modulo 2^62; and, reading `UseWalk`, no map is lent exclusively or
+  assigned inside a `for` over its keys. It finds some inserts, removals,
+  lookups, `contains_key` calls and loops over keys.
 - **Borrow coverage**: of 40 programs, at least half of those declaring a
-  trait object parameter pass `&v` to one, and likewise for a reference
-  parameter.
+  trait object parameter pass `&v` to one, read from the text, and
+  likewise for a reference parameter, read from the model (a `&` of a
+  variable or a temporary whose type is a reference), since a map's
+  lookup spells `.get(&v1)` too.
 - **Enum implementation coverage**: of the same 40 programs' models, some
   call a trait method on an enum value, some instantiate a trait-bounded
   function at an enum, and some borrow an enum variable for a trait
@@ -1136,7 +1178,7 @@ layers, lowest first:
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
 | `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures, `Exhaustiveness`'s arms and `Capture`'s captured values (3.2) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits`, `moves`, `references`, `drops`, `holders`, `arrays`, `texts`, `dynamic_arrays` |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits`, `moves`, `references`, `drops`, `holders`, `arrays`, `texts`, `dynamic_arrays`, `maps` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |
@@ -1314,8 +1356,9 @@ generator never reads through an `Rc`.
    by construction (reduced against a length the generator knows);
    iteration order is observed only where the collection fixes it. (Done:
    `arrays`, fixed arrays and the slices viewing them, `strings`,
-   `String` locals, and `dynamic-arrays`, `Array` locals with the fewest
-   elements each holds tracked. To come: `HashMap`.)
+   `String` locals, `dynamic-arrays`, `Array` locals with the fewest
+   elements each holds tracked, and `maps`, `HashMap` locals observed by a
+   sum no iteration order changes. The stage is complete.)
 7. **A differential driver** (CryoGate, `cryogate smith-diff`). Builds one
    program under several configurations - `-O0` and `-O2`, the pin and
    the compiler under test, Windows and Linux (through WSL) - runs each
