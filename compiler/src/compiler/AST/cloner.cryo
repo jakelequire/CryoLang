@@ -63,8 +63,9 @@ type struct ASTCloner {
 
     /// When false, the copy carries nothing the type check decided about
     /// the original's names, locals and calls: no identifier's type, no
-    /// local's type, and no callee chosen for a call or for a function
-    /// named as a value.  A copy whose parameters take other types is
+    /// local's type, no callee chosen for a call or for a function named as
+    /// a value, and no operator or index it rewrote into a trait method's
+    /// call.  A copy whose parameters take other types is
     /// checked from scratch, since an argument reading a retyped parameter
     /// may select another callee than the original's call did, and a
     /// closure written in it is a closure type of its own, which a local
@@ -476,8 +477,11 @@ type struct ASTCloner {
                 // Carry an index-operator-overload desugar (`*(a.index(i))`,
                 // built at sema for a bounded-param or generic container) into
                 // the specialization so the substituter can concretize its
-                // type-args and codegen finds it.
-                if (n.desugared_call != null) {
+                // type-args and codegen finds it.  A copy the type check
+                // walks from scratch builds its own: the type check reads a
+                // carried desugar as the node's answer, and one carried
+                // without its analysis answers no type.
+                if (this.carries_analysis && n.desugared_call != null) {
                     mut ca: mut ArrayAccessExpr* = ExpressionNode::array_access_of(c);
                     ca.desugared_call = this.clone_expr(n.desugared_call);
                 }
@@ -489,22 +493,28 @@ type struct ASTCloner {
                 // Carry an operator-overload desugar (built at sema for a
                 // bounded-param operand) into the specialization so the
                 // substituter can concretize its stashed type-args and codegen
-                // finds the trait-method call.
-                if (n.desugared_call != null) {
-                    cb.desugared_call = this.clone_expr(n.desugared_call);
+                // finds the trait-method call, and the `append` a string `+`
+                // was bound to.  A copy the type check walks from scratch
+                // decides both again, as it does every callee.
+                if (this.carries_analysis) {
+                    if (n.desugared_call != null) {
+                        cb.desugared_call = this.clone_expr(n.desugared_call);
+                    }
+                    cb.desugar_by_bound = n.desugar_by_bound;
+                    cb.append_entry = n.append_entry;
                 }
-                cb.desugar_by_bound = n.desugar_by_bound;
-                cb.append_entry = n.append_entry;
             }
             ExprKind::Unary(n) => {
                 c = ExpressionNode::unary_expr(n.op, this.clone_expr(n.operand), node.span);
                 mut cu: mut UnaryExpr* = ExpressionNode::unary_of(c);
                 cu.is_postfix   = n.is_postfix;
                 cu.is_synthetic = n.is_synthetic;
-                if (n.desugared_call != null) {
-                    cu.desugared_call = this.clone_expr(n.desugared_call);
+                if (this.carries_analysis) {
+                    if (n.desugared_call != null) {
+                        cu.desugared_call = this.clone_expr(n.desugared_call);
+                    }
+                    cu.desugar_by_bound = n.desugar_by_bound;
                 }
-                cu.desugar_by_bound = n.desugar_by_bound;
                 cu.borrowed_as_pointer = n.borrowed_as_pointer;
             }
             ExprKind::Cast(n) => {
