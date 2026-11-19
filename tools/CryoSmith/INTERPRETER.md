@@ -191,6 +191,7 @@ first.
 | call | the callee by its pin; a method's receiver first.  In a `&this` or `mut &this` method `this` names the receiver's value where it lies - the type checker types `this` as the owner type, not a reference - reached from the object through as many references and pointers as it takes; a `this` method gets the value moved in |
 | field | the member at the pin's index of the place or value |
 | struct literal | each field's value in the order written, then defaults for the fields not written, stored in declaration order |
+| array literal of `[T]` | the elements in the order written (a repeat's value once, then its count) in a heap block the function claiming the `alloc` language item gives, its body interpreted; the array holds the block's address, its length and its capacity, both the number of elements - the growable array's first three members, checked to be an address and two integers; no elements, no block |
 | `&x`, `mut &x` | the address of `x`'s place |
 | `*p` | the cell `p` addresses, checked as section 4 says |
 | closure | one that captures: the value of its struct, each field initialized in capture order from the capture's value where the closure is made (the type checker's `capture_values`: the binding, or `&binding` for a capture by reference); a call is the struct's `__call__` method, by the call's pin. One that captures nothing: a function value naming the lambda; a call binds its parameters and runs its body |
@@ -263,7 +264,11 @@ the machine is exactly two kinds of declaration:
   `printf` conversions the standard library's print path uses: `%.*s`,
   `%c`, `%s`, `%d`, `%u`, `%llu`); the host's console queries answer that
   standard output is not a console, so a run's output is the same on every
-  host.
+  host; the operating system's random sources (`SystemFunction036`,
+  `getrandom`) fill their buffer from a fixed stream, the same in every
+  run, so a hash map's per-map key is drawn as the library draws it but
+  never varies; `memset` sets one-byte elements to its byte and wider ones
+  only to zero (each the integer 0 or the null address).
 
 A machine rule is small and written against the C or LLVM definition of the
 operation, never against the compiler's lowering of it. A foreign function

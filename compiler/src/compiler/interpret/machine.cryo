@@ -78,6 +78,12 @@ implement struct Interpreter {
                 this.count_argument(values, 2, span)?, span)?;
             return Result::Ok(Operand::Value(Scalar::Pointer(target)));
         }
+        if (symbol == Str::new("memset")) {
+            const target: Address = this.address_argument(values, 0, span)?;
+            this.set_bytes(target, values[0].argument_type, this.count_argument(values, 1, span)?,
+                this.count_argument(values, 2, span)?, span)?;
+            return Result::Ok(Operand::Value(Scalar::Pointer(target)));
+        }
         if (symbol == Str::new("memcmp")) {
             const order: i64 = this.compare_bytes(this.address_argument(values, 0, span)?, this.address_argument(values, 1, span)?,
                 this.count_argument(values, 2, span)?, span)?;
@@ -97,6 +103,18 @@ implement struct Interpreter {
             return this.integer_result(byte as u64, result, span);
         }
         if (symbol == Str::new("fflush")) { return this.integer_result(0, result, span); }
+        // The operating system's random sources: `SystemFunction036`
+        // (`RtlGenRandom`) fills its buffer and answers true, `getrandom`
+        // fills it and answers the count.
+        if (symbol == Str::new("SystemFunction036")) {
+            this.fill_random(this.address_argument(values, 0, span)?, this.count_argument(values, 1, span)?, span)?;
+            return this.integer_result(1, result, span);
+        }
+        if (symbol == Str::new("getrandom")) {
+            const count: i64 = this.count_argument(values, 1, span)?;
+            this.fill_random(this.address_argument(values, 0, span)?, count, span)?;
+            return this.integer_result(count as u64, result, span);
+        }
         // The host's console queries: a run's standard output is never a
         // console, so it is the same bytes on every host.
         if (symbol == Str::new("_get_osfhandle")) { return this.integer_result(0, result, span); }
@@ -195,6 +213,37 @@ implement struct Interpreter {
         return Result::Ok(());
     }
 
+    /// `memset`: `bytes` bytes at `target`, each set to `value`'s low byte,
+    /// as elements of the one-cell scalar type `target_type` points at.  An
+    /// element of one byte takes the byte; a wider one is set only to zero -
+    /// the integer 0 or the null address - since a cell holds a value, not
+    /// the bytes of one.
+    set_bytes(mut &this, target: Address, target_type: TypeRef, value: i64, bytes: i64, span: SourceSpan) -> Result<(), Stop> {
+        if (bytes == 0) { return Result::Ok(()); }
+        const element: TypeRef = this.layout.pointee(target_type);
+        if (!element.is_valid() || this.layout.cells(element) != 1) {
+            return Result::Err(Interpreter::not_covered("a `memset` of anything but one-cell scalars", span));
+        }
+        const element_bytes: i64 = this.layout.bytes(element);
+        const byte: i64 = value & 255;
+        if (bytes % element_bytes != 0) { return Result::Err(Interpreter::not_covered("a `memset` of part of an element", span)); }
+        if (element_bytes != 1 && byte != 0) {
+            return Result::Err(Interpreter::not_covered("a `memset` of wider values to a byte other than zero", span));
+        }
+        mut zero: Scalar = Scalar::Pointer(Address::null());
+        match (this.layout.integer_kind(element)) {
+            Option::Some(kind) => { zero = Scalar::Integer(kind.reduce(byte as u64), kind); }
+            Option::None => {
+                if (!this.layout.is_address(element)) {
+                    return Result::Err(Interpreter::not_covered("a `memset` of values that are neither integers nor addresses", span));
+                }
+            }
+        }
+        this.memory.shape(target.allocation, element_bytes, 1);
+        for (mut i: i64 = 0; i < bytes / element_bytes; i++) { this.store(target.plus(i), zero, span)?; }
+        return Result::Ok(());
+    }
+
     /// `memcmp`: the first `count` bytes at `left` and `right`, compared as
     /// unsigned bytes in order; the difference of the first pair that
     /// differs, or 0.  Each cell read must hold a byte: comparing the bytes
@@ -218,6 +267,26 @@ implement struct Interpreter {
             _ => { Result::Err(Interpreter::violation("a byte comparison reading a value that is no byte", span)) }
         };
     }
+
+    /// `count` bytes at `address` from the random sources' stream: a fixed
+    /// sequence, the same in every run on every host, so a run's output
+    /// never depends on it unless the program's does on the bytes, which no
+    /// program CryoSmith writes does (a map's order is never observed).
+    fill_random(mut &this, address: Address, count: i64, span: SourceSpan) -> Result<(), Stop> {
+        if (count <= 0) { return Result::Ok(()); }
+        if (address.is_null()) { return Result::Err(Interpreter::violation("random bytes asked for into the null pointer", span)); }
+        const byte: IntegerKind = IntegerKind::new(8, false);
+        this.memory.shape(address.allocation, 1, 1);
+        for (mut i: i64 = 0; i < count; i++) {
+            this.random_state = this.random_state.wrapping_add(Interpreter::RANDOM_STEP);
+            this.store(address.plus(i), Scalar::Integer(this.random_state >> 56, byte), span)?;
+        }
+        return Result::Ok(());
+    }
+
+    /// The step the random sources' stream advances by per byte: an odd
+    /// constant, so the stream visits every state before repeating.
+    const RANDOM_STEP: u64 = 0x9E3779B97F4A7C15;
 
     // ---- Text ----
 

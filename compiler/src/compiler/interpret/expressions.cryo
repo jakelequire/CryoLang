@@ -825,7 +825,9 @@ implement struct Interpreter {
         const t: TypeRef = expression.resolved_type;
         const ty: Type* = this.layout.type_of(t);
         if (ty == null || ty.kind != TypeKind::Array) {
-            return Result::Err(Interpreter::not_covered("an array literal of a growable array", expression.span));
+            const growable: TypeRef = this.ctx.type_arena.default_array_element(t);
+            if (growable.is_valid()) { return this.evaluate_growable_array(expression, array, growable); }
+            return Result::Err(Interpreter::not_covered("an array literal of this type", expression.span));
         }
         const element: TypeRef = ty.as_array().element;
         const cells: i64 = this.layout.cells(element);
@@ -841,6 +843,63 @@ implement struct Interpreter {
             this.initialize(place.plus(i * cells), element, array.elements[i])?;
         }
         this.complete_temporary(place);
+        return Result::Ok(Operand::Place(place));
+    }
+
+    /// A literal of a growable array, `[T]` (`Array<T>` with the default
+    /// allocator), of `element`s: the elements, in the order written - a
+    /// repeat's value once, then its count - in a heap block the function
+    /// claiming the `alloc` language item gives, its body interpreted as
+    /// every allocation's is; and the array holding the block's address,
+    /// its length and its capacity, both the number of elements, in its
+    /// first three members.  No elements hold no block.
+    evaluate_growable_array(mut &this, expression: ExpressionNode*, array: ArrayExpr*,
+                            element: TypeRef) -> Result<Operand, Stop> {
+        const span: SourceSpan = expression.span;
+        const t: TypeRef = expression.resolved_type;
+        if (!this.layout.is_address(this.layout.field_type(t, 0))
+                || !this.layout.integer_kind(this.layout.field_type(t, 1)).is_some()
+                || !this.layout.integer_kind(this.layout.field_type(t, 2)).is_some()
+                || this.layout.cells(t) != 3) {
+            return Result::Err(Interpreter::not_covered("a growable array not laid out as its address, length and capacity", span));
+        }
+        const cells: i64 = this.layout.cells(element);
+        const repeated: boolean = array.repeat_count_expr != null || array.repeat_count > 0;        if (repeated && array.elements.length() != 1) {
+            return Result::Err(Interpreter::not_covered("an array repeat literal of this shape", span));
+        }
+        // A repeat's value is made once, into a temporary, and copied.
+        mut repeat_value: Address = Address::null();
+        mut count: i64 = array.elements.length();
+        if (repeated) {
+            repeat_value = this.temporary(element);
+            this.initialize(repeat_value, element, array.elements[0])?;
+            count = array.repeat_count;
+            if (array.repeat_count_expr != null) {
+                count = match (this.scalar_of(array.repeat_count_expr)?) {
+                    Scalar::Integer(bits, kind) => { TrueValue::of(kind, bits).signed_value() }
+                    _ => { return Result::Err(Interpreter::violation("an array repeat count that is no integer", span)); }
+                };
+            }
+            if (count < 0) { return Result::Err(Interpreter::violation("an array repeat count below zero", span)); }
+        }
+        mut block: Address = Address::null();
+        if (count > 0) {
+            block = this.allocate_through_item(count * this.layout.bytes(element), this.layout.alignment(element), span)?;
+            this.memory.shape(block.allocation, this.layout.bytes(element), cells);
+        }
+        for (mut i: i64 = 0; i < count; i++) {
+            if (repeated) {
+                this.copy_value(block.plus(i * cells), repeat_value, element, span)?;
+            } else {
+                this.initialize(block.plus(i * cells), element, array.elements[i])?;
+            }
+        }
+        const place: Address = this.temporary(t);
+        const length_kind: IntegerKind = this.layout.integer_kind(this.layout.field_type(t, 1)).unwrap();
+        const capacity_kind: IntegerKind = this.layout.integer_kind(this.layout.field_type(t, 2)).unwrap();
+        this.store(place.plus(this.layout.field_offset(t, 0)), Scalar::Pointer(block), span)?;
+        this.store(place.plus(this.layout.field_offset(t, 1)), Scalar::Integer(length_kind.reduce(count as u64), length_kind), span)?;
+        this.store(place.plus(this.layout.field_offset(t, 2)), Scalar::Integer(capacity_kind.reduce(count as u64), capacity_kind), span)?;
         return Result::Ok(Operand::Place(place));
     }
 
