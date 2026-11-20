@@ -1,9 +1,11 @@
-///! smith-farm's decisions: the log it resumes from, the next batch, the
-///! known findings and the jobs the host's memory allows.
+///! smith-farm's decisions: the log it resumes from, the next batch, what a
+///! batch's report says of each seed, the jobs the host's memory allows,
+///! the findings and the report.
 ![config(testing)]
 namespace cryogate::tests::farm;
 
 import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::option::{ Option };
@@ -11,14 +13,16 @@ import std::core::result::{ Result };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect };
 
-import cryogate::smith::farm::{ FarmEntry, FarmKind, FarmLog, KnownFindings, MemoryBudget, MemoryVerdict };
+import cryogate::smith::farm::{ BatchReport, FarmEntry, FarmFinding, FarmKind, FarmLog, FarmReport, MemoryBudget, MemoryVerdict };
 
 ![test]
 function a_log_line_reads_back_as_it_was_written() -> Result<(), TestError> {
-    const entry: FarmEntry = FarmEntry { seed: 41, kind: String::from_str(Str::new("crash")), verdict: String::from_str(Str::new("internal error [drop-argument] E0900")) };
+    const entry: FarmEntry = FarmEntry { seed: 41, kind: String::from_str(Str::new("crash")), mutation: Option::Some(3), verdict: String::from_str(Str::new("internal error [drop-argument] E0900")) };
+    expect(entry.line().as_str() == Str::new("seed 41 crash mutation 3 internal error [drop-argument] E0900"), entry.line().as_str())?;
     const log: FarmLog = FarmLog::read(entry.line().as_str()).unwrap();
     expect(log.entries.length() == 1, Str::new("one entry"))?;
     expect(log.entries[0].line().as_str() == entry.line().as_str(), log.entries[0].line().as_str())?;
+    expect(log.entries[0].mutation.unwrap_or(0) == 3 && log.entries[0].verdict.as_str() == Str::new("internal error [drop-argument] E0900"), Str::new("the mutation is not the signature's"))?;
     return expect(log.judged(41, FarmKind::Crash) && !log.judged(41, FarmKind::Diff), Str::new("judged by its own kind only"));
 }
 
@@ -32,34 +36,64 @@ function a_line_that_is_no_entry_is_refused_by_its_number() -> Result<(), TestEr
 }
 
 ![test]
-function a_kind_the_farm_does_not_judge_by_is_refused() -> Result<(), TestError> {
-    return expect(FarmLog::read(Str::new("seed 1 reduce ok\n")).is_err(), Str::new("`reduce` is not a kind"));
+function a_kind_the_farm_does_not_judge_by_and_a_bare_mutation_are_refused() -> Result<(), TestError> {
+    expect(FarmLog::read(Str::new("seed 1 reduce ok\n")).is_err(), Str::new("`reduce` is not a kind"))?;
+    return expect(FarmLog::read(Str::new("seed 1 crash mutation 2\n")).is_err(), Str::new("a mutation with no signature"));
+}
+
+/// `batch` is the first seed `first` and the count `count`.
+private function is_batch(batch: Option<Pair<u64, u64>>, first: u64, count: u64) -> boolean {
+    return match (batch) {
+        Option::Some(pair) => { pair.first == first && pair.second == count }
+        Option::None       => { false }
+    };
 }
 
 ![test]
-function the_next_batch_skips_what_the_log_judged_by_that_kind() -> Result<(), TestError> {
+function the_next_batch_is_the_consecutive_seeds_the_log_has_not_judged_by_that_kind() -> Result<(), TestError> {
     const log: FarmLog = FarmLog::read(Str::new("seed 1 diff ok\nseed 2 diff ok\nseed 4 diff mismatch [tree -O0 | tree -O2]\nseed 3 crash ok\n")).unwrap();
-    const differences: Array<u64> = log.next_batch(1, 9, 3, FarmKind::Diff);
-    expect(differences.length() == 3 && differences[0] == 3 && differences[1] == 5 && differences[2] == 6, Str::new("3, 5 and 6"))?;
-    const crashes: Array<u64> = log.next_batch(1, 4, 8, FarmKind::Crash);
-    expect(crashes.length() == 3 && crashes[0] == 1 && crashes[1] == 2 && crashes[2] == 4, Str::new("1, 2 and 4: the range ends the batch"))?;
-    return expect(log.next_batch(1, 2, 5, FarmKind::Diff).is_empty(), Str::new("a range wholly judged gives nothing"));
+    expect(is_batch(log.next_batch(1, 9, 3, FarmKind::Diff), 3, 1), Str::new("seed 3 alone: seed 4 is judged"))?;
+    expect(is_batch(log.next_batch(4, 9, 3, FarmKind::Diff), 5, 3), Str::new("5, 6 and 7: the size ends the batch"))?;
+    expect(is_batch(log.next_batch(1, 4, 8, FarmKind::Crash), 1, 2), Str::new("1 and 2 for crash"))?;
+    expect(is_batch(log.next_batch(3, 4, 8, FarmKind::Crash), 4, 1), Str::new("4 alone: the range ends the batch"))?;
+    return expect(log.next_batch(1, 2, 5, FarmKind::Diff).is_none(), Str::new("a range wholly judged gives nothing"));
 }
 
 ![test]
-function a_known_signature_names_its_bug() -> Result<(), TestError> {
-    const known: KnownFindings = KnownFindings::read(Str::new("# known\n0364 internal error [drop-argument] E0900\n\n0365 mismatch [tree -O0, tree -O2 | linux -O2]\n")).unwrap();
-    expect(known.bug_of(Str::new("internal error [drop-argument] E0900")).unwrap_or(String::new()).as_str() == Str::new("0364"), Str::new("0364"))?;
-    expect(known.bug_of(Str::new("mismatch [tree -O0, tree -O2 | linux -O2]")).unwrap_or(String::new()).as_str() == Str::new("0365"), Str::new("0365"))?;
-    expect(known.bug_of(Str::new("internal error [drop-brace] E0900")).is_none(), Str::new("another operator is another signature"))?;
-    return expect(KnownFindings::read(Str::new("0364\n")).is_err(), Str::new("a bug with no signature is refused"));
+function a_diff_report_gives_each_seed_its_verdict_and_signature() -> Result<(), TestError> {
+    const output: Str = Str::new("ok    seed 7 cryosmith-hash 12\nknown seed 8: known compiler bug 0362\nFAIL  seed 9: internal error: tree -O0, tree -O2: E0900 GEP\n      signature internal error [tree -O0, tree -O2] E0900 GEP\nclass internal error: 1\nsignature internal error [tree -O0, tree -O2] E0900 GEP: 1 programs, first seed 9\nsmith-diff: FAIL (1 of 3 programs: 1 internal error; 1 signatures)\n");
+    const read: BatchReport = BatchReport::of_diff(output, 7, 3).unwrap();
+    expect(read.entries.length() == 3, Str::new("three entries"))?;
+    expect(read.entries[0].line().as_str() == Str::new("seed 7 diff ok"), read.entries[0].line().as_str())?;
+    expect(read.entries[1].line().as_str() == Str::new("seed 8 diff known 0362"), read.entries[1].line().as_str())?;
+    expect(read.entries[2].line().as_str() == Str::new("seed 9 diff internal error [tree -O0, tree -O2] E0900 GEP"), read.entries[2].line().as_str())?;
+    return expect(read.entries[2].is_finding() && !read.entries[1].is_finding() && !read.entries[0].is_finding(), Str::new("only the failing seed is a finding"));
+}
+
+![test]
+function a_diff_report_cut_short_or_missing_a_signature_is_refused() -> Result<(), TestError> {
+    expect(BatchReport::of_diff(Str::new("ok    seed 7 cryosmith-hash 12\nsmith-diff: FAIL (cryosmith could not write the programs)\n"), 7, 2).is_err(), Str::new("seed 8 was never judged"))?;
+    expect(BatchReport::of_diff(Str::new("FAIL  seed 7: run crash: tree -O2\nsmith-diff: FAIL (1 of 1 programs)\n"), 7, 1).is_err(), Str::new("a failure with no signature line"))?;
+    return expect(BatchReport::of_diff(Str::new("ok    seed 6 cryosmith-hash 1\nok    seed 7 cryosmith-hash 1\n"), 7, 1).is_err(), Str::new("a seed outside the batch"));
+}
+
+![test]
+function a_crash_report_gives_each_finding_its_mutation_and_every_other_seed_ok() -> Result<(), TestError> {
+    const output: Str = Str::new("FAIL  seed 5 mutation 0: compile crash [drop-argument] exit -1073741819\nFAIL  seed 3 mutation 2: internal error [swap-arguments] E0900 GEP: base\nsignature compile crash [drop-argument] exit -1073741819: 1 programs, first seed 5 mutation 0\nsmith-crash: FAIL (2 findings in 12 programs, 2 signatures; 7 refused, 3 accepted)\n");
+    const read: BatchReport = BatchReport::of_crash(output, 3, 3).unwrap();
+    expect(read.entries.length() == 3, Str::new("one entry a seed here"))?;
+    expect(read.entries[0].line().as_str() == Str::new("seed 3 crash mutation 2 internal error [swap-arguments] E0900 GEP: base"), read.entries[0].line().as_str())?;
+    expect(read.entries[1].line().as_str() == Str::new("seed 4 crash ok"), read.entries[1].line().as_str())?;
+    expect(read.entries[2].line().as_str() == Str::new("seed 5 crash mutation 0 compile crash [drop-argument] exit -1073741819"), read.entries[2].line().as_str())?;
+    expect(read.refused == 7 && read.accepted == 3, Str::new("7 refused and 3 accepted"))?;
+    return expect(BatchReport::of_crash(Str::new("smith-crash: FAIL (cryosmith could not write the programs)\n"), 3, 3).is_err(), Str::new("no verdict line is no batch judged"));
 }
 
 /// The verdict `committed` gives under a 40 GB ceiling, a 52 GB hard limit
 /// and 0.4 GB a job, at most 8 jobs, as `run N`, `wait` or `stop`.
 private function verdict_at(committed: u64) -> String {
     const gigabyte: u64 = 1073741824;
-    const budget: MemoryBudget = MemoryBudget { committed: committed, hard_limit: 52 * gigabyte, ceiling: 40 * gigabyte, per_job: (gigabyte * 4) / 10 };
+    const budget: MemoryBudget = MemoryBudget { committed: committed, hard_limit: 52 * gigabyte, ceiling: 40 * gigabyte, per_job: (gigabyte * 4) / 10, cap: 52 * gigabyte };
     return match (budget.verdict(8)) {
         MemoryVerdict::Run(jobs) => { f"run {jobs}" }
         MemoryVerdict::Wait      => { String::from_str(Str::new("wait")) }
@@ -75,4 +109,76 @@ function the_jobs_are_what_the_room_under_the_ceiling_holds() -> Result<(), Test
     expect(verdict_at(40 * gigabyte - gigabyte / 10).as_str() == Str::new("wait"), Str::new("room for less than a job waits"))?;
     expect(verdict_at(45 * gigabyte).as_str() == Str::new("wait"), Str::new("past the ceiling waits"))?;
     return expect(verdict_at(52 * gigabyte).as_str() == Str::new("stop"), Str::new("the hard limit stops"));
+}
+
+![test]
+function the_cap_holds_the_farms_own_jobs_whatever_the_room() -> Result<(), TestError> {
+    const gigabyte: u64 = 1073741824;
+    const budget: MemoryBudget = MemoryBudget { committed: 10 * gigabyte, hard_limit: 52 * gigabyte, ceiling: 40 * gigabyte, per_job: (gigabyte * 4) / 10, cap: gigabyte };
+    return match (budget.verdict(8)) {
+        MemoryVerdict::Run(jobs) => { expect(jobs == 2, Str::new("1 GiB holds two jobs of 0.4 GiB")) }
+        _                        => { expect(false, Str::new("room under the ceiling runs")) }
+    };
+}
+
+![test]
+function the_host_file_sets_every_size_and_refuses_what_it_cannot_read() -> Result<(), TestError> {
+    const budget: MemoryBudget = MemoryBudget::read(Str::new("# this host\nceiling 52 GiB\nhard-limit 58 GiB\n\nper-job 400 MiB\ncap 6 GiB\n"), 7).unwrap();
+    expect(budget.ceiling == 52 * 1073741824 && budget.hard_limit == 58 * 1073741824 && budget.per_job == 400 * 1048576 && budget.cap == 6 * 1073741824 && budget.committed == 7, Str::new("each setting in bytes"))?;
+    expect(MemoryBudget::read(Str::new("ceiling 52 GiB\nper-job 400 MiB\ncap 6 GiB\n"), 0).is_err(), Str::new("no hard limit"))?;
+    expect(MemoryBudget::read(Str::new("ceiling 52 GB\nhard-limit 58 GiB\nper-job 400 MiB\ncap 6 GiB\n"), 0).is_err(), Str::new("GB is no unit"))?;
+    expect(MemoryBudget::read(Str::new("ceiling 52 GiB\nhard-limit 58 GiB\nper-job 400 MiB\ncap 300 MiB\n"), 0).is_err(), Str::new("a cap with no room for one job"))?;
+    return expect(MemoryBudget::read(Str::new("ceiling 52 GiB\nhard-limit 58 GiB\nper-job 400 MiB\ncap 6 GiB\nmargin 1 GiB\n"), 0).is_err(), Str::new("no such setting"));
+}
+
+![test]
+function the_log_findings_are_each_signature_once_with_its_count_and_first_seed() -> Result<(), TestError> {
+    const log: FarmLog = FarmLog::read(Str::new("seed 1 diff ok\nseed 2 diff run crash [tree -O2] exit 3\nseed 2 crash mutation 1 compile hang [delete-token]\nseed 3 diff known 0362\nseed 4 diff run crash [tree -O2] exit 3\nseed 5 diff uncompared\nseed 6 diff listed compiler bug 0362 passes\n")).unwrap();
+    const findings: Array<FarmFinding> = log.findings();
+    expect(findings.length() == 4, Str::new("four signatures"))?;
+    expect(findings[0].signature.as_str() == Str::new("run crash [tree -O2] exit 3") && findings[0].programs == 2 && findings[0].first_seed == 2 && findings[0].first_entry == 1, Str::new("the run crash twice, first at seed 2"))?;
+    expect(findings[1].first_mutation.unwrap_or(9) == 1 && findings[1].kind.as_str() == Str::new("crash"), Str::new("the crash finding's mutation"))?;
+    expect(findings[0].reducible() && findings[1].reducible(), Str::new("a run crash and a compile hang reduce"))?;
+    expect(!findings[2].reducible() && !findings[3].reducible(), Str::new("uncompared and a listed seed passing do not"))?;
+    return expect(log.seeds_judged(FarmKind::Diff) == 6 && log.count(FarmKind::Diff, Str::new("known 0362")) == 1, Str::new("six seeds judged by diff, one known"));
+}
+
+![test]
+function a_signature_names_the_same_folder_every_time() -> Result<(), TestError> {
+    const first: String = FarmFinding::directory_name(Str::new("run crash [tree -O2] exit 3"));
+    expect(first.length() == 16, first.as_str())?;
+    expect(first.as_str() == FarmFinding::directory_name(Str::new("run crash [tree -O2] exit 3")).as_str(), Str::new("the same signature, the same folder"))?;
+    return expect(first.as_str() != FarmFinding::directory_name(Str::new("run crash [tree -O0] exit 3")).as_str(), Str::new("another signature, another folder"));
+}
+
+![test]
+function the_report_lists_this_runs_new_findings_apart_from_known_and_earlier_ones() -> Result<(), TestError> {
+    const log: FarmLog = FarmLog::read(Str::new("seed 1 diff run crash [tree -O2] exit 3\nseed 2 diff ok\nseed 3 diff internal error [tree -O0] E0900\nseed 4 diff refusal [tree -O0, tree -O2] E0200\n")).unwrap();
+    mut known_bugs: Array<String> = Array::<String>::new();
+    known_bugs.push(String::new());
+    known_bugs.push(String::new());
+    known_bugs.push(String::from_str(Str::new("0364")));
+    mut reductions: Array<String> = Array::<String>::new();
+    reductions.push(String::from_str(Str::new("folder 0123: smith-reduce: OK")));
+    reductions.push(String::from_str(Str::new("folder 4567: smith-reduce: OK")));
+    reductions.push(String::new());
+    const report: FarmReport = FarmReport {
+        setting: Array::<String>::new(), first_entry_this_run: 1, known_bugs: known_bugs, reductions: reductions,
+        batches: Array::<String>::new(), waits: Array::<String>::new(), refused: 0, accepted: 0,
+    };
+    const text: String = report.text(&log);
+    const new_part: Str = match (text.as_str().split_once(&Str::new("## New findings this run"))) {
+        Option::Some(pair) => {
+            match (pair.second.split_once(&Str::new("## Every finding"))) {
+                Option::Some(parts) => { parts.first }
+                Option::None        => { Str::new("") }
+            }
+        }
+        Option::None => { Str::new("") }
+    };
+    expect(new_part.contains(&Str::new("internal error [tree -O0] E0900")), Str::new("seed 3's finding is new"))?;
+    expect(!new_part.contains(&Str::new("run crash")), Str::new("seed 1's was logged by an earlier run"))?;
+    expect(!new_part.contains(&Str::new("E0200")), Str::new("seed 4's is a known bug"))?;
+    expect(text.as_str().contains(&Str::new("refusal [tree -O0, tree -O2] E0200` (diff): 1 programs, first seed 4; known compiler bug 0364")), Str::new("the known one names its bug"))?;
+    return expect(text.as_str().contains(&Str::new("- class run crash: 1 programs")), Str::new("the coverage counts each class"));
 }

@@ -1663,77 +1663,101 @@ generator never reads through an `Rc`.
    - **Unit 2**: `swap-type` and `swap-arguments`, as text edits over
      the declarations and the calls `drop-argument` already reads
      (built, generator version 42). `escape-borrow` waits, as above.
-10. **A fuzz farm** (CryoGate, `cryogate smith-farm`). Overnight batches
-    of the differential driver over consecutive seeds, failures
-    deduplicated by their signature (the diagnostic code, the crash site,
-    the disagreeing configuration), reduced, and a summary written.
+10. **A fuzz farm** (done: `cryogate smith-farm`). Overnight batches of
+    the differential driver and the crash fuzzer over consecutive seeds,
+    each finding deduplicated by its signature, each new one reduced once,
+    and a report written.
 
-    *Design.* `cryogate smith-farm --cryo <compiler> [--reference
-    <compiler>]... [--interpret] [--linux <compiler>] --work <directory>
-    --findings <directory> --seeds A..B [--hours H] [--mutations J]
-    [--jobs N] [--known <file>] [--build-limit S] [--run-limit S] [--
-    <generation options>...]`. One host, one process; a farm of several
-    machines is after 1.0 and not designed here.
-    - **Batches on the shared runner.** The seeds A to B are taken in
-      batches of a few times the job count; each batch is one smith-diff
-      run over its seeds and, with `--mutations J`, one smith-crash run
-      over the same seeds, both through `smith/run/programs.cryo` as the
-      commands themselves run them. A batch is never cut short: the time
-      budget (`--hours`) and the memory are checked before each one, and
-      the farm stops cleanly at a batch boundary.
-    - **Memory.** Before each batch the host's commit (the memory promised
-      to every process: Windows' commit charge, Linux's `Committed_AS`)
-      decides the job count: as many as the room under a ceiling holds at
-      about 0.4 GB a compile, at most `--jobs`; with room for no job the
-      farm waits, and past a hard limit it stops, saying so
-      (`MemoryBudget`). The ceiling, the hard limit and the cost of a job
-      are the host's, read from a configuration file in the findings
-      directory, never written as code per machine.
-    - **Resumable.** `<findings>/farm.log` gets one line per judged seed,
-      `seed <N> <kind> <verdict>` - the kind `diff` or `crash`, the verdict
-      `ok` or the finding's signature - appended as each batch ends; a
-      farm started again over the same findings directory takes only the
-      seeds the log has not judged by that kind (`FarmLog`), so a stop at
-      any point loses at most the batch in progress. A log line the farm
-      cannot read refuses the run: resuming from a misread log judges
-      seeds twice or never.
-    - **Deduplication.** A finding's signature (item 7's, or item 9's for
-      a crash) is looked up among the signatures already in the findings
-      directory and in `--known`, a file of `<bug> <signature>` lines
-      (`KnownFindings`). A known signature is counted; a new one is
-      reduced once (item 8, with `--text` for a crash), under a time limit
-      of its own, into `<findings>/<signature digest>/` - the reduced
-      program, the drafted bug file and the seed and options it came
-      from - and is then known to the rest of the run.
+    `cryogate smith-farm --cryo <compiler> [--reference <compiler>]...
+    [--interpret] [--linux <compiler> [--linux-stdlib <directory>]]
+    --work <directory> --findings <directory> --seeds A..B [--hours H]
+    [--mutations J] [--jobs N] [--smith <cryosmith>] [--stdlib
+    <directory>] [--build-limit S] [--run-limit S] [--reduce-limit S] [--
+    <generation options>...]`. One host; a farm of several machines is
+    after 1.0 and not designed here.
+    - **Batches are the commands themselves.** The seeds A to B are taken
+      in batches of four times `--jobs` (default: a quarter of the
+      scheduler's CPU count, as the test-infrastructure decisions in
+      `docs/roadmap.md` set the farm's share). Each batch is one `cryogate smith-diff` run over its seeds
+      and, with `--mutations J`, one `cryogate smith-crash` run over a
+      batch of its own, each a child of the farm's cryogate, so a batch
+      judges exactly as the command does and a child that dies takes no
+      farm with it. The farm reads each child's report
+      (`BatchReport`): smith-diff prints a failing program's signature
+      on a line of its own, `      signature <signature>`, after its
+      `FAIL` line, and smith-crash prints it on the `FAIL` line. A report
+      that does not judge every seed of its batch (a child that stopped
+      early) stops the farm, logging nothing of that batch. A batch is a
+      range of consecutive seeds (`FarmLog::next_batch`), so a resumed
+      farm's first batch may be shorter.
+    - **The farm never blocks a heavy run.** It never takes the heavy-run
+      lock: before each batch, while someone holds it, the farm waits a
+      minute and looks again, and a stale lock stops it. A heavy run
+      started during a batch runs beside it, the commit ceiling guarding
+      the host.
+    - **Memory.** Before each batch the farm reads the host's commit, the
+      memory promised to every process (`SystemMemory::committed_bytes`:
+      Windows' commit charge, Linux's `Committed_AS`), and
+      `MemoryBudget` decides the job count from `<findings>/farm-host`,
+      the host's settings, `ceiling`, `hard-limit`, `per-job` and `cap`,
+      each a size in MiB or GiB: as many jobs as the room under the
+      ceiling holds and the cap on the farm's own memory allows, at most
+      `--jobs`; with room for none the farm waits a minute and asks
+      again, and at the hard limit it stops, saying so. A farm with no
+      host file refuses to start; the settings are the host's, never code
+      per machine. On the maintainer's machine the ceiling is the 52 GiB
+      line heavy work holds above, and the cap the decisions' 6 GB. With
+      `--hours H` no batch starts once H hours have passed; a batch is
+      never cut short. Not built from those decisions: the 01:00 to 07:00
+      window (a farm started at 01:00 with `--hours 6` keeps it), and
+      pausing while `soloapps-train` runs in WSL or a full-screen
+      application is in front.
+    - **Resumable.** `<findings>/farm.log` gets a line per judgement as
+      each batch ends, `seed <N> <kind> <verdict>`: the kind `diff` or
+      `crash`; the verdict `ok`, `known <bug>` for a seed
+      `tests/smith-known-bugs` lists, or the finding's signature, a crash
+      finding's after `mutation <M>`. A farm started again over the same
+      findings directory takes only the seeds the log has not judged by
+      that kind, so a stop loses at most the batch in progress. A log line
+      the farm cannot read refuses the run: resuming from a misread log
+      judges seeds twice or never.
+    - **The known list is one hand-kept list.** `tests/smith-known-bugs`
+      holds, beside its seed entries, `bug <number> signature
+      <signature>` entries (`KnownBugs::bug_with_signature`), since a
+      signature recurs across seeds and generator versions where a seed
+      entry names one program. The farm counts a finding with a listed
+      signature as that bug; corpus-check, smith-diff and verify's
+      `smith` gate read only the seed entries. An entry goes when its bug
+      is fixed, as a seed entry does.
+    - **Reductions.** Every other finding smith-reduce can shrink (any
+      class but `uncompared`) is reduced once, by a `cryogate
+      smith-reduce` child (`--text` for a crash finding, which judges at
+      `-O0` with the compiler under test alone) under `--reduce-limit`
+      seconds (default 3600), into `<findings>/<the first sixteen hex
+      digits of the signature's SHA-256>/`: the reduced program, the
+      drafted bug file, `finding` (the signature, the seed and the options
+      with the mutation) and `reduction` (how the reduction ended), written
+      last. A reduction builds one trial at a time, after the batch. A
+      folder holding `reduction` is never
+      reduced again; a farm stopped during a reduction leaves none, and
+      the next farm over the directory reduces it before its first batch.
+    - **Findings are drafted, never filed or committed.** A person reads
+      each draft, files the bug in the bug log with its repro, and adds
+      its signature entry to `tests/smith-known-bugs`; the test that
+      keeps a fixed bug fixed is written by the fix's own session.
     - **Report.** `<findings>/farm-report.md` is written again after each
-      batch: the new findings, each known one seen and how often, and the
-      coverage - seeds judged, builds per configuration, mutations per
-      operator, refusals per code, findings per class, time per batch and
-      every memory wait or stop.
-    - **Unit 1** (built): the decisions, `smith/farm.cryo` - the log read
-      and the next batch, the known findings, the memory verdict - with
-      their unit tests. **Unit 2**: the gate, the batches on the runner,
-      the report. **Unit 3**: the reductions of new signatures.
-    - **Questions for the maintainer** (lettered options, recommendation
-      first): (a) what `--known` is. `tests/smith-known-bugs` already
-      names, by seed and printed hash lines, the differential findings a
-      filed bug explains, and the farm reads it for those; what is open is
-      the crash signatures, which no seed list can name since a signature
-      recurs across seeds: (A) `tests/smith-known-bugs` gains a second
-      entry form, `bug <number> signature <signature>`, read by the same
-      `KnownBugs` - one list of filed bugs, kept by hand as bugs are filed
-      and fixed - or (B) a second file beside it of `<bug> <signature>`
-      lines (`KnownFindings` as built), or (C) read from the bug log of
-      the checkout; A, since two hand-kept lists of filed bugs drift and
-      the bug log is local to one checkout. (b) whether a farm run's findings are ever
-      committed: (A) never - the farm drafts bug files for review - or (B)
-      a reduced program becomes a test with its fix; A for the farm, B by
-      the fix's own session. (c) where the commit is read: (A) the
-      standard library's `SystemMemory` gains the commit and its limit
-      beside the physical memory it reports, or (B) CryoGate reads them
-      through its own bindings; A, since a second reading of the same
-      system call beside the library's is the near-duplicate this tree
-      refuses, but it is new public API and so not decided here.
+      batch and each wait: the setting, the coverage (seeds judged
+      by each kind, this run's mutated programs refused and accepted, the
+      seeds each listed bug explained, the programs of each finding
+      class), the findings new this run, every finding with its count,
+      first seed and its bug or reduction, this run's batches with their
+      jobs, time and findings, and every wait (for memory or a heavy run)
+      and stop. The
+      children's reports carry no build count per configuration,
+      mutation count per operator or refusal count per code, so the
+      report has none.
+    - Exit 0 when the run met no finding the known list does not name, 1
+      on a new finding or a stop short, 2 on a usage error.
 11. **A corpus gate in `make verify`** (done: verify's `smith` gate). A
     small fixed set of seeds at a pinned generator version, checked as
     `corpus-check` checks them, run by verify beside its other gates; a

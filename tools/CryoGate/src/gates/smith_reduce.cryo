@@ -25,8 +25,10 @@
 ///! crashes the compiler is the defect.  A refusal is never reduced this
 ///! way, since a deletion's own refusal would read as the bug.
 ///!
-///! The reduced program and a drafted bug file go to `--out`; each trial's
-///! files are removed from `--work` once judged.  Exit 0 when reduced, 1
+///! The reduced program and a drafted bug file go to `--out`, the program
+///! written again at each step kept, so a reduction stopped early (a time
+///! limit) leaves the smallest program it had found; each trial's files
+///! are removed from `--work` once judged.  Exit 0 when reduced, 1
 ///! when the seed does not show the failure or a trial cannot run, 2 on a
 ///! usage error.
 
@@ -69,6 +71,19 @@ type struct Reduction {
     kept: Trial;
     steps: i64;
     trials: i64;
+
+    /// Keep `trial`, the step `change`, and write its program to `program`,
+    /// so a reduction stopped at any point leaves the smallest program it
+    /// found.
+    keep(mut &this, trial: Trial, change: String, program: Path) -> void {
+        fmt::println(f"kept  {change.as_str()}: {Text::lines(trial.source.as_str()).length()} lines");
+        match (File::write_text(program, trial.source.as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { fmt::println(f"cannot write {program.as_str()}: {error.describe()}"); }
+        }
+        this.kept = trial;
+        this.steps++;
+    }
 }
 
 /// `cryogate smith-reduce`'s settings.
@@ -79,6 +94,9 @@ public type struct SmithReduce {
     text: boolean;
     smith: String;
     work: PathBuf;
+    /// Where the reduced program is written, `smith-<seed>-reduced.cryo`
+    /// in `--out`.
+    program: PathBuf;
     stdlib: Option<String>;
     build_limit: u64;
     run_limit: u64;
@@ -179,6 +197,7 @@ public type struct SmithReduce {
                 Option::None       => { Host::executable_name(default_smith.as_path().join(Str::new("cryosmith")).as_path().as_str()) }
             },
             work:           work_path,
+            program:        out_path.as_path().join(f"smith-{seed}-reduced.cryo".as_str()),
             stdlib:         match (parsed.value(Str::new("--stdlib"))) {
                 Option::Some(stdlib) => { Option::Some(String::from_str(stdlib)) }
                 Option::None         => { Option::None }
@@ -218,7 +237,7 @@ public type struct SmithReduce {
         const kept: &Trial = &reduced.kept;
         const current: ProgramHeader = ProgramHeader::parse(kept.source.as_str()).unwrap();
         const lines_after: i64 = Text::lines(kept.source.as_str()).length();
-        const program: PathBuf = out_path.as_path().join(f"smith-{seed}-reduced.cryo".as_str());
+        const program: &PathBuf = &reducer.program;
         const draft_path: PathBuf = out_path.as_path().join(f"bug-draft-{seed}.md".as_str());
         const omissions_path: PathBuf = out_path.as_path().join(f"smith-{seed}-omissions.txt".as_str());
         mut command: String = String::new();
@@ -283,10 +302,9 @@ public type struct SmithReduce {
                     reduced.trials++;
                     match (tried) {
                         Option::Some(trial) => {
-                            fmt::println(f"kept  {candidate.change_from(&current).as_str()}: {Text::lines(trial.source.as_str()).length()} lines");
+                            const change: String = candidate.change_from(&current);
                             current = ProgramHeader::parse(trial.source.as_str())?;
-                            reduced.kept = trial;
-                            reduced.steps++;
+                            reduced.keep(trial, change, this.program.as_path());
                             changed = true;
                             break;
                         }
@@ -304,10 +322,8 @@ public type struct SmithReduce {
                         reduced.trials++;
                         match (tried) {
                             Option::Some(trial) => {
-                                fmt::println(f"kept  feature {feature.as_str()} off: {Text::lines(trial.source.as_str()).length()} lines");
                                 current = ProgramHeader::parse(trial.source.as_str())?;
-                                reduced.kept = trial;
-                                reduced.steps++;
+                                reduced.keep(trial, f"feature {feature.as_str()} off", this.program.as_path());
                                 changed = true;
                             }
                             Option::None => { }
@@ -339,10 +355,8 @@ public type struct SmithReduce {
                     reduced.trials++;
                     match (tried) {
                         Option::Some(trial) => {
-                            fmt::println(f"kept  {paths.length()} {names[group]} taken out: {Text::lines(trial.source.as_str()).length()} lines");
                             current = ProgramHeader::parse(trial.source.as_str())?;
-                            reduced.kept = trial;
-                            reduced.steps++;
+                            reduced.keep(trial, f"{paths.length()} {names[group]} taken out", this.program.as_path());
                             changed = true;
                         }
                         Option::None => { halving.refused(&chunk); }
@@ -390,9 +404,7 @@ public type struct SmithReduce {
                     match (tried) {
                         Option::Some(trial) => {
                             deletion.delete(&chunk);
-                            fmt::println(f"kept  {chunk.length()} {names[phase]} deleted: {Text::lines(trial.source.as_str()).length()} lines");
-                            reduced.kept = trial;
-                            reduced.steps++;
+                            reduced.keep(trial, f"{chunk.length()} {names[phase]} deleted", this.program.as_path());
                             changed = true;
                         }
                         Option::None => { halving.refused(&chunk); }
