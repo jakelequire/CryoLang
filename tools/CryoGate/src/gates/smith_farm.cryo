@@ -22,8 +22,14 @@
 ///! GiB): as many jobs as the room under the ceiling holds and the cap on
 ///! the farm's own memory allows, at most `--jobs`; with room for none the
 ///! farm waits a minute and asks again, and at the hard limit it stops.
+///! The farm also makes way for the person at the machine: before each
+///! batch, while a full-screen application is in front (Windows) or a
+///! process matching a `pause-while <pattern>` line of the host file runs
+///! (`pgrep -f`; inside WSL on Windows, asked only while WSL runs), it
+///! waits a minute and looks again.
 ///! With `--hours H` no batch starts once H hours have passed.  A batch is
-///! never cut short.
+///! never cut short.  The overnight window is a farm started at 01:00 with
+///! `--hours 6`.
 ///!
 ///! `<findings>/farm.log` gets a line per judgement as each batch ends; a
 ///! farm started again over the same findings directory skips what it
@@ -70,12 +76,14 @@ import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::schedule::{ Scheduler };
 import cryogate::core::text::{ Text };
-import cryogate::smith::farm::{ BatchReport, FarmEntry, FarmFinding, FarmKind, FarmLog, FarmReport, MemoryBudget, MemoryVerdict };
+import cryogate::core::wsl::{ Wsl };
+import cryogate::smith::farm::{ BatchReport, FarmEntry, FarmFinding, FarmHost, FarmKind, FarmLog, FarmReport, MemoryBudget, MemoryVerdict };
 import cryogate::smith::known::{ KnownBugs };
 import cryogate::smith::run::programs::{ SmithRun };
 
-/// How long the farm waits before asking the memory again.
-const MEMORY_WAIT_SECONDS: u64 = 60;
+/// How long the farm waits before looking again at what held off a batch:
+/// the memory, a heavy run, or what the farm makes way for.
+const WAIT_SECONDS: u64 = 60;
 
 /// `cryogate smith-farm`'s settings and what its run has done so far.
 public type struct SmithFarm {
@@ -98,6 +106,8 @@ public type struct SmithFarm {
     reduce_limit: u64;
     work: PathBuf;
     findings: PathBuf;
+    /// `<findings>/farm-host`.
+    host: FarmHost;
     known: KnownBugs;
     log: FarmLog;
     first_entry_this_run: i64;
@@ -202,17 +212,17 @@ public type struct SmithFarm {
             }
         }
         const host_path: PathBuf = findings_path.as_path().join(Str::new("farm-host"));
-        const host: String = match (File::read_text(host_path.as_path())) {
+        const host_text: String = match (File::read_text(host_path.as_path())) {
             Result::Ok(text)   => { text }
             Result::Err(error) => {
-                fmt::println(f"smith-farm: FAIL (cannot read the host's memory settings {host_path.as_path().as_str()}: {error.describe()}; write `ceiling <size>`, `hard-limit <size>`, `per-job <size>` and `cap <size>` there, each size a number then MiB or GiB)");
+                fmt::println(f"smith-farm: FAIL (cannot read the host's settings {host_path.as_path().as_str()}: {error.describe()}; write `ceiling <size>`, `hard-limit <size>`, `per-job <size>` and `cap <size>` there, each size a number then MiB or GiB, and a `pause-while <pattern>` line for each process the farm makes way for)");
                 return 1;
             }
         };
-        match (MemoryBudget::read(host.as_str(), 0)) {
-            Result::Ok(_)       => { }
+        const host: FarmHost = match (FarmHost::read(host_text.as_str())) {
+            Result::Ok(host)    => { host }
             Result::Err(reason) => { fmt::println(f"smith-farm: FAIL ({host_path.as_path().as_str()}: {reason.as_str()})"); return 1; }
-        }
+        };
         const log_path: PathBuf = findings_path.as_path().join(Str::new("farm.log"));
         const log: FarmLog = if (log_path.as_path().is_file()) {
             match (File::read_text(log_path.as_path())) {
@@ -250,21 +260,22 @@ public type struct SmithFarm {
             reduce_limit:            numbers[5],
             work:                    work_path,
             findings:                findings_path,
+            host:                    host,
             known:                   known,
             log:                     log,
             first_entry_this_run:    first_entry_this_run,
             batches:                 Array::<String>::new(),
-            waits:           Array::<String>::new(),
+            waits:                   Array::<String>::new(),
             refused:                 0,
             accepted:                0,
             setting:                 setting,
         };
-        return farm.farm(repository, logs, range, numbers[0], numbers[2] as i64, host.as_str());
+        return farm.farm(repository, logs, range, numbers[0], numbers[2] as i64);
     }
 
     /// Run batches until the seeds are judged, the hours spent, or the
     /// memory or a child stops the farm.
-    private farm(mut &this, repository: Path, logs: &RunLogs, range: Pair<u64, u64>, hours: u64, most: i64, host: Str) -> i32 {
+    private farm(mut &this, repository: Path, logs: &RunLogs, range: Pair<u64, u64>, hours: u64, most: i64) -> i32 {
         const started: Instant = Instant::now();
         const size: u64 = (most as u64) * 4;
         const lock_path: PathBuf = match (HeavyLock::default_path(repository)) {
@@ -286,18 +297,11 @@ public type struct SmithFarm {
                 Result::Ok(memory) => { memory.committed_bytes() }
                 Result::Err(error) => { stopped = f"cannot read the host's commit: {error.describe()}"; break; }
             };
-            const budget: MemoryBudget = match (MemoryBudget::read(host, committed)) {
-                Result::Ok(budget)  => { budget }
-                Result::Err(reason) => { stopped = reason; break; }
-            };
+            const budget: MemoryBudget = this.host.budget(committed);
             const jobs: i64 = match (budget.verdict(most)) {
                 MemoryVerdict::Run(jobs) => { jobs }
                 MemoryVerdict::Wait      => {
-                    const event: String = f"waited {MEMORY_WAIT_SECONDS} s: {committed / 1048576} MiB committed, the ceiling {budget.ceiling / 1048576} MiB";
-                    fmt::println(f"smith-farm: {event.as_str()}");
-                    this.waits.push(event);
-                    this.write_report();
-                    std::time::clock::sleep(Duration::from_seconds(MEMORY_WAIT_SECONDS));
+                    this.wait(f"waited {WAIT_SECONDS} s: {committed / 1048576} MiB committed, the ceiling {budget.ceiling / 1048576} MiB");
                     continue;
                 }
                 MemoryVerdict::Stop => {
@@ -308,11 +312,7 @@ public type struct SmithFarm {
             };
             match (HeavyLock::holder(lock_path.as_path(), SystemTime::now().unix_seconds())) {
                 Holder::Held(holder) => {
-                    const event: String = f"waited {MEMORY_WAIT_SECONDS} s for a heavy run: {holder.as_str()}";
-                    fmt::println(f"smith-farm: {event.as_str()}");
-                    this.waits.push(event);
-                    this.write_report();
-                    std::time::clock::sleep(Duration::from_seconds(MEMORY_WAIT_SECONDS));
+                    this.wait(f"waited {WAIT_SECONDS} s for a heavy run: {holder.as_str()}");
                     continue;
                 }
                 Holder::Stale(holder) => {
@@ -320,6 +320,14 @@ public type struct SmithFarm {
                     break;
                 }
                 _ => { }
+            }
+            match (this.pause_reason(logs)) {
+                Result::Ok(Option::Some(reason)) => {
+                    this.wait(f"waited {WAIT_SECONDS} s: {reason.as_str()}");
+                    continue;
+                }
+                Result::Ok(Option::None) => { }
+                Result::Err(reason)      => { stopped = reason; break; }
             }
             mut failed: String = String::new();
             match (diff) {
@@ -543,7 +551,7 @@ public type struct SmithFarm {
             known_bugs:           known_bugs,
             reductions:           reductions,
             batches:              this.batches.clone(),
-            waits:        this.waits.clone(),
+            waits:                this.waits.clone(),
             refused:              this.refused,
             accepted:             this.accepted,
         };
@@ -552,6 +560,57 @@ public type struct SmithFarm {
             Result::Ok(_)      => { }
             Result::Err(error) => { fmt::println(f"smith-farm: cannot write {path.as_path().as_str()}: {error.describe()}"); }
         }
+    }
+
+    /// Hold off the next batch: print and record `event`, write the report,
+    /// and sleep before the farm looks again.
+    private wait(mut &this, event: String) -> void {
+        fmt::println(f"smith-farm: {event.as_str()}");
+        this.waits.push(event);
+        this.write_report();
+        std::time::clock::sleep(Duration::from_seconds(WAIT_SECONDS));
+    }
+
+    /// What the farm makes way for before a batch, when anything is there:
+    /// a full-screen application in front, or a process a `pause-while`
+    /// line of the host file names.  Fails when it cannot ask whether such
+    /// a process runs, since a farm that cannot see the job it makes way
+    /// for would run over it.
+    private pause_reason(&this, logs: &RunLogs) -> Result<Option<String>, String> {
+        if (Host::full_screen_in_front()) { return Result::Ok(Option::Some(String::from_str(Str::new("a full-screen application is in front")))); }
+        for (pattern in this.host.pause_while.iterate_references()) {
+            match (SmithFarm::matching_process(pattern.as_str(), logs)) {
+                Result::Ok(Option::Some(process)) => { return Result::Ok(Option::Some(f"`{pattern.as_str()}` runs: {process.as_str()}")); }
+                Result::Ok(Option::None)          => { }
+                Result::Err(reason)               => { return Result::Err(reason); }
+            }
+        }
+        return Result::Ok(Option::None);
+    }
+
+    /// The last process listed whose command line matches `pattern`
+    /// (`pgrep -f -a`, an extended regular expression), as `<pid> <command
+    /// line>`, or none.  On a Windows host the processes are WSL's, asked only while a
+    /// distribution runs, so the farm never starts one; elsewhere the
+    /// host's.  Fails when pgrep exits other than 0 (a match) or 1 (none).
+    private static matching_process(pattern: Str, logs: &RunLogs) -> Result<Option<String>, String> {
+        const windows: boolean = Host::os() == Str::new("windows");
+        if (windows && !Wsl::running(logs)) { return Result::Ok(Option::None); }
+        mut job: Job = Job::new(if (windows) { Str::new("wsl.exe") } else { Str::new("pgrep") });
+        if (windows) {
+            job.argument(Str::new("-e"));
+            job.argument(Str::new("pgrep"));
+        }
+        job.argument(Str::new("-f"));
+        job.argument(Str::new("-a"));
+        job.argument(pattern);
+        job.log_to(logs.file(Str::new("farm-pause")).as_str());
+        const done: Completion = job.run();
+        return match (done.outcome.exit_code()) {
+            Option::Some(0) => { Result::Ok(Option::Some(Text::last_line(done.output().as_str()))) }
+            Option::Some(1) => { Result::Ok(Option::None) }
+            _               => { Result::Err(f"cannot ask whether `{pattern}` runs: pgrep {done.outcome.describe().as_str()}; see {done.log.as_str()}") }
+        };
     }
 
     /// `A..B` as the first and last seed; none when it is not that, or A

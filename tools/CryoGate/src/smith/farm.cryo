@@ -439,31 +439,31 @@ public type enum MemoryVerdict {
     Stop;
 }
 
-/// The host's memory as the farm budgets it, all in bytes.
-public type struct MemoryBudget {
-    /// The commit (the memory promised to every process) now.
-    public committed: u64;
-    /// The commit the farm stops at, whatever the margin.
+/// The host file `<findings>/farm-host`: the host's memory, in bytes, and
+/// what the farm makes way for.
+public type struct FarmHost {
+    /// The sizes, as `MemoryBudget` names them.
     public hard_limit: u64;
-    /// The commit the farm keeps below while it starts jobs.
     public ceiling: u64;
-    /// What one job (one compile) is budgeted.
     public per_job: u64;
-    /// The most the farm's own jobs may be budgeted together.
     public cap: u64;
+    /// While a process whose command line matches one of these runs, no
+    /// batch starts.
+    public pause_while: Array<String>;
 
-    /// The budget the host file `text` describes, at the commit
-    /// `committed`: one setting a line, `ceiling <size>`, `hard-limit
-    /// <size>`, `per-job <size>` and `cap <size>`, each size a whole number
-    /// then `MiB` or `GiB`; blank lines and lines starting `#` are skipped.
-    /// Fails naming a line it cannot read, a setting missing, or a cap or
-    /// a ceiling with no room for one job, since a farm guessing a host's
-    /// memory is the overload it exists to avoid.
-    public static read(text: Str, committed: u64) -> Result<MemoryBudget, String> {
+    /// The host file `text`: one setting a line, `ceiling <size>`,
+    /// `hard-limit <size>`, `per-job <size>` and `cap <size>`, each size a
+    /// whole number then `MiB` or `GiB`, and any number of `pause-while
+    /// <pattern>` lines, the pattern the rest of the line; blank lines and
+    /// lines starting `#` are skipped.  Fails naming a line it cannot read,
+    /// a size missing, or a cap with no room for one job, since a farm
+    /// guessing a host's memory is the overload it exists to avoid.
+    public static read(text: Str) -> Result<FarmHost, String> {
         mut ceiling: Option<u64> = Option::None;
         mut hard_limit: Option<u64> = Option::None;
         mut per_job: Option<u64> = Option::None;
         mut cap: Option<u64> = Option::None;
+        mut pause_while: Array<String> = Array::<String>::new();
         mut number: i64 = 0;
         for (raw in Text::lines(text).iterate_references()) {
             number++;
@@ -471,6 +471,12 @@ public type struct MemoryBudget {
             if (line.is_empty() || line.starts_with(&Str::new("#"))) { continue; }
             mut words: Array<Str> = Array::<Str>::new();
             for (word in line.split_whitespace()) { words.push(word); }
+            if (words[0] == Str::new("pause-while")) {
+                const pattern: Str = line.byte_substring(words[0].length(), line.length()).trim();
+                if (pattern.is_empty()) { return Result::Err(f"line {number}: `pause-while` names no pattern"); }
+                pause_while.push(String::from_str(pattern));
+                continue;
+            }
             if (words.length() != 3 || !Text::is_digits(words[1])) { return Result::Err(f"line {number}: `{line}` is no `<setting> <number> MiB|GiB` line"); }
             mut unit: u64 = 0;
             if (words[2] == Str::new("MiB")) { unit = 1048576; }
@@ -484,7 +490,7 @@ public type struct MemoryBudget {
             if (words[0] == Str::new("hard-limit")) { hard_limit = Option::Some(size); continue; }
             if (words[0] == Str::new("per-job")) { per_job = Option::Some(size); continue; }
             if (words[0] == Str::new("cap")) { cap = Option::Some(size); continue; }
-            return Result::Err(f"line {number}: `{words[0]}` is no setting; the settings are ceiling, hard-limit, per-job and cap");
+            return Result::Err(f"line {number}: `{words[0]}` is no setting; the settings are ceiling, hard-limit, per-job, cap and pause-while");
         }
         if (ceiling.is_none() || hard_limit.is_none() || per_job.is_none() || cap.is_none()) {
             return Result::Err(String::from_str(Str::new("it must set ceiling, hard-limit, per-job and cap")));
@@ -492,8 +498,27 @@ public type struct MemoryBudget {
         if (per_job.unwrap() == 0 || cap.unwrap() < per_job.unwrap()) {
             return Result::Err(String::from_str(Str::new("per-job must be more than nothing and the cap must hold one job")));
         }
-        return Result::Ok(MemoryBudget { committed: committed, hard_limit: hard_limit.unwrap(), ceiling: ceiling.unwrap(), per_job: per_job.unwrap(), cap: cap.unwrap() });
+        return Result::Ok(FarmHost { hard_limit: hard_limit.unwrap(), ceiling: ceiling.unwrap(), per_job: per_job.unwrap(), cap: cap.unwrap(), pause_while: pause_while });
     }
+
+    /// The host's memory budget at the commit `committed`.
+    public budget(&this, committed: u64) -> MemoryBudget {
+        return MemoryBudget { committed: committed, hard_limit: this.hard_limit, ceiling: this.ceiling, per_job: this.per_job, cap: this.cap };
+    }
+}
+
+/// The host's memory as the farm budgets it, all in bytes.
+public type struct MemoryBudget {
+    /// The commit (the memory promised to every process) now.
+    public committed: u64;
+    /// The commit the farm stops at, whatever the margin.
+    public hard_limit: u64;
+    /// The commit the farm keeps below while it starts jobs.
+    public ceiling: u64;
+    /// What one job (one compile) is budgeted.
+    public per_job: u64;
+    /// The most the farm's own jobs may be budgeted together.
+    public cap: u64;
 
     /// The jobs the room under the ceiling holds and the cap allows, at
     /// most `most`: a commit at the hard limit stops the farm, and room for

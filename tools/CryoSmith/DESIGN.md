@@ -1241,12 +1241,32 @@ claims to.
 
 ## 9. Roadmap
 
-CryoSmith joins `main` when all twelve items below are done, in this
-order. Items 1 to 6 are generator stages (section 4): each adds features,
-their forms, the guarantees that keep the forms valid, a switch check in
-the self-test, an old-seed reproduction check and a corpus. Items 7 to 12
-are the tools that use what the stages generate; most of them belong to
-CryoGate, which runs compilers, while CryoSmith stays a generator.
+**Complete.** The twelve items below are done, and CryoSmith joins
+`main` with them. Items 1 to 6 are generator stages (section 4): each
+adds features, their forms, the guarantees that keep the forms valid, a
+switch check in the self-test, an old-seed reproduction check and a
+corpus. Items 7 to 12 are the tools that use what the stages generate;
+most of them belong to CryoGate, which runs compilers, while CryoSmith
+stays a generator.
+
+**Follows after the merge.**
+
+- The compiler bugs CryoSmith filed and that are still open, silent
+  miscompiles first: 0362 (a `match` arm releases its value's borrowed
+  temporaries when the arm ends; the generator keeps off the shape),
+  0363 (a `&i64` argument for an `i64` parameter passes the address),
+  0364 (a call through a generic bound is not checked for its argument
+  count or types: a crash, or a silent conversion), 0369 (an enum value
+  for an integer parameter, and back, is accepted), 0376 (an `if` or
+  `match` expression with one literal branch narrows a wider branch
+  silently); then 0365, 0366, 0367, 0368, 0370, 0372, 0373, 0374 and 0375
+  (crashes, wrong errors and missing checks). Each is fixed by its own
+  session, and a fix that lifts a keep-off is a new generator version.
+- `escape-borrow` (item 9) moves to the memory-safety plan: it needs that
+  plan's borrow checker on `main` before an escaping borrow is refused, so
+  it is built with the checker, not here. Item 9 is complete without it.
+- Item 8's last omission, a generic function made concrete at its one type
+  argument.
 
 **A compiler or standard library bug the corpus finds is filed, not
 fixed here.** It gets a bug file with a minimal repro, and work goes on.
@@ -1621,7 +1641,7 @@ generator never reads through an `Rc`.
      no new generator version: `cryosmith batch` writes
      `smith-<seed>.must-refuse` beside a marked program (and removes a
      stale one), and smith-crash reads it.
-   - **`escape-borrow` waits for the borrow checker** (a function
+   - **`escape-borrow` belongs to the memory-safety plan** (a function
      returning `&D<N>` made to return a borrow of a local of its own, or
      a reference parameter's borrow given on after the value moved). It
      cannot be a text edit: a function returning a borrow has, in the
@@ -1632,7 +1652,8 @@ generator never reads through an `Rc`.
      accepts an escaping borrow, so every such program would be counted
      accepted and could find nothing. It comes with that checker, when a
      refusal with its code is the expected outcome and anything else -
-     acceptance included - is a finding of its own.
+     acceptance included - is a finding of its own. It is built there,
+     and this item is complete without it.
    - **The gate**, `cryogate smith-crash --cryo <compiler> --work
      <directory> [--first-seed N] [--count K] [--mutations J] [--jobs N]
      [--build-limit S] [-- <generation options>...]`: J mutations of each
@@ -1683,7 +1704,8 @@ generator never reads through an `Rc`.
      and its decisions in `smith/crash.cryo`, `smith-reduce --text`.)
    - **Unit 2**: `swap-type` and `swap-arguments`, as text edits over
      the declarations and the calls `drop-argument` already reads
-     (built, generator version 42). `escape-borrow` waits, as above.
+     (built, generator version 42). `escape-borrow` is the memory-safety
+     plan's, as above.
 10. **A fuzz farm** (done: `cryogate smith-farm`). Overnight batches of
     the differential driver and the crash fuzzer over consecutive seeds,
     each finding deduplicated by its signature, each new one reduced once,
@@ -1727,12 +1749,25 @@ generator never reads through an `Rc`.
       again, and at the hard limit it stops, saying so. A farm with no
       host file refuses to start; the settings are the host's, never code
       per machine. On the maintainer's machine the ceiling is the 52 GiB
-      line heavy work holds above, and the cap the decisions' 6 GB. With
-      `--hours H` no batch starts once H hours have passed; a batch is
-      never cut short. Not built from those decisions: the 01:00 to 07:00
-      window (a farm started at 01:00 with `--hours 6` keeps it), and
-      pausing while `soloapps-train` runs in WSL or a full-screen
-      application is in front.
+      line heavy work holds above, and the cap the decisions' 6 GB.
+    - **The window.** With `--hours H` no batch starts once H hours have
+      passed; a batch is never cut short. The overnight window, 01:00 to
+      07:00, is a farm started at 01:00 with `--hours 6`: the farm keeps
+      no clock of its own, so whatever starts it (a scheduled task) sets
+      the window.
+    - **Making way for the person at the machine.** Before each batch,
+      after the memory and the lock, the farm waits a minute and looks
+      again while a full-screen application is in front or the user is
+      presenting (the shell's own answer, `SHQueryUserNotificationState`,
+      on Windows; a locked screen is neither, so a night run goes on), or
+      while a process runs whose command line matches a `pause-while
+      <pattern>` line of the host file (`pgrep -f`, an extended regular
+      expression). On Windows the processes looked at are WSL's, since the
+      long jobs the farm makes way for run there (the maintainer's host
+      file names `soloapps-train|images.py`), and WSL is asked only while
+      `wsl.exe --list --running` says a distribution runs, so the farm
+      never starts it. When pgrep cannot answer, the farm stops rather
+      than run over a job it cannot see. Each wait is in the report.
     - **Resumable.** `<findings>/farm.log` gets a line per judgement as
       each batch ends, `seed <N> <kind> <verdict>`: the kind `diff` or
       `crash`; the verdict `ok`, `known <bug>` for a seed
@@ -1767,15 +1802,18 @@ generator never reads through an `Rc`.
     - **Findings are drafted, never filed or committed.** A person reads
       each draft, files the bug in the bug log with its repro, and adds
       its signature entry to `tests/smith-known-bugs`; the test that
-      keeps a fixed bug fixed is written by the fix's own session.
+      keeps a fixed bug fixed is written by the fix's own session. The
+      number of drafts a night is not capped: the decisions' limit of five
+      automatically filed bugs a night is a limit on filings, and a draft
+      is not one.
     - **Report.** `<findings>/farm-report.md` is written again after each
       batch and each wait: the setting, the coverage (seeds judged
       by each kind, this run's mutated programs refused and accepted, the
       seeds each listed bug explained, the programs of each finding
       class), the findings new this run, every finding with its count,
       first seed and its bug or reduction, this run's batches with their
-      jobs, time and findings, and every wait (for memory or a heavy run)
-      and stop. The
+      jobs, time and findings, and every wait (for memory, a heavy run,
+      or what the farm makes way for) and stop. The
       children's reports carry no build count per configuration,
       mutation count per operator or refusal count per code, so the
       report has none.
