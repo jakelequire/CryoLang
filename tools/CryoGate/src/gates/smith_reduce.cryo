@@ -1,0 +1,284 @@
+///! `cryogate smith-reduce --seed N --cryo <compiler> [--reference
+///! <compiler>]... [--interpret] --work <directory> --out <directory>
+///! [--signature S] [--smith <cryosmith>] [--stdlib <directory>]
+///! [--build-limit S] [--run-limit S] [-- <generation options>...]`: a
+///! failing CryoSmith program shrunk while its smith-diff signature
+///! persists, and its bug file drafted.
+///!
+///! The seed's program is generated from the options given and judged as
+///! smith-diff judges it, under the same configurations; its signature, or
+///! `--signature`, is the failure kept.  Then, until a round keeps nothing,
+///! the reduction tries fewer functions, a smaller size and each feature
+///! left out (`smith/reduction.cryo`), each a program CryoSmith generates
+///! from the same seed, keeping a candidate only when its verdict has
+///! exactly that signature.  The reduced program and a drafted bug file go
+///! to `--out`; each trial's files are removed from `--work` once judged.
+///! Exit 0 when reduced, 1 when the seed does not show the failure or a
+///! trial cannot run, 2 on a usage error.
+
+namespace cryogate::gates::smith_reduce;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::time::duration::{ Duration };
+
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
+import cryogate::smith::corpus::{ CorpusLayout };
+import cryogate::smith::difference::{ Configuration, SmithDecision, SmithVerdict };
+import cryogate::smith::reduction::{ BugDraft, ProgramHeader };
+import cryogate::smith::run::programs::{ Attempt, SmithRun };
+
+/// One program tried: its source and what smith-diff made of it.
+type struct Trial {
+    source: String;
+    /// The finding's signature, kind and detail; empty when it passed.
+    signature: String;
+    kind: String;
+    detail: String;
+}
+
+/// `cryogate smith-reduce`'s settings.
+public type struct SmithReduce {
+    seed: u64;
+    configurations: Array<Configuration>;
+    smith: String;
+    work: PathBuf;
+    stdlib: Option<String>;
+    build_limit: u64;
+    run_limit: u64;
+
+    /// Run `cryogate smith-reduce` with `arguments` from index `first`; 0
+    /// when reduced, 1 when the seed does not show the failure or a trial
+    /// cannot run, 2 on a usage error.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate smith-reduce --seed N --cryo <compiler> [--reference <compiler>]... [--interpret] --work <directory> --out <directory> [--signature S] [--smith <cryosmith>] [--stdlib <directory>] [--build-limit S] [--run-limit S] [-- <generation options>...]"));
+        options.valued(Str::new("--seed"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--reference"));
+        options.flag(Str::new("--interpret"));
+        options.valued(Str::new("--work"));
+        options.valued(Str::new("--out"));
+        options.valued(Str::new("--signature"));
+        options.valued(Str::new("--smith"));
+        options.valued(Str::new("--stdlib"));
+        options.valued(Str::new("--build-limit"));
+        options.valued(Str::new("--run-limit"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-reduce: {reason.as_str()}"); return 2; }
+        };
+        const compiler: Option<Str> = parsed.value(Str::new("--cryo"));
+        const work: Option<Str> = parsed.value(Str::new("--work"));
+        const out: Option<Str> = parsed.value(Str::new("--out"));
+        const seed_text: Option<Str> = parsed.value(Str::new("--seed"));
+        if (compiler.is_none() || work.is_none() || out.is_none() || seed_text.is_none() || !parsed.positionals().is_empty()) {
+            fmt::eprintln(f"cryogate smith-reduce: usage: {options.usage()}");
+            return 2;
+        }
+        const seed: u64 = match (parsed.number(Str::new("--seed"), 0, 0)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-reduce: {reason.as_str()}"); return 2; }
+        };
+        const build_limit: u64 = match (parsed.number(Str::new("--build-limit"), 300, 1)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-reduce: {reason.as_str()}"); return 2; }
+        };
+        const run_limit: u64 = match (parsed.number(Str::new("--run-limit"), 60, 1)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-reduce: {reason.as_str()}"); return 2; }
+        };
+        mut references: Array<String> = Array::<String>::new();
+        for (reference in parsed.values_of(Str::new("--reference")).iterate_references()) { references.push(Host::absolute(reference.as_str())); }
+        const tree: String = Host::absolute(compiler.unwrap());
+        const default_smith: PathBuf = repository.join(Str::new("tools/CryoSmith/build"));
+        const reducer: SmithReduce = SmithReduce {
+            seed:           seed,
+            configurations: Configuration::of_compilers(tree.as_str(), &references, parsed.has(Str::new("--interpret"))),
+            smith:          match (parsed.value(Str::new("--smith"))) {
+                Option::Some(path) => { Host::absolute(path) }
+                Option::None       => { Host::executable_name(default_smith.as_path().join(Str::new("cryosmith")).as_path().as_str()) }
+            },
+            work:           PathBuf::from(Host::absolute(work.unwrap()).as_str()),
+            stdlib:         match (parsed.value(Str::new("--stdlib"))) {
+                Option::Some(stdlib) => { Option::Some(String::from_str(stdlib)) }
+                Option::None         => { Option::None }
+            },
+            build_limit:    build_limit,
+            run_limit:      run_limit,
+        };
+        const out_path: PathBuf = PathBuf::from(Host::absolute(out.unwrap()).as_str());
+        mut directories: Array<PathBuf> = Array::<PathBuf>::new();
+        directories.push(PathBuf::from(reducer.work.as_path().as_str()));
+        directories.push(PathBuf::from(out_path.as_path().as_str()));
+        for (directory in directories.iterate_references()) {
+            match (Directory::create_all(directory.as_path())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { fmt::eprintln(f"cryogate smith-reduce: cannot create {directory.as_path().as_str()}: {error.describe()}"); return 1; }
+            }
+        }
+        // The seed as given, and the failure it shows.
+        mut trials: i64 = 0;
+        const start: Trial = match (reducer.trial(trials, parsed.rest(), logs)) {
+            Result::Ok(trial)   => { trial }
+            Result::Err(reason) => { fmt::println(f"smith-reduce: FAIL ({reason.as_str()})"); return 1; }
+        };
+        trials++;
+        if (start.signature.is_empty()) {
+            fmt::println(f"smith-reduce: FAIL (seed {seed} passes under every configuration; nothing to reduce)");
+            return 1;
+        }
+        const signature: String = match (parsed.value(Str::new("--signature"))) {
+            Option::Some(given) => { String::from_str(given) }
+            Option::None        => { start.signature.clone() }
+        };
+        if (start.signature.as_str() != signature.as_str()) {
+            fmt::println(f"smith-reduce: FAIL (seed {seed} shows `{start.signature.as_str()}`, not `{signature.as_str()}`)");
+            return 1;
+        }
+        const before: ProgramHeader = match (ProgramHeader::parse(start.source.as_str())) {
+            Result::Ok(header)  => { header }
+            Result::Err(reason) => { fmt::println(f"smith-reduce: FAIL (seed {seed}'s program: {reason.as_str()})"); return 1; }
+        };
+        const lines_before: i64 = Text::lines(start.source.as_str()).length();
+        fmt::println(f"start seed {seed}: {lines_before} lines, {signature.as_str()}");
+        mut current: ProgramHeader = ProgramHeader::parse(start.source.as_str()).unwrap();
+        mut kept: Trial = start;
+        mut steps: i64 = 0;
+        mut changed: boolean = true;
+        while (changed) {
+            changed = false;
+            // The fewest functions, then the smallest size, that keep it.
+            mut phase: i64 = 0;
+            while (phase < 2) {
+                const candidates: Array<ProgramHeader> = if (phase == 0) { current.fewer_functions() } else { current.smaller_sizes() };
+                for (candidate in candidates.iterate_references()) {
+                    const tried: Option<Trial> = reducer.keeps(trials, candidate, signature.as_str(), logs);
+                    trials++;
+                    match (tried) {
+                        Option::Some(trial) => {
+                            fmt::println(f"kept  {candidate.change_from(&current).as_str()}: {Text::lines(trial.source.as_str()).length()} lines");
+                            current = ProgramHeader::parse(trial.source.as_str()).unwrap();
+                            kept = trial;
+                            steps++;
+                            changed = true;
+                            break;
+                        }
+                        Option::None => { }
+                    }
+                }
+                phase++;
+            }
+            // Each feature left out in turn.
+            const features: Array<String> = current.features.clone();
+            for (feature in features.iterate_references()) {
+                match (current.without(feature.as_str())) {
+                    Option::Some(candidate) => {
+                        const tried: Option<Trial> = reducer.keeps(trials, &candidate, signature.as_str(), logs);
+                        trials++;
+                        match (tried) {
+                            Option::Some(trial) => {
+                                fmt::println(f"kept  feature {feature.as_str()} off: {Text::lines(trial.source.as_str()).length()} lines");
+                                current = ProgramHeader::parse(trial.source.as_str()).unwrap();
+                                kept = trial;
+                                steps++;
+                                changed = true;
+                            }
+                            Option::None => { }
+                        }
+                    }
+                    Option::None => { }
+                }
+            }
+        }
+        const lines_after: i64 = Text::lines(kept.source.as_str()).length();
+        const program: PathBuf = out_path.as_path().join(f"smith-{seed}-reduced.cryo".as_str());
+        const draft_path: PathBuf = out_path.as_path().join(f"bug-draft-{seed}.md".as_str());
+        mut command: String = f"cryogate smith-diff --cryo {tree.as_str()}";
+        for (reference in references.iterate_references()) { command.push(f" --reference {reference.as_str()}".as_str()); }
+        if (parsed.has(Str::new("--interpret"))) { command.push(Str::new(" --interpret")); }
+        command.push(f" --work <directory> --first-seed {seed} --count 1 -- {Text::joined(&current.options(), Str::new(" ")).as_str()}".as_str());
+        const draft: BugDraft = BugDraft {
+            kind:         kept.kind.clone(),
+            signature:    signature.clone(),
+            detail:       kept.detail.clone(),
+            before:       before,
+            after:        current,
+            lines_before: lines_before,
+            lines_after:  lines_after,
+            source:       kept.source.clone(),
+            command:      command,
+        };
+        match (File::write_text(program.as_path(), kept.source.as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { fmt::println(f"smith-reduce: FAIL (cannot write {program.as_path().as_str()}: {error.describe()})"); return 1; }
+        }
+        match (File::write_text(draft_path.as_path(), draft.text().as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { fmt::println(f"smith-reduce: FAIL (cannot write {draft_path.as_path().as_str()}: {error.describe()})"); return 1; }
+        }
+        fmt::println(f"wrote {program.as_path().as_str()} and {draft_path.as_path().as_str()}");
+        fmt::println(f"smith-reduce: OK ({lines_before} -> {lines_after} lines, {steps} steps kept of {trials - 1} tried, signature {signature.as_str()})");
+        return 0;
+    }
+
+    /// The trial of `candidate` when it shows `signature`.
+    private keeps(&this, number: i64, candidate: &ProgramHeader, signature: Str, logs: &RunLogs) -> Option<Trial> {
+        match (this.trial(number, &candidate.options(), logs)) {
+            Result::Ok(trial) => {
+                if (trial.signature.as_str() == signature) { return Option::Some(trial); }
+            }
+            Result::Err(_) => { }
+        }
+        return Option::None;
+    }
+
+    /// The program CryoSmith generates for the seed from `generation`,
+    /// judged under every configuration in a directory of its own, which
+    /// is removed once judged; why it could not be.
+    private trial(&this, number: i64, generation: &Array<String>, logs: &RunLogs) -> Result<Trial, String> {
+        const directory: PathBuf = this.work.as_path().join(f"trial-{number}".as_str());
+        match (Directory::create_all(directory.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot create {directory.as_path().as_str()}: {error.describe()}"); }
+        }
+        const programs: SmithRun = SmithRun {
+            configurations: this.configurations.clone(),
+            layout:         CorpusLayout::new(directory.as_path()),
+            work:           PathBuf::from(directory.as_path().as_str()),
+            stdlib:         this.stdlib.clone(),
+            build_limit:    Option::Some(Duration::from_seconds(this.build_limit)),
+            run_limit:      Option::Some(Duration::from_seconds(this.run_limit)),
+            jobs:           0,
+            log_prefix:     f"smith-reduce-{number}",
+        };
+        programs.write_programs(this.smith.as_str(), this.seed, 1, generation, logs)?;
+        const source: String = match (File::read_text(programs.layout.source(this.seed).as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read the program CryoSmith wrote: {error.describe()}"); }
+        };
+        const attempts: Array<Array<Attempt>> = programs.attempts(this.seed, 1, logs);
+        const trial: Trial = match (SmithDecision::decide(&this.configurations, &SmithRun::observations(&attempts[0]))) {
+            SmithVerdict::Agreed(_) => {
+                Trial { source: source, signature: String::new(), kind: String::new(), detail: String::new() }
+            }
+            SmithVerdict::Found(finding) => {
+                Trial { source: source, signature: finding.signature.clone(), kind: String::from_str(finding.kind.name()), detail: finding.detail.clone() }
+            }
+        };
+        match (Directory::remove_all(directory.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot remove {directory.as_path().as_str()}: {error.describe()}"); }
+        }
+        return Result::Ok(trial);
+    }
+}

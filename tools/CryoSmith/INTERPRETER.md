@@ -366,10 +366,14 @@ program as not covered, never as agreeing.
 
 ## 9. The corpus check's third comparison
 
-`cryogate corpus-check --interpret` adds the interpreter to the comparison:
-each seed is built at `-O0` and `-O2` as before and also run with
-`cryo interpret`, under the same time limit scaled for the interpreter. A
-seed passes when the three print the same line and exit 0.
+`cryogate corpus-check --interpret` adds the interpreter to the comparison
+as a third configuration on the runner it shares with `smith-diff`
+(CryoGate's `smith/run/programs.cryo`): each seed is built at `-O0` and
+`-O2` as before and also run with `cryo interpret`. The builds are judged
+first, exactly as without `--interpret`; a seed whose builds pass then
+passes when the interpreter prints the same line and exits 0.
+`smith-diff --interpret` puts the same configuration among its others, and
+its verdict leaves a not-covered configuration out of the comparison.
 
 The interpreter's verdict for a seed is one of: **agrees**, **disagrees**
 (a different hash, which fails the seed and names which side differs), a
@@ -379,4 +383,5 @@ agreement: the summary line counts the seeds the interpreter ran and the
 seeds it did not cover, each by its construct, so a corpus the interpreter
 skipped entirely reads as `0 interpreted`, never as a pass.
 
-Without `--interpret` the check is unchanged.
+Without `--interpret` the check's report is the same bytes as before the
+interpreter existed.

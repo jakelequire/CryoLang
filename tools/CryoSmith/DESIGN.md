@@ -704,15 +704,6 @@ payload left behind, and `-O2` another value). Found by the 8c corpus
 binding in a generic function's copy as everywhere else`) and is not on
 this branch; the keep-off goes when it arrives.
 
-A map declared in a generic body (bug 0360): a `HashMap` local in a
-method of a generic struct that is never instantiated fails the build
-with an internal error, an unresolved `Entry<i32, i16>` after
-monomorphization; the instance is minted outside the symbolic walk of the
-method's body and is neither marked as the walk's nor monomorphized.
-Found by the 8d corpus (seed 13). Pre-existing; the fix is not started,
-and the keep-off is wider than the defect (it covers generic functions,
-which build) so that it is one condition to remove.
-
 ## 3. Guarantees, and how each is enforced
 
 ### 3.1 Valid under either overflow rule
@@ -1070,7 +1061,9 @@ statement budget of one function, default 24), `--no-header`, and
   around: the check gives each build no copy of its source and no
   directory of its own to stand in for the flag. The report is printed in
   seed order once every program has run, so it is the same bytes for any
-  job count.
+  job count. With `--expect` it checks the pinned corpus `make verify`
+  runs (section 9, item 11): each program must also print the hash line
+  pinned for its seed.
 - **Plants prove the checks can refuse.** `--plant unguarded-division`
   generates `(a / (b & M))`, without the `| 1`. The static audit must refuse
   every planted program that divides, and the corpus check must report the
@@ -1224,7 +1217,9 @@ layers, lowest first:
 4. A new safety rule goes in `guarantees/`, and section 3 says why it holds.
 5. `selftest/features.cryo` gets the feature's switch check: some program
    spells it with the feature on, none with it off. Raise
-   `GENERATOR_VERSION` when an existing seed's text changes.
+   `GENERATOR_VERSION` when an existing seed's text changes, and re-pin
+   verify's corpus in the same commit (`make smith-corpus-pin`, section
+   9, item 11): verify refuses a cryosmith of another version.
 
 **Proving a change preserves output.** A change meant to move no text is
 checked by generating the same seeds before and after and comparing the
@@ -1244,15 +1239,16 @@ the self-test, an old-seed reproduction check and a corpus. Items 7 to 12
 are the tools that use what the stages generate; most of them belong to
 CryoGate, which runs compilers, while CryoSmith stays a generator.
 
-**A compiler bug the corpus finds is fixed, not avoided.** The fix lands on
-this branch as any compiler change does: a test of the shape, the pin as
-the control, a mutation the test refuses, and `make verify` with its
-declarations. The generator is then left generating the shape. A keep-off
-(a shape the generator avoids, written under "Kept off" in section 2 with
-the bug that needs it) is allowed only while that bug's fix is queued in
-the same session, or when the fix is clearly a large project of its own,
-which is then put to the maintainer as a question rather than left in
-place.
+**A compiler or standard library bug the corpus finds is filed, not
+fixed here.** It gets a bug file with a minimal repro, and work goes on.
+The generator keeps off the shape, written under "Kept off" in section 2
+with the bug file that records it. A seed the interpreter disagrees on
+because of such a bug is reported as "known compiler bug NNNN" in the
+coverage count, never as agreeing. The exception is a bug whose keep-off
+would itself be a large workaround: that one is fixed as any compiler
+change is - a test of the shape, the pin as the control, a mutation the
+test refuses, and `make verify` with its declarations. A defect in the
+interpreter's own code is always fixed.
 
 **What proves a change.**
 
@@ -1365,13 +1361,111 @@ generator never reads through an `Rc`.
    under a time limit, and reports a mismatch, a crash, a refusal or a
    hang, naming the seed and the configuration. CryoSmith adds nothing but
    the output contract it already has.
+
+   *Design.* `cryogate smith-diff --cryo <compiler> [--reference
+   <compiler>]... [--interpret] --work <directory> [--first-seed N]
+   [--count K] [--jobs N] [--build-limit S] [--run-limit S] [--
+   <generation options>...]`.
+   - **Configurations.** A configuration is one way of getting a seed's
+     hash line: a compiler at `-O0`, the same at `-O2`, or the compiler
+     under test's `cryo interpret` (with `--interpret`, once the
+     interpreter is on this branch; nothing else changes when it is
+     absent). `--cryo` gives two, each `--reference` (the pin, a
+     baseline's compiler) two more. Windows against Linux, a build or a
+     run inside WSL as selfhost's Linux arm runs one, is a later unit: one
+     more kind of configuration, not another command.
+   - **Each configuration's observation** of a seed is exactly one of:
+     *printed* a line (exit 0, one hash line); *refused* (the compiler
+     exited 1 with error diagnostics; their codes kept); *internal
+     error* (a refusal holding an `E09xx` code); *compile crash* (the
+     compiler died by a signal or an exit other than 0 and 1); *compile
+     hang* (past `--build-limit`, default 300 s); *run crash* (the
+     program exited non-zero, died by a signal, or printed something
+     other than one hash line); *run hang* (past `--run-limit`, default
+     60 s). Every generated program terminates within its cost budget
+     (section 3.3), so a run past the limit is a finding, not a slow run.
+   - **A seed's verdict** comes from its observations alone, in a pure
+     decision (`smith/` in CryoGate, unit-tested): *ok* when every
+     configuration printed the same line; otherwise the first class that
+     holds, in this order: compile crash, compile hang, internal error,
+     refusal, run crash, run hang, mismatch. A generated program is valid
+     by construction, so a refusal is a finding as much as a crash. A
+     mismatch names the groups of configurations that agree (`tree -O0,
+     tree -O2 | pin -O0, pin -O2`), so a disagreement between compilers
+     reads apart from one between levels. Each finding has a signature -
+     its class, the configurations involved and the first diagnostic code
+     or crash outcome - which the fuzz farm (item 10) deduplicates by.
+   - **Report.** One line per seed in seed order, the same bytes for any
+     job count, then one count per class and the verdict line
+     `smith-diff: OK (K programs, C configurations agree)` or
+     `smith-diff: FAIL (F of K programs: ...)`; exit 0, 1 on a finding, 2
+     on a usage error. A failing seed's source and executables stay in the
+     work directory; a passing seed's executables are removed.
+   - **Built on corpus-check, not beside it.** The work directory's
+     layout, the hash-line judgement and the quoting of a failed build
+     (`smith/corpus.cryo`) are shared; the builds and runs of every
+     configuration are scheduled as corpus-check schedules its two. Once
+     smith-diff stands, corpus-check becomes its two-configuration case
+     (the compiler under test at both levels), keeping its own verdict
+     line and `--expect`/`--pin`, and its report proven byte-identical
+     before and after over the same seeds.
+   - **Each build compiles its own copy of the program**, placed in its
+     build directory: an older compiler (the pin) writes a single file's
+     build beside the file whatever `--build-dir` says, and builds running
+     at once would then link each other's objects.
+   - (Done, but for Windows against Linux: `cryogate smith-diff`,
+     `smith/difference.cryo` for the decisions, `smith/run/programs.cryo`
+     for the builds and runs both commands share.)
 8. **A reducer** (CryoGate, `cryogate smith-reduce`). Shrinks a failing
-   program while the same failure reproduces: first by asking CryoSmith
-   for fewer functions and a smaller `--size` from the same seed (section
-   6), then by deleting lines and subtrees. It drafts the bug file: the
-   reduced repro, the configurations that disagree, the seed and header.
+   program while the same failure reproduces, and drafts its bug file.
    CryoSmith's part is section 6's reduction-friendliness, kept as the
    stages grow.
+
+   *Design.* `cryogate smith-reduce --seed N --cryo <compiler>
+   [--reference <compiler>]... [--interpret] --work <directory> --out
+   <directory> [--signature S] [--smith <cryosmith>] [--stdlib <directory>]
+   [--build-limit S] [--run-limit S] [-- <generation options>...]`.
+   - **The failure kept** is a smith-diff signature (item 7): its class,
+     the configurations involved and the first code or how the child
+     ended, never a hash. `--signature` names it; without one it is the
+     signature of the seed as given, and a seed that passes is a usage
+     error. A candidate is kept only when smith-diff's verdict over it,
+     under the same configurations, has exactly that signature: a
+     candidate failing differently is not the same bug.
+   - **Every candidate is a CryoSmith program**, so it is valid, well
+     typed and terminates by construction, and a refusal or a mismatch it
+     shows is still the compiler's. The reducer never edits text: a
+     deleted line that leaves a use behind is a refusal of the reducer's
+     making, which under a refusal signature would be kept as the bug.
+   - **Unit 1: the generation knobs**, from the program's own header (the
+     features list, `functions`, `size`), each tried smallest first and
+     kept when the signature persists, the whole repeated until a round
+     changes nothing: `--functions` from 0 up to the current count;
+     `--size` over 1, 2, 3, 4, 6, 8, 12, 16 and so on below the current
+     size; then each feature of the list turned off in turn (written out
+     as the list without it; a list CryoSmith refuses is not a
+     candidate). Functions are independent of the count (section 3.5),
+     so dropping the later ones keeps the earlier ones' text. (Done:
+     `smith/reduction.cryo` and `gates/smith_reduce.cryo`.)
+   - **Unit 2: the model's own edits**, in CryoSmith (`cryosmith generate
+     ... --omit <path>...`): a statement, a whole function, a struct's or
+     enum's member, or an expression replaced by a literal of its type,
+     each named by its path in the program tree and removed by the
+     generator before printing, which re-checks what depends on it
+     (a local's later uses become literals, a removed variant's arms go)
+     so the result keeps every section 3 guarantee. The reducer then
+     drives `--omit` paths as it drives the knobs, one at a time and in
+     tree order, keeping each that leaves the signature.
+   - **Output**, in `--out`: the reduced program `smith-<seed>-reduced.cryo`
+     (its header names the options that rebuild it), and
+     `bug-draft-<seed>.md`, a bug file drafted for review and never
+     committed: the title from the class, the signature, each
+     configuration's observation, the seed, the generation options before
+     and after, the line counts before and after, the reduced source and
+     the command that reproduces it. The report prints each step kept and
+     ends `smith-reduce: OK (<lines before> -> <lines after> lines, <steps>
+     steps kept, signature <S>)`; exit 0, 1 when the seed does not fail or
+     the reduction could not run, 2 on a usage error.
 9. **A crash fuzzer.** Near-valid programs: CryoSmith's `--plant` grows
    into mutations of a valid program (a deleted line, a swapped operand,
    a wrong type), each expected to be refused with a diagnostic, never to
@@ -1381,19 +1475,74 @@ generator never reads through an `Rc`.
     of the differential driver over consecutive seeds, failures
     deduplicated by their signature (the diagnostic code, the crash site,
     the disagreeing configuration), reduced, and a summary written.
-11. **A corpus gate in `make verify`.** A small fixed set of seeds at a
-    pinned generator version, checked as `corpus-check` checks them, run
-    by verify beside its other gates; a seed that fails is a compiler
-    finding, and a new generator version re-pins the set. Once the
-    memory-safety plan's checker is on `main`, the corpus is also run
-    under it as a gate: every generated program must pass it unchanged,
-    with no `unsafe`, since the generator promises validity under that
-    plan's rules as well as today's.
+11. **A corpus gate in `make verify`** (done: verify's `smith` gate). A
+    small fixed set of seeds at a pinned generator version, checked as
+    `corpus-check` checks them, run by verify beside its other gates; a
+    seed that fails is a compiler finding, and a new generator version
+    re-pins the set. `tests/smith-corpus` holds the generator version,
+    the generation options and seeds 1 to 24, each with the hash line its
+    program prints; `cryogate corpus-check --expect tests/smith-corpus`
+    builds each at `-O0` and `-O2` with the compiler under test and
+    requires both to print the pinned line, so a miscompile both levels
+    share is caught too, which the two levels' agreement alone cannot see.
+    A program's hash is fixed by its text, so the pinned line is the
+    program's meaning, not any compiler's output. The gate refuses to run
+    a cryosmith of another generator version; `make smith-corpus-pin`
+    (`corpus-check --pin`) re-pins the file, from a run in which every
+    program passed. Once the memory-safety plan's checker is on `main`,
+    the corpus is also run under it as a gate: every generated program
+    must pass it unchanged, with no `unsafe`, since the generator promises
+    validity under that plan's rules as well as today's. Once the
+    interpreter (item 12) is on this branch, the gate also evaluates each
+    program with `--interpret` and requires the pinned line there too.
 12. **The reference interpreter.** `cryo interpret`, a module of the
     compiler that runs the typed program the front end leaves - not
     CryoSmith's own model, which would check the generator against itself
     - by the language reference, with an explicit memory model and its own
     account of moves and drops: an oracle that does not share code
-    generation's mistakes. `cryogate corpus-check --interpret` compares
-    its hash with the compiled programs'. Its design, its coverage by
+    generation's mistakes. It is one more configuration on the runner
+    smith-diff and corpus-check share (`Configuration::interpreted`):
+    `cryogate corpus-check --interpret` and `smith-diff --interpret`
+    compare its hash with the compiled programs', and a program it does
+    not cover (exit 71, the construct named) is left out of the
+    comparison, never counted as agreeing. Its design, its coverage by
     stage and the comparison are in INTERPRETER.md.
+
+**Merging the interpreter's branch into this one.** The interpreter was
+built on its own branch, `cryosmith-interp`, which took this branch's
+commits by merging them in. It joins this branch by the same route the
+other way:
+
+1. On the interpreter's branch, merge this branch's tip. The conflicts are
+   additive: both branches add lines at the end of
+   `tests/started-compiling` (keep both); `corpus_check.cryo` gains
+   `--interpret` on one side and the shared runner with `--expect`/`--pin`
+   on the other, and the interpretation becomes a configuration on that
+   runner, judged after the builds' line (and a pinned seed's line) is
+   settled, so a run without `--interpret` reports the same bytes as
+   before; CryoGate's `tests/smith.cryo` gains tests on both sides (keep
+   both, imports joined); and item 11 above is this branch's text while
+   item 12 is the interpreter branch's. The move check
+   (`passes/move_check.cryo`) merges without a conflict but is changed on
+   both sides, so it is read again after the merge.
+2. The merged tree passes the full batch against this branch's tip as the
+   baseline: verify with `--require-identical` (the census, the smith gate
+   on `tests/smith-corpus`, and the objects, each moved one already
+   declared by the commit that moved it), `warnings-check` with its
+   planted control, the selfhost check on both arms, and
+   `corpus-check --interpret` on the 200 default seeds with every seed
+   interpreted and agreeing or a known compiler bug.
+3. This branch fast-forwards to the merged commit, and `cryosmith-interp`
+   is retired.
+4. Item 11's gate then interprets its pinned corpus as well: verify's
+   `smith` gate runs `corpus-check --expect tests/smith-corpus
+   --interpret`, so each pinned program must print its pinned line when
+   interpreted too, and a seed the interpreter does not cover fails the
+   gate rather than being skipped. The change lands with a CryoGate test
+   and a mutation (an interpreter that changes one rule fails the gate).
+5. The generator's keep-off ("Kept off", section 2: a `match` arm
+   assigning its subject inside a generic body) is lifted: its fix, a
+   `Copy` payload binding copied into a slot of its own in a generic
+   function's copy, is on the interpreter's branch and arrives with the
+   merge. Lifting it changes what the generator writes, so it is a new
+   generator version and re-pins `tests/smith-corpus` in the same commit.

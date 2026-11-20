@@ -1304,7 +1304,7 @@ type struct MoveChecker {
             }
             DeclKind::Union(ud) => {
                 this.push_owner_copy_params(&ud.where_bounds);
-                this.walk_methods(ud.methods);
+                this.walk_methods(ud.methods, ud.is_generic());
             }
             DeclKind::Struct(sd) => {
                 // The closure of a lambda written in a generic body is a
@@ -1313,7 +1313,7 @@ type struct MoveChecker {
                 // its type parameters say what is `Copy`.
                 if (stmt.generated && sd.generic_params.length() > 0) { return; }
                 this.push_owner_copy_params(&sd.where_bounds);
-                this.walk_methods(sd.methods);
+                this.walk_methods(sd.methods, sd.is_generic());
             }
             DeclKind::Impl(ib) => {
                 this.push_owner_copy_params(&ib.where_bounds);
@@ -1322,7 +1322,7 @@ type struct MoveChecker {
                     const declared: [TraitBound]* = target.declared_where_bounds();
                     if (declared != null) { this.push_owner_copy_params(declared); }
                 }
-                this.walk_methods(ib.methods);
+                this.walk_methods(ib.methods, ib.is_template() || target != null);
             }
             DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
             | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
@@ -1331,13 +1331,22 @@ type struct MoveChecker {
         }
     }
 
-    walk_methods(mut &this, methods: &[DeclarationNode*]) -> void {
+    /// Walk the bodies of `methods`.  The methods of a template (`template`)
+    /// are its own bodies, written over its parameters: a type they name may
+    /// be an instantiation nothing demands, made only inside the template, so
+    /// what the walk's questions build is built without demanding it, as
+    /// sema's walk of the same bodies builds it.  Nothing monomorphizes it,
+    /// and GenericValidation does not count it unresolved.
+    walk_methods(mut &this, methods: &[DeclarationNode*], template: boolean) -> void {
+        const was: boolean = this.arena.symbolic_no_demand_active;
+        if (template) { this.arena.set_symbolic_no_demand(true); }
         for (mut i: i64 = 0; i < methods.length(); i++) {
             const m_decl: DeclarationNode* = methods[i];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
             this.walk_function(m.func);
         }
+        this.arena.set_symbolic_no_demand(was);
     }
 
     walk_function(mut &this, func_decl: DeclarationNode*) -> void {
