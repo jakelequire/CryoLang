@@ -1532,6 +1532,59 @@ generator never reads through an `Rc`.
    a wrong type), each expected to be refused with a diagnostic, never to
    crash the compiler. CryoGate builds them and reports a crash, a hang or
    an internal error, not a refusal.
+
+   *Design.*
+   - **Mutations are CryoSmith's**, applied to a valid program's printed
+     text after any omissions (`cryosmith generate ... --mutation M`, and
+     `batch` likewise): `M` seeds a stream of its own, which picks one
+     operator and one site among those the text offers, so a seed, its
+     options and `M` reproduce the file. The header records it,
+     ` mutation <M> <operator> <site>`. CryoSmith still runs no compiler.
+   - **Operators**, each a near-valid shape a compiler must refuse with a
+     diagnostic (or may accept, when the edit happens to leave a valid
+     program): `delete-token` and `duplicate-token` (a token of the body,
+     split on spaces and punctuation); `drop-brace` and `extra-brace` (a
+     `}` deleted, a `{` added at a line's end); `swap-type` (a declared
+     local's type replaced by another of the program's type names);
+     `drop-annotation` (`const v: T = ..` written `const v = ..`);
+     `drop-argument` and `extra-argument` (a call given one argument
+     fewer, or its last twice); `swap-arguments` (a call's first two
+     arguments exchanged, where they differ in type); `escape-borrow` (a
+     function returning `&D<N>` made to return a borrow of a local of its
+     own, or a reference parameter's borrow given on after the value
+     moved). The printer's shape - one statement per line, every
+     operation parenthesised - is what lets an operator find its sites
+     in the text exactly.
+   - **The gate**, `cryogate smith-crash --cryo <compiler> --work
+     <directory> [--first-seed N] [--count K] [--mutations J] [--jobs N]
+     [--build-limit S] [-- <generation options>...]`: J mutations of each
+     of K seeds' programs, each built once (`--opt-level=0`) under the
+     build limit. Its observation is smith-diff's (item 7), judged
+     differently: a refusal with an error code and an acceptance are
+     both fine; a compile crash, a compile hang, an internal error
+     (`E09xx`) and a refusal printing no error code are findings. The
+     signature is the class, the operator and the first code or how the
+     compiler ended, so one defect reached through many seeds is one
+     finding; the report prints each finding once with its count and
+     first seed, then `smith-crash: OK (P programs, R refused, A
+     accepted)` or `smith-crash: FAIL (F findings in P programs: ...)`.
+   - **Reduction**: for a crash, a hang or an internal error the reducer
+     may edit the text itself - any input that makes the compiler crash
+     is the defect, valid or not, and the signature keeps a different
+     crash apart - so `smith-reduce --text` deletes lines, then tokens,
+     halves first and down to one at a time, keeping each deletion that
+     keeps the signature, from the mutated program. A refusal is never
+     reduced this way: a deletion's own refusal would read as the bug.
+   - **Unit 1**: the text operators (`delete-token`, `duplicate-token`,
+     `drop-brace`, `extra-brace`, `drop-annotation`, `drop-argument`,
+     `extra-argument`) and `smith-crash`; a planted compiler crash on one
+     malformed shape found and reduced is the proof, then a live run over
+     a bounded seed range with every finding filed. `swap-type`,
+     `swap-arguments` and `escape-borrow` need the model's types at the
+     site and come second. (Built: the seven text operators in
+     `mutate/`, their self-test check, `smith-crash` and its decisions
+     in `smith/crash.cryo`. Not yet: `smith-reduce --text`, the planted
+     crash and the live run.)
 10. **A fuzz farm** (CryoGate, `cryogate smith-farm`). Overnight batches
     of the differential driver over consecutive seeds, failures
     deduplicated by their signature (the diagnostic code, the crash site,

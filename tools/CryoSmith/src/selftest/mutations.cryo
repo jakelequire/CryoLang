@@ -1,0 +1,65 @@
+///! The mutation check: every operator finds sites in the default programs,
+///! a mutation is the same text for the same seed and number, its header
+///! names it, and it leaves the prelude - the hash state and `mix` - as
+///! the generator wrote it.
+
+namespace cryosmith::selftest::mutations;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+
+import cryosmith::mutate::{ Mutation, MutationOperator };
+import cryosmith::selftest::runner::{ SelfTest };
+
+/// How many seeds' default programs are mutated.
+const MUTATED_PROGRAMS: u64 = 6;
+
+/// How many mutation numbers each is mutated with.
+const MUTATIONS_EACH: u64 = 8;
+
+implement struct SelfTest {
+    /// Mutate the default programs of the first seeds.
+    internal mutation_check(mut &this) -> void {
+        const operators: Array<MutationOperator> = MutationOperator::all();
+        mut sited: Array<i64> = Array::<i64>::new();
+        while (sited.length() < operators.length()) { sited.push(0); }
+        mut seed: u64 = 1;
+        while (seed <= MUTATED_PROGRAMS) {
+            const text: String = this.default_text(seed);
+            const prelude_end: i64 = text.as_str().find(&Str::new("\n}\n")).unwrap_or(0) + 3;
+            mut position: i64 = 0;
+            while (position < operators.length()) {
+                if (Mutation::sites(operators[position], text.as_str()).length() > 0) { sited.set(position, sited[position] + 1); }
+                position = position + 1;
+            }
+            mut number: u64 = 0;
+            while (number < MUTATIONS_EACH) {
+                match (Mutation::choose(seed, number, text.as_str())) {
+                    Option::Some(mutation) => {
+                        const mutated: String = mutation.apply(text.as_str()).unwrap_or(String::new());
+                        const again: String = Mutation::choose(seed, number, text.as_str()).unwrap().apply(text.as_str()).unwrap_or(String::new());
+                        this.expect(mutated.as_str() == again.as_str(), f"seed {seed} mutation {number}: not the same text twice");
+                        this.expect(mutated.as_str() != text.as_str(), f"seed {seed} mutation {number}: the text is unchanged");
+                        const named: String = f" mutation {number} {mutation.operator.name()} {mutation.site}\n";
+                        this.expect(mutated.as_str().contains(&named.as_str()), f"seed {seed} mutation {number}: the header does not name it");
+                        const header_end: i64 = text.as_str().find(&Str::new("\n")).unwrap_or(0);
+                        const kept: Str = text.as_str().byte_substring(header_end, prelude_end);
+                        const moved_to: i64 = header_end + named.length() - 1;
+                        this.expect(mutated.length() >= moved_to + kept.length() && mutated.as_str().byte_substring(moved_to, moved_to + kept.length()) == kept,
+                            f"seed {seed} mutation {number}: the prelude changed");
+                    }
+                    Option::None => { this.expect(false, f"seed {seed} mutation {number}: no operator has a site"); }
+                }
+                number = number + 1;
+            }
+            seed = seed + 1;
+        }
+        mut position: i64 = 0;
+        while (position < operators.length()) {
+            this.expect(sited[position] > 0, f"operator {operators[position].name()} found no site in any program");
+            position = position + 1;
+        }
+    }
+}

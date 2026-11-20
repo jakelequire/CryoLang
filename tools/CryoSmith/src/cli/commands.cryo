@@ -19,6 +19,7 @@ import cryosmith::configuration::{ Feature, FeatureSet, GENERATOR_VERSION, Gener
 import cryosmith::emit::{ Printer };
 import cryosmith::generate::{ Generator };
 import cryosmith::model::{ Omission, Program };
+import cryosmith::mutate::{ Mutation };
 import cryosmith::reduce::{ Omitter };
 import cryosmith::selftest::{ SelfTest };
 
@@ -68,7 +69,8 @@ public type struct Cli {
             "Checking the programs against a compiler is `cryogate corpus-check`.\n\n"
             "generation options: --features LIST (default `default`; `no-<name>`\n"
             "removes one), --functions N, --size N, --no-header, --plant NAME,\n"
-            "--omissions FILE (paths a reducer takes out, in order)\n\n"
+            "--omissions FILE (paths a reducer takes out, in order), --mutation M\n"
+            "(mutation M of the program, a near-valid one for the crash fuzzer)\n\n"
             "exit codes: 0 done, 1 a file could not be written or the self-test failed,\n"
             "2 a usage error")));
     }
@@ -139,7 +141,10 @@ public type struct Cli {
             Result::Ok(program) => { program }
             Result::Err(reason) => { fmt::eprintln(f"cryosmith generate: {reason.as_str()}"); return 2; }
         };
-        const text: String = Printer::print(&program, &options);
+        const text: String = match (Cli::mutated(&parsed, seed, Printer::print(&program, &options))) {
+            Result::Ok(text)    => { text }
+            Result::Err(reason) => { fmt::eprintln(f"cryosmith generate: {reason.as_str()}"); return 2; }
+        };
         match (parsed.value(Str::new("out"))) {
             Option::Some(path) => {
                 match (File::write_text(PathBuf::from(path).as_path(), text.as_str())) {
@@ -192,7 +197,10 @@ public type struct Cli {
                 Result::Ok(program) => { program }
                 Result::Err(reason) => { fmt::eprintln(f"cryosmith batch: seed {seed}: {reason.as_str()}"); return 2; }
             };
-            const text: String = Printer::print(&program, &options);
+            const text: String = match (Cli::mutated(&parsed, seed, Printer::print(&program, &options))) {
+                Result::Ok(text)    => { text }
+                Result::Err(reason) => { fmt::eprintln(f"cryosmith batch: seed {seed}: {reason.as_str()}"); return 2; }
+            };
             match (File::write_text(path.as_path(), text.as_str())) {
                 Result::Ok(_)       => { fmt::println(f"{path.as_path().as_str()}"); }
                 Result::Err(reason) => { fmt::eprintln(f"cryosmith: cannot write {path.as_path().as_str()}: {reason}"); return 1; }
@@ -254,6 +262,23 @@ public type struct Cli {
             Omitter::apply(&program, omission)?;
         }
         return Result::Ok(program);
+    }
+
+    /// `text`, the program of `seed`, with `--mutation`'s mutation made
+    /// when one is given; why it cannot be.
+    private static mutated(parsed: &ParsedArguments, seed: u64, text: String) -> Result<String, String> {
+        const number: u64 = match (GenerationArguments::number(parsed, Str::new("mutation"))?) {
+            Option::Some(number) => { number }
+            Option::None         => { return Result::Ok(text); }
+        };
+        const mutation: Mutation = match (Mutation::choose(seed, number, text.as_str())) {
+            Option::Some(mutation) => { mutation }
+            Option::None           => { return Result::Err(String::from_str(Str::new("the program offers no mutation a site"))); }
+        };
+        return match (mutation.apply(text.as_str())) {
+            Option::Some(mutated) => { Result::Ok(mutated) }
+            Option::None          => { Result::Err(String::from_str(Str::new("the mutation drawn has no site"))) }
+        };
     }
 
     /// `features`: every feature, its stage, and whether `default` holds it.

@@ -1,0 +1,271 @@
+///! `Mutation`: one edit that turns a valid program's text into a
+///! near-valid one, for the crash fuzzer (section 9, item 9 of the design).
+///!
+///! An operator offers the sites the text has for it, in text order, each
+///! an edit of a span of the program's body - everything after the
+///! prelude's `mix` - so the hash state and its fold stay written as the
+///! generator wrote them.  A mutation's number seeds a stream of its own,
+///! which picks an operator among those with a site and then one of its
+///! sites, so a seed, its options and the number give the same file.  The
+///! printer's shape - one statement per line, every operation in
+///! parentheses - is what lets a site be found in the text exactly.
+
+namespace cryosmith::mutate::mutation;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+
+import cryosmith::random::{ RandomStream };
+
+/// What a mutation does to its site.
+public type enum MutationOperator {
+    /// A token of the body deleted: a name, a number or one punctuation
+    /// character.
+    DeleteToken;
+    /// A token of the body written twice, a space between.
+    DuplicateToken;
+    /// A `}` of the body deleted.
+    DropBrace;
+    /// A `{` added at the end of a line of the body.
+    ExtraBrace;
+    /// A declared local's type left out: `const v0: u8 = 1;` written
+    /// `const v0 = 1;`.
+    DropAnnotation;
+    /// A call of a function or method given its last argument fewer.
+    DropArgument;
+    /// A call of a function or method given its last argument twice.
+    ExtraArgument;
+}
+
+implement enum MutationOperator {
+    /// Every operator, in the order a mutation draws among them.
+    public static all() -> Array<MutationOperator> {
+        return [MutationOperator::DeleteToken, MutationOperator::DuplicateToken, MutationOperator::DropBrace, MutationOperator::ExtraBrace,
+                MutationOperator::DropAnnotation, MutationOperator::DropArgument, MutationOperator::ExtraArgument];
+    }
+
+    /// The operator's name, as a header and a report spell it.
+    public name(&this) -> Str {
+        return match (&this) {
+            MutationOperator::DeleteToken    => { Str::new("delete-token") }
+            MutationOperator::DuplicateToken => { Str::new("duplicate-token") }
+            MutationOperator::DropBrace      => { Str::new("drop-brace") }
+            MutationOperator::ExtraBrace     => { Str::new("extra-brace") }
+            MutationOperator::DropAnnotation => { Str::new("drop-annotation") }
+            MutationOperator::DropArgument   => { Str::new("drop-argument") }
+            MutationOperator::ExtraArgument  => { Str::new("extra-argument") }
+        };
+    }
+}
+
+/// An edit of a text: the bytes from `start` to `end` replaced by
+/// `replacement`.
+public type struct TextEdit {
+    /// Where the span starts.
+    public start: i64;
+    /// Where it ends, past its last byte.
+    public end: i64;
+    /// What it is replaced by.
+    public replacement: String;
+}
+
+/// One mutation of a program: its number, the operator it drew and the
+/// site, by its place among the operator's sites.
+public type struct Mutation {
+    /// The number the mutation was drawn from.
+    public number: u64;
+    /// What it does.
+    public operator: MutationOperator;
+    /// Where, among the operator's sites in text order.
+    public site: i64;
+
+    /// Mutation `number` of `text`, the program of `seed`: an operator
+    /// drawn among those with a site, then one of its sites; none when no
+    /// operator has one.
+    public static choose(seed: u64, number: u64, text: Str) -> Option<Mutation> {
+        mut weights: Array<i64> = Array::<i64>::new();
+        mut counts: Array<i64> = Array::<i64>::new();
+        mut any: boolean = false;
+        const operators: Array<MutationOperator> = MutationOperator::all();
+        for (operator in operators.iter()) {
+            const count: i64 = Mutation::sites(operator, text).length();
+            counts.push(count);
+            weights.push(if (count > 0) { 1 } else { 0 });
+            if (count > 0) { any = true; }
+        }
+        if (!any) { return Option::None; }
+        mut stream: RandomStream = RandomStream::for_mutation(seed, number);
+        const drawn: i64 = stream.pick(&weights);
+        return Option::Some(Mutation { number: number, operator: operators[drawn], site: stream.below(counts[drawn]) });
+    }
+
+    /// `text` with the mutation made, and the header's first line, when it
+    /// has one, ending ` mutation <number> <operator> <site>`; none when
+    /// the text has no such site.
+    public apply(&this, text: Str) -> Option<String> {
+        const edits: Array<TextEdit> = Mutation::sites(this.operator, text);
+        if (this.site < 0 || this.site >= edits.length()) { return Option::None; }
+        mut mutated: String = String::from_str(text.byte_substring(0, edits[this.site].start));
+        mutated.push(edits[this.site].replacement.as_str());
+        mutated.push(text.byte_substring(edits[this.site].end, text.length()));
+        if (!mutated.as_str().starts_with(&Str::new("// cryosmith "))) { return Option::Some(mutated); }
+        const header_end: i64 = mutated.as_str().find(&Str::new("\n")).unwrap_or(mutated.length());
+        mut headed: String = String::from_str(mutated.as_str().byte_substring(0, header_end));
+        headed.push(f" mutation {this.number} {this.operator.name()} {this.site}".as_str());
+        headed.push(mutated.as_str().byte_substring(header_end, mutated.length()));
+        return Option::Some(headed);
+    }
+
+    /// Every site `operator` has in `text`'s body, in text order.
+    public static sites(operator: MutationOperator, text: Str) -> Array<TextEdit> {
+        const body: i64 = Mutation::body_start(text);
+        return match (operator) {
+            MutationOperator::DeleteToken    => { Mutation::token_edits(text, body, false) }
+            MutationOperator::DuplicateToken => { Mutation::token_edits(text, body, true) }
+            MutationOperator::DropBrace      => { Mutation::byte_edits(text, body, Str::new("}"), Str::new("")) }
+            MutationOperator::ExtraBrace     => { Mutation::byte_edits(text, body, Str::new("\n"), Str::new(" {\n")) }
+            MutationOperator::DropAnnotation => { Mutation::annotation_edits(text, body) }
+            MutationOperator::DropArgument   => { Mutation::argument_edits(text, body, false) }
+            MutationOperator::ExtraArgument  => { Mutation::argument_edits(text, body, true) }
+        };
+    }
+
+    /// Where the body starts: past the closing brace of the prelude's
+    /// `mix`, the first line that is only `}`.
+    private static body_start(text: Str) -> i64 {
+        return match (text.find(&Str::new("\n}\n"))) {
+            Option::Some(at) => { at + 3 }
+            Option::None     => { 0 }
+        };
+    }
+
+    /// Whether the one-byte `character` belongs to a name or a number.
+    private static is_word(character: Str) -> boolean {
+        return Str::new("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_").contains(&character);
+    }
+
+    /// The tokens of `text` from `from`, as spans: each name or number
+    /// whole, each other byte that is not a space or a line end alone.
+    private static tokens(text: Str, from: i64) -> Array<TextEdit> {
+        mut tokens: Array<TextEdit> = Array::<TextEdit>::new();
+        mut at: i64 = from;
+        while (at < text.length()) {
+            const character: Str = text.byte_substring(at, at + 1);
+            if (character == Str::new(" ") || character == Str::new("\n")) {
+                at = at + 1;
+                continue;
+            }
+            mut end: i64 = at + 1;
+            if (Mutation::is_word(character)) {
+                while (end < text.length() && Mutation::is_word(text.byte_substring(end, end + 1))) { end = end + 1; }
+            }
+            tokens.push(TextEdit { start: at, end: end, replacement: String::from_str(text.byte_substring(at, end)) });
+            at = end;
+        }
+        return tokens;
+    }
+
+    /// Each token from `from` deleted, or with `twice` written twice.
+    private static token_edits(text: Str, from: i64, twice: boolean) -> Array<TextEdit> {
+        mut edits: Array<TextEdit> = Array::<TextEdit>::new();
+        const tokens: Array<TextEdit> = Mutation::tokens(text, from);
+        for (token in tokens.iterate_references()) {
+            mut replacement: String = String::new();
+            if (twice) {
+                replacement.push(token.replacement.as_str());
+                replacement.push(Str::new(" "));
+                replacement.push(token.replacement.as_str());
+            }
+            edits.push(TextEdit { start: token.start, end: token.end, replacement: replacement });
+        }
+        return edits;
+    }
+
+    /// Each occurrence of the one-byte `found` from `from`, replaced by
+    /// `replacement`.
+    private static byte_edits(text: Str, from: i64, found: Str, replacement: Str) -> Array<TextEdit> {
+        mut edits: Array<TextEdit> = Array::<TextEdit>::new();
+        mut at: i64 = from;
+        while (at < text.length()) {
+            if (text.byte_substring(at, at + 1) == found) { edits.push(TextEdit { start: at, end: at + 1, replacement: String::from_str(replacement) }); }
+            at = at + 1;
+        }
+        return edits;
+    }
+
+    /// Each declaration line from `from` - `const` or `mut` first, then a
+    /// name and `: T = ` - with its `: T` taken out.
+    private static annotation_edits(text: Str, from: i64) -> Array<TextEdit> {
+        mut edits: Array<TextEdit> = Array::<TextEdit>::new();
+        mut start: i64 = from;
+        while (start < text.length()) {
+            const rest: Str = text.byte_substring(start, text.length());
+            const length: i64 = rest.find(&Str::new("\n")).unwrap_or(rest.length());
+            const line: Str = rest.byte_substring(0, length);
+            const declared: Str = line.trim_start();
+            if (declared.starts_with(&Str::new("const ")) || declared.starts_with(&Str::new("mut "))) {
+                const colon: Option<i64> = line.find(&Str::new(": "));
+                const equals: Option<i64> = line.find(&Str::new(" = "));
+                if (colon.is_some() && equals.is_some() && colon.unwrap() < equals.unwrap()) {
+                    edits.push(TextEdit { start: start + colon.unwrap(), end: start + equals.unwrap(), replacement: String::new() });
+                }
+            }
+            start = start + length + 1;
+        }
+        return edits;
+    }
+
+    /// Each call from `from` of a function or method by its generated name
+    /// (`h3(`, `.m0(`, `.t2(`, `g1(`, `k0(`) given at least one argument:
+    /// its last argument dropped, or with `twice` written again after
+    /// itself.  Arguments are split at the commas outside any nested
+    /// parentheses, brackets or braces.
+    private static argument_edits(text: Str, from: i64, twice: boolean) -> Array<TextEdit> {
+        mut edits: Array<TextEdit> = Array::<TextEdit>::new();
+        const tokens: Array<TextEdit> = Mutation::tokens(text, from);
+        for (token in tokens.iterate_references()) {
+            const name: Str = token.replacement.as_str();
+            if (name.length() < 2 || !Str::new("hmtgk").contains(&name.byte_substring(0, 1)) || !Mutation::all_digits(name.byte_substring(1, name.length()))) { continue; }
+            if (token.end >= text.length() || text.byte_substring(token.end, token.end + 1) != Str::new("(")) { continue; }
+            const open: i64 = token.end;
+            mut depth: i64 = 0;
+            mut last_comma: i64 = -1;
+            mut close: i64 = -1;
+            mut at: i64 = open;
+            while (at < text.length() && close < 0) {
+                const character: Str = text.byte_substring(at, at + 1);
+                if (character == Str::new("(") || character == Str::new("[") || character == Str::new("{")) { depth = depth + 1; }
+                if (character == Str::new(")") || character == Str::new("]") || character == Str::new("}")) {
+                    depth = depth - 1;
+                    if (depth == 0) { close = at; }
+                }
+                if (character == Str::new(",") && depth == 1) { last_comma = at; }
+                at = at + 1;
+            }
+            if (close < 0 || close == open + 1) { continue; }
+            const last_start: i64 = if (last_comma >= 0) { last_comma + 1 } else { open + 1 };
+            if (twice) {
+                mut replacement: String = String::from_str(Str::new(", "));
+                replacement.push(text.byte_substring(last_start, close).trim_start());
+                edits.push(TextEdit { start: close, end: close, replacement: replacement });
+            } else {
+                const dropped_from: i64 = if (last_comma >= 0) { last_comma } else { open + 1 };
+                edits.push(TextEdit { start: dropped_from, end: close, replacement: String::new() });
+            }
+        }
+        return edits;
+    }
+
+    /// Whether `text` is one or more decimal digits.
+    private static all_digits(text: Str) -> boolean {
+        if (text.is_empty()) { return false; }
+        mut at: i64 = 0;
+        while (at < text.length()) {
+            if (!Str::new("0123456789").contains(&text.byte_substring(at, at + 1))) { return false; }
+            at = at + 1;
+        }
+        return true;
+    }
+}
