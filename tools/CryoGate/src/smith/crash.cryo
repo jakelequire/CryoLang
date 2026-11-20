@@ -1,0 +1,77 @@
+///! smith-crash's decisions: what a build of a mutated CryoSmith program
+///! shows, judged as a crash fuzzer judges it.  Pure over what it is
+///! handed.
+///!
+///! A mutated program is near-valid: the compiler may refuse it, with an
+///! error code, or accept it when the edit left a valid program.  A compile
+///! crash, a compile hang, an internal error, and a refusal printing no
+///! error code (which smith-diff's observation already counts a crash) are
+///! findings.  A finding's signature is its class, the mutation's operator
+///! and the code or how the compiler ended, so one defect reached through
+///! many seeds and mutations is one finding.
+
+namespace cryogate::smith::crash;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+
+import cryogate::core::text::{ Text };
+import cryogate::smith::difference::{ FindingClass, Observation };
+
+/// A build of a mutated program the compiler did not handle properly.
+public type struct CrashFinding {
+    /// Its class: a compile crash, a compile hang or an internal error.
+    public kind: FindingClass;
+    /// The mutation's operator, as the program's header names it.
+    public operator: String;
+    /// The code, or how the compiler ended; empty for a hang.
+    public detail: String;
+    /// What tells this defect from another: class, operator and detail.
+    public signature: String;
+}
+
+/// The crash fuzzer's judgement of one build.
+public type struct CrashDecision {
+    /// The operator a mutated program's header names, ` mutation <M>
+    /// <operator> <site>` on its first line; empty when it names none.
+    public static operator_of(program: Str) -> String {
+        const lines: Array<String> = Text::lines(program);
+        if (lines.is_empty()) { return String::new(); }
+        mut words: Array<String> = Array::<String>::new();
+        for (word in lines[0].as_str().split(&Str::new(" "))) {
+            if (!word.is_empty()) { words.push(String::from_str(word)); }
+        }
+        mut index: i64 = 0;
+        while (index + 3 < words.length()) {
+            if (words[index].as_str() == Str::new("mutation")) { return words[index + 2].clone(); }
+            index++;
+        }
+        return String::new();
+    }
+
+    /// The finding a build of a program mutated by `operator` shows, from
+    /// what the build observed (`None` when it succeeded): none for an
+    /// acceptance or a refusal with an error code.
+    public static decide(operator: Str, observation: &Option<Observation>) -> Option<CrashFinding> {
+        const observed: Observation = match (observation) {
+            Option::Some(observed) => { observed.clone() }
+            Option::None           => { return Option::None; }
+        };
+        const kind: FindingClass = match (observed.kind()) {
+            Option::Some(kind) => { kind }
+            Option::None       => { return Option::None; }
+        };
+        match (kind) {
+            FindingClass::CompileCrash  => { }
+            FindingClass::CompileHang   => { }
+            FindingClass::InternalError => { }
+            _                           => { return Option::None; }
+        }
+        const detail: String = observed.detail();
+        mut signature: String = f"{kind.name()} [{operator}]";
+        if (!detail.is_empty()) { signature.push(f" {detail.as_str()}".as_str()); }
+        return Option::Some(CrashFinding { kind: kind, operator: String::from_str(operator), detail: detail, signature: signature });
+    }
+}
