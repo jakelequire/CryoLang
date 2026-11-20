@@ -694,10 +694,22 @@ overflow rule. Addition modulo 2^62 is commutative and associative, so the
 sum, and the hash, is the same in any order. The map audit (section 7)
 holds the model to these rules.
 
-**Kept off.** Nothing at present. A shape the generator keeps off because
-of a compiler or standard library bug is listed here with the bug file
-that records it, and is lifted, with a new generator version, when the
-fix lands. A `match` arm assigning its subject inside a generic body was
+**Kept off.** A shape the generator keeps off because of a compiler or
+standard library bug is listed here with the bug file that records it,
+and is lifted, with a new generator version, when the fix lands.
+
+- A `match` expression's arm value borrowing a temporary,
+  `h0(match (e) { E0::V0 => { h1(&(D0 { .. })) } .. })` (bug 0362,
+  `.bug-report/0362-match-arm-value-releases-borrowed-temporary-at-arm-end.md`):
+  the compiled program releases the temporary when the arm ends, before
+  `h0` runs, where the language releases it at the end of the statement,
+  as it does an `if` expression's branch's. Tracked: no borrowed
+  temporary is made while an arm's value is (`making_arm_value`), and the
+  loan audit refuses one inside an arm's value. Lifted, with a new
+  generator version, when the compiler releases them at the statement's
+  end.
+
+A `match` arm assigning its subject inside a generic body was
 kept off until a `Copy` payload binding in a generic function's copy was
 copied into a slot of its own on entering the arm, as everywhere else.
 

@@ -5,7 +5,10 @@
 ///! passed on there - an assignment's target aside, which is written once
 ///! its value is made; and a value a function returns that is a reference
 ///! borrows no variable of the function and no temporary, so it refers
-///! only to what the function's reference parameters do.
+///! only to what the function's reference parameters do.  A `match`
+///! expression's arm value borrows no temporary either: the compiled
+///! program releases one at the arm's end rather than its statement's
+///! (DESIGN.md, "Kept off").
 
 namespace cryosmith::selftest::loans;
 
@@ -52,6 +55,8 @@ internal type struct LoanAudit {
     private static function(returns_reference: boolean, uses: Array<Use>) -> Result<i64, String> {
         mut lent: i64 = 0;
         mut returning: boolean = false;
+        // How many `match` arm values the walk is inside.
+        mut arm_values: i64 = 0;
         mut statement: Array<Use> = Array::<Use>::new();
         for (used in uses.iter()) {
             match (used.kind) {
@@ -63,6 +68,8 @@ internal type struct LoanAudit {
                 }
                 UseKind::ReturnStarted => { returning = true; }
                 UseKind::ReturnEnded => { returning = false; }
+                UseKind::ArmValueEntered => { arm_values = arm_values + 1; }
+                UseKind::ArmValueLeft => { arm_values = arm_values - 1; }
                 UseKind::SharedBorrow => {
                     if (returning && returns_reference) { return Result::Err(f"a returned reference borrows variable {used.variable}"); }
                     statement.push(used);
@@ -73,6 +80,7 @@ internal type struct LoanAudit {
                 }
                 UseKind::TemporaryBorrow => {
                     if (returning && returns_reference) { return Result::Err(String::from_str(Str::new("a returned reference borrows a temporary"))); }
+                    if (arm_values > 0) { return Result::Err(String::from_str(Str::new("a `match` expression's arm value borrows a temporary"))); }
                     lent = lent + 1;
                 }
                 _ => { statement.push(used); }
