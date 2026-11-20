@@ -77,10 +77,12 @@ public type struct Span {
     public end: i64;
 }
 
-/// A call by a generated name, as its text has it: the parentheses and
-/// each argument, split at the commas outside any nested parentheses,
-/// brackets or braces, without the space after a comma.
+/// A call by a generated name, as its text has it: the name, the
+/// parentheses and each argument, split at the commas outside any nested
+/// parentheses, brackets or braces, without the space after a comma.
 public type struct CallText {
+    /// The name called.
+    public name: Span;
     /// The `(` opening the arguments.
     public open: i64;
     /// The `)` closing them.
@@ -98,6 +100,10 @@ public type struct TextEdit {
     public end: i64;
     /// What it is replaced by.
     public replacement: String;
+    /// Whether the edit leaves a program the compiler must refuse, so an
+    /// acceptance of it is a finding.  Unmarked edits may leave a valid
+    /// program.
+    public refused: boolean;
 }
 
 /// One mutation of a program: its number, the operator it drew and the
@@ -147,6 +153,16 @@ public type struct Mutation {
         return Option::Some(headed);
     }
 
+    /// Whether the edit this mutation makes in `text` leaves a program the
+    /// compiler must refuse: an argument dropped from, or added to, a call
+    /// of a name declared exactly once, or a number, a bracket or a
+    /// generated name written twice outside a string literal.
+    public must_be_refused(&this, text: Str) -> boolean {
+        const edits: Array<TextEdit> = Mutation::sites(this.operator, text);
+        if (this.site < 0 || this.site >= edits.length()) { return false; }
+        return edits[this.site].refused;
+    }
+
     /// Every site `operator` has in `text`'s body, in text order.
     public static sites(operator: MutationOperator, text: Str) -> Array<TextEdit> {
         const body: i64 = Mutation::body_start(text);
@@ -192,26 +208,69 @@ public type struct Mutation {
             if (Mutation::is_word(character)) {
                 while (end < text.length() && Mutation::is_word(text.byte_substring(end, end + 1))) { end = end + 1; }
             }
-            tokens.push(TextEdit { start: at, end: end, replacement: String::from_str(text.byte_substring(at, end)) });
+            tokens.push(TextEdit { start: at, end: end, replacement: String::from_str(text.byte_substring(at, end)), refused: false });
             at = end;
         }
         return tokens;
     }
 
-    /// Each token from `from` deleted, or with `twice` written twice.
+    /// Each token from `from` deleted, or with `twice` written twice.  A
+    /// number, a bracket or a generated name written twice outside a
+    /// string literal is marked refused: two numbers or two names never
+    /// stand side by side in the language, and a doubled bracket leaves
+    /// the brackets unbalanced.  Any other token may double into valid
+    /// text (`- -x`, `;;`), and one inside a string literal is text.
     private static token_edits(text: Str, from: i64, twice: boolean) -> Array<TextEdit> {
         mut edits: Array<TextEdit> = Array::<TextEdit>::new();
         const tokens: Array<TextEdit> = Mutation::tokens(text, from);
+        const strings: Array<Span> = Mutation::string_spans(text);
+        mut next_string: i64 = 0;
         for (token in tokens.iterate_references()) {
             mut replacement: String = String::new();
+            mut refused: boolean = false;
             if (twice) {
                 replacement.push(token.replacement.as_str());
                 replacement.push(Str::new(" "));
                 replacement.push(token.replacement.as_str());
+                while (next_string < strings.length() && strings[next_string].end <= token.start) { next_string = next_string + 1; }
+                const quoted: boolean = next_string < strings.length() && strings[next_string].start <= token.start;
+                // A generated name is letters, then digits: `v3`, `S0`, `u8`.
+                const spelled: Str = token.replacement.as_str();
+                mut letters: i64 = 0;
+                while (letters < spelled.length() && !Str::new("0123456789_").contains(&spelled.byte_substring(letters, letters + 1))) { letters = letters + 1; }
+                const generated: boolean = letters > 0 && Mutation::all_digits(spelled.byte_substring(letters, spelled.length()));
+                const number: boolean = letters == 0 && Mutation::is_word(spelled.byte_substring(0, 1)) && spelled.byte_substring(0, 1) != Str::new("_");
+                refused = !quoted && (number || generated || Str::new("()[]{}").contains(&spelled));
             }
-            edits.push(TextEdit { start: token.start, end: token.end, replacement: replacement });
+            edits.push(TextEdit { start: token.start, end: token.end, replacement: replacement, refused: refused });
         }
         return edits;
+    }
+
+    /// The string literals of `text`, their quotes included, in text
+    /// order: each from a `"` to the next `"` no backslash escapes.  An
+    /// f-string's holes lie inside its span.
+    private static string_spans(text: Str) -> Array<Span> {
+        mut spans: Array<Span> = Array::<Span>::new();
+        mut opened: i64 = -1;
+        mut at: i64 = 0;
+        while (at < text.length()) {
+            const character: Str = text.byte_substring(at, at + 1);
+            if (opened >= 0 && character == Str::new("\\")) {
+                at = at + 2;
+                continue;
+            }
+            if (character == Str::new("\"")) {
+                if (opened < 0) {
+                    opened = at;
+                } else {
+                    spans.push(Span { start: opened, end: at + 1 });
+                    opened = -1;
+                }
+            }
+            at = at + 1;
+        }
+        return spans;
     }
 
     /// Each occurrence of the one-byte `found` from `from`, replaced by
@@ -220,7 +279,7 @@ public type struct Mutation {
         mut edits: Array<TextEdit> = Array::<TextEdit>::new();
         mut at: i64 = from;
         while (at < text.length()) {
-            if (text.byte_substring(at, at + 1) == found) { edits.push(TextEdit { start: at, end: at + 1, replacement: String::from_str(replacement) }); }
+            if (text.byte_substring(at, at + 1) == found) { edits.push(TextEdit { start: at, end: at + 1, replacement: String::from_str(replacement), refused: false }); }
             at = at + 1;
         }
         return edits;
@@ -253,7 +312,7 @@ public type struct Mutation {
         mut edits: Array<TextEdit> = Array::<TextEdit>::new();
         const types: Array<Span> = Mutation::declared_types(text, from);
         for (declared in types.iterate_references()) {
-            edits.push(TextEdit { start: declared.start - 2, end: declared.end, replacement: String::new() });
+            edits.push(TextEdit { start: declared.start - 2, end: declared.end, replacement: String::new(), refused: false });
         }
         return edits;
     }
@@ -274,7 +333,7 @@ public type struct Mutation {
         for (declared in types.iterate_references()) {
             const at: i64 = distinct.index_of(&text.byte_substring(declared.start, declared.end)).unwrap();
             const next: Str = distinct[(at + 1) % distinct.length()];
-            edits.push(TextEdit { start: declared.start, end: declared.end, replacement: String::from_str(next) });
+            edits.push(TextEdit { start: declared.start, end: declared.end, replacement: String::from_str(next), refused: false });
         }
         return edits;
     }
@@ -309,13 +368,18 @@ public type struct Mutation {
                 at = at + 1;
             }
             if (close < 0) { continue; }
-            calls.push(CallText { open: open, close: close, arguments: arguments });
+            calls.push(CallText { name: Span { start: token.start, end: token.end }, open: open, close: close, arguments: arguments });
         }
         return calls;
     }
 
     /// Each call from `from` given at least one argument: its last
-    /// argument dropped, or with `twice` written again after itself.
+    /// argument dropped, or with `twice` written again after itself.  A
+    /// call of a name declared exactly once is marked refused, since its
+    /// one declaration takes exactly the arguments the generator gave it;
+    /// a name declared more than once - an overload set, a trait's method
+    /// and its implementations, methods of one name on several types - may
+    /// have a declaration the edited call fits.
     private static argument_edits(text: Str, from: i64, twice: boolean) -> Array<TextEdit> {
         mut edits: Array<TextEdit> = Array::<TextEdit>::new();
         const calls: Array<CallText> = Mutation::calls(text, from);
@@ -323,16 +387,64 @@ public type struct Mutation {
             const count: i64 = call.arguments.length();
             if (count == 0) { continue; }
             const last: Span = call.arguments[count - 1];
+            // A name that begins its line's code, after `function `,
+            // `static ` or nothing, is a declaration's - whose parameter list
+            // may lose its last parameter validly when nothing calls it - or
+            // a call statement's, which stays unmarked with it.
+            const line_start: i64 = match (text.byte_substring(0, call.name.start).find_last(&Str::new("\n"))) {
+                Option::Some(at) => { at + 1 }
+                Option::None     => { 0 }
+            };
+            const lead: Str = text.byte_substring(line_start, call.name.start).trim_start();
+            const declared_here: boolean = lead.is_empty() || lead == Str::new("function ") || lead == Str::new("static ");
+            const refused: boolean = !declared_here && Mutation::declarations(text, text.byte_substring(call.name.start, call.name.end)) == 1;
             if (twice) {
                 mut replacement: String = String::from_str(Str::new(", "));
                 replacement.push(text.byte_substring(last.start, last.end));
-                edits.push(TextEdit { start: call.close, end: call.close, replacement: replacement });
+                edits.push(TextEdit { start: call.close, end: call.close, replacement: replacement, refused: refused });
             } else {
                 const dropped_from: i64 = if (count > 1) { call.arguments[count - 2].end } else { call.open + 1 };
-                edits.push(TextEdit { start: dropped_from, end: call.close, replacement: String::new() });
+                edits.push(TextEdit { start: dropped_from, end: call.close, replacement: String::new(), refused: refused });
             }
         }
         return edits;
+    }
+
+    /// How many declarations of the generated callable `name` `text` has:
+    /// the lines that, past their indentation, begin `function name`,
+    /// `static name`, or `name` followed by a receiver or a type parameter
+    /// list (`name(&this`, `name(mut &this`, `name(this`, `name<`).  The
+    /// printer writes every declaration of a function or method on such a
+    /// line, and no call begins one: a function's call statement begins
+    /// `name(` with an argument that is no receiver, a method's is reached
+    /// through its object or type.  A call passing `this` as its first
+    /// argument reads as a declaration too, which only keeps an edit
+    /// unmarked.
+    private static declarations(text: Str, name: Str) -> i64 {
+        mut forms: Array<String> = Array::<String>::new();
+        forms.push(f"function {name}(");
+        forms.push(f"function {name}<");
+        forms.push(f"static {name}(");
+        forms.push(f"static {name}<");
+        forms.push(f"{name}(&this");
+        forms.push(f"{name}(mut &this");
+        forms.push(f"{name}(this");
+        forms.push(f"{name}<");
+        mut found: i64 = 0;
+        mut start: i64 = 0;
+        while (start < text.length()) {
+            const rest: Str = text.byte_substring(start, text.length());
+            const length: i64 = rest.find(&Str::new("\n")).unwrap_or(rest.length());
+            const line: Str = rest.byte_substring(0, length).trim_start();
+            for (form in forms.iterate_references()) {
+                if (line.starts_with(&form.as_str())) {
+                    found = found + 1;
+                    break;
+                }
+            }
+            start = start + length + 1;
+        }
+        return found;
     }
 
     /// Each call from `from` given at least two arguments whose texts
@@ -350,7 +462,7 @@ public type struct Mutation {
             mut replacement: String = String::from_str(second_text);
             replacement.push(text.byte_substring(first.end, second.start));
             replacement.push(first_text);
-            edits.push(TextEdit { start: first.start, end: second.end, replacement: replacement });
+            edits.push(TextEdit { start: first.start, end: second.end, replacement: replacement, refused: false });
         }
         return edits;
     }
