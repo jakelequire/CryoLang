@@ -38,7 +38,9 @@ make verify              # build once; census, examples, lsp, cross, incr, relin
                          # baseline it also FAILS on a unit-suite build warning the baseline's
                          # build did not print (code, file, line, compared as sets)
 make smith-corpus-pin    # re-pin tests/smith-corpus (verify's `smith` gate: seeds 1-24, each
-                         # with the hash its program prints) after a CryoSmith generator
+                         # with the hash its program prints built at both levels and
+                         # interpreted; a seed `cryo interpret` does not cover fails
+                         # the gate and the pin) after a CryoSmith generator
                          # version change; verify refuses a cryosmith of another version
 make roster-check        # every unit test, project and negative file against the roster
                          # golden (tests/test-roster.txt); its OK line prints the current counts

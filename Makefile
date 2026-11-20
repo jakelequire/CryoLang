@@ -655,10 +655,11 @@ cryosmith-selftest: $(CRYOSMITH) $(CRYOGATE)
 
 # Re-pin tests/smith-corpus, the corpus verify's `smith` gate checks, after
 # the generator version changes: seeds 1 to 24 at the default features, each
-# built at -O0 and -O2 by the compiler under test, and each hash written
-# beside its seed once every program passes.  `cryogate corpus-check --pin`.
+# built at -O0 and -O2 and interpreted by the compiler under test, and each
+# hash written beside its seed once every program passes, the interpreter
+# agreeing on all of them.  `cryogate corpus-check --pin --interpret`.
 smith-corpus-pin: cryo $(CRYOGATE) $(CRYOSMITH)
-	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) corpus-check --cryo "$(STAGE2_FILE)" --stdlib "$(ROOT)/stdlib" --work .verify/smith-corpus --pin tests/smith-corpus --first-seed 1 --count 24
+	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) corpus-check --cryo "$(STAGE2_FILE)" --stdlib "$(ROOT)/stdlib" --work .verify/smith-corpus --pin tests/smith-corpus --first-seed 1 --count 24 --interpret
 
 # ---- CryoAnalyzer VS Code extension -----------------------------------
 # Builds and installs the server from the current tree (`lsp`), runs its
