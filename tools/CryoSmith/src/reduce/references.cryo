@@ -1,0 +1,650 @@
+///! `References`: what the printed part of a program names, and where its
+///! printed statements are linked from.  A reducer may take out a thing
+///! only when nothing printed names it, so this walk decides what is
+///! omissible; it walks exactly what the printer prints - the items not
+///! omitted, the bodies of the functions printed, the arms of variants not
+///! omitted, the entries of fields not omitted.
+
+namespace cryosmith::reduce::references;
+
+import std::collections::array::{ Array };
+
+import cryosmith::model::{
+    BinaryOperator, Closure, Enumeration, ExpressionKind, ExpressionNode, Field, Function, MatchArm, Omission, OwnedStructure, PatternElement,
+    Program, Signature, StatementKind, StatementNode, Structure, TraitDeclaration, UnaryOperator, ValueType, VariantDeclaration
+};
+
+/// What one reference names.
+public type enum Referent {
+    /// A variable, read, borrowed, moved or released.
+    Variable(i64);
+    /// A function, called.
+    Function(i64);
+    /// A struct, as a type.
+    Structure(i64);
+    /// A generic struct, through one of its instances.
+    Template(i64);
+    /// An enum, as a type.
+    Enumeration(i64);
+    /// A generic enum, through one of its instances.
+    EnumerationTemplate(i64);
+    /// An owned struct, as a type or held by one.
+    Owned(i64);
+    /// A trait: a bound, an object, a supertrait or a call of its method.
+    Trait(i64);
+    /// A struct's field, read or written.
+    Field(i64);
+    /// An enum's variant, by its place among the program's variants,
+    /// built or named by a nested pattern.
+    Variant(i64);
+    /// A value of a type used where a trait is needed - an instance's
+    /// argument under a trait bound, a borrow for a trait object, a call of
+    /// one of the trait's methods on it - so the type must implement the
+    /// trait: the type, and the trait.
+    Bound(ValueType, i64);
+}
+
+implement enum Referent {
+    /// Whether `other` names the same thing.
+    public same(&this, other: &Referent) -> boolean {
+        return this.kind_number() == other.kind_number() && this.index() == other.index() && this.type_identity() == other.type_identity();
+    }
+
+    /// The thing's place in its arena; for a bound, the trait's.
+    public index(&this) -> i64 {
+        return match (&this) {
+            Referent::Variable(index)            => { index }
+            Referent::Function(index)            => { index }
+            Referent::Structure(index)           => { index }
+            Referent::Template(index)            => { index }
+            Referent::Enumeration(index)         => { index }
+            Referent::EnumerationTemplate(index) => { index }
+            Referent::Owned(index)               => { index }
+            Referent::Trait(index)               => { index }
+            Referent::Field(index)               => { index }
+            Referent::Variant(index)             => { index }
+            Referent::Bound(_, index)            => { index }
+        };
+    }
+
+    private kind_number(&this) -> i64 {
+        return match (&this) {
+            Referent::Variable(_)            => { 0 }
+            Referent::Function(_)            => { 1 }
+            Referent::Structure(_)           => { 2 }
+            Referent::Template(_)            => { 3 }
+            Referent::Enumeration(_)         => { 4 }
+            Referent::EnumerationTemplate(_) => { 5 }
+            Referent::Owned(_)               => { 6 }
+            Referent::Trait(_)               => { 7 }
+            Referent::Field(_)               => { 8 }
+            Referent::Variant(_)             => { 9 }
+            Referent::Bound(_, _)            => { 10 }
+        };
+    }
+
+    private type_identity(&this) -> i64 {
+        return match (&this) {
+            Referent::Bound(bound, _) => { bound.identity() }
+            _                         => { -1 }
+        };
+    }
+}
+
+/// One reference: the function whose signature or body makes it, or -1
+/// for an item's declaration, and what it names.
+public type struct Reference {
+    /// The function making it, or -1.
+    public from: i64;
+    /// What it names.
+    public referent: Referent;
+}
+
+/// Where a printed statement is linked from: the statement before it in
+/// its block, or what holds its block's first statement.
+public type enum Link {
+    /// The statement before it.
+    After(i64);
+    /// The first of function `N`'s body.
+    Body(i64);
+    /// The first of branch statement `N`'s `if` block.
+    Then(i64);
+    /// The first of branch statement `N`'s `else` block.
+    Otherwise(i64);
+    /// The first of loop statement `N`'s body.
+    LoopBody(i64);
+    /// The first of `for` statement `N`'s body over elements.
+    EachBody(i64);
+    /// The first of arm `N`'s body, in a `match` statement.
+    ArmBody(i64);
+    /// The first of the observations arm `N` runs, in a `match` expression.
+    ArmObservations(i64);
+    /// The first of the observations closure `N` runs.
+    ClosureObservations(i64);
+}
+
+/// What the printed part of a program names.
+public type struct References {
+    /// Every reference, in the order the walk met them.
+    public references: Array<Reference>;
+    /// Every printed statement, in printed order.
+    public statements: Array<i64>;
+    /// Where each of `statements` is linked from, at the same place.
+    public links: Array<Link>;
+    /// The printed statements whose own expressions append to a dynamic
+    /// array: the fewest elements the array holds afterwards counts the
+    /// element, so the statement stays.
+    public appending: Array<i64>;
+    /// Every printed expression, in printed order.
+    public expressions: Array<i64>;
+    /// The printed expressions a literal of their type may replace: of an
+    /// integer or `boolean` type, not a literal already, not the place an
+    /// assignment writes, and no operand of a guarded operator - `+`, `-`,
+    /// `*`, `/`, `%`, a shift or a negation - whose guard keeps it in
+    /// range (section 3.1 of the design), nor what such an operand
+    /// converts with a cast: a divisor `(v.length() as u64)` is a guard
+    /// by its length.  A guard is replaced inside, below its mask or its
+    /// `| 1`, never by a value it was there to keep out.
+    public replaceable: Array<i64>;
+    /// The function being walked, or -1.
+    private from: i64;
+    /// The statement whose own expressions are being walked, or -1.
+    private statement: i64;
+
+    /// What the printed part of `program` names.
+    public static of(program: &Program) -> References {
+        mut walk: References = References {
+            references:  Array::<Reference>::new(),
+            statements:  Array::<i64>::new(),
+            links:       Array::<Link>::new(),
+            appending:   Array::<i64>::new(),
+            expressions: Array::<i64>::new(),
+            replaceable: Array::<i64>::new(),
+            from:        -1,
+            statement:   -1,
+        };
+        walk.declarations(program);
+        mut index: i64 = 0;
+        while (index < program.functions.length()) {
+            if (!program.omits_function(index)) { walk.definition(program, index); }
+            index = index + 1;
+        }
+        return walk;
+    }
+
+    /// Whether anything printed names `referent`.
+    public names(&this, referent: Referent) -> boolean {
+        for (reference in this.references.iterate_references()) {
+            if (reference.referent.same(&referent)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether `statement` is printed.
+    public prints_statement(&this, statement: i64) -> boolean { return this.statements.contains(&statement); }
+
+    /// Whether expression `expression` is printed.
+    public prints_expression(&this, expression: i64) -> boolean { return this.expressions.contains(&expression); }
+
+    /// The declarations of every item printed: enums' payloads, structs'
+    /// fields and defaults, owned structs' fields, traits' supertraits and
+    /// method types.  An owned struct's `drop` reads only its own fields
+    /// and `observed`, so its body names nothing a reducer may take out.
+    private declarations(mut &this, program: &Program) -> void {
+        mut index: i64 = 0;
+        while (index < program.enumerations.length()) {
+            const declared: Enumeration = program.enumeration_at(index);
+            if (!declared.is_instance() && !program.omits(Omission::Enumeration(index))) { this.variants(program, declared); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.enumeration_templates.length()) {
+            if (!program.omits(Omission::EnumerationTemplate(index))) { this.variants(program, program.enumeration_templates.get(index).unwrap()); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.structures.length()) {
+            const declared: Structure = program.structure_at(index);
+            if (!declared.is_instance() && !program.omits(Omission::Structure(index))) { this.fields(program, declared.first_field, declared.field_count); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.templates.length()) {
+            const declared: Structure = program.template_at(index);
+            if (!program.omits(Omission::Template(index))) { this.fields(program, declared.first_field, declared.field_count); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.owned_structures.length()) {
+            const owned: OwnedStructure = program.owned_at(index);
+            if (!program.omits(Omission::Owned(index))) { this.fields(program, owned.first_field, owned.field_count); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.traits.length()) {
+            const declared: TraitDeclaration = program.trait_at(index);
+            if (!program.omits(Omission::Trait(index))) {
+                if (declared.supertrait >= 0) { this.refer(Referent::Trait(declared.supertrait)); }
+                mut method: i64 = declared.first_method;
+                while (method < declared.first_method + declared.method_count) {
+                    this.mark_type(program, program.trait_method_at(method).function_type);
+                    method = method + 1;
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    /// The payload types of `declared`'s variants not omitted.
+    private variants(mut &this, program: &Program, declared: Enumeration) -> void {
+        mut variant: i64 = declared.first_variant;
+        while (variant < declared.first_variant + declared.variant_count) {
+            if (!program.omits(Omission::Variant(variant))) {
+                const shape: VariantDeclaration = program.variants.get(variant).unwrap();
+                mut position: i64 = 0;
+                while (position < shape.payload_count) {
+                    this.mark_type(program, program.payload_type(shape, position));
+                    position = position + 1;
+                }
+            }
+            variant = variant + 1;
+        }
+    }
+
+    /// The types and defaults of the `count` fields from `first` not
+    /// omitted.  A default is no body a literal may be put in.
+    private fields(mut &this, program: &Program, first: i64, count: i64) -> void {
+        mut field: i64 = first;
+        while (field < first + count) {
+            if (!program.omits(Omission::Field(field))) {
+                const declared: Field = program.field_at(field);
+                this.mark_type(program, declared.value_type);
+                if (declared.default_value >= 0) { this.expression(program, declared.default_value, false); }
+            }
+            field = field + 1;
+        }
+    }
+
+    /// Function `index`'s signature and body.  A default body is the
+    /// trait's own and names the trait it is written in through nothing
+    /// but its place there.
+    private definition(mut &this, program: &Program, index: i64) -> void {
+        this.from = index;
+        const defined: Function = program.function_at(index);
+        this.mark_type(program, defined.owner);
+        if (defined.genericity.is_generic() && defined.genericity.bounding_trait() >= 0) {
+            this.refer(Referent::Trait(defined.genericity.bounding_trait()));
+        }
+        this.mark_type(program, defined.callable);
+        this.mark_type(program, defined.returns);
+        mut position: i64 = 0;
+        while (position < defined.parameter_count) {
+            this.mark_type(program, program.variable_at(program.list_at(defined.first_parameter + position)).value_type);
+            position = position + 1;
+        }
+        this.block(program, defined.body, Link::Body(index));
+        this.from = -1;
+    }
+
+    /// The block from `first`, its first statement linked from `head`.
+    private block(mut &this, program: &Program, first: i64, head: Link) -> void {
+        mut current: i64 = first;
+        mut link: Link = head;
+        while (current >= 0) {
+            this.statements.push(current);
+            this.links.push(link);
+            this.statement_at(program, current);
+            link = Link::After(current);
+            current = program.statement_at(current).next;
+        }
+    }
+
+    /// Statement `index`: its own expressions, then its blocks.
+    private statement_at(mut &this, program: &Program, index: i64) -> void {
+        const enclosing: i64 = this.statement;
+        this.statement = index;
+        const node: StatementNode = program.statement_at(index);
+        match (node.kind) {
+            StatementKind::Declare(variable, value) => {
+                this.mark_type(program, program.variable_at(variable).value_type);
+                this.expression(program, value, true);
+            }
+            StatementKind::Assign(place, value) => {
+                this.expression(program, place, false);
+                this.expression(program, value, true);
+            }
+            StatementKind::Compound(operator, place, value) => {
+                this.expression(program, place, false);
+                this.expression(program, value, !References::guards(operator));
+            }
+            StatementKind::Observe(value) => { this.expression(program, value, true); }
+            StatementKind::Evaluate(value) => { this.expression(program, value, true); }
+            StatementKind::Release(variable) => { this.refer(Referent::Variable(variable)); }
+            StatementKind::Branch(condition, then_block, else_block) => {
+                this.expression(program, condition, true);
+                this.block(program, then_block, Link::Then(index));
+                this.block(program, else_block, Link::Otherwise(index));
+            }
+            StatementKind::Loop(_, counter, _, body) => {
+                this.mark_type(program, program.variable_at(counter).value_type);
+                this.block(program, body, Link::LoopBody(index));
+            }
+            StatementKind::Exit(_, condition) => { this.expression(program, condition, true); }
+            StatementKind::ReturnIf(condition, value) => {
+                this.expression(program, condition, true);
+                if (value >= 0) { this.expression(program, value, true); }
+            }
+            StatementKind::Return(value) => {
+                if (value >= 0) { this.expression(program, value, true); }
+            }
+            StatementKind::Match(subject, first, count) => {
+                this.expression(program, subject, true);
+                this.arms(program, program.expression_at(subject).value_type, first, count, true);
+            }
+            StatementKind::Finish => { }
+            StatementKind::Each(variable, binding, body) => {
+                this.refer(Referent::Variable(variable));
+                this.mark_type(program, program.variable_at(binding).value_type);
+                this.block(program, body, Link::EachBody(index));
+            }
+        }
+        this.statement = enclosing;
+    }
+
+    /// The `count` arms from `first` of a `match` over a value of
+    /// `matched` that are printed: their patterns, and their bodies, a
+    /// block in a statement or the observations and value of an
+    /// expression.
+    private arms(mut &this, program: &Program, matched: ValueType, first: i64, count: i64, statement: boolean) -> void {
+        mut index: i64 = first;
+        while (index < first + count) {
+            const arm: MatchArm = program.arm_at(index);
+            if (!program.omits_arm(matched, arm)) {
+                this.pattern_elements(program, arm.first_element, arm.element_count);
+                if (statement) {
+                    this.block(program, arm.body, Link::ArmBody(index));
+                } else {
+                    this.block(program, arm.observations, Link::ArmObservations(index));
+                    this.expression(program, arm.body, true);
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    /// The `count` pattern elements from `first` in the index lists.
+    private pattern_elements(mut &this, program: &Program, first: i64, count: i64) -> void {
+        mut position: i64 = 0;
+        while (position < count) {
+            match (program.pattern_element_at(program.list_at(first + position))) {
+                PatternElement::Binding(variable) => { this.mark_type(program, program.variable_at(variable).value_type); }
+                PatternElement::Wildcard => { }
+                PatternElement::Variant(matched, variant, inner_first, inner_count) => {
+                    this.mark_type(program, matched);
+                    this.refer(Referent::Variant(program.enumeration_at(matched.enumeration()).first_variant + variant));
+                    this.pattern_elements(program, inner_first, inner_count);
+                }
+            }
+            position = position + 1;
+        }
+    }
+
+    /// Expression `index` and its operands; `replaceable` when its place
+    /// lets a literal stand for it.
+    private expression(mut &this, program: &Program, index: i64, replaceable: boolean) -> void {
+        const node: ExpressionNode = program.expression_at(index);
+        this.expressions.push(index);
+        this.mark_type(program, node.value_type);
+        if (replaceable && (node.value_type.is_integer() || node.value_type.same(ValueType::Boolean)) && !References::is_literal(program, index)) {
+            this.replaceable.push(index);
+        }
+        match (node.kind) {
+            ExpressionKind::Variable(variable) => { this.refer(Referent::Variable(variable)); }
+            ExpressionKind::Unary(operator, operand) => {
+                const negates: boolean = match (operator) {
+                    UnaryOperator::Negate => { true }
+                    _                     => { false }
+                };
+                this.expression(program, operand, !negates);
+            }
+            ExpressionKind::Binary(operator, left, right) => {
+                const free: boolean = !References::guards(operator);
+                this.expression(program, left, free);
+                this.expression(program, right, free);
+            }
+            ExpressionKind::Wrapping(_, left, right) => {
+                this.expression(program, left, true);
+                this.expression(program, right, true);
+            }
+            ExpressionKind::Cast(operand) => { this.expression(program, operand, replaceable); }
+            ExpressionKind::Widen(operand) => { this.expression(program, operand, replaceable); }
+            ExpressionKind::Conditional(condition, then_value, else_value) => {
+                this.expression(program, condition, true);
+                this.expression(program, then_value, true);
+                this.expression(program, else_value, true);
+            }
+            ExpressionKind::Call(callee, first, count) => {
+                this.refer(Referent::Function(callee));
+                this.list(program, first, count, 1);
+            }
+            ExpressionKind::GenericCall(callee, argument, _, first, count) => {
+                this.refer(Referent::Function(callee));
+                this.mark_type(program, argument);
+                const bounding: i64 = program.function_at(callee).genericity.bounding_trait();
+                if (bounding >= 0) { this.refer(Referent::Bound(argument, bounding)); }
+                this.list(program, first, count, 1);
+            }
+            ExpressionKind::MethodCall(receiver, callee, first, count) => {
+                this.refer(Referent::Function(callee));
+                const called: Function = program.function_at(callee);
+                if (called.implements >= 0) {
+                    this.refer(Referent::Bound(program.expression_at(receiver).value_type, program.trait_method_at(called.implements).declared_by));
+                }
+                this.expression(program, receiver, true);
+                this.list(program, first, count, 1);
+            }
+            ExpressionKind::TraitCall(receiver, method, first, count) => {
+                this.refer(Referent::Trait(program.trait_method_at(method).declared_by));
+                this.expression(program, receiver, true);
+                this.list(program, first, count, 1);
+            }
+            ExpressionKind::Borrow(variable) => {
+                this.refer(Referent::Variable(variable));
+                const object: i64 = node.value_type.object_trait();
+                if (object >= 0) { this.refer(Referent::Bound(program.variable_at(variable).value_type, object)); }
+            }
+            ExpressionKind::Field(base, field) => {
+                this.refer(Referent::Field(field));
+                this.expression(program, base, true);
+            }
+            ExpressionKind::StructureLiteral(_, _, first, count) => { this.entries(program, first, count); }
+            ExpressionKind::OwnedLiteral(_, first, count) => { this.entries(program, first, count); }
+            ExpressionKind::Variant(variant, _, first, count) => {
+                this.refer(Referent::Variant(program.enumeration_at(node.value_type.enumeration()).first_variant + variant));
+                this.list(program, first, count, 1);
+            }
+            ExpressionKind::Match(subject, first, count) => {
+                this.expression(program, subject, true);
+                this.arms(program, program.expression_at(subject).value_type, first, count, false);
+            }
+            ExpressionKind::Mix(state, value) => {
+                this.expression(program, state, true);
+                this.expression(program, value, true);
+            }
+            ExpressionKind::Closure(closure) => {
+                const made: Closure = program.closure_at(closure);
+                this.mark_type(program, made.function_type);
+                mut position: i64 = 0;
+                while (position < made.parameter_count) {
+                    this.mark_type(program, program.variable_at(program.list_at(made.first_parameter + position)).value_type);
+                    position = position + 1;
+                }
+                this.block(program, made.observations, Link::ClosureObservations(closure));
+                this.expression(program, made.body, true);
+            }
+            ExpressionKind::Invoke(callee, first, count) => {
+                this.expression(program, callee, true);
+                this.list(program, first, count, 1);
+            }
+            ExpressionKind::Move(variable) => { this.refer(Referent::Variable(variable)); }
+            ExpressionKind::BorrowTemporary(value) => { this.expression(program, value, true); }
+            ExpressionKind::Dereference(operand) => { this.expression(program, operand, true); }
+            ExpressionKind::Hold(value, _) => { this.expression(program, value, true); }
+            ExpressionKind::Absent(code, _) => {
+                if (code >= 0) { this.expression(program, code, true); }
+            }
+            ExpressionKind::Share(variable) => { this.refer(Referent::Variable(variable)); }
+            ExpressionKind::Count(owner) => { this.expression(program, owner, true); }
+            ExpressionKind::Unwrap(variable) => { this.refer(Referent::Variable(variable)); }
+            ExpressionKind::Propagate(value) => { this.expression(program, value, true); }
+            ExpressionKind::Presence(subject, binding, present, error_binding, absent) => {
+                this.expression(program, subject, true);
+                this.mark_type(program, program.variable_at(binding).value_type);
+                this.expression(program, present, true);
+                if (error_binding >= 0) { this.mark_type(program, program.variable_at(error_binding).value_type); }
+                this.expression(program, absent, true);
+            }
+            ExpressionKind::ArrayLiteral(first, count) => { this.list(program, first, count, 1); }
+            ExpressionKind::ArrayRepeat(value) => { this.expression(program, value, true); }
+            ExpressionKind::Element(variable, element) => {
+                this.refer(Referent::Variable(variable));
+                this.expression(program, element, true);
+            }
+            ExpressionKind::Length(variable) => { this.refer(Referent::Variable(variable)); }
+            ExpressionKind::TextOf(value) => { this.expression(program, value, true); }
+            ExpressionKind::AsStr(variable) => { this.refer(Referent::Variable(variable)); }
+            ExpressionKind::Push(variable, value) => {
+                this.refer(Referent::Variable(variable));
+                this.expression(program, value, true);
+            }
+            ExpressionKind::DynamicRepeat(value, _) => { this.expression(program, value, true); }
+            ExpressionKind::Duplicate(variable) => { this.refer(Referent::Variable(variable)); }
+            ExpressionKind::Append(variable, value) => {
+                if (this.statement >= 0 && !this.appending.contains(&this.statement)) { this.appending.push(this.statement); }
+                this.refer(Referent::Variable(variable));
+                this.expression(program, value, true);
+            }
+            ExpressionKind::Pop(variable) => { this.refer(Referent::Variable(variable)); }
+            ExpressionKind::Insert(map, key, value, default_value) => {
+                this.refer(Referent::Variable(map));
+                this.expression(program, key, true);
+                this.expression(program, value, true);
+                this.expression(program, default_value, true);
+            }
+            ExpressionKind::Lookup(map, key, default_value) => {
+                this.refer(Referent::Variable(map));
+                this.expression(program, key, true);
+                this.expression(program, default_value, true);
+            }
+            ExpressionKind::Removal(map, key, default_value) => {
+                this.refer(Referent::Variable(map));
+                this.expression(program, key, true);
+                this.expression(program, default_value, true);
+            }
+            ExpressionKind::Contains(map, key) => {
+                this.refer(Referent::Variable(map));
+                this.expression(program, key, true);
+            }
+            _ => { }
+        }
+    }
+
+    /// The `count` expressions from `first` in the index lists, every
+    /// `stride` places.
+    private list(mut &this, program: &Program, first: i64, count: i64, stride: i64) -> void {
+        mut position: i64 = 0;
+        while (position < count) {
+            this.expression(program, program.list_at(first + position * stride), true);
+            position = position + 1;
+        }
+    }
+
+    /// The values of a literal's `count` entries from `first`, each a field
+    /// and its value, but those of fields omitted, which are not printed.
+    private entries(mut &this, program: &Program, first: i64, count: i64) -> void {
+        mut entry: i64 = 0;
+        while (entry < count) {
+            if (!program.omits(Omission::Field(program.list_at(first + 2 * entry)))) {
+                this.expression(program, program.list_at(first + 2 * entry + 1), true);
+            }
+            entry = entry + 1;
+        }
+    }
+
+    /// Every item `value_type` names: a struct and, for an instance, its
+    /// generic struct and argument; an enum likewise; a function type's
+    /// parameters and return; a trait object's trait; the owned struct a
+    /// holder, a reference or an owned type names.
+    private mark_type(mut &this, program: &Program, value_type: ValueType) -> void {
+        match (value_type) {
+            ValueType::Record(index) => {
+                this.refer(Referent::Structure(index));
+                const named: Structure = program.structure_at(index);
+                if (named.is_instance()) {
+                    this.refer(Referent::Template(named.template));
+                    this.mark_type(program, named.argument);
+                }
+            }
+            ValueType::Enumeration(index) => {
+                this.refer(Referent::Enumeration(index));
+                const named: Enumeration = program.enumeration_at(index);
+                if (named.is_instance()) {
+                    this.refer(Referent::EnumerationTemplate(named.template));
+                    this.mark_type(program, named.argument);
+                }
+            }
+            ValueType::Function(_) => {
+                const signature: Signature = program.signature_of(value_type);
+                mut position: i64 = 0;
+                while (position < signature.parameter_count) {
+                    this.mark_type(program, program.signature_parameter(signature, position));
+                    position = position + 1;
+                }
+                this.mark_type(program, signature.returns);
+            }
+            ValueType::TraitObject(index) => { this.refer(Referent::Trait(index)); }
+            ValueType::Owned(index) => { this.refer(Referent::Owned(index)); }
+            ValueType::SharedReference(index) => { this.refer(Referent::Owned(index)); }
+            ValueType::ExclusiveReference(index) => { this.refer(Referent::Owned(index)); }
+            ValueType::Boxed(index) => { this.refer(Referent::Owned(index)); }
+            ValueType::Counted(index) => { this.refer(Referent::Owned(index)); }
+            ValueType::Optional(index) => { this.refer(Referent::Owned(index)); }
+            ValueType::Fallible(index) => { this.refer(Referent::Owned(index)); }
+            _ => { }
+        }
+    }
+
+    private refer(mut &this, referent: Referent) -> void { this.references.push(Reference { from: this.from, referent: referent }); }
+
+    /// Whether `operator`'s operands are kept in range by a guard: the
+    /// plain arithmetic, the division and the shifts.
+    private static guards(operator: BinaryOperator) -> boolean {
+        return match (operator) {
+            BinaryOperator::Add        => { true }
+            BinaryOperator::Subtract   => { true }
+            BinaryOperator::Multiply   => { true }
+            BinaryOperator::Divide     => { true }
+            BinaryOperator::Remainder  => { true }
+            BinaryOperator::ShiftLeft  => { true }
+            BinaryOperator::ShiftRight => { true }
+            _                          => { false }
+        };
+    }
+
+    /// Whether expression `index` is a literal: an integer's, a boolean's,
+    /// a named limit, or an integer literal cast to its type.
+    private static is_literal(program: &Program, index: i64) -> boolean {
+        return match (program.expression_at(index).kind) {
+            ExpressionKind::IntegerLiteral(_, _) => { true }
+            ExpressionKind::BooleanLiteral(_)    => { true }
+            ExpressionKind::Limit(_)             => { true }
+            ExpressionKind::Cast(operand)        => {
+                match (program.expression_at(operand).kind) {
+                    ExpressionKind::IntegerLiteral(_, _) => { true }
+                    _                                    => { false }
+                }
+            }
+            _ => { false }
+        };
+    }
+}

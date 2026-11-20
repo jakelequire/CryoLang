@@ -11,8 +11,8 @@ import std::collections::string::{ String };
 import cryosmith::configuration::{ GENERATOR_VERSION, GenerationOptions, Plant };
 import cryosmith::guarantees::{ Observation };
 import cryosmith::model::{
-    Enumeration, Field, Function, OwnedStructure, Program, Receiver, Signature, StatementKind, Structure, TraitDeclaration, TraitMethod,
-    ValueType, Variable, VariableRole, VariantDeclaration
+    Enumeration, Field, Function, Omission, OwnedStructure, Program, Receiver, Signature, StatementKind, Structure, TraitDeclaration,
+    TraitMethod, ValueType, Variable, VariableRole, VariantDeclaration
 };
 
 /// Writes one program's text.
@@ -27,37 +27,46 @@ public type struct Printer {
     /// The source of `program`, generated with `options`.
     public static print(program: &Program, options: &GenerationOptions) -> String {
         mut printer: Printer = Printer { text: String::new(), plant: options.plant, observation_locals: 0 };
-        if (options.header) { printer.header(options); }
+        if (options.header) { printer.header(program, options); }
         printer.prelude(program);
         mut index: i64 = 0;
         while (index < program.enumerations.length()) {
             const declared: Enumeration = program.enumeration_at(index);
-            if (!declared.is_instance()) {
+            if (!declared.is_instance() && !program.omits(Omission::Enumeration(index))) {
                 const name: String = f"E{declared.number}";
                 printer.enumeration(program, declared, name.as_str());
             }
             index = index + 1;
         }
-        for (generic in program.enumeration_templates.iter()) {
-            const name: String = f"G{generic.number}<T>";
-            printer.enumeration(program, generic, name.as_str());
+        index = 0;
+        while (index < program.enumeration_templates.length()) {
+            const generic: Enumeration = program.enumeration_templates.get(index).unwrap();
+            if (!program.omits(Omission::EnumerationTemplate(index))) {
+                const name: String = f"G{generic.number}<T>";
+                printer.enumeration(program, generic, name.as_str());
+            }
+            index = index + 1;
         }
         index = 0;
         while (index < program.structures.length()) {
             const declared: Structure = program.structure_at(index);
-            if (!declared.is_instance()) { printer.structure(program, declared, f"S{declared.number}", index); }
+            if (!declared.is_instance() && !program.omits(Omission::Structure(index))) { printer.structure(program, declared, f"S{declared.number}", index); }
             index = index + 1;
         }
         index = 0;
         while (index < program.templates.length()) {
             const declared: Structure = program.template_at(index);
-            printer.structure(program, declared, f"B{declared.number}<T>", program.own_instance(index));
+            if (!program.omits(Omission::Template(index))) { printer.structure(program, declared, f"B{declared.number}<T>", program.own_instance(index)); }
             index = index + 1;
         }
-        for (owned in program.owned_structures.iter()) { printer.owned_structure(program, owned); }
+        index = 0;
+        while (index < program.owned_structures.length()) {
+            if (!program.omits(Omission::Owned(index))) { printer.owned_structure(program, program.owned_at(index)); }
+            index = index + 1;
+        }
         index = 0;
         while (index < program.traits.length()) {
-            printer.trait_declaration(program, program.trait_at(index));
+            if (!program.omits(Omission::Trait(index))) { printer.trait_declaration(program, program.trait_at(index)); }
             index = index + 1;
         }
         index = 0;
@@ -69,7 +78,7 @@ public type struct Printer {
         index = 0;
         while (index < program.functions.length()) {
             const defined: Function = program.function_at(index);
-            if (defined.is_unowned() && !defined.is_default()) { printer.definition(program, defined, 0); }
+            if (defined.is_unowned() && !defined.is_default() && !program.omits_function(index)) { printer.definition(program, defined, 0); }
             index = index + 1;
         }
         return printer.text;
@@ -134,20 +143,25 @@ public type struct Printer {
         const kind: Str = if (implementor.is_record()) { Str::new("struct") } else { Str::new("enum") };
         this.text.push(f"\nimplement trait Tr{declared.number} for {kind} {program.type_name(implementor).as_str()} ");
         this.text.push(Str::new("{\n"));
-        for (defined in program.functions.iter()) {
+        mut member: i64 = 0;
+        while (member < program.functions.length()) {
+            const defined: Function = program.function_at(member);
             if (defined.owner.same(implementor) && defined.implements >= declared.first_method
-                    && defined.implements < declared.first_method + declared.method_count) {
+                    && defined.implements < declared.first_method + declared.method_count && !program.omits_function(member)) {
                 this.definition(program, defined, 1);
             }
+            member = member + 1;
         }
         this.text.push(Str::new("}\n"));
     }
 
-    /// The comment that reproduces the program: the generator version and
-    /// every option it was generated with.
-    private header(mut &this, options: &GenerationOptions) -> void {
+    /// The comment that reproduces the program: the generator version,
+    /// every option it was generated with, and the paths of what a reducer
+    /// took out of it, in the order taken.
+    private header(mut &this, program: &Program, options: &GenerationOptions) -> void {
         this.text.push(f"// cryosmith {GENERATOR_VERSION} seed {options.seed} features {options.features.canonical().as_str()} functions {options.function_count()} size {options.size}");
         if (options.plant.is_planted()) { this.text.push(f" plant {options.plant.name()}"); }
+        if (!program.omissions.is_empty()) { this.text.push(f" omit {program.omission_paths().as_str()}"); }
         this.text.push(Str::new("\n\n"));
     }
 
@@ -200,6 +214,10 @@ public type struct Printer {
         this.text.push(Str::new("{\n"));
         mut variant: i64 = 0;
         while (variant < declared.variant_count) {
+            if (program.omits(Omission::Variant(declared.first_variant + variant))) {
+                variant = variant + 1;
+                continue;
+            }
             this.indent(1);
             this.text.push(f"V{variant}");
             const shape: VariantDeclaration = program.variants.get(declared.first_variant + variant).unwrap();
@@ -227,6 +245,10 @@ public type struct Printer {
         this.text.push(Str::new("{\n"));
         mut index: i64 = declared.first_field;
         while (index < declared.first_field + declared.field_count) {
+            if (program.omits(Omission::Field(index))) {
+                index = index + 1;
+                continue;
+            }
             const field: Field = program.field_at(index);
             this.indent(1);
             this.text.push(f"f{field.number}: {program.type_name(field.value_type).as_str()}");
@@ -240,7 +262,7 @@ public type struct Printer {
         index = 0;
         while (index < program.functions.length()) {
             const defined: Function = program.function_at(index);
-            if (owner >= 0 && defined.owner.structure() == owner && defined.implements < 0) { this.definition(program, defined, 1); }
+            if (owner >= 0 && defined.owner.structure() == owner && defined.implements < 0 && !program.omits_function(index)) { this.definition(program, defined, 1); }
             index = index + 1;
         }
         this.text.push(Str::new("}\n"));

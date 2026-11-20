@@ -1446,15 +1446,77 @@ generator never reads through an `Rc`.
      candidate). Functions are independent of the count (section 3.5),
      so dropping the later ones keeps the earlier ones' text. (Done:
      `smith/reduction.cryo` and `gates/smith_reduce.cryo`.)
-   - **Unit 2: the model's own edits**, in CryoSmith (`cryosmith generate
-     ... --omit <path>...`): a statement, a whole function, a struct's or
-     enum's member, or an expression replaced by a literal of its type,
-     each named by its path in the program tree and removed by the
-     generator before printing, which re-checks what depends on it
-     (a local's later uses become literals, a removed variant's arms go)
-     so the result keeps every section 3 guarantee. The reducer then
-     drives `--omit` paths as it drives the knobs, one at a time and in
-     tree order, keeping each that leaves the signature.
+   - **Unit 2: the model's own omissions**, in CryoSmith's `reduce/`
+     layer, which imports `model` alone (`cli` and `selftest` import
+     it). The generator builds the whole program; omissions then apply to
+     its model before printing, so every program tried is still one
+     CryoSmith vouches for.
+     - *What may be taken out* is what the printed program no longer
+       names (`References`, a walk of exactly what the printer prints):
+       a statement - but a function's last `return`, `main`'s end, the
+       declaration of a variable something still names, and a statement
+       appending to a dynamic array or assigning one whole (the fewest
+       elements the array is known to hold counts what it adds, and
+       every later index and pop is reduced below that); an integer or
+       `boolean` expression, replaced by `false` or `(0 as T)` (a cast,
+       so an overloaded call or an inferred type argument still reads
+       exactly `T`) - but a literal, the place an assignment writes, an
+       operand of a guarded `+`, `-`, `*`, `/`, `%`, shift or negation,
+       and what such an operand converts with a cast (a divisor
+       `(v.length() as u64)` is a guard by its length): a guard is
+       replaced inside, below its mask or its `| 1`, never by a value it
+       keeps out (section 3.1); a free, generic or own method
+       nothing calls, or a trait implementation's method with a default
+       body, which then runs instead; a trait's implementation for a
+       type when nothing outside it calls its methods, no value of the
+       type is used where the trait (or one over it) is needed, and the
+       type implements no trait over it; a trait nothing implements or
+       names but its own default bodies; a struct, generic struct, enum,
+       generic enum or owned struct no type names; a declared enum's
+       variant nothing builds or names in a nested pattern, other than
+       its first (its arms go with it); a declared struct's field
+       nothing reads or writes (its literals' entries go with it).
+       Taking out only removes names, so what may be taken out stays so
+       while other things go: any set of the candidates listed may be
+       applied in the order listed, and one an earlier one took with it
+       (an expression inside a statement taken out) is left alone.
+     - *Paths*: a letter and an arena index (`model/omissions.cryo`):
+       `s` statement, `e` expression, `f` function, `i<T>r<N>` /
+       `i<T>n<N>` trait `T`'s implementation for struct or enum `N`, `t`
+       trait, `r` struct, `b` generic struct, `k` field, `n` enum, `g`
+       generic enum, `v` variant, `d` owned struct. The same seed and
+       options give the same arenas, so the list reproduces the program;
+       the header records it after the options, ` omit s3,e10,f2`.
+     - *Command line*: `--omissions FILE`, a generation option of
+       `generate` and `batch`, applies the paths FILE lists (separated by
+       commas, spaces or line ends) in order; one that names nothing, or
+       something still needed, is a usage error. It is the one file a
+       command reads, and the command line names it, so the same
+       arguments still give the same text (section 3.5). `cryosmith
+       omissions --seed N [generation options] [--out FILE]` lists what
+       may be taken out now, a path per line: statements, expressions
+       in printed order, then functions, implementations, traits,
+       structs, generic structs, enums, generic enums, owned structs,
+       variants and fields.
+     - *Self-test*: the omission check takes every candidate of each
+       class out of four programs in turn and finds each taken, the
+       static audit still passing, the header's list rebuilding the
+       program byte for byte, and `main` and its end refused. Taken
+       outermost first, an operator goes whole before its operand is
+       reached, so it also replaces six smaller programs' expressions
+       innermost first, auditing the text every four: a guard replaced
+       is printed while its operator stands.
+     - *The reducer* (CryoGate), once the knobs are reduced: lists the
+       candidates, and tries each class in turn - statements, then
+       expressions, then items - all of a class at once, then each half
+       of a set that does not keep the signature, down to one at a time;
+       until a round keeps nothing. The list goes to CryoSmith as a file
+       in the work directory (it outgrows a command line), and the
+       reduced program's list to `--out` beside it,
+       `smith-<seed>-omissions.txt`, which the drafted command names.
+     - Not yet: a generic function made concrete at its one type
+       argument (generic parameters removed), which needs the model to
+       substitute `T` through a body.
    - **Output**, in `--out`: the reduced program `smith-<seed>-reduced.cryo`
      (its header names the options that rebuild it), and
      `bug-draft-<seed>.md`, a bug file drafted for review and never

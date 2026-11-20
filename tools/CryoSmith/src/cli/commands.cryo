@@ -18,6 +18,8 @@ import std::fs::path::{ PathBuf };
 import cryosmith::configuration::{ Feature, FeatureSet, GENERATOR_VERSION, GenerationArguments, GenerationOptions };
 import cryosmith::emit::{ Printer };
 import cryosmith::generate::{ Generator };
+import cryosmith::model::{ Omission, Program };
+import cryosmith::reduce::{ Omitter };
 import cryosmith::selftest::{ SelfTest };
 
 /// The command line's commands.
@@ -33,6 +35,7 @@ public type struct Cli {
         const rest: Array<String> = Cli::after_command(arguments);
         if (command == Str::new("generate")) { return Cli::generate(&rest); }
         if (command == Str::new("batch")) { return Cli::batch(&rest); }
+        if (command == Str::new("omissions")) { return Cli::omissions(&rest); }
         if (command == Str::new("features")) { return Cli::features(); }
         if (command == Str::new("version")) { fmt::println(f"cryosmith {GENERATOR_VERSION}"); return 0; }
         if (command == Str::new("selftest")) { return Cli::selftest(&rest); }
@@ -51,6 +54,9 @@ public type struct Cli {
             "  batch --first-seed N --count K --out-dir DIR [generation options]\n"
             "                      write DIR/smith-<seed>.cryo for K seeds, one path\n"
             "                      per line\n"
+            "  omissions --seed N [generation options] [--out FILE]\n"
+            "                      every omission a reducer may take from the\n"
+            "                      program now, a path per line\n"
             "  features            every feature, its stage, and whether `default`\n"
             "                      holds it\n"
             "  version             the generator version\n"
@@ -61,7 +67,8 @@ public type struct Cli {
             "                      check once\n\n"
             "Checking the programs against a compiler is `cryogate corpus-check`.\n\n"
             "generation options: --features LIST (default `default`; `no-<name>`\n"
-            "removes one), --functions N, --size N, --no-header, --plant NAME\n\n"
+            "removes one), --functions N, --size N, --no-header, --plant NAME,\n"
+            "--omissions FILE (paths a reducer takes out, in order)\n\n"
             "exit codes: 0 done, 1 a file could not be written or the self-test failed,\n"
             "2 a usage error")));
     }
@@ -128,7 +135,11 @@ public type struct Cli {
             Result::Ok(options) => { options }
             Result::Err(reason) => { fmt::eprintln(reason); return 2; }
         };
-        const text: String = Printer::print(&Generator::generate(options), &options);
+        const program: Program = match (Cli::reduced(&parsed, options)) {
+            Result::Ok(program) => { program }
+            Result::Err(reason) => { fmt::eprintln(f"cryosmith generate: {reason.as_str()}"); return 2; }
+        };
+        const text: String = Printer::print(&program, &options);
         match (parsed.value(Str::new("out"))) {
             Option::Some(path) => {
                 match (File::write_text(PathBuf::from(path).as_path(), text.as_str())) {
@@ -177,7 +188,11 @@ public type struct Cli {
             };
             mut path: PathBuf = PathBuf::from(directory);
             path.push(f"smith-{seed}.cryo".as_str());
-            const text: String = Printer::print(&Generator::generate(options), &options);
+            const program: Program = match (Cli::reduced(&parsed, options)) {
+                Result::Ok(program) => { program }
+                Result::Err(reason) => { fmt::eprintln(f"cryosmith batch: seed {seed}: {reason.as_str()}"); return 2; }
+            };
+            const text: String = Printer::print(&program, &options);
             match (File::write_text(path.as_path(), text.as_str())) {
                 Result::Ok(_)       => { fmt::println(f"{path.as_path().as_str()}"); }
                 Result::Err(reason) => { fmt::eprintln(f"cryosmith: cannot write {path.as_path().as_str()}: {reason}"); return 1; }
@@ -185,6 +200,60 @@ public type struct Cli {
             offset = offset + 1;
         }
         return 0;
+    }
+
+    /// `omissions`: every omission the program generated (after its own
+    /// `--omissions`) may take now, a path per line, to `--out` or
+    /// standard output.
+    private static omissions(arguments: &Array<String>) -> i32 {
+        mut parser: ArgumentParser = ArgumentParser::new(Str::new("cryosmith omissions"));
+        GenerationArguments::declare(&parser);
+        parser.option(Str::new("seed"), Option::None, Str::new("N"), Str::new("the seed"))
+            .option(Str::new("out"), Option::None, Str::new("FILE"), Str::new("where to write the list"));
+        const parsed: ParsedArguments = match (Cli::parse(&parser, arguments)) {
+            Option::Some(parsed) => { parsed }
+            Option::None         => { return 2; }
+        };
+        const seed: u64 = match (GenerationArguments::number(&parsed, Str::new("seed"))) {
+            Result::Ok(Option::Some(seed)) => { seed }
+            Result::Ok(Option::None)       => { fmt::eprintln(String::from_str(Str::new("cryosmith omissions: --seed is required"))); return 2; }
+            Result::Err(reason)            => { fmt::eprintln(reason); return 2; }
+        };
+        const options: GenerationOptions = match (GenerationArguments::read(&parsed, seed)) {
+            Result::Ok(options) => { options }
+            Result::Err(reason) => { fmt::eprintln(reason); return 2; }
+        };
+        const program: Program = match (Cli::reduced(&parsed, options)) {
+            Result::Ok(program) => { program }
+            Result::Err(reason) => { fmt::eprintln(f"cryosmith omissions: {reason.as_str()}"); return 2; }
+        };
+        mut text: String = String::new();
+        const candidates: Array<Omission> = Omitter::candidates(&program);
+        for (candidate in candidates.iterate_references()) {
+            text.push(candidate.path().as_str());
+            text.push(Str::new("\n"));
+        }
+        match (parsed.value(Str::new("out"))) {
+            Option::Some(path) => {
+                match (File::write_text(PathBuf::from(path).as_path(), text.as_str())) {
+                    Result::Ok(_)       => { return 0; }
+                    Result::Err(reason) => { fmt::eprintln(f"cryosmith: cannot write {path}: {reason}"); return 1; }
+                }
+            }
+            Option::None => { fmt::print(text); return 0; }
+        }
+    }
+
+    /// The program `options` generate, with what `--omissions` lists taken
+    /// out in order; why a listed omission cannot be taken.
+    private static reduced(parsed: &ParsedArguments, options: GenerationOptions) -> Result<Program, String> {
+        mut program: Program = Generator::generate(options);
+        const paths: Array<String> = GenerationArguments::omissions(parsed)?;
+        for (path in paths.iterate_references()) {
+            const omission: Omission = Omission::parse(path.as_str())?;
+            Omitter::apply(&program, omission)?;
+        }
+        return Result::Ok(program);
     }
 
     /// `features`: every feature, its stage, and whether `default` holds it.

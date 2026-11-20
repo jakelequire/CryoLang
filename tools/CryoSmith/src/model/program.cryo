@@ -12,6 +12,7 @@ import cryosmith::model::items::{
     Closure, Enumeration, Field, Function, Genericity, OwnedStructure, Signature, Structure, TraitDeclaration, TraitMethod, Variable, VariableRole,
     VariantDeclaration
 };
+import cryosmith::model::omissions::{ Omission };
 import cryosmith::model::statements::{ StatementKind, StatementNode };
 import cryosmith::model::types::{ ValueType };
 
@@ -63,10 +64,15 @@ public type struct Program {
     public trait_methods: Array<TraitMethod>;
     /// Every owned struct, `D<N>`, in the order they are printed.
     public owned_structures: Array<OwnedStructure>;
+    /// What a reducer took out, in the order it was taken: a statement or
+    /// an expression is already gone from its body, an item is printed
+    /// nowhere.
+    public omissions: Array<Omission>;
 
     /// A program holding only `observed`.
     public static new() -> Program {
         mut program: Program = Program {
+            omissions:   Array::<Omission>::new(),
             owned_structures: Array::<OwnedStructure>::new(),
             traits:      Array::<TraitDeclaration>::new(),
             trait_methods: Array::<TraitMethod>::new(),
@@ -276,13 +282,54 @@ public type struct Program {
     /// type no method belongs to - a scalar, `T`, `void` - implements none.
     public implements(&this, implementor: ValueType, index: i64) -> boolean {
         const declared: TraitDeclaration = this.trait_at(index);
-        for (defined in this.functions.iter()) {
+        mut member: i64 = 0;
+        while (member < this.functions.length()) {
+            const defined: Function = this.function_at(member);
             if (!defined.is_unowned() && defined.owner.same(implementor) && defined.implements >= declared.first_method
-                    && defined.implements < declared.first_method + declared.method_count) {
+                    && defined.implements < declared.first_method + declared.method_count && !this.omits_function(member)) {
                 return true;
             }
+            member = member + 1;
         }
         return false;
+    }
+
+    /// Whether `omission` was taken out.
+    public omits(&this, omission: Omission) -> boolean {
+        for (taken in this.omissions.iterate_references()) {
+            if (taken.same(&omission)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether function `index` is printed nowhere: taken out itself, with
+    /// the implementation it belongs to, or with the trait whose default
+    /// body it is.
+    public omits_function(&this, index: i64) -> boolean {
+        if (this.omissions.is_empty()) { return false; }
+        if (this.omits(Omission::Function(index))) { return true; }
+        const defined: Function = this.function_at(index);
+        if (defined.implements < 0) { return false; }
+        const declaring: i64 = this.trait_method_at(defined.implements).declared_by;
+        if (defined.is_default()) { return this.omits(Omission::Trait(declaring)); }
+        return this.omits(Omission::Implementation(declaring, defined.owner));
+    }
+
+    /// Whether a `match` arm over a value of `matched` is printed nowhere:
+    /// the variant it matches was taken out of its enum.
+    public omits_arm(&this, matched: ValueType, arm: MatchArm) -> boolean {
+        if (arm.pattern < 0 || matched.enumeration() < 0) { return false; }
+        return this.omits(Omission::Variant(this.enumeration_at(matched.enumeration()).first_variant + arm.pattern));
+    }
+
+    /// The paths of what was taken out, in order, separated by commas.
+    public omission_paths(&this) -> String {
+        mut paths: String = String::new();
+        for (taken in this.omissions.iterate_references()) {
+            if (!paths.is_empty()) { paths.push(Str::new(",")); }
+            paths.push(taken.path().as_str());
+        }
+        return paths;
     }
 
     /// Whether the expression at `value` is a closure that captures: a

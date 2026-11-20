@@ -3,12 +3,15 @@
 
 namespace cryosmith::configuration::arguments;
 
+import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::convert::{ TryFrom };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::env::arguments::{ ArgumentParser, ParsedArguments };
+import std::fs::file::{ File };
+import std::fs::path::{ PathBuf };
 
 import cryosmith::configuration::features::{ FeatureSet };
 import cryosmith::configuration::options::{ GenerationOptions, Plant };
@@ -21,7 +24,33 @@ public type struct GenerationArguments {
             .option(Str::new("functions"), Option::None, Str::new("N"), Str::new("helper functions (default: from the seed)"))
             .option(Str::new("size"), Option::None, Str::new("N"), Str::new("statements per function"))
             .option(Str::new("plant"), Option::None, Str::new("NAME"), Str::new("a deliberate defect, for a check's control"))
+            .option(Str::new("omissions"), Option::None, Str::new("FILE"), Str::new("what a reducer takes out, a path per entry"))
             .flag(Str::new("no-header"), Option::None, Str::new("leave the header comment out"));
+    }
+
+    /// The paths of the omissions `--omissions FILE` lists, in the order
+    /// listed, separated by commas, spaces or line ends; none without the
+    /// option.  The one file a command reads, named by the command line,
+    /// so the same arguments still give the same text.
+    public static omissions(parsed: &ParsedArguments) -> Result<Array<String>, String> {
+        mut paths: Array<String> = Array::<String>::new();
+        const file: Str = match (parsed.value(Str::new("omissions"))) {
+            Option::Some(file) => { file }
+            Option::None       => { return Result::Ok(paths); }
+        };
+        const text: String = match (File::read_text(PathBuf::from(file).as_path())) {
+            Result::Ok(text)    => { text }
+            Result::Err(reason) => { return Result::Err(f"cannot read {file}: {reason}"); }
+        };
+        for (line in text.as_str().split(&Str::new("\n"))) {
+            for (entry in line.split(&Str::new(","))) {
+                for (word in entry.split(&Str::new(" "))) {
+                    const path: Str = word.trim();
+                    if (!path.is_empty()) { paths.push(String::from_str(path)); }
+                }
+            }
+        }
+        return Result::Ok(paths);
     }
 
     /// The generation options `parsed` gives, for `seed`.
