@@ -13,13 +13,24 @@ import std::test::assert::{ expect };
 import cryogate::smith::crash::{ CrashDecision, CrashFinding };
 import cryogate::smith::difference::{ Observation };
 
-/// The signature `observation` gives a program mutated by `operator`, or
-/// `none` when it is no finding.
-private function signature_of(operator: Str, observation: Option<Observation>) -> String {
-    return match (CrashDecision::decide(operator, &observation)) {
+/// The signature `observation` gives a program mutated by `operator`,
+/// marked as one the compiler must refuse when `must_refuse`, or `none`
+/// when it is no finding.
+private function signature_of(operator: Str, must_refuse: boolean, observation: Option<Observation>) -> String {
+    return match (CrashDecision::decide(operator, must_refuse, &observation)) {
         Option::Some(finding) => { finding.signature.clone() }
         Option::None          => { String::from_str(Str::new("none")) }
     };
+}
+
+![test]
+function an_acceptance_of_a_marked_edit_is_a_finding_and_a_refusal_of_one_is_not() -> Result<(), TestError> {
+    const accepted: String = signature_of(Str::new("drop-argument"), true, Option::None);
+    expect(accepted.as_str() == Str::new("acceptance [drop-argument]"), accepted.as_str())?;
+    const refused: String = signature_of(Str::new("drop-argument"), true, Option::Some(Observation::Refused(String::from_str(Str::new("E0213")))));
+    expect(refused.as_str() == Str::new("none"), refused.as_str())?;
+    const hung: String = signature_of(Str::new("duplicate-token"), true, Option::Some(Observation::CompileHang));
+    return expect(hung.as_str() == Str::new("compile hang [duplicate-token]"), hung.as_str());
 }
 
 ![test]
@@ -32,22 +43,22 @@ function a_mutated_header_names_its_operator() -> Result<(), TestError> {
 
 ![test]
 function an_acceptance_and_a_refusal_with_a_code_are_no_finding() -> Result<(), TestError> {
-    expect(signature_of(Str::new("delete-token"), Option::None).as_str() == Str::new("none"), Str::new("an acceptance"))?;
-    return expect(signature_of(Str::new("delete-token"), Option::Some(Observation::Refused(String::from_str(Str::new("E0100"))))).as_str() == Str::new("none"), Str::new("a refusal with a code"));
+    expect(signature_of(Str::new("delete-token"), false, Option::None).as_str() == Str::new("none"), Str::new("an acceptance"))?;
+    return expect(signature_of(Str::new("delete-token"), false, Option::Some(Observation::Refused(String::from_str(Str::new("E0100"))))).as_str() == Str::new("none"), Str::new("a refusal with a code"));
 }
 
 ![test]
 function a_crash_a_hang_and_an_internal_error_are_findings_by_operator() -> Result<(), TestError> {
-    const erred: String = signature_of(Str::new("drop-brace"), Option::Some(Observation::InternalError(String::from_str(Str::new("E0900")))));
+    const erred: String = signature_of(Str::new("drop-brace"), false, Option::Some(Observation::InternalError(String::from_str(Str::new("E0900")))));
     expect(erred.as_str() == Str::new("internal error [drop-brace] E0900"), erred.as_str())?;
-    const crashed: String = signature_of(Str::new("delete-token"), Option::Some(Observation::CompileCrash(String::from_str(Str::new("exit 3")))));
+    const crashed: String = signature_of(Str::new("delete-token"), false, Option::Some(Observation::CompileCrash(String::from_str(Str::new("exit 3")))));
     expect(crashed.as_str() == Str::new("compile crash [delete-token] exit 3"), crashed.as_str())?;
-    const hung: String = signature_of(Str::new("extra-brace"), Option::Some(Observation::CompileHang));
+    const hung: String = signature_of(Str::new("extra-brace"), false, Option::Some(Observation::CompileHang));
     return expect(hung.as_str() == Str::new("compile hang [extra-brace]"), hung.as_str());
 }
 
 ![test]
 function a_refusal_with_no_code_is_a_crash() -> Result<(), TestError> {
-    const codeless: String = signature_of(Str::new("drop-argument"), Option::Some(Observation::CompileCrash(String::from_str(Str::new("exit 1 with no error diagnostic")))));
+    const codeless: String = signature_of(Str::new("drop-argument"), false, Option::Some(Observation::CompileCrash(String::from_str(Str::new("exit 1 with no error diagnostic")))));
     return expect(codeless.as_str() == Str::new("compile crash [drop-argument] exit 1 with no error diagnostic"), codeless.as_str());
 }

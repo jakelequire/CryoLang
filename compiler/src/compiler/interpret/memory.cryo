@@ -8,6 +8,38 @@ import compiler::interpret::integer::{ IntegerKind };
 import compiler::decl_index::{ OverloadId };
 import compiler::ast::expression::{ LambdaExpr };
 import compiler::ast::declaration::{ ImplBlock };
+import compiler::types::type_ref::{ TypeRef };
+
+/// What one element of an allocation is: its type, and how many bytes and
+/// cells it takes.  A local, a parameter, a temporary or a module-level
+/// variable is one element of its type; a string's bytes are elements of
+/// one byte; a heap block takes its element from its first typed access
+/// and has none, no type and no cells, until then.
+type struct Element {
+    element_type: TypeRef;
+    bytes:        i64;
+    cells:        i64;
+
+    /// No element yet: a heap block no typed access has reached.
+    static none() -> Element {
+        return Element { element_type: TypeRef::invalid(), bytes: 0, cells: 0 };
+    }
+
+    /// One byte in one cell.  Its type is not needed: an element of one
+    /// cell starts at its own first byte, whatever its type.
+    static byte() -> Element {
+        return Element { element_type: TypeRef::invalid(), bytes: 1, cells: 1 };
+    }
+}
+
+/// An integer made from an address: the allocation it came from and its
+/// byte offset there (tools/CryoSmith/INTERPRETER.md section 4.1).  Its
+/// value is the allocation's base plus the offset; no operation the
+/// interpreter runs on it depends on the base.
+type struct Provenance {
+    allocation: i64;
+    offset:     i64;
+}
 
 /// Where an address points: an allocation, and the cell within it, counted
 /// in cells from the allocation's start.
@@ -41,6 +73,9 @@ type struct Address {
 type enum Scalar {
     /// An integer's bits, stored as its kind reduces them.
     Integer(u128, IntegerKind);
+    /// An integer made from an address, at its integer kind: it keeps the
+    /// allocation it came from instead of bits.
+    AddressInteger(Provenance, IntegerKind);
     Boolean(boolean);
     /// A pointer or reference, the null pointer among them.
     Pointer(Address);
@@ -87,12 +122,12 @@ type struct Allocation {
     length: i64;
     live:   boolean;
     kind:   AllocationKind;
-    /// A heap block's size in bytes, as the allocator was asked for it.
+    /// The allocation's size in bytes: a heap block's as the allocator was
+    /// asked for it, any other's its elements'.
     bytes:  i64;
-    /// How many cells and bytes one of a heap block's elements takes,
-    /// fixed by its first typed access; zero until then.
-    element_cells: i64;
-    element_bytes: i64;
+    /// What each of its elements is; a heap block's is fixed by its first
+    /// typed access.
+    element: Element;
 }
 
 /// Why an access was refused.
@@ -137,15 +172,16 @@ type struct Memory {
         return Memory { cells: [], allocations: [] };
     }
 
-    /// A new allocation of `length` uninitialised cells.
-    allocate(mut &this, length: i64, kind: AllocationKind) -> i64 {
+    /// A new allocation of `count` uninitialised elements of `element`.
+    allocate(mut &this, element: Element, count: i64, kind: AllocationKind) -> i64 {
         const start: i64 = this.cells.length();
+        const length: i64 = count * element.cells;
         for (mut i: i64 = 0; i < length; i++) {
             this.cells.push(Cell { state: CellState::Uninitialised, value: Scalar::Boolean(false) });
         }
         this.allocations.push(Allocation {
             start: start, length: length, live: true, kind: kind,
-            bytes: 0, element_cells: 0, element_bytes: 0,
+            bytes: count * element.bytes, element: element,
         });
         return this.allocations.length() - 1;
     }
@@ -155,31 +191,29 @@ type struct Memory {
     allocate_heap(mut &this, bytes: i64) -> i64 {
         this.allocations.push(Allocation {
             start: this.cells.length(), length: 0, live: true, kind: AllocationKind::Heap,
-            bytes: bytes, element_cells: 0, element_bytes: 0,
+            bytes: bytes, element: Element::none(),
         });
         return this.allocations.length() - 1;
     }
 
     /// Give the heap block `allocation`, if it has no element type yet,
-    /// elements of `element_bytes` bytes and `element_cells` cells each: as
-    /// many as its size holds, uninitialised.  Any other allocation, and a
-    /// block already shaped, is left as it is.
-    shape(mut &this, allocation: i64, element_bytes: i64, element_cells: i64) -> void {
-        if (allocation < 0 || element_cells <= 0 || element_bytes <= 0) { return; }
+    /// elements of `element`: as many as its size holds, uninitialised.
+    /// Any other allocation, and a block already shaped, is left as it is.
+    shape(mut &this, allocation: i64, element: Element) -> void {
+        if (allocation < 0 || element.cells <= 0 || element.bytes <= 0) { return; }
         match (this.allocations[allocation].kind) {
             AllocationKind::Heap => { }
             _ => { return; }
         }
-        if (this.allocations[allocation].element_cells > 0 || !this.allocations[allocation].live) { return; }
-        const count: i64 = this.allocations[allocation].bytes / element_bytes;
+        if (this.allocations[allocation].element.cells > 0 || !this.allocations[allocation].live) { return; }
+        const count: i64 = this.allocations[allocation].bytes / element.bytes;
         const start: i64 = this.cells.length();
-        for (mut i: i64 = 0; i < count * element_cells; i++) {
+        for (mut i: i64 = 0; i < count * element.cells; i++) {
             this.cells.push(Cell { state: CellState::Uninitialised, value: Scalar::Boolean(false) });
         }
         this.allocations[allocation].start = start;
-        this.allocations[allocation].length = count * element_cells;
-        this.allocations[allocation].element_cells = element_cells;
-        this.allocations[allocation].element_bytes = element_bytes;
+        this.allocations[allocation].length = count * element.cells;
+        this.allocations[allocation].element = element;
     }
 
     /// Make `allocation` read-only, as a string literal's bytes are.

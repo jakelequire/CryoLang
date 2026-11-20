@@ -10,7 +10,7 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::option::{ Option };
 
-import cryosmith::mutate::{ Mutation, MutationOperator };
+import cryosmith::mutate::{ Mutation, MutationOperator, TextEdit };
 import cryosmith::selftest::runner::{ SelfTest };
 
 /// How many seeds' default programs are mutated.
@@ -24,14 +24,22 @@ implement struct SelfTest {
     internal mutation_check(mut &this) -> void {
         const operators: Array<MutationOperator> = MutationOperator::all();
         mut sited: Array<i64> = Array::<i64>::new();
-        while (sited.length() < operators.length()) { sited.push(0); }
+        mut marked: Array<i64> = Array::<i64>::new();
+        while (sited.length() < operators.length()) {
+            sited.push(0);
+            marked.push(0);
+        }
         mut seed: u64 = 1;
         while (seed <= MUTATED_PROGRAMS) {
             const text: String = this.default_text(seed);
             const prelude_end: i64 = text.as_str().find(&Str::new("\n}\n")).unwrap_or(0) + 3;
             mut position: i64 = 0;
             while (position < operators.length()) {
-                if (Mutation::sites(operators[position], text.as_str()).length() > 0) { sited.set(position, sited[position] + 1); }
+                const edits: Array<TextEdit> = Mutation::sites(operators[position], text.as_str());
+                if (edits.length() > 0) { sited.set(position, sited[position] + 1); }
+                for (edit in edits.iterate_references()) {
+                    if (edit.refused) { marked.set(position, marked[position] + 1); }
+                }
                 position = position + 1;
             }
             mut number: u64 = 0;
@@ -59,6 +67,16 @@ implement struct SelfTest {
         mut position: i64 = 0;
         while (position < operators.length()) {
             this.expect(sited[position] > 0, f"operator {operators[position].name()} found no site in any program");
+            // Only these three operators know an edit the compiler must
+            // refuse, and each finds one; every other edit may leave a valid
+            // program.
+            const marks: boolean = match (operators[position]) {
+                MutationOperator::DuplicateToken => { true }
+                MutationOperator::DropArgument   => { true }
+                MutationOperator::ExtraArgument  => { true }
+                _                                => { false }
+            };
+            this.expect((marked[position] > 0) == marks, f"operator {operators[position].name()} marked {marked[position]} sites refused");
             position = position + 1;
         }
     }

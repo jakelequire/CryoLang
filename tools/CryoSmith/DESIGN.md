@@ -1603,6 +1603,24 @@ generator never reads through an `Rc`.
      program, which is accepted and is no finding. The operators are
      drawn among in the order the list above gives them, so adding one
      changes which mutation a number draws: a new generator version.
+   - **Edits the compiler must refuse.** Most edits may leave a valid
+     program, so an acceptance is no finding by itself; an edit that
+     cannot is marked, and its acceptance is one. Three operators mark:
+     `drop-argument` and `extra-argument` at a call of a name declared
+     exactly once in the program (a line beginning `function name`,
+     `static name`, `name(&this`, `name(mut &this`, `name(this` or
+     `name<`), since that one declaration takes exactly the arguments
+     the generator wrote - an overloaded name, a trait's method and its
+     implementations, or a method name on several types stays unmarked,
+     and so does a site where the name begins its line's code, a
+     declaration's parameter list or a call statement; `duplicate-token`
+     for a number, a bracket or a generated name (letters, then digits)
+     outside a string literal, since two numbers or names never stand
+     side by side and a doubled bracket unbalances. The mark is not in
+     the program text, so marking changes no generated program and needs
+     no new generator version: `cryosmith batch` writes
+     `smith-<seed>.must-refuse` beside a marked program (and removes a
+     stale one), and smith-crash reads it.
    - **`escape-borrow` waits for the borrow checker** (a function
      returning `&D<N>` made to return a borrow of a local of its own, or
      a reference parameter's borrow given on after the value moved). It
@@ -1622,7 +1640,8 @@ generator never reads through an `Rc`.
      build limit. Its observation is smith-diff's (item 7), judged
      differently: a refusal with an error code and an acceptance are
      both fine; a compile crash, a compile hang, an internal error
-     (`E09xx`) and a refusal printing no error code are findings. The
+     (`E09xx`), a refusal printing no error code, and an acceptance of a
+     marked edit (`acceptance [<operator>]`) are findings. The
      signature is the class, the operator and the first code or how the
      compiler ended, so one defect reached through many seeds is one
      finding; an internal error's code is followed by its diagnostic's
@@ -1644,6 +1663,8 @@ generator never reads through an `Rc`.
      line or token deleted from a generated program leaves one that does
      not. A refusal is never
      reduced this way: a deletion's own refusal would read as the bug.
+     Nor is an acceptance: a deletion can make a marked program valid, so
+     a trial carries no mark.
      The seed's program is generated from the options given, `--mutation`
      among them, and every trial is judged as smith-crash judges a build
      (the compiler under test at `-O0`, smith-crash's signature), so
@@ -1730,7 +1751,9 @@ generator never reads through an `Rc`.
       `smith` gate read only the seed entries. An entry goes when its bug
       is fixed, as a seed entry does.
     - **Reductions.** Every other finding smith-reduce can shrink (any
-      class but `uncompared`) is reduced once, by a `cryogate
+      class but `uncompared`, and `acceptance`, since a deletion can make
+      a program the compiler must refuse valid) is reduced once, by a
+      `cryogate
       smith-reduce` child (`--text` for a crash finding, which judges at
       `-O0` with the compiler under test alone) under `--reduce-limit`
       seconds (default 3600), into `<findings>/<the first sixteen hex
