@@ -1,13 +1,16 @@
 ///! `cryogate smith-diff --cryo <compiler> [--reference <compiler>]...
-///! [--interpret] --work <directory> [--smith <cryosmith>] [--stdlib
-///! <directory>] [--first-seed N] [--count K] [--jobs N] [--build-limit S]
-///! [--run-limit S] [-- <generation options>...]`: CryoSmith's programs
-///! checked differentially.
+///! [--interpret] [--linux <compiler inside WSL> [--linux-stdlib
+///! <directory inside WSL>]] --work <directory> [--smith <cryosmith>]
+///! [--stdlib <directory>] [--first-seed N] [--count K] [--jobs N]
+///! [--build-limit S] [--run-limit S] [-- <generation options>...]`:
+///! CryoSmith's programs checked differentially.
 ///!
 ///! Each program is built and run under every configuration: the compiler
 ///! under test at `-O0` and `-O2`, each `--reference` compiler (the pin, a
-///! baseline's compiler) at both levels, and with `--interpret` the
-///! compiler under test's `cryo interpret`.  A build or an interpretation
+///! baseline's compiler) at both levels, with `--interpret` the compiler
+///! under test's `cryo interpret`, and with `--linux`, from a Windows host,
+///! a Linux compiler at both levels inside WSL, building and running there
+///! from the same work directory.  A build or an interpretation
 ///! is killed past `--build-limit` seconds (default 300), a program's run
 ///! past `--run-limit` (default 60); every program terminates within its
 ///! cost budget, so either is a finding, not a slow child.  Each
@@ -33,8 +36,10 @@ import std::fs::directory::{ Directory };
 import std::fs::path::{ Path, PathBuf };
 import std::time::duration::{ Duration };
 
+import cryogate::core::child::{ Completion };
 import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
+import cryogate::core::wsl::{ Wsl, WslMapping };
 import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::text::{ Text };
 import cryogate::smith::corpus::{ CorpusLayout };
@@ -46,10 +51,12 @@ public type struct SmithDiff {
     /// Run `cryogate smith-diff` with `arguments` from index `first`; 0
     /// when every program passed, 1 on a finding, 2 on a usage error.
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
-        mut options: Options = Options::new(Str::new("cryogate smith-diff --cryo <compiler> [--reference <compiler>]... [--interpret] --work <directory> [--smith <cryosmith>] [--stdlib <directory>] [--first-seed N] [--count K] [--jobs N] [--build-limit S] [--run-limit S] [-- <generation options>...]"));
+        mut options: Options = Options::new(Str::new("cryogate smith-diff --cryo <compiler> [--reference <compiler>]... [--interpret] [--linux <compiler inside WSL> [--linux-stdlib <directory inside WSL>]] --work <directory> [--smith <cryosmith>] [--stdlib <directory>] [--first-seed N] [--count K] [--jobs N] [--build-limit S] [--run-limit S] [-- <generation options>...]"));
         options.valued(Str::new("--cryo"));
         options.valued(Str::new("--reference"));
         options.flag(Str::new("--interpret"));
+        options.valued(Str::new("--linux"));
+        options.valued(Str::new("--linux-stdlib"));
         options.valued(Str::new("--work"));
         options.valued(Str::new("--smith"));
         options.valued(Str::new("--stdlib"));
@@ -91,7 +98,16 @@ public type struct SmithDiff {
         };
         mut references: Array<String> = Array::<String>::new();
         for (reference in parsed.values_of(Str::new("--reference")).iterate_references()) { references.push(Host::absolute(reference.as_str())); }
-        const configurations: Array<Configuration> = Configuration::of_compilers(Host::absolute(compiler.unwrap()).as_str(), &references, parsed.has(Str::new("--interpret")));
+        const linux: Option<Str> = parsed.value(Str::new("--linux"));
+        if (linux.is_none() && parsed.value(Str::new("--linux-stdlib")).is_some()) {
+            fmt::eprintln(f"cryogate smith-diff: --linux-stdlib names the stdlib of a --linux compiler, and none is named");
+            return 2;
+        }
+        if (linux.is_some() && Host::os() != Str::new("windows")) {
+            fmt::eprintln(f"cryogate smith-diff: --linux builds inside WSL from a Windows host; this host is {Host::os()}");
+            return 2;
+        }
+        mut configurations: Array<Configuration> = Configuration::of_compilers(Host::absolute(compiler.unwrap()).as_str(), &references, parsed.has(Str::new("--interpret")));
         const default_smith: PathBuf = repository.join(Str::new("tools/CryoSmith/build"));
         const smith: String = match (parsed.value(Str::new("--smith"))) {
             Option::Some(path) => { Host::absolute(path) }
@@ -101,6 +117,27 @@ public type struct SmithDiff {
         match (Directory::create_all(work_path.as_path())) {
             Result::Ok(_)      => { }
             Result::Err(error) => { fmt::eprintln(f"cryogate smith-diff: cannot create {work_path.as_path().as_str()}: {error.describe()}"); return 1; }
+        }
+        // The Linux arm: WSL started, and the work directory's path inside
+        // it asked once.  A host where either fails refuses the run.
+        match (linux) {
+            Option::Some(linux_compiler) => {
+                const started: Completion = Wsl::start(logs);
+                if (!started.outcome.succeeded()) {
+                    fmt::println(f"smith-diff: FAIL (wsl.exe could not start WSL ({started.outcome.describe().as_str()}); see {started.log.as_str()})");
+                    return 1;
+                }
+                const inside: String = match (Wsl::path(work_path.as_path().as_str(), logs)) {
+                    Result::Ok(inside) => { inside }
+                    Result::Err(done)  => { fmt::println(f"smith-diff: FAIL (wslpath could not name {work_path.as_path().as_str()} ({done.outcome.describe().as_str()}); see {done.log.as_str()})"); return 1; }
+                };
+                const mapping: WslMapping = WslMapping { windows: String::from_str(work_path.as_path().as_str()), inside: inside };
+                const levels: Array<Str> = [Str::new("0"), Str::new("2")];
+                for (level in levels.iter()) {
+                    configurations.push(Configuration::linux(linux_compiler, parsed.value(Str::new("--linux-stdlib")), level, &mapping));
+                }
+            }
+            Option::None => { }
         }
         const programs: SmithRun = SmithRun {
             configurations: configurations,

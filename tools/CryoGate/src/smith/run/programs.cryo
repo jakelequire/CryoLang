@@ -212,20 +212,19 @@ public type struct SmithRun {
             // A copy that fails is reported by the build finding no program.
             const _: Result<i64, IoError> = File::copy(this.layout.source(seed).as_path(), program.as_path());
         }
-        mut job: Job = Job::new(configuration.compiler.as_str());
+        mut job: Job = SmithRun::started(configuration, configuration.compiler.as_str(), this.build_limit);
         job.argument(Str::new("build"));
-        job.argument(program.as_path().as_str());
+        job.argument(SmithRun::named(configuration, program.as_path()).as_str());
         job.argument(f"--opt-level={level}".as_str());
-        job.argument(f"--build-dir={directory.as_path().as_str()}".as_str());
+        job.argument(f"--build-dir={SmithRun::named(configuration, directory.as_path()).as_str()}".as_str());
         job.argument(Str::new("-o"));
-        job.argument(this.layout.executable(seed, configuration.key.as_str()).as_path().as_str());
-        this.give_stdlib(&job);
-        job.directory(directory.as_path().as_str());
-        job.default_c_compiler();
-        match (this.build_limit) {
-            Option::Some(limit) => { job.limit(limit); }
-            Option::None        => { }
+        job.argument(SmithRun::named(configuration, this.layout.executable(seed, configuration.key.as_str()).as_path()).as_str());
+        match (&configuration.stdlib) {
+            Option::Some(stdlib) => { job.argument(f"--stdlib={stdlib.as_str()}".as_str()); }
+            Option::None         => { this.give_stdlib(&job); }
         }
+        job.directory(directory.as_path().as_str());
+        if (configuration.wsl.is_none()) { job.default_c_compiler(); }
         job.log_to(this.log(seed, configuration, Str::new(""), logs).as_str());
         job.errors_to(this.log(seed, configuration, Str::new("-errors"), logs).as_str());
         return job;
@@ -233,12 +232,9 @@ public type struct SmithRun {
 
     /// The run of `seed`'s build in `configuration`.
     private execute(&this, seed: u64, configuration: &Configuration, logs: &RunLogs) -> Job {
-        mut job: Job = Job::new(this.layout.executable(seed, configuration.key.as_str()).as_path().as_str());
+        const program: PathBuf = this.layout.executable(seed, configuration.key.as_str());
+        mut job: Job = SmithRun::started(configuration, SmithRun::named(configuration, program.as_path()).as_str(), this.run_limit);
         job.directory(this.work.as_path().as_str());
-        match (this.run_limit) {
-            Option::Some(limit) => { job.limit(limit); }
-            Option::None        => { }
-        }
         job.log_to(this.log(seed, configuration, Str::new("-run"), logs).as_str());
         job.errors_to(this.log(seed, configuration, Str::new("-run-errors"), logs).as_str());
         return job;
@@ -260,6 +256,49 @@ public type struct SmithRun {
         job.log_to(this.log(seed, configuration, Str::new("-run"), logs).as_str());
         job.errors_to(this.log(seed, configuration, Str::new("-run-errors"), logs).as_str());
         return job;
+    }
+
+    /// The job that starts `program` for `configuration` under `limit`: the
+    /// program itself on the host; inside WSL, `wsl.exe` running it under
+    /// `timeout` with the same limit, the job's own a little longer, since
+    /// stopping `wsl.exe` does not stop what it started there.  The
+    /// program's arguments follow.
+    private static started(configuration: &Configuration, program: Str, limit: Option<Duration>) -> Job {
+        if (configuration.wsl.is_none()) {
+            mut job: Job = Job::new(program);
+            match (limit) {
+                Option::Some(limit) => { job.limit(limit); }
+                Option::None        => { }
+            }
+            return job;
+        }
+        mut job: Job = Job::new(Str::new("wsl.exe"));
+        job.argument(Str::new("-e"));
+        match (limit) {
+            Option::Some(limit) => {
+                job.argument(Str::new("timeout"));
+                job.argument(Str::new("--kill-after=5"));
+                job.argument(f"{limit.as_seconds()}".as_str());
+                job.limit(Duration::from_seconds(limit.as_seconds() + SmithRun::WSL_GRACE));
+            }
+            Option::None => { }
+        }
+        job.argument(program);
+        return job;
+    }
+
+    /// The seconds a job inside WSL is given past its own limit before it
+    /// is killed from the host: `timeout`'s own kill comes five seconds
+    /// after the limit.
+    const WSL_GRACE: u64 = 15;
+
+    /// `path` as `configuration`'s children name it: as it is on the host,
+    /// its path inside WSL there.
+    private static named(configuration: &Configuration, path: Path) -> String {
+        return match (&configuration.wsl) {
+            Option::Some(mapping) => { mapping.path(path.as_str()) }
+            Option::None          => { String::from_str(path.as_str()) }
+        };
     }
 
     private give_stdlib(&this, job: mut &Job) -> void {
@@ -287,7 +326,7 @@ public type struct SmithRun {
         const quoted: String = CorpusJudge::first_lines(errors.as_str(), output.as_str());
         const both: String = f"{errors.as_str()}\n{output.as_str()}";
         return Attempt {
-            observation: Observation::of_build(&done.outcome, both.as_str()).unwrap(),
+            observation: Observation::of_build(&configuration.outcome_of(&done.outcome), both.as_str()).unwrap(),
             stage:       Stage::Build,
             reason:      f"--opt-level={level} build failed ({done.outcome.describe().as_str()}): {quoted.as_str()}",
         };
@@ -297,7 +336,7 @@ public type struct SmithRun {
     private program_run(&this, seed: u64, configuration: &Configuration, done: &Completion) -> Attempt {
         const program: PathBuf = this.layout.executable(seed, configuration.key.as_str());
         const output: String = done.output();
-        const observation: Observation = Observation::of_run(&done.outcome, output.as_str());
+        const observation: Observation = Observation::of_run(&configuration.outcome_of(&done.outcome), output.as_str());
         if (!done.outcome.succeeded()) {
             return Attempt { observation: observation, stage: Stage::Run, reason: f"{program.as_path().as_str()} ended with {done.outcome.describe().as_str()}" };
         }

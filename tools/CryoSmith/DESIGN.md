@@ -1410,9 +1410,33 @@ generator never reads through an `Rc`.
      build directory: an older compiler (the pin) writes a single file's
      build beside the file whatever `--build-dir` says, and builds running
      at once would then link each other's objects.
-   - (Done, but for Windows against Linux: `cryogate smith-diff`,
-     `smith/difference.cryo` for the decisions, `smith/run/programs.cryo`
-     for the builds and runs both commands share.)
+   - **Windows against Linux**, from a Windows host: `--linux <compiler>`
+     names a Linux compiler by its path inside WSL (selfhost's Linux arm
+     builds one in its copy), with `--linux-stdlib <directory>`, also a
+     path inside WSL, when it needs one. It adds two configurations,
+     `linux -O0` and `linux -O2` (key `linux-O0`, `linux-O2`), built and
+     run as child processes of `wsl.exe`: the build `wsl.exe -e <compiler>
+     build <program> --opt-level=L --build-dir=<directory> -o
+     <executable>`, the run `wsl.exe -e <executable>`, every path the
+     work directory's own below its WSL path, which `wslpath` gives once
+     per run (`core/wsl`), so nothing is copied and each configuration's
+     files stay beside the others'. Its observations are judged as any
+     configuration's, so a program printing another line on Linux is a
+     mismatch naming `linux -O0, linux -O2` as its own group. Each build
+     and run is started under `timeout` inside WSL with the same limit,
+     the job's own limit a little longer, since stopping `wsl.exe` does
+     not stop what it started there; `timeout`'s exit 124 is read as the
+     hang it reports. WSL is started first; a host where it cannot start
+     refuses the run (exit 1), never skipping the arm while reporting OK.
+     On a Linux host the option is a usage error: the other arm there is
+     wine, not taken up here. Git Bash rewrites an argument starting
+     `/home/` into a Windows path before cryogate sees it, so the Linux
+     paths reach WSL as `C:/Program Files/Git/home/...` and every Linux
+     build exits 127: start the run from PowerShell, or with
+     `MSYS_NO_PATHCONV=1`.
+   - (Done: `cryogate smith-diff`, `smith/difference.cryo` for the
+     decisions, `smith/run/programs.cryo` for the builds and runs both
+     commands share, and the Linux arm through `core/wsl`.)
 8. **A reducer** (CryoGate, `cryogate smith-reduce`). Shrinks a failing
    program while the same failure reproduces, and drafts its bug file.
    CryoSmith's part is section 6's reduction-friendliness, kept as the

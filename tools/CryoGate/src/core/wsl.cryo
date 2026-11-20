@@ -1,10 +1,12 @@
-///! WSL from a Windows host, as child processes of `wsl.exe`: starting it, and
-///! the path a Windows path has inside it.
+///! WSL from a Windows host, as child processes of `wsl.exe`: starting it,
+///! the path a Windows path has inside it, and the paths below a directory
+///! mapped once that is known.
 
 namespace cryogate::core::wsl;
 
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::core::clone::{ Clone };
 import std::core::result::{ Result };
 
 import cryogate::core::child::{ Completion, Job };
@@ -39,5 +41,31 @@ public type struct Wsl {
         const answer: String = String::from_str(done.output().as_str().trim());
         if (!done.outcome.succeeded() || answer.is_empty()) { return Result::Err(done); }
         return Result::Ok(answer);
+    }
+}
+
+/// A Windows directory and the path it has inside WSL, so that a path
+/// below it is named inside WSL without asking `wslpath` again.
+public type struct WslMapping {
+    /// The directory as Windows names it.
+    public windows: String;
+    /// The same directory inside WSL (`/mnt/c/...`).
+    public inside: String;
+
+    /// The path `path`, below `windows`, has inside WSL: the part after
+    /// `windows` put after `inside`, its separators made `/`.  A path not
+    /// below `windows` is given back as it is, separators made `/`.
+    public path(&this, path: Str) -> String {
+        const windows: String = this.windows.as_str().replace(&Str::new("\\"), &Str::new("/"));
+        const given: String = path.replace(&Str::new("\\"), &Str::new("/"));
+        if (!given.as_str().starts_with(&windows.as_str())) { return given; }
+        return f"{this.inside.as_str()}{given.as_str().byte_substring(windows.length(), given.length())}";
+    }
+}
+
+/// A mapping copied whole: every configuration built inside WSL carries one.
+implement trait Clone for WslMapping {
+    clone(&this) -> WslMapping {
+        return WslMapping { windows: this.windows.clone(), inside: this.inside.clone() };
     }
 }

@@ -19,6 +19,7 @@ import std::core::result::{ Result };
 
 import cryogate::core::child::{ Outcome };
 import cryogate::core::text::{ Text };
+import cryogate::core::wsl::{ WslMapping };
 import cryogate::smith::corpus::{ CorpusJudge };
 
 /// One way of getting a program's hash line: a compiler building it at one
@@ -35,6 +36,12 @@ public type struct Configuration {
     public compiler: String;
     /// The optimisation level it builds at; `None` for the interpreter.
     public level: Option<String>;
+    /// Where the work directory is inside WSL, for a configuration that
+    /// builds and runs there; `None` for one on the host itself.
+    public wsl: Option<WslMapping>;
+    /// The stdlib its compiler is given in place of the run's: a Linux
+    /// compiler inside WSL cannot read a Windows path.
+    public stdlib: Option<String>;
 
     /// `compiler` building at optimisation `level` (`0`, `2`).  `label`
     /// names the compiler in reports (`tree`, `reference 1`) and `prefix`
@@ -46,8 +53,43 @@ public type struct Configuration {
             key:      key,
             compiler: String::from_str(compiler),
             level:    Option::Some(String::from_str(level)),
+            wsl:      Option::None,
+            stdlib:   Option::None,
         };
     }
+
+    /// The Linux compiler `compiler`, a path inside WSL, building at
+    /// optimisation `level` inside WSL, the work directory reached there
+    /// through `mapping`, given `stdlib` (a path inside WSL) when named:
+    /// `linux -O0`, keyed `linux-O0`.
+    public static linux(compiler: Str, stdlib: Option<Str>, level: Str, mapping: &WslMapping) -> Configuration {
+        mut configuration: Configuration = Configuration::compiled(Str::new("linux"), Str::new("linux"), compiler, level);
+        configuration.wsl = Option::Some(mapping.clone());
+        match (stdlib) {
+            Option::Some(path) => { configuration.stdlib = Option::Some(String::from_str(path)); }
+            Option::None       => { }
+        }
+        return configuration;
+    }
+
+    /// What `outcome`, a build or run of this configuration's, means: as
+    /// it is, except that inside WSL, where each child runs under
+    /// `timeout`, its exit 124 is the hang it reports.
+    public outcome_of(&this, outcome: &Outcome) -> Outcome {
+        if (this.wsl.is_some()) {
+            match (outcome.exit_code()) {
+                Option::Some(code) => {
+                    if (code == Configuration::TIMEOUT_EXIT) { return Outcome::TimedOut; }
+                }
+                Option::None => { }
+            }
+        }
+        return outcome.clone();
+    }
+
+    /// The exit of `timeout` when the command it ran was stopped for
+    /// running past the limit.
+    public const TIMEOUT_EXIT: i32 = 124;
 
     /// The configurations of a differential run: the compiler under test
     /// `tree` at `-O0` and `-O2`, each of `references` at both (named
@@ -76,6 +118,8 @@ public type struct Configuration {
             key:      String::from_str(Str::new("interpreted")),
             compiler: String::from_str(compiler),
             level:    Option::None,
+            wsl:      Option::None,
+            stdlib:   Option::None,
         };
     }
 }
@@ -84,7 +128,10 @@ public type struct Configuration {
 /// the same ones.
 implement trait Clone for Configuration {
     clone(&this) -> Configuration {
-        return Configuration { name: this.name.clone(), key: this.key.clone(), compiler: this.compiler.clone(), level: this.level.clone() };
+        return Configuration {
+            name: this.name.clone(), key: this.key.clone(), compiler: this.compiler.clone(), level: this.level.clone(),
+            wsl: this.wsl.clone(), stdlib: this.stdlib.clone(),
+        };
     }
 }
 
