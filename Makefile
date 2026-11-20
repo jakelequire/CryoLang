@@ -361,9 +361,12 @@ Side effects beyond the named output
                   worktree (CRYOGATE_HEAVY_LOCK names another), while their
                   recipe runs (their prerequisites build before it is
                   taken): one waits, polling each minute,
-                  while another checkout's heavy run holds it, and refuses a
-                  lock older than three hours.  An interrupted run leaves
-                  the file behind; delete it once nobody holds it.
+                  while another checkout's heavy run holds it.  The file
+                  names its holder's process id; an interrupted run leaves
+                  it behind, and the next run that finds that process gone
+                  takes it over.  A lock naming no process (one taken by
+                  hand) older than three hours is refused; delete it once
+                  nobody holds it.
 endef
 
 help:
