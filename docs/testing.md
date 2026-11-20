@@ -234,7 +234,8 @@ cryo test [PATTERN] [FLAGS]
 
 | Flag | Effect |
 | --- | --- |
-| `--list` | List matching tests without running them |
+| `--suite=unit\|compile-fail\|projects` | Run one suite alone; without it all three run, in that order |
+| `--list` | List matching unit tests without running them (refused beside `--suite=compile-fail` or `--suite=projects`) |
 | `--ignored` | Run only the `![ignore]`-marked tests |
 | `--exact` | Treat `PATTERN` as an exact name, not a substring |
 | `-q`, `--quiet` | Terse output |
@@ -371,7 +372,7 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 
 | `test.json` field | Meaning |
 | --- | --- |
-| `"outcome"` | `"collect"` (default) / `"build"` / `"compile_fail"` / `"run"` |
+| `"outcome"` | `"collect"` (default) / `"build"` / `"compile_fail"` / `"run"` / `"interpret"` |
 | `"ignore"` | `true` skips the project (reported as ignored) |
 | `"expect"` | per-outcome assertions (below) |
 
@@ -427,6 +428,17 @@ row, printed whatever the count.
 
   ```json
   { "outcome": "run", "expect": { "exit_code": 0, "stdout_contains": "ready" } }
+  ```
+
+- **`interpret`** - run the file `arguments` names with `cryo interpret`
+  (tools/CryoSmith/INTERPRETER.md); the assertions judge the interpreter's
+  exit and its streams, as `run`'s judge the program's.  The interpreter's
+  own tests are these: what a program prints when interpreted, and the
+  line and exit code of each ending it reports (a violation, a construct
+  not covered, a panic).
+
+  ```json
+  { "outcome": "interpret", "arguments": ["main.cryo"], "expect": { "exit_code": 70 } }
   ```
 
 A project whose report carries a machine-applicable suggestion proves the
@@ -562,7 +574,8 @@ the comparison reads:
   must pass it, its objects are left out of the comparison, and at least one
   of them must have moved; a declared project whose objects are all
   unchanged fails, and so does any object that moved in a project nothing
-  declares.
+  declares.  `moved:examples/<name>` says the same of an example both
+  compilers build, judged in the examples' comparison.
 - `moved-archive:<module>` in `tests/started-passing` - a standard-library
   module, written by its full name (`moved-archive:std::time::clock`), whose
   objects in the stdlib archives the change moves on purpose: a compiler
@@ -574,6 +587,15 @@ the comparison reads:
   SOURCE never needs it: verify builds this tree's stdlib with both
   compilers, so a source edit moves nothing there by construction - prove one
   by building the library before and after at one path.
+- `moved-instances:<module>` in `tests/started-passing` - a standard-library
+  module, by its full name, whose object in the unit suite's own build the
+  change moves on purpose.  That object holds the generic instances of the
+  module the unit tests use and no archive holds, so a compiler change to how
+  generic code compiles moves it whether or not it moves the module's archive
+  objects.  The unit suite's object of the module is left out of the tests'
+  comparison and must have moved; a declared module the unit suite built no
+  object of, or whose object is unchanged, fails.  A project's object of the
+  same module is the project's, declared with `moved:<project>`.
 - `moved-runtime:<configuration>/<member>` in `tests/started-passing` - a
   member of the runtime archive of one configuration (`freestanding`,
   `hosted-abort` or `hosted-unwind`), written by the configuration and the

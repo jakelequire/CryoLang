@@ -1,0 +1,120 @@
+///! An audit of the model's holders: every `unwrap` is of a `const` local
+///! declared with an option or a result built holding a value, so none
+///! panics; every `?` stands in a function other than `main` that returns
+///! an option or a result, applies to one, and yields the owned value it
+///! holds; and every clone is of a shared owner.  The move audit holds the
+///! variables an unwrap or a `?` moves out of to the rules of every move.
+
+namespace cryosmith::selftest::holders;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+
+import cryosmith::configuration::{ GenerationOptions };
+import cryosmith::generate::{ Generator };
+import cryosmith::model::{ ExpressionKind, Function, Program, StatementKind, ValueType, Variable };
+import cryosmith::selftest::runner::{ SelfTest };
+import cryosmith::selftest::uses::{ UseKind, UseWalk };
+
+/// How many programs the holder audit reads.
+const HOLDER_AUDITED_PROGRAMS: u64 = 200;
+
+/// What the holder audit counted over the programs it read.
+internal type struct HolderCounts {
+    /// `unwrap` calls.
+    internal unwraps: i64;
+    /// `?` operators.
+    internal propagations: i64;
+    /// Clones of shared owners.
+    internal shares: i64;
+    /// Boxes built.
+    internal boxes: i64;
+}
+
+/// The audit of one program's holders.
+internal type struct HolderAudit {
+    /// Add one program's holders to `counts`, each within the rules; or
+    /// the first that breaks one.
+    internal static check(program: &Program, counts: mut &HolderCounts) -> Result<i64, String> {
+        mut present: Array<i64> = Array::<i64>::new();
+        for (statement in program.statements.iter()) {
+            match (statement.kind) {
+                StatementKind::Declare(variable, value) => {
+                    const declared: Variable = program.variable_at(variable);
+                    const built_holding: boolean = match (program.expression_at(value).kind) {
+                        ExpressionKind::Hold(_, _) => { true }
+                        _                          => { false }
+                    };
+                    if (built_holding && declared.value_type.may_be_absent() && !declared.mutable) { present.push(variable); }
+                }
+                _ => { }
+            }
+        }
+        for (node in program.expressions.iter()) {
+            match (node.kind) {
+                ExpressionKind::Unwrap(variable) => {
+                    if (!present.contains(&variable)) { return Result::Err(f"variable {variable} is unwrapped but was not declared `const` built holding a value"); }
+                    counts.unwraps = counts.unwraps + 1;
+                }
+                ExpressionKind::Propagate(operand) => {
+                    const operand_type: ValueType = program.expression_at(operand).value_type;
+                    if (!operand_type.may_be_absent()) { return Result::Err(String::from_str(Str::new("a `?` applies to a value that is not an option or a result"))); }
+                    if (!node.value_type.same(ValueType::Owned(operand_type.held()))) { return Result::Err(String::from_str(Str::new("a `?` yields a value other than the one its operand holds"))); }
+                    counts.propagations = counts.propagations + 1;
+                }
+                ExpressionKind::Share(variable) => {
+                    match (program.variable_at(variable).value_type) {
+                        ValueType::Counted(_) => { }
+                        _ => { return Result::Err(f"variable {variable} is cloned but holds no shared owner"); }
+                    }
+                    counts.shares = counts.shares + 1;
+                }
+                ExpressionKind::Hold(_, _) => {
+                    match (node.value_type) {
+                        ValueType::Boxed(_) => { counts.boxes = counts.boxes + 1; }
+                        _ => { }
+                    }
+                }
+                _ => { }
+            }
+        }
+        mut index: i64 = 0;
+        while (index < program.functions.length()) {
+            const defined: Function = program.function_at(index);
+            for (used in UseWalk::of(program, defined).iter()) {
+                match (used.kind) {
+                    UseKind::Propagated => {
+                        if (defined.is_main || !defined.returns.may_be_absent()) {
+                            return Result::Err(f"function {index} uses `?` but returns no option or result");
+                        }
+                    }
+                    _ => { }
+                }
+            }
+            index = index + 1;
+        }
+        return Result::Ok(0);
+    }
+}
+
+implement struct SelfTest {
+    /// Every holder keeps the rules, and the audit finds unwraps, `?`s,
+    /// clones and boxes to check.
+    internal holder_audit(mut &this) -> void {
+        mut counts: HolderCounts = HolderCounts { unwraps: 0, propagations: 0, shares: 0, boxes: 0 };
+        mut seed: u64 = 1;
+        while (seed <= HOLDER_AUDITED_PROGRAMS) {
+            match (HolderAudit::check(this.default_model(seed), &counts)) {
+                Result::Ok(_)       => { }
+                Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }
+            }
+            seed = seed + 1;
+        }
+        this.expect(counts.unwraps > 0, String::from_str(Str::new("the holder audit found no unwrap")));
+        this.expect(counts.propagations > 0, String::from_str(Str::new("the holder audit found no `?`")));
+        this.expect(counts.shares > 0, String::from_str(Str::new("the holder audit found no clone of a shared owner")));
+        this.expect(counts.boxes > 0, String::from_str(Str::new("the holder audit found no box")));
+    }
+}

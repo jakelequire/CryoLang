@@ -1,0 +1,287 @@
+///! `cryogate smith-diff --cryo <compiler> [--reference <compiler>]...
+///! [--interpret] [--linux <compiler inside WSL> [--linux-stdlib
+///! <directory inside WSL>]] --work <directory> [--smith <cryosmith>]
+///! [--stdlib <directory>] [--first-seed N] [--count K] [--jobs N]
+///! [--build-limit S] [--run-limit S] [-- <generation options>...]`:
+///! CryoSmith's programs checked differentially.
+///!
+///! Each program is built and run under every configuration: the compiler
+///! under test at `-O0` and `-O2`, each `--reference` compiler (the pin, a
+///! baseline's compiler) at both levels, with `--interpret` the compiler
+///! under test's `cryo interpret`, and with `--linux`, from a Windows host,
+///! a Linux compiler at both levels inside WSL, building and running there
+///! from the same work directory.  A build or an interpretation
+///! is killed past `--build-limit` seconds (default 300), a program's run
+///! past `--run-limit` (default 60); every program terminates within its
+///! cost budget, so either is a finding, not a slow child.  Each
+///! configuration's observation and the program's verdict are
+///! `smith/difference.cryo`'s.
+///!
+///! The report is one line per program in seed order, the same bytes for
+///! any job count, a failing program's followed by its signature on a
+///! line of its own (`      signature <signature>`, which the fuzz farm
+///! reads); then each finding class with its count, and each distinct
+///! signature with its count and first seed; then the verdict line.  A failing program's source and executables stay in the work
+///! directory; a passing program's executables are removed.  Exit 0 when
+///! every program passed, 1 on a finding, 2 on a usage error.
+///!
+///! A seed listed in `tests/smith-known-bugs` (`smith/known.cryo`) whose
+///! configurations print the lines its entry records is reported `known`,
+///! with the bug's number, counted on a line of its own, and is neither a
+///! pass nor a finding.  A listed seed printing anything else fails, even
+///! when every configuration agrees.
+
+namespace cryogate::gates::smith_diff;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::path::{ Path, PathBuf };
+import std::time::duration::{ Duration };
+
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
+import cryogate::smith::corpus::{ CorpusLayout };
+import cryogate::smith::difference::{ Configuration, FindingClass, Observation, SmithDecision, SmithFinding, SmithVerdict };
+import cryogate::smith::known::{ KnownBugMatch, KnownBugs };
+import cryogate::smith::run::programs::{ Attempt, SmithRun };
+
+/// `cryogate smith-diff`.
+public type struct SmithDiff {
+    /// Run `cryogate smith-diff` with `arguments` from index `first`; 0
+    /// when every program passed, 1 on a finding, 2 on a usage error.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate smith-diff --cryo <compiler> [--reference <compiler>]... [--interpret] [--linux <compiler inside WSL> [--linux-stdlib <directory inside WSL>]] --work <directory> [--smith <cryosmith>] [--stdlib <directory>] [--first-seed N] [--count K] [--jobs N] [--build-limit S] [--run-limit S] [-- <generation options>...]"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--reference"));
+        options.flag(Str::new("--interpret"));
+        options.valued(Str::new("--linux"));
+        options.valued(Str::new("--linux-stdlib"));
+        options.valued(Str::new("--work"));
+        options.valued(Str::new("--smith"));
+        options.valued(Str::new("--stdlib"));
+        options.valued(Str::new("--first-seed"));
+        options.valued(Str::new("--count"));
+        options.valued(Str::new("--jobs"));
+        options.valued(Str::new("--build-limit"));
+        options.valued(Str::new("--run-limit"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-diff: {reason.as_str()}"); return 2; }
+        };
+        const compiler: Option<Str> = parsed.value(Str::new("--cryo"));
+        const work: Option<Str> = parsed.value(Str::new("--work"));
+        if (compiler.is_none() || work.is_none() || !parsed.positionals().is_empty()) {
+            fmt::eprintln(f"cryogate smith-diff: usage: {options.usage()}");
+            return 2;
+        }
+        const first_seed: u64 = match (parsed.number(Str::new("--first-seed"), 1, 0)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-diff: {reason.as_str()}"); return 2; }
+        };
+        const count: u64 = match (parsed.number(Str::new("--count"), 200, 1)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-diff: {reason.as_str()}"); return 2; }
+        };
+        // 0, the default, leaves the scheduler's own count.
+        const jobs: u64 = match (parsed.number(Str::new("--jobs"), 0, 1)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-diff: {reason.as_str()}"); return 2; }
+        };
+        const build_limit: u64 = match (parsed.number(Str::new("--build-limit"), 300, 1)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-diff: {reason.as_str()}"); return 2; }
+        };
+        const run_limit: u64 = match (parsed.number(Str::new("--run-limit"), 60, 1)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-diff: {reason.as_str()}"); return 2; }
+        };
+        mut references: Array<String> = Array::<String>::new();
+        for (reference in parsed.values_of(Str::new("--reference")).iterate_references()) { references.push(Host::absolute(reference.as_str())); }
+        const linux: Option<Str> = parsed.value(Str::new("--linux"));
+        if (linux.is_none() && parsed.value(Str::new("--linux-stdlib")).is_some()) {
+            fmt::eprintln(f"cryogate smith-diff: --linux-stdlib names the stdlib of a --linux compiler, and none is named");
+            return 2;
+        }
+        if (linux.is_some() && Host::os() != Str::new("windows")) {
+            fmt::eprintln(f"cryogate smith-diff: --linux builds inside WSL from a Windows host; this host is {Host::os()}");
+            return 2;
+        }
+        mut configurations: Array<Configuration> = Configuration::of_compilers(Host::absolute(compiler.unwrap()).as_str(), &references, parsed.has(Str::new("--interpret")));
+        const default_smith: PathBuf = repository.join(Str::new("tools/CryoSmith/build"));
+        const smith: String = match (parsed.value(Str::new("--smith"))) {
+            Option::Some(path) => { Host::absolute(path) }
+            Option::None       => { Host::executable_name(default_smith.as_path().join(Str::new("cryosmith")).as_path().as_str()) }
+        };
+        const work_path: PathBuf = PathBuf::from(Host::absolute(work.unwrap()).as_str());
+        match (Directory::create_all(work_path.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { fmt::eprintln(f"cryogate smith-diff: cannot create {work_path.as_path().as_str()}: {error.describe()}"); return 1; }
+        }
+        match (linux) {
+            Option::Some(linux_compiler) => {
+                match (SmithRun::linux_configurations(linux_compiler, parsed.value(Str::new("--linux-stdlib")), work_path.as_path(), logs)) {
+                    Result::Ok(arm)     => { for (configuration in arm.iterate_references()) { configurations.push(configuration.clone()); } }
+                    Result::Err(reason) => { fmt::println(f"smith-diff: FAIL ({reason.as_str()})"); return 1; }
+                }
+            }
+            Option::None => { }
+        }
+        const printed: String = SmithRun::generator_version(smith.as_str(), logs, Str::new("smith-diff-version"));
+        const known: KnownBugs = match (KnownBugs::read(repository, printed.as_str())) {
+            Result::Ok(known)   => { known }
+            Result::Err(reason) => { fmt::println(f"smith-diff: FAIL ({reason.as_str()})"); return 1; }
+        };
+        const programs: SmithRun = SmithRun {
+            configurations: configurations,
+            layout:         CorpusLayout::new(work_path.as_path()),
+            work:           work_path,
+            stdlib:         match (parsed.value(Str::new("--stdlib"))) {
+                Option::Some(stdlib) => { Option::Some(String::from_str(stdlib)) }
+                Option::None         => { Option::None }
+            },
+            build_limit:    Option::Some(Duration::from_seconds(build_limit)),
+            run_limit:      Option::Some(Duration::from_seconds(run_limit)),
+            jobs:           jobs as i64,
+            log_prefix:     String::from_str(Str::new("smith-diff")),
+        };
+        match (programs.write_programs(smith.as_str(), first_seed, count, parsed.rest(), logs)) {
+            Result::Ok(_)       => { }
+            Result::Err(reason) => { fmt::println(f"smith-diff: FAIL ({reason.as_str()})"); return 1; }
+        }
+        const attempts: Array<Array<Attempt>> = programs.attempts(first_seed, count, logs);
+        mut findings: Array<SmithFinding> = Array::<SmithFinding>::new();
+        mut finding_seeds: Array<u64> = Array::<u64>::new();
+        mut uncovered: u64 = 0;
+        // Each seed that met a known compiler bug, with the bug, and how
+        // many listed seeds passed instead.
+        mut met: Array<String> = Array::<String>::new();
+        mut stale: u64 = 0;
+        mut offset: u64 = 0;
+        while (offset < count) {
+            const seed: u64 = first_seed.wrapping_add(offset);
+            const each: &Array<Attempt> = &attempts[offset as i64];
+            const observations: Array<Observation> = SmithRun::observations(each);
+            mut not_covered: String = String::new();
+            for (observation in observations.iterate_references()) {
+                match (observation) {
+                    Observation::NotCovered(construct) => { not_covered = construct.clone(); }
+                    _                                  => { }
+                }
+            }
+            const listed: KnownBugMatch = known.of(seed, parsed.rest(), &programs.configurations, &observations);
+            match (&listed) {
+                KnownBugMatch::Reproduces(bug) => {
+                    fmt::println(f"known seed {seed}: known compiler bug {bug.as_str()}");
+                    met.push(f"{seed} ({bug.as_str()})");
+                    offset = offset + 1;
+                    continue;
+                }
+                _ => { }
+            }
+            // A listed seed that did not print its entry's lines is judged
+            // as any other, and fails even when every configuration agrees.
+            const listed_bug: String = match (&listed) {
+                KnownBugMatch::Missed(bug) => { bug.clone() }
+                _                          => { String::new() }
+            };
+            const missed: String = if (listed_bug.is_empty()) { String::new() } else { f" (listed as known compiler bug {listed_bug.as_str()}, whose lines it did not print)" };
+            match (SmithDecision::decide(&programs.configurations, &observations)) {
+                SmithVerdict::Agreed(line) => {
+                    if (!missed.is_empty()) {
+                        fmt::println(f"FAIL  seed {seed}: passes, and is listed in tests/smith-known-bugs{missed.as_str()}: take its entry off, or record what it prints now");
+                        fmt::println(f"      signature listed compiler bug {listed_bug.as_str()} passes");
+                        stale = stale + 1;
+                        offset = offset + 1;
+                        continue;
+                    }
+                    match (programs.remove_executables(seed)) {
+                        Result::Ok(_) => {
+                            if (not_covered.is_empty()) {
+                                fmt::println(f"ok    seed {seed} {line.as_str()}");
+                            } else {
+                                fmt::println(f"ok    seed {seed} {line.as_str()} (interpreter: not covered: {not_covered.as_str()})");
+                                uncovered = uncovered + 1;
+                            }
+                        }
+                        Result::Err(reason) => {
+                            fmt::println(f"FAIL  seed {seed}: {reason.as_str()}");
+                            return 1;
+                        }
+                    }
+                }
+                SmithVerdict::Found(finding) => {
+                    fmt::println(f"FAIL  seed {seed}: {finding.detail.as_str()}{missed.as_str()}");
+                    fmt::println(f"      signature {finding.signature.as_str()}");
+                    findings.push(finding);
+                    finding_seeds.push(seed);
+                }
+            }
+            offset = offset + 1;
+        }
+        if (!met.is_empty()) {
+            fmt::println(f"smith-diff: {met.length()} known compiler bugs, neither passing nor failing: seeds {Text::joined(&met, Str::new(", ")).as_str()}");
+        }
+        if (stale > 0 && findings.is_empty()) {
+            fmt::println(f"smith-diff: FAIL ({stale} of {count} programs: listed known compiler bugs that pass)");
+            return 1;
+        }
+        if (findings.is_empty()) {
+            const agreeing: i64 = programs.configurations.length();
+            if (uncovered > 0) {
+                fmt::println(f"smith-diff: OK ({count} programs, {agreeing} configurations agree; {uncovered} not covered by the interpreter)");
+            } else {
+                fmt::println(f"smith-diff: OK ({count} programs, {agreeing} configurations agree)");
+            }
+            return 0;
+        }
+        SmithDiff::summarise(&findings, &finding_seeds, count);
+        return 1;
+    }
+
+    /// Print each finding class's count, each distinct signature's count
+    /// and first seed, then the verdict line.
+    private static summarise(findings: &Array<SmithFinding>, seeds: &Array<u64>, count: u64) -> void {
+        mut classes: Array<String> = Array::<String>::new();
+        mut rank: i64 = FindingClass::CompileCrash.rank();
+        while (rank <= FindingClass::Uncompared.rank()) {
+            mut name: String = String::new();
+            mut found: i64 = 0;
+            for (finding in findings.iterate_references()) {
+                if (finding.kind.rank() == rank) {
+                    name = String::from_str(finding.kind.name());
+                    found++;
+                }
+            }
+            if (found > 0) {
+                fmt::println(f"class {name.as_str()}: {found}");
+                classes.push(f"{found} {name.as_str()}");
+            }
+            rank++;
+        }
+        mut signatures: Array<String> = Array::<String>::new();
+        for (finding in findings.iterate_references()) {
+            if (!signatures.contains(&finding.signature)) { signatures.push(finding.signature.clone()); }
+        }
+        for (signature in signatures.iterate_references()) {
+            mut found: i64 = 0;
+            mut first: u64 = 0;
+            mut index: i64 = 0;
+            while (index < findings.length()) {
+                if (findings[index].signature.as_str() == signature.as_str()) {
+                    if (found == 0) { first = seeds[index]; }
+                    found++;
+                }
+                index++;
+            }
+            fmt::println(f"signature {signature.as_str()}: {found} programs, first seed {first}");
+        }
+        fmt::println(f"smith-diff: FAIL ({findings.length()} of {count} programs: {Text::joined(&classes, Str::new(", ")).as_str()}; {signatures.length()} signatures)");
+    }
+}

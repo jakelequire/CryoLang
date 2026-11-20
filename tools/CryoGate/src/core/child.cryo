@@ -13,6 +13,7 @@ import std::collections::array::{ Array };
 import std::collections::pair::{ Pair };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::core::clone::{ Clone };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::env;
@@ -78,6 +79,19 @@ implement enum Outcome {
     }
 }
 
+/// An outcome copied whole: one read again under another meaning (a
+/// configuration's) is still the child's.
+implement trait Clone for Outcome {
+    clone(&this) -> Outcome {
+        return match (&this) {
+            Outcome::Exited(code)          => { Outcome::Exited(code) }
+            Outcome::Signalled(signal)     => { Outcome::Signalled(signal) }
+            Outcome::TimedOut              => { Outcome::TimedOut }
+            Outcome::CouldNotStart(reason) => { Outcome::CouldNotStart(reason.clone()) }
+        };
+    }
+}
+
 /// A finished job.
 public type struct Completion {
     public outcome: Outcome;
@@ -105,9 +119,12 @@ public type struct Running {
     started: Instant;
     limit: Option<Duration>;
     log: String;
+    /// Whether the child roots a process tree, killed whole at the limit.
+    tree: boolean;
 
     /// The job's completion once it has finished, `None` while it runs.  A
-    /// job past its limit is killed here and completes as `TimedOut`.
+    /// job past its limit is killed here, with every process it started
+    /// when it roots a tree, and completes as `TimedOut`.
     public poll(mut &this) -> Option<Completion> {
         match (this.child.try_wait()) {
             Result::Ok(Option::Some(status)) => { return Option::Some(this.complete(Outcome::from_status(&status))); }
@@ -119,7 +136,7 @@ public type struct Running {
                 if (this.started.elapsed() >= limit) {
                     // The verdict is `TimedOut` whatever the kill and the
                     // reap report.
-                    const _: Result<(), IoError> = this.child.kill();
+                    const _: Result<(), IoError> = if (this.tree) { this.child.kill_tree() } else { this.child.kill() };
                     const _: Result<ExitStatus, IoError> = this.child.wait();
                     return Option::Some(this.complete(Outcome::TimedOut));
                 }
@@ -161,6 +178,7 @@ public type struct Job {
     log: String;
     errors: String;
     limit: Option<Duration>;
+    tree: boolean;
 
     /// A job running `program`, writing to the console.  A program named by
     /// a path is resolved against the current directory now, so a job run
@@ -176,6 +194,7 @@ public type struct Job {
             log:       String::new(),
             errors:    String::new(),
             limit:     Option::None,
+            tree:      false,
         };
     }
 
@@ -219,6 +238,11 @@ public type struct Job {
     /// Kill the job and report it `TimedOut` once it has run this long.
     public limit(mut &this, limit: Duration) -> void { this.limit = Option::Some(limit); }
 
+    /// Start the job as the root of a process tree every process it starts
+    /// joins, so a job past its limit is killed with all of them: a child
+    /// that runs children of its own (a cryogate gate) leaves none behind.
+    public root_tree(mut &this) -> void { this.tree = true; }
+
     /// The program and its arguments as one line, for a report.
     public command_line(&this) -> String {
         mut line: String = this.program.clone();
@@ -244,6 +268,7 @@ public type struct Job {
         }
         this.build_environment(&command);
         command.stdin(Stdio::Null);
+        if (this.tree) { command.group_descendants(); }
         if (!this.log.is_empty()) {
             match (File::create(Path::from(this.log.as_str()))) {
                 Result::Ok(file) => {
@@ -269,7 +294,7 @@ public type struct Job {
         }
         return match (command.spawn()) {
             Result::Ok(child) => {
-                Result::Ok(Running { child: child, started: started, limit: this.limit, log: this.log.clone() })
+                Result::Ok(Running { child: child, started: started, limit: this.limit, log: this.log.clone(), tree: this.tree })
             }
             Result::Err(error) => {
                 Result::Err(this.never_ran(started, String::from_str(error.describe())))

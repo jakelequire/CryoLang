@@ -605,8 +605,8 @@ type struct AbiClassifier {
     ///     that fully fills the bucket-relevant bytes => SSE class.
     ///     Slot type is `double` (for f64) or `float` (for f32).
     ///   - Mixed / integer / multiple-float bucket => INTEGER class.
-    ///     Slot type is the smallest power-of-two integer that holds
-    ///     `bucket_size` bytes (`eightbyte_integer_type`).
+    ///     Slot type is the integer exactly `bucket_size` bytes wide
+    ///     (`eightbyte_integer_type`).
     ///
     /// Multi-float SSE: when the bucket has more than one float-class
     /// field and every such field is F32, promote to `<2 x float>` so
@@ -1166,17 +1166,17 @@ type struct AbiClassifier {
     // so anyone with a `SignaturePlan*` / `ParamPlan*` / size in hand can
     // call them without routing through an instance.
 
-    /// Pick the LLVM integer type for an INTEGER-class eightbyte of the
-    /// given byte length.  Matches what clang emits for small struct
-    /// returns/params (e.g. `{i32, i32}` of size 8 lowers to `i64`, a
-    /// 5-byte struct to `i40` rounded - we use the smallest power-of-two
-    /// container >= size_bytes to stay register-shaped: i8 / i16 / i32 / i64).
+    /// The LLVM integer type for an INTEGER-class eightbyte of the given
+    /// byte length: exactly that many bytes wide (`i24` for 3 bytes, `i48`
+    /// for 6), as clang lowers the same C struct, so a C caller or callee
+    /// agrees with it.  The width must equal the bytes it carries: every
+    /// spill between the aggregate and its register stores one type and
+    /// loads the other through the same slot, so a wider integer would
+    /// write past the aggregate's storage in the callee and read past it
+    /// at the call site.  LLVM widens the odd width to the register.
     static eightbyte_integer_type(size_bytes: u64) -> LType {
         if (size_bytes == 0) { return LType::null(); }
-        if (size_bytes <= 1) { return LType::i8();  }
-        if (size_bytes <= 2) { return LType::i16(); }
-        if (size_bytes <= 4) { return LType::i32(); }
-        return LType::i64();
+        return LType::int_type((size_bytes * 8) as u32);
     }
 
     /// LLVM slot index at which source parameter `param_idx` begins.

@@ -1,0 +1,138 @@
+///! An audit of the `match` arms that assign their subject: each matches on
+///! a `mut` local, opens its body by assigning that local a variant other
+///! than the arm's own, and observes every binding of its pattern after
+///! that - so a binding that named the subject's storage rather than a copy
+///! taken on entering the arm would fold the new value into the hash, and
+///! the two optimisation levels or the evaluator could disagree.
+
+namespace cryosmith::selftest::subject_assignments;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+
+import cryosmith::configuration::{ FeatureSet, GenerationOptions };
+import cryosmith::generate::{ Generator };
+import cryosmith::model::{ ExpressionKind, MatchArm, Program, StatementKind, Variable, VariableRole };
+import cryosmith::selftest::bindings::{ BindingAudit };
+import cryosmith::selftest::runner::{ SelfTest };
+
+/// How many programs the audit reads with the feature on, and with it off.
+const SUBJECT_AUDITED_PROGRAMS: u64 = 200;
+
+/// How many arms assign their subject, and how many of those bind a
+/// payload value.
+internal type struct SubjectAssignmentCount {
+    /// The arms assigning their subject.
+    internal arms: i64;
+    /// Those of them whose pattern binds a value.
+    internal binding_arms: i64;
+}
+
+/// The audit of one program's arms that assign their subject.
+internal type struct SubjectAssignmentAudit {
+    /// The arms assigning their subject, each within the rules; or the
+    /// first that is not within them.
+    internal static check(program: &Program) -> Result<SubjectAssignmentCount, String> {
+        mut counted: SubjectAssignmentCount = SubjectAssignmentCount { arms: 0, binding_arms: 0 };
+        mut index: i64 = 0;
+        while (index < program.statements.length()) {
+            match (program.statement_at(index).kind) {
+                StatementKind::Match(subject, first, count) => {
+                    mut arm: i64 = first;
+                    while (arm < first + count) {
+                        const taken: MatchArm = program.arm_at(arm);
+                        if (taken.subject_assignment >= 0) {
+                            match (SubjectAssignmentAudit::arm(program, subject, taken)) {
+                                Result::Ok(bindings) => {
+                                    counted.arms = counted.arms + 1;
+                                    if (bindings > 0) { counted.binding_arms = counted.binding_arms + 1; }
+                                }
+                                Result::Err(reason) => { return Result::Err(reason); }
+                            }
+                        }
+                        arm = arm + 1;
+                    }
+                }
+                _ => { }
+            }
+            index = index + 1;
+        }
+        return Result::Ok(counted);
+    }
+
+    /// Whether `taken`, an arm of a `match` on `subject` that assigns its
+    /// subject, keeps the rules: how many bindings it observes after the
+    /// assignment, or the rule it breaks.
+    private static arm(program: &Program, subject: i64, taken: MatchArm) -> Result<i64, String> {
+        const local: i64 = match (program.expression_at(subject).kind) {
+            ExpressionKind::Variable(variable) => { variable }
+            _ => { -1 }
+        };
+        if (local < 0) { return Result::Err(String::from_str(Str::new("an arm assigns a subject that is no variable"))); }
+        const declared: Variable = program.variable_at(local);
+        const is_local: boolean = match (declared.role) {
+            VariableRole::Local => { true }
+            _                   => { false }
+        };
+        if (!is_local || !declared.mutable) { return Result::Err(f"an arm assigns variable {local}, which is no `mut` local"); }
+        if (taken.pattern < 0) { return Result::Err(String::from_str(Str::new("a `_` arm assigns its subject"))); }
+        if (taken.body != taken.subject_assignment) { return Result::Err(String::from_str(Str::new("an arm's assignment of its subject does not open its body"))); }
+        match (program.statement_at(taken.subject_assignment).kind) {
+            StatementKind::Assign(place, value) => {
+                const target: i64 = match (program.expression_at(place).kind) {
+                    ExpressionKind::Variable(variable) => { variable }
+                    _ => { -1 }
+                };
+                if (target != local) { return Result::Err(f"an arm on variable {local} assigns another place"); }
+                const variant: i64 = match (program.expression_at(value).kind) {
+                    ExpressionKind::Variant(number, _, _, _) => { number }
+                    _ => { -1 }
+                };
+                if (variant < 0 || variant == taken.pattern) {
+                    return Result::Err(f"an arm matching V{taken.pattern} assigns its subject V{variant}, not another variant");
+                }
+            }
+            _ => { return Result::Err(String::from_str(Str::new("an arm's subject assignment is no assignment"))); }
+        }
+        mut bindings: Array<i64> = Array::<i64>::new();
+        BindingAudit::bound(program, taken.first_element, taken.element_count, &bindings);
+        for (binding in bindings.iter()) {
+            if (!BindingAudit::observed(program, taken.body, binding)) {
+                return Result::Err(f"an arm assigning its subject does not observe its binding {binding}");
+            }
+        }
+        return Result::Ok(bindings.length());
+    }
+}
+
+implement struct SelfTest {
+    /// With `subject-assignments` on, every arm assigning its subject keeps
+    /// the rules, and some of them bind a payload value, so the copy rule is
+    /// exercised; with it off, no arm assigns its subject.
+    internal subject_assignment_audit(mut &this) -> void {
+        mut checked: i64 = 0;
+        mut binding_arms: i64 = 0;
+        mut leaked: i64 = 0;
+        mut seed: u64 = 1;
+        while (seed <= SUBJECT_AUDITED_PROGRAMS) {
+            match (SubjectAssignmentAudit::check(this.default_model(seed))) {
+                Result::Ok(counted) => {
+                    checked = checked + counted.arms;
+                    binding_arms = binding_arms + counted.binding_arms;
+                }
+                Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }
+            }
+            mut off_options: GenerationOptions = GenerationOptions::new(seed);
+            off_options.features = FeatureSet::parse(Str::new("default,no-subject-assignments")).unwrap();
+            match (SubjectAssignmentAudit::check(&Generator::generate(off_options))) {
+                Result::Ok(counted) => { leaked = leaked + counted.arms; }
+                Result::Err(_)      => { leaked = leaked + 1; }
+            }
+            seed = seed + 1;
+        }
+        this.expect(checked > 0 && binding_arms > 0, f"`subject-assignments` on: {checked} arms assign their subject, {binding_arms} of them binding a payload value");
+        this.expect(leaked == 0, f"`subject-assignments` off: {leaked} arms still assign their subject");
+    }
+}

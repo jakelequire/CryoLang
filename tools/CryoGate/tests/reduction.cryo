@@ -1,0 +1,206 @@
+///! smith-reduce's handling of what CryoSmith takes out of a program: a
+///! header's `omit` list read back, a candidate taking more out, the classes
+///! a reduction tries in turn, and the drafted bug file saying what was
+///! taken.
+![config(testing)]
+namespace cryogate::tests::reduction;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect };
+
+import cryogate::core::text::{ Text };
+import cryogate::smith::reduction::{ BugDraft, Halving, ProgramHeader, TextDeletion };
+
+/// A reduced program's first line and a body.
+private function omitting_header() -> Str {
+    return Str::new("// cryosmith 39 seed 22 features booleans,structs functions 3 size 8 omit s3,e10,f2\nfunction main() -> i32 { return 0; }\n");
+}
+
+/// `paths`, as strings.
+private function paths(listed: Array<Str>) -> Array<String> {
+    mut owned: Array<String> = Array::<String>::new();
+    for (path in listed.iter()) { owned.push(String::from_str(path)); }
+    return owned;
+}
+
+![test]
+function a_header_reads_its_omit_list_in_order() -> Result<(), TestError> {
+    const header: ProgramHeader = ProgramHeader::parse(omitting_header()).unwrap();
+    expect(header.seed == 22 && header.functions == 3 && header.size == 8 && header.features.length() == 2, Str::new("the options before the list"))?;
+    expect(Text::joined(&header.omissions, Str::new(" ")).as_str() == Str::new("s3 e10 f2"), Text::joined(&header.omissions, Str::new(" ")).as_str())?;
+    expect(header.omission_list().as_str() == Str::new("s3\ne10\nf2\n"), header.omission_list().as_str())?;
+    const options: String = Text::joined(&header.options(), Str::new(" "));
+    return expect(options.as_str() == Str::new("--features booleans,structs --functions 3 --size 8"), options.as_str());
+}
+
+![test]
+function a_header_with_other_trailing_words_is_refused() -> Result<(), TestError> {
+    expect(ProgramHeader::parse(Str::new("// cryosmith 39 seed 22 features booleans functions 3 size 8 drop s3\n")).is_err(), Str::new("a word other than omit"))?;
+    return expect(ProgramHeader::parse(Str::new("// cryosmith 39 seed 22 features booleans functions 3 size 8 omit\n")).is_err(), Str::new("omit with no list"));
+}
+
+![test]
+function a_header_as_generated_takes_nothing_out() -> Result<(), TestError> {
+    const header: ProgramHeader = ProgramHeader::parse(Str::new("// cryosmith 39 seed 22 features booleans functions 3 size 8\n")).unwrap();
+    return expect(header.omissions.is_empty() && header.omission_list().is_empty(), Str::new("no omissions"));
+}
+
+![test]
+function omitting_takes_more_out_after_what_is_taken() -> Result<(), TestError> {
+    const header: ProgramHeader = ProgramHeader::parse(omitting_header()).unwrap();
+    const more: ProgramHeader = header.omitting(&paths([Str::new("e5"), Str::new("k1")]));
+    expect(Text::joined(&more.omissions, Str::new(" ")).as_str() == Str::new("s3 e10 f2 e5 k1"), Text::joined(&more.omissions, Str::new(" ")).as_str())?;
+    return expect(more.seed == 22 && more.functions == 3 && more.size == 8 && more.features.length() == 2, Str::new("the options kept"));
+}
+
+![test]
+function a_change_of_options_takes_nothing_out() -> Result<(), TestError> {
+    const header: ProgramHeader = ProgramHeader::parse(omitting_header()).unwrap();
+    for (candidate in header.fewer_functions().iterate_references()) {
+        expect(candidate.omissions.is_empty(), Str::new("fewer functions keep no omission"))?;
+    }
+    for (candidate in header.smaller_sizes().iterate_references()) {
+        expect(candidate.omissions.is_empty(), Str::new("a smaller size keeps no omission"))?;
+    }
+    return expect(header.without(Str::new("structs")).unwrap().omissions.is_empty(), Str::new("a feature off keeps no omission"));
+}
+
+![test]
+function candidates_split_into_statements_expressions_and_items_in_order() -> Result<(), TestError> {
+    const listed: Array<String> = paths([Str::new("f1"), Str::new("s2"), Str::new("e3"), Str::new("s4"), Str::new("i0r1"), Str::new("e5"), Str::new("k2")]);
+    const classes: Array<Array<String>> = ProgramHeader::omission_classes(&listed);
+    expect(classes.length() == 3, Str::new("three classes"))?;
+    expect(Text::joined(&classes[0], Str::new(" ")).as_str() == Str::new("s2 s4"), Text::joined(&classes[0], Str::new(" ")).as_str())?;
+    expect(Text::joined(&classes[1], Str::new(" ")).as_str() == Str::new("e3 e5"), Text::joined(&classes[1], Str::new(" ")).as_str())?;
+    return expect(Text::joined(&classes[2], Str::new(" ")).as_str() == Str::new("f1 i0r1 k2"), Text::joined(&classes[2], Str::new(" ")).as_str());
+}
+
+![test]
+function a_draft_says_how_much_was_taken_out() -> Result<(), TestError> {
+    const before: ProgramHeader = ProgramHeader::parse(Str::new("// cryosmith 39 seed 22 features booleans,structs functions 3 size 8\n")).unwrap();
+    const after: ProgramHeader = ProgramHeader::parse(omitting_header()).unwrap();
+    const draft: BugDraft = BugDraft {
+        kind:         String::from_str(Str::new("mismatch")),
+        signature:    String::from_str(Str::new("mismatch [tree -O0, tree -O2 | reference -O0, reference -O2]")),
+        detail:       String::from_str(Str::new("they disagree")),
+        before:       before,
+        after:        after,
+        lines_before: 300,
+        lines_after:  20,
+        source:       String::from_str(omitting_header()),
+        command:      String::from_str(Str::new("cryogate smith-diff ... --omissions out/smith-22-omissions.txt")),
+        by_text:      false,
+    };
+    const text: String = draft.text();
+    expect(text.as_str().contains(&Str::new("with 3 things taken out")), Str::new("the count taken out"))?;
+    return expect(text.as_str().contains(&Str::new("300 lines to 20")), Str::new("the lines before and after"));
+}
+
+/// A mutated program's first line and a body.
+private function mutated_header() -> Str {
+    return Str::new("// cryosmith 39 seed 7 features booleans functions 1 size 2 mutation 3 drop-argument 30\nfunction main() -> i32 {\n    return f(1, 2);\n}\n");
+}
+
+![test]
+function a_mutated_header_reads_its_mutation_number() -> Result<(), TestError> {
+    const header: ProgramHeader = ProgramHeader::parse(mutated_header()).unwrap();
+    expect(header.mutation.unwrap() == 3 && header.omissions.is_empty(), Str::new("mutation 3, nothing taken out"))?;
+    const options: String = Text::joined(&header.options(), Str::new(" "));
+    expect(options.as_str() == Str::new("--features booleans --functions 1 --size 2 --mutation 3"), options.as_str())?;
+    const both: ProgramHeader = ProgramHeader::parse(Str::new("// cryosmith 39 seed 7 features booleans functions 1 size 2 omit s3 mutation 0 drop-brace 4\n")).unwrap();
+    expect(both.mutation.unwrap() == 0 && both.omissions.length() == 1, Str::new("an omit list before the mutation"))?;
+    expect(ProgramHeader::parse(Str::new("// cryosmith 39 seed 7 features booleans functions 1 size 2 mutation 3 drop-argument\n")).is_err(), Str::new("a mutation missing its site"))?;
+    return expect(ProgramHeader::parse(Str::new("// cryosmith 39 seed 7 features booleans functions 1 size 2 mutation 0 drop-brace 4 omit s3\n")).is_err(), Str::new("an omit list after the mutation"));
+}
+
+/// The groups `halving` hands out, refusing every one, as text.
+private function tried_refusing_all(count: i64) -> String {
+    mut halving: Halving = Halving::of(count);
+    mut tried: Array<String> = Array::<String>::new();
+    while (true) {
+        const group: Array<i64> = match (halving.next()) {
+            Option::Some(group) => { group }
+            Option::None        => { break; }
+        };
+        mut places: Array<String> = Array::<String>::new();
+        for (place in group.iter()) { places.push(f"{place}"); }
+        tried.push(Text::joined(&places, Str::new(",")));
+        halving.refused(&group);
+    }
+    return Text::joined(&tried, Str::new(" "));
+}
+
+![test]
+function halving_tries_all_then_each_half_first_half_first() -> Result<(), TestError> {
+    const tried: String = tried_refusing_all(5);
+    expect(tried.as_str() == Str::new("0,1,2,3,4 0,1 0 1 2,3,4 2 3,4 3 4"), tried.as_str())?;
+    return expect(tried_refusing_all(0).is_empty(), Str::new("nothing to try in an empty set"));
+}
+
+![test]
+function halving_drops_a_group_that_kept_the_failure() -> Result<(), TestError> {
+    mut halving: Halving = Halving::of(4);
+    const all: Array<i64> = halving.next().unwrap();
+    halving.refused(&all);
+    const first: Array<i64> = halving.next().unwrap();
+    expect(first.length() == 2 && first[0] == 0, Str::new("the first half next"))?;
+    const second: Array<i64> = halving.next().unwrap();
+    expect(second.length() == 2 && second[0] == 2, Str::new("the first half kept, so the second half next"))?;
+    return expect(halving.next().is_none(), Str::new("nothing left once the second half kept it too"));
+}
+
+![test]
+function text_deletion_keeps_the_header_line() -> Result<(), TestError> {
+    const lines: TextDeletion = TextDeletion::lines(mutated_header());
+    expect(lines.count() == 3, f"{lines.count()} deletable lines".as_str())?;
+    const every: Array<i64> = [0, 1, 2];
+    const left: String = lines.without(&every);
+    expect(left.as_str() == Str::new("// cryosmith 39 seed 7 features booleans functions 1 size 2 mutation 3 drop-argument 30\n"), left.as_str())?;
+    const tokens: TextDeletion = TextDeletion::tokens(mutated_header());
+    mut all: Array<i64> = Array::<i64>::new();
+    mut index: i64 = 0;
+    while (index < tokens.count()) {
+        all.push(index);
+        index++;
+    }
+    const bare: String = tokens.without(&all);
+    return expect(bare.as_str().starts_with(&Str::new("// cryosmith 39 seed 7 features booleans functions 1 size 2 mutation 3 drop-argument 30\n"))
+        && bare.as_str().trim().length() == Str::new("// cryosmith 39 seed 7 features booleans functions 1 size 2 mutation 3 drop-argument 30").length(), bare.as_str());
+}
+
+![test]
+function text_deletion_takes_tokens_whole_and_remembers_what_is_deleted() -> Result<(), TestError> {
+    mut tokens: TextDeletion = TextDeletion::tokens(mutated_header());
+    // Each byte that is neither a name, a number nor whitespace is a token
+    // alone, so `->` is two: `function`, `main`, `(`, `)`, `-`, `>`, `i32`,
+    // `{`, `return`, `f`, `(`, `1`, `,`, `2`, `)`, `;`, `}`.
+    expect(tokens.count() == 17, f"{tokens.count()} tokens".as_str())?;
+    const comma: Array<i64> = [12];
+    tokens.delete(&comma);
+    const two: Array<i64> = [13];
+    const without: String = tokens.without(&two);
+    expect(without.as_str().contains(&Str::new("return f(1 );")), without.as_str())?;
+    const none: Array<i64> = Array::<i64>::new();
+    const kept: String = tokens.without(&none);
+    return expect(kept.as_str().contains(&Str::new("return f(1 2);")), kept.as_str());
+}
+
+![test]
+function a_block_runs_from_the_line_opening_it_to_the_line_closing_it() -> Result<(), TestError> {
+    const program: Str = Str::new("// cryosmith 39 seed 7 features booleans functions 1 size 2 mutation 3 drop-argument 30 {\nfunction f() -> i32 {\n    if (true) { return 1; }\n    while (true) {\n        return 2;\n    }\n}\nfunction g() -> i32 {\n");
+    const blocks: TextDeletion = TextDeletion::blocks(program);
+    // `f` whole and the `while` inside it; not the header, not the line
+    // whose braces balance, not `g`, never closed.
+    expect(blocks.count() == 2, f"{blocks.count()} blocks".as_str())?;
+    const inner: Array<i64> = [1];
+    const without_loop: String = blocks.without(&inner);
+    expect(without_loop.as_str().contains(&Str::new("    if (true) { return 1; }\n}\nfunction g")), without_loop.as_str())?;
+    const both: Array<i64> = [0, 1];
+    const without_f: String = blocks.without(&both);
+    return expect(without_f.as_str().ends_with(&Str::new("drop-argument 30 {\nfunction g() -> i32 {\n")), without_f.as_str());
+}

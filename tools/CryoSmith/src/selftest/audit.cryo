@@ -1,6 +1,7 @@
 ///! A static audit of a printed program: every `/` and `%` divides by a
-///! `((e & M) | 1)` guard, and every `<<` and `>>` shifts by an amount
-///! masked below the width.
+///! `((e & M) | 1)` guard, a positive literal, or a slice's `(v.length() as
+///! u64)`, no fixed array is empty, so a slice of one never is, and every
+///! `<<` and `>>` shifts by an amount masked below the width.
 ///!
 ///! It reads the printed text, not the model, and spells the guards out
 ///! itself rather than asking `guarantees` for them, so a generator that
@@ -32,16 +33,19 @@ internal type struct Audit {
         for (line in text.lines()) {
             line_number = line_number + 1;
             if (line.trim_start().starts_with(&Str::new("//"))) { continue; }
+            if (line.contains(&Str::new("; 0]"))) { return Result::Err(f"line {line_number}: an empty fixed array"); }
             mut position: i64 = 0;
             while (position < line.length()) {
                 const division: i64 = Audit::operator_at(line, position, Str::new(" /"), Str::new(" %"));
                 const shift: i64 = Audit::operator_at(line, position, Str::new(" <<"), Str::new(" >>"));
-                if (division > 0 || shift > 0) {
+                if (division > 0 && Audit::positive_literal_at(line, position + division)) {
+                    sites = sites + 1;
+                } else if (division > 0 || shift > 0) {
                     const after: i64 = position + division + shift;
                     match (Audit::group(line, after)) {
                         Option::Some(inner) => {
                             const guarded: boolean = if (division > 0) {
-                                inner.starts_with(&Str::new("(")) && inner.ends_with(&Str::new(" | 1"))
+                                (inner.starts_with(&Str::new("(")) && inner.ends_with(&Str::new(" | 1"))) || Audit::is_length(inner)
                             } else {
                                 inner.ends_with(&Str::new(" & 7")) || inner.ends_with(&Str::new(" & 15"))
                                     || inner.ends_with(&Str::new(" & 31")) || inner.ends_with(&Str::new(" & 63"))
@@ -74,6 +78,32 @@ internal type struct Audit {
         return 0;
     }
 
+    /// Whether an integer literal other than zero stands at `position`: a
+    /// run of digits not all `0`, ended by `)`, `]` or the line's end.
+    private static positive_literal_at(line: Str, position: i64) -> boolean {
+        mut index: i64 = position;
+        mut nonzero: boolean = false;
+        while (index < line.length()) {
+            const byte: u8 = line.byte_at(index).unwrap();
+            if (byte < '0' as u8 || byte > '9' as u8) { break; }
+            if (byte != '0' as u8) { nonzero = true; }
+            index = index + 1;
+        }
+        if (index == position || !nonzero) { return false; }
+        if (index == line.length()) { return true; }
+        const ending: u8 = line.byte_at(index).unwrap();
+        return ending == ')' as u8 || ending == ']' as u8;
+    }
+
+    /// Whether `inner` is `v.length() as u64`, a slice's length, `v` a
+    /// name.
+    private static is_length(inner: Str) -> boolean {
+        return match (inner.strip_suffix(&Str::new(".length() as u64"))) {
+            Option::Some(named) => { named.length() > 0 && !named.contains(&Str::new(" ")) && !named.contains(&Str::new("(")) }
+            Option::None        => { false }
+        };
+    }
+
     /// The text inside the parentheses that open at `position`, if they do.
     private static group(line: Str, position: i64) -> Option<Str> {
         if (line.byte_at(position) != Option::Some('(' as u8)) { return Option::None; }
@@ -99,7 +129,7 @@ implement struct SelfTest {
         mut sites: i64 = 0;
         mut seed: u64 = 1;
         while (seed <= AUDITED_PROGRAMS) {
-            const text: String = SelfTest::program(GenerationOptions::new(seed));
+            const text: String = this.default_text(seed);
             match (Audit::check(text.as_str())) {
                 Result::Ok(count)   => { sites = sites + count; }
                 Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }

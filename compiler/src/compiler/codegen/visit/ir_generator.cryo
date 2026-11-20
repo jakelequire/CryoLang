@@ -282,11 +282,12 @@ type struct IRGeneratorVisitor {
         return out;
     }
 
-    /// Release the borrowed temporaries recorded from index `first` on,
-    /// newest first, where the builder stands.  One stored in the block the
-    /// release starts in is live here on every path; one stored elsewhere is
-    /// released under its liveness flag.  Each flag is cleared after its
-    /// release.  Nothing is emitted into a block that has already ended.
+    /// Release the temporaries recorded from index `first` on, newest first,
+    /// where the builder stands.  One stored in the block the release starts
+    /// in is live here on every path; one stored elsewhere is released under
+    /// its liveness flag.  Each flag is cleared after its release; a
+    /// statement's discarded result has none.  Nothing is emitted into a
+    /// block that has already ended.
     release_temporaries_from(mut &this, first: i64) -> void {
         const start: LBasicBlock = this.cg.builder.get_insert_block();
         if (!start.is_valid() || start.has_terminator()) { return; }
@@ -297,7 +298,9 @@ type struct IRGeneratorVisitor {
             const temporary: BorrowedTemporary = this.cg.temporaries.at(i);
             if (temporary.block.raw == start.raw) {
                 this.release_temporary(temporary, temporary.slot, temporary.ty, 0, name);
-                this.cg.builder.build_store(LType::const_int(flag_type, 0, false), temporary.flag);
+                if (temporary.flag.is_valid()) {
+                    this.cg.builder.build_store(LType::const_int(flag_type, 0, false), temporary.flag);
+                }
                 continue;
             }
             const live_bb: LBasicBlock = LBasicBlock::append(owner, "temporary.release");
@@ -543,7 +546,13 @@ type struct IRGeneratorVisitor {
     /// value a block-bodied match arm yields.
     visit_expr_stmt(mut &this, stmt: Stmt*, node: ExprStmt*) -> Emitted {
         if (node.expression == null) { return Emitted::none(); }
-        return Emitted::rvalue(this.dispatch.codegen_rvalue(this,node.expression));
+        const value: LValue = this.dispatch.codegen_rvalue(this, node.expression);
+        if (node.releases_result && value.is_valid()) {
+            const slot: LValue = this.cg.flow.temp_slot(LType { raw: llvm::LLVMTypeOf(value.raw) }, "discarded");
+            this.cg.builder.build_store(value, slot);
+            this.cg.record_discarded_result(node.expression, slot);
+        }
+        return Emitted::rvalue(value);
     }
 
     visit_unsafe_block(mut &this, stmt: Stmt*, node: UnsafeBlockStmt*) -> Emitted {

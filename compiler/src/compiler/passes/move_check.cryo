@@ -319,6 +319,12 @@ type struct MoveChecker {
     /// loop-carried rather than tracked.
     loop_repeat: boolean;
 
+    /// While `loop_repeat` holds, where the bindings the repeated
+    /// expressions declare begin in `captured_decl_keys`.  Such a binding -
+    /// a `?`'s residual, a `match` arm's payload inside the condition - is
+    /// made afresh at every test, so moving it is not carried to the next.
+    repeat_declarations_start: i64;
+
     /// The receiver of the function being walked when that function is a
     /// `Drop` implementation's `drop`, invalid otherwise.  Its fields are
     /// released by field glue when the destructor returns, so moving one out
@@ -398,6 +404,7 @@ type struct MoveChecker {
             assigned_members:     [],
             branch_depth:       0,
             loop_repeat:        false,
+            repeat_declarations_start: 0,
             unsafe_depth:        0,
             arg_binding_unknown: false,
             drop_receiver:       SymbolID::invalid(),
@@ -450,6 +457,7 @@ type struct MoveChecker {
         this.assigned_members     = [];
         this.branch_depth       = 0;
         this.loop_repeat        = false;
+        this.repeat_declarations_start = 0;
         this.unsafe_depth       = 0;
         this.arg_binding_unknown = false;
         this.drop_receiver       = SymbolID::invalid();
@@ -1296,7 +1304,7 @@ type struct MoveChecker {
             }
             DeclKind::Union(ud) => {
                 this.push_owner_copy_params(&ud.where_bounds);
-                this.walk_methods(ud.methods);
+                this.walk_methods(ud.methods, ud.is_generic());
             }
             DeclKind::Struct(sd) => {
                 // The closure of a lambda written in a generic body is a
@@ -1305,7 +1313,7 @@ type struct MoveChecker {
                 // its type parameters say what is `Copy`.
                 if (stmt.generated && sd.generic_params.length() > 0) { return; }
                 this.push_owner_copy_params(&sd.where_bounds);
-                this.walk_methods(sd.methods);
+                this.walk_methods(sd.methods, sd.is_generic());
             }
             DeclKind::Impl(ib) => {
                 this.push_owner_copy_params(&ib.where_bounds);
@@ -1314,7 +1322,7 @@ type struct MoveChecker {
                     const declared: [TraitBound]* = target.declared_where_bounds();
                     if (declared != null) { this.push_owner_copy_params(declared); }
                 }
-                this.walk_methods(ib.methods);
+                this.walk_methods(ib.methods, ib.is_template() || target != null);
             }
             DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
             | DeclKind::Field(_) | DeclKind::GenericParam(_) | DeclKind::Import(_)
@@ -1323,13 +1331,22 @@ type struct MoveChecker {
         }
     }
 
-    walk_methods(mut &this, methods: &[DeclarationNode*]) -> void {
+    /// Walk the bodies of `methods`.  The methods of a template (`template`)
+    /// are its own bodies, written over its parameters: a type they name may
+    /// be an instantiation nothing demands, made only inside the template, so
+    /// what the walk's questions build is built without demanding it, as
+    /// sema's walk of the same bodies builds it.  Nothing monomorphizes it,
+    /// and GenericValidation does not count it unresolved.
+    walk_methods(mut &this, methods: &[DeclarationNode*], template: boolean) -> void {
+        const was: boolean = this.arena.symbolic_no_demand_active;
+        if (template) { this.arena.set_symbolic_no_demand(true); }
         for (mut i: i64 = 0; i < methods.length(); i++) {
             const m_decl: DeclarationNode* = methods[i];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { continue; }
             this.walk_function(m.func);
         }
+        this.arena.set_symbolic_no_demand(was);
     }
 
     walk_function(mut &this, func_decl: DeclarationNode*) -> void {
@@ -1655,13 +1672,30 @@ type struct MoveChecker {
 
     /// Walk what the back edge evaluates: a `for`'s update, then the
     /// condition.  Either may be null.  Every value or field moved there is
-    /// refused as loop-carried (`handle_ident`, `check_field_move_out`).
+    /// refused as loop-carried (`handle_ident`, `check_field_move_out`),
+    /// unless the binding moved is one they declare themselves
+    /// (`repeats_move_of`).  Their declarations stay recorded until the
+    /// loop's walk ends, so the discovery walk does not stage them as
+    /// carried either.
     walk_back_edge(mut &this, update: Stmt*, condition: ExpressionNode*) -> void {
         const prev: boolean = this.loop_repeat;
+        const prev_start: i64 = this.repeat_declarations_start;
+        const prev_capture: boolean = this.capture_decls;
         this.loop_repeat = true;
+        this.repeat_declarations_start = this.captured_decl_keys.length();
+        this.capture_decls = true;
         this.walk_stmt(update);
         this.walk_condition(condition);
         this.loop_repeat = prev;
+        this.repeat_declarations_start = prev_start;
+        this.capture_decls = prev_capture;
+    }
+
+    /// Whether moving the binding `key` here is a move the loop makes again
+    /// at every back edge: the walk is in its repeated expressions and the
+    /// binding was declared before them.
+    repeats_move_of(&this, key: u64) -> boolean {
+        return this.loop_repeat && !this.is_body_local(key, this.repeat_declarations_start);
     }
 
     walk_var_decl(mut &this, d: DeclarationNode*) -> void {
@@ -2796,7 +2830,8 @@ type struct MoveChecker {
         // binding, non-droppable non-Copy field - keeps the hard E0453.
         // A loop's condition or update moves the field again on every
         // iteration: the same double free as a carried whole value.
-        if (this.loop_repeat && this.type_needs_drop(field_ty) && this.partial_move_shape(ma)) {
+        if (this.type_needs_drop(field_ty) && this.partial_move_shape(ma)
+            && this.repeats_move_of(ExpressionNode::identifier_of(ma.object).res.local_sym().key())) {
             if (!this.suppress_emit) {
                 const owner: string = this.intern.resolve(ExpressionNode::identifier_of(ma.object).name);
                 this.emit_loop_carried_text(
@@ -3205,7 +3240,7 @@ type struct MoveChecker {
         // A move in a loop's condition or update is made again at every back
         // edge.  Refused even when the body gave the value a new one: the
         // value the last test moved is still the one the scope releases.
-        if (this.loop_repeat && in_move_context && real) {
+        if (in_move_context && real && this.repeats_move_of(sym.key())) {
             if (!this.suppress_emit) { this.emit_loop_carried(name, e.span); }
             return;
         }

@@ -7,31 +7,338 @@
 ///! is assigned whole; a field is written only through a `mut` local or a
 ///! `mut &this`; a parameter, a `const` local, a counter and a `&this` are
 ///! read and never written.
+///!
+///! An owned value moved out of a variable leaves the variable holding
+///! nothing: it is out of every query from then on, so nothing reads it
+///! after the move, nor is it observed when its scope ends.  A variable is
+///! moved only inside the loop it was declared in: one declared outside an
+///! enclosing loop would be moved again on the next trip.
+///!
+///! A borrow lends its variable until the statement making it ends, since
+///! no reference outlives one: a variable lent exclusively is used nowhere
+///! else in that statement, one lent at all is not moved or lent
+///! exclusively there.
+///!
+///! A dynamic array carries the fewest elements it holds wherever
+///! generation stands, which every index into it stays below: its
+///! declaration's count, one more after each push, one fewer after each
+///! pop.  A block that ends leaves each array with the fewer of what it
+///! held entering and what it holds at the block's end, since the block may
+///! not have run; and an array is popped only inside the loop it was
+///! declared in, since the pop would otherwise run again on the next trip.
 
 namespace cryosmith::typing::environment;
 
 import std::collections::array::{ Array };
+import std::core::option::{ Option };
 
 import cryosmith::model::{ Program, ValueType, Variable, VariableRole };
 
 /// The names in scope, and the numbering of the names still to come.
 public type struct Environment {
     private names: Array<i64>;
+    /// Where the innermost closure's body starts in `names`: the names
+    /// before it are the enclosing function's, out of the body's scope.
+    private floor: i64;
     private locals: i64;
     private counters: i64;
+    private bindings: i64;
+    private closure_parameters: i64;
+    /// The variables whose owned values were moved out.
+    private moved: Array<i64>;
+    /// Where each enclosing loop's body starts in `names`, innermost last.
+    private loop_floors: Array<i64>;
+    /// The variables kept to be borrowed, which are never moved.
+    private kept: Array<i64>;
+    /// The variables the statement being generated lends shared.
+    private shared_loans: Array<i64>;
+    /// The variables the statement being generated lends exclusively.
+    private exclusive_loans: Array<i64>;
+    /// The `const` locals holding an option or a result that certainly
+    /// holds a value: each was declared with one built holding it.
+    private present: Array<i64>;
+    /// The dynamic array locals declared in the function, in declaration
+    /// order.
+    private sized: Array<i64>;
+    /// Beside each of `sized`, the fewest elements it holds wherever
+    /// generation stands.
+    private fewest: Array<i64>;
 
     /// An environment holding nothing; `enter_function` starts one.
     public static new() -> Environment {
-        return Environment { names: Array::<i64>::new(), locals: 0, counters: 0 };
+        return Environment {
+            names: Array::<i64>::new(), floor: 0, locals: 0, counters: 0, bindings: 0, closure_parameters: 0,
+            moved: Array::<i64>::new(), loop_floors: Array::<i64>::new(), kept: Array::<i64>::new(),
+            shared_loans: Array::<i64>::new(), exclusive_loans: Array::<i64>::new(), present: Array::<i64>::new(),
+            sized: Array::<i64>::new(), fewest: Array::<i64>::new(),
+        };
     }
 
-    /// Start a function: only `observed` in scope, and every numbering
-    /// from zero.
+    /// Start a function: only `observed` in scope, nothing moved or lent,
+    /// no dynamic array declared, and every numbering from zero.
     public enter_function(mut &this) -> void {
         this.names.clear();
         this.names.push(Program::observed());
+        this.moved.clear();
+        this.loop_floors.clear();
+        this.kept.clear();
+        this.present.clear();
+        this.sized.clear();
+        this.fewest.clear();
+        this.begin_statement();
+        this.floor = 0;
         this.locals = 0;
         this.counters = 0;
+        this.bindings = 0;
+        this.closure_parameters = 0;
+    }
+
+    /// Enter a closure's body: nothing in scope, not even `observed`, until
+    /// its captures are bound and its parameters declared; the numbering
+    /// goes on, so a name stays unique in its function.  The floor to give
+    /// `leave_closure`.
+    public enter_closure(mut &this) -> i64 {
+        const outer: i64 = this.floor;
+        this.floor = this.names.length();
+        return outer;
+    }
+
+    /// Whether generation stands in a closure's body, where a `?` would
+    /// return from the closure rather than the function.
+    public in_closure(&this) -> boolean { return this.floor > 0; }
+
+    /// Record that the `const` local `variable` holds an option or a
+    /// result certainly holding a value.
+    public mark_present(mut &this, variable: i64) -> void { this.present.push(variable); }
+
+    /// The variables holding a value of `wanted`, an option or a result,
+    /// that certainly holds a value and may be moved here.
+    public present_movable(&this, program: &Program, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.movable(program, wanted).iter()) {
+            if (this.present.contains(&variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// The parameters and locals in scope holding a shared owner of
+    /// `wanted`'s type that may be borrowed to clone it here: any not lent
+    /// exclusively.
+    public shareable(&this, program: &Program, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.in_scope().iter()) {
+            const declared: Variable = program.variable_at(variable);
+            const named: boolean = match (declared.role) {
+                VariableRole::Parameter => { true }
+                VariableRole::Local     => { true }
+                _                       => { false }
+            };
+            if (named && declared.value_type.same(wanted) && !this.exclusive_loans.contains(&variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// The `mut` locals in scope holding a box, whose value's fields may
+    /// be written through it here: any not lent by the statement.
+    public writable_boxes(&this, program: &Program) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.in_scope().iter()) {
+            const declared: Variable = program.variable_at(variable);
+            const boxed: boolean = match (declared.value_type) {
+                ValueType::Boxed(_) => { true }
+                _                   => { false }
+            };
+            if (boxed && Environment::fields_writable(declared) && !this.is_lent(variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// Leave a closure's body, back to the scope `enter_closure` left.
+    public leave_closure(mut &this, outer: i64) -> void {
+        this.names.truncate(this.floor);
+        this.floor = outer;
+    }
+
+    /// Declare the next closure parameter, `q<N>`, and bring it into scope.
+    public declare_closure_parameter(mut &this, program: mut &Program, value_type: ValueType) -> i64 {
+        const variable: i64 = program.variable(Variable { role: VariableRole::ClosureParameter, number: this.closure_parameters, value_type: value_type, mutable: false });
+        this.closure_parameters = this.closure_parameters + 1;
+        this.names.push(variable);
+        return variable;
+    }
+
+    /// Whether `variable` is in scope.
+    public holds(&this, variable: i64) -> boolean { return this.in_scope().contains(&variable); }
+
+    /// The names in scope: those since the innermost closure's floor that
+    /// still hold a value.
+    public in_scope(&this) -> Array<i64> { return this.holding_since(this.floor); }
+
+    /// The names from `start` in `names` on that were not moved out of.
+    private holding_since(&this, start: i64) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        mut index: i64 = start;
+        while (index < this.names.length()) {
+            const variable: i64 = this.names.get(index).unwrap();
+            if (!this.moved.contains(&variable)) { found.push(variable); }
+            index = index + 1;
+        }
+        return found;
+    }
+
+    /// Record that `variable`'s value was moved out: it holds nothing from
+    /// here on.
+    public move_out(mut &this, variable: i64) -> void { this.moved.push(variable); }
+
+    /// Whether `variable`'s value was moved out.
+    public is_moved(&this, variable: i64) -> boolean { return this.moved.contains(&variable); }
+
+    /// Enter a loop's body: what it declares from here on may be moved in
+    /// it.
+    public enter_loop(mut &this) -> void { this.loop_floors.push(this.names.length()); }
+
+    /// Leave the innermost loop's body.
+    public leave_loop(mut &this) -> void { this.loop_floors.truncate(this.loop_floors.length() - 1); }
+
+    /// Where the names a statement may move or shrink start in `names`:
+    /// the innermost loop's body, or the innermost closure's floor where
+    /// no loop is nearer.
+    private loop_start(&this) -> i64 {
+        if (this.loop_floors.length() > 0 && this.loop_floors.get(this.loop_floors.length() - 1).unwrap() > this.floor) {
+            return this.loop_floors.get(this.loop_floors.length() - 1).unwrap();
+        }
+        return this.floor;
+    }
+
+    /// Record that the dynamic array local `variable` was declared holding
+    /// `length` elements.
+    public size(mut &this, variable: i64, length: i64) -> void {
+        this.sized.push(variable);
+        this.fewest.push(length);
+    }
+
+    /// The fewest elements the dynamic array `variable` holds here; 0 for a
+    /// variable no declaration sized.
+    public fewest_elements(&this, variable: i64) -> i64 {
+        return match (this.sized.index_of(&variable)) {
+            Option::Some(place) => { this.fewest.get(place).unwrap() }
+            Option::None        => { 0 }
+        };
+    }
+
+    /// Record that the statement made here leaves the dynamic array
+    /// `variable` holding at least `length` elements.
+    public set_fewest(mut &this, variable: i64, length: i64) -> void {
+        this.fewest.set(this.sized.index_of(&variable).unwrap(), length);
+    }
+
+    /// Whether a statement here runs at most once each time `variable` is
+    /// declared: it was declared inside the innermost loop or outside every
+    /// loop.  Only such a statement may leave a dynamic array fewer
+    /// elements, or one run again on the loop's next trip would find fewer
+    /// than its first run left.
+    public once_per_declaration(&this, variable: i64) -> boolean {
+        return this.holding_since(this.loop_start()).contains(&variable);
+    }
+
+    /// The fewest elements of every dynamic array declared so far, to give
+    /// `keep_fewest` where a block ends.
+    public known_lengths(&this) -> Array<i64> { return this.fewest.clone(); }
+
+    /// Leave a block entered where the arrays had the fewest elements
+    /// `entered`: the block may not have run, or may have left early, so
+    /// each array still in scope holds the fewer of what it held then and
+    /// what it holds where the block ends, and those the block declared are
+    /// gone.
+    public keep_fewest(mut &this, entered: &Array<i64>) -> void {
+        this.sized.truncate(entered.length());
+        this.fewest.truncate(entered.length());
+        mut place: i64 = 0;
+        while (place < entered.length()) {
+            const before: i64 = entered.get(place).unwrap();
+            if (before < this.fewest.get(place).unwrap()) { this.fewest.set(place, before); }
+            place = place + 1;
+        }
+    }
+
+    /// Keep `variable` to be borrowed: it is never moved, so it holds its
+    /// value until its scope ends.
+    public keep(mut &this, variable: i64) -> void { this.kept.push(variable); }
+
+    /// Start a statement: the borrows of the one before it have ended.
+    public begin_statement(mut &this) -> void {
+        this.shared_loans.clear();
+        this.exclusive_loans.clear();
+    }
+
+    /// Record that the statement being generated lends `variable`, shared
+    /// or `exclusive`.
+    public lend(mut &this, variable: i64, exclusive: boolean) -> void {
+        if (exclusive) { this.exclusive_loans.push(variable); } else { this.shared_loans.push(variable); }
+    }
+
+    /// Whether the statement being generated lends `variable`
+    /// exclusively.
+    public is_lent_exclusively(&this, variable: i64) -> boolean { return this.exclusive_loans.contains(&variable); }
+
+    /// Whether the statement being generated lends `variable` at all.
+    public is_lent(&this, variable: i64) -> boolean {
+        return this.shared_loans.contains(&variable) || this.exclusive_loans.contains(&variable);
+    }
+
+    /// The parameters and locals in scope a reference to a value of owned
+    /// struct `referent` may borrow here: one holding such a value and not
+    /// lent exclusively for a shared reference, a `mut` local holding one
+    /// and not lent at all for an exclusive one.
+    public borrowable(&this, program: &Program, referent: i64, exclusive: boolean) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.in_scope().iter()) {
+            const declared: Variable = program.variable_at(variable);
+            const holds: boolean = match (declared.role) {
+                VariableRole::Local     => { !exclusive || declared.mutable }
+                VariableRole::Parameter => { !exclusive }
+                _                       => { false }
+            };
+            if (!holds || !declared.value_type.same(ValueType::Owned(referent))) { continue; }
+            if (exclusive && this.is_lent(variable)) { continue; }
+            if (this.exclusive_loans.contains(&variable)) { continue; }
+            found.push(variable);
+        }
+        return found;
+    }
+
+    /// The reference parameters in scope that may be passed on where a
+    /// reference to owned struct `referent` is wanted: an exclusive one
+    /// wherever it is not lent, and for a shared reference, a shared one
+    /// not lent exclusively.  Passing an exclusive reference on lends it
+    /// exclusively, whichever reference is wanted.
+    public passable(&this, program: &Program, referent: i64, exclusive: boolean) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.in_scope().iter()) {
+            const value_type: ValueType = program.variable_at(variable).value_type;
+            if (value_type.referent() != referent) { continue; }
+            if (value_type.is_exclusive() && !this.is_lent(variable)) { found.push(variable); }
+            if (!value_type.is_exclusive() && !exclusive && !this.exclusive_loans.contains(&variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// The parameters and locals in scope holding a value of `wanted` that
+    /// may be moved here: declared inside the innermost enclosing loop, or
+    /// anywhere outside every loop, and not lent by the statement being
+    /// generated.
+    public movable(&this, program: &Program, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.holding_since(this.loop_start()).iter()) {
+            const declared: Variable = program.variable_at(variable);
+            const named: boolean = match (declared.role) {
+                VariableRole::Parameter => { true }
+                VariableRole::Local     => { true }
+                _                       => { false }
+            };
+            if (named && declared.value_type.same(wanted) && !this.is_lent(variable) && !this.kept.contains(&variable)) { found.push(variable); }
+        }
+        return found;
     }
 
     /// Bring `variable` into scope.
@@ -59,17 +366,24 @@ public type struct Environment {
         return variable;
     }
 
-    /// The locals declared since `mark`, in declaration order.
+    /// Declare the next `match` binding, `b<N>`, and bring it into scope;
+    /// it leaves with its arm's scope.
+    public declare_binding(mut &this, program: mut &Program, value_type: ValueType) -> i64 {
+        const variable: i64 = program.variable(Variable { role: VariableRole::Binding, number: this.bindings, value_type: value_type, mutable: false });
+        this.bindings = this.bindings + 1;
+        this.names.push(variable);
+        return variable;
+    }
+
+    /// The locals declared since `mark` that still hold a value, in
+    /// declaration order.
     public locals_since(&this, program: &Program, mark: i64) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        mut index: i64 = mark;
-        while (index < this.names.length()) {
-            const variable: i64 = this.names.get(index).unwrap();
+        for (variable in this.holding_since(mark).iter()) {
             match (program.variable_at(variable).role) {
                 VariableRole::Local => { found.push(variable); }
                 _                   => { }
             }
-            index = index + 1;
         }
         return found;
     }
@@ -77,7 +391,7 @@ public type struct Environment {
     /// The variables in scope of type `wanted`.
     public variables_of(&this, program: &Program, wanted: ValueType) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        for (variable in this.names.iter()) {
+        for (variable in this.in_scope().iter()) {
             if (program.variable_at(variable).value_type.same(wanted)) { found.push(variable); }
         }
         return Environment::observed_last(found);
@@ -86,7 +400,7 @@ public type struct Environment {
     /// The integer variables in scope of a type other than `excluded`.
     public integers_except(&this, program: &Program, excluded: ValueType) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        for (variable in this.names.iter()) {
+        for (variable in this.in_scope().iter()) {
             const value_type: ValueType = program.variable_at(variable).value_type;
             if (value_type.is_integer() && !value_type.same(excluded)) { found.push(variable); }
         }
@@ -97,7 +411,7 @@ public type struct Environment {
     /// type `wanted`.
     public field_roots(&this, program: &Program, wanted: ValueType) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        for (variable in this.names.iter()) {
+        for (variable in this.in_scope().iter()) {
             if (program.reaches(program.variable_at(variable).value_type, wanted)) { found.push(variable); }
         }
         return found;
@@ -108,7 +422,7 @@ public type struct Environment {
     /// `writable`, only those whose fields may be written.
     public receiver_roots(&this, program: &Program, owner: ValueType, writable: boolean) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        for (variable in this.names.iter()) {
+        for (variable in this.in_scope().iter()) {
             const declared: Variable = program.variable_at(variable);
             if (writable && !Environment::fields_writable(declared)) { continue; }
             if (declared.value_type.same(owner) || program.reaches(declared.value_type, owner)) { found.push(variable); }
@@ -119,7 +433,7 @@ public type struct Environment {
     /// The `mut` locals in scope, which may be assigned whole.
     public assignable(&this, program: &Program) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        for (variable in this.names.iter()) {
+        for (variable in this.in_scope().iter()) {
             const declared: Variable = program.variable_at(variable);
             match (declared.role) {
                 VariableRole::Local => { if (declared.mutable) { found.push(variable); } }
@@ -133,7 +447,7 @@ public type struct Environment {
     /// a `mut &this`.
     public writable_records(&this, program: &Program) -> Array<i64> {
         mut found: Array<i64> = Array::<i64>::new();
-        for (variable in this.names.iter()) {
+        for (variable in this.in_scope().iter()) {
             const declared: Variable = program.variable_at(variable);
             if (declared.value_type.is_record() && Environment::fields_writable(declared)) { found.push(variable); }
         }

@@ -1,0 +1,654 @@
+///! `cryogate smith-farm --cryo <compiler> [--reference <compiler>]...
+///! [--interpret] [--linux <compiler inside WSL> [--linux-stdlib <directory
+///! inside WSL>]] --work <directory> --findings <directory> --seeds A..B
+///! [--hours H] [--mutations J] [--jobs N] [--smith <cryosmith>] [--stdlib
+///! <directory>] [--build-limit S] [--run-limit S] [--reduce-limit S] [--
+///! <generation options>...]`: smith-diff and smith-crash run over a range
+///! of seeds in batches, overnight, each finding deduplicated by its
+///! signature and each new one reduced once.
+///!
+///! The seeds A to B are taken in batches of four times the most jobs
+///! (`--jobs`, default a quarter of the CPUs); each batch is one `cryogate
+///! smith-diff` run over its seeds and, with `--mutations J`, one
+///! `cryogate smith-crash` run over a batch of its own, each a child of
+///! this cryogate.  The farm reads each child's report (`smith/farm.cryo`).
+///! The farm never takes the heavy-run lock, so it never holds up a heavy
+///! run: before each batch, while someone holds the lock, it waits a
+///! minute and looks again.
+///!
+///! Before each batch the host's commit (`SystemMemory`) decides the job
+///! count against `<findings>/farm-host`, the host's memory settings
+///! (`ceiling`, `hard-limit`, `per-job` and `cap`, each a size in MiB or
+///! GiB): as many jobs as the room under the ceiling holds and the cap on
+///! the farm's own memory allows, at most `--jobs`; with room for none the
+///! farm waits a minute and asks again, and at the hard limit it stops.
+///! The farm also makes way for the person at the machine: before each
+///! batch, while a full-screen application is in front (Windows) or a
+///! process matching a `pause-while <pattern>` line of the host file runs
+///! (`pgrep -f`; inside WSL on Windows, asked only while WSL runs), it
+///! waits a minute and looks again.
+///! With `--hours H` no batch starts once H hours have passed.  A batch is
+///! never cut short.  The overnight window is a farm started at 01:00 with
+///! `--hours 6`.
+///!
+///! `<findings>/farm.log` gets a line per judgement as each batch ends; a
+///! farm started again over the same findings directory skips what it
+///! holds.  A finding whose signature `tests/smith-known-bugs` lists is
+///! counted as that bug.  Any other finding smith-reduce can shrink is
+///! reduced once, by `cryogate smith-reduce` (`--text` for a crash
+///! finding) after the batch, one trial at a time, under `--reduce-limit`
+///! seconds (default 3600), into
+///! `<findings>/<the signature's digest>/`: the reduced program, the drafted
+///! bug file, `finding` (the signature and the seed and options that showed
+///! it) and `reduction` (how the reduction ended, written last).  A folder
+///! holding `reduction` is never reduced again; one without it, left by a
+///! farm stopped during the reduction, is reduced when the farm starts
+///! again.  Findings are drafted, never filed or
+///! committed: a person reads the drafts and files the bugs.
+///! `<findings>/farm-report.md` is written again as each batch or
+///! reduction starts, after each batch and at each wait; it opens with
+///! what the farm is doing now (running, paused or stopped, and why), the
+///! findings so far and when it was written.
+///!
+///! The batch's work directory under `--work` is removed once its report
+///! is read.  Exit 0 when the run met no finding the known list does not
+///! name, 1 on a new finding or when the farm stopped short (memory, a
+///! child it could not read), 2 on a usage error.
+
+namespace cryogate::gates::smith_farm;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env;
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::process::memory::{ SystemMemory };
+import std::time::clock::{ Instant, SystemTime };
+import std::time::datetime::{ DateTime };
+import std::time::duration::{ Duration };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::lock::{ HeavyLock, Holder };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::schedule::{ Scheduler };
+import cryogate::core::text::{ Text };
+import cryogate::core::wsl::{ Wsl };
+import cryogate::smith::farm::{ BatchReport, FarmEntry, FarmFinding, FarmHost, FarmKind, FarmLog, FarmReport, MemoryBudget, MemoryVerdict };
+import cryogate::smith::known::{ KnownBugs };
+import cryogate::smith::run::programs::{ SmithRun };
+
+/// How long the farm waits before looking again at what held off a batch:
+/// the memory, a heavy run, or what the farm makes way for.
+const WAIT_SECONDS: u64 = 60;
+
+/// `cryogate smith-farm`'s settings and what its run has done so far.
+public type struct SmithFarm {
+    /// This cryogate, which runs the children.
+    cryogate: String;
+    /// The arguments every smith-diff child and every diff reduction gets
+    /// for its configurations: the compiler under test, the references,
+    /// the interpreter and the Linux arm, as the farm was given them.
+    configuration_arguments: Array<String>;
+    /// The compiler under test.
+    compiler: String;
+    /// The arguments every child gets, whatever its kind: the CryoSmith
+    /// and the stdlib, when named.
+    shared_arguments: Array<String>;
+    /// The generation options.
+    generation: Array<String>;
+    mutations: u64;
+    build_limit: u64;
+    run_limit: u64;
+    reduce_limit: u64;
+    work: PathBuf;
+    findings: PathBuf;
+    /// `<findings>/farm-host`.
+    host: FarmHost;
+    known: KnownBugs;
+    log: FarmLog;
+    first_entry_this_run: i64;
+    batches: Array<String>;
+    waits: Array<String>;
+    refused: u64;
+    accepted: u64;
+    /// What the farm is doing, as the report's first lines say it.
+    state: String;
+    /// What the report heads with.
+    setting: Array<String>;
+
+    /// Run `cryogate smith-farm` with `arguments` from index `first`; 0
+    /// when nothing new was found, 1 on a new finding or a stop short, 2
+    /// on a usage error.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate smith-farm --cryo <compiler> [--reference <compiler>]... [--interpret] [--linux <compiler inside WSL> [--linux-stdlib <directory inside WSL>]] --work <directory> --findings <directory> --seeds A..B [--hours H] [--mutations J] [--jobs N] [--smith <cryosmith>] [--stdlib <directory>] [--build-limit S] [--run-limit S] [--reduce-limit S] [-- <generation options>...]"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--reference"));
+        options.flag(Str::new("--interpret"));
+        options.valued(Str::new("--linux"));
+        options.valued(Str::new("--linux-stdlib"));
+        options.valued(Str::new("--work"));
+        options.valued(Str::new("--findings"));
+        options.valued(Str::new("--seeds"));
+        options.valued(Str::new("--hours"));
+        options.valued(Str::new("--mutations"));
+        options.valued(Str::new("--jobs"));
+        options.valued(Str::new("--smith"));
+        options.valued(Str::new("--stdlib"));
+        options.valued(Str::new("--build-limit"));
+        options.valued(Str::new("--run-limit"));
+        options.valued(Str::new("--reduce-limit"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-farm: {reason.as_str()}"); return 2; }
+        };
+        const compiler: Option<Str> = parsed.value(Str::new("--cryo"));
+        const work: Option<Str> = parsed.value(Str::new("--work"));
+        const findings: Option<Str> = parsed.value(Str::new("--findings"));
+        const seeds: Option<Str> = parsed.value(Str::new("--seeds"));
+        if (compiler.is_none() || work.is_none() || findings.is_none() || seeds.is_none() || !parsed.positionals().is_empty()) {
+            fmt::eprintln(f"cryogate smith-farm: usage: {options.usage()}");
+            return 2;
+        }
+        const range: Pair<u64, u64> = match (SmithFarm::seed_range(seeds.unwrap())) {
+            Option::Some(range) => { range }
+            Option::None        => { fmt::eprintln(f"cryogate smith-farm: --seeds takes A..B, the first and last seed, A at most B"); return 2; }
+        };
+        mut numbers: Array<u64> = Array::<u64>::new();
+        const named: [Str; 6] = [Str::new("--hours"), Str::new("--mutations"), Str::new("--jobs"), Str::new("--build-limit"), Str::new("--run-limit"), Str::new("--reduce-limit")];
+        const quarter: i64 = Scheduler::new().slots() / 4;
+        const defaults: [u64; 6] = [0, 0, if (quarter > 1) { quarter as u64 } else { 1 }, 300, 60, 3600];
+        const least: [u64; 6] = [0, 0, 1, 1, 1, 1];
+        for (index in 0..6) {
+            match (parsed.number(named[index], defaults[index], least[index])) {
+                Result::Ok(value)   => { numbers.push(value); }
+                Result::Err(reason) => { fmt::eprintln(f"cryogate smith-farm: {reason.as_str()}"); return 2; }
+            }
+        }
+        if (parsed.value(Str::new("--linux")).is_none() && parsed.value(Str::new("--linux-stdlib")).is_some()) {
+            fmt::eprintln(f"cryogate smith-farm: --linux-stdlib names the stdlib of a --linux compiler, and none is named");
+            return 2;
+        }
+        const cryogate: String = match (env::current_executable()) {
+            Option::Some(path) => { path }
+            Option::None       => { fmt::println(f"smith-farm: FAIL (cannot read the path of this cryogate)"); return 1; }
+        };
+        const tree: String = Host::absolute(compiler.unwrap());
+        mut configuration_arguments: Array<String> = Array::<String>::new();
+        configuration_arguments.push(String::from_str(Str::new("--cryo")));
+        configuration_arguments.push(tree.clone());
+        for (reference in parsed.values_of(Str::new("--reference")).iterate_references()) {
+            configuration_arguments.push(String::from_str(Str::new("--reference")));
+            configuration_arguments.push(Host::absolute(reference.as_str()));
+        }
+        if (parsed.has(Str::new("--interpret"))) { configuration_arguments.push(String::from_str(Str::new("--interpret"))); }
+        const linux_named: [Str; 2] = [Str::new("--linux"), Str::new("--linux-stdlib")];
+        for (name in linux_named) {
+            match (parsed.value(name)) {
+                Option::Some(value) => { configuration_arguments.push(String::from_str(name)); configuration_arguments.push(String::from_str(value)); }
+                Option::None        => { }
+            }
+        }
+        mut shared_arguments: Array<String> = Array::<String>::new();
+        const default_smith: PathBuf = repository.join(Str::new("tools/CryoSmith/build"));
+        const smith: String = match (parsed.value(Str::new("--smith"))) {
+            Option::Some(path) => { Host::absolute(path) }
+            Option::None       => { Host::executable_name(default_smith.as_path().join(Str::new("cryosmith")).as_path().as_str()) }
+        };
+        shared_arguments.push(String::from_str(Str::new("--smith")));
+        shared_arguments.push(smith.clone());
+        match (parsed.value(Str::new("--stdlib"))) {
+            Option::Some(stdlib) => { shared_arguments.push(String::from_str(Str::new("--stdlib"))); shared_arguments.push(Host::absolute(stdlib)); }
+            Option::None         => { }
+        }
+        const findings_path: PathBuf = PathBuf::from(Host::absolute(findings.unwrap()).as_str());
+        const work_path: PathBuf = PathBuf::from(Host::absolute(work.unwrap()).as_str());
+        const directories: [Path; 2] = [findings_path.as_path(), work_path.as_path()];
+        for (directory in directories) {
+            match (Directory::create_all(directory)) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { fmt::println(f"smith-farm: FAIL (cannot create {directory.as_str()}: {error.describe()})"); return 1; }
+            }
+        }
+        const host_path: PathBuf = findings_path.as_path().join(Str::new("farm-host"));
+        const host_text: String = match (File::read_text(host_path.as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => {
+                fmt::println(f"smith-farm: FAIL (cannot read the host's settings {host_path.as_path().as_str()}: {error.describe()}; write `ceiling <size>`, `hard-limit <size>`, `per-job <size>` and `cap <size>` there, each size a number then MiB or GiB, and a `pause-while <pattern>` line for each process the farm makes way for)");
+                return 1;
+            }
+        };
+        const host: FarmHost = match (FarmHost::read(host_text.as_str())) {
+            Result::Ok(host)    => { host }
+            Result::Err(reason) => { fmt::println(f"smith-farm: FAIL ({host_path.as_path().as_str()}: {reason.as_str()})"); return 1; }
+        };
+        const log_path: PathBuf = findings_path.as_path().join(Str::new("farm.log"));
+        const log: FarmLog = if (log_path.as_path().is_file()) {
+            match (File::read_text(log_path.as_path())) {
+                Result::Ok(text) => {
+                    match (FarmLog::read(text.as_str())) {
+                        Result::Ok(log)     => { log }
+                        Result::Err(reason) => { fmt::println(f"smith-farm: FAIL ({log_path.as_path().as_str()}: {reason.as_str()})"); return 1; }
+                    }
+                }
+                Result::Err(error) => { fmt::println(f"smith-farm: FAIL (cannot read {log_path.as_path().as_str()}: {error.describe()})"); return 1; }
+            }
+        } else {
+            FarmLog { entries: Array::<FarmEntry>::new() }
+        };
+        const printed: String = SmithRun::generator_version(smith.as_str(), logs, Str::new("smith-farm-version"));
+        const known: KnownBugs = match (KnownBugs::read(repository, printed.as_str())) {
+            Result::Ok(known)   => { known }
+            Result::Err(reason) => { fmt::println(f"smith-farm: FAIL ({reason.as_str()})"); return 1; }
+        };
+        mut setting: Array<String> = Array::<String>::new();
+        setting.push(f"compiler under test: {tree.as_str()}");
+        setting.push(f"configuration arguments: {Text::joined(&configuration_arguments, Str::new(" ")).as_str()}");
+        setting.push(f"seeds {range.first}..{range.second}; {numbers[1]} mutations a seed; generator {printed.as_str().trim()}");
+        setting.push(f"generation options: {Text::joined(parsed.rest(), Str::new(" ")).as_str()}");
+        const first_entry_this_run: i64 = log.entries.length();
+        mut farm: SmithFarm = SmithFarm {
+            cryogate:                cryogate,
+            configuration_arguments: configuration_arguments,
+            compiler:                tree,
+            shared_arguments:        shared_arguments,
+            generation:              parsed.rest().clone(),
+            mutations:               numbers[1],
+            build_limit:             numbers[3],
+            run_limit:               numbers[4],
+            reduce_limit:            numbers[5],
+            work:                    work_path,
+            findings:                findings_path,
+            host:                    host,
+            known:                   known,
+            log:                     log,
+            first_entry_this_run:    first_entry_this_run,
+            batches:                 Array::<String>::new(),
+            waits:                   Array::<String>::new(),
+            refused:                 0,
+            accepted:                0,
+            state:                   String::from_str(Str::new("running: starting")),
+            setting:                 setting,
+        };
+        return farm.farm(repository, logs, range, numbers[0], numbers[2] as i64);
+    }
+
+    /// Run batches until the seeds are judged, the hours spent, or the
+    /// memory or a child stops the farm.
+    private farm(mut &this, repository: Path, logs: &RunLogs, range: Pair<u64, u64>, hours: u64, most: i64) -> i32 {
+        const started: Instant = Instant::now();
+        const size: u64 = (most as u64) * 4;
+        const lock_path: PathBuf = match (HeavyLock::default_path(repository)) {
+            Result::Ok(path)    => { path }
+            Result::Err(reason) => { fmt::println(f"smith-farm: FAIL ({reason.as_str()})"); return 1; }
+        };
+        mut stopped: String = String::new();
+        // What an earlier run found and did not finish reducing.
+        this.reduce_new_findings(logs);
+        loop {
+            if (hours > 0 && started.elapsed().as_seconds() >= hours * 3600) {
+                stopped = f"the {hours} hours are spent";
+                break;
+            }
+            const diff: Option<Pair<u64, u64>> = this.log.next_batch(range.first, range.second, size, FarmKind::Diff);
+            const crash: Option<Pair<u64, u64>> = if (this.mutations > 0) { this.log.next_batch(range.first, range.second, size, FarmKind::Crash) } else { Option::None };
+            if (diff.is_none() && crash.is_none()) { break; }
+            const committed: u64 = match (SystemMemory::query()) {
+                Result::Ok(memory) => { memory.committed_bytes() }
+                Result::Err(error) => { stopped = f"cannot read the host's commit: {error.describe()}"; break; }
+            };
+            const budget: MemoryBudget = this.host.budget(committed);
+            const jobs: i64 = match (budget.verdict(most)) {
+                MemoryVerdict::Run(jobs) => { jobs }
+                MemoryVerdict::Wait      => {
+                    this.wait(f"{committed / 1048576} MiB committed, the ceiling {budget.ceiling / 1048576} MiB");
+                    continue;
+                }
+                MemoryVerdict::Stop => {
+                    stopped = f"{committed / 1048576} MiB committed, past the hard limit {budget.hard_limit / 1048576} MiB";
+                    this.waits.push(f"stopped: {stopped.as_str()}");
+                    break;
+                }
+            };
+            match (HeavyLock::holder(lock_path.as_path(), SystemTime::now().unix_seconds())) {
+                Holder::Held(holder) => {
+                    this.wait(f"a heavy run holds the lock: {holder.as_str()}");
+                    continue;
+                }
+                Holder::Stale(holder) => {
+                    stopped = f"the heavy-run lock {lock_path.as_path().as_str()} is stale, and a heavy run may still hold it: {holder.as_str()}";
+                    break;
+                }
+                _ => { }
+            }
+            match (this.pause_reason(logs)) {
+                Result::Ok(Option::Some(reason)) => {
+                    this.wait(reason);
+                    continue;
+                }
+                Result::Ok(Option::None) => { }
+                Result::Err(reason)      => { stopped = reason; break; }
+            }
+            mut failed: String = String::new();
+            match (diff) {
+                Option::Some(batch) => {
+                    match (this.batch(logs, FarmKind::Diff, batch, jobs)) {
+                        Result::Ok(_)       => { }
+                        Result::Err(reason) => { failed = reason; }
+                    }
+                }
+                Option::None => { }
+            }
+            match (crash) {
+                Option::Some(batch) => {
+                    if (failed.is_empty()) {
+                        match (this.batch(logs, FarmKind::Crash, batch, jobs)) {
+                            Result::Ok(_)       => { }
+                            Result::Err(reason) => { failed = reason; }
+                        }
+                    }
+                }
+                Option::None => { }
+            }
+            if (failed.is_empty()) { this.reduce_new_findings(logs); }
+            this.write_report();
+            if (!failed.is_empty()) { stopped = failed; break; }
+        }
+        this.state = if (stopped.is_empty()) { String::from_str(Str::new("finished")) } else { f"stopped: {stopped.as_str()}" };
+        this.write_report();
+        mut new_ones: i64 = 0;
+        for (finding in this.log.findings().iterate_references()) {
+            if (finding.first_entry >= this.first_entry_this_run && this.known.bug_with_signature(finding.signature.as_str()).is_none()) { new_ones++; }
+        }
+        const judged: i64 = this.log.entries.length() - this.first_entry_this_run;
+        const report: PathBuf = this.findings.as_path().join(Str::new("farm-report.md"));
+        if (!stopped.is_empty()) {
+            fmt::println(f"smith-farm: FAIL (stopped: {stopped.as_str()}; {judged} judgements this run, {new_ones} new findings; {report.as_path().as_str()})");
+            return 1;
+        }
+        if (new_ones > 0) {
+            fmt::println(f"smith-farm: FAIL ({judged} judgements this run, {new_ones} new findings; {report.as_path().as_str()})");
+            return 1;
+        }
+        fmt::println(f"smith-farm: OK ({judged} judgements this run, no new finding; {report.as_path().as_str()})");
+        return 0;
+    }
+
+    /// Run one batch of `kind` over `batch` (its first seed and count) with
+    /// `jobs` jobs, and log what its report says; why it could not.
+    private batch(mut &this, logs: &RunLogs, kind: FarmKind, batch: Pair<u64, u64>, jobs: i64) -> Result<(), String> {
+        const last: u64 = batch.first + batch.second - 1;
+        const name: String = f"{kind.name()}-{batch.first}";
+        const directory: PathBuf = this.work.as_path().join(f"batch-{name.as_str()}".as_str());
+        mut child: Job = Job::new(this.cryogate.as_str());
+        match (kind) {
+            FarmKind::Diff => {
+                child.argument(Str::new("smith-diff"));
+                for (argument in this.configuration_arguments.iterate_references()) { child.argument(argument.as_str()); }
+                child.argument(Str::new("--run-limit"));
+                child.argument(f"{this.run_limit}".as_str());
+            }
+            FarmKind::Crash => {
+                child.argument(Str::new("smith-crash"));
+                child.argument(Str::new("--cryo"));
+                child.argument(this.compiler.as_str());
+                child.argument(Str::new("--mutations"));
+                child.argument(f"{this.mutations}".as_str());
+            }
+        }
+        for (argument in this.shared_arguments.iterate_references()) { child.argument(argument.as_str()); }
+        const numbered: [Str; 4] = [Str::new("--first-seed"), Str::new("--count"), Str::new("--jobs"), Str::new("--build-limit")];
+        const values: [u64; 4] = [batch.first, batch.second, jobs as u64, this.build_limit];
+        for (index in 0..4) {
+            child.argument(numbered[index]);
+            child.argument(f"{values[index]}".as_str());
+        }
+        child.argument(Str::new("--work"));
+        child.argument(directory.as_path().as_str());
+        child.argument(Str::new("--"));
+        for (option in this.generation.iterate_references()) { child.argument(option.as_str()); }
+        child.log_to(logs.file(f"smith-farm-{name.as_str()}".as_str()).as_str());
+        this.announce(f"{kind.name()} seeds {batch.first}..{last}, {jobs} jobs");
+        const done: Completion = child.run();
+        const exit: i32 = done.outcome.exit_code().unwrap_or(-1);
+        if (exit != 0 && exit != 1) {
+            return Result::Err(f"{kind.name()} seeds {batch.first}..{last}: the child {done.outcome.describe().as_str()}; its log {done.log.as_str()}");
+        }
+        const output: String = done.output();
+        const reading: Result<BatchReport, String> = match (kind) {
+            FarmKind::Diff  => { BatchReport::of_diff(output.as_str(), batch.first, batch.second) }
+            FarmKind::Crash => { BatchReport::of_crash(output.as_str(), batch.first, batch.second) }
+        };
+        const read: BatchReport = match (reading) {
+            Result::Ok(read)    => { read }
+            Result::Err(reason) => { return Result::Err(f"{reason.as_str()}; its log {done.log.as_str()}"); }
+        };
+        mut lines: String = String::new();
+        mut found: i64 = 0;
+        for (entry in read.entries.iterate_references()) {
+            lines.push(entry.line().as_str());
+            lines.push(Str::new("\n"));
+            if (entry.is_finding()) { found++; }
+        }
+        const log_path: PathBuf = this.findings.as_path().join(Str::new("farm.log"));
+        match (File::append_text(log_path.as_path(), lines.as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot append to {log_path.as_path().as_str()}: {error.describe()}"); }
+        }
+        for (entry in read.entries.iterate_references()) {
+            this.log.entries.push(FarmEntry { seed: entry.seed, kind: entry.kind.clone(), mutation: entry.mutation, verdict: entry.verdict.clone() });
+        }
+        this.refused = this.refused + read.refused;
+        this.accepted = this.accepted + read.accepted;
+        const summary: String = f"{kind.name()} seeds {batch.first}..{last}: {jobs} jobs, {done.seconds as i64} s, {found} findings";
+        fmt::println(f"smith-farm: {summary.as_str()}");
+        this.batches.push(summary);
+        return match (Directory::remove_all(directory.as_path())) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot remove {directory.as_path().as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// Reduce each finding of the log the known list does not name, which
+    /// smith-reduce can shrink and whose folder in the findings directory
+    /// holds no `reduction` yet (a farm stopped during a reduction leaves
+    /// none), into a folder of its own.
+    private reduce_new_findings(mut &this, logs: &RunLogs) -> void {
+        for (finding in this.log.findings().iterate_references()) {
+            if (!finding.reducible() || this.known.bug_with_signature(finding.signature.as_str()).is_some()) { continue; }
+            const folder: PathBuf = this.findings.as_path().join(FarmFinding::directory_name(finding.signature.as_str()).as_str());
+            if (folder.as_path().join(Str::new("reduction")).as_path().exists()) { continue; }
+            this.reduce(logs, finding, folder.as_path());
+        }
+    }
+
+    /// Reduce `finding` into `folder`, writing `finding` and `reduction`
+    /// there; a reduction that fails says so in `reduction` and is not
+    /// tried again.
+    private reduce(mut &this, logs: &RunLogs, finding: &FarmFinding, folder: Path) -> void {
+        const crash: boolean = finding.kind.as_str() == FarmKind::Crash.name();
+        mut generation: Array<String> = this.generation.clone();
+        match (&finding.first_mutation) {
+            Option::Some(mutation) => {
+                generation.push(String::from_str(Str::new("--mutation")));
+                generation.push(f"{mutation}");
+            }
+            Option::None => { }
+        }
+        const work: PathBuf = folder.join(Str::new("work"));
+        mut outcome: String = String::new();
+        match (Directory::create_all(work.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { outcome = f"not reduced: cannot create {work.as_path().as_str()}: {error.describe()}"; }
+        }
+        const described: String = f"signature {finding.signature.as_str()}\nkind {finding.kind.as_str()}\nseed {finding.first_seed}\ngeneration options {Text::joined(&generation, Str::new(" ")).as_str()}\ncompiler under test {this.compiler.as_str()}\n";
+        match (File::write_text(folder.join(Str::new("finding")).as_path(), described.as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { outcome = f"not reduced: cannot write its finding file: {error.describe()}"; }
+        }
+        if (outcome.is_empty()) {
+            mut child: Job = Job::new(this.cryogate.as_str());
+            child.argument(Str::new("smith-reduce"));
+            child.argument(Str::new("--seed"));
+            child.argument(f"{finding.first_seed}".as_str());
+            if (crash) {
+                child.argument(Str::new("--cryo"));
+                child.argument(this.compiler.as_str());
+                child.argument(Str::new("--text"));
+            } else {
+                for (argument in this.configuration_arguments.iterate_references()) { child.argument(argument.as_str()); }
+                child.argument(Str::new("--run-limit"));
+                child.argument(f"{this.run_limit}".as_str());
+            }
+            for (argument in this.shared_arguments.iterate_references()) { child.argument(argument.as_str()); }
+            child.argument(Str::new("--build-limit"));
+            child.argument(f"{this.build_limit}".as_str());
+            child.argument(Str::new("--signature"));
+            child.argument(finding.signature.as_str());
+            child.argument(Str::new("--work"));
+            child.argument(work.as_path().as_str());
+            child.argument(Str::new("--out"));
+            child.argument(folder.as_str());
+            child.argument(Str::new("--"));
+            for (option in generation.iterate_references()) { child.argument(option.as_str()); }
+            child.log_to(logs.file(f"smith-farm-reduce-{FarmFinding::directory_name(finding.signature.as_str()).as_str()}".as_str()).as_str());
+            child.limit(Duration::from_seconds(this.reduce_limit));
+            child.root_tree();
+            this.announce(f"reducing `{finding.signature.as_str()}` from seed {finding.first_seed}");
+            const done: Completion = child.run();
+            const last: String = Text::last_line(done.output().as_str());
+            // smith-reduce writes the smallest program at each step, so one
+            // stopped at the limit leaves it, and no bug draft.
+            outcome = if (done.outcome.succeeded()) { last } else { f"stopped short, no bug drafted: {done.outcome.describe().as_str()}; {last.as_str()}" };
+        }
+        fmt::println(f"smith-farm: {outcome.as_str()}");
+        match (File::write_text(folder.join(Str::new("reduction")).as_path(), f"{outcome.as_str()}\n".as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { fmt::println(f"smith-farm: cannot write {folder.as_str()}/reduction: {error.describe()}"); }
+        }
+        match (Directory::remove_all(work.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { fmt::println(f"smith-farm: cannot remove {work.as_path().as_str()}: {error.describe()}"); }
+        }
+    }
+
+    /// Write `farm-report.md` from the log and this run so far.
+    private write_report(&this) -> void {
+        const findings: Array<FarmFinding> = this.log.findings();
+        mut known_bugs: Array<String> = Array::<String>::new();
+        mut reductions: Array<String> = Array::<String>::new();
+        for (finding in findings.iterate_references()) {
+            known_bugs.push(this.known.bug_with_signature(finding.signature.as_str()).unwrap_or(String::new()));
+            const name: String = FarmFinding::directory_name(finding.signature.as_str());
+            const outcome: PathBuf = this.findings.as_path().join(name.as_str()).as_path().join(Str::new("reduction"));
+            reductions.push(match (File::read_text(outcome.as_path())) {
+                Result::Ok(text) => { f"folder {name.as_str()}: {text.as_str().trim()}" }
+                Result::Err(_)   => { String::new() }
+            });
+        }
+        const report: FarmReport = FarmReport {
+            setting:              this.setting.clone(),
+            first_entry_this_run: this.first_entry_this_run,
+            known_bugs:           known_bugs,
+            reductions:           reductions,
+            batches:              this.batches.clone(),
+            waits:                this.waits.clone(),
+            refused:              this.refused,
+            accepted:             this.accepted,
+            state:                this.state.clone(),
+            updated:              DateTime::now().format_rfc3339(),
+        };
+        const path: PathBuf = this.findings.as_path().join(Str::new("farm-report.md"));
+        match (File::write_text(path.as_path(), report.text(&this.log).as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { fmt::println(f"smith-farm: cannot write {path.as_path().as_str()}: {error.describe()}"); }
+        }
+    }
+
+    /// Hold off the next batch for `reason`: print and record the wait,
+    /// write the report paused, and sleep before the farm looks again.
+    private wait(mut &this, reason: String) -> void {
+        const event: String = f"waited {WAIT_SECONDS} s: {reason.as_str()}";
+        fmt::println(f"smith-farm: {event.as_str()}");
+        this.waits.push(event);
+        this.state = f"paused: {reason.as_str()}";
+        this.write_report();
+        std::time::clock::sleep(Duration::from_seconds(WAIT_SECONDS));
+    }
+
+    /// Start `work` (a batch or a reduction): print it and write the report
+    /// running it, so the report says what is under way while it runs.
+    private announce(mut &this, work: String) -> void {
+        fmt::println(f"smith-farm: {work.as_str()}");
+        this.state = f"running: {work.as_str()}";
+        this.write_report();
+    }
+
+    /// What the farm makes way for before a batch, when anything is there:
+    /// a full-screen application in front, or a process a `pause-while`
+    /// line of the host file names.  Fails when it cannot ask whether such
+    /// a process runs, since a farm that cannot see the job it makes way
+    /// for would run over it.
+    private pause_reason(&this, logs: &RunLogs) -> Result<Option<String>, String> {
+        if (Host::full_screen_in_front()) { return Result::Ok(Option::Some(String::from_str(Str::new("a full-screen application is in front")))); }
+        for (pattern in this.host.pause_while.iterate_references()) {
+            match (SmithFarm::matching_process(pattern.as_str(), logs)) {
+                Result::Ok(Option::Some(process)) => { return Result::Ok(Option::Some(f"`{pattern.as_str()}` runs: {process.as_str()}")); }
+                Result::Ok(Option::None)          => { }
+                Result::Err(reason)               => { return Result::Err(reason); }
+            }
+        }
+        return Result::Ok(Option::None);
+    }
+
+    /// The last process listed whose command line matches `pattern`
+    /// (`pgrep -f -a`, an extended regular expression), as `<pid> <command
+    /// line>`, or none.  On a Windows host the processes are WSL's, asked only while a
+    /// distribution runs, so the farm never starts one; elsewhere the
+    /// host's.  Fails when pgrep exits other than 0 (a match) or 1 (none).
+    private static matching_process(pattern: Str, logs: &RunLogs) -> Result<Option<String>, String> {
+        const windows: boolean = Host::os() == Str::new("windows");
+        if (windows && !Wsl::running(logs)) { return Result::Ok(Option::None); }
+        mut job: Job = Job::new(if (windows) { Str::new("wsl.exe") } else { Str::new("pgrep") });
+        if (windows) {
+            job.argument(Str::new("-e"));
+            job.argument(Str::new("pgrep"));
+        }
+        job.argument(Str::new("-f"));
+        job.argument(Str::new("-a"));
+        job.argument(pattern);
+        job.log_to(logs.file(Str::new("farm-pause")).as_str());
+        const done: Completion = job.run();
+        return match (done.outcome.exit_code()) {
+            Option::Some(0) => { Result::Ok(Option::Some(Text::last_line(done.output().as_str()))) }
+            Option::Some(1) => { Result::Ok(Option::None) }
+            _               => { Result::Err(f"cannot ask whether `{pattern}` runs: pgrep {done.outcome.describe().as_str()}; see {done.log.as_str()}") }
+        };
+    }
+
+    /// `A..B` as the first and last seed; none when it is not that, or A
+    /// is past B.
+    private static seed_range(text: Str) -> Option<Pair<u64, u64>> {
+        const parts: Pair<Str, Str> = match (text.split_once(&Str::new(".."))) {
+            Option::Some(parts) => { parts }
+            Option::None        => { return Option::None; }
+        };
+        const first: u64 = match (u64::try_from(parts.first)) {
+            Result::Ok(value) => { value }
+            Result::Err(_)    => { return Option::None; }
+        };
+        const last: u64 = match (u64::try_from(parts.second)) {
+            Result::Ok(value) => { value }
+            Result::Err(_)    => { return Option::None; }
+        };
+        if (first > last) { return Option::None; }
+        return Option::Some(Pair::new(first, last));
+    }
+}

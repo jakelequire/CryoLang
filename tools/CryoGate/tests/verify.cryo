@@ -79,6 +79,12 @@ type struct Judged {
         return VerifyJudges::archive_module_moves(&Judged::list(names), &left, &right).length();
     }
 
+    private static instance_moves(names: Str, a: Str, b: Str) -> i64 {
+        mut left: HashMap<String, String> = Judged::map(a);
+        mut right: HashMap<String, String> = Judged::map(b);
+        return VerifyJudges::instance_moves(&Judged::list(names), &left, &right).length();
+    }
+
     private static runtime_moves(names: Str, a: Str, b: Str) -> i64 {
         mut left: HashMap<String, String> = Judged::map(a);
         mut right: HashMap<String, String> = Judged::map(b);
@@ -152,7 +158,7 @@ function a_gate_passes_on_its_exit_code_and_its_own_verdict_line() -> Result<(),
     expect_equal(GateVerdict::of(census, Str::new("everything fine\n"), 0).ok, false)?;
     expect_equal(GateVerdict::of(census, Str::new("test-census: OK\ntest-census: FAIL -- two\n"), 0).ok, false)?;
     expect_equal(GateVerdict::of(census, Str::new("  test-census: OK -- indented\n"), 0).ok, false)?;
-    const fast: &GateCommand = &gates[7];
+    const fast: &GateCommand = &gates[8];
     expect_equal(fast.name.as_str(), Str::new("fast"))?;
     const quoted: GateVerdict = GateVerdict::of(fast, Str::new("\"check-fast: OK (all)\"\n"), 0);
     expect_equal(quoted.line.as_str(), Str::new("check-fast: OK (all)"))?;
@@ -175,8 +181,11 @@ function a_gates_command_line_fills_in_the_compiler_and_the_stdlib() -> Result<(
         Str::new("cryogate examples --cryo C --stdlib S"))?;
     expect_equal(Text::joined(&gates[2].command(Str::new("C"), Str::new("S")), Str::new(" ")).as_str(),
         Str::new("cryogate lsp --cryo C"))?;
-    return expect_equal(Text::joined(&gates[6].command(Str::new("C"), Str::new("S")), Str::new(" ")).as_str(),
-        Str::new("cryogate abi --cryo C"));
+    expect_equal(Text::joined(&gates[6].command(Str::new("C"), Str::new("S")), Str::new(" ")).as_str(),
+        Str::new("cryogate abi --cryo C"))?;
+    expect_equal(gates[7].name.as_str(), Str::new("smith"))?;
+    return expect_equal(Text::joined(&gates[7].command(Str::new("C"), Str::new("S")), Str::new(" ")).as_str(),
+        Str::new("cryogate corpus-check --cryo C --stdlib S --work .verify/smith-corpus --expect tests/smith-corpus --interpret"));
 }
 
 ![test]
@@ -280,8 +289,10 @@ type struct Comparing {
     private static nothing_declared() -> DeclaredChanges {
         return DeclaredChanges {
             names: Array::<String>::new(), units: Array::<Pair<String, String>>::new(),
-            moved_projects: Array::<String>::new(), moved_modules: Array::<String>::new(),
-            moved_members: Array::<String>::new(), archive_files: Array::<String>::new(), problems: Array::<String>::new(),
+            moved_projects: Array::<String>::new(), moved_examples: Array::<String>::new(),
+            moved_modules: Array::<String>::new(), moved_instances: Array::<String>::new(),
+            moved_members: Array::<String>::new(),
+            archive_files: Array::<String>::new(), problems: Array::<String>::new(),
         };
     }
 
@@ -405,6 +416,16 @@ function a_project_declared_moved_must_move_one_of_its_objects() -> Result<(), T
 }
 
 ![test]
+function an_example_declared_moved_must_move_one_of_its_objects() -> Result<(), TestError> {
+    const prefix: Str = Str::new("examples/e/build/");
+    expect_equal(Judged::project_moves(Str::new("moved:examples/e"), f"{prefix}a.o=1;{prefix}b.o=1".as_str(), f"{prefix}a.o=1;{prefix}b.o=2".as_str()), 0)?;
+    expect_equal(Judged::project_moves(Str::new("moved:examples/e"), f"{prefix}a.o=1".as_str(), f"{prefix}a.o=1".as_str()), 1)?;
+    // A test project of the same name is not the example.
+    return expect_equal(Judged::project_moves(Str::new("moved:examples/e"),
+        Str::new("tests/tests/projects/examples/e/a.o=1"), Str::new("tests/tests/projects/examples/e/a.o=2")), 1);
+}
+
+![test]
 function a_module_declared_moved_archive_must_move_an_archive_object() -> Result<(), TestError> {
     expect_equal(Judged::archive_module_moves(Str::new("moved-archive:std::m"),
         Str::new("stdlib-archive/t/O0/x/deps/std/m.o=1;stdlib-archive/t/O2/x/deps/std/m.o=1"),
@@ -420,6 +441,26 @@ function a_module_declared_moved_archive_must_move_an_archive_object() -> Result
     expect_equal(VerifyJudges::archive_module_moves(&Judged::list(Str::new("moved-archive:std::m")), &left, &right).length(), 0)?;
     return expect(left.length() == 1 && right.length() == 1
         && left.contains_key(&String::from_str(Str::new("s/x/deps/std/n.o"))), Str::new("only the declared module's objects are removed"));
+}
+
+![test]
+function a_module_declared_moved_instances_must_move_the_unit_suite_object() -> Result<(), TestError> {
+    const declared: Str = Str::new("moved-instances:std::m");
+    const unit: Str = Str::new("tests/build/target/release/h/std/deps/std/m.o");
+    expect_equal(Judged::instance_moves(declared, f"{unit}=1".as_str(), f"{unit}=2".as_str()), 0)?;
+    expect_equal(Judged::instance_moves(declared, f"{unit}=1".as_str(), f"{unit}=1".as_str()), 1)?;
+    expect_equal(Judged::instance_moves(declared, Str::new(""), Str::new("")), 1)?;
+    // A project's object of the module is not the unit suite's.
+    const project: Str = Str::new("tests/tests/projects/p/build/target/release/h/std/deps/std/m.o");
+    expect_equal(Judged::instance_moves(declared, f"{project}=1".as_str(), f"{project}=2".as_str()), 1)?;
+    // Another module's moved object, and the project's, stay in both maps.
+    const other: Str = Str::new("tests/build/target/release/h/std/deps/std/n.o");
+    mut left: HashMap<String, String> = Judged::map(f"{unit}=1;{other}=1;{project}=1".as_str());
+    mut right: HashMap<String, String> = Judged::map(f"{unit}=2;{other}=2;{project}=2".as_str());
+    expect_equal(VerifyJudges::instance_moves(&Judged::list(declared), &left, &right).length(), 0)?;
+    return expect(left.length() == 2 && right.length() == 2
+        && left.contains_key(&String::from_str(other)) && left.contains_key(&String::from_str(project)),
+        Str::new("only the unit suite's object of the declared module is removed"));
 }
 
 ![test]
@@ -723,6 +764,8 @@ function the_moved_archive_form_is_its_own_kind_naming_the_module() -> Result<()
 function each_form_names_its_kind() -> Result<(), TestError> {
     expect(match (Declarations::kind(Str::new("archive:lang/u.cryo"))) { DeclarationKind::Archive => { true } _ => { false } }, Str::new("archive"))?;
     expect(match (Declarations::kind(Str::new("moved:p"))) { DeclarationKind::Moved => { true } _ => { false } }, Str::new("moved"))?;
+    expect(match (Declarations::kind(Str::new("moved-instances:std::a"))) { DeclarationKind::MovedInstances => { true } _ => { false } }, Str::new("moved-instances"))?;
+    expect_equal(Declarations::program_of(Str::new("moved-instances:std::a")), Str::new("std::a"))?;
     expect(match (Declarations::kind(Str::new("negative/E1_x.cryo"))) { DeclarationKind::Negative => { true } _ => { false } }, Str::new("negative before unit"))?;
     expect(match (Declarations::kind(Str::new("examples/01-hello"))) { DeclarationKind::Example => { true } _ => { false } }, Str::new("example"))?;
     expect(match (Declarations::kind(Str::new("lang/u.cryo"))) { DeclarationKind::Unit => { true } _ => { false } }, Str::new("unit"))?;

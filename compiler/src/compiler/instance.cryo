@@ -92,10 +92,11 @@ type struct CompilerConfig {
     show_ast:           boolean;
     emit_llvm:          boolean;
     /// CLI override for project output_dir.  Empty string ("") means
-    /// "use whatever the cryoconfig says".  Set from `--build-dir=...`
-    /// in cmd_project.  Lets stage 3/4 self-host runs land in distinct
-    /// directories so their emitted IR/.o can be diff'd for fixed-point
-    /// equivalence.
+    /// "use whatever the cryoconfig says" (for a single file, `build/`
+    /// beside it).  Set from `--build-dir=...` by `build`, of a project or
+    /// of a single file, `run` and `test`.  Lets stage 3/4 self-host runs
+    /// land in distinct directories so their emitted IR/.o can be diff'd for
+    /// fixed-point equivalence.
     output_dir_override: string;
     /// CLI override for the standard library root.  Empty string ("")
     /// means "use the search-order fallback chain".  Set from
@@ -409,8 +410,12 @@ type struct CompilerInstance {
         // helpers (profile_dir / bin_artifact_path), so a relative
         // "build" would resolve against the CWD and `cryo build
         // sub/hello.cryo` would scatter its build tree away from the
-        // file it belongs to.
-        if (config.project_root.length() > 0
+        // file it belongs to.  `--build-dir=PATH` names the directory
+        // instead, read against the CWD as a project build reads it, so two
+        // builds of files in one directory can be kept apart.
+        if (this.config.output_dir_override.length() > 0) {
+            config.output_dir = this.config.output_dir_override;
+        } else if (config.project_root.length() > 0
                 && !config.project_root.eq(".")) {
             config.output_dir = Path::from(config.project_root).join("build").into_raw();
         }
@@ -445,10 +450,25 @@ type struct CompilerInstance {
     /// E0203/E0233 that a real build did not report).  Loading the whole module
     /// graph the way a build does makes `check` agree with `build`.
     compile_for_check(&this, source_text: string) -> CompilationResult {
+        return this.analyse_file(source_text, CompileMode::Check).result;
+    }
+
+    /// Compile for `cryo interpret`: the `cryo check` front end in
+    /// `CompileMode::Interpret`, which stops before the passes that rewrite
+    /// the program for code generation.  The context comes back holding every
+    /// module's typed tree for the interpreter to run; it is null when the
+    /// build failed before one was made.
+    compile_for_interpret(&this, source_text: string) -> ProjectBuild {
+        return this.analyse_file(source_text, CompileMode::Interpret);
+    }
+
+    /// Analyse the single file `source_text` as its own project in `mode`,
+    /// which generates no code, and return the context it was analysed in.
+    analyse_file(&this, source_text: string, mode: CompileMode) -> ProjectBuild {
         const source: string = source_text;
         if (!Path::from(source).exists()) {
             fmt::eprintln(f"error: file not found: {source}");
-            return CompilationResult::failed(1, 0);
+            return ProjectBuild { result: CompilationResult::failed(1, 0), ctx: null };
         }
 
         // The same single-file project view `compile_file` builds, so module
@@ -459,10 +479,10 @@ type struct CompilerInstance {
         const root_path: string = config.discovery_root_path();
         if (!Path::from(root_path).exists()) {
             fmt::eprintln(f"error: entry point not found: {root_path}");
-            return CompilationResult::failed(1, 0);
+            return ProjectBuild { result: CompilationResult::failed(1, 0), ctx: null };
         }
 
-        return this.compile_project_to_context(config, CompileMode::Check, []).result;
+        return this.compile_project_to_context(config, mode, []);
     }
 
     /// The project a single source file makes on its own: the file is the
@@ -802,34 +822,10 @@ type struct CompilerInstance {
             config.profile = this.config.profile_override;
         }
 
-        // Priority: CLI -> $CRYO_STDLIB -> $CRYO_HOME -> binary-relative ->
-        // cryoconfig stdlib_root -> legacy fallbacks.
         mut stdlib_root: string = "";
         if (!config.no_std) {
-            mut tried: [String] = [];
-            stdlib_root = CompilerInstance::resolve_stdlib_root(
-                this.config.stdlib_path_override,
-                config.stdlib_root,
-                config.project_root,
-                &tried);
-            if (stdlib_root.length() > 0) {
-                Log::debug(LogArea::Driver, f"standard library root {stdlib_root}");
-            } else {
-                // No prelude available: hard-fail rather than silently
-                // compile a project that can't see `Result`, `String`,
-                // etc.  Pass `--no-std` (or set `no_std = true` in
-                // cryoconfig) for genuinely freestanding builds.
-                fmt::eprintf("error: cannot locate the Cryo standard library\n");
-                fmt::eprintf("  none of the candidate paths contained a 'lib.cryo':\n");
-                for (mut ti: i64 = 0; ti < tried.length(); ti++) {
-                    fmt::eprintln(f"    {tried[ti].as_str()}");
-                }
-                fmt::eprintf("  fix one of:\n");
-                fmt::eprintf("    --stdlib=PATH                            (one-off override)\n");
-                fmt::eprintf("    export CRYO_STDLIB=/path/to/stdlib       (explicit env)\n");
-                fmt::eprintf("    export CRYO_HOME=/path/to/install        (install root; stdlib at $CRYO_HOME/stdlib)\n");
-                fmt::eprintf("    [project] stdlib_root = \"...\"            (in cryoconfig; relative to project_root)\n");
-                fmt::eprintf("    --no-std                                 (build without the standard library)\n");
+            stdlib_root = this.locate_stdlib(&config);
+            if (stdlib_root.length() == 0) {
                 return ProjectBuild { result: CompilationResult::failed(1, 0), ctx: null };
             }
         }
@@ -1665,13 +1661,20 @@ type struct CompilerInstance {
         // BodiesTypeChecked is an INCOMING
         // provision here (sema provided it earlier) so MoveCheck's requirement
         // is satisfied.
-        pipeline.set_passes([
-            PassID::GenericValidation,
-            PassID::MoveCheck,
-            PassID::DeadCodeAnalysis,
-            PassID::DropInsertion,
-            PassID::TypeLowering,
-        ]);
+        if (ctx.options.mode.lowers_ownership()) {
+            pipeline.set_passes([
+                PassID::GenericValidation,
+                PassID::MoveCheck,
+                PassID::DeadCodeAnalysis,
+                PassID::DropInsertion,
+                PassID::TypeLowering,
+            ]);
+        } else {
+            pipeline.set_passes([
+                PassID::GenericValidation,
+                PassID::DeadCodeAnalysis,
+            ]);
+        }
         {
             mut initial6b: ProvisionSet = ProvisionSet::empty();
             initial6b.mark(Provision::ASTValidated);
@@ -2955,6 +2958,38 @@ type struct CompilerInstance {
             }
             Result::Err(reason) => { return reason; }
         }
+    }
+
+    /// The standard library root a build of the project `config` reads,
+    /// first found of: `--stdlib`, `$CRYO_STDLIB`, `$CRYO_HOME`, beside the
+    /// binary, the cryoconfig's `stdlib_root`.  When none holds a
+    /// `lib.cryo` it prints every candidate tried and the ways to name one,
+    /// and returns "": a project that cannot see `Result` or `String` is
+    /// refused rather than compiled.  `--no-std` (or `no_std = true` in the
+    /// cryoconfig) is how a freestanding build says it needs none.
+    locate_stdlib(&this, config: &ProjectConfig) -> string {
+        mut tried: [String] = [];
+        const root: string = CompilerInstance::resolve_stdlib_root(
+            this.config.stdlib_path_override,
+            config.stdlib_root,
+            config.project_root,
+            &tried);
+        if (root.length() > 0) {
+            Log::debug(LogArea::Driver, f"standard library root {root}");
+            return root;
+        }
+        fmt::eprintf("error: cannot locate the Cryo standard library\n");
+        fmt::eprintf("  none of the candidate paths contained a 'lib.cryo':\n");
+        for (mut ti: i64 = 0; ti < tried.length(); ti++) {
+            fmt::eprintln(f"    {tried[ti].as_str()}");
+        }
+        fmt::eprintf("  fix one of:\n");
+        fmt::eprintf("    --stdlib=PATH                            (one-off override)\n");
+        fmt::eprintf("    export CRYO_STDLIB=/path/to/stdlib       (explicit env)\n");
+        fmt::eprintf("    export CRYO_HOME=/path/to/install        (install root; stdlib at $CRYO_HOME/stdlib)\n");
+        fmt::eprintf("    [project] stdlib_root = \"...\"            (in cryoconfig; relative to project_root)\n");
+        fmt::eprintf("    --no-std                                 (build without the standard library)\n");
+        return "";
     }
 
     /// The standard library's root, as its canonical absolute path, or ""

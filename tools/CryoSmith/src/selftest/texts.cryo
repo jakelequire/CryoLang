@@ -1,0 +1,127 @@
+///! An audit of the model's `String` locals: each is given a new `String`
+///! whenever it is declared or assigned - of a literal, of an integer's
+///! digits or empty - and never another variable's, so none is copied or
+///! moved; each is appended to only as a `mut` local, never with its own
+///! view; and a comparison of `String`s compares two `String` variables.
+///! The loan audit holds an append to the rule that nothing else uses the
+///! `String` appended to in its statement.
+
+namespace cryosmith::selftest::texts;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+
+import cryosmith::model::{ ExpressionKind, Program, StatementKind, Variable, VariableRole };
+import cryosmith::selftest::runner::{ SelfTest };
+
+/// How many programs the text audit reads.
+const TEXT_AUDITED_PROGRAMS: u64 = 200;
+
+/// What the text audit counted over the programs it read.
+internal type struct TextCounts {
+    /// `String` locals given a value, declared or assigned.
+    internal values: i64;
+    /// Appends.
+    internal pushes: i64;
+    /// Appends of another `String`'s view.
+    internal views: i64;
+    /// Comparisons of two `String`s.
+    internal comparisons: i64;
+}
+
+/// The audit of one program's `String` locals.
+internal type struct TextAudit {
+    /// Add one program's `String` locals to `counts`, each within the
+    /// rules; or the first that breaks one.
+    internal static check(program: &Program, counts: mut &TextCounts) -> Result<i64, String> {
+        for (statement in program.statements.iter()) {
+            match (statement.kind) {
+                StatementKind::Declare(variable, value) => {
+                    if (program.variable_at(variable).value_type.is_text()) {
+                        if (!TextAudit::is_new_text(program, value)) { return Result::Err(f"`String` variable {variable} is declared with no new `String`"); }
+                        counts.values = counts.values + 1;
+                    }
+                }
+                StatementKind::Assign(place, value) => {
+                    if (program.expression_at(place).value_type.is_text()) {
+                        if (!TextAudit::is_new_text(program, value)) { return Result::Err(String::from_str(Str::new("a `String` is assigned no new `String`"))); }
+                        counts.values = counts.values + 1;
+                    }
+                }
+                _ => { }
+            }
+        }
+        for (node in program.expressions.iter()) {
+            match (node.kind) {
+                ExpressionKind::Push(variable, value) => {
+                    const target: Variable = program.variable_at(variable);
+                    const local: boolean = match (target.role) {
+                        VariableRole::Local => { true }
+                        _                   => { false }
+                    };
+                    if (!local || !target.mutable || !target.value_type.is_text()) { return Result::Err(f"variable {variable} is appended to but is no `mut` `String` local"); }
+                    match (program.expression_at(value).kind) {
+                        ExpressionKind::AsStr(viewed) => {
+                            if (viewed == variable) { return Result::Err(f"`String` variable {variable} is appended its own view"); }
+                            counts.views = counts.views + 1;
+                        }
+                        _ => { }
+                    }
+                    counts.pushes = counts.pushes + 1;
+                }
+                ExpressionKind::Binary(operator, left, right) => {
+                    const left_text: boolean = program.expression_at(left).value_type.is_text();
+                    const right_text: boolean = program.expression_at(right).value_type.is_text();
+                    if (left_text || right_text) {
+                        if (!left_text || !right_text || !TextAudit::is_read(program, left) || !TextAudit::is_read(program, right) || !operator.is_comparison()) {
+                            return Result::Err(String::from_str(Str::new("an operator on a `String` is no comparison of two `String` variables")));
+                        }
+                        counts.comparisons = counts.comparisons + 1;
+                    }
+                }
+                _ => { }
+            }
+        }
+        return Result::Ok(0);
+    }
+
+    /// Whether `value` makes a new `String`: of a literal, of an integer's
+    /// digits, or empty.
+    private static is_new_text(program: &Program, value: i64) -> boolean {
+        return match (program.expression_at(value).kind) {
+            ExpressionKind::TextLiteral(_) => { true }
+            ExpressionKind::TextOf(digits) => { program.expression_at(digits).value_type.is_integer() }
+            ExpressionKind::EmptyText      => { true }
+            _                              => { false }
+        };
+    }
+
+    /// Whether `operand` names a variable.
+    private static is_read(program: &Program, operand: i64) -> boolean {
+        return match (program.expression_at(operand).kind) {
+            ExpressionKind::Variable(_) => { true }
+            _                           => { false }
+        };
+    }
+}
+
+implement struct SelfTest {
+    /// Every `String` local keeps the rules, and the audit finds values,
+    /// appends, appended views and comparisons to check.
+    internal text_audit(mut &this) -> void {
+        mut counts: TextCounts = TextCounts { values: 0, pushes: 0, views: 0, comparisons: 0 };
+        mut seed: u64 = 1;
+        while (seed <= TEXT_AUDITED_PROGRAMS) {
+            match (TextAudit::check(this.default_model(seed), &counts)) {
+                Result::Ok(_)       => { }
+                Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }
+            }
+            seed = seed + 1;
+        }
+        this.expect(counts.values > 0, String::from_str(Str::new("the text audit found no `String` given a value")));
+        this.expect(counts.pushes > 0, String::from_str(Str::new("the text audit found no append")));
+        this.expect(counts.views > 0, String::from_str(Str::new("the text audit found no append of another `String`'s view")));
+        this.expect(counts.comparisons > 0, String::from_str(Str::new("the text audit found no comparison of `String`s")));
+    }
+}

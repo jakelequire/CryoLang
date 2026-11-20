@@ -1,0 +1,67 @@
+/// An assignment releases the value its destination holds.  When the right
+/// side moves the destination out on one branch only, the release reads
+/// whether that branch ran: the old value is released when it is still
+/// there, and not when the right side took it.  A right side that takes it
+/// on every path releases nothing.
+namespace AssignmentReleasesAfterBranchMove::Main;
+
+import std::fmt;
+
+mut log: u64 = 0;
+
+type struct Tracked { code: u64; }
+
+implement trait Drop for struct Tracked {
+    drop(mut &this) -> void { log = log * 10 + this.code; }
+}
+
+function passed(value: Option<Tracked>) -> Option<Tracked> { return value; }
+
+/// The log during the assignment and after the scope ends.
+function replaced(keep: boolean) -> (u64, u64) {
+    log = 0;
+    mut during: u64 = 0;
+    {
+        mut slot: Option<Tracked> = Option::Some(Tracked { code: 1 });
+        slot = if (keep) { slot } else { Option::Some(Tracked { code: 2 }) };
+        during = log;
+    }
+    return (during, log);
+}
+
+function taken() -> (u64, u64) {
+    log = 0;
+    mut during: u64 = 0;
+    {
+        mut slot: Option<Tracked> = Option::Some(Tracked { code: 3 });
+        if (log == 0) { slot = passed(slot); }
+        slot = passed(slot);
+        during = log;
+    }
+    return (during, log);
+}
+
+/// A binding a branch moved has a move flag; given a value again, it is
+/// then moved on every path by its own assignment's right side, which takes
+/// the value the release would otherwise find.
+function flagged() -> (u64, u64) {
+    log = 0;
+    mut during: u64 = 0;
+    {
+        mut slot: Option<Tracked> = Option::Some(Tracked { code: 6 });
+        const _other: Option<Tracked> = if (log == 0) { slot } else { Option::None };
+        slot = Option::Some(Tracked { code: 7 });
+        slot = passed(slot);
+        during = log;
+    }
+    return (during, log);
+}
+
+function main() -> i32 {
+    const kept: (u64, u64) = replaced(true);
+    const swapped: (u64, u64) = replaced(false);
+    const every_path: (u64, u64) = taken();
+    const after_flag: (u64, u64) = flagged();
+    fmt::println(f"released: {kept[0]} {kept[1]} {swapped[0]} {swapped[1]} {every_path[0]} {every_path[1]} {after_flag[0]} {after_flag[1]}");
+    return 0;
+}

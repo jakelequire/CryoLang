@@ -1,0 +1,204 @@
+///! An audit of the model's arrays and slices: every index is reduced into
+///! the length of what it indexes - `(e % N)` for an array of `N`, `(e %
+///! (v.length() as u64))` for a slice - so none is out of range; a slice is
+///! only a parameter, given `&v` of an array of its element or another
+///! slice parameter; an element is written only in a `mut` array local;
+///! and a statement writing an array borrows it nowhere, so no view of it
+///! is held across the write.
+
+namespace cryosmith::selftest::arrays;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+
+import cryosmith::model::{ BinaryOperator, ExpressionKind, Function, Program, StatementKind, ValueType, Variable, VariableRole };
+import cryosmith::selftest::runner::{ SelfTest };
+import cryosmith::selftest::uses::{ Use, UseKind, UseWalk };
+
+/// How many programs the array audit reads.
+const ARRAY_AUDITED_PROGRAMS: u64 = 200;
+
+/// What the array audit counted over the programs it read.
+internal type struct ArrayCounts {
+    /// Elements read or written.
+    internal elements: i64;
+    /// Elements written.
+    internal stores: i64;
+    /// Arrays borrowed for a slice.
+    internal borrows: i64;
+    /// `for` loops over an array or a slice.
+    internal iterations: i64;
+}
+
+/// The audit of one program's arrays and slices.
+internal type struct ArrayAudit {
+    /// Add one program's arrays to `counts`, each within the rules; or the
+    /// first that breaks one.
+    internal static check(program: &Program, counts: mut &ArrayCounts) -> Result<i64, String> {
+        for (declared in program.variables.iter()) {
+            const named_slice: boolean = match (declared.role) {
+                VariableRole::Parameter => { true }
+                _                       => { false }
+            };
+            if (declared.value_type.is_slice() && !named_slice) { return Result::Err(String::from_str(Str::new("a variable other than a parameter holds a slice"))); }
+        }
+        for (node in program.expressions.iter()) {
+            match (node.kind) {
+                ExpressionKind::Element(variable, index) => {
+                    if (!ArrayAudit::in_range(program, variable, index)) { return Result::Err(f"an index into variable {variable} is not reduced into its length"); }
+                    counts.elements = counts.elements + 1;
+                }
+                ExpressionKind::Borrow(variable) => {
+                    if (node.value_type.is_slice()) {
+                        const lent: Variable = program.variable_at(variable);
+                        const local: boolean = match (lent.role) {
+                            VariableRole::Local => { true }
+                            _                   => { false }
+                        };
+                        const array: boolean = lent.value_type.is_array() || lent.value_type.is_dynamic_array();
+                        if (!local || !array || !lent.value_type.element().same(node.value_type.element())) {
+                            return Result::Err(f"a slice borrows variable {variable}, which is no array local of its element");
+                        }
+                        counts.borrows = counts.borrows + 1;
+                    }
+                }
+                _ => { }
+            }
+        }
+        for (statement in program.statements.iter()) {
+            match (statement.kind) {
+                StatementKind::Assign(place, _) => {
+                    const written: i64 = ArrayAudit::written_element(program, place);
+                    if (written == -2) { return Result::Err(String::from_str(Str::new("an element is written through a variable that is no `mut` array local"))); }
+                    if (written >= 0) { counts.stores = counts.stores + 1; }
+                }
+                StatementKind::Compound(_, place, _) => {
+                    const written: i64 = ArrayAudit::written_element(program, place);
+                    if (written == -2) { return Result::Err(String::from_str(Str::new("an element is written through a variable that is no `mut` array local"))); }
+                    if (written >= 0) { counts.stores = counts.stores + 1; }
+                }
+                StatementKind::Each(_, _, _) => { counts.iterations = counts.iterations + 1; }
+                _ => { }
+            }
+        }
+        mut index: i64 = 0;
+        while (index < program.functions.length()) {
+            const defined: Function = program.function_at(index);
+            const verdict: Result<i64, String> = ArrayAudit::writes_unborrowed(program, &UseWalk::of(program, defined));
+            if (verdict.is_err()) { return Result::Err(f"function {index}: {verdict.unwrap_err().as_str()}"); }
+            index = index + 1;
+        }
+        return Result::Ok(0);
+    }
+
+    /// Whether `index` reduces into the length of what `variable` holds:
+    /// `(e % N)` with `N` the array's length written as a literal, `(e %
+    /// (v.length() as u64))` of the slice `variable` itself, or `(e % K)` of
+    /// a dynamic array, `K` a positive literal (the dynamic array audit
+    /// checks it against the elements the array holds).
+    private static in_range(program: &Program, variable: i64, index: i64) -> boolean {
+        const held: ValueType = program.variable_at(variable).value_type;
+        return match (program.expression_at(index).kind) {
+            ExpressionKind::Binary(operator, _, divisor) => {
+                if (operator != BinaryOperator::Remainder) { return false; }
+                match (program.expression_at(divisor).kind) {
+                    ExpressionKind::IntegerLiteral(length, negative) => {
+                        const fixed: boolean = held.is_array() && length as i64 == held.array_length();
+                        !negative && length > 0 && (fixed || held.is_dynamic_array())
+                    }
+                    ExpressionKind::Cast(measured) => {
+                        match (program.expression_at(measured).kind) {
+                            ExpressionKind::Length(viewed) => { held.is_slice() && viewed == variable }
+                            _                              => { false }
+                        }
+                    }
+                    _ => { false }
+                }
+            }
+            _ => { false }
+        };
+    }
+
+    /// The array local whose element the store target `place` is, or -1
+    /// when it is no element, or -2 when it is an element of anything but
+    /// a `mut` array local.
+    private static written_element(program: &Program, place: i64) -> i64 {
+        const variable: i64 = match (program.expression_at(place).kind) {
+            ExpressionKind::Element(base, _) => { base }
+            _                                => { -1 }
+        };
+        if (variable < 0) { return -1; }
+        const declared: Variable = program.variable_at(variable);
+        const local: boolean = match (declared.role) {
+            VariableRole::Local => { true }
+            _                   => { false }
+        };
+        const array: boolean = declared.value_type.is_array() || declared.value_type.is_dynamic_array();
+        return if (local && declared.mutable && array) { variable } else { -2 };
+    }
+
+    /// Whether no statement of `uses` both writes an array and borrows it.
+    private static writes_unborrowed(program: &Program, uses: &Array<Use>) -> Result<i64, String> {
+        mut start: i64 = 0;
+        while (start < uses.length()) {
+            mut end: i64 = start + 1;
+            while (end < uses.length() && !ArrayAudit::starts_statement(uses[end].kind)) { end = end + 1; }
+            mut position: i64 = start;
+            while (position < end) {
+                const written: Use = uses[position];
+                const assigned: boolean = match (written.kind) {
+                    UseKind::Assigned => { written.variable >= 0 && program.variable_at(written.variable).value_type.is_array() }
+                    _                 => { false }
+                };
+                if (assigned) {
+                    mut other: i64 = start;
+                    while (other < end) {
+                        const borrowed: boolean = match (uses[other].kind) {
+                            UseKind::SharedBorrow    => { true }
+                            UseKind::ExclusiveBorrow => { true }
+                            _                        => { false }
+                        };
+                        if (borrowed && uses[other].variable == written.variable) {
+                            return Result::Err(f"variable {written.variable} is written and borrowed in one statement");
+                        }
+                        other = other + 1;
+                    }
+                }
+                position = position + 1;
+            }
+            start = end;
+        }
+        return Result::Ok(0);
+    }
+
+    /// Whether a use of `kind` marks a statement's start.
+    private static starts_statement(kind: UseKind) -> boolean {
+        return match (kind) {
+            UseKind::StatementStarted => { true }
+            _                         => { false }
+        };
+    }
+}
+
+implement struct SelfTest {
+    /// Every array and slice keeps the rules, and the audit finds element
+    /// reads, element stores, borrowed slices and loops over elements to
+    /// check.
+    internal array_audit(mut &this) -> void {
+        mut counts: ArrayCounts = ArrayCounts { elements: 0, stores: 0, borrows: 0, iterations: 0 };
+        mut seed: u64 = 1;
+        while (seed <= ARRAY_AUDITED_PROGRAMS) {
+            match (ArrayAudit::check(this.default_model(seed), &counts)) {
+                Result::Ok(_)       => { }
+                Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }
+            }
+            seed = seed + 1;
+        }
+        this.expect(counts.elements > 0, String::from_str(Str::new("the array audit found no element read or written")));
+        this.expect(counts.stores > 0, String::from_str(Str::new("the array audit found no element written")));
+        this.expect(counts.borrows > 0, String::from_str(Str::new("the array audit found no array borrowed for a slice")));
+        this.expect(counts.iterations > 0, String::from_str(Str::new("the array audit found no loop over elements")));
+    }
+}

@@ -13,7 +13,7 @@ import std::collections::array::{ Array };
 
 import cryosmith::configuration::{ Feature };
 import cryosmith::generate::generator::{ Generator };
-import cryosmith::model::{ ExpressionKind, Field, Function, Receiver, Structure, ValueType };
+import cryosmith::model::{ ExpressionKind, Field, Function, Receiver, Structure, TypeArgumentSpelling, ValueType };
 import cryosmith::random::{ RandomStream };
 import cryosmith::typing::{ TypeChoice };
 
@@ -74,7 +74,7 @@ implement struct Generator {
             const owner: i64 = owners.get(index).unwrap();
             const number: i64 = numbers.get(owner).unwrap();
             numbers.set(owner, number + 1);
-            this.define(number, owner, receivers.get(index).unwrap());
+            this.define(number, ValueType::Record(owner), receivers.get(index).unwrap());
             index = index + 1;
         }
     }
@@ -88,7 +88,7 @@ implement struct Generator {
         const variables: Array<i64> = this.environment.variables_of(&this.program, wanted);
         const roots: Array<i64> = this.environment.field_roots(&this.program, wanted);
         const callees: Array<i64> = this.callees(wanted);
-        const methods: Array<i64> = this.method_calls(wanted, false);
+        const methods: Array<MethodCandidate> = this.method_calls(wanted, false);
         const generic_callees: Array<i64> = this.generic_callees(wanted);
         mut weights: Array<i64> = Array::<i64>::new();
         weights.push(8);
@@ -112,15 +112,43 @@ implement struct Generator {
     }
 
     /// `S { f: value, ... }`, its fields in a shuffled order; a field with a
-    /// default is left out half the time.
+    /// default is left out half the time.  An instance's literal that
+    /// leaves its type argument to inference gives a deciding value for
+    /// each field of type `T`; its first field is one, and has no default.
+    /// Inside a generic struct's own method, a literal of that struct is
+    /// spelled the same ways, so the instance its fields bind need not be
+    /// the one the body belongs to.
     private record_literal(mut &this, wanted: ValueType, depth: i64) -> i64 {
         const declared: Structure = this.program.structure_at(wanted.structure());
+        const spelling: TypeArgumentSpelling = if (declared.is_instance()) { this.type_argument_spelling() } else { TypeArgumentSpelling::Written };
         mut order: Array<i64> = Array::<i64>::new();
         mut field: i64 = declared.first_field;
         while (field < declared.first_field + declared.field_count) {
             if (this.program.field_at(field).default_value < 0 || this.random.chance(50)) { order.push(field); }
             field = field + 1;
         }
+        this.shuffle(&order);
+        mut values: Array<i64> = Array::<i64>::new();
+        for (written in order.iter()) {
+            const field_type: ValueType = this.program.field_at(written).value_type;
+            if (spelling.is_inferred() && this.program.field_is_type_argument(wanted.structure(), written)) {
+                values.push(this.deciding_value(field_type, depth));
+            } else {
+                values.push(this.typed_place(field_type, depth));
+            }
+        }
+        const first: i64 = this.program.lists.length();
+        mut index: i64 = 0;
+        while (index < order.length()) {
+            this.program.lists.push(order.get(index).unwrap());
+            this.program.lists.push(values.get(index).unwrap());
+            index = index + 1;
+        }
+        return this.node(ExpressionKind::StructureLiteral(wanted.structure(), spelling, first, order.length()), wanted);
+    }
+
+    /// Put `order` in a drawn order: a literal writes its fields in any.
+    internal shuffle(mut &this, order: mut &Array<i64>) -> void {
         mut index: i64 = order.length() - 1;
         while (index > 0) {
             const other: i64 = this.random.below(index + 1);
@@ -129,16 +157,6 @@ implement struct Generator {
             order.set(other, swapped);
             index = index - 1;
         }
-        mut values: Array<i64> = Array::<i64>::new();
-        for (written in order.iter()) { values.push(this.typed_place(this.program.field_at(written).value_type, depth)); }
-        const first: i64 = this.program.lists.length();
-        index = 0;
-        while (index < order.length()) {
-            this.program.lists.push(order.get(index).unwrap());
-            this.program.lists.push(values.get(index).unwrap());
-            index = index + 1;
-        }
-        return this.node(ExpressionKind::StructureLiteral(wanted.structure(), first, order.length()), wanted);
     }
 
     /// A field reached from the writable struct `root`, for a store: a
@@ -179,33 +197,76 @@ implement struct Generator {
         return place;
     }
 
-    /// A call of the method `callee` on a place of its struct: one whose
-    /// fields may be written when the method takes `mut &this`.
-    internal method_call(mut &this, callee: i64, depth: i64) -> i64 {
-        const called: Function = this.program.function_at(callee);
-        const owner: ValueType = ValueType::Record(called.owner);
-        const roots: Array<i64> = this.environment.receiver_roots(&this.program, owner, called.receiver.writes_receiver());
-        const receiver: i64 = this.place(roots.get(this.random.below(roots.length())).unwrap(), owner);
-        const first: i64 = this.arguments(called, depth);
-        return this.node(ExpressionKind::MethodCall(receiver, callee, first, called.parameter_count), called.returns);
+    /// A call of `candidate`'s method on a place of its receiver type: one
+    /// whose fields may be written when the method takes `mut &this`.  On
+    /// an instance of a generic struct, `T` stands for the instance's
+    /// argument, in the arguments and in what the call returns.
+    internal method_call(mut &this, candidate: MethodCandidate, depth: i64) -> i64 {
+        const called: Function = this.program.function_at(candidate.method);
+        const roots: Array<i64> = this.environment.receiver_roots(&this.program, candidate.receiver, called.receiver.writes_receiver());
+        const receiver: i64 = this.place(roots.get(this.random.below(roots.length())).unwrap(), candidate.receiver);
+        const type_argument: ValueType = if (candidate.receiver.is_record()) { this.program.structure_at(candidate.receiver.structure()).argument } else { ValueType::Void };
+        const first: i64 = this.instantiated_arguments(called, type_argument, false, depth);
+        const returned: ValueType = if (called.returns.same(ValueType::TypeParameter)) { type_argument } else { called.returns };
+        return this.node(ExpressionKind::MethodCall(receiver, candidate.method, first, called.parameter_count), returned);
     }
 
     /// The earlier methods taking a receiver and returning `wanted` that
     /// are affordable and have a receiver in scope: methods taking
     /// `mut &this` when `writes` (they return nothing), `&this` otherwise.
-    internal method_calls(&this, wanted: ValueType, writes: boolean) -> Array<i64> {
-        mut found: Array<i64> = Array::<i64>::new();
+    /// A generic struct's method is a candidate once for each of its
+    /// instances, its own among them, that has a receiver in scope and on
+    /// which it returns `wanted`.  A method of an enum's implementation is
+    /// a candidate on that enum.  A trait method's default body is a
+    /// candidate once for each struct or enum that runs it, implementing
+    /// the trait and writing no method of its own for the default.
+    internal method_calls(&this, wanted: ValueType, writes: boolean) -> Array<MethodCandidate> {
+        mut found: Array<MethodCandidate> = Array::<MethodCandidate>::new();
         if (!this.options.features.has(Feature::Calls)) { return found; }
         mut index: i64 = 0;
         while (index < this.program.functions.length()) {
             const candidate: Function = this.program.function_at(index);
             const matches: boolean = !candidate.receiver.is_called_by_name() && candidate.receiver.writes_receiver() == writes;
-            if (matches && candidate.returns.same(wanted) && this.budget.affordable(candidate.cost)
-                && this.environment.receiver_roots(&this.program, ValueType::Record(candidate.owner), writes).length() > 0) {
-                found.push(index);
+            if (matches && candidate.is_default() && candidate.returns.same(wanted) && this.budget.affordable(candidate.cost)) {
+                const implementors: Array<ValueType> = this.program.implementing_types();
+                for (implementor in implementors.iter()) {
+                    if (this.program.runs_default(implementor, candidate.implements)
+                        && this.environment.receiver_roots(&this.program, implementor, writes).length() > 0) {
+                        found.push(MethodCandidate { method: index, receiver: implementor });
+                    }
+                }
+            } else if (matches && !candidate.is_default() && candidate.owner.is_enumeration() && this.budget.affordable(candidate.cost) && this.may_call(&candidate)) {
+                if (candidate.returns.same(wanted) && this.environment.receiver_roots(&this.program, candidate.owner, writes).length() > 0) {
+                    found.push(MethodCandidate { method: index, receiver: candidate.owner });
+                }
+            } else if (matches && !candidate.is_default() && this.budget.affordable(candidate.cost) && this.may_call(&candidate)) {
+                const owned_by: i64 = candidate.owner.structure();
+                const owner: Structure = this.program.structure_at(owned_by);
+                mut receiver: i64 = if (owner.is_own_instance()) { 0 } else { owned_by };
+                const last: i64 = if (owner.is_own_instance()) { this.program.structures.length() - 1 } else { owned_by };
+                while (receiver <= last) {
+                    const instance: Structure = this.program.structure_at(receiver);
+                    const receives: boolean = receiver == owned_by || (owner.is_own_instance() && instance.template == owner.template);
+                    const returned: ValueType = if (candidate.returns.same(ValueType::TypeParameter)) { instance.argument } else { candidate.returns };
+                    if (receives && returned.same(wanted)
+                        && this.environment.receiver_roots(&this.program, ValueType::Record(receiver), writes).length() > 0) {
+                        found.push(MethodCandidate { method: index, receiver: ValueType::Record(receiver) });
+                    }
+                    receiver = receiver + 1;
+                }
             }
             index = index + 1;
         }
         return found;
     }
+}
+
+/// A method call the generator may write: the method, and the type of the
+/// place it is called on - its own struct, or for a generic struct's
+/// method, one of that struct's instances.
+internal type struct MethodCandidate {
+    /// The method, by its place among the functions.
+    internal method: i64;
+    /// The receiver's type.
+    internal receiver: ValueType;
 }

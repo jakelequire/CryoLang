@@ -1,0 +1,60 @@
+///! smith-diff's Linux arm from a Windows host: a path below the work
+///! directory named inside WSL, the two Linux configurations, and how an
+///! outcome inside WSL is read.
+![config(testing)]
+namespace cryogate::tests::linux;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect };
+
+import cryogate::core::child::{ Outcome };
+import cryogate::core::wsl::{ WslMapping };
+import cryogate::smith::difference::{ Configuration, Observation };
+
+/// The work directory `C:\work\smith` as WSL names it.
+private function work() -> WslMapping {
+    return WslMapping { windows: String::from_str(Str::new("C:\\work\\smith")), inside: String::from_str(Str::new("/mnt/c/work/smith")) };
+}
+
+![test]
+function a_path_below_the_work_directory_is_named_inside_wsl() -> Result<(), TestError> {
+    const mapping: WslMapping = work();
+    const back: String = mapping.path(Str::new("C:\\work\\smith\\build-3-linux-O0\\smith-3.cryo"));
+    expect(back.as_str() == Str::new("/mnt/c/work/smith/build-3-linux-O0/smith-3.cryo"), back.as_str())?;
+    const forward: String = mapping.path(Str::new("C:/work/smith/smith-3-linux-O2.exe"));
+    expect(forward.as_str() == Str::new("/mnt/c/work/smith/smith-3-linux-O2.exe"), forward.as_str())?;
+    const elsewhere: String = mapping.path(Str::new("D:\\other\\file"));
+    return expect(elsewhere.as_str() == Str::new("D:/other/file"), elsewhere.as_str());
+}
+
+![test]
+function a_linux_configuration_is_named_and_keyed_apart_and_carries_its_stdlib() -> Result<(), TestError> {
+    const mapping: WslMapping = work();
+    const unoptimised: Configuration = Configuration::linux(Str::new("/home/u/cryo/compiler/build/cryo"), Option::Some(Str::new("/home/u/cryo/stdlib")), Str::new("0"), &mapping);
+    expect(unoptimised.name.as_str() == Str::new("linux -O0") && unoptimised.key.as_str() == Str::new("linux-O0"), unoptimised.name.as_str())?;
+    expect(unoptimised.stdlib.unwrap().as_str() == Str::new("/home/u/cryo/stdlib"), Str::new("its own stdlib"))?;
+    expect(unoptimised.wsl.is_some(), Str::new("built inside WSL"))?;
+    const host: Configuration = Configuration::compiled(Str::new("tree"), Str::new(""), Str::new("cryo.exe"), Str::new("2"));
+    return expect(host.wsl.is_none() && host.stdlib.is_none(), Str::new("a host configuration is neither"));
+}
+
+![test]
+function inside_wsl_timeouts_exit_124_is_a_hang_and_on_the_host_a_crash() -> Result<(), TestError> {
+    const mapping: WslMapping = work();
+    const linux: Configuration = Configuration::linux(Str::new("cryo"), Option::None, Str::new("0"), &mapping);
+    const host: Configuration = Configuration::compiled(Str::new("tree"), Str::new(""), Str::new("cryo.exe"), Str::new("0"));
+    const stopped: Outcome = Outcome::Exited(124);
+    const linux_build: Option<Observation> = Observation::of_build(&linux.outcome_of(&stopped), Str::new(""));
+    expect(linux_build.unwrap().kind().unwrap().name() == Str::new("compile hang"), Str::new("a Linux build stopped by timeout"))?;
+    const linux_run: Observation = Observation::of_run(&linux.outcome_of(&stopped), Str::new(""));
+    expect(linux_run.kind().unwrap().name() == Str::new("run hang"), Str::new("a Linux run stopped by timeout"))?;
+    const host_build: Option<Observation> = Observation::of_build(&host.outcome_of(&stopped), Str::new(""));
+    expect(host_build.unwrap().kind().unwrap().name() == Str::new("compile crash"), Str::new("exit 124 on the host"))?;
+    const crashed: Outcome = Outcome::Exited(139);
+    const linux_crash: Option<Observation> = Observation::of_build(&linux.outcome_of(&crashed), Str::new(""));
+    return expect(linux_crash.unwrap().detail().as_str() == Str::new("exit 139"), Str::new("a segfault inside WSL, as timeout reports it"));
+}

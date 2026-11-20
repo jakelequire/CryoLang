@@ -170,9 +170,9 @@ const b: u8 = 200 + 100;   // error: 300 does not fit `u8`, and would silently t
 const c: i8 = 0 - 128;     // -128: held
 ```
 
-A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. An operand made only of literals beside one that is not - outside a shift - and a compound assignment's value made only of literals are their exact value, computed first, and take the other operand's type only where that type holds the value: with `x: i8`, `x + (200 / 2)` adds 100. Where the type does not hold it, the value keeps its default type and the operation widens the other operand to it, as an implicit conversion does: with `w: u8`, `w + (1 << 20)` is the `i32` 1048577, and `w + (200 + 100)` is an `i32` sum, which a `u8` place does not take (`E0200`). A negated literal is held the same way by a signed operand: beside an `i8`, `-129` keeps its default type rather than wrapping to 127, so `x + -129` is an `i32` sum. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value. An argument is held to its parameter the same way, including a parameter whose type the call's expected type decides: `const h: Holder<i16> = Holder::make(-3);` passes `-3` as an `i16`, while `-129` for an `i8` or `-3` for a `u16` is refused (`E0214`). An argument made only of literals passes its exact value and is held by its parameter as that value's literal would be: `take_i8(-(100 + 28))` passes -128, and `take_u8(200 + 100)` is refused (`E0214`).
+A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. An operand made only of literals beside one that is not - outside a shift - and a compound assignment's value made only of literals are their exact value, computed first, and take the other operand's type only where that type holds the value: with `x: i8`, `x + (200 / 2)` adds 100. Where the type does not hold it, the value keeps its default type and the operation widens the other operand to it, as an implicit conversion does: with `w: u8`, `w + (1 << 20)` is the `i32` 1048577, and `w + (200 + 100)` is an `i32` sum, which a `u8` place does not take (`E0200`). A negated literal is held the same way by a signed operand: beside an `i8`, `-129` keeps its default type rather than wrapping to 127, so `x + -129` is an `i32` sum. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value. A complement of a literal beside an unsigned operand is that operand's bit pattern, not a negative number: with `x: u32`, `x & ~0xFF` clears the low eight bits of `x`. An argument is held to its parameter the same way, including a parameter whose type the call's expected type decides: `const h: Holder<i16> = Holder::make(-3);` passes `-3` as an `i16`, while `-129` for an `i8` or `-3` for a `u16` is refused (`E0214`). An argument made only of literals passes its exact value and is held by its parameter as that value's literal would be: `take_i8(-(100 + 28))` passes -128, and `take_u8(200 + 100)` is refused (`E0214`).
 
-A shift's amount does not type the value shifted: a literal shifted by an amount not made only of literals takes the integer type expected of the result, where one is - an initializer's, an assignment's, an argument's or a return's - so `const p: u64 = 1 << (u64::BITS - 1);` shifts at 64 bits, not at the `u32` amount's 32.  A shift's result is always the shifted value's type, and the amount's type never changes it: `b << n` with `b: u8` and `n: u64` is a `u8`.  Where no integer type is expected, a shifted literal takes the amount's type.
+A shift's amount does not type the value shifted: a literal shifted by an amount not made only of literals takes the integer type expected of the result, where one is - an initializer's, an assignment's, an argument's or a return's - so `const p: u64 = 1 << (u64::BITS - 1);` shifts at 64 bits, not at the `u32` amount's 32.  A shift's result is always the shifted value's type, and the amount's type never changes it: `b << n` with `b: u8` and `n: u64` is a `u8`.  Where no integer type is expected, a shifted literal takes the amount's type, and must be held by it as a literal stored at that type is: with `u: u8` and `n: i8`, `300 << u` and `-129 << n` are refused (`E0010`) rather than shifted as 44 and 127.
 
 An integer literal stored where a `char` is takes `char`, and must be at most `0x10FFFF`, the largest Unicode scalar value: `const c: char = 0x110000;` is refused (`E0010`).
 
@@ -399,7 +399,7 @@ const &int         // the same type as &int
 
 The receiver shape on a method is part of its signature: a `&this` method may not modify the receiver; a `mut &this` method may. Callers see this distinction without reading the body.
 
-**Read-only places.** A place reached through a read-only borrow - a `&T`, a `virtual &Trait`, or `this` in a `&this` method - or through a read-only pointer `T*` is not written: assigning it, giving it a compound assignment (`+=` and the rest) and calling a `mut &this` method on it are each refused (`E0250`). The last indirection on the way to a place decides, so `r.x = 1` with `r: &(mut Foo*)` writes through the writable pointer, and `r.scale(2)` with `r: &virtual mut &Shape` through the writable object, while `p.x = 1` with `p: Foo*` is refused. A `*` strips one level, so the place `*p` is decided by the outermost indirection of `p` alone: `*p = q` with `p: &(mut Foo*)` writes the borrowed pointer and is refused, and with `p: mut (&Foo)*` writes the borrow the pointer points at. Indexing a pointer is the same, since `p[i]` is `*(p + i)`: `p[0] = q` with `p: mut (u8*)*` writes the writable outer level, and with `p: (mut u8*)*` is refused. A `mut &this` method is not called on a `const` binding either. A binding a `match` makes follows the value it matched: a match on a writable value, a `mut &T`, a `mut T*` or `&x` of a writable `x` binds writable names, and a match on a `&T`, a `T*` or a `const` binding read-only ones; a `mut` written before the name does not change that.
+**Read-only places.** A place reached through a read-only borrow - a `&T`, a `virtual &Trait`, or `this` in a `&this` method - or through a read-only pointer `T*` is not written: assigning it, giving it a compound assignment (`+=` and the rest) and calling a `mut &this` method on it are each refused (`E0250`). The last indirection on the way to a place decides, so `r.x = 1` with `r: &(mut Foo*)` writes through the writable pointer, and `r.scale(2)` with `r: &virtual mut &Shape` through the writable object, while `p.x = 1` with `p: Foo*` is refused. A `*` strips one level, so the place `*p` is decided by the outermost indirection of `p` alone: `*p = q` with `p: &(mut Foo*)` writes the borrowed pointer and is refused, and with `p: mut (&Foo)*` writes the borrow the pointer points at. Indexing a pointer is the same, since `p[i]` is `*(p + i)`: `p[0] = q` with `p: mut (u8*)*` writes the writable outer level, and with `p: (mut u8*)*` is refused. A `mut &this` method is not called on a `const` binding either. A binding a `match` makes follows the value it matched: a match on a writable value, a `mut &T`, a `mut T*` or `&x` of a writable `x` binds writable names, and a match on a `&T`, a `T*` or a `const` binding read-only ones; a `mut` written before the name does not change that. What a write to a binding reaches - the matched value or a copy of its own - is said in [section 7.2](#72-enum-destructuring).
 
 **Write access is not made from read access.** `&x` takes its mutability from what is wanted of it and from `x`: where a value that writes is wanted - a `mut &T`, a `virtual mut &Trait`, or a `mut T*`, as a parameter, a declared type, a `return` or an assigned place - `&x` is a writable borrow, and is refused (`E0251`) when `x` is a read-only place (held by a `const` binding, or reached through a `&T`, a `virtual &Trait`, a `T*` or a `&this` receiver). With nothing such wanted, `&x` is exactly as writable as `x`. So a writable borrow is written `&x` too, and `&mut x` is refused at the `mut` (`E0101`). A `&T` value converts to a `T*` and never to a `mut T*` or a `mut &T`: passing one where those are wanted is refused (`E0251`), and `as` is the one way to a writable pointer from it. `mut &T` converts to `&T`, and to `mut T*` and `T*`. `&a[i]` and `&*b` borrowed for writing go through `index_mutable` and `deref_mutable` ([section 10.6](#106-operator-overloading)).
 
@@ -701,7 +701,13 @@ parameter or slot is different: it holds a function pointer, which has no room
 for the closure's captures. One function-typed parameter takes a capturing
 closure - a non-generic free function's, when the function is declared in the
 same module: that function is copied for each closure type passed to it, with
-the parameter retyped to the closure. Everything else is refused at compile
+the parameter retyped to the closure. In the copy the parameter holds the
+closure, so passing it on to another such function passes the closure, and
+that function is copied for it in turn. The call's other arguments are
+checked against the copy's parameters as any call's are against its
+callee's: a value given for a trait object parameter becomes the object
+there, and an argument of a type its parameter does not take is refused
+(**E0214**). Everything else is refused at compile
 time with **E0458** rather than compiled to a call through a pointer that is
 not one:
 
@@ -847,7 +853,7 @@ A path through an alias names what the same path through its target names, type 
 
 ### 2.9 Casting with `as`
 
-Cryo never inserts a conversion that can change a value, and never an implicit pointer conversion. A number converts implicitly - at an initializer, an assignment, a compound assignment, an argument, a return, a struct literal's field, an array or tuple literal's element (to the element type the literal is expected to have: `[x, x]` with `x: f32` written where a `[f64; 2]` is expected) and a two-branch expression's arm - only to a type that holds every value of its own:
+Cryo never inserts a conversion that can change a value, and never an implicit pointer conversion. A number converts implicitly - at an initializer, an assignment, a compound assignment, an argument, a return, a struct literal's field, an array or tuple literal's element (to the element type the literal is expected to have: `[x, x]` with `x: f32` written where a `[f64; 2]` is expected), a two-branch expression's arm and a `match` expression's arm - only to a type that holds every value of its own:
 
 - an integer to a wider integer of the same signedness, or an unsigned integer to a wider signed one (`u32` to `i64`);
 - `usize` and `isize`, which are as wide as a pointer - 32 or 64 bits by target - only where the conversion keeps every value on every target: into `usize` from an unsigned type of at most 32 bits, into `isize` from a signed type of at most 32 bits or an unsigned one of at most 16; out of `usize` into an unsigned type of at least 64 bits or a signed one wider than 64, out of `isize` into a signed type of at least 64. A `u64` is not a `usize`, nor an `isize` an `i64`;
@@ -1464,6 +1470,7 @@ The range operators `..` / `..=` bind looser than every arithmetic and compariso
 - a binary operator's left operand before its right one; `&&`, `||` and `??` evaluate the right operand only when the left one does not decide the result;
 - an assignment's place before its value, for `=` and every compound assignment ([section 5.5](#55-assignment)): the calls and indexes that locate the place run first, so `slots[note(1)] = note(2)` and `pair_at(note(1)).second += note(2)` both run `note(1)` before `note(2)`;
 - a call's arguments in the order they are written, each before the function is entered;
+- an array literal's elements in the order they are written, and a repeat `[value; count]`'s value before its count, so `[note(1); note(2)]` runs `note(1)` before `note(2)`;
 - a method call's receiver before its arguments.
 
 The order is part of a program's meaning, so it is the same at every optimisation level. Precedence decides only how operands group, not when they run: in `note(1) + note(2) * note(3)` the three calls run in the order written, and the product is formed before the sum.
@@ -1503,7 +1510,7 @@ if (x > 0) {
 }
 ```
 
-`if` may also be used as an **expression** that evaluates to the value of the chosen branch. When used this way, both arms are required and must produce the same type. An arm that is `null` converts to any pointer, so the expression has the other arm's type, whichever arm the `null` is in: `if (c) { null } else { b }` is a `B*` for `b: B*`, and is refused where an unrelated pointer type is declared. The conditional form `c ? x : y` follows the same rule.
+`if` may also be used as an **expression** that evaluates to the value of the chosen branch. When used this way, both arms are required and must produce the same type. An arm that is `null` converts to any pointer, so the expression has the other arm's type, whichever arm the `null` is in: `if (c) { null } else { b }` is a `B*` for `b: B*`, and is refused where an unrelated pointer type is declared. Likewise, an arm that constructs a variant of a generic enum without naming its instance, `Option::None` or a `Result::Ok(x)` whose payload binds only some of the enum's parameters, takes the instance of that enum another arm has, so `if (c) { Option::None } else { Option::Some(4) }` is an `Option<i32>` where no type is expected of it. An arm of another type names no instance for it, and a variant no arm, payload or expected type names one for is refused (E0307). The conditional form `c ? x : y` follows the same rules, and so do the arms of a `match` expression.
 
 ```cryo
 const is_even: boolean = if (n % 2 == 0) { true } else { false };
@@ -1622,7 +1629,7 @@ There is no fallthrough between arms. See [section 7](#7-pattern-matching) for t
 
 ### 6.8 Match: Expression Form
 
-Used as an expression, `match` evaluates to the value of the matching arm. All arms must produce the same type.
+Used as an expression, `match` evaluates to the value of the matching arm. All arms must produce the same type, and that type is the expression's: its arms are unified as an `if` expression's branches are. The type expected where the `match` stands - an initializer's, an argument's parameter, a return's - reaches each arm's value as it reaches an `if` expression's branches, so a literal arm takes it (`take_u64(match (e) { E::A => { 4000000000 } _ => { 1 } })` passes `u64`s); it never types the `match` itself, which then converts where it stands as any value does. The subject is matched as the value it is: nothing is expected of it, so a `match` as another's subject is typed by its own arms.
 
 ```cryo
 const name: string = match (n) {
@@ -1798,6 +1805,23 @@ function describe(s: Shape) -> void {
 ```
 
 In each arm, the variables are introduced for the payload of that variant. The compiler enforces that the count and types match the variant's declaration.
+
+**A binding of a `Copy` value is a copy taken when the arm is entered.** In a `match` on a variable by value, a binding not written `mut` whose payload is `Copy` holds the payload as it was when the arm was chosen: assigning the variable inside the arm does not change the binding, and writing the binding (where the variable is writable) does not change the variable. A name binding the whole subject (`whole => ..`) is the same. A binding written `mut`, and a binding of a payload that is not `Copy`, names the payload where it lies in the variable: a write to it writes the variable, and assigning the variable is seen through it. A `match` through a borrow or a pointer (`match (&x)`, `match (&this)`, `match (p)` with `p: T*`) binds every name inside the value it reaches, so `&value` of a binding points into that value.
+
+```cryo
+mut v: Outer = Outer::X(7, Inner::A(11, 13));
+match (v) {
+    Outer::X(a, b) => {
+        v = Outer::Y(1);
+        // `a` is still 7 and `b` still Inner::A(11, 13)
+    }
+    Outer::Y(_) => { }
+}
+match (v) {
+    Outer::Y(mut n) => { n = 5; }   // writes v: it is now Outer::Y(5)
+    Outer::X(_, _) => { }
+}
+```
 
 If you don't need a payload, use `_`: `Option::Some(_) => { ... }`.
 
@@ -2044,7 +2068,7 @@ const strs: Pair<string> = Pair::<string>::new("hello", "world");
 
 `Pair<int>` and `Pair<string>` are independent types. See [section 11.6](#116-monomorphisation).
 
-A generic struct's literal written without type arguments is one instance of it: the one its expected type names, or else the one its field values bind. Inside a generic body that instance may be over the body's own parameters, so `return Pair { first: a, second: b };` in `new` above is a `Pair<T>`, and `Holder { f: f }` returned from `function hold<F>(f: F) -> Holder<F>` is a `Holder<F>`. The owner's own literal follows the same rule: in a method of `type struct Two<A, B>` declared `-> Two<B, A>`, `return Two { a: this.b, b: this.a };` builds a `Two<B, A>`, not the `Two<A, B>` the method belongs to.
+A generic struct's literal written without type arguments is one instance of it: the one its expected type names, or else the one its field values bind. Inside a generic body that instance may be over the body's own parameters, so `return Pair { first: a, second: b };` in `new` above is a `Pair<T>`, and `Holder { f: f }` returned from `function hold<F>(f: F) -> Holder<F>` is a `Holder<F>`. The owner's own literal follows the same rule: in a method of `type struct Two<A, B>` declared `-> Two<B, A>`, `return Two { a: this.b, b: this.a };` builds a `Two<B, A>`, not the `Two<A, B>` the method belongs to. With nothing expected, its fields decide it there as anywhere: in a method of `type struct Box<T> { f0: T; }`, `Box { f0: x }` with `x: u16` is a `Box<u16>`, and in `Box::make(Box { f0: p })`, the owner's arguments left to the call, the literal is a `Box<Pixel>` for `p: Pixel` and the call's owner `Box<Box<Pixel>>`; `Box { f0: this.f0 }` is the body's own `Box<T>`.
 
 Where the field values bind the instance, a value in a field written over the struct's parameters is typed on its own, as a generic function's argument is: `Holder { inner: 3, peeked: Option::Some(2) }` is a `Holder<i32>` because `3` and `Some(2)` say so, and a variant's payload binds the parameters it carries (`Result::Ok(5)` binds the `T` of a field `Result<T, E>`, leaving `E` to the other fields). A value that only its field can type - `Option::None`, an empty `[]` - takes the instance's field once the other values have bound it. Every value is then checked against the instance's field, so `Pair { a: 1, b: true }` for `type struct Pair<T> { a: T; b: T; }` is refused (E0200) at `true`.
 
@@ -2219,7 +2243,7 @@ const r: Result<string, int>  = Result::Ok("success");
 
 Each instantiation is an independent type at the machine level; `Option<int>` and `Option<string>` share no runtime representation.
 
-A variant constructs one instantiation, and something must say which: type arguments written on the path (`Option::<i32>::None`, `Result::Ok::<i32, i32>(4)`), the expected type (an annotation, a parameter, a return type), or the variant's own arguments (`Option::Some(42)` is an `Option<i32>`). A variant nothing instantiates - `const n = Option::None;`, or `Result::Ok(1)` with `E` unbound - is refused (`E0307`). A variant's arguments are checked against its payloads in the instantiation it constructs, as a call's are against its parameters, however that instantiation is named and in a non-generic enum too: `Result::<i32, i32>::Ok("x")`, `Option::Some(w)` where an `Option<i64>` is expected and `w` is a struct, and `Slot::Full(w)` for a `Full(i64)` payload are refused (`E0214`). An argument converts there as it does at a parameter, so `Option::Some(&c)` where an `Option<virtual &Shape>` is expected holds a trait object ([section 10.7](#107-trait-objects)), and in `Option::<u8>::Some(200)` the literal is a `u8`.
+A variant constructs one instantiation, and something must say which: type arguments written on the path (`Option::<i32>::None`, `Result::Ok::<i32, i32>(4)`), the expected type (an annotation, a parameter, a return type), or the variant's own arguments (`Option::Some(42)` is an `Option<i32>`). The expected type reaches each arm of an `if`, `?:` or `match` expression standing where it is expected, so in `take(if (c) { Option::None } else { found })` the `None` is the instance `take`'s parameter names, as it is in an annotated declaration's initializer. A variant nothing instantiates - `const n = Option::None;`, or `Result::Ok(1)` with `E` unbound - is refused (`E0307`). A variant's arguments are checked against its payloads in the instantiation it constructs, as a call's are against its parameters, however that instantiation is named and in a non-generic enum too: `Result::<i32, i32>::Ok("x")`, `Option::Some(w)` where an `Option<i64>` is expected and `w` is a struct, and `Slot::Full(w)` for a `Full(i64)` payload are refused (`E0214`). An argument converts there as it does at a parameter, so `Option::Some(&c)` where an `Option<virtual &Shape>` is expected holds a trait object ([section 10.7](#107-trait-objects)), and in `Option::<u8>::Some(200)` the literal is a `u8`.
 
 ### 9.4 Methods on Enums
 
@@ -3342,6 +3366,10 @@ A bound of one says, in the signature, which types a generic accepts - a call wi
 
 `implement` adds methods to a type without modifying its original declaration. There are three forms.
 
+The type a head names may be written after a kind keyword, `struct`, `enum` or `union` (`implement struct Point`, `implement trait Eq for enum Color`). The keyword is optional, and when written it names the kind of that type: `struct` a struct, `enum` an enum, `union` a union, and an alias the type it names. A keyword naming another kind is refused (E0319), with the type's own keyword as the fix; a type that is none of the three, such as a primitive, takes no keyword, and the fix removes it.
+
+A head may name the type through an alias, since an alias is the type it names: with `type PointAlias = Point;`, `implement trait Measure for PointAlias` implements `Measure` for `Point`, and `implement PointAlias { .. }` gives `Point` its methods. They are reached through either name - on a `Point` value, on a `PointAlias` value, as `Point::at(..)` or `PointAlias::at(..)`, through a bound and through a trait object - and an alias of an alias reaches the same type. The alias must reach a type a head names by its declaration, a struct, an enum, a union or a primitive; one naming a generic instance (`type WideWrapper = Wrapper<i64>;`), a pointer, an array or a function type is refused (E0320). A generic instance is implemented for by writing it after `for` (`implement trait Widen for Wrapper<i64>`).
+
 ### 12.1 Inherent Implementation
 
 Adds methods to a type. For a struct, an inherent block is interchangeable with declaring the methods inline:
@@ -3925,6 +3953,8 @@ Implementing `Drop` declares "I own resources that must be released." The compil
 
 The last three are released at the statement that performs them, and every statement counts as one wherever it stands: a braceless loop body or `if` branch, and a `for` loop's update clause, release exactly as they would inside braces.
 
+A statement's temporaries are released in reverse order of creation, and a discarded result counts as the last one created: it is released first, before any temporary it may borrow. `watch(&make());`, where `watch` returns a value holding the reference it was given, releases what `watch` returned while `make()`'s value is still alive, then `make()`'s value; `watch_two(&make(1), &make(2));` releases the result, then `make(2)`'s value, then `make(1)`'s. A temporary is created when its value is complete, after the temporaries its own members made: `peek(&(T { f: peek(&(T { f: 0 })) }))` releases the outer `T` first, then the inner one. The value an assignment displaces - what its destination held before the store - is older than every value its statement makes, so it is released last, after all of the statement's temporaries: `v = combine(&make(1), &make(2));` releases `make(2)`'s value, then `make(1)`'s, then the value `v` held. Such an assignment stores between the two: the right side is evaluated, the statement's temporaries are released, the new value is stored, and the displaced value is released last, so a temporary's release that reads the destination still finds the value it held before the statement. An assignment whose destination has nothing to release - its type has no destructor, as an `i64` has none - stores its value as soon as the right side is evaluated, before the statement's temporaries are released, so a temporary's release that reads that destination finds the new value: in `plain = plain_make(2, &(PlainWatcher { target: plain_pointer }));`, where `plain` is an `i64` holding 1, `plain_pointer` points at it and the watcher's release reads `*target`, the watcher reads 2.
+
 A reference into a borrowed temporary does not outlive its statement: `const s: Str = make_string().as_str();` would leave `s` pointing at released storage, and is refused (`E0460`). Bind the value first (`const text: String = make_string();`) and borrow the binding. The compiler cannot see what a call's result points into, so it refuses a local declaration whose initializer borrows an owning temporary - a borrowing method's receiver, an argument passed by reference, the operand of `&`, or the value a field of one is read from - when the local's type has room for an address and owns nothing, and the borrow reaches it through results of such types (`make_words().get_reference(0).unwrap().as_str()`). An assignment to an existing local is a statement of its own whose temporaries are released when it ends, so it is refused the same way (`s = make_string().as_str();`), whether the local was declared with a value or without one. So is an assignment to a place that outlives the statement as a local does - a field (`holder.s = make_string().as_str();`), a field reached through a pointer, an array's element, or what a pointer points at (`*p = ...`). A result that owns something is a value of its own (`make_string().clone()`), and a scalar holds no address (`make_words().length()`), so neither is refused; a type that is still generic is not judged. A method that returns a view of something other than its receiver (a string literal, say) is refused all the same when called on a temporary: bind the temporary first.
 
 Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations, and members of such a local reached by field or constant-index access (`x.f`, `x[0]`). It does **not** yet cover pattern bindings (`match` arms).
@@ -3944,6 +3974,10 @@ The destinations below do *not* release what they overwrite, because nothing vis
 | `p.f = v` where `p` is a raw pointer | the same: whatever `p` addresses may not have been initialised |
 | `xs[i] = v` with a run-time `i` | no single member for the compiler to track |
 | a module-level global | globals are never auto-dropped |
+
+A local whose value the assignment's own right-hand side takes holds nothing to release: `t = takes_it(t)` releases nothing, and `t = if (c) { t } else { make() }` releases the old value exactly when `c` is false, the branch that left it in place.
+
+What is released is what the destination holds once the right-hand side has run. A right-hand side may change the destination through a reference first - `v = D { f: set(&v) }`, where `set` assigns a member of what it is given - and the assignment then releases the value `set` left there, not the one `v` held before the statement began.
 
 A store through a reference also releases nothing when the function moved a value out from behind the same binding earlier, or the store's own right-hand side does (`this.f = wrap(this.f)` inside an `unsafe` block, where such a move is not refused): the place still holds the bits of a value its new owner releases.
 
@@ -4061,7 +4095,7 @@ use(a);                // error E0452: use of moved value `a`
 
 Two move/ownership hazards that are unambiguous memory errors, called out as their own hard-error classes for clearer diagnostics, are:
 
-- **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.  A loop's condition, and a `for`'s update, run again at every back edge, so a value or field moved in them is refused, even when the body assigns it a new one, unless the body always leaves the loop with `break` or `return`.
+- **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.  A loop's condition, and a `for`'s update, run again at every back edge, so a value or field moved in them is refused, even when the body assigns it a new one, unless the body always leaves the loop with `break` or `return`.  A binding the condition or update declares itself - the residual a `?` in `while (f()?)` binds, a `match` arm's payload inside the condition - is made afresh at every test, so moving it is not carried; a binding an enclosing loop's body declares is the same binding at every test of an inner loop, and moving it there is refused.
 - **Returning the address of a local** (`E0455`) - `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine - those are caller-backed.)
 - **A field moved out on some paths only** (`E0453`) - a field moved out of a local runs its owner's release without that field at scope exit, which is sound only when the move certainly happened.  So a field may be moved out of a local of a struct with no destructor in straight-line code, and is refused inside an `if`, `match` or loop body, on the right of `&&` or `||`, and in an arm of `?:` or of an `if` expression - each runs on some paths only.  The refusal names the local and the field ("cannot move field 'a' out of `h` on only some paths"); a field moved out of a value whose type implements `Drop` is refused as owning a destructor, and one out of any other value the partial move does not track (a tuple, a pattern binding, a field of a field) as a value that drops it at scope exit.
 - **A reference to a value with a field moved out** (`E0452`) - a reference names the whole value, and a store through it releases what it displaces, so `&p`, `p` passed where a reference is taken, and a method called on `p` are refused once a field has been moved out of `p`, until that field is given a new value.  The fields that remain may still be read and borrowed (`&p.b`).
@@ -5069,7 +5103,14 @@ cryo test --list                   # discover only; print and exit
 cryo test --ignored                # also run ![ignore]-marked tests
 cryo test --exact                  # treat the filter as an exact match
 cryo test -q, --quiet              # suppress per-test ok / ignored lines
+cryo test --suite=projects         # one suite alone: unit, compile-fail or projects
 ```
+
+A project's `cryo test` runs three suites in order: its unit tests, the
+compile-fail files under `tests/negative/`, and the projects under
+`tests/projects/`. `--suite=` runs one of them alone, so separate runs can
+proceed side by side; a run of the compile-fail or project suite builds no unit
+test binary and finds the standard library the way that build would.
 
 ### Output format
 
@@ -5208,9 +5249,11 @@ target_triple = ""                  # cross-compile triple; empty => build for h
 stdlib_root   = ""                  # project-pinned stdlib root (see section 23.3)
 ```
 
-`entry_point`, `source_dir` and a relative `output_dir` are paths in the project's directory, the one holding its cryoconfig, wherever the build is started from: `cryo build app/` writes `app/build/`. A `--build-dir=PATH` given on the command line is read against the directory the command runs in.
+`entry_point`, `source_dir` and a relative `output_dir` are paths in the project's directory, the one holding its cryoconfig, wherever the build is started from: `cryo build app/` writes `app/build/`. A single file built on its own (`cryo build app/main.cryo`) is a project rooted at the file's directory and writes `app/build/` the same way. A `--build-dir=PATH` given on the command line, for a project or a single file, replaces that directory and is read against the directory the command runs in.
 
 `target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and selects the target ABI and toolchain. For `x86_64-pc-windows-gnu` the build drives a full mingw-w64 link to a `.exe`: from a Linux host with `clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld` over the mingw-w64 sysroot (binutils' GNU ld for mingw relocates thread-local offsets, so a program it links faults on its first thread-local access once Windows moves the image), and the environment variable `CRYO_CC` names another driver.  The driver is found by searching `PATH`, not by starting it; what it answers about its toolchain (whether it unwinds through libgcc) is kept in the stdlib's `.bin/<triple>/toolchain/` and asked again only for a driver that resolves to another program, or to the same program with another size or modification time.  For other x86-64 triples without a known toolchain (windows-msvc, ...) the host link step is skipped and the object files are left for a manual link. The compiler's LLVM carries the x86-64 backend only: a triple for another architecture (aarch64, riscv64, ...) is refused with `E0647`, which gives LLVM's reason, and so is an object file LLVM cannot write. The CLI `--target=TRIPLE` overrides it.
+
+With no `target_triple` and no `--target`, a build targets the host. On Windows the host's ABI follows the C driver the link will run: `x86_64-pc-windows-gnu` when `CRYO_CC` names a gcc (the program it starts, without its directory and `.exe`, is `gcc` or ends in `-gcc`), whether or not that gcc is on `PATH`; otherwise `x86_64-pc-windows-gnu` when `x86_64-w64-mingw32-gcc` is on `PATH`; otherwise `x86_64-pc-windows-msvc` when `lld-link` or `link` is on `PATH`, whose objects are left for a manual link; otherwise `x86_64-pc-windows-gnu`. `cryo version --triple` prints the answer.
 
 ### 23.2 `[compiler]`
 
@@ -5484,6 +5527,7 @@ color  = "auto"                     # auto | always | never
 | `cryo run`               | Build the project and run the resulting executable.                                                                 |
 | `cryo test [pattern]`    | Build and run the project's `![test]` functions.                                                                    |
 | `cryo check <file>`      | Front-end + semantic analysis only; no codegen.                                                                     |
+| `cryo interpret <file>`  | Analyse the file as `check` does, then run its `main` by interpreting the typed program, checking memory and ownership as it goes (`tools/CryoSmith/INTERPRETER.md`). |
 | `cryo init [dir]`        | Scaffold a new project (`cryoconfig` + `main.cryo`).                                                                |
 | `cryo demangle <sym>`    | Decode a mangled symbol to its source form.                                                                         |
 | `cryo api-index write\|check <root> <file>` | Write, or check that `<file>` already holds, the one-line-per-declaration index of the standard library under `<root>`. |
@@ -5529,7 +5573,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--apply-fixes`       | Make every machine-applicable suggestion the build reports in the project's own files (never the stdlib's or a vendor binding's), then build again once; a suggestion overlapping one already made is left for the next build. |
 | `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable).           |
 
-Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
+Test-only flags: `--suite=NAME`, `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
 
 **Compiler logging.** The compiler logs what it does, for whoever is working on the compiler; it is off unless switched on, by `CRYO_LOG=SPEC` in the environment or `--log=SPEC` (or `--debug`, meaning `--log=debug`), or by `debug = true` in cryoconfig. `--debug` switches logging on and does nothing else: the AST is `--ast`'s and the IR `--emit-llvm`'s. The command line is applied after the environment, so a flag wins; `debug = true` sets `debug` only in the areas neither of them set, so `--log=off` or `CRYO_LOG=off` silences a project that asks for logging, and `debug = false` switches nothing off. A spec is a comma-separated list of items: an area, `driver`, which logs that area at `debug`; `area=level`; or a level alone, which sets every area. A later item overrides an earlier one, so `CRYO_LOG=sema,codegen` logs two areas and `--log=debug,parse=off` logs all but one. The areas are `driver`, `loader`, `lex`, `parse`, `resolve`, `types`, `sema`, `mono`, `drop`, `codegen`, `link`, `bindgen`, `deps`, `diag`, `lsp` and `time`; the levels, from least to most said, `off`, `error`, `warn`, `info`, `debug` and `trace`. An item naming neither is reported on stderr and the rest of the spec still applies. Lines go to stderr, or appended to the file `CRYO_LOG_FILE` or `--log-file` names, each as `[level area] file:line function: message`, the place being where in the compiler's source the line was written. The `time` area at `info` reports how long each stage of a build took, at its end. The language server takes no flags, so it reads `CRYO_LOG` and `CRYO_LOG_FILE` alone, and with them unset it logs nothing.
 

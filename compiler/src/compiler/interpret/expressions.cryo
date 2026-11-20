@@ -1,0 +1,1150 @@
+/// Expressions: values, places, the operators, conversions and literals,
+/// each by the language reference's rule.  Operands are evaluated left to
+/// right, each completely before the next (docs/cryo.md section 5.8).
+
+namespace compiler::interpret::expressions;
+
+import compiler::ast::{ LiteralKind, MemberPin };
+import compiler::ast::expression::{
+    ArrayAccessExpr, ArrayExpr, BinaryExpr, CastExpr, ExpressionNode, ExprKind, IdentifierExpr,
+    LambdaExpr, LiteralExpr, MemberAccessExpr, ObjectConversionExpr, ScopeResolutionExpr, StructExpr,
+    TupleExpr, UnaryExpr
+};
+import compiler::ast::declaration::{ DeclarationNode, ImplBlock, VarDecl };
+import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
+import compiler::ast::pattern::{ StaticMatchArmNode };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::interpret::integer::{ IntegerFault, IntegerKind, IntegerOperation, IntegerResult, TrueValue };
+import compiler::interpret::interpreter::{ Flow, Interpreter, LiteralBytes, Operand };
+import compiler::interpret::memory::{ AccessFault, Address, AllocationKind, Element, Provenance, Scalar };
+import compiler::interpret::outcome::{ Stop };
+import compiler::lex::{ TokenType };
+import compiler::lex::lexer::{ Lexer };
+import compiler::resolver::res::{ DefId, Res, ResSlot };
+import compiler::types::{ TypeKind };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+implement struct Interpreter {
+    // ---- Values ----
+
+    /// Evaluate `expression`: its scalar, the place its aggregate value is
+    /// in, or nothing.
+    evaluate(mut &this, expression: ExpressionNode*) -> Result<Operand, Stop> {
+        this.step(expression.span)?;
+        const span: SourceSpan = expression.span;
+        return match (expression.kind) {
+            ExprKind::Literal(literal)       => { this.evaluate_literal(expression, literal) }
+            ExprKind::Identifier(identifier) => { this.evaluate_identifier(expression, identifier) }
+            ExprKind::ScopeResolution(scope) => { this.evaluate_scope_resolution(expression, scope) }
+            ExprKind::Binary(binary)         => { this.evaluate_binary(expression, binary) }
+            ExprKind::Unary(unary)           => { this.evaluate_unary(expression, unary) }
+            ExprKind::Cast(cast)             => { this.evaluate_cast(expression, cast) }
+            ExprKind::MemberAccess(_)        => { this.read_place(expression) }
+            ExprKind::ArrayAccess(access)    => {
+                const element: ExpressionNode* = if (access.desugared_call != null) { access.desugared_call } else { expression };
+                this.read_place(element)
+            }
+            ExprKind::If(choice) => {
+                const chosen: ExpressionNode* = if (this.boolean_of(choice.condition)?) { choice.then_expr } else { choice.else_expr };
+                this.evaluate_as(chosen, expression.resolved_type)
+            }
+            ExprKind::Ternary(choice) => {
+                const chosen: ExpressionNode* = if (this.boolean_of(choice.condition)?) { choice.true_expr } else { choice.false_expr };
+                this.evaluate_as(chosen, expression.resolved_type)
+            }
+            ExprKind::Match(m)          => { this.evaluate_match(expression, m.subject, &m.arms) }
+            ExprKind::StaticMatch(s)    => { this.evaluate_static_match(expression, &s.arms) }
+            ExprKind::Call(call)        => { this.evaluate_call(expression, call) }
+            ExprKind::Struct(literal)   => { this.evaluate_struct(expression, literal) }
+            ExprKind::Tuple(tuple)      => { this.evaluate_tuple(expression, tuple) }
+            ExprKind::Array(array)      => { this.evaluate_array(expression, array) }
+            ExprKind::Try(t)            => { this.evaluate(t.desugared) }
+            ExprKind::Sizeof(s)         => {
+                Result::Ok(Operand::Value(Scalar::Integer(this.layout.bytes(s.operand_type) as u64, IntegerKind::new(64, false))))
+            }
+            ExprKind::Alignof(a)        => {
+                Result::Ok(Operand::Value(Scalar::Integer(this.layout.alignment(a.operand_type) as u64, IntegerKind::new(64, false))))
+            }
+            ExprKind::ObjectConversion(conversion) => { this.evaluate_object(conversion, span) }
+            ExprKind::Lambda(lambda) => { this.evaluate_lambda(expression, lambda) }
+            ExprKind::New(_)     => { Result::Err(Interpreter::not_covered("`new`", span)) }
+            ExprKind::Delete(_)  => { Result::Err(Interpreter::not_covered("`delete`", span)) }
+            ExprKind::Await(_)   => { Result::Err(Interpreter::not_covered("`await`", span)) }
+            ExprKind::Yield(_)   => { Result::Err(Interpreter::not_covered("`yield`", span)) }
+            ExprKind::Typeof(_)  => { Result::Err(Interpreter::not_covered("`typeof` as a value", span)) }
+        };
+    }
+
+    /// A `static match` expression the monomorphiser pruned to the arm its
+    /// type chose.
+    evaluate_static_match(mut &this, expression: ExpressionNode*, arms: &[mut StaticMatchArmNode*]) -> Result<Operand, Stop> {
+        if (arms.length() != 1) {
+            return Result::Err(Interpreter::violation("a `static match` the monomorphiser left unpruned", expression.span));
+        }
+        return this.evaluate_body_value(arms[0].body, expression.resolved_type, expression.span);
+    }
+
+    /// Evaluate `expression` where a value of type `wanted` is expected: a
+    /// narrower integer is widened to it, keeping its value.
+    evaluate_as(mut &this, expression: ExpressionNode*, wanted: TypeRef) -> Result<Operand, Stop> {
+        const operand: Operand = this.evaluate(expression)?;
+        return match (operand) {
+            Operand::Value(value) => {
+                Result::Ok(Operand::Value(this.converted(value, expression.resolved_type, wanted, expression.span)?))
+            }
+            _ => { Result::Ok(operand) }
+        };
+    }
+
+    /// The scalar a place expression's place holds, or the place of its
+    /// aggregate.
+    read_place(mut &this, expression: ExpressionNode*) -> Result<Operand, Stop> {
+        const place: Address = this.place_of(expression)?;
+        return this.operand_at(place, expression.resolved_type, expression.span);
+    }
+
+    /// The operand the value of type `t` at `place` is.
+    operand_at(&this, place: Address, t: TypeRef, span: SourceSpan) -> Result<Operand, Stop> {
+        if (this.layout.is_aggregate(t)) { return Result::Ok(Operand::Place(place)); }
+        if (this.layout.cells(t) == 0) { return Result::Ok(Operand::Nothing); }
+        return Result::Ok(Operand::Value(this.load(place, span)?));
+    }
+
+    /// The scalar `expression` evaluates to.
+    scalar_of(mut &this, expression: ExpressionNode*) -> Result<Scalar, Stop> {
+        return match (this.evaluate(expression)?) {
+            Operand::Value(value) => { Result::Ok(value) }
+            _ => { Result::Err(Interpreter::violation("an aggregate or empty value where a scalar is used", expression.span)) }
+        };
+    }
+
+    boolean_of(mut &this, expression: ExpressionNode*) -> Result<boolean, Stop> {
+        return match (this.scalar_of(expression)?) {
+            Scalar::Boolean(b) => { Result::Ok(b) }
+            _ => { Result::Err(Interpreter::violation("a condition that is not a boolean", expression.span)) }
+        };
+    }
+
+    /// The address a pointer, reference or `string` expression holds.
+    pointer_of(mut &this, expression: ExpressionNode*) -> Result<Address, Stop> {
+        return match (this.scalar_of(expression)?) {
+            Scalar::Pointer(address) => { Result::Ok(address) }
+            Scalar::Object(address, _) => { Result::Ok(address) }
+            _ => { Result::Err(Interpreter::violation("an address read from a value that is no pointer", expression.span)) }
+        };
+    }
+
+    // ---- Storing ----
+
+    /// Store the value of `expression` into the uninitialised `place` of
+    /// type `t`: a scalar converted to `t`, an aggregate copied, and moved
+    /// when its type is not `Copy`.
+    initialize(mut &this, place: Address, t: TypeRef, expression: ExpressionNode*) -> Result<(), Stop> {
+        const operand: Operand = this.evaluate(expression)?;
+        return this.store_operand(place, t, operand, expression.resolved_type, expression.span);
+    }
+
+    store_operand(mut &this, place: Address, t: TypeRef, operand: Operand, from: TypeRef, span: SourceSpan) -> Result<(), Stop> {
+        return match (operand) {
+            Operand::Value(value) => { this.store(place, this.converted(value, from, t, span)?, span) }
+            Operand::Place(source) => { this.move_value(place, source, t, span) }
+            Operand::Nothing => { Result::Ok(()) }
+        };
+    }
+
+    /// `operand`, of type `t`, with a value that is not `Copy` moved out of
+    /// the place it names into a temporary, so its source is moved-from
+    /// before anything else happens to it.
+    taken(mut &this, operand: Operand, t: TypeRef, span: SourceSpan) -> Result<Operand, Stop> {
+        match (operand) {
+            Operand::Place(source) => {
+                if (this.is_copy(t)) { return Result::Ok(operand); }
+                const held: Address = this.temporary(t);
+                this.move_value(held, source, t, span)?;
+                return Result::Ok(Operand::Place(held));
+            }
+            _ => { return Result::Ok(operand); }
+        }
+    }
+
+    /// Copy the value of type `t` at `source` to `target`; the source is
+    /// moved out when `t` is not `Copy`.
+    move_value(mut &this, target: Address, source: Address, t: TypeRef, span: SourceSpan) -> Result<(), Stop> {
+        if (target.same(source)) { return Result::Ok(()); }
+        this.copy_value(target, source, t, span)?;
+        if (!this.is_copy(t)) { this.memory.mark_moved(source, this.layout.cells(t)); }
+        return Result::Ok(());
+    }
+
+    /// Copy the value of type `t` at `source` to `target`, leaving the
+    /// source as it is.  Every cell must hold a value or be a hole the
+    /// value's own type leaves (a variant's unused payload cells).
+    copy_value(mut &this, target: Address, source: Address, t: TypeRef, span: SourceSpan) -> Result<(), Stop> {
+        const fault: AccessFault = this.memory.copy(target, source, this.layout.cells(t));
+        if (!fault.is_none()) { return Result::Err(this.fault(fault, span)); }
+        return Result::Ok(());
+    }
+
+    /// `value`, of type `from`, where a value of type `to` is expected: an
+    /// integer converted keeping its value (a conversion that would change
+    /// it is one the type checker refuses, so meeting one is a violation);
+    /// any other scalar as it is.
+    converted(&this, value: Scalar, from: TypeRef, to: TypeRef, span: SourceSpan) -> Result<Scalar, Stop> {
+        match (value) {
+            Scalar::Integer(bits, kind) => {
+                match (this.layout.integer_kind(to)) {
+                    Option::Some(target) => {
+                        const result: u128 = target.converted(kind, bits);
+                        if (TrueValue::of(target, result).compare(&TrueValue::of(kind, bits)) != 0) {
+                            return Result::Err(Interpreter::violation("an implicit conversion that changes the value", span));
+                        }
+                        return Result::Ok(Scalar::Integer(result, target));
+                    }
+                    Option::None => { return Result::Ok(value); }
+                }
+            }
+            Scalar::AddressInteger(_, _) => { return this.address_integer_cast(value, from, to, span); }
+            _ => { return Result::Ok(value); }
+        }
+    }
+
+    // ---- Places ----
+
+    /// Where the value `expression` names lives.  An expression that names
+    /// no place - a call, a literal - is evaluated into a temporary.
+    place_of(mut &this, expression: ExpressionNode*) -> Result<Address, Stop> {
+        const span: SourceSpan = expression.span;
+        match (expression.kind) {
+            ExprKind::Identifier(identifier) => {
+                if (!identifier.resolved_callee.is_some()) {
+                    match (identifier.res.require("interpret: identifier")) {
+                        Res::Local(symbol)    => { return this.local(symbol, span); }
+                        Res::Def(definition)  => { return this.global(definition, span); }
+                        _ => { }
+                    }
+                }
+            }
+            ExprKind::ScopeResolution(scope) => {
+                if (scope.member_def.is_valid()) {
+                    const decl: DeclarationNode* = this.ctx.decl_index.declaration_of(scope.member_def);
+                    if (decl != null && DeclarationNode::var_of(decl) != null) { return this.global(scope.member_def, span); }
+                }
+            }
+            ExprKind::MemberAccess(access) => {
+                match (access.resolved_member) {
+                    MemberPin::Field(index) => {
+                        const owner: Address = this.object_place(access.object)?;
+                        const owner_type: TypeRef = this.dereferenced_type(access.object.resolved_type);
+                        return Result::Ok(owner.plus(this.layout.field_offset(owner_type, index)));
+                    }
+                    _ => { return Result::Err(Interpreter::not_covered("a member access that is no field", span)); }
+                }
+            }
+            ExprKind::Unary(unary) => {
+                if (unary.desugared_call != null) { return this.place_of(unary.desugared_call); }
+                if (unary.op.kind == TokenType::Star) {
+                    const target: Address = this.pointer_of(unary.operand)?;
+                    return this.reach(target, expression.resolved_type, span);
+                }
+            }
+            ExprKind::ArrayAccess(access) => {
+                if (access.desugared_call != null) { return this.place_of(access.desugared_call); }
+                return this.element_place(access, span);
+            }
+            _ => { }
+        }
+        // Not a place: the value goes in a temporary.
+        const operand: Operand = this.evaluate(expression)?;
+        return match (operand) {
+            Operand::Place(place) => { Result::Ok(place) }
+            Operand::Value(value) => {
+                const place: Address = this.temporary(expression.resolved_type);
+                this.store(place, value, span)?;
+                Result::Ok(place)
+            }
+            Operand::Nothing => { Result::Ok(this.temporary(expression.resolved_type)) }
+        };
+    }
+
+    /// The place of the value `object` reaches, through any number of
+    /// references and one raw pointer (a member access dereferences them).
+    object_place(mut &this, object: ExpressionNode*) -> Result<Address, Stop> {
+        mut t: TypeRef = object.resolved_type;
+        mut place: Address = this.place_of(object)?;
+        for (mut guard: i32 = 0; guard < 16; guard++) {
+            const target: TypeRef = this.layout.pointee(t);
+            if (!target.is_valid()) { return Result::Ok(place); }
+            const value: Scalar = this.load(place, object.span)?;
+            place = match (value) {
+                Scalar::Pointer(address) => { address }
+                Scalar::Object(address, _) => { address }
+                _ => { return Result::Err(Interpreter::violation("a member access through a value that is no pointer", object.span)); }
+            };
+            place = this.reach(place, target, object.span)?;
+            t = target;
+        }
+        return Result::Ok(place);
+    }
+
+    /// `t` with every reference and pointer layer taken off.
+    dereferenced_type(&this, t: TypeRef) -> TypeRef {
+        mut current: TypeRef = t;
+        for (mut guard: i32 = 0; guard < 16; guard++) {
+            const target: TypeRef = this.layout.pointee(current);
+            if (!target.is_valid()) { return current; }
+            current = target;
+        }
+        return current;
+    }
+
+    /// `address`, reached as a value of type `t`: a heap block reached for
+    /// the first time takes `t` as its element type.  Null is refused.
+    reach(mut &this, address: Address, t: TypeRef, span: SourceSpan) -> Result<Address, Stop> {
+        if (address.is_null()) { return Result::Err(this.fault(AccessFault::NullAddress, span)); }
+        this.memory.shape(address.allocation, this.layout.element(t));
+        return Result::Ok(address);
+    }
+
+    /// The place of `a[i]`: an element of a fixed array, bounds-checked, or
+    /// the `i`th element on from a pointer.
+    element_place(mut &this, access: ArrayAccessExpr*, span: SourceSpan) -> Result<Address, Stop> {
+        const array_type: TypeRef = access.array.resolved_type;
+        const ty: Type* = this.layout.type_of(array_type);
+        if (ty == null) { return Result::Err(Interpreter::violation("an index into a value with no type", span)); }
+        match (ty.kind) {
+            TypeKind::Array => {
+                const base: Address = this.place_of(access.array)?;
+                const index: i64 = this.index_of(access.index)?;
+                if (index < 0 || index >= ty.as_array().size) {
+                    return Result::Err(Interpreter::violation("an index out of an array's bounds", span));
+                }
+                return Result::Ok(base.plus(index * this.layout.cells(ty.as_array().element)));
+            }
+            TypeKind::Pointer => {
+                const base: Address = this.pointer_of(access.array)?;
+                const index: i64 = this.index_of(access.index)?;
+                const element: TypeRef = ty.as_pointer().pointee;
+                const target: Address = this.reach(base, element, span)?;
+                return Result::Ok(target.plus(index * this.layout.cells(element)));
+            }
+            TypeKind::String => {
+                const base: Address = this.pointer_of(access.array)?;
+                const index: i64 = this.index_of(access.index)?;
+                return Result::Ok(base.plus(index));
+            }
+            // A tuple's element, at the index the type checker required to
+            // be a constant in range.
+            TypeKind::Tuple => {
+                const base: Address = this.place_of(access.array)?;
+                const index: i64 = this.index_of(access.index)?;
+                if (index < 0 || index >= ty.as_tuple().elements.length()) {
+                    return Result::Err(Interpreter::violation("an index out of a tuple's elements", span));
+                }
+                return Result::Ok(base.plus(this.layout.field_offset(array_type, index)));
+            }
+            _ => { return Result::Err(Interpreter::not_covered("an index into a value that is no array, tuple or pointer", span)); }
+        }
+    }
+
+    /// An index's value, as a signed count.
+    index_of(mut &this, expression: ExpressionNode*) -> Result<i64, Stop> {
+        const value: Scalar = this.scalar_of(expression)?;
+        return match (value) {
+            Scalar::Integer(bits, _) => { Result::Ok(bits as i64) }
+            _ => { Result::Err(Interpreter::no_integer_bits(value, "an index that is no integer", expression.span)) }
+        };
+    }
+
+    // ---- Names ----
+
+    evaluate_identifier(mut &this, expression: ExpressionNode*, identifier: IdentifierExpr*) -> Result<Operand, Stop> {
+        if (identifier.resolved_callee.is_some()) {
+            return Result::Ok(Operand::Value(Scalar::Function(identifier.resolved_callee.entry(this.ctx.decl_index))));
+        }
+        return this.read_place(expression);
+    }
+
+    evaluate_scope_resolution(mut &this, expression: ExpressionNode*, scope: ScopeResolutionExpr*) -> Result<Operand, Stop> {
+        const span: SourceSpan = expression.span;
+        if (scope.resolved_callee.is_some()) {
+            return Result::Ok(Operand::Value(Scalar::Function(scope.resolved_callee.entry(this.ctx.decl_index))));
+        }
+        match (scope.resolved_member) {
+            MemberPin::Variant(variant) => {
+                const place: Address = this.temporary(expression.resolved_type);
+                this.store(place, Scalar::Integer(variant as u64, IntegerKind::new(64, false)), span)?;
+                return Result::Ok(Operand::Place(place));
+            }
+            _ => { }
+        }
+        if (scope.member_def.is_valid()) { return this.read_place(expression); }
+        return Result::Err(Interpreter::not_covered("a path that names no value the interpreter reads", span));
+    }
+
+    // ---- Literals ----
+
+    evaluate_literal(mut &this, expression: ExpressionNode*, literal: LiteralExpr*) -> Result<Operand, Stop> {
+        const span: SourceSpan = expression.span;
+        return match (literal.literal_kind) {
+            LiteralKind::Integer => {
+                match (this.layout.integer_kind(expression.resolved_type)) {
+                    Option::Some(kind) => {
+                        match (Lexer::integer_literal_value(literal.value, literal.suffix)) {
+                            // A literal is its type's value; a magnitude one past
+                            // a signed type's greatest is only ever negated
+                            // (`-9223372036854775808`), so it is reduced as
+                            // two's complement reads it.
+                            Option::Some(value) => { Result::Ok(Operand::Value(Scalar::Integer(kind.reduce(value), kind))) }
+                            Option::None => { Result::Err(Interpreter::violation("an integer literal that does not read as a number", span)) }
+                        }
+                    }
+                    Option::None => { Result::Err(Interpreter::not_covered("an integer literal of no integer type", span)) }
+                }
+            }
+            LiteralKind::Boolean => { Result::Ok(Operand::Value(Scalar::Boolean(Str::new(literal.value) == Str::new("true")))) }
+            LiteralKind::Null    => { Result::Ok(Operand::Value(Scalar::Pointer(Address::null()))) }
+            LiteralKind::String  => { Result::Ok(Operand::Value(Scalar::Pointer(this.literal_bytes(expression, literal)))) }
+            LiteralKind::Char    => { Result::Err(Interpreter::not_covered("a character literal", span)) }
+            LiteralKind::Float   => { Result::Err(Interpreter::not_covered("a floating-point literal", span)) }
+        };
+    }
+
+    /// The read-only bytes of a string literal, ending in a zero byte: made
+    /// once per literal.
+    literal_bytes(mut &this, expression: ExpressionNode*, literal: LiteralExpr*) -> Address {
+        for (mut i: i64 = 0; i < this.literals.length(); i++) {
+            if (this.literals[i].node == expression) { return Address::at(this.literals[i].allocation, 0); }
+        }
+        const length: i64 = literal.byte_length;
+        const allocation: i64 = this.memory.allocate(Element::byte(), length + 1, AllocationKind::Stack);
+        const bytes: u8* = literal.value as u8*;
+        const byte: IntegerKind = IntegerKind::new(8, false);
+        for (mut i: i64 = 0; i < length; i++) {
+            this.memory.write(Address::at(allocation, i), Scalar::Integer(bytes[i] as u64, byte));
+        }
+        this.memory.write(Address::at(allocation, length), Scalar::Integer(0, byte));
+        this.memory.seal(allocation);
+        this.literals.push(LiteralBytes { node: expression, allocation: allocation });
+        return Address::at(allocation, 0);
+    }
+
+    // ---- Operators ----
+
+    evaluate_binary(mut &this, expression: ExpressionNode*, binary: BinaryExpr*) -> Result<Operand, Stop> {
+        const span: SourceSpan = expression.span;
+        const op: TokenType = binary.op.kind;
+        if (op == TokenType::Equal) { return this.assign(binary, span); }
+        const base: TokenType = op.compound_base();
+        if (base != TokenType::Unknown) { return this.assign_compound(binary, base, span); }
+        if (binary.desugared_call != null) { return this.evaluate(binary.desugared_call); }
+        if (op == TokenType::AmpAmp) {
+            if (!this.boolean_of(binary.left)?) { return Result::Ok(Operand::Value(Scalar::Boolean(false))); }
+            return Result::Ok(Operand::Value(Scalar::Boolean(this.boolean_of(binary.right)?)));
+        }
+        if (op == TokenType::PipePipe) {
+            if (this.boolean_of(binary.left)?) { return Result::Ok(Operand::Value(Scalar::Boolean(true))); }
+            return Result::Ok(Operand::Value(Scalar::Boolean(this.boolean_of(binary.right)?)));
+        }
+        const left: Operand = this.evaluate(binary.left)?;
+        const right: Operand = this.evaluate(binary.right)?;
+        return Result::Ok(Operand::Value(this.binary_value(op, left, binary.left.resolved_type, right, binary.right.resolved_type, expression.resolved_type, span)?));
+    }
+
+    /// `left op right`, both evaluated, `result` the expression's type.
+    binary_value(mut &this, op: TokenType, left: Operand, left_type: TypeRef, right: Operand, right_type: TypeRef,
+                 result: TypeRef, span: SourceSpan) -> Result<Scalar, Stop> {
+        // Two enum values compare by their variant numbers.
+        match (left) {
+            Operand::Place(l) => {
+                match (right) {
+                    Operand::Place(r) => {
+                        if (this.layout.kind_of(left_type) == TypeKind::Enum && (op == TokenType::EqualEqual || op == TokenType::ExclaimEqual)) {
+                            const same: boolean = this.variant_of(l, span)? == this.variant_of(r, span)?;
+                            return Result::Ok(Scalar::Boolean(if (op == TokenType::EqualEqual) { same } else { !same }));
+                        }
+                    }
+                    _ => { }
+                }
+                return Result::Err(Interpreter::not_covered("an operator on aggregate values", span));
+            }
+            Operand::Nothing => { return Result::Err(Interpreter::violation("an operator on an empty value", span)); }
+            Operand::Value(_) => { }
+        }
+        const a: Scalar = match (left) { Operand::Value(v) => { v } _ => { Scalar::Boolean(false) } };
+        const b: Scalar = match (right) {
+            Operand::Value(v) => { v }
+            _ => { return Result::Err(Interpreter::violation("an operator whose right operand is no scalar", span)); }
+        };
+        match (a) {
+            Scalar::AddressInteger(_, _) => { return this.address_integer_binary(op, a, b, result, span); }
+            Scalar::Integer(left_bits, left_kind) => {
+                match (b) {
+                    Scalar::Integer(right_bits, right_kind) => {
+                        return this.integer_binary(op, left_bits, left_kind, right_bits, right_kind, result, span);
+                    }
+                    Scalar::AddressInteger(_, _) => { return this.address_integer_binary(op, a, b, result, span); }
+                    _ => { return Result::Err(Interpreter::violation("an integer operator with a right operand that is no integer", span)); }
+                }
+            }
+            Scalar::Boolean(x) => {
+                match (b) {
+                    Scalar::Boolean(y) => {
+                        return match (op) {
+                            TokenType::EqualEqual   => { Result::Ok(Scalar::Boolean(x == y)) }
+                            TokenType::ExclaimEqual => { Result::Ok(Scalar::Boolean(x != y)) }
+                            TokenType::Amp          => { Result::Ok(Scalar::Boolean(x && y)) }
+                            TokenType::Pipe         => { Result::Ok(Scalar::Boolean(x || y)) }
+                            TokenType::Caret        => { Result::Ok(Scalar::Boolean(x != y)) }
+                            _ => { Result::Err(Interpreter::not_covered("this operator on booleans", span)) }
+                        };
+                    }
+                    _ => { return Result::Err(Interpreter::violation("a boolean operator with a right operand that is no boolean", span)); }
+                }
+            }
+            Scalar::Pointer(p) => { return this.pointer_binary(op, p, left_type, b, span); }
+            _ => { return Result::Err(Interpreter::not_covered("an operator on this kind of value", span)); }
+        }
+    }
+
+    /// An operator on two integers.  A comparison compares true values
+    /// whatever the types; arithmetic computes in the result type, each
+    /// operand converted to it keeping its value; a shift's amount is read
+    /// at its own type.
+    integer_binary(&this, op: TokenType, left_bits: u128, left_kind: IntegerKind, right_bits: u128, right_kind: IntegerKind,
+                   result: TypeRef, span: SourceSpan) -> Result<Scalar, Stop> {
+        const order: i32 = TrueValue::of(left_kind, left_bits).compare(&TrueValue::of(right_kind, right_bits));
+        match (op) {
+            TokenType::EqualEqual   => { return Result::Ok(Scalar::Boolean(order == 0)); }
+            TokenType::ExclaimEqual => { return Result::Ok(Scalar::Boolean(order != 0)); }
+            TokenType::LAngle       => { return Result::Ok(Scalar::Boolean(order < 0)); }
+            TokenType::LessEqual    => { return Result::Ok(Scalar::Boolean(order <= 0)); }
+            TokenType::RAngle       => { return Result::Ok(Scalar::Boolean(order > 0)); }
+            TokenType::GreaterEqual => { return Result::Ok(Scalar::Boolean(order >= 0)); }
+            _ => { }
+        }
+        const operation: IntegerOperation = match (op) {
+            TokenType::Plus    => { IntegerOperation::Add }
+            TokenType::Minus   => { IntegerOperation::Subtract }
+            TokenType::Star    => { IntegerOperation::Multiply }
+            TokenType::Slash   => { IntegerOperation::Divide }
+            TokenType::Percent => { IntegerOperation::Remainder }
+            TokenType::Amp     => { IntegerOperation::And }
+            TokenType::Pipe    => { IntegerOperation::Or }
+            TokenType::Caret   => { IntegerOperation::Xor }
+            TokenType::LessLess       => { IntegerOperation::ShiftLeft }
+            TokenType::GreaterGreater => { IntegerOperation::ShiftRight }
+            _ => { return Result::Err(Interpreter::not_covered("this operator on integers", span)); }
+        };
+        const kind: IntegerKind = match (this.layout.integer_kind(result)) {
+            Option::Some(k) => { k }
+            Option::None => { return Result::Err(Interpreter::violation("integer arithmetic whose type is no integer", span)); }
+        };
+        const a: u128 = this.widened(left_bits, left_kind, kind, span)?;
+        const shifting: boolean = op == TokenType::LessLess || op == TokenType::GreaterGreater;
+        const b: u128 = if (shifting) { right_bits } else { this.widened(right_bits, right_kind, kind, span)? };
+        const outcome: IntegerResult = operation.apply(kind, a, b, right_kind);
+        if (!outcome.is_ok()) { return Result::Err(Interpreter::violation(outcome.fault.describe(), span)); }
+        return Result::Ok(Scalar::Integer(outcome.bits, kind));
+    }
+
+    /// `bits` of `from` at `to`, which must hold its value.
+    widened(&this, bits: u128, from: IntegerKind, to: IntegerKind, span: SourceSpan) -> Result<u128, Stop> {
+        const result: u128 = to.converted(from, bits);
+        if (TrueValue::of(to, result).compare(&TrueValue::of(from, bits)) != 0) {
+            return Result::Err(Interpreter::violation("an operand converted to its operation's type changes value", span));
+        }
+        return Result::Ok(result);
+    }
+
+    /// An operator with an integer made from an address on either side
+    /// (tools/CryoSmith/INTERPRETER.md section 4.1).  Its answer depends
+    /// only on byte offsets: an integer moved within its allocation keeps
+    /// it; two from one allocation compare by offset and subtract to their
+    /// distance; a modulus by a power of two up to its allocation's
+    /// alignment, or a mask one below such a power, reads the offset's low
+    /// bits; one is never equal to 0, nor to one from another allocation
+    /// unless either is at its allocation's end.  Anything whose answer
+    /// would depend on the made-up base is not covered.
+    address_integer_binary(&this, op: TokenType, left: Scalar, right: Scalar, result: TypeRef, span: SourceSpan) -> Result<Scalar, Stop> {
+        const left_origin: Option<Provenance> = this.live_provenance(left, span)?;
+        const right_origin: Option<Provenance> = this.live_provenance(right, span)?;
+        const operation: string = op.to_string();
+        if (left_origin.is_some() && right_origin.is_some()) {
+            const p: Provenance = left_origin.unwrap();
+            const q: Provenance = right_origin.unwrap();
+            // The end of one compiled allocation may be the start of the
+            // next, so only two from one allocation, or two from different
+            // ones neither at its end, have a known equality.
+            const apart: boolean = p.allocation != q.allocation;
+            const at_an_end: boolean = p.offset == this.memory.allocations[p.allocation].bytes
+                || q.offset == this.memory.allocations[q.allocation].bytes;
+            if ((op == TokenType::EqualEqual || op == TokenType::ExclaimEqual) && !(apart && at_an_end)) {
+                const same: boolean = !apart && p.offset == q.offset;
+                return Result::Ok(Scalar::Boolean(if (op == TokenType::EqualEqual) { same } else { !same }));
+            }
+            if (apart) {
+                return Result::Err(Stop::not_covered(f"`{operation}` between integers made from addresses in two allocations", span));
+            }
+            if (op == TokenType::LAngle)       { return Result::Ok(Scalar::Boolean(p.offset < q.offset)); }
+            if (op == TokenType::LessEqual)    { return Result::Ok(Scalar::Boolean(p.offset <= q.offset)); }
+            if (op == TokenType::RAngle)       { return Result::Ok(Scalar::Boolean(p.offset > q.offset)); }
+            if (op == TokenType::GreaterEqual) { return Result::Ok(Scalar::Boolean(p.offset >= q.offset)); }
+            if (op == TokenType::Minus) {
+                match (this.layout.integer_kind(result)) {
+                    Option::Some(kind) => { return Result::Ok(Scalar::Integer(kind.reduce((p.offset - q.offset) as u128), kind)); }
+                    Option::None => { }
+                }
+            }
+            return Result::Err(Stop::not_covered(f"`{operation}` between integers made from addresses", span));
+        }
+        const from_left: boolean = left_origin.is_some();
+        const origin: Provenance = if (from_left) { left_origin.unwrap() } else { right_origin.unwrap() };
+        const plain: Scalar = if (from_left) { right } else { left };
+        const value: TrueValue = match (plain) {
+            Scalar::Integer(bits, kind) => { TrueValue::of(kind, bits) }
+            _ => { return Result::Err(Interpreter::violation("an integer operator with an operand that is no integer", span)); }
+        };
+        if (op == TokenType::EqualEqual || op == TokenType::ExclaimEqual) {
+            if (value.magnitude != 0) {
+                return Result::Err(Stop::not_covered(f"`{operation}` between an integer made from an address and an integer other than 0", span));
+            }
+            return Result::Ok(Scalar::Boolean(op == TokenType::ExclaimEqual));
+        }
+        const kind: IntegerKind = match (this.layout.integer_kind(result)) {
+            Option::Some(k) => { k }
+            Option::None => { return Result::Err(Interpreter::violation("integer arithmetic whose type is no integer", span)); }
+        };
+        if (op == TokenType::Plus || (op == TokenType::Minus && from_left)) {
+            const moved: i64 = if (op == TokenType::Plus) { origin.offset + value.signed_value() } else { origin.offset - value.signed_value() };
+            if (moved < 0 || moved > this.memory.allocations[origin.allocation].bytes) {
+                return Result::Err(Interpreter::not_covered("an integer made from an address moved outside its allocation", span));
+            }
+            return Result::Ok(Scalar::AddressInteger(Provenance { allocation: origin.allocation, offset: moved }, kind));
+        }
+        // A compiled allocation is as aligned as its element's type, and no
+        // more is promised: below that alignment the low bits of the
+        // integer are the offset's, whatever the base.
+        const limit: u128 = this.layout.alignment(this.memory.allocations[origin.allocation].element.element_type) as u128;
+        if (!value.negative && op == TokenType::Percent && from_left
+                && value.magnitude > 0 && value.magnitude <= limit && (value.magnitude & (value.magnitude - 1)) == 0) {
+            return Result::Ok(Scalar::Integer(kind.reduce((origin.offset as u128) % value.magnitude), kind));
+        }
+        if (!value.negative && op == TokenType::Amp
+                && value.magnitude < limit && (value.magnitude & (value.magnitude + 1)) == 0) {
+            return Result::Ok(Scalar::Integer(kind.reduce((origin.offset as u128) & value.magnitude), kind));
+        }
+        return Result::Err(Stop::not_covered(f"`{operation}` on an integer made from an address", span));
+    }
+
+    /// The allocation and offset an integer made from an address keeps, or
+    /// none for any other value.  Such an integer whose allocation has
+    /// ended is not covered by any operation: a compiled program may have
+    /// given its address to a new allocation, which the numbering never
+    /// does.
+    live_provenance(&this, value: Scalar, span: SourceSpan) -> Result<Option<Provenance>, Stop> {
+        return match (value) {
+            Scalar::AddressInteger(origin, _) => {
+                if (!this.memory.is_live(origin.allocation)) {
+                    return Result::Err(Interpreter::not_covered("an integer made from an address whose allocation has ended", span));
+                }
+                Result::Ok(Option::Some(origin))
+            }
+            _ => { Result::Ok(Option::None) }
+        };
+    }
+
+    /// `value`, of type `from`, as the type `to` where an address becomes
+    /// an integer or an integer made from one changes type
+    /// (tools/CryoSmith/INTERPRETER.md section 4.1).  An address becomes
+    /// its byte offset in its allocation, kept with the allocation, at an
+    /// integer type at least as wide as an address; null becomes 0.  Such
+    /// an integer widens keeping its allocation, and becomes the address
+    /// of the cell starting at its offset again, found in the allocation
+    /// it kept.
+    address_integer_cast(&this, value: Scalar, from: TypeRef, to: TypeRef, span: SourceSpan) -> Result<Scalar, Stop> {
+        const target: Option<IntegerKind> = this.layout.integer_kind(to);
+        const kept: Option<Provenance> = this.live_provenance(value, span)?;
+        match (value) {
+            Scalar::Pointer(address) => {
+                const kind: IntegerKind = match (target) {
+                    Option::Some(k) => { k }
+                    Option::None => { return Result::Ok(value); }
+                };
+                if (address.is_null()) { return Result::Ok(Scalar::Integer(0, kind)); }
+                if ((kind.width as i64) < this.layout.bytes(from) * 8) {
+                    return Result::Err(Interpreter::not_covered("a cast of an address to an integer narrower than an address", span));
+                }
+                // An element's cells hold it in declaration order, so the
+                // cell's index splits into the element's and the cell's
+                // within it.  A block no typed access has reached holds no
+                // cells, and an address into it is its start.
+                const element: Element = this.memory.allocations[address.allocation].element;
+                const cells: i64 = if (element.cells > 0) { element.cells } else { 1 };
+                const inside: i64 = match (this.layout.cell_bytes(element.element_type, address.offset % cells)) {
+                    Option::Some(b) => { b }
+                    Option::None => { return Result::Err(Interpreter::not_covered("a cast to an integer of an address inside an enum's payload, an optional or a union", span)); }
+                };
+                const offset: i64 = (address.offset / cells) * element.bytes + inside;
+                if (offset < 0 || offset > this.memory.allocations[address.allocation].bytes) {
+                    return Result::Err(Interpreter::not_covered("a cast to an integer of an address outside its allocation", span));
+                }
+                return Result::Ok(Scalar::AddressInteger(Provenance { allocation: address.allocation, offset: offset }, kind));
+            }
+            Scalar::AddressInteger(_, kind) => {
+                const origin: Provenance = kept.unwrap();
+                match (target) {
+                    Option::Some(t) => {
+                        if (t.width < kind.width) {
+                            return Result::Err(Interpreter::not_covered("a narrowing cast of an integer made from an address", span));
+                        }
+                        return Result::Ok(Scalar::AddressInteger(origin, t));
+                    }
+                    Option::None => { }
+                }
+                if (!this.layout.is_address(to)) {
+                    return Result::Err(Interpreter::not_covered("a cast of an integer made from an address to this type", span));
+                }
+                if (origin.offset == 0) { return Result::Ok(Scalar::Pointer(Address::at(origin.allocation, 0))); }
+                const element: Element = this.memory.allocations[origin.allocation].element;
+                if (element.cells > 0 && element.bytes > 0) {
+                    const inside: i64 = origin.offset % element.bytes;
+                    for (mut cell: i64 = 0; cell < element.cells; cell++) {
+                        match (this.layout.cell_bytes(element.element_type, cell)) {
+                            Option::Some(b) => {
+                                if (b == inside) {
+                                    return Result::Ok(Scalar::Pointer(Address::at(origin.allocation, (origin.offset / element.bytes) * element.cells + cell)));
+                                }
+                            }
+                            Option::None => { }
+                        }
+                    }
+                }
+                return Result::Err(Interpreter::not_covered("a cast to an address of an integer at no cell's start in its allocation", span));
+            }
+            _ => { return Result::Err(Interpreter::violation("an address cast of a value that is no address", span)); }
+        }
+    }
+
+    /// An operator with a pointer on the left: comparison, or stepping by
+    /// a count of elements.
+    pointer_binary(mut &this, op: TokenType, p: Address, left_type: TypeRef, b: Scalar, span: SourceSpan) -> Result<Scalar, Stop> {
+        match (b) {
+            Scalar::Pointer(q) => {
+                return match (op) {
+                    TokenType::EqualEqual   => { Result::Ok(Scalar::Boolean(p.same(q))) }
+                    TokenType::ExclaimEqual => { Result::Ok(Scalar::Boolean(!p.same(q))) }
+                    TokenType::Minus => { this.pointer_distance(p, q, left_type, span) }
+                    _ => { Result::Err(Interpreter::not_covered("an ordering comparison of pointers", span)) }
+                };
+            }
+            Scalar::Integer(bits, kind) => {
+                const count: i64 = TrueValue::of(kind, bits).signed_value();
+                const element: TypeRef = this.layout.pointee(left_type);
+                if (!element.is_valid()) { return Result::Err(Interpreter::not_covered("arithmetic on this kind of pointer", span)); }
+                const cells: i64 = this.layout.cells(element);
+                if (!p.is_null()) { this.memory.shape(p.allocation, this.layout.element(element)); }
+                return match (op) {
+                    TokenType::Plus  => { Result::Ok(Scalar::Pointer(p.plus(count * cells))) }
+                    TokenType::Minus => { Result::Ok(Scalar::Pointer(p.plus(0 - count * cells))) }
+                    _ => { Result::Err(Interpreter::not_covered("this operator on a pointer and an integer", span)) }
+                };
+            }
+            _ => { return Result::Err(Interpreter::not_covered("an operator on a pointer and this kind of value", span)); }
+        }
+    }
+
+    /// `p - q`: how many elements of `p`'s type `p` is past `q`, both in
+    /// one allocation.
+    pointer_distance(&this, p: Address, q: Address, pointer_type: TypeRef, span: SourceSpan) -> Result<Scalar, Stop> {
+        if (p.allocation != q.allocation) {
+            return Result::Err(Interpreter::violation("the distance between pointers into different allocations", span));
+        }
+        mut element: i64 = this.layout.cells(this.layout.pointee(pointer_type));
+        if (element == 0) { element = 1; }
+        return Result::Ok(Scalar::Integer(((p.offset - q.offset) / element) as u128, IntegerKind::new(64, true)));
+    }
+
+    /// `left = right`: the place first, then the value.  When the store
+    /// releases what the place held (docs/cryo.md section 15.2), that value
+    /// is the oldest in play and is released last: the right side's value
+    /// is complete and the statement's temporaries are released, then the
+    /// value is stored, then the displaced one is dropped.  What the place
+    /// holds is read only after the right side has run: a right side
+    /// naming the place itself (`v = if (c) { v } else { .. }`) has moved
+    /// its value out, and the release then finds nothing to drop.
+    assign(mut &this, binary: BinaryExpr*, span: SourceSpan) -> Result<Operand, Stop> {
+        const t: TypeRef = binary.left.resolved_type;
+        const mark: i64 = this.temporaries.length();
+        const place: Address = this.place_of(binary.left)?;
+        const value: Operand = this.taken(this.evaluate(binary.right)?, binary.right.resolved_type, span)?;
+        if (!this.assignment_releases(binary.left) || !this.needs_drop(t)) {
+            this.store_operand(place, t, value, binary.right.resolved_type, span)?;
+            return Result::Ok(Operand::Nothing);
+        }
+        const staged: Address = Address::at(this.memory.allocate(this.layout.element(t), 1, AllocationKind::Stack), 0);
+        this.store_operand(staged, t, value, binary.right.resolved_type, span)?;
+        this.release_temporaries(mark, span)?;
+        const displaced: Address = Address::at(this.memory.allocate(this.layout.element(t), 1, AllocationKind::Stack), 0);
+        this.copy_value(displaced, place, t, span)?;
+        this.move_value(place, staged, t, span)?;
+        this.memory.end(staged.allocation);
+        this.drop_place(displaced, t, span)?;
+        this.memory.end(displaced.allocation);
+        return Result::Ok(Operand::Nothing);
+    }
+
+    /// `left op= right`: the place first, then the value, then the result
+    /// of `op` stored back.
+    assign_compound(mut &this, binary: BinaryExpr*, base: TokenType, span: SourceSpan) -> Result<Operand, Stop> {
+        const t: TypeRef = binary.left.resolved_type;
+        if (binary.desugared_call != null) {
+            const place: Address = this.place_of(binary.left)?;
+            const result: Operand = this.evaluate(binary.desugared_call)?;
+            this.store_operand(place, t, result, binary.desugared_call.resolved_type, span)?;
+            return Result::Ok(Operand::Nothing);
+        }
+        const place: Address = this.place_of(binary.left)?;
+        const old: Scalar = this.load(place, span)?;
+        const right: Operand = this.evaluate(binary.right)?;
+        const value: Scalar = this.binary_value(base, Operand::Value(old), t, right, binary.right.resolved_type, t, span)?;
+        this.store(place, value, span)?;
+        return Result::Ok(Operand::Nothing);
+    }
+
+    /// Whether storing into the place `target` names releases what it
+    /// held (docs/cryo.md section 15.2): a local or a member of one, or a
+    /// place reached through a reference does; one reached through a raw
+    /// pointer, an element at a run-time index and a module-level variable
+    /// do not.  The nearest dereference decides.
+    assignment_releases(&this, target: ExpressionNode*) -> boolean {
+        return match (target.kind) {
+            ExprKind::Identifier(identifier) => {
+                match (identifier.res.require("interpret: assignment target")) {
+                    Res::Local(_) => { true }
+                    _             => { false }
+                }
+            }
+            ExprKind::MemberAccess(access) => {
+                match (this.layout.kind_of(access.object.resolved_type)) {
+                    TypeKind::Pointer   => { false }
+                    TypeKind::Reference => { true }
+                    _                   => { this.assignment_releases(access.object) }
+                }
+            }
+            ExprKind::Unary(unary) => {
+                unary.op.kind == TokenType::Star && this.layout.kind_of(unary.operand.resolved_type) == TypeKind::Reference
+            }
+            _ => { false }
+        };
+    }
+
+    evaluate_unary(mut &this, expression: ExpressionNode*, unary: UnaryExpr*) -> Result<Operand, Stop> {
+        const span: SourceSpan = expression.span;
+        if (unary.desugared_call != null) { return this.evaluate(unary.desugared_call); }
+        const op: TokenType = unary.op.kind;
+        if (op == TokenType::Amp) {
+            // A slice reference is the slice's two words, where they lie.
+            if (this.layout.is_slice_reference(expression.resolved_type)) {
+                return Result::Ok(Operand::Place(this.place_of(unary.operand)?));
+            }
+            return Result::Ok(Operand::Value(Scalar::Pointer(this.place_of(unary.operand)?)));
+        }
+        if (op == TokenType::Star) {
+            const target: Address = this.reach(this.pointer_of(unary.operand)?, expression.resolved_type, span)?;
+            return this.operand_at(target, expression.resolved_type, span);
+        }
+        if (op == TokenType::PlusPlus || op == TokenType::MinusMinus) {
+            const place: Address = this.place_of(unary.operand)?;
+            const old: Scalar = this.load(place, span)?;
+            const one: Scalar = Scalar::Integer(1, IntegerKind::new(64, false));
+            const step: TokenType = if (op == TokenType::PlusPlus) { TokenType::Plus } else { TokenType::Minus };
+            const updated: Scalar = match (old) {
+                Scalar::Integer(bits, kind) => {
+                    const outcome: IntegerResult = (if (op == TokenType::PlusPlus) { IntegerOperation::Add } else { IntegerOperation::Subtract }).apply(kind, bits, 1, kind);
+                    Scalar::Integer(outcome.bits, kind)
+                }
+                Scalar::Pointer(_) => { this.binary_value(step, Operand::Value(old), unary.operand.resolved_type, Operand::Value(one), unary.operand.resolved_type, unary.operand.resolved_type, span)? }
+                Scalar::AddressInteger(_, _) => { this.binary_value(step, Operand::Value(old), unary.operand.resolved_type, Operand::Value(one), unary.operand.resolved_type, unary.operand.resolved_type, span)? }
+                _ => { return Result::Err(Interpreter::violation("`++` or `--` on a value that is no integer or pointer", span)); }
+            };
+            this.store(place, updated, span)?;
+            return Result::Ok(Operand::Value(if (unary.is_postfix) { old } else { updated }));
+        }
+        const value: Scalar = this.scalar_of(unary.operand)?;
+        match (value) {
+            Scalar::Integer(bits, from) => {
+                const kind: IntegerKind = match (this.layout.integer_kind(expression.resolved_type)) {
+                    Option::Some(k) => { k }
+                    Option::None => { from }
+                };
+                const operand: u128 = this.widened(bits, from, kind, span)?;
+                return match (op) {
+                    TokenType::Minus   => { Result::Ok(Operand::Value(Scalar::Integer(kind.reduce(0 - operand), kind))) }
+                    TokenType::Tilde   => { Result::Ok(Operand::Value(Scalar::Integer(kind.reduce(~operand), kind))) }
+                    TokenType::Exclaim => { Result::Ok(Operand::Value(Scalar::Integer(kind.reduce(~operand), kind))) }
+                    _ => { Result::Err(Interpreter::not_covered("this prefix operator on an integer", span)) }
+                };
+            }
+            Scalar::Boolean(b) => {
+                if (op == TokenType::Exclaim || op == TokenType::Tilde) { return Result::Ok(Operand::Value(Scalar::Boolean(!b))); }
+                return Result::Err(Interpreter::not_covered("this prefix operator on a boolean", span));
+            }
+            Scalar::AddressInteger(_, _) => {
+                return Result::Err(Stop::not_covered(f"prefix `{op.to_string()}` on an integer made from an address", span));
+            }
+            _ => { return Result::Err(Interpreter::not_covered("a prefix operator on this kind of value", span)); }
+        }
+    }
+
+    /// `value as T`.  Between integers: the value's two's-complement bits
+    /// at the target's width.  A boolean is 1 or 0; an enum its variant's
+    /// tag.  Between pointers, references and `string`s: the address.
+    evaluate_cast(mut &this, expression: ExpressionNode*, cast: CastExpr*) -> Result<Operand, Stop> {
+        const span: SourceSpan = expression.span;
+        const to: TypeRef = cast.resolved_target;
+        const from: TypeRef = cast.expression.resolved_type;
+        const operand: Operand = this.evaluate(cast.expression)?;
+        match (operand) {
+            Operand::Place(place) => {
+                const source: Type* = this.layout.type_of(from);
+                if (source != null && source.kind == TypeKind::Enum) {
+                    const variant: i64 = this.variant_of(place, span)?;
+                    const tag: u64 = source.as_enum().variants[variant].tag_value;
+                    match (this.layout.integer_kind(to)) {
+                        Option::Some(kind) => { return Result::Ok(Operand::Value(Scalar::Integer(kind.reduce(tag), kind))); }
+                        Option::None => { }
+                    }
+                }
+                if (this.layout.is_aggregate(to)) { return Result::Ok(operand); }
+                return Result::Err(Interpreter::not_covered("a cast of an aggregate value", span));
+            }
+            Operand::Nothing => { return Result::Ok(operand); }
+            Operand::Value(value) => {
+                const target: Option<IntegerKind> = this.layout.integer_kind(to);
+                match (value) {
+                    Scalar::Integer(bits, kind) => {
+                        match (target) {
+                            Option::Some(t) => { return Result::Ok(Operand::Value(Scalar::Integer(t.converted(kind, bits), t))); }
+                            Option::None => { }
+                        }
+                        if (this.layout.kind_of(to) == TypeKind::Bool) { return Result::Ok(Operand::Value(Scalar::Boolean(bits != 0))); }
+                        if (this.layout.is_address(to)) {
+                            if (bits == 0) { return Result::Ok(Operand::Value(Scalar::Pointer(Address::null()))); }
+                            return Result::Err(Interpreter::not_covered("a cast to an address of an integer not made from one", span));
+                        }
+                        return Result::Err(Interpreter::not_covered("a cast of an integer to this type", span));
+                    }
+                    Scalar::Boolean(b) => {
+                        match (target) {
+                            Option::Some(t) => { return Result::Ok(Operand::Value(Scalar::Integer(if (b) { 1 } else { 0 }, t))); }
+                            Option::None => { return Result::Ok(operand); }
+                        }
+                    }
+                    Scalar::Pointer(_)           => { return Result::Ok(Operand::Value(this.address_integer_cast(value, from, to, span)?)); }
+                    Scalar::AddressInteger(_, _) => { return Result::Ok(Operand::Value(this.address_integer_cast(value, from, to, span)?)); }
+                    _ => { return Result::Ok(operand); }
+                }
+            }
+        }
+    }
+
+    // ---- Aggregates ----
+
+    /// A struct literal: its fields' values in the order written, each
+    /// stored at its field; the fields not written have their defaults,
+    /// which the type checker appended.
+    evaluate_struct(mut &this, expression: ExpressionNode*, literal: StructExpr*) -> Result<Operand, Stop> {
+        const t: TypeRef = expression.resolved_type;
+        const place: Address = this.temporary(t);
+        for (mut i: i64 = 0; i < literal.field_inits.length(); i++) {
+            const index: i64 = match (literal.field_inits[i].pin) {
+                MemberPin::Field(f) => { f }
+                _ => { return Result::Err(Interpreter::violation("a struct literal field the type checker did not pin", expression.span)); }
+            };
+            this.initialize(place.plus(this.layout.field_offset(t, index)), this.layout.field_type(t, index), literal.field_inits[i].value)?;
+        }
+        this.complete_temporary(place);
+        this.count_made_handle(place, t, expression.span)?;
+        return Result::Ok(Operand::Place(place));
+    }
+
+    /// A closure.  One that captures is a value of the struct the type
+    /// checker made for it, each field initialized, in the order of the
+    /// captures, from the capture's value where the closure is made: the
+    /// captured binding's value, or its address for a capture by
+    /// reference.  Calling it calls that struct's method, by the call's
+    /// pin.  One that captures nothing is a function value, its lambda.
+    evaluate_lambda(mut &this, expression: ExpressionNode*, lambda: LambdaExpr*) -> Result<Operand, Stop> {
+        const t: TypeRef = expression.resolved_type;
+        if (!this.layout.is_aggregate(t)) { return Result::Ok(Operand::Value(Scalar::Lambda(lambda))); }
+        const place: Address = this.temporary(t);
+        for (mut i: i64 = 0; i < lambda.capture_values.length(); i++) {
+            this.initialize(place.plus(this.layout.field_offset(t, i)), this.layout.field_type(t, i), lambda.capture_values[i])?;
+        }
+        this.complete_temporary(place);
+        return Result::Ok(Operand::Place(place));
+    }
+
+    evaluate_tuple(mut &this, expression: ExpressionNode*, tuple: TupleExpr*) -> Result<Operand, Stop> {
+        const t: TypeRef = expression.resolved_type;
+        const place: Address = this.temporary(t);
+        for (mut i: i64 = 0; i < tuple.elements.length(); i++) {
+            this.initialize(place.plus(this.layout.field_offset(t, i)), this.layout.field_type(t, i), tuple.elements[i])?;
+        }
+        this.complete_temporary(place);
+        return Result::Ok(Operand::Place(place));
+    }
+
+    evaluate_array(mut &this, expression: ExpressionNode*, array: ArrayExpr*) -> Result<Operand, Stop> {
+        const t: TypeRef = expression.resolved_type;
+        const ty: Type* = this.layout.type_of(t);
+        if (ty == null || ty.kind != TypeKind::Array) {
+            const growable: TypeRef = this.ctx.type_arena.default_array_element(t);
+            if (growable.is_valid()) { return this.evaluate_growable_array(expression, array, growable); }
+            return Result::Err(Interpreter::not_covered("an array literal of this type", expression.span));
+        }
+        const element: TypeRef = ty.as_array().element;
+        const cells: i64 = this.layout.cells(element);
+        const place: Address = this.temporary(t);
+        if (array.repeat_count_expr != null || array.repeat_count > 0) {
+            if (array.elements.length() != 1) { return Result::Err(Interpreter::not_covered("an array repeat literal of this shape", expression.span)); }
+            this.initialize(place, element, array.elements[0])?;
+            for (mut i: i64 = 1; i < ty.as_array().size; i++) { this.copy_value(place.plus(i * cells), place, element, expression.span)?; }
+            this.complete_temporary(place);
+            return Result::Ok(Operand::Place(place));
+        }
+        for (mut i: i64 = 0; i < array.elements.length(); i++) {
+            this.initialize(place.plus(i * cells), element, array.elements[i])?;
+        }
+        this.complete_temporary(place);
+        return Result::Ok(Operand::Place(place));
+    }
+
+    /// A literal of a growable array, `[T]` (`Array<T>` with the default
+    /// allocator), of `element`s: the elements, in the order written - a
+    /// repeat's value once, then its count - in a heap block the function
+    /// claiming the `alloc` language item gives, its body interpreted as
+    /// every allocation's is; and the array holding the block's address,
+    /// its length and its capacity, both the number of elements, in its
+    /// first three members.  No elements hold no block.
+    evaluate_growable_array(mut &this, expression: ExpressionNode*, array: ArrayExpr*,
+                            element: TypeRef) -> Result<Operand, Stop> {
+        const span: SourceSpan = expression.span;
+        const t: TypeRef = expression.resolved_type;
+        if (!this.layout.is_address(this.layout.field_type(t, 0))
+                || !this.layout.integer_kind(this.layout.field_type(t, 1)).is_some()
+                || !this.layout.integer_kind(this.layout.field_type(t, 2)).is_some()
+                || this.layout.cells(t) != 3) {
+            return Result::Err(Interpreter::not_covered("a growable array not laid out as its address, length and capacity", span));
+        }
+        const cells: i64 = this.layout.cells(element);
+        const repeated: boolean = array.repeat_count_expr != null || array.repeat_count > 0;
+        if (repeated && array.elements.length() != 1) {
+            return Result::Err(Interpreter::not_covered("an array repeat literal of this shape", span));
+        }
+        // A repeat's value is made once, into a temporary, and copied.
+        mut repeat_value: Address = Address::null();
+        mut count: i64 = array.elements.length();
+        if (repeated) {
+            repeat_value = this.temporary(element);
+            this.initialize(repeat_value, element, array.elements[0])?;
+            count = array.repeat_count;
+            if (array.repeat_count_expr != null) {
+                const repeat: Scalar = this.scalar_of(array.repeat_count_expr)?;
+                count = match (repeat) {
+                    Scalar::Integer(bits, kind) => { TrueValue::of(kind, bits).signed_value() }
+                    _ => { return Result::Err(Interpreter::no_integer_bits(repeat, "an array repeat count that is no integer", span)); }
+                };
+            }
+            if (count < 0) { return Result::Err(Interpreter::violation("an array repeat count below zero", span)); }
+        }
+        mut block: Address = Address::null();
+        if (count > 0) {
+            block = this.allocate_through_item(count * this.layout.bytes(element), this.layout.alignment(element), span)?;
+            this.memory.shape(block.allocation, this.layout.element(element));
+        }
+        for (mut i: i64 = 0; i < count; i++) {
+            if (repeated) {
+                this.copy_value(block.plus(i * cells), repeat_value, element, span)?;
+            } else {
+                this.initialize(block.plus(i * cells), element, array.elements[i])?;
+            }
+        }
+        const place: Address = this.temporary(t);
+        const length_kind: IntegerKind = this.layout.integer_kind(this.layout.field_type(t, 1)).unwrap();
+        const capacity_kind: IntegerKind = this.layout.integer_kind(this.layout.field_type(t, 2)).unwrap();
+        this.store(place.plus(this.layout.field_offset(t, 0)), Scalar::Pointer(block), span)?;
+        this.store(place.plus(this.layout.field_offset(t, 1)), Scalar::Integer(length_kind.reduce(count as u64), length_kind), span)?;
+        this.store(place.plus(this.layout.field_offset(t, 2)), Scalar::Integer(capacity_kind.reduce(count as u64), capacity_kind), span)?;
+        return Result::Ok(Operand::Place(place));
+    }
+
+    /// A trait object: the address of the value it borrows and the
+    /// implementation whose table it is - the conversion's implementation
+    /// when that holds a table, else its copy for the value's type, which
+    /// monomorphization settled (`ImplBlock::object_instance`).
+    evaluate_object(mut &this, conversion: ObjectConversionExpr*, span: SourceSpan) -> Result<Operand, Stop> {
+        if (conversion.implementation == null) {
+            return Result::Err(Interpreter::not_covered("a trait object made in a generic body", span));
+        }
+        const table: ImplBlock* = if (conversion.implementation.object_table_symbol.is_valid()) {
+            conversion.implementation
+        } else {
+            conversion.implementation.object_instance(conversion.source)
+        };
+        if (table == null) {
+            return Result::Err(Interpreter::violation("a trait object whose implementation has no table for the value's type", span));
+        }
+        const target: Address = this.pointer_of(conversion.operand)?;
+        return Result::Ok(Operand::Value(Scalar::Object(target, table)));
+    }
+
+    // ---- Blocks as values ----
+
+    /// The value of a block standing for an expression (a `match` arm's
+    /// body): its statements, then its last expression's value, the scope
+    /// left only after the value is out of it.  A `return` in it leaves the
+    /// function.
+    evaluate_body_value(mut &this, body: Stmt*, t: TypeRef, span: SourceSpan) -> Result<Operand, Stop> {
+        const block: BlockStmt* = match (body.kind) {
+            StmtKind::Block(b) => { b }
+            _ => { return Result::Err(Interpreter::not_covered("an arm body that is no block", span)); }
+        };
+        const tail: ExpressionNode* = body.tail_expression();
+        const count: i64 = if (tail == null) { block.statements.length() } else { block.statements.length() - 1 };
+        this.push_scope();
+        for (mut i: i64 = 0; i < count; i++) {
+            const flow: Flow = this.execute(block.statements[i])?;
+            match (flow) {
+                Flow::Normal => { }
+                Flow::Return => {
+                    this.pop_scope(span)?;
+                    return Result::Err(Stop::returning(span));
+                }
+                _ => {
+                    this.pop_scope(span)?;
+                    return Result::Err(Interpreter::not_covered("a `break` or `continue` out of an expression", span));
+                }
+            }
+        }
+        mut value: Operand = Operand::Nothing;
+        if (tail != null) {
+            const operand: Operand = this.evaluate_as(tail, t)?;
+            value = match (operand) {
+                Operand::Place(source) => {
+                    // The value leaves the arm's scope: it is moved to a
+                    // temporary of the enclosing statement first.
+                    const place: Address = this.temporary(t);
+                    this.move_value(place, source, t, span)?;
+                    Operand::Place(place)
+                }
+                _ => { operand }
+            };
+        }
+        this.pop_scope(span)?;
+        return Result::Ok(value);
+    }
+}

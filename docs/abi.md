@@ -214,9 +214,15 @@ the slot:
 3. **Two F32 fields packing into one 8-byte eightbyte**: emit
    `<2 x float>` via `LLVMVectorType` - multi-float SSE.
 4. **Anything else** (mixed int/ptr, multiple non-float fields, F32+F64
-   sharing a bucket, ...): emit the smallest power-of-two integer
-   container >= `bucket_size` (`i8` / `i16` / `i32` / `i64`) - INTEGER
-   class.
+   sharing a bucket, ...): emit the integer exactly `bucket_size` bytes
+   wide (`i8`, `i16`, `i24`, `i32`, `i40`, `i48`, `i56`, `i64`) -
+   INTEGER class. A 3-byte struct travels as `i24`, an 11-byte one as
+   `{i64, i24}`; LLVM widens the odd width to the register.
+
+The width is exact because every coercion in section 5 stores one of
+the two types and loads the other through the same slot: an integer
+wider than the bytes it carries would store past the aggregate's
+storage in the callee's prologue and load bytes the caller never wrote.
 
 This matches what clang emits for the same source layouts. The
 multi-float SSE branch in particular is required for C interop with

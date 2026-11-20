@@ -1,0 +1,118 @@
+///! A generic struct's own methods: static, taking `&this` or taking
+///! `mut &this`, written inside `type struct B<N><T> { .. }`.
+///!
+///! Each generic struct gets its own instance first, `B<N><T>`: the struct
+///! at its own parameter, whose `T` fields stay `T`.  It owns the methods,
+///! so inside one `this` is a `B<N><T>` and a `T` field of it is a `T`
+///! value, read, passed, returned and written as a generic function's `T`
+///! values are, and never observed.  The own instances are made after every
+///! other structure, so no value but `this` has one's type.
+///!
+///! Each method is bounded `where T: Copy`, as every generic function is: a
+///! `T` value is used as often as the body likes, and every type a value
+///! has is `Copy`.
+///!
+///! A static method takes a `T` first and returns `T`, so it is called as a
+///! generic function is, at a type argument spelled any of the three ways:
+///! `B0::<u16>::m0(a)`, `B0::<_>::m0(a)`, `B0::m0(a)`.  A method taking a
+///! receiver is called on a place of any instance of its generic struct,
+///! `T` standing for that instance's argument; one taking `mut &this`
+///! returns nothing and is called as a statement of its own, on a place
+///! whose fields may be written.  The methods come from streams of their
+///! own, so with the feature off no draw is taken.
+
+namespace cryosmith::generate::generic_methods;
+
+import std::collections::array::{ Array };
+
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::guarantees::{ CostBudget };
+import cryosmith::model::{ Function, Genericity, Receiver, StatementKind, ValueType, Variable, VariableRole };
+import cryosmith::random::{ RandomStream };
+
+/// The most methods a generic struct has.
+const MOST_GENERIC_METHODS: i64 = 3;
+
+implement struct Generator {
+    /// Make every generic struct's own instance, then declare each one's
+    /// methods, one to three, from the methods' own stream.
+    internal declare_generic_methods(mut &this) -> void {
+        mut owners: Array<i64> = Array::<i64>::new();
+        mut template: i64 = 0;
+        while (template < this.program.templates.length()) {
+            owners.push(this.instantiate(template, ValueType::TypeParameter));
+            template = template + 1;
+        }
+        mut deciding: RandomStream = RandomStream::for_generic_methods(this.options.seed);
+        mut ordinal: i64 = 0;
+        for (owner in owners.iter()) {
+            const methods: i64 = 1 + deciding.below(MOST_GENERIC_METHODS);
+            mut number: i64 = 0;
+            while (number < methods) {
+                const roll: i64 = deciding.below(10);
+                const receiver: Receiver = if (roll < 3) { Receiver::Static } else { if (roll < 7) { Receiver::Shared } else { Receiver::Exclusive } };
+                this.define_generic_method(number, owner, receiver, ordinal);
+                number = number + 1;
+                ordinal = ordinal + 1;
+            }
+        }
+    }
+
+    /// Generate method `number` of the own instance `owner` from the
+    /// stream of the generic method at `ordinal`.  A static method's first
+    /// parameter is `T` and it returns `T`; one taking `&this` returns `T`
+    /// or a value type; one taking `mut &this` returns nothing.
+    private define_generic_method(mut &this, number: i64, owner: i64, receiver: Receiver, ordinal: i64) -> void {
+        this.random = RandomStream::for_generic_method(this.options.seed, ordinal);
+        this.environment.enter_function();
+        this.loop_depth = 0;
+        this.block_depth = 0;
+        this.budget = CostBudget::for_function(false);
+        this.statements_left = (this.options.size + 1) / 2;
+        this.in_main = false;
+        this.genericity = Genericity::Copyable;
+        mut receiver_variable: i64 = -1;
+        if (!receiver.is_called_by_name()) {
+            receiver_variable = this.program.variable(Variable {
+                role: VariableRole::Receiver, number: 0, value_type: ValueType::Record(owner), mutable: receiver.writes_receiver(),
+            });
+            this.environment.bind(receiver_variable);
+        }
+        const is_static: boolean = receiver.is_called_by_name();
+        const first_parameter: i64 = this.program.lists.length();
+        const parameter_count: i64 = if (is_static) { 1 + this.random.below(3) } else { this.random.below(3) };
+        mut index: i64 = 0;
+        while (index < parameter_count) {
+            const value_type: ValueType = if ((is_static && index == 0) || this.random.chance(30)) { ValueType::TypeParameter } else { this.any_type() };
+            const parameter: i64 = this.program.variable(Variable { role: VariableRole::Parameter, number: index, value_type: value_type, mutable: false });
+            this.program.lists.push(parameter);
+            this.environment.bind(parameter);
+            index = index + 1;
+        }
+        this.returns = match (receiver) {
+            Receiver::Exclusive => { ValueType::Void }
+            Receiver::Shared    => { (if (this.random.chance(50)) { ValueType::TypeParameter } else { this.any_type() }) }
+            _                   => { ValueType::TypeParameter }
+        };
+        mut statements: Array<i64> = Array::<i64>::new();
+        const body_start: i64 = this.environment.mark();
+        this.fill(&statements, true);
+        this.observe_declared(body_start, &statements);
+        index = 0;
+        while (index < parameter_count) {
+            this.observe_place(this.read(this.program.list_at(first_parameter + index)), &statements);
+            index = index + 1;
+        }
+        if (receiver_variable >= 0) { this.observe_place(this.read(receiver_variable), &statements); }
+        if (!this.returns.same(ValueType::Void)) {
+            const value: i64 = this.typed_place(this.returns, this.depth());
+            statements.push(this.program.statement(StatementKind::Return(value)));
+        }
+        const body: i64 = this.program.block(&statements);
+        this.program.functions.push(Function {
+            number: number, is_main: false, owner: ValueType::Record(owner), receiver: receiver, first_parameter: first_parameter,
+            parameter_count: parameter_count, returns: this.returns, body: body, cost: this.budget.spent(),
+            genericity: Genericity::Copyable, callable: ValueType::Void, implements: -1,
+        });
+    }
+}

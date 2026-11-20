@@ -44,6 +44,16 @@ public type struct Generator {
     /// Whether the function is generic, and its bound: what its `T` values
     /// may do.
     internal genericity: Genericity;
+    /// The first member of the overload set the function being generated
+    /// joins, by its place among the functions; -1 anywhere else.
+    internal joining_set: i64;
+    /// Whether the value being made is a reference the function returns,
+    /// which borrows from the function's reference parameters only.
+    internal returning_reference: boolean;
+    /// Whether the value being made is a `match` expression's arm value,
+    /// which borrows no temporary: the compiled program releases one at
+    /// the arm's end rather than its statement's (DESIGN.md, "Kept off").
+    internal making_arm_value: boolean;
 
     /// The program `options` describe.
     public static generate(options: GenerationOptions) -> Program {
@@ -51,17 +61,21 @@ public type struct Generator {
             program: Program::new(), options: options, random: RandomStream::for_program(options.seed),
             environment: Environment::new(), budget: CostBudget::for_function(false), loop_depth: 0, block_depth: 0,
             statements_left: 0, in_main: false, returns: ValueType::I32, genericity: Genericity::Concrete,
+            joining_set: -1, returning_reference: false, making_arm_value: false,
         };
+        if (options.features.has(Feature::Enums)) { generator.declare_enumerations(); }
         if (options.features.has(Feature::Structs)) { generator.declare_structures(); }
         if (options.features.has(Feature::GenericStructs)) { generator.declare_generic_structures(); }
         if (options.features.has(Feature::Generics)) { generator.declare_generics(); }
+        generator.declare_traits();
+        generator.declare_owned_structures();
         const count: i64 = options.function_count();
         mut number: i64 = 0;
         while (number < count) {
-            generator.define(number, -1, Receiver::Free);
+            generator.define(number, ValueType::Void, Receiver::Free);
             number = number + 1;
         }
-        generator.define(count, -1, Receiver::Free);
+        generator.define(count, ValueType::Void, Receiver::Free);
         return generator.program;
     }
 
@@ -71,12 +85,46 @@ public type struct Generator {
     /// literals combined with each other are typed by where the whole
     /// stands, and an operand gives them none.  With `reads_name`, not even
     /// a bare literal: a method's receiver, a cast's operand and an `if`
-    /// expression's arms give a literal no type either.
+    /// expression's arms give a literal no type either.  An integer, boolean
+    /// or enum value is sometimes a `match` expression, whose arms read a
+    /// name, so it may stand as an operand, a receiver, an arm or a subject.
     internal expression(mut &this, wanted: ValueType, depth: i64, reads_name: boolean) -> i64 {
+        if (this.matches_enumerations() && wanted.is_matchable() && depth > 0 && this.random.chance(8)) {
+            return this.match_expression(wanted, depth - 1);
+        }
+        if (this.options.features.has(Feature::Closures) && depth > 0) {
+            const calls: Array<i64> = this.closure_calls(wanted);
+            if (calls.length() > 0 && this.random.chance(15)) {
+                return this.closure_call(calls.get(this.random.below(calls.length())).unwrap(), depth - 1);
+            }
+        }
+        if (depth > 0) {
+            const invocables: Array<i64> = this.invocable_values(wanted);
+            if (invocables.length() > 0 && this.random.chance(15)) {
+                return this.invocation(invocables.get(this.random.below(invocables.length())).unwrap(), depth - 1);
+            }
+            const bound: Array<i64> = this.bound_calls(wanted);
+            if (bound.length() > 0 && this.random.chance(25)) {
+                return this.bound_call(bound.get(this.random.below(bound.length())).unwrap(), depth - 1);
+            }
+            const objects: Array<i64> = this.object_calls(wanted);
+            if (objects.length() > 0 && this.random.chance(25)) { return this.object_call(&objects, depth - 1); }
+        }
         match (wanted) {
+            ValueType::Function(_) => { return this.function_value(wanted, false); }
             ValueType::Boolean   => { return this.boolean_expression(depth, reads_name); }
             ValueType::Record(_) => { return this.record_expression(wanted, depth); }
+            ValueType::Enumeration(_) => { return this.enumeration_expression(wanted, depth); }
             ValueType::TypeParameter => { return this.type_parameter_expression(depth); }
+            ValueType::Owned(_)  => { return this.owned_expression(wanted, depth); }
+            ValueType::Boxed(_)  => { return this.holder_expression(wanted, depth); }
+            ValueType::Counted(_) => { return this.holder_expression(wanted, depth); }
+            ValueType::Optional(_) => { return this.holder_expression(wanted, depth); }
+            ValueType::Fallible(_) => { return this.holder_expression(wanted, depth); }
+            ValueType::SharedReference(_) => { return this.reference_expression(wanted, depth); }
+            ValueType::ExclusiveReference(_) => { return this.reference_expression(wanted, depth); }
+            ValueType::FixedArray(_) => { return this.array_value(wanted, depth); }
+            ValueType::Text => { return this.text_value(depth); }
             _                    => { return this.integer_expression(wanted, depth, reads_name); }
         }
     }
@@ -85,6 +133,9 @@ public type struct Generator {
     /// an initializer, an assignment, an argument, a return value or a
     /// struct literal's field.  It may be a narrower value, widened.
     internal typed_place(mut &this, wanted: ValueType, depth: i64) -> i64 {
+        if (this.matches_enumerations() && wanted.is_matchable() && depth > 0 && this.random.chance(12)) {
+            return this.match_expression(wanted, depth - 1);
+        }
         if (this.options.features.has(Feature::Widening) && wanted.is_integer() && this.random.chance(15)) {
             const narrower: Array<ValueType> = TypeChoice::narrower(wanted);
             if (narrower.length() > 0) {
@@ -121,8 +172,9 @@ public type struct Generator {
     /// An expression depth for a statement: 1 to 4.
     internal depth(mut &this) -> i64 { return 1 + this.random.below(4); }
 
-    /// A type for a value: a scalar, or sometimes a declared struct.
+    /// A type for a value: a scalar, or sometimes a declared struct or an
+    /// instance, never an own instance.
     internal any_type(mut &this) -> ValueType {
-        return TypeChoice::any(&this.random, this.options.features, this.program.structures.length());
+        return TypeChoice::any(&this.random, this.options.features, this.program.value_structure_count(), this.program.enumerations.length());
     }
 }

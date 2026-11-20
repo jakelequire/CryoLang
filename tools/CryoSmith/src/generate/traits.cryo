@@ -1,0 +1,415 @@
+///! Traits (stage 6): declarations, `type trait Tr0 { t0(&this, p0: u8) ->
+///! i32; }`, and their implementations for the declared structs, `implement
+///! trait Tr0 for struct S1 { t0(&this, p0: u8) -> i32 { .. } }`.
+///!
+///! One or two traits of one or two methods each are declared from their
+///! own stream after the generic functions, and each declared struct
+///! implements each trait six times in ten.  A trait method takes `&this`
+///! and zero to two scalar parameters and returns a scalar; it is named
+///! `t<N>`, numbered across the program, so no two traits share a method's
+///! name and none shares one with a struct's own methods, `m<N>`.  An
+///! implementation's method is generated as a `&this` method of its struct
+///! is, from a stream of its own, and is called on the struct's values as
+///! one is (`v1.t0(a)`), the call naming the one implementation the
+///! receiver's type has.
+///!
+///! With `trait-bounds`, a trait some struct implements bounds a generic
+///! function `k<N><T>` seven times in ten, `where T: Tr0 + Copy`, generated
+///! as a generic function `g<N>` is.  Its body calls the trait's methods on
+///! its `T` values, `p0.t0(a)`, each call charged the costliest
+///! implementation's work, and it is called only at a struct implementing
+///! the trait, whose implementation each such call then runs.
+///!
+///! With `trait-objects`, a free function sometimes takes `virtual &Tr<N>`
+///! last, calls the trait's methods on it through the table of the value
+///! it borrows, and is called with `&v` of a parameter or local whose
+///! struct implements the trait.  The object lives only as that parameter,
+///! for the call.
+///!
+///! With `trait-defaults`, a trait may declare up to three methods, and each
+///! after its first has a default body six times in ten, generated after
+///! every implementation as a `&this` method whose `this` is the
+///! implementing type, `T` bounded by the trait alone: it calls the
+///! trait's earlier methods on `this`, never its own or a later one, so the
+///! calls stay acyclic.  An implementation writes its own method for a
+///! defaulted one half the time; a value of a struct that writes none runs
+///! the default, called on it as its own method is (`v1.t2(a)`), through a
+///! bound or through an object.
+///!
+///! With `supertraits`, a second trait is declared over the first half the
+///! time, `type trait Tr1 : Tr0`: only a struct implementing `Tr0`
+///! implements `Tr1`, and a `T` bounded by `Tr1`, an object of `Tr1` and
+///! `Tr1`'s default bodies call `Tr0`'s methods too.
+///!
+///! With `enum-implementations`, each declared enum (no generic enum's
+///! instance) implements each trait six times in ten too, after the
+///! structs, `implement trait Tr0 for enum E0 { .. }`.  Its methods are
+///! generated as a struct's are, with `this` of the enum, observed by a
+///! `match` on it like any enum value; the enum's values are receivers of
+///! its methods, type arguments of a bound it satisfies and the values an
+///! object of the trait borrows, as a struct's are.  A struct implements a
+///! supertrait's subtrait only after the supertrait, and so does an enum.
+
+namespace cryosmith::generate::traits;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::model::{
+    ExpressionKind, Function, Genericity, Receiver, Signature, StatementKind, TraitDeclaration, TraitMethod, ValueType,
+    Variable, VariableRole
+};
+import cryosmith::random::{ RandomStream };
+
+/// The most traits a program declares.
+const MOST_TRAITS: i64 = 2;
+
+/// The most methods a trait declares.
+const MOST_TRAIT_METHODS: i64 = 2;
+
+/// How often, in a hundred, a declared struct implements a trait.
+const IMPLEMENTATION_CHANCE: i64 = 60;
+
+/// How often, in a hundred, a trait some struct implements bounds a
+/// generic function.
+const BOUNDED_CHANCE: i64 = 70;
+
+/// How often, in a hundred, a free function takes a trait object.
+const OBJECT_CHANCE: i64 = 30;
+
+/// How often, in a hundred, a trait method after a trait's first has a
+/// default body.
+const DEFAULT_CHANCE: i64 = 60;
+
+/// How often, in a hundred, an implementation writes its own method for a
+/// method with a default body.
+const OVERRIDE_CHANCE: i64 = 50;
+
+/// How often, in a hundred, a second trait is declared over the first.
+const SUPERTRAIT_CHANCE: i64 = 50;
+
+implement struct Generator {
+    /// Declare the traits and generate their implementations, then their
+    /// methods' default bodies: none without `traits`, or with nothing to
+    /// implement one - no `structs`, and no enum under
+    /// `enum-implementations`.
+    internal declare_traits(mut &this) -> void {
+        if (!this.options.features.has(Feature::Traits) || !this.has_implementing_types()) { return; }
+        this.random = RandomStream::for_traits(this.options.seed);
+        this.genericity = Genericity::Concrete;
+        const defaults: boolean = this.options.features.has(Feature::TraitDefaults);
+        const count: i64 = 1 + this.random.below(MOST_TRAITS);
+        while (this.program.traits.length() < count) {
+            const index: i64 = this.program.traits.length();
+            const first_method: i64 = this.program.trait_methods.length();
+            mut method_count: i64 = 1 + this.random.below(MOST_TRAIT_METHODS);
+            if (defaults) { method_count = method_count + this.random.below(2); }
+            while (this.program.trait_methods.length() < first_method + method_count) {
+                const number: i64 = this.program.trait_methods.length();
+                const function_type: ValueType = this.closure_signature();
+                const defaulted: boolean = defaults && number > first_method && this.random.chance(DEFAULT_CHANCE);
+                this.program.trait_methods.push(TraitMethod { number: number, function_type: function_type, declared_by: index, defaulted: defaulted });
+            }
+            const supertrait: i64 = if (index > 0 && this.options.features.has(Feature::Supertraits) && this.random.chance(SUPERTRAIT_CHANCE)) { index - 1 } else { -1 };
+            this.program.traits.push(TraitDeclaration { number: index, first_method: first_method, method_count: method_count, supertrait: supertrait });
+        }
+        mut implementations: Array<Implementation> = Array::<Implementation>::new();
+        const candidates: Array<ValueType> = this.program.implementing_types();
+        for (implementor in candidates.iter()) {
+            if (!this.may_implement(implementor)) { continue; }
+            mut index: i64 = 0;
+            while (index < count) {
+                if (this.random.chance(IMPLEMENTATION_CHANCE) && this.chosen_supertrait(&implementations, implementor, index)) {
+                    implementations.push(Implementation { implementor: implementor, index: index, overridden: this.drawn_overrides(index) });
+                }
+                index = index + 1;
+            }
+        }
+        for (chosen in implementations.iter()) { this.implement(chosen); }
+        mut method: i64 = 0;
+        while (method < this.program.trait_methods.length()) {
+            if (this.program.trait_method_at(method).defaulted) { this.define_default(method); }
+            method = method + 1;
+        }
+        this.genericity = Genericity::Concrete;
+        if (this.options.features.has(Feature::TraitBounds) && this.options.features.has(Feature::Generics)) {
+            this.declare_bounded_functions();
+        }
+    }
+
+    /// Whether some type may implement a trait: a declared struct, or with
+    /// `enum-implementations`, a declared enum.
+    private has_implementing_types(&this) -> boolean {
+        const candidates: Array<ValueType> = this.program.implementing_types();
+        for (implementor in candidates.iter()) {
+            if (this.may_implement(implementor)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether `implementor` may implement a trait: a struct no generic
+    /// struct's instance is, under `structs`; an enum, under
+    /// `enum-implementations`.  No draw is taken for one that may not.
+    private may_implement(&this, implementor: ValueType) -> boolean {
+        if (implementor.is_record()) {
+            return this.options.features.has(Feature::Structs) && !this.program.structure_at(implementor.structure()).is_instance();
+        }
+        return implementor.is_enumeration() && this.options.features.has(Feature::EnumImplementations);
+    }
+
+    /// Whether `implementor` may implement trait `index`: the trait has no
+    /// supertrait, or the type implements it, chosen earlier in `chosen`.
+    private chosen_supertrait(&this, chosen: &Array<Implementation>, implementor: ValueType, index: i64) -> boolean {
+        const supertrait: i64 = this.program.trait_at(index).supertrait;
+        if (supertrait < 0) { return true; }
+        for (implementation in chosen.iter()) {
+            if (implementation.implementor.same(implementor) && implementation.index == supertrait) { return true; }
+        }
+        return false;
+    }
+
+    /// Which of trait `index`'s defaulted methods an implementation writes
+    /// its own method for, a bit per method by its place in the trait, each
+    /// `OVERRIDE_CHANCE` in a hundred.  No draw for a trait with no default.
+    private drawn_overrides(mut &this, index: i64) -> u64 {
+        const declared: TraitDeclaration = this.program.trait_at(index);
+        mut overridden: u64 = 0;
+        mut bit: u64 = 1;
+        mut method: i64 = declared.first_method;
+        while (method < declared.first_method + declared.method_count) {
+            if (this.program.trait_method_at(method).defaulted && this.random.chance(OVERRIDE_CHANCE)) { overridden = overridden | bit; }
+            bit = bit << 1;
+            method = method + 1;
+        }
+        return overridden;
+    }
+
+    /// With `trait-bounds` (and `generics`, whose functions these are): for
+    /// each trait some struct implements, seven
+    /// times in ten, a generic function `k<N><T>` bounded by it, generated
+    /// as a generic function `g<N>` is, from a stream of its own.
+    private declare_bounded_functions(mut &this) -> void {
+        mut deciding: RandomStream = RandomStream::for_bounded(this.options.seed, -1);
+        mut number: i64 = 0;
+        mut index: i64 = 0;
+        while (index < this.program.traits.length()) {
+            if (this.program.implementors(index).length() > 0 && deciding.chance(BOUNDED_CHANCE)) {
+                this.random = RandomStream::for_bounded(this.options.seed, number);
+                this.generic_function(number, Genericity::Implementing(index));
+                number = number + 1;
+            }
+            index = index + 1;
+        }
+    }
+
+    /// The methods of the trait bounding this function's `T`, and of its
+    /// supertraits, that return `wanted` and that one more call of keeps its
+    /// work under its limit, when a `T` value is in scope to call one on;
+    /// none outside a body bounded by a trait.  In a default body, only the
+    /// methods declared before its own, so no default calls itself or a
+    /// default that calls it.
+    internal bound_calls(&this, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        const bounding: i64 = this.genericity.bounding_trait();
+        if (bounding < 0 || this.environment.variables_of(&this.program, ValueType::TypeParameter).length() == 0) { return found; }
+        const defaulted: i64 = this.genericity.defaulted_method();
+        for (method in this.program.methods_through(bounding).iter()) {
+            const signature: Signature = this.program.signature_of(this.program.trait_method_at(method).function_type);
+            if ((defaulted < 0 || method < defaulted) && signature.returns.same(wanted)
+                    && this.budget.affordable(this.program.trait_method_cost(method))) {
+                found.push(method);
+            }
+        }
+        return found;
+    }
+
+    /// `p0.t<N>(..)`: trait method `method` called through the bound on a
+    /// `T` value, charged its costliest implementation's work.
+    internal bound_call(mut &this, method: i64, depth: i64) -> i64 {
+        const values: Array<i64> = this.environment.variables_of(&this.program, ValueType::TypeParameter);
+        const receiver: i64 = this.read(values.get(this.random.below(values.length())).unwrap());
+        return this.trait_call(receiver, method, depth);
+    }
+
+    /// A trait object parameter for a free function, sometimes: with
+    /// `trait-objects`, `OBJECT_CHANCE` times in a hundred when some struct
+    /// implements a trait, `virtual &Tr<N>` of one such trait added to
+    /// `parameter_types`.  No draw is taken without the feature or such a
+    /// trait.  Whether one was added.
+    internal add_object_parameter(mut &this, parameter_types: mut &Array<ValueType>) -> boolean {
+        if (!this.options.features.has(Feature::TraitObjects)) { return false; }
+        mut implemented: Array<i64> = Array::<i64>::new();
+        mut index: i64 = 0;
+        while (index < this.program.traits.length()) {
+            if (this.program.implementors(index).length() > 0) { implemented.push(index); }
+            index = index + 1;
+        }
+        if (implemented.length() == 0 || !this.random.chance(OBJECT_CHANCE)) { return false; }
+        parameter_types.push(ValueType::TraitObject(implemented.get(this.random.below(implemented.length())).unwrap()));
+        return true;
+    }
+
+    /// The variables in scope a trait object of trait `index` may borrow:
+    /// a parameter or local holding a struct or an enum that implements
+    /// it.  A receiver is a reference already, and is never borrowed again.
+    private object_sources(&this, index: i64) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.in_scope().iter()) {
+            const declared: Variable = this.program.variable_at(variable);
+            const named: boolean = match (declared.role) {
+                VariableRole::Parameter => { true }
+                VariableRole::Local     => { true }
+                _                       => { false }
+            };
+            if (named && this.program.implements(declared.value_type, index)) {
+                found.push(variable);
+            }
+        }
+        return found;
+    }
+
+    /// In `main`, with `trait-objects`: for each trait some helper takes an
+    /// object of, a local of a struct or an enum implementing it, declared
+    /// first, so main's calls of those helpers have a value to pass `&v`
+    /// of.  No draw where no helper takes an object.
+    internal declare_object_sources(mut &this, statements: mut &Array<i64>) -> void {
+        if (!this.options.features.has(Feature::TraitObjects)) { return; }
+        mut index: i64 = 0;
+        while (index < this.program.traits.length()) {
+            if (this.takes_object_of(index)) {
+                const implementors: Array<ValueType> = this.program.implementors(index);
+                const source: ValueType = implementors.get(this.random.below(implementors.length())).unwrap();
+                const value: i64 = if (source.is_record()) { this.record_expression(source, this.depth()) } else { this.enumeration_expression(source, this.depth()) };
+                const variable: i64 = this.environment.declare_local(&this.program, source, false);
+                statements.push(this.program.statement(StatementKind::Declare(variable, value)));
+            }
+            index = index + 1;
+        }
+    }
+
+    /// Whether some function generated so far takes an object of trait
+    /// `index`.
+    private takes_object_of(&this, index: i64) -> boolean {
+        for (defined in this.program.functions.iter()) {
+            mut position: i64 = 0;
+            while (position < defined.parameter_count) {
+                if (this.program.variable_at(this.program.list_at(defined.first_parameter + position)).value_type.object_trait() == index) { return true; }
+                position = position + 1;
+            }
+        }
+        return false;
+    }
+
+    /// Whether every trait object parameter of `candidate` has a variable
+    /// in scope to borrow, so a call of it can be written here.
+    internal passes_objects(&this, candidate: &Function) -> boolean {
+        mut index: i64 = 0;
+        while (index < candidate.parameter_count) {
+            const object: i64 = this.program.variable_at(this.program.list_at(candidate.first_parameter + index)).value_type.object_trait();
+            if (object >= 0 && this.object_sources(object).length() == 0) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    /// `&v` for a trait object parameter of type `wanted`: a variable in
+    /// scope whose struct implements the object's trait, borrowed for the
+    /// call alone.
+    internal object_argument(mut &this, wanted: ValueType) -> i64 {
+        const sources: Array<i64> = this.object_sources(wanted.object_trait());
+        return this.node(ExpressionKind::Borrow(sources.get(this.random.below(sources.length())).unwrap()), wanted);
+    }
+
+    /// The calls through a trait object parameter in scope that return
+    /// `wanted` and keep this function's work under its limit, as pairs of
+    /// the parameter and the trait method, its trait's or a supertrait's.
+    internal object_calls(&this, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.in_scope().iter()) {
+            const object: i64 = this.program.variable_at(variable).value_type.object_trait();
+            if (object >= 0) {
+                for (method in this.program.methods_through(object).iter()) {
+                    const signature: Signature = this.program.signature_of(this.program.trait_method_at(method).function_type);
+                    if (signature.returns.same(wanted) && this.budget.affordable(this.program.trait_method_cost(method))) {
+                        found.push(variable);
+                        found.push(method);
+                    }
+                }
+            }
+        }
+        return found;
+    }
+
+    /// `p1.t<N>(..)` through a trait object: one of `calls`, the pairs
+    /// `object_calls` found, its method run from the table of the value
+    /// the object borrows.
+    internal object_call(mut &this, calls: &Array<i64>, depth: i64) -> i64 {
+        const chosen: i64 = 2 * this.random.below(calls.length() / 2);
+        return this.trait_call(this.read(calls.get(chosen).unwrap()), calls.get(chosen + 1).unwrap(), depth);
+    }
+
+    /// `receiver.t<N>(..)` with an argument for each of trait method
+    /// `method`'s parameters, charged its costliest implementation's work.
+    internal trait_call(mut &this, receiver: i64, method: i64, depth: i64) -> i64 {
+        const signature: Signature = this.program.signature_of(this.program.trait_method_at(method).function_type);
+        this.budget.charge(this.program.trait_method_cost(method));
+        mut arguments: Array<i64> = Array::<i64>::new();
+        while (arguments.length() < signature.parameter_count) {
+            arguments.push(this.typed_place(this.program.signature_parameter(signature, arguments.length()), depth));
+        }
+        const first: i64 = this.program.list_run(&arguments);
+        return this.node(ExpressionKind::TraitCall(receiver, method, first, signature.parameter_count), signature.returns);
+    }
+
+    /// Generate the methods of an implementation, each from the stream of
+    /// its place among the functions: every method of the trait with no
+    /// default, and each defaulted one the implementation overrides.
+    private implement(mut &this, chosen: Implementation) -> void {
+        const declared: TraitDeclaration = this.program.trait_at(chosen.index);
+        mut bit: u64 = 1;
+        mut method: i64 = declared.first_method;
+        while (method < declared.first_method + declared.method_count) {
+            if (!this.program.trait_method_at(method).defaulted || (chosen.overridden & bit) != 0) {
+                this.random = RandomStream::for_method(this.options.seed, this.program.functions.length());
+                this.define_trait_method(method, chosen.implementor);
+            }
+            bit = bit << 1;
+            method = method + 1;
+        }
+    }
+
+    /// Generate trait method `method`'s default body from the stream of its
+    /// place among the functions: a `&this` method whose `this` is the
+    /// implementing type, bounded by the trait alone.
+    private define_default(mut &this, method: i64) -> void {
+        this.random = RandomStream::for_method(this.options.seed, this.program.functions.length());
+        this.genericity = Genericity::Defaulting(this.program.trait_method_at(method).declared_by, method);
+        this.define_trait_method(method, ValueType::Void);
+    }
+
+    /// Generate a method implementing trait method `method` with its
+    /// signature, for the struct or enum `owner`, or for `void` its default
+    /// body.
+    private define_trait_method(mut &this, method: i64, owner: ValueType) -> void {
+        const signature: Signature = this.program.signature_of(this.program.trait_method_at(method).function_type);
+        mut parameter_types: Array<ValueType> = Array::<ValueType>::new();
+        while (parameter_types.length() < signature.parameter_count) {
+            parameter_types.push(this.program.signature_parameter(signature, parameter_types.length()));
+        }
+        this.define_with(this.program.trait_method_at(method).number, owner, Receiver::Shared, &parameter_types, signature.returns, method);
+    }
+}
+
+/// A struct's or an enum's implementation of a trait, as drawn: the
+/// implementing type, the trait by its place, and a bit per method of the
+/// trait, by its place in the trait, for each defaulted method the
+/// implementation writes its own method for.
+private type struct Implementation {
+    /// The implementing struct or enum.
+    private implementor: ValueType;
+    /// The trait.
+    private index: i64;
+    /// The defaulted methods it overrides.
+    private overridden: u64;
+}

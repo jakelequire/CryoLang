@@ -21,56 +21,103 @@ import cryosmith::random::{ RandomStream };
 
 implement struct Generator {
     /// Generate one function from its own random stream: free function
-    /// `number` (or `main` after the last), or method `number` of struct
-    /// `owner`.
-    internal define(mut &this, number: i64, owner: i64, receiver: Receiver) -> void {
-        const is_main: boolean = owner < 0 && number == this.options.function_count();
-        this.random = if (owner < 0) {
+    /// `number` (or `main` after the last) when `owner` is `void`, or
+    /// method `number` of the struct `owner`.
+    internal define(mut &this, number: i64, owner: ValueType, receiver: Receiver) -> void {
+        const free: boolean = owner.same(ValueType::Void);
+        const is_main: boolean = free && number == this.options.function_count();
+        this.random = if (free) {
             RandomStream::for_function(this.options.seed, number)
         } else {
             RandomStream::for_method(this.options.seed, this.program.functions.length())
         };
+        this.genericity = Genericity::Concrete;
+        mut parameter_types: Array<ValueType> = Array::<ValueType>::new();
+        mut takes_function: boolean = false;
+        mut takes_object: boolean = false;
+        mut takes_owned: boolean = false;
+        mut takes_reference: boolean = false;
+        mut takes_slice: boolean = false;
+        if (!is_main) {
+            const parameter_count: i64 = if (free) { 1 + this.random.below(4) } else { this.random.below(4) };
+            while (parameter_types.length() < parameter_count) { parameter_types.push(this.any_type()); }
+            if (free) { takes_function = this.add_function_parameter(&parameter_types); }
+            if (free) { takes_object = this.add_object_parameter(&parameter_types); }
+            if (free) { takes_owned = this.add_owned_parameter(&parameter_types); }
+            if (free) { takes_reference = this.add_reference_parameter(&parameter_types); }
+            if (free) { takes_slice = this.add_slice_parameter(&parameter_types); }
+        }
+        const reference: ValueType = if (takes_reference) { this.reference_return_type(&parameter_types) } else { ValueType::Void };
+        const returns: ValueType = if (reference.is_reference()) { reference } else { this.drawn_return_type(owner, receiver, is_main) };
+        this.define_with(number, owner, receiver, &parameter_types, returns, -1);
+        if (!is_main && !takes_function && !takes_object && !takes_owned && !takes_reference && !takes_slice && this.options.features.has(Feature::Overloads)) {
+            this.define_overloads(this.program.functions.length() - 1);
+        }
+    }
+
+    /// What a function generated from the stream already chosen returns:
+    /// nothing for a `mut &this` method, sometimes its own struct for a
+    /// static method, `i32` for `main`, and otherwise a drawn type.
+    internal drawn_return_type(mut &this, owner: ValueType, receiver: Receiver, is_main: boolean) -> ValueType {
+        return match (receiver) {
+            Receiver::Exclusive => { ValueType::Void }
+            Receiver::Static    => { (if (this.random.chance(50)) { owner } else { this.any_type() }) }
+            Receiver::Free      => { (if (is_main) { ValueType::I32 } else { this.free_return_type() }) }
+            _                   => { this.any_type() }
+        };
+    }
+
+    /// Generate the rest of a function whose parameters are
+    /// `parameter_types` and which returns `returns`, from the stream
+    /// already chosen: its body and its cost, and the genericity it was
+    /// generated under.  `implements` is the trait method a trait's
+    /// implementation's method, or a default body with a `void` `owner`,
+    /// implements, or -1.  A method's `this` is of its `owner`, a default
+    /// body's of the implementing type, `T`.
+    internal define_with(mut &this, number: i64, owner: ValueType, receiver: Receiver, parameter_types: &Array<ValueType>, returns: ValueType, implements: i64) -> void {
+        const free: boolean = owner.same(ValueType::Void) && implements < 0;
+        const is_main: boolean = free && number == this.options.function_count();
         this.environment.enter_function();
         this.loop_depth = 0;
         this.block_depth = 0;
         this.budget = CostBudget::for_function(is_main);
-        this.statements_left = if (owner < 0) { this.options.size } else { (this.options.size + 1) / 2 };
+        this.statements_left = if (free) { this.options.size } else { (this.options.size + 1) / 2 };
         this.in_main = is_main;
-        this.genericity = Genericity::Concrete;
         mut receiver_variable: i64 = -1;
         if (!receiver.is_called_by_name()) {
+            const receiver_type: ValueType = if (owner.same(ValueType::Void)) { ValueType::TypeParameter } else { owner };
             receiver_variable = this.program.variable(Variable {
-                role: VariableRole::Receiver, number: 0, value_type: ValueType::Record(owner), mutable: receiver.writes_receiver(),
+                role: VariableRole::Receiver, number: 0, value_type: receiver_type, mutable: receiver.writes_receiver(),
             });
             this.environment.bind(receiver_variable);
         }
         const first_parameter: i64 = this.program.lists.length();
-        mut parameter_count: i64 = 0;
-        if (!is_main) {
-            parameter_count = if (owner < 0) { 1 + this.random.below(4) } else { this.random.below(4) };
-            mut index: i64 = 0;
-            while (index < parameter_count) {
-                const value_type: ValueType = this.any_type();
-                const parameter: i64 = this.program.variable(Variable { role: VariableRole::Parameter, number: index, value_type: value_type, mutable: false });
-                this.program.lists.push(parameter);
-                this.environment.bind(parameter);
-                index = index + 1;
-            }
+        const parameter_count: i64 = parameter_types.length();
+        mut position: i64 = 0;
+        while (position < parameter_count) {
+            const parameter: i64 = this.program.variable(Variable {
+                role: VariableRole::Parameter, number: position, value_type: parameter_types.get(position).unwrap(), mutable: false,
+            });
+            this.program.lists.push(parameter);
+            this.environment.bind(parameter);
+            position = position + 1;
         }
-        this.returns = match (receiver) {
-            Receiver::Exclusive => { ValueType::Void }
-            Receiver::Static    => { (if (this.random.chance(50)) { ValueType::Record(owner) } else { this.any_type() }) }
-            _                   => { (if (is_main) { ValueType::I32 } else { this.any_type() }) }
-        };
+        this.returns = returns;
         mut statements: Array<i64> = Array::<i64>::new();
         const body_start: i64 = this.environment.mark();
+        if (is_main) {
+            this.declare_object_sources(&statements);
+            this.declare_reference_holders(&statements);
+            this.declare_array_sources(&statements);
+        }
         this.fill(&statements, true);
         this.observe_declared(body_start, &statements);
         if (is_main) {
             mut helper: i64 = 0;
             while (helper < this.program.functions.length()) {
                 const called: Function = this.program.function_at(helper);
-                if (called.owner < 0 && this.callees(called.returns).contains(&helper)) {
+                this.environment.begin_statement();
+                if (called.is_unowned() && this.callees(called.returns).contains(&helper)) {
                     this.observe_value(this.call(helper, 2), &statements);
                 }
                 helper = helper + 1;
@@ -81,12 +128,13 @@ implement struct Generator {
             mut index: i64 = 0;
             while (index < parameter_count) {
                 const parameter: i64 = this.program.list_at(first_parameter + index);
-                this.observe_place(this.read(parameter), &statements);
+                if (!this.environment.is_moved(parameter)) { this.observe_place(this.read(parameter), &statements); }
                 index = index + 1;
             }
             if (receiver_variable >= 0) { this.observe_place(this.read(receiver_variable), &statements); }
             if (!this.returns.same(ValueType::Void)) {
-                const value: i64 = this.typed_place(this.returns, this.depth());
+                this.environment.begin_statement();
+                const value: i64 = this.returned_value();
                 statements.push(this.program.statement(StatementKind::Return(value)));
             }
         }
@@ -94,8 +142,17 @@ implement struct Generator {
         this.program.functions.push(Function {
             number: number, is_main: is_main, owner: owner, receiver: receiver, first_parameter: first_parameter,
             parameter_count: parameter_count, returns: this.returns, body: body, cost: this.budget.spent(),
-            genericity: Genericity::Concrete,
+            genericity: this.genericity, callable: ValueType::Void, implements: implements,
         });
+    }
+
+    /// A value for the function to return: a reference it returns borrows
+    /// from its reference parameters only.
+    internal returned_value(mut &this) -> i64 {
+        this.returning_reference = this.returns.is_reference();
+        const value: i64 = this.typed_place(this.returns, this.depth());
+        this.returning_reference = false;
+        return value;
     }
 
     /// A call of the free function or static method `callee`, with
@@ -109,19 +166,36 @@ implement struct Generator {
     /// Charge a call of `called` and generate its arguments; the first
     /// argument's place in the index lists.
     internal arguments(mut &this, called: Function, depth: i64) -> i64 {
-        return this.instantiated_arguments(called, ValueType::TypeParameter, depth);
+        return this.instantiated_arguments(called, ValueType::TypeParameter, false, depth);
     }
 
     /// `arguments` for a call of `called` at `type_argument`: a parameter of
-    /// type `T` takes a value of `type_argument`.
-    internal instantiated_arguments(mut &this, called: Function, type_argument: ValueType, depth: i64) -> i64 {
+    /// type `T` takes a value of `type_argument`, a deciding value when
+    /// `inferred`, since then the call does not write the type argument.
+    /// Every argument of a call of an overloaded name is a deciding value
+    /// too, since it chooses the overload (`Overloading`).  A
+    /// callable-bounded parameter takes a closure written here, of its bound
+    /// at `type_argument`.
+    internal instantiated_arguments(mut &this, called: Function, type_argument: ValueType, inferred: boolean, depth: i64) -> i64 {
         this.budget.charge(called.cost);
+        const overloaded: boolean = this.program.overload_set(&called).length() > 1;
         mut arguments: Array<i64> = Array::<i64>::new();
         mut index: i64 = 0;
         while (index < called.parameter_count) {
             const parameter: Variable = this.program.variable_at(this.program.list_at(called.first_parameter + index));
-            const wanted: ValueType = if (parameter.value_type.same(ValueType::TypeParameter)) { type_argument } else { parameter.value_type };
-            if (this.constant_wanted(wanted)) {
+            const decides: boolean = parameter.value_type.same(ValueType::TypeParameter);
+            const wanted: ValueType = if (decides) { type_argument } else { parameter.value_type };
+            if (called.takes_callable() && index == called.parameter_count - 1) {
+                arguments.push(this.written_closure(this.program.instantiated_function_type(called.callable, type_argument), true));
+            } else if (wanted.object_trait() >= 0) {
+                arguments.push(this.object_argument(wanted));
+            } else if (wanted.is_slice()) {
+                arguments.push(this.slice_argument(wanted));
+            } else if (wanted.is_function()) {
+                arguments.push(this.function_value(wanted, true));
+            } else if ((decides && inferred) || overloaded) {
+                arguments.push(this.deciding_value(wanted, if (depth < 0) { 0 } else { depth }));
+            } else if (this.constant_wanted(wanted)) {
                 arguments.push(this.constant(wanted));
             } else {
                 arguments.push(this.typed_place(wanted, if (depth < 0) { 0 } else { depth }));
@@ -142,7 +216,9 @@ implement struct Generator {
         while (index < this.program.functions.length()) {
             const candidate: Function = this.program.function_at(index);
             if (candidate.receiver.is_called_by_name() && !candidate.genericity.is_generic()
-                    && candidate.returns.same(wanted) && this.budget.affordable(candidate.cost)) {
+                    && candidate.returns.same(wanted) && this.budget.affordable(candidate.cost) && this.may_call(&candidate)
+                    && this.passes_objects(&candidate) && this.passes_references(&candidate)
+                    && this.passes_slices(candidate.first_parameter, candidate.parameter_count)) {
                 found.push(index);
             }
             index = index + 1;

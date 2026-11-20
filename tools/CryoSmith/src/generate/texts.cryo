@@ -1,0 +1,119 @@
+///! Strings (stage 8): `String` locals.
+///!
+///! With `strings`, a function declares `String` locals, built from a
+///! literal, from an integer value's digits or empty; appends to a `mut`
+///! one an integer, a string literal or another `String`'s view
+///! (`v3.push(v1.as_str())`); compares two (`==`, `<`, ..) where a boolean
+///! is wanted; and reads one's length where an `i64` is wanted.  A `String`
+///! is never read by value - never copied, moved, passed or returned - so
+///! it needs no ownership state of its own, and one being appended to is
+///! lent exclusively for its statement, so the view appended is always
+///! another's.  A `String` is observed by its length and by a `for` over
+///! its bytes, in order.
+
+namespace cryosmith::generate::texts;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature, FeatureSet };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::model::{ ExpressionKind, StatementKind, ValueType, Variable, VariableRole };
+import cryosmith::typing::{ TypeChoice };
+
+/// How many string literals a program may spell: the numbers below it,
+/// each up to four characters (`Program::text_of`).
+const TEXT_CODES: i64 = 1679616;
+
+implement struct Generator {
+    /// Whether `String` locals are generated: `strings` is on, and so is
+    /// `loops`, since one is observed by a `for` over its bytes.
+    internal makes_strings(&this) -> boolean {
+        const features: FeatureSet = this.options.features;
+        return features.has(Feature::Strings) && features.has(Feature::Loops);
+    }
+
+    /// `const` or `mut` `String` local with its initial value.
+    internal text_declaration(mut &this) -> i64 {
+        const value: i64 = this.text_value(this.depth());
+        const mutable: boolean = this.random.chance(50);
+        const variable: i64 = this.environment.declare_local(&this.program, ValueType::Text, mutable);
+        return this.program.statement(StatementKind::Declare(variable, value));
+    }
+
+    /// A new `String`: of a literal's text, of an integer value's digits,
+    /// or empty.  Never another variable's, which would move it.
+    internal text_value(mut &this, depth: i64) -> i64 {
+        const next: i64 = if (depth > 0) { depth - 1 } else { 0 };
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(5);
+        weights.push(4);
+        weights.push(1);
+        const form: i64 = this.random.pick(&weights);
+        if (form == 0) { return this.node(ExpressionKind::TextLiteral(this.random.below(TEXT_CODES) as u64), ValueType::Text); }
+        if (form == 1) {
+            const digits: i64 = this.expression(TypeChoice::integer(&this.random), next, true);
+            return this.node(ExpressionKind::TextOf(digits), ValueType::Text);
+        }
+        return this.node(ExpressionKind::EmptyText, ValueType::Text);
+    }
+
+    /// The `String` locals in scope, which may be compared and measured
+    /// here: any not lent exclusively, as one being appended to is.
+    internal texts(&this) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.in_scope().iter()) {
+            const declared: Variable = this.program.variable_at(variable);
+            const local: boolean = match (declared.role) {
+                VariableRole::Local => { true }
+                _                   => { false }
+            };
+            if (local && declared.value_type.is_text() && !this.environment.is_lent_exclusively(variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// The `mut` `String` locals in scope that may be appended to here:
+    /// any not lent by the statement.
+    internal writable_texts(&this) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.assignable(&this.program).iter()) {
+            if (this.program.variable_at(variable).value_type.is_text() && !this.environment.is_lent(variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// `v.push(value);` on one of `writable`, lent exclusively first: an
+    /// integer value, a string literal, or the view of another `String`
+    /// in scope, lent shared.
+    internal text_push(mut &this, writable: &Array<i64>) -> i64 {
+        const variable: i64 = writable.get(this.random.below(writable.length())).unwrap();
+        this.environment.lend(variable, true);
+        const others: Array<i64> = this.texts();
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(4);
+        weights.push(3);
+        weights.push(if (others.length() > 0) { 3 } else { 0 });
+        const form: i64 = this.random.pick(&weights);
+        mut value: i64 = -1;
+        if (form == 0) { value = this.expression(TypeChoice::integer(&this.random), this.depth(), true); }
+        if (form == 1) { value = this.node(ExpressionKind::StrLiteral(this.random.below(TEXT_CODES) as u64), ValueType::Void); }
+        if (form == 2) {
+            const viewed: i64 = others.get(this.random.below(others.length())).unwrap();
+            this.environment.lend(viewed, false);
+            value = this.node(ExpressionKind::AsStr(viewed), ValueType::Void);
+        }
+        return this.program.statement(StatementKind::Evaluate(this.node(ExpressionKind::Push(variable, value), ValueType::Void)));
+    }
+
+    /// Observe the `String` `variable` holds: its length, then `for (n in
+    /// v.as_bytes()) { observe n }`, every byte in order.
+    internal observe_text(mut &this, variable: i64, statements: mut &Array<i64>) -> void {
+        statements.push(this.observation(this.node(ExpressionKind::Length(variable), ValueType::I64)));
+        const mark: i64 = this.environment.mark();
+        const binding: i64 = this.environment.declare_counter(&this.program, ValueType::U8);
+        mut body: Array<i64> = Array::<i64>::new();
+        body.push(this.observation(this.read(binding)));
+        this.environment.leave(mark);
+        statements.push(this.program.statement(StatementKind::Each(variable, binding, this.program.block(&body))));
+    }
+}

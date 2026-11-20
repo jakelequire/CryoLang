@@ -1,0 +1,61 @@
+namespace main;
+
+import std::env;
+import std::fmt;
+import std::collections::str::{ Str };
+import compiler::toolchain::{ ExecutablePath, HostTriple };
+
+const MSVC: string = "x86_64-pc-windows-msvc";
+const GNU: string = "x86_64-pc-windows-gnu";
+
+mut g_failed: i32 = 0;
+
+function check(what: string, got: string, want: string) -> void {
+    if (got != want) {
+        fmt::printf("FAIL %s\n  got:  [%s]\n  want: [%s]\n", what, got, want);
+        g_failed = g_failed + 1;
+    }
+}
+
+function check_flag(what: string, got: boolean, want: boolean) -> void {
+    if (got != want) {
+        fmt::printf("FAIL %s: got %d, want %d\n", what, got as i32, want as i32);
+        g_failed = g_failed + 1;
+    }
+}
+
+/// The triple picked for an LLVM that reports windows-msvc, with `CRYO_CC`
+/// set to `driver` ("" leaves it unset).
+function picked(driver: string) -> string {
+    if (driver.length() == 0) {
+        env::remove_var(Str::new("CRYO_CC"));
+    } else {
+        env::set_var(Str::new("CRYO_CC"), Str::new(driver));
+    }
+    return HostTriple::on_windows(MSVC);
+}
+
+function main() -> int {
+    check_flag("absolute gcc.exe", ExecutablePath::starts_gcc("C:\\msys64\\mingw64\\bin\\gcc.exe"), true);
+    check_flag("cross gcc with an option", ExecutablePath::starts_gcc("x86_64-w64-mingw32-gcc -O2"), true);
+    check_flag("posix path gcc", ExecutablePath::starts_gcc("/usr/bin/gcc"), true);
+    check_flag("clang", ExecutablePath::starts_gcc("clang --target=x86_64-w64-mingw32"), false);
+    check_flag("gcc-ar", ExecutablePath::starts_gcc("gcc-ar"), false);
+    check_flag("empty", ExecutablePath::starts_gcc(""), false);
+
+    // PATH holds an MSVC linker and no gcc: only what `CRYO_CC` names can
+    // select windows-gnu.
+    env::set_var(Str::new("PATH"), Str::new("tools"));
+    check("gcc named by CRYO_CC, not on PATH", picked("Z:\\no-toolchain\\bin\\gcc.exe"), GNU);
+    check("cross gcc named by CRYO_CC", picked("x86_64-w64-mingw32-gcc"), GNU);
+    check("clang named by CRYO_CC", picked("clang"), MSVC);
+    check("no CRYO_CC", picked(""), MSVC);
+    check("a triple LLVM reports that is not msvc", HostTriple::on_windows("x86_64-pc-linux-gnu"), "x86_64-pc-linux-gnu");
+
+    // Nothing on PATH at all: the port's default.
+    env::set_var(Str::new("PATH"), Str::new("no-such-directory"));
+    check("no toolchain anywhere", picked("clang"), GNU);
+
+    fmt::printf("default triple checks: %d failed\n", g_failed);
+    return if (g_failed == 0) { 0 } else { 1 };
+}

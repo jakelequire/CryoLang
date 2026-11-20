@@ -61,12 +61,33 @@ type struct ASTCloner {
     /// over what is typed.
     carries_types: boolean;
 
+    /// When false, the copy carries nothing the type check decided about
+    /// the original's names, locals and calls: no identifier's type, no
+    /// local's type, no callee chosen for a call or for a function named as
+    /// a value, and no operator or index it rewrote into a trait method's
+    /// call.  A copy whose parameters take other types is
+    /// checked from scratch, since an argument reading a retyped parameter
+    /// may select another callee than the original's call did, and a
+    /// closure written in it is a closure type of its own, which a local
+    /// keeping the original's type would refuse.
+    carries_analysis: boolean;
+
     static new() -> ASTCloner {
         return ASTCloner {
             spec_name:     SymbolStr::empty(),
             skip_generics: false,
             carries_types: false,
+            carries_analysis: true,
         };
+    }
+
+    /// A cloner for a copy of a function whose parameters are given other
+    /// types (a function copied for the closure passed to it), which the
+    /// type check walks as if it were new.
+    static for_retyped_copy() -> ASTCloner {
+        mut c: ASTCloner = ASTCloner::new();
+        c.carries_analysis = false;
+        return c;
     }
 
     /// A cloner for a copy monomorphization makes: its expressions carry
@@ -228,7 +249,7 @@ type struct ASTCloner {
             c.add_argument(this.clone_expr(node.arguments[i]));
         }
         c.generic_args = this.clone_type_annotations(node.generic_args);
-        c.resolved_callee = node.resolved_callee;
+        if (this.carries_analysis) { c.resolved_callee = node.resolved_callee; }
         c.named_method = node.named_method;
         c.template_method = node.template_method;
         c.template_recv = node.template_recv;
@@ -406,7 +427,7 @@ type struct ASTCloner {
                 ci.is_this_keyword      = n.is_this_keyword;
                 ci.is_this_type_keyword = n.is_this_type_keyword;
                 ci.generic_args         = this.clone_type_annotations(n.generic_args);
-                ci.resolved_callee      = n.resolved_callee;
+                if (this.carries_analysis) { ci.resolved_callee = n.resolved_callee; }
                 ci.res                  = n.res;
                 mut vta: [TypeRef] = [];
                 for (mut i: i64 = 0; i < n.value_type_args.length(); i++) { vta.push(n.value_type_args[i]); }
@@ -419,13 +440,21 @@ type struct ASTCloner {
                 // `raw` is a `match`-bound local).  Codegen re-resolves identifier types
                 // from their declaration, so carrying a still-generic type here is safe;
                 // the monomorphizer applies the active substitution at its walk.
-                c.set_resolved_type(node.resolved_type);
+                if (this.carries_analysis) { c.set_resolved_type(node.resolved_type); }
             }
             ExprKind::Lambda(n) => {
                 c = ExpressionNode::lambda_expr(node.span);
                 mut cl: mut LambdaExpr* = ExpressionNode::lambda_of(c);
+                // A lambda's parameters are declared in the body, and no
+                // signature of the copy's is built for them: their decided
+                // types are carried, as a local's are, and the copy's
+                // substitution rewrites them with the return type.
                 for (mut i: i64 = 0; i < n.parameters.length(); i++) {
-                    cl.add_parameter(this.clone_var_decl(n.parameters[i]));
+                    const parameter: DeclarationNode* = this.clone_var_decl(n.parameters[i]);
+                    if (this.carries_analysis) {
+                        DeclarationNode::var_of(parameter).resolved_type = DeclarationNode::var_of(n.parameters[i]).resolved_type;
+                    }
+                    cl.add_parameter(parameter);
                 }
                 if (n.return_type.is_valid()) {
                     cl.set_return_type(n.return_type);
@@ -456,8 +485,11 @@ type struct ASTCloner {
                 // Carry an index-operator-overload desugar (`*(a.index(i))`,
                 // built at sema for a bounded-param or generic container) into
                 // the specialization so the substituter can concretize its
-                // type-args and codegen finds it.
-                if (n.desugared_call != null) {
+                // type-args and codegen finds it.  A copy the type check
+                // walks from scratch builds its own: the type check reads a
+                // carried desugar as the node's answer, and one carried
+                // without its analysis answers no type.
+                if (this.carries_analysis && n.desugared_call != null) {
                     mut ca: mut ArrayAccessExpr* = ExpressionNode::array_access_of(c);
                     ca.desugared_call = this.clone_expr(n.desugared_call);
                 }
@@ -469,22 +501,28 @@ type struct ASTCloner {
                 // Carry an operator-overload desugar (built at sema for a
                 // bounded-param operand) into the specialization so the
                 // substituter can concretize its stashed type-args and codegen
-                // finds the trait-method call.
-                if (n.desugared_call != null) {
-                    cb.desugared_call = this.clone_expr(n.desugared_call);
+                // finds the trait-method call, and the `append` a string `+`
+                // was bound to.  A copy the type check walks from scratch
+                // decides both again, as it does every callee.
+                if (this.carries_analysis) {
+                    if (n.desugared_call != null) {
+                        cb.desugared_call = this.clone_expr(n.desugared_call);
+                    }
+                    cb.desugar_by_bound = n.desugar_by_bound;
+                    cb.append_entry = n.append_entry;
                 }
-                cb.desugar_by_bound = n.desugar_by_bound;
-                cb.append_entry = n.append_entry;
             }
             ExprKind::Unary(n) => {
                 c = ExpressionNode::unary_expr(n.op, this.clone_expr(n.operand), node.span);
                 mut cu: mut UnaryExpr* = ExpressionNode::unary_of(c);
                 cu.is_postfix   = n.is_postfix;
                 cu.is_synthetic = n.is_synthetic;
-                if (n.desugared_call != null) {
-                    cu.desugared_call = this.clone_expr(n.desugared_call);
+                if (this.carries_analysis) {
+                    if (n.desugared_call != null) {
+                        cu.desugared_call = this.clone_expr(n.desugared_call);
+                    }
+                    cu.desugar_by_bound = n.desugar_by_bound;
                 }
-                cu.desugar_by_bound = n.desugar_by_bound;
                 cu.borrowed_as_pointer = n.borrowed_as_pointer;
             }
             ExprKind::Cast(n) => {
@@ -644,7 +682,11 @@ type struct ASTCloner {
             }
             StmtKind::Break    => { StmtKind::Break }
             StmtKind::Continue => { StmtKind::Continue }
-            StmtKind::Expr(n)  => { StmtKind::Expr(new ExprStmt { expression: this.clone_expr(n.expression) }) }
+            StmtKind::Expr(n)  => {
+                StmtKind::Expr(new ExprStmt {
+                    expression: this.clone_expr(n.expression), releases_result: n.releases_result,
+                })
+            }
             StmtKind::Decl(n)  => {
                 StmtKind::Decl(new DeclStmt {
                     declaration: this.clone_decl(n.declaration),
@@ -663,7 +705,7 @@ type struct ASTCloner {
 
     /// The payload of a method's copy; the generic method it specializes is
     /// not carried (a copy is the same method, not an instance of it).
-    copy_method(mut &this, node: MethodDecl*) -> MethodDecl* {
+    copy_method(mut &this, node: MethodDecl*) -> mut MethodDecl* {
         mut c: mut MethodDecl* = MethodDecl::new(this.clone_func_decl(node.func));
         c.visibility            = node.visibility;
         c.is_static             = node.is_static;
@@ -941,7 +983,7 @@ type struct ASTCloner {
                 // substitution rewrites it.  Only here: a parameter's type is
                 // the copy's signature, which monomorphization builds itself
                 // (`clone_var_decl`).
-                c.resolved_type = n.resolved_type;
+                if (this.carries_analysis) { c.resolved_type = n.resolved_type; }
                 DeclKind::Variable(c)
             }
         };
@@ -1003,11 +1045,15 @@ type struct ASTCloner {
                     new_elems.push(PatternElement::Sub(ns));
                 }
                 PatternElement::Binding(pb) => {
-                    const nb: PatternBinding* = new PatternBinding {
+                    // The binding's decided type is carried, as a local's
+                    // is, and the copy's substitution rewrites it: code
+                    // generation reads it to copy a `Copy` payload on
+                    // entering the arm.
+                    const nb: mut PatternBinding* = new PatternBinding {
                         name:   pb.name,
                         span:   pb.span,
                         sym_id: pb.sym_id,
-                        resolved_type: TypeRef::invalid(),
+                        resolved_type: if (this.carries_analysis) { pb.resolved_type } else { TypeRef::invalid() },
                         written_mut: pb.written_mut,
                     };
                     new_elems.push(PatternElement::Binding(nb));
@@ -1164,9 +1210,12 @@ type struct ASTCloner {
             PatternKind::Literal(n)  => { PatternKind::Literal(LiteralPattern::new(n.value, n.literal_kind)) }
             PatternKind::Range(n)    => { PatternKind::Range(RangePattern::new(n.low, n.high, n.literal_kind)) }
             PatternKind::Binding(n)  => {
-                // A clone is typed when its own body is checked.
+                // The decided type is carried as an enum pattern's
+                // bindings' are; a copy the type check walks from scratch
+                // types it there.
                 mut b: mut BindingPattern* = BindingPattern::new(n.name);
                 b.binding_sym = n.binding_sym;
+                if (this.carries_analysis) { b.binding_type = n.binding_type; }
                 PatternKind::Binding(b)
             }
             PatternKind::Constant(n) => {

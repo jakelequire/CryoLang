@@ -43,7 +43,7 @@ import compiler::ast::walk::{ Walk };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, DeclarationNode, DestructureDecl, EnumDecl,
     EnumVariant, FieldDecl, FunctionDecl, GenericParamDecl,
-    DeclKind, ImplBlock, MethodDecl, StructDecl,
+    DeclKind, ImplBlock, KindKeyword, MethodDecl, StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -433,7 +433,7 @@ type struct TypeResolutionRunner {
         if (!trait_id.is_valid()) { return; }
         const decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(trait_id);
         if (decl == null) { return; }
-        const owner: TypeRef = this.ctx.decl_index.impl_owner(impl_node, "type_resolution/impl conformance");
+        const owner: TypeRef = this.ctx.decl_index.impl_owner(impl_node, this.ctx.type_arena, "type_resolution/impl conformance");
         if (!owner.is_valid()) { return; }
         const intern: InternTable* = this.ctx.get_intern_table();
         const trait_name: string = intern.resolve(
@@ -772,6 +772,87 @@ type struct TypeResolutionRunner {
             d = d.at_with_label(head_span, "`new` of this type never calls an `Allocate` implementation");
             this.ctx.emit_diagnostic(d);
         }
+    }
+
+    /// The kind keyword an `implement` head writes before its target
+    /// against the kind of the type the head names (E0319): `struct` names
+    /// a struct, `enum` an enum, `union` a union, and a type of any other
+    /// kind takes no keyword.  An alias is the type it names.  The fix is
+    /// certain either way: the keyword is the kind's own, or none.
+    check_implement_kind_keyword(&this, impl_node: ImplBlock*) -> void {
+        const written: KindKeyword = match (impl_node.kind_keyword) {
+            Option::Some(keyword) => { keyword }
+            Option::None          => { return; }
+        };
+        const owner: TypeRef = this.ctx.decl_index.impl_owner(impl_node, this.arena,
+            "type_resolution/implement kind keyword");
+        if (!owner.is_valid()) { return; }
+        const t: Type* = this.arena.lookup(owner);
+        // A generic alias is still an alias after `follow_alias`, which
+        // leaves it to be expanded where it is instantiated: its kind is not
+        // known here, so it gets no verdict.
+        if (t == null || t.kind == TypeKind::Error || t.kind == TypeKind::TypeAlias) { return; }
+        mut actual: Option<KindKeyword> = Option::None;
+        if (t.kind == TypeKind::Enum) { actual = Option::Some(KindKeyword::Enum); }
+        if (t.kind == TypeKind::Struct) {
+            actual = Option::Some(if (t.as_struct().is_union) { KindKeyword::Union } else { KindKeyword::Struct });
+        }
+        const keyword_span: SourceSpan = impl_node.kind_keyword_span;
+        const shown: string = this.shown_type(owner);
+        const d: Diagnostic = match (actual) {
+            Option::Some(kind) => {
+                if (kind == written) { return; }
+                Diagnostic::error(ErrorCode::E0319_IMPLEMENT_KIND_MISMATCH,
+                    fmt::format("`%s` is %s, not %s", shown, kind.described(), written.described()))
+                    .at_with_label(keyword_span, fmt::format("`%s` names %s", written.spelling(), written.described()))
+                    .help(fmt::format("the keyword before the type names its kind, so %s is written after `%s`",
+                        kind.described(), kind.spelling()))
+                    .suggest(Suggestion::machine_applicable(keyword_span, kind.spelling(),
+                        fmt::format("write `%s`", kind.spelling())))
+            }
+            Option::None => {
+                Diagnostic::error(ErrorCode::E0319_IMPLEMENT_KIND_MISMATCH,
+                    fmt::format("`%s` is not a struct, an enum or a union, so no kind keyword names it", shown))
+                    .at_with_label(keyword_span, fmt::format("`%s` names %s", written.spelling(), written.described()))
+                    .help("only a struct, an enum or a union is written after a kind keyword; any other type is written alone")
+                    .suggest(Suggestion::machine_applicable(
+                        SourceSpan::covering(keyword_span, impl_node.target_type_span.start_point()), "",
+                        fmt::format("remove `%s`", written.spelling())))
+            }
+        };
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// An implement head naming an alias is for the type the alias names,
+    /// which must be a type a head names by its declaration - a struct, an
+    /// enum, a union or a primitive - so that the alias reaches nothing a
+    /// head written without it could not (E0320).  A generic instance is
+    /// written out in the head instead; a pointer, an array or a function
+    /// type is implemented for by no head.  A generic alias, still an alias
+    /// after `follow_alias`, is expanded where it is instantiated and is not
+    /// judged here.
+    check_implement_alias_target(&this, impl_node: ImplBlock*) -> void {
+        const named: DefId = impl_node.target_def();
+        if (!named.is_valid()) { return; }
+        const written: TypeRef = this.ctx.decl_index.type_of_def(named);
+        const alias: Type* = this.arena.lookup(written);
+        if (alias == null || alias.kind != TypeKind::TypeAlias) { return; }
+        const owner: TypeRef = this.arena.follow_alias(written);
+        const target: Type* = this.arena.lookup(owner);
+        if (target == null || target.kind == TypeKind::Error || target.kind == TypeKind::TypeAlias) { return; }
+        if (this.ctx.decl_index.registered_def(owner).is_valid()) { return; }
+        const alias_shown: string = this.shown_type(written);
+        const target_shown: string = this.shown_type(owner);
+        const help: string = if (target.kind == TypeKind::InstantiatedType) {
+            fmt::format("write the instance itself after `for`, `%s`, in place of its alias", target_shown).into_raw()
+        } else {
+            "an alias in an implement head names a struct, an enum, a union or a primitive type"
+        };
+        this.ctx.emit_diagnostic(Diagnostic::error(ErrorCode::E0320_IMPLEMENT_ALIAS_TARGET,
+                fmt::format("`%s` is an alias of `%s`, which an implement head cannot name through an alias",
+                    alias_shown, target_shown))
+            .at_with_label(impl_node.target_type_span, fmt::format("names `%s`", target_shown))
+            .help(help));
     }
 
     report_conformance<T>(&this, span: SourceSpan, message: T) -> void where T: Display {
@@ -1905,7 +1986,7 @@ type struct TypeResolutionPasses {
                 // registered here alone.
                 ctx.generic_registry.register_trait_impl(
                     node.trait_def,
-                    ctx.decl_index.impl_owner(node, "type_resolution/trait impl"), decl);
+                    ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/trait impl"), decl);
             }
         }
         // A head whose target is a parameter of its own (`implement<T> trait
@@ -1970,7 +2051,7 @@ type struct TypeResolutionPasses {
                 // at one named type that fails it (`overlap_excused`);
                 // nothing here can prove two bounds on a parameter disjoint.
                 const unified: [DeclarationNode*] = ctx.generic_registry.overlapping_heads(
-                    node.trait_def, ctx.decl_index.impl_owner(node, "type_resolution/overlap"), node);
+                    node.trait_def, ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/overlap"), node);
                 mut over: DeclarationNode* = null;
                 for (mut oi: i64 = 0; oi < unified.length() && over == null; oi++) {
                     if (!TypeResolutionPasses::overlap_excused(node, DeclarationNode::impl_of(unified[oi]), ctx)) {
@@ -1991,7 +2072,7 @@ type struct TypeResolutionPasses {
         // in the owner's parameters.
         mut head: TypeSubstitution = TypeResolutionPasses::impl_params_to_owner(node, ctx, arena);
         ctx.decl_index.register_methods_through(
-            ctx.decl_index.impl_owner(node, "type_resolution/register impl methods"),
+            ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/register impl methods"),
             node.methods, &head, &node.trait_arg_types, ctx.intern_table, arena,
             "type_resolution/register impl methods");
     }
@@ -3257,7 +3338,7 @@ type struct TypeResolutionPasses {
     /// module.
     static sync_impl_methods(node: ImplBlock*, ctx: CompilationContext*, arena: mut TypeArena*) -> void {
         if (node.is_generic()) { return; }
-        const tgt: TypeRef = ctx.decl_index.impl_owner(node, "type_resolution/struct field sync");
+        const tgt: TypeRef = ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/struct field sync");
         if (!tgt.is_valid()) { return; }
         const tgt_t: Type* = arena.lookup(tgt);
         if (tgt_t == null) { return; }
@@ -3411,7 +3492,7 @@ type struct TypeResolutionPasses {
         const impl_args: [TypeRef] = runner.impl_owner_args(node, &impl_ctx);
         runner.bind_parameter_head_this(node, &impl_ctx);
         runner.resolve_method_signatures(node.methods, &impl_ctx,
-            ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def(), &impl_args);
+            ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/impl methods"), node.target_def(), &impl_args);
         return node.methods.length();
     }
 
@@ -3871,8 +3952,10 @@ type struct TypeResolutionPasses {
                     // FuncSig phase above.
                     const impl_args: [TypeRef] = runner.impl_owner_args(node, &impl_ctx);
                     runner.resolve_method_signatures(node.methods, &impl_ctx,
-                        ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def(), &impl_args);
+                        ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/impl methods"), node.target_def(), &impl_args);
                     runner.emit_method_signature_diagnostics(node.methods);
+                    runner.check_implement_kind_keyword(node);
+                    runner.check_implement_alias_target(node);
                     runner.check_impl_conformance(stmt, node, &impl_ctx);
                     resolver.resolve_written_bounds(&node.where_bounds, &impl_ctx);
                 }
@@ -4013,7 +4096,7 @@ type struct TypeResolutionPasses {
                             node.generic_params, &runner.res_ctx);
                         runner.bind_trait_args_for_impl(node, &impl_ctx);
                         const impl_args: [TypeRef] = runner.impl_owner_args(node, &impl_ctx);
-                        const impl_owner: TypeRef = ctx.decl_index.impl_owner(node, "type_resolution/impl bodies");
+                        const impl_owner: TypeRef = ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/impl bodies");
                         if (impl_owner.is_valid()) {
                             impl_ctx.set_this_type(runner.resolver.owner_this_type(impl_owner, &impl_args, &impl_ctx));
                         }

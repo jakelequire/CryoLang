@@ -1,0 +1,647 @@
+///! smith-farm's decisions: which seeds a farm has judged, which it takes
+///! next, what a batch's smith-diff or smith-crash report says of each
+///! seed, how many jobs the host's memory allows, and the report the farm
+///! writes.  Pure over what it is handed; running the batches and reading
+///! the log, the known list and the memory is the gate's.
+///!
+///! A farm judges each seed once per kind - `diff` for smith-diff's
+///! verdict, `crash` for smith-crash's over its mutations - and appends
+///! lines to its log as each batch ends, `seed <N> <kind> <verdict>`: the
+///! verdict `ok`, `known <bug>` for a seed the known-compiler-bug list
+///! explains, or the finding's signature, a crash finding's after
+///! `mutation <M>`.  A seed may have several crash lines, one per finding.
+///! A farm started again over the same log takes only the seeds the log
+///! does not hold for that kind, so a stop at any point loses at most the
+///! batch in progress.
+
+namespace cryogate::smith::farm;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::encoding::sha256::{ Sha256 };
+
+import cryogate::core::text::{ Text };
+import cryogate::smith::difference::{ FindingClass };
+
+/// What a farm judges a seed by.
+public type enum FarmKind {
+    /// smith-diff's verdict over every configuration.
+    Diff;
+    /// smith-crash's, over the seed's mutations.
+    Crash;
+}
+
+implement enum FarmKind {
+    /// The kind as the log spells it.
+    public name(&this) -> Str {
+        return match (&this) {
+            FarmKind::Diff  => { Str::new("diff") }
+            FarmKind::Crash => { Str::new("crash") }
+        };
+    }
+}
+
+/// One judgement of a seed, as one line of the farm's log.
+public type struct FarmEntry {
+    /// The seed.
+    public seed: u64;
+    /// What it was judged by: `diff` or `crash`.
+    public kind: String;
+    /// The mutation a crash finding was made by; none otherwise.
+    public mutation: Option<u64>;
+    /// `ok`, `known <bug>`, or the signature of what was found.
+    public verdict: String;
+
+    /// The entry as the log writes it.
+    public line(&this) -> String {
+        return match (&this.mutation) {
+            Option::Some(mutation) => { f"seed {this.seed} {this.kind.as_str()} mutation {mutation} {this.verdict.as_str()}" }
+            Option::None           => { f"seed {this.seed} {this.kind.as_str()} {this.verdict.as_str()}" }
+        };
+    }
+
+    /// Whether the verdict is a finding: neither `ok` nor a known bug.
+    public is_finding(&this) -> boolean {
+        return this.verdict.as_str() != Str::new("ok") && !this.verdict.as_str().starts_with(&Str::new("known "));
+    }
+}
+
+/// The farm's log: every judgement so far, in the order made.
+public type struct FarmLog {
+    /// The entries read.
+    public entries: Array<FarmEntry>;
+
+    /// The log `text` holds.  Fails naming the first line that is not
+    /// `seed <N> <kind> [mutation <M>] <verdict>`, since a farm resuming
+    /// from a log it misreads judges seeds twice or never.
+    public static read(text: Str) -> Result<FarmLog, String> {
+        mut entries: Array<FarmEntry> = Array::<FarmEntry>::new();
+        const lines: Array<String> = Text::lines(text);
+        mut number: i64 = 0;
+        for (line in lines.iterate_references()) {
+            number++;
+            if (line.as_str().trim().is_empty()) { continue; }
+            match (FarmLog::entry(line.as_str())) {
+                Option::Some(entry) => { entries.push(entry); }
+                Option::None        => { return Result::Err(f"line {number} is not `seed <N> <kind> <verdict>`: {line.as_str()}"); }
+            }
+        }
+        return Result::Ok(FarmLog { entries: entries });
+    }
+
+    /// One line read as an entry; none when it is not one.
+    private static entry(line: Str) -> Option<FarmEntry> {
+        const rest: Str = match (line.strip_prefix(&Str::new("seed "))) {
+            Option::Some(rest) => { rest }
+            Option::None       => { return Option::None; }
+        };
+        const seed_and_rest: Pair<Str, Str> = match (rest.split_once(&Str::new(" "))) {
+            Option::Some(pair) => { pair }
+            Option::None       => { return Option::None; }
+        };
+        const kind_and_verdict: Pair<Str, Str> = match (seed_and_rest.second.split_once(&Str::new(" "))) {
+            Option::Some(pair) => { pair }
+            Option::None       => { return Option::None; }
+        };
+        if (!Text::is_digits(seed_and_rest.first) || kind_and_verdict.second.trim().is_empty()) { return Option::None; }
+        if (kind_and_verdict.first != FarmKind::Diff.name() && kind_and_verdict.first != FarmKind::Crash.name()) { return Option::None; }
+        mut verdict: Str = kind_and_verdict.second.trim();
+        mut mutation: Option<u64> = Option::None;
+        match (verdict.strip_prefix(&Str::new("mutation "))) {
+            Option::Some(numbered) => {
+                const number_and_signature: Pair<Str, Str> = match (numbered.split_once(&Str::new(" "))) {
+                    Option::Some(pair) => { pair }
+                    Option::None       => { return Option::None; }
+                };
+                if (!Text::is_digits(number_and_signature.first) || number_and_signature.second.trim().is_empty()) { return Option::None; }
+                mutation = match (u64::try_from(number_and_signature.first)) {
+                    Result::Ok(value) => { Option::Some(value) }
+                    Result::Err(_)    => { return Option::None; }
+                };
+                verdict = number_and_signature.second.trim();
+            }
+            Option::None => { }
+        }
+        return match (u64::try_from(seed_and_rest.first)) {
+            Result::Ok(seed) => {
+                Option::Some(FarmEntry {
+                    seed:     seed,
+                    kind:     String::from_str(kind_and_verdict.first),
+                    mutation: mutation,
+                    verdict:  String::from_str(verdict),
+                })
+            }
+            Result::Err(_) => { Option::None }
+        };
+    }
+
+    /// Whether `seed` has been judged by `kind`.
+    public judged(&this, seed: u64, kind: FarmKind) -> boolean {
+        for (entry in this.entries.iterate_references()) {
+            if (entry.seed == seed && entry.kind.as_str() == kind.name()) { return true; }
+        }
+        return false;
+    }
+
+    /// The next batch for `kind`, as its first seed and its count: the
+    /// first seed from `first` to `last`, both included, that `kind` has
+    /// not judged, and the seeds after it up to the next one judged, at
+    /// most `size`; none when every seed in the range is judged.  The
+    /// seeds are consecutive, since a batch is one run over a range.
+    public next_batch(&this, first: u64, last: u64, size: u64, kind: FarmKind) -> Option<Pair<u64, u64>> {
+        mut seed: u64 = first;
+        while (seed <= last && this.judged(seed, kind)) {
+            if (seed == u64::MAX) { return Option::None; }
+            seed = seed + 1;
+        }
+        if (seed > last || size == 0) { return Option::None; }
+        const start: u64 = seed;
+        mut count: u64 = 0;
+        while (seed <= last && count < size && !this.judged(seed, kind)) {
+            count = count + 1;
+            if (seed == u64::MAX) { break; }
+            seed = seed + 1;
+        }
+        return Option::Some(Pair::new(start, count));
+    }
+
+    /// Each distinct finding the log holds, in the order first logged.
+    public findings(&this) -> Array<FarmFinding> {
+        mut signatures: Array<String> = Array::<String>::new();
+        mut firsts: Array<i64> = Array::<i64>::new();
+        mut counts: Array<i64> = Array::<i64>::new();
+        mut index: i64 = 0;
+        while (index < this.entries.length()) {
+            const entry: &FarmEntry = &this.entries[index];
+            if (entry.is_finding()) {
+                match (signatures.index_of(&entry.verdict)) {
+                    Option::Some(at) => { counts[at] = counts[at] + 1; }
+                    Option::None     => {
+                        signatures.push(entry.verdict.clone());
+                        firsts.push(index);
+                        counts.push(1);
+                    }
+                }
+            }
+            index++;
+        }
+        mut findings: Array<FarmFinding> = Array::<FarmFinding>::new();
+        index = 0;
+        while (index < signatures.length()) {
+            const first: &FarmEntry = &this.entries[firsts[index]];
+            findings.push(FarmFinding {
+                signature:      signatures[index].clone(),
+                kind:           first.kind.clone(),
+                programs:       counts[index],
+                first_seed:     first.seed,
+                first_mutation: first.mutation,
+                first_entry:    firsts[index],
+            });
+            index++;
+        }
+        return findings;
+    }
+
+    /// How many entries of `kind` have the verdict `verdict`.
+    public count(&this, kind: FarmKind, verdict: Str) -> i64 {
+        mut counted: i64 = 0;
+        for (entry in this.entries.iterate_references()) {
+            if (entry.kind.as_str() == kind.name() && entry.verdict.as_str() == verdict) { counted++; }
+        }
+        return counted;
+    }
+
+    /// How many distinct seeds `kind` has judged.
+    public seeds_judged(&this, kind: FarmKind) -> i64 {
+        mut seeds: Array<u64> = Array::<u64>::new();
+        for (entry in this.entries.iterate_references()) {
+            if (entry.kind.as_str() == kind.name() && !seeds.contains(&entry.seed)) { seeds.push(entry.seed); }
+        }
+        return seeds.length();
+    }
+}
+
+/// One distinct finding of a farm: a signature, and where it was met.
+public type struct FarmFinding {
+    /// The signature, as smith-diff or smith-crash printed it.
+    public signature: String;
+    /// The kind that found it: `diff` or `crash`.
+    public kind: String;
+    /// How many programs showed it.
+    public programs: i64;
+    /// The first seed that showed it.
+    public first_seed: u64;
+    /// That seed's mutation, for a crash finding.
+    public first_mutation: Option<u64>;
+    /// The index of the log entry that first showed it.
+    public first_entry: i64;
+
+    /// Its finding class, the signature's words before ` [`; none for a
+    /// signature that names no class (a listed seed that passes).
+    public finding_class(&this) -> Option<FindingClass> {
+        const name: Str = match (this.signature.as_str().split_once(&Str::new(" ["))) {
+            Option::Some(pair) => { pair.first }
+            Option::None       => { this.signature.as_str() }
+        };
+        const classes: [FindingClass; 9] = [
+            FindingClass::CompileCrash, FindingClass::CompileHang, FindingClass::InternalError, FindingClass::Refusal,
+            FindingClass::RunCrash, FindingClass::RunHang, FindingClass::Mismatch, FindingClass::Uncompared,
+            FindingClass::Acceptance
+        ];
+        for (candidate in classes) {
+            if (candidate.name() == name) { return Option::Some(candidate); }
+        }
+        return Option::None;
+    }
+
+    /// Whether smith-reduce can shrink it: a finding of a class, and not
+    /// one no configuration covered, which has no failure to keep, nor an
+    /// acceptance of an edit the compiler must refuse, since a deletion
+    /// can make that program valid and smith-reduce reduces none.
+    public reducible(&this) -> boolean {
+        return match (this.finding_class()) {
+            Option::Some(found) => { found.rank() != FindingClass::Uncompared.rank() && found.rank() != FindingClass::Acceptance.rank() }
+            Option::None        => { false }
+        };
+    }
+
+    /// The name of the findings directory's folder for `signature`: the
+    /// first sixteen hexadecimal digits of its SHA-256, the same for one
+    /// signature in every run.
+    public static directory_name(signature: Str) -> String {
+        const digest: String = Sha256::digest(signature.as_bytes()).to_hex();
+        return String::from_str(digest.as_str().byte_substring(0, 16));
+    }
+}
+
+/// What a batch's report says of each seed it judged.
+public type struct BatchReport {
+    /// One entry per judgement, in seed order.
+    public entries: Array<FarmEntry>;
+    /// smith-crash's mutated programs the compiler refused with a code.
+    public refused: u64;
+    /// smith-crash's mutated programs the compiler accepted.
+    public accepted: u64;
+
+    /// What `cryogate smith-diff`'s report `output` says of each of the
+    /// `count` seeds from `first`: a line per seed, `ok    seed <N> ...`,
+    /// `known seed <N>: known compiler bug <bug>`, or `FAIL  seed <N>: ...`
+    /// followed by `      signature <signature>`.  Fails when a seed has no
+    /// line, since a report cut short judged nothing past its end.
+    public static of_diff(output: Str, first: u64, count: u64) -> Result<BatchReport, String> {
+        const lines: Array<String> = Text::lines(output);
+        mut entries: Array<FarmEntry> = Array::<FarmEntry>::new();
+        mut index: i64 = 0;
+        while (index < lines.length()) {
+            const line: Str = lines[index].as_str();
+            index++;
+            mut verdict: String = String::new();
+            mut rest: Str = Str::new("");
+            match (line.strip_prefix(&Str::new("ok    seed "))) {
+                Option::Some(after) => { rest = after; verdict = String::from_str(Str::new("ok")); }
+                Option::None        => { }
+            }
+            match (line.strip_prefix(&Str::new("known seed "))) {
+                Option::Some(after) => {
+                    rest = after;
+                    verdict = match (after.split_once(&Str::new("known compiler bug "))) {
+                        Option::Some(pair) => { f"known {pair.second.trim()}" }
+                        Option::None       => { return Result::Err(f"smith-diff's line `{line}` names no bug"); }
+                    };
+                }
+                Option::None => { }
+            }
+            match (line.strip_prefix(&Str::new("FAIL  seed "))) {
+                Option::Some(after) => {
+                    rest = after;
+                    const next: Str = if (index < lines.length()) { lines[index].as_str() } else { Str::new("") };
+                    verdict = match (next.strip_prefix(&Str::new("      signature "))) {
+                        Option::Some(signature) => { String::from_str(signature.trim()) }
+                        Option::None            => { return Result::Err(f"smith-diff's line `{line}` is followed by no signature"); }
+                    };
+                    index++;
+                }
+                Option::None => { }
+            }
+            if (verdict.is_empty()) { continue; }
+            const seed_word: Str = match (rest.split_once(&Str::new(" "))) {
+                Option::Some(pair) => { pair.first }
+                Option::None       => { rest }
+            };
+            const seed: u64 = match (u64::try_from(seed_word.strip_suffix(&Str::new(":")).unwrap_or(seed_word))) {
+                Result::Ok(seed) => { seed }
+                Result::Err(_)   => { return Result::Err(f"smith-diff's line `{line}` names no seed"); }
+            };
+            entries.push(FarmEntry { seed: seed, kind: String::from_str(FarmKind::Diff.name()), mutation: Option::None, verdict: verdict });
+        }
+        BatchReport::check_seeds(&entries, first, count, true, Str::new("smith-diff"), output)?;
+        return Result::Ok(BatchReport { entries: entries, refused: 0, accepted: 0 });
+    }
+
+    /// What `cryogate smith-crash`'s report `output` says of each of the
+    /// `count` seeds from `first`: one entry per `FAIL  seed <N> mutation
+    /// <M>: <signature>` line, and `ok` for a seed with none, once the
+    /// verdict line `smith-crash: OK (...)` or `smith-crash: FAIL (<n>
+    /// findings in ...)` shows every program was built; its refused and
+    /// accepted counts are kept.  Fails without such a verdict line.
+    public static of_crash(output: Str, first: u64, count: u64) -> Result<BatchReport, String> {
+        const lines: Array<String> = Text::lines(output);
+        mut found: Array<FarmEntry> = Array::<FarmEntry>::new();
+        mut summary: Str = Str::new("");
+        for (held in lines.iterate_references()) {
+            const line: Str = held.as_str();
+            match (line.strip_prefix(&Str::new("FAIL  seed "))) {
+                Option::Some(after) => {
+                    const place_and_signature: Pair<Str, Str> = match (after.split_once(&Str::new(": "))) {
+                        Option::Some(pair) => { pair }
+                        Option::None       => { return Result::Err(f"smith-crash's line `{line}` names no signature"); }
+                    };
+                    mut words: Array<Str> = Array::<Str>::new();
+                    for (word in place_and_signature.first.split_whitespace()) { words.push(word); }
+                    if (words.length() != 3 || words[1] != Str::new("mutation")) { return Result::Err(f"smith-crash's line `{line}` names no seed and mutation"); }
+                    const seed: u64 = match (u64::try_from(words[0])) {
+                        Result::Ok(seed) => { seed }
+                        Result::Err(_)   => { return Result::Err(f"smith-crash's line `{line}` names no seed"); }
+                    };
+                    const mutation: u64 = match (u64::try_from(words[2])) {
+                        Result::Ok(mutation) => { mutation }
+                        Result::Err(_)       => { return Result::Err(f"smith-crash's line `{line}` names no mutation"); }
+                    };
+                    found.push(FarmEntry { seed: seed, kind: String::from_str(FarmKind::Crash.name()), mutation: Option::Some(mutation), verdict: String::from_str(place_and_signature.second.trim()) });
+                }
+                Option::None => { }
+            }
+            if (line.starts_with(&Str::new("smith-crash: OK (")) || (line.starts_with(&Str::new("smith-crash: FAIL (")) && line.contains(&Str::new(" findings in ")))) { summary = line; }
+        }
+        if (summary.is_empty()) {
+            return Result::Err(f"smith-crash judged no batch: {Text::last_line(output).as_str()}");
+        }
+        mut entries: Array<FarmEntry> = Array::<FarmEntry>::new();
+        mut offset: u64 = 0;
+        while (offset < count) {
+            const seed: u64 = first + offset;
+            mut any: boolean = false;
+            for (entry in found.iterate_references()) {
+                if (entry.seed == seed) {
+                    entries.push(FarmEntry { seed: seed, kind: entry.kind.clone(), mutation: entry.mutation, verdict: entry.verdict.clone() });
+                    any = true;
+                }
+            }
+            if (!any) { entries.push(FarmEntry { seed: seed, kind: String::from_str(FarmKind::Crash.name()), mutation: Option::None, verdict: String::from_str(Str::new("ok")) }); }
+            offset = offset + 1;
+        }
+        BatchReport::check_seeds(&found, first, count, false, Str::new("smith-crash"), output)?;
+        mut words: Array<Str> = Array::<Str>::new();
+        for (word in summary.split_whitespace()) { words.push(word); }
+        mut refused: u64 = 0;
+        mut accepted: u64 = 0;
+        mut at: i64 = 1;
+        while (at < words.length()) {
+            if (words[at] == Str::new("refused,")) { refused = u64::try_from(words[at - 1]).unwrap_or(0); }
+            if (words[at] == Str::new("accepted)")) { accepted = u64::try_from(words[at - 1]).unwrap_or(0); }
+            at++;
+        }
+        return Result::Ok(BatchReport { entries: entries, refused: refused, accepted: accepted });
+    }
+
+    /// Fails when one of `entries` judges a seed outside the `count` seeds
+    /// from `first`; with `every`, also when one of those seeds has no
+    /// entry, quoting how the report ended.
+    private static check_seeds(entries: &Array<FarmEntry>, first: u64, count: u64, every: boolean, gate: Str, output: Str) -> Result<(), String> {
+        for (entry in entries.iterate_references()) {
+            if (entry.seed < first || entry.seed - first >= count) { return Result::Err(f"{gate} judged seed {entry.seed}, outside the batch's {count} from {first}"); }
+        }
+        if (!every) { return Result::Ok(()); }
+        mut offset: u64 = 0;
+        while (offset < count) {
+            mut seen: boolean = false;
+            for (entry in entries.iterate_references()) {
+                if (entry.seed == first + offset) { seen = true; }
+            }
+            if (!seen) { return Result::Err(f"{gate} did not judge seed {first + offset}: {Text::last_line(output).as_str()}"); }
+            offset = offset + 1;
+        }
+        return Result::Ok(());
+    }
+}
+
+/// What the host's memory allows before a batch.
+public type enum MemoryVerdict {
+    /// Run the batch with this many jobs.
+    Run(i64);
+    /// Too little room for one job: wait and ask again.
+    Wait;
+    /// The commit is past the hard limit: stop the farm, saying so.
+    Stop;
+}
+
+/// The host file `<findings>/farm-host`: the host's memory, in bytes, and
+/// what the farm makes way for.
+public type struct FarmHost {
+    /// The sizes, as `MemoryBudget` names them.
+    public hard_limit: u64;
+    public ceiling: u64;
+    public per_job: u64;
+    public cap: u64;
+    /// While a process whose command line matches one of these runs, no
+    /// batch starts.
+    public pause_while: Array<String>;
+
+    /// The host file `text`: one setting a line, `ceiling <size>`,
+    /// `hard-limit <size>`, `per-job <size>` and `cap <size>`, each size a
+    /// whole number then `MiB` or `GiB`, and any number of `pause-while
+    /// <pattern>` lines, the pattern the rest of the line; blank lines and
+    /// lines starting `#` are skipped.  Fails naming a line it cannot read,
+    /// a size missing, or a cap with no room for one job, since a farm
+    /// guessing a host's memory is the overload it exists to avoid.
+    public static read(text: Str) -> Result<FarmHost, String> {
+        mut ceiling: Option<u64> = Option::None;
+        mut hard_limit: Option<u64> = Option::None;
+        mut per_job: Option<u64> = Option::None;
+        mut cap: Option<u64> = Option::None;
+        mut pause_while: Array<String> = Array::<String>::new();
+        mut number: i64 = 0;
+        for (raw in Text::lines(text).iterate_references()) {
+            number++;
+            const line: Str = raw.as_str().trim();
+            if (line.is_empty() || line.starts_with(&Str::new("#"))) { continue; }
+            mut words: Array<Str> = Array::<Str>::new();
+            for (word in line.split_whitespace()) { words.push(word); }
+            if (words[0] == Str::new("pause-while")) {
+                const pattern: Str = line.byte_substring(words[0].length(), line.length()).trim();
+                if (pattern.is_empty()) { return Result::Err(f"line {number}: `pause-while` names no pattern"); }
+                pause_while.push(String::from_str(pattern));
+                continue;
+            }
+            if (words.length() != 3 || !Text::is_digits(words[1])) { return Result::Err(f"line {number}: `{line}` is no `<setting> <number> MiB|GiB` line"); }
+            mut unit: u64 = 0;
+            if (words[2] == Str::new("MiB")) { unit = 1048576; }
+            if (words[2] == Str::new("GiB")) { unit = 1073741824; }
+            if (unit == 0) { return Result::Err(f"line {number}: `{words[2]}` is no unit; write MiB or GiB"); }
+            const size: u64 = match (u64::try_from(words[1])) {
+                Result::Ok(value) => { value * unit }
+                Result::Err(_)    => { return Result::Err(f"line {number}: `{words[1]}` is too large"); }
+            };
+            if (words[0] == Str::new("ceiling")) { ceiling = Option::Some(size); continue; }
+            if (words[0] == Str::new("hard-limit")) { hard_limit = Option::Some(size); continue; }
+            if (words[0] == Str::new("per-job")) { per_job = Option::Some(size); continue; }
+            if (words[0] == Str::new("cap")) { cap = Option::Some(size); continue; }
+            return Result::Err(f"line {number}: `{words[0]}` is no setting; the settings are ceiling, hard-limit, per-job, cap and pause-while");
+        }
+        if (ceiling.is_none() || hard_limit.is_none() || per_job.is_none() || cap.is_none()) {
+            return Result::Err(String::from_str(Str::new("it must set ceiling, hard-limit, per-job and cap")));
+        }
+        if (per_job.unwrap() == 0 || cap.unwrap() < per_job.unwrap()) {
+            return Result::Err(String::from_str(Str::new("per-job must be more than nothing and the cap must hold one job")));
+        }
+        return Result::Ok(FarmHost { hard_limit: hard_limit.unwrap(), ceiling: ceiling.unwrap(), per_job: per_job.unwrap(), cap: cap.unwrap(), pause_while: pause_while });
+    }
+
+    /// The host's memory budget at the commit `committed`.
+    public budget(&this, committed: u64) -> MemoryBudget {
+        return MemoryBudget { committed: committed, hard_limit: this.hard_limit, ceiling: this.ceiling, per_job: this.per_job, cap: this.cap };
+    }
+}
+
+/// The host's memory as the farm budgets it, all in bytes.
+public type struct MemoryBudget {
+    /// The commit (the memory promised to every process) now.
+    public committed: u64;
+    /// The commit the farm stops at, whatever the margin.
+    public hard_limit: u64;
+    /// The commit the farm keeps below while it starts jobs.
+    public ceiling: u64;
+    /// What one job (one compile) is budgeted.
+    public per_job: u64;
+    /// The most the farm's own jobs may be budgeted together.
+    public cap: u64;
+
+    /// The jobs the room under the ceiling holds and the cap allows, at
+    /// most `most`: a commit at the hard limit stops the farm, and room for
+    /// no job waits.
+    public verdict(&this, most: i64) -> MemoryVerdict {
+        if (this.committed >= this.hard_limit) { return MemoryVerdict::Stop; }
+        if (this.committed >= this.ceiling || this.per_job == 0) { return MemoryVerdict::Wait; }
+        mut room: u64 = (this.ceiling - this.committed) / this.per_job;
+        const capped: u64 = this.cap / this.per_job;
+        if (capped < room) { room = capped; }
+        if (room == 0) { return MemoryVerdict::Wait; }
+        if (room >= most as u64) { return MemoryVerdict::Run(most); }
+        return MemoryVerdict::Run(room as i64);
+    }
+}
+
+/// The farm's report, `farm-report.md`, written again after each batch.
+public type struct FarmReport {
+    /// What was run: the compiler, configurations, seeds and options, one
+    /// line each.
+    public setting: Array<String>;
+    /// The index of the first log entry this run made.
+    public first_entry_this_run: i64;
+    /// For each of the log's findings, in its order: the bug the known
+    /// list names for its signature, or empty.
+    public known_bugs: Array<String>;
+    /// For each of the log's findings, in its order: what became of its
+    /// reduction, or empty when it has none.
+    public reductions: Array<String>;
+    /// This run's batches, one line each.
+    public batches: Array<String>;
+    /// This run's waits (for memory, a heavy run, or what the farm makes
+    /// way for) and stops, one line each.
+    public waits: Array<String>;
+    /// smith-crash's mutated programs refused this run.
+    public refused: u64;
+    /// smith-crash's mutated programs accepted this run.
+    public accepted: u64;
+    /// What the farm is doing as the report is written: `running: ...`
+    /// with the batch or reduction, `paused: ...` with why, `stopped: ...`
+    /// with why, or `finished`.
+    public state: String;
+    /// When the report was written.
+    public updated: String;
+
+    /// The report's text over `log`, every judgement so far, this run's
+    /// and earlier runs' alike.  It opens with what the farm is doing now,
+    /// so a glance at its first lines answers whether it is working.
+    public text(&this, log: &FarmLog) -> String {
+        const findings: Array<FarmFinding> = log.findings();
+        mut new_ones: i64 = 0;
+        mut index: i64 = 0;
+        while (index < findings.length()) {
+            if (findings[index].first_entry >= this.first_entry_this_run && this.known_bugs[index].is_empty()) { new_ones++; }
+            index++;
+        }
+        mut text: String = String::from_str(Str::new("# smith-farm report\n\n## Now\n\n"));
+        text.push(f"- {this.state.as_str()}\n".as_str());
+        text.push(f"- findings so far: {findings.length()} signatures over {log.entries.length()} judgements, {new_ones} new this run\n".as_str());
+        text.push(f"- updated {this.updated.as_str()}\n\n## Setting\n\n".as_str());
+        for (line in this.setting.iterate_references()) { text.push(f"- {line.as_str()}\n".as_str()); }
+        text.push(Str::new("\n## Coverage\n\n"));
+        text.push(f"- diff: {log.seeds_judged(FarmKind::Diff)} seeds judged\n".as_str());
+        text.push(f"- crash: {log.seeds_judged(FarmKind::Crash)} seeds judged; this run {this.refused} mutated programs refused, {this.accepted} accepted\n".as_str());
+        mut known: Array<String> = Array::<String>::new();
+        for (entry in log.entries.iterate_references()) {
+            if (entry.verdict.as_str().starts_with(&Str::new("known ")) && !known.contains(&entry.verdict)) { known.push(entry.verdict.clone()); }
+        }
+        for (verdict in known.iterate_references()) {
+            text.push(f"- seeds listed as {verdict.as_str()}: {log.count(FarmKind::Diff, verdict.as_str())}\n".as_str());
+        }
+        mut rank: i64 = FindingClass::CompileCrash.rank();
+        while (rank <= FindingClass::Acceptance.rank()) {
+            mut name: Str = Str::new("");
+            mut programs: i64 = 0;
+            for (finding in findings.iterate_references()) {
+                match (finding.finding_class()) {
+                    Option::Some(found) => {
+                        if (found.rank() == rank) { name = found.name(); programs = programs + finding.programs; }
+                    }
+                    Option::None => { }
+                }
+            }
+            if (programs > 0) { text.push(f"- class {name}: {programs} programs\n".as_str()); }
+            rank++;
+        }
+        text.push(Str::new("\n## New findings this run\n\n"));
+        index = 0;
+        while (index < findings.length()) {
+            if (findings[index].first_entry >= this.first_entry_this_run && this.known_bugs[index].is_empty()) {
+                text.push(FarmReport::finding_line(&findings[index], this.reductions[index].as_str()).as_str());
+            }
+            index++;
+        }
+        if (new_ones == 0) { text.push(Str::new("None.\n")); }
+        text.push(Str::new("\n## Every finding\n\n"));
+        if (findings.is_empty()) { text.push(Str::new("None.\n")); }
+        index = 0;
+        while (index < findings.length()) {
+            const bug: Str = this.known_bugs[index].as_str();
+            const state: String = if (bug.is_empty()) { this.reductions[index].clone() } else { f"known compiler bug {bug}" };
+            text.push(FarmReport::finding_line(&findings[index], state.as_str()).as_str());
+            index++;
+        }
+        text.push(Str::new("\n## Batches this run\n\n"));
+        if (this.batches.is_empty()) { text.push(Str::new("None.\n")); }
+        for (line in this.batches.iterate_references()) { text.push(f"- {line.as_str()}\n".as_str()); }
+        text.push(Str::new("\n## Waits and stops this run\n\n"));
+        if (this.waits.is_empty()) { text.push(Str::new("None.\n")); }
+        for (line in this.waits.iterate_references()) { text.push(f"- {line.as_str()}\n".as_str()); }
+        return text;
+    }
+
+    /// One finding's line: its signature, kind, programs and first seed,
+    /// then `state` when there is one.
+    private static finding_line(finding: &FarmFinding, state: Str) -> String {
+        const first: String = match (&finding.first_mutation) {
+            Option::Some(mutation) => { f"seed {finding.first_seed} mutation {mutation}" }
+            Option::None           => { f"seed {finding.first_seed}" }
+        };
+        mut line: String = f"- `{finding.signature.as_str()}` ({finding.kind.as_str()}): {finding.programs} programs, first {first.as_str()}";
+        if (!state.is_empty()) { line.push(f"; {state}".as_str()); }
+        line.push(Str::new("\n"));
+        return line;
+    }
+}

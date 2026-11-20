@@ -1,0 +1,582 @@
+///! `cryogate smith-reduce --seed N --cryo <compiler> [--reference
+///! <compiler>]... [--interpret] [--text] [--linux <compiler inside WSL>
+///! [--linux-stdlib <directory inside WSL>]] --work <directory> --out
+///! <directory> [--signature S] [--smith <cryosmith>] [--stdlib <directory>]
+///! [--build-limit S] [--run-limit S] [-- <generation options>...]`: a
+///! failing CryoSmith program shrunk while its failure persists, and its bug
+///! file drafted.
+///!
+///! The seed's program is generated from the options given and judged as
+///! smith-diff judges it, under the same configurations (`--linux` adding
+///! smith-diff's Linux arm); its signature, or
+///! `--signature`, is the failure kept.  Then, until a round keeps nothing,
+///! the reduction tries fewer functions, a smaller size and each feature
+///! left out (`smith/reduction.cryo`), each a program CryoSmith generates
+///! from the same seed, and then what CryoSmith may take out of the program
+///! those options generate, keeping a candidate only when its verdict has
+///! exactly that signature.
+///!
+///! With `--text` the program is a smith-crash finding's (the generation
+///! options carry its `--mutation`), judged as smith-crash judges it: built
+///! once at `-O0` by the compiler under test, a crash, a hang or an internal
+///! error its failure.  Its brace-matched blocks, then its lines, then its
+///! tokens, are deleted while the same failure persists, until a round
+///! deletes nothing: any input that
+///! crashes the compiler is the defect.  A refusal is never reduced this
+///! way, since a deletion's own refusal would read as the bug.
+///!
+///! The reduced program and a drafted bug file go to `--out`, the program
+///! written again at each step kept, so a reduction stopped early (a time
+///! limit) leaves the smallest program it had found; each trial's files
+///! are removed from `--work` once judged.  Exit 0 when reduced, 1
+///! when the seed does not show the failure or a trial cannot run, 2 on a
+///! usage error.
+
+namespace cryogate::gates::smith_reduce;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::time::duration::{ Duration };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
+import cryogate::smith::corpus::{ CorpusLayout };
+import cryogate::smith::crash::{ CrashDecision };
+import cryogate::smith::difference::{ Configuration, Observation, SmithDecision, SmithVerdict };
+import cryogate::smith::reduction::{ BugDraft, Halving, ProgramHeader, TextDeletion };
+import cryogate::smith::run::programs::{ Attempt, SmithRun, Stage };
+
+/// One program tried: its source and what was made of it.
+type struct Trial {
+    source: String;
+    /// The finding's signature, kind and detail; empty when it passed.
+    signature: String;
+    kind: String;
+    detail: String;
+}
+
+/// Where a reduction got to: the last program that kept the failure, the
+/// steps kept, and the number the next trial takes.
+type struct Reduction {
+    kept: Trial;
+    steps: i64;
+    trials: i64;
+
+    /// Keep `trial`, the step `change`, and write its program to `program`,
+    /// so a reduction stopped at any point leaves the smallest program it
+    /// found.
+    keep(mut &this, trial: Trial, change: String, program: Path) -> void {
+        fmt::println(f"kept  {change.as_str()}: {Text::lines(trial.source.as_str()).length()} lines");
+        match (File::write_text(program, trial.source.as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { fmt::println(f"cannot write {program.as_str()}: {error.describe()}"); }
+        }
+        this.kept = trial;
+        this.steps++;
+    }
+}
+
+/// `cryogate smith-reduce`'s settings.
+public type struct SmithReduce {
+    seed: u64;
+    configurations: Array<Configuration>;
+    /// Whether text is deleted, each trial judged as smith-crash judges it.
+    text: boolean;
+    smith: String;
+    work: PathBuf;
+    /// Where the reduced program is written, `smith-<seed>-reduced.cryo`
+    /// in `--out`.
+    program: PathBuf;
+    stdlib: Option<String>;
+    build_limit: u64;
+    run_limit: u64;
+
+    /// Run `cryogate smith-reduce` with `arguments` from index `first`; 0
+    /// when reduced, 1 when the seed does not show the failure or a trial
+    /// cannot run, 2 on a usage error.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate smith-reduce --seed N --cryo <compiler> [--reference <compiler>]... [--interpret] [--text] [--linux <compiler inside WSL> [--linux-stdlib <directory inside WSL>]] --work <directory> --out <directory> [--signature S] [--smith <cryosmith>] [--stdlib <directory>] [--build-limit S] [--run-limit S] [-- <generation options>...]"));
+        options.valued(Str::new("--seed"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--reference"));
+        options.flag(Str::new("--interpret"));
+        options.flag(Str::new("--text"));
+        options.valued(Str::new("--linux"));
+        options.valued(Str::new("--linux-stdlib"));
+        options.valued(Str::new("--work"));
+        options.valued(Str::new("--out"));
+        options.valued(Str::new("--signature"));
+        options.valued(Str::new("--smith"));
+        options.valued(Str::new("--stdlib"));
+        options.valued(Str::new("--build-limit"));
+        options.valued(Str::new("--run-limit"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-reduce: {reason.as_str()}"); return 2; }
+        };
+        const compiler: Option<Str> = parsed.value(Str::new("--cryo"));
+        const work: Option<Str> = parsed.value(Str::new("--work"));
+        const out: Option<Str> = parsed.value(Str::new("--out"));
+        const seed_text: Option<Str> = parsed.value(Str::new("--seed"));
+        if (compiler.is_none() || work.is_none() || out.is_none() || seed_text.is_none() || !parsed.positionals().is_empty()) {
+            fmt::eprintln(f"cryogate smith-reduce: usage: {options.usage()}");
+            return 2;
+        }
+        const text: boolean = parsed.has(Str::new("--text"));
+        if (text && (parsed.value(Str::new("--reference")).is_some() || parsed.has(Str::new("--interpret")))) {
+            fmt::eprintln(f"cryogate smith-reduce: --text judges one build by the compiler under test; it takes no --reference or --interpret");
+            return 2;
+        }
+        const seed: u64 = match (parsed.number(Str::new("--seed"), 0, 0)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-reduce: {reason.as_str()}"); return 2; }
+        };
+        const build_limit: u64 = match (parsed.number(Str::new("--build-limit"), 300, 1)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-reduce: {reason.as_str()}"); return 2; }
+        };
+        const run_limit: u64 = match (parsed.number(Str::new("--run-limit"), 60, 1)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-reduce: {reason.as_str()}"); return 2; }
+        };
+        const linux: Option<Str> = parsed.value(Str::new("--linux"));
+        if (linux.is_none() && parsed.value(Str::new("--linux-stdlib")).is_some()) {
+            fmt::eprintln(f"cryogate smith-reduce: --linux-stdlib names the stdlib of a --linux compiler, and none is named");
+            return 2;
+        }
+        if (linux.is_some() && (text || Host::os() != Str::new("windows"))) {
+            fmt::eprintln(f"cryogate smith-reduce: --linux builds inside WSL from a Windows host, and not with --text; this host is {Host::os()}");
+            return 2;
+        }
+        const work_path: PathBuf = PathBuf::from(Host::absolute(work.unwrap()).as_str());
+        const out_path: PathBuf = PathBuf::from(Host::absolute(out.unwrap()).as_str());
+        mut directories: Array<PathBuf> = Array::<PathBuf>::new();
+        directories.push(PathBuf::from(work_path.as_path().as_str()));
+        directories.push(PathBuf::from(out_path.as_path().as_str()));
+        for (directory in directories.iterate_references()) {
+            match (Directory::create_all(directory.as_path())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { fmt::eprintln(f"cryogate smith-reduce: cannot create {directory.as_path().as_str()}: {error.describe()}"); return 1; }
+            }
+        }
+        mut references: Array<String> = Array::<String>::new();
+        for (reference in parsed.values_of(Str::new("--reference")).iterate_references()) { references.push(Host::absolute(reference.as_str())); }
+        const tree: String = Host::absolute(compiler.unwrap());
+        mut configurations: Array<Configuration> = Array::<Configuration>::new();
+        if (text) {
+            configurations.push(Configuration::compiled(Str::new("tree"), Str::new(""), tree.as_str(), Str::new("0")));
+        } else {
+            configurations = Configuration::of_compilers(tree.as_str(), &references, parsed.has(Str::new("--interpret")));
+        }
+        match (linux) {
+            Option::Some(linux_compiler) => {
+                match (SmithRun::linux_configurations(linux_compiler, parsed.value(Str::new("--linux-stdlib")), work_path.as_path(), logs)) {
+                    Result::Ok(arm)     => { for (configuration in arm.iterate_references()) { configurations.push(configuration.clone()); } }
+                    Result::Err(reason) => { fmt::println(f"smith-reduce: FAIL ({reason.as_str()})"); return 1; }
+                }
+            }
+            Option::None => { }
+        }
+        const default_smith: PathBuf = repository.join(Str::new("tools/CryoSmith/build"));
+        const reducer: SmithReduce = SmithReduce {
+            seed:           seed,
+            configurations: configurations,
+            text:           text,
+            smith:          match (parsed.value(Str::new("--smith"))) {
+                Option::Some(path) => { Host::absolute(path) }
+                Option::None       => { Host::executable_name(default_smith.as_path().join(Str::new("cryosmith")).as_path().as_str()) }
+            },
+            work:           work_path,
+            program:        out_path.as_path().join(f"smith-{seed}-reduced.cryo".as_str()),
+            stdlib:         match (parsed.value(Str::new("--stdlib"))) {
+                Option::Some(stdlib) => { Option::Some(String::from_str(stdlib)) }
+                Option::None         => { Option::None }
+            },
+            build_limit:    build_limit,
+            run_limit:      run_limit,
+        };
+        // The seed as given, and the failure it shows.
+        const start: Trial = match (reducer.generated(0, parsed.rest(), logs)) {
+            Result::Ok(trial)   => { trial }
+            Result::Err(reason) => { fmt::println(f"smith-reduce: FAIL ({reason.as_str()})"); return 1; }
+        };
+        if (start.signature.is_empty()) {
+            const shows: Str = if (text) { Str::new("builds with no crash, hang or internal error") } else { Str::new("passes under every configuration") };
+            fmt::println(f"smith-reduce: FAIL (seed {seed} {shows}; nothing to reduce)");
+            return 1;
+        }
+        const signature: String = match (parsed.value(Str::new("--signature"))) {
+            Option::Some(given) => { String::from_str(given) }
+            Option::None        => { start.signature.clone() }
+        };
+        if (start.signature.as_str() != signature.as_str()) {
+            fmt::println(f"smith-reduce: FAIL (seed {seed} shows `{start.signature.as_str()}`, not `{signature.as_str()}`)");
+            return 1;
+        }
+        const before: ProgramHeader = match (ProgramHeader::parse(start.source.as_str())) {
+            Result::Ok(header)  => { header }
+            Result::Err(reason) => { fmt::println(f"smith-reduce: FAIL (seed {seed}'s program: {reason.as_str()})"); return 1; }
+        };
+        const lines_before: i64 = Text::lines(start.source.as_str()).length();
+        fmt::println(f"start seed {seed}: {lines_before} lines, {signature.as_str()}");
+        const rounds: Result<Reduction, String> = if (text) { reducer.text_rounds(start, signature.as_str(), logs) } else { reducer.option_rounds(start, signature.as_str(), logs) };
+        const reduced: Reduction = match (rounds) {
+            Result::Ok(reduced) => { reduced }
+            Result::Err(reason) => { fmt::println(f"smith-reduce: FAIL ({reason.as_str()})"); return 1; }
+        };
+        const kept: &Trial = &reduced.kept;
+        const current: ProgramHeader = ProgramHeader::parse(kept.source.as_str()).unwrap();
+        const lines_after: i64 = Text::lines(kept.source.as_str()).length();
+        const program: &PathBuf = &reducer.program;
+        const draft_path: PathBuf = out_path.as_path().join(f"bug-draft-{seed}.md".as_str());
+        const omissions_path: PathBuf = out_path.as_path().join(f"smith-{seed}-omissions.txt".as_str());
+        mut command: String = String::new();
+        if (text) {
+            command = f"{tree.as_str()} build {program.as_path().as_str()} --opt-level=0";
+        } else {
+            command = f"cryogate smith-diff --cryo {tree.as_str()}";
+            for (reference in references.iterate_references()) { command.push(f" --reference {reference.as_str()}".as_str()); }
+            if (parsed.has(Str::new("--interpret"))) { command.push(Str::new(" --interpret")); }
+            command.push(f" --work <directory> --first-seed {seed} --count 1 -- {Text::joined(&current.options(), Str::new(" ")).as_str()}".as_str());
+            if (!current.omissions.is_empty()) {
+                command.push(f" --omissions {omissions_path.as_path().as_str()}".as_str());
+                match (File::write_text(omissions_path.as_path(), current.omission_list().as_str())) {
+                    Result::Ok(_)      => { }
+                    Result::Err(error) => { fmt::println(f"smith-reduce: FAIL (cannot write {omissions_path.as_path().as_str()}: {error.describe()})"); return 1; }
+                }
+            }
+        }
+        const draft: BugDraft = BugDraft {
+            kind:         kept.kind.clone(),
+            signature:    signature.clone(),
+            detail:       kept.detail.clone(),
+            before:       before,
+            after:        current,
+            lines_before: lines_before,
+            lines_after:  lines_after,
+            source:       kept.source.clone(),
+            command:      command,
+            by_text:      text,
+        };
+        match (File::write_text(program.as_path(), kept.source.as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { fmt::println(f"smith-reduce: FAIL (cannot write {program.as_path().as_str()}: {error.describe()})"); return 1; }
+        }
+        match (File::write_text(draft_path.as_path(), draft.text().as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { fmt::println(f"smith-reduce: FAIL (cannot write {draft_path.as_path().as_str()}: {error.describe()})"); return 1; }
+        }
+        fmt::println(f"wrote {program.as_path().as_str()} and {draft_path.as_path().as_str()}");
+        fmt::println(f"smith-reduce: OK ({lines_before} -> {lines_after} lines, {reduced.steps} steps kept of {reduced.trials - 1} tried, signature {signature.as_str()})");
+        return 0;
+    }
+
+    /// The reduction from `start` by its generation options: the fewest
+    /// functions, the smallest size and each feature left out, then what
+    /// CryoSmith may take out of the program those options generate, a
+    /// class at a time - statements, expressions, items - in `Halving`'s
+    /// order; each until a round keeps nothing.  Each candidate is one
+    /// CryoSmith vouches for, so a set of them is still a valid program.
+    private option_rounds(&this, start: Trial, signature: Str, logs: &RunLogs) -> Result<Reduction, String> {
+        mut current: ProgramHeader = ProgramHeader::parse(start.source.as_str())?;
+        mut reduced: Reduction = Reduction { kept: start, steps: 0, trials: 1 };
+        mut changed: boolean = true;
+        while (changed) {
+            changed = false;
+            // The fewest functions, then the smallest size, that keep it.
+            mut phase: i64 = 0;
+            while (phase < 2) {
+                const candidates: Array<ProgramHeader> = if (phase == 0) { current.fewer_functions() } else { current.smaller_sizes() };
+                for (candidate in candidates.iterate_references()) {
+                    const tried: Option<Trial> = this.keeps(reduced.trials, candidate, signature, logs);
+                    reduced.trials++;
+                    match (tried) {
+                        Option::Some(trial) => {
+                            const change: String = candidate.change_from(&current);
+                            current = ProgramHeader::parse(trial.source.as_str())?;
+                            reduced.keep(trial, change, this.program.as_path());
+                            changed = true;
+                            break;
+                        }
+                        Option::None => { }
+                    }
+                }
+                phase++;
+            }
+            // Each feature left out in turn.
+            const features: Array<String> = current.features.clone();
+            for (feature in features.iterate_references()) {
+                match (current.without(feature.as_str())) {
+                    Option::Some(candidate) => {
+                        const tried: Option<Trial> = this.keeps(reduced.trials, &candidate, signature, logs);
+                        reduced.trials++;
+                        match (tried) {
+                            Option::Some(trial) => {
+                                current = ProgramHeader::parse(trial.source.as_str())?;
+                                reduced.keep(trial, f"feature {feature.as_str()} off", this.program.as_path());
+                                changed = true;
+                            }
+                            Option::None => { }
+                        }
+                    }
+                    Option::None => { }
+                }
+            }
+        }
+        changed = true;
+        while (changed) {
+            changed = false;
+            const listed: Array<String> = this.candidates(reduced.trials, &current, logs)?;
+            reduced.trials++;
+            const classes: Array<Array<String>> = ProgramHeader::omission_classes(&listed);
+            const names: Array<Str> = [Str::new("statements"), Str::new("expressions"), Str::new("items")];
+            mut group: i64 = 0;
+            while (group < classes.length()) {
+                mut halving: Halving = Halving::of(classes[group].length());
+                while (true) {
+                    const chunk: Array<i64> = match (halving.next()) {
+                        Option::Some(chunk) => { chunk }
+                        Option::None        => { break; }
+                    };
+                    mut paths: Array<String> = Array::<String>::new();
+                    for (place in chunk.iter()) { paths.push(classes[group][place].clone()); }
+                    const candidate: ProgramHeader = current.omitting(&paths);
+                    const tried: Option<Trial> = this.keeps(reduced.trials, &candidate, signature, logs);
+                    reduced.trials++;
+                    match (tried) {
+                        Option::Some(trial) => {
+                            current = ProgramHeader::parse(trial.source.as_str())?;
+                            reduced.keep(trial, f"{paths.length()} {names[group]} taken out", this.program.as_path());
+                            changed = true;
+                        }
+                        Option::None => { halving.refused(&chunk); }
+                    }
+                }
+                group++;
+            }
+        }
+        return Result::Ok(reduced);
+    }
+
+    /// The reduction from `start` by deleting its text: its blocks, then
+    /// its lines, then its tokens, in `Halving`'s order, each deletion
+    /// kept when the failure persists; until a round deletes nothing.  A
+    /// block goes first because most smaller deletions leave a program
+    /// that no longer parses, which fails differently.  A trial that
+    /// cannot run keeps nothing, so this never fails.
+    private text_rounds(&this, start: Trial, signature: Str, logs: &RunLogs) -> Result<Reduction, String> {
+        mut reduced: Reduction = Reduction { kept: start, steps: 0, trials: 1 };
+        const names: Array<Str> = [Str::new("blocks"), Str::new("lines"), Str::new("tokens")];
+        mut changed: boolean = true;
+        while (changed) {
+            changed = false;
+            mut phase: i64 = 0;
+            while (phase < names.length()) {
+                const source: Str = reduced.kept.source.as_str();
+                mut deletion: TextDeletion = TextDeletion::tokens(source);
+                if (phase == 0) { deletion = TextDeletion::blocks(source); }
+                if (phase == 1) { deletion = TextDeletion::lines(source); }
+                mut halving: Halving = Halving::of(deletion.count());
+                while (true) {
+                    const chunk: Array<i64> = match (halving.next()) {
+                        Option::Some(chunk) => { chunk }
+                        Option::None        => { break; }
+                    };
+                    const candidate: String = deletion.without(&chunk);
+                    mut tried: Option<Trial> = Option::None;
+                    match (this.edited(reduced.trials, candidate, logs)) {
+                        Result::Ok(trial) => {
+                            if (trial.signature.as_str() == signature) { tried = Option::Some(trial); }
+                        }
+                        Result::Err(_) => { }
+                    }
+                    reduced.trials++;
+                    match (tried) {
+                        Option::Some(trial) => {
+                            deletion.delete(&chunk);
+                            reduced.keep(trial, f"{chunk.length()} {names[phase]} deleted", this.program.as_path());
+                            changed = true;
+                        }
+                        Option::None => { halving.refused(&chunk); }
+                    }
+                }
+                phase++;
+            }
+        }
+        return Result::Ok(reduced);
+    }
+
+    /// The trial of `candidate` when it shows `signature`.
+    private keeps(&this, number: i64, candidate: &ProgramHeader, signature: Str, logs: &RunLogs) -> Option<Trial> {
+        const generation: Array<String> = match (this.generation(number, candidate)) {
+            Result::Ok(generation) => { generation }
+            Result::Err(_)         => { return Option::None; }
+        };
+        const tried: Result<Trial, String> = this.generated(number, &generation, logs);
+        if (!this.forget_omissions(number)) { return Option::None; }
+        match (tried) {
+            Result::Ok(trial) => {
+                if (trial.signature.as_str() == signature) { return Option::Some(trial); }
+            }
+            Result::Err(_) => { }
+        }
+        return Option::None;
+    }
+
+    /// The file of omissions written for trial `number`, in the work
+    /// directory.
+    private omissions_file(&this, number: i64) -> PathBuf {
+        return this.work.as_path().join(f"omissions-{number}.txt".as_str());
+    }
+
+    /// Remove trial `number`'s file of omissions once CryoSmith has read
+    /// it; whether there is none left.
+    private forget_omissions(&this, number: i64) -> boolean {
+        const list: PathBuf = this.omissions_file(number);
+        if (!list.as_path().exists()) { return true; }
+        return File::remove(list.as_path()).is_ok();
+    }
+
+    /// The generation options of `header`, and when it takes things out,
+    /// `--omissions` naming a file of them written in the work directory
+    /// for trial `number`: the list outgrows a command line.
+    private generation(&this, number: i64, header: &ProgramHeader) -> Result<Array<String>, String> {
+        mut generation: Array<String> = header.options();
+        if (header.omissions.is_empty()) { return Result::Ok(generation); }
+        const list: PathBuf = this.omissions_file(number);
+        match (File::write_text(list.as_path(), header.omission_list().as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot write {list.as_path().as_str()}: {error.describe()}"); }
+        }
+        generation.push(String::from_str(Str::new("--omissions")));
+        generation.push(String::from_str(list.as_path().as_str()));
+        return Result::Ok(generation);
+    }
+
+    /// What CryoSmith may take out of the program `header` describes now,
+    /// a path per entry (`cryosmith omissions`); why it could not say.
+    private candidates(&this, number: i64, header: &ProgramHeader, logs: &RunLogs) -> Result<Array<String>, String> {
+        const generation: Array<String> = this.generation(number, header)?;
+        const list: PathBuf = this.work.as_path().join(f"candidates-{number}.txt".as_str());
+        mut job: Job = Job::new(this.smith.as_str());
+        job.argument(Str::new("omissions"));
+        job.argument(Str::new("--seed"));
+        job.argument(f"{this.seed}".as_str());
+        for (option in generation.iterate_references()) { job.argument(option.as_str()); }
+        job.argument(Str::new("--out"));
+        job.argument(list.as_path().as_str());
+        job.log_to(logs.file(f"smith-reduce-{number}-candidates".as_str()).as_str());
+        const done: Completion = job.run();
+        if (!this.forget_omissions(number)) { return Result::Err(f"cannot remove {this.omissions_file(number).as_path().as_str()}"); }
+        if (!done.outcome.succeeded()) {
+            return Result::Err(f"cryosmith could not list the omissions: {done.outcome.describe().as_str()}; {done.log.as_str()}");
+        }
+        const text: String = match (File::read_text(list.as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read {list.as_path().as_str()}: {error.describe()}"); }
+        };
+        match (File::remove(list.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot remove {list.as_path().as_str()}: {error.describe()}"); }
+        }
+        mut listed: Array<String> = Array::<String>::new();
+        const lines: Array<String> = Text::lines(text.as_str());
+        for (line in lines.iterate_references()) {
+            if (!line.is_empty()) { listed.push(line.clone()); }
+        }
+        return Result::Ok(listed);
+    }
+
+    /// The program CryoSmith generates for the seed from `generation`,
+    /// judged; why it could not be.
+    private generated(&this, number: i64, generation: &Array<String>, logs: &RunLogs) -> Result<Trial, String> {
+        const programs: SmithRun = this.programs(number)?;
+        programs.write_programs(this.smith.as_str(), this.seed, 1, generation, logs)?;
+        const source: String = match (File::read_text(programs.layout.source(this.seed).as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read the program CryoSmith wrote: {error.describe()}"); }
+        };
+        return this.judged(&programs, source, logs);
+    }
+
+    /// `source`, a program's text after a deletion, judged; why it could
+    /// not be.
+    private edited(&this, number: i64, source: String, logs: &RunLogs) -> Result<Trial, String> {
+        const programs: SmithRun = this.programs(number)?;
+        match (File::write_text(programs.layout.source(this.seed).as_path(), source.as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot write {programs.layout.source(this.seed).as_path().as_str()}: {error.describe()}"); }
+        }
+        return this.judged(&programs, source, logs);
+    }
+
+    /// The run of trial `number`'s program, in a directory of its own.
+    private programs(&this, number: i64) -> Result<SmithRun, String> {
+        const directory: PathBuf = this.work.as_path().join(f"trial-{number}".as_str());
+        match (Directory::create_all(directory.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot create {directory.as_path().as_str()}: {error.describe()}"); }
+        }
+        return Result::Ok(SmithRun {
+            configurations: this.configurations.clone(),
+            layout:         CorpusLayout::new(directory.as_path()),
+            work:           PathBuf::from(directory.as_path().as_str()),
+            stdlib:         this.stdlib.clone(),
+            build_limit:    Option::Some(Duration::from_seconds(this.build_limit)),
+            run_limit:      Option::Some(Duration::from_seconds(this.run_limit)),
+            jobs:           0,
+            log_prefix:     f"smith-reduce-{number}",
+        });
+    }
+
+    /// The program `source` of `programs`' directory, judged under every
+    /// configuration as smith-diff judges it, or with `--text` as
+    /// smith-crash does; the directory is removed once judged.
+    private judged(&this, programs: &SmithRun, source: String, logs: &RunLogs) -> Result<Trial, String> {
+        const attempts: Array<Array<Attempt>> = programs.attempts(this.seed, 1, logs);
+        mut trial: Trial = Trial { source: source, signature: String::new(), kind: String::new(), detail: String::new() };
+        if (this.text) {
+            const attempt: &Attempt = &attempts[0][0];
+            const failed: boolean = match (attempt.stage) {
+                Stage::Build => { true }
+                _            => { false }
+            };
+            const observation: Option<Observation> = if (failed) { Option::Some(attempt.observation.clone()) } else { Option::None };
+            // A deletion can turn a program the compiler must refuse into
+            // a valid one, so a trial carries no refusal mark: an
+            // acceptance is not reduced.
+            match (CrashDecision::decide(CrashDecision::operator_of(trial.source.as_str()).as_str(), false, &observation)) {
+                Option::Some(finding) => {
+                    trial.signature = finding.signature.clone();
+                    trial.kind = String::from_str(finding.kind.name());
+                    trial.detail = finding.detail.clone();
+                }
+                Option::None => { }
+            }
+        } else {
+            match (SmithDecision::decide(&this.configurations, &SmithRun::observations(&attempts[0]))) {
+                SmithVerdict::Agreed(_) => { }
+                SmithVerdict::Found(finding) => {
+                    trial.signature = finding.signature.clone();
+                    trial.kind = String::from_str(finding.kind.name());
+                    trial.detail = finding.detail.clone();
+                }
+            }
+        }
+        match (Directory::remove_all(programs.work.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot remove {programs.work.as_path().as_str()}: {error.describe()}"); }
+        }
+        return Result::Ok(trial);
+    }
+}

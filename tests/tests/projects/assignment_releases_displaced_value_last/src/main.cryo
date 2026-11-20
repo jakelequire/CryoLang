@@ -1,0 +1,100 @@
+namespace AssignmentReleasesDisplacedValueLast;
+
+import std::core::drop::{ Drop };
+import std::fmt;
+
+// The value an assignment displaces is older than every value its statement
+// makes, so it is released last, after the statement's temporaries - for a
+// local, a field of one, and a place reached through a reference alike.  The
+// new value is stored between the two: a temporary released by the statement
+// still reads the value the destination held before it.
+//
+// A destination with nothing to release - an `i64` - is stored before the
+// statement's temporaries are released, so a temporary released by the
+// statement reads the new value.
+//
+// Each release appends the released resource's id to `g_order`; a watcher's
+// release appends 5 and records the id its target holds in `g_seen`, and a
+// plain watcher's records the integer its target holds in `g_plain_seen`.
+
+mut g_order: i64 = 0;
+
+type struct Resource {
+    id: i64;
+}
+
+implement trait Drop for struct Resource {
+    drop(mut &this) -> void { g_order = g_order * 10 + this.id; }
+}
+
+type struct Holder {
+    resource: Resource;
+}
+
+mut g_seen: i64 = 0;
+
+type struct Watcher {
+    target: Resource*;
+}
+
+implement trait Drop for struct Watcher {
+    drop(mut &this) -> void {
+        g_seen = (*this.target).id;
+        g_order = g_order * 10 + 5;
+    }
+}
+
+mut g_plain_seen: i64 = 0;
+
+type struct PlainWatcher {
+    target: i64*;
+}
+
+implement trait Drop for struct PlainWatcher {
+    drop(mut &this) -> void { g_plain_seen = *this.target; }
+}
+
+function make(id: i64) -> Resource { return Resource { id: id }; }
+
+function plain_make(value: i64, watcher: &PlainWatcher) -> i64 { return value; }
+
+function watched_make(id: i64, watcher: &Watcher) -> Resource { return Resource { id: id }; }
+
+function combine(first: &Resource, second: &Resource) -> Resource {
+    return Resource { id: first.id + second.id };
+}
+
+function store_through(target: mut &Resource) -> void {
+    *target = combine(&make(5), &make(2));
+}
+
+function main() -> i32 {
+    mut local: Resource = make(9);
+    g_order = 0;
+    local = combine(&make(1), &make(2));
+    const one: i64 = g_order;
+
+    mut holder: Holder = Holder { resource: make(7) };
+    g_order = 0;
+    holder.resource = combine(&make(4), &make(5));
+    const two: i64 = g_order;
+
+    mut target: Resource = make(8);
+    g_order = 0;
+    store_through(&target);
+    const three: i64 = g_order;
+
+    mut watched: Resource = make(6);
+    const pointer: Resource* = &watched;
+    g_order = 0;
+    watched = watched_make(4, &(Watcher { target: pointer }));
+    const four: i64 = g_order;
+
+    mut plain: i64 = 1;
+    const plain_pointer: i64* = &plain;
+    plain = plain_make(2, &(PlainWatcher { target: plain_pointer }));
+
+    fmt::println(f"order: {one} {two} {three} {local.id} {holder.resource.id} {target.id} {four} {g_seen} {watched.id}");
+    fmt::println(f"plain: {g_plain_seen} {plain}");
+    return 0;
+}

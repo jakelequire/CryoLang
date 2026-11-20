@@ -7,8 +7,12 @@ import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 
-import cryosmith::model::expressions::{ ExpressionKind, ExpressionNode };
-import cryosmith::model::items::{ Field, Function, Structure, Variable, VariableRole };
+import cryosmith::model::expressions::{ ExpressionKind, ExpressionNode, MatchArm, PatternElement, TypeArgumentSpelling };
+import cryosmith::model::items::{
+    Closure, Enumeration, Field, Function, Genericity, OwnedStructure, Signature, Structure, TraitDeclaration, TraitMethod, Variable, VariableRole,
+    VariantDeclaration
+};
+import cryosmith::model::omissions::{ Omission };
 import cryosmith::model::statements::{ StatementKind, StatementNode };
 import cryosmith::model::types::{ ValueType };
 
@@ -31,13 +35,56 @@ public type struct Program {
     /// literal entries.
     public lists: Array<i64>;
     /// The functions in the order they were generated: every struct's
-    /// methods, then the free functions, `main` last.  A function calls
-    /// only functions before it.
+    /// methods, then the generic structs' methods, then the generic
+    /// functions, the methods of the traits' implementations and the free
+    /// functions, `main` last.  A function calls only functions before it.
     public functions: Array<Function>;
+    /// Every enum a value may have: the declared enums `E<N>`, in the order
+    /// they are printed, then the generic enums' instances.
+    public enumerations: Array<Enumeration>;
+    /// Every generic enum, `G<N><T>`, in the order they are printed.
+    public enumeration_templates: Array<Enumeration>;
+    /// Every `match` arm, each `match`'s a run.
+    public arms: Array<MatchArm>;
+    /// Every enum's variants, each enum's a run.
+    public variants: Array<VariantDeclaration>;
+    /// The types of every variant's payload, each variant's a run.
+    public payload_types: Array<ValueType>;
+    /// Every element of a pattern's payload.
+    public pattern_elements: Array<PatternElement>;
+    /// Every function type, each written once.
+    public signatures: Array<Signature>;
+    /// The parameter types of every signature, each signature's a run.
+    public signature_types: Array<ValueType>;
+    /// Every closure.
+    public closures: Array<Closure>;
+    /// Every trait, `Tr<N>`, in the order they are printed.
+    public traits: Array<TraitDeclaration>;
+    /// Every trait's methods, each trait's a run.
+    public trait_methods: Array<TraitMethod>;
+    /// Every owned struct, `D<N>`, in the order they are printed.
+    public owned_structures: Array<OwnedStructure>;
+    /// What a reducer took out, in the order it was taken: a statement or
+    /// an expression is already gone from its body, an item is printed
+    /// nowhere.
+    public omissions: Array<Omission>;
 
     /// A program holding only `observed`.
     public static new() -> Program {
         mut program: Program = Program {
+            omissions:   Array::<Omission>::new(),
+            owned_structures: Array::<OwnedStructure>::new(),
+            traits:      Array::<TraitDeclaration>::new(),
+            trait_methods: Array::<TraitMethod>::new(),
+            pattern_elements: Array::<PatternElement>::new(),
+            signatures:  Array::<Signature>::new(),
+            signature_types: Array::<ValueType>::new(),
+            closures:    Array::<Closure>::new(),
+            enumerations: Array::<Enumeration>::new(),
+            enumeration_templates: Array::<Enumeration>::new(),
+            arms:        Array::<MatchArm>::new(),
+            variants:    Array::<VariantDeclaration>::new(),
+            payload_types: Array::<ValueType>::new(),
             structures:  Array::<Structure>::new(),
             templates:   Array::<Structure>::new(),
             fields:     Array::<Field>::new(),
@@ -53,6 +100,247 @@ public type struct Program {
 
     /// The index of `observed`.
     public static observed() -> i64 { return 0; }
+
+    /// The function type taking `parameters` and returning `returns`: the
+    /// signature written before when there is one, so equal function types
+    /// are the same type.
+    public function_type(mut &this, parameters: &Array<ValueType>, returns: ValueType) -> ValueType {
+        mut index: i64 = 0;
+        while (index < this.signatures.length()) {
+            if (this.signature_is(ValueType::Function(index), parameters, returns)) { return ValueType::Function(index); }
+            index = index + 1;
+        }
+        const first: i64 = this.signature_types.length();
+        for (parameter in parameters.iter()) { this.signature_types.push(parameter); }
+        this.signatures.push(Signature { first_parameter: first, parameter_count: parameters.length(), returns: returns });
+        return ValueType::Function(this.signatures.length() - 1);
+    }
+
+    /// Whether function type `function_type` takes exactly `parameters` and
+    /// returns `returns`.
+    public signature_is(&this, function_type: ValueType, parameters: &Array<ValueType>, returns: ValueType) -> boolean {
+        const held: Signature = this.signature_of(function_type);
+        mut equal: boolean = held.returns.same(returns) && held.parameter_count == parameters.length();
+        mut position: i64 = 0;
+        while (equal && position < held.parameter_count) {
+            equal = this.signature_parameter(held, position).same(parameters.get(position).unwrap());
+            position = position + 1;
+        }
+        return equal;
+    }
+
+    /// The signature function type `function_type` names.
+    public signature_of(&this, function_type: ValueType) -> Signature {
+        return this.signatures.get(function_type.signature()).unwrap();
+    }
+
+    /// Function type `function_type` with `T` replaced by `argument` in its
+    /// parameters and its return type; itself when `argument` is `T`.
+    public instantiated_function_type(mut &this, function_type: ValueType, argument: ValueType) -> ValueType {
+        const signature: Signature = this.signature_of(function_type);
+        mut parameters: Array<ValueType> = Array::<ValueType>::new();
+        while (parameters.length() < signature.parameter_count) {
+            const parameter: ValueType = this.signature_parameter(signature, parameters.length());
+            parameters.push(if (parameter.same(ValueType::TypeParameter)) { argument } else { parameter });
+        }
+        const returns: ValueType = if (signature.returns.same(ValueType::TypeParameter)) { argument } else { signature.returns };
+        return this.function_type(&parameters, returns);
+    }
+
+    /// Parameter `position`'s type in `signature`.
+    public signature_parameter(&this, signature: Signature, position: i64) -> ValueType {
+        return this.signature_types.get(signature.first_parameter + position).unwrap();
+    }
+
+    /// Closure `index`.
+    public closure_at(&this, index: i64) -> Closure { return this.closures.get(index).unwrap(); }
+
+    /// Trait `index`.
+    public trait_at(&this, index: i64) -> TraitDeclaration { return this.traits.get(index).unwrap(); }
+
+    /// Trait method `index`.
+    public trait_method_at(&this, index: i64) -> TraitMethod { return this.trait_methods.get(index).unwrap(); }
+
+    /// Owned struct `index`.
+    public owned_at(&this, index: i64) -> OwnedStructure { return this.owned_structures.get(index).unwrap(); }
+
+    /// Whether a function of `genericity` may be instantiated at
+    /// `argument`: a value type its bound admits - an integer or `boolean`
+    /// under `Eq`, a struct implementing the trait under a trait bound - or
+    /// `T` itself inside a generic body whose own parameter, bounded by
+    /// `inside`, satisfies the bound: a trait bound by being bounded by the
+    /// trait or by one declared over it.
+    public admits(&this, genericity: Genericity, argument: ValueType, inside: Genericity) -> boolean {
+        if (!genericity.is_generic()) { return false; }
+        const bounding: i64 = genericity.bounding_trait();
+        if (argument.same(ValueType::TypeParameter)) {
+            if (!inside.is_generic()) { return false; }
+            if (bounding >= 0) { return this.inherits(inside.bounding_trait(), bounding); }
+            return !genericity.compares() || inside.compares();
+        }
+        if (argument.same(ValueType::Void)) { return false; }
+        if (bounding >= 0) { return this.implements(argument, bounding); }
+        if (genericity.compares()) { return argument.is_integer() || argument.same(ValueType::Boolean); }
+        return true;
+    }
+
+    /// The types that may implement a trait, in the order implementations
+    /// are drawn and printed: the declared structs, then the enums that are
+    /// no generic enum's instance.
+    public implementing_types(&this) -> Array<ValueType> {
+        mut found: Array<ValueType> = Array::<ValueType>::new();
+        mut structure: i64 = 0;
+        while (structure < this.structures.length()) {
+            found.push(ValueType::Record(structure));
+            structure = structure + 1;
+        }
+        mut enumeration: i64 = 0;
+        while (enumeration < this.enumerations.length()) {
+            if (!this.enumeration_at(enumeration).is_instance()) { found.push(ValueType::Enumeration(enumeration)); }
+            enumeration = enumeration + 1;
+        }
+        return found;
+    }
+
+    /// The types implementing trait `index`, in `implementing_types`'
+    /// order.
+    public implementors(&this, index: i64) -> Array<ValueType> {
+        mut found: Array<ValueType> = Array::<ValueType>::new();
+        const candidates: Array<ValueType> = this.implementing_types();
+        for (implementor in candidates.iter()) {
+            if (this.implements(implementor, index)) { found.push(implementor); }
+        }
+        return found;
+    }
+
+    /// Whether trait `derived` is trait `base` or declared over it, directly
+    /// or through its supertrait; false for -1, no trait.
+    public inherits(&this, derived: i64, base: i64) -> boolean {
+        mut index: i64 = derived;
+        while (index >= 0) {
+            if (index == base) { return true; }
+            index = this.trait_at(index).supertrait;
+        }
+        return false;
+    }
+
+    /// The trait methods a value bounded by trait `index` has: its own,
+    /// then its supertrait's and theirs.  Each is named alone, `t<N>`,
+    /// since no two traits share a method's name.
+    public methods_through(&this, index: i64) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        mut declaring: i64 = index;
+        while (declaring >= 0) {
+            const declared: TraitDeclaration = this.trait_at(declaring);
+            mut method: i64 = declared.first_method;
+            while (method < declared.first_method + declared.method_count) {
+                found.push(method);
+                method = method + 1;
+            }
+            declaring = declared.supertrait;
+        }
+        return found;
+    }
+
+    /// The default body of trait method `method`, by its place among the
+    /// functions; -1 while it has none.
+    public default_of(&this, method: i64) -> i64 {
+        mut index: i64 = 0;
+        while (index < this.functions.length()) {
+            const defined: Function = this.function_at(index);
+            if (defined.is_default() && defined.implements == method) { return index; }
+            index = index + 1;
+        }
+        return -1;
+    }
+
+    /// Whether a value of `implementor` runs trait method `method`'s
+    /// default body when the method is called on it: the type implements
+    /// the declaring trait and writes no method of its own for it.
+    public runs_default(&this, implementor: ValueType, method: i64) -> boolean {
+        if (!this.implements(implementor, this.trait_method_at(method).declared_by)) { return false; }
+        for (defined in this.functions.iter()) {
+            if (defined.owner.same(implementor) && defined.implements == method) { return false; }
+        }
+        return true;
+    }
+
+    /// The most work a call of trait method `method` through a bound or an
+    /// object can do: the costliest implementation's, its default body's
+    /// among them.
+    public trait_method_cost(&this, method: i64) -> u64 {
+        mut most: u64 = 0;
+        for (defined in this.functions.iter()) {
+            if (defined.implements == method && defined.cost > most) { most = defined.cost; }
+        }
+        return most;
+    }
+
+    /// Whether `implementor` implements trait `index`: some method belonging
+    /// to that type implements one of the trait's methods, as every
+    /// implementation does, a trait's first method having no default.  A
+    /// type no method belongs to - a scalar, `T`, `void` - implements none.
+    public implements(&this, implementor: ValueType, index: i64) -> boolean {
+        const declared: TraitDeclaration = this.trait_at(index);
+        mut member: i64 = 0;
+        while (member < this.functions.length()) {
+            const defined: Function = this.function_at(member);
+            if (!defined.is_unowned() && defined.owner.same(implementor) && defined.implements >= declared.first_method
+                    && defined.implements < declared.first_method + declared.method_count && !this.omits_function(member)) {
+                return true;
+            }
+            member = member + 1;
+        }
+        return false;
+    }
+
+    /// Whether `omission` was taken out.
+    public omits(&this, omission: Omission) -> boolean {
+        for (taken in this.omissions.iterate_references()) {
+            if (taken.same(&omission)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether function `index` is printed nowhere: taken out itself, with
+    /// the implementation it belongs to, or with the trait whose default
+    /// body it is.
+    public omits_function(&this, index: i64) -> boolean {
+        if (this.omissions.is_empty()) { return false; }
+        if (this.omits(Omission::Function(index))) { return true; }
+        const defined: Function = this.function_at(index);
+        if (defined.implements < 0) { return false; }
+        const declaring: i64 = this.trait_method_at(defined.implements).declared_by;
+        if (defined.is_default()) { return this.omits(Omission::Trait(declaring)); }
+        return this.omits(Omission::Implementation(declaring, defined.owner));
+    }
+
+    /// Whether a `match` arm over a value of `matched` is printed nowhere:
+    /// the variant it matches was taken out of its enum.
+    public omits_arm(&this, matched: ValueType, arm: MatchArm) -> boolean {
+        if (arm.pattern < 0 || matched.enumeration() < 0) { return false; }
+        return this.omits(Omission::Variant(this.enumeration_at(matched.enumeration()).first_variant + arm.pattern));
+    }
+
+    /// The paths of what was taken out, in order, separated by commas.
+    public omission_paths(&this) -> String {
+        mut paths: String = String::new();
+        for (taken in this.omissions.iterate_references()) {
+            if (!paths.is_empty()) { paths.push(Str::new(",")); }
+            paths.push(taken.path().as_str());
+        }
+        return paths;
+    }
+
+    /// Whether the expression at `value` is a closure that captures: a
+    /// value of its own type, which a variable of function type cannot
+    /// hold.
+    public holds_capturing_closure(&this, value: i64) -> boolean {
+        return match (this.expression_at(value).kind) {
+            ExpressionKind::Closure(index) => { this.closure_at(index).capture_count > 0 }
+            _ => { false }
+        };
+    }
 
     /// Add an expression node; its index.
     public expression(mut &this, kind: ExpressionKind, value_type: ValueType) -> i64 {
@@ -100,11 +388,185 @@ public type struct Program {
     /// The function at `index`.
     public function_at(&this, index: i64) -> Function { return this.functions.get(index).unwrap(); }
 
+    /// The enum at `index`.
+    public enumeration_at(&this, index: i64) -> Enumeration { return this.enumerations.get(index).unwrap(); }
+
+    /// Variant `variant` of the enum at `enumeration`.
+    public variant_of(&this, enumeration: i64, variant: i64) -> VariantDeclaration {
+        return this.variants.get(this.enumeration_at(enumeration).first_variant + variant).unwrap();
+    }
+
+    /// The type of payload value `position` of `declared`.
+    public payload_type(&this, declared: VariantDeclaration, position: i64) -> ValueType {
+        return this.payload_types.get(declared.first_payload + position).unwrap();
+    }
+
+    /// The arm at `index`.
+    public arm_at(&this, index: i64) -> MatchArm { return this.arms.get(index).unwrap(); }
+
+    /// Add a pattern element; its index.
+    public pattern_element(mut &this, element: PatternElement) -> i64 {
+        this.pattern_elements.push(element);
+        return this.pattern_elements.length() - 1;
+    }
+
+    /// The pattern element at `index`.
+    public pattern_element_at(&this, index: i64) -> PatternElement { return this.pattern_elements.get(index).unwrap(); }
+
+    /// Whether the `count` pattern elements from `first` in the index lists
+    /// can fail to match a value of their variant: one is a variant
+    /// pattern, which matches only that variant of its enum.
+    public elements_refutable(&this, first: i64, count: i64) -> boolean {
+        mut index: i64 = 0;
+        while (index < count) {
+            match (this.pattern_element_at(this.list_at(first + index))) {
+                PatternElement::Variant(_, _, _, _) => { return true; }
+                _ => { }
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    /// Whether evaluating the expression at `value` runs code of the
+    /// program's own, which may fold into `observed` while it runs: a call
+    /// of any kind or a `match`, anywhere inside it, and a `?`, whose early
+    /// return drops the function's values.  A closure written as a value
+    /// runs nothing until it is called, and `mix` is the prelude's.
+    public runs_code(&this, value: i64) -> boolean {
+        return match (this.expression_at(value).kind) {
+            ExpressionKind::Call(_, _, _) => { true }
+            ExpressionKind::GenericCall(_, _, _, _, _) => { true }
+            ExpressionKind::MethodCall(_, _, _, _) => { true }
+            ExpressionKind::TraitCall(_, _, _, _) => { true }
+            ExpressionKind::Invoke(_, _, _) => { true }
+            ExpressionKind::Match(_, _, _) => { true }
+            ExpressionKind::Unary(_, operand) => { this.runs_code(operand) }
+            ExpressionKind::Cast(operand) => { this.runs_code(operand) }
+            ExpressionKind::Widen(operand) => { this.runs_code(operand) }
+            ExpressionKind::Field(base, _) => { this.runs_code(base) }
+            ExpressionKind::BorrowTemporary(value) => { this.runs_code(value) }
+            ExpressionKind::Binary(_, left, right) => { this.runs_code(left) || this.runs_code(right) }
+            ExpressionKind::Wrapping(_, left, right) => { this.runs_code(left) || this.runs_code(right) }
+            ExpressionKind::Mix(state, folded) => { this.runs_code(state) || this.runs_code(folded) }
+            ExpressionKind::Conditional(condition, then_value, else_value) => {
+                this.runs_code(condition) || this.runs_code(then_value) || this.runs_code(else_value)
+            }
+            ExpressionKind::StructureLiteral(_, _, first, count) => { this.any_runs_code(first + 1, count, 2) }
+            ExpressionKind::OwnedLiteral(_, first, count) => { this.any_runs_code(first + 1, count, 2) }
+            ExpressionKind::Variant(_, _, first, count) => { this.any_runs_code(first, count, 1) }
+            ExpressionKind::Hold(held, _) => { this.runs_code(held) }
+            ExpressionKind::Absent(code, _) => { code >= 0 && this.runs_code(code) }
+            ExpressionKind::Count(_) => { true }
+            ExpressionKind::Propagate(_) => { true }
+            ExpressionKind::Presence(_, _, _, _, _) => { true }
+            ExpressionKind::ArrayLiteral(first, count) => { this.any_runs_code(first, count, 1) }
+            ExpressionKind::ArrayRepeat(value) => { this.runs_code(value) }
+            ExpressionKind::Element(_, index) => { this.runs_code(index) }
+            ExpressionKind::Length(_) => { true }
+            ExpressionKind::TextOf(operand) => { this.runs_code(operand) }
+            ExpressionKind::Push(_, _) => { true }
+            ExpressionKind::DynamicRepeat(value, _) => { this.runs_code(value) }
+            ExpressionKind::Duplicate(_) => { true }
+            ExpressionKind::Append(_, _) => { true }
+            ExpressionKind::Pop(_) => { true }
+            ExpressionKind::Insert(_, _, _, _) => { true }
+            ExpressionKind::Lookup(_, _, _) => { true }
+            ExpressionKind::Removal(_, _, _) => { true }
+            ExpressionKind::Contains(_, _) => { true }
+            _ => { false }
+        };
+    }
+
+    /// Whether any of `count` expressions in the index lists, from `first`
+    /// every `stride` places, runs code (`runs_code`).
+    private any_runs_code(&this, first: i64, count: i64, stride: i64) -> boolean {
+        mut index: i64 = 0;
+        while (index < count) {
+            if (this.runs_code(this.list_at(first + index * stride))) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    /// Add `indices` to the index lists as one run; the first one's place.
+    public list_run(mut &this, indices: &Array<i64>) -> i64 {
+        const first: i64 = this.lists.length();
+        for (index in indices.iter()) { this.lists.push(index); }
+        return first;
+    }
+
+    /// Add `arms` as one run; the first one's place.
+    public arm_run(mut &this, arms: &Array<MatchArm>) -> i64 {
+        const first: i64 = this.arms.length();
+        for (arm in arms.iter()) { this.arms.push(arm); }
+        return first;
+    }
+
+    /// The functions spelled with `named`'s name, `named` among them once
+    /// it is in the arena: its overload set, in the order generated.
+    public overload_set(&this, named: &Function) -> Array<i64> {
+        mut members: Array<i64> = Array::<i64>::new();
+        mut index: i64 = 0;
+        while (index < this.functions.length()) {
+            if (this.function_at(index).shares_name_with(named)) { members.push(index); }
+            index = index + 1;
+        }
+        return members;
+    }
+
+    /// The types of function `index`'s parameters, in order.
+    public parameter_types(&this, index: i64) -> Array<ValueType> {
+        const defined: Function = this.function_at(index);
+        mut types: Array<ValueType> = Array::<ValueType>::new();
+        mut position: i64 = 0;
+        while (position < defined.parameter_count) {
+            types.push(this.variable_at(this.list_at(defined.first_parameter + position)).value_type);
+            position = position + 1;
+        }
+        return types;
+    }
+
     /// The structure at `index`.
     public structure_at(&this, index: i64) -> Structure { return this.structures.get(index).unwrap(); }
 
     /// The generic struct at `index`.
     public template_at(&this, index: i64) -> Structure { return this.templates.get(index).unwrap(); }
+
+    /// How many structures a value may have.  The own instances (`B0<T>`)
+    /// are made after every other structure, so these are the first ones.
+    public value_structure_count(&this) -> i64 {
+        mut count: i64 = 0;
+        while (count < this.structures.length() && !this.structure_at(count).is_own_instance()) { count = count + 1; }
+        return count;
+    }
+
+    /// The own instance of generic struct `template`, `B<N><T>`, which owns
+    /// its methods; -1 when it has none.
+    public own_instance(&this, template: i64) -> i64 {
+        mut index: i64 = 0;
+        while (index < this.structures.length()) {
+            const candidate: Structure = this.structure_at(index);
+            if (candidate.is_own_instance() && candidate.template == template) { return index; }
+            index = index + 1;
+        }
+        return -1;
+    }
+
+    /// The text a string literal numbered `code` spells: its digits in base
+    /// 36, lowest first, as `0`-`9` and `a`-`z`, so every code spells one
+    /// text of at least one character, printable and of one byte each.
+    public static text_of(code: u64) -> String {
+        const digits: Str = Str::new("0123456789abcdefghijklmnopqrstuvwxyz");
+        mut text: String = String::new();
+        mut rest: u64 = code;
+        while (true) {
+            text.push_byte(digits.byte_at((rest % 36) as i64).unwrap());
+            rest = rest / 36;
+            if (rest == 0) { break; }
+        }
+        return text;
+    }
 
     /// A type's name as a program spells it: `u16`, `S1`, `B0<u16>`,
     /// `B1<B0<boolean>>`.
@@ -121,13 +583,94 @@ public type struct Program {
             ValueType::Boolean       => { String::from_str(Str::new("boolean")) }
             ValueType::Void          => { String::from_str(Str::new("void")) }
             ValueType::Record(index) => { this.structure_name(index, Str::new("<")) }
+            ValueType::Enumeration(index) => { this.enumeration_name(index, Str::new("<")) }
             ValueType::TypeParameter => { String::from_str(Str::new("T")) }
+            ValueType::TraitObject(index) => { f"virtual &Tr{this.trait_at(index).number}" }
+            ValueType::Owned(index) => { f"D{this.owned_at(index).number}" }
+            ValueType::SharedReference(index) => { f"&D{this.owned_at(index).number}" }
+            ValueType::ExclusiveReference(index) => { f"mut &D{this.owned_at(index).number}" }
+            ValueType::Boxed(index) => { f"Box<D{this.owned_at(index).number}>" }
+            ValueType::Counted(index) => { f"Rc<D{this.owned_at(index).number}>" }
+            ValueType::Optional(index) => { f"Option<D{this.owned_at(index).number}>" }
+            ValueType::Fallible(index) => { f"Result<D{this.owned_at(index).number}, u32>" }
+            ValueType::FixedArray(_) => { f"[{this.type_name(value_type.element()).as_str()}; {value_type.array_length()}]" }
+            ValueType::SliceReference(_) => { f"&Slice<{this.type_name(value_type.element()).as_str()}>" }
+            ValueType::Text => { String::from_str(Str::new("String")) }
+            ValueType::DynamicArray(_) => { f"[{this.type_name(value_type.element()).as_str()}]" }
+            ValueType::Map(_) => { f"HashMap<{this.type_name(value_type.map_key()).as_str()}, {this.type_name(value_type.map_value()).as_str()}>" }
+            ValueType::Function(index) => {
+                const signature: Signature = this.signatures.get(index).unwrap();
+                mut name: String = String::from_str(Str::new("("));
+                mut position: i64 = 0;
+                while (position < signature.parameter_count) {
+                    if (position > 0) { name.push(Str::new(", ")); }
+                    name.push(this.type_name(this.signature_parameter(signature, position)).as_str());
+                    position = position + 1;
+                }
+                name.push(f") -> {this.type_name(signature.returns).as_str()}".as_str());
+                name
+            }
         };
     }
 
+    /// Enum `index`'s name, an instance's type argument opened by
+    /// `opening`: `E1`, `G0<u16>`, `G0::<u16>`.
+    private enumeration_name(&this, index: i64, opening: Str) -> String {
+        const named: Enumeration = this.enumeration_at(index);
+        if (!named.is_instance()) { return f"E{named.number}"; }
+        return f"{this.enumeration_path(index).as_str()}{opening}{this.type_name(named.argument).as_str()}>";
+    }
+
+    /// The path a pattern over enum `index` names its variants through:
+    /// the enum's own name, a generic enum's without its argument, `G0`.
+    public enumeration_path(&this, index: i64) -> String {
+        const named: Enumeration = this.enumeration_at(index);
+        if (!named.is_instance()) { return f"E{named.number}"; }
+        return f"G{this.enumeration_templates.get(named.template).unwrap().number}";
+    }
+
+    /// The path a variant value of enum `index` opens with: `E0`, or an
+    /// instance spelled as `spelling` says, `G0::<u16>`, `G0::<_>` or `G0`.
+    public variant_path(&this, index: i64, spelling: TypeArgumentSpelling) -> String {
+        if (!this.enumeration_at(index).is_instance()) { return this.enumeration_path(index); }
+        return match (spelling) {
+            TypeArgumentSpelling::Written     => { this.enumeration_name(index, Str::new("::<")) }
+            TypeArgumentSpelling::Placeholder => { f"{this.enumeration_path(index).as_str()}::<_>" }
+            TypeArgumentSpelling::Omitted     => { this.enumeration_path(index) }
+        };
+    }
+
+    /// Whether payload value `position` of variant `variant` of enum
+    /// `index` is of the type argument: one its generic enum declares of
+    /// type `T`.
+    public payload_is_type_argument(&this, index: i64, variant: i64, position: i64) -> boolean {
+        const named: Enumeration = this.enumeration_at(index);
+        if (!named.is_instance()) { return false; }
+        const generic: Enumeration = this.enumeration_templates.get(named.template).unwrap();
+        const declared: VariantDeclaration = this.variants.get(generic.first_variant + variant).unwrap();
+        return this.payload_type(declared, position).same(ValueType::TypeParameter);
+    }
+
     /// The path a struct literal of struct `index` opens with: `S1`, or an
-    /// instance with its type argument written, `B0::<u16>`.
-    public literal_path(&this, index: i64) -> String { return this.structure_name(index, Str::new("::<")); }
+    /// instance spelled as `spelling` says, `B0::<u16>`, `B0::<_>` or `B0`.
+    public literal_path(&this, index: i64, spelling: TypeArgumentSpelling) -> String {
+        const named: Structure = this.structure_at(index);
+        if (!named.is_instance()) { return this.structure_name(index, Str::new("::<")); }
+        return match (spelling) {
+            TypeArgumentSpelling::Written     => { this.structure_name(index, Str::new("::<")) }
+            TypeArgumentSpelling::Placeholder => { f"B{this.template_at(named.template).number}::<_>" }
+            TypeArgumentSpelling::Omitted     => { f"B{this.template_at(named.template).number}" }
+        };
+    }
+
+    /// Whether field `field` of struct `index` is of the type argument: an
+    /// instance's field its generic struct declares of type `T`.
+    public field_is_type_argument(&this, index: i64, field: i64) -> boolean {
+        const named: Structure = this.structure_at(index);
+        if (!named.is_instance()) { return false; }
+        const generic: Structure = this.template_at(named.template);
+        return this.field_at(generic.first_field + (field - named.first_field)).value_type.same(ValueType::TypeParameter);
+    }
 
     /// Struct `index`'s name, an instance's type argument opened by
     /// `opening`.
