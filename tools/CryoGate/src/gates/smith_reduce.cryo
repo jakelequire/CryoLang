@@ -29,6 +29,7 @@ import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
 import std::time::duration::{ Duration };
 
+import cryogate::core::child::{ Completion, Job };
 import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
@@ -200,13 +201,73 @@ public type struct SmithReduce {
                 }
             }
         }
+        // Then what CryoSmith may take out of the program those options
+        // generate, a class at a time - statements, expressions, items -
+        // each class's candidates all at once, then each half of a set that
+        // does not keep the signature, down to one at a time; until a round
+        // keeps nothing.  Each candidate is one CryoSmith vouches for, so a
+        // set of them is still a valid program.
+        changed = true;
+        while (changed) {
+            changed = false;
+            const listed: Array<String> = match (reducer.candidates(trials, &current, logs)) {
+                Result::Ok(listed)  => { listed }
+                Result::Err(reason) => { fmt::println(f"smith-reduce: FAIL ({reason.as_str()})"); return 1; }
+            };
+            trials++;
+            const classes: Array<Array<String>> = ProgramHeader::omission_classes(&listed);
+            const names: Array<Str> = [Str::new("statements"), Str::new("expressions"), Str::new("items")];
+            mut group: i64 = 0;
+            while (group < classes.length()) {
+                mut pending: Array<Array<String>> = Array::<Array<String>>::new();
+                if (!classes[group].is_empty()) { pending.push(classes[group].clone()); }
+                while (!pending.is_empty()) {
+                    const chunk: Array<String> = pending.pop().unwrap();
+                    const candidate: ProgramHeader = current.omitting(&chunk);
+                    const tried: Option<Trial> = reducer.keeps(trials, &candidate, signature.as_str(), logs);
+                    trials++;
+                    match (tried) {
+                        Option::Some(trial) => {
+                            fmt::println(f"kept  {chunk.length()} {names[group]} taken out: {Text::lines(trial.source.as_str()).length()} lines");
+                            current = ProgramHeader::parse(trial.source.as_str()).unwrap();
+                            kept = trial;
+                            steps++;
+                            changed = true;
+                        }
+                        Option::None => {
+                            if (chunk.length() > 1) {
+                                const half: i64 = chunk.length() / 2;
+                                mut first_half: Array<String> = Array::<String>::new();
+                                mut second_half: Array<String> = Array::<String>::new();
+                                mut position: i64 = 0;
+                                while (position < chunk.length()) {
+                                    if (position < half) { first_half.push(chunk[position].clone()); } else { second_half.push(chunk[position].clone()); }
+                                    position++;
+                                }
+                                pending.push(second_half);
+                                pending.push(first_half);
+                            }
+                        }
+                    }
+                }
+                group++;
+            }
+        }
         const lines_after: i64 = Text::lines(kept.source.as_str()).length();
         const program: PathBuf = out_path.as_path().join(f"smith-{seed}-reduced.cryo".as_str());
         const draft_path: PathBuf = out_path.as_path().join(f"bug-draft-{seed}.md".as_str());
+        const omissions_path: PathBuf = out_path.as_path().join(f"smith-{seed}-omissions.txt".as_str());
         mut command: String = f"cryogate smith-diff --cryo {tree.as_str()}";
         for (reference in references.iterate_references()) { command.push(f" --reference {reference.as_str()}".as_str()); }
         if (parsed.has(Str::new("--interpret"))) { command.push(Str::new(" --interpret")); }
         command.push(f" --work <directory> --first-seed {seed} --count 1 -- {Text::joined(&current.options(), Str::new(" ")).as_str()}".as_str());
+        if (!current.omissions.is_empty()) {
+            command.push(f" --omissions {omissions_path.as_path().as_str()}".as_str());
+            match (File::write_text(omissions_path.as_path(), current.omission_list().as_str())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { fmt::println(f"smith-reduce: FAIL (cannot write {omissions_path.as_path().as_str()}: {error.describe()})"); return 1; }
+            }
+        }
         const draft: BugDraft = BugDraft {
             kind:         kept.kind.clone(),
             signature:    signature.clone(),
@@ -233,13 +294,62 @@ public type struct SmithReduce {
 
     /// The trial of `candidate` when it shows `signature`.
     private keeps(&this, number: i64, candidate: &ProgramHeader, signature: Str, logs: &RunLogs) -> Option<Trial> {
-        match (this.trial(number, &candidate.options(), logs)) {
+        const generation: Array<String> = match (this.generation(number, candidate)) {
+            Result::Ok(generation) => { generation }
+            Result::Err(_)         => { return Option::None; }
+        };
+        match (this.trial(number, &generation, logs)) {
             Result::Ok(trial) => {
                 if (trial.signature.as_str() == signature) { return Option::Some(trial); }
             }
             Result::Err(_) => { }
         }
         return Option::None;
+    }
+
+    /// The generation options of `header`, and when it takes things out,
+    /// `--omissions` naming a file of them written in the work directory
+    /// for trial `number`: the list outgrows a command line.
+    private generation(&this, number: i64, header: &ProgramHeader) -> Result<Array<String>, String> {
+        mut generation: Array<String> = header.options();
+        if (header.omissions.is_empty()) { return Result::Ok(generation); }
+        const list: PathBuf = this.work.as_path().join(f"omissions-{number}.txt".as_str());
+        match (File::write_text(list.as_path(), header.omission_list().as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot write {list.as_path().as_str()}: {error.describe()}"); }
+        }
+        generation.push(String::from_str(Str::new("--omissions")));
+        generation.push(String::from_str(list.as_path().as_str()));
+        return Result::Ok(generation);
+    }
+
+    /// What CryoSmith may take out of the program `header` describes now,
+    /// a path per entry (`cryosmith omissions`); why it could not say.
+    private candidates(&this, number: i64, header: &ProgramHeader, logs: &RunLogs) -> Result<Array<String>, String> {
+        const generation: Array<String> = this.generation(number, header)?;
+        const list: PathBuf = this.work.as_path().join(f"candidates-{number}.txt".as_str());
+        mut job: Job = Job::new(this.smith.as_str());
+        job.argument(Str::new("omissions"));
+        job.argument(Str::new("--seed"));
+        job.argument(f"{this.seed}".as_str());
+        for (option in generation.iterate_references()) { job.argument(option.as_str()); }
+        job.argument(Str::new("--out"));
+        job.argument(list.as_path().as_str());
+        job.log_to(logs.file(f"smith-reduce-{number}-candidates".as_str()).as_str());
+        const done: Completion = job.run();
+        if (!done.outcome.succeeded()) {
+            return Result::Err(f"cryosmith could not list the omissions: {done.outcome.describe().as_str()}; {done.log.as_str()}");
+        }
+        const text: String = match (File::read_text(list.as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read {list.as_path().as_str()}: {error.describe()}"); }
+        };
+        mut listed: Array<String> = Array::<String>::new();
+        const lines: Array<String> = Text::lines(text.as_str());
+        for (line in lines.iterate_references()) {
+            if (!line.is_empty()) { listed.push(line.clone()); }
+        }
+        return Result::Ok(listed);
     }
 
     /// The program CryoSmith generates for the seed from `generation`,

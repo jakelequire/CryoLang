@@ -19,7 +19,8 @@ import cryogate::core::text::{ Text };
 
 /// The generation options a program's header names: the first line of a
 /// file CryoSmith wrote, `// cryosmith <version> seed <N> features <list>
-/// functions <F> size <S>`.
+/// functions <F> size <S>`, and after a reduction took things out of the
+/// program, ` omit <path>,<path>...`.
 public type struct ProgramHeader {
     /// The generator version that wrote it.
     public generator: u64;
@@ -31,13 +32,18 @@ public type struct ProgramHeader {
     public functions: u64;
     /// The statement budget of one function.
     public size: u64;
+    /// The paths of what was taken out of the program generated, in the
+    /// order taken (`cryosmith ... --omissions`); none for a program as
+    /// generated.
+    public omissions: Array<String>;
 
     /// The header `program` (a whole file) opens with; why it is not one.
     public static parse(program: Str) -> Result<ProgramHeader, String> {
         const lines: Array<String> = Text::lines(program);
         if (lines.is_empty()) { return Result::Err(String::from_str(Str::new("the program is empty"))); }
         const words: Array<String> = ProgramHeader::words(lines[0].as_str());
-        if (words.length() != 11 || words[0].as_str() != Str::new("//") || words[1].as_str() != Str::new("cryosmith")
+        const omits: boolean = words.length() == 13 && words[11].as_str() == Str::new("omit");
+        if ((words.length() != 11 && !omits) || words[0].as_str() != Str::new("//") || words[1].as_str() != Str::new("cryosmith")
             || words[3].as_str() != Str::new("seed") || words[5].as_str() != Str::new("features")
             || words[7].as_str() != Str::new("functions") || words[9].as_str() != Str::new("size")) {
             return Result::Err(f"`{lines[0].as_str()}` is not a CryoSmith header");
@@ -46,17 +52,35 @@ public type struct ProgramHeader {
         for (feature in words[6].as_str().split(&Str::new(","))) {
             if (!feature.is_empty()) { features.push(String::from_str(feature)); }
         }
+        mut omissions: Array<String> = Array::<String>::new();
+        if (omits) {
+            for (path in words[12].as_str().split(&Str::new(","))) {
+                if (!path.is_empty()) { omissions.push(String::from_str(path)); }
+            }
+        }
         return Result::Ok(ProgramHeader {
             generator: ProgramHeader::number(words[2].as_str())?,
             seed:      ProgramHeader::number(words[4].as_str())?,
             features:  features,
             functions: ProgramHeader::number(words[8].as_str())?,
             size:      ProgramHeader::number(words[10].as_str())?,
+            omissions: omissions,
         });
     }
 
-    /// The generation options that rebuild the program: `--features`,
-    /// `--functions` and `--size`, each written out.
+    /// The paths of `omissions` as `--omissions` reads them, one per line.
+    public omission_list(&this) -> String {
+        mut list: String = String::new();
+        for (path in this.omissions.iterate_references()) {
+            list.push(path.as_str());
+            list.push(Str::new("\n"));
+        }
+        return list;
+    }
+
+    /// The generation options that rebuild the program as generated:
+    /// `--features`, `--functions` and `--size`, each written out.  What
+    /// was taken out is `--omissions`', a file of `omission_list`.
     public options(&this) -> Array<String> {
         mut options: Array<String> = Array::<String>::new();
         options.push(String::from_str(Str::new("--features")));
@@ -92,6 +116,34 @@ public type struct ProgramHeader {
         return candidates;
     }
 
+    /// This header with `more` taken out after what it takes out already.
+    public omitting(&this, more: &Array<String>) -> ProgramHeader {
+        mut omissions: Array<String> = this.omissions.clone();
+        for (path in more.iterate_references()) { omissions.push(path.clone()); }
+        return ProgramHeader {
+            generator: this.generator, seed: this.seed, features: this.features.clone(), functions: this.functions, size: this.size,
+            omissions: omissions,
+        };
+    }
+
+    /// The candidates `listed` (CryoSmith's `omissions`, a path per entry)
+    /// in the three classes a reduction tries in turn, each in the order
+    /// listed: statements (`s<N>`), expressions (`e<N>`), and every item.
+    /// Taking out statements first leaves fewer expressions to try, and an
+    /// item may be taken out only once nothing printed names it.
+    public static omission_classes(listed: &Array<String>) -> Array<Array<String>> {
+        mut classes: Array<Array<String>> = Array::<Array<String>>::new();
+        classes.push(Array::<String>::new());
+        classes.push(Array::<String>::new());
+        classes.push(Array::<String>::new());
+        for (path in listed.iterate_references()) {
+            mut group: i64 = 2;
+            if (path.as_str().starts_with(&Str::new("s"))) { group = 0; } else if (path.as_str().starts_with(&Str::new("e"))) { group = 1; }
+            classes[group].push(path.clone());
+        }
+        return classes;
+    }
+
     /// This header without `feature`; none when it does not hold it.
     public without(&this, feature: Str) -> Option<ProgramHeader> {
         mut index: i64 = 0;
@@ -113,7 +165,9 @@ public type struct ProgramHeader {
     }
 
     /// This header with `functions` and `size`, and without the feature at
-    /// `left_out` (none when negative).
+    /// `left_out` (none when negative), taking nothing out: an omission
+    /// names a node of the program the options generate, and other options
+    /// generate another.
     private with(&this, functions: u64, size: u64, left_out: i64) -> ProgramHeader {
         mut features: Array<String> = Array::<String>::new();
         mut index: i64 = 0;
@@ -121,7 +175,9 @@ public type struct ProgramHeader {
             if (index != left_out) { features.push(this.features[index].clone()); }
             index++;
         }
-        return ProgramHeader { generator: this.generator, seed: this.seed, features: features, functions: functions, size: size };
+        return ProgramHeader {
+            generator: this.generator, seed: this.seed, features: features, functions: functions, size: size, omissions: Array::<String>::new(),
+        };
     }
 
     private static words(line: Str) -> Array<String> {
@@ -166,7 +222,11 @@ public type struct BugDraft {
         text.push(f"# {this.kind.as_str()} found by smith-diff (seed {this.after.seed})\n\n".as_str());
         text.push(f"**Signature:** `{this.signature.as_str()}`\n\n".as_str());
         text.push(f"**Observed:** {this.detail.as_str()}\n\n".as_str());
-        text.push(f"**Generation options:** `{Text::joined(&this.after.options(), Str::new(" ")).as_str()}` (CryoSmith {this.after.generator}, seed {this.after.seed}); reduced from `{Text::joined(&this.before.options(), Str::new(" ")).as_str()}`, {this.lines_before} lines to {this.lines_after}.\n\n".as_str());
+        text.push(f"**Generation options:** `{Text::joined(&this.after.options(), Str::new(" ")).as_str()}` (CryoSmith {this.after.generator}, seed {this.after.seed})".as_str());
+        if (!this.after.omissions.is_empty()) {
+            text.push(f", with {this.after.omissions.length()} things taken out of the program they generate (the header's `omit` list, given to `--omissions` as a file)".as_str());
+        }
+        text.push(f"; reduced from `{Text::joined(&this.before.options(), Str::new(" ")).as_str()}`, {this.lines_before} lines to {this.lines_after}.\n\n".as_str());
         text.push(f"**Reproduce:** `{this.command.as_str()}`\n\n".as_str());
         text.push(Str::new("**Severity:** to be decided on review.\n\n**Cause:** not yet known.\n\n## Repro\n\n```\n"));
         text.push(this.source.as_str());
