@@ -381,7 +381,10 @@ The interpreter's verdict for a seed is one of: **agrees**, **disagrees**
 **not covered** - which does not fail the seed but is never counted as
 agreement: the summary line counts the seeds the interpreter ran and the
 seeds it did not cover, each by its construct, so a corpus the interpreter
-skipped entirely reads as `0 interpreted`, never as a pass.
+skipped entirely reads as `0 interpreted`, never as a pass. A pinned corpus
+(`--expect`, verify's `smith` gate, and `--pin`, which writes one) is the
+exception: there a seed the interpreter does not cover fails, so the pinned
+seeds are interpreted whole.
 
 Without `--interpret` the check's report is the same bytes as before the
 interpreter existed.

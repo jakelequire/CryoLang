@@ -694,15 +694,12 @@ overflow rule. Addition modulo 2^62 is commutative and associative, so the
 sum, and the hash, is the same in any order. The map audit (section 7)
 holds the model to these rules.
 
-**Kept off.** A `match` arm assigning its subject inside a generic body
-(a generic function or a generic struct's method): the compiler's copy of
-a generic function names a `Copy` payload binding in the subject's
-storage instead of copying it on entering the arm, so the arm's
-assignment changes the binding (`-O0` then reads what the new, shorter
-payload left behind, and `-O2` another value). Found by the 8c corpus
-(seed 28). The fix exists on the interpreter lane's branch (`Copy a match
-binding in a generic function's copy as everywhere else`) and is not on
-this branch; the keep-off goes when it arrives.
+**Kept off.** Nothing at present. A shape the generator keeps off because
+of a compiler or standard library bug is listed here with the bug file
+that records it, and is lifted, with a new generator version, when the
+fix lands. A `match` arm assigning its subject inside a generic body was
+kept off until a `Copy` payload binding in a generic function's copy was
+copied into a slot of its own on entering the arm, as everywhere else.
 
 ## 3. Guarantees, and how each is enforced
 
@@ -1621,9 +1618,11 @@ generator never reads through an `Rc`.
     program passed. Once the memory-safety plan's checker is on `main`,
     the corpus is also run under it as a gate: every generated program
     must pass it unchanged, with no `unsafe`, since the generator promises
-    validity under that plan's rules as well as today's. Once the
-    interpreter (item 12) is on this branch, the gate also evaluates each
-    program with `--interpret` and requires the pinned line there too.
+    validity under that plan's rules as well as today's. The gate also
+    evaluates each program with the interpreter (item 12, `--interpret`)
+    and requires the pinned line there too; a seed the interpreter does
+    not cover fails the gate, and fails a re-pin, rather than being
+    skipped, so the pinned set stays wholly interpreted.
 12. **The reference interpreter.** `cryo interpret`, a module of the
     compiler that runs the typed program the front end leaves - not
     CryoSmith's own model, which would check the generator against itself
@@ -1662,16 +1661,18 @@ other way:
    `corpus-check --interpret` on the 200 default seeds with every seed
    interpreted and agreeing or a known compiler bug.
 3. This branch fast-forwards to the merged commit, and `cryosmith-interp`
-   is retired.
+   is retired. (Done.)
 4. Item 11's gate then interprets its pinned corpus as well: verify's
    `smith` gate runs `corpus-check --expect tests/smith-corpus
    --interpret`, so each pinned program must print its pinned line when
    interpreted too, and a seed the interpreter does not cover fails the
    gate rather than being skipped. The change lands with a CryoGate test
    and a mutation (an interpreter that changes one rule fails the gate).
+   (Done.)
 5. The generator's keep-off ("Kept off", section 2: a `match` arm
    assigning its subject inside a generic body) is lifted: its fix, a
    `Copy` payload binding copied into a slot of its own in a generic
    function's copy, is on the interpreter's branch and arrives with the
    merge. Lifting it changes what the generator writes, so it is a new
    generator version and re-pins `tests/smith-corpus` in the same commit.
+   (Done: generator version 40.)

@@ -112,10 +112,11 @@ function the_two_builds_must_print_the_same_line() -> Result<(), TestError> {
 
 /// What corpus-check makes of an interpretation that ended with `outcome`,
 /// writing `errors` and printing `output`, of a program whose builds printed
-/// `cryosmith-hash 42`; `why` stands for its attempt's reason.
-private function interpreted(outcome: Outcome, errors: Str, output: Str) -> Interpretation {
+/// `cryosmith-hash 42`; `why` stands for its attempt's reason.  `pinned`
+/// when the program is one of a pinned corpus.
+private function interpreted(outcome: Outcome, errors: Str, output: Str, pinned: boolean) -> Interpretation {
     const observation: Observation = Observation::of_interpretation(&outcome, errors, output);
-    return Interpretation::of(&observation, Str::new("cryosmith-hash 42"), Str::new("why"));
+    return Interpretation::of(&observation, Str::new("cryosmith-hash 42"), Str::new("why"), pinned);
 }
 
 /// Whether `seen` is a failure whose reason is `reason`.
@@ -128,29 +129,40 @@ private function fails_with(seen: Interpretation, reason: Str) -> boolean {
 
 ![test]
 function the_interpreter_agrees_only_by_printing_the_builds_line_and_exiting_zero() -> Result<(), TestError> {
-    const agrees: boolean = match (interpreted(Outcome::Exited(0), Str::new(""), Str::new("cryosmith-hash 42\n"))) {
+    const agrees: boolean = match (interpreted(Outcome::Exited(0), Str::new(""), Str::new("cryosmith-hash 42\n"), false)) {
         Interpretation::Agrees => { true }
         _                      => { false }
     };
     expect(agrees, Str::new("the same line, exit 0"))?;
-    expect(fails_with(interpreted(Outcome::Exited(0), Str::new(""), Str::new("cryosmith-hash 43\n")),
+    expect(fails_with(interpreted(Outcome::Exited(0), Str::new(""), Str::new("cryosmith-hash 43\n"), false),
         Str::new("the builds printed `cryosmith-hash 42`, the interpreter printed `cryosmith-hash 43`")), Str::new("another hash"))?;
-    expect(fails_with(interpreted(Outcome::Exited(70), Str::new("interpret: violation: a read of a value that was moved out at p.cryo:3:5\n"), Str::new("cryosmith-hash 42\n")),
+    expect(fails_with(interpreted(Outcome::Exited(70), Str::new("interpret: violation: a read of a value that was moved out at p.cryo:3:5\n"), Str::new("cryosmith-hash 42\n"), false),
         Str::new("why")), Str::new("a violation fails even beside the right line"))?;
-    expect(fails_with(interpreted(Outcome::Exited(101), Str::new(""), Str::new("")), Str::new("why")), Str::new("a panic"))?;
-    expect(fails_with(interpreted(Outcome::Exited(0), Str::new(""), Str::new("hello\n")), Str::new("why")), Str::new("no hash line"))?;
-    return expect(fails_with(interpreted(Outcome::TimedOut, Str::new(""), Str::new("")), Str::new("why")), Str::new("no exit"));
+    expect(fails_with(interpreted(Outcome::Exited(101), Str::new(""), Str::new(""), false), Str::new("why")), Str::new("a panic"))?;
+    expect(fails_with(interpreted(Outcome::Exited(0), Str::new(""), Str::new("hello\n"), false), Str::new("why")), Str::new("no hash line"))?;
+    return expect(fails_with(interpreted(Outcome::TimedOut, Str::new(""), Str::new(""), false), Str::new("why")), Str::new("no exit"));
 }
 
 ![test]
 function a_program_the_interpreter_does_not_cover_is_named_and_never_agrees() -> Result<(), TestError> {
-    const named: boolean = match (interpreted(Outcome::Exited(Observation::NOT_COVERED), Str::new("interpret: not covered: a closure at p.cryo:9:13\n"), Str::new(""))) {
+    const named: boolean = match (interpreted(Outcome::Exited(Observation::NOT_COVERED), Str::new("interpret: not covered: a closure at p.cryo:9:13\n"), Str::new(""), false)) {
         Interpretation::NotCovered(construct) => { construct.as_str() == Str::new("a closure at p.cryo:9:13") }
         _                                     => { false }
     };
     expect(named, Str::new("the construct named"))?;
-    return expect(fails_with(interpreted(Outcome::Exited(Observation::NOT_COVERED), Str::new(""), Str::new("")), Str::new("why")),
+    return expect(fails_with(interpreted(Outcome::Exited(Observation::NOT_COVERED), Str::new(""), Str::new(""), false), Str::new("why")),
         Str::new("an unnamed 71 fails"));
+}
+
+![test]
+function a_pinned_program_the_interpreter_does_not_cover_fails() -> Result<(), TestError> {
+    expect(fails_with(interpreted(Outcome::Exited(Observation::NOT_COVERED), Str::new("interpret: not covered: a closure at p.cryo:9:13\n"), Str::new(""), true),
+        Str::new("the interpreter does not cover a closure at p.cryo:9:13, and a pinned program must be interpreted")), Str::new("not covered fails"))?;
+    const agrees: boolean = match (interpreted(Outcome::Exited(0), Str::new(""), Str::new("cryosmith-hash 42\n"), true)) {
+        Interpretation::Agrees => { true }
+        _                      => { false }
+    };
+    return expect(agrees, Str::new("a pinned program still agrees by printing the builds' line"));
 }
 
 /// A pinned corpus of seeds 4 to 6 at generator version 39.
