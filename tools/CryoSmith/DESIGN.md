@@ -694,15 +694,12 @@ overflow rule. Addition modulo 2^62 is commutative and associative, so the
 sum, and the hash, is the same in any order. The map audit (section 7)
 holds the model to these rules.
 
-**Kept off.** A `match` arm assigning its subject inside a generic body
-(a generic function or a generic struct's method): the compiler's copy of
-a generic function names a `Copy` payload binding in the subject's
-storage instead of copying it on entering the arm, so the arm's
-assignment changes the binding (`-O0` then reads what the new, shorter
-payload left behind, and `-O2` another value). Found by the 8c corpus
-(seed 28). The fix exists on the interpreter lane's branch (`Copy a match
-binding in a generic function's copy as everywhere else`) and is not on
-this branch; the keep-off goes when it arrives.
+**Kept off.** Nothing at present. A shape the generator keeps off because
+of a compiler or standard library bug is listed here with the bug file
+that records it, and is lifted, with a new generator version, when the
+fix lands. A `match` arm assigning its subject inside a generic body was
+kept off until a `Copy` payload binding in a generic function's copy was
+copied into a slot of its own on entering the arm, as everywhere else.
 
 ## 3. Guarantees, and how each is enforced
 
@@ -1549,3 +1546,4 @@ other way:
    function's copy, is on the interpreter's branch and arrives with the
    merge. Lifting it changes what the generator writes, so it is a new
    generator version and re-pins `tests/smith-corpus` in the same commit.
+   (Done: generator version 40.)
