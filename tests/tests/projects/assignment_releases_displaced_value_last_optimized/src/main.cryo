@@ -5,9 +5,12 @@ import std::fmt;
 
 // The value an assignment displaces is older than every value its statement
 // makes, so it is released last, after the statement's temporaries - for a
-// local, a field of one, and a place reached through a reference alike.
+// local, a field of one, and a place reached through a reference alike.  The
+// new value is stored between the two: a temporary released by the statement
+// still reads the value the destination held before it.
 //
-// Each release appends the released resource's id to `g_order`.
+// Each release appends the released resource's id to `g_order`; a watcher's
+// release appends 5 and records the id its target holds in `g_seen`.
 
 mut g_order: i64 = 0;
 
@@ -23,7 +26,22 @@ type struct Holder {
     resource: Resource;
 }
 
+mut g_seen: i64 = 0;
+
+type struct Watcher {
+    target: Resource*;
+}
+
+implement trait Drop for struct Watcher {
+    drop(mut &this) -> void {
+        g_seen = (*this.target).id;
+        g_order = g_order * 10 + 5;
+    }
+}
+
 function make(id: i64) -> Resource { return Resource { id: id }; }
+
+function watched_make(id: i64, watcher: &Watcher) -> Resource { return Resource { id: id }; }
 
 function combine(first: &Resource, second: &Resource) -> Resource {
     return Resource { id: first.id + second.id };
@@ -49,6 +67,12 @@ function main() -> i32 {
     store_through(&target);
     const three: i64 = g_order;
 
-    fmt::println(f"order: {one} {two} {three} {local.id} {holder.resource.id} {target.id}");
+    mut watched: Resource = make(6);
+    const pointer: Resource* = &watched;
+    g_order = 0;
+    watched = watched_make(4, &(Watcher { target: pointer }));
+    const four: i64 = g_order;
+
+    fmt::println(f"order: {one} {two} {three} {local.id} {holder.resource.id} {target.id} {four} {g_seen} {watched.id}");
     return 0;
 }

@@ -694,10 +694,22 @@ overflow rule. Addition modulo 2^62 is commutative and associative, so the
 sum, and the hash, is the same in any order. The map audit (section 7)
 holds the model to these rules.
 
-**Kept off.** Nothing at present. A shape the generator keeps off because
-of a compiler or standard library bug is listed here with the bug file
-that records it, and is lifted, with a new generator version, when the
-fix lands. A `match` arm assigning its subject inside a generic body was
+**Kept off.** A shape the generator keeps off because of a compiler or
+standard library bug is listed here with the bug file that records it,
+and is lifted, with a new generator version, when the fix lands.
+
+- A `match` expression's arm value borrowing a temporary,
+  `h0(match (e) { E0::V0 => { h1(&(D0 { .. })) } .. })` (bug 0362,
+  `.bug-report/0362-match-arm-value-releases-borrowed-temporary-at-arm-end.md`):
+  the compiled program releases the temporary when the arm ends, before
+  `h0` runs, where the language releases it at the end of the statement,
+  as it does an `if` expression's branch's. Tracked: no borrowed
+  temporary is made while an arm's value is (`making_arm_value`), and the
+  loan audit refuses one inside an arm's value. Lifted, with a new
+  generator version, when the compiler releases them at the statement's
+  end.
+
+A `match` arm assigning its subject inside a generic body was
 kept off until a `Copy` payload binding in a generic function's copy was
 copied into a slot of its own on entering the arm, as everywhere else.
 
@@ -1241,7 +1253,14 @@ fixed here.** It gets a bug file with a minimal repro, and work goes on.
 The generator keeps off the shape, written under "Kept off" in section 2
 with the bug file that records it. A seed the interpreter disagrees on
 because of such a bug is reported as "known compiler bug NNNN" in the
-coverage count, never as agreeing. The exception is a bug whose keep-off
+coverage count, never as agreeing. The seeds are listed in
+`tests/smith-known-bugs`, each with the hash line every configuration
+prints when it meets the bug, at one generator version that must be
+cryosmith's; corpus-check, smith-diff and verify's `smith` gate read it. A
+listed seed counts as its bug only while every configuration prints its
+recorded line: any other line on that seed fails as any finding does, and
+a listed seed that passes fails too, so an entry goes when its bug is
+fixed or the seed's program changes. The exception is a bug whose keep-off
 would itself be a large workaround: that one is fixed as any compiler
 change is - a test of the shape, the pin as the control, a mutation the
 test refuses, and `make verify` with its declarations. A defect in the
@@ -1643,7 +1662,7 @@ generator never reads through an `Rc`.
      and its decisions in `smith/crash.cryo`, `smith-reduce --text`.)
    - **Unit 2**: `swap-type` and `swap-arguments`, as text edits over
      the declarations and the calls `drop-argument` already reads
-     (built, generator version 41). `escape-borrow` waits, as above.
+     (built, generator version 42). `escape-borrow` waits, as above.
 10. **A fuzz farm** (CryoGate, `cryogate smith-farm`). Overnight batches
     of the differential driver over consecutive seeds, failures
     deduplicated by their signature (the diagnostic code, the crash site,
@@ -1696,10 +1715,17 @@ generator never reads through an `Rc`.
       their unit tests. **Unit 2**: the gate, the batches on the runner,
       the report. **Unit 3**: the reductions of new signatures.
     - **Questions for the maintainer** (lettered options, recommendation
-      first): (a) what `--known` is: (A) a file in the tree, beside
-      `tests/smith-corpus`, kept by hand as bugs are filed and fixed, or
-      (B) read from the bug log of the checkout; A, since the bug log is
-      local to one checkout. (b) whether a farm run's findings are ever
+      first): (a) what `--known` is. `tests/smith-known-bugs` already
+      names, by seed and printed hash lines, the differential findings a
+      filed bug explains, and the farm reads it for those; what is open is
+      the crash signatures, which no seed list can name since a signature
+      recurs across seeds: (A) `tests/smith-known-bugs` gains a second
+      entry form, `bug <number> signature <signature>`, read by the same
+      `KnownBugs` - one list of filed bugs, kept by hand as bugs are filed
+      and fixed - or (B) a second file beside it of `<bug> <signature>`
+      lines (`KnownFindings` as built), or (C) read from the bug log of
+      the checkout; A, since two hand-kept lists of filed bugs drift and
+      the bug log is local to one checkout. (b) whether a farm run's findings are ever
       committed: (A) never - the farm drafts bug files for review - or (B)
       a reduced program becomes a test with its fix; A for the farm, B by
       the fix's own session. (c) where the commit is read: (A) the

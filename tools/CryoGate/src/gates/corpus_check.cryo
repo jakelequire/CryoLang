@@ -33,6 +33,13 @@
 ///! corpus the interpreter skipped entirely reads `0 interpreted`.  With
 ///! `--expect` or `--pin` a program the interpreter does not cover fails:
 ///! a pinned corpus is interpreted whole, and so is one being pinned.
+///!
+///! A seed listed in `tests/smith-known-bugs` (`smith/known.cryo`) whose
+///! configurations print the lines its entry records is reported `known`,
+///! with the bug's number, and counted on a line of its own: it neither
+///! passes nor fails the check, except while pinning, where it fails.  A
+///! listed seed printing anything else fails, even where it would pass.
+///! The list must be at cryosmith's generator version.
 
 namespace cryogate::gates::corpus_check;
 
@@ -46,12 +53,13 @@ import std::fs::directory::{ Directory };
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
 
-import cryogate::core::child::{ Completion, Job };
 import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
 import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
 import cryogate::smith::corpus::{ CorpusJudge, CorpusLayout };
 import cryogate::smith::difference::{ Configuration, Interpretation };
+import cryogate::smith::known::{ KnownBugMatch, KnownBugs };
 import cryogate::smith::pinned::{ PinnedCorpus };
 import cryogate::smith::run::programs::{ Attempt, SmithRun, Stage };
 
@@ -146,14 +154,15 @@ public type struct CorpusCheck {
             Result::Ok(_)      => { }
             Result::Err(error) => { fmt::eprintln(f"cryogate corpus-check: cannot create {work_path.as_path().as_str()}: {error.describe()}"); return 1; }
         }
-        // The generator version a pinned corpus is checked at, or pinned at.
+        // The generator version a pinned corpus is checked at, or pinned
+        // at, and the known-compiler-bug list is written at.
+        const printed: String = SmithRun::generator_version(smith.as_str(), logs, Str::new("corpus-version"));
+        const known: KnownBugs = match (KnownBugs::read(repository, printed.as_str())) {
+            Result::Ok(known)   => { known }
+            Result::Err(reason) => { fmt::println(f"corpus-check: FAIL ({reason.as_str()})"); return 1; }
+        };
         mut generator: i64 = 0;
         if (pinned.is_some() || pin.is_some()) {
-            mut version: Job = Job::new(smith.as_str());
-            version.argument(Str::new("version"));
-            version.log_to(logs.file(Str::new("corpus-version")).as_str());
-            const asked: Completion = version.run();
-            const printed: String = asked.output();
             const problem: Option<String> = match (&pinned) {
                 Option::Some(corpus) => { corpus.version_problem(printed.as_str()) }
                 Option::None => {
@@ -197,12 +206,35 @@ public type struct CorpusCheck {
         mut failed: u64 = 0;
         mut agreed: u64 = 0;
         mut uncovered: u64 = 0;
+        // Each seed that met a known compiler bug, with the bug.
+        mut met: Array<String> = Array::<String>::new();
         mut hashes: Array<String> = Array::<String>::new();
         mut each: Array<String> = Array::<String>::new();
         mut offset: u64 = 0;
         while (offset < count) {
             const seed: u64 = first_seed.wrapping_add(offset);
             const program: &Array<Attempt> = &attempts[offset as i64];
+            const listed: KnownBugMatch = known.of(seed, &generation, &programs.configurations, &SmithRun::observations(program));
+            match (&listed) {
+                KnownBugMatch::Reproduces(bug) => {
+                    if (pin.is_some()) {
+                        fmt::println(f"FAIL  seed {seed}: meets known compiler bug {bug.as_str()}, and a program being pinned must agree");
+                        failed = failed + 1;
+                    } else {
+                        fmt::println(f"known seed {seed}: known compiler bug {bug.as_str()}");
+                        met.push(f"{seed} ({bug.as_str()})");
+                    }
+                    offset = offset + 1;
+                    continue;
+                }
+                _ => { }
+            }
+            // A listed seed that did not print its entry's lines is judged
+            // as any other, and fails even when it passes.
+            const missed: String = match (&listed) {
+                KnownBugMatch::Missed(bug) => { f" (listed as known compiler bug {bug.as_str()}, whose lines it did not print)" }
+                _                          => { String::new() }
+            };
             mut verdict: Result<String, String> = CorpusCheck::judge(program);
             if (verdict.is_ok()) {
                 match (programs.remove_executables(seed)) {
@@ -225,34 +257,47 @@ public type struct CorpusCheck {
             }
             match (verdict) {
                 Result::Ok(hash) => {
-                    if (interpreting) {
-                        const interpretation: &Attempt = &program[CorpusCheck::COMPILED];
-                        match (Interpretation::of(&interpretation.observation, hash.as_str(), interpretation.reason.as_str(), pinned.is_some() || pin.is_some())) {
-                            Interpretation::Agrees => {
-                                fmt::println(f"ok    seed {seed} {hash.as_str()} (interpreted)");
-                                agreed = agreed + 1;
-                            }
-                            Interpretation::NotCovered(construct) => {
-                                fmt::println(f"ok    seed {seed} {hash.as_str()} (not covered: {construct.as_str()})");
-                                uncovered = uncovered + 1;
-                            }
-                            Interpretation::Fails(reason) => {
-                                fmt::println(f"FAIL  seed {seed}: {reason.as_str()}");
+                    const interpretation: Option<Interpretation> = if (interpreting) {
+                        Option::Some(Interpretation::of(&program[CorpusCheck::COMPILED].observation, hash.as_str(), program[CorpusCheck::COMPILED].reason.as_str(), pinned.is_some() || pin.is_some()))
+                    } else {
+                        Option::None
+                    };
+                    match (&interpretation) {
+                        Option::Some(Interpretation::Fails(reason)) => {
+                            fmt::println(f"FAIL  seed {seed}: {reason.as_str()}{missed.as_str()}");
+                            failed = failed + 1;
+                        }
+                        _ => {
+                            if (!missed.is_empty()) {
+                                fmt::println(f"FAIL  seed {seed}: passes, and is listed in tests/smith-known-bugs{missed.as_str()}: take its entry off, or record what it prints now");
                                 failed = failed + 1;
+                            } else {
+                                match (&interpretation) {
+                                    Option::Some(Interpretation::NotCovered(construct)) => {
+                                        fmt::println(f"ok    seed {seed} {hash.as_str()} (not covered: {construct.as_str()})");
+                                        uncovered = uncovered + 1;
+                                    }
+                                    Option::Some(_) => {
+                                        fmt::println(f"ok    seed {seed} {hash.as_str()} (interpreted)");
+                                        agreed = agreed + 1;
+                                    }
+                                    Option::None => { fmt::println(f"ok    seed {seed} {hash.as_str()}"); }
+                                }
                             }
                         }
-                    } else {
-                        fmt::println(f"ok    seed {seed} {hash.as_str()}");
                     }
                     each.push(hash.clone());
                     if (!hashes.contains(&hash)) { hashes.push(hash); }
                 }
-                Result::Err(reason) => { fmt::println(f"FAIL  seed {seed}: {reason.as_str()}"); failed = failed + 1; }
+                Result::Err(reason) => { fmt::println(f"FAIL  seed {seed}: {reason.as_str()}{missed.as_str()}"); failed = failed + 1; }
             }
             offset = offset + 1;
         }
         if (interpreting) {
             fmt::println(f"corpus-check: {agreed} interpreted and agreeing, {uncovered} not covered");
+        }
+        if (!met.is_empty()) {
+            fmt::println(f"corpus-check: {met.length()} known compiler bugs, neither passing nor failing: seeds {Text::joined(&met, Str::new(", ")).as_str()}");
         }
         if (failed > 0) {
             fmt::println(f"corpus-check: FAIL ({failed} of {count} programs)");

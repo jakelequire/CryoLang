@@ -158,6 +158,77 @@ At exit every heap block must have been freed. A block still live is a
 **leak** and a violation: this is how the interpreter judges the standard
 library's reference counting without trusting it (section 6).
 
+### 4.1 An address as an integer (proposed, not built)
+
+**Status: a design awaiting the maintainer's approval; no code follows it
+yet.** Today `p as u64` of an address, and every other construct below,
+stops the run as not covered.
+
+A compiled program's addresses are wherever its allocator and stack put
+them: they differ between `-O0` and `-O2`, between hosts and between runs.
+So a program whose output depends on an address's numeric value is not one
+two configurations can agree on, and the interpreter must not invent an
+answer for it. What a program can rely on is what holds of every placement:
+two addresses in one allocation are a fixed distance apart, an address is
+as aligned as its allocation guarantees, two live allocations do not
+overlap, and null is zero.
+
+**The numbering.** Each allocation gets a made-up base when it is made:
+the bases are handed out in creation order from `0x10000` upward, each
+aligned to 4096 bytes and placed past the end of the one before with a gap
+of at least 4096 bytes, and never reused, even after an allocation ends.
+The integer of an address is its allocation's base plus its byte offset:
+the offsets of the members on its path and its element index times the
+element's size, by the layout rules (docs/abi.md). Null is 0. The numbering
+is a function of the program's own evaluation order and of nothing on the
+host, so it is the same on every run and on both hosts.
+
+**Provenance.** An integer made from an address keeps the allocation it
+came from, and arithmetic keeps it while the result still names a place in
+that allocation. An operation whose result would depend on the made-up base
+is refused as not covered (exit 71, the operation named), so no base ever
+reaches the output; what remains depends only on offsets, and so agrees
+with any compiled build of the same program:
+
+| construct | result |
+|---|---|
+| `p as u64` (or any integer type at least as wide as an address) | the base plus the offset, keeping the allocation |
+| `+`, `-` of an integer with no provenance | the offset moved, provenance kept |
+| `q - p`, both from one live allocation | their distance, with no provenance |
+| `x % m` or `x & (m - 1)`, `m` a power of two up to 4096 | the low bits, which the base's alignment leaves to the offset, with no provenance |
+| `==`, `!=` between two | equal when the allocation and offset are; two allocations' never are |
+| `<`, `<=`, `>`, `>=` between two from one allocation | by offset |
+| `==`, `!=` against 0 | false, true: a base is never 0 |
+| `x as T*` of an integer with provenance | the address it was made from, again checked as section 4 says; an offset that falls inside no cell of the allocation's type is not covered |
+| `0 as T*` | null |
+
+Not covered, each naming what was met:
+
+- any other operation with an operand that has provenance: `*`, `/`,
+  shifts, `^`, `|`, a mask or modulus that is not a power of two up to
+  4096, a narrowing `as`, comparing against an integer other than 0, and
+  so anything that hashes, prints or folds the value into `mix`;
+- ordering, or a distance, between two allocations;
+- any operation on an integer whose allocation has ended (a compiled
+  program may hand that address to a new allocation, the interpreter never
+  does);
+- `x as T*` of an integer with no provenance other than 0, since no
+  allocation is there;
+- reading the bytes of an integer that has provenance (as `u8` elements,
+  section 4), which would take the base apart.
+
+A raw pointer's own `==`, `!=` and pointer arithmetic are unchanged:
+section 5.1's rules over addresses already decide them without integers.
+
+**Why provenance, and not the numbering alone.** With the numbering alone,
+every construct above would run and print a number, and a program folding
+an address into its hash would print one line interpreted and another
+compiled; a disagreement the compiler is not at fault for, reported as one.
+Provenance turns that into "not covered" at the operation that let the base
+through, and it makes a round trip exact: an integer cast back to an
+address finds its allocation by provenance, not by searching the numbering,
+so the checks of section 4 still hold of the address that comes back.
+
 ## 5. Execution
 
 The interpreter walks the typed tree of each function body. A call pushes a
