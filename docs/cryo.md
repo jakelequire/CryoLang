@@ -1470,6 +1470,7 @@ The range operators `..` / `..=` bind looser than every arithmetic and compariso
 - a binary operator's left operand before its right one; `&&`, `||` and `??` evaluate the right operand only when the left one does not decide the result;
 - an assignment's place before its value, for `=` and every compound assignment ([section 5.5](#55-assignment)): the calls and indexes that locate the place run first, so `slots[note(1)] = note(2)` and `pair_at(note(1)).second += note(2)` both run `note(1)` before `note(2)`;
 - a call's arguments in the order they are written, each before the function is entered;
+- an array literal's elements in the order they are written, and a repeat `[value; count]`'s value before its count, so `[note(1); note(2)]` runs `note(1)` before `note(2)`;
 - a method call's receiver before its arguments.
 
 The order is part of a program's meaning, so it is the same at every optimisation level. Precedence decides only how operands group, not when they run: in `note(1) + note(2) * note(3)` the three calls run in the order written, and the product is formed before the sum.
