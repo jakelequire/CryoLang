@@ -1,0 +1,203 @@
+///! smith-farm's decisions: which seeds a farm has judged, which it takes
+///! next, how many jobs the host's memory allows, and which findings are
+///! known.  Pure over what it is handed; reading the log, the known list
+///! and the memory is the gate's.
+///!
+///! A farm judges each seed once per kind - `diff` for smith-diff's
+///! verdict, `crash` for smith-crash's over its mutations - and appends a
+///! line to its log as each batch ends, `seed <N> <kind> <verdict>`, the
+///! verdict `ok` or the finding's signature.  A farm started again over
+///! the same log takes only the seeds the log does not hold for that kind,
+///! so a stop at any point loses at most the batch in progress.
+
+namespace cryogate::smith::farm;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+import cryogate::core::text::{ Text };
+
+/// What a farm judges a seed by.
+public type enum FarmKind {
+    /// smith-diff's verdict over every configuration.
+    Diff;
+    /// smith-crash's, over the seed's mutations.
+    Crash;
+}
+
+implement enum FarmKind {
+    /// The kind as the log spells it.
+    public name(&this) -> Str {
+        return match (&this) {
+            FarmKind::Diff  => { Str::new("diff") }
+            FarmKind::Crash => { Str::new("crash") }
+        };
+    }
+}
+
+/// One judged seed, as one line of the farm's log.
+public type struct FarmEntry {
+    /// The seed.
+    public seed: u64;
+    /// What it was judged by: `diff` or `crash`.
+    public kind: String;
+    /// `ok`, or the signature of what was found.
+    public verdict: String;
+
+    /// The entry as the log writes it.
+    public line(&this) -> String {
+        return f"seed {this.seed} {this.kind.as_str()} {this.verdict.as_str()}";
+    }
+}
+
+/// The farm's log: every seed judged so far, in the order judged.
+public type struct FarmLog {
+    /// The entries read.
+    public entries: Array<FarmEntry>;
+
+    /// The log `text` holds.  Fails naming the first line that is not
+    /// `seed <N> <kind> <verdict>`, since a farm resuming from a log it
+    /// misreads judges seeds twice or never.
+    public static read(text: Str) -> Result<FarmLog, String> {
+        mut entries: Array<FarmEntry> = Array::<FarmEntry>::new();
+        const lines: Array<String> = Text::lines(text);
+        mut number: i64 = 0;
+        for (line in lines.iterate_references()) {
+            number++;
+            if (line.as_str().trim().is_empty()) { continue; }
+            match (FarmLog::entry(line.as_str())) {
+                Option::Some(entry) => { entries.push(entry); }
+                Option::None        => { return Result::Err(f"line {number} is not `seed <N> <kind> <verdict>`: {line.as_str()}"); }
+            }
+        }
+        return Result::Ok(FarmLog { entries: entries });
+    }
+
+    /// One line read as an entry; none when it is not one.
+    private static entry(line: Str) -> Option<FarmEntry> {
+        const rest: Str = match (line.strip_prefix(&Str::new("seed "))) {
+            Option::Some(rest) => { rest }
+            Option::None       => { return Option::None; }
+        };
+        const seed_and_rest: Pair<Str, Str> = match (rest.split_once(&Str::new(" "))) {
+            Option::Some(pair) => { pair }
+            Option::None       => { return Option::None; }
+        };
+        const kind_and_verdict: Pair<Str, Str> = match (seed_and_rest.second.split_once(&Str::new(" "))) {
+            Option::Some(pair) => { pair }
+            Option::None       => { return Option::None; }
+        };
+        if (!Text::is_digits(seed_and_rest.first) || kind_and_verdict.second.trim().is_empty()) { return Option::None; }
+        if (kind_and_verdict.first != FarmKind::Diff.name() && kind_and_verdict.first != FarmKind::Crash.name()) { return Option::None; }
+        return match (u64::try_from(seed_and_rest.first)) {
+            Result::Ok(seed) => {
+                Option::Some(FarmEntry {
+                    seed:    seed,
+                    kind:    String::from_str(kind_and_verdict.first),
+                    verdict: String::from_str(kind_and_verdict.second.trim()),
+                })
+            }
+            Result::Err(_) => { Option::None }
+        };
+    }
+
+    /// Whether `seed` has been judged by `kind`.
+    public judged(&this, seed: u64, kind: FarmKind) -> boolean {
+        for (entry in this.entries.iterate_references()) {
+            if (entry.seed == seed && entry.kind.as_str() == kind.name()) { return true; }
+        }
+        return false;
+    }
+
+    /// The next batch: up to `size` seeds from `first` to `last`, both
+    /// included, in order, that `kind` has not judged.
+    public next_batch(&this, first: u64, last: u64, size: i64, kind: FarmKind) -> Array<u64> {
+        mut batch: Array<u64> = Array::<u64>::new();
+        mut seed: u64 = first;
+        while (seed <= last && batch.length() < size) {
+            if (!this.judged(seed, kind)) { batch.push(seed); }
+            if (seed == u64::MAX) { break; }
+            seed = seed + 1;
+        }
+        return batch;
+    }
+}
+
+/// The findings already explained: each signature with the bug that
+/// explains it.
+public type struct KnownFindings {
+    /// The signatures, in the order listed.
+    public signatures: Array<String>;
+    /// Each one's bug, at the same place.
+    public bugs: Array<String>;
+
+    /// The list `text` holds: one finding a line, `<bug> <signature>`, the
+    /// bug one word (its file's number); blank lines and lines starting
+    /// `#` are skipped.  Fails naming a line with no signature after the
+    /// bug.
+    public static read(text: Str) -> Result<KnownFindings, String> {
+        mut known: KnownFindings = KnownFindings { signatures: Array::<String>::new(), bugs: Array::<String>::new() };
+        const lines: Array<String> = Text::lines(text);
+        mut number: i64 = 0;
+        for (line in lines.iterate_references()) {
+            number++;
+            const trimmed: Str = line.as_str().trim();
+            if (trimmed.is_empty() || trimmed.starts_with(&Str::new("#"))) { continue; }
+            match (trimmed.split_once(&Str::new(" "))) {
+                Option::Some(pair) => {
+                    if (pair.second.trim().is_empty()) { return Result::Err(f"line {number} names a bug and no signature: {trimmed}"); }
+                    known.bugs.push(String::from_str(pair.first));
+                    known.signatures.push(String::from_str(pair.second.trim()));
+                }
+                Option::None => { return Result::Err(f"line {number} names a bug and no signature: {trimmed}"); }
+            }
+        }
+        return Result::Ok(known);
+    }
+
+    /// The bug explaining `signature`; none when it is not known.
+    public bug_of(&this, signature: Str) -> Option<String> {
+        return match (this.signatures.index_of(&String::from_str(signature))) {
+            Option::Some(at) => { Option::Some(this.bugs[at].clone()) }
+            Option::None     => { Option::None }
+        };
+    }
+}
+
+/// What the host's memory allows before a batch.
+public type enum MemoryVerdict {
+    /// Run the batch with this many jobs.
+    Run(i64);
+    /// Too little room for one job: wait and ask again.
+    Wait;
+    /// The commit is past the hard limit: stop the farm, saying so.
+    Stop;
+}
+
+/// The host's memory as the farm budgets it, all in bytes.
+public type struct MemoryBudget {
+    /// The commit (the memory promised to every process) now.
+    public committed: u64;
+    /// The commit the farm stops at, whatever the margin.
+    public hard_limit: u64;
+    /// The commit the farm keeps below while it starts jobs.
+    public ceiling: u64;
+    /// What one job (one compile) is budgeted.
+    public per_job: u64;
+
+    /// The jobs the room under the ceiling holds, at most `most`: a
+    /// commit past the hard limit stops the farm, and room for no job
+    /// waits.
+    public verdict(&this, most: i64) -> MemoryVerdict {
+        if (this.committed >= this.hard_limit) { return MemoryVerdict::Stop; }
+        if (this.committed >= this.ceiling || this.per_job == 0) { return MemoryVerdict::Wait; }
+        const room: u64 = (this.ceiling - this.committed) / this.per_job;
+        if (room == 0) { return MemoryVerdict::Wait; }
+        if (room >= most as u64) { return MemoryVerdict::Run(most); }
+        return MemoryVerdict::Run(room as i64);
+    }
+}

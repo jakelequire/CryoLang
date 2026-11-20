@@ -36,10 +36,8 @@ import std::fs::directory::{ Directory };
 import std::fs::path::{ Path, PathBuf };
 import std::time::duration::{ Duration };
 
-import cryogate::core::child::{ Completion };
 import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
-import cryogate::core::wsl::{ Wsl, WslMapping };
 import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::text::{ Text };
 import cryogate::smith::corpus::{ CorpusLayout };
@@ -118,23 +116,11 @@ public type struct SmithDiff {
             Result::Ok(_)      => { }
             Result::Err(error) => { fmt::eprintln(f"cryogate smith-diff: cannot create {work_path.as_path().as_str()}: {error.describe()}"); return 1; }
         }
-        // The Linux arm: WSL started, and the work directory's path inside
-        // it asked once.  A host where either fails refuses the run.
         match (linux) {
             Option::Some(linux_compiler) => {
-                const started: Completion = Wsl::start(logs);
-                if (!started.outcome.succeeded()) {
-                    fmt::println(f"smith-diff: FAIL (wsl.exe could not start WSL ({started.outcome.describe().as_str()}); see {started.log.as_str()})");
-                    return 1;
-                }
-                const inside: String = match (Wsl::path(work_path.as_path().as_str(), logs)) {
-                    Result::Ok(inside) => { inside }
-                    Result::Err(done)  => { fmt::println(f"smith-diff: FAIL (wslpath could not name {work_path.as_path().as_str()} ({done.outcome.describe().as_str()}); see {done.log.as_str()})"); return 1; }
-                };
-                const mapping: WslMapping = WslMapping { windows: String::from_str(work_path.as_path().as_str()), inside: inside };
-                const levels: Array<Str> = [Str::new("0"), Str::new("2")];
-                for (level in levels.iter()) {
-                    configurations.push(Configuration::linux(linux_compiler, parsed.value(Str::new("--linux-stdlib")), level, &mapping));
+                match (SmithRun::linux_configurations(linux_compiler, parsed.value(Str::new("--linux-stdlib")), work_path.as_path(), logs)) {
+                    Result::Ok(arm)     => { for (configuration in arm.iterate_references()) { configurations.push(configuration.clone()); } }
+                    Result::Err(reason) => { fmt::println(f"smith-diff: FAIL ({reason.as_str()})"); return 1; }
                 }
             }
             Option::None => { }

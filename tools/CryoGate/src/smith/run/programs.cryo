@@ -24,6 +24,7 @@ import std::time::duration::{ Duration };
 import cryogate::core::child::{ Completion, Job };
 import cryogate::core::log::{ RunLogs };
 import cryogate::core::schedule::{ Cost, Scheduler };
+import cryogate::core::wsl::{ Wsl, WslMapping };
 import cryogate::smith::corpus::{ CorpusJudge, CorpusLayout };
 import cryogate::smith::difference::{ Configuration, Observation };
 
@@ -285,6 +286,30 @@ public type struct SmithRun {
         }
         job.argument(program);
         return job;
+    }
+
+    /// The Linux arm's configurations, `linux -O0` and `linux -O2`: the
+    /// Linux compiler `compiler`, a path inside WSL, given `stdlib` (also
+    /// inside WSL) when named, building below `work`, which must exist.
+    /// WSL is started and asked once where `work` is inside it; a host
+    /// where either fails gives the reason, and the run is refused rather
+    /// than run without the arm.
+    public static linux_configurations(compiler: Str, stdlib: Option<Str>, work: Path, logs: &RunLogs) -> Result<Array<Configuration>, String> {
+        const started: Completion = Wsl::start(logs);
+        if (!started.outcome.succeeded()) {
+            return Result::Err(f"wsl.exe could not start WSL ({started.outcome.describe().as_str()}); see {started.log.as_str()}");
+        }
+        const inside: String = match (Wsl::path(work.as_str(), logs)) {
+            Result::Ok(inside) => { inside }
+            Result::Err(done)  => { return Result::Err(f"wslpath could not name {work.as_str()} ({done.outcome.describe().as_str()}); see {done.log.as_str()}"); }
+        };
+        const mapping: WslMapping = WslMapping { windows: String::from_str(work.as_str()), inside: inside };
+        mut configurations: Array<Configuration> = Array::<Configuration>::new();
+        const levels: Array<Str> = [Str::new("0"), Str::new("2")];
+        for (level in levels.iter()) {
+            configurations.push(Configuration::linux(compiler, stdlib, level, &mapping));
+        }
+        return Result::Ok(configurations);
     }
 
     /// The seconds a job inside WSL is given past its own limit before it

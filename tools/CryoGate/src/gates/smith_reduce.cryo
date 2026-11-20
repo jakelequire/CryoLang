@@ -1,12 +1,14 @@
 ///! `cryogate smith-reduce --seed N --cryo <compiler> [--reference
-///! <compiler>]... [--interpret] [--text] --work <directory> --out
+///! <compiler>]... [--interpret] [--text] [--linux <compiler inside WSL>
+///! [--linux-stdlib <directory inside WSL>]] --work <directory> --out
 ///! <directory> [--signature S] [--smith <cryosmith>] [--stdlib <directory>]
 ///! [--build-limit S] [--run-limit S] [-- <generation options>...]`: a
 ///! failing CryoSmith program shrunk while its failure persists, and its bug
 ///! file drafted.
 ///!
 ///! The seed's program is generated from the options given and judged as
-///! smith-diff judges it, under the same configurations; its signature, or
+///! smith-diff judges it, under the same configurations (`--linux` adding
+///! smith-diff's Linux arm); its signature, or
 ///! `--signature`, is the failure kept.  Then, until a round keeps nothing,
 ///! the reduction tries fewer functions, a smaller size and each feature
 ///! left out (`smith/reduction.cryo`), each a program CryoSmith generates
@@ -85,12 +87,14 @@ public type struct SmithReduce {
     /// when reduced, 1 when the seed does not show the failure or a trial
     /// cannot run, 2 on a usage error.
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
-        mut options: Options = Options::new(Str::new("cryogate smith-reduce --seed N --cryo <compiler> [--reference <compiler>]... [--interpret] [--text] --work <directory> --out <directory> [--signature S] [--smith <cryosmith>] [--stdlib <directory>] [--build-limit S] [--run-limit S] [-- <generation options>...]"));
+        mut options: Options = Options::new(Str::new("cryogate smith-reduce --seed N --cryo <compiler> [--reference <compiler>]... [--interpret] [--text] [--linux <compiler inside WSL> [--linux-stdlib <directory inside WSL>]] --work <directory> --out <directory> [--signature S] [--smith <cryosmith>] [--stdlib <directory>] [--build-limit S] [--run-limit S] [-- <generation options>...]"));
         options.valued(Str::new("--seed"));
         options.valued(Str::new("--cryo"));
         options.valued(Str::new("--reference"));
         options.flag(Str::new("--interpret"));
         options.flag(Str::new("--text"));
+        options.valued(Str::new("--linux"));
+        options.valued(Str::new("--linux-stdlib"));
         options.valued(Str::new("--work"));
         options.valued(Str::new("--out"));
         options.valued(Str::new("--signature"));
@@ -127,6 +131,26 @@ public type struct SmithReduce {
             Result::Ok(value)   => { value }
             Result::Err(reason) => { fmt::eprintln(f"cryogate smith-reduce: {reason.as_str()}"); return 2; }
         };
+        const linux: Option<Str> = parsed.value(Str::new("--linux"));
+        if (linux.is_none() && parsed.value(Str::new("--linux-stdlib")).is_some()) {
+            fmt::eprintln(f"cryogate smith-reduce: --linux-stdlib names the stdlib of a --linux compiler, and none is named");
+            return 2;
+        }
+        if (linux.is_some() && (text || Host::os() != Str::new("windows"))) {
+            fmt::eprintln(f"cryogate smith-reduce: --linux builds inside WSL from a Windows host, and not with --text; this host is {Host::os()}");
+            return 2;
+        }
+        const work_path: PathBuf = PathBuf::from(Host::absolute(work.unwrap()).as_str());
+        const out_path: PathBuf = PathBuf::from(Host::absolute(out.unwrap()).as_str());
+        mut directories: Array<PathBuf> = Array::<PathBuf>::new();
+        directories.push(PathBuf::from(work_path.as_path().as_str()));
+        directories.push(PathBuf::from(out_path.as_path().as_str()));
+        for (directory in directories.iterate_references()) {
+            match (Directory::create_all(directory.as_path())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { fmt::eprintln(f"cryogate smith-reduce: cannot create {directory.as_path().as_str()}: {error.describe()}"); return 1; }
+            }
+        }
         mut references: Array<String> = Array::<String>::new();
         for (reference in parsed.values_of(Str::new("--reference")).iterate_references()) { references.push(Host::absolute(reference.as_str())); }
         const tree: String = Host::absolute(compiler.unwrap());
@@ -135,6 +159,15 @@ public type struct SmithReduce {
             configurations.push(Configuration::compiled(Str::new("tree"), Str::new(""), tree.as_str(), Str::new("0")));
         } else {
             configurations = Configuration::of_compilers(tree.as_str(), &references, parsed.has(Str::new("--interpret")));
+        }
+        match (linux) {
+            Option::Some(linux_compiler) => {
+                match (SmithRun::linux_configurations(linux_compiler, parsed.value(Str::new("--linux-stdlib")), work_path.as_path(), logs)) {
+                    Result::Ok(arm)     => { for (configuration in arm.iterate_references()) { configurations.push(configuration.clone()); } }
+                    Result::Err(reason) => { fmt::println(f"smith-reduce: FAIL ({reason.as_str()})"); return 1; }
+                }
+            }
+            Option::None => { }
         }
         const default_smith: PathBuf = repository.join(Str::new("tools/CryoSmith/build"));
         const reducer: SmithReduce = SmithReduce {
@@ -145,7 +178,7 @@ public type struct SmithReduce {
                 Option::Some(path) => { Host::absolute(path) }
                 Option::None       => { Host::executable_name(default_smith.as_path().join(Str::new("cryosmith")).as_path().as_str()) }
             },
-            work:           PathBuf::from(Host::absolute(work.unwrap()).as_str()),
+            work:           work_path,
             stdlib:         match (parsed.value(Str::new("--stdlib"))) {
                 Option::Some(stdlib) => { Option::Some(String::from_str(stdlib)) }
                 Option::None         => { Option::None }
@@ -153,16 +186,6 @@ public type struct SmithReduce {
             build_limit:    build_limit,
             run_limit:      run_limit,
         };
-        const out_path: PathBuf = PathBuf::from(Host::absolute(out.unwrap()).as_str());
-        mut directories: Array<PathBuf> = Array::<PathBuf>::new();
-        directories.push(PathBuf::from(reducer.work.as_path().as_str()));
-        directories.push(PathBuf::from(out_path.as_path().as_str()));
-        for (directory in directories.iterate_references()) {
-            match (Directory::create_all(directory.as_path())) {
-                Result::Ok(_)      => { }
-                Result::Err(error) => { fmt::eprintln(f"cryogate smith-reduce: cannot create {directory.as_path().as_str()}: {error.describe()}"); return 1; }
-            }
-        }
         // The seed as given, and the failure it shows.
         const start: Trial = match (reducer.generated(0, parsed.rest(), logs)) {
             Result::Ok(trial)   => { trial }

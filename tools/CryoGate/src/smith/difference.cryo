@@ -170,7 +170,7 @@ implement enum Observation {
                 if (code == 1) {
                     const codes: Array<String> = Text::error_codes(output);
                     for (found in codes.iterate_references()) {
-                        if (found.as_str().starts_with(&Str::new("E09"))) { return Option::Some(Observation::InternalError(found.clone())); }
+                        if (found.as_str().starts_with(&Str::new("E09"))) { return Option::Some(Observation::InternalError(Observation::internal_error(found.as_str(), output))); }
                     }
                     if (!codes.is_empty()) { return Option::Some(Observation::Refused(codes[0].clone())); }
                     return Option::Some(Observation::CompileCrash(String::from_str(Str::new("exit 1 with no error diagnostic"))));
@@ -180,6 +180,45 @@ implement enum Observation {
             Outcome::TimedOut => { return Option::Some(Observation::CompileHang); }
             _                 => { return Option::Some(Observation::CompileCrash(outcome.describe())); }
         }
+    }
+
+    /// An internal error's detail: its `code`, then what the first
+    /// diagnostic of that code in `output` says it is, every backquoted
+    /// name in it written `` `_` `` and cut at its first ` (`, then, when
+    /// the build printed one, the first reason LLVM reports.  Every
+    /// internal error shares the code, so the code alone would make one
+    /// defect of any two; the names would make many of one defect reached
+    /// through different programs.
+    private static internal_error(code: Str, output: Str) -> String {
+        const opening: String = f"error[{code}]: ";
+        mut detail: String = String::from_str(code);
+        mut described: boolean = false;
+        for (line in Text::lines(output).iterate_references()) {
+            const trimmed: Str = line.as_str().trim();
+            if (!described && trimmed.starts_with(&opening.as_str())) {
+                const headline: Str = trimmed.byte_substring(opening.length(), trimmed.length());
+                const cut: Str = match (headline.find(&Str::new(" ("))) {
+                    Option::Some(at) => { headline.byte_substring(0, at) }
+                    Option::None     => { headline }
+                };
+                mut abstracted: String = String::new();
+                mut quoted: boolean = false;
+                for (piece in cut.split(&Str::new("`"))) {
+                    if (quoted) { abstracted.push(Str::new("`_`")); } else { abstracted.push(piece); }
+                    quoted = !quoted;
+                }
+                detail.push(f" {abstracted.as_str()}".as_str());
+                described = true;
+            }
+            match (trimmed.strip_prefix(&Str::new("note: LLVM reports: "))) {
+                Option::Some(reason) => {
+                    detail.push(f": {reason}".as_str());
+                    return detail;
+                }
+                Option::None => { }
+            }
+        }
+        return detail;
     }
 
     /// What a run of a built program that ended with `outcome` and printed

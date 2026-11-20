@@ -37,13 +37,20 @@ public type enum MutationOperator {
     DropArgument;
     /// A call of a function or method given its last argument twice.
     ExtraArgument;
+    /// A declared local's type replaced by the next of the types the
+    /// program's declarations name, in the order they first appear:
+    /// `const v0: u8 = 1;` written `const v0: i64 = 1;`.
+    SwapType;
+    /// A call's first two arguments exchanged, where their texts differ.
+    SwapArguments;
 }
 
 implement enum MutationOperator {
     /// Every operator, in the order a mutation draws among them.
     public static all() -> Array<MutationOperator> {
         return [MutationOperator::DeleteToken, MutationOperator::DuplicateToken, MutationOperator::DropBrace, MutationOperator::ExtraBrace,
-                MutationOperator::DropAnnotation, MutationOperator::DropArgument, MutationOperator::ExtraArgument];
+                MutationOperator::DropAnnotation, MutationOperator::DropArgument, MutationOperator::ExtraArgument,
+                MutationOperator::SwapType, MutationOperator::SwapArguments];
     }
 
     /// The operator's name, as a header and a report spell it.
@@ -56,8 +63,30 @@ implement enum MutationOperator {
             MutationOperator::DropAnnotation => { Str::new("drop-annotation") }
             MutationOperator::DropArgument   => { Str::new("drop-argument") }
             MutationOperator::ExtraArgument  => { Str::new("extra-argument") }
+            MutationOperator::SwapType       => { Str::new("swap-type") }
+            MutationOperator::SwapArguments  => { Str::new("swap-arguments") }
         };
     }
+}
+
+/// A span of a text: the bytes from `start` to `end`.
+public type struct Span {
+    /// Where it starts.
+    public start: i64;
+    /// Where it ends, past its last byte.
+    public end: i64;
+}
+
+/// A call by a generated name, as its text has it: the parentheses and
+/// each argument, split at the commas outside any nested parentheses,
+/// brackets or braces, without the space after a comma.
+public type struct CallText {
+    /// The `(` opening the arguments.
+    public open: i64;
+    /// The `)` closing them.
+    public close: i64;
+    /// Each argument's span, in order.
+    public arguments: Array<Span>;
 }
 
 /// An edit of a text: the bytes from `start` to `end` replaced by
@@ -129,6 +158,8 @@ public type struct Mutation {
             MutationOperator::DropAnnotation => { Mutation::annotation_edits(text, body) }
             MutationOperator::DropArgument   => { Mutation::argument_edits(text, body, false) }
             MutationOperator::ExtraArgument  => { Mutation::argument_edits(text, body, true) }
+            MutationOperator::SwapType       => { Mutation::type_edits(text, body) }
+            MutationOperator::SwapArguments  => { Mutation::swap_edits(text, body) }
         };
     }
 
@@ -195,10 +226,10 @@ public type struct Mutation {
         return edits;
     }
 
-    /// Each declaration line from `from` - `const` or `mut` first, then a
-    /// name and `: T = ` - with its `: T` taken out.
-    private static annotation_edits(text: Str, from: i64) -> Array<TextEdit> {
-        mut edits: Array<TextEdit> = Array::<TextEdit>::new();
+    /// The type of each declaration line from `from` - `const` or `mut`
+    /// first, then a name and `: T = ` - as the span of its `T`.
+    private static declared_types(text: Str, from: i64) -> Array<Span> {
+        mut types: Array<Span> = Array::<Span>::new();
         mut start: i64 = from;
         while (start < text.length()) {
             const rest: Str = text.byte_substring(start, text.length());
@@ -209,29 +240,58 @@ public type struct Mutation {
                 const colon: Option<i64> = line.find(&Str::new(": "));
                 const equals: Option<i64> = line.find(&Str::new(" = "));
                 if (colon.is_some() && equals.is_some() && colon.unwrap() < equals.unwrap()) {
-                    edits.push(TextEdit { start: start + colon.unwrap(), end: start + equals.unwrap(), replacement: String::new() });
+                    types.push(Span { start: start + colon.unwrap() + 2, end: start + equals.unwrap() });
                 }
             }
             start = start + length + 1;
+        }
+        return types;
+    }
+
+    /// Each declaration line from `from` with its `: T` taken out.
+    private static annotation_edits(text: Str, from: i64) -> Array<TextEdit> {
+        mut edits: Array<TextEdit> = Array::<TextEdit>::new();
+        const types: Array<Span> = Mutation::declared_types(text, from);
+        for (declared in types.iterate_references()) {
+            edits.push(TextEdit { start: declared.start - 2, end: declared.end, replacement: String::new() });
+        }
+        return edits;
+    }
+
+    /// Each declaration line from `from` with its type replaced by the
+    /// next of the distinct types the declarations name, in the order
+    /// they first appear, the last by the first; none when they name
+    /// fewer than two.
+    private static type_edits(text: Str, from: i64) -> Array<TextEdit> {
+        const types: Array<Span> = Mutation::declared_types(text, from);
+        mut distinct: Array<Str> = Array::<Str>::new();
+        for (declared in types.iterate_references()) {
+            const name: Str = text.byte_substring(declared.start, declared.end);
+            if (!distinct.contains(&name)) { distinct.push(name); }
+        }
+        mut edits: Array<TextEdit> = Array::<TextEdit>::new();
+        if (distinct.length() < 2) { return edits; }
+        for (declared in types.iterate_references()) {
+            const at: i64 = distinct.index_of(&text.byte_substring(declared.start, declared.end)).unwrap();
+            const next: Str = distinct[(at + 1) % distinct.length()];
+            edits.push(TextEdit { start: declared.start, end: declared.end, replacement: String::from_str(next) });
         }
         return edits;
     }
 
     /// Each call from `from` of a function or method by its generated name
-    /// (`h3(`, `.m0(`, `.t2(`, `g1(`, `k0(`) given at least one argument:
-    /// its last argument dropped, or with `twice` written again after
-    /// itself.  Arguments are split at the commas outside any nested
-    /// parentheses, brackets or braces.
-    private static argument_edits(text: Str, from: i64, twice: boolean) -> Array<TextEdit> {
-        mut edits: Array<TextEdit> = Array::<TextEdit>::new();
+    /// (`h3(`, `.m0(`, `.t2(`, `g1(`, `k0(`).
+    private static calls(text: Str, from: i64) -> Array<CallText> {
+        mut calls: Array<CallText> = Array::<CallText>::new();
         const tokens: Array<TextEdit> = Mutation::tokens(text, from);
         for (token in tokens.iterate_references()) {
             const name: Str = token.replacement.as_str();
             if (name.length() < 2 || !Str::new("hmtgk").contains(&name.byte_substring(0, 1)) || !Mutation::all_digits(name.byte_substring(1, name.length()))) { continue; }
             if (token.end >= text.length() || text.byte_substring(token.end, token.end + 1) != Str::new("(")) { continue; }
             const open: i64 = token.end;
+            mut arguments: Array<Span> = Array::<Span>::new();
             mut depth: i64 = 0;
-            mut last_comma: i64 = -1;
+            mut argument_start: i64 = open + 1;
             mut close: i64 = -1;
             mut at: i64 = open;
             while (at < text.length() && close < 0) {
@@ -241,19 +301,56 @@ public type struct Mutation {
                     depth = depth - 1;
                     if (depth == 0) { close = at; }
                 }
-                if (character == Str::new(",") && depth == 1) { last_comma = at; }
+                if ((character == Str::new(",") && depth == 1) || (close == at && at > open + 1)) {
+                    arguments.push(Span { start: argument_start, end: at });
+                    argument_start = at + 1;
+                    if (argument_start < text.length() && text.byte_substring(argument_start, argument_start + 1) == Str::new(" ")) { argument_start = argument_start + 1; }
+                }
                 at = at + 1;
             }
-            if (close < 0 || close == open + 1) { continue; }
-            const last_start: i64 = if (last_comma >= 0) { last_comma + 1 } else { open + 1 };
+            if (close < 0) { continue; }
+            calls.push(CallText { open: open, close: close, arguments: arguments });
+        }
+        return calls;
+    }
+
+    /// Each call from `from` given at least one argument: its last
+    /// argument dropped, or with `twice` written again after itself.
+    private static argument_edits(text: Str, from: i64, twice: boolean) -> Array<TextEdit> {
+        mut edits: Array<TextEdit> = Array::<TextEdit>::new();
+        const calls: Array<CallText> = Mutation::calls(text, from);
+        for (call in calls.iterate_references()) {
+            const count: i64 = call.arguments.length();
+            if (count == 0) { continue; }
+            const last: Span = call.arguments[count - 1];
             if (twice) {
                 mut replacement: String = String::from_str(Str::new(", "));
-                replacement.push(text.byte_substring(last_start, close).trim_start());
-                edits.push(TextEdit { start: close, end: close, replacement: replacement });
+                replacement.push(text.byte_substring(last.start, last.end));
+                edits.push(TextEdit { start: call.close, end: call.close, replacement: replacement });
             } else {
-                const dropped_from: i64 = if (last_comma >= 0) { last_comma } else { open + 1 };
-                edits.push(TextEdit { start: dropped_from, end: close, replacement: String::new() });
+                const dropped_from: i64 = if (count > 1) { call.arguments[count - 2].end } else { call.open + 1 };
+                edits.push(TextEdit { start: dropped_from, end: call.close, replacement: String::new() });
             }
+        }
+        return edits;
+    }
+
+    /// Each call from `from` given at least two arguments whose texts
+    /// differ: its first two exchanged.
+    private static swap_edits(text: Str, from: i64) -> Array<TextEdit> {
+        mut edits: Array<TextEdit> = Array::<TextEdit>::new();
+        const calls: Array<CallText> = Mutation::calls(text, from);
+        for (call in calls.iterate_references()) {
+            if (call.arguments.length() < 2) { continue; }
+            const first: Span = call.arguments[0];
+            const second: Span = call.arguments[1];
+            const first_text: Str = text.byte_substring(first.start, first.end);
+            const second_text: Str = text.byte_substring(second.start, second.end);
+            if (first_text == second_text) { continue; }
+            mut replacement: String = String::from_str(second_text);
+            replacement.push(text.byte_substring(first.end, second.start));
+            replacement.push(first_text);
+            edits.push(TextEdit { start: first.start, end: second.end, replacement: replacement });
         }
         return edits;
     }

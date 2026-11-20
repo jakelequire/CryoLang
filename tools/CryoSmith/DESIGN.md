@@ -1433,7 +1433,10 @@ generator never reads through an `Rc`.
      `/home/` into a Windows path before cryogate sees it, so the Linux
      paths reach WSL as `C:/Program Files/Git/home/...` and every Linux
      build exits 127: start the run from PowerShell, or with
-     `MSYS_NO_PATHCONV=1`.
+     `MSYS_NO_PATHCONV=1`. `smith-reduce` takes the same `--linux` and
+     `--linux-stdlib` (not with `--text`), so a finding only Linux shows
+     is reduced while it persists there; both commands build the arm's
+     configurations through one function of the shared runner.
    - (Done: `cryogate smith-diff`, `smith/difference.cryo` for the
      decisions, `smith/run/programs.cryo` for the builds and runs both
      commands share, and the Linux arm through `core/wsl`.)
@@ -1567,16 +1570,32 @@ generator never reads through an `Rc`.
      program): `delete-token` and `duplicate-token` (a token of the body,
      split on spaces and punctuation); `drop-brace` and `extra-brace` (a
      `}` deleted, a `{` added at a line's end); `swap-type` (a declared
-     local's type replaced by another of the program's type names);
+     local's type replaced by the next of the distinct types the
+     program's declarations name, in the order they first appear);
      `drop-annotation` (`const v: T = ..` written `const v = ..`);
      `drop-argument` and `extra-argument` (a call given one argument
      fewer, or its last twice); `swap-arguments` (a call's first two
-     arguments exchanged, where they differ in type); `escape-borrow` (a
-     function returning `&D<N>` made to return a borrow of a local of its
-     own, or a reference parameter's borrow given on after the value
-     moved). The printer's shape - one statement per line, every
-     operation parenthesised - is what lets an operator find its sites
-     in the text exactly.
+     arguments exchanged, where their texts differ). The printer's shape
+     - one statement per line, every operation parenthesised, every
+     local's type written - is what lets an operator find its sites in
+     the text exactly, and lets the declarations stand for the model's
+     types: `swap-type` needs no more than the types written there, and
+     `swap-arguments` exchanging two arguments of one type leaves a valid
+     program, which is accepted and is no finding. The operators are
+     drawn among in the order the list above gives them, so adding one
+     changes which mutation a number draws: a new generator version.
+   - **`escape-borrow` waits for the borrow checker** (a function
+     returning `&D<N>` made to return a borrow of a local of its own, or
+     a reference parameter's borrow given on after the value moved). It
+     cannot be a text edit: a function returning a borrow has, in the
+     generated programs, no local of the borrowed type to escape and
+     nothing in its text that builds one, so the mutation is the
+     generator's, printing such a function with the escape in it. And
+     until the memory-safety plan's checker is on `main` the compiler
+     accepts an escaping borrow, so every such program would be counted
+     accepted and could find nothing. It comes with that checker, when a
+     refusal with its code is the expected outcome and anything else -
+     acceptance included - is a finding of its own.
    - **The gate**, `cryogate smith-crash --cryo <compiler> --work
      <directory> [--first-seed N] [--count K] [--mutations J] [--jobs N]
      [--build-limit S] [-- <generation options>...]`: J mutations of each
@@ -1587,7 +1606,11 @@ generator never reads through an `Rc`.
      (`E09xx`) and a refusal printing no error code are findings. The
      signature is the class, the operator and the first code or how the
      compiler ended, so one defect reached through many seeds is one
-     finding; the report prints each finding once with its count and
+     finding; an internal error's code is followed by its diagnostic's
+     headline, every backquoted name in it written `` `_` `` and cut at
+     its first ` (`, and the first reason LLVM reports, since every
+     internal error shares its code (`E0900`) and the code alone would
+     make one finding - and to the reducer one failure - of any two; the report prints each finding once with its count and
      first seed, then `smith-crash: OK (P programs, R refused, A
      accepted)` or `smith-crash: FAIL (F findings in P programs: ...)`.
    - **Reduction**: for a crash, a hang or an internal error the reducer
@@ -1615,16 +1638,76 @@ generator never reads through an `Rc`.
      `drop-brace`, `extra-brace`, `drop-annotation`, `drop-argument`,
      `extra-argument`) and `smith-crash`; a planted compiler crash on one
      malformed shape found and reduced is the proof, then a live run over
-     a bounded seed range with every finding filed. `swap-type`,
-     `swap-arguments` and `escape-borrow` need the model's types at the
-     site and come second. (Built: the seven text operators in
-     `mutate/`, their self-test check, `smith-crash` and its decisions
-     in `smith/crash.cryo`. Not yet: `smith-reduce --text`, the planted
-     crash and the live run.)
+     a bounded seed range with every finding filed. (Built: the seven
+     text operators in `mutate/`, their self-test check, `smith-crash`
+     and its decisions in `smith/crash.cryo`, `smith-reduce --text`.)
+   - **Unit 2**: `swap-type` and `swap-arguments`, as text edits over
+     the declarations and the calls `drop-argument` already reads
+     (built, generator version 41). `escape-borrow` waits, as above.
 10. **A fuzz farm** (CryoGate, `cryogate smith-farm`). Overnight batches
     of the differential driver over consecutive seeds, failures
     deduplicated by their signature (the diagnostic code, the crash site,
     the disagreeing configuration), reduced, and a summary written.
+
+    *Design.* `cryogate smith-farm --cryo <compiler> [--reference
+    <compiler>]... [--interpret] [--linux <compiler>] --work <directory>
+    --findings <directory> --seeds A..B [--hours H] [--mutations J]
+    [--jobs N] [--known <file>] [--build-limit S] [--run-limit S] [--
+    <generation options>...]`. One host, one process; a farm of several
+    machines is after 1.0 and not designed here.
+    - **Batches on the shared runner.** The seeds A to B are taken in
+      batches of a few times the job count; each batch is one smith-diff
+      run over its seeds and, with `--mutations J`, one smith-crash run
+      over the same seeds, both through `smith/run/programs.cryo` as the
+      commands themselves run them. A batch is never cut short: the time
+      budget (`--hours`) and the memory are checked before each one, and
+      the farm stops cleanly at a batch boundary.
+    - **Memory.** Before each batch the host's commit (the memory promised
+      to every process: Windows' commit charge, Linux's `Committed_AS`)
+      decides the job count: as many as the room under a ceiling holds at
+      about 0.4 GB a compile, at most `--jobs`; with room for no job the
+      farm waits, and past a hard limit it stops, saying so
+      (`MemoryBudget`). The ceiling, the hard limit and the cost of a job
+      are the host's, read from a configuration file in the findings
+      directory, never written as code per machine.
+    - **Resumable.** `<findings>/farm.log` gets one line per judged seed,
+      `seed <N> <kind> <verdict>` - the kind `diff` or `crash`, the verdict
+      `ok` or the finding's signature - appended as each batch ends; a
+      farm started again over the same findings directory takes only the
+      seeds the log has not judged by that kind (`FarmLog`), so a stop at
+      any point loses at most the batch in progress. A log line the farm
+      cannot read refuses the run: resuming from a misread log judges
+      seeds twice or never.
+    - **Deduplication.** A finding's signature (item 7's, or item 9's for
+      a crash) is looked up among the signatures already in the findings
+      directory and in `--known`, a file of `<bug> <signature>` lines
+      (`KnownFindings`). A known signature is counted; a new one is
+      reduced once (item 8, with `--text` for a crash), under a time limit
+      of its own, into `<findings>/<signature digest>/` - the reduced
+      program, the drafted bug file and the seed and options it came
+      from - and is then known to the rest of the run.
+    - **Report.** `<findings>/farm-report.md` is written again after each
+      batch: the new findings, each known one seen and how often, and the
+      coverage - seeds judged, builds per configuration, mutations per
+      operator, refusals per code, findings per class, time per batch and
+      every memory wait or stop.
+    - **Unit 1** (built): the decisions, `smith/farm.cryo` - the log read
+      and the next batch, the known findings, the memory verdict - with
+      their unit tests. **Unit 2**: the gate, the batches on the runner,
+      the report. **Unit 3**: the reductions of new signatures.
+    - **Questions for the maintainer** (lettered options, recommendation
+      first): (a) what `--known` is: (A) a file in the tree, beside
+      `tests/smith-corpus`, kept by hand as bugs are filed and fixed, or
+      (B) read from the bug log of the checkout; A, since the bug log is
+      local to one checkout. (b) whether a farm run's findings are ever
+      committed: (A) never - the farm drafts bug files for review - or (B)
+      a reduced program becomes a test with its fix; A for the farm, B by
+      the fix's own session. (c) where the commit is read: (A) the
+      standard library's `SystemMemory` gains the commit and its limit
+      beside the physical memory it reports, or (B) CryoGate reads them
+      through its own bindings; A, since a second reading of the same
+      system call beside the library's is the near-duplicate this tree
+      refuses, but it is new public API and so not decided here.
 11. **A corpus gate in `make verify`** (done: verify's `smith` gate). A
     small fixed set of seeds at a pinned generator version, checked as
     `corpus-check` checks them, run by verify beside its other gates; a
