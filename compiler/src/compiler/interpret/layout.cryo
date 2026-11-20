@@ -13,6 +13,7 @@
 namespace compiler::interpret::layout;
 
 import compiler::interpret::integer::{ IntegerKind };
+import compiler::interpret::memory::{ Element };
 import compiler::types::{ TypeKind };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
@@ -244,6 +245,54 @@ type struct Layout {
     /// How many payload elements variant `variant` of the enum `t` has.
     payload_count(&this, t: TypeRef, variant: i64) -> i64 {
         return this.type_of(t).as_enum().variants[variant].payload_types.length();
+    }
+
+    /// `t` as an allocation's element: its bytes and its cells.
+    element(&this, t: TypeRef) -> Element {
+        return Element { element_type: t, bytes: this.bytes(t), cells: this.cells(t) };
+    }
+
+    /// The byte offset at which cell `cell` of a value of `t` starts, by
+    /// the layout rules `bytes` follows: a struct's or tuple's members each
+    /// at the next multiple of their alignment, an array's elements one
+    /// after another.  The first cell of any value is its first byte.  A
+    /// cell inside an enum's payload, an optional or a union has no offset
+    /// of its own here, since which member it is depends on the value it
+    /// holds.
+    cell_bytes(&this, t: TypeRef, cell: i64) -> Option<i64> {
+        if (cell == 0) { return Option::Some(0); }
+        const ty: Type* = this.type_of(t);
+        if (ty == null || cell < 0) { return Option::None; }
+        match (ty.kind) {
+            TypeKind::Array => {
+                const a: ArrayType* = ty.as_array();
+                const element_cells: i64 = this.cells(a.element);
+                if (element_cells <= 0) { return Option::None; }
+                return match (this.cell_bytes(a.element, cell % element_cells)) {
+                    Option::Some(inside) => { Option::Some((cell / element_cells) * this.bytes(a.element) + inside) }
+                    Option::None => { Option::None }
+                };
+            }
+            TypeKind::Struct => { if (ty.as_struct().is_union) { return Option::None; } }
+            TypeKind::Tuple => { }
+            _ => { return Option::None; }
+        }
+        mut rest: i64 = cell;
+        mut offset: i64 = 0;
+        for (mut i: i64 = 0; i < this.field_count(t); i++) {
+            const member: TypeRef = this.field_type(t, i);
+            offset = Layout::round_up(offset, this.alignment(member));
+            const member_cells: i64 = this.cells(member);
+            if (rest < member_cells) {
+                return match (this.cell_bytes(member, rest)) {
+                    Option::Some(inside) => { Option::Some(offset + inside) }
+                    Option::None => { Option::None }
+                };
+            }
+            rest = rest - member_cells;
+            offset = offset + this.bytes(member);
+        }
+        return Option::None;
     }
 
     /// How many bytes a value of `t` takes.

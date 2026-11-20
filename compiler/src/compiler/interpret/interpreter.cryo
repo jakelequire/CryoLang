@@ -153,6 +153,7 @@ type struct Interpreter {
             Operand::Value(value) => {
                 match (value) {
                     Scalar::Integer(bits, _) => { code = bits as i32; }
+                    Scalar::AddressInteger(_, _) => { return Result::Err(Interpreter::no_integer_bits(value, "an exit code that is no integer", main.body.span)); }
                     _ => { }
                 }
             }
@@ -199,6 +200,17 @@ type struct Interpreter {
 
     static not_covered(text: string, span: SourceSpan) -> Stop {
         return Stop::not_covered(String::from_str(Str::new(text)), span);
+    }
+
+    /// What stops a read of an integer's bits from `value`, which holds
+    /// none: an integer made from an address is not covered, since its bits
+    /// would be its allocation's made-up base (tools/CryoSmith/INTERPRETER.md
+    /// section 4.1); any other value is the violation `what`.
+    static no_integer_bits(value: Scalar, what: string, span: SourceSpan) -> Stop {
+        return match (value) {
+            Scalar::AddressInteger(_, _) => { Interpreter::not_covered("a read of the bits of an integer made from an address", span) }
+            _ => { Interpreter::violation(what, span) }
+        };
     }
 
     // ---- Memory through the reports ----
@@ -248,7 +260,7 @@ type struct Interpreter {
     /// Declare a local of type `t` bound to `symbol`, uninitialised; its
     /// storage.
     declare(mut &this, symbol: SymbolID, t: TypeRef) -> Address {
-        const allocation: i64 = this.memory.allocate(this.layout.cells(t), AllocationKind::Stack);
+        const allocation: i64 = this.memory.allocate(this.layout.element(t), 1, AllocationKind::Stack);
         this.bindings.push(Binding { symbol: symbol, allocation: allocation, offset: 0, binding_type: t, owns: true });
         return Address::at(allocation, 0);
     }
@@ -273,7 +285,7 @@ type struct Interpreter {
     /// A temporary for an aggregate of type `t`, released at the end of
     /// the statement making it.
     temporary(mut &this, t: TypeRef) -> Address {
-        const allocation: i64 = this.memory.allocate(this.layout.cells(t), AllocationKind::Stack);
+        const allocation: i64 = this.memory.allocate(this.layout.element(t), 1, AllocationKind::Stack);
         this.temporaries.push(Temporary { allocation: allocation, value_type: t });
         return Address::at(allocation, 0);
     }
@@ -320,7 +332,7 @@ type struct Interpreter {
         if (variable == null) {
             return Result::Err(Interpreter::violation("a name resolved to a definition that is no variable", span));
         }
-        const allocation: i64 = this.memory.allocate(this.layout.cells(variable.resolved_type), AllocationKind::Global);
+        const allocation: i64 = this.memory.allocate(this.layout.element(variable.resolved_type), 1, AllocationKind::Global);
         this.globals.push(Global { definition: definition, allocation: allocation });
         const place: Address = Address::at(allocation, 0);
         if (variable.initializer != null) {

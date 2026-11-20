@@ -12,7 +12,7 @@ import compiler::diag::source_span::{ SourceSpan };
 import compiler::interpret::calls::{ Callee };
 import compiler::interpret::integer::{ IntegerKind, TrueValue };
 import compiler::interpret::interpreter::{ Interpreter, Operand };
-import compiler::interpret::memory::{ AccessFault, Address, AllocationKind, Scalar };
+import compiler::interpret::memory::{ AccessFault, Address, AllocationKind, Element, Scalar };
 import compiler::interpret::outcome::{ Stop };
 import compiler::intrinsic_kind::{ IntrinsicKind };
 import compiler::types::type_ref::{ TypeRef };
@@ -160,7 +160,7 @@ implement struct Interpreter {
         if (index >= values.length()) { return Result::Err(Interpreter::violation("a machine call missing an argument", span)); }
         return match (values[index].value) {
             Scalar::Integer(bits, _) => { Result::Ok(bits) }
-            _ => { Result::Err(Interpreter::violation("a machine call given no integer where one is taken", span)) }
+            _ => { Result::Err(Interpreter::no_integer_bits(values[index].value, "a machine call given no integer where one is taken", span)) }
         };
     }
 
@@ -176,7 +176,7 @@ implement struct Interpreter {
         if (index >= values.length()) { return Result::Err(Interpreter::violation("a foreign call missing an argument", span)); }
         return match (values[index].value) {
             Scalar::Integer(bits, kind) => { Result::Ok(TrueValue::of(kind, bits).signed_value()) }
-            _ => { Result::Err(Interpreter::violation("a foreign call given no integer where one is taken", span)) }
+            _ => { Result::Err(Interpreter::no_integer_bits(values[index].value, "a foreign call given no integer where one is taken", span)) }
         };
     }
 
@@ -206,10 +206,9 @@ implement struct Interpreter {
         const block: i64 = this.memory.allocate_heap(bytes);
         if (address.is_null()) { return Result::Ok(Address::at(block, 0)); }
         const old: i64 = address.allocation;
-        const element_bytes: i64 = this.memory.allocations[old].element_bytes;
-        const element_cells: i64 = this.memory.allocations[old].element_cells;
-        if (element_cells > 0) {
-            this.memory.shape(block, element_bytes, element_cells);
+        const element: Element = this.memory.allocations[old].element;
+        if (element.cells > 0) {
+            this.memory.shape(block, element);
             mut cells: i64 = this.memory.allocations[old].length;
             if (this.memory.allocations[block].length < cells) { cells = this.memory.allocations[block].length; }
             const fault: AccessFault = this.memory.copy(Address::at(block, 0), Address::at(old, 0), cells);
@@ -224,23 +223,20 @@ implement struct Interpreter {
     copy_bytes(mut &this, target: Address, target_type: TypeRef, source: Address, source_type: TypeRef,
                bytes: i64, span: SourceSpan) -> Result<(), Stop> {
         if (bytes == 0) { return Result::Ok(()); }
-        mut element: TypeRef = this.layout.pointee(source_type);
-        if (!element.is_valid() || this.layout.cells(element) == 0) { element = this.layout.pointee(target_type); }
-        mut element_bytes: i64 = 0;
-        mut element_cells: i64 = 0;
-        if (element.is_valid() && this.layout.cells(element) > 0) {
-            element_bytes = this.layout.bytes(element);
-            element_cells = this.layout.cells(element);
-        } else if (!source.is_null() && this.memory.allocations[source.allocation].element_cells > 0) {
-            element_bytes = this.memory.allocations[source.allocation].element_bytes;
-            element_cells = this.memory.allocations[source.allocation].element_cells;
+        mut pointee: TypeRef = this.layout.pointee(source_type);
+        if (!pointee.is_valid() || this.layout.cells(pointee) == 0) { pointee = this.layout.pointee(target_type); }
+        mut element: Element = Element::none();
+        if (pointee.is_valid() && this.layout.cells(pointee) > 0) {
+            element = this.layout.element(pointee);
+        } else if (!source.is_null() && this.memory.allocations[source.allocation].element.cells > 0) {
+            element = this.memory.allocations[source.allocation].element;
         } else {
             return Result::Err(Interpreter::not_covered("a byte copy between untyped addresses", span));
         }
-        if (bytes % element_bytes != 0) { return Result::Err(Interpreter::not_covered("a byte copy of part of an element", span)); }
-        if (!target.is_null()) { this.memory.shape(target.allocation, element_bytes, element_cells); }
-        if (!source.is_null()) { this.memory.shape(source.allocation, element_bytes, element_cells); }
-        const fault: AccessFault = this.memory.copy(target, source, (bytes / element_bytes) * element_cells);
+        if (bytes % element.bytes != 0) { return Result::Err(Interpreter::not_covered("a byte copy of part of an element", span)); }
+        if (!target.is_null()) { this.memory.shape(target.allocation, element); }
+        if (!source.is_null()) { this.memory.shape(source.allocation, element); }
+        const fault: AccessFault = this.memory.copy(target, source, (bytes / element.bytes) * element.cells);
         if (!fault.is_none()) { return Result::Err(this.fault(fault, span)); }
         return Result::Ok(());
     }
@@ -271,7 +267,7 @@ implement struct Interpreter {
                 }
             }
         }
-        this.memory.shape(target.allocation, element_bytes, 1);
+        this.memory.shape(target.allocation, this.layout.element(element));
         for (mut i: i64 = 0; i < bytes / element_bytes; i++) { this.store(target.plus(i), zero, span)?; }
         return Result::Ok(());
     }
@@ -291,12 +287,13 @@ implement struct Interpreter {
 
     /// The unsigned byte the cell at `address` holds.
     byte_at(&this, address: Address, span: SourceSpan) -> Result<i64, Stop> {
-        return match (this.load(address, span)?) {
+        const value: Scalar = this.load(address, span)?;
+        return match (value) {
             Scalar::Integer(bits, kind) => {
                 if (kind.width != 8) { return Result::Err(Interpreter::not_covered("a byte comparison of values wider than a byte", span)); }
                 Result::Ok((bits & 255) as i64)
             }
-            _ => { Result::Err(Interpreter::violation("a byte comparison reading a value that is no byte", span)) }
+            _ => { Result::Err(Interpreter::no_integer_bits(value, "a byte comparison reading a value that is no byte", span)) }
         };
     }
 
@@ -308,7 +305,7 @@ implement struct Interpreter {
         if (count <= 0) { return Result::Ok(()); }
         if (address.is_null()) { return Result::Err(Interpreter::violation("random bytes asked for into the null pointer", span)); }
         const byte: IntegerKind = IntegerKind::new(8, false);
-        this.memory.shape(address.allocation, 1, 1);
+        this.memory.shape(address.allocation, Element::byte());
         for (mut i: i64 = 0; i < count; i++) {
             this.random_state = this.random_state.wrapping_add(Interpreter::RANDOM_STEP);
             this.store(address.plus(i), Scalar::Integer(this.random_state >> 56, byte), span)?;
@@ -326,12 +323,13 @@ implement struct Interpreter {
     c_string(&this, address: Address, span: SourceSpan) -> Result<String, Stop> {
         mut text: String = String::new();
         for (mut i: i64 = 0; i < Interpreter::LONGEST_C_STRING; i++) {
-            match (this.load(address.plus(i), span)?) {
+            const value: Scalar = this.load(address.plus(i), span)?;
+            match (value) {
                 Scalar::Integer(bits, _) => {
                     if (bits == 0) { return Result::Ok(text); }
                     text.push_byte(bits as u8);
                 }
-                _ => { return Result::Err(Interpreter::violation("a C string holding a value that is no byte", span)); }
+                _ => { return Result::Err(Interpreter::no_integer_bits(value, "a C string holding a value that is no byte", span)); }
             }
         }
         return Result::Err(Interpreter::violation("a C string with no terminating zero byte", span));
@@ -341,9 +339,10 @@ implement struct Interpreter {
     byte_run(&this, address: Address, count: i64, span: SourceSpan) -> Result<String, Stop> {
         mut text: String = String::new();
         for (mut i: i64 = 0; i < count; i++) {
-            match (this.load(address.plus(i), span)?) {
+            const value: Scalar = this.load(address.plus(i), span)?;
+            match (value) {
                 Scalar::Integer(bits, _) => { text.push_byte(bits as u8); }
-                _ => { return Result::Err(Interpreter::violation("a byte run holding a value that is no byte", span)); }
+                _ => { return Result::Err(Interpreter::no_integer_bits(value, "a byte run holding a value that is no byte", span)); }
             }
         }
         return Result::Ok(text);
@@ -395,7 +394,7 @@ implement struct Interpreter {
                 if (next >= values.length()) { return Result::Err(Interpreter::violation("a `printf` conversion with no argument", span)); }
                 const value: TrueValue = match (values[next].value) {
                     Scalar::Integer(bits, kind) => { TrueValue::of(kind, bits) }
-                    _ => { return Result::Err(Interpreter::violation("a `printf` integer conversion given no integer", span)); }
+                    _ => { return Result::Err(Interpreter::no_integer_bits(values[next].value, "a `printf` integer conversion given no integer", span)); }
                 };
                 const text: String = if (value.negative) { f"-{value.magnitude}" } else { f"{value.magnitude}" };
                 next = next + 1;
@@ -421,7 +420,7 @@ implement struct Interpreter {
 
     /// A read-only allocation holding `text` and a terminating zero byte.
     text_bytes(mut &this, text: Str) -> Address {
-        const allocation: i64 = this.memory.allocate(text.length() + 1, AllocationKind::Stack);
+        const allocation: i64 = this.memory.allocate(Element::byte(), text.length() + 1, AllocationKind::Stack);
         const byte: IntegerKind = IntegerKind::new(8, false);
         for (mut i: i64 = 0; i < text.length(); i++) {
             this.memory.write(Address::at(allocation, i), Scalar::Integer(text.byte_at(i).unwrap_or(0) as u64, byte));

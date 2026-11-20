@@ -95,6 +95,8 @@ A value is one of:
 - **an integer** - its bits and its type (width 8 to 128, signed or not);
   every arithmetic result is reduced to its type's width at the operation
   that produced it, never later;
+- **an integer made from an address** - its allocation, its byte offset
+  there and its type, in place of bits (section 4.1);
 - **a boolean**;
 - **unit**;
 - **an aggregate** - a struct's, tuple's or fixed array's members, in
@@ -158,11 +160,7 @@ At exit every heap block must have been freed. A block still live is a
 **leak** and a violation: this is how the interpreter judges the standard
 library's reference counting without trusting it (section 6).
 
-### 4.1 An address as an integer (proposed, not built)
-
-**Status: a design awaiting the maintainer's approval; no code follows it
-yet.** Today `p as u64` of an address, and every other construct below,
-stops the run as not covered.
+### 4.1 An address as an integer
 
 A compiled program's addresses are wherever its allocator and stack put
 them: they differ between `-O0` and `-O2`, between hosts and between runs.
@@ -170,52 +168,69 @@ So a program whose output depends on an address's numeric value is not one
 two configurations can agree on, and the interpreter must not invent an
 answer for it. What a program can rely on is what holds of every placement:
 two addresses in one allocation are a fixed distance apart, an address is
-as aligned as its allocation guarantees, two live allocations do not
-overlap, and null is zero.
+as aligned as its allocation's type guarantees and no more, two live
+allocations do not overlap (though one may begin where another ends), and
+null is zero.
 
-**The numbering.** Each allocation gets a made-up base when it is made:
-the bases are handed out in creation order from `0x10000` upward, each
-aligned to 4096 bytes and placed past the end of the one before with a gap
-of at least 4096 bytes, and never reused, even after an allocation ends.
-The integer of an address is its allocation's base plus its byte offset:
-the offsets of the members on its path and its element index times the
-element's size, by the layout rules (docs/abi.md). Null is 0. The numbering
-is a function of the program's own evaluation order and of nothing on the
-host, so it is the same on every run and on both hosts.
+**The numbering.** Each allocation stands at a made-up base: the bases are
+handed out in creation order from `0x10000` upward, each aligned to 4096
+bytes and placed past the end of the one before with a gap of at least 4096
+bytes, and never reused, even after an allocation ends. The integer of an
+address is its allocation's base plus its byte offset: the offsets of the
+members on its path and its element index times the element's size, by the
+layout rules (docs/abi.md). Null is 0. The numbering is a function of the
+program's own evaluation order and of nothing on the host, so it is the
+same on every run and on both hosts.
 
 **Provenance.** An integer made from an address keeps the allocation it
-came from, and arithmetic keeps it while the result still names a place in
-that allocation. An operation whose result would depend on the made-up base
-is refused as not covered (exit 71, the operation named), so no base ever
-reaches the output; what remains depends only on offsets, and so agrees
-with any compiled build of the same program:
+came from (the scalar `AddressInteger`, holding the allocation and the byte
+offset), and arithmetic keeps it while the result still names a place in
+that allocation, its end included. An operation whose result would depend
+on the made-up base is refused as not covered (exit 71, the operation
+named), so no base ever reaches the output; what remains depends only on
+offsets, and so agrees with any compiled build of the same program. Since
+no operation the interpreter runs reads a base, it never computes one: the
+numbering is what makes the rules below true, not a value it keeps.
+
+To find an address's byte offset every allocation records its element -
+the type of a local, a parameter, a temporary or a module-level variable,
+one byte for a string's bytes, and for a heap block the type of its first
+typed access - and the offset of a cell within an element follows the
+layout rules: a struct's or tuple's members each at the next multiple of
+their alignment, an array's elements one after another.
 
 | construct | result |
 |---|---|
-| `p as u64` (or any integer type at least as wide as an address) | the base plus the offset, keeping the allocation |
-| `+`, `-` of an integer with no provenance | the offset moved, provenance kept |
+| `p as u64` (or any integer type at least as wide as an address) | the base plus the offset, keeping the allocation; an address inside an enum's payload, an optional or a union, whose cell's offset depends on the value held, is not covered |
+| `null as u64` | 0, with no provenance |
+| `+`, `-` of an integer with no provenance, `++`, `--`, `+=`, `-=` | the offset moved, provenance kept, while it stays within the allocation or at its end |
 | `q - p`, both from one live allocation | their distance, with no provenance |
-| `x % m` or `x & (m - 1)`, `m` a power of two up to 4096 | the low bits, which the base's alignment leaves to the offset, with no provenance |
-| `==`, `!=` between two | equal when the allocation and offset are; two allocations' never are |
+| `x % m` or `x & (m - 1)`, `m` a power of two up to the alignment of the allocation's element type | the low bits, which that alignment leaves to the offset, with no provenance |
+| `==`, `!=` between two | equal when the allocation and offset are; two allocations' never are, unless either is at its allocation's end, which is not covered |
 | `<`, `<=`, `>`, `>=` between two from one allocation | by offset |
 | `==`, `!=` against 0 | false, true: a base is never 0 |
-| `x as T*` of an integer with provenance | the address it was made from, again checked as section 4 says; an offset that falls inside no cell of the allocation's type is not covered |
+| a widening `as`, or a conversion to a wider integer type | the same integer, provenance kept |
+| `x as T*` of an integer with provenance | the address of the cell that starts at its offset, again checked as section 4 says; an offset at which no cell of the allocation starts is not covered |
 | `0 as T*` | null |
 
 Not covered, each naming what was met:
 
 - any other operation with an operand that has provenance: `*`, `/`,
-  shifts, `^`, `|`, a mask or modulus that is not a power of two up to
-  4096, a narrowing `as`, comparing against an integer other than 0, and
-  so anything that hashes, prints or folds the value into `mix`;
+  shifts, `^`, `|`, a prefix operator, a mask or modulus that is not a
+  power of two up to the allocation's alignment, a narrowing `as`,
+  comparing against an integer other than 0, and so anything that hashes,
+  prints or folds the value into `mix`;
+- an integer moved outside its allocation, past its end or before its
+  start;
 - ordering, or a distance, between two allocations;
 - any operation on an integer whose allocation has ended (a compiled
   program may hand that address to a new allocation, the interpreter never
   does);
 - `x as T*` of an integer with no provenance other than 0, since no
   allocation is there;
-- reading the bytes of an integer that has provenance (as `u8` elements,
-  section 4), which would take the base apart.
+- reading an integer with provenance where its bits are taken whole: as an
+  index, a count, an exit code, a byte, a `printf` argument, or against an
+  integer pattern, each of which would take the base apart.
 
 A raw pointer's own `==`, `!=` and pointer arithmetic are unchanged:
 section 5.1's rules over addresses already decide them without integers.
@@ -295,6 +310,9 @@ section 15, and reads nothing the compiler's ownership passes decided:
   stored, and then the displaced one is dropped; what the place holds is
   read only after the right side has run, so a right side that moves the
   place itself out (`v = if (c) { v } else { .. }`) leaves nothing to drop;
+  a place with nothing to release, whose type has no destructor, is
+  stored as soon as the right side's value is complete, before the
+  statement's temporaries are released;
 - a statement's temporaries are released when it ends, the newest first,
   and a result the statement discards is the newest of them, so it is
   released before any temporary it borrows (docs/cryo.md section 15); a
