@@ -1,0 +1,191 @@
+/// Patterns: testing a `match` subject against an arm's patterns, and
+/// binding the names of the one that matched (docs/cryo.md section 7.2).
+///
+/// A subject is tested where it lies, without moving it.  On a subject
+/// matched by value, a binding not written `mut` whose type is `Copy` is a
+/// copy taken when the arm is entered; every other binding - a `mut` one,
+/// one of a type that is not `Copy`, and every binding of a subject reached
+/// through a borrow or a pointer - names the payload where it lies.
+
+namespace compiler::interpret::patterns;
+
+import compiler::ast::{ LiteralKind, MemberPin, PatternBinding, PatternElement };
+import compiler::ast::expression::{ ExpressionNode };
+import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::interpret::integer::{ IntegerKind, TrueValue };
+import compiler::interpret::interpreter::{ Interpreter, Operand };
+import compiler::interpret::memory::{ Address, Scalar };
+import compiler::interpret::outcome::{ Stop };
+import compiler::types::{ TypeKind };
+import compiler::types::type_ref::{ TypeRef };
+import std::collections::str::{ Str };
+
+/// A `match` subject: where its value lies, its type, and whether it was
+/// reached through a borrow or a pointer.
+type struct Subject {
+    place:             Address;
+    subject_type:      TypeRef;
+    through_reference: boolean;
+}
+
+implement struct Interpreter {
+    /// Evaluate a `match` subject once and find where its value lies,
+    /// following a borrow or a pointer to the value it reaches.
+    subject(mut &this, expression: ExpressionNode*) -> Result<Subject, Stop> {
+        const t: TypeRef = expression.resolved_type;
+        match (this.layout.kind_of(t)) {
+            TypeKind::Reference => {
+                const target: Address = this.pointer_of(expression)?;
+                return Result::Ok(Subject {
+                    place: target, subject_type: this.layout.type_of(t).as_reference().referent, through_reference: true,
+                });
+            }
+            TypeKind::Pointer => {
+                const target: Address = this.pointer_of(expression)?;
+                return Result::Ok(Subject {
+                    place: target, subject_type: this.layout.type_of(t).as_pointer().pointee, through_reference: true,
+                });
+            }
+            _ => { }
+        }
+        return Result::Ok(Subject { place: this.place_of(expression)?, subject_type: t, through_reference: false });
+    }
+
+    /// The index of the first of `arm`'s alternatives that matches the
+    /// subject, or -1.
+    matching_pattern(mut &this, arm: MatchArmNode*, subject: &Subject) -> Result<i64, Stop> {
+        for (mut p: i64 = 0; p < arm.patterns.length(); p++) {
+            if (this.matches(arm.patterns[p], subject.place, subject.subject_type)?) { return Result::Ok(p); }
+        }
+        return Result::Ok(-1);
+    }
+
+    /// Whether `pattern` matches the value of type `t` at `place`.
+    matches(mut &this, pattern: Pattern*, place: Address, t: TypeRef) -> Result<boolean, Stop> {
+        return match (pattern.kind) {
+            PatternKind::Wildcard    => { Result::Ok(true) }
+            PatternKind::Binding(_)  => { Result::Ok(true) }
+            PatternKind::Enum(e)     => { this.matches_variant(e, place, t, pattern.span) }
+            PatternKind::Literal(l)  => {
+                match (l.literal_kind) {
+                    LiteralKind::Boolean => {
+                        const value: Scalar = this.load(place, pattern.span)?;
+                        const wanted: boolean = Str::new(this.ctx.intern_table.resolve(l.value)) == Str::new("true");
+                        Result::Ok(match (value) { Scalar::Boolean(b) => { b == wanted } _ => { false } })
+                    }
+                    _ => { Result::Err(Interpreter::not_covered("a literal pattern other than a boolean", pattern.span)) }
+                }
+            }
+            PatternKind::Range(_)    => { Result::Err(Interpreter::not_covered("a range pattern", pattern.span)) }
+            PatternKind::Constant(_) => { Result::Err(Interpreter::not_covered("a constant pattern", pattern.span)) }
+        };
+    }
+
+    /// Whether the enum value at `place` is the variant `e` names, and each
+    /// payload element matches its sub-pattern.
+    matches_variant(mut &this, e: EnumPattern*, place: Address, t: TypeRef, span: SourceSpan) -> Result<boolean, Stop> {
+        const variant: i64 = match (e.resolved_member) {
+            MemberPin::Variant(v) => { v }
+            _ => { return Result::Err(Interpreter::violation("an enum pattern the type checker did not pin to a variant", span)); }
+        };
+        if (this.variant_of(place, span)? != variant) { return Result::Ok(false); }
+        for (mut i: i64 = 0; i < e.elements.length(); i++) {
+            const element_place: Address = place.plus(this.layout.payload_offset(t, variant, i));
+            const element_type: TypeRef = this.layout.payload_type(t, variant, i);
+            const ok: boolean = match (e.elements[i]) {
+                PatternElement::Binding(_)  => { true }
+                PatternElement::Wildcard(_) => { true }
+                PatternElement::Sub(sub)    => { this.matches(sub.pattern, element_place, element_type)? }
+                PatternElement::LiteralInt(literal) => {
+                    const value: Scalar = this.load(element_place, span)?;
+                    match (value) {
+                        Scalar::Integer(bits, kind) => {
+                            const wanted: TrueValue = TrueValue::of(IntegerKind::new(64, true), literal.value as u128);
+                            TrueValue::of(kind, bits).compare(&wanted) == 0
+                        }
+                        _ => { false }
+                    }
+                }
+                PatternElement::LiteralBool(literal) => {
+                    const value: Scalar = this.load(element_place, span)?;
+                    match (value) { Scalar::Boolean(b) => { b == literal.value } _ => { false } }
+                }
+                _ => { return Result::Err(Interpreter::not_covered("a float or string literal inside an enum pattern", span)); }
+            };
+            if (!ok) { return Result::Ok(false); }
+        }
+        return Result::Ok(true);
+    }
+
+    /// The variant number of the enum value at `place`.
+    variant_of(&this, place: Address, span: SourceSpan) -> Result<i64, Stop> {
+        return match (this.load(place, span)?) {
+            Scalar::Integer(bits, _) => { Result::Ok(bits as i64) }
+            _ => { Result::Err(Interpreter::violation("an enum value whose variant cell holds no variant number", span)) }
+        };
+    }
+
+    /// Bind the names of `pattern`, which matched the subject's value of
+    /// type `t` at `place`.
+    bind_pattern(mut &this, pattern: Pattern*, place: Address, t: TypeRef, subject: &Subject) -> Result<(), Stop> {
+        match (pattern.kind) {
+            PatternKind::Binding(b) => {
+                this.bind_name(b.binding_sym, place, t, false, subject, pattern.span)?;
+            }
+            PatternKind::Enum(e) => {
+                const variant: i64 = match (e.resolved_member) { MemberPin::Variant(v) => { v } _ => { 0 } };
+                for (mut i: i64 = 0; i < e.elements.length(); i++) {
+                    const element_place: Address = place.plus(this.layout.payload_offset(t, variant, i));
+                    const element_type: TypeRef = this.layout.payload_type(t, variant, i);
+                    match (e.elements[i]) {
+                        PatternElement::Binding(binding) => {
+                            this.bind_name(binding.sym_id, element_place, element_type, binding.written_mut, subject, binding.span)?;
+                        }
+                        PatternElement::Sub(sub) => { this.bind_pattern(sub.pattern, element_place, element_type, subject)?; }
+                        _ => { }
+                    }
+                }
+            }
+            _ => { }
+        }
+        return Result::Ok(());
+    }
+
+    /// Bind `symbol` to the value of type `t` at `place`: a copy for a
+    /// binding not written `mut` of a `Copy` value in a subject matched by
+    /// value, the place itself otherwise.
+    bind_name(mut &this, symbol: compiler::resolver::symbol_id::SymbolID, place: Address, t: TypeRef,
+              written_mut: boolean, subject: &Subject, span: SourceSpan) -> Result<(), Stop> {
+        if (!subject.through_reference && !written_mut && this.is_copy(t)) {
+            const copy: Address = this.declare(symbol, t);
+            this.copy_value(copy, place, t, span)?;
+            return Result::Ok(());
+        }
+        this.bind_in_place(symbol, place, t);
+        return Result::Ok(());
+    }
+
+    /// A `match` expression: the subject once, the first matching arm's
+    /// value.
+    evaluate_match(mut &this, expression: ExpressionNode*, subject_expression: ExpressionNode*,
+                   arms: &[mut MatchArmNode*]) -> Result<Operand, Stop> {
+        const span: SourceSpan = expression.span;
+        const subject: Subject = this.subject(subject_expression)?;
+        for (mut a: i64 = 0; a < arms.length(); a++) {
+            const arm: MatchArmNode* = arms[a];
+            const chosen: i64 = this.matching_pattern(arm, &subject)?;
+            if (chosen < 0) { continue; }
+            this.push_scope();
+            this.bind_pattern(arm.patterns[chosen], subject.place, subject.subject_type, &subject)?;
+            if (arm.guard != null && !this.condition(arm.guard)?) {
+                this.pop_scope(span)?;
+                continue;
+            }
+            const value: Operand = this.evaluate_body_value(arm.body, expression.resolved_type, span)?;
+            this.pop_scope(span)?;
+            return Result::Ok(value);
+        }
+        return Result::Err(Interpreter::violation("a `match` no arm of which matches its subject", span));
+    }
+}

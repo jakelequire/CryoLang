@@ -1,0 +1,430 @@
+/// Calls: which function a call runs, read off the pins the type checker
+/// and the monomorphiser wrote; how its receiver and arguments bind to its
+/// parameters; running its body in a frame of its own; and dropping a
+/// value by its type's destructor and its members' glue.
+
+namespace compiler::interpret::calls;
+
+import compiler::ast::{ ArgBinding, MemberPin };
+import compiler::ast::declaration::{ DeclarationNode, DeclKind, FunctionDecl, ImplBlock, MethodDecl, VarDecl };
+import compiler::ast::expression::{ CallExpr, ExpressionNode, ExprKind, LambdaExpr, MemberAccessExpr, ScopeResolutionExpr };
+import compiler::ast::statement::{ Stmt };
+import compiler::decl_index::{ OverloadId };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::interpret::integer::{ IntegerKind };
+import compiler::interpret::interpreter::{ Binding, Flow, Frame, Interpreter, Operand };
+import compiler::interpret::memory::{ Address, AllocationKind, Scalar };
+import compiler::interpret::outcome::{ Stop };
+import compiler::interpret::shared_handles::{ CountedCall };
+import compiler::intrinsic_kind::{ IntrinsicKind };
+import compiler::resolver::lang_item::{ LangItem };
+import compiler::resolver::res::{ DefId };
+import compiler::types::{ TypeKind };
+import compiler::types::trait_checker::{ TraitChecker };
+import compiler::types::type_base::{ Type };
+import compiler::types::type_ref::{ TypeRef };
+
+/// What a call runs: a body to interpret, or a machine rule.
+type struct Callee {
+    /// The function whose body runs; null for a machine rule.
+    routine: FunctionDecl*;
+    /// The declaration-index entry, for a machine rule's identity.
+    entry:    OverloadId;
+    /// How the entry lowers: `Call` for a body or a foreign routine.
+    intrinsic: IntrinsicKind;
+    return_type: TypeRef;
+}
+
+implement struct Interpreter {
+    /// A call expression.
+    evaluate_call(mut &this, expression: ExpressionNode*, call: CallExpr*) -> Result<Operand, Stop> {
+        const span: SourceSpan = expression.span;
+        const callee: ExpressionNode* = call.callee;
+        if (call.resolved_callee.is_some()) {
+            const entry: OverloadId = call.resolved_callee.entry(this.ctx.decl_index);
+            const receiver: ExpressionNode* = match (callee.kind) {
+                ExprKind::MemberAccess(access) => { access.object }
+                _ => { null }
+            };
+            return this.call_entry(entry, receiver, &call.arguments, expression.resolved_type, span);
+        }
+        match (callee.kind) {
+            ExprKind::ScopeResolution(scope) => {
+                match (scope.resolved_member) {
+                    MemberPin::Variant(variant) => { return this.construct_variant(expression, variant, &call.arguments); }
+                    _ => { }
+                }
+            }
+            ExprKind::MemberAccess(access) => {
+                if (access.resolved_trait.is_valid()) { return this.call_through_object(expression, access, &call.arguments); }
+            }
+            _ => { }
+        }
+        // A function value the program computed.
+        return match (this.scalar_of(callee)?) {
+            Scalar::Function(entry) => { this.call_entry(entry, null, &call.arguments, expression.resolved_type, span) }
+            Scalar::Lambda(lambda)  => { this.call_lambda(lambda, &call.arguments, expression.resolved_type, span) }
+            _ => { Result::Err(Interpreter::violation("a call of a value that is no function", span)) }
+        };
+    }
+
+    /// An enum variant made with its payload: the payload's values in the
+    /// order written, then the variant's number.
+    construct_variant(mut &this, expression: ExpressionNode*, variant: i64, arguments: &[mut ExpressionNode*]) -> Result<Operand, Stop> {
+        const t: TypeRef = expression.resolved_type;
+        const place: Address = this.temporary(t);
+        for (mut i: i64 = 0; i < arguments.length(); i++) {
+            this.initialize(place.plus(this.layout.payload_offset(t, variant, i)), this.layout.payload_type(t, variant, i), arguments[i])?;
+        }
+        this.store(place, Scalar::Integer(variant as u64, IntegerKind::new(64, false)), expression.span)?;
+        this.complete_temporary(place);
+        return Result::Ok(Operand::Place(place));
+    }
+
+    /// What the declaration-index entry `entry` runs.
+    callee_of(&this, entry: OverloadId, span: SourceSpan) -> Result<Callee, Stop> {
+        const decl: DeclarationNode* = this.ctx.decl_index.entry_decl(entry);
+        if (decl == null) { return Result::Err(Interpreter::violation("a call pinned to an entry with no declaration", span)); }
+        const kind: IntrinsicKind = this.ctx.decl_index.entry_intrinsic_kind(entry);
+        match (decl.kind) {
+            DeclKind::Intrinsic(declared) => {
+                return Result::Ok(Callee { routine: null, entry: entry, intrinsic: kind, return_type: declared.resolved_return_type });
+            }
+            _ => { }
+        }
+        mut routine: FunctionDecl* = DeclarationNode::fn_of(decl);
+        if (routine == null) {
+            const method: MethodDecl* = DeclarationNode::method_of(decl);
+            if (method != null) { routine = DeclarationNode::fn_of(method.func); }
+        }
+        if (routine == null) { return Result::Err(Interpreter::violation("a call pinned to a declaration that is no function", span)); }
+        if (routine.body == null || routine.is_intrinsic) {
+            return Result::Ok(Callee { routine: null, entry: entry, intrinsic: kind, return_type: routine.resolved_return_type });
+        }
+        return Result::Ok(Callee { routine: routine, entry: entry, intrinsic: kind, return_type: routine.resolved_return_type });
+    }
+
+    /// Call `entry`, `receiver` the object of a method call written
+    /// `object.method(..)` (null for any other call), with `arguments`.
+    call_entry(mut &this, entry: OverloadId, receiver: ExpressionNode*, arguments: &[mut ExpressionNode*],
+               result: TypeRef, span: SourceSpan) -> Result<Operand, Stop> {
+        const callee: Callee = this.callee_of(entry, span)?;
+        if (callee.routine == null) { return this.machine(callee, receiver, arguments, result, span); }
+        const routine: FunctionDecl* = callee.routine;
+        mut staged: [Binding] = [];
+        mut first: i64 = 0;
+        if (receiver != null && routine.parameters.length() > 0) {
+            const parameter: VarDecl* = DeclarationNode::var_of(routine.parameters[0]);
+            if (parameter != null && parameter.is_receiver()) {
+                staged.push(this.bind_receiver(parameter, receiver, span)?);
+                first = 1;
+            }
+        }
+        for (mut i: i64 = 0; i < arguments.length(); i++) {
+            if (first + i >= routine.parameters.length()) {
+                return Result::Err(Interpreter::not_covered("a call passing more arguments than its function declares", span));
+            }
+            const parameter: VarDecl* = DeclarationNode::var_of(routine.parameters[first + i]);
+            staged.push(this.bind_argument(parameter, arguments[i], span)?);
+        }
+        mut counted: Option<CountedCall> = Option::None;
+        if (first == 1) { counted = this.begin_counted(routine, staged[0], span)?; }
+        const returned: Operand = this.call_body(routine.body, staged, this.result_slot(result), result, span)?;
+        match (counted) {
+            Option::Some(call) => { this.end_counted(call, returned, span)?; }
+            Option::None => { }
+        }
+        return Result::Ok(returned);
+    }
+
+    /// Call the closure `lambda`, which captures nothing, with `arguments`
+    /// bound to its parameters.
+    call_lambda(mut &this, lambda: LambdaExpr*, arguments: &[mut ExpressionNode*], result: TypeRef,
+                span: SourceSpan) -> Result<Operand, Stop> {
+        if (arguments.length() != lambda.parameters.length()) {
+            return Result::Err(Interpreter::violation("a closure called with another number of arguments than it declares", span));
+        }
+        mut staged: [Binding] = [];
+        for (mut i: i64 = 0; i < arguments.length(); i++) {
+            staged.push(this.bind_argument(DeclarationNode::var_of(lambda.parameters[i]), arguments[i], span)?);
+        }
+        return this.call_body(lambda.body, staged, this.result_slot(result), result, span);
+    }
+
+    /// Where an aggregate result of type `t` goes: a temporary of the
+    /// caller's; null for a scalar result.
+    result_slot(mut &this, t: TypeRef) -> Address {
+        if (this.layout.is_aggregate(t)) { return this.temporary(t); }
+        return Address::null();
+    }
+
+    /// A parameter bound to an argument: its storage, filled with the
+    /// argument's value, or the argument's address where the parameter is a
+    /// reference the argument is passed to by value.
+    bind_argument(mut &this, parameter: VarDecl*, argument: ExpressionNode*, span: SourceSpan) -> Result<Binding, Stop> {
+        const t: TypeRef = parameter.resolved_type;
+        const allocation: i64 = this.memory.allocate(this.layout.cells(t), AllocationKind::Stack);
+        const place: Address = Address::at(allocation, 0);
+        if (argument.autoref) {
+            const target: Address = this.place_of(argument)?;
+            this.store(place, Scalar::Pointer(target), span)?;
+        } else {
+            this.initialize(place, t, argument)?;
+        }
+        return Result::Ok(Binding { symbol: parameter.sym_id, allocation: allocation, offset: 0, binding_type: t, owns: true });
+    }
+
+    /// The receiver parameter bound to the object of a method call.  In a
+    /// `&this` or `mut &this` method `this` names the value the object
+    /// reaches, where it lies (the type checker types it as that value);
+    /// in a `this` method it is the value itself, moved in.
+    bind_receiver(mut &this, parameter: VarDecl*, object: ExpressionNode*, span: SourceSpan) -> Result<Binding, Stop> {
+        const t: TypeRef = parameter.resolved_type;
+        if (parameter.is_ref_receiver()) {
+            const owner: TypeRef = this.receiver_owner(t);
+            return Result::Ok(Interpreter::receiver_in_place(parameter, this.receiver_place(object, owner)?, owner));
+        }
+        const allocation: i64 = this.memory.allocate(this.layout.cells(t), AllocationKind::Stack);
+        this.move_value(Address::at(allocation, 0), this.receiver_place(object, t)?, t, span)?;
+        return Result::Ok(Binding { symbol: parameter.sym_id, allocation: allocation, offset: 0, binding_type: t, owns: true });
+    }
+
+    /// The type a `&this` receiver of type `t` names: the referent of the
+    /// reference it is declared as.
+    receiver_owner(&this, t: TypeRef) -> TypeRef {
+        const referent: TypeRef = this.layout.pointee(t);
+        if (referent.is_valid()) { return referent; }
+        return t;
+    }
+
+    /// The `&this` receiver `parameter` naming the value of type `owner`
+    /// at `target`.
+    static receiver_in_place(parameter: VarDecl*, target: Address, owner: TypeRef) -> Binding {
+        return Binding { symbol: parameter.sym_id, allocation: target.allocation, offset: target.offset, binding_type: owner, owns: false };
+    }
+
+    /// The place of the value of type `owner` a method's object reaches:
+    /// the object itself, or what it points at, through as many
+    /// references and pointers as it takes.
+    receiver_place(mut &this, object: ExpressionNode*, owner: TypeRef) -> Result<Address, Stop> {
+        mut t: TypeRef = object.resolved_type;
+        mut place: Address = this.place_of(object)?;
+        const wanted: TypeRef = this.layout.concrete(owner);
+        for (mut guard: i32 = 0; guard < 16; guard++) {
+            if (this.layout.concrete(t).equals(wanted)) { return Result::Ok(place); }
+            const target: TypeRef = this.layout.pointee(t);
+            if (!target.is_valid()) { return Result::Ok(place); }
+            place = match (this.load(place, object.span)?) {
+                Scalar::Pointer(address) => { this.reach(address, target, object.span)? }
+                _ => { return Result::Err(Interpreter::violation("a method called through a value that is no pointer", object.span)); }
+            };
+            t = target;
+        }
+        return Result::Ok(place);
+    }
+
+    /// Run a function's or a closure's `body` in a new frame whose
+    /// parameters are `staged`, an aggregate result written to `slot`.  The
+    /// frame's temporaries, scopes and bindings are released when it ends,
+    /// however it ends.
+    call_body(mut &this, body: Stmt*, staged: [Binding], slot: Address, result: TypeRef,
+              span: SourceSpan) -> Result<Operand, Stop> {
+        if (this.frames.length() >= Interpreter::DEEPEST_CALL) {
+            return Result::Err(Interpreter::violation("calls nested deeper than the interpreter's limit", span));
+        }
+        const frame: Frame = Frame {
+            binding_base: this.bindings.length(), scope_base: this.scope_marks.length(),
+            temporary_base: this.temporaries.length(), return_slot: slot, return_type: result,
+        };
+        this.frames.push(frame);
+        for (mut i: i64 = 0; i < staged.length(); i++) { this.bindings.push(staged[i]); }
+        mut returned: boolean = false;
+        match (this.execute(body)) {
+            Result::Ok(flow) => {
+                match (flow) { Flow::Return => { returned = true; } _ => { } }
+            }
+            Result::Err(stop) => {
+                if (!stop.is_return()) { return Result::Err(stop); }
+                returned = true;
+            }
+        }
+        this.release_temporaries(frame.temporary_base, span)?;
+        while (this.scope_marks.length() > frame.scope_base) { this.scope_marks.pop(); }
+        this.release_bindings(frame.binding_base, span)?;
+        this.frames.pop();
+        if (!slot.is_null()) {
+            if (!returned) { return Result::Err(Interpreter::violation("a function returning a value ended without a `return`", span)); }
+            return Result::Ok(Operand::Place(slot));
+        }
+        if (this.layout.cells(result) == 0 || !returned) { return Result::Ok(Operand::Nothing); }
+        return Result::Ok(Operand::Value(this.returned));
+    }
+
+    /// A method called through a trait object: the method at the call's
+    /// slot of the call's declaring trait - the object's own or a
+    /// supertrait - in that trait's implementation among those the
+    /// object's table holds (`object_table_traits`, and the implementations
+    /// the type checker recorded with the table).
+    call_through_object(mut &this, expression: ExpressionNode*, access: MemberAccessExpr*,
+                        arguments: &[mut ExpressionNode*]) -> Result<Operand, Stop> {
+        const span: SourceSpan = expression.span;
+        const object: Scalar = this.object_value(access.object)?;
+        const target: Address = match (object) { Scalar::Object(address, _) => { address } _ => { Address::null() } };
+        const table: mut ImplBlock* = match (object) {
+            Scalar::Object(_, block) => { block as mut ImplBlock* }
+            _ => { return Result::Err(Interpreter::violation("a trait method called on a value that is no trait object", span)); }
+        };
+        const traits: [DefId] = this.ctx.generic_registry.object_table_traits(table.trait_def);
+        if (traits.length() != table.object_table_blocks.length()) {
+            return Result::Err(Interpreter::violation("a trait object whose table records another number of implementations than it has traits", span));
+        }
+        mut implementation: mut ImplBlock* = null;
+        for (mut k: i64 = 0; k < traits.length(); k++) {
+            if (traits[k].equals(access.resolved_trait)) { implementation = table.object_table_blocks[k]; }
+        }
+        if (implementation == null) {
+            return Result::Err(Interpreter::violation("a trait object call naming a trait its table does not hold", span));
+        }
+        const method_decl: DeclarationNode* = this.ctx.generic_registry.trait_item_method(implementation, access.resolved_trait_slot);
+        const method: MethodDecl* = if (method_decl == null) { null } else { DeclarationNode::method_of(method_decl) };
+        const routine: FunctionDecl* = if (method == null) { null } else { DeclarationNode::fn_of(method.func) };
+        if (routine == null || routine.body == null) {
+            return Result::Err(Interpreter::violation("a trait object whose implementation has no method at the call's slot", span));
+        }
+        mut staged: [Binding] = [];
+        const receiver: VarDecl* = DeclarationNode::var_of(routine.parameters[0]);
+        staged.push(Interpreter::receiver_in_place(receiver, target, this.receiver_owner(receiver.resolved_type)));
+        for (mut i: i64 = 0; i < arguments.length(); i++) {
+            staged.push(this.bind_argument(DeclarationNode::var_of(routine.parameters[i + 1]), arguments[i], span)?);
+        }
+        const result: TypeRef = expression.resolved_type;
+        return this.call_body(routine.body, staged, this.result_slot(result), result, span);
+    }
+
+    /// The trait object `object` evaluates to, through any references to
+    /// one.
+    object_value(mut &this, object: ExpressionNode*) -> Result<Scalar, Stop> {
+        mut value: Scalar = this.scalar_of(object)?;
+        for (mut guard: i32 = 0; guard < 16; guard++) {
+            match (value) {
+                Scalar::Object(_, _) => { return Result::Ok(value); }
+                Scalar::Pointer(address) => { value = this.load(address, object.span)?; }
+                _ => { return Result::Ok(value); }
+            }
+        }
+        return Result::Ok(value);
+    }
+
+    /// `bytes` bytes aligned to `alignment`, from the function claiming the
+    /// `alloc` language item - the allocation a construct the language
+    /// lowers itself makes - its body interpreted: the address it gives.
+    allocate_through_item(mut &this, bytes: i64, alignment: i64, span: SourceSpan) -> Result<Address, Stop> {
+        const item: DefId = this.ctx.generic_registry.wellknown(LangItem::Alloc);
+        const decl: DeclarationNode* = if (item.is_valid()) { this.ctx.decl_index.declaration_of(item) } else { null };
+        const routine: FunctionDecl* = if (decl == null) { null } else { DeclarationNode::fn_of(decl) };
+        if (routine == null || routine.body == null || routine.parameters.length() != 2) {
+            return Result::Err(Interpreter::not_covered("an allocation with no function claiming the `alloc` language item", span));
+        }
+        const values: [u64] = [bytes as u64, alignment as u64];
+        mut staged: [Binding] = [];
+        for (mut i: i64 = 0; i < 2; i++) {
+            const parameter: VarDecl* = DeclarationNode::var_of(routine.parameters[i]);
+            const kind: IntegerKind = match (this.layout.integer_kind(parameter.resolved_type)) {
+                Option::Some(found) => { found }
+                Option::None => { return Result::Err(Interpreter::violation("the `alloc` language item's function takes no integer size", span)); }
+            };
+            const allocation: i64 = this.memory.allocate(1, AllocationKind::Stack);
+            this.store(Address::at(allocation, 0), Scalar::Integer(kind.reduce(values[i]), kind), span)?;
+            staged.push(Binding { symbol: parameter.sym_id, allocation: allocation, offset: 0, binding_type: parameter.resolved_type, owns: true });
+        }
+        return match (this.call_body(routine.body, staged, Address::null(), routine.resolved_return_type, span)?) {
+            Operand::Value(Scalar::Pointer(address)) => { Result::Ok(address) }
+            _ => { Result::Err(Interpreter::violation("the `alloc` language item's function gave no address", span)) }
+        };
+    }
+
+    // ---- Drops ----
+
+    /// Drop the value of type `t` at `place`, if it still holds one: its
+    /// type's destructor first, then its members' glue, each member that
+    /// still holds a value (docs/cryo.md section 15.2).  The place holds
+    /// nothing afterwards.
+    drop_place(mut &this, place: Address, t: TypeRef, span: SourceSpan) -> Result<(), Stop> {
+        if (place.is_null() || !this.needs_drop(t)) { return Result::Ok(()); }
+        const cells: i64 = this.layout.cells(t);
+        if (cells == 0 || !this.holds_any(place, cells)) { return Result::Ok(()); }
+        this.note_shared_drop(place, t);
+        const destructor: FunctionDecl* = this.destructor_of(t);
+        if (destructor != null) {
+            const receiver: VarDecl* = DeclarationNode::var_of(destructor.parameters[0]);
+            const binding: Binding = Interpreter::receiver_in_place(receiver, place, t);
+            mut staged: [Binding] = [];
+            staged.push(binding);
+            const counted: Option<CountedCall> = this.begin_counted(destructor, binding, span)?;
+            // A drop runs while a `return`'s value may be on its way out of
+            // the scope being left; the destructor's own calls leave it as
+            // it was.
+            const pending: Scalar = this.returned;
+            this.call_body(destructor.body, staged, Address::null(), destructor.resolved_return_type, span)?;
+            this.returned = pending;
+            match (counted) {
+                Option::Some(call) => { this.end_counted(call, Operand::Nothing, span)?; }
+                Option::None => { }
+            }
+        }
+        const ty: Type* = this.layout.type_of(t);
+        match (ty.kind) {
+            TypeKind::Struct => {
+                for (mut i: i64 = 0; i < this.layout.field_count(t); i++) {
+                    this.drop_place(place.plus(this.layout.field_offset(t, i)), this.layout.field_type(t, i), span)?;
+                }
+            }
+            TypeKind::Tuple => {
+                for (mut i: i64 = 0; i < this.layout.field_count(t); i++) {
+                    this.drop_place(place.plus(this.layout.field_offset(t, i)), this.layout.field_type(t, i), span)?;
+                }
+            }
+            TypeKind::Enum => {
+                match (this.memory.read(place)) {
+                    Result::Ok(_) => {
+                        const variant: i64 = this.variant_of(place, span)?;
+                        for (mut i: i64 = 0; i < this.layout.payload_count(t, variant); i++) {
+                            this.drop_place(place.plus(this.layout.payload_offset(t, variant, i)), this.layout.payload_type(t, variant, i), span)?;
+                        }
+                    }
+                    Result::Err(_) => { }
+                }
+            }
+            TypeKind::Array => {
+                const element: TypeRef = ty.as_array().element;
+                const each: i64 = this.layout.cells(element);
+                for (mut i: i64 = 0; i < ty.as_array().size; i++) { this.drop_place(place.plus(i * each), element, span)?; }
+            }
+            _ => { }
+        }
+        this.memory.mark_moved(place, cells);
+        return Result::Ok(());
+    }
+
+    /// The `drop` of the `Drop` implementation for `t`, or null when `t`
+    /// has none: the implementation the trait checker selects for `t`, and
+    /// in it the method at the trait's `drop` slot.
+    destructor_of(&this, t: TypeRef) -> FunctionDecl* {
+        if (this.is_copy(t)) { return null; }
+        const drop_method: DefId = this.ctx.generic_registry.wellknown(LangItem::DropDrop);
+        if (!drop_method.is_valid()) { return null; }
+        const checker: TraitChecker = TraitChecker::new(this.ctx.type_arena, this.ctx.generic_registry,
+            this.ctx.intern_table, this.ctx.diagnostics, this.ctx.type_resolver);
+        const block: mut ImplBlock* = checker.select_impl(this.ctx.defs.parent_of(drop_method), t, 0);
+        if (block == null) { return null; }
+        const method_decl: DeclarationNode* = this.ctx.generic_registry.trait_item_method(block,
+            this.ctx.generic_registry.trait_item_position(drop_method));
+        if (method_decl == null) { return null; }
+        const method: MethodDecl* = DeclarationNode::method_of(method_decl);
+        if (method == null) { return null; }
+        return DeclarationNode::fn_of(method.func);
+    }
+
+    /// How deep calls may nest before a run is refused.
+    const DEEPEST_CALL: i64 = 4096;
+}

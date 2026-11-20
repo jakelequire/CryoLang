@@ -1239,15 +1239,16 @@ the self-test, an old-seed reproduction check and a corpus. Items 7 to 12
 are the tools that use what the stages generate; most of them belong to
 CryoGate, which runs compilers, while CryoSmith stays a generator.
 
-**A compiler bug the corpus finds is fixed, not avoided.** The fix lands on
-this branch as any compiler change does: a test of the shape, the pin as
-the control, a mutation the test refuses, and `make verify` with its
-declarations. The generator is then left generating the shape. A keep-off
-(a shape the generator avoids, written under "Kept off" in section 2 with
-the bug that needs it) is allowed only while that bug's fix is queued in
-the same session, or when the fix is clearly a large project of its own,
-which is then put to the maintainer as a question rather than left in
-place.
+**A compiler or standard library bug the corpus finds is filed, not
+fixed here.** It gets a bug file with a minimal repro, and work goes on.
+The generator keeps off the shape, written under "Kept off" in section 2
+with the bug file that records it. A seed the interpreter disagrees on
+because of such a bug is reported as "known compiler bug NNNN" in the
+coverage count, never as agreeing. The exception is a bug whose keep-off
+would itself be a large workaround: that one is fixed as any compiler
+change is - a test of the shape, the pin as the control, a mutation the
+test refuses, and `make verify` with its declarations. A defect in the
+interpreter's own code is always fixed.
 
 **What proves a change.**
 
@@ -1623,8 +1624,54 @@ generator never reads through an `Rc`.
     validity under that plan's rules as well as today's. Once the
     interpreter (item 12) is on this branch, the gate also evaluates each
     program with `--interpret` and requires the pinned line there too.
-12. **The reference interpreter.** An evaluator over the program model
-    (section 1) that computes the hash without compiling: an oracle that
-    does not share the compiler's mistakes. CryoSmith gains an `evaluate`
-    command, or a library CryoGate links, and the corpus check compares
-    the compiled programs' hash with the evaluated one.
+12. **The reference interpreter.** `cryo interpret`, a module of the
+    compiler that runs the typed program the front end leaves - not
+    CryoSmith's own model, which would check the generator against itself
+    - by the language reference, with an explicit memory model and its own
+    account of moves and drops: an oracle that does not share code
+    generation's mistakes. It is one more configuration on the runner
+    smith-diff and corpus-check share (`Configuration::interpreted`):
+    `cryogate corpus-check --interpret` and `smith-diff --interpret`
+    compare its hash with the compiled programs', and a program it does
+    not cover (exit 71, the construct named) is left out of the
+    comparison, never counted as agreeing. Its design, its coverage by
+    stage and the comparison are in INTERPRETER.md.
+
+**Merging the interpreter's branch into this one.** The interpreter was
+built on its own branch, `cryosmith-interp`, which took this branch's
+commits by merging them in. It joins this branch by the same route the
+other way:
+
+1. On the interpreter's branch, merge this branch's tip. The conflicts are
+   additive: both branches add lines at the end of
+   `tests/started-compiling` (keep both); `corpus_check.cryo` gains
+   `--interpret` on one side and the shared runner with `--expect`/`--pin`
+   on the other, and the interpretation becomes a configuration on that
+   runner, judged after the builds' line (and a pinned seed's line) is
+   settled, so a run without `--interpret` reports the same bytes as
+   before; CryoGate's `tests/smith.cryo` gains tests on both sides (keep
+   both, imports joined); and item 11 above is this branch's text while
+   item 12 is the interpreter branch's. The move check
+   (`passes/move_check.cryo`) merges without a conflict but is changed on
+   both sides, so it is read again after the merge.
+2. The merged tree passes the full batch against this branch's tip as the
+   baseline: verify with `--require-identical` (the census, the smith gate
+   on `tests/smith-corpus`, and the objects, each moved one already
+   declared by the commit that moved it), `warnings-check` with its
+   planted control, the selfhost check on both arms, and
+   `corpus-check --interpret` on the 200 default seeds with every seed
+   interpreted and agreeing or a known compiler bug.
+3. This branch fast-forwards to the merged commit, and `cryosmith-interp`
+   is retired.
+4. Item 11's gate then interprets its pinned corpus as well: verify's
+   `smith` gate runs `corpus-check --expect tests/smith-corpus
+   --interpret`, so each pinned program must print its pinned line when
+   interpreted too, and a seed the interpreter does not cover fails the
+   gate rather than being skipped. The change lands with a CryoGate test
+   and a mutation (an interpreter that changes one rule fails the gate).
+5. The generator's keep-off ("Kept off", section 2: a `match` arm
+   assigning its subject inside a generic body) is lifted: its fix, a
+   `Copy` payload binding copied into a slot of its own in a generic
+   function's copy, is on the interpreter's branch and arrives with the
+   merge. Lifting it changes what the generator writes, so it is a new
+   generator version and re-pins `tests/smith-corpus` in the same commit.

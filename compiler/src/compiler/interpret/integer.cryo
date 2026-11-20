@@ -1,0 +1,240 @@
+/// Integer arithmetic by the language reference, independent of how code
+/// generation lowers it: every result is computed exactly on the operand
+/// bits and reduced to its type's width at the operation that made it.
+
+namespace compiler::interpret::integer;
+
+/// An integer type as the interpreter computes with it: its width in bits
+/// (8 to 128) and whether it is signed.
+type struct IntegerKind {
+    width:  u32;
+    signed: boolean;
+
+    static new(width: u32, signed: boolean) -> IntegerKind {
+        return IntegerKind { width: width, signed: signed };
+    }
+
+    /// The bits of the type's width set.
+    mask(&this) -> u128 {
+        if (this.width >= 128) { return u128::MAX; }
+        return (1 << (this.width as u128)) - 1;
+    }
+
+    /// `bits` reduced to this width, as the stored representation: the low
+    /// `width` bits, sign-extended to 128 for a signed type.
+    reduce(&this, bits: u128) -> u128 {
+        const low: u128 = bits & this.mask();
+        if (!this.signed || this.width >= 128) { return low; }
+        const sign: u128 = 1 << ((this.width - 1) as u128);
+        if ((low & sign) != 0) { return low | (~this.mask()); }
+        return low;
+    }
+
+    /// Whether `bits`, as this type stores it, is negative.
+    is_negative(&this, bits: u128) -> boolean {
+        return this.signed && (bits as i128) < 0;
+    }
+
+    /// The type's least value, as stored.
+    minimum(&this) -> u128 {
+        if (!this.signed) { return 0; }
+        return this.reduce(1 << ((this.width - 1) as u128));
+    }
+
+    /// `bits`, stored at `from`, converted to this type as `as` converts:
+    /// the true value's two's-complement bits truncated to this width.  A
+    /// stored value is already sign-extended (signed) or zero-extended
+    /// (unsigned) to 128 bits, so the conversion is this type's reduction
+    /// of those bits.
+    converted(&this, from: IntegerKind, bits: u128) -> u128 {
+        return this.reduce(from.reduce(bits));
+    }
+
+    /// `bits` at this width with its bytes in reverse order.
+    byte_swapped(&this, bits: u128) -> u128 {
+        mut swapped: u128 = 0;
+        for (mut i: u32 = 0; i < this.width / 8; i++) {
+            swapped = (swapped << 8) | ((bits >> ((i * 8) as u128)) & 255);
+        }
+        return swapped;
+    }
+
+    /// How many of the low `width` bits of `bits` are set.
+    set_bits(&this, bits: u128) -> u32 {
+        mut count: u32 = 0;
+        for (mut i: u32 = 0; i < this.width; i++) {
+            if (((bits >> (i as u128)) & 1) != 0) { count = count + 1; }
+        }
+        return count;
+    }
+
+    /// How many bits at this width are zero above the highest set one: the
+    /// width itself for zero.
+    leading_zero_bits(&this, bits: u128) -> u32 {
+        mut count: u32 = 0;
+        while (count < this.width && ((bits >> ((this.width - 1 - count) as u128)) & 1) == 0) { count = count + 1; }
+        return count;
+    }
+
+    /// How many bits at this width are zero below the lowest set one: the
+    /// width itself for zero.
+    trailing_zero_bits(&this, bits: u128) -> u32 {
+        mut count: u32 = 0;
+        while (count < this.width && ((bits >> (count as u128)) & 1) == 0) { count = count + 1; }
+        return count;
+    }
+
+    /// `bits` at this width rotated left by `amount` modulo the width: the
+    /// bits leaving the top enter at the bottom.
+    rotated_left(&this, bits: u128, amount: u32) -> u128 {
+        const shift: u32 = amount % this.width;
+        const low: u128 = bits & this.mask();
+        if (shift == 0) { return low; }
+        return ((low << (shift as u128)) | (low >> ((this.width - shift) as u128))) & this.mask();
+    }
+}
+
+/// The value of a stored integer, as a sign and a magnitude, so two
+/// integers of any types compare by their true values.
+type struct TrueValue {
+    negative:  boolean;
+    magnitude: u128;
+
+    static of(kind: IntegerKind, bits: u128) -> TrueValue {
+        if (kind.is_negative(bits)) {
+            return TrueValue { negative: true, magnitude: (~bits) + 1 };
+        }
+        return TrueValue { negative: false, magnitude: bits };
+    }
+
+    /// The value as a signed 64-bit count - a length, an index, an offset;
+    /// one beyond that range keeps its low 64 bits.
+    signed_value(&this) -> i64 {
+        const low: i64 = this.magnitude as i64;
+        if (this.negative) { return 0 - low; }
+        return low;
+    }
+
+    /// -1, 0 or 1 as this value is below, equal to or above `other`.
+    compare(&this, other: &TrueValue) -> i32 {
+        if (this.negative && !other.negative) { return -1; }
+        if (!this.negative && other.negative) { return 1; }
+        if (this.magnitude == other.magnitude) { return 0; }
+        const below: boolean = this.magnitude < other.magnitude;
+        // Two negatives order the other way round by magnitude.
+        if (this.negative) { return if (below) { 1 } else { -1 }; }
+        return if (below) { -1 } else { 1 };
+    }
+}
+
+/// An arithmetic operation the reference defines on two integers of one
+/// type.
+type enum IntegerOperation {
+    Add;
+    Subtract;
+    Multiply;
+    Divide;
+    Remainder;
+    And;
+    Or;
+    Xor;
+    ShiftLeft;
+    ShiftRight;
+}
+
+/// Why an operation has no result: the reference leaves it undefined or
+/// faults on it.
+type enum IntegerFault {
+    None;
+    DivideByZero;
+    DivideOverflow;
+    ShiftTooWide;
+}
+
+/// One operation's result: its bits at the type, or the fault that stops it.
+type struct IntegerResult {
+    bits:  u128;
+    fault: IntegerFault;
+
+    static ok(bits: u128) -> IntegerResult {
+        return IntegerResult { bits: bits, fault: IntegerFault::None };
+    }
+
+    static faulted(fault: IntegerFault) -> IntegerResult {
+        return IntegerResult { bits: 0, fault: fault };
+    }
+
+    is_ok(&this) -> boolean {
+        return match (this.fault) {
+            IntegerFault::None => { true }
+            _                  => { false }
+        };
+    }
+}
+
+implement enum IntegerFault {
+    /// What the fault is, for a violation report.
+    describe(&this) -> string {
+        return match (this) {
+            IntegerFault::None           => { "no fault" }
+            IntegerFault::DivideByZero   => { "division or remainder by zero" }
+            IntegerFault::DivideOverflow => { "division or remainder of the least value by -1" }
+            IntegerFault::ShiftTooWide   => { "a shift by the width of its type or more" }
+        };
+    }
+}
+
+implement enum IntegerOperation {
+    /// `left op right` at `kind`, both operands stored at `kind`.  Addition,
+    /// subtraction and multiplication wrap: the exact result modulo 2^width
+    /// is the low bits of the 128-bit result, which `reduce` keeps.
+    /// Division truncates toward zero.  A shift amount is the right
+    /// operand's value, read at the right operand's own kind.
+    apply(&this, kind: IntegerKind, left: u128, right: u128, amount_kind: IntegerKind) -> IntegerResult {
+        return match (this) {
+            IntegerOperation::Add      => { IntegerResult::ok(kind.reduce(left.wrapping_add(right))) }
+            IntegerOperation::Subtract => { IntegerResult::ok(kind.reduce(left.wrapping_subtract(right))) }
+            IntegerOperation::Multiply => { IntegerResult::ok(kind.reduce(left.wrapping_multiply(right))) }
+            IntegerOperation::Divide    => { IntegerOperation::divide(kind, left, right, false) }
+            IntegerOperation::Remainder => { IntegerOperation::divide(kind, left, right, true) }
+            IntegerOperation::And => { IntegerResult::ok(kind.reduce(left & right)) }
+            IntegerOperation::Or  => { IntegerResult::ok(kind.reduce(left | right)) }
+            IntegerOperation::Xor => { IntegerResult::ok(kind.reduce(left ^ right)) }
+            IntegerOperation::ShiftLeft  => { IntegerOperation::shift(kind, left, right, amount_kind, true) }
+            IntegerOperation::ShiftRight => { IntegerOperation::shift(kind, left, right, amount_kind, false) }
+        };
+    }
+
+    static divide(kind: IntegerKind, left: u128, right: u128, remainder: boolean) -> IntegerResult {
+        if (right == 0) { return IntegerResult::faulted(IntegerFault::DivideByZero); }
+        if (!kind.signed) {
+            const quotient: u128 = if (remainder) { left % right } else { left / right };
+            return IntegerResult::ok(kind.reduce(quotient));
+        }
+        // -1 is stored as every bit set, whatever the signed type's width.
+        if (left == kind.minimum() && right == u128::MAX) {
+            return IntegerResult::faulted(IntegerFault::DivideOverflow);
+        }
+        const a: TrueValue = TrueValue::of(kind, left);
+        const b: TrueValue = TrueValue::of(kind, right);
+        // Truncation toward zero: the magnitudes divide, the quotient takes
+        // the sign of the operands' product, the remainder the dividend's.
+        const magnitude: u128 = if (remainder) { a.magnitude % b.magnitude } else { a.magnitude / b.magnitude };
+        const negative: boolean = if (remainder) { a.negative } else { a.negative != b.negative };
+        const bits: u128 = if (negative) { (~magnitude) + 1 } else { magnitude };
+        return IntegerResult::ok(kind.reduce(bits));
+    }
+
+    static shift(kind: IntegerKind, value: u128, amount: u128, amount_kind: IntegerKind, left: boolean) -> IntegerResult {
+        if (amount_kind.is_negative(amount) || amount >= (kind.width as u128)) {
+            return IntegerResult::faulted(IntegerFault::ShiftTooWide);
+        }
+        if (left) { return IntegerResult::ok(kind.reduce(value << amount)); }
+        if (kind.signed) {
+            // Arithmetic: the stored value is sign-extended to 128 bits, so
+            // a 128-bit arithmetic shift is the type's.
+            return IntegerResult::ok(kind.reduce(((value as i128) >> (amount as i128)) as u128));
+        }
+        return IntegerResult::ok(kind.reduce(value >> amount));
+    }
+}

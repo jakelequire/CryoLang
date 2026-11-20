@@ -198,6 +198,29 @@ not done. The remaining limits are here so nobody rediscovers them:
   specified.`** onto the last compile-fail file's line, which moves that
   file's verdict to the next line where verify cannot name it. The tree's own
   runner no longer prints it; a baseline that old does.
+- **A baseline compiler that refuses the tree's stdlib proves nothing.**
+  verify builds REV's `compiler/src` and `runtime/` but compiles every
+  program, the baseline's included, against the TREE's stdlib. When that
+  stdlib uses something REV's compiler refuses - a language item it does
+  not name (E0152) - every baseline build fails and the object comparison
+  has nothing to compare. Verify instead against a synthetic baseline: REV
+  with only the compiler files the refusal needs taken from the commit that
+  added them, kept to what the stdlib must have (a name table, not
+  behaviour), since what a borrowed file changes is invisible to the
+  comparison:
+
+  ```bash
+  export GIT_INDEX_FILE=<scratch>/index
+  git read-tree REV
+  git update-index --cacheinfo 100644,$(git rev-parse FIX:<path>),<path>
+  tree=$(git write-tree); unset GIT_INDEX_FILE
+  git update-ref refs/scratch/verify-base $(git commit-tree $tree -p REV -m "REV with FIX's <path>")
+  make verify ARGS="--baseline refs/scratch/verify-base --require-identical"
+  git update-ref -d refs/scratch/verify-base
+  ```
+
+  The baseline's cache key is its trees, so a synthetic commit rebuilt
+  later from the same files reuses the compiler already built.
 
 Read the log's **own summary line**, not a chained exit code — `make test;
 echo $?; tail log` reports `tail`'s status.

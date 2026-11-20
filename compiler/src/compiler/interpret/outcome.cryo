@@ -1,0 +1,83 @@
+/// How a run of the interpreter ends, and the exit code and report line
+/// each ending gives (tools/CryoSmith/INTERPRETER.md section 7).
+
+namespace compiler::interpret::outcome;
+
+import compiler::diag::source_span::{ SourceSpan };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fmt;
+
+/// Why a run stopped before its end.
+type enum StopKind {
+    /// The program panicked, as a compiled build would.
+    Panic;
+    /// The program broke a rule of the language or of memory.
+    Violation;
+    /// The program uses a construct the interpreter does not run yet.
+    NotCovered;
+    /// The program ran more steps than the limit.
+    StepLimit;
+    /// A `return` inside an expression (the failure arm of a `?`) leaving
+    /// its function: the call running the function catches it, so it never
+    /// ends a run.
+    Return;
+}
+
+/// A run stopped: why, where, and what to report.
+type struct Stop {
+    kind:    StopKind;
+    message: String;
+    span:    SourceSpan;
+
+    static panic(message: String, span: SourceSpan) -> Stop {
+        return Stop { kind: StopKind::Panic, message: message, span: span };
+    }
+
+    static violation(message: String, span: SourceSpan) -> Stop {
+        return Stop { kind: StopKind::Violation, message: message, span: span };
+    }
+
+    static not_covered(message: String, span: SourceSpan) -> Stop {
+        return Stop { kind: StopKind::NotCovered, message: message, span: span };
+    }
+
+    static step_limit(span: SourceSpan) -> Stop {
+        return Stop { kind: StopKind::StepLimit, message: String::new(), span: span };
+    }
+
+    static returning(span: SourceSpan) -> Stop {
+        return Stop { kind: StopKind::Return, message: String::new(), span: span };
+    }
+
+    /// Whether this is a `return` leaving its function, not an ending.
+    is_return(&this) -> boolean {
+        return match (this.kind) {
+            StopKind::Return => { true }
+            _                => { false }
+        };
+    }
+
+    /// The process exit code this stop gives.
+    exit_code(&this) -> i32 {
+        return match (this.kind) {
+            StopKind::Panic      => { 101 }
+            StopKind::Violation  => { 70 }
+            StopKind::NotCovered => { 71 }
+            StopKind::StepLimit  => { 72 }
+            StopKind::Return     => { 70 }
+        };
+    }
+
+    /// Write the stop's one report line to standard error.
+    report(&this) -> void {
+        const at: String = f"{this.span.file}:{this.span.start_line}:{this.span.start_col}";
+        match (this.kind) {
+            StopKind::Panic      => { fmt::eprintln(f"interpret: panic: {this.message} at {at}"); }
+            StopKind::Violation  => { fmt::eprintln(f"interpret: violation: {this.message} at {at}"); }
+            StopKind::NotCovered => { fmt::eprintln(f"interpret: not covered: {this.message} at {at}"); }
+            StopKind::StepLimit  => { fmt::eprintln(String::from_str(Str::new("interpret: step limit reached"))); }
+            StopKind::Return     => { fmt::eprintln(f"interpret: violation: a `return` that left no function at {at}"); }
+        }
+    }
+}

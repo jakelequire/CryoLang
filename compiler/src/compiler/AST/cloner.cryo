@@ -445,8 +445,16 @@ type struct ASTCloner {
             ExprKind::Lambda(n) => {
                 c = ExpressionNode::lambda_expr(node.span);
                 mut cl: mut LambdaExpr* = ExpressionNode::lambda_of(c);
+                // A lambda's parameters are declared in the body, and no
+                // signature of the copy's is built for them: their decided
+                // types are carried, as a local's are, and the copy's
+                // substitution rewrites them with the return type.
                 for (mut i: i64 = 0; i < n.parameters.length(); i++) {
-                    cl.add_parameter(this.clone_var_decl(n.parameters[i]));
+                    const parameter: DeclarationNode* = this.clone_var_decl(n.parameters[i]);
+                    if (this.carries_analysis) {
+                        DeclarationNode::var_of(parameter).resolved_type = DeclarationNode::var_of(n.parameters[i]).resolved_type;
+                    }
+                    cl.add_parameter(parameter);
                 }
                 if (n.return_type.is_valid()) {
                     cl.set_return_type(n.return_type);
@@ -674,7 +682,11 @@ type struct ASTCloner {
             }
             StmtKind::Break    => { StmtKind::Break }
             StmtKind::Continue => { StmtKind::Continue }
-            StmtKind::Expr(n)  => { StmtKind::Expr(new ExprStmt { expression: this.clone_expr(n.expression) }) }
+            StmtKind::Expr(n)  => {
+                StmtKind::Expr(new ExprStmt {
+                    expression: this.clone_expr(n.expression), releases_result: n.releases_result,
+                })
+            }
             StmtKind::Decl(n)  => {
                 StmtKind::Decl(new DeclStmt {
                     declaration: this.clone_decl(n.declaration),
@@ -1033,11 +1045,15 @@ type struct ASTCloner {
                     new_elems.push(PatternElement::Sub(ns));
                 }
                 PatternElement::Binding(pb) => {
+                    // The binding's decided type is carried, as a local's
+                    // is, and the copy's substitution rewrites it: code
+                    // generation reads it to copy a `Copy` payload on
+                    // entering the arm.
                     const nb: mut PatternBinding* = new PatternBinding {
                         name:   pb.name,
                         span:   pb.span,
                         sym_id: pb.sym_id,
-                        resolved_type: TypeRef::invalid(),
+                        resolved_type: if (this.carries_analysis) { pb.resolved_type } else { TypeRef::invalid() },
                         written_mut: pb.written_mut,
                     };
                     new_elems.push(PatternElement::Binding(nb));
@@ -1194,9 +1210,12 @@ type struct ASTCloner {
             PatternKind::Literal(n)  => { PatternKind::Literal(LiteralPattern::new(n.value, n.literal_kind)) }
             PatternKind::Range(n)    => { PatternKind::Range(RangePattern::new(n.low, n.high, n.literal_kind)) }
             PatternKind::Binding(n)  => {
-                // A clone is typed when its own body is checked.
+                // The decided type is carried as an enum pattern's
+                // bindings' are; a copy the type check walks from scratch
+                // types it there.
                 mut b: mut BindingPattern* = BindingPattern::new(n.name);
                 b.binding_sym = n.binding_sym;
+                if (this.carries_analysis) { b.binding_type = n.binding_type; }
                 PatternKind::Binding(b)
             }
             PatternKind::Constant(n) => {

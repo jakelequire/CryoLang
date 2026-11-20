@@ -1,0 +1,378 @@
+/// The interpreter: runs a program's `main` by walking the typed tree the
+/// front end left (tools/CryoSmith/INTERPRETER.md).  The state of a run is
+/// here - memory, the call frames, the bindings and temporaries they hold,
+/// the module-level variables - and the walk is in `statements.cryo`,
+/// `expressions.cryo`, `calls.cryo` and `machine.cryo`.
+
+namespace compiler::interpret::interpreter;
+
+import compiler::compilation_context::{ CompilationContext };
+import compiler::ast::declaration::{ DeclarationNode, FunctionDecl, VarDecl };
+import compiler::ast::expression::{ ExpressionNode };
+import compiler::diag::source_span::{ SourceSpan };
+import compiler::interpret::integer::{ IntegerKind };
+import compiler::interpret::layout::{ Layout };
+import compiler::interpret::memory::{ AccessFault, Address, AllocationKind, CellState, Memory, Scalar };
+import compiler::interpret::outcome::{ Stop };
+import compiler::resolver::res::{ DefId };
+import compiler::resolver::symbol_id::{ SymbolID };
+import compiler::types::ownership::{ OwnershipQuery };
+import compiler::types::type_ref::{ TypeRef };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+/// A local a running frame holds: the binding's symbol, its place and its
+/// type.  A binding that owns its storage is dropped and ended with its
+/// scope; one that names a place inside another value (a `match` binding
+/// in place) is neither.
+type struct Binding {
+    symbol:       SymbolID;
+    allocation:   i64;
+    offset:       i64;
+    binding_type: TypeRef;
+    owns:         boolean;
+}
+
+/// A temporary a statement made: an aggregate value no binding names.
+type struct Temporary {
+    allocation: i64;
+    value_type: TypeRef;
+}
+
+/// A running call: where its bindings, scopes and temporaries begin on the
+/// interpreter's stacks, and where its result goes.
+type struct Frame {
+    binding_base:   i64;
+    scope_base:     i64;
+    temporary_base: i64;
+    /// Where an aggregate result is written; null for a scalar result.
+    return_slot:    Address;
+    return_type:    TypeRef;
+}
+
+/// How a statement ended.
+type enum Flow {
+    Normal;
+    Break;
+    Continue;
+    Return;
+}
+
+/// What an expression evaluated to: a scalar, the place an aggregate value
+/// is in, or nothing (a `void` or unit expression).
+type enum Operand {
+    Value(Scalar);
+    Place(Address);
+    Nothing;
+}
+
+/// A module-level variable's storage, made the first time it is read.
+type struct Global {
+    definition: DefId;
+    allocation: i64;
+}
+
+/// How many live `Rc` handles point at one block.
+type struct HandleCount {
+    block:   i64;
+    handles: i64;
+}
+
+/// An `rc_release` running: the block its handle pointed at, the type of
+/// the value the block shares, and whether that value has been dropped
+/// since the release began.
+type struct Release {
+    block:      i64;
+    value_type: TypeRef;
+    dropped:    boolean;
+}
+
+/// A string literal's bytes, made once per literal node.
+type struct LiteralBytes {
+    node:       ExpressionNode*;
+    allocation: i64;
+}
+
+type struct Interpreter {
+    ctx:     mut CompilationContext*;
+    layout:  Layout;
+    memory:  Memory;
+    frames:      [Frame];
+    bindings:    [Binding];
+    scope_marks: [i64];
+    temporaries: [Temporary];
+    globals:     [Global];
+    literals:    [LiteralBytes];
+    /// The scalar a `return` handed back, read by the call that ran it.
+    returned:    Scalar;
+    /// What the program wrote to its standard output.
+    output:      String;
+    steps:       u64;
+    step_limit:  u64;
+    /// The live `Rc` handles pointing at each block (`shared_handles.cryo`).
+    handle_counts: [HandleCount];
+    /// The `rc_release` calls running, the newest last.
+    releases:      [Release];
+    /// Where the random sources' stream is (`machine.cryo`'s `fill_random`).
+    random_state:  u64;
+
+    /// An interpreter over the program analysed in `ctx`, stopping after
+    /// `step_limit` steps.
+    static new(ctx: mut CompilationContext*, step_limit: u64) -> Interpreter {
+        return Interpreter {
+            ctx:         ctx,
+            layout:      Layout::new(ctx.type_arena),
+            memory:      Memory::new(),
+            frames:      [],
+            bindings:    [],
+            scope_marks: [],
+            temporaries: [],
+            globals:     [],
+            literals:    [],
+            handle_counts: [],
+            releases:      [],
+            random_state:  0,
+            returned:    Scalar::Boolean(false),
+            output:      String::new(),
+            steps:       0,
+            step_limit:  step_limit,
+        };
+    }
+
+    /// Run the program's `main` to its end: its exit code, or why it
+    /// stopped.  A run that ends with a heap block still allocated has
+    /// leaked, which is a violation.
+    run(mut &this) -> Result<i32, Stop> {
+        const main: FunctionDecl* = this.find_main();
+        if (main == null) {
+            return Result::Err(Stop::not_covered(String::from_str(Str::new("a program with no `main`")), SourceSpan::none()));
+        }
+        const result: Operand = this.call_body(main.body, [], Address::null(), main.resolved_return_type, main.body.span)?;
+        mut code: i32 = 0;
+        match (result) {
+            Operand::Value(value) => {
+                match (value) {
+                    Scalar::Integer(bits, _) => { code = bits as i32; }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        const leaked: i64 = this.memory.leaked();
+        if (leaked > 0) {
+            return Result::Err(Stop::violation(f"{leaked} heap block(s) still allocated at exit: a leak", main.body.span));
+        }
+        return Result::Ok(code);
+    }
+
+    /// The program's entry point, the definition the build recorded as it.
+    find_main(&this) -> FunctionDecl* {
+        if (!this.ctx.entry_fn.is_valid()) { return null; }
+        const decl: DeclarationNode* = this.ctx.decl_index.declaration_of(this.ctx.entry_fn);
+        if (decl == null) { return null; }
+        return DeclarationNode::fn_of(decl);
+    }
+
+    /// The steps a run takes before it is stopped, unless the command
+    /// line says otherwise.
+    const DEFAULT_STEP_LIMIT: u64 = 200000000;
+
+    // ---- Steps ----
+
+    /// Count one step, refusing to go past the limit.
+    step(mut &this, span: SourceSpan) -> Result<(), Stop> {
+        this.steps = this.steps + 1;
+        if (this.steps > this.step_limit) { return Result::Err(Stop::step_limit(span)); }
+        return Result::Ok(());
+    }
+
+    // ---- Reports ----
+
+    /// A violation of a memory rule, at `span`.
+    fault(&this, fault: AccessFault, span: SourceSpan) -> Stop {
+        return Stop::violation(String::from_str(Str::new(fault.describe())), span);
+    }
+
+    static violation(text: string, span: SourceSpan) -> Stop {
+        return Stop::violation(String::from_str(Str::new(text)), span);
+    }
+
+    static not_covered(text: string, span: SourceSpan) -> Stop {
+        return Stop::not_covered(String::from_str(Str::new(text)), span);
+    }
+
+    // ---- Memory through the reports ----
+
+    /// The scalar at `address`, or the violation reading it is.
+    load(&this, address: Address, span: SourceSpan) -> Result<Scalar, Stop> {
+        return match (this.memory.read(address)) {
+            Result::Ok(value)  => { Result::Ok(value) }
+            Result::Err(fault) => { Result::Err(this.fault(fault, span)) }
+        };
+    }
+
+    /// Store `value` at `address`, or report the violation storing it is.
+    store(mut &this, address: Address, value: Scalar, span: SourceSpan) -> Result<(), Stop> {
+        const fault: AccessFault = this.memory.write(address, value);
+        if (!fault.is_none()) { return Result::Err(this.fault(fault, span)); }
+        return Result::Ok(());
+    }
+
+    // ---- Scopes and bindings ----
+
+    push_scope(mut &this) -> void {
+        this.scope_marks.push(this.bindings.length());
+    }
+
+    /// Leave the innermost scope: drop what its bindings still hold, in
+    /// reverse order of declaration, and end their storage.
+    pop_scope(mut &this, span: SourceSpan) -> Result<(), Stop> {
+        const mark: i64 = this.scope_marks[this.scope_marks.length() - 1];
+        this.scope_marks.pop();
+        return this.release_bindings(mark, span);
+    }
+
+    /// Drop and end every binding above `mark`, newest first.
+    release_bindings(mut &this, mark: i64, span: SourceSpan) -> Result<(), Stop> {
+        while (this.bindings.length() > mark) {
+            const last: Binding = this.bindings[this.bindings.length() - 1];
+            this.bindings.pop();
+            if (last.owns) {
+                this.drop_place(Address::at(last.allocation, 0), last.binding_type, span)?;
+                this.memory.end(last.allocation);
+            }
+        }
+        return Result::Ok(());
+    }
+
+    /// Declare a local of type `t` bound to `symbol`, uninitialised; its
+    /// storage.
+    declare(mut &this, symbol: SymbolID, t: TypeRef) -> Address {
+        const allocation: i64 = this.memory.allocate(this.layout.cells(t), AllocationKind::Stack);
+        this.bindings.push(Binding { symbol: symbol, allocation: allocation, offset: 0, binding_type: t, owns: true });
+        return Address::at(allocation, 0);
+    }
+
+    /// Bind `symbol` to the place `place` of type `t` inside another value:
+    /// the binding owns nothing.
+    bind_in_place(mut &this, symbol: SymbolID, place: Address, t: TypeRef) -> void {
+        this.bindings.push(Binding { symbol: symbol, allocation: place.allocation, offset: place.offset, binding_type: t, owns: false });
+    }
+
+    /// The storage of the local `symbol` names in the running frame.
+    local(&this, symbol: SymbolID, span: SourceSpan) -> Result<Address, Stop> {
+        const base: i64 = this.frames[this.frames.length() - 1].binding_base;
+        for (mut i: i64 = this.bindings.length() - 1; i >= base; i--) {
+            if (this.bindings[i].symbol.equals(symbol)) { return Result::Ok(Address::at(this.bindings[i].allocation, this.bindings[i].offset)); }
+        }
+        return Result::Err(Interpreter::violation("a name that binds no local of the running call", span));
+    }
+
+    // ---- Temporaries ----
+
+    /// A temporary for an aggregate of type `t`, released at the end of
+    /// the statement making it.
+    temporary(mut &this, t: TypeRef) -> Address {
+        const allocation: i64 = this.memory.allocate(this.layout.cells(t), AllocationKind::Stack);
+        this.temporaries.push(Temporary { allocation: allocation, value_type: t });
+        return Address::at(allocation, 0);
+    }
+
+    /// The temporary at `place` now holds its whole value: it takes its
+    /// place in the release order here, as the newest.  A value is created
+    /// when it is complete, so an aggregate whose members made temporaries
+    /// of their own (`&(D { f: g(&(D { .. })) })`) is newer than every one
+    /// of them, and is released before them (docs/cryo.md section 15.2).
+    complete_temporary(mut &this, place: Address) -> void {
+        for (mut i: i64 = this.temporaries.length() - 1; i >= 0; i--) {
+            if (this.temporaries[i].allocation == place.allocation) {
+                const made: Temporary = this.temporaries[i];
+                this.temporaries.remove(i);
+                this.temporaries.push(made);
+                return;
+            }
+        }
+    }
+
+    /// Release every temporary made since `mark`: what each still holds is
+    /// dropped, newest first, and its storage ended.
+    release_temporaries(mut &this, mark: i64, span: SourceSpan) -> Result<(), Stop> {
+        while (this.temporaries.length() > mark) {
+            const last: Temporary = this.temporaries[this.temporaries.length() - 1];
+            this.temporaries.pop();
+            this.drop_place(Address::at(last.allocation, 0), last.value_type, span)?;
+            this.memory.end(last.allocation);
+        }
+        return Result::Ok(());
+    }
+
+    // ---- Module-level variables ----
+
+    /// The storage of the module-level variable `definition`, made and
+    /// initialised the first time it is reached.  One without an
+    /// initializer starts as zero, as a module-level variable does.
+    global(mut &this, definition: DefId, span: SourceSpan) -> Result<Address, Stop> {
+        for (mut i: i64 = 0; i < this.globals.length(); i++) {
+            if (this.globals[i].definition.equals(definition)) { return Result::Ok(Address::at(this.globals[i].allocation, 0)); }
+        }
+        const decl: DeclarationNode* = this.ctx.decl_index.declaration_of(definition);
+        const variable: VarDecl* = if (decl == null) { null } else { DeclarationNode::var_of(decl) };
+        if (variable == null) {
+            return Result::Err(Interpreter::violation("a name resolved to a definition that is no variable", span));
+        }
+        const allocation: i64 = this.memory.allocate(this.layout.cells(variable.resolved_type), AllocationKind::Global);
+        this.globals.push(Global { definition: definition, allocation: allocation });
+        const place: Address = Address::at(allocation, 0);
+        if (variable.initializer != null) {
+            this.frames.push(Frame {
+                binding_base: this.bindings.length(), scope_base: this.scope_marks.length(),
+                temporary_base: this.temporaries.length(), return_slot: Address::null(),
+                return_type: variable.resolved_type,
+            });
+            const mark: i64 = this.temporaries.length();
+            this.initialize(place, variable.resolved_type, variable.initializer)?;
+            this.release_temporaries(mark, span)?;
+            this.frames.pop();
+        } else {
+            this.zero(place, variable.resolved_type, span)?;
+        }
+        return Result::Ok(place);
+    }
+
+    /// Fill the value of type `t` at `place` with zeros: integers 0,
+    /// booleans false, pointers null.
+    zero(mut &this, place: Address, t: TypeRef, span: SourceSpan) -> Result<(), Stop> {
+        if (this.layout.is_aggregate(t)) {
+            return Result::Err(Interpreter::not_covered("a module-level aggregate with no initializer", span));
+        }
+        match (this.layout.integer_kind(t)) {
+            Option::Some(kind) => { return this.store(place, Scalar::Integer(0, kind), span); }
+            Option::None => { }
+        }
+        return match (this.layout.kind_of(t)) {
+            compiler::types::TypeKind::Bool => { this.store(place, Scalar::Boolean(false), span) }
+            _ => { this.store(place, Scalar::Pointer(Address::null()), span) }
+        };
+    }
+
+    // ---- Ownership queries ----
+
+    is_copy(&this, t: TypeRef) -> boolean {
+        return OwnershipQuery::is_copy(this.ctx.type_arena, this.ctx.generic_registry, this.ctx.intern_table, t);
+    }
+
+    needs_drop(&this, t: TypeRef) -> boolean {
+        return OwnershipQuery::needs_drop(this.ctx.type_arena, this.ctx.generic_registry, this.ctx.intern_table, t);
+    }
+
+    /// Whether any cell of the `cells` from `address` still holds a value.
+    holds_any(&this, address: Address, cells: i64) -> boolean {
+        for (mut i: i64 = 0; i < cells; i++) {
+            match (this.memory.state(address.plus(i))) {
+                CellState::Holding => { return true; }
+                _ => { }
+            }
+        }
+        return false;
+    }
+}

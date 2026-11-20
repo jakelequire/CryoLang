@@ -450,10 +450,25 @@ type struct CompilerInstance {
     /// E0203/E0233 that a real build did not report).  Loading the whole module
     /// graph the way a build does makes `check` agree with `build`.
     compile_for_check(&this, source_text: string) -> CompilationResult {
+        return this.analyse_file(source_text, CompileMode::Check).result;
+    }
+
+    /// Compile for `cryo interpret`: the `cryo check` front end in
+    /// `CompileMode::Interpret`, which stops before the passes that rewrite
+    /// the program for code generation.  The context comes back holding every
+    /// module's typed tree for the interpreter to run; it is null when the
+    /// build failed before one was made.
+    compile_for_interpret(&this, source_text: string) -> ProjectBuild {
+        return this.analyse_file(source_text, CompileMode::Interpret);
+    }
+
+    /// Analyse the single file `source_text` as its own project in `mode`,
+    /// which generates no code, and return the context it was analysed in.
+    analyse_file(&this, source_text: string, mode: CompileMode) -> ProjectBuild {
         const source: string = source_text;
         if (!Path::from(source).exists()) {
             fmt::eprintln(f"error: file not found: {source}");
-            return CompilationResult::failed(1, 0);
+            return ProjectBuild { result: CompilationResult::failed(1, 0), ctx: null };
         }
 
         // The same single-file project view `compile_file` builds, so module
@@ -464,10 +479,10 @@ type struct CompilerInstance {
         const root_path: string = config.discovery_root_path();
         if (!Path::from(root_path).exists()) {
             fmt::eprintln(f"error: entry point not found: {root_path}");
-            return CompilationResult::failed(1, 0);
+            return ProjectBuild { result: CompilationResult::failed(1, 0), ctx: null };
         }
 
-        return this.compile_project_to_context(config, CompileMode::Check, []).result;
+        return this.compile_project_to_context(config, mode, []);
     }
 
     /// The project a single source file makes on its own: the file is the
@@ -1646,13 +1661,20 @@ type struct CompilerInstance {
         // BodiesTypeChecked is an INCOMING
         // provision here (sema provided it earlier) so MoveCheck's requirement
         // is satisfied.
-        pipeline.set_passes([
-            PassID::GenericValidation,
-            PassID::MoveCheck,
-            PassID::DeadCodeAnalysis,
-            PassID::DropInsertion,
-            PassID::TypeLowering,
-        ]);
+        if (ctx.options.mode.lowers_ownership()) {
+            pipeline.set_passes([
+                PassID::GenericValidation,
+                PassID::MoveCheck,
+                PassID::DeadCodeAnalysis,
+                PassID::DropInsertion,
+                PassID::TypeLowering,
+            ]);
+        } else {
+            pipeline.set_passes([
+                PassID::GenericValidation,
+                PassID::DeadCodeAnalysis,
+            ]);
+        }
         {
             mut initial6b: ProvisionSet = ProvisionSet::empty();
             initial6b.mark(Provision::ASTValidated);
