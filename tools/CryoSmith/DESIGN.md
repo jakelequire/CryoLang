@@ -1806,8 +1806,14 @@ generator never reads through an `Rc`.
       number of drafts a night is not capped: the decisions' limit of five
       automatically filed bugs a night is a limit on filings, and a draft
       is not one.
-    - **Report.** `<findings>/farm-report.md` is written again after each
-      batch and each wait: the setting, the coverage (seeds judged
+    - **Report.** `<findings>/farm-report.md` is written again as each
+      batch or reduction starts, after each batch and at each wait. It
+      opens with what the farm is doing now, so a glance answers whether
+      it is working: running (the batch's kind, seeds and jobs, or the
+      signature being reduced), paused and why, stopped and why, or
+      finished; the findings so far (signatures, judgements, new this
+      run); and when it was written. The farm never opens a window: the
+      report is how a person sees it. Then come the setting, the coverage (seeds judged
       by each kind, this run's mutated programs refused and accepted, the
       seeds each listed bug explained, the programs of each finding
       class), the findings new this run, every finding with its count,

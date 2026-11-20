@@ -45,7 +45,10 @@
 ///! farm stopped during the reduction, is reduced when the farm starts
 ///! again.  Findings are drafted, never filed or
 ///! committed: a person reads the drafts and files the bugs.
-///! `<findings>/farm-report.md` is written again after each batch.
+///! `<findings>/farm-report.md` is written again as each batch or
+///! reduction starts, after each batch and at each wait; it opens with
+///! what the farm is doing now (running, paused or stopped, and why), the
+///! findings so far and when it was written.
 ///!
 ///! The batch's work directory under `--work` is removed once its report
 ///! is read.  Exit 0 when the run met no finding the known list does not
@@ -67,6 +70,7 @@ import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
 import std::process::memory::{ SystemMemory };
 import std::time::clock::{ Instant, SystemTime };
+import std::time::datetime::{ DateTime };
 import std::time::duration::{ Duration };
 
 import cryogate::core::child::{ Completion, Job };
@@ -115,6 +119,8 @@ public type struct SmithFarm {
     waits: Array<String>;
     refused: u64;
     accepted: u64;
+    /// What the farm is doing, as the report's first lines say it.
+    state: String;
     /// What the report heads with.
     setting: Array<String>;
 
@@ -268,6 +274,7 @@ public type struct SmithFarm {
             waits:                   Array::<String>::new(),
             refused:                 0,
             accepted:                0,
+            state:                   String::from_str(Str::new("running: starting")),
             setting:                 setting,
         };
         return farm.farm(repository, logs, range, numbers[0], numbers[2] as i64);
@@ -301,7 +308,7 @@ public type struct SmithFarm {
             const jobs: i64 = match (budget.verdict(most)) {
                 MemoryVerdict::Run(jobs) => { jobs }
                 MemoryVerdict::Wait      => {
-                    this.wait(f"waited {WAIT_SECONDS} s: {committed / 1048576} MiB committed, the ceiling {budget.ceiling / 1048576} MiB");
+                    this.wait(f"{committed / 1048576} MiB committed, the ceiling {budget.ceiling / 1048576} MiB");
                     continue;
                 }
                 MemoryVerdict::Stop => {
@@ -312,7 +319,7 @@ public type struct SmithFarm {
             };
             match (HeavyLock::holder(lock_path.as_path(), SystemTime::now().unix_seconds())) {
                 Holder::Held(holder) => {
-                    this.wait(f"waited {WAIT_SECONDS} s for a heavy run: {holder.as_str()}");
+                    this.wait(f"a heavy run holds the lock: {holder.as_str()}");
                     continue;
                 }
                 Holder::Stale(holder) => {
@@ -323,7 +330,7 @@ public type struct SmithFarm {
             }
             match (this.pause_reason(logs)) {
                 Result::Ok(Option::Some(reason)) => {
-                    this.wait(f"waited {WAIT_SECONDS} s: {reason.as_str()}");
+                    this.wait(reason);
                     continue;
                 }
                 Result::Ok(Option::None) => { }
@@ -354,6 +361,7 @@ public type struct SmithFarm {
             this.write_report();
             if (!failed.is_empty()) { stopped = failed; break; }
         }
+        this.state = if (stopped.is_empty()) { String::from_str(Str::new("finished")) } else { f"stopped: {stopped.as_str()}" };
         this.write_report();
         mut new_ones: i64 = 0;
         for (finding in this.log.findings().iterate_references()) {
@@ -407,7 +415,7 @@ public type struct SmithFarm {
         child.argument(Str::new("--"));
         for (option in this.generation.iterate_references()) { child.argument(option.as_str()); }
         child.log_to(logs.file(f"smith-farm-{name.as_str()}".as_str()).as_str());
-        fmt::println(f"smith-farm: {kind.name()} seeds {batch.first}..{last}, {jobs} jobs");
+        this.announce(f"{kind.name()} seeds {batch.first}..{last}, {jobs} jobs");
         const done: Completion = child.run();
         const exit: i32 = done.outcome.exit_code().unwrap_or(-1);
         if (exit != 0 && exit != 1) {
@@ -464,7 +472,7 @@ public type struct SmithFarm {
     /// Reduce `finding` into `folder`, writing `finding` and `reduction`
     /// there; a reduction that fails says so in `reduction` and is not
     /// tried again.
-    private reduce(&this, logs: &RunLogs, finding: &FarmFinding, folder: Path) -> void {
+    private reduce(mut &this, logs: &RunLogs, finding: &FarmFinding, folder: Path) -> void {
         const crash: boolean = finding.kind.as_str() == FarmKind::Crash.name();
         mut generation: Array<String> = this.generation.clone();
         match (&finding.first_mutation) {
@@ -513,7 +521,7 @@ public type struct SmithFarm {
             child.log_to(logs.file(f"smith-farm-reduce-{FarmFinding::directory_name(finding.signature.as_str()).as_str()}".as_str()).as_str());
             child.limit(Duration::from_seconds(this.reduce_limit));
             child.root_tree();
-            fmt::println(f"smith-farm: reducing `{finding.signature.as_str()}` from seed {finding.first_seed}");
+            this.announce(f"reducing `{finding.signature.as_str()}` from seed {finding.first_seed}");
             const done: Completion = child.run();
             const last: String = Text::last_line(done.output().as_str());
             // smith-reduce writes the smallest program at each step, so one
@@ -554,6 +562,8 @@ public type struct SmithFarm {
             waits:                this.waits.clone(),
             refused:              this.refused,
             accepted:             this.accepted,
+            state:                this.state.clone(),
+            updated:              DateTime::now().format_rfc3339(),
         };
         const path: PathBuf = this.findings.as_path().join(Str::new("farm-report.md"));
         match (File::write_text(path.as_path(), report.text(&this.log).as_str())) {
@@ -562,13 +572,23 @@ public type struct SmithFarm {
         }
     }
 
-    /// Hold off the next batch: print and record `event`, write the report,
-    /// and sleep before the farm looks again.
-    private wait(mut &this, event: String) -> void {
+    /// Hold off the next batch for `reason`: print and record the wait,
+    /// write the report paused, and sleep before the farm looks again.
+    private wait(mut &this, reason: String) -> void {
+        const event: String = f"waited {WAIT_SECONDS} s: {reason.as_str()}";
         fmt::println(f"smith-farm: {event.as_str()}");
         this.waits.push(event);
+        this.state = f"paused: {reason.as_str()}";
         this.write_report();
         std::time::clock::sleep(Duration::from_seconds(WAIT_SECONDS));
+    }
+
+    /// Start `work` (a batch or a reduction): print it and write the report
+    /// running it, so the report says what is under way while it runs.
+    private announce(mut &this, work: String) -> void {
+        fmt::println(f"smith-farm: {work.as_str()}");
+        this.state = f"running: {work.as_str()}";
+        this.write_report();
     }
 
     /// What the farm makes way for before a batch, when anything is there:

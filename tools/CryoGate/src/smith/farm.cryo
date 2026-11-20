@@ -550,20 +550,36 @@ public type struct FarmReport {
     public reductions: Array<String>;
     /// This run's batches, one line each.
     public batches: Array<String>;
-    /// This run's waits (for memory or for a heavy run) and stops, one
-    /// line each.
+    /// This run's waits (for memory, a heavy run, or what the farm makes
+    /// way for) and stops, one line each.
     public waits: Array<String>;
     /// smith-crash's mutated programs refused this run.
     public refused: u64;
     /// smith-crash's mutated programs accepted this run.
     public accepted: u64;
+    /// What the farm is doing as the report is written: `running: ...`
+    /// with the batch or reduction, `paused: ...` with why, `stopped: ...`
+    /// with why, or `finished`.
+    public state: String;
+    /// When the report was written.
+    public updated: String;
 
     /// The report's text over `log`, every judgement so far, this run's
-    /// and earlier runs' alike.
+    /// and earlier runs' alike.  It opens with what the farm is doing now,
+    /// so a glance at its first lines answers whether it is working.
     public text(&this, log: &FarmLog) -> String {
-        mut text: String = String::from_str(Str::new("# smith-farm report\n\n"));
-        for (line in this.setting.iterate_references()) { text.push(f"- {line.as_str()}\n".as_str()); }
         const findings: Array<FarmFinding> = log.findings();
+        mut new_ones: i64 = 0;
+        mut index: i64 = 0;
+        while (index < findings.length()) {
+            if (findings[index].first_entry >= this.first_entry_this_run && this.known_bugs[index].is_empty()) { new_ones++; }
+            index++;
+        }
+        mut text: String = String::from_str(Str::new("# smith-farm report\n\n## Now\n\n"));
+        text.push(f"- {this.state.as_str()}\n".as_str());
+        text.push(f"- findings so far: {findings.length()} signatures over {log.entries.length()} judgements, {new_ones} new this run\n".as_str());
+        text.push(f"- updated {this.updated.as_str()}\n\n## Setting\n\n".as_str());
+        for (line in this.setting.iterate_references()) { text.push(f"- {line.as_str()}\n".as_str()); }
         text.push(Str::new("\n## Coverage\n\n"));
         text.push(f"- diff: {log.seeds_judged(FarmKind::Diff)} seeds judged\n".as_str());
         text.push(f"- crash: {log.seeds_judged(FarmKind::Crash)} seeds judged; this run {this.refused} mutated programs refused, {this.accepted} accepted\n".as_str());
@@ -590,12 +606,10 @@ public type struct FarmReport {
             rank++;
         }
         text.push(Str::new("\n## New findings this run\n\n"));
-        mut new_ones: i64 = 0;
-        mut index: i64 = 0;
+        index = 0;
         while (index < findings.length()) {
             if (findings[index].first_entry >= this.first_entry_this_run && this.known_bugs[index].is_empty()) {
                 text.push(FarmReport::finding_line(&findings[index], this.reductions[index].as_str()).as_str());
-                new_ones++;
             }
             index++;
         }
