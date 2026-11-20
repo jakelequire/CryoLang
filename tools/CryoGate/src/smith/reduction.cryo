@@ -1,11 +1,14 @@
 ///! smith-reduce's decisions: a program's header read back into the
 ///! generation options that rebuild it, the candidates tried from those
-///! options, and the bug file drafted from a reduction.  Pure over the text
-///! handed in.
+///! options, the order a set of candidates is tried in, the deletions tried
+///! from a crashing program's text, and the bug file drafted from a
+///! reduction.  Pure over the text handed in.
 ///!
-///! Every candidate is a set of generation options, so every program tried
-///! is one CryoSmith generated: valid, well typed and terminating by
-///! construction.  The reducer never edits a program's text.
+///! A candidate from generation options is a program CryoSmith generated:
+///! valid, well typed and terminating by construction, so a refusal or a
+///! mismatch it shows is still the compiler's.  Text is deleted only from a
+///! program the compiler crashed on, hung on or reported an internal error
+///! for, where any input showing the same failure is the defect.
 
 namespace cryogate::smith::reduction;
 
@@ -15,12 +18,13 @@ import std::collections::string::{ String };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 
-import cryogate::core::text::{ Text };
+import cryogate::core::text::{ Scanner, Text };
 
 /// The generation options a program's header names: the first line of a
 /// file CryoSmith wrote, `// cryosmith <version> seed <N> features <list>
-/// functions <F> size <S>`, and after a reduction took things out of the
-/// program, ` omit <path>,<path>...`.
+/// functions <F> size <S>`; after a reduction took things out of the
+/// program, ` omit <path>,<path>...`; and for a program mutated into a
+/// near-valid one, ` mutation <M> <operator> <site>` last.
 public type struct ProgramHeader {
     /// The generator version that wrote it.
     public generator: u64;
@@ -36,14 +40,16 @@ public type struct ProgramHeader {
     /// order taken (`cryosmith ... --omissions`); none for a program as
     /// generated.
     public omissions: Array<String>;
+    /// The mutation made after the omissions (`--mutation`); none for a
+    /// valid program.
+    public mutation: Option<u64>;
 
     /// The header `program` (a whole file) opens with; why it is not one.
     public static parse(program: Str) -> Result<ProgramHeader, String> {
         const lines: Array<String> = Text::lines(program);
         if (lines.is_empty()) { return Result::Err(String::from_str(Str::new("the program is empty"))); }
         const words: Array<String> = ProgramHeader::words(lines[0].as_str());
-        const omits: boolean = words.length() == 13 && words[11].as_str() == Str::new("omit");
-        if ((words.length() != 11 && !omits) || words[0].as_str() != Str::new("//") || words[1].as_str() != Str::new("cryosmith")
+        if (words.length() < 11 || words[0].as_str() != Str::new("//") || words[1].as_str() != Str::new("cryosmith")
             || words[3].as_str() != Str::new("seed") || words[5].as_str() != Str::new("features")
             || words[7].as_str() != Str::new("functions") || words[9].as_str() != Str::new("size")) {
             return Result::Err(f"`{lines[0].as_str()}` is not a CryoSmith header");
@@ -52,12 +58,20 @@ public type struct ProgramHeader {
         for (feature in words[6].as_str().split(&Str::new(","))) {
             if (!feature.is_empty()) { features.push(String::from_str(feature)); }
         }
+        mut at: i64 = 11;
         mut omissions: Array<String> = Array::<String>::new();
-        if (omits) {
-            for (path in words[12].as_str().split(&Str::new(","))) {
+        if (words.length() > at + 1 && words[at].as_str() == Str::new("omit")) {
+            for (path in words[at + 1].as_str().split(&Str::new(","))) {
                 if (!path.is_empty()) { omissions.push(String::from_str(path)); }
             }
+            at = at + 2;
         }
+        mut mutation: Option<u64> = Option::None;
+        if (words.length() == at + 4 && words[at].as_str() == Str::new("mutation")) {
+            mutation = Option::Some(ProgramHeader::number(words[at + 1].as_str())?);
+            at = at + 4;
+        }
+        if (at != words.length()) { return Result::Err(f"`{lines[0].as_str()}` is not a CryoSmith header"); }
         return Result::Ok(ProgramHeader {
             generator: ProgramHeader::number(words[2].as_str())?,
             seed:      ProgramHeader::number(words[4].as_str())?,
@@ -65,6 +79,7 @@ public type struct ProgramHeader {
             functions: ProgramHeader::number(words[8].as_str())?,
             size:      ProgramHeader::number(words[10].as_str())?,
             omissions: omissions,
+            mutation:  mutation,
         });
     }
 
@@ -79,8 +94,9 @@ public type struct ProgramHeader {
     }
 
     /// The generation options that rebuild the program as generated:
-    /// `--features`, `--functions` and `--size`, each written out.  What
-    /// was taken out is `--omissions`', a file of `omission_list`.
+    /// `--features`, `--functions` and `--size`, each written out, and
+    /// `--mutation` when it was mutated.  What was taken out is
+    /// `--omissions`', a file of `omission_list`.
     public options(&this) -> Array<String> {
         mut options: Array<String> = Array::<String>::new();
         options.push(String::from_str(Str::new("--features")));
@@ -89,6 +105,13 @@ public type struct ProgramHeader {
         options.push(f"{this.functions}");
         options.push(String::from_str(Str::new("--size")));
         options.push(f"{this.size}");
+        match (this.mutation) {
+            Option::Some(mutation) => {
+                options.push(String::from_str(Str::new("--mutation")));
+                options.push(f"{mutation}");
+            }
+            Option::None => { }
+        }
         return options;
     }
 
@@ -122,7 +145,7 @@ public type struct ProgramHeader {
         for (path in more.iterate_references()) { omissions.push(path.clone()); }
         return ProgramHeader {
             generator: this.generator, seed: this.seed, features: this.features.clone(), functions: this.functions, size: this.size,
-            omissions: omissions,
+            omissions: omissions, mutation: this.mutation,
         };
     }
 
@@ -167,7 +190,8 @@ public type struct ProgramHeader {
     /// This header with `functions` and `size`, and without the feature at
     /// `left_out` (none when negative), taking nothing out: an omission
     /// names a node of the program the options generate, and other options
-    /// generate another.
+    /// generate another.  A mutation is kept: its number draws an operator
+    /// and a site from whatever text the options give.
     private with(&this, functions: u64, size: u64, left_out: i64) -> ProgramHeader {
         mut features: Array<String> = Array::<String>::new();
         mut index: i64 = 0;
@@ -177,6 +201,7 @@ public type struct ProgramHeader {
         }
         return ProgramHeader {
             generator: this.generator, seed: this.seed, features: features, functions: functions, size: size, omissions: Array::<String>::new(),
+            mutation: this.mutation,
         };
     }
 
@@ -193,6 +218,200 @@ public type struct ProgramHeader {
             Result::Ok(value) => { Result::Ok(value) }
             Result::Err(_)    => { Result::Err(f"`{text}` in a CryoSmith header is not a number") }
         };
+    }
+}
+
+/// The order a reduction tries a set of candidates in, each by its place in
+/// the set: all at once, then each half of a group that did not keep the
+/// failure, first half first, down to one at a time.  A group that kept it
+/// is gone; the rest are still tried.
+public type struct Halving {
+    /// The groups still to try, the next last.
+    pending: Array<Array<i64>>;
+
+    /// The order for a set of `count` candidates.
+    public static of(count: i64) -> Halving {
+        mut pending: Array<Array<i64>> = Array::<Array<i64>>::new();
+        if (count > 0) {
+            mut every: Array<i64> = Array::<i64>::new();
+            mut index: i64 = 0;
+            while (index < count) {
+                every.push(index);
+                index++;
+            }
+            pending.push(every);
+        }
+        return Halving { pending: pending };
+    }
+
+    /// The next group to try; none when every group has been tried.
+    public next(mut &this) -> Option<Array<i64>> {
+        return this.pending.pop();
+    }
+
+    /// `group` did not keep the failure: its halves are tried next, unless
+    /// it held one candidate.
+    public refused(mut &this, group: &Array<i64>) -> void {
+        if (group.length() < 2) { return; }
+        const half: i64 = group.length() / 2;
+        mut first_half: Array<i64> = Array::<i64>::new();
+        mut second_half: Array<i64> = Array::<i64>::new();
+        mut position: i64 = 0;
+        while (position < group.length()) {
+            if (position < half) { first_half.push(group[position]); } else { second_half.push(group[position]); }
+            position++;
+        }
+        this.pending.push(second_half);
+        this.pending.push(first_half);
+    }
+}
+
+/// A program's text cut into pieces, and the runs of them a reduction may
+/// delete: its blocks, its lines, or its tokens.  The header, the
+/// program's first line, is never deleted, so what is left still says
+/// what it was generated from and which mutation it carries.
+public type struct TextDeletion {
+    /// The text, in order; joined they are the program.
+    pieces: Array<String>;
+    /// The first and last place in `pieces` of each candidate, in order: a
+    /// candidate is a place in these.  Candidates may overlap (a block
+    /// inside another).
+    first: Array<i64>;
+    last: Array<i64>;
+    /// Whether each piece is deleted.
+    deleted: Array<boolean>;
+
+    /// `program` cut into lines, each with its line end; every line but
+    /// the header a candidate.
+    public static lines(program: Str) -> TextDeletion {
+        mut deletion: TextDeletion = TextDeletion::cut_into_lines(program);
+        mut line: i64 = 1;
+        while (line < deletion.pieces.length()) {
+            deletion.candidate(line, line);
+            line++;
+        }
+        return deletion;
+    }
+
+    /// `program` cut into lines, each block a candidate: a line opening
+    /// more braces than it closes, through the line that closes them, so a
+    /// function, an implementation or a statement's body goes whole.  A
+    /// block the program never closes is no candidate.
+    public static blocks(program: Str) -> TextDeletion {
+        mut deletion: TextDeletion = TextDeletion::cut_into_lines(program);
+        mut opening: i64 = 1;
+        while (opening < deletion.pieces.length()) {
+            mut depth: i64 = TextDeletion::braces_opened(deletion.pieces[opening].as_str());
+            if (depth > 0) {
+                mut closing: i64 = opening + 1;
+                while (closing < deletion.pieces.length() && depth > 0) {
+                    depth = depth + TextDeletion::braces_opened(deletion.pieces[closing].as_str());
+                    if (depth > 0) { closing++; }
+                }
+                if (closing < deletion.pieces.length()) { deletion.candidate(opening, closing); }
+            }
+            opening++;
+        }
+        return deletion;
+    }
+
+    /// `program` cut into tokens - each name or number whole, each other
+    /// byte that is not whitespace alone - and the whitespace between them;
+    /// every token after the header a candidate.
+    public static tokens(program: Str) -> TextDeletion {
+        mut deletion: TextDeletion = TextDeletion { pieces: Array::<String>::new(), first: Array::<i64>::new(), last: Array::<i64>::new(), deleted: Array::<boolean>::new() };
+        mut at: i64 = 0;
+        while (at < program.length() && program.byte_at(at).unwrap() != '\n' as u8) { at++; }
+        if (at < program.length()) { at++; }
+        deletion.piece(program.byte_substring(0, at), false);
+        while (at < program.length()) {
+            const start: i64 = at;
+            const first: u8 = program.byte_at(at).unwrap();
+            at++;
+            if (first.is_whitespace()) {
+                while (at < program.length() && program.byte_at(at).unwrap().is_whitespace()) { at++; }
+                deletion.piece(program.byte_substring(start, at), false);
+                continue;
+            }
+            if (Scanner::is_word_byte(first)) {
+                while (at < program.length() && Scanner::is_word_byte(program.byte_at(at).unwrap())) { at++; }
+            }
+            deletion.piece(program.byte_substring(start, at), true);
+        }
+        return deletion;
+    }
+
+    /// How many candidates there are.
+    public count(&this) -> i64 { return this.first.length(); }
+
+    /// The text left with what is deleted and the candidates `group` gone.
+    public without(&this, group: &Array<i64>) -> String {
+        mut gone: Array<boolean> = this.deleted.clone();
+        TextDeletion::mark(&gone, &this.first, &this.last, group);
+        mut text: String = String::new();
+        mut index: i64 = 0;
+        while (index < this.pieces.length()) {
+            if (!gone[index]) { text.push(this.pieces[index].as_str()); }
+            index++;
+        }
+        return text;
+    }
+
+    /// Delete the candidates `group`.
+    public delete(mut &this, group: &Array<i64>) -> void {
+        TextDeletion::mark(&this.deleted, &this.first, &this.last, group);
+    }
+
+    /// Mark in `gone` every piece of each candidate of `group`.
+    private static mark(gone: mut &Array<boolean>, first: &Array<i64>, last: &Array<i64>, group: &Array<i64>) -> void {
+        for (candidate in group.iter()) {
+            mut place: i64 = first[candidate];
+            while (place <= last[candidate]) {
+                gone[place] = true;
+                place++;
+            }
+        }
+    }
+
+    /// `program` cut into lines, each with its line end, with no
+    /// candidate yet.
+    private static cut_into_lines(program: Str) -> TextDeletion {
+        mut deletion: TextDeletion = TextDeletion { pieces: Array::<String>::new(), first: Array::<i64>::new(), last: Array::<i64>::new(), deleted: Array::<boolean>::new() };
+        mut start: i64 = 0;
+        mut at: i64 = 0;
+        while (at < program.length()) {
+            if (program.byte_at(at).unwrap() == '\n' as u8) {
+                deletion.piece(program.byte_substring(start, at + 1), false);
+                start = at + 1;
+            }
+            at++;
+        }
+        if (start < program.length()) { deletion.piece(program.byte_substring(start, program.length()), false); }
+        return deletion;
+    }
+
+    /// How many more braces `line` opens than it closes.
+    private static braces_opened(line: Str) -> i64 {
+        mut depth: i64 = 0;
+        mut at: i64 = 0;
+        while (at < line.length()) {
+            const byte: u8 = line.byte_at(at).unwrap();
+            if (byte == '{' as u8) { depth++; }
+            if (byte == '}' as u8) { depth--; }
+            at++;
+        }
+        return depth;
+    }
+
+    private candidate(mut &this, first: i64, last: i64) -> void {
+        this.first.push(first);
+        this.last.push(last);
+    }
+
+    private piece(mut &this, text: Str, deletable: boolean) -> void {
+        if (deletable) { this.candidate(this.pieces.length(), this.pieces.length()); }
+        this.pieces.push(String::from_str(text));
+        this.deleted.push(false);
     }
 }
 
@@ -215,18 +434,26 @@ public type struct BugDraft {
     public source: String;
     /// The command that shows the finding on the reduced program.
     public command: String;
+    /// Whether the reduction deleted text from a smith-crash finding's
+    /// program, so that what is left is no program CryoSmith generates.
+    public by_text: boolean;
 
     /// The draft as a markdown file.
     public text(&this) -> String {
         mut text: String = String::new();
-        text.push(f"# {this.kind.as_str()} found by smith-diff (seed {this.after.seed})\n\n".as_str());
+        const finder: Str = if (this.by_text) { Str::new("smith-crash") } else { Str::new("smith-diff") };
+        text.push(f"# {this.kind.as_str()} found by {finder} (seed {this.after.seed})\n\n".as_str());
         text.push(f"**Signature:** `{this.signature.as_str()}`\n\n".as_str());
         text.push(f"**Observed:** {this.detail.as_str()}\n\n".as_str());
         text.push(f"**Generation options:** `{Text::joined(&this.after.options(), Str::new(" ")).as_str()}` (CryoSmith {this.after.generator}, seed {this.after.seed})".as_str());
         if (!this.after.omissions.is_empty()) {
             text.push(f", with {this.after.omissions.length()} things taken out of the program they generate (the header's `omit` list, given to `--omissions` as a file)".as_str());
         }
-        text.push(f"; reduced from `{Text::joined(&this.before.options(), Str::new(" ")).as_str()}`, {this.lines_before} lines to {this.lines_after}.\n\n".as_str());
+        if (this.by_text) {
+            text.push(f"; the program they generate, {this.lines_before} lines, reduced to {this.lines_after} by deleting lines and tokens while the compiler failed the same way.\n\n".as_str());
+        } else {
+            text.push(f"; reduced from `{Text::joined(&this.before.options(), Str::new(" ")).as_str()}`, {this.lines_before} lines to {this.lines_after}.\n\n".as_str());
+        }
         text.push(f"**Reproduce:** `{this.command.as_str()}`\n\n".as_str());
         text.push(Str::new("**Severity:** to be decided on review.\n\n**Cause:** not yet known.\n\n## Repro\n\n```\n"));
         text.push(this.source.as_str());

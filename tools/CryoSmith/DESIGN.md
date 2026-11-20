@@ -1571,10 +1571,24 @@ generator never reads through an `Rc`.
    - **Reduction**: for a crash, a hang or an internal error the reducer
      may edit the text itself - any input that makes the compiler crash
      is the defect, valid or not, and the signature keeps a different
-     crash apart - so `smith-reduce --text` deletes lines, then tokens,
-     halves first and down to one at a time, keeping each deletion that
-     keeps the signature, from the mutated program. A refusal is never
+     crash apart - so `smith-reduce --text` deletes blocks (a line opening
+     braces through the line closing them: a function, an implementation,
+     a statement's body), then lines, then tokens, halves first and down
+     to one at a time, keeping each deletion that keeps the signature,
+     from the mutated program. Blocks go first because a crash past the
+     parser needs a program that still parses, and almost every single
+     line or token deleted from a generated program leaves one that does
+     not. A refusal is never
      reduced this way: a deletion's own refusal would read as the bug.
+     The seed's program is generated from the options given, `--mutation`
+     among them, and every trial is judged as smith-crash judges a build
+     (the compiler under test at `-O0`, smith-crash's signature), so
+     `--text` takes no `--reference` or `--interpret`. A token is a name
+     or a number whole, or one other byte that is not whitespace; the
+     header line is never deleted, so the reduced file still names its
+     seed, options and mutation, and the drafted bug file says the
+     reduction deleted text. The order a set of candidates is tried in
+     (`Halving`) is the one the omission classes use.
    - **Unit 1**: the text operators (`delete-token`, `duplicate-token`,
      `drop-brace`, `extra-brace`, `drop-annotation`, `drop-argument`,
      `extra-argument`) and `smith-crash`; a planted compiler crash on one
