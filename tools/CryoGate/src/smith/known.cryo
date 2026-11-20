@@ -1,0 +1,177 @@
+///! The compiler bugs CryoSmith's programs are known to meet, filed and not
+///! yet fixed.  A seed whose configurations print exactly the lines its
+///! entry records is reported as that bug: never as agreeing, and never
+///! left out of the report.  A listed seed that prints anything else is
+///! judged as any other program, and one that now passes fails, so an
+///! entry outlives neither its bug nor a change in what the seed prints.
+///!
+///! The list is `tests/smith-known-bugs`:
+///!
+///!     # comments
+///!     generator 40
+///!     bug 0362 seed 162 O0 1634 O2 1634 interpreted 1654 options
+///!
+///! Every entry is at the one generator version, which must be the version
+///! of the CryoSmith that writes the programs: a seed names a program only
+///! at one version.  After the seed come configuration keys (`O0`, `O2`,
+///! `interpreted`, `smith/difference.cryo`), each with the number of the
+///! hash line it prints, then `options` and the generation options the
+///! seed was written with, none for the defaults.
+
+namespace cryogate::smith::known;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::text::{ Text };
+import cryogate::smith::difference::{ Configuration, Observation };
+import cryogate::smith::pinned::{ PinnedCorpus };
+
+/// One seed known to meet a filed compiler bug, and what each
+/// configuration prints when it does.
+public type struct KnownBug {
+    /// The bug's number, as its file in `.bug-report/` is numbered.
+    public bug: String;
+    /// The seed.
+    public seed: u64;
+    /// The generation options the seed's program was written with.
+    public options: Array<String>;
+    /// The keys of the configurations the entry records.
+    public keys: Array<String>;
+    /// The hash line the configuration `keys[i]` prints, at index `i`.
+    public lines: Array<String>;
+
+    /// Whether `configurations[i]` observing `observations[i]`, for every
+    /// `i`, is this bug: every configuration printed a line, one the entry
+    /// records printed its recorded line, and any other printed one of the
+    /// recorded lines.
+    public reproduces(&this, configurations: &Array<Configuration>, observations: &Array<Observation>) -> boolean {
+        mut index: i64 = 0;
+        while (index < observations.length()) {
+            const line: String = match (&observations[index]) {
+                Observation::Printed(line) => { line.clone() }
+                _                          => { return false; }
+            };
+            mut recorded: boolean = false;
+            mut entry: i64 = 0;
+            while (entry < this.keys.length()) {
+                if (this.keys[entry].as_str() == configurations[index].key.as_str()) {
+                    recorded = true;
+                    if (this.lines[entry].as_str() != line.as_str()) { return false; }
+                }
+                entry++;
+            }
+            if (!recorded && !this.lines.contains(&line)) { return false; }
+            index++;
+        }
+        return true;
+    }
+}
+
+/// What the list says of one program.
+public type enum KnownBugMatch {
+    /// No entry records the seed at these generation options.
+    Unlisted;
+    /// The configurations printed the entry's lines; the bug's number.
+    Reproduces(String);
+    /// An entry records the seed and the configurations did not print its
+    /// lines; the bug's number.
+    Missed(String);
+}
+
+/// The known-compiler-bug list.
+public type struct KnownBugs {
+    /// The generator version every entry is at.
+    public generator: i64;
+    /// The entries, in the order written.
+    public bugs: Array<KnownBug>;
+
+    /// The list in `repository`, checked against the generator that
+    /// `cryosmith version` reports as `printed`; why it cannot be used
+    /// otherwise.
+    public static read(repository: Path, printed: Str) -> Result<KnownBugs, String> {
+        const path: PathBuf = repository.join(Str::new("tests/smith-known-bugs"));
+        const text: String = match (File::read_text(path.as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read the known-compiler-bug list {path.as_path().as_str()}: {error.describe()}"); }
+        };
+        const list: KnownBugs = match (KnownBugs::parse(text.as_str())) {
+            Result::Ok(list)    => { list }
+            Result::Err(reason) => { return Result::Err(f"the known-compiler-bug list {path.as_path().as_str()}: {reason.as_str()}"); }
+        };
+        const version: i64 = PinnedCorpus::generator_of(printed)?;
+        if (version != list.generator) {
+            return Result::Err(f"cryosmith is generator version {version} and the known-compiler-bug list tests/smith-known-bugs is at version {list.generator}: check each entry's seed at the new version and write the version");
+        }
+        return Result::Ok(list);
+    }
+
+    /// The list `text` holds; why it is not one otherwise.
+    public static parse(text: Str) -> Result<KnownBugs, String> {
+        mut generator: Option<i64> = Option::None;
+        mut bugs: Array<KnownBug> = Array::<KnownBug>::new();
+        mut number: i64 = 0;
+        for (raw in Text::lines(text).iterate_references()) {
+            number++;
+            const line: Str = raw.as_str().trim();
+            if (line.is_empty() || line.starts_with(&Str::new("#"))) { continue; }
+            mut words: Array<Str> = Array::<Str>::new();
+            for (word in line.split_whitespace()) { words.push(word); }
+            if (words[0] == Str::new("generator")) {
+                if (words.length() != 2 || generator.is_some()) { return Result::Err(f"line {number}: one `generator <version>` line"); }
+                generator = match (i64::try_from(words[1])) {
+                    Result::Ok(version) => { Option::Some(version) }
+                    Result::Err(_)      => { return Result::Err(f"line {number}: `{words[1]}` is no generator version"); }
+                };
+                continue;
+            }
+            if (words.length() < 5 || words[0] != Str::new("bug") || !Text::is_digits(words[1]) || words[2] != Str::new("seed")) {
+                return Result::Err(f"line {number}: `{line}` is no `bug <number> seed <N> <key> <hash>... options [<option>...]` line");
+            }
+            const seed: u64 = match (u64::try_from(words[3])) {
+                Result::Ok(seed) => { seed }
+                Result::Err(_)   => { return Result::Err(f"line {number}: `{words[3]}` is no seed"); }
+            };
+            mut keys: Array<String> = Array::<String>::new();
+            mut lines: Array<String> = Array::<String>::new();
+            mut at: i64 = 4;
+            while (at < words.length() && words[at] != Str::new("options")) {
+                if (at + 1 >= words.length() || !Text::is_digits(words[at + 1])) { return Result::Err(f"line {number}: `{words[at]}` has no hash after it"); }
+                const key: String = String::from_str(words[at]);
+                if (keys.contains(&key)) { return Result::Err(f"line {number}: `{words[at]}` recorded twice"); }
+                keys.push(key);
+                lines.push(f"cryosmith-hash {words[at + 1]}");
+                at = at + 2;
+            }
+            if (at >= words.length()) { return Result::Err(f"line {number}: no `options` after the hashes"); }
+            if (keys.is_empty()) { return Result::Err(f"line {number}: no configuration's hash"); }
+            mut options: Array<String> = Array::<String>::new();
+            for (index in (at + 1)..words.length()) { options.push(String::from_str(words[index])); }
+            for (held in bugs.iterate_references()) {
+                if (held.seed == seed && Text::joined(&held.options, Str::new(" ")).as_str() == Text::joined(&options, Str::new(" ")).as_str()) {
+                    return Result::Err(f"line {number}: seed {seed} at these options listed twice");
+                }
+            }
+            bugs.push(KnownBug { bug: String::from_str(words[1]), seed: seed, options: options, keys: keys, lines: lines });
+        }
+        if (generator.is_none()) { return Result::Err(String::from_str(Str::new("no `generator` line"))); }
+        return Result::Ok(KnownBugs { generator: generator.unwrap(), bugs: bugs });
+    }
+
+    /// What the list says of `seed`, written with the generation `options`,
+    /// whose `configurations[i]` observed `observations[i]`.
+    public of(&this, seed: u64, options: &Array<String>, configurations: &Array<Configuration>, observations: &Array<Observation>) -> KnownBugMatch {
+        const written: String = Text::joined(options, Str::new(" "));
+        for (entry in this.bugs.iterate_references()) {
+            if (entry.seed != seed || Text::joined(&entry.options, Str::new(" ")).as_str() != written.as_str()) { continue; }
+            if (entry.reproduces(configurations, observations)) { return KnownBugMatch::Reproduces(entry.bug.clone()); }
+            return KnownBugMatch::Missed(entry.bug.clone());
+        }
+        return KnownBugMatch::Unlisted;
+    }
+}

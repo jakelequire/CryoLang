@@ -20,6 +20,12 @@
 ///! line.  A failing program's source and executables stay in the work
 ///! directory; a passing program's executables are removed.  Exit 0 when
 ///! every program passed, 1 on a finding, 2 on a usage error.
+///!
+///! A seed listed in `tests/smith-known-bugs` (`smith/known.cryo`) whose
+///! configurations print the lines its entry records is reported `known`,
+///! with the bug's number, counted on a line of its own, and is neither a
+///! pass nor a finding.  A listed seed printing anything else fails, even
+///! when every configuration agrees.
 
 namespace cryogate::gates::smith_diff;
 
@@ -39,6 +45,7 @@ import cryogate::core::options::{ Options, Parsed };
 import cryogate::core::text::{ Text };
 import cryogate::smith::corpus::{ CorpusLayout };
 import cryogate::smith::difference::{ Configuration, FindingClass, Observation, SmithDecision, SmithFinding, SmithVerdict };
+import cryogate::smith::known::{ KnownBugMatch, KnownBugs };
 import cryogate::smith::run::programs::{ Attempt, SmithRun };
 
 /// `cryogate smith-diff`.
@@ -102,6 +109,11 @@ public type struct SmithDiff {
             Result::Ok(_)      => { }
             Result::Err(error) => { fmt::eprintln(f"cryogate smith-diff: cannot create {work_path.as_path().as_str()}: {error.describe()}"); return 1; }
         }
+        const printed: String = SmithRun::generator_version(smith.as_str(), logs, Str::new("smith-diff-version"));
+        const known: KnownBugs = match (KnownBugs::read(repository, printed.as_str())) {
+            Result::Ok(known)   => { known }
+            Result::Err(reason) => { fmt::println(f"smith-diff: FAIL ({reason.as_str()})"); return 1; }
+        };
         const programs: SmithRun = SmithRun {
             configurations: configurations,
             layout:         CorpusLayout::new(work_path.as_path()),
@@ -123,6 +135,10 @@ public type struct SmithDiff {
         mut findings: Array<SmithFinding> = Array::<SmithFinding>::new();
         mut finding_seeds: Array<u64> = Array::<u64>::new();
         mut uncovered: u64 = 0;
+        // Each seed that met a known compiler bug, with the bug, and how
+        // many listed seeds passed instead.
+        mut met: Array<String> = Array::<String>::new();
+        mut stale: u64 = 0;
         mut offset: u64 = 0;
         while (offset < count) {
             const seed: u64 = first_seed.wrapping_add(offset);
@@ -135,8 +151,30 @@ public type struct SmithDiff {
                     _                                  => { }
                 }
             }
+            const listed: KnownBugMatch = known.of(seed, parsed.rest(), &programs.configurations, &observations);
+            match (&listed) {
+                KnownBugMatch::Reproduces(bug) => {
+                    fmt::println(f"known seed {seed}: known compiler bug {bug.as_str()}");
+                    met.push(f"{seed} ({bug.as_str()})");
+                    offset = offset + 1;
+                    continue;
+                }
+                _ => { }
+            }
+            // A listed seed that did not print its entry's lines is judged
+            // as any other, and fails even when every configuration agrees.
+            const missed: String = match (&listed) {
+                KnownBugMatch::Missed(bug) => { f" (listed as known compiler bug {bug.as_str()}, whose lines it did not print)" }
+                _                          => { String::new() }
+            };
             match (SmithDecision::decide(&programs.configurations, &observations)) {
                 SmithVerdict::Agreed(line) => {
+                    if (!missed.is_empty()) {
+                        fmt::println(f"FAIL  seed {seed}: passes, and is listed in tests/smith-known-bugs{missed.as_str()}: take its entry off, or record what it prints now");
+                        stale = stale + 1;
+                        offset = offset + 1;
+                        continue;
+                    }
                     match (programs.remove_executables(seed)) {
                         Result::Ok(_) => {
                             if (not_covered.is_empty()) {
@@ -153,12 +191,19 @@ public type struct SmithDiff {
                     }
                 }
                 SmithVerdict::Found(finding) => {
-                    fmt::println(f"FAIL  seed {seed}: {finding.detail.as_str()}");
+                    fmt::println(f"FAIL  seed {seed}: {finding.detail.as_str()}{missed.as_str()}");
                     findings.push(finding);
                     finding_seeds.push(seed);
                 }
             }
             offset = offset + 1;
+        }
+        if (!met.is_empty()) {
+            fmt::println(f"smith-diff: {met.length()} known compiler bugs, neither passing nor failing: seeds {Text::joined(&met, Str::new(", ")).as_str()}");
+        }
+        if (stale > 0 && findings.is_empty()) {
+            fmt::println(f"smith-diff: FAIL ({stale} of {count} programs: listed known compiler bugs that pass)");
+            return 1;
         }
         if (findings.is_empty()) {
             const agreeing: i64 = programs.configurations.length();

@@ -1241,7 +1241,14 @@ fixed here.** It gets a bug file with a minimal repro, and work goes on.
 The generator keeps off the shape, written under "Kept off" in section 2
 with the bug file that records it. A seed the interpreter disagrees on
 because of such a bug is reported as "known compiler bug NNNN" in the
-coverage count, never as agreeing. The exception is a bug whose keep-off
+coverage count, never as agreeing. The seeds are listed in
+`tests/smith-known-bugs`, each with the hash line every configuration
+prints when it meets the bug, at one generator version that must be
+cryosmith's; corpus-check, smith-diff and verify's `smith` gate read it. A
+listed seed counts as its bug only while every configuration prints its
+recorded line: any other line on that seed fails as any finding does, and
+a listed seed that passes fails too, so an entry goes when its bug is
+fixed or the seed's program changes. The exception is a bug whose keep-off
 would itself be a large workaround: that one is fixed as any compiler
 change is - a test of the shape, the pin as the control, a mutation the
 test refuses, and `make verify` with its declarations. A defect in the

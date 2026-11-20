@@ -657,7 +657,10 @@ cryosmith-selftest: $(CRYOSMITH) $(CRYOGATE)
 # the generator version changes: seeds 1 to 24 at the default features, each
 # built at -O0 and -O2 and interpreted by the compiler under test, and each
 # hash written beside its seed once every program passes, the interpreter
-# agreeing on all of them.  `cryogate corpus-check --pin --interpret`.
+# agreeing on all of them.  `cryogate corpus-check --pin --interpret`.  The
+# known-compiler-bug list, tests/smith-known-bugs, is at the generator
+# version too, and is written at the new one by hand: each entry's seed is
+# run again and kept only where it still meets its bug.
 smith-corpus-pin: cryo $(CRYOGATE) $(CRYOSMITH)
 	@$(CRYOGATE_HEAVY) $(CRYOGATE_COMMAND) corpus-check --cryo "$(STAGE2_FILE)" --stdlib "$(ROOT)/stdlib" --work .verify/smith-corpus --pin tests/smith-corpus --first-seed 1 --count 24 --interpret
 

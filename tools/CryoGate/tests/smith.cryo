@@ -19,6 +19,7 @@ import cryogate::smith::corpus::{ CorpusJudge, CorpusLayout };
 import cryogate::core::text::{ Text };
 import cryogate::smith::difference::{ Configuration, FindingClass, Interpretation, Observation, SmithDecision, SmithFinding, SmithVerdict };
 import cryogate::smith::reduction::{ BugDraft, ProgramHeader };
+import cryogate::smith::known::{ KnownBugMatch, KnownBugs };
 import cryogate::smith::pinned::{ PinnedCorpus };
 import cryogate::smith::selftest::{ PartReport, SelfTestParts };
 
@@ -434,4 +435,82 @@ function a_finding_names_every_configuration_of_its_class_and_the_first_detail()
     hang.push(Observation::RunHang);
     const run_hang: SmithFinding = found(SmithDecision::decide(&numbered(2), &hang))?;
     return expect(run_hang.signature.as_str() == Str::new("run hang [c1 -O0]"), run_hang.signature.as_str());
+}
+
+/// A known-compiler-bug list at generator version 40: seed 9 meets bug 0001
+/// with the builds printing 5 and the interpreter 6, at the default options.
+private function known_list() -> KnownBugs {
+    return KnownBugs::parse(Str::new("# known\ngenerator 40\nbug 0001 seed 9 O0 5 O2 5 interpreted 6 options\n\nbug 0002 seed 9 O0 1 O2 2 options --features default\n")).unwrap();
+}
+
+/// What the list says of seed 9 at the default options, under the
+/// configurations `of_compilers` makes of `references` compilers and the
+/// interpreter, observed printing `cryosmith-hash <word>` for each word of
+/// `hashes` in order.
+private function printing(references: i64, hashes: Str) -> KnownBugMatch {
+    mut compilers: Array<String> = Array::<String>::new();
+    mut added: i64 = 0;
+    while (added < references) { compilers.push(String::from_str(Str::new("ref"))); added++; }
+    const configurations: Array<Configuration> = Configuration::of_compilers(Str::new("tree"), &compilers, true);
+    mut observations: Array<Observation> = Array::<Observation>::new();
+    for (hash in hashes.split_whitespace()) { observations.push(Observation::Printed(f"cryosmith-hash {hash}")); }
+    return known_list().of(9, &Array::<String>::new(), &configurations, &observations);
+}
+
+/// Whether `seen` names bug `bug` as `reproduced` (otherwise as missed).
+private function names_bug(seen: KnownBugMatch, bug: Str, reproduced: boolean) -> boolean {
+    return match (seen) {
+        KnownBugMatch::Reproduces(number) => { reproduced && number.as_str() == bug }
+        KnownBugMatch::Missed(number)     => { !reproduced && number.as_str() == bug }
+        KnownBugMatch::Unlisted           => { false }
+    };
+}
+
+![test]
+function a_known_bug_list_reads_its_version_and_each_entry_and_refuses_a_malformed_one() -> Result<(), TestError> {
+    const list: KnownBugs = known_list();
+    expect(list.generator == 40 && list.bugs.length() == 2, Str::new("version and entries"))?;
+    expect(list.bugs[0].bug.as_str() == Str::new("0001") && list.bugs[0].seed == 9 && list.bugs[0].keys.length() == 3 && list.bugs[0].options.is_empty(), Str::new("the first entry"))?;
+    expect(list.bugs[0].lines[2].as_str() == Str::new("cryosmith-hash 6") && list.bugs[1].options.length() == 2, Str::new("lines and options"))?;
+    expect(KnownBugs::parse(Str::new("bug 0001 seed 9 O0 5 options\n")).is_err(), Str::new("no generator line"))?;
+    expect(KnownBugs::parse(Str::new("generator 40\nbug 0001 seed 9 O0 5\n")).is_err(), Str::new("no options word"))?;
+    expect(KnownBugs::parse(Str::new("generator 40\nbug 0001 seed 9 options\n")).is_err(), Str::new("no hash"))?;
+    expect(KnownBugs::parse(Str::new("generator 40\nbug 0001 seed 9 O0 5 O0 5 options\n")).is_err(), Str::new("a key twice"))?;
+    expect(KnownBugs::parse(Str::new("generator 40\nbug 0001 seed 9 O0 x options\n")).is_err(), Str::new("no hash number"))?;
+    return expect(KnownBugs::parse(Str::new("generator 40\nbug 0001 seed 9 O0 5 options\nbug 0002 seed 9 O2 5 options\n")).is_err(), Str::new("a seed twice at one set of options"));
+}
+
+![test]
+function a_listed_seed_is_its_bug_only_when_every_configuration_prints_its_recorded_line() -> Result<(), TestError> {
+    expect(names_bug(printing(0, Str::new("5 5 6")), Str::new("0001"), true), Str::new("the recorded lines"))?;
+    // Another disagreement on a listed seed is not the bug.
+    expect(names_bug(printing(0, Str::new("5 5 7")), Str::new("0001"), false), Str::new("the interpreter printing a third line"))?;
+    expect(names_bug(printing(0, Str::new("5 6 6")), Str::new("0001"), false), Str::new("-O2 printing the interpreter's line"))?;
+    expect(names_bug(printing(0, Str::new("6 6 6")), Str::new("0001"), false), Str::new("every configuration agreeing"))?;
+    // A configuration the entry does not record prints one of its lines.
+    expect(names_bug(printing(1, Str::new("5 5 6 6 6")), Str::new("0001"), true), Str::new("a reference printing the right line"))?;
+    expect(names_bug(printing(1, Str::new("5 5 5 8 6")), Str::new("0001"), false), Str::new("a reference printing another line"))?;
+    const list: KnownBugs = known_list();
+    const configurations: Array<Configuration> = Configuration::of_compilers(Str::new("tree"), &Array::<String>::new(), true);
+    mut uncovered: Array<Observation> = Array::<Observation>::new();
+    uncovered.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 5"))));
+    uncovered.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 5"))));
+    uncovered.push(Observation::NotCovered(String::from_str(Str::new("a cast"))));
+    expect(names_bug(list.of(9, &Array::<String>::new(), &configurations, &uncovered), Str::new("0001"), false), Str::new("an interpretation not covering it"))?;
+    mut compiled: Array<Configuration> = Array::<Configuration>::new();
+    compiled.push(configurations[0].clone());
+    compiled.push(configurations[1].clone());
+    mut builds: Array<Observation> = Array::<Observation>::new();
+    builds.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 5"))));
+    builds.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 5"))));
+    expect(names_bug(list.of(9, &Array::<String>::new(), &compiled, &builds), Str::new("0001"), true), Str::new("the builds alone printing their recorded line"))?;
+    mut other: Array<String> = Array::<String>::new();
+    other.push(String::from_str(Str::new("--features")));
+    other.push(String::from_str(Str::new("default")));
+    expect(names_bug(list.of(9, &other, &compiled, &builds), Str::new("0002"), false), Str::new("the entry at the seed's options"))?;
+    const unlisted: boolean = match (list.of(10, &Array::<String>::new(), &compiled, &builds)) {
+        KnownBugMatch::Unlisted => { true }
+        _                       => { false }
+    };
+    return expect(unlisted, Str::new("another seed"));
 }
