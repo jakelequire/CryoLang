@@ -42,17 +42,24 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="${ROOT}/dist"
 PLATFORM="${1:-}"
 ALLOW_UNSMOKED=0
+# --dynamic (linux): link cryo and cryolsp against the host's shared LLVM,
+# for a host without the static LLVM libraries.  The tarball then runs only
+# where those libraries are installed, so it is named `-dynamic` and no
+# release ever ships it; `make install-check` builds one to test the
+# installers with.
+DYNAMIC=0
 shift || true
 for arg in "$@"; do
     case "$arg" in
         --allow-unsmoked) ALLOW_UNSMOKED=1 ;;
+        --dynamic) DYNAMIC=1 ;;
         *) echo "build-release.sh: unknown argument $arg" >&2; exit 2 ;;
     esac
 done
 
 case "$PLATFORM" in
     linux|windows) ;;
-    *) echo "usage: build-release.sh <linux|windows> [--allow-unsmoked]" >&2; exit 1 ;;
+    *) echo "usage: build-release.sh <linux|windows> [--allow-unsmoked] [--dynamic]" >&2; exit 1 ;;
 esac
 
 # Single source of truth for the version.
@@ -134,7 +141,10 @@ smoke_stage() {
     # compiler would build again.
     rm -rf "${stage}/stdlib/.bin" "${stage}/runtime/.bin"
     make -C "$ROOT" cryogate >/dev/null
+    # Named with the host's suffix: a checkout shared with another OS holds
+    # that OS's cryogate beside this one's.
     local cryogate="${ROOT}/tools/CryoGate/build/cryogate"
+    if host_is windows; then cryogate="${cryogate}.exe"; fi
     env "${smoke_env[@]}" "$cryogate" release-smoke "$stage" "$exe" "${runner[@]}"
     trim_stdlib_archives "$stage"
     trim_runtime_archives "$stage"
@@ -241,10 +251,12 @@ build_linux() {
     echo "[build-release] building the bootstrap compiler"
     make -C "$ROOT" cryo >/dev/null
 
-    echo "[build-release] linking static cryo (--release-static)"
+    local link=(--release-static) name="cryo-${VER}-linux-x86_64"
+    if [ "$DYNAMIC" = 1 ]; then link=(--profile=release); name="${name}-dynamic"; fi
+    echo "[build-release] linking cryo (${link[*]})"
     rm -rf "${ROOT}/compiler/build/release-static"
     ( cd "${ROOT}/compiler" && CRYO_STDLIB="${ROOT}/stdlib" \
-        ./build/cryo build --release-static --no-incremental \
+        ./build/cryo build "${link[@]}" --no-incremental \
         --build-dir=build/release-static )
 
     local out="${ROOT}/compiler/build/release-static/cryo"
@@ -257,13 +269,13 @@ build_linux() {
     # that ship, which the compiler then reads instead of hashing itself.
     ( cd "$ROOT" && "${ROOT}/bin/cryo" stamp "${stage}/bin/cryo" --profile=release )
 
-    stage_lsp "$stage" "${ROOT}/compiler/build/cryo" cryolsp --release-static
+    stage_lsp "$stage" "${ROOT}/compiler/build/cryo" cryolsp "${link[@]}"
     strip "${stage}/bin/cryolsp" 2>/dev/null || true
 
     # Confirm both really are fully static: no libLLVM runtime dep, and no
     # dynamic loader at all (glibc ldd: "not a dynamic executable";
     # musl ldd: "not a valid dynamic program").
-    if command -v ldd >/dev/null 2>&1; then
+    if [ "$DYNAMIC" = 0 ] && command -v ldd >/dev/null 2>&1; then
         local ldd_out binary
         for binary in cryo cryolsp; do
             ldd_out="$(ldd "${stage}/bin/${binary}" 2>&1 || true)"
@@ -279,10 +291,12 @@ build_linux() {
 
     stage_common "$stage"
     stage_runtime "$stage"
+    cp "${ROOT}/scripts/install-dependencies.sh" "${stage}/install-dependencies.sh"
+    chmod +x "${stage}/install-dependencies.sh"
 
     if host_is linux; then smoke_stage "$stage" "cryo" 0; else smoke_stage "$stage" "cryo" 1; fi
 
-    local archive="${DIST}/cryo-${VER}-linux-x86_64.tar.gz"
+    local archive="${DIST}/${name}.tar.gz"
     ( cd "$DIST" && tar -czf "$archive" "cryo-${VER}-linux-x86_64" )
     ( cd "$DIST" && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256" )
     rm -rf "$stage"
@@ -321,6 +335,7 @@ build_windows() {
 
     stage_common "$stage"
     stage_runtime "$stage"
+    cp "${ROOT}/scripts/install-dependencies.ps1" "${stage}/install-dependencies.ps1"
 
     if host_is windows; then
         smoke_stage "$stage" "cryo.exe" 0

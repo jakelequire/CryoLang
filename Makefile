@@ -1094,7 +1094,7 @@ release-windows:
 # ---- dev install via symlink (the repo-local toolchain) ----------------
 # `make install` is the DEV install: symlink the committed bin/cryo +
 # stdlib into a prefix.  End users instead run the production downloader:
-#   curl -fsSL https://cryo-lang.org/install.sh | bash
+#   curl -fsSL https://cryolang.org/install.sh | bash
 install:
 	@./install.sh --dev
 

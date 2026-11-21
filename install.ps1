@@ -5,38 +5,57 @@
 .DESCRIPTION
     The one-liner target for Windows:
 
-        irm https://cryo-lang.org/install.ps1 | iex
+        irm https://cryolang.org/install.ps1 | iex
 
-    Detects the host (Windows x86_64 for v1), downloads the matching release
-    zip from GitHub Releases, verifies its sha256, extracts a toolchain into
+    To pass options through the one-liner (a version, -Uninstall):
+
+        & ([scriptblock]::Create((irm https://cryolang.org/install.ps1))) -Version 1.0.0
+
+    Downloads the Windows x86_64 release zip from GitHub Releases (or takes
+    a local one with -Archive), verifies its sha256, installs it into
     %USERPROFILE%\.cryo, and adds %USERPROFILE%\.cryo\bin to the User PATH.
+    An existing install is replaced whole: the new tree is put in place
+    before the old one is removed.
 
-    The Windows build ships cryo.exe alongside LLVM-C.dll (its LLVM runtime
-    dependency) - both live in .cryo\bin so the loader finds the DLL.
+    The install holds cryo.exe, the cryolsp.exe language server, the LLVM
+    DLLs they load, the standard library and the runtime.  The compiler
+    finds its standard library and runtime beside itself; no environment
+    variable is set.
 
-    NOTE: compiling YOUR programs shells out to a C compiler/linker for the
-    final link. Install a mingw-w64 gcc (e.g. via MSYS2 or scoop) and put it
-    on PATH; the cryo.exe itself needs nothing beyond the bundled DLL.
+    Compiling a program links it with a C toolchain.  After installing, the
+    installer builds a hello-world with the installed compiler; when that
+    fails it offers to install llvm-mingw for the current user with winget
+    (install-dependencies.ps1, shipped in the install).
 
 .PARAMETER Version
     Install a specific version (e.g. 1.0.0). Default: latest GitHub release.
+
+.PARAMETER Archive
+    Install this local release zip instead of downloading one.  A sibling
+    <zip>.sha256, when present, is checked.
 
 .PARAMETER Prefix
     Install root. Default: $env:USERPROFILE\.cryo
 
 .PARAMETER Uninstall
-    Remove the install and the PATH entry.
+    Remove the install, its PATH entry, and the archives it built in the
+    user's cache.
 
 .PARAMETER NoModifyPath
     Do not modify the User PATH; print the directory to add instead.
+
+.PARAMETER Yes
+    Install a missing C toolchain without asking.
 #>
 
 [CmdletBinding()]
 param(
     [string]$Version = "",
+    [string]$Archive = "",
     [string]$Prefix  = "",
     [switch]$Uninstall,
-    [switch]$NoModifyPath
+    [switch]$NoModifyPath,
+    [switch]$Yes
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,104 +73,126 @@ if ($arch -ne "AMD64") {
 }
 $target = "windows-x86_64"
 
-if (-not $Prefix) {
-    if ($env:CRYO_HOME) { $Prefix = $env:CRYO_HOME } else { $Prefix = Join-Path $env:USERPROFILE ".cryo" }
+if (-not $Prefix) { $Prefix = Join-Path $env:USERPROFILE ".cryo" }
+$Prefix = [System.IO.Path]::GetFullPath($Prefix)
+$bindir = Join-Path $Prefix "bin"
+
+# An install the MSI made is the MSI's to change: Apps & Features records
+# it, and an upgrade or removal by this script would leave that record
+# pointing at files it no longer describes.
+$msiInstall = Get-ChildItem "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue |
+    ForEach-Object { Get-ItemProperty $_.PSPath } |
+    Where-Object { $_.DisplayName -eq "Cryo" -and $_.InstallLocation -and
+                   ([System.IO.Path]::GetFullPath($_.InstallLocation).TrimEnd('\') -eq $Prefix.TrimEnd('\')) }
+if ($msiInstall) {
+    Die ("Cryo is installed at $Prefix by its MSI. Upgrade it with a newer MSI or winget " +
+         "(winget upgrade CryoLang.Cryo), and remove it from Settings > Apps.")
 }
 
-# --- uninstall ---------------------------------------------------------------
+# The archives an install builds on demand live in the user's cache, below
+# the directory the compiler's cache root names.
+function Get-CacheArchives {
+    if ($env:CRYO_HOME) { return Join-Path $env:CRYO_HOME "cache\archives" }
+    if ($env:LOCALAPPDATA) { return Join-Path $env:LOCALAPPDATA "cryo\archives" }
+    return Join-Path $env:USERPROFILE ".cache\cryo\archives"
+}
+
 function Remove-FromUserPath($dir) {
     $cur = [Environment]::GetEnvironmentVariable("Path", "User")
     if (-not $cur) { return }
-    $parts = $cur.Split(';') | Where-Object { $_ -and ($_ -ne $dir) }
+    $parts = $cur.Split(';') | Where-Object { $_ -and ($_.TrimEnd('\') -ne $dir.TrimEnd('\')) }
     [Environment]::SetEnvironmentVariable("Path", ($parts -join ';'), "User")
 }
 
+# --- uninstall ---------------------------------------------------------------
 if ($Uninstall) {
     if (Test-Path $Prefix) { Remove-Item -Recurse -Force $Prefix; Ok "removed $Prefix" }
     else { Info "nothing to remove at $Prefix" }
-    Remove-FromUserPath (Join-Path $Prefix "bin")
-    if ([Environment]::GetEnvironmentVariable("CRYO_HOME", "User")) {
-        [Environment]::SetEnvironmentVariable("CRYO_HOME", $null, "User")
-        Ok "removed CRYO_HOME from the User environment"
-    }
+    $archives = Get-CacheArchives
+    if (Test-Path $archives) { Remove-Item -Recurse -Force $archives; Ok "removed $archives" }
+    if (-not $NoModifyPath) { Remove-FromUserPath $bindir; Ok "removed $bindir from your User PATH" }
     Ok "Done. (uninstall)"
     exit 0
 }
 
-# --- resolve version ---------------------------------------------------------
-if ($Version) {
-    $ver = $Version.TrimStart('v')
-} else {
-    Info "resolving latest release..."
-    try {
-        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/releases/latest" -Headers @{ "User-Agent" = "cryo-install" }
-        $ver = ($rel.tag_name).TrimStart('v')
-    } catch {
-        Die "could not resolve the latest release. Pass -Version X.Y.Z explicitly."
-    }
-}
-
-$zip    = "cryo-$ver-$target.zip"
-$url    = "https://github.com/$RepoSlug/releases/download/v$ver/$zip"
-$sumUrl = "$url.sha256"
-
-Write-Host ""
-Write-Host "This installer will:" -ForegroundColor Cyan
-Write-Host "  - download $zip (v$ver, $target)"
-Write-Host "  - verify its sha256 checksum"
-Write-Host "  - install to $Prefix"
-Write-Host "  - add $Prefix\bin to your User PATH"
-Write-Host ""
-
-# --- download + verify -------------------------------------------------------
+# --- the zip -----------------------------------------------------------------
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("cryo-" + [System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
-    $zipPath = Join-Path $tmp $zip
-    Info "downloading $url"
-    Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
-
-    Info "downloading checksum"
-    $sumText = (Invoke-WebRequest -Uri $sumUrl -UseBasicParsing).Content
-    # sha256sum format: "<hex>  <filename>"
-    $expected = ($sumText -split '\s+')[0].ToLower()
-    $actual = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToLower()
-    if ($expected -ne $actual) {
-        Die "checksum mismatch - refusing to install.`n  expected $expected`n  actual   $actual"
+    if ($Archive) {
+        if (-not (Test-Path $Archive)) { Die "no archive at $Archive" }
+        $zipPath = [System.IO.Path]::GetFullPath($Archive)
+        $sumPath = "$zipPath.sha256"
+        $sumText = if (Test-Path $sumPath) { Get-Content -Raw $sumPath } else { "" }
+        Info "installing $zipPath"
+    } else {
+        if ($Version) {
+            $ver = $Version.TrimStart('v')
+        } else {
+            Info "resolving latest release..."
+            try {
+                $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/releases/latest" -Headers @{ "User-Agent" = "cryo-install" }
+                $ver = ($rel.tag_name).TrimStart('v')
+            } catch {
+                Die "could not resolve the latest release. Pass -Version X.Y.Z explicitly."
+            }
+        }
+        $zip = "cryo-$ver-$target.zip"
+        $url = "https://github.com/$RepoSlug/releases/download/v$ver/$zip"
+        $zipPath = Join-Path $tmp $zip
+        Info "downloading $url"
+        Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
+        Info "downloading checksum"
+        $sumText = (Invoke-WebRequest -Uri "$url.sha256" -UseBasicParsing).Content
+        if ($sumText -is [byte[]]) { $sumText = [System.Text.Encoding]::ASCII.GetString($sumText) }
     }
-    Ok "checksum verified"
+    if ($sumText) {
+        # sha256sum format: "<hex>  <filename>" (a leading '*' marks binary mode)
+        $expected = ($sumText.Trim() -split '\s+')[0].ToLower()
+        $actual = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToLower()
+        if ($expected -ne $actual) {
+            Die "checksum mismatch - refusing to install.`n  expected $expected`n  actual   $actual"
+        }
+        Ok "checksum verified"
+    } elseif (-not $Archive) {
+        Die "no checksum was published beside the release zip - refusing to install."
+    } else {
+        Warn "no $sumPath beside the archive; installing it unchecked"
+    }
 
-    # Extract (zip wraps everything in one top dir) then swap into place.
+    # Extract (the zip wraps everything in one top dir) then swap into place.
     Info "extracting"
     $stage = Join-Path $tmp "stage"
-    if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
     Expand-Archive -Path $zipPath -DestinationPath $stage
     $top = @(Get-ChildItem -Directory $stage)
     if ($top.Count -ne 1) {
         Die "unexpected archive layout (expected exactly one top-level directory, found $($top.Count))."
     }
     $top = $top[0]
-    # Refuse to install a zip that doesn't contain what we expect.
-    foreach ($required in @("bin\cryo.exe", "bin\LLVM-C.dll", "stdlib\lib.cryo", "VERSION")) {
+    foreach ($required in @("bin\cryo.exe", "bin\cryolsp.exe", "bin\LLVM-C.dll", "bin\libclang.dll",
+                            "stdlib\lib.cryo", "stdlib\.bin\shipped", "runtime\lib.cryo",
+                            "runtime\.bin\shipped", "install-dependencies.ps1", "VERSION")) {
         if (-not (Test-Path (Join-Path $top.FullName $required))) {
             Die "archive is missing '$required' - corrupted or unexpected layout, refusing to install."
         }
     }
+    $ver = (Get-Content -Raw (Join-Path $top.FullName "VERSION")).Trim()
 
-    # Stage the new tree next to the destination, then swap: the previous
-    # install is moved ASIDE (not deleted) until the new one is in place, so
-    # a failed move can never destroy a working install (mirrors install.sh).
+    # The previous install is moved ASIDE (not deleted) until the new one is
+    # in place, so a failed move can never destroy a working install.
     New-Item -ItemType Directory -Path (Split-Path $Prefix) -Force | Out-Null
     $incoming = "$Prefix.new"
     $outgoing = "$Prefix.old"
     if (Test-Path $incoming) { Remove-Item -Recurse -Force $incoming }
     if (Test-Path $outgoing) { Remove-Item -Recurse -Force $outgoing }
     Move-Item -Path $top.FullName -Destination $incoming
-    if (Test-Path $Prefix) { Move-Item -Path $Prefix -Destination $outgoing }
+    if (Test-Path $Prefix) {
+        try { Move-Item -Path $Prefix -Destination $outgoing }
+        catch { Die "could not move the current install at $Prefix aside (is cryo.exe or cryolsp.exe running?): $_" }
+    }
     try {
         Move-Item -Path $incoming -Destination $Prefix
     } catch {
-        # Put the previous install back before failing.
         if (Test-Path $outgoing) { Move-Item -Path $outgoing -Destination $Prefix }
         Die "failed to move the new install into place: $_"
     }
@@ -159,39 +200,44 @@ try {
         try { Remove-Item -Recurse -Force $outgoing }
         catch { Warn "could not remove the previous install at $outgoing (a cryo.exe may still be running) - delete it manually." }
     }
-    Ok "installed to $Prefix"
+    Ok "installed cryo $ver to $Prefix"
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 
+& (Join-Path $bindir "cryo.exe") --version
+if ($LASTEXITCODE -ne 0) {
+    Die "post-install verification failed: 'cryo.exe --version' exited with code $LASTEXITCODE. The download may be corrupted - re-run the installer."
+}
+
 # --- PATH --------------------------------------------------------------------
-$bindir = Join-Path $Prefix "bin"
 if ($NoModifyPath) {
     Info "PATH not modified. Add this directory to your PATH: $bindir"
 } else {
     $cur = [Environment]::GetEnvironmentVariable("Path", "User")
     if (-not $cur) { $cur = "" }
-    if (($cur.Split(';')) -notcontains $bindir) {
+    if (($cur.Split(';') | ForEach-Object { $_.TrimEnd('\') }) -notcontains $bindir.TrimEnd('\')) {
         $new = if ($cur) { "$cur;$bindir" } else { $bindir }
         [Environment]::SetEnvironmentVariable("Path", $new, "User")
-        [Environment]::SetEnvironmentVariable("CRYO_HOME", $Prefix, "User")
-        Ok "added $bindir to your User PATH"
-        Info "open a new terminal for PATH changes to take effect"
+        Ok "added $bindir to your User PATH (open a new terminal for it to take effect)"
     } else {
         Info "PATH already contains $bindir"
     }
 }
 
+# --- the C toolchain ---------------------------------------------------------
+$dependencyArguments = @{}
+if ($Yes) { $dependencyArguments["Yes"] = $true }
+& (Join-Path $Prefix "install-dependencies.ps1") @dependencyArguments
+$linked = ($LASTEXITCODE -eq 0)
+
 Write-Host ""
-& (Join-Path $bindir "cryo.exe") --version
-if ($LASTEXITCODE -ne 0) {
-    Die "post-install verification failed: 'cryo.exe --version' exited with code $LASTEXITCODE. The download may be corrupted - re-run the installer."
+if ($linked) {
+    Ok "Done.  cryo $ver is installed and links programs."
+} else {
+    Warn "cryo $ver is installed, but cannot link programs until the step above succeeds:"
+    Warn "  $Prefix\install-dependencies.ps1"
 }
-Ok "Done.  cryo v$ver installed."
-Write-Host ""
-Write-Host "Next:" -ForegroundColor Cyan
-Write-Host "  - open a new terminal, then:  cryo --version"
-Write-Host "  - compiling a program needs a mingw-w64 gcc on PATH for the final link"
-Write-Host "    (e.g. install MSYS2 and 'pacman -S mingw-w64-x86_64-gcc', or 'scoop install gcc')"
-Write-Host ""
-Write-Host "https://github.com/$RepoSlug" -ForegroundColor Cyan
+Write-Host "  which install runs:  cryo version --verbose"
+Write-Host "  uninstall:           & ([scriptblock]::Create((irm https://cryolang.org/install.ps1))) -Uninstall"
+if (-not $linked) { exit 1 }

@@ -5,47 +5,43 @@
 # TWO modes:
 #
 #   PRODUCTION (default) - the one-liner target:
-#       curl -fsSL https://cryo-lang.org/install.sh | bash
-#     Detects the host (Linux x86_64 for v1), downloads the matching release
-#     tarball from GitHub Releases, verifies its sha256, extracts a
-#     self-contained toolchain into ~/.cryo, and adds ~/.cryo/bin to PATH via
-#     your shell rc.  The shipped `cryo` is a static binary (no libLLVM
-#     runtime dependency).  No repo checkout required.
+#       curl -fsSL https://cryolang.org/install.sh | bash
+#     Downloads the Linux x86_64 release tarball from GitHub Releases (or
+#     takes a local one with --archive), verifies its sha256, installs it
+#     into ~/.cryo, and adds ~/.cryo/bin to PATH via your shell rc.  An
+#     existing install is replaced whole.  The shipped `cryo` and `cryolsp`
+#     are static binaries.  No repo checkout required.
+#
+#     Compiling a program links it with a C compiler.  After installing, the
+#     installer builds a hello-world with the installed compiler; when that
+#     fails it offers to install gcc with your package manager
+#     (install-dependencies.sh, shipped in the install).
 #
 #   DEV (--dev) - for working in a cloned repo:
 #       ./install.sh --dev
 #     Symlinks the committed <repo>/bin/cryo + <repo>/stdlib into a prefix
-#     (default /usr/local), building the stdlib archive once if needed.  This
-#     is what `make install` runs.  No download.
+#     (default /usr/local).  This is what `make install` runs.  No download.
 #
-# NOTE (both modes): compiling YOUR programs shells out to a system C
-# compiler/linker (cc/gcc/clang) for the final link - install one if you
-# don't have it (the static `cryo` itself needs nothing).
-#
-# Stdlib lookup at runtime, in priority order:
-#   1. --stdlib=PATH                   (one-off CLI override)
-#   2. $CRYO_STDLIB                    (explicit stdlib path env override)
-#   3. $CRYO_HOME/stdlib               (install-root env; cross-platform)
-#      $CRYO_HOME/share/cryo/stdlib    (FHS layout under install root)
-#   4. <bindir>/../stdlib              (Linux only, via /proc/self/exe)
-#      <bindir>/../share/cryo/stdlib   (Linux only, via /proc/self/exe)
-#   5. [project] stdlib_root           (per-project pin in cryoconfig)
-#   6. <project_root>/../stdlib        (legacy in-tree fallback)
-# The ~/.cryo/bin/cryo + ~/.cryo/stdlib layout below satisfies (4) on Linux
-# with no env var; we also export CRYO_HOME for resilience.
+# The compiler finds its stdlib and runtime beside itself
+# (<bindir>/../stdlib, <bindir>/../runtime); no environment variable is set.
+# `cryo version --verbose` names the binary that runs and the stdlib it uses.
 #
 # Usage: install.sh [options]
 #   PRODUCTION:
 #       --version=X.Y.Z   Install a specific version (default: latest release)
-#       --prefix=DIR      Install root (default: $CRYO_HOME or ~/.cryo)
-#       --uninstall       Remove the ~/.cryo install + the PATH rc line
+#       --archive=FILE    Install this local release tarball (a sibling
+#                         FILE.sha256, when present, is checked)
+#       --prefix=DIR      Install root (default: ~/.cryo)
+#       --uninstall       Remove the install, the PATH rc block, and the
+#                         archives it built in the user's cache
 #       --no-modify-path  Don't touch shell rc files (print the line instead)
 #   DEV (--dev):
 #       --prefix=DIR      Symlink prefix (default: /usr/local)
 #       --no-lsp          Skip the cryolsp symlink
 #       --uninstall       Remove the dev symlinks
 #   COMMON:
-#   -y, --yes             Skip the interactive confirmation
+#   -y, --yes             Don't ask: confirm the install, and install a
+#                         missing C compiler
 #   -h, --help            Show usage and exit
 #
 
@@ -97,7 +93,7 @@ print_banner() {
 }
 
 usage() {
-    sed -n '3,52p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,46p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -110,6 +106,7 @@ MODE="prod"
 PREFIX=""               # mode-specific default resolved later
 INSTALL_LSP=1
 REQ_VERSION=""
+ARCHIVE=""
 MODIFY_PATH=1
 
 for arg in "$@"; do
@@ -117,6 +114,7 @@ for arg in "$@"; do
         -y|--yes)         ASSUME_YES=1 ;;
         --dev|--from-source) MODE="dev" ;;
         --prefix=*)       PREFIX="${arg#--prefix=}" ;;
+        --archive=*)      ARCHIVE="${arg#--archive=}" ;;
         --version=*)      REQ_VERSION="${arg#--version=}" ;;
         --no-lsp)         INSTALL_LSP=0 ;;
         --no-modify-path) MODIFY_PATH=0 ;;
@@ -178,36 +176,42 @@ prod_add_path() {
         return
     fi
     {
-        echo ""
         echo "$marker"
-        echo "export CRYO_HOME=\"${INSTALL_ROOT}\""
         echo "$line"
         echo "# <<< cryo install (managed) <<<"
     } >> "$rc"
-    log_ok "added ~/.cryo/bin to PATH in ${rc/#$HOME/\~}"
+    log_ok "added ${bindir/#$HOME/\~} to PATH in ${rc/#$HOME/\~}"
     log_info "open a new shell or run:  source ${rc/#$HOME/\~}"
 }
 
 prod_install() {
-    command -v curl >/dev/null 2>&1 || die "curl is required."
     command -v tar  >/dev/null 2>&1 || die "tar is required."
     command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required."
 
-    local target ver tarball url sumurl tmp
+    # `tmp` is global: the EXIT trap that removes it runs after this returns.
+    local target ver tarball url source
     target="$(prod_detect_target)"
-    if [ -n "$REQ_VERSION" ]; then ver="${REQ_VERSION#v}"; else
-        log_info "resolving latest release..."
-        ver="$(prod_latest_version)"
+    if [ -n "$ARCHIVE" ]; then
+        [ -f "$ARCHIVE" ] || die "no archive at ${ARCHIVE}"
+        tarball="$(basename "$ARCHIVE")"
+        source="${ARCHIVE}"
+    else
+        command -v curl >/dev/null 2>&1 || die "curl is required."
+        if [ -n "$REQ_VERSION" ]; then ver="${REQ_VERSION#v}"; else
+            log_info "resolving latest release..."
+            ver="$(prod_latest_version)"
+        fi
+        tarball="cryo-${ver}-${target}.tar.gz"
+        url="https://github.com/${REPO_SLUG}/releases/download/v${ver}/${tarball}"
+        source="${url}"
     fi
-    tarball="cryo-${ver}-${target}.tar.gz"
-    url="https://github.com/${REPO_SLUG}/releases/download/v${ver}/${tarball}"
-    sumurl="${url}.sha256"
 
     echo "This installer will:"
-    echo "  • download ${tarball} (v${ver}, ${target})"
+    echo "  • install ${source}"
     echo "  • verify its sha256 checksum"
-    echo "  • install a self-contained toolchain into ${INSTALL_ROOT}"
+    echo "  • replace anything at ${INSTALL_ROOT} with it"
     echo "  • add ${INSTALL_ROOT}/bin to PATH via your shell rc"
+    echo "  • check that this machine links programs, and offer to install a C compiler if not"
     echo
     if [ $ASSUME_YES -ne 1 ] && [ -t 0 ]; then
         read -r -p "Continue? [Y/n] " reply
@@ -217,17 +221,28 @@ prod_install() {
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
 
-    log_info "downloading ${url}"
-    curl -fSL --progress-bar -o "${tmp}/${tarball}" "$url" \
-        || die "download failed - is v${ver} a published release for ${target}?"
-    log_info "downloading checksum"
-    curl -fsSL -o "${tmp}/${tarball}.sha256" "$sumurl" \
-        || die "checksum download failed (${sumurl})."
+    if [ -n "$ARCHIVE" ]; then
+        cp "$ARCHIVE" "${tmp}/${tarball}"
+        if [ -f "${ARCHIVE}.sha256" ]; then
+            cp "${ARCHIVE}.sha256" "${tmp}/${tarball}.sha256"
+        else
+            log_warn "no ${ARCHIVE}.sha256 beside the archive; installing it unchecked"
+        fi
+    else
+        log_info "downloading ${url}"
+        curl -fSL --progress-bar -o "${tmp}/${tarball}" "$url" \
+            || die "download failed - is v${ver} a published release for ${target}?"
+        log_info "downloading checksum"
+        curl -fsSL -o "${tmp}/${tarball}.sha256" "${url}.sha256" \
+            || die "checksum download failed (${url}.sha256)."
+    fi
 
-    log_info "verifying checksum"
-    ( cd "$tmp" && sha256sum -c "${tarball}.sha256" >/dev/null 2>&1 ) \
-        || die "checksum mismatch - refusing to install ${tarball}."
-    log_ok "checksum verified"
+    if [ -f "${tmp}/${tarball}.sha256" ]; then
+        log_info "verifying checksum"
+        ( cd "$tmp" && sha256sum -c "${tarball}.sha256" >/dev/null 2>&1 ) \
+            || die "checksum mismatch - refusing to install ${tarball}."
+        log_ok "checksum verified"
+    fi
 
     # Extract into a staging dir (tarball wraps everything in one top dir),
     # then atomically swap it into place so an upgrade never leaves a
@@ -237,8 +252,13 @@ prod_install() {
     tar -xzf "${tmp}/${tarball}" -C "${tmp}/stage" --strip-components=1
 
     # Refuse to install a tarball that doesn't contain what we expect.
-    [ -f "${tmp}/stage/bin/cryo" ] && [ -f "${tmp}/stage/stdlib/lib.cryo" ] \
-        || die "archive is missing bin/cryo or stdlib/ - corrupted or unexpected layout, refusing to install."
+    local required
+    for required in bin/cryo bin/cryolsp stdlib/lib.cryo stdlib/.bin/shipped runtime/lib.cryo \
+                    runtime/.bin/shipped install-dependencies.sh VERSION; do
+        [ -e "${tmp}/stage/${required}" ] \
+            || die "archive is missing ${required} - corrupted or unexpected layout, refusing to install."
+    done
+    ver="$(cat "${tmp}/stage/VERSION")"
 
     mkdir -p "$(dirname "$INSTALL_ROOT")"
     rm -rf "${INSTALL_ROOT}.old"
@@ -255,19 +275,34 @@ prod_install() {
 
     prod_add_path "${INSTALL_ROOT}/bin"
 
+    local linked=1 dependency_arguments=()
+    [ $ASSUME_YES -eq 1 ] && dependency_arguments=(--yes)
+    "${INSTALL_ROOT}/install-dependencies.sh" "${dependency_arguments[@]}" || linked=0
+
     echo
-    echo "${GREEN}${BOLD}Done.${RESET}  cryo v${ver} installed."
+    if [ $linked -eq 1 ]; then
+        echo "${GREEN}${BOLD}Done.${RESET}  cryo ${ver} is installed and links programs."
+    else
+        log_warn "cryo ${ver} is installed, but cannot link programs until this succeeds:"
+        log_warn "  ${INSTALL_ROOT}/install-dependencies.sh"
+    fi
     echo
     echo "  ${verstr}"
-    echo
-    echo "Next:"
-    echo "  • open a new shell (or source your rc), then:  cryo --version"
-    echo "  • compiling a program needs a system C compiler for the final link:"
-    echo "      Debian/Ubuntu:  sudo apt install gcc"
-    echo "      Fedora:         sudo dnf install gcc"
-    echo "      Alpine:         sudo apk add gcc musl-dev"
+    echo "  open a new shell (or source your rc) to put cryo on PATH"
+    echo "  which install runs:  cryo version --verbose"
+    echo "  uninstall:           curl -fsSL https://cryolang.org/install.sh | bash -s -- --uninstall"
     echo
     echo "${TEAL}${BOLD}https://github.com/${REPO_SLUG}${RESET}"
+    [ $linked -eq 1 ]
+}
+
+# The archives an install builds on demand live in the user's cache, below
+# the directory the compiler's cache root names.
+prod_cache_archives() {
+    if [ -n "${CRYO_HOME:-}" ]; then echo "${CRYO_HOME}/cache/archives"
+    elif [ -n "${XDG_CACHE_HOME:-}" ]; then echo "${XDG_CACHE_HOME}/cryo/archives"
+    else echo "${HOME}/.cache/cryo/archives"
+    fi
 }
 
 prod_uninstall() {
@@ -277,6 +312,13 @@ prod_uninstall() {
     else
         log_info "nothing to remove at ${INSTALL_ROOT}"
     fi
+    local archives
+    archives="$(prod_cache_archives)"
+    if [ -e "$archives" ]; then
+        rm -rf "$archives"
+        log_ok "removed ${archives}"
+    fi
+    [ $MODIFY_PATH -eq 1 ] || return 0
     # Strip the managed PATH block from common rc files.
     local rc
     for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
@@ -295,7 +337,7 @@ dev_run() {
     [ -z "$PREFIX" ] && PREFIX="/usr/local"
 
     local SCRIPT_PATH REPO_ROOT SRC_BIN SRC_STDLIB SRC_LSP
-    SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")"
+    SCRIPT_PATH="$(readlink -f "$0")"
     REPO_ROOT="$(dirname "$SCRIPT_PATH")"
     SRC_BIN="${REPO_ROOT}/bin/cryo"
     SRC_STDLIB="${REPO_ROOT}/stdlib"
@@ -380,7 +422,7 @@ print_banner
 if [ "$MODE" = "dev" ]; then
     dev_run
 else
-    INSTALL_ROOT="${PREFIX:-${CRYO_HOME:-$HOME/.cryo}}"
+    INSTALL_ROOT="${PREFIX:-$HOME/.cryo}"
     case "$ACTION" in
         install)   prod_install ;;
         uninstall) prod_uninstall ;;
