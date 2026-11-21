@@ -91,6 +91,9 @@ type struct LinkerConfig {
     exe_suffix:          string;
     extra_system_libs:   string;
     supported:           boolean;
+    /// Whether the target is the host's own, linked by the host's C
+    /// compiler: the one an install's dependency step puts in place.
+    host:                boolean;
 
     /// Pick the right toolchain for `triple`.  `triple` is the post-
     /// `resolve_effective_triple` value (empty falls back to host).  Today:
@@ -133,6 +136,7 @@ type struct LinkerConfig {
                 exe_suffix:         ".exe",
                 extra_system_libs:  "-lm -lws2_32 -lntdll -lcrypt32",
                 supported:          true,
+                host:               false,
             };
         }
         // Unknown triple - keep the existing object-files-only behaviour.
@@ -141,6 +145,7 @@ type struct LinkerConfig {
             exe_suffix:         "",
             extra_system_libs:  "",
             supported:          false,
+            host:               false,
         };
     }
 
@@ -261,6 +266,7 @@ type struct LinkerConfig {
             exe_suffix:         "",
             extra_system_libs:  "-lm",
             supported:          true,
+            host:               true,
         };
     }
 
@@ -288,6 +294,7 @@ type struct LinkerConfig {
             exe_suffix:         ".exe",
             extra_system_libs:  "-lm -lws2_32 -lntdll -lcrypt32",
             supported:          true,
+            host:               true,
         };
     }
 }
@@ -372,6 +379,51 @@ type struct CodegenPasses {
             d = d.with_note(fmt::format("the tool reported:\n%s", output));
         }
         return d;
+    }
+
+    /// The refusal of a build whose C toolchain lacks a program: `command`
+    /// is the one the build would run, `variable` the environment variable
+    /// that names another (`CRYO_CC`, `CRYO_AR`), and `searched` what was
+    /// looked for when it names none.  An install's dependency step installs
+    /// the host's whole C toolchain, so for a `host` tool with no variable
+    /// naming another it is the fix shown, run from the install the compiler
+    /// was started from; a compiler outside an install names the programs
+    /// to install instead.
+    static missing_toolchain(message: string, command: string, variable: string,
+                             searched: Str, host: boolean) -> Diagnostic {
+        mut missing: Diagnostic = Diagnostic::error(ErrorCode::E0705_NO_C_TOOLCHAIN, message);
+        const named: boolean = match (env::var(Str::new(variable))) {
+            Option::Some(value) => { value.length() > 0 }
+            Option::None        => { false }
+        };
+        if (named) {
+            return missing.with_note(f"{variable} names `{command}`, which is not on PATH")
+                .help(f"set {variable} to a program on PATH, or unset it to use the one found there");
+        }
+        missing = missing.with_note(searched);
+        if (!host) {
+            return missing.help(f"install the toolchain that provides `{ExecutablePath::program_word(command)}`, or set {variable} to the program to use");
+        }
+        const install_root: Option<Path> = match (Path::from(env::current_executable().unwrap_or(String::new()).as_str()).parent()) {
+            Option::Some(bin_directory) => { bin_directory.parent() }
+            Option::None                => { Option::None }
+        };
+        match (install_root) {
+            Option::Some(root) => {
+                const powershell_step: PathBuf = root.join("install-dependencies.ps1");
+                if (powershell_step.as_path().is_file()) {
+                    return missing.help_with_example("this install's dependency step installs a C toolchain; run:",
+                        f"powershell -ExecutionPolicy Bypass -File \"{powershell_step.as_str()}\"");
+                }
+                const shell_step: PathBuf = root.join("install-dependencies.sh");
+                if (shell_step.as_path().is_file()) {
+                    return missing.help_with_example("this install's dependency step installs a C toolchain; run:",
+                        f"\"{shell_step.as_str()}\"");
+                }
+            }
+            Option::None => { }
+        }
+        return missing.help(f"install a C toolchain (gcc or clang, and an archiver), or set {variable} to the program to use");
     }
 
     /// Quote one path/argument for the active build host's shell.  POSIX:
@@ -1231,6 +1283,17 @@ type struct CodegenPasses {
             return PassResult::ok();
         }
 
+        // Every link is driven by a C compiler; one that is not on PATH is
+        // refused before the link is attempted.
+        const link_driver: string = link_cfg.link_driver();
+        if (ExecutablePath::of_command(link_driver).length() == 0) {
+            const searched: String = if (link_cfg.host) { String::from("none of `cc`, `gcc` and `clang` is on PATH") }
+                                     else { f"`{ExecutablePath::program_word(link_driver)}` is not on PATH" };
+            ctx.emit_diagnostic(CodegenPasses::missing_toolchain("no C compiler to link the program with",
+                link_driver, "CRYO_CC", searched.as_str(), link_cfg.host));
+            return PassResult::failure(1);
+        }
+
         // The executable is linked under the per-profile cache
         // (`<output_dir>/target/<profile>/<name>[.exe]`) and HOISTED to
         // the build root afterwards; ensure the per-profile dir exists
@@ -1271,7 +1334,6 @@ type struct CodegenPasses {
             return PassResult::failure(1);
         }
 
-        const link_driver: string = link_cfg.link_driver();
         mut cmd: String = String::from_string(link_driver);
         cmd.push(Str::new(" -o "));
         cmd.push(CodegenPasses::link_quote(exe_path.as_str()));
@@ -1550,6 +1612,11 @@ type struct CodegenPasses {
         // `c_header_import` leaves `cc`) so a quoted-path first token can't
         // trip cmd's outer-quote-stripping rule.
         const ar: string = CodegenPasses::pick_archiver();
+        if (ExecutablePath::of_command(ar).length() == 0) {
+            ctx.emit_diagnostic(CodegenPasses::missing_toolchain("no archiver to bundle the library with",
+                ar, "CRYO_AR", Str::new("none of `ar`, `llvm-ar` and `llvm-ar-20` is on PATH"), true));
+            return PassResult::failure(1);
+        }
         const rsp_path: PathBuf = PathBuf::from(f"{archive_path.as_str()}.rsp".as_str());
         if (!CodegenPasses::write_rsp_file(rsp_path.as_path(), objs)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,

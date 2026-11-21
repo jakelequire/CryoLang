@@ -1,0 +1,115 @@
+///! The install check's fixed parts: the files an install must hold, the
+///! two-module program built with it, and the judges of what the installed
+///! compiler reports.
+
+namespace cryogate::release::install;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+
+/// What an install holds and what the check builds with it.
+public type struct InstallLayout {
+    /// The files, `/`-separated below the install root, an install on `os`
+    /// (`linux` or `windows`) holds: the compiler, the language server, the
+    /// stdlib and runtime trees marked shipped, the dependency step and the
+    /// version, and on Windows the LLVM libraries the binaries load.
+    public static required(os: Str) -> Array<String> {
+        mut files: Array<String> = Array::<String>::new();
+        const windows: boolean = os == Str::new("windows");
+        if (windows) {
+            files.push(String::from_str(Str::new("bin/cryo.exe")));
+            files.push(String::from_str(Str::new("bin/cryolsp.exe")));
+            files.push(String::from_str(Str::new("bin/LLVM-C.dll")));
+            files.push(String::from_str(Str::new("bin/libclang.dll")));
+            files.push(String::from_str(Str::new("install-dependencies.ps1")));
+        } else {
+            files.push(String::from_str(Str::new("bin/cryo")));
+            files.push(String::from_str(Str::new("bin/cryolsp")));
+            files.push(String::from_str(Str::new("install-dependencies.sh")));
+        }
+        files.push(String::from_str(Str::new("stdlib/lib.cryo")));
+        files.push(String::from_str(Str::new("stdlib/.bin/shipped")));
+        files.push(String::from_str(Str::new("runtime/lib.cryo")));
+        files.push(String::from_str(Str::new("runtime/.bin/shipped")));
+        files.push(String::from_str(Str::new("VERSION")));
+        return files;
+    }
+
+    /// The program's project file.
+    public static configuration() -> Str {
+        return Str::new(
+            "[project]\n"
+            "project_name = \"install_check\"\n"
+            "output_dir = \"build\"\n"
+            "target_type = \"executable\"\n"
+            "source_dir = \"src\"\n"
+            "entry_point = \"src/main.cryo\"\n");
+    }
+
+    /// The program's entry module: it prints what its second module gives
+    /// and returns 7, an exit code the runtime has to carry back from
+    /// `main`.
+    public static main_source() -> Str {
+        return Str::new(
+            "namespace install_check;\n"
+            "\n"
+            "import std::fmt;\n"
+            "import install_check::greeting::{ Greeting };\n"
+            "\n"
+            "function main() -> int {\n"
+            "    fmt::println(Greeting::text());\n"
+            "    return 7;\n"
+            "}\n");
+    }
+
+    /// The program's second module.
+    public static greeting_source() -> Str {
+        return Str::new(
+            "namespace install_check::greeting;\n"
+            "\n"
+            "public type struct Greeting {\n"
+            "    public static text() -> string { return \"install-check ok\"; }\n"
+            "}\n");
+    }
+
+    /// What the program prints.
+    public static greeting() -> Str { return Str::new("install-check ok"); }
+
+    /// The first line of the block install.sh writes into the shell's rc
+    /// file.
+    public static path_marker() -> Str { return Str::new("# >>> cryo install (managed) >>>"); }
+
+    /// Whether the report of `cryo version --verbose` names `root`: the
+    /// paths are compared with `\` read as `/`, and on Windows without
+    /// regard to case, as the file system compares them.
+    public static names_root(report: Str, root: Str, os: Str) -> boolean {
+        mut said: String = report.replace(&Str::new("\\"), &Str::new("/"));
+        mut wanted: String = root.replace(&Str::new("\\"), &Str::new("/"));
+        if (os == Str::new("windows")) {
+            said = said.as_str().to_ascii_lowercase();
+            wanted = wanted.as_str().to_ascii_lowercase();
+        }
+        return said.as_str().contains(&wanted.as_str());
+    }
+
+    /// Why a build with no C toolchain to link with failed the check, or
+    /// `None` when it was refused as one should be: a failing exit, the code
+    /// E0705, and the install's own dependency step named as the fix.
+    public static judge_no_toolchain(exit: Option<i32>, output: Str) -> Option<String> {
+        match (exit) {
+            Option::Some(code) => {
+                if (code == 0) { return Option::Some(String::from_str(Str::new("a build with no C toolchain to link with succeeded"))); }
+            }
+            Option::None => { return Option::Some(String::from_str(Str::new("a build with no C toolchain to link with did not run to an exit"))); }
+        }
+        if (!output.contains(&Str::new("error[E0705]"))) {
+            return Option::Some(String::from_str(Str::new("a build with no C toolchain to link with was not refused with E0705")));
+        }
+        if (!output.contains(&Str::new("install-dependencies"))) {
+            return Option::Some(String::from_str(Str::new("the E0705 report does not name the install's dependency step")));
+        }
+        return Option::None;
+    }
+}

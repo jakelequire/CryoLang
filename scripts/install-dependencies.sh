@@ -62,10 +62,11 @@ if builds_a_program; then
     exit 0
 fi
 
-if ! printf '%s\n' "$REPORT" | grep -qi 'link'; then
+# The compiler reports E0705 when it finds no C compiler to link with; any
+# other failure is not one a toolchain install answers.
+if ! printf '%s\n' "$REPORT" | grep -q 'E0705'; then
     echo "[error]   the installed compiler could not build a test program, and not for want of a C compiler:" >&2
     printf '%s\n' "$REPORT" | tail -n 12 | sed 's/^/            /' >&2
-    echo "          the install is damaged; install it again." >&2
     exit 1
 fi
 echo "[warn]    the installed compiler cannot link a program yet:"

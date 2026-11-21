@@ -74,7 +74,7 @@ curl -fsSL https://cryolang.org/install.sh | bash
 irm https://cryolang.org/install.ps1 | iex
 ```
 
-Compiling a program links it with a C toolchain. The installer checks that the installed compiler can build and run a program, and if it cannot, offers to install what is missing: `gcc` and the C library headers through your package manager on Linux, llvm-mingw for your user through `winget` on Windows. The same check runs again any time with `~/.cryo/install-dependencies.sh` (`install-dependencies.ps1` on Windows).
+Compiling a program links it with a C toolchain. The installer checks that the installed compiler can build and run a program, and if it cannot, offers to install what is missing: `gcc` and the C library headers through your package manager on Linux, llvm-mingw for your user through `winget` on Windows. The same check runs again any time with `~/.cryo/install-dependencies.sh` (`install-dependencies.ps1` on Windows), and a build that finds no C toolchain stops with error E0705 naming that command.
 
 Open a new shell, then `cryo version --verbose`: it names the binary that runs and the standard library it uses, which tells you which install is on your `PATH`.
 

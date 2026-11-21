@@ -14,7 +14,7 @@ Every gate is a `cryogate` subcommand (`tools/CryoGate`); none is a script.
 | script | what it does | called by |
 |---|---|---|
 | `build-release.sh` | Builds and stages the Linux tarball (static, stamped `cryo` and `cryolsp`; `--dynamic` for a local test tarball no release ships) or the Windows zip under `dist/`, marks the stdlib and runtime trees shipped, then smokes it with `cryogate release-smoke` | `make release`, `make release-linux`, `make release-windows`, CI, release |
-| `install-dependencies.sh` | Shipped at the root of every Linux install: builds and runs a hello-world with the installed compiler, and when the link fails offers to install gcc and the C library headers with the package manager | `install.sh`, the user |
+| `install-dependencies.sh` | Shipped at the root of every Linux install: builds and runs a hello-world with the installed compiler, and when the compiler refuses it with E0705 (no C toolchain) offers to install gcc and the C library headers with the package manager | `install.sh`, the user |
 | `install-dependencies.ps1` | Shipped at the root of every Windows install: the same check, offering llvm-mingw for the current user through winget | `install.ps1`, the user |
 
 ## Toolchain

@@ -58,10 +58,11 @@ function Test-LinksProgram {
 $report = Test-LinksProgram
 if ($null -eq $report) { Ok "this machine links Cryo programs"; exit 0 }
 
-if ($report -notmatch 'link') {
+# The compiler reports E0705 when it finds no C toolchain to link with; any
+# other failure is not one a toolchain install answers.
+if ($report -notmatch 'E0705') {
     Write-Host "[error] the installed compiler could not build a test program, and not for want of a C toolchain:" -ForegroundColor Red
     ($report -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 12) | ForEach-Object { Write-Host "          $_" }
-    Write-Host "        the install is damaged; install it again." -ForegroundColor Red
     exit 1
 }
 Warn "the installed compiler cannot link a program yet:"
