@@ -95,11 +95,7 @@ type struct LinkerConfig {
     /// Pick the right toolchain for `triple`.  `triple` is the post-
     /// `resolve_effective_triple` value (empty falls back to host).  Today:
     ///
-    ///   - SysV-amd64 host (linux/macos): `cc -lm -lstdc++`, no suffix.
-    ///     `-lstdc++` drags in LLVM-20's C++ runtime, which
-    ///     the cryo compiler itself needs (libLLVM-20 is C++); ordinary
-    ///     cryo programs don't reference it but the symbol set is a no-op
-    ///     so keeping it on the host line costs nothing.
+    ///   - SysV-amd64 host (linux/macos): `cc -lm`, no suffix.
     ///   - x86_64 windows-gnu: the driver `windows_gnu_link_driver` names
     ///     (clang + lld on a POSIX host), `-lm`, `.exe` suffix.
     ///     mingw-w64 ships its own libc/libm equivalents; no C++ runtime to
@@ -248,24 +244,22 @@ type struct LinkerConfig {
     ///
     ///   - exe suffix: empty on POSIX, `.exe` on Windows so the hoisted
     ///     binary opens correctly under cmd / Explorer.
-    ///   - extra system libs: `-lstdc++` on POSIX (the self-hosted compiler
-    ///     links libLLVM-20, which is C++; user programs never reference
-    ///     C++ symbols so the flag is inert for them).  On Windows we need
-    ///     `-lws2_32` + `-lntdll` instead: mingw auto-links neither the way
-    ///     it auto-links kernel32/advapi32, so any program using `std::net`
-    ///     (Winsock) or the async reactor (whose Windows readiness backend
-    ///     reaches `\Device\Afd` through the NT layer) would otherwise fail
-    ///     to link.  `-lstdc++` is omitted on Windows
-    ///     because the compiler binary itself isn't relinked here (the
-    ///     committed `cryo.exe` is already linked) and ordinary cryo
-    ///     programs don't need it.
+    ///   - extra system libs: only `-lm` on POSIX.  No C++ runtime: a host
+    ///     with a C compiler and no C++ one has no `libstdc++.so` to link,
+    ///     a shared libLLVM names its own, and the one link that needs it,
+    ///     static LLVM, names it beside LLVM (`run_linking`).  On Windows we
+    ///     need `-lws2_32` + `-lntdll` as well: mingw auto-links neither the
+    ///     way it auto-links kernel32/advapi32, so any program using
+    ///     `std::net` (Winsock) or the async reactor (whose Windows readiness
+    ///     backend reaches `\Device\Afd` through the NT layer) would
+    ///     otherwise fail to link.
     ///   - the rest (`cc` driver, supported) is identical.
     ![target(unix)]
     static host_linker_config() -> LinkerConfig {
         return LinkerConfig {
             default_driver:     "cc",
             exe_suffix:         "",
-            extra_system_libs:  "-lm -lstdc++",
+            extra_system_libs:  "-lm",
             supported:          true,
         };
     }
@@ -1221,7 +1215,7 @@ type struct CodegenPasses {
 
         // Resolve the toolchain for the effective triple.  For host
         // builds (empty triple, or triple == host) this picks `cc` plus
-        // the `-lm -lstdc++` line.  For x86_64 windows-gnu it picks the
+        // the `-lm` line.  For x86_64 windows-gnu it picks the
         // mingw-w64 driver.  For triples we don't
         // know how to drive end-to-end (aarch64, riscv, windows-msvc,
         // ...) `supported` is false and we keep the historic
@@ -1375,7 +1369,9 @@ type struct CodegenPasses {
         // llvm-config in place of the dynamic `-lLLVM-20` skipped above.
         // Placed after the objects and the stdlib archive and before the
         // system libs, so the single-pass static link order is objects ->
-        // libcryo.a -> LLVM -> libm/libstdc++.
+        // libcryo.a -> LLVM -> libstdc++ -> libm.  Static LLVM is C++, so its
+        // C++ runtime is named here and on no other link line: a shared
+        // libLLVM names its own, and a program that links no LLVM needs none.
         if (ctx.options.static_link) {
             const llvm_static: string = CodegenPasses::static_llvm_link_flags(CodegenPasses::pick_llvm_config());
             if (llvm_static.length() == 0) {
@@ -1385,6 +1381,7 @@ type struct CodegenPasses {
             }
             cmd.push(Str::new(" "));
             cmd.push(Str::new(llvm_static));
+            cmd.push(Str::new(" -lstdc++"));
         }
         // A freestanding link has no libc to satisfy the panic/alloc/backtrace
         // lang items, so the runtime archive supplies them all.  A hosted
@@ -1413,7 +1410,7 @@ type struct CodegenPasses {
         // runtime (`-static-libstdc++ -static-libgcc`) so the produced binary
         // has no `libLLVM-20.so`/`libstdc++.so` runtime dependency.  These are
         // position-independent driver flags, so trailing placement is safe;
-        // `-static-libstdc++` makes the earlier `-lstdc++` resolve to the
+        // `-static-libstdc++` makes the `-lstdc++` after LLVM resolve to the
         // archive.  Linux host only (this branch is the unix link path).
         if (ctx.options.static_link) {
             cmd.push(Str::new(" -static -static-libstdc++ -static-libgcc"));

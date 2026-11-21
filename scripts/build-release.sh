@@ -126,25 +126,34 @@ smoke_stage() {
     fi
     # The first smoke builds the stdlib archives of the default profiles, and
     # the runtime archive of the default configuration, with the staged
-    # compiler; they ship.  The second runs from a copy of the tree in another
-    # directory, as an install is, and must link them as shipped: an archive
-    # it rebuilt, or one more, is one every installed compiler would build
-    # again.
+    # compiler; they ship, and the trees are then marked shipped, so an
+    # installed compiler only reads them and builds any other archive in the
+    # user's cache.  The second runs from a copy of the tree in another
+    # directory, as an install is, with an empty cache: an archive it built
+    # there, or a file it changed in the tree, is one every installed
+    # compiler would build again.
     rm -rf "${stage}/stdlib/.bin" "${stage}/runtime/.bin"
     make -C "$ROOT" cryogate >/dev/null
     local cryogate="${ROOT}/tools/CryoGate/build/cryogate"
     env "${smoke_env[@]}" "$cryogate" release-smoke "$stage" "$exe" "${runner[@]}"
     trim_stdlib_archives "$stage"
     trim_runtime_archives "$stage"
-    local moved="${stage}.moved" shipped
-    rm -rf "$moved"
+    touch "${stage}/stdlib/.bin/shipped" "${stage}/runtime/.bin/shipped"
+    local moved="${stage}.moved" home="${stage}.home" home_spec shipped
+    rm -rf "$moved" "$home"
     cp -R "$stage" "$moved"
+    mkdir -p "$home"
+    home_spec="$home"
+    if [ "${runner[*]:-}" = wine ]; then home_spec="Z:$(printf '%s' "$home" | tr '/' '\\')"; fi
     shipped="$(cd "$stage" && find stdlib/.bin runtime/.bin -type f | sort | xargs sha256sum)"
-    env "${smoke_env[@]}" "$cryogate" release-smoke "$moved" "$exe" "${runner[@]}"
-    find "${moved}/stdlib/.bin" "${moved}/runtime/.bin" -name last-use -delete
+    env "${smoke_env[@]}" "CRYO_HOME=${home_spec}" "$cryogate" release-smoke "$moved" "$exe" "${runner[@]}"
     [ "$shipped" = "$(cd "$moved" && find stdlib/.bin runtime/.bin -type f | sort | xargs sha256sum)" ] \
-        || { echo "error: a copy of the staged tree elsewhere did not link the shipped stdlib and runtime archives as they are" >&2; exit 1; }
-    rm -rf "$moved"
+        || { echo "error: a copy of the staged tree elsewhere changed its shipped stdlib or runtime archives" >&2; exit 1; }
+    local built
+    built="$(find "$home" -name '*.manifest')"
+    [ -z "$built" ] \
+        || { echo "error: a copy of the staged tree elsewhere built archives it does not ship:" >&2; echo "$built" >&2; exit 1; }
+    rm -rf "$moved" "$home"
 }
 
 trim_runtime_archives() {
@@ -175,6 +184,35 @@ trim_stdlib_archives() {
         done < <(find "$home" -type f)
         find "$home" -type d -empty -delete
     done
+    # What the smoke's link driver answered about itself describes the
+    # build machine's toolchain, not the user's.
+    rm -rf "${stage}"/stdlib/.bin/*/toolchain
+}
+
+stage_lsp() {
+    # $1 = staging dir, $2 = the compiler that builds it, $3 = the binary's
+    # name, then the build's own options.  The language server ships beside
+    # the compiler, built by the compiler that ships, from the same tree.
+    local stage="$1" compiler="$2" name="$3"
+    shift 3
+    echo "[build-release] building ${name}"
+    rm -rf "${ROOT}/tools/CryoLSP/build/release"
+    ( cd "${ROOT}/tools/CryoLSP" && CRYO_STDLIB="${ROOT}/stdlib" \
+        "$compiler" build --no-incremental --build-dir=build/release "$@" )
+    [ -f "${ROOT}/tools/CryoLSP/build/release/${name}" ] \
+        || { echo "error: ${name} not produced at tools/CryoLSP/build/release" >&2; exit 1; }
+    cp "${ROOT}/tools/CryoLSP/build/release/${name}" "${stage}/bin/${name}"
+}
+
+pack_zip() {
+    # $1 = archive, $2 = directory below $DIST.  `zip` where it is installed;
+    # a Windows host packs with the tar that ships with Windows, which
+    # writes a zip for a .zip name.
+    if command -v zip >/dev/null 2>&1; then
+        ( cd "$DIST" && zip -qr "$1" "$2" )
+    else
+        ( cd "$DIST" && "${SYSTEMROOT:-C:/Windows}/System32/tar.exe" -a -c -f "$(basename "$1")" "$2" )
+    fi
 }
 
 host_is() {   # $1 = linux|windows
@@ -219,19 +257,24 @@ build_linux() {
     # that ship, which the compiler then reads instead of hashing itself.
     ( cd "$ROOT" && "${ROOT}/bin/cryo" stamp "${stage}/bin/cryo" --profile=release )
 
-    # Confirm it really is fully static: no libLLVM runtime dep, and no
+    stage_lsp "$stage" "${ROOT}/compiler/build/cryo" cryolsp --release-static
+    strip "${stage}/bin/cryolsp" 2>/dev/null || true
+
+    # Confirm both really are fully static: no libLLVM runtime dep, and no
     # dynamic loader at all (glibc ldd: "not a dynamic executable";
     # musl ldd: "not a valid dynamic program").
     if command -v ldd >/dev/null 2>&1; then
-        local ldd_out
-        ldd_out="$(ldd "${stage}/bin/cryo" 2>&1 || true)"
-        if echo "$ldd_out" | grep -qi 'LLVM'; then
-            echo "error: shipped cryo still links libLLVM dynamically" >&2; exit 1
-        fi
-        if ! echo "$ldd_out" | grep -qiE 'not a dynamic executable|not a valid dynamic program|statically linked'; then
-            echo "error: shipped cryo is not fully static; ldd reports:" >&2
-            echo "$ldd_out" >&2; exit 1
-        fi
+        local ldd_out binary
+        for binary in cryo cryolsp; do
+            ldd_out="$(ldd "${stage}/bin/${binary}" 2>&1 || true)"
+            if echo "$ldd_out" | grep -qi 'LLVM'; then
+                echo "error: shipped ${binary} still links libLLVM dynamically" >&2; exit 1
+            fi
+            if ! echo "$ldd_out" | grep -qiE 'not a dynamic executable|not a valid dynamic program|statically linked'; then
+                echo "error: shipped ${binary} is not fully static; ldd reports:" >&2
+                echo "$ldd_out" >&2; exit 1
+            fi
+        done
     fi
 
     stage_common "$stage"
@@ -255,12 +298,23 @@ build_windows() {
     [ -f "$dll" ] || { echo "error: ${dll} missing - run scripts/fetch-windows-llvm.sh first" >&2; exit 1; }
     [ -f "$clang_dll" ] || { echo "error: ${clang_dll} missing - run scripts/fetch-windows-llvm.sh first" >&2; exit 1; }
 
-    echo "[build-release] cross-building cryo.exe"
-    make -C "$ROOT" cryo-exe >/dev/null
-
+    # A Windows host builds cryo.exe and the server natively; any other
+    # cross-builds them with the host compiler.
     local exe="${ROOT}/compiler/build/cryo.exe"
-    [ -x "$exe" ] || [ -f "$exe" ] || { echo "error: cryo.exe not produced at $exe" >&2; exit 1; }
-    cp "$exe" "${stage}/bin/cryo.exe"
+    if host_is windows; then
+        echo "[build-release] building cryo.exe"
+        make -C "$ROOT" cryo >/dev/null
+        [ -f "$exe" ] || { echo "error: cryo.exe not produced at $exe" >&2; exit 1; }
+        cp "$exe" "${stage}/bin/cryo.exe"
+        stage_lsp "$stage" "$exe" cryolsp.exe
+    else
+        echo "[build-release] cross-building cryo.exe"
+        make -C "$ROOT" cryo-exe >/dev/null
+        [ -f "$exe" ] || { echo "error: cryo.exe not produced at $exe" >&2; exit 1; }
+        cp "$exe" "${stage}/bin/cryo.exe"
+        CRYO_CC="clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld" \
+            stage_lsp "$stage" "${ROOT}/compiler/build/cryo" cryolsp.exe --target=x86_64-pc-windows-gnu
+    fi
     cp "$dll" "${stage}/bin/LLVM-C.dll"
     # libclang.dll: runtime dep of the C-import engine (Compiler::Bindgen).
     cp "$clang_dll" "${stage}/bin/libclang.dll"
@@ -276,7 +330,7 @@ build_windows() {
 
     local archive="${DIST}/cryo-${VER}-windows-x86_64.zip"
     rm -f "$archive"
-    ( cd "$DIST" && zip -qr "$archive" "cryo-${VER}-windows-x86_64" )
+    pack_zip "$archive" "cryo-${VER}-windows-x86_64"
     ( cd "$DIST" && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256" )
     rm -rf "$stage"
     echo "[build-release] wrote ${archive#$ROOT/}"
