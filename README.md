@@ -76,6 +76,13 @@ irm https://cryolang.org/install.ps1 | iex
 
 Compiling a program links it with a C toolchain. The installer checks that the installed compiler can build and run a program, and if it cannot, offers to install what is missing: `gcc` and the C library headers through your package manager on Linux, llvm-mingw for your user through `winget` on Windows. The same check runs again any time with `~/.cryo/install-dependencies.sh` (`install-dependencies.ps1` on Windows), and a build that finds no C toolchain stops with error E0705 naming that command.
 
+### Packages
+
+Each release also ships:
+
+- **Debian / Ubuntu:** `cryo_<version>-1_amd64.deb`. `sudo apt install ./cryo_<version>-1_amd64.deb` installs it into `/usr/lib/cryo` with `cryo` and `cryolsp` in `/usr/bin`, and pulls in `gcc` and the C library headers.
+- **Windows:** `cryo-<version>-windows-x86_64.msi`, a per-user install into `%USERPROFILE%\.cryo` that adds its `bin` to your `PATH` and, installed interactively, runs the same toolchain check. `winget install CryoLang.Cryo` installs the MSI with llvm-mingw as its dependency.
+
 Open a new shell, then `cryo version --verbose`: it names the binary that runs and the standard library it uses, which tells you which install is on your `PATH`.
 
 Running the installer again upgrades: the new tree replaces the old one whole. To pin a version, or to uninstall (the install, its `PATH` entry, and the libraries it built in your cache):

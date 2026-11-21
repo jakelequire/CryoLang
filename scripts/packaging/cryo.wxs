@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Cryo MSI: a per-user install of the Windows release tree into
+  %USERPROFILE%\.cryo, the place install.ps1 installs to.  Built on Linux by
+  scripts/build-msi.sh with wixl, with the tree's files harvested by
+  wixl-heat into the CryoFiles component group.
+
+  Beyond its files, the MSI runs msi-setup.ps1 as the installing user to add
+  the install's bin directory to the User PATH (and to remove it, with the
+  archives the install built in the user's cache, before uninstalling), and,
+  when installed with its full interface, the install's dependency step,
+  which offers to install a C toolchain through winget and asks first.  A
+  quiet install (winget's) asks nothing; winget installs the toolchain as
+  the package's dependency.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="Cryo" Language="1033" Version="$(var.Version)"
+           Manufacturer="CryoLang" UpgradeCode="6B1A3E2C-9C1D-4F3E-8A57-2D0C5E4B7A19">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser"
+             Description="The Cryo compiler, standard library, runtime and language server"/>
+    <MajorUpgrade DowngradeErrorMessage="A newer Cryo is already installed."/>
+    <Media Id="1" Cabinet="cryo.cab" EmbedCab="yes"/>
+
+    <Property Id="ARPURLINFOABOUT" Value="https://cryolang.org"/>
+    <Property Id="ARPNOMODIFY" Value="1"/>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="INSTALLDIR" Name=".cryo"/>
+    </Directory>
+
+    <Feature Id="Cryo" Level="1">
+      <ComponentGroupRef Id="CryoFiles"/>
+    </Feature>
+
+    <!-- Where the files go, and where Apps & Features (and install.ps1,
+         which leaves an MSI's install to the MSI) finds them. -->
+    <CustomAction Id="SetInstallDirectory" Property="INSTALLDIR" Value="[%USERPROFILE]\.cryo\"/>
+    <CustomAction Id="SetInstallLocation" Property="ARPINSTALLLOCATION" Value="[INSTALLDIR]"/>
+    <CustomAction Id="SetPowerShell" Property="POWERSHELL"
+                  Value="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"/>
+
+    <CustomAction Id="AddToPath" Property="POWERSHELL" Execute="immediate" Return="ignore"
+                  ExeCommand="-NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALLDIR]msi-setup.ps1&quot; -AddToPath"/>
+    <CustomAction Id="DependencyStep" Property="POWERSHELL" Execute="immediate" Return="ignore"
+                  ExeCommand="-NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALLDIR]install-dependencies.ps1&quot;"/>
+    <CustomAction Id="RemoveFromPath" Property="POWERSHELL" Execute="deferred" Impersonate="yes" Return="ignore"
+                  ExeCommand="-NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALLDIR]msi-setup.ps1&quot; -RemoveFromPath"/>
+
+    <!-- The directory is set on every run, removal included, since the
+         removal's own action runs a script from it.  wixl places an action
+         given only After= at the end of the sequence, so the actions every
+         later one reads are given their numbers: CostFinalize is 1000. -->
+    <InstallUISequence>
+      <Custom Action="SetInstallDirectory" Sequence="990"/>
+    </InstallUISequence>
+    <InstallExecuteSequence>
+      <Custom Action="SetInstallDirectory" Sequence="990"/>
+      <Custom Action="SetInstallLocation" Sequence="1001"/>
+      <Custom Action="SetPowerShell" Sequence="1002"/>
+      <Custom Action="RemoveFromPath" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="AddToPath" After="InstallFinalize">NOT Installed AND NOT REMOVE</Custom>
+      <Custom Action="DependencyStep" After="AddToPath">NOT Installed AND NOT REMOVE AND UILevel &gt;= 5</Custom>
+    </InstallExecuteSequence>
+  </Product>
+</Wix>

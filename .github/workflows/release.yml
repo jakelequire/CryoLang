@@ -51,6 +51,9 @@ jobs:
       - name: Build static release tarball
         run: ./scripts/build-release.sh linux
 
+      - name: Build the Debian package from the tarball
+        run: ./scripts/build-deb.sh dist/cryo-*-linux-x86_64.tar.gz
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -58,6 +61,8 @@ jobs:
           path: |
             dist/cryo-*-linux-x86_64.tar.gz
             dist/cryo-*-linux-x86_64.tar.gz.sha256
+            dist/cryo_*_amd64.deb
+            dist/cryo_*_amd64.deb.sha256
 
   # ---------------------------------------------------------------------------
   # Windows x86_64 - cross-built cryo.exe + bundled LLVM-C.dll (not static;
@@ -86,7 +91,7 @@ jobs:
       - name: Install the mingw-w64 cross toolchain + wine
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zip wine
+          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zip wine wixl msitools
 
       - name: Restore the windows LLVM bits cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -106,6 +111,11 @@ jobs:
           WINEDLLOVERRIDES: "mscoree,mshtml="
         run: ./scripts/build-release.sh windows
 
+      - name: Build the MSI from the zip, and its winget manifests
+        run: |
+          ./scripts/build-msi.sh dist/cryo-*-windows-x86_64.zip
+          ./scripts/build-winget.sh dist/cryo-*-windows-x86_64.msi
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -113,6 +123,9 @@ jobs:
           path: |
             dist/cryo-*-windows-x86_64.zip
             dist/cryo-*-windows-x86_64.zip.sha256
+            dist/cryo-*-windows-x86_64.msi
+            dist/cryo-*-windows-x86_64.msi.sha256
+            dist/winget/
 
   # ---------------------------------------------------------------------------
   # Verify - re-run the correctness suite on the tagged commit itself, so a tag
@@ -126,13 +139,12 @@ jobs:
   # `publish` - and it is the one place where a green turns into bytes other
   # people download.  It now carries the gates that say something about the
   # ARTIFACT: the roster, the suite with its counts asserted, the runtime the
-  # archive actually ships, and the examples.
+  # archive actually ships, the language server it ships, and the examples.
   #
   # Deliberately NOT here:
-  #   lsp-check              tools/CryoLSP is not in the release archive.
-  #   api-index-check        docs/stdlib-api.txt is not in it either.
-  # Both exclusions are decisions rather than oversights; reverse them if
-  # either starts shipping.
+  #   api-index-check        docs/stdlib-api.txt is not in the archive.
+  # The exclusion is a decision rather than an oversight; reverse it if the
+  # index starts shipping.
   # ---------------------------------------------------------------------------
   test:
     name: verify suite on the tagged commit
@@ -179,6 +191,9 @@ jobs:
       # in a zero.
       - name: Freestanding runtime acceptance (linux arm; windows needs wine)
         run: make verify-freestanding ARGS=--allow-skipped-arm
+
+      - name: The language server builds with this compiler and passes its checks
+        run: make lsp-check
 
       - name: Build the example projects (examples/*/ smoke gate)
         run: make examples
@@ -270,6 +285,28 @@ jobs:
               || { echo "::error::$(basename "$tree") ships $n stdlib archives, expected 2"; exit 1; }
           done
 
+          # The .deb holds the tarball's tree under /usr/lib/cryo, the
+          # /usr/bin links, and depends on the C toolchain and nothing the
+          # static binary does not need.
+          deb="$(ls cryo_*_amd64.deb)"
+          dpkg-deb -c "$deb" | grep -q ' ./usr/lib/cryo/bin/cryo$' || { echo "::error::$deb holds no /usr/lib/cryo/bin/cryo"; exit 1; }
+          dpkg-deb -c "$deb" | grep -q ' ./usr/bin/cryo -> ../lib/cryo/bin/cryo$' || { echo "::error::$deb links no /usr/bin/cryo"; exit 1; }
+          [ "$(dpkg-deb -f "$deb" Depends)" = "gcc, libc6-dev" ] || { echo "::error::$deb depends on: $(dpkg-deb -f "$deb" Depends)"; exit 1; }
+
+          # The MSI holds every file of the zip, plus its own setup script,
+          # and runs it to add the PATH entry and take it out again.
+          sudo apt-get install -y msitools
+          msiextract -C /tmp/relcheck-msi cryo-*-windows-x86_64.msi > /dev/null
+          ( cd /tmp/relcheck-win/cryo-* && find . -type f | sort ) > /tmp/zip.files
+          ( cd /tmp/relcheck-msi/.cryo && find . -type f ! -name msi-setup.ps1 | sort ) > /tmp/msi.files
+          diff /tmp/zip.files /tmp/msi.files || { echo "::error::the MSI's files differ from the zip's"; exit 1; }
+          for action in AddToPath RemoveFromPath DependencyStep; do
+            msiinfo export cryo-*-windows-x86_64.msi CustomAction | grep -q "^${action}"$'\t' \
+              || { echo "::error::the MSI has no ${action} action"; exit 1; }
+          done
+          test -f winget/manifests/c/CryoLang/Cryo/*/CryoLang.Cryo.installer.yaml \
+            || { echo "::error::no winget installer manifest"; exit 1; }
+
       # Curated body: install one-liners + platform matrix, then the
       # CHANGELOG section for this version. The auto-generated "what's
       # changed" PR list is appended after it by gh-release.
@@ -295,9 +332,11 @@ jobs:
           | Platform | Artifact | Notes |
           | --- | --- | --- |
           | Linux x86_64 (any glibc distro) | \`cryo-${BASE}-linux-x86_64.tar.gz\` | Fully static binary - no LLVM or other runtime dependencies. |
-          | Windows 10+ x86_64 | \`cryo-${BASE}-windows-x86_64.zip\` | \`cryo.exe\` + bundled \`LLVM-C.dll\`; linking your programs needs a mingw-w64 gcc on PATH. |
+          | Debian / Ubuntu x86_64 | \`cryo_${BASE}-1_amd64.deb\` | \`sudo apt install ./cryo_${BASE}-1_amd64.deb\`; pulls in gcc and the C library headers. |
+          | Windows 10+ x86_64 | \`cryo-${BASE}-windows-x86_64.zip\` | \`cryo.exe\` + bundled \`LLVM-C.dll\`; the installer offers llvm-mingw for the link. |
+          | Windows 10+ x86_64 | \`cryo-${BASE}-windows-x86_64.msi\` | Per-user install into \`%USERPROFILE%\\.cryo\`, added to PATH. |
 
-          Compiling your programs shells out to a system C compiler for the final link (\`gcc\`/\`clang\` on Linux, mingw-w64 \`gcc\` on Windows). macOS, ARM64 and musl/Alpine prebuilts are not part of v1 - build from source with \`./install.sh --dev\`.
+          Compiling your programs shells out to a system C compiler for the final link (\`gcc\`/\`clang\` on Linux, llvm-mingw or mingw-w64 \`gcc\` on Windows); a build that finds none stops with E0705 and names the install's \`install-dependencies\` step. The winget manifests for \`CryoLang.Cryo\` are attached for the winget package repository. macOS, ARM64 and musl/Alpine prebuilts are not part of v1 - build from source with \`./install.sh --dev\`.
 
           ## Changelog
 
@@ -322,3 +361,8 @@ jobs:
             dist/cryo-*-linux-x86_64.tar.gz.sha256
             dist/cryo-*-windows-x86_64.zip
             dist/cryo-*-windows-x86_64.zip.sha256
+            dist/cryo_*_amd64.deb
+            dist/cryo_*_amd64.deb.sha256
+            dist/cryo-*-windows-x86_64.msi
+            dist/cryo-*-windows-x86_64.msi.sha256
+            dist/winget/manifests/c/CryoLang/Cryo/*/*.yaml
