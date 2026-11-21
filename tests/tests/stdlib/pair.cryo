@@ -6,11 +6,10 @@
 ///!     and the `Pair::new(a, b)` factory).
 ///!   * Parametric `Eq` - equality routes through each member's own
 ///!     `Eq` impl.  A mismatch in either half must return false.
-///!   * Parametric `Drop` - the where-bound `A: Drop, B: Drop` impl
-///!     must fire each member's drop exactly once when the pair itself
-///!     is dropped.  This is the load-bearing piece: if `Pair<String, V>`
-///!     forgets to drop the key, every `[Pair<string, V>]`-as-map use
-///!     site silently leaks.
+///!   * Release - a `Pair` has no destructor of its own: its members are
+///!     released once each, by the pair's field glue when it is released
+///!     whole, or by their new owners when it is taken apart.  A pair of
+///!     `Copy` members is itself `Copy`.
 ///!
 ///! No tests assert ordering of the two member drops here - Cryo's
 ///! drop-insertion contract doesn't yet promise an order across struct
@@ -130,14 +129,13 @@ function eq_both_differ_yields_false() -> Result<(), TestError> {
 }
 
 // ============================================================================
-// Parametric Drop - wiring check
+// Release - each member once
 // ============================================================================
 
 ![test]
 function drop_fires_for_both_members() -> Result<(), TestError> {
-    // A `Pair<Probe, Probe>` is itself `Drop` (via the parametric impl).
-    // Its drop must dispatch to each member's drop exactly once - total
-    // of two counter increments.
+    // Releasing a `Pair<Probe, Probe>` releases each member exactly
+    // once - two counter increments.
     reset_drops();
     {
         const _p: Pair<Probe, Probe> = Pair::new(Probe::new(1), Probe::new(2));
@@ -159,19 +157,30 @@ function drop_runs_once_per_scope_exit() -> Result<(), TestError> {
     return expect_equal(drop_count(), 4);
 }
 
-// ============================================================================
-// Where-bound interaction - Pair<Copy, Copy> is not Drop
-// ============================================================================
-//
-// We can't directly assert "Pair<i32, i32> is NOT Drop" from inside the
-// test runner - Cryo's where-bound machinery is checked at the call
-// site, and a negative assertion needs a compile-failure harness we
-// don't have yet.  The closest pin is: this test reaches `Pair<i32,i32>`
-// going out of scope without an explicit drop, with the drop-insertion
-// pass set to NOT synthesize a `.drop()` call for the (non-Drop) type.
-// If a regression mistakenly made `Pair<Copy, Copy>` Drop, the build
-// would fail (we'd be calling i32's nonexistent drop) - that's the
-// catch-net we get for now.
+![test]
+function a_pair_of_owning_members_is_taken_apart_once_each() -> Result<(), TestError> {
+    // With no destructor of its own, a pair is taken apart into its
+    // members, and each is released by its new owner, once.
+    reset_drops();
+    {
+        const p: Pair<Probe, Probe> = Pair::new(Probe::new(1), Probe::new(2));
+        const first: Probe = p.first;
+        const second: Probe = p.second;
+        expect_equal(drop_count(), 0)?;
+        expect_equal(first.tag + second.tag, 3)?;
+    }
+    return expect_equal(drop_count(), 2);
+}
+
+![test]
+function a_pair_of_copy_members_is_copied() -> Result<(), TestError> {
+    // Both members are `Copy` and the pair has no destructor, so the pair
+    // is `Copy`: reading it twice copies it twice.
+    const p: Pair<i32, i32> = Pair::new(5, 6);
+    const a: Pair<i32, i32> = p;
+    const b: Pair<i32, i32> = p;
+    return expect_equal(a.first + b.second, 11);
+}
 
 ![test]
 function pair_of_copy_types_needs_no_explicit_drop() -> Result<(), TestError> {
