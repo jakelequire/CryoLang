@@ -220,7 +220,7 @@ What is left:
   file under no project takes 0.85 s, all but a few milliseconds of it the
   standard library: discovery 0.33 s, name resolution 0.19 s.  Every pass
   after semantic analysis reports diagnostics the editor shows (move
-  checking, the dead-code lint, E0456 from drop insertion, E0236 and E0237
+  checking, the dead-code lint, E0236 and E0237
   from type lowering), so the editor's mode skips none of them.  In order:
   1. The frozen standard library layer.  Every table of an analysis lives
      in one context and one arena, and monomorphization routes the

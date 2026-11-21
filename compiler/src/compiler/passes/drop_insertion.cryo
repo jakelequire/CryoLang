@@ -1876,8 +1876,7 @@ type struct DropInserter {
 
     ///
     /// `out` is where a drop flag the join needs is declared, ahead of the
-    /// match (of the statement holding a match expression); with none, a
-    /// binding moved on some arms only is reported E0456 and left undropped.
+    /// match (of the statement holding a match expression).
     walk_match_arms(mut &this, span: SourceSpan,
                     subject: ExpressionNode*,
                     arms: &[mut MatchArmNode*], is_expr: boolean,
@@ -2113,8 +2112,8 @@ type struct DropInserter {
 
     /// True if `key` matches an id that's currently in `binding_names`
     /// i.e. the binding is live at the point of the if/match join.
-    /// Used to discard moves of branch-local bindings from the join,
-    /// which otherwise produce false `E0456_CONDITIONAL_MOVE` reports.
+    /// Used to discard moves of branch-local bindings from the join: a
+    /// binding released within its arm needs no flag after it.
     binding_in_outer_scope(&this, key: u64) -> boolean {
         return this.slot_of(key) >= 0;
     }
@@ -2292,8 +2291,8 @@ type struct DropInserter {
     /// written by every arm that moved it and did not write it: its flag is
     /// declared in `out` (ahead of the construct) if it has none, and it is
     /// returned for the caller to write in those arms (`moved_unwritten`).
-    /// With no `out`, a binding moved on some arms only is reported E0456 and
-    /// left undropped.  Every logged binding stays moved after the join.
+    /// Every join is reached inside a statement, which supplies `out`.  Every
+    /// logged binding stays moved after the join.
     join_arm_moves(mut &this, log: &ArmMoveLog, snap: i64, live_arms: i64,
                    out: mut [Stmt*]*, span: SourceSpan) -> [u64] {
         mut writes:    [u64] = [];
@@ -2315,7 +2314,11 @@ type struct DropInserter {
                 writes.push(key);
                 gov = true;
             } else if (cond_move) {
-                this.emit_conditional_move_by_id(key, log.lines[i]);
+                // Every join is walked inside a statement, which supplies
+                // `out`; a binding moved on some arms only with nowhere to
+                // declare its flag would be released on the paths that moved
+                // it, or on none.
+                this.ctx.ice_at("a binding moved on some arms only reached a join with no statement to declare its drop flag ahead of", span);
             }
             def_keys.push(key);
             def_lines.push(log.lines[i]);
@@ -2412,41 +2415,6 @@ type struct DropInserter {
         return SourceSpan::new(this.ctx.source_file,
             line as u32, 1 as u32,
             line as u32, 1 as u32);
-    }
-
-    emit_conditional_move_by_id(mut &this, key: u64, line: i32) -> void {
-        // Emit as a warning rather than an error.  The
-        // analysis is over-eager: it reports any binding moved on
-        // some control-flow paths but not others, even when the
-        // binding's scope ends before the divergence becomes
-        // observable (e.g. declared inside a loop body that resets
-        // each iteration).  Once synthesis is enabled and proper
-        // escape analysis is in place, this can be promoted to error.
-        const sym: SymbolStr = this.spelling_of(key);
-        mut name_str: string = if (sym.is_valid()) { this.intern.resolve(sym) } else { "" };
-        if (name_str.length() == 0) {
-            name_str = "<binding>";
-        }
-        // Anchor at the binding's declaration span, which carries real
-        // start/end columns so the renderer underlines the binding name
-        // properly.  The move-set only tracks the move's line (no columns),
-        // so a line-only span underlined column 1 (the left margin); fall
-        // back to that only when the declaration span can't be recovered.
-        const line_u: u32 = if (line > 0) { line as u32 } else { 0 };
-        mut span: SourceSpan = SourceSpan::new(this.ctx.source_file, line_u, 1, line_u, 1);
-        for (mut bi: i64 = 0; bi < this.binding_syms.length(); bi++) {
-            if (this.binding_syms[bi].key() == key && this.binding_spans[bi].has_location()) {
-                span = this.binding_spans[bi];
-                break;
-            }
-        }
-        const msg: string = fmt::format(
-            "value `%s` is moved on some control-flow paths but not others",
-            name_str).into_raw();
-        mut diag: Diagnostic = Diagnostic::warning(ErrorCode::E0456_CONDITIONAL_MOVE, msg);
-        diag = diag.at_with_label(span, "this binding may not be dropped on every path");
-        this.ctx.emit_diagnostic(diag);
-        this.fired += 1;
     }
 
     // ---- drop synthesis --------------------------------------------------
@@ -4589,8 +4557,8 @@ type struct DropInserter {
                 // binding: it now owns the rhs result and must be dropped
                 // at scope exit.  Clear any stale moved state for the lhs
                 // so (a) `x = f(x)` doesn't leave `x` marked moved (which
-                // would suppress its scope-exit drop -> leak, and surface
-                // as a spurious E0456 conditional-move at branch joins),
+                // would suppress its scope-exit drop -> leak, and give it a
+                // needless drop flag at branch joins),
                 // and (b) `consume(x); x = make();` revives `x`.  Mirrors
                 // move_check::read_binary.  unmark_moved here is
                 // length-preserving (tombstones in place), so the
