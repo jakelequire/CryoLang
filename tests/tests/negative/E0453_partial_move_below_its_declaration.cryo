@@ -1,0 +1,79 @@
+// E0453: a field may be moved out of a local only at the branch depth the
+// local was declared at. A move inside an `if`, `match` or loop body, or on
+// the right of `&&`, entered AFTER the declaration runs on some paths only,
+// so the owner cannot tell at its scope end whether the field is still in it.
+// That holds for a local declared inside a loop body too: a branch or an
+// inner loop below its declaration is refused as one below a function's.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::PartialMoveBelowItsDeclaration;
+
+type struct Owned { p: mut void*; }
+
+implement trait Drop for struct Owned {
+    drop(mut &this) -> void { }
+}
+
+type struct Parts { a: Owned; b: Owned; }
+
+function make() -> Parts {
+    return Parts { a: Owned { p: null }, b: Owned { p: null } };
+}
+
+function take(x: Owned) -> void { }
+
+function owner_declared_before_the_loop() -> void {
+    const parts: Parts = make();
+    for (mut i: i32 = 0; i < 2; i++) {
+        take(parts.a);   //~ ERROR[E0453] cannot move field `a` out of `parts` on only some paths
+    }
+}
+
+function branch_below_a_loop_body_declaration(flag: boolean) -> void {
+    for (mut i: i32 = 0; i < 2; i++) {
+        const parts: Parts = make();
+        if (flag) {
+            take(parts.a);   //~ ERROR[E0453] cannot move field `a` out of `parts` on only some paths
+        }
+    }
+}
+
+function inner_loop_below_a_loop_body_declaration() -> void {
+    mut i: i32 = 0;
+    while (i < 2) {
+        const parts: Parts = make();
+        for (mut j: i32 = 0; j < 1; j++) {
+            take(parts.b);   //~ ERROR[E0453] cannot move field `b` out of `parts` on only some paths
+        }
+        i += 1;
+    }
+}
+
+function arm_below_a_branch_declaration(choice: i32) -> void {
+    if (choice > 0) {
+        const parts: Parts = make();
+        match (choice) {
+            1 => { take(parts.a); }   //~ ERROR[E0453] cannot move field `a` out of `parts` on only some paths
+            _ => { }
+        }
+    }
+}
+
+function consumes(x: Owned) -> boolean { return true; }
+
+function right_of_and_below_a_loop_body_declaration(flag: boolean) -> void {
+    loop {
+        const parts: Parts = make();
+        if (flag && consumes(parts.a)) { }   //~ ERROR[E0453] cannot move field `a` out of `parts` on only some paths
+        break;
+    }
+}
+
+function main() -> int {
+    owner_declared_before_the_loop();
+    branch_below_a_loop_body_declaration(true);
+    inner_loop_below_a_loop_body_declaration();
+    arm_below_a_branch_declaration(1);
+    right_of_and_below_a_loop_body_declaration(true);
+    return 0;
+}

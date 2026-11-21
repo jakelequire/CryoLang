@@ -333,11 +333,13 @@ type struct MoveChecker {
     /// identity, `pm_field[i]` the moved field's name id - a field IS named by
     /// its leaf within the owner in hand, which is why only the owner half
     /// moves to an identity.  A move is recorded
-    /// (and ALLOWED) only when the owner is a straight-line (`branch_depth ==
-    /// 0`) bare local of a struct with no user `Drop`, so
+    /// (and ALLOWED) only when the owner is a bare local of a struct with no
+    /// user `Drop`, moved at the branch depth it was declared at, so
     /// drop_insertion can skip exactly these fields at the owner's scope exit
-    /// - no drop flags needed because an unconditional move is definitely gone
-    /// at every scope exit.  Everything else stays a hard E0453.  Mirrors
+    /// - no drop flags needed because the move is made on every path from the
+    /// declaration and is gone at every scope exit after it.  Everything else
+    /// stays a hard E0453.  An entry outlives its owner's scope, and is
+    /// cleared when the declaration is walked again.  Mirrors
     /// drop_insertion's `pm_binding`/`pm_field`; the two passes MUST classify
     /// the identical set (a divergence is a double-free or a leak).  Reset in
     /// `enter_function`.  `pm_site[i]` is where the field was moved out,
@@ -401,12 +403,19 @@ type struct MoveChecker {
     arg_binding_unknown: boolean;
 
     /// Depth of enclosing conditional / loop bodies.  A partial field move is
-    /// tracked only at `branch_depth == 0`; inside any `if`/`match`/
-    /// loop body it stays a hard E0453, because drop-skip without per-field
-    /// drop flags is sound only for an *unconditional* move.  Incremented
-    /// around `merge_branches` / `walk_loop_body`;
+    /// tracked only at the depth its owner was declared at: an `if`/`match`/
+    /// loop body entered after the declaration makes it a hard E0453, because
+    /// drop-skip without per-field drop flags is sound only for a move made
+    /// on every path from the declaration to the owner's scope end.
+    /// Incremented around `merge_branches` / `walk_loop_body`;
     /// mirrored in drop_insertion.
     branch_depth: i64;
+
+    /// The `branch_depth` each binding of the function being walked was
+    /// declared at.  A loop body's local is declared and released within one
+    /// iteration, so a field moved out of it at its own depth is moved on
+    /// every pass that reaches its scope end.
+    declaration_depths: HashMap<SymbolKey, i64, GlobalAllocator, FnvHasher>;
 
     /// True while a loop's repeated expressions - its condition and a `for`'s
     /// update - are walked again at the back edge.  A value or field moved
@@ -511,6 +520,7 @@ type struct MoveChecker {
             assigned_member_keys: [],
             assigned_members:     [],
             branch_depth:       0,
+            declaration_depths: HashMap::<SymbolKey, i64, GlobalAllocator, FnvHasher>::new(),
             loop_repeat:        false,
             repeat_declarations_start: 0,
             unsafe_depth:        0,
@@ -568,6 +578,7 @@ type struct MoveChecker {
         this.assigned_member_keys = [];
         this.assigned_members     = [];
         this.branch_depth       = 0;
+        this.declaration_depths = HashMap::<SymbolKey, i64, GlobalAllocator, FnvHasher>::new();
         this.loop_repeat        = false;
         this.repeat_declarations_start = 0;
         this.unsafe_depth       = 0;
@@ -627,6 +638,15 @@ type struct MoveChecker {
                      span: SourceSpan) -> void {
         if (!this.require_identity(sym, name, span)) { return; }
         this.types.insert(sym.table_key(), ty);
+        this.declaration_depths.insert(sym.table_key(), this.branch_depth);
+        // A declaration walked again (a loop body's second walk) makes a
+        // whole value: no field of it is moved out yet.
+        for (mut i: i64 = this.pm_binding.length() - 1; i >= 0; i--) {
+            if (this.pm_binding[i] != sym.key()) { continue; }
+            this.pm_binding.remove(i);
+            this.pm_field.remove(i);
+            this.pm_site.remove(i);
+        }
         // A binding holding a borrowing closure keeps it able to run while
         // the binding is in scope.
         this.arena.frame_borrowing_closures(ty, &this.holder_closures);
@@ -1097,8 +1117,9 @@ type struct MoveChecker {
     /// value is walked.
     merge_branches(mut &this, bodies: [Stmt*], arms: [ExpressionNode*],
                    result: BranchResult) -> void {
-        // Inside a conditional: a field-move-out here is NOT an unconditional
-        // partial move, so partial_move_allowed rejects it (stays E0453).
+        // Inside a conditional: a field moved out here of a value declared
+        // before it is NOT an unconditional partial move, so
+        // partial_move_allowed rejects it (stays E0453).
         this.branch_depth += 1;
         // Full pre-branch snapshot (element-wise copy). A length checkpoint
         // alone is unsound here: an in-branch assignment (`x = ...`) calls
@@ -1712,8 +1733,9 @@ type struct MoveChecker {
                    condition: ExpressionNode*, exits: LoopExits) -> void {
         if (body == null) { return; }
         const loops_back: boolean = !this.leaves_loop(body);
-        // A loop body is conditional (0+ iterations): a field-move-out inside
-        // it is not an unconditional partial move, so it stays E0453.
+        // A loop body is conditional (0+ iterations): a field moved out
+        // inside it of a value declared before the loop is not an
+        // unconditional partial move, so it stays E0453.
         this.branch_depth += 1;
         // All bookkeeping uses persistent parallel-array stacks with
         // length checkpoints (like `moved_keys`), so nested loops just
@@ -2936,15 +2958,15 @@ type struct MoveChecker {
     /// `this.r = this.r.with_flag();`) gives the owner that field back, so
     /// the owner is whole again and its later uses are not partial-move
     /// uses. Only an unconditional assignment does: one in a branch or a
-    /// loop leaves the field moved on the paths that skip it, so the entry
-    /// stays. Mirrored in drop_insertion, whose scope-exit drop then
-    /// releases the field again.
+    /// loop entered after the owner's declaration leaves the field moved on
+    /// the paths that skip it, so the entry stays. Mirrored in
+    /// drop_insertion, whose scope-exit drop then releases the field again.
     reinitialise_moved_field(mut &this, place: ExpressionNode*) -> void {
-        if (this.branch_depth != 0 || place == null) { return; }
+        if (place == null) { return; }
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(place);
         if (ma == null) { return; }
         const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
-        if (id == null) { return; }
+        if (id == null || !this.at_declaration_depth(id.res.local_sym())) { return; }
         const moved: i64 = this.pm_position(id.res.local_sym().key(), ma.member.id);
         if (moved < 0) { return; }
         this.pm_binding.remove(moved);
@@ -3022,14 +3044,25 @@ type struct MoveChecker {
         return null as Type*;
     }
 
-    /// v1 allow-rule for a field-move-out `ma` (`p.field`): permit (and track)
-    /// it ONLY when the owner is a straight-line bare local of a non-`Drop`
-    /// struct value.  Anything else keeps the conservative E0453.
+    /// The allow-rule for a field-move-out `ma` (`p.field`): permit (and
+    /// track) it ONLY when the owner is a bare local of a non-`Drop` struct
+    /// value, moved at the branch depth it was declared at.  Anything else
+    /// keeps the conservative E0453.
     partial_move_allowed(&this, ma: MemberAccessExpr*) -> boolean {
         // Unconditional only: drop-skip without per-field flags is sound only
-        // for a definitely-moved field.
-        if (this.branch_depth != 0) { return false; }
-        return this.partial_move_shape(ma);
+        // for a field moved on every path to the owner's scope end.
+        if (!this.partial_move_shape(ma)) { return false; }
+        return this.at_declaration_depth(ExpressionNode::identifier_of(ma.object).res.local_sym());
+    }
+
+    /// True when the walk is at the branch depth `sym` was declared at: no
+    /// `if`, `match`, loop body or conditional operand was entered since, so
+    /// whatever runs here runs on every path from the declaration onwards.
+    at_declaration_depth(&this, sym: SymbolID) -> boolean {
+        match (this.declaration_depths.get(&sym.table_key())) {
+            Option::Some(depth) => { return depth == this.branch_depth; }
+            Option::None        => { return false; }
+        }
     }
 
     /// The owner shape `partial_move_allowed` accepts, whatever the branch
@@ -3177,7 +3210,8 @@ type struct MoveChecker {
             return;
         }
         // Partial-move model ("allow + track" half): a non-Copy *droppable*
-        // field moved out of a straight-line, non-`Drop` owned local is
+        // field moved out of a non-`Drop` owned local, at the depth the local
+        // was declared at, is
         // ALLOWED and recorded, so drop_insertion skips exactly this field at
         // the owner's scope exit (per-field glue makes that sound).  Every
         // other shape - `Drop` owner, in-branch (conditional) move, pattern
@@ -3483,7 +3517,7 @@ type struct MoveChecker {
         mut label: String = String::from("moving this field out leaves the source to drop it again at scope exit (double free)");
         if (this.has_user_drop(ma.object.resolved_type)) {
             headline = fmt::format("cannot move field `%s` out of a value that owns a destructor", field);
-        } else if (this.branch_depth != 0 && this.partial_move_shape(ma)) {
+        } else if (this.partial_move_shape(ma) && !this.partial_move_allowed(ma)) {
             const owner: string = this.intern.resolve(ExpressionNode::identifier_of(ma.object).name);
             headline = fmt::format("cannot move field `%s` out of `%s` on only some paths", field, owner);
             label = fmt::format("moved only when this runs, so `%s` cannot tell at scope exit whether to drop `%s` (double free)",
@@ -3491,9 +3525,11 @@ type struct MoveChecker {
         }
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE, headline);
         diag = diag.at_with_label(e.span, label);
+        const named: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
+        const owner_text: string = if (named != null) { this.intern.resolve(named.name) } else { "owner" };
         diag = diag.help_with_example(
             "swap the field out with `core::mem::swap`, leaving a valid value to be dropped in place; or use a `Copy` field type",
-            fmt::format("mut taken = <a value to leave behind>;\ncore::mem::swap(&taken, &owner.%s);", field));
+            fmt::format("mut taken = <a value to leave behind>;\ncore::mem::swap(&taken, &%s.%s);", owner_text, field));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;

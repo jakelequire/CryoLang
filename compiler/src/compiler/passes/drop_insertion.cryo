@@ -427,18 +427,20 @@ type struct DropInserter {
     /// owner's scope exit its drop is emitted per-field, SKIPPING the moved
     /// fields (`append_partial_drops`) instead of the monolithic `.drop()` that
     /// would double-free them.  MoveCheck (fatal, runs first) is the gatekeeper:
-    /// it only ALLOWS such a move when the owner is a straight-line
-    /// (`branch_depth == 0`) bare local of a non-`Drop` struct, so by the
-    /// time this pass runs every recorded partial move is unconditional.  The
-    /// classification predicate here is kept identical to MoveCheck's (same
-    /// owner shape, non-`Drop`, droppable field, `branch_depth == 0`) so both
-    /// passes track the IDENTICAL set - a divergence is a double-free or leak.
+    /// it only ALLOWS such a move when the owner is a bare local of a
+    /// non-`Drop` struct moved at the branch depth it was declared at, so by
+    /// the time this pass runs every recorded partial move is made on every
+    /// path from its owner's declaration.  The classification predicate here
+    /// is kept identical to MoveCheck's (same owner shape, non-`Drop`,
+    /// droppable field, the declaration's depth) so both passes track the
+    /// IDENTICAL set - a divergence is a double-free or leak.
     pm_binding: [u64];
     pm_field:   [u32];
 
     /// Enclosing conditional / loop body depth; a partial move is tracked only
-    /// at depth 0 (mirrors move_check::branch_depth).  Bumped around the branch
-    /// walks (`walk_if`/`walk_match_arms`/loop walkers).
+    /// at its owner's declaration depth (mirrors move_check::branch_depth).
+    /// Bumped around the branch walks (`walk_if`/`walk_match_arms`/loop
+    /// walkers).
     branch_depth: i64;
 
     fired:        i64;
@@ -451,6 +453,11 @@ type struct DropInserter {
     /// address escaped).  Only the first may have its old value released on
     /// assignment; conflating them would free storage a callee never filled.
     binding_definit: [u8];
+
+    /// Per binding slot: the `branch_depth` it was declared at.  A field moved
+    /// out at that same depth is moved on every path from the declaration to
+    /// the binding's scope end (mirrors move_check::declaration_depths).
+    binding_depths: [i64];
 
     /// The assignment whose displaced value must be released, decided by
     /// `record_assign_drop` and consumed by the enclosing expression
@@ -568,6 +575,7 @@ type struct DropInserter {
             pw_proj_key:     [],
             pw_whole:        [],
             binding_definit: [],
+            binding_depths:  [],
             pend_assign_node:  null,
             pend_assign_guard: PassLocal::none(),
             pend_assign_guard_moved: false,
@@ -635,6 +643,7 @@ type struct DropInserter {
             this.binding_initflags.pop();
             this.binding_dropflags.pop();
             this.binding_definit.pop();
+            this.binding_depths.pop();
             this.types_keys.pop();
             this.types_refs.pop();
         }
@@ -717,6 +726,14 @@ type struct DropInserter {
         // on some paths only upgrades the slot via register_drop_flag.
         this.binding_dropflags.push(PassLocal::none());
         this.binding_definit.push(if (definit) { 1 as u8 } else { 0 as u8 });
+        this.binding_depths.push(this.branch_depth);
+        // A declaration walked again makes a whole value: no field of it is
+        // moved out yet (mirrors MoveCheck's `register_binding`).
+        for (mut i: i64 = this.pm_binding.length() - 1; i >= 0; i--) {
+            if (this.pm_binding[i] != sym.key()) { continue; }
+            this.pm_binding.remove(i);
+            this.pm_field.remove(i);
+        }
     }
 
     /// Same as register_binding but stores a type-only entry (no
@@ -800,6 +817,19 @@ type struct DropInserter {
                 this.mark_moved_key(this.link_subject[i], span);
             }
         }
+    }
+
+    /// True when `sym` is live and the walk is at the branch depth it was
+    /// declared at: no branch or loop body was entered since, so whatever
+    /// runs here runs on every path from the declaration onwards.
+    at_declaration_depth(&this, sym: SymbolID) -> boolean {
+        if (!sym.is_valid()) { return false; }
+        for (mut i: i64 = this.binding_syms.length() - 1; i >= 0; i--) {
+            if (this.binding_syms[i].key() == sym.key()) {
+                return this.binding_depths[i] == this.branch_depth;
+            }
+        }
+        return false;
     }
 
     /// True if the binding is currently live (registered in an as-yet-unpopped
@@ -1018,6 +1048,7 @@ type struct DropInserter {
         this.binding_spans   = [];
         this.binding_initflags = [];
         this.binding_definit = [];
+        this.binding_depths  = [];
         this.pend_assign_node = null;
         this.reference_moved_roots = [];
         this.assign_seq      = 0;
@@ -1086,6 +1117,7 @@ type struct DropInserter {
                 this.binding_dropflags.push(PassLocal::none());
                 // The caller's move-in made it live before the body runs.
                 this.binding_definit.push(1 as u8);
+                this.binding_depths.push(this.branch_depth);
             }
         }
         this.walk_block_body(func.body);
@@ -1507,9 +1539,10 @@ type struct DropInserter {
         // untracked while MoveCheck allowed it, and every exit after it
         // would release the moved field a second time.
         if (it.condition != null) { this.walk_expr_read(it.condition); }
-        // Branch bodies are conditional: a field-move-out inside is not an
-        // unconditional partial move, so classify_field_move_out ignores it
-        // (mirrors MoveCheck, which rejects it as E0453 before this pass).
+        // Branch bodies are conditional: a field moved out inside of a value
+        // declared before the branch is not an unconditional partial move, so
+        // classify_field_move_out ignores it (mirrors MoveCheck, which
+        // rejects it as E0453 before this pass).
         this.branch_depth += 1;
         const snap: i64 = this.snapshot_moves();
 
@@ -1908,8 +1941,9 @@ type struct DropInserter {
         mut live_arms:   i64 = 0;
         mut diverge_count: i64 = 0;
 
-        // Arm bodies are conditional paths: a field-move-out inside is not an
-        // unconditional partial move, so classify_field_move_out ignores it
+        // Arm bodies are conditional paths: a field moved out inside of a
+        // value declared before the match is not an unconditional partial
+        // move, so classify_field_move_out ignores it
         // (mirrors MoveCheck).  Bump only around the arm walk; the flag/join
         // bookkeeping after the loop synthesizes nodes and never classifies.
         // A move in an arm happens on that arm's path only, so the join
@@ -2612,11 +2646,11 @@ type struct DropInserter {
     /// the owner still holds; the value the assignment displaced was moved
     /// out, and `record_assign_drop` has already declined to release it.
     reinitialise_moved_field(mut &this, place: ExpressionNode*) -> void {
-        if (this.branch_depth != 0 || place == null) { return; }
+        if (place == null) { return; }
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(place);
         if (ma == null) { return; }
         const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
-        if (id == null) { return; }
+        if (id == null || !this.at_declaration_depth(id.res.local_sym())) { return; }
         const owner_id: u64 = id.res.local_sym().key();
         for (mut i: i64 = 0; i < this.pm_binding.length(); i++) {
             if (this.pm_binding[i] == owner_id && this.pm_field[i] == ma.member.id) {
@@ -2688,18 +2722,17 @@ type struct DropInserter {
     }
 
     /// Mirror of move_check::partial_move_allowed: is `ma` (`p.field`) an
-    /// allowed, tracked partial move?  Owner must be a straight-line bare
-    /// live local of a non-`Drop` struct value.  `sym_is_live`
-    /// excludes match/pattern payload bindings (registered type-only, never in
+    /// allowed, tracked partial move?  Owner must be a bare
+    /// live local of a non-`Drop` struct value, moved at the depth it was
+    /// declared at.  Liveness (`at_declaration_depth` asks it) excludes match/pattern payload bindings (registered type-only, never in
     /// the scope stack), matching MoveCheck's "real let/param local" rule.
     partial_move_allowed(&this, ma: MemberAccessExpr*) -> boolean {
-        if (this.branch_depth != 0) { return false; }
         const id: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
         if (id == null) {
             return false;
         }
         const sym: SymbolID = id.res.local_sym();
-        if (!this.sym_is_live(sym)) { return false; }
+        if (!this.at_declaration_depth(sym)) { return false; }
         const decl_ty: TypeRef = this.lookup_type(sym);
         if (!decl_ty.is_valid()) { return false; }
         if (this.is_ptr_or_ref(decl_ty)) { return false; }

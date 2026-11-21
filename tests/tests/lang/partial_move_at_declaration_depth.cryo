@@ -1,0 +1,181 @@
+///! A field moved out of a local at the depth the local was declared at -
+///! inside a loop body, an `if` branch or a `match` arm, with no further
+///! branch or loop between the declaration and the move - is moved on every
+///! path from the declaration to the local's scope end. The local is created
+///! and released within one pass of the body, so it releases only the fields
+///! left in it, once per pass, and the moved field is released once by its
+///! new owner.
+///!
+///! Each `Probe::drop()` bumps a counter; a test asserts the exact count -
+///! fewer is a leak, more is a double release.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::PartialMoveAtDeclarationDepth;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::drop::{ Drop };
+import std::core::iter::{ Iterator };
+import std::collections::pair::{ Pair };
+import std::collections::hashmap::{ HashMap };
+import std::collections::btree_map::{ BTreeMap };
+import std::collections::string::{ String };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_equal, expect_true };
+
+mut g_drop_count: i32 = 0;
+function reset() -> void { g_drop_count = 0; }
+function count() -> i32  { return g_drop_count; }
+
+type struct Probe { tag: i32; }
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void { g_drop_count = g_drop_count + 1; }
+}
+
+type struct ProbePair { a: Probe; b: Probe; }
+
+function sink(p: Probe) -> void { }
+
+function make_pair(tag: i32) -> ProbePair {
+    return ProbePair { a: Probe { tag: tag }, b: Probe { tag: tag + 1 } };
+}
+
+![test]
+function a_loop_body_local_gives_up_one_field() -> Result<(), TestError> {
+    reset();
+    for (mut i: i32 = 0; i < 3; i++) {
+        const pair: ProbePair = make_pair(i);
+        sink(pair.a);
+    }
+    return expect_equal(count(), 6);
+}
+
+![test]
+function a_loop_body_local_gives_up_both_fields() -> Result<(), TestError> {
+    reset();
+    mut i: i32 = 0;
+    while (i < 3) {
+        const pair: ProbePair = make_pair(i);
+        sink(pair.a);
+        sink(pair.b);
+        i += 1;
+    }
+    return expect_equal(count(), 6);
+}
+
+![test]
+function a_continue_after_the_move_releases_what_is_left() -> Result<(), TestError> {
+    reset();
+    for (mut i: i32 = 0; i < 4; i++) {
+        const pair: ProbePair = make_pair(i);
+        sink(pair.a);
+        if (i % 2 == 0) { continue; }
+    }
+    return expect_equal(count(), 8);
+}
+
+
+![test]
+function an_exit_before_the_move_releases_the_whole_value() -> Result<(), TestError> {
+    reset();
+    for (mut i: i32 = 0; i < 3; i++) {
+        const pair: ProbePair = make_pair(i);
+        if (i == 1) { continue; }
+        sink(pair.b);
+    }
+    return expect_equal(count(), 6);
+}
+
+![test]
+function a_break_after_the_move_releases_what_is_left() -> Result<(), TestError> {
+    reset();
+    mut passes: i32 = 0;
+    loop {
+        const pair: ProbePair = make_pair(passes);
+        sink(pair.a);
+        passes += 1;
+        if (passes == 3) { break; }
+    }
+    return expect_equal(count(), 6);
+}
+
+![test]
+function a_field_given_back_in_the_body_is_released_with_its_owner() -> Result<(), TestError> {
+    reset();
+    for (mut i: i32 = 0; i < 2; i++) {
+        mut pair: ProbePair = make_pair(i);
+        sink(pair.a);
+        pair.a = Probe { tag: 9 };
+    }
+    return expect_equal(count(), 6);
+}
+
+![test]
+function a_branch_local_gives_up_a_field() -> Result<(), TestError> {
+    reset();
+    const taken: boolean = count() == 0;
+    if (taken) {
+        const pair: ProbePair = make_pair(1);
+        sink(pair.a);
+    }
+    return expect_equal(count(), 2);
+}
+
+![test]
+function a_match_arm_local_gives_up_a_field() -> Result<(), TestError> {
+    reset();
+    const chosen: Option<i32> = Option::Some(4);
+    match (chosen) {
+        Option::Some(tag) => {
+            const pair: ProbePair = make_pair(tag);
+            sink(pair.b);
+        }
+        Option::None => { }
+    }
+    return expect_equal(count(), 2);
+}
+
+/// Yields `limit` owning pairs of strings, `"k<n>"` to `"v<n>"`.
+type struct Entries { next_index: i32; limit: i32; }
+implement trait Iterator<Pair<String, String>> for struct Entries {
+    next(mut &this) -> Option<Pair<String, String>> {
+        if (this.next_index == this.limit) { return Option::None; }
+        const n: i32 = this.next_index;
+        this.next_index += 1;
+        return Option::Some(Pair::<String, String>::new(f"k{n}", f"v{n}"));
+    }
+}
+
+![test]
+function owning_pairs_are_taken_apart_into_a_map() -> Result<(), TestError> {
+    mut out: HashMap<String, String> = HashMap::<String, String>::new();
+    for (pair in Entries { next_index: 0, limit: 5 }) {
+        const entry: Pair<String, String> = pair;
+        out.insert(entry.first, entry.second);
+    }
+    match (expect_equal(out.length(), 5)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(out.contains_key(&String::from("k3")), "k3 is a key");
+}
+
+![test]
+function owning_pairs_are_collected_into_a_hash_map() -> Result<(), TestError> {
+    const out: HashMap<String, String> = HashMap::<String, String>::from_iterator(Entries { next_index: 0, limit: 3 });
+    match (expect_equal(out.length(), 3)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(out.contains_key(&String::from("k2")), "k2 is a key");
+}
+
+![test]
+function owning_pairs_are_collected_into_a_btree_map() -> Result<(), TestError> {
+    const out: BTreeMap<String, String> = BTreeMap::<String, String>::from_iterator(Entries { next_index: 0, limit: 4 });
+    match (expect_equal(out.length(), 4)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(out.contains_key(&String::from("k0")), "k0 is a key");
+}
