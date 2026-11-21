@@ -345,6 +345,7 @@ build_windows() {
     stage_common "$stage"
     stage_runtime "$stage"
     cp "${ROOT}/scripts/install-dependencies.ps1" "${stage}/install-dependencies.ps1"
+    cp "${ROOT}/scripts/user-setup.ps1" "${stage}/user-setup.ps1"
 
     if host_is windows; then
         smoke_stage "$stage" "cryo.exe" 0

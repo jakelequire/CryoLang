@@ -89,28 +89,22 @@ if ($msiInstall) {
          "(winget upgrade CryoLang.Cryo), and remove it from Settings > Apps.")
 }
 
-# The archives an install builds on demand live in the user's cache, below
-# the directory the compiler's cache root names.
-function Get-CacheArchives {
-    if ($env:CRYO_HOME) { return Join-Path $env:CRYO_HOME "cache\archives" }
-    if ($env:LOCALAPPDATA) { return Join-Path $env:LOCALAPPDATA "cryo\archives" }
-    return Join-Path $env:USERPROFILE ".cache\cryo\archives"
-}
-
-function Remove-FromUserPath($dir) {
-    $cur = [Environment]::GetEnvironmentVariable("Path", "User")
-    if (-not $cur) { return }
-    $parts = $cur.Split(';') | Where-Object { $_ -and ($_.TrimEnd('\') -ne $dir.TrimEnd('\')) }
-    [Environment]::SetEnvironmentVariable("Path", ($parts -join ';'), "User")
-}
+# The install's changes outside its tree (the PATH entry, the archives it
+# builds in the user's cache) are made and undone by the user-setup.ps1 it
+# ships, the script the MSI runs too.
+$userSetup = Join-Path $Prefix "user-setup.ps1"
 
 # --- uninstall ---------------------------------------------------------------
 if ($Uninstall) {
-    if (Test-Path $Prefix) { Remove-Item -Recurse -Force $Prefix; Ok "removed $Prefix" }
-    else { Info "nothing to remove at $Prefix" }
-    $archives = Get-CacheArchives
-    if (Test-Path $archives) { Remove-Item -Recurse -Force $archives; Ok "removed $archives" }
-    if (-not $NoModifyPath) { Remove-FromUserPath $bindir; Ok "removed $bindir from your User PATH" }
+    if (-not (Test-Path $Prefix)) {
+        Info "nothing to remove at $Prefix"
+        exit 0
+    }
+    $undo = @{ RemoveArchives = $true }
+    if (-not $NoModifyPath) { $undo["RemoveFromPath"] = $true }
+    & $userSetup @undo
+    Remove-Item -Recurse -Force $Prefix
+    Ok "removed $Prefix"
     Ok "Done. (uninstall)"
     exit 0
 }
@@ -171,7 +165,7 @@ try {
     $top = $top[0]
     foreach ($required in @("bin\cryo.exe", "bin\cryolsp.exe", "bin\LLVM-C.dll", "bin\libclang.dll",
                             "stdlib\lib.cryo", "stdlib\.bin\shipped", "runtime\lib.cryo",
-                            "runtime\.bin\shipped", "install-dependencies.ps1", "VERSION")) {
+                            "runtime\.bin\shipped", "install-dependencies.ps1", "user-setup.ps1", "VERSION")) {
         if (-not (Test-Path (Join-Path $top.FullName $required))) {
             Die "archive is missing '$required' - corrupted or unexpected layout, refusing to install."
         }
@@ -214,15 +208,7 @@ if ($LASTEXITCODE -ne 0) {
 if ($NoModifyPath) {
     Info "PATH not modified. Add this directory to your PATH: $bindir"
 } else {
-    $cur = [Environment]::GetEnvironmentVariable("Path", "User")
-    if (-not $cur) { $cur = "" }
-    if (($cur.Split(';') | ForEach-Object { $_.TrimEnd('\') }) -notcontains $bindir.TrimEnd('\')) {
-        $new = if ($cur) { "$cur;$bindir" } else { $bindir }
-        [Environment]::SetEnvironmentVariable("Path", $new, "User")
-        Ok "added $bindir to your User PATH (open a new terminal for it to take effect)"
-    } else {
-        Info "PATH already contains $bindir"
-    }
+    & $userSetup -AddToPath
 }
 
 # --- the C toolchain ---------------------------------------------------------
