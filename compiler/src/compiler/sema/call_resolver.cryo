@@ -1534,7 +1534,7 @@ type struct CallResolver {
                         closure_value.span, closure_value.span);
                     return this.resolve_call(visitor, call_e, call);
                 }
-                const field_return: TypeRef = this.resolve_field_call(field_owner, call.callee, callee_member);
+                const field_return: TypeRef = this.resolve_field_call(field_owner, call.callee, callee_member, call);
                 if (field_return.is_valid()) {
                     const field_signature: FunctionType* =
                         this.arena.lookup(this.callable_signature(call.callee.resolved_type)).as_function();
@@ -1717,8 +1717,11 @@ type struct CallResolver {
     /// return the signature's return type; invalid when `obj_type` has no
     /// such field.  Calling the field reads it, so it is gated as a read
     /// is: a private field is refused outside the module that may reach it.
+    /// `call`'s arguments are bound to the signature's parameters, as a
+    /// named callee's are: an argument a `&T` parameter takes is borrowed,
+    /// not given away.
     resolve_field_call(mut &this, obj_type: TypeRef, member_e: mut ExpressionNode*,
-                       member: mut MemberAccessExpr*) -> TypeRef {
+                       member: mut MemberAccessExpr*, call: CallExpr*) -> TypeRef {
         const fa: FieldAnswer = this.member.field_of(obj_type, member.member);
         if (!fa.found() || fa.index < 0) { return TypeRef::invalid(); }
         const ft: Type* = this.arena.lookup(fa.ty);
@@ -1730,7 +1733,9 @@ type struct CallResolver {
         member_e.set_resolved_type(fa.ty);
         const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member_e.span };
         this.member.pin_field(member, &fa, acc_span);
-        return this.arena.lookup(signature).as_function().return_type;
+        const function_type: FunctionType* = this.arena.lookup(signature).as_function();
+        if (call != null) { this.classify_args_from_params(call, &function_type.param_types); }
+        return function_type.return_type;
     }
 
     /// Whether a call's callee is a name, a path or a member - the callees
@@ -6104,7 +6109,7 @@ type struct CallResolver {
             if (mret.is_valid()) { member_e.set_resolved_type(mret); return mret; }
             // No method of the name: a call through a function-typed field,
             // pinned here so every copy of the body carries the field.
-            const field_ret: TypeRef = this.resolve_field_call(obj_type, member_e, member);
+            const field_ret: TypeRef = this.resolve_field_call(obj_type, member_e, member, call);
             // Nor a field: the call is through `Deref`, or names no method,
             // which the lookup below answers as it does for any receiver.
             // This walk is the only one the owner's bodies get, so a call
@@ -6268,7 +6273,7 @@ type struct CallResolver {
             return method_ret;
         }
 
-        const field_ret: TypeRef = this.resolve_field_call(lookup_ref, member_e, member);
+        const field_ret: TypeRef = this.resolve_field_call(lookup_ref, member_e, member, call);
         if (field_ret.is_valid()) {
             return field_ret;
         }

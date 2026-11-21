@@ -29,7 +29,7 @@ import compiler::const_table::{ ConstEval, FoldedInteger };
 import compiler::ast::{
     cloner, declaration, expression, GenericAnnotation, ImplTraitAnnotation, LiteralKind,
     MemberPin, NamedAnnotation, node, node_locator, ObjectForm, pattern, PatternBinding, PatternElement, PointerAnnotation,
-    statement, TraitRef, TypeAnnotation, Visibility
+    statement, TraitBound, TraitRef, TypeAnnotation, Visibility
 };
 import compiler::passes::pass_id::{ PassResult, Provision };
 import compiler::compilation_context::{ CompilationContext };
@@ -559,16 +559,26 @@ type struct SemaVisitor {
                     // The head's owner, off the stamp; the written
                     // target is what a refusal names.
                     mut owner_params: [DeclarationNode*] = this.impl_owner_params(ib);
-                    this.declare_async_methods(ib.methods, owner_params,
+                    // The block's own bounds, and the ones its template
+                    // declares, which hold in every method written on it.
+                    mut owner_bounds: [TraitBound] = ib.where_bounds.clone();
+                    const target: const TemplateEntry* = this.ctx.generic_registry.template_of(ib.target_def());
+                    if (target != null) {
+                        const declared: [TraitBound]* = target.declared_where_bounds();
+                        if (declared != null) {
+                            for (mut bi: i64 = 0; bi < declared.length(); bi++) { owner_bounds.push((*declared)[bi].clone()); }
+                        }
+                    }
+                    this.declare_async_methods(ib.methods, owner_params, &owner_bounds,
                         this.ctx.decl_index.impl_owner(ib, this.ctx.type_arena, "sema/async declare"), ib.target_type,
                         stmt);
                 }
                 DeclKind::Struct(s) => {
-                    this.declare_async_methods(s.methods, s.generic_params,
+                    this.declare_async_methods(s.methods, s.generic_params, &s.where_bounds,
                         this.ctx.decl_index.type_of_decl(s.def, "sema/async declare struct"), s.name, null);
                 }
                 DeclKind::Union(u) => {
-                    this.declare_async_methods(u.methods, u.generic_params,
+                    this.declare_async_methods(u.methods, u.generic_params, &u.where_bounds,
                         this.ctx.decl_index.type_of_decl(u.def, "sema/async declare union"), u.name, null);
                 }
                 DeclKind::Destructure(_) | DeclKind::Enum(_) | DeclKind::Extern(_)
@@ -590,9 +600,11 @@ type struct SemaVisitor {
     /// `impl_decl` is the enclosing impl block's declaration when the owner
     /// is one (null otherwise); a trait impl uses it to bind the trait's
     /// implicit `<Method>Fut` associated type to the future each method
-    /// lowers to.
+    /// lowers to.  `owner_bounds` are the `where` bounds the owner's methods
+    /// are written under, which each future's body is checked under too.
     declare_async_methods(mut &this, methods: &[DeclarationNode*],
                           owner_params: &[DeclarationNode*],
+                          owner_bounds: &[TraitBound],
                           owner_ty: TypeRef, written: SymbolStr,
                           impl_decl: DeclarationNode*) -> void {
         if (!owner_ty.is_valid()) { this.reject_undeclarable_async(methods, written); return; }
@@ -608,6 +620,7 @@ type struct SemaVisitor {
                 written: written,
                 params: this.clone_generic_params(owner_params),
                 impl_decl: impl_decl,
+                bounds: owner_bounds.clone(),
             };
             this.async_lower.declare_method(own);
         }

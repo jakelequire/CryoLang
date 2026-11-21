@@ -1,0 +1,78 @@
+// E0452: a generic function's body is move-checked once, over its own type
+// parameters.  A parameter no bound makes `Copy` owns at some instance, so a
+// body that moves a value of it twice is refused whatever the calls
+// instantiate it at - here only `u8`, which is `Copy`, and one function that
+// nothing calls at all.  A `Copy` bound, or a single move, is accepted.
+![config(testing)]
+![config(negative, E0452)]
+namespace CryoTests::Negative::GenericBodyMovesItsParameterTwice;
+
+import std::core::marker::{ Copy };
+import std::future;
+
+function take<T>(a: T, b: T) -> i32 { return 0; }
+
+function passed_twice<T>(p: T) -> i32 {
+    return take::<T>(p, p);
+    //~^ ERROR[E0452] use of moved value `p`
+}
+
+function stored_twice<T>(p: T) -> T {
+    mut x: T = p;
+    x = p;
+    //~^ ERROR[E0452] use of moved value `p`
+    return x;
+}
+
+function never_called<T>(p: T) -> i32 {
+    const first: T = p;
+    const second: T = p;
+    //~^ ERROR[E0452] use of moved value `p`
+    return 0;
+}
+
+// A trait's default method is checked in the trait, over its own parameters,
+// whether or not anything implements the trait.
+type trait Keeper {
+    keep_twice<U>(&this, p: U) -> i32 {
+        const first: U = p;
+        const second: U = p;
+        //~^ ERROR[E0452] use of moved value `p`
+        return 0;
+    }
+}
+
+// An `async` body is checked where it is lowered, in its future's `poll`,
+// under the same bounds as the function it came from.
+async function passed_twice_later<T>(p: T) -> i32 {
+    return take::<T>(p, p);
+    //~^ ERROR[E0452] use of moved value `p`
+}
+
+type struct Slot<T> {
+    v: T;
+
+    async passed_twice_later(&this, p: T) -> i32 {
+        return take::<T>(p, p);
+        //~^ ERROR[E0452] use of moved value `p`
+    }
+
+    // Controls: the method's own bound, and the owner's below.
+    async copied_twice_later(&this, p: T) -> i32 where T: Copy { return take::<T>(p, p); }
+}
+
+type struct CopySlot<T> where T: Copy {
+    v: T;
+
+    async copied_twice_later(&this, p: T) -> i32 { return take::<T>(p, p); }
+}
+
+// Controls.
+function copied_twice<T>(p: T) -> i32 where T: Copy { return take::<T>(p, p); }
+function moved_once<T>(p: T) -> T { return p; }
+async function copied_twice_later<T>(p: T) -> i32 where T: Copy { return take::<T>(p, p); }
+
+function main() -> i32 {
+    return passed_twice::<u8>(3) + stored_twice::<u8>(4) as i32 + copied_twice::<u8>(5)
+        + moved_once::<u8>(6) as i32;
+}

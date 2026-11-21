@@ -4111,6 +4111,8 @@ A `break` leaves its loop with whatever was moved on the path that reached it. A
 
 References (`&T` / `mut &T`) and raw pointers borrow; passing `&x` keeps `x` usable. Reassigning a binding re-initialises it, so `consume(x); x = make();` is legal and `x` is live again after the assignment. A moved-from binding holds nothing, so that second assignment releases nothing - the callee owns what it took (see [section 15.2](#152-the-drop-trait) for what assignment does release).
 
+A generic body is checked once, over its own type parameters, and not again for each instance: a value of a parameter that no bound in scope makes `Copy` ([section 15.1](#151-the-copy-trait)) is moved where it is used, whatever the calls instantiate the body at. So `function twice<T>(p: T) -> (T, T) { return (p, p); }` is refused (`E0452`) even when every call passes an integer, and is accepted written `where T: Copy`; a field read by value through `&this` in a method of `Holder<T>` (`return this.value;`) is refused the same way (`E0453`) unless `T` is bounded `Copy`. This holds for a function nothing calls, for a trait's default method, and for an `async` function or method, whose body is checked under its own bounds and its owner's.
+
 ```cryo
 const a: Buffer = make_buffer(1024);
 const b: Buffer = a;   // moves a -> b

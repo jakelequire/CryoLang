@@ -802,10 +802,8 @@ type struct MoveChecker {
     /// type (e.g. builtin `string`, a primitive-only struct) is safe to
     /// reuse after a by-value move: there is no drop to run twice.
     type_needs_drop(&this, ty: TypeRef) -> boolean {
-        if (!ty.is_valid())   { return false; }
-        if (this.is_copy(ty)) { return false; }
-        return OwnershipQuery::needs_drop(this.arena, this.registry,
-                                          this.intern, ty);
+        if (!ty.is_valid()) { return false; }
+        return OwnershipQuery::owns_given(this.arena, this.registry, this.intern, ty, &this.copy_params);
     }
 
     is_polled(&this, sym: SymbolID) -> boolean {
@@ -1302,6 +1300,20 @@ type struct MoveChecker {
         this.fatal += 1;
     }
 
+    /// `diag` with the bound a generic body needs when `ty` is a type
+    /// parameter no bound in scope makes `Copy`: the body is checked over
+    /// its own parameters, so a value of one is moved wherever it is used,
+    /// whatever the calls instantiate it at.  Shown, not applied: the bound
+    /// narrows what every caller may pass.
+    with_copy_bound_help(&this, diag: Diagnostic, ty: TypeRef) -> Diagnostic {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null || t.kind != TypeKind::GenericParam) { return diag; }
+        const shown: string = this.arena.resolve_display_name_short(ty);
+        return diag.help_with_example(fmt::format(
+            "`%s` is a type parameter that no bound in scope makes `Copy`, so its values are moved whatever the body is instantiated at; if it is meant only for `Copy` types, bound it in the `where` clause",
+            shown), fmt::format("where %s: Copy", shown));
+    }
+
     /// `diag`, a refused use of a value of type `ty` that was first moved
     /// at `moved_at`, with the way to keep the value: a type implementing
     /// `Clone` is offered `.clone()` where the value is first moved, which
@@ -1311,8 +1323,9 @@ type struct MoveChecker {
     /// moved, or null when the move is of a named variable: one that binds
     /// looser than a postfix call (`*r`) is bracketed before `.clone()`, or
     /// the fix would clone the wrong thing.
-    with_clone_hint(&this, diag: Diagnostic, ty: TypeRef, moved_at: SourceSpan,
+    with_clone_hint(&this, refused: Diagnostic, ty: TypeRef, moved_at: SourceSpan,
                     moved: ExpressionNode*) -> Diagnostic {
+        const diag: Diagnostic = this.with_copy_bound_help(refused, ty);
         const clone_trait: DefId = this.ctx.generic_registry.wellknown(LangItem::Clone);
         if (!clone_trait.is_valid() || !ty.is_valid() || !moved_at.has_location()) { return diag; }
         const shown: string = this.arena.resolve_display_name_short(ty);
@@ -1504,12 +1517,25 @@ type struct MoveChecker {
     walk_function(mut &this, func_decl: DeclarationNode*) -> void {
         const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
         if (func == null || func.body == null) { return; }
-        if (func.is_generic()) { return; }
-        if (Log::enabled(LogArea::Drop, LogLevel::Trace)) {
+        // An implementation's copy of a trait's default method is the
+        // trait's body: checked once in the trait, over the trait's
+        // parameters.  While the copy is still generic its nodes hold the
+        // answers of whichever instance was made last, not its own; each
+        // instance is checked where it is made.
+        if (func.is_synth_default && func.is_generic()) { return; }        if (Log::enabled(LogArea::Drop, LogLevel::Trace)) {
             Log::trace(LogArea::Drop, f"move checking function '{this.intern.resolve(func.name)}'");
         }
+        // A generic function's body is checked once, over its own type
+        // parameters, as a template's methods are: a parameter its bounds do
+        // not make `Copy` owns at some instance, so the verdict does not
+        // wait for a call that instantiates it at an owning type.  What the
+        // walk's questions build over the parameters is built without
+        // demanding it (see `walk_methods`).
+        const was: boolean = this.arena.symbolic_no_demand_active;
+        if (func.is_generic()) { this.arena.set_symbolic_no_demand(true); }
         this.enter_function(func_decl);
         this.walk_stmt(func.body);
+        this.arena.set_symbolic_no_demand(was);
     }
 
     /// Walk `stmt` as an open statement (`open_statements`); a block drops
@@ -2998,9 +3024,12 @@ type struct MoveChecker {
     /// Resolve `ty` to the underlying struct Type* whose per-field drop
     /// glue we can enumerate, peeling `InstantiatedType` wrappers.  Returns
     /// null for anything we can't safely drop field-by-field (unions, enums,
-    /// arrays, primitives, unresolved generics).  Mirrors
-    /// drop_insertion::aggregate_type_of so both passes agree on which owners
-    /// admit a partial move.
+    /// arrays, primitives).  Mirrors drop_insertion::aggregate_type_of so
+    /// both passes agree on which owners admit a partial move.  An instance
+    /// written over a generic body's own parameters (`Pair<K, V>` in
+    /// `from_iterator<I>`) has no resolved type, and its template answers:
+    /// it is the same kind of value, with the same fields, at every instance.
+    /// Drop insertion meets only instances that have one.
     aggregate_type_of(&this, ty: TypeRef) -> Type* {
         if (!ty.is_valid() || this.arena == null) { return null as Type*; }
         mut cur: TypeRef = ty;
@@ -3008,8 +3037,7 @@ type struct MoveChecker {
         mut guard: i32 = 0;
         while (t != null && t.kind == TypeKind::InstantiatedType && guard < 16) {
             const inst: InstantiatedType* = t.as_instantiated();
-            if (!inst.has_resolved_type()) { return null as Type*; }
-            cur = inst.resolved_type;
+            cur = if (inst.has_resolved_type()) { inst.resolved_type } else { inst.generic_base };
             t = this.arena.lookup(cur);
             guard = guard + 1;
         }
@@ -3294,7 +3322,7 @@ type struct MoveChecker {
                         take_example)
             }
         };
-        this.ctx.emit_diagnostic(diag);
+        this.ctx.emit_diagnostic(this.with_copy_bound_help(diag, field_ty));
         this.fired += 1;
         this.fatal += 1;
     }

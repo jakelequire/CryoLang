@@ -34,7 +34,7 @@ import compiler::resolver::symbol_id::{ SymbolID };
 import compiler::ast::{
     ArgBinding, cloner, declaration, expression, GenericAnnotation,
     LiteralKind, MemberPin, node, pattern, PatternBinding,
-    PointerAnnotation, statement, TypeAnnotation, Visibility
+    PointerAnnotation, statement, TraitBound, TypeAnnotation, Visibility
 };
 import compiler::lex::{ Token, TokenType };
 import compiler::diag::{ diagnostic, ErrorCode, source_span };
@@ -324,12 +324,15 @@ type struct AsyncOwner {
     /// the future it lowers to, and so the future is minted in the block's
     /// module.
     impl_decl:    DeclarationNode*;
+    /// The `where` bounds the owner's methods are written under: the
+    /// owner's own, and for an impl block on a template the template's too.
+    bounds:       [TraitBound];
 
     /// The owner of a free function: no method, no receiver, no owner keys.
     static free() -> AsyncOwner {
         return AsyncOwner { method: null, ty: TypeRef::invalid(),
                             decl: TypeRef::invalid(), written: SymbolStr::empty(),
-                            params: [], impl_decl: null };
+                            params: [], impl_decl: null, bounds: [] };
     }
 }
 
@@ -7950,6 +7953,16 @@ type struct AsyncLower {
             // `target_args` is what makes `This` inside the impl resolve to the
             // full `Fut<T>` rather than the bare template base.
             impl_node.target_args = this.spelling.generic_parameters(d.fut_params, span);
+            // `poll` is the function's body, so it is checked under the
+            // bounds that body was written under: its owner's and its own.
+            // A body that copies a `T` bounded `Copy` is refused here
+            // otherwise, though the function it came from accepts it.
+            for (mut bi: i64 = 0; bi < owner.bounds.length(); bi++) {
+                impl_node.where_bounds.push(owner.bounds[bi].clone());
+            }
+            for (mut bi: i64 = 0; bi < node.trait_bounds.length(); bi++) {
+                impl_node.where_bounds.push(node.trait_bounds[bi].clone());
+            }
             // Hang the block off the template so the same demand that specializes
             // `Fut<i64>` specializes its `Future` impl. Without it the
             // specialization exists but has no `poll`.
