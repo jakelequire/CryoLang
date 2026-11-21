@@ -121,6 +121,7 @@ jobs:
       - name: Build the MSI from the zip, and its winget manifests
         run: |
           ./scripts/build-msi.sh dist/cryo-*-windows-x86_64.zip
+          ./scripts/check-msi.sh dist/cryo-*-windows-x86_64.msi dist/cryo-*-windows-x86_64.zip
           ./scripts/build-winget.sh dist/cryo-*-windows-x86_64.msi
 
       - name: Upload artifact
@@ -300,26 +301,10 @@ jobs:
           dpkg-deb -c "$deb" | grep -q ' ./usr/bin/cryo -> ../lib/cryo/bin/cryo$' || { echo "::error::$deb links no /usr/bin/cryo"; exit 1; }
           [ "$(dpkg-deb -f "$deb" Depends)" = "gcc, libc6-dev" ] || { echo "::error::$deb depends on: $(dpkg-deb -f "$deb" Depends)"; exit 1; }
 
-          # The MSI holds exactly the zip's files, and runs the tree's
-          # user-setup.ps1 to add the PATH entry and take it out again.
-          sudo apt-get install -y msitools
-          msiextract -C /tmp/relcheck-msi cryo-*-windows-x86_64.msi > /dev/null
-          ( cd /tmp/relcheck-win/cryo-* && find . -type f | sort ) > /tmp/zip.files
-          ( cd /tmp/relcheck-msi/.cryo && find . -type f | sort ) > /tmp/msi.files
-          diff /tmp/zip.files /tmp/msi.files || { echo "::error::the MSI's files differ from the zip's"; exit 1; }
-          for action in AddToPath RemoveFromPath DependencyStep; do
-            msiinfo export cryo-*-windows-x86_64.msi CustomAction | grep -q "^${action}"$'\t' \
-              || { echo "::error::the MSI has no ${action} action"; exit 1; }
-          done
-          # Removal runs the deferred RemoveFromPath inside the transaction
-          # InstallInitialize opens and before RemoveFiles deletes its script;
-          # an upgrade removes the older Cryo before InstallInitialize.
-          sequence="$(msiinfo export cryo-*-windows-x86_64.msi InstallExecuteSequence)"
-          at() { printf '%s\n' "$sequence" | awk -F'\t' -v action="$1" '$1 == action { sub(/\r$/, "", $3); print $3 }'; }
-          [ "$(at InstallInitialize)" -lt "$(at RemoveFromPath)" ] && [ "$(at RemoveFromPath)" -lt "$(at RemoveFiles)" ] \
-            || { echo "::error::the MSI runs RemoveFromPath at $(at RemoveFromPath), not between InstallInitialize and RemoveFiles"; exit 1; }
-          [ "$(at RemoveExistingProducts)" -lt "$(at InstallInitialize)" ] \
-            || { echo "::error::the MSI runs RemoveExistingProducts at $(at RemoveExistingProducts), after InstallInitialize"; exit 1; }
+          # The MSI: its files, its actions and their sequences, its wizard.
+          cd .. && sudo apt-get install -y msitools
+          ./scripts/check-msi.sh dist/cryo-*-windows-x86_64.msi dist/cryo-*-windows-x86_64.zip
+          cd dist
           test -f winget/manifests/c/CryoLang/Cryo/*/CryoLang.Cryo.installer.yaml \
             || { echo "::error::no winget installer manifest"; exit 1; }
 

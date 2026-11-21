@@ -81,7 +81,7 @@ Compiling a program links it with a C toolchain. The installer checks that the i
 Each release also ships:
 
 - **Debian / Ubuntu:** `cryo_<version>-1_amd64.deb`. `sudo apt install ./cryo_<version>-1_amd64.deb` installs it into `/usr/lib/cryo` with `cryo` and `cryolsp` in `/usr/bin`, and pulls in `gcc` and the C library headers.
-- **Windows:** `cryo-<version>-windows-x86_64.msi`, a per-user install into `%USERPROFILE%\.cryo` that adds its `bin` to your `PATH` and, installed interactively, runs the same toolchain check. `winget install CryoLang.Cryo` installs the MSI with llvm-mingw as its dependency.
+- **Windows:** `cryo-<version>-windows-x86_64.msi`, a per-user install with a setup wizard: the license, the install location (`%USERPROFILE%\.cryo` unless you pick another), whether to install llvm-mingw if no C toolchain is found, and a last page that says whether the computer can link programs and, if not, why. It adds its `bin` to your `PATH`. `winget install CryoLang.Cryo` installs the MSI with llvm-mingw as its dependency.
 
 Open a new shell, then `cryo version --verbose`: it names the binary that runs and the standard library it uses, which tells you which install is on your `PATH`.
 

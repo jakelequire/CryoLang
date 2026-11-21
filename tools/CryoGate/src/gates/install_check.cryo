@@ -11,7 +11,14 @@
 ///!   install    the installer exits 0, its own dependency step included,
 ///!              the install holds every file an install must, and its
 ///!              files are the archive's, byte for byte
-///!   version    `cryo version --verbose` names the installed compiler
+///!   dependency (Windows) the install's dependency step run as the MSI's
+///!              wizard runs it - the same PowerShell, no one to answer,
+///!              told to install nothing, its report written to a file -
+///!              from a process whose PATH holds no toolchain and no winget,
+///!              as an installer's environment is not the user's: the step
+///!              reads the PATH a new terminal gets, so it links a program
+///!              wherever the install step did
+///!   version   `cryo version --verbose` names the installed compiler
 ///!   program    a two-module program builds from outside any project and
 ///!              runs, printing what it should and exiting 7
 ///!   shipped    a build under a profile whose archives the install does
@@ -37,6 +44,7 @@ import std::collections::string::{ String };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::encoding::sha256::{ Sha256 };
+import std::env;
 import std::fmt;
 import std::fs::directory::{ Directory };
 import std::fs::file::{ File };
@@ -145,6 +153,35 @@ public type struct InstallCheck {
         }
         this.holds_the_archive(&shipped, Str::new("after the installer ran"))?;
         fmt::println(f"install-check: install ok -- {this.prefix.as_str()}");
+
+        // dependency
+        if (Host::os() == Str::new("windows")) {
+            const report: String = f"{this.home.as_str()}/install-dependencies.log";
+            const system_root: String = match (env::var(Str::new("SystemRoot"))) {
+                Option::Some(directory) => { directory }
+                Option::None => { return Result::Err(String::from_str(Str::new("no SystemRoot in the environment, to find the PowerShell the MSI runs"))); }
+            };
+            mut step: Job = this.isolated(Job::new(f"{system_root.as_str()}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".as_str()));
+            step.argument(Str::new("-NoProfile"));
+            step.argument(Str::new("-NonInteractive"));
+            step.argument(Str::new("-ExecutionPolicy"));
+            step.argument(Str::new("Bypass"));
+            step.argument(Str::new("-File"));
+            step.argument(f"{this.prefix.as_str()}/install-dependencies.ps1".as_str());
+            step.argument(Str::new("-No"));
+            step.argument(Str::new("-Log"));
+            step.argument(report.as_str());
+            step.directory(this.empty.as_str());
+            step.set_variable(Str::new("PATH"), this.empty.as_str());
+            const stepped: Completion = this.ran(logs, step, Str::new("dependency"));
+            if (!stepped.outcome.succeeded()) {
+                return Result::Err(f"the install's dependency step, run as the MSI runs it with no toolchain or winget on its own PATH, failed ({stepped.outcome.describe().as_str()}); its log: {stepped.log.as_str()}");
+            }
+            if (!InstallCheck::read(Path::from(report.as_str()))?.as_str().contains(&Str::new("[ok]"))) {
+                return Result::Err(f"the install's dependency step exited 0 and wrote no [ok] to its report {report.as_str()}");
+            }
+            fmt::println(String::from_str(Str::new("install-check: dependency ok -- run as the MSI runs it, it read the user's PATH and linked a program")));
+        }
 
         // version
         mut version: Job = this.compiler_job();

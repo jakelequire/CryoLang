@@ -29,7 +29,7 @@ unzip -q "$ZIP" -d "${work}/zip"
 tree="$(find "${work}/zip" -mindepth 1 -maxdepth 1 -type d)"
 [ "$(printf '%s\n' "$tree" | wc -l)" -eq 1 ] || { echo "error: the zip does not hold exactly one top directory" >&2; exit 1; }
 for required in bin/cryo.exe bin/cryolsp.exe bin/LLVM-C.dll bin/libclang.dll stdlib/.bin/shipped runtime/.bin/shipped \
-                install-dependencies.ps1 user-setup.ps1 VERSION; do
+                install-dependencies.ps1 user-setup.ps1 VERSION LICENSE; do
     [ -e "${tree}/${required}" ] || { echo "error: the zip holds no ${required}" >&2; exit 1; }
 done
 
@@ -38,9 +38,18 @@ find "$tree" -type f | sort \
     | wixl-heat -p "${tree}/" --directory-ref INSTALLDIR --component-group CryoFiles --var var.SourceDir --win64 \
     > "${work}/files.wxs"
 
+# The wizard's license page shows the tree's LICENSE as rich text: each
+# line a paragraph, with the characters rich text reserves escaped.
+{
+    printf '{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0\\fmodern Consolas;}}\\f0\\fs16\n'
+    sed -e 's/\\/\\\\/g' -e 's/{/\\{/g' -e 's/}/\\}/g' -e 's/$/\\par/' "${tree}/LICENSE"
+    printf '}\n'
+} > "${work}/License.rtf"
+
 mkdir -p "$DIST"
 msi="${DIST}/$(basename "$tree").msi"
-wixl -a x64 -D Win64=yes -D SourceDir="$tree" -D Version="${release%%-*}" -o "$msi" \
-    "${ROOT}/scripts/packaging/cryo.wxs" "${work}/files.wxs"
+wixl -a x64 --ext ui -D Win64=yes -D SourceDir="$tree" -D Version="${release%%-*}" \
+    -D LicenseRtf="${work}/License.rtf" -D DependencyStepScript="${ROOT}/scripts/packaging/dependency-step.js" \
+    -o "$msi" "${ROOT}/scripts/packaging/cryo.wxs" "${ROOT}/scripts/packaging/cryo-ui.wxs" "${work}/files.wxs"
 ( cd "$DIST" && sha256sum "$(basename "$msi")" > "$(basename "$msi").sha256" )
 echo "[build-msi] wrote ${msi#$ROOT/}"
