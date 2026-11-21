@@ -1,10 +1,12 @@
 ///! The install check's judges: the files an install must hold on each OS,
-///! how a reported path is matched against the install root, and every
-///! refusal of a build with no C toolchain.
+///! how a reported path is matched against the install root, an install's
+///! files against the archive's, and every refusal of a build with no C
+///! toolchain.
 ![config(testing)]
 namespace cryogate::tests::install;
 
 import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::option::{ Option };
@@ -33,6 +35,42 @@ function a_reported_root_matches_across_separators_and_case_only_on_windows() ->
     expect(InstallLayout::names_root(report, Str::new("c:/users/me/temp/prefix"), Str::new("windows")), Str::new("windows ignores case and separators"))?;
     expect(!InstallLayout::names_root(Str::new("binary: /home/Me/prefix/bin/cryo"), Str::new("/home/me/prefix"), Str::new("linux")), Str::new("linux keeps case"))?;
     return expect(!InstallLayout::names_root(report, Str::new("c:/users/me/temp/other"), Str::new("windows")), Str::new("another root does not match"));
+}
+
+![test]
+function an_install_holds_the_archive_only_with_the_same_files_and_bytes() -> Result<(), TestError> {
+    mut archive: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+    archive.push(Pair::new(String::from_str(Str::new("bin/cryo")), String::from_str(Str::new("aa"))));
+    archive.push(Pair::new(String::from_str(Str::new("stdlib/.bin/shipped")), String::from_str(Str::new("bb"))));
+    mut same: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+    same.push(Pair::new(String::from_str(Str::new("bin/cryo")), String::from_str(Str::new("aa"))));
+    same.push(Pair::new(String::from_str(Str::new("stdlib/.bin/shipped")), String::from_str(Str::new("bb"))));
+    expect(InstallLayout::first_difference(&archive, &same).is_none(), Str::new("the same files and bytes pass"))?;
+
+    mut changed: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+    changed.push(Pair::new(String::from_str(Str::new("bin/cryo")), String::from_str(Str::new("aa"))));
+    changed.push(Pair::new(String::from_str(Str::new("stdlib/.bin/shipped")), String::from_str(Str::new("cc"))));
+    expect(InstallLayout::first_difference(&archive, &changed).unwrap().as_str().contains(&Str::new("stdlib/.bin/shipped is not the archive's")),
+        Str::new("a changed file is named"))?;
+
+    mut written: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+    written.push(Pair::new(String::from_str(Str::new("bin/cryo")), String::from_str(Str::new("aa"))));
+    written.push(Pair::new(String::from_str(Str::new("stdlib/.bin/last-use")), String::from_str(Str::new("ee"))));
+    written.push(Pair::new(String::from_str(Str::new("stdlib/.bin/shipped")), String::from_str(Str::new("bb"))));
+    expect(InstallLayout::first_difference(&archive, &written).unwrap().as_str().contains(&Str::new("holds stdlib/.bin/last-use where")),
+        Str::new("a file written into the install is named"))?;
+
+    mut appended: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+    appended.push(Pair::new(String::from_str(Str::new("bin/cryo")), String::from_str(Str::new("aa"))));
+    appended.push(Pair::new(String::from_str(Str::new("stdlib/.bin/shipped")), String::from_str(Str::new("bb"))));
+    appended.push(Pair::new(String::from_str(Str::new("zz")), String::from_str(Str::new("ff"))));
+    expect(InstallLayout::first_difference(&archive, &appended).unwrap().as_str().contains(&Str::new("holds zz, which the archive does not")),
+        Str::new("a file after the archive's last is named"))?;
+
+    mut short: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+    short.push(Pair::new(String::from_str(Str::new("bin/cryo")), String::from_str(Str::new("aa"))));
+    return expect(InstallLayout::first_difference(&archive, &short).unwrap().as_str().contains(&Str::new("lacks stdlib/.bin/shipped")),
+        Str::new("a missing file is named"));
 }
 
 ![test]

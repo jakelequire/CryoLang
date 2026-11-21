@@ -327,10 +327,11 @@ Pins and release
   make install-check ARCHIVE=<file>
                          The host OS's installer over a release archive, in a
                          scratch home: install, build and run a two-module
-                         program, the install left byte-identical by a build
-                         that needs archives it does not ship, a build with no
-                         C toolchain refused with E0705, upgrade, uninstall
-                         (`cryogate install-check`).
+                         program, the install's files the archive's byte for
+                         byte after the installer, after builds (one needing
+                         archives it does not ship) and after an upgrade, a
+                         build with no C toolchain refused with E0705,
+                         uninstall (`cryogate install-check`).
   make install           Symlink bin/cryo and the stdlib into a prefix (POSIX).
   make uninstall         Remove those symlinks.
   make clean             Remove every build output in the tree: compiler,

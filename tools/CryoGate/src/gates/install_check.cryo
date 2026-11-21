@@ -9,17 +9,19 @@
 ///! change PATH outside the scratch home.  In order:
 ///!
 ///!   install    the installer exits 0, its own dependency step included,
-///!              and the install holds every file an install must
+///!              the install holds every file an install must, and its
+///!              files are the archive's, byte for byte
 ///!   version    `cryo version --verbose` names the installed compiler
 ///!   program    a two-module program builds from outside any project and
 ///!              runs, printing what it should and exiting 7
 ///!   shipped    a build under a profile whose archives the install does
-///!              not ship builds them in the user's cache and leaves every
-///!              byte of the install as it was
+///!              not ship builds them in the user's cache, and the install's
+///!              files are still the archive's
 ///!   toolchain  with nothing on PATH, so no C toolchain to link with, the
 ///!              build is refused with E0705, naming the install's
 ///!              dependency step
-///!   upgrade    installing again replaces the install and keeps the cache
+///!   upgrade    installing again replaces the install with the archive's
+///!              files and keeps the cache
 ///!   uninstall  removes the install and the archives it built, and leaves
 ///!              the shell's rc file as it was before the install
 ///!
@@ -29,6 +31,7 @@
 namespace cryogate::gates::install_check;
 
 import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::option::{ Option };
@@ -60,6 +63,8 @@ public type struct InstallCheck {
     program: String;
     /// An empty directory: the whole PATH of a build with no C toolchain.
     empty: String;
+    /// Where the check extracts the archive itself, to know its files.
+    unpacked: String;
 
     /// Run `cryogate install-check` with `arguments` from index `first`.
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
@@ -96,6 +101,7 @@ public type struct InstallCheck {
             cache:     f"{root.as_str()}/cache",
             program:   f"{root.as_str()}/program",
             empty:     f"{root.as_str()}/empty",
+            unpacked:  f"{root.as_str()}/unpacked",
         };
         return match (check.steps(logs)) {
             Result::Ok(_) => {
@@ -118,6 +124,11 @@ public type struct InstallCheck {
             && File::write_text(Path::from(this.program.as_str()).join(Str::new("src/main.cryo")).as_path(), InstallLayout::main_source()).is_ok()
             && File::write_text(Path::from(this.program.as_str()).join(Str::new("src/greeting.cryo")).as_path(), InstallLayout::greeting_source()).is_ok();
         if (!written) { return Result::Err(f"cannot set up the scratch home and program below {this.home.as_str()}"); }
+        // The archive's own files are what the install must hold, and hold
+        // still: the installer's dependency step already builds with the
+        // installed compiler, so a snapshot taken after it would take in
+        // anything that build wrote.
+        const shipped: Array<Pair<String, String>> = this.archive_listing(logs)?;
 
         // install
         this.install(logs,Str::new("install"))?;
@@ -132,7 +143,7 @@ public type struct InstallCheck {
                 return Result::Err(String::from_str(Str::new("the install wrote no PATH block naming its bin/ into the shell's rc file")));
             }
         }
-        const installed: String = InstallCheck::digest(Path::from(this.prefix.as_str()))?;
+        this.holds_the_archive(&shipped, Str::new("after the installer ran"))?;
         fmt::println(f"install-check: install ok -- {this.prefix.as_str()}");
 
         // version
@@ -155,9 +166,7 @@ public type struct InstallCheck {
         if (!this.archives().as_path().is_directory()) {
             return Result::Err(f"a --panic=abort build left no archive in the user's cache at {this.archives().as_path().as_str()}");
         }
-        if (InstallCheck::digest(Path::from(this.prefix.as_str()))? != installed) {
-            return Result::Err(String::from_str(Str::new("a build changed the install's files; a shipped tree must only be read")));
-        }
+        this.holds_the_archive(&shipped, Str::new("after builds with it; a shipped tree must only be read"))?;
         fmt::println(String::from_str(Str::new("install-check: shipped ok -- archives built in the user's cache, the install unchanged")));
 
         // toolchain
@@ -174,9 +183,7 @@ public type struct InstallCheck {
 
         // upgrade
         this.install(logs,Str::new("upgrade"))?;
-        if (InstallCheck::digest(Path::from(this.prefix.as_str()))? != installed) {
-            return Result::Err(String::from_str(Str::new("installing the same archive again left a different install")));
-        }
+        this.holds_the_archive(&shipped, Str::new("after installing the same archive again"))?;
         if (!this.archives().as_path().is_directory()) {
             return Result::Err(String::from_str(Str::new("an upgrade removed the archives in the user's cache")));
         }
@@ -306,21 +313,64 @@ public type struct InstallCheck {
     /// Where the install's on-demand archives are built.
     private archives(&this) -> PathBuf { return Path::from(this.cache.as_str()).join(Str::new("cryo/archives")); }
 
-    /// One sha256 over every file below `root`: each file's relative path
-    /// and its own digest, in sorted order.
-    private static digest(root: Path) -> Result<String, String> {
+    /// Extract the archive into `unpacked` as the installer would (a zip
+    /// with PowerShell's Expand-Archive, a tarball with tar), and list the
+    /// files of its one top directory.
+    private archive_listing(&this, logs: &RunLogs) -> Result<Array<Pair<String, String>>, String> {
+        if (!Directory::create_all(Path::from(this.unpacked.as_str())).is_ok()) {
+            return Result::Err(f"cannot create {this.unpacked.as_str()}");
+        }
+        const windows: boolean = Host::os() == Str::new("windows");
+        mut unpack: Job = Job::new(if (windows) { Str::new("powershell") } else { Str::new("tar") });
+        if (windows) {
+            unpack.argument(Str::new("-NoProfile"));
+            unpack.argument(Str::new("-NonInteractive"));
+            unpack.argument(Str::new("-Command"));
+            unpack.argument(f"Expand-Archive -LiteralPath '{this.archive.as_str()}' -DestinationPath '{this.unpacked.as_str()}'".as_str());
+        } else {
+            unpack.argument(Str::new("-x"));
+            unpack.argument(Str::new("-z"));
+            unpack.argument(Str::new("-f"));
+            unpack.argument(this.archive.as_str());
+            unpack.argument(Str::new("-C"));
+            unpack.argument(this.unpacked.as_str());
+        }
+        const unpacked: Completion = this.ran(logs, unpack, Str::new("unpack"));
+        if (!unpacked.outcome.succeeded()) {
+            return Result::Err(f"cannot extract the archive ({unpacked.outcome.describe().as_str()}); its log: {unpacked.log.as_str()}");
+        }
+        const excluded: Array<String> = Array::<String>::new();
+        const tops: Array<String> = Tree::names(Path::from(this.unpacked.as_str()), &excluded)?;
+        if (tops.length() != 1) {
+            return Result::Err(f"the archive holds {tops.length()} top-level entries, not one directory");
+        }
+        return InstallCheck::listing(Path::from(this.unpacked.as_str()).join(tops.get_reference(0).unwrap().as_str()).as_path());
+    }
+
+    /// Fail unless the install's files are `shipped`, byte for byte; `when`
+    /// says at which point of the check.
+    private holds_the_archive(&this, shipped: &Array<Pair<String, String>>, when: Str) -> Result<(), String> {
+        const installed: Array<Pair<String, String>> = InstallCheck::listing(Path::from(this.prefix.as_str()))?;
+        return match (InstallLayout::first_difference(shipped, &installed)) {
+            Option::Some(difference) => { Result::Err(f"the install's files are not the archive's {when}: {difference.as_str()}") }
+            Option::None => { Result::Ok(()) }
+        };
+    }
+
+    /// Every file below `root`, its path below `root` with its sha256, in
+    /// the order the tree is walked.
+    private static listing(root: Path) -> Result<Array<Pair<String, String>>, String> {
         const excluded: Array<String> = Array::<String>::new();
         const files: Array<String> = Tree::files(root, &excluded)?;
-        mut whole: Sha256 = Sha256::new();
+        mut listed: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
         for (file in files.iterate_references()) {
             const bytes: Array<u8> = match (File::read_bytes(root.join(file.as_str()).as_path())) {
                 Result::Ok(bytes)  => { bytes }
                 Result::Err(error) => { return Result::Err(f"cannot read {file.as_str()}: {error.describe()}"); }
             };
-            const line: String = f"{file.as_str()} {Sha256::digest(bytes.as_slice()).to_hex().as_str()}\n";
-            whole.update(line.as_str().as_bytes());
+            listed.push(Pair::new(file.clone(), Sha256::digest(bytes.as_slice()).to_hex()));
         }
-        return Result::Ok(whole.finish().to_hex());
+        return Result::Ok(listed);
     }
 
     private static read(path: Path) -> Result<String, String> {
