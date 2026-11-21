@@ -615,7 +615,7 @@ type struct TypeUtils {
 
     /// True when `arg` and `param` describe the same underlying type up to one
     /// level of pointer/reference spelling - `&T`<->`&mut T`, `&T`<->`T*`,
-    /// value->`&T` (call-site auto-ref) and `T*`->value.  At least one side
+    /// value->`&T` (call-site auto-ref) and `&T`->value.  At least one side
     /// must be an indirection, and the underlying types must be the SAME
     /// type: an indirection is spelled differently, never converted, so a
     /// pointee that only converts (`i32` for `i64`) leaves the callee reading
@@ -625,7 +625,10 @@ type struct TypeUtils {
     /// `indirection_spelling_compatible` instead.  A value is never passed
     /// for a `T*` parameter (`value_for_pointer`): the argument is written
     /// `&x`, since nothing takes an address for it, and an enum constructor
-    /// given one would hold the value where its payload is the pointer.
+    /// given one would hold the value where its payload is the pointer.  Nor
+    /// is a `T*` passed for a `T` parameter (`pointer_for_value`): the callee
+    /// would own a bit copy of what the pointer's owner still releases, so
+    /// the read is written `*p`, where the move checker judges it.
     ///
     /// A reference parameter borrows a value of its referent's type whatever
     /// that type is, a pointer among them: `T*` binds `&T*`.  Peeling both
@@ -636,6 +639,7 @@ type struct TypeUtils {
         if (this.widens_read_only(arg_ty, param_ty)) { return false; }
         if (this.pairs_slice_reference_with_pointer(arg_ty, param_ty)) { return false; }
         if (this.value_for_pointer(arg_ty, param_ty)) { return false; }
+        if (this.pointer_for_value(arg_ty, param_ty)) { return false; }
         const a_peeled: TypeRef = this.peel_indirection(arg_ty);
         const p_peeled: TypeRef = this.peel_indirection(param_ty);
         if (!a_peeled.is_valid() && !p_peeled.is_valid()) { return false; }
@@ -677,6 +681,15 @@ type struct TypeUtils {
         if (param_t == null || param_t.kind != TypeKind::Pointer) { return false; }
         if (this.peel_indirection(arg_ty).is_valid()) { return false; }
         return this.checker.is_same_type(arg_ty, param_t.as_pointer().pointee);
+    }
+
+    /// Whether `arg_ty` is a pointer and `param_ty` the value it points to:
+    /// the argument a call is passed as `*p`, which reads the value out.
+    pointer_for_value(&this, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
+        const arg_t: Type* = this.arena.lookup(arg_ty);
+        if (arg_t == null || arg_t.kind != TypeKind::Pointer) { return false; }
+        if (this.peel_indirection(param_ty).is_valid()) { return false; }
+        return this.checker.is_same_type(arg_t.as_pointer().pointee, param_ty);
     }
 
     /// Whether one side is a slice reference and the other a pointer: a

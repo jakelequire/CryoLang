@@ -1,0 +1,68 @@
+// A parameter of a value type takes the value, and a pointer is not the
+// value it points at: a pointer is read through as `*p`, where the move
+// checker judges the read.  A pointer written where its pointee's type is
+// expected is refused - at a plain call (where an owning pointee would be
+// released by the callee and again by its owner), for a static method's
+// parameter, as an enum constructor's payload, as a method's argument and
+// in a generic body whatever `T` becomes.  The `*` forms of a `Copy`
+// pointee are accepted.
+![config(testing)]
+![config(negative, E0214)]
+namespace CryoTests::Negative::PointerPassedForAValue;
+
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+
+function consume(text: String) -> i64 { return text.length(); }
+function doubled(n: i64) -> i64 { return n * 2; }
+function taken<T>(value: T) -> void { }
+
+type struct Counter {
+    total: i64;
+
+    static started_at(start: i64) -> Counter { return Counter { total: start }; }
+
+    increase(mut &this, amount: i64) -> void { this.total = this.total + amount; }
+}
+
+function plain_call() -> i64 {
+    const owned: String = String::from_str(Str::new("owned"));
+    const text: String* = &owned;
+    const n: i64 = 4;
+    const number: i64* = &n;
+    const refused: i64 = consume(text) + doubled(number);
+    //~^ ERROR[E0214] mismatched types
+    //~^^ ERROR[E0214] mismatched types
+    return refused + doubled(*number);
+}
+
+function static_and_method_arguments() -> i64 {
+    const n: i64 = 5;
+    const number: i64* = &n;
+    mut counter: Counter = Counter::started_at(number);
+    //~^ ERROR[E0214] mismatched types
+    counter.increase(number);
+    //~^ ERROR[E0214] mismatched types
+    counter.increase(*number);
+    return counter.total;
+}
+
+function constructor_payload() -> i64 {
+    const n: i64 = 6;
+    const number: i64* = &n;
+    const held: Option<i64> = Option::Some(number);
+    //~^ ERROR[E0214] mismatched types
+    const read: Option<i64> = Option::Some(*number);
+    return held.unwrap_or(0) + read.unwrap_or(0);
+}
+
+function generic_body<T>(p: T*) -> void {
+    taken::<T>(p);
+    //~^ ERROR[E0214] mismatched types
+}
+
+function main() -> int {
+    const n: i64 = 1;
+    generic_body::<i64>(&n);
+    return (plain_call() + static_and_method_arguments() + constructor_payload()) as int;
+}
