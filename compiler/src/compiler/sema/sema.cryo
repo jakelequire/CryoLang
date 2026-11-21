@@ -3093,7 +3093,10 @@ type struct SemaVisitor {
                             bin.left, lhs, bin.right, map, bin.op, e.span, false);
                         if (de != null) { bin.desugared_call = de; }
                     }
-                    if (bin.desugared_call == null) { this.pin_string_append(bin, base_op, lhs); }
+                    if (bin.desugared_call == null) {
+                        this.pin_string_append(bin, base_op, lhs);
+                        this.refuse_constant_shift_out_of_range(base_op, lhs, bin.right);
+                    }
                 } else {
                     mut overloaded: boolean = false;
                     if (map.valid && bin.desugared_call == null) {
@@ -3297,6 +3300,7 @@ type struct SemaVisitor {
                     if (de != null) { bin.desugared_call = de; return de.resolved_type; }
                 }
                 this.pin_string_append(bin, bin.op.kind, lhs);
+                this.refuse_constant_shift_out_of_range(bin.op.kind, lhs, bin.right);
                 return result.result_type;
             }
             // Phase 1: `check_binary_op` rejected - a concrete user type with a
@@ -3327,6 +3331,48 @@ type struct SemaVisitor {
         if (lhs.is_valid()) { return lhs; }
         if (rhs.is_valid()) { return rhs; }
         return TypeRef::invalid();
+    }
+
+    /// Refuse (E0464) a shift of an integer of type `shifted` whose amount
+    /// folds to a constant at or above that type's width, or below zero:
+    /// the run-time check before the shift fails whenever it runs, so the
+    /// program is refused where it is written.  An amount the constant
+    /// environment cannot fold is left to that check.
+    refuse_constant_shift_out_of_range(&this, op: TokenType, shifted: TypeRef, amount: ExpressionNode*) -> void {
+        if (op != TokenType::LessLess && op != TokenType::GreaterGreater) { return; }
+        const t: Type* = this.arena.lookup(shifted);
+        if (t == null || t.kind != TypeKind::Int || amount == null) { return; }
+        const folded: Option<FoldedInteger> =
+            ConstEval::new(this.ctx.const_table, this.ctx.intern_table, null).fold(amount);
+        if (folded.is_none()) { return; }
+        const value: FoldedInteger = folded.unwrap();
+        const width: u64 = t.int_kind().bit_width();
+        if (!value.negative && value.bits < width as u128) { return; }
+        const shown: string = value.to_decimal_string();
+        const type_name: string = this.types.type_display_name(shifted);
+        if (value.negative) {
+            this.ctx.emit_diagnostic(Diagnostic::error(ErrorCode::E0464_SHIFT_OUT_OF_RANGE,
+                fmt::format("shift amount %s is negative", shown))
+                .at_with_label(amount.span, "this shift always panics")
+                .help_with_example(
+                    "a negative amount does not shift the other way; shift the other way by its distance",
+                    fmt::format("%s %s", if (op == TokenType::LessLess) { ">>" } else { "<<" },
+                        value.magnitude().to_decimal_string())));
+            return;
+        }
+        const refusal: Diagnostic = Diagnostic::error(ErrorCode::E0464_SHIFT_OUT_OF_RANGE,
+            fmt::format("shift amount %s is not less than the width of `%s` (%s)",
+                shown, type_name, width.to_decimal_string()))
+            .at_with_label(amount.span, "this shift always panics")
+            .help(fmt::format("a `%s` shifts by 0 to %s", type_name, (width - 1).to_decimal_string()));
+        // Every bit shifted out leaves 0, except a signed value shifted right,
+        // which leaves its sign.
+        if (op == TokenType::LessLess || !t.int_kind().is_signed()) {
+            this.ctx.emit_diagnostic(refusal.help_with_example(
+                "where every bit is meant to be shifted out, write the result directly", "0"));
+            return;
+        }
+        this.ctx.emit_diagnostic(refusal);
     }
 
     /// Whether a binary operation is decided by the pointer rules alone,

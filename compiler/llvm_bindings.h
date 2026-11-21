@@ -325,6 +325,7 @@ LLVMUseRef        LLVMGetNextUse(LLVMUseRef U);
 LLVMValueRef      LLVMGetUser(LLVMUseRef U);
 LLVMValueRef      LLVMIsAGlobalValue(LLVMValueRef Val);
 LLVMValueRef      LLVMIsAArgument(LLVMValueRef Val);
+LLVMValueRef      LLVMIsAConstantInt(LLVMValueRef Val);
 
 
 /* ===================================================================

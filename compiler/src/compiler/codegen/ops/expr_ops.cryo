@@ -1791,7 +1791,14 @@ type struct ExprOps {
                 lhs_kind == LTypeKind::Integer && rhs_kind == LTypeKind::Integer) {
                 const lhs_w: u32 = llvm::LLVMGetIntTypeWidth(lhs_ty);
                 const rhs_w: u32 = llvm::LLVMGetIntTypeWidth(rhs_ty);
-                if (lhs_w < rhs_w) {
+                const shifting: boolean = op_kind == TokenType::LessLess || op_kind == TokenType::GreaterGreater;
+                if (shifting && lhs_w < rhs_w) {
+                    // A shift computes at the shifted value's width, whatever
+                    // the amount's type: the amount is narrowed to it, which
+                    // loses nothing for an amount the shift's check lets
+                    // through (one below that width).
+                    rhs = this.builder.build_trunc(rhs, LType { raw: lhs_ty }, "shift.amount");
+                } else if (lhs_w < rhs_w) {
                     const target: LType = LType { raw: rhs_ty };
                     if (is_signed) {
                         lhs = this.builder.build_sext(lhs, target, "widen");
@@ -1947,8 +1954,16 @@ type struct ExprOps {
             TokenType::Amp            => { out_value = this.builder.build_and(lhs, rhs, "andtmp"); }
             TokenType::Pipe           => { out_value = this.builder.build_or(lhs, rhs, "ortmp"); }
             TokenType::Caret          => { out_value = this.builder.build_xor(lhs, rhs, "xortmp"); }
-            TokenType::LessLess       => { out_value = this.builder.build_shl(lhs, rhs, "shltmp"); }
+            TokenType::LessLess => {
+                if (t_kind == TypeKind::Int) {
+                    this.emit_shift_guard(rhs_val, rhs_is_signed, t.int_kind().bit_width(), visitor, div_sched, div_span);
+                }
+                out_value = this.builder.build_shl(lhs, rhs, "shltmp");
+            }
             TokenType::GreaterGreater => {
+                if (t_kind == TypeKind::Int) {
+                    this.emit_shift_guard(rhs_val, rhs_is_signed, t.int_kind().bit_width(), visitor, div_sched, div_span);
+                }
                 out_value = if (is_signed) {
                     this.builder.build_ashr(lhs, rhs, "shrtmp")
                 } else {
@@ -2054,13 +2069,17 @@ type struct ExprOps {
     /// IR shape (signed case; unsigned omits the INT_MIN/-1 arm):
     ///
     ///   %iszero = icmp eq %rhs, 0
-    ///   %neg1   = icmp eq %rhs, -1          ; signed only
-    ///   %imin   = icmp eq %lhs, INT_MIN     ; signed only
-    ///   %ovf    = and  %neg1, %imin         ; signed only
-    ///   %trap   = or   %iszero, %ovf        ; signed only
-    ///   br i1 %trap, label %div.trap, label %div.ok
+    ///   br i1 %iszero, label %div.trap, label %div.nonzero
     /// div.trap:
-    ///   call void @abort()
+    ///   call @__cryo_panic_div_zero(...)    ; "attempt to divide by zero"
+    ///   unreachable
+    /// div.nonzero:
+    ///   %neg1   = icmp eq %rhs, -1
+    ///   %imin   = icmp eq %lhs, INT_MIN
+    ///   %ovf    = and  %neg1, %imin
+    ///   br i1 %ovf, label %div.overflow, label %div.ok
+    /// div.overflow:
+    ///   call @__cryo_panic_div_overflow(...) ; "attempt to divide with overflow"
     ///   unreachable
     /// div.ok:
     ///   <caller continues with the div/rem here>
@@ -2078,7 +2097,20 @@ type struct ExprOps {
         const is_zero: LValue = this.builder.build_icmp(
             LIntPredicate::EQ, rhs, zero, "div.iszero");
 
-        mut trap_cond: LValue = is_zero;
+        const cur_bb: LBasicBlock = this.builder.get_insert_block();
+        if (!cur_bb.is_valid()) { return; }
+        const fn: LValue = cur_bb.get_parent();
+        const trap_bb: LBasicBlock = LBasicBlock::append(fn, "div.trap");
+        const nonzero_bb: LBasicBlock = LBasicBlock::append(fn, "div.nonzero");
+        this.builder.build_cond_br(is_zero, trap_bb, nonzero_bb);
+
+        // Zero divisor: the runtime's handler reports it and diverges.
+        this.builder.position_at_end(trap_bb);
+        mut dz_ops: [LValue] = [];
+        this.emit_check_failure(visitor, div_sched, div_span, MangledName::new("__cryo_panic_div_zero"), &dz_ops);
+        this.builder.position_at_end(nonzero_bb);
+
+        // `INT_MIN / -1` (and `%`): the quotient is one past the maximum.
         if (is_signed) {
             const lhs_ty_raw: mut void* = llvm::LLVMTypeOf(lhs.raw);
             const lhs_ty: LType = LType { raw: lhs_ty_raw };
@@ -2100,23 +2132,69 @@ type struct ExprOps {
                 LIntPredicate::EQ, lhs, int_min, "div.lhsmin");
             const overflow: LValue = this.builder.build_and(
                 rhs_is_neg1, lhs_is_intmin, "div.ovf");
-            trap_cond = this.builder.build_or(is_zero, overflow, "div.trap");
+            const overflow_bb: LBasicBlock = LBasicBlock::append(fn, "div.overflow");
+            const ok_bb: LBasicBlock = LBasicBlock::append(fn, "div.ok");
+            this.builder.build_cond_br(overflow, overflow_bb, ok_bb);
+            this.builder.position_at_end(overflow_bb);
+            mut overflow_ops: [LValue] = [];
+            this.emit_check_failure(visitor, div_sched, div_span, MangledName::new("__cryo_panic_div_overflow"), &overflow_ops);
+            // OK arm: caller continues with the div/rem here.
+            this.builder.position_at_end(ok_bb);
         }
+    }
+
+    /// Emit a run-time check before a shift: `amount`, read at its own
+    /// type, must be below `width`, the width of the value shifted.  LLVM's
+    /// `shl`, `lshr` and `ashr` give poison for an amount at or above the
+    /// width, so the check is what gives every shift a defined outcome: a
+    /// panic naming the amount and the width.  The compare is unsigned, so a
+    /// negative amount reads as a large one and is caught too; the handler
+    /// is told it was negative, so the report shows the amount written.  A
+    /// constant amount below the width needs no check and gets none.
+    /// Leaves the builder at the block that continues with the shift.
+    emit_shift_guard(mut &this, amount: LValue, amount_is_signed: boolean, width: u64,
+                     visitor: mut IRGeneratorVisitor*, sched: [Stmt*]*, span: SourceSpan) -> void {
+        const amount_ty_raw: mut void* = llvm::LLVMTypeOf(amount.raw);
+        if (amount_ty_raw == null || LType::kind_of(amount_ty_raw) != LTypeKind::Integer) { return; }
+        const amount_ty: LType = LType { raw: amount_ty_raw };
+        const amount_width: u32 = llvm::LLVMGetIntTypeWidth(amount_ty_raw);
+        if (amount_width <= 64 && llvm::LLVMIsAConstantInt(amount.raw) != null
+            && llvm::LLVMConstIntGetZExtValue(amount.raw) < width) {
+            return;
+        }
+        const limit: LValue = LType::const_int(amount_ty, width, false);
+        const in_range: LValue = this.builder.build_icmp(LIntPredicate::ULT, amount, limit, "shift.inrange");
 
         const cur_bb: LBasicBlock = this.builder.get_insert_block();
         if (!cur_bb.is_valid()) { return; }
         const fn: LValue = cur_bb.get_parent();
-        const trap_bb: LBasicBlock = LBasicBlock::append(fn, "div.trap");
-        const ok_bb: LBasicBlock = LBasicBlock::append(fn, "div.ok");
+        const trap_bb: LBasicBlock = LBasicBlock::append(fn, "shift.trap");
+        const ok_bb: LBasicBlock = LBasicBlock::append(fn, "shift.ok");
+        this.builder.build_cond_br(in_range, ok_bb, trap_bb);
 
-        this.builder.build_cond_br(trap_cond, trap_bb, ok_bb);
-
-        // Trap arm: the runtime's handler reports the failure and diverges.
+        // The handler takes the amount's distance from zero as a `u64`, and
+        // whether it was negative.
         this.builder.position_at_end(trap_bb);
-        mut dz_ops: [LValue] = [];
-        this.emit_check_failure(visitor, div_sched, div_span, MangledName::new("__cryo_panic_div_zero"), &dz_ops);
+        mut negative: LValue = LType::const_int(LType::i1(), 0, false);
+        mut magnitude: LValue = amount;
+        if (amount_is_signed) {
+            negative = this.builder.build_icmp(LIntPredicate::SLT, amount,
+                LType::const_int(amount_ty, 0, false), "shift.negative");
+            magnitude = this.builder.build_select(negative,
+                this.builder.build_neg(amount, "shift.negated"), amount, "shift.magnitude");
+        }
+        if (amount_width < 64) {
+            magnitude = this.builder.build_zext(magnitude, LType::i64(), "shift.magnitude64");
+        } else if (amount_width > 64) {
+            magnitude = this.builder.build_trunc(magnitude, LType::i64(), "shift.magnitude64");
+        }
+        mut shift_ops: [LValue] = [
+            magnitude,
+            this.builder.build_zext(negative, LType::i32(), "shift.negative32"),
+            LType::const_int(LType::i32(), width, false)
+        ];
+        this.emit_check_failure(visitor, sched, span, MangledName::new("__cryo_panic_shift"), &shift_ops);
 
-        // OK arm: caller continues with the div/rem here.
         this.builder.position_at_end(ok_bb);
     }
 

@@ -1351,7 +1351,9 @@ The alternative - quietly dereferencing - was rejected because the comparison di
 | `~`          | Bitwise NOT (unary)                                            |
 | `<<` `>>`    | Left / right shift (arithmetic on signed, logical on unsigned) |
 
-**A shift amount must be less than the width.** `x << n` and `x >> n` with `n` at or above the bit width of `x`'s type (or negative, which reads as a very large amount) panic, in every build, with `shift amount <n> is not less than the width <w>`; such a shift has no meaningful result. An amount the compiler can see is in range costs nothing at run time, and a constant amount out of range is refused at compile time (`E0464`). *Not yet enforced; see the rollout in [section 15.5](#155-memory-safety): today such a shift gives an unspecified value.*
+**A shift amount must be less than the width.** `x << n` and `x >> n` with `n` at or above the bit width of `x`'s type panic, in every build, with `shift amount <n> is not less than the width <w>`, and with a negative `n` they panic with `shift amount <n> is negative`; such a shift has no meaningful result. A constant amount below the width costs nothing at run time, and a constant amount out of range, or negative, is refused at compile time (`E0464`). An amount in range shifts at the width of `x`'s type whatever the amount's own type: with `b: u8` and `n: i64` holding 7, `b << n` is the `u8` `b` shifted by 7, its bits past the eighth gone.
+
+Dividing the least value of a signed type by -1 (`i32::MIN / -1`, and `%` the same) panics with `attempt to divide with overflow`: the quotient is one past the type's greatest value. A zero divisor panics with `attempt to divide by zero`.
 
 ### 5.5 Assignment
 
@@ -4360,7 +4362,7 @@ standard library, the compiler and the tools build with none:
 
 | phase | rules | today |
 |---|---|---|
-| 1 | initialisation of every local (rule 2: `E0219`, and warning `W0018` for a `Copy` local until it becomes `E0219`); a reference carried out of its function through a local, a by-value parameter or a by-value receiver (rule 4, `E0455`); generic bodies checked once against their own type parameters; the shift check; `unsafe` no longer accepting the reads of [section 15.3](#153-move-checking) that release a value twice | initialisation enforced (`W0018` for `Copy` locals, which becomes `E0219` after one merge to the main line has carried it with none reported); a reference carried out of its function enforced; `unsafe` accepting none of those reads enforced, a take written `pointer::read`; the rest not yet |
+| 1 | initialisation of every local (rule 2: `E0219`, and warning `W0018` for a `Copy` local until it becomes `E0219`); a reference carried out of its function through a local, a by-value parameter or a by-value receiver (rule 4, `E0455`); generic bodies checked once against their own type parameters; the shift check; `unsafe` no longer accepting the reads of [section 15.3](#153-move-checking) that release a value twice | initialisation enforced (`W0018` for `Copy` locals, which becomes `E0219` after one merge to the main line has carried it with none reported); a reference carried out of its function enforced; `unsafe` accepting none of those reads enforced, a take written `pointer::read`; generic bodies checked once enforced; the shift check enforced (`E0464` for a constant amount) |
 | 2 | unsafe operations (rule 7): warning `W0019`, then `E0462` | not yet |
 | 3 | views (rule 3): warning `W0020`, then `E0461`; collections hand out `&T` instead of `T*` | not yet |
 | 4 | loans and shared-or-writable (rules 5 and 6): warnings `W0021` and `W0022`, then `E0450` and `E0451` | not yet |
