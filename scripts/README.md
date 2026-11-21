@@ -18,6 +18,7 @@ Every gate is a `cryogate` subcommand (`tools/CryoGate`); none is a script.
 | `build-msi.sh` | Packages the Windows release zip as a per-user MSI with wixl (`packaging/cryo.wxs`, the tree harvested by wixl-heat, plus `msi-setup.ps1`) | release, the user |
 | `build-winget.sh` | Writes a release MSI's winget manifests (`CryoLang.Cryo`, llvm-mingw as a dependency) under `dist/winget/` | release, the user |
 | `msi-setup.ps1` | Shipped only in the MSI, which runs it as the installing user: adds the install's `bin` to the User PATH, and on removal takes it out and deletes the archives the install built in the user's cache | the MSI |
+| `build-static-libclang.sh` | Builds libclang's C API, with the clang libraries it needs, as one archive under `.toolchains/libclang-static/` for the static Linux compiler (`[link.release-static]`) | `build-release.sh linux` |
 | `install-dependencies.sh` | Shipped at the root of every Linux install: builds and runs a hello-world with the installed compiler, and when the compiler refuses it with E0705 (no C toolchain) offers to install gcc and the C library headers with the package manager | `install.sh`, the user |
 | `install-dependencies.ps1` | Shipped at the root of every Windows install: the same check, offering llvm-mingw for the current user through winget | `install.ps1`, the user |
 

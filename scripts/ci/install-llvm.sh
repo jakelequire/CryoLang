@@ -11,8 +11,9 @@
 #                 post-job cache step uploads it for next time
 #
 # Always installs llvm-X-dev, clang-X AND libpolly-X-dev (the static Polly
-# libs `llvm-config --link-static` lists) so a single cache entry serves
-# every job, including the --release-static release build.  lld-X too: the
+# libs `llvm-config --link-static` lists) and libclang-X-dev (the clang
+# archives scripts/build-static-libclang.sh merges) so a single cache entry
+# serves every job, including the --release-static release build.  lld-X too: the
 # cross build of cryo.exe links with it (the Makefile's WIN_LINK_CC).
 #
 # The version comes from scripts/llvm-version.env (single source of truth).
@@ -56,6 +57,7 @@ toolchain_ok() {
         && "llvm-config-${LLVM_MAJOR}" --libs core >/dev/null 2>&1 \
         && "ld.lld-${LLVM_MAJOR}" --version >/dev/null 2>&1 \
         && [ -e "/usr/lib/llvm-${LLVM_MAJOR}/lib/libclang-${LLVM_MAJOR}.so.1" ] \
+        && [ -e "/usr/lib/llvm-${LLVM_MAJOR}/lib/libclangAST.a" ] \
         && clang_resource_ok
 }
 
@@ -68,7 +70,8 @@ install_from_apt() {
     # links against - /usr/lib/llvm-N/lib/libclang-N.so.1 (a symlink into the
     # multiarch dir, captured by write_cache_tarball below).
     sudo apt-get install -y "llvm-${LLVM_MAJOR}-dev" "clang-${LLVM_MAJOR}" \
-        "libpolly-${LLVM_MAJOR}-dev" "libclang1-${LLVM_MAJOR}" "lld-${LLVM_MAJOR}"
+        "libpolly-${LLVM_MAJOR}-dev" "libclang1-${LLVM_MAJOR}" "libclang-${LLVM_MAJOR}-dev" \
+        "lld-${LLVM_MAJOR}"
 }
 
 write_cache_tarball() {
@@ -84,7 +87,7 @@ write_cache_tarball() {
         "llvm-${LLVM_MAJOR}" "llvm-${LLVM_MAJOR}-dev" "llvm-${LLVM_MAJOR}-runtime"
         "clang-${LLVM_MAJOR}" "libclang1-${LLVM_MAJOR}"
         "libclang-common-${LLVM_MAJOR}-dev" "libclang-cpp${LLVM_MAJOR}"
-        "libpolly-${LLVM_MAJOR}-dev" "libllvm${LLVM_MAJOR}"
+        "libpolly-${LLVM_MAJOR}-dev" "libclang-${LLVM_MAJOR}-dev" "libllvm${LLVM_MAJOR}"
         "lld-${LLVM_MAJOR}" "liblld-${LLVM_MAJOR}"
     )
     local present=()

@@ -9,8 +9,8 @@
 # read from compiler/src/main.cryo (the single source of truth).
 #
 # LINUX: builds the shipped `cryo` with `--release-static`, i.e. statically
-# linked against libLLVM + the C++ runtime, so the binary has no libLLVM-20.so
-# runtime dependency.  Honors the static-link env knobs, which is how the same
+# linked against libLLVM, libclang and the C++ runtime, so the binary has no
+# libLLVM-20.so or libclang runtime dependency.  Honors the static-link env knobs, which is how the same
 # script produces a fully-static MUSL binary when run inside an Alpine
 # container (set before invoking):
 #     CRYO_LLVM_CONFIG=llvm-config   # Alpine's musl-built llvm-config
@@ -19,7 +19,11 @@
 #
 # Host prerequisites:
 #   linux:   llvm-20-dev + libpolly-20-dev (the static Polly libs llvm-config
-#            lists), a C toolchain with static libstdc++ (gcc), make, tar.
+#            lists) + libclang-20-dev (the clang archives
+#            scripts/build-static-libclang.sh merges), the archives of the
+#            system libraries LLVM uses (libzstd-dev, zlib1g-dev,
+#            libxml2-dev), a C toolchain with static libstdc++ (gcc, g++),
+#            curl, make, tar.
 #            (Alpine/musl: llvm20-static llvm20-dev clang lld musl-dev
 #             libstdc++-dev + the static C++ runtime; gcompat to run the pin.)
 #   windows: x86_64-w64-mingw32-gcc + binutils, the fetched .toolchains (run
@@ -252,7 +256,12 @@ build_linux() {
     make -C "$ROOT" cryo >/dev/null
 
     local link=(--release-static) name="cryo-${VER}-linux-x86_64"
-    if [ "$DYNAMIC" = 1 ]; then link=(--profile=release); name="${name}-dynamic"; fi
+    if [ "$DYNAMIC" = 1 ]; then
+        link=(--profile=release); name="${name}-dynamic"
+    else
+        # The static libclang `[link.release-static]` names.
+        "${ROOT}/scripts/build-static-libclang.sh"
+    fi
     echo "[build-release] linking cryo (${link[*]})"
     rm -rf "${ROOT}/compiler/build/release-static"
     ( cd "${ROOT}/compiler" && CRYO_STDLIB="${ROOT}/stdlib" \
@@ -279,8 +288,8 @@ build_linux() {
         local ldd_out binary
         for binary in cryo cryolsp; do
             ldd_out="$(ldd "${stage}/bin/${binary}" 2>&1 || true)"
-            if echo "$ldd_out" | grep -qi 'LLVM'; then
-                echo "error: shipped ${binary} still links libLLVM dynamically" >&2; exit 1
+            if echo "$ldd_out" | grep -qiE 'LLVM|clang'; then
+                echo "error: shipped ${binary} still links libLLVM or libclang dynamically" >&2; exit 1
             fi
             if ! echo "$ldd_out" | grep -qiE 'not a dynamic executable|not a valid dynamic program|statically linked'; then
                 echo "error: shipped ${binary} is not fully static; ldd reports:" >&2

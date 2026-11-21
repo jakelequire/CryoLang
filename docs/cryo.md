@@ -5473,6 +5473,16 @@ static = ["helpers/libhelpers-windows.a"]
 system = ["ws2_32"]                  # winsock, windows targets only
 ```
 
+`[link.release-static]` carries the same three keys and is read only by a `--release-static` build, which links it in place of `[link.unix]`: the unix overlay names the host's shared libraries, which a fully static link refuses, and this section names their static equivalents. The compiler's own project uses it for the static libclang archive its release links; LLVM's static archives come from `llvm-config` either way.
+
+```ini
+[link.unix]
+static = ["/usr/lib/llvm-20/lib/libclang-20.so.1"]
+
+[link.release-static]
+static = ["../.toolchains/libclang-static/libclang.a"]
+```
+
 > Migrating from pre-1.0: `link_libs` -> `[link] system`, `link_paths` -> `[link] search` (or `[link] static` for a local archive). The old `[compiler] args = ["--emit-llvm"]` flag-smuggling is gone - set `emit_llvm = true`. `[compiler] include_paths` -> `[project] source_paths`. `[project] target` -> `[project] target_triple`.
 
 ### 23.4 Multi-target: `[lib]` and `[[bin]]`
@@ -5563,7 +5573,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--opt-level=N`       | Optimization level `0`..`3`; overrides the profile and `[compiler] optimize`.                                                           |
 | `-g`, `--debug-info`  | Emit DWARF debug info.                                                                                                                  |
 | `--release`           | Build with the `release` profile (O2, no debug info).                                                                                   |
-| `--release-static`    | Static-link libLLVM + the C++ runtime into a self-contained binary for distribution (Linux host only; implies `--release`).             |
+| `--release-static`    | Static-link libLLVM + the C++ runtime into a self-contained binary for distribution, with `[link.release-static]` in place of `[link.unix]` (Linux host only; implies `--release`). |
 | `--dev`               | Build with the `debug` profile (O0 + DWARF).                                                                                            |
 | `--profile=NAME`      | Build with a named profile (cache under `build/target/NAME/`).                                                                          |
 | `--no-incremental`    | Force a full build: skip the up-to-date short-circuit and the manifest/fingerprint write.                                               |
