@@ -1,0 +1,246 @@
+///! An audit of the model's maps: each map is a `mut` local; each insert and
+///! removal is a whole observed value, so it stands in a statement of its
+///! own; each key an operation is given is `(e & 7)`, or a `for` over the
+///! map's own keys gives it; each `for` over a map's keys only adds each
+///! entry's mix into one sum modulo 2^62 (`(((s & M) + (h & M)) & M)`),
+///! which no iteration order changes; and, reading `UseWalk`, no map is
+///! changed inside a `for` over its keys.  The loan audit reads the same
+///! uses: an insert and a removal lend the map exclusively, a lookup and a
+///! `contains_key` shared.
+
+namespace cryosmith::selftest::maps;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+
+import cryosmith::model::{ BinaryOperator, ExpressionKind, Program, StatementKind, StatementNode, Variable, VariableRole };
+import cryosmith::selftest::runner::{ SelfTest };
+import cryosmith::selftest::uses::{ Use, UseKind, UseWalk };
+
+/// How many programs the map audit reads.
+const MAP_AUDITED_PROGRAMS: u64 = 200;
+
+/// The mask each key is reduced by.
+const AUDITED_KEY_MASK: u64 = 7;
+
+/// The mask a map's entry sum keeps its terms and itself below.
+const AUDITED_SUM_MASK: u64 = 4611686018427387903;
+
+/// What the map audit counted over the programs it read.
+internal type struct MapCounts {
+    /// Inserts.
+    internal inserts: i64;
+    /// Removals.
+    internal removals: i64;
+    /// Lookups outside a `for` over a map's keys.
+    internal lookups: i64;
+    /// `contains_key` calls.
+    internal contains: i64;
+    /// `for` loops over a map's keys.
+    internal iterations: i64;
+}
+
+/// The audit of one program's maps.
+internal type struct MapAudit {
+    /// Add one program's maps to `counts`, each within the rules; or the
+    /// first that breaks one.
+    internal static check(program: &Program, counts: mut &MapCounts) -> Result<i64, String> {
+        for (declared in program.variables.iter()) {
+            const local: boolean = match (declared.role) {
+                VariableRole::Local => { true }
+                _                   => { false }
+            };
+            if (declared.value_type.is_map() && (!local || !declared.mutable)) { return Result::Err(String::from_str(Str::new("a map is held by a variable other than a `mut` local"))); }
+        }
+        mut observed_changes: i64 = 0;
+        for (statement in program.statements.iter()) {
+            match (statement.kind) {
+                StatementKind::Observe(value) => {
+                    match (program.expression_at(value).kind) {
+                        ExpressionKind::Insert(_, _, _, _) => { observed_changes = observed_changes + 1; }
+                        ExpressionKind::Removal(_, _, _) => { observed_changes = observed_changes + 1; }
+                        _ => { }
+                    }
+                }
+                StatementKind::Each(variable, binding, body) => {
+                    if (program.variable_at(variable).value_type.is_map()) {
+                        if (!MapAudit::sums_entries(program, variable, binding, body)) { return Result::Err(f"a `for` over map {variable}'s keys does more than add each entry into one sum"); }
+                        counts.iterations = counts.iterations + 1;
+                    }
+                }
+                _ => { }
+            }
+        }
+        mut changes: i64 = 0;
+        for (node in program.expressions.iter()) {
+            match (node.kind) {
+                ExpressionKind::Insert(_, key, _, _) => {
+                    if (!MapAudit::is_reduced_key(program, key)) { return Result::Err(String::from_str(Str::new("an insert's key is not reduced by `& 7`"))); }
+                    changes = changes + 1;
+                    counts.inserts = counts.inserts + 1;
+                }
+                ExpressionKind::Removal(_, key, _) => {
+                    if (!MapAudit::is_reduced_key(program, key)) { return Result::Err(String::from_str(Str::new("a removal's key is not reduced by `& 7`"))); }
+                    changes = changes + 1;
+                    counts.removals = counts.removals + 1;
+                }
+                ExpressionKind::Lookup(_, key, _) => {
+                    if (MapAudit::is_reduced_key(program, key)) { counts.lookups = counts.lookups + 1; }
+                }
+                ExpressionKind::Contains(_, key) => {
+                    if (!MapAudit::is_reduced_key(program, key)) { return Result::Err(String::from_str(Str::new("a `contains_key`'s key is not reduced by `& 7`"))); }
+                    counts.contains = counts.contains + 1;
+                }
+                _ => { }
+            }
+        }
+        if (changes != observed_changes) { return Result::Err(String::from_str(Str::new("an insert or a removal stands inside a larger expression"))); }
+        mut index: i64 = 0;
+        while (index < program.functions.length()) {
+            const verdict: Result<i64, String> = MapAudit::unchanged_while_iterated(program, &UseWalk::of(program, program.function_at(index)));
+            if (verdict.is_err()) { return Result::Err(f"function {index}: {verdict.unwrap_err().as_str()}"); }
+            index = index + 1;
+        }
+        return Result::Ok(0);
+    }
+
+    /// Whether `key` is `(e & 7)`.
+    private static is_reduced_key(program: &Program, key: i64) -> boolean {
+        match (program.expression_at(key).kind) {
+            ExpressionKind::Binary(operator, _, mask) => {
+                if (operator != BinaryOperator::BitAnd) { return false; }
+                match (program.expression_at(mask).kind) {
+                    ExpressionKind::IntegerLiteral(literal, negative) => { return !negative && literal == AUDITED_KEY_MASK; }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        return false;
+    }
+
+    /// Whether the body `body` of a `for` binding `binding` over `map`'s
+    /// keys is one assignment `s = (((s & M) + (h & M)) & M)`, `h` reading
+    /// neither `s` nor anything but the binding and `map` looked up at it.
+    private static sums_entries(program: &Program, map: i64, binding: i64, body: i64) -> boolean {
+        if (body < 0) { return false; }
+        const only: StatementNode = program.statement_at(body);
+        if (only.next >= 0) { return false; }
+        match (only.kind) {
+            StatementKind::Assign(place, value) => {
+                const sum: i64 = MapAudit::variable_read(program, place);
+                if (sum < 0) { return false; }
+                const total: i64 = MapAudit::masked(program, value);
+                match (program.expression_at(total).kind) {
+                    ExpressionKind::Binary(operator, left, right) => {
+                        if (operator != BinaryOperator::Add) { return false; }
+                        return MapAudit::variable_read(program, MapAudit::masked(program, left)) == sum
+                            && MapAudit::is_entry(program, MapAudit::masked(program, right), map, binding);
+                    }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        return false;
+    }
+
+    /// The operand of `(x & M)`, or -1 for any other expression.
+    private static masked(program: &Program, value: i64) -> i64 {
+        if (value < 0) { return -1; }
+        match (program.expression_at(value).kind) {
+            ExpressionKind::Binary(operator, operand, mask) => {
+                if (operator != BinaryOperator::BitAnd) { return -1; }
+                match (program.expression_at(mask).kind) {
+                    ExpressionKind::IntegerLiteral(literal, negative) => { if (!negative && literal == AUDITED_SUM_MASK) { return operand; } }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        return -1;
+    }
+
+    /// The variable `value` reads, or -1 when it is no variable read.
+    private static variable_read(program: &Program, value: i64) -> i64 {
+        if (value < 0) { return -1; }
+        return match (program.expression_at(value).kind) {
+            ExpressionKind::Variable(variable) => { variable }
+            _                                  => { -1 }
+        };
+    }
+
+    /// Whether `value` is `mix(mix(c, binding), map.get(&binding)..)`.
+    private static is_entry(program: &Program, value: i64, map: i64, binding: i64) -> boolean {
+        if (value < 0) { return false; }
+        match (program.expression_at(value).kind) {
+            ExpressionKind::Mix(salted, looked_up) => {
+                const keyed: boolean = match (program.expression_at(salted).kind) {
+                    ExpressionKind::Mix(_, key) => { MapAudit::variable_read(program, key) == binding }
+                    _                           => { false }
+                };
+                return match (program.expression_at(looked_up).kind) {
+                    ExpressionKind::Lookup(looked, key, _) => { keyed && looked == map && MapAudit::variable_read(program, key) == binding }
+                    _                                      => { false }
+                };
+            }
+            _ => { }
+        }
+        return false;
+    }
+
+    /// Whether no map is lent exclusively or assigned inside a `for` over
+    /// its own keys, in one function's `uses`.
+    private static unchanged_while_iterated(program: &Program, uses: &Array<Use>) -> Result<i64, String> {
+        mut depth: i64 = 0;
+        mut iterating: Array<i64> = Array::<i64>::new();
+        mut iterated_at: Array<i64> = Array::<i64>::new();
+        for (used in uses.iter()) {
+            match (used.kind) {
+                UseKind::BlockEntered => { depth = depth + 1; }
+                UseKind::BlockLeft => {
+                    depth = depth - 1;
+                    while (iterated_at.length() > 0 && iterated_at.get(iterated_at.length() - 1).unwrap() >= depth) {
+                        iterated_at.truncate(iterated_at.length() - 1);
+                        iterating.truncate(iterating.length() - 1);
+                    }
+                }
+                UseKind::Iterated => {
+                    iterating.push(used.variable);
+                    iterated_at.push(depth);
+                }
+                UseKind::ExclusiveBorrow => {
+                    if (iterating.contains(&used.variable)) { return Result::Err(f"map {used.variable} is changed inside a `for` over its keys"); }
+                }
+                UseKind::Assigned => {
+                    if (iterating.contains(&used.variable)) { return Result::Err(f"map {used.variable} is assigned inside a `for` over its keys"); }
+                }
+                _ => { }
+            }
+        }
+        return Result::Ok(0);
+    }
+}
+
+implement struct SelfTest {
+    /// Every map keeps the rules, and the audit finds inserts, removals,
+    /// lookups, `contains_key` calls and `for` loops over keys to check.
+    internal map_audit(mut &this) -> void {
+        mut counts: MapCounts = MapCounts { inserts: 0, removals: 0, lookups: 0, contains: 0, iterations: 0 };
+        mut seed: u64 = 1;
+        while (seed <= MAP_AUDITED_PROGRAMS) {
+            match (MapAudit::check(this.default_model(seed), &counts)) {
+                Result::Ok(_)       => { }
+                Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }
+            }
+            seed = seed + 1;
+        }
+        this.expect(counts.inserts > 0, String::from_str(Str::new("the map audit found no insert")));
+        this.expect(counts.removals > 0, String::from_str(Str::new("the map audit found no removal")));
+        this.expect(counts.lookups > 0, String::from_str(Str::new("the map audit found no lookup")));
+        this.expect(counts.contains > 0, String::from_str(Str::new("the map audit found no `contains_key`")));
+        this.expect(counts.iterations > 0, String::from_str(Str::new("the map audit found no `for` over a map's keys")));
+    }
+}

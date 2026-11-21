@@ -1,11 +1,14 @@
-///! The machine's physical memory: how much it has, and how much is still
-///! available to a program that starts now.
+///! The machine's memory: how much physical memory it has and how much is
+///! still available to a program that starts now, and its commit - the
+///! memory the system has promised to every running process - beside the
+///! most it will promise.
 ///!
 ///! ```cryo
 ///! import std::process::memory::{ SystemMemory };
 ///!
 ///! const memory: SystemMemory = SystemMemory::query().unwrap();
 ///! const spare_megabytes: u64 = memory.available_bytes() / 1048576;
+///! const promised_gigabytes: u64 = memory.committed_bytes() / 1073741824;
 ///! ```
 
 namespace std::process::memory;
@@ -19,39 +22,49 @@ import std::fs::file::{ File };
 import std::fs::path::{ Path };
 import std::sys::syscall;
 
-/// The machine's physical memory, read once by `query`.
+/// The machine's memory, read once by `query`.
 public type struct SystemMemory {
     private total: u64;
     private available: u64;
+    private committed: u64;
+    private commit_limit: u64;
 
-    /// Read the machine's memory now: `MemTotal` and `MemAvailable` from
-    /// `/proc/meminfo` on Linux, `GlobalMemoryStatusEx` on Windows.
+    /// Read the machine's memory now: `MemTotal`, `MemAvailable`,
+    /// `Committed_AS` and `CommitLimit` from `/proc/meminfo` on Linux,
+    /// `GlobalMemoryStatusEx` and `GetPerformanceInfo` on Windows.
     /// Fails with the error reading `/proc/meminfo` gave, or `InvalidData`
-    /// when either line is missing or not a number.
+    /// when any of those lines is missing or not a number.
     ![target(linux)]
     public static query() -> Result<SystemMemory, IoError> {
         const text: String = File::read_text(Path::from(Str::new("/proc/meminfo")))?;
         mut total: Option<u64> = Option::None;
         mut available: Option<u64> = Option::None;
+        mut committed: Option<u64> = Option::None;
+        mut commit_limit: Option<u64> = Option::None;
         for (line in text.as_str().lines()) {
-            match (line.strip_prefix(&Str::new("MemTotal:"))) {
-                Option::Some(rest) => { total = kibibytes(rest); }
-                Option::None       => { }
-            }
-            match (line.strip_prefix(&Str::new("MemAvailable:"))) {
-                Option::Some(rest) => { available = kibibytes(rest); }
-                Option::None       => { }
+            match (line.split_once(&Str::new(":"))) {
+                Option::Some(pair) => {
+                    if (pair.first == Str::new("MemTotal")) { total = kibibytes(pair.second); }
+                    if (pair.first == Str::new("MemAvailable")) { available = kibibytes(pair.second); }
+                    if (pair.first == Str::new("Committed_AS")) { committed = kibibytes(pair.second); }
+                    if (pair.first == Str::new("CommitLimit")) { commit_limit = kibibytes(pair.second); }
+                }
+                Option::None => { }
             }
         }
-        if (total.is_none() || available.is_none()) {
+        if (total.is_none() || available.is_none() || committed.is_none() || commit_limit.is_none()) {
             return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
         }
-        return Result::Ok(SystemMemory { total: total.unwrap(), available: available.unwrap() });
+        return Result::Ok(SystemMemory {
+            total: total.unwrap(), available: available.unwrap(),
+            committed: committed.unwrap(), commit_limit: commit_limit.unwrap()
+        });
     }
 
     /// Read the machine's memory now: the total and available physical
-    /// memory `GlobalMemoryStatusEx` reports (`/proc/meminfo` on Linux).
-    /// Fails with the system's error when that call fails.
+    /// memory `GlobalMemoryStatusEx` reports, and the commit charge and
+    /// its limit `GetPerformanceInfo` reports (`/proc/meminfo` on Linux).
+    /// Fails with the system's error when either call fails.
     ![target(windows)]
     public static query() -> Result<SystemMemory, IoError> {
         mut status: syscall::MEMORYSTATUSEX = syscall::MEMORYSTATUSEX {
@@ -62,7 +75,20 @@ public type struct SystemMemory {
         if (syscall::GlobalMemoryStatusEx(&status) == 0) {
             return Result::Err(IoError::last_os_error());
         }
-        return Result::Ok(SystemMemory { total: status.ullTotalPhys, available: status.ullAvailPhys });
+        mut performance: syscall::PERFORMANCE_INFORMATION = syscall::PERFORMANCE_INFORMATION {
+            cb: 104, CommitTotal: 0, CommitLimit: 0, CommitPeak: 0,
+            PhysicalTotal: 0, PhysicalAvailable: 0, SystemCache: 0,
+            KernelTotal: 0, KernelPaged: 0, KernelNonpaged: 0, PageSize: 0,
+            HandleCount: 0, ProcessCount: 0, ThreadCount: 0
+        };
+        if (syscall::K32GetPerformanceInfo(&performance, 104) == 0) {
+            return Result::Err(IoError::last_os_error());
+        }
+        return Result::Ok(SystemMemory {
+            total: status.ullTotalPhys, available: status.ullAvailPhys,
+            committed: performance.CommitTotal * performance.PageSize,
+            commit_limit: performance.CommitLimit * performance.PageSize
+        });
     }
 
     /// The physical memory installed, in bytes.
@@ -74,6 +100,24 @@ public type struct SystemMemory {
     /// system paging anything out, in bytes.
     public available_bytes(&this) -> u64 {
         return this.available;
+    }
+
+    /// The memory the system has promised to every running process, in
+    /// bytes: what they have allocated, whether or not they have touched
+    /// it yet.  Windows calls it the commit charge; it counts against
+    /// physical memory and the page file together, and an allocation that
+    /// would take it past `commit_limit_bytes` fails.  On Linux it is
+    /// `Committed_AS`, which may exceed the limit, since Linux promises
+    /// more than it has unless told not to overcommit.
+    public committed_bytes(&this) -> u64 {
+        return this.committed;
+    }
+
+    /// The most memory the system will promise, in bytes: physical memory
+    /// and the page file (Windows), or the limit Linux enforces when it is
+    /// told not to overcommit (`CommitLimit`).
+    public commit_limit_bytes(&this) -> u64 {
+        return this.commit_limit;
     }
 }
 

@@ -944,16 +944,18 @@ public:
     /// from the declaration where it is written, and this index files the
     /// method under the type the implementation head or the type body
     /// resolved to, so the two answer where a method lives independently.
-    /// The definition must be a method of `owner`, under the method's own
-    /// leaf, registered for this very node.  A method with no definition is
-    /// a copy (a trait default placed here, a monomorphized clone) and is
-    /// not checked.
-    check_method_def(&this, owner: TypeRef, method_decl: DeclarationNode*, intern: InternTable*) -> void {
+    /// The definition must be a method of a type that is `owner` - its
+    /// own, or an alias naming it, since a head naming an alias implements
+    /// for the alias's target - under the method's own leaf, registered for
+    /// this very node.  A method with no definition is a copy (a trait
+    /// default placed here, a monomorphized clone) and is not checked.
+    check_method_def(&this, owner: TypeRef, method_decl: DeclarationNode*, intern: InternTable*,
+                     arena: TypeArena*) -> void {
         const method: MethodDecl* = DeclarationNode::method_of(method_decl);
         const d: DefId = DeclarationNode::fn_of(method.func).def;
         if (!d.is_valid()) { return; }
         if (this.defs.kind_of(d) == DefKind::Method
-                && this.defs.parent_of(d).equals(this.registered_def(owner))
+                && arena.follow_alias(this.type_of_def(this.defs.parent_of(d))).equals(owner)
                 && this.defs.leaf_of(d).spelling().equals(DeclarationNode::fn_of(method.func).name)
                 && this.method_decl_of(d) == method_decl) {
             return;
@@ -1222,7 +1224,7 @@ public:
             const method_decl: DeclarationNode* = methods[i];
             const method: MethodDecl* = DeclarationNode::method_of(method_decl);
             if (method == null || method.func == null) { continue; }
-            this.check_method_def(owner, method_decl, intern);
+            this.check_method_def(owner, method_decl, intern, arena);
             // Self-returning trait defaults (combinators) are deferred
             // templates with unresolved signatures - they are instantiated
             // lazily at call sites and the concrete spec is registered there
@@ -1526,14 +1528,19 @@ public:
     /// Nothing else can name a type here: a type parameter, a local and an
     /// already-failed resolution each name something that is not a
     /// declaration, so there is no key to look one up under.
-    impl_owner(&this, node: ImplBlock*, site: string) -> TypeRef {
+    ///
+    /// A head naming a non-generic alias is for the type the alias names
+    /// (`TypeArena::follow_alias`), as every other place the alias is
+    /// written is: its methods and its trait belong to that type, and are
+    /// reached through it and through the alias alike.
+    impl_owner(&this, node: ImplBlock*, arena: TypeArena*, site: string) -> TypeRef {
         return match (node.res) {
             ResSlot::Answered(r) => {
                 match (r) {
                     Res::Def(q) => {
                         const found: TypeRef = this.type_of_def(q);
                         if (!found.is_valid()) { compiler::resolver::res::record_unregistered_def(site); }
-                        found
+                        arena.follow_alias(found)
                     }
                     Res::PrimTy(n) => { this.type_of_def(this.defs.primitive(n)) }
                     _              => { TypeRef::invalid() }

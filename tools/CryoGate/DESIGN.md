@@ -33,7 +33,8 @@ upward, and no two files of one layer import each other in a cycle.
 | `freestanding/` | the runtime's freestanding check: its programs and project files, and what each must exit with and print | core |
 | `freestanding/run/` | the freestanding run itself: the runtime built per arm, each program built, linked by hand and run, natively and under wine | core, the freestanding decisions |
 | `release/` | a release archive's smoke: its hello-world and its judge | the stdlib |
-| `smith/` | CryoSmith's programs as checked: the hash line each must print, the two builds' agreement, a failed build quoted (CryoSmith generates; checking a corpus is cryogate's) | core |
+| `smith/` | CryoSmith's programs as checked: the hash line each must print, the two builds' agreement, a failed build quoted, the configurations a program is built and run under, what each made of it and the program's verdict and signature, the pinned corpus verify checks, the known-compiler-bug list (CryoSmith generates; checking a corpus is cryogate's) | core |
+| `smith/run/` | the programs built and run under each configuration, as corpus-check and smith-diff both do it | core, smith's decisions |
 | `negative/` | the compile-fail suite's `//~` annotations: the diagnostics a run anchors in a file, the lines that pin them, and the two-way check | core |
 | `abi/` | the runtime's ABI: the lang-item registry's rows and what each configuration must define, the symbols an archive's members define, the `__cryo_` names the sources spell | core |
 | `lsp/` | the language server's checks: reading a message, the wire (framing, URIs, UTF-16 positions), a fixture's `checks.json` and markers, each kind of check's judgement of an answer, a server build's report | core |
@@ -50,8 +51,9 @@ compiler; `verify/run/` is where verify's children are started, so
 `gates/verify.cryo` stays the command line only.  `selfhost/` is ordered
 the same way: stages, trees, archives, digest, mirror, arms, judges, then
 its `run/` (arm, wsl); `incremental/` too: edits, snapshots, then its
-`run/` (matrix); and `lsp/`: reading, wire, fixture, judges, build, then its
-`run/` (server, smoke).
+`run/` (matrix); `lsp/`: reading, wire, fixture, judges, build, then its
+`run/` (server, smoke); and `smith/`: corpus, difference, pinned, selftest,
+then its `run/` (programs).
 
 The test files under `tests/` import whichever layer they test.
 

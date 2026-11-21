@@ -1,0 +1,103 @@
+///! Drops (stage 7): owned values released before the scope holding them
+///! ends, each release running the value's `drop`, which folds into the
+///! hash where it runs.
+///!
+///! With `drops` (and `moves`): `mem::drop(v);` releases a variable that
+///! may be moved here, which is then moved out of; a call's owned result
+///! discarded by a statement of its own, `h3(..);`, is released when the
+///! statement ends; a shared reference argument is sometimes a borrowed
+///! temporary, `&(D0 { .. })` or `&(h3(..))`, released when the statement
+///! ends, after the call borrowing it returns - never in a reference a
+///! function returns, which would outlive it; and a store through an
+///! exclusive reference parameter sometimes writes the whole value,
+///! `*p0 = D0 { .. };`, releasing the one it replaces.
+
+namespace cryosmith::generate::drops;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::model::{ ExpressionKind, StatementKind, ValueType };
+
+/// How often, in a hundred, a shared reference argument borrows a
+/// temporary, with drops on.
+const TEMPORARY_CHANCE: i64 = 20;
+
+/// How often, in a hundred, a store through an exclusive reference writes
+/// the whole value, with drops on.
+const WHOLE_STORE_CHANCE: i64 = 30;
+
+implement struct Generator {
+    /// Whether values are released early: `drops` is on, and the program
+    /// has owned structs.
+    internal makes_drops(&this) -> boolean {
+        return this.options.features.has(Feature::Drops) && this.makes_owned();
+    }
+
+    /// The variables `mem::drop` may release here: those holding a value
+    /// that moves and that may be moved here; none without drops.
+    internal releasable(&this) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        if (!this.makes_drops()) { return found; }
+        for (moving in this.moving_types().iter()) {
+            for (variable in this.environment.movable(&this.program, moving).iter()) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// `mem::drop(v);` of one of `variables`, which is moved out.
+    internal release(mut &this, variables: &Array<i64>) -> i64 {
+        const variable: i64 = variables.get(this.random.below(variables.length())).unwrap();
+        this.environment.move_out(variable);
+        return this.program.statement(StatementKind::Release(variable));
+    }
+
+    /// The functions returning a value that moves a statement may call and
+    /// discard the result of here, a result's excepted since it must be
+    /// used; none without drops.
+    internal discardable(&this) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        if (!this.makes_drops()) { return found; }
+        for (moving in this.moving_types().iter()) {
+            if (moving.must_be_used()) { continue; }
+            for (callee in this.callees(moving).iter()) { found.push(callee); }
+        }
+        return found;
+    }
+
+    /// `h3(..);`, a call of one of `callees` whose owned result is
+    /// released when the statement ends.
+    internal discarded_result(mut &this, callees: &Array<i64>) -> i64 {
+        const callee: i64 = callees.get(this.random.below(callees.length())).unwrap();
+        return this.program.statement(StatementKind::Evaluate(this.call(callee, this.depth())));
+    }
+
+    /// Whether a shared reference argument of `wanted` borrows a temporary:
+    /// `TEMPORARY_CHANCE` times in a hundred with drops on, never for an
+    /// exclusive reference, a returned one or one in a `match` expression's
+    /// arm value.  No draw otherwise.
+    internal borrows_temporary(mut &this, wanted: ValueType) -> boolean {
+        return this.makes_drops() && !wanted.is_exclusive() && !this.returning_reference && !this.making_arm_value && this.random.chance(TEMPORARY_CHANCE);
+    }
+
+    /// `&(D0 { .. })` or `&(h3(..))`: an owned value no variable holds,
+    /// borrowed as `wanted` and released when the statement ends.
+    internal temporary_borrow(mut &this, wanted: ValueType) -> i64 {
+        const owned: ValueType = ValueType::Owned(wanted.referent());
+        const callees: Array<i64> = this.callees(owned);
+        const value: i64 = if (callees.length() > 0 && this.random.chance(40)) {
+            this.call(callees.get(this.random.below(callees.length())).unwrap(), 1)
+        } else {
+            this.owned_literal(owned, 1)
+        };
+        return this.node(ExpressionKind::BorrowTemporary(value), wanted);
+    }
+
+    /// Whether a store through an exclusive reference writes the whole
+    /// value: `WHOLE_STORE_CHANCE` times in a hundred with drops on.  No
+    /// draw otherwise.
+    internal stores_whole(mut &this) -> boolean {
+        return this.makes_drops() && this.random.chance(WHOLE_STORE_CHANCE);
+    }
+}

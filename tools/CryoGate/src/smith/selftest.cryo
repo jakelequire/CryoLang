@@ -1,0 +1,112 @@
+///! CryoSmith's self-test run in parts: what each part reported, and the
+///! verdict of all of them together.  Pure over the text handed in.
+///!
+///! `cryosmith selftest --part I/N` numbers every unit of the run (a check,
+///! or one feature switch) in order and runs those whose number leaves I
+///! divided by N.  It prints `cryosmith selftest: part I/N ran U of T
+///! units`, then the whole run's own verdict line, `cryosmith selftest: OK
+///! (C checks)` or, on its error stream, `cryosmith selftest: FAIL (F of C
+///! checks)`.  The parts together pass when every one passed, each counted
+///! the same T, and their U add up to T: each unit ran, and ran once.
+
+namespace cryogate::smith::selftest;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+import cryogate::core::text::{ Text };
+
+/// What one part printed.
+public type struct PartReport {
+    /// The part's number, from 0.
+    public part: i64;
+    /// Its output stream.
+    public output: String;
+    /// Its error stream.
+    public errors: String;
+
+    /// The report of part `part`.
+    public static new(part: i64, output: Str, errors: Str) -> PartReport {
+        return PartReport { part: part, output: String::from_str(output), errors: String::from_str(errors) };
+    }
+}
+
+/// The units one part ran, and the units it counted in the whole run.
+private type struct PartUnits {
+    ran: i64;
+    counted: i64;
+}
+
+/// The verdict of the parts of one self-test run.
+public type struct SelfTestParts {
+    /// The whole run's verdict line from the parts' reports: `cryosmith
+    /// selftest: OK (C checks)` with C their sum, or `FAIL (F of C
+    /// checks)`; why the parts do not make a whole run otherwise.
+    public static verdict(reports: &Array<PartReport>) -> Result<String, String> {
+        if (reports.is_empty()) { return Result::Err(String::from_str(Str::new("no part ran"))); }
+        mut units: i64 = 0;
+        mut total: i64 = -1;
+        mut checks: i64 = 0;
+        mut failed: i64 = 0;
+        for (report in reports.iterate_references()) {
+            const counted: PartUnits = SelfTestParts::units(report)?;
+            if (total >= 0 && counted.counted != total) { return Result::Err(f"part {report.part} counted {counted.counted} units, part 0 counted {total}"); }
+            total = counted.counted;
+            units = units + counted.ran;
+            match (SelfTestParts::number_after(report.output.as_str(), Str::new("cryosmith selftest: OK ("))) {
+                Option::Some(passed) => { checks = checks + passed; }
+                Option::None => {
+                    const failures: i64 = match (SelfTestParts::number_after(report.errors.as_str(), Str::new("cryosmith selftest: FAIL ("))) {
+                        Option::Some(number) => { number }
+                        Option::None         => { return Result::Err(f"part {report.part} printed no verdict"); }
+                    };
+                    const of: i64 = match (SelfTestParts::number_after(report.errors.as_str(), f"cryosmith selftest: FAIL ({failures} of ".as_str())) {
+                        Option::Some(number) => { number }
+                        Option::None         => { return Result::Err(f"part {report.part} printed no check count"); }
+                    };
+                    failed = failed + failures;
+                    checks = checks + of;
+                }
+            }
+        }
+        if (units != total) { return Result::Err(f"the parts ran {units} of {total} units"); }
+        if (checks == 0) { return Result::Err(String::from_str(Str::new("no check ran"))); }
+        if (failed > 0) { return Result::Ok(f"cryosmith selftest: FAIL ({failed} of {checks} checks)"); }
+        return Result::Ok(f"cryosmith selftest: OK ({checks} checks)");
+    }
+
+    /// The units a part ran and the units it counted, from its part line.
+    private static units(report: &PartReport) -> Result<PartUnits, String> {
+        const opening: String = f"cryosmith selftest: part {report.part}/";
+        for (line in Text::lines(report.output.as_str()).iterate_references()) {
+            if (!line.as_str().starts_with(&opening.as_str())) { continue; }
+            match (SelfTestParts::number_after(line.as_str(), Str::new(" ran "))) {
+                Option::Some(ran) => {
+                    match (SelfTestParts::number_after(line.as_str(), f" ran {ran} of ".as_str())) {
+                        Option::Some(counted) => { return Result::Ok(PartUnits { ran: ran, counted: counted }); }
+                        Option::None          => { }
+                    }
+                }
+                Option::None => { }
+            }
+            return Result::Err(f"part {report.part} printed `{line.as_str()}`, not a part line");
+        }
+        return Result::Err(f"part {report.part} printed no part line");
+    }
+
+    /// The whole number written right after the first `opening` in `text`.
+    private static number_after(text: Str, opening: Str) -> Option<i64> {
+        const at: i64 = text.find(&opening)?;
+        const rest: Str = text.byte_substring(at + opening.length(), text.length());
+        mut length: i64 = 0;
+        while (length < rest.length() && rest.byte_at(length).unwrap() >= '0' as u8 && rest.byte_at(length).unwrap() <= '9' as u8) { length = length + 1; }
+        if (length == 0) { return Option::None; }
+        return match (i64::try_from(rest.byte_substring(0, length))) {
+            Result::Ok(value) => { Option::Some(value) }
+            Result::Err(_)    => { Option::None }
+        };
+    }
+}

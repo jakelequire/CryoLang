@@ -1,0 +1,57 @@
+// `cryo interpret` keeps its own account of moves and drops: a value moved
+// between locals, into a call and out of a return is dropped once, where
+// its last owner ends; an assignment whose right side moves the place
+// itself out drops nothing; `mem::drop` and a discarded result drop at
+// once; locals drop in reverse order of declaration, and a struct's own
+// `drop` runs before its members'.
+
+namespace Main;
+
+import std::fmt;
+import std::core::mem;
+
+mut log: u64 = 0;
+
+function note(code: u64) -> void { log = log * 10 + code; }
+
+type struct Tracked {
+    code: u64;
+}
+
+implement trait Drop for struct Tracked {
+    drop(mut &this) -> void { note(this.code); }
+}
+
+type struct Holder {
+    first: Tracked;
+    second: Tracked;
+}
+
+implement trait Drop for struct Holder {
+    drop(mut &this) -> void { note(9); }
+}
+
+function passed_through(value: Tracked) -> Tracked { return value; }
+
+function made(code: u64) -> Tracked { return Tracked { code: code }; }
+
+function scoped() -> void {
+    const _a: Tracked = made(1);
+    const _b: Tracked = made(2);
+    const _holder: Holder = Holder { first: made(3), second: made(4) };
+}
+
+function main() -> i32 {
+    scoped();
+    const after_scope: u64 = log;
+    log = 0;
+    mut kept: Option<Tracked> = Option::Some(made(5));
+    kept = if (log == 0) { kept } else { Option::None };
+    const after_self_assignment: u64 = log;
+    const moved: Tracked = passed_through(made(6));
+    mem::drop(moved);
+    made(7);
+    const after_releases: u64 = log;
+    fmt::println(f"ownership: {after_scope} {after_self_assignment} {after_releases}");
+    return 0;
+}

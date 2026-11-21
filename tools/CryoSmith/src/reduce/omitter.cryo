@@ -1,0 +1,421 @@
+///! `Omitter`: what may be taken out of a generated program now, and taking
+///! one thing out.
+///!
+///! A thing may be taken out when the printed program no longer names it,
+///! so the program left is as valid, well typed and terminating as the one
+///! generated: a statement whose variable nothing reads, a function nothing
+///! calls, a struct no type names.  Taking out only ever removes names, so
+///! whatever may be taken out stays so while other things are taken out
+///! before it; a reducer may take out any set of the candidates listed,
+///! applied in the order listed, and a thing an earlier one took with it
+///! (an expression inside a statement taken out) is left alone.  Two rules
+///! keep what remains free of a fault the generator's guarantees ruled
+///! out: an expression a literal replaces is never the operand of a guard
+///! (`References::replaceable`), and a statement appending to a dynamic
+///! array, or assigning one whole, stays, since the fewest elements the
+///! array is known to hold - which every later index and pop is reduced
+///! below - counts what it adds.
+
+namespace cryosmith::reduce::omitter;
+
+import std::collections::array::{ Array };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+
+import cryosmith::model::{
+    Closure, Enumeration, ExpressionKind, ExpressionNode, Function, MatchArm, Omission, Program, StatementKind, StatementNode, Structure,
+    ValueType
+};
+import cryosmith::reduce::references::{ Link, References, Referent };
+
+/// What may be taken out of a program, and taking it out.
+public type struct Omitter {
+    /// Every omission `program` may take now: its printed statements, then
+    /// its printed expressions, each in printed order, then its functions,
+    /// trait implementations, traits, structs, generic structs, enums,
+    /// generic enums, owned structs, variants and fields, each in the
+    /// order of its arena.
+    public static candidates(program: &Program) -> Array<Omission> {
+        const found: References = References::of(program);
+        mut candidates: Array<Omission> = Array::<Omission>::new();
+        for (statement in found.statements.iter()) {
+            if (Omitter::statement_removable(program, &found, statement)) { candidates.push(Omission::Statement(statement)); }
+        }
+        for (expression in found.replaceable.iter()) { candidates.push(Omission::Expression(expression)); }
+        mut index: i64 = 0;
+        while (index < program.functions.length()) {
+            if (Omitter::function_removable(program, &found, index)) { candidates.push(Omission::Function(index)); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.traits.length()) {
+            if (!program.omits(Omission::Trait(index))) {
+                const implementors: Array<ValueType> = program.implementors(index);
+                for (implementor in implementors.iter()) {
+                    if (Omitter::implementation_removable(program, &found, index, implementor)) { candidates.push(Omission::Implementation(index, implementor)); }
+                }
+            }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.traits.length()) {
+            if (Omitter::trait_removable(program, &found, index)) { candidates.push(Omission::Trait(index)); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.structures.length()) {
+            if (Omitter::structure_removable(program, &found, index)) { candidates.push(Omission::Structure(index)); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.templates.length()) {
+            if (!program.omits(Omission::Template(index)) && !found.names(Referent::Template(index))) { candidates.push(Omission::Template(index)); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.enumerations.length()) {
+            if (Omitter::enumeration_removable(program, &found, index)) { candidates.push(Omission::Enumeration(index)); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.enumeration_templates.length()) {
+            if (!program.omits(Omission::EnumerationTemplate(index)) && !found.names(Referent::EnumerationTemplate(index))) {
+                candidates.push(Omission::EnumerationTemplate(index));
+            }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.owned_structures.length()) {
+            if (!program.omits(Omission::Owned(index)) && !found.names(Referent::Owned(index))) { candidates.push(Omission::Owned(index)); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.variants.length()) {
+            if (Omitter::variant_removable(program, &found, index)) { candidates.push(Omission::Variant(index)); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.fields.length()) {
+            if (Omitter::field_removable(program, &found, index)) { candidates.push(Omission::Field(index)); }
+            index = index + 1;
+        }
+        return candidates;
+    }
+
+    /// Take `omission` out of `program`, and record it: true when taken,
+    /// false when there is nothing left to take - it was taken already, or
+    /// with something taken before it; why it may not be taken.
+    public static apply(program: mut &Program, omission: Omission) -> Result<boolean, String> {
+        const found: References = References::of(program);
+        const index: i64 = omission.index();
+        if (index < 0 || index >= Omitter::arena_length(program, &omission)) {
+            return Result::Err(f"`{omission.path().as_str()}` names nothing in this program");
+        }
+        const removable: boolean = match (omission) {
+            Omission::Statement(_) => {
+                if (!found.prints_statement(index)) { return Result::Ok(false); }
+                Omitter::statement_removable(program, &found, index)
+            }
+            Omission::Expression(_) => {
+                if (!found.prints_expression(index)) { return Result::Ok(false); }
+                found.replaceable.contains(&index)
+            }
+            Omission::Function(_) => {
+                if (program.omits_function(index)) { return Result::Ok(false); }
+                Omitter::function_removable(program, &found, index)
+            }
+            Omission::Implementation(_, implementor) => {
+                if (program.omits(Omission::Trait(index)) || !program.implements(implementor, index)) { return Result::Ok(false); }
+                Omitter::implementation_removable(program, &found, index, implementor)
+            }
+            Omission::Trait(_) => {
+                if (program.omits(Omission::Trait(index))) { return Result::Ok(false); }
+                Omitter::trait_removable(program, &found, index)
+            }
+            Omission::Structure(_) => {
+                if (program.omits(Omission::Structure(index))) { return Result::Ok(false); }
+                Omitter::structure_removable(program, &found, index)
+            }
+            Omission::Template(_) => {
+                if (program.omits(Omission::Template(index))) { return Result::Ok(false); }
+                !found.names(Referent::Template(index))
+            }
+            Omission::Field(_) => {
+                const holder: i64 = Omitter::field_holder(program, index);
+                if (holder >= 0 && program.omits(Omission::Structure(holder))) { return Result::Ok(false); }
+                if (program.omits(Omission::Field(index))) { return Result::Ok(false); }
+                Omitter::field_removable(program, &found, index)
+            }
+            Omission::Enumeration(_) => {
+                if (program.omits(Omission::Enumeration(index))) { return Result::Ok(false); }
+                Omitter::enumeration_removable(program, &found, index)
+            }
+            Omission::EnumerationTemplate(_) => {
+                if (program.omits(Omission::EnumerationTemplate(index))) { return Result::Ok(false); }
+                !found.names(Referent::EnumerationTemplate(index))
+            }
+            Omission::Variant(_) => {
+                const holder: i64 = Omitter::variant_holder(program, index);
+                if (holder >= 0 && program.omits(Omission::Enumeration(holder))) { return Result::Ok(false); }
+                if (program.omits(Omission::Variant(index))) { return Result::Ok(false); }
+                Omitter::variant_removable(program, &found, index)
+            }
+            Omission::Owned(_) => {
+                if (program.omits(Omission::Owned(index))) { return Result::Ok(false); }
+                !found.names(Referent::Owned(index))
+            }
+        };
+        if (!removable) { return Result::Err(f"`{omission.path().as_str()}` is still needed by what the program prints"); }
+        match (omission) {
+            Omission::Statement(_) => {
+                mut position: i64 = 0;
+                while (found.statements[position] != index) { position = position + 1; }
+                Omitter::unlink(program, found.links[position], program.statement_at(index).next);
+            }
+            Omission::Expression(_) => { Omitter::replace(program, index); }
+            _ => { }
+        }
+        program.omissions.push(omission);
+        return Result::Ok(true);
+    }
+
+    /// How many nodes or items the arena `omission` indexes holds; for an
+    /// implementation, the traits.
+    private static arena_length(program: &Program, omission: &Omission) -> i64 {
+        return match (omission) {
+            Omission::Statement(_)           => { program.statements.length() }
+            Omission::Expression(_)          => { program.expressions.length() }
+            Omission::Function(_)            => { program.functions.length() }
+            Omission::Implementation(_, _)   => { program.traits.length() }
+            Omission::Trait(_)               => { program.traits.length() }
+            Omission::Structure(_)           => { program.structures.length() }
+            Omission::Template(_)            => { program.templates.length() }
+            Omission::Field(_)               => { program.fields.length() }
+            Omission::Enumeration(_)         => { program.enumerations.length() }
+            Omission::EnumerationTemplate(_) => { program.enumeration_templates.length() }
+            Omission::Variant(_)             => { program.variants.length() }
+            Omission::Owned(_)               => { program.owned_structures.length() }
+        };
+    }
+
+    /// Whether printed statement `index` may be taken out: not a function's
+    /// last `return` or `main`'s end, not a declaration of a variable
+    /// something still names, not an append to a dynamic array nor an
+    /// assignment of one whole.
+    private static statement_removable(program: &Program, found: &References, index: i64) -> boolean {
+        if (found.appending.contains(&index)) { return false; }
+        const node: StatementNode = program.statement_at(index);
+        return match (node.kind) {
+            StatementKind::Declare(variable, _) => { !found.names(Referent::Variable(variable)) }
+            StatementKind::Assign(place, _)     => { !program.expression_at(place).value_type.is_dynamic_array() }
+            StatementKind::Return(_)            => { false }
+            StatementKind::Finish               => { false }
+            _                                   => { true }
+        };
+    }
+
+    /// Whether function `index` may be taken out: printed, not `main`, a
+    /// free function, a generic one or a struct's own method - or a
+    /// trait's implementation of a method with a default body, which then
+    /// runs instead - and called nowhere.
+    private static function_removable(program: &Program, found: &References, index: i64) -> boolean {
+        if (program.omits_function(index)) { return false; }
+        const defined: Function = program.function_at(index);
+        if (defined.is_main || defined.is_default()) { return false; }
+        if (defined.implements >= 0 && !program.trait_method_at(defined.implements).defaulted) { return false; }
+        return !found.names(Referent::Function(index));
+    }
+
+    /// Whether trait `index`'s implementation for `implementor` may be
+    /// taken out: nothing outside it calls its methods, no value of the
+    /// type is used where the trait or one declared over it is needed, and
+    /// the type implements no trait declared over it.
+    private static implementation_removable(program: &Program, found: &References, index: i64, implementor: ValueType) -> boolean {
+        mut members: Array<i64> = Array::<i64>::new();
+        mut member: i64 = 0;
+        while (member < program.functions.length()) {
+            const defined: Function = program.function_at(member);
+            if (!defined.is_unowned() && defined.owner.same(implementor) && defined.implements >= 0
+                    && program.trait_method_at(defined.implements).declared_by == index && !program.omits_function(member)) {
+                members.push(member);
+            }
+            member = member + 1;
+        }
+        for (reference in found.references.iterate_references()) {
+            if (members.contains(&reference.from)) { continue; }
+            match (reference.referent) {
+                Referent::Function(called) => {
+                    if (members.contains(&called)) { return false; }
+                }
+                Referent::Bound(bound, needed) => {
+                    if (bound.same(implementor) && program.inherits(needed, index)) { return false; }
+                }
+                _ => { }
+            }
+        }
+        mut other: i64 = 0;
+        while (other < program.traits.length()) {
+            if (other != index && !program.omits(Omission::Trait(other)) && program.inherits(other, index) && program.implements(implementor, other)) {
+                return false;
+            }
+            other = other + 1;
+        }
+        return true;
+    }
+
+    /// Whether trait `index` may be taken out: printed, implemented by
+    /// nothing, and named by nothing but its own default bodies.
+    private static trait_removable(program: &Program, found: &References, index: i64) -> boolean {
+        if (program.omits(Omission::Trait(index)) || !program.implementors(index).is_empty()) { return false; }
+        for (reference in found.references.iterate_references()) {
+            match (reference.referent) {
+                Referent::Trait(named) => {
+                    if (named == index && !Omitter::default_of_trait(program, reference.from, index)) { return false; }
+                }
+                _ => { }
+            }
+        }
+        return true;
+    }
+
+    /// Whether function `referrer` (-1 for none) is a default body of trait
+    /// `index`.
+    private static default_of_trait(program: &Program, referrer: i64, index: i64) -> boolean {
+        if (referrer < 0) { return false; }
+        const defined: Function = program.function_at(referrer);
+        return defined.is_default() && program.trait_method_at(defined.implements).declared_by == index;
+    }
+
+    /// Whether struct `index` may be taken out: a declared one, printed,
+    /// that no type names - its own methods name it, so they go first.
+    private static structure_removable(program: &Program, found: &References, index: i64) -> boolean {
+        return !program.structure_at(index).is_instance() && !program.omits(Omission::Structure(index)) && !found.names(Referent::Structure(index));
+    }
+
+    /// Whether enum `index` may be taken out: a declared one, printed, that
+    /// no type names.
+    private static enumeration_removable(program: &Program, found: &References, index: i64) -> boolean {
+        return !program.enumeration_at(index).is_instance() && !program.omits(Omission::Enumeration(index))
+            && !found.names(Referent::Enumeration(index));
+    }
+
+    /// Whether variant `index` may be taken out: a variant of a declared
+    /// enum printed, other than its first, that nothing builds or names in
+    /// a nested pattern; the arms matching it go with it.  The first stays,
+    /// so an enum keeps a variant, and since it is never taken out, which
+    /// variants may be stays the same as others go.
+    private static variant_removable(program: &Program, found: &References, index: i64) -> boolean {
+        const holder: i64 = Omitter::variant_holder(program, index);
+        if (holder < 0 || program.omits(Omission::Enumeration(holder)) || program.omits(Omission::Variant(index))) { return false; }
+        return index != program.enumeration_at(holder).first_variant && !found.names(Referent::Variant(index));
+    }
+
+    /// The declared enum whose variant `index` is, or -1 when a generic
+    /// enum or an instance holds it.
+    private static variant_holder(program: &Program, index: i64) -> i64 {
+        mut enumeration: i64 = 0;
+        while (enumeration < program.enumerations.length()) {
+            const declared: Enumeration = program.enumeration_at(enumeration);
+            if (!declared.is_instance() && index >= declared.first_variant && index < declared.first_variant + declared.variant_count) { return enumeration; }
+            enumeration = enumeration + 1;
+        }
+        return -1;
+    }
+
+    /// Whether field `index` may be taken out: a field of a declared struct
+    /// printed that nothing reads or writes; the literals' entries for it
+    /// go with it.
+    private static field_removable(program: &Program, found: &References, index: i64) -> boolean {
+        const holder: i64 = Omitter::field_holder(program, index);
+        if (holder < 0 || program.omits(Omission::Structure(holder)) || program.omits(Omission::Field(index))) { return false; }
+        return !found.names(Referent::Field(index));
+    }
+
+    /// The declared struct whose field `index` is, or -1 when a generic
+    /// struct, an instance or an owned struct holds it.
+    private static field_holder(program: &Program, index: i64) -> i64 {
+        mut structure: i64 = 0;
+        while (structure < program.structures.length()) {
+            const declared: Structure = program.structure_at(structure);
+            if (!declared.is_instance() && index >= declared.first_field && index < declared.first_field + declared.field_count) { return structure; }
+            structure = structure + 1;
+        }
+        return -1;
+    }
+
+    /// Link `next` where a statement linked from `link` was.
+    private static unlink(program: mut &Program, link: Link, next: i64) -> void {
+        match (link) {
+            Link::After(previous) => {
+                mut node: StatementNode = program.statement_at(previous);
+                node.next = next;
+                program.statements.set(previous, node);
+            }
+            Link::Body(holder) => {
+                mut defined: Function = program.function_at(holder);
+                defined.body = next;
+                program.functions.set(holder, defined);
+            }
+            Link::Then(statement) => {
+                mut node: StatementNode = program.statement_at(statement);
+                match (node.kind) {
+                    StatementKind::Branch(condition, _, else_block) => { node.kind = StatementKind::Branch(condition, next, else_block); }
+                    _ => { }
+                }
+                program.statements.set(statement, node);
+            }
+            Link::Otherwise(statement) => {
+                mut node: StatementNode = program.statement_at(statement);
+                match (node.kind) {
+                    StatementKind::Branch(condition, then_block, _) => { node.kind = StatementKind::Branch(condition, then_block, next); }
+                    _ => { }
+                }
+                program.statements.set(statement, node);
+            }
+            Link::LoopBody(statement) => {
+                mut node: StatementNode = program.statement_at(statement);
+                match (node.kind) {
+                    StatementKind::Loop(shape, counter, trips, _) => { node.kind = StatementKind::Loop(shape, counter, trips, next); }
+                    _ => { }
+                }
+                program.statements.set(statement, node);
+            }
+            Link::EachBody(statement) => {
+                mut node: StatementNode = program.statement_at(statement);
+                match (node.kind) {
+                    StatementKind::Each(variable, binding, _) => { node.kind = StatementKind::Each(variable, binding, next); }
+                    _ => { }
+                }
+                program.statements.set(statement, node);
+            }
+            Link::ArmBody(arm) => {
+                mut held: MatchArm = program.arm_at(arm);
+                held.body = next;
+                program.arms.set(arm, held);
+            }
+            Link::ArmObservations(arm) => {
+                mut held: MatchArm = program.arm_at(arm);
+                held.observations = next;
+                program.arms.set(arm, held);
+            }
+            Link::ClosureObservations(closure) => {
+                mut made: Closure = program.closure_at(closure);
+                made.observations = next;
+                program.closures.set(closure, made);
+            }
+        }
+    }
+
+    /// Replace expression `index` by a literal of its type: `false`, or 0
+    /// cast to its integer type, which a call of an overloaded name or an
+    /// inferred type argument reads as exactly that type.
+    private static replace(program: mut &Program, index: i64) -> void {
+        const node: ExpressionNode = program.expression_at(index);
+        if (node.value_type.same(ValueType::Boolean)) {
+            program.expressions.set(index, ExpressionNode { kind: ExpressionKind::BooleanLiteral(false), value_type: ValueType::Boolean });
+            return;
+        }
+        const literal: i64 = program.expression(ExpressionKind::IntegerLiteral(0, false), node.value_type);
+        program.expressions.set(index, ExpressionNode { kind: ExpressionKind::Cast(literal), value_type: node.value_type });
+    }
+}

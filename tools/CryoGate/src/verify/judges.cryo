@@ -14,6 +14,7 @@ import std::core::option::{ Option };
 
 import cryogate::core::text::{ Text };
 import cryogate::verify::declarations::{ DeclarationKind, Declarations, RuntimeMember };
+import cryogate::verify::objects::{ ObjectOwner };
 import cryogate::verify::record::{ BaselineRecord };
 
 /// A baseline census's verdicts, as the judges read them.
@@ -90,7 +91,8 @@ public type struct VerifyJudges {
         for (name in declared.iterate_references()) { judged.push(name.clone()); }
         for (name in fixed.iterate_references()) {
             match (Declarations::kind(name.as_str())) {
-                DeclarationKind::Unit | DeclarationKind::Archive | DeclarationKind::Moved | DeclarationKind::MovedArchive | DeclarationKind::MovedRuntime => { }
+                DeclarationKind::Unit | DeclarationKind::Archive | DeclarationKind::Moved | DeclarationKind::MovedArchive
+                    | DeclarationKind::MovedInstances | DeclarationKind::MovedRuntime => { }
                 _ => { judged.push(name.clone()); }
             }
         }
@@ -120,31 +122,13 @@ public type struct VerifyJudges {
         if (fixed) { return problems; }
         if (base_exit == 0) {
             problems.push(f"{name}: the baseline compiler BUILDS it (exit 0); it is not a program this change makes compile");
-        } else if (!VerifyJudges::reports_an_error(base_output)) {
+        } else if (Text::error_codes(base_output).is_empty()) {
             problems.push(f"{name}: the baseline exits {base_exit} with no error diagnostic; a crash or a link failure is not a refusal");
         }
         if (tree_exit != 0) {
             problems.push(f"{name}: the compiler under test does not build it (exit {tree_exit})");
         }
         return problems;
-    }
-
-    /// Whether `output` holds an error diagnostic's code, `error[E` and
-    /// four digits and `]`, anywhere in it.
-    private static reports_an_error(output: Str) -> boolean {
-        mut rest: Str = output;
-        while (true) {
-            const at: i64 = match (rest.find(&Str::new("error[E"))) {
-                Option::Some(at) => { at }
-                Option::None     => { return false; }
-            };
-            const after: Str = rest.byte_substring(at + 7, rest.length());
-            if (after.length() >= 5 && Text::is_digits(after.byte_substring(0, 4)) && after.byte_substring(4, 5) == Str::new("]")) {
-                return true;
-            }
-            rest = after;
-        }
-        return false;
     }
 
     /// Problems with the tree's unit-suite build warnings against the
@@ -211,15 +195,15 @@ public type struct VerifyJudges {
         return problems;
     }
 
-    /// Problems with the projects `names` declared `moved:` over the hash
-    /// maps `a` and `b`: each must have objects in both, and one of them
-    /// must differ (moved, or in one run only).  Their objects are removed
-    /// from both.
+    /// Problems with the projects or examples `names` declared `moved:` over
+    /// the hash maps `a` and `b`: each must have objects in both, and one of
+    /// them must differ (moved, or in one run only).  Their objects are
+    /// removed from both.
     public static project_moves(names: &Array<String>, a: mut &HashMap<String, String>,
                                 b: mut &HashMap<String, String>) -> Array<String> {
         mut problems: Array<String> = Array::<String>::new();
         for (name in Text::sorted_distinct(names.clone()).iterate_references()) {
-            const prefix: String = f"tests/tests/projects/{Declarations::program_of(name.as_str())}/";
+            const prefix: String = Declarations::moved_prefix(name.as_str());
             const in_a: Array<String> = VerifyJudges::paths_where(a, (path: Str) -> boolean { return path.starts_with(&prefix.as_str()); });
             const in_b: Array<String> = VerifyJudges::paths_where(b, (path: Str) -> boolean { return path.starts_with(&prefix.as_str()); });
             if (in_a.is_empty() || in_b.is_empty()) {
@@ -236,11 +220,10 @@ public type struct VerifyJudges {
     /// Problems with the standard-library modules `names` declared
     /// `moved-archive:` over the archive hash maps `a` and `b`: each must
     /// have objects in both - one per archive built - and one of them must
-    /// differ (moved, or in one run only), unless the module is among
-    /// `unit_build_moved`, whose unit-build object moved instead.  Their
-    /// objects are removed from both.
-    public static archive_module_moves(names: &Array<String>, unit_build_moved: &Array<String>,
-                                       a: mut &HashMap<String, String>, b: mut &HashMap<String, String>) -> Array<String> {
+    /// differ (moved, or in one run only).  Their objects are removed from
+    /// both.
+    public static archive_module_moves(names: &Array<String>, a: mut &HashMap<String, String>,
+                                       b: mut &HashMap<String, String>) -> Array<String> {
         mut problems: Array<String> = Array::<String>::new();
         for (name in Text::sorted_distinct(names.clone()).iterate_references()) {
             const suffix: String = Declarations::archive_module_suffix(name.as_str());
@@ -248,8 +231,8 @@ public type struct VerifyJudges {
             const in_b: Array<String> = VerifyJudges::paths_where(b, (path: Str) -> boolean { return path.ends_with(&suffix.as_str()); });
             if (in_a.is_empty() || in_b.is_empty()) {
                 problems.push(f"{name.as_str()}: {in_a.length()} baseline and {in_b.length()} tree archive objects end in {suffix.as_str()}; a module declared as moving its objects is in both runs' archives");
-            } else if (VerifyJudges::unchanged(a, b, &in_a, &in_b) && !unit_build_moved.contains(name)) {
-                problems.push(f"{name.as_str()} is declared as moving its objects, but none of its {in_a.length()} archive objects moved, nor its object in the unit build");
+            } else if (VerifyJudges::unchanged(a, b, &in_a, &in_b)) {
+                problems.push(f"{name.as_str()} is declared as moving its archive objects, but none of its {in_a.length()} moved");
             }
             VerifyJudges::remove_all(a, &in_a);
             VerifyJudges::remove_all(b, &in_b);
@@ -257,29 +240,31 @@ public type struct VerifyJudges {
         return problems;
     }
 
-    /// The unit build's objects of the standard-library modules `names`
-    /// declared `moved-archive:`, over the tests hash maps `a` and `b`: the
-    /// unit build compiles a module's object itself when the archive lacks
-    /// a generic instance the tests need, and that object moves with the
-    /// module.  Its objects (`tests/build/.../std/deps/<module>.o`, in
-    /// either run or neither) are removed from both; the names of the
-    /// modules whose unit-build object differs (moved, or in one run only).
-    public static unit_build_module_moves(names: &Array<String>, a: mut &HashMap<String, String>,
-                                          b: mut &HashMap<String, String>) -> Array<String> {
-        mut moved: Array<String> = Array::<String>::new();
+    /// Problems with the standard-library modules `names` declared
+    /// `moved-instances:` over the test objects' hash maps `a` and `b`: the
+    /// unit suite's object of each module must be in both, one each, and
+    /// must have moved.  It is removed from both; a project's object of the
+    /// same module is not the unit suite's, and stays.
+    public static instance_moves(names: &Array<String>, a: mut &HashMap<String, String>,
+                                 b: mut &HashMap<String, String>) -> Array<String> {
+        mut problems: Array<String> = Array::<String>::new();
         for (name in Text::sorted_distinct(names.clone()).iterate_references()) {
-            const suffix: String = f"/std{Declarations::archive_module_suffix(name.as_str()).as_str()}";
+            const suffix: String = Declarations::archive_module_suffix(name.as_str());
             const in_a: Array<String> = VerifyJudges::paths_where(a, (path: Str) -> boolean {
-                return path.starts_with(&Str::new("tests/build/")) && path.ends_with(&suffix.as_str());
+                return ObjectOwner::in_unit_suite(path) && path.ends_with(&suffix.as_str());
             });
             const in_b: Array<String> = VerifyJudges::paths_where(b, (path: Str) -> boolean {
-                return path.starts_with(&Str::new("tests/build/")) && path.ends_with(&suffix.as_str());
+                return ObjectOwner::in_unit_suite(path) && path.ends_with(&suffix.as_str());
             });
-            if (!VerifyJudges::unchanged(a, b, &in_a, &in_b)) { moved.push(name.clone()); }
+            if (in_a.length() != 1 || in_b.length() != 1) {
+                problems.push(f"{name.as_str()}: {in_a.length()} baseline and {in_b.length()} tree unit-suite objects end in {suffix.as_str()}; one each is declared");
+            } else if (VerifyJudges::same(a, b, &in_a[0], &in_b[0])) {
+                problems.push(f"{name.as_str()} is declared as moving the unit suite's object, but {in_a[0].as_str()} did not move");
+            }
             VerifyJudges::remove_all(a, &in_a);
             VerifyJudges::remove_all(b, &in_b);
         }
-        return moved;
+        return problems;
     }
 
     /// Problems with the runtime archive members `names` declared

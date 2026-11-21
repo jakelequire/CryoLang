@@ -1,0 +1,421 @@
+///! CryoSmith's programs built and run under several configurations
+///! (`smith/difference.cryo`), as corpus-check and smith-diff both do it.
+///!
+///! Every build runs `jobs` at once, each in a build directory of its own,
+///! then every run of what was built and every interpretation; completions
+///! come back in the order the jobs were added, so what is returned is in
+///! seed order whatever the job count.  A build that succeeded has its
+///! build directory removed; its executable stays for the caller to remove
+///! once the program has passed.
+
+namespace cryogate::smith::run::programs;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::io::error::{ IoError };
+import std::time::duration::{ Duration };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::schedule::{ Cost, Scheduler };
+import cryogate::core::wsl::{ Wsl, WslMapping };
+import cryogate::smith::corpus::{ CorpusJudge, CorpusLayout };
+import cryogate::smith::difference::{ Configuration, Observation };
+
+/// How far one configuration got with one program.
+public type enum Stage {
+    /// Its build failed, or its build directory could not be removed.
+    Build;
+    /// Its run, or the interpretation, did not exit 0.
+    Run;
+    /// It exited 0 without printing one hash line, or the interpreter does
+    /// not cover the program.
+    Output;
+    /// It printed its hash line.
+    Printed;
+}
+
+implement enum Stage {
+    /// Its place in the order a corpus check reports failures in.
+    public rank(&this) -> i64 {
+        return match (&this) {
+            Stage::Build   => { 0 }
+            Stage::Run     => { 1 }
+            Stage::Output  => { 2 }
+            Stage::Printed => { 3 }
+        };
+    }
+}
+
+/// What one configuration made of one program.
+public type struct Attempt {
+    /// It, as smith-diff classes it.
+    public observation: Observation;
+    /// How far it got.
+    public stage: Stage;
+    /// Why it stopped short of printing its line, as a corpus check reports
+    /// it; empty when it printed it.
+    public reason: String;
+}
+
+/// A run of the programs of a work directory under some configurations.
+public type struct SmithRun {
+    /// The configurations, in the order a report names them.
+    public configurations: Array<Configuration>;
+    /// Where each program's files are.
+    public layout: CorpusLayout;
+    /// The directory every child runs in.
+    public work: PathBuf;
+    /// The stdlib each compiler is given, when one is named.
+    public stdlib: Option<String>;
+    /// How long a build or an interpretation may take; none: no limit.
+    public build_limit: Option<Duration>;
+    /// How long a built program may run; none: no limit.
+    public run_limit: Option<Duration>;
+    /// How many children run at once; 0 leaves the scheduler's own count.
+    public jobs: i64;
+    /// What the names of this run's logs start with.
+    public log_prefix: String;
+
+    /// Have the CryoSmith at `smith` write the programs of `count` seeds
+    /// from `first_seed` into the work directory, from the generation
+    /// options `generation`; why it could not.
+    public write_programs(&this, smith: Str, first_seed: u64, count: u64, generation: &Array<String>, logs: &RunLogs) -> Result<(), String> {
+        mut batch: Job = Job::new(smith);
+        batch.argument(Str::new("batch"));
+        batch.argument(Str::new("--first-seed"));
+        batch.argument(f"{first_seed}".as_str());
+        batch.argument(Str::new("--count"));
+        batch.argument(f"{count}".as_str());
+        batch.argument(Str::new("--out-dir"));
+        batch.argument(this.work.as_path().as_str());
+        for (option in generation.iterate_references()) { batch.argument(option.as_str()); }
+        batch.log_to(logs.file(f"{this.log_prefix.as_str()}-generate".as_str()).as_str());
+        const generated: Completion = batch.run();
+        if (!generated.outcome.succeeded()) {
+            return Result::Err(f"cryosmith could not write the programs: {generated.outcome.describe().as_str()}; {generated.log.as_str()}");
+        }
+        return Result::Ok(());
+    }
+
+    /// What the CryoSmith at `smith` prints for `cryosmith version`, its
+    /// generator version, logged to the log named `name`.
+    public static generator_version(smith: Str, logs: &RunLogs, name: Str) -> String {
+        mut version: Job = Job::new(smith);
+        version.argument(Str::new("version"));
+        version.log_to(logs.file(name).as_str());
+        const asked: Completion = version.run();
+        return asked.output();
+    }
+
+    /// Each configuration's attempt at each of `count` programs from
+    /// `first_seed`: one array per seed, in seed order, holding one attempt
+    /// per configuration, in the configurations' order.
+    public attempts(&this, first_seed: u64, count: u64, logs: &RunLogs) -> Array<Array<Attempt>> {
+        mut builds: Scheduler = Scheduler::new();
+        builds.set_slots(this.jobs);
+        mut built_at: Array<i64> = Array::<i64>::new();
+        mut offset: u64 = 0;
+        while (offset < count) {
+            const seed: u64 = first_seed.wrapping_add(offset);
+            for (configuration in this.configurations.iterate_references()) {
+                match (&configuration.level) {
+                    Option::Some(level) => { built_at.push(builds.add(this.build(seed, configuration, level.as_str(), logs), Cost::Compile)); }
+                    Option::None        => { built_at.push(-1); }
+                }
+            }
+            offset = offset + 1;
+        }
+        const built: Array<Completion> = builds.run();
+        // What each build left, then every run of a build that succeeded
+        // and every interpretation.
+        mut runs: Scheduler = Scheduler::new();
+        runs.set_slots(this.jobs);
+        mut problems: Array<Option<String>> = Array::<Option<String>>::new();
+        mut ran_at: Array<i64> = Array::<i64>::new();
+        mut at: i64 = 0;
+        offset = 0;
+        while (offset < count) {
+            const seed: u64 = first_seed.wrapping_add(offset);
+            for (configuration in this.configurations.iterate_references()) {
+                const index: i64 = built_at[at];
+                if (index < 0) {
+                    problems.push(Option::None);
+                    ran_at.push(runs.add(this.interpret(seed, configuration, logs), Cost::Compile));
+                } else if (built[index].outcome.succeeded()) {
+                    const problem: Option<String> = this.clear(seed, configuration);
+                    if (problem.is_none()) { ran_at.push(runs.add(this.execute(seed, configuration, logs), Cost::Light)); } else { ran_at.push(-1); }
+                    problems.push(problem);
+                } else {
+                    problems.push(Option::None);
+                    ran_at.push(-1);
+                }
+                at++;
+            }
+            offset = offset + 1;
+        }
+        const ran: Array<Completion> = runs.run();
+        mut every: Array<Array<Attempt>> = Array::<Array<Attempt>>::new();
+        at = 0;
+        offset = 0;
+        while (offset < count) {
+            const seed: u64 = first_seed.wrapping_add(offset);
+            mut attempts: Array<Attempt> = Array::<Attempt>::new();
+            for (configuration in this.configurations.iterate_references()) {
+                const index: i64 = built_at[at];
+                if (index < 0) {
+                    attempts.push(this.interpretation(seed, configuration, &ran[ran_at[at]], logs));
+                } else if (ran_at[at] >= 0) {
+                    attempts.push(this.program_run(seed, configuration, &ran[ran_at[at]]));
+                } else {
+                    match (&problems[at]) {
+                        Option::Some(problem) => {
+                            attempts.push(Attempt { observation: Observation::CompileCrash(problem.clone()), stage: Stage::Build, reason: problem.clone() });
+                        }
+                        Option::None => { attempts.push(this.failed_build(seed, configuration, &built[index], logs)); }
+                    }
+                }
+                at++;
+            }
+            every.push(attempts);
+            offset = offset + 1;
+        }
+        return every;
+    }
+
+    /// What each of `attempts` observed, in the same order.
+    public static observations(attempts: &Array<Attempt>) -> Array<Observation> {
+        mut observations: Array<Observation> = Array::<Observation>::new();
+        for (attempt in attempts.iterate_references()) { observations.push(attempt.observation.clone()); }
+        return observations;
+    }
+
+    /// Remove the executables every compiled configuration built of
+    /// `seed`, in the configurations' order; why one cannot be removed.
+    public remove_executables(&this, seed: u64) -> Result<(), String> {
+        for (configuration in this.configurations.iterate_references()) {
+            if (configuration.level.is_none()) { continue; }
+            const path: PathBuf = this.layout.executable(seed, configuration.key.as_str());
+            match (File::remove(path.as_path())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { return Result::Err(f"cannot remove {path.as_path().as_str()}: {error.describe()}"); }
+            }
+        }
+        return Result::Ok(());
+    }
+
+    /// The build of `seed`'s program in `configuration`, at `level`, in
+    /// its own build directory, of a copy of the program placed there: a
+    /// compiler that writes a single file's build beside the file and not
+    /// in `--build-dir` (an older one) then still shares it with no other
+    /// build.  A directory or a copy that cannot be made leaves the build
+    /// with no program to read, which its attempt reports.
+    private build(&this, seed: u64, configuration: &Configuration, level: Str, logs: &RunLogs) -> Job {
+        const directory: PathBuf = this.layout.build_directory(seed, configuration.key.as_str());
+        const program: PathBuf = this.layout.build_source(seed, configuration.key.as_str());
+        if (Directory::create_all(directory.as_path()).is_ok()) {
+            // A copy that fails is reported by the build finding no program.
+            const _: Result<i64, IoError> = File::copy(this.layout.source(seed).as_path(), program.as_path());
+        }
+        mut job: Job = SmithRun::started(configuration, configuration.compiler.as_str(), this.build_limit);
+        job.argument(Str::new("build"));
+        job.argument(SmithRun::named(configuration, program.as_path()).as_str());
+        job.argument(f"--opt-level={level}".as_str());
+        job.argument(f"--build-dir={SmithRun::named(configuration, directory.as_path()).as_str()}".as_str());
+        job.argument(Str::new("-o"));
+        job.argument(SmithRun::named(configuration, this.layout.executable(seed, configuration.key.as_str()).as_path()).as_str());
+        match (&configuration.stdlib) {
+            Option::Some(stdlib) => { job.argument(f"--stdlib={stdlib.as_str()}".as_str()); }
+            Option::None         => { this.give_stdlib(&job); }
+        }
+        job.directory(directory.as_path().as_str());
+        if (configuration.wsl.is_none()) { job.default_c_compiler(); }
+        job.log_to(this.log(seed, configuration, Str::new(""), logs).as_str());
+        job.errors_to(this.log(seed, configuration, Str::new("-errors"), logs).as_str());
+        return job;
+    }
+
+    /// The run of `seed`'s build in `configuration`.
+    private execute(&this, seed: u64, configuration: &Configuration, logs: &RunLogs) -> Job {
+        const program: PathBuf = this.layout.executable(seed, configuration.key.as_str());
+        mut job: Job = SmithRun::started(configuration, SmithRun::named(configuration, program.as_path()).as_str(), this.run_limit);
+        job.directory(this.work.as_path().as_str());
+        job.log_to(this.log(seed, configuration, Str::new("-run"), logs).as_str());
+        job.errors_to(this.log(seed, configuration, Str::new("-run-errors"), logs).as_str());
+        return job;
+    }
+
+    /// `configuration`'s `cryo interpret` of `seed`'s program, under the
+    /// build limit: it compiles the program's front end before it
+    /// evaluates.
+    private interpret(&this, seed: u64, configuration: &Configuration, logs: &RunLogs) -> Job {
+        mut job: Job = Job::new(configuration.compiler.as_str());
+        job.argument(Str::new("interpret"));
+        job.argument(this.layout.source(seed).as_path().as_str());
+        this.give_stdlib(&job);
+        job.directory(this.work.as_path().as_str());
+        match (this.build_limit) {
+            Option::Some(limit) => { job.limit(limit); }
+            Option::None        => { }
+        }
+        job.log_to(this.log(seed, configuration, Str::new("-run"), logs).as_str());
+        job.errors_to(this.log(seed, configuration, Str::new("-run-errors"), logs).as_str());
+        return job;
+    }
+
+    /// The job that starts `program` for `configuration` under `limit`: the
+    /// program itself on the host; inside WSL, `wsl.exe` running it under
+    /// `timeout` with the same limit, the job's own a little longer, since
+    /// stopping `wsl.exe` does not stop what it started there.  The
+    /// program's arguments follow.
+    private static started(configuration: &Configuration, program: Str, limit: Option<Duration>) -> Job {
+        if (configuration.wsl.is_none()) {
+            mut job: Job = Job::new(program);
+            match (limit) {
+                Option::Some(limit) => { job.limit(limit); }
+                Option::None        => { }
+            }
+            return job;
+        }
+        mut job: Job = Job::new(Str::new("wsl.exe"));
+        job.argument(Str::new("-e"));
+        match (limit) {
+            Option::Some(limit) => {
+                job.argument(Str::new("timeout"));
+                job.argument(Str::new("--kill-after=5"));
+                job.argument(f"{limit.as_seconds()}".as_str());
+                job.limit(Duration::from_seconds(limit.as_seconds() + SmithRun::WSL_GRACE));
+            }
+            Option::None => { }
+        }
+        job.argument(program);
+        return job;
+    }
+
+    /// The Linux arm's configurations, `linux -O0` and `linux -O2`: the
+    /// Linux compiler `compiler`, a path inside WSL, given `stdlib` (also
+    /// inside WSL) when named, building below `work`, which must exist.
+    /// WSL is started and asked once where `work` is inside it; a host
+    /// where either fails gives the reason, and the run is refused rather
+    /// than run without the arm.
+    public static linux_configurations(compiler: Str, stdlib: Option<Str>, work: Path, logs: &RunLogs) -> Result<Array<Configuration>, String> {
+        const started: Completion = Wsl::start(logs);
+        if (!started.outcome.succeeded()) {
+            return Result::Err(f"wsl.exe could not start WSL ({started.outcome.describe().as_str()}); see {started.log.as_str()}");
+        }
+        const inside: String = match (Wsl::path(work.as_str(), logs)) {
+            Result::Ok(inside) => { inside }
+            Result::Err(done)  => { return Result::Err(f"wslpath could not name {work.as_str()} ({done.outcome.describe().as_str()}); see {done.log.as_str()}"); }
+        };
+        const mapping: WslMapping = WslMapping { windows: String::from_str(work.as_str()), inside: inside };
+        mut configurations: Array<Configuration> = Array::<Configuration>::new();
+        const levels: Array<Str> = [Str::new("0"), Str::new("2")];
+        for (level in levels.iter()) {
+            configurations.push(Configuration::linux(compiler, stdlib, level, &mapping));
+        }
+        return Result::Ok(configurations);
+    }
+
+    /// The seconds a job inside WSL is given past its own limit before it
+    /// is killed from the host: `timeout`'s own kill comes five seconds
+    /// after the limit.
+    const WSL_GRACE: u64 = 15;
+
+    /// `path` as `configuration`'s children name it: as it is on the host,
+    /// its path inside WSL there.
+    private static named(configuration: &Configuration, path: Path) -> String {
+        return match (&configuration.wsl) {
+            Option::Some(mapping) => { mapping.path(path.as_str()) }
+            Option::None          => { String::from_str(path.as_str()) }
+        };
+    }
+
+    private give_stdlib(&this, job: mut &Job) -> void {
+        match (&this.stdlib) {
+            Option::Some(stdlib) => { job.argument(f"--stdlib={stdlib.as_str()}".as_str()); }
+            Option::None         => { }
+        }
+    }
+
+    /// Why the build directory of a successful build of `seed` cannot be
+    /// removed.
+    private clear(&this, seed: u64, configuration: &Configuration) -> Option<String> {
+        const directory: PathBuf = this.layout.build_directory(seed, configuration.key.as_str());
+        return match (Directory::remove_all(directory.as_path())) {
+            Result::Ok(_)      => { Option::None }
+            Result::Err(error) => { Option::Some(f"cannot remove {directory.as_path().as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// The attempt of a build of `seed` that ended `done` and failed.
+    private failed_build(&this, seed: u64, configuration: &Configuration, done: &Completion, logs: &RunLogs) -> Attempt {
+        const errors: String = SmithRun::read(this.log(seed, configuration, Str::new("-errors"), logs).as_str());
+        const output: String = done.output();
+        const level: String = SmithRun::level(configuration);
+        const quoted: String = CorpusJudge::first_lines(errors.as_str(), output.as_str());
+        const both: String = f"{errors.as_str()}\n{output.as_str()}";
+        return Attempt {
+            observation: Observation::of_build(&configuration.outcome_of(&done.outcome), both.as_str()).unwrap(),
+            stage:       Stage::Build,
+            reason:      f"--opt-level={level} build failed ({done.outcome.describe().as_str()}): {quoted.as_str()}",
+        };
+    }
+
+    /// The attempt of the run `done` of `seed`'s build.
+    private program_run(&this, seed: u64, configuration: &Configuration, done: &Completion) -> Attempt {
+        const program: PathBuf = this.layout.executable(seed, configuration.key.as_str());
+        const output: String = done.output();
+        const observation: Observation = Observation::of_run(&configuration.outcome_of(&done.outcome), output.as_str());
+        if (!done.outcome.succeeded()) {
+            return Attempt { observation: observation, stage: Stage::Run, reason: f"{program.as_path().as_str()} ended with {done.outcome.describe().as_str()}" };
+        }
+        return match (CorpusJudge::hash_line(program.as_path().as_str(), output.as_str())) {
+            Result::Ok(_)       => { Attempt { observation: observation, stage: Stage::Printed, reason: String::new() } }
+            Result::Err(reason) => { Attempt { observation: observation, stage: Stage::Output, reason: reason } }
+        };
+    }
+
+    /// The attempt of the interpretation `done` of `seed`'s program.
+    private interpretation(&this, seed: u64, configuration: &Configuration, done: &Completion, logs: &RunLogs) -> Attempt {
+        const errors: String = SmithRun::read(this.log(seed, configuration, Str::new("-run-errors"), logs).as_str());
+        const output: String = done.output();
+        const observation: Observation = Observation::of_interpretation(&done.outcome, errors.as_str(), output.as_str());
+        return match (&observation) {
+            Observation::Printed(_) => { Attempt { observation: observation, stage: Stage::Printed, reason: String::new() } }
+            Observation::NotCovered(construct) => {
+                const reason: String = f"the interpreter does not cover {construct.as_str()}";
+                Attempt { observation: observation, stage: Stage::Output, reason: reason }
+            }
+            _ => {
+                const reason: String = f"the interpreter ended with {done.outcome.describe().as_str()}:{CorpusJudge::first_lines(errors.as_str(), output.as_str()).as_str()}";
+                Attempt { observation: observation, stage: Stage::Run, reason: reason }
+            }
+        };
+    }
+
+    /// The log of `seed` in `configuration` whose name ends with `suffix`.
+    private log(&this, seed: u64, configuration: &Configuration, suffix: Str, logs: &RunLogs) -> String {
+        return logs.file(f"{this.log_prefix.as_str()}-smith-{seed}-{configuration.key.as_str()}{suffix}".as_str());
+    }
+
+    /// The level a compiled configuration builds at.
+    private static level(configuration: &Configuration) -> String {
+        return match (&configuration.level) {
+            Option::Some(level) => { level.clone() }
+            Option::None        => { String::new() }
+        };
+    }
+
+    private static read(path: Str) -> String {
+        return match (File::read_text(Path::from(path))) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { String::new() }
+        };
+    }
+}

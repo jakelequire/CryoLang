@@ -29,15 +29,21 @@ generated as text.
   of statements, each naming the next (`-1` ends the chain), so no node owns
   another and the whole model is plain data.
 - **Types** are the eight integer types, `boolean`, `void` (what a method
-  that writes its receiver returns), a generated struct, named by its
-  index, and a generic function's type parameter `T`.
+  that writes its receiver returns), a generated struct or enum, named by
+  its index, and a generic function's type parameter `T`.
 - **Expression nodes** carry their type and one of: an integer or boolean
   literal; a type's named limit (`i8::MIN`, `u32::MAX`); a variable read; a
   unary operator; a binary operator; a wrapping method call
   (`a.wrapping_add(b)`); a cast (`a as T`); an implicit widening (a narrower
   value where its wider type is expected, printed bare); an `if` expression;
-  a call of a free function or a static method; a method call on a place
-  (`v2.f1.m0(a)`); a field (`v2.f1`); a struct literal (`S1 { f2: a, f0: b }`).
+  a call of a free function or a static method; a generic call, its type
+  argument written, a placeholder or left out (`g0::<u16>(a, b)`,
+  `g0::<_>(a, b)`, `g0(a, b)`); a method call on a place
+  (`v2.f1.m0(a)`); a field (`v2.f1`); a struct literal (`S1 { f2: a, f0: b }`),
+  an instance's spelling its type argument the same three ways; an enum's
+  variant (`E0::V1`); a `match` expression. A `match`, expression or
+  statement, names a run of **arms** in an arena of its own, each a
+  pattern (a variant, or `_`) and a body (an expression, or a block).
 - **Statement nodes:** a declaration (`const` / `mut`), an assignment (plain
   or compound) to a place - a `mut` local, or a field reached from one or
   from a `mut &this` - an observation (`observed = mix(observed, ...)`), a
@@ -53,8 +59,9 @@ generated as text.
   writes or observes a struct serves an instance unchanged. A type's name
   is the program's to spell, since an instance's names its argument.
 - **Functions** are free functions `h<N>`, generic functions `g<N><T>`,
-  `main`, and a struct's methods `m<N>`: static, or taking `&this` or
-  `mut &this`. Each has numbered
+  `main`, and a struct's or generic struct's methods `m<N>`: static, or
+  taking `&this` or `mut &this`. Functions of one owner and number are
+  one **overload set**, printed with one name. Each has numbered
   parameters, a return type, a body and a **cost**: the most work one call
   can do (section 3.3).
 - **The printer** walks the model once. Every binary expression is
@@ -132,9 +139,11 @@ range, so the argument is typed by the parameter and never refused.
 **Generics.** With `generics`, one to three generic functions
 `g<N><T>` are declared after the structs' methods and before `h0`: the
 first two parameters are `T`, the rest `T` or a value type, and the
-function returns `T`. Half are unbounded and half `where T: Eq`. In the
+function returns `T`. Half are bounded `where T: Copy` and half `where T:
+Eq + Copy`. In the
 body a `T` value is a read of a `T` name, an `if` expression over two, or a
-call of an earlier generic function at `T` (an `Eq`-bounded callee only
+call at `T` of an earlier generic function or generic struct's static
+method (an `Eq`-bounded callee only
 from an `Eq`-bounded body); under `Eq`, a boolean may compare two `T`
 values with `==` or `!=`. A call writes its type argument,
 `g0::<u16>(a, b)`: anywhere a value of that type is wanted, at an integer
@@ -151,7 +160,558 @@ may have, drawn as a declared struct is: a local, a parameter, a return
 type, a field of nothing (an instance is never a declared struct's field),
 a generic function's type argument. A literal writes the type argument,
 `B0::<u16> { f1: a, f0: b }`; a field of an instance is read, written and
-observed as any struct field is. A generic struct has no method.
+observed as any struct field is.
+
+**Generic methods.** With `generic-methods`, each generic struct has one
+to three methods written in its body, each static, taking `&this` or
+taking `mut &this`. They belong to the struct's **own instance**,
+`B<N><T>`, the struct at its own parameter, made after every other
+structure and the type of no value but `this`; so inside a method a `T`
+field of `this` is a `T` value, read, passed, returned and written as a
+generic function's are, and never observed. A static method takes a `T`
+first and returns `T`, and is called as a generic function is, its type
+argument written, a placeholder or left out: `B0::<u16>::m0(a)`,
+`B0::<_>::m0(a)`, `B0::m0(a)`. A method taking a receiver is called on a
+place of any instance of its struct, `T` standing for that instance's
+argument in its parameters and its result: `v1.m1(a)` with `v1: B0<u16>`
+takes and returns `u16` where `m1` says `T`. One taking `mut &this` returns
+nothing and is called as a statement on a writable place, as a declared
+struct's is. A method calls only earlier ones, its own struct's on `this`
+among them. Each method is bounded `where T: Copy`, as every generic
+function is, so its body may pass, store and select a `T` value as often
+as it likes (a type parameter is otherwise not `Copy`, and each of those
+moves it); every type a value has is `Copy`, so any instance may call it,
+and a generic function may call a static one at its own `T`.
+
+Inside a generic struct's method, a literal of that same generic struct is
+spelled as any instance's literal is: written, with `_`, or left to
+inference. Left out, its type argument is the one its fields bind, which
+need not be the body's own, so `B0::m0(B0 { f0: x })` calls the static
+method of `B0<B0<u16>>` for an `x: u16`.
+
+**Overload sets.** With `overloads`, four times in ten a free function
+`h<N>` or a declared struct's method `m<N>` is followed at once by one or
+two more functions spelled with its name and taking the same receiver,
+each with its first member's parameters with one added, one removed or one
+retyped, and a return type of its own; a member whose parameters some
+member already has is not made. A call of the name passes deciding
+values, exactly each parameter's type and reading a name, so its
+arguments' types are one member's parameter types and no other's (section
+3.2). A member's body never calls its own set, which is not whole while it
+is generated. A generic function and a generic struct's method are never
+overloaded: a call two generic overloads, or a generic and a plain one,
+both accept is ambiguous, and nothing generated would be certain to avoid
+that.
+
+**Enums and `match`.** With `enums`, one or two enums `E<N>` with two to
+four unit variants `V<N>` are declared first, before the structs, from a
+stream of their own. An enum is a type a value may have - a local, a
+parameter, a return type, a generic function's type argument - and every
+enum is `Copy`, its variants carrying nothing. A value of one is a variant
+(`E0::V1`), a variable, a call, a method call or an `if` expression, so it
+always reads a name. A `match` over a value of some enum writes an arm for
+one to all of its variants, in a shuffled order, then `_` when a variant
+is left (section 3.2). As a statement its arms are blocks. As an
+expression, of an integer, boolean or enum type, its arms are values of
+that type that read a name, since an arm, as an `if` expression's, gives a
+bare literal no type. A `match` expression is typed by its arms, so it
+stands wherever a value of its type that reads a name may: the whole value
+of a place, an operand, a receiver, another `match`'s arm or subject. An
+enum value is observed by passing `match (e) { E0::V0 => { 1 } E0::V1 => {
+2 } }`, its variant's number plus one, to `mix`, whose `u64` parameter
+types the literal arms.
+
+**Payload variants.** With `enum-payloads`, each variant carries none, one
+or two scalar values, `V1(u8, boolean)`, drawn from the enums' own stream;
+an enum stays `Copy`, as each of its payload's types is. A variant value
+gives a value of each payload type, `E0::V1(v2, (p0 > 3))`, generated as a
+call's argument is. A `match` arm over a payload variant binds every
+value, `E0::V1(b0, b1)`; the bindings `b<N>` are numbered per function,
+read only, and in scope in their arm alone. Every binding reaches the
+hash: a statement's arm observes them at the end of its block; an integer
+expression's arm folds its value and then its bindings by `mix`, from its
+position plus one, and converts the fold back to its type
+(`E0::V1(b0, b1) => { (mix(mix(mix(2, (v3 as u64)), (b0 as u64)), if (b1)
+{ 1 } else { 2 }) as i32) }`; no operator, so no feature, is needed); any
+other expression's arm (a boolean's or an enum's) observes them by
+statements before its value (`E0::V1(b0) => { observed = mix(observed, (b0
+as u64)); v3 }`). An observation of a value holding such a `match` binds
+the value to a local before reading `observed` (section 3.4), so what an
+arm observes is kept. The self-test's binding audit holds every binding to
+one of these. The
+printer's observation folds a payload into its variant's number,
+`E0::V1(b0, b1) => { mix(mix(2, (b0 as u64)), if (b1) { 1 } else { 2 }) }`.
+
+**Generic enums.** With `generic-enums`, one or two generic enums
+`G<N><T>` follow the declared enums, from the same stream; a generic
+enum's `T` is carried only by payloads, so without `enum-payloads` none is
+declared. Variant 1
+carries a payload of type `T` first, and every other payload value is of
+type `T` half the time, otherwise a scalar. Each is instantiated at one or
+two scalar type arguments; an instance is an enum of its own whose
+variants are the generic enum's with `T` replaced, so its values, matches,
+bindings and observation are an enum's. A pattern names the variant
+through the generic enum alone, `G0::V1(b0, b1)`. A variant value with a
+payload of type `T` spells its type argument as `inferred-type-arguments`
+draws it (`G0::<u16>::V1(a, b)`, `G0::<_>::V1(a, b)`, `G0::V1(a, b)`),
+giving a deciding value for each such payload when it is inferred; one
+with no such payload writes it, `G0::<u16>::V0`, since nothing in it says
+which instance.
+
+**Nested patterns.** With `nested-patterns`, a declared enum's payload
+value is of an enum declared before it half the time, `V2(E0, u8)`, and a
+`match` arm's pattern gives each payload value an element of its own: a
+binding, `_` a fifth of the time, or, for a value of an enum, a variant
+pattern of that enum two times in five, itself with elements,
+`E1::V2(E0::V1(b0, _), b1)`. A variant pattern matches only its variant,
+so an arm holding one is refutable, and its `match` then ends with `_`
+(section 3.2) even when every variant has an arm. The printer's
+observation folds a payload value of an enum through that value's own
+variant number. Every binding is still observed; a `_` binds nothing.
+
+**Inferred type arguments.** With `inferred-type-arguments`, a generic
+call or an instance's literal leaves its type argument to inference four
+times in ten (`g0(a, b)`, `B0 { f0: a }`) and writes the placeholder twice
+(`g0::<_>(a, b)`, `B0::<_> { f0: a }`). Inference reads the type argument
+off the values given for `T`, so there every such value is a **deciding
+value**: exactly the type argument, reading a name. A narrower value,
+widened where it is written, would bind `T` to its own narrower type,
+since inference never widens; a literal, or an expression made only of
+literals, decides no type parameter. An instance's first field is of type
+`T` and has no default, so its literal always gives one. The other
+parameters and fields are generated as before, widening and constants
+included.
+
+**Closures.** With `closures`, a statement of a function that is not
+generic (and with `generic-closures`, of one that is) may declare a `const` local holding a closure of its function
+type, `const v3: (u8, i32) -> boolean = (q0: u8, q1: i32) -> boolean {
+return .. };`: zero to two scalar parameters `q<N>`, numbered per
+function, and a scalar return type. A function type is a `ValueType` of
+its own, each signature written once in the program (`Program::function_type`),
+so two closures of one signature have one type. The body returns one value,
+generated in a scope of its own (`Environment::enter_closure`) that holds
+its parameters and nothing of the enclosing function, not even `observed`,
+so it captures nothing and its function type may hold it; it may call the
+functions generated before it. A closure local is called wherever a value
+of its return type is wanted, `v3(a, b)`, with an argument of each
+parameter's type generated as a call's argument is, and is observed by one
+such call where its block observes its locals. It is never `mut`, so it is
+never assigned.
+
+**Captures.** With `closure-captures`, six closures in ten capture one or
+two values the enclosing function names where the closure is made: a
+parameter, a local, a loop counter or a `match` binding holding a scalar, a
+struct or an enum (`guarantees/capture.cryo`). Every such value is `Copy`,
+so it is copied into the closure where the closure is made, whether or not
+it is written `move` (docs/cryo.md section 2.5), and a later assignment of
+a `mut` local it was taken from does not reach it. The captured names are
+bound in the closure's scope above its floor, so the body may read them as
+it reads its parameters, and the body observes each before its value,
+`const v4 = (q0: u8) -> u16 { observed = mix(observed, (v2 as u64));
+return .. };`, so every captured value reaches the hash at every call. A
+closure that captures is a value of its own type, which a variable of
+function type cannot hold (E0458), so its local is declared with no type.
+Nothing is captured by reference: `this` is never captured (a closure
+holding the receiver would hold a view of it while the method writes it),
+a closure local is never captured, and `observed`, a global, is written
+where it stands. So no closure holds a reference, and none outlives what
+it was made from; the closure stays in its local, called in its scope.
+
+**Function values.** With `function-values` (and `closures`), a free
+function `h<N>` takes a parameter of a scalar function type last, a
+quarter of the time, `h2(p0: u8, p1: (u8) -> i32)`, and returns a function
+type instead of a value type, 15 times in a hundred, `h3(p0: boolean) ->
+(u8) -> i32`. A value given to a function-typed parameter is a closure
+written there (`h2(v1, (q0: u8) -> i32 { return .. })`), which may capture
+as a closure local does, a closure local, or a function-typed parameter of
+the caller passed on (the callee is copied for a capturing closure's type,
+and so is every function its copy passes the parameter on to, docs/cryo.md
+section 2.5). A value returned is a closure written there or a closure
+local, and captures nothing: a function type holds only a function
+pointer, so a capturing closure is never returned, and a parameter, which
+may hold one in a copy made for it, is never returned either. A
+function-typed parameter is called wherever a value of its return type is
+wanted, `p1(a)`, and so is a call returning a function type, `h3(b)(a)`;
+the parameter is observed by one call of it where the body observes its
+parameters, and `main` observes a call returning a function type by calling
+what it returns. A function with a function-typed parameter starts no
+overload set. Free functions named as values are not generated: a helper
+is almost never cheap enough to be a function value, or typed exactly as
+the scalar signature wanted.
+
+**Closures in generic bodies.** With `generic-closures` (and `closures`), a
+generic function `g<N><T>` and a generic struct's method declare closure
+locals as any function does, generic over the body's `T` (docs/cryo.md
+section 2.5: each copy of the body has its own closure type). Each
+parameter and the return type is `T` four times in ten, `const v1: (i32, T)
+-> T = (q0: i32, q1: T) -> T { return .. };`, and a closure returning `T`
+also takes a `T`, one more parameter when none was drawn: inside the body
+the enclosing function's `T` names are behind the closure's floor, and a
+`T` value is only ever read, so a `T` parameter is the one source of the
+value. A closure returning `T` (with `if-expressions`) may capture a `T`
+parameter or local, which `T: Copy` copies in; nothing converts a `T` to a
+`u64`, so such a capture is read by the closure's value instead of an
+observation, an `if` choosing it, `return (if (c) { p0 } else { .. });`. A
+closure local returning `T` is called where the block would observe it and
+its value is left unused.
+
+**Callable bounds.** With `callable-bounds` (and `closures`,
+`generic-closures`), four generic functions in ten take one more
+parameter last, of a second type parameter bounded by a function type
+drawn as a generic closure's signature is: `function g1<T, F>(p0: T, p1:
+T, p2: F) -> T where T: Copy, F: (u8, T) -> T`. The body calls it as it
+calls a function-typed parameter, charged the function-value limit, and
+observes it by one call. Each call of the function gives it a closure
+written there, of the bound with `T` replaced by the call's type argument,
+and the closure may capture (docs/cryo.md section 2.5: a callable-bounded
+parameter takes a capturing closure from any callee). `F` is never written:
+`g1::<u8, _>(..)`, `g1::<_, _>(..)` or `g1(..)`, inference binding it from
+the closure. A closure local or a parameter is never given to `F`, since
+passing one moves it and its later call or observation would be a use
+after a move.
+
+**Traits.** With `traits` (and `structs`), one or two traits `Tr<N>` are
+declared from a stream of their own after the generic functions, each
+with one or two methods that take `&this` and zero to two scalar
+parameters and return a scalar, `type trait Tr0 { t0(&this, p0: u8) ->
+i32; }`. A trait method's name `t<N>` is numbered across the program, so
+no two traits declare one name and none is a struct's own method's name
+(`m<N>`): a call names one method whatever traits its receiver's type
+implements. Each declared struct implements each trait six times in ten,
+`implement trait Tr0 for struct S1 { t0(&this, p0: u8) -> i32 { .. } }`,
+each method generated as a `&this` method of the struct is, from the
+stream of its place among the functions, and called as one is, on any
+value of the struct the caller can reach (`v1.t0(a)`, `this.f2.t0(a)`).
+Such a call names the one implementation its receiver's type has, so it is
+resolved at compile time. A generic struct's instance implements no trait.
+
+**Enum implementations.** With `enum-implementations` (and `traits`,
+`enums`), each declared enum - no generic enum's instance - implements
+each trait six times in ten as a struct does, drawn after the structs from
+the same stream, `implement trait Tr0 for enum E0 { t0(&this, p0: u8) ->
+i32 { .. } }`. Its methods are generated as a struct's are, with `this` of
+the enum; the body observes `this` as any enum value is observed, by a
+`match` on it giving its variant's number, and may match it elsewhere,
+binding its payloads read-only through the reference. Wherever a struct
+implementing a trait is used, an implementing enum is too: its values are
+receivers of the methods (`v2.t0(a)`), the type argument of a bound it
+satisfies (`k0::<E0>(..)`), the variable an object borrows (`&v2`), and
+runners of a default it does not override. A function belongs to its
+owner as a type (`Function.owner`: `void`, a struct or an enum), so the
+lookups `implements`, `implementors` and `runs_default` read one owner for
+both kinds. Enum values are `Copy`, so nothing here moves, and a borrow of
+one for an object is the same view a struct's is.
+
+**Trait bounds.** With `trait-bounds` (and `traits`, `generics`), each
+trait some struct implements bounds a generic function seven times in
+ten, `function k0<T>(p0: T, p1: T, p2: u8) -> T where T: Tr0 + Copy`,
+generated as a generic function `g<N>` is from a stream of its own after
+the implementations (`Genericity::Implementing`). Its body calls the
+trait's methods on its `T` values wherever a value of a method's return
+type is wanted, `p0.t0(a)`, one form in four where one may be called, each
+call charged the costliest implementation's work, and observes each `T`
+parameter by a call of the trait's first method. It is called only at a
+struct or enum implementing the trait (`Program::admits`), written, `_` or left
+to inference as any generic call, and `main` observes one call of each at
+an implementing struct drawn for it. Each instance's bound calls run that
+struct's implementation, chosen at compile time per instance; a `k` body
+calls a `g` at `T`, since `Copy` is in its bound, and another `k` only of
+its own trait.
+
+**Trait objects.** With `trait-objects` (and `traits`), a free function
+takes a trait object parameter after its others three times in ten, when
+some struct implements a trait, `function h2(p0: u8, p1: virtual &Tr0) ->
+i32` (docs/cryo.md section 10.7). Its body calls the trait's methods on
+it, `p1.t0(a)`, one form in four where one may be called, each run from
+the table of the value the object borrows and charged the costliest
+implementation's work, and observes it by a call of the trait's first
+method. A call of the function passes `&v`, a parameter or local of the
+caller holding a struct or enum that implements the trait, and the function is
+called only where such a variable is in scope (`passes_objects`). `main`
+declares one first, a local of a struct implementing each trait some
+helper takes an object of, so its calls of those helpers pass one and an
+object is exercised wherever it is declared; the self-test holds at least
+half the programs declaring an object parameter to passing `&v`. So one
+function runs different structs' implementations from different callers,
+chosen at run time. The object exists only as a parameter, borrowing the
+caller's variable for the call: it is never stored, returned, captured by
+a closure (`Capture::admits` takes no reference) or held past the call,
+so it is a valid view under the memory-safety plan's rules too. A
+function taking an object starts no overload set, since a struct
+implementing two traits would convert to either object.
+
+**Default methods.** With `trait-defaults` (and `traits`), a trait
+declares up to three methods, and each after its first has a default body
+six times in ten, written in the trait (docs/cryo.md section 10.1): `t2(&this,
+p0: u8) -> i32 { .. }`. A trait's first method never has one, so every
+implementation writes at least that method, and every value of a trait's
+type is observed by it. A default body is generated after every
+implementation, as a `&this` method is, from the stream of its place among
+the functions, under `Genericity::Defaulting`: its `this` is the
+implementing type, `T` in the model, bounded by the trait alone and not
+`Copy`, so it is never stored, passed or captured, only called and observed
+by a call of the trait's first method. It calls the trait's methods
+declared before its own on `this` (`this.t0(a)`), each charged the
+costliest implementation's or default's work, never its own or a later one,
+so a default never reaches itself; the default audit (section 7) reads the
+text to hold every default to that. An implementation writes its own method
+for each defaulted one half the time. A struct that writes none runs the
+default: a call on its value (`v1.t2(a)`, `Program::runs_default`) names the
+default, as does a call through a bound or an object; each implementation's
+copy of the default calls that implementation's own methods.
+
+**Supertraits.** With `supertraits` (and `traits`), a second trait is
+declared over the first half the time, `type trait Tr1 : Tr0` (docs/cryo.md
+section 10.1). A struct implements `Tr1` only where it implements `Tr0`,
+whose implementation is printed first. A `T` bounded by `Tr1`, an object of
+`Tr1` and `Tr1`'s default bodies call `Tr0`'s methods as well as `Tr1`'s
+(`Program::methods_through`), the name alone choosing the method since no
+two traits share one, and a body bounded by `Tr1` calls a generic function
+bounded by `Tr0` at its own `T` (`Program::inherits`).
+
+**Moves.** With `moves`, one or two owned structs `D<N>` of one to three
+scalar fields are declared from a stream of their own after the traits,
+each implementing `Drop` (docs/cryo.md section 15.2): `drop(mut &this) ->
+void` folds the struct's tag (7001 plus its number) and then each field
+into `observed`, so every drop reaches the hash, in the order and the
+number the program makes them. Implementing `Drop` is what makes the
+struct not `Copy` (section 15.1), so each pass, store and return of a value
+moves it. A value of `D<N>` is a literal writing every field, a parameter
+or local moved out of (`ExpressionKind::Move`), a call of a function
+returning one, or an `if` expression each of whose branches is one of these
+- the branch that runs is moved. Owned values are held by `const` locals
+(`const v3: D0 = v1;` moves `v1`), taken by a free function's by-value
+parameter three times in ten and returned by one about one time in seven;
+such a function starts no overload set. A variable moved out of holds
+nothing: `Environment::move_out` takes it out of every query, so nothing
+reads, borrows or moves it again and no block observes it when it ends;
+the move audit (section 7) holds the model to that. A variable is moved
+only inside the loop it was declared in (`Environment::movable`), so no
+loop's next trip moves it again (E0452). Every value made is dropped once:
+where its last owner's scope ends, at an early `return`, or when the call
+it was moved into returns, and a value moved on one branch only is dropped
+at the end of its scope on the paths that kept it. `main`'s own owned
+locals are dropped after its hash line is printed, so their drops are not
+in the hash.
+
+**References.** With `references` (and `moves`), a free function takes a
+reference to an owned struct first three times in ten, `p0: &D0`, or four
+times in ten of those `p0: mut &D0`, and one taking a shared reference
+returns that type three times in ten (docs/cryo.md section 2.3). A
+reference is a parameter's or a return's type only, never a local's,
+field's or capture's, so every borrow ends with the statement that makes
+it, and `Environment`'s loans keep shared and exclusive apart within one:
+a variable lent exclusively is used nowhere else in the statement, and
+one lent at all is neither moved nor lent exclusively there. A reference
+given where one is wanted is `&v` of a parameter or local holding the
+value - for an exclusive one, a `mut` local - a reference parameter passed
+on, a call returning one, or an `if` expression choosing between two
+borrows or parameters, made before its condition. A reference returned
+borrows from the function's reference parameters only: a parameter passed
+on, or a call given only those (`returning_reference`), so it never
+refers to a local or a by-value parameter (E0455); under the
+memory-safety plan's rule that a returned reference borrows from every
+reference argument, its caller uses it within the statement that made it.
+Fields are written through a `mut &D0` parameter (`p0.f1 = ..`) and read
+through any reference when the function observes its parameters; a
+reference a call returns is observed by its first field where the call
+stands. With references on, an owned local is `mut` four times in ten, so
+it may be lent exclusively and assigned whole, which drops the value it
+held, and `main` first declares a `mut` local of each owned struct some
+helper takes a reference to, as it does for trait objects. The loan audit
+(section 7) holds the model to these rules; today's compiler checks only
+the return of a local's address, so the audit is the one check of shared
+and exclusive until the memory-safety plan's checker lands.
+
+**Drops.** With `drops` (and `moves`), owned values are also released
+before the scope holding them ends, each release running `drop` and so
+reaching the hash where it runs (docs/cryo.md section 15.2):
+`mem::drop(v);` releases a variable that may be moved here (it is then
+moved out, so the move audit holds every later use to the rule, and the
+program imports `std::core::mem` only when it releases one); a statement
+calling a function that returns an owned value discards the result,
+`h3(..);`, released when the statement ends; a shared reference argument
+is a borrowed temporary two times in ten, `&(D0 { .. })` or `&(h3(..))`,
+released when its statement ends, after the call borrowing it returns -
+never in an `if` expression's branch, where a call making one could lend
+exclusively what the other branch borrows, and never in a returned
+reference, which would outlive it (the loan audit refuses both); and a
+store through a `mut &D0` parameter writes the whole value three times in
+ten, `*p0 = D0 { .. };`, releasing the value it replaces. `main`'s locals
+for references to borrow are kept (`Environment::keep`): never moved or
+released, so its calls of the helpers taking references always have a
+value to borrow.
+
+**Boxes.** With `boxes` (and `moves`), a type whose values move - a
+parameter's, a return's or a local's - is sometimes a holder of an owned
+struct rather than the struct itself (`drawn_moving`): `Box<D0>` or
+`Rc<D0>`, both in the prelude. A box is `Box::new(v)` around an owned
+value (moved in), a variable moved out of, a call, or an `if` choosing
+one; its value's fields are read through it by the dereference the box
+implements (`b.f0`, docs/cryo.md section 10.6), and through a `mut` local
+written (`b.f1 = ..;`), and dropping the box drops the value once. A
+shared owner is `Rc::new(v)` or `v.clone()` of a variable holding one -
+the variable borrowed for the statement, never moved there - and is
+observed by `v.strong_count()`, so the count each owner sees reaches the
+hash; the value is dropped with its last owner, so a count off by one
+shows as a drop missing or doubled. A shared owner is never read through:
+the standard library reaches its value only by a raw pointer, which the
+memory-safety plan puts behind `unsafe`.
+
+**Options.** With `options` (and `moves`, `enums` and `enum-payloads`),
+the holder is also `Option<D0>` or `Result<D0, u32>`: built holding a value
+(`Option::Some(v)`, `Result::Ok(v)`), empty (`Option::None`,
+`Result::Err(code)`, the code a `u32`), moved, returned by a call or chosen
+by an `if`. One is observed by a `match` on it in place, folding its
+value's fields or its error code; the subject is a variable, not consumed
+by the match (docs/cryo.md section 7.2), so it is dropped where its scope
+ends. An owned value is taken out of one in two ways. `v.unwrap()` moves
+`v` and is written only where `v` certainly holds a value: a `const` local
+declared with one built holding it (`Environment::mark_present`), so no
+unwrap panics. `(x)?` (docs/cryo.md section 5.6) stands only in a function
+returning an option where `x` is an option, or a result where `x` is a
+result, never in `main` or a closure's body; `x` is a variable moved out
+of, a call, or an `if` choosing between a value built holding one and
+none, so the function returns early on one path only and drops what it
+holds there. The holder audit (section 7) holds the model to these rules.
+A `?`'s operand has no expected type, so each arm of that `if` takes its
+instance from its payload or from its sibling arm (docs/cryo.md, `if`
+expressions). With `sibling-variants`, `Option::Some(D0 { .. })` names
+`Option<D0>` and `Option::None` beside it writes no type arguments; a
+result's `Ok` and `Err` payloads each name one argument, so one of the two
+arms is written in full (`Result::<D0, u32>::Ok(..)`) and the other leaves
+its arguments out. Without it both arms write them.
+
+A `match` statement's arm may assign the local its subject reads. Its
+bindings are never written `mut` and their payloads are `Copy`, so each is
+a copy taken when the arm is entered (docs/cryo.md, enum destructuring)
+and keeps the value the arm was chosen with; `match (v) { E::X(a) => { v =
+E::Y(1); .. a .. } }` observes the `a` of `E::X`.
+
+**Subject assignments.** With `subject-assignments` (and `enums`), a
+`match` statement matches on a `mut` local of an enum type half the time
+one is in scope, and each arm over a variant opens, six times in ten, by
+assigning the local a variant other than its own (`MatchArm`'s
+`subject_assignment`): `G0::V1(b10, b11) => { v2 = G0::V2((!b11)); .. }`.
+The arm observes its bindings at its end, after the assignment, so a
+binding that named the subject's storage instead of holding a copy would
+fold the new variant's payload into the hash. The subject-assignment
+audit (section 7) holds each such arm to opening its body with the
+assignment, of the subject, of another variant, and to observing every
+binding after it.
+
+**Arrays.** With `arrays` (and `division` and `loops`), a function
+declares fixed array locals of an integer element and one to eight
+elements, `const v2: [i16; 3] = [a, b, c];` or `[a; 3]`, or a copy of an
+array in scope; reads an element wherever an integer of its type is
+wanted, `v2[(e % 3)]`; writes one through a `mut` array, `v2[(e % 3)] =
+..;` or a compound store; and assigns a `mut` array whole. A free
+function sometimes takes `&Slice<E>` as its last parameter
+(`ValueType::SliceReference`), given `&v` of an array local of its
+element or a slice parameter passed on, and reads its elements,
+`p3[(e % (p3.length() as u64))]`, and its length, an `i64`; `main`
+declares an array of each element some helper takes a slice of, first,
+so it can call them. Every index is reduced into the length where it is
+written, `e` a `u64` that reads a name, and no array is empty, so a
+slice of one never is and no index is out of range under either overflow
+rule. An array or a slice is observed by `for (n4 in v2) { observed =
+mix(observed, n4); }`, every element in order (`StatementKind::Each`),
+and a slice by its length too. Under the memory-safety plan's rules as
+well as today's: a slice is a parameter only, so no reference to an
+array outlives the call borrowing it; a statement writing an array, an
+element or the whole, lends it exclusively first, so neither its index
+nor its value borrows it; and an element read copies an integer out,
+holding no reference. The array audit (section 7) holds the model to
+these rules.
+
+**Strings.** With `strings` (and `loops`), a function declares `String`
+locals (`ValueType::Text`), each given a new `String` whenever it is
+declared or assigned: `String::from("q7k")` of a literal whose text a
+number spells (`Program::text_of`, base 36), `String::from(e)` of an
+integer value's digits, or `String::new()`. A `mut` one is appended to,
+`v3.push(e)` of an integer, of a string literal or of another `String`'s
+view, `v3.push(v1.as_str())`; two are compared where a boolean is wanted
+(`==`, `!=`, `<`, `<=`, `>`, `>=`); and one's length is an `i64` value. A
+`String` is never read by value - never copied, moved, passed or returned
+- so it needs no ownership state, and a `String` being appended to is
+lent exclusively for its statement, so neither its own view nor its
+length or a comparison of it appears in what is appended. It is observed
+by its length and by `for (n3 in v2.as_bytes())` over its bytes, in
+order. The text audit (section 7) holds the model to these rules, and
+the loan audit sees an append as an exclusive borrow and a view as a
+shared one.
+
+**Dynamic arrays.** With `dynamic-arrays` (and `division` and `loops`), a
+function declares dynamic array locals of an integer element
+(`ValueType::DynamicArray`, spelled `[i16]`, the standard library's
+`Array<i16>`), each given a new array whenever it is declared or assigned:
+a literal of one to eight elements, `[a, b, c]`, a repeat, `[a; 3]`, an
+empty one, `Array::new()`, or a clone of another in scope, `v1.clone()`.
+A `mut` one is appended to, `v2.push(e)`, popped, `const o4: u64 =
+(v2.pop().unwrap() as u64);`, written element by element, and assigned a
+new array whole. The environment carries the fewest elements each holds
+where generation stands (`Environment::fewest_elements`): the count its
+value made, one more after a push, one fewer after a pop; a block that
+ends leaves each the fewer of what it held entering and what it holds at
+the block's end, since the block may not have run or may have left
+early. An element is read or written, `v2[(e % K)]` with `K` that count,
+and a pop or a borrow for a slice made (`&v2` for a helper's `&Slice<i16>`,
+converted by the standard library's `AsSlice`), only where `K` is at
+least one, so no index is out of range and no `unwrap` finds none; and a
+pop or a whole assignment, which may leave an array fewer elements,
+stands only in the loop the array was declared in or outside every loop,
+or a second trip would find fewer than the first left. A dynamic array
+is never read by value, so it needs no ownership state; a statement
+changing one - an element store, a push, a pop, a whole assignment -
+lends it exclusively, so nothing else in that statement names it, and an
+element read copies an integer out, holding no reference, so no
+reference to an element is ever held across a change of its array,
+under the memory-safety plan's rules as well as today's. One is observed
+by its length and by `for (n3 in v2)` over its elements, in order. The
+dynamic array audit (section 7) follows the counts through each function
+apart from the generator and holds the model to these rules.
+
+**Maps.** With `maps` (and `loops`), a function declares `mut` map locals
+of an integer key and an integer value (`ValueType::Map`, spelled
+`HashMap<u8, i32>`), built empty, `HashMap::new()`. One is inserted into
+and removed from in a statement of its own that observes what the call
+gives back, `const o3: u64 = (v2.insert((e & 7), x).unwrap_or(d) as
+u64);` and `v2.remove(&(e & 7)).unwrap_or(d)`; looked up wherever a value
+of its value type is wanted, `v2.get(&(e & 7)).unwrap_or(d)`; asked
+`v2.contains_key(&(e & 7))` wherever a boolean is; measured wherever an
+`i64` is; and given a new empty map whole. Every key is reduced to eight
+values, `(e & 7)`, so operations meet keys already there, and every
+`Option` a call gives is read with a default, so nothing panics. A map is
+never read by value, so it needs no ownership state; a statement changing
+one lends it exclusively, and a lookup or a `contains_key` shared, so no
+value is held by reference across a change. The standard library promises
+no iteration order - the default hasher is keyed per map from a
+per-process random seed - so a map is observed by its length and by a sum
+over its keys, each key mixed with its value looked up, added modulo
+2^62: `for (n3 in v2.keys()) { v9 = (((v9 & M) + (mix(mix(9, n3), v2.get(&n3).unwrap_or(0)) & M)) & M); }`,
+`M` = 2^62 - 1, two terms below 2^62 adding without overflow under either
+overflow rule. Addition modulo 2^62 is commutative and associative, so the
+sum, and the hash, is the same in any order. The map audit (section 7)
+holds the model to these rules.
+
+**Kept off.** A shape the generator keeps off because of a compiler or
+standard library bug is listed here with the bug file that records it,
+and is lifted, with a new generator version, when the fix lands.
+
+- A `match` expression's arm value borrowing a temporary,
+  `h0(match (e) { E0::V0 => { h1(&(D0 { .. })) } .. })` (bug 0362,
+  `.bug-report/0362-match-arm-value-releases-borrowed-temporary-at-arm-end.md`):
+  the compiled program releases the temporary when the arm ends, before
+  `h0` runs, where the language releases it at the end of the statement,
+  as it does an `if` expression's branch's. Tracked: no borrowed
+  temporary is made while an arm's value is (`making_arm_value`), and the
+  loan audit refuses one inside an arm's value. Lifted, with a new
+  generator version, when the compiler releases them at the statement's
+  end.
+
+A `match` arm assigning its subject inside a generic body was
+kept off until a `Copy` payload binding in a generic function's copy was
+copied into a slot of its own on entering the arm, as everywhere else.
 
 ## 3. Guarantees, and how each is enforced
 
@@ -192,8 +752,9 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   exactly that type: operands are of `T`, a different type is converted with
   `as`, and widening appears only at the implicit-conversion places.
 - Names are declared before use, in scope, unique per function (`v<N>`,
-  `p<N>`, counters `n<N>`, functions `h<N>` and `g<N>`, structs `S<N>` and
-  `B<N>`, fields `f<N>`, methods `m<N>`); only `mut` names are assigned, and no loop counter is. No
+  `p<N>`, counters `n<N>`, functions `h<N>`, `g<N>` and `k<N>`, structs
+  `S<N>` and `B<N>`, fields `f<N>`, methods `m<N>`, traits `Tr<N>` and
+  their methods `t<N>`); only `mut` names are assigned, and no loop counter is. No
   name is spelled like a type: a local `i8` would stand in front of the type
   in `i8::MIN`, and a function `f32` in front of `f32`. A struct has at most
   four fields, so no field is `f32` either.
@@ -203,13 +764,56 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   static method is called through its struct (`S1::m0()`), never on a value.
   `this` is never assigned whole.
 - A struct literal writes every field that has no default.
-- **Generic bodies.** A `T` value is never observed, cast, combined by an
-  operator or assigned: nothing converts a `T` to a `u64`, and no `T` local
-  is declared. It is compared only under `where T: Eq`, and a generic
+- **Generic bodies.** A `T` value is never cast or combined by an
+  operator, and is observed only under a trait bound, by a call of the
+  trait's first method (which returns a scalar): nothing else converts a
+  `T` to a `u64`. No `T` local is declared. The one `T` place assigned is a `T` field of a `mut &this`, and
+  only whole, never with a compound operator. It is compared only under `where T: Eq`, and a generic
   function is instantiated only at a type its bound admits - an `Eq`-bounded
-  one never at a struct, which does not implement `Eq`. Every call writes
-  its type argument, so no argument (a literal among them) is left to infer
-  it.
+  one never at a struct, which does not implement `Eq`.
+- **Moves.** A type parameter is not `Copy` unless a bound says so, and
+  each pass, store or selection of a value that is not `Copy` moves it.
+  Every generic function and generic struct method is bounded by `Copy`
+  (`where T: Copy`, or `where T: Eq + Copy`), so a body uses a `T` value
+  as often as it likes, and every type it is instantiated at is `Copy`:
+  an owned struct (`moves`), the one value type that is not, is never a
+  type argument, a field, a closure's parameter or a capture.
+  The self-test's bound audit (section 7) refuses a generic definition
+  that names a `T` parameter twice, or once inside a loop, without the
+  bound; it reads the text, since the compiler accepts such a function
+  when every instance's type is `Copy` and so cannot be the check.
+- **Every `match` is exhaustive and every arm reachable.** A `match`
+  covers each variant once, by its own arm or by a `_` written last, and
+  writes `_` only when a variant is left
+  (`guarantees/exhaustiveness.cryo`) or an arm's pattern nests a variant
+  pattern, which leaves the rest of its variant to `_`
+  (`Program::elements_refutable`): no variant is uncovered, no arm
+  follows `_`, and no variant has two arms.
+- **Overload resolution is certain.** A call of an overloaded name
+  selects the member its arguments fit, and no implicit conversion makes
+  one fit: a narrower integer is not widened, and a literal where the
+  members' parameters differ is an `i32`. So the members of a set differ
+  in their parameter count or in some parameter's type
+  (`guarantees/overloading.cryo`), and every argument of a call of an
+  overloaded name is a deciding value, of exactly its parameter's type and
+  never a literal or made only of literals: one member fits, and no other.
+- **Inference is certain.** A call or literal that leaves its type
+  argument to inference gives `T` only deciding values (section 2), so
+  each of them has the type argument's type and they agree; nothing else
+  the call or literal holds names a type parameter. One that writes its
+  type argument may pass anything that converts to it - unless the list
+  also holds a `_`, as every call of a callable-bounded function's does
+  (`g1::<u8, _>`): such a list is inferred with the written argument
+  already bound, so an argument of a narrower type conflicts with it
+  (E0214, docs/cryo.md section 4.2) and the arguments for `T` are
+  deciding values there too.
+- **Captures are copies.** A closure captures only what `Capture::admits`:
+  a parameter, local, counter or binding of a `Copy` value type, in scope
+  where the closure is made. Its body reads only what it captures, its own
+  parameters and the bindings its own `match`es make; the self-test's
+  capture audit walks every closure's body to hold it to that, and finds
+  every capture observed (section 3.4) - a `T` capture, which nothing
+  converts, selected by the closure's value instead.
 - A function's body ends with a `return` of its type, or with nothing when
   it returns `void`; `main` never returns early, so its final print always
   runs.
@@ -224,11 +828,26 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   (the increment comes first, so a `continue` cannot skip it) and
   `for (n2 in 0..5)`. Loops nest at most three deep.
 - **No recursion.** Functions are generated in one order - every struct's
-  methods, then `g0`, `g1`, ..., then `h0`, `h1`, ..., then `main` - and
+  methods, then every generic struct's, then `g0`, `g1`, ..., then the
+  traits' implementations, then their default bodies in the order of their
+  methods, then `k0`, `k1`, ..., then `h0`, `h1`, ..., then `main` - and
   each calls only functions generated before it: the call graph is acyclic.
+  A call through a bound or an object runs an implementation or a default
+  body, all generated before any function making such a call, except a
+  default body's call on `this`, which names only a method declared before
+  its own and so a default generated before it.
 - **A cost model.** A statement costs its expressions' nodes (a store's
   target is written, not read, and costs nothing); a loop costs its trip
-  count times its body; an `if` the dearer arm; a call the callee's cost.
+  count times its body; an `if` the dearer arm; a call the callee's cost;
+  a closure's body is measured on a budget of its own when it is made,
+  and that cost is charged at every call of it. A function value costs at
+  most `FUNCTION_VALUE_COST_LIMIT`: a closure local is passed only when it
+  does, and a closure written where it is passed or returned is generated
+  at depth 1 on a budget whose calls stay under half the limit. A call
+  through a parameter or through a returned value is charged the limit;
+  the self-test's function-value audit holds every value to it. An owned
+  value's `drop` is charged to no function: it does a fixed amount of
+  work, once per value made, and every value made is a charged node.
   A call is generated only while the caller's cost stays under its limit, so
   every program does a bounded amount of work, known at generation time.
 
@@ -237,33 +856,42 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
 - No input, no clock, no address, no environment, no thread: the only
   output is the final hash line.
 - `observed` is a global `u64`. An observation folds a value into it with
-  `mix`, defined in the program as FNV-1a's step plus a constant
-  (`(state ^ value).wrapping_multiply(1099511628211).wrapping_add(2654435769)`),
-  so folding the state into itself does not stick at zero. An integer is
+  `mix`, defined in the program as
+  `(state.wrapping_multiply(1099511628211) ^ value).wrapping_multiply(1099511628211).wrapping_add(2654435769)`.
+  For a fixed value it is a bijection of the state and for a fixed state
+  one of the value, and folding a value equal to the state still depends
+  on the state: a program that observes `observed` itself (a generic call
+  handed `observed` twice returns it) keeps every earlier observation,
+  where a plain exclusive-or of the two would cancel them. An integer is
   folded as `(e as u64)`; a boolean as `1` or `2`. `observed` is read as a
   value only where no other name of the wanted type is in scope.
 - A struct is observed field by field, nested structs through their own
   fields (`v2.f1.f0`); a struct a call returns is bound to a local first, so
   the call runs once.
 - Each block ends by observing every name it declared, a function body ends
-  by observing its parameters (and a method's, its receiver), and `main` ends
+  by observing its parameters (and a method's, its receiver), a closure's
+  body by observing what it captures before its value, and `main` ends
   by observing one call of each helper the cost model allows, so every value
   a program computes reaches the hash. A nested block spends at most half the
   statements left, so no function is one untaken branch.
 - **No expression both writes a struct and reads it.** A method taking
   `mut &this` returns `void` and is called only as a statement of its own,
   so the order in which an expression's operands are evaluated never
-  decides a struct's value. (`observed` is the exception the stage-1 forms
-  already make: a call inside `mix(observed, ...)` may observe, and so
-  change `observed`, while the same statement reads it.)
-- **Operand evaluation order is guaranteed.** That exception's hash
-  depends on the order a call's arguments and an operator's operands are
-  evaluated in: `observed = mix(observed, (h1(v0) as u64))` reads
-  `observed` before `h1` changes it because the language evaluates
-  operands left to right - a binary operator's left operand first, a
-  call's arguments in the order written, a method call's receiver before
-  its arguments (docs/cryo.md section 5.8, "Evaluation Order"). So the
-  hash a program prints is fixed by the source, and these statements stay.
+  decides a struct's value.
+- **An observation folds in a value that runs nothing.** In
+  `observed = mix(observed, h1(v0))` the statement reads `observed` before
+  the call, so whatever `h1` observes while it runs would be overwritten. A
+  value holding a call of any kind or a `match` (whose arms may observe)
+  is bound to a fresh local first and the local folded in:
+  `const o0: u64 = (h1(v0) as u64); observed = mix(observed, o0);`
+  (`Program::runs_code`, the printer's `bind_observed`). The self-test
+  reads every printed `mix(observed, ..)` for a call.
+- **Operand evaluation order is guaranteed.** Two calls in one expression
+  that each observe, `h0(h1(v0), h2(v1))`, change `observed` in the order
+  they run, which the language fixes: operands left to right - a binary
+  operator's left operand first, a call's arguments in the order written,
+  a method call's receiver before its arguments (docs/cryo.md section 5.8,
+  "Evaluation Order"). So the hash a program prints is fixed by the source.
   A compiler that changed the order would print a different hash at every
   optimisation level alike, which the corpus check (comparing -O0 with
   -O2) cannot see; the test project `evaluation_order_left_to_right` is
@@ -283,17 +911,51 @@ both, because no plain `+`, `-`, `*` or negation can overflow:
   seeded with its place among the methods. The generic functions' count
   comes from a stream of its own, and each generic function from one
   seeded with its number. The generic structs and their instances come
-  from one stream of their own.
+  from one stream of their own; how many methods each has and how each
+  takes its receiver from another, and each such method from one seeded
+  with its place among them. The enums come from one stream of their
+  own. Whether a function gains an overload set
+  comes from a stream keyed by its name, and each member from one keyed by
+  the name and the member's place in the set.
 - **The function count shapes nothing before `main`**: a program generated
   with `--functions 3` is the same structs and methods and the first three
   helpers of the same seed's program with more, plus its own `main`.
 - **A new stage leaves the old forms' draws alone.** A form a stage adds
   takes no random draw where its feature is off or nothing it needs exists,
   so with every later stage's features removed a seed generates an earlier
-  generator's text, header aside: `--features
-  default,no-structs,no-constants,no-generics,no-generic-structs` version
-  1's, `default,no-generics,no-generic-structs` version 3's, and
-  `default,no-generic-structs` version 4's.
+  generator's text, header aside. Any list removing `boxes` and
+  `options` (or `options`' `enums` or `enum-payloads`) generates version
+  31's text for that list. Any list removing `drops` generates
+  version 30's text for that list, but for `main` with `references` on,
+  whose locals for references to borrow are no longer moved; any list
+  removing `references` generates version 29's text for that list; one removing
+  `subject-assignments` too, version 28's, and `moves` as well, version
+  27's. Any list removing `trait-objects`
+  generates version 26's text for that list, version 27 adding only
+  `main`'s locals for objects to borrow; in version 26,
+  `default,no-trait-defaults,no-supertraits` generated version 25's text,
+  and with those two also removed, `default,no-trait-objects` generates
+  version 24's text, `default,no-trait-objects,no-trait-bounds` version
+  23's, `default,no-traits` version 22's, `default,no-traits,no-generic-closures,no-callable-bounds`
+  version 21's; with those three also removed, `default,no-function-values`
+  gives version 20's and `default,no-function-values,no-closure-captures`
+  version 19's; and `default,no-nested-patterns` generates
+  version 14's text, `default,no-nested-patterns,no-generic-enums`
+  version 13's, and `default,no-enum-payloads` (which declares no
+  generic enum either) version 12's. `default,no-enums` generates version 9's
+  text, `default,no-overloads,no-enums` version 8's, and with both added
+  to each list,
+  `default,no-structs,no-constants,no-generics,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
+  version 1's, `default,no-generics,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
+  version 3's, `default,no-generic-structs,no-inferred-type-arguments,no-generic-methods`
+  version 4's, `default,no-inferred-type-arguments,no-generic-methods`
+  version 5's, and `default,no-generic-methods` version 6's - for version
+  7 and earlier, once the text is rewritten back in the three places
+  version 8 alone changed: `mix`'s body, and a generic function's bound,
+  `where T: Copy` (dropped) and `where T: Eq + Copy` (written `where T:
+  Eq`). Version 8 also lets a generic function call a generic struct's
+  static method at its own `T`, so with `generic-methods` on a seed's
+  generic functions may draw differently.
 - The header records the **generator version**, raised whenever one seed may
   produce different text, so a seed filed in a bug report names the
   generator that reproduces it.
@@ -307,12 +969,15 @@ every feature of the current stage; `no-<name>` removes one.
 |---|---|
 | 1 | `integers` (always on), `booleans`, `wrapping`, `guarded`, `bitwise`, `shifts`, `division`, `casts`, `widening`, `if-expressions`, `branches`, `loops`, `loop-exits`, `calls`, `early-returns` |
 | 2 | `structs`: one to three structs with integer, boolean and nested struct fields, defaults, struct literals, field reads and writes, structs as parameters, returns and locals, and inline methods (static, `&this`, `mut &this`); `constants`: arguments made only of literals |
-| 3 (this one) | `generics`: generic functions over one type parameter, unbounded or `where T: Eq`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2). Still to come in this stage: inferred type arguments, overload sets, methods of generic structs |
-| 4 | `references`, `moves`: `&` / `mut &`, receivers, move-checked bindings |
-| 5 | `drop`: a drop log folded into the hash, the expected drop order |
-| 6 | `closures`: capturing and not, passed to function-typed slots |
-| 7 | `traits`: default methods, implementations, calls through a bound |
-| 8 | `async` |
+| 3 | `generics`: generic functions over one type parameter, `where T: Copy` or `where T: Eq + Copy`, called with the type argument written; `generic-structs`: generic structs and their instances at written type arguments, as the types of values (section 2); `inferred-type-arguments`: calls and instance literals that leave the type argument to inference; `generic-methods`: a generic struct's static, `&this` and `mut &this` methods, called on its instances; `overloads`: free functions and methods sharing a name, each call choosing exactly one |
+| 4 | `enums`: enums with unit variants as the types of values, and `match` over them, as a statement and as an expression, with qualified variants and wildcards (section 2); `enum-payloads`: variants carrying scalar values, constructed with them and matched with a binding for each; `generic-enums`: generic enums whose payloads may be of type `T`, and their instances at scalar type arguments; `nested-patterns`: payload values of earlier enums, and `_` and variant patterns inside a payload's pattern. The stage is complete |
+| 5 | `closures`: closures that capture nothing, held by `const` locals of their function type and called (section 2); `closure-captures`: closures that copy one or two of the enclosing function's values and observe them, held by locals of their own type; `function-values`: free functions taking a function-typed parameter or returning a function type, given closures and parameters passed on, and calls through them; `generic-closures`: closures declared in generic bodies, generic over `T`; `callable-bounds`: generic functions taking a parameter of a callable-bounded `F`, given a closure written at each call. The stage is complete |
+| 6 | `traits`: traits of `&this` methods, implemented for the declared structs and called on their values (section 2); `trait-bounds`: generic functions bounded by a trait, calling its methods on `T` values; `trait-objects`: free functions taking `virtual &Tr<N>`, calling through the table; `trait-defaults`: methods with a default body calling the trait's earlier methods on `this`, left out by some implementations; `supertraits`: a trait declared over another, its bounds, objects and defaults calling both traits' methods; `enum-implementations`: traits implemented for the declared enums, their methods matching on `this`, called on the enums' values, through bounds at an enum and through objects borrowing one. The stage is complete |
+| 7 | `moves`: owned structs with a destructor that folds into the hash, moved between locals, into calls and out of returns (section 2); `subject-assignments`: `match` arms assigning their subject another variant, then observing their bindings; `references`: `&D0` and `mut &D0` parameters, `&D0` returns, kept shared or exclusive per statement; `drops`: `mem::drop`, discarded results, borrowed temporaries and whole stores through `mut &D0`; `boxes`: `Box<D0>` read and written through, `Rc<D0>` cloned and counted; `options`: `Option<D0>` and `Result<D0, u32>` matched, unwrapped where certainly holding a value, and propagated with `?`; `sibling-variants`: a `?`'s `if` operand leaving a variant's type arguments to its sibling arm (section 2) |
+| 8 | `arrays`: fixed arrays of integers built by a literal, a repeat or a copy, their elements read and written at an index reduced into the length, and `&Slice<E>` parameters given `&v` of one, each observed by a `for` over its elements (section 2); `strings`: `String` locals built from a literal, an integer's digits or nothing, appended to, compared and measured, observed by their length and bytes; `dynamic-arrays`: `[E]` locals built by a literal, a repeat, empty or as a clone, pushed, popped, indexed below the fewest elements they hold and given `&v` for a slice, observed by their length and elements; `maps`: `HashMap<K, V>` locals inserted into, removed from, looked up and asked for keys below 8, measured, and observed by their length and a sum over their entries that no iteration order changes. The stage is complete |
+
+Section 9 places each stage among the rest of the work, the tools that
+run what the stages generate.
 
 A new stage adds features; it never changes what an existing seed and
 feature list generate without raising the generator version.
@@ -369,13 +1034,26 @@ statement budget of one function, default 24), `--no-header`, and
 - **`cryosmith selftest`** runs in process and builds nothing, so
   `make check-fast` runs it: the same seed gives the same bytes; different
   seeds differ; the function prefix property of section 3.5; feature lists
-  parse and print canonically; a disabled feature's forms never appear; and
-  the static audit below passes over a few hundred programs and refuses
+  parse and print canonically; a disabled feature's forms never appear
+  (over 40 programs, and 200 for a form drawn rarely, a `?` choosing
+  between a variant and its sibling); and the static audit below passes over a few hundred programs and refuses
   every planted one. It counts its checks and fails if it ran none.
+  The default program of each seed is generated once and shared by every
+  check that reads it, as its model and its text; the checks only read
+  them, and the determinism check compares each of the first twenty with
+  the seed generated afresh. A run is a sequence of units, each check and
+  each feature switch on its own, numbered in the order they run;
+  `selftest --part I/N` runs the units whose number leaves I divided by N
+  and says how many it ran of how many there are. `make
+  cryosmith-selftest` is `cryogate smith-selftest`, which runs N parts at
+  once (`CRYOGATE_JOBS`, default the logical CPUs) and prints the whole
+  run's verdict line, the same for any N; it refuses parts that do not
+  run every unit exactly once between them.
 - **A static audit** of printed programs: every `/` and `%` divides by a
-  `| 1)` guard and every `<<` / `>>` amount is masked. The audit reads the
-  printed text, not the model, so it does not share the generator's
-  mistakes about what it built.
+  `| 1)` guard, a positive literal or a slice's `(v.length() as u64)`, no
+  fixed array is written with no elements, and every `<<` / `>>` amount is
+  masked. The audit reads the printed text, not the model, so it does not
+  share the generator's mistakes about what it built.
 - **The corpus check** is CryoGate's, `cryogate corpus-check`: CryoSmith
   writes K seeds' programs (`batch`), each is built at `--opt-level=0` and
   `--opt-level=2` with the compiler named, and both run. A program passes
@@ -383,11 +1061,111 @@ statement budget of one function, default 24), `--no-header`, and
   line; the summary counts the distinct hashes, since a hash every program
   shares is a stuck one. CryoSmith generates and never runs a compiler;
   checking what it generated is the gate runner's, and the output contract
-  of section 5 is what the two share.
+  of section 5 is what the two share. The builds run `--jobs` at once
+  (default `CRYOGATE_JOBS`, else the logical CPUs), each with a build
+  directory of its own (`--build-dir`), since two builds sharing one write
+  the same objects and one program then reports another's hash; a build
+  that writes no build directory is a failure. So a compiler from before a
+  single-file build honoured `--build-dir` is refused rather than worked
+  around: the check gives each build no copy of its source and no
+  directory of its own to stand in for the flag. The report is printed in
+  seed order once every program has run, so it is the same bytes for any
+  job count. With `--expect` it checks the pinned corpus `make verify`
+  runs (section 9, item 11): each program must also print the hash line
+  pinned for its seed.
 - **Plants prove the checks can refuse.** `--plant unguarded-division`
   generates `(a / (b & M))`, without the `| 1`. The static audit must refuse
   every planted program that divides, and the corpus check must report the
-  plant as a failure. A plant is never on by default and the header names it.
+  plant as a failure. `--plant uncopied-type-parameter` prints every
+  generic function and method without its `Copy` bound; the bound audit
+  must refuse such a program exactly when the same seed's unplanted text
+  has a generic definition that uses a `T` value more than once. A plant
+  is never on by default and the header names it.
+- **The bound audit** reads every generic signature's `T` parameters and
+  counts their uses in its body, a use inside a loop twice; one used more
+  than once needs `Copy` in the bound (section 3.2).
+- **The capture audit** walks every closure of 200 programs in the model:
+  each variable its body reads is one it captures, one of its parameters or
+  a binding of a `match` inside it, and each capture is read by one of the
+  body's observations - the capture, a field of it, or the `match` giving
+  its variant number (section 3.2); a `T` capture by the closure's value,
+  an `if` choosing it.
+- **The function-value audit** reads every argument given to a
+  function-typed parameter and every function value returned in 200
+  programs: each costs at most `FUNCTION_VALUE_COST_LIMIT`, and each one
+  returned captures nothing and is no parameter (sections 2 and 3.3).
+- **The default audit** reads every trait's default bodies in 200
+  programs' text: each call on `this` names a method numbered below the
+  default's own (section 3.3).
+- **The move audit** walks every function of 200 programs in the model, in
+  the order the text is printed: each move is out of a variable of an
+  owned type, nothing names the variable afterwards, and no variable is
+  moved inside a loop it was declared outside (section 2).
+- **The subject-assignment audit** walks every `match` statement of 200
+  programs in the model: each arm assigning its subject matches a variant,
+  opens its body with that assignment, gives the `mut` local it matches on
+  another variant, and observes each of its bindings after it; with the
+  feature off, no arm assigns its subject.
+- **The loan audit** reads every function of 200 programs as the move
+  audit does, from the same list of uses in printed order (`UseWalk`): no
+  local holds a reference; within one statement a variable borrowed
+  exclusively, an exclusive reference passed on or a variable moved has
+  no other use but an assignment to it; and no value a function returns
+  as a reference borrows a variable of the function.
+- **The holder audit** reads the model of 200 programs: each `unwrap` is
+  of a `const` local declared with an option or a result built holding a
+  value; each `?` applies to an option or a result, yields the owned value
+  it holds, and stands in a function other than `main` that returns an
+  option or a result; each clone is of a shared owner; and the audit finds
+  some of each, and some box. The move audit counts an `unwrap` as a move,
+  and the loan audit a clone as a shared borrow.
+- **The array audit** reads the model of 200 programs: each element read
+  or written has its index reduced into the length of what it indexes, `(e
+  % N)` with `N` the array's own length or `(e % (v.length() as u64))` of
+  the same slice; only a parameter holds a slice, and each `&v` given for
+  one borrows an array local of its element; an element is written only in
+  a `mut` array local; and no statement both writes an array and borrows
+  it (from `UseWalk`, which walks an element target's index with its
+  statement). It finds some element reads, stores, borrowed arrays and
+  loops over elements.
+- **The text audit** reads the model of 200 programs: each `String` local
+  declared or assigned is given a new `String` (a literal's, an integer's
+  digits, or empty), never a variable's; each append is to a `mut`
+  `String` local and never of its own view; and each operator over a
+  `String` compares two `String` variables. It finds some of each, and
+  some append of another `String`'s view.
+- **The dynamic array audit** reads every function of 200 programs from
+  `UseWalk`'s list, which marks where each nested block begins and ends
+  and names the expression each element access, push, pop, clone, borrow
+  and assigned value is made by. Apart from the generator it follows the
+  fewest elements each dynamic array holds - a value's count, one more
+  per push, one fewer per pop, the fewer of entering and leaving where a
+  block ends - and refuses an index `(e % K)` with `K` below 1 or above
+  it, a pop or a borrow for a slice where it may be 0, a pop or a whole
+  assignment inside a loop the array was declared outside, a change of a
+  `const` one, and a change inside a `for` over its own elements. It finds
+  some element reads and stores, pushes, pops, clones, slice borrows and
+  whole assignments. The loan audit reads the same list: a push, a pop
+  and an element store of a dynamic array are exclusive borrows, a clone
+  a shared one, so nothing else in their statement names the array.
+- **The map audit** reads the model of 200 programs: each map is a `mut`
+  local; each insert and removal is the whole value of an observation, a
+  statement of its own; each key an operation is given is `(e & 7)`, but
+  in a `for` over the map's own keys; each such `for` is one assignment
+  adding the entry's mix of its key and its looked-up value into one sum
+  modulo 2^62; and, reading `UseWalk`, no map is lent exclusively or
+  assigned inside a `for` over its keys. It finds some inserts, removals,
+  lookups, `contains_key` calls and loops over keys.
+- **Borrow coverage**: of 40 programs, at least half of those declaring a
+  trait object parameter pass `&v` to one, read from the text, and
+  likewise for a reference parameter, read from the model (a `&` of a
+  variable or a temporary whose type is a reference), since a map's
+  lookup spells `.get(&v1)` too.
+- **Enum implementation coverage**: of the same 40 programs' models, some
+  call a trait method on an enum value, some instantiate a trait-bounded
+  function at an enum, and some borrow an enum variable for a trait
+  object, so each way a struct's implementation is reached is reached
+  through an enum too.
 
 ## 8. Architecture
 
@@ -401,8 +1179,8 @@ layers, lowest first:
 | `random/` | `RandomStream`: every draw, and the seed of each part's stream (section 3.5) |
 | `configuration/` | `Feature` and `FeatureSet`, `GenerationOptions`, `Plant`, `GENERATOR_VERSION`, and `GenerationArguments`, the options as a command line spells them |
 | `typing/` | `Environment`, the names in scope and what each allows (section 3.2), and `TypeChoice`, drawing a type |
-| `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4) |
-| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures` |
+| `guarantees/` | each rule of section 3 stated once: `ArithmeticGuard`'s masks (3.1), `CostBudget` and the loop limits (3.3), `Observation`'s hash and output line (3.4), `Overloading`'s distinct signatures, `Exhaustiveness`'s arms and `Capture`'s captured values (3.2) |
+| `generate/` | `Generator`: the struct and its entry point in `generator.cryo`, and one file per stage's forms - `functions`, `control_flow`, `scalars`, `observations`, `structs`, `constants`, `generics`, `generic_structures`, `inference`, `generic_methods`, `overloads`, `enums`, `closures`, `function_values`, `traits`, `moves`, `references`, `drops`, `holders`, `arrays`, `texts`, `dynamic_arrays`, `maps` |
 | `emit/` | `Printer`: the header, the prelude, items, statements and expressions as text |
 | `selftest/` | `SelfTest` and the static audit (section 7) |
 | `cli/` | `Cli`: the commands, the usage text, the exit codes |
@@ -448,7 +1226,9 @@ layers, lowest first:
 4. A new safety rule goes in `guarantees/`, and section 3 says why it holds.
 5. `selftest/features.cryo` gets the feature's switch check: some program
    spells it with the feature on, none with it off. Raise
-   `GENERATOR_VERSION` when an existing seed's text changes.
+   `GENERATOR_VERSION` when an existing seed's text changes, and re-pin
+   verify's corpus in the same commit (`make smith-corpus-pin`, section
+   9, item 11): verify refuses a cryosmith of another version.
 
 **Proving a change preserves output.** A change meant to move no text is
 checked by generating the same seeds before and after and comparing the
@@ -458,3 +1238,665 @@ no-structs,no-constants`, every feature named, and smaller ones), and the
 two corpora must be byte-identical. A one-character change to the printer
 must make that comparison fail, or the comparison is not reading what it
 claims to.
+
+## 9. Roadmap
+
+**Complete.** The twelve items below are done, and CryoSmith joins
+`main` with them. Items 1 to 6 are generator stages (section 4): each
+adds features, their forms, the guarantees that keep the forms valid, a
+switch check in the self-test, an old-seed reproduction check and a
+corpus. Items 7 to 12 are the tools that use what the stages generate;
+most of them belong to CryoGate, which runs compilers, while CryoSmith
+stays a generator.
+
+**Follows after the merge.**
+
+- The compiler bugs CryoSmith filed and that are still open, silent
+  miscompiles first: 0362 (a `match` arm releases its value's borrowed
+  temporaries when the arm ends; the generator keeps off the shape),
+  0363 (a `&i64` argument for an `i64` parameter passes the address),
+  0364 (a call through a generic bound is not checked for its argument
+  count or types: a crash, or a silent conversion), 0369 (an enum value
+  for an integer parameter, and back, is accepted), 0376 (an `if` or
+  `match` expression with one literal branch narrows a wider branch
+  silently); then 0365, 0366, 0367, 0368, 0370, 0372, 0373, 0374 and 0375
+  (crashes, wrong errors and missing checks). Each is fixed by its own
+  session, and a fix that lifts a keep-off is a new generator version.
+- `escape-borrow` (item 9) moves to the memory-safety plan: it needs that
+  plan's borrow checker on `main` before an escaping borrow is refused, so
+  it is built with the checker, not here. Item 9 is complete without it.
+- Item 8's last omission, a generic function made concrete at its one type
+  argument.
+
+**A compiler or standard library bug the corpus finds is filed, not
+fixed here.** It gets a bug file with a minimal repro, and work goes on.
+The generator keeps off the shape, written under "Kept off" in section 2
+with the bug file that records it. A seed the interpreter disagrees on
+because of such a bug is reported as "known compiler bug NNNN" in the
+coverage count, never as agreeing. The seeds are listed in
+`tests/smith-known-bugs`, each with the hash line every configuration
+prints when it meets the bug, at one generator version that must be
+cryosmith's; corpus-check, smith-diff and verify's `smith` gate read it. A
+listed seed counts as its bug only while every configuration prints its
+recorded line: any other line on that seed fails as any finding does, and
+a listed seed that passes fails too, so an entry goes when its bug is
+fixed or the seed's program changes. The exception is a bug whose keep-off
+would itself be a large workaround: that one is fixed as any compiler
+change is - a test of the shape, the pin as the control, a mutation the
+test refuses, and `make verify` with its declarations. A defect in the
+interpreter's own code is always fixed.
+
+**What proves a change.**
+
+- Each unit of work: its build, its own tests with an inversion or a
+  mutation, `make check-fast`, the self-test, the reproduction check of
+  section 8, and a corpus of 50 seeds (a mutation pair's corpus keeps its
+  own size). A unit changing only `tools/CryoSmith` is pushed after that
+  proof.
+- A unit changing the compiler, the standard library, the runtime or
+  CryoGate (a trial the maintainer set, to be judged on how it works for
+  agents): its own tests, the pin as their control, a mutation they
+  refuse, `make check-fast` and a `-Werror` build of `compiler/` by the
+  compiler under test, with its declarations in the same commit; then it
+  is committed locally and not pushed. One `make verify ARGS="--baseline
+  <last pushed tip> --require-identical"` at the end of the session
+  covers every local unit, and nothing is pushed until it passes. When it
+  fails, the culprit is found by running verify with `--baseline` set to
+  each local commit in turn, and the session's handoff records how hard
+  that was and how long it took.
+- The end of a session: the 200-seed corpus, once. When the session
+  changed only `tools/CryoSmith`, that and `cryogate verify --only
+  cross,fast` are the whole batch: every population the full verify
+  hashes is built by the compiler, the standard library and the runtime,
+  so it cannot move, and the only gates that read CryoSmith's code are
+  `fast` (the self-test) and `cross` (CryoSmith built for the other OS).
+  When the compiler, the standard library or the runtime changed, the full
+  batch runs: `verify --baseline <session start> --require-identical`,
+  `warnings-check` with its planted control, the selfhost check on both
+  arms when compiled output moved, and the 200-seed corpus.
+
+**Pending elsewhere.** `Rc` gains a safe read (`Deref`, or `get(&this) ->
+&T`) with the memory-safety work, not on this branch; until then the
+generator never reads through an `Rc`.
+
+1. **Finish stage 3: overload sets** (done: `overloads`, section 2).
+   `model/`: functions of one owner and number share a name.
+   `generate/overloads.cryo`: a set's members differ in parameter count or
+   in a parameter's type, and a call passes arguments of exactly one
+   member's types, never a value that would widen to another's.
+   `guarantees/overloading.cryo`: the rule that keeps a call unambiguous.
+2. **Stage 4: enums and `match`.** `model/`: enums `E<N>` (and generic
+   `E<N><T>`) with unit and payload variants, an enum type in `ValueType`,
+   variant constructions, and a `match` node, both a statement and an
+   expression, holding arms of patterns. `generate/enums.cryo` and
+   `generate/matching.cryo`: values of an enum type, and matches over
+   them with qualified variants, payload bindings, nested patterns and
+   wildcards. `guarantees/`: every match is exhaustive (each variant
+   covered, or a wildcard last) and every binding is used as its type
+   allows (observed, or passed where its type is wanted). `typing/`:
+   bindings enter an arm's scope and leave with it. `emit/`: enum
+   declarations, constructions, patterns. Observation: an enum value is
+   observed by a `match` that folds its variant's number and its payload.
+3. **Stage 5: closures.** `model/`: function types and closure
+   expressions, captures. `generate/`: closures with and without captures,
+   passed to function-typed parameters and called. `guarantees/`: a
+   closure's cost is its body's, charged at each call; a capture is read,
+   never moved twice. `typing/`: a closure's own scope over its captures.
+   (Done: `closures`, closures capturing nothing, `closure-captures`,
+   closures copying the enclosing function's values, `function-values`,
+   closures passed to function-typed parameters and returned,
+   `generic-closures`, closures in generic bodies, and `callable-bounds`,
+   closures given to a callable-bounded parameter.) Every closure generated is valid under the memory-safety
+   plan as well as today's rules: it captures only `Copy` values, by copy,
+   and none holding a reference is stored in a struct or a global or
+   returned past what it refers to.
+4. **Stage 6: traits and dynamic dispatch.** Classes were removed from
+   the language, so this stage has none. `model/`: traits with required
+   and default methods, implementations for structs and enums, trait
+   objects. `generate/`: calls through a bound and through a trait object.
+   `guarantees/`: every call resolves to one implementation; the hash is
+   the same whichever way it is dispatched. (Done: `traits`, declarations
+   and implementations called on the implementing struct's values,
+   `trait-bounds`, calls through a bound, `trait-objects`, calls through a
+   trait object, `trait-defaults`, default bodies, `supertraits`, and
+   `enum-implementations`, the same reached through an enum's values. The
+   stage is complete.)
+5. **Stage 7: ownership.** `model/`: references (`&`, `mut &`) as values,
+   `Box`, `Rc`, `Option`, `Result`, types with a drop. `generate/`: moves,
+   borrows, early drops. `guarantees/`: no use after a move and no borrow
+   outliving its owner, decided by the generator's own ownership state in
+   `typing/`; a drop log folded into the hash, so the order of drops is
+   checked by both optimisation levels agreeing. This stage also generates
+   `match` arms that assign the subject a value different from the one
+   matched (`match (v) { E::X(a) => { v = E::Y(1); .. a .. } }` with the
+   new value drawn apart from the old), so the rule that a binding is a
+   copy taken on entering its arm is exercised; most assignments generated
+   today write the subject's own value back. Every program it generates is
+   valid under the memory-safety plan's rules as well as today's: a
+   reference lives only in a local, parameter or return, never outlives
+   what it borrows, and is never shared and mutable at once, and nothing
+   needs `unsafe`. (Done: `moves`, owned values moved between locals,
+   into calls and out of returns, each dropped into the hash,
+   `subject-assignments`, arms assigning their subject another variant,
+   `references`, borrows given to reference parameters and references
+   returned from them, `drops`, releases before scope exit, `boxes`,
+   `Box` and `Rc`, and `options`, `Option` and `Result` with `unwrap`
+   and `?`.)
+6. **Stage 8: strings, arrays and collections.** `model/`: `Str`,
+   `String`, fixed arrays, `Array`, `HashMap`. `generate/`: building,
+   indexing within bounds, iterating. `guarantees/`: an index is in range
+   by construction (reduced against a length the generator knows);
+   iteration order is observed only where the collection fixes it. (Done:
+   `arrays`, fixed arrays and the slices viewing them, `strings`,
+   `String` locals, `dynamic-arrays`, `Array` locals with the fewest
+   elements each holds tracked, and `maps`, `HashMap` locals observed by a
+   sum no iteration order changes. The stage is complete.)
+7. **A differential driver** (CryoGate, `cryogate smith-diff`). Builds one
+   program under several configurations - `-O0` and `-O2`, the pin and
+   the compiler under test, Windows and Linux (through WSL) - runs each
+   under a time limit, and reports a mismatch, a crash, a refusal or a
+   hang, naming the seed and the configuration. CryoSmith adds nothing but
+   the output contract it already has.
+
+   *Design.* `cryogate smith-diff --cryo <compiler> [--reference
+   <compiler>]... [--interpret] --work <directory> [--first-seed N]
+   [--count K] [--jobs N] [--build-limit S] [--run-limit S] [--
+   <generation options>...]`.
+   - **Configurations.** A configuration is one way of getting a seed's
+     hash line: a compiler at `-O0`, the same at `-O2`, or the compiler
+     under test's `cryo interpret` (with `--interpret`, once the
+     interpreter is on this branch; nothing else changes when it is
+     absent). `--cryo` gives two, each `--reference` (the pin, a
+     baseline's compiler) two more. Windows against Linux, a build or a
+     run inside WSL as selfhost's Linux arm runs one, is a later unit: one
+     more kind of configuration, not another command.
+   - **Each configuration's observation** of a seed is exactly one of:
+     *printed* a line (exit 0, one hash line); *refused* (the compiler
+     exited 1 with error diagnostics; their codes kept); *internal
+     error* (a refusal holding an `E09xx` code); *compile crash* (the
+     compiler died by a signal or an exit other than 0 and 1); *compile
+     hang* (past `--build-limit`, default 300 s); *run crash* (the
+     program exited non-zero, died by a signal, or printed something
+     other than one hash line); *run hang* (past `--run-limit`, default
+     60 s). Every generated program terminates within its cost budget
+     (section 3.3), so a run past the limit is a finding, not a slow run.
+   - **A seed's verdict** comes from its observations alone, in a pure
+     decision (`smith/` in CryoGate, unit-tested): *ok* when every
+     configuration printed the same line; otherwise the first class that
+     holds, in this order: compile crash, compile hang, internal error,
+     refusal, run crash, run hang, mismatch. A generated program is valid
+     by construction, so a refusal is a finding as much as a crash. A
+     mismatch names the groups of configurations that agree (`tree -O0,
+     tree -O2 | pin -O0, pin -O2`), so a disagreement between compilers
+     reads apart from one between levels. Each finding has a signature -
+     its class, the configurations involved and the first diagnostic code
+     or crash outcome - which the fuzz farm (item 10) deduplicates by.
+   - **Report.** One line per seed in seed order, the same bytes for any
+     job count, then one count per class and the verdict line
+     `smith-diff: OK (K programs, C configurations agree)` or
+     `smith-diff: FAIL (F of K programs: ...)`; exit 0, 1 on a finding, 2
+     on a usage error. A failing seed's source and executables stay in the
+     work directory; a passing seed's executables are removed.
+   - **Built on corpus-check, not beside it.** The work directory's
+     layout, the hash-line judgement and the quoting of a failed build
+     (`smith/corpus.cryo`) are shared; the builds and runs of every
+     configuration are scheduled as corpus-check schedules its two. Once
+     smith-diff stands, corpus-check becomes its two-configuration case
+     (the compiler under test at both levels), keeping its own verdict
+     line and `--expect`/`--pin`, and its report proven byte-identical
+     before and after over the same seeds.
+   - **Each build compiles its own copy of the program**, placed in its
+     build directory: an older compiler (the pin) writes a single file's
+     build beside the file whatever `--build-dir` says, and builds running
+     at once would then link each other's objects.
+   - **Windows against Linux**, from a Windows host: `--linux <compiler>`
+     names a Linux compiler by its path inside WSL (selfhost's Linux arm
+     builds one in its copy), with `--linux-stdlib <directory>`, also a
+     path inside WSL, when it needs one. It adds two configurations,
+     `linux -O0` and `linux -O2` (key `linux-O0`, `linux-O2`), built and
+     run as child processes of `wsl.exe`: the build `wsl.exe -e <compiler>
+     build <program> --opt-level=L --build-dir=<directory> -o
+     <executable>`, the run `wsl.exe -e <executable>`, every path the
+     work directory's own below its WSL path, which `wslpath` gives once
+     per run (`core/wsl`), so nothing is copied and each configuration's
+     files stay beside the others'. Its observations are judged as any
+     configuration's, so a program printing another line on Linux is a
+     mismatch naming `linux -O0, linux -O2` as its own group. Each build
+     and run is started under `timeout` inside WSL with the same limit,
+     the job's own limit a little longer, since stopping `wsl.exe` does
+     not stop what it started there; `timeout`'s exit 124 is read as the
+     hang it reports. WSL is started first; a host where it cannot start
+     refuses the run (exit 1), never skipping the arm while reporting OK.
+     On a Linux host the option is a usage error: the other arm there is
+     wine, not taken up here. Git Bash rewrites an argument starting
+     `/home/` into a Windows path before cryogate sees it, so the Linux
+     paths reach WSL as `C:/Program Files/Git/home/...` and every Linux
+     build exits 127: start the run from PowerShell, or with
+     `MSYS_NO_PATHCONV=1`. `smith-reduce` takes the same `--linux` and
+     `--linux-stdlib` (not with `--text`), so a finding only Linux shows
+     is reduced while it persists there; both commands build the arm's
+     configurations through one function of the shared runner.
+   - (Done: `cryogate smith-diff`, `smith/difference.cryo` for the
+     decisions, `smith/run/programs.cryo` for the builds and runs both
+     commands share, and the Linux arm through `core/wsl`.)
+8. **A reducer** (CryoGate, `cryogate smith-reduce`). Shrinks a failing
+   program while the same failure reproduces, and drafts its bug file.
+   CryoSmith's part is section 6's reduction-friendliness, kept as the
+   stages grow.
+
+   *Design.* `cryogate smith-reduce --seed N --cryo <compiler>
+   [--reference <compiler>]... [--interpret] --work <directory> --out
+   <directory> [--signature S] [--smith <cryosmith>] [--stdlib <directory>]
+   [--build-limit S] [--run-limit S] [-- <generation options>...]`.
+   - **The failure kept** is a smith-diff signature (item 7): its class,
+     the configurations involved and the first code or how the child
+     ended, never a hash. `--signature` names it; without one it is the
+     signature of the seed as given, and a seed that passes is a usage
+     error. A candidate is kept only when smith-diff's verdict over it,
+     under the same configurations, has exactly that signature: a
+     candidate failing differently is not the same bug.
+   - **Every candidate is a CryoSmith program**, so it is valid, well
+     typed and terminates by construction, and a refusal or a mismatch it
+     shows is still the compiler's. The reducer never edits text: a
+     deleted line that leaves a use behind is a refusal of the reducer's
+     making, which under a refusal signature would be kept as the bug.
+   - **Unit 1: the generation knobs**, from the program's own header (the
+     features list, `functions`, `size`), each tried smallest first and
+     kept when the signature persists, the whole repeated until a round
+     changes nothing: `--functions` from 0 up to the current count;
+     `--size` over 1, 2, 3, 4, 6, 8, 12, 16 and so on below the current
+     size; then each feature of the list turned off in turn (written out
+     as the list without it; a list CryoSmith refuses is not a
+     candidate). Functions are independent of the count (section 3.5),
+     so dropping the later ones keeps the earlier ones' text. (Done:
+     `smith/reduction.cryo` and `gates/smith_reduce.cryo`.)
+   - **Unit 2: the model's own omissions**, in CryoSmith's `reduce/`
+     layer, which imports `model` alone (`cli` and `selftest` import
+     it). The generator builds the whole program; omissions then apply to
+     its model before printing, so every program tried is still one
+     CryoSmith vouches for.
+     - *What may be taken out* is what the printed program no longer
+       names (`References`, a walk of exactly what the printer prints):
+       a statement - but a function's last `return`, `main`'s end, the
+       declaration of a variable something still names, and a statement
+       appending to a dynamic array or assigning one whole (the fewest
+       elements the array is known to hold counts what it adds, and
+       every later index and pop is reduced below that); an integer or
+       `boolean` expression, replaced by `false` or `(0 as T)` (a cast,
+       so an overloaded call or an inferred type argument still reads
+       exactly `T`) - but a literal, the place an assignment writes, an
+       operand of a guarded `+`, `-`, `*`, `/`, `%`, shift or negation,
+       and what such an operand converts with a cast (a divisor
+       `(v.length() as u64)` is a guard by its length): a guard is
+       replaced inside, below its mask or its `| 1`, never by a value it
+       keeps out (section 3.1); a free, generic or own method
+       nothing calls, or a trait implementation's method with a default
+       body, which then runs instead; a trait's implementation for a
+       type when nothing outside it calls its methods, no value of the
+       type is used where the trait (or one over it) is needed, and the
+       type implements no trait over it; a trait nothing implements or
+       names but its own default bodies; a struct, generic struct, enum,
+       generic enum or owned struct no type names; a declared enum's
+       variant nothing builds or names in a nested pattern, other than
+       its first (its arms go with it); a declared struct's field
+       nothing reads or writes (its literals' entries go with it).
+       Taking out only removes names, so what may be taken out stays so
+       while other things go: any set of the candidates listed may be
+       applied in the order listed, and one an earlier one took with it
+       (an expression inside a statement taken out) is left alone.
+     - *Paths*: a letter and an arena index (`model/omissions.cryo`):
+       `s` statement, `e` expression, `f` function, `i<T>r<N>` /
+       `i<T>n<N>` trait `T`'s implementation for struct or enum `N`, `t`
+       trait, `r` struct, `b` generic struct, `k` field, `n` enum, `g`
+       generic enum, `v` variant, `d` owned struct. The same seed and
+       options give the same arenas, so the list reproduces the program;
+       the header records it after the options, ` omit s3,e10,f2`.
+     - *Command line*: `--omissions FILE`, a generation option of
+       `generate` and `batch`, applies the paths FILE lists (separated by
+       commas, spaces or line ends) in order; one that names nothing, or
+       something still needed, is a usage error. It is the one file a
+       command reads, and the command line names it, so the same
+       arguments still give the same text (section 3.5). `cryosmith
+       omissions --seed N [generation options] [--out FILE]` lists what
+       may be taken out now, a path per line: statements, expressions
+       in printed order, then functions, implementations, traits,
+       structs, generic structs, enums, generic enums, owned structs,
+       variants and fields.
+     - *Self-test*: the omission check takes every candidate of each
+       class out of four programs in turn and finds each taken, the
+       static audit still passing, the header's list rebuilding the
+       program byte for byte, and `main` and its end refused. Taken
+       outermost first, an operator goes whole before its operand is
+       reached, so it also replaces six smaller programs' expressions
+       innermost first, auditing the text every four: a guard replaced
+       is printed while its operator stands.
+     - *The reducer* (CryoGate), once the knobs are reduced: lists the
+       candidates, and tries each class in turn - statements, then
+       expressions, then items - all of a class at once, then each half
+       of a set that does not keep the signature, down to one at a time;
+       until a round keeps nothing. The list goes to CryoSmith as a file
+       in the work directory (it outgrows a command line), and the
+       reduced program's list to `--out` beside it,
+       `smith-<seed>-omissions.txt`, which the drafted command names.
+     - Not yet: a generic function made concrete at its one type
+       argument (generic parameters removed), which needs the model to
+       substitute `T` through a body.
+   - **Output**, in `--out`: the reduced program `smith-<seed>-reduced.cryo`
+     (its header names the options that rebuild it), and
+     `bug-draft-<seed>.md`, a bug file drafted for review and never
+     committed: the title from the class, the signature, each
+     configuration's observation, the seed, the generation options before
+     and after, the line counts before and after, the reduced source and
+     the command that reproduces it. The report prints each step kept and
+     ends `smith-reduce: OK (<lines before> -> <lines after> lines, <steps>
+     steps kept, signature <S>)`; exit 0, 1 when the seed does not fail or
+     the reduction could not run, 2 on a usage error.
+9. **A crash fuzzer.** Near-valid programs: CryoSmith's `--plant` grows
+   into mutations of a valid program (a deleted line, a swapped operand,
+   a wrong type), each expected to be refused with a diagnostic, never to
+   crash the compiler. CryoGate builds them and reports a crash, a hang or
+   an internal error, not a refusal.
+
+   *Design.*
+   - **Mutations are CryoSmith's**, applied to a valid program's printed
+     text after any omissions (`cryosmith generate ... --mutation M`, and
+     `batch` likewise): `M` seeds a stream of its own, which picks one
+     operator and one site among those the text offers, so a seed, its
+     options and `M` reproduce the file. The header records it,
+     ` mutation <M> <operator> <site>`. CryoSmith still runs no compiler.
+   - **Operators**, each a near-valid shape a compiler must refuse with a
+     diagnostic (or may accept, when the edit happens to leave a valid
+     program): `delete-token` and `duplicate-token` (a token of the body,
+     split on spaces and punctuation); `drop-brace` and `extra-brace` (a
+     `}` deleted, a `{` added at a line's end); `swap-type` (a declared
+     local's type replaced by the next of the distinct types the
+     program's declarations name, in the order they first appear);
+     `drop-annotation` (`const v: T = ..` written `const v = ..`);
+     `drop-argument` and `extra-argument` (a call given one argument
+     fewer, or its last twice); `swap-arguments` (a call's first two
+     arguments exchanged, where their texts differ). The printer's shape
+     - one statement per line, every operation parenthesised, every
+     local's type written - is what lets an operator find its sites in
+     the text exactly, and lets the declarations stand for the model's
+     types: `swap-type` needs no more than the types written there, and
+     `swap-arguments` exchanging two arguments of one type leaves a valid
+     program, which is accepted and is no finding. The operators are
+     drawn among in the order the list above gives them, so adding one
+     changes which mutation a number draws: a new generator version.
+   - **Edits the compiler must refuse.** Most edits may leave a valid
+     program, so an acceptance is no finding by itself; an edit that
+     cannot is marked, and its acceptance is one. Three operators mark:
+     `drop-argument` and `extra-argument` at a call of a name declared
+     exactly once in the program (a line beginning `function name`,
+     `static name`, `name(&this`, `name(mut &this`, `name(this` or
+     `name<`), since that one declaration takes exactly the arguments
+     the generator wrote - an overloaded name, a trait's method and its
+     implementations, or a method name on several types stays unmarked,
+     and so does a site where the name begins its line's code, a
+     declaration's parameter list or a call statement; `duplicate-token`
+     for a number, a bracket or a generated name (letters, then digits)
+     outside a string literal, since two numbers or names never stand
+     side by side and a doubled bracket unbalances. The mark is not in
+     the program text, so marking changes no generated program and needs
+     no new generator version: `cryosmith batch` writes
+     `smith-<seed>.must-refuse` beside a marked program (and removes a
+     stale one), and smith-crash reads it.
+   - **`escape-borrow` belongs to the memory-safety plan** (a function
+     returning `&D<N>` made to return a borrow of a local of its own, or
+     a reference parameter's borrow given on after the value moved). It
+     cannot be a text edit: a function returning a borrow has, in the
+     generated programs, no local of the borrowed type to escape and
+     nothing in its text that builds one, so the mutation is the
+     generator's, printing such a function with the escape in it. And
+     until the memory-safety plan's checker is on `main` the compiler
+     accepts an escaping borrow, so every such program would be counted
+     accepted and could find nothing. It comes with that checker, when a
+     refusal with its code is the expected outcome and anything else -
+     acceptance included - is a finding of its own. It is built there,
+     and this item is complete without it.
+   - **The gate**, `cryogate smith-crash --cryo <compiler> --work
+     <directory> [--first-seed N] [--count K] [--mutations J] [--jobs N]
+     [--build-limit S] [-- <generation options>...]`: J mutations of each
+     of K seeds' programs, each built once (`--opt-level=0`) under the
+     build limit. Its observation is smith-diff's (item 7), judged
+     differently: a refusal with an error code and an acceptance are
+     both fine; a compile crash, a compile hang, an internal error
+     (`E09xx`), a refusal printing no error code, and an acceptance of a
+     marked edit (`acceptance [<operator>]`) are findings. The
+     signature is the class, the operator and the first code or how the
+     compiler ended, so one defect reached through many seeds is one
+     finding; an internal error's code is followed by its diagnostic's
+     headline, every backquoted name in it written `` `_` `` and cut at
+     its first ` (`, and the first reason LLVM reports, since every
+     internal error shares its code (`E0900`) and the code alone would
+     make one finding - and to the reducer one failure - of any two; the report prints each finding once with its count and
+     first seed, then `smith-crash: OK (P programs, R refused, A
+     accepted)` or `smith-crash: FAIL (F findings in P programs: ...)`.
+   - **Reduction**: for a crash, a hang or an internal error the reducer
+     may edit the text itself - any input that makes the compiler crash
+     is the defect, valid or not, and the signature keeps a different
+     crash apart - so `smith-reduce --text` deletes blocks (a line opening
+     braces through the line closing them: a function, an implementation,
+     a statement's body), then lines, then tokens, halves first and down
+     to one at a time, keeping each deletion that keeps the signature,
+     from the mutated program. Blocks go first because a crash past the
+     parser needs a program that still parses, and almost every single
+     line or token deleted from a generated program leaves one that does
+     not. A refusal is never
+     reduced this way: a deletion's own refusal would read as the bug.
+     Nor is an acceptance: a deletion can make a marked program valid, so
+     a trial carries no mark.
+     The seed's program is generated from the options given, `--mutation`
+     among them, and every trial is judged as smith-crash judges a build
+     (the compiler under test at `-O0`, smith-crash's signature), so
+     `--text` takes no `--reference` or `--interpret`. A token is a name
+     or a number whole, or one other byte that is not whitespace; the
+     header line is never deleted, so the reduced file still names its
+     seed, options and mutation, and the drafted bug file says the
+     reduction deleted text. The order a set of candidates is tried in
+     (`Halving`) is the one the omission classes use.
+   - **Unit 1**: the text operators (`delete-token`, `duplicate-token`,
+     `drop-brace`, `extra-brace`, `drop-annotation`, `drop-argument`,
+     `extra-argument`) and `smith-crash`; a planted compiler crash on one
+     malformed shape found and reduced is the proof, then a live run over
+     a bounded seed range with every finding filed. (Built: the seven
+     text operators in `mutate/`, their self-test check, `smith-crash`
+     and its decisions in `smith/crash.cryo`, `smith-reduce --text`.)
+   - **Unit 2**: `swap-type` and `swap-arguments`, as text edits over
+     the declarations and the calls `drop-argument` already reads
+     (built, generator version 42). `escape-borrow` is the memory-safety
+     plan's, as above.
+10. **A fuzz farm** (done: `cryogate smith-farm`). Overnight batches of
+    the differential driver and the crash fuzzer over consecutive seeds,
+    each finding deduplicated by its signature, each new one reduced once,
+    and a report written.
+
+    `cryogate smith-farm --cryo <compiler> [--reference <compiler>]...
+    [--interpret] [--linux <compiler> [--linux-stdlib <directory>]]
+    --work <directory> --findings <directory> --seeds A..B [--hours H]
+    [--mutations J] [--jobs N] [--smith <cryosmith>] [--stdlib
+    <directory>] [--build-limit S] [--run-limit S] [--reduce-limit S] [--
+    <generation options>...]`. One host; a farm of several machines is
+    after 1.0 and not designed here.
+    - **Batches are the commands themselves.** The seeds A to B are taken
+      in batches of four times `--jobs` (default: a quarter of the
+      scheduler's CPU count, as the test-infrastructure decisions in
+      `docs/roadmap.md` set the farm's share). Each batch is one `cryogate smith-diff` run over its seeds
+      and, with `--mutations J`, one `cryogate smith-crash` run over a
+      batch of its own, each a child of the farm's cryogate, so a batch
+      judges exactly as the command does and a child that dies takes no
+      farm with it. The farm reads each child's report
+      (`BatchReport`): smith-diff prints a failing program's signature
+      on a line of its own, `      signature <signature>`, after its
+      `FAIL` line, and smith-crash prints it on the `FAIL` line. A report
+      that does not judge every seed of its batch (a child that stopped
+      early) stops the farm, logging nothing of that batch. A batch is a
+      range of consecutive seeds (`FarmLog::next_batch`), so a resumed
+      farm's first batch may be shorter.
+    - **The farm never blocks a heavy run.** It never takes the heavy-run
+      lock: before each batch, while someone holds it, the farm waits a
+      minute and looks again, and a stale lock stops it. A heavy run
+      started during a batch runs beside it, the commit ceiling guarding
+      the host.
+    - **Memory.** Before each batch the farm reads the host's commit, the
+      memory promised to every process (`SystemMemory::committed_bytes`:
+      Windows' commit charge, Linux's `Committed_AS`), and
+      `MemoryBudget` decides the job count from `<findings>/farm-host`,
+      the host's settings, `ceiling`, `hard-limit`, `per-job` and `cap`,
+      each a size in MiB or GiB: as many jobs as the room under the
+      ceiling holds and the cap on the farm's own memory allows, at most
+      `--jobs`; with room for none the farm waits a minute and asks
+      again, and at the hard limit it stops, saying so. A farm with no
+      host file refuses to start; the settings are the host's, never code
+      per machine. On the maintainer's machine the ceiling is the 52 GiB
+      line heavy work holds above, and the cap the decisions' 6 GB.
+    - **The window.** With `--hours H` no batch starts once H hours have
+      passed; a batch is never cut short. The overnight window, 01:00 to
+      07:00, is a farm started at 01:00 with `--hours 6`: the farm keeps
+      no clock of its own, so whatever starts it (a scheduled task) sets
+      the window.
+    - **Making way for the person at the machine.** Before each batch,
+      after the memory and the lock, the farm waits a minute and looks
+      again while a full-screen application is in front or the user is
+      presenting (the shell's own answer, `SHQueryUserNotificationState`,
+      on Windows; a locked screen is neither, so a night run goes on), or
+      while a process runs whose command line matches a `pause-while
+      <pattern>` line of the host file (`pgrep -f`, an extended regular
+      expression). On Windows the processes looked at are WSL's, since the
+      long jobs the farm makes way for run there (the maintainer's host
+      file names `soloapps-train|images.py`), and WSL is asked only while
+      `wsl.exe --list --running` says a distribution runs, so the farm
+      never starts it. When pgrep cannot answer, the farm stops rather
+      than run over a job it cannot see. Each wait is in the report.
+    - **Resumable.** `<findings>/farm.log` gets a line per judgement as
+      each batch ends, `seed <N> <kind> <verdict>`: the kind `diff` or
+      `crash`; the verdict `ok`, `known <bug>` for a seed
+      `tests/smith-known-bugs` lists, or the finding's signature, a crash
+      finding's after `mutation <M>`. A farm started again over the same
+      findings directory takes only the seeds the log has not judged by
+      that kind, so a stop loses at most the batch in progress. A log line
+      the farm cannot read refuses the run: resuming from a misread log
+      judges seeds twice or never.
+    - **The known list is one hand-kept list.** `tests/smith-known-bugs`
+      holds, beside its seed entries, `bug <number> signature
+      <signature>` entries (`KnownBugs::bug_with_signature`), since a
+      signature recurs across seeds and generator versions where a seed
+      entry names one program. The farm counts a finding with a listed
+      signature as that bug; corpus-check, smith-diff and verify's
+      `smith` gate read only the seed entries. An entry goes when its bug
+      is fixed, as a seed entry does.
+    - **Reductions.** Every other finding smith-reduce can shrink (any
+      class but `uncompared`, and `acceptance`, since a deletion can make
+      a program the compiler must refuse valid) is reduced once, by a
+      `cryogate
+      smith-reduce` child (`--text` for a crash finding, which judges at
+      `-O0` with the compiler under test alone) under `--reduce-limit`
+      seconds (default 3600), into `<findings>/<the first sixteen hex
+      digits of the signature's SHA-256>/`: the reduced program, the
+      drafted bug file, `finding` (the signature, the seed and the options
+      with the mutation) and `reduction` (how the reduction ended), written
+      last. A reduction builds one trial at a time, after the batch. A
+      folder holding `reduction` is never
+      reduced again; a farm stopped during a reduction leaves none, and
+      the next farm over the directory reduces it before its first batch.
+    - **Findings are drafted, never filed or committed.** A person reads
+      each draft, files the bug in the bug log with its repro, and adds
+      its signature entry to `tests/smith-known-bugs`; the test that
+      keeps a fixed bug fixed is written by the fix's own session. The
+      number of drafts a night is not capped: the decisions' limit of five
+      automatically filed bugs a night is a limit on filings, and a draft
+      is not one.
+    - **Report.** `<findings>/farm-report.md` is written again as each
+      batch or reduction starts, after each batch and at each wait. It
+      opens with what the farm is doing now, so a glance answers whether
+      it is working: running (the batch's kind, seeds and jobs, or the
+      signature being reduced), paused and why, stopped and why, or
+      finished; the findings so far (signatures, judgements, new this
+      run); and when it was written. The farm never opens a window: the
+      report is how a person sees it. Then come the setting, the coverage (seeds judged
+      by each kind, this run's mutated programs refused and accepted, the
+      seeds each listed bug explained, the programs of each finding
+      class), the findings new this run, every finding with its count,
+      first seed and its bug or reduction, this run's batches with their
+      jobs, time and findings, and every wait (for memory, a heavy run,
+      or what the farm makes way for) and stop. The
+      children's reports carry no build count per configuration,
+      mutation count per operator or refusal count per code, so the
+      report has none.
+    - Exit 0 when the run met no finding the known list does not name, 1
+      on a new finding or a stop short, 2 on a usage error.
+11. **A corpus gate in `make verify`** (done: verify's `smith` gate). A
+    small fixed set of seeds at a pinned generator version, checked as
+    `corpus-check` checks them, run by verify beside its other gates; a
+    seed that fails is a compiler finding, and a new generator version
+    re-pins the set. `tests/smith-corpus` holds the generator version,
+    the generation options and seeds 1 to 24, each with the hash line its
+    program prints; `cryogate corpus-check --expect tests/smith-corpus`
+    builds each at `-O0` and `-O2` with the compiler under test and
+    requires both to print the pinned line, so a miscompile both levels
+    share is caught too, which the two levels' agreement alone cannot see.
+    A program's hash is fixed by its text, so the pinned line is the
+    program's meaning, not any compiler's output. The gate refuses to run
+    a cryosmith of another generator version; `make smith-corpus-pin`
+    (`corpus-check --pin`) re-pins the file, from a run in which every
+    program passed. Once the memory-safety plan's checker is on `main`,
+    the corpus is also run under it as a gate: every generated program
+    must pass it unchanged, with no `unsafe`, since the generator promises
+    validity under that plan's rules as well as today's. The gate also
+    evaluates each program with the interpreter (item 12, `--interpret`)
+    and requires the pinned line there too; a seed the interpreter does
+    not cover fails the gate, and fails a re-pin, rather than being
+    skipped, so the pinned set stays wholly interpreted.
+12. **The reference interpreter.** `cryo interpret`, a module of the
+    compiler that runs the typed program the front end leaves - not
+    CryoSmith's own model, which would check the generator against itself
+    - by the language reference, with an explicit memory model and its own
+    account of moves and drops: an oracle that does not share code
+    generation's mistakes. It is one more configuration on the runner
+    smith-diff and corpus-check share (`Configuration::interpreted`):
+    `cryogate corpus-check --interpret` and `smith-diff --interpret`
+    compare its hash with the compiled programs', and a program it does
+    not cover (exit 71, the construct named) is left out of the
+    comparison, never counted as agreeing. Its design, its coverage by
+    stage and the comparison are in INTERPRETER.md.
+
+**Merging the interpreter's branch into this one.** The interpreter was
+built on its own branch, `cryosmith-interp`, which took this branch's
+commits by merging them in. It joins this branch by the same route the
+other way:
+
+1. On the interpreter's branch, merge this branch's tip. The conflicts are
+   additive: both branches add lines at the end of
+   `tests/started-compiling` (keep both); `corpus_check.cryo` gains
+   `--interpret` on one side and the shared runner with `--expect`/`--pin`
+   on the other, and the interpretation becomes a configuration on that
+   runner, judged after the builds' line (and a pinned seed's line) is
+   settled, so a run without `--interpret` reports the same bytes as
+   before; CryoGate's `tests/smith.cryo` gains tests on both sides (keep
+   both, imports joined); and item 11 above is this branch's text while
+   item 12 is the interpreter branch's. The move check
+   (`passes/move_check.cryo`) merges without a conflict but is changed on
+   both sides, so it is read again after the merge.
+2. The merged tree passes the full batch against this branch's tip as the
+   baseline: verify with `--require-identical` (the census, the smith gate
+   on `tests/smith-corpus`, and the objects, each moved one already
+   declared by the commit that moved it), `warnings-check` with its
+   planted control, the selfhost check on both arms, and
+   `corpus-check --interpret` on the 200 default seeds with every seed
+   interpreted and agreeing or a known compiler bug.
+3. This branch fast-forwards to the merged commit, and `cryosmith-interp`
+   is retired. (Done.)
+4. Item 11's gate then interprets its pinned corpus as well: verify's
+   `smith` gate runs `corpus-check --expect tests/smith-corpus
+   --interpret`, so each pinned program must print its pinned line when
+   interpreted too, and a seed the interpreter does not cover fails the
+   gate rather than being skipped. The change lands with a CryoGate test
+   and a mutation (an interpreter that changes one rule fails the gate).
+   (Done.)
+5. The generator's keep-off ("Kept off", section 2: a `match` arm
+   assigning its subject inside a generic body) is lifted: its fix, a
+   `Copy` payload binding copied into a slot of its own in a generic
+   function's copy, is on the interpreter's branch and arrives with the
+   merge. Lifting it changes what the generator writes, so it is a new
+   generator version and re-pins `tests/smith-corpus` in the same commit.
+   (Done: generator version 40.)

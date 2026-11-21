@@ -1,14 +1,99 @@
-///! The corpus check's judgements over CryoSmith's output contract.
+///! The corpus check's judgements over CryoSmith's output contract,
+///! smith-diff's observations and verdicts, and the verdict of CryoSmith's
+///! self-test run in parts.
 ![config(testing)]
 namespace cryogate::tests::smith;
 
+import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::core::option::{ Option };
 import std::core::result::{ Result };
+import std::fs::path::{ Path, PathBuf };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect };
 
-import cryogate::smith::corpus::{ CorpusJudge };
+
+import cryogate::core::child::{ Outcome };
+import cryogate::smith::corpus::{ CorpusJudge, CorpusLayout };
+import cryogate::core::text::{ Text };
+import cryogate::smith::difference::{ Configuration, FindingClass, Interpretation, Observation, SmithDecision, SmithFinding, SmithVerdict };
+import cryogate::smith::reduction::{ BugDraft, ProgramHeader };
+import cryogate::smith::known::{ KnownBugMatch, KnownBugs };
+import cryogate::smith::pinned::{ PinnedCorpus };
+import cryogate::smith::selftest::{ PartReport, SelfTestParts };
+
+/// Two parts' reports: part 0 ran `first` units, part 1 `second`, of `total`.
+function two_parts(first: i64, second: i64, total: i64, checks: Str) -> Array<PartReport> {
+    mut reports: Array<PartReport> = Array::<PartReport>::new();
+    reports.push(PartReport::new(0, f"cryosmith selftest: part 0/2 ran {first} of {total} units\ncryosmith selftest: OK (7 checks)\n".as_str(), Str::new("")));
+    reports.push(PartReport::new(1, f"cryosmith selftest: part 1/2 ran {second} of {total} units\n{checks}\n".as_str(), Str::new("")));
+    return reports;
+}
+
+![test]
+function parts_covering_every_unit_once_pass_with_their_checks_summed() -> Result<(), TestError> {
+    const verdict: Result<String, String> = SelfTestParts::verdict(&two_parts(3, 2, 5, Str::new("cryosmith selftest: OK (5 checks)")));
+    return expect(verdict.is_ok() && verdict.unwrap() == String::from_str(Str::new("cryosmith selftest: OK (12 checks)")), Str::new("the whole run's line"));
+}
+
+![test]
+function parts_missing_a_unit_are_no_whole_run() -> Result<(), TestError> {
+    const verdict: Result<String, String> = SelfTestParts::verdict(&two_parts(3, 1, 5, Str::new("cryosmith selftest: OK (5 checks)")));
+    return expect(verdict.is_err() && verdict.unwrap_err() == String::from_str(Str::new("the parts ran 4 of 5 units")), Str::new("a unit no part ran"));
+}
+
+![test]
+function parts_counting_different_totals_are_no_whole_run() -> Result<(), TestError> {
+    mut reports: Array<PartReport> = two_parts(3, 2, 5, Str::new("cryosmith selftest: OK (5 checks)"));
+    reports.push(PartReport::new(2, Str::new("cryosmith selftest: part 2/3 ran 0 of 6 units\ncryosmith selftest: OK (0 checks)\n"), Str::new("")));
+    const verdict: Result<String, String> = SelfTestParts::verdict(&reports);
+    return expect(verdict.is_err() && verdict.unwrap_err() == String::from_str(Str::new("part 2 counted 6 units, part 0 counted 5")), Str::new("totals disagree"));
+}
+
+![test]
+function a_failed_part_fails_the_whole_run_with_every_check_counted() -> Result<(), TestError> {
+    mut reports: Array<PartReport> = Array::<PartReport>::new();
+    reports.push(PartReport::new(0, Str::new("cryosmith selftest: part 0/2 ran 3 of 5 units\ncryosmith selftest: OK (7 checks)\n"), Str::new("")));
+    reports.push(PartReport::new(1, Str::new("cryosmith selftest: part 1/2 ran 2 of 5 units\n"), Str::new("cryosmith selftest: FAIL seed 4: no\ncryosmith selftest: FAIL (1 of 5 checks)\n")));
+    const verdict: Result<String, String> = SelfTestParts::verdict(&reports);
+    return expect(verdict.is_ok() && verdict.unwrap() == String::from_str(Str::new("cryosmith selftest: FAIL (1 of 12 checks)")), Str::new("the whole run's failure line"));
+}
+
+![test]
+function a_part_that_printed_no_part_line_is_no_whole_run() -> Result<(), TestError> {
+    mut reports: Array<PartReport> = Array::<PartReport>::new();
+    reports.push(PartReport::new(0, Str::new("cryosmith selftest: OK (7 checks)\n"), Str::new("")));
+    const verdict: Result<String, String> = SelfTestParts::verdict(&reports);
+    return expect(verdict.is_err() && verdict.unwrap_err() == String::from_str(Str::new("part 0 printed no part line")), Str::new("a crashed or old part"));
+}
+
+![test]
+function every_build_of_a_corpus_has_a_build_directory_of_its_own() -> Result<(), TestError> {
+    const layout: CorpusLayout = CorpusLayout::new(Path::from(Str::new("work")));
+    const configurations: Array<Configuration> = four_compiled();
+    mut seen: Array<String> = Array::<String>::new();
+    mut seed: u64 = 1;
+    while (seed <= 12) {
+        for (configuration in configurations.iterate_references()) {
+            const directory: String = String::from_str(layout.build_directory(seed, configuration.key.as_str()).as_path().as_str());
+            expect(!seen.contains(&directory), directory.as_str())?;
+            seen.push(directory);
+        }
+        seed = seed + 1;
+    }
+    return expect(seen.length() == 48, Str::new("four builds a seed"));
+}
+
+![test]
+function a_build_writes_its_executable_outside_its_build_directory() -> Result<(), TestError> {
+    const layout: CorpusLayout = CorpusLayout::new(Path::from(Str::new("work")));
+    const executable: PathBuf = layout.executable(7, Str::new("O2"));
+    const directory: PathBuf = layout.build_directory(7, Str::new("O2"));
+    expect(executable.as_path().as_str() == Str::new("work/smith-7-O2.exe"), executable.as_path().as_str())?;
+    expect(layout.source(7).as_path().as_str() == Str::new("work/smith-7.cryo"), Str::new("the program CryoSmith wrote"))?;
+    return expect(!executable.as_path().as_str().starts_with(&directory.as_path().as_str()), directory.as_path().as_str());
+}
 
 ![test]
 function a_program_must_print_exactly_one_hash_line() -> Result<(), TestError> {
@@ -26,8 +111,431 @@ function the_two_builds_must_print_the_same_line() -> Result<(), TestError> {
     return expect(differ.is_err() && differ.unwrap_err() == String::from_str(Str::new("-O0 printed `cryosmith-hash 1`, -O2 printed `cryosmith-hash 2`")), Str::new("named"));
 }
 
+/// What corpus-check makes of an interpretation that ended with `outcome`,
+/// writing `errors` and printing `output`, of a program whose builds printed
+/// `cryosmith-hash 42`; `why` stands for its attempt's reason.  `pinned`
+/// when the program is one of a pinned corpus.
+private function interpreted(outcome: Outcome, errors: Str, output: Str, pinned: boolean) -> Interpretation {
+    const observation: Observation = Observation::of_interpretation(&outcome, errors, output);
+    return Interpretation::of(&observation, Str::new("cryosmith-hash 42"), Str::new("why"), pinned);
+}
+
+/// Whether `seen` is a failure whose reason is `reason`.
+private function fails_with(seen: Interpretation, reason: Str) -> boolean {
+    return match (seen) {
+        Interpretation::Fails(text) => { text.as_str() == reason }
+        _                           => { false }
+    };
+}
+
+![test]
+function the_interpreter_agrees_only_by_printing_the_builds_line_and_exiting_zero() -> Result<(), TestError> {
+    const agrees: boolean = match (interpreted(Outcome::Exited(0), Str::new(""), Str::new("cryosmith-hash 42\n"), false)) {
+        Interpretation::Agrees => { true }
+        _                      => { false }
+    };
+    expect(agrees, Str::new("the same line, exit 0"))?;
+    expect(fails_with(interpreted(Outcome::Exited(0), Str::new(""), Str::new("cryosmith-hash 43\n"), false),
+        Str::new("the builds printed `cryosmith-hash 42`, the interpreter printed `cryosmith-hash 43`")), Str::new("another hash"))?;
+    expect(fails_with(interpreted(Outcome::Exited(70), Str::new("interpret: violation: a read of a value that was moved out at p.cryo:3:5\n"), Str::new("cryosmith-hash 42\n"), false),
+        Str::new("why")), Str::new("a violation fails even beside the right line"))?;
+    expect(fails_with(interpreted(Outcome::Exited(101), Str::new(""), Str::new(""), false), Str::new("why")), Str::new("a panic"))?;
+    expect(fails_with(interpreted(Outcome::Exited(0), Str::new(""), Str::new("hello\n"), false), Str::new("why")), Str::new("no hash line"))?;
+    return expect(fails_with(interpreted(Outcome::TimedOut, Str::new(""), Str::new(""), false), Str::new("why")), Str::new("no exit"));
+}
+
+![test]
+function a_program_the_interpreter_does_not_cover_is_named_and_never_agrees() -> Result<(), TestError> {
+    const named: boolean = match (interpreted(Outcome::Exited(Observation::NOT_COVERED), Str::new("interpret: not covered: a closure at p.cryo:9:13\n"), Str::new(""), false)) {
+        Interpretation::NotCovered(construct) => { construct.as_str() == Str::new("a closure at p.cryo:9:13") }
+        _                                     => { false }
+    };
+    expect(named, Str::new("the construct named"))?;
+    return expect(fails_with(interpreted(Outcome::Exited(Observation::NOT_COVERED), Str::new(""), Str::new(""), false), Str::new("why")),
+        Str::new("an unnamed 71 fails"));
+}
+
+![test]
+function a_pinned_program_the_interpreter_does_not_cover_fails() -> Result<(), TestError> {
+    expect(fails_with(interpreted(Outcome::Exited(Observation::NOT_COVERED), Str::new("interpret: not covered: a closure at p.cryo:9:13\n"), Str::new(""), true),
+        Str::new("the interpreter does not cover a closure at p.cryo:9:13, and a pinned program must be interpreted")), Str::new("not covered fails"))?;
+    const agrees: boolean = match (interpreted(Outcome::Exited(0), Str::new(""), Str::new("cryosmith-hash 42\n"), true)) {
+        Interpretation::Agrees => { true }
+        _                      => { false }
+    };
+    return expect(agrees, Str::new("a pinned program still agrees by printing the builds' line"));
+}
+
+/// A pinned corpus of seeds 4 to 6 at generator version 39.
+function three_seeds() -> Str {
+    return Str::new("# pinned\ngenerator 39\noptions --features default\nseed 4 cryosmith-hash 11\n\nseed 5 cryosmith-hash 12\nseed 6 cryosmith-hash 13\n");
+}
+
+![test]
+function a_pinned_corpus_reads_its_version_options_and_each_seeds_hash() -> Result<(), TestError> {
+    const parsed: Result<PinnedCorpus, String> = PinnedCorpus::parse(three_seeds());
+    expect(parsed.is_ok(), Str::new("the file reads"))?;
+    const corpus: PinnedCorpus = parsed.unwrap();
+    expect(corpus.generator == 39 && corpus.first_seed == 4 && corpus.count() == 3, Str::new("version, first seed and count"))?;
+    expect(corpus.options.length() == 2 && corpus.options[1] == String::from_str(Str::new("default")), Str::new("the options' words"))?;
+    expect(corpus.mismatch(5, Str::new("cryosmith-hash 12")).is_none(), Str::new("seed 5's pinned line"))?;
+    const differs: Option<String> = corpus.mismatch(5, Str::new("cryosmith-hash 13"));
+    expect(differs.is_some() && differs.unwrap() == String::from_str(Str::new("printed `cryosmith-hash 13`, pinned `cryosmith-hash 12`")), Str::new("another line refused"))?;
+    expect(corpus.mismatch(3, Str::new("cryosmith-hash 11")).is_some(), Str::new("a seed before the first"))?;
+    return expect(corpus.mismatch(7, Str::new("cryosmith-hash 11")).is_some(), Str::new("a seed past the last"));
+}
+
+![test]
+function a_pinned_corpus_is_written_as_it_reads() -> Result<(), TestError> {
+    const corpus: PinnedCorpus = PinnedCorpus::parse(three_seeds()).unwrap();
+    const again: Result<PinnedCorpus, String> = PinnedCorpus::parse(corpus.text().as_str());
+    expect(again.is_ok(), Str::new("the written file reads"))?;
+    const reread: PinnedCorpus = again.unwrap();
+    expect(reread.text() == corpus.text(), Str::new("the same text twice"))?;
+    expect(reread.mismatch(6, Str::new("cryosmith-hash 13")).is_none(), Str::new("the last seed kept"))?;
+    const bare: PinnedCorpus = PinnedCorpus { generator: 1, options: Array::<String>::new(), first_seed: 1, hashes: corpus.hashes.clone() };
+    const bare_again: Result<PinnedCorpus, String> = PinnedCorpus::parse(bare.text().as_str());
+    return expect(bare_again.is_ok() && bare_again.unwrap().options.is_empty(), Str::new("no generation options"));
+}
+
+![test]
+function a_pinned_corpus_refuses_a_gap_a_repeat_and_a_missing_header() -> Result<(), TestError> {
+    const gap: Result<PinnedCorpus, String> = PinnedCorpus::parse(Str::new("generator 39\noptions\nseed 4 cryosmith-hash 1\nseed 6 cryosmith-hash 2\n"));
+    expect(gap.is_err() && gap.unwrap_err() == String::from_str(Str::new("line 4: seed 6 where seed 5 comes next")), Str::new("a gap"))?;
+    const repeat: Result<PinnedCorpus, String> = PinnedCorpus::parse(Str::new("generator 39\noptions\nseed 4 cryosmith-hash 1\nseed 4 cryosmith-hash 1\n"));
+    expect(repeat.is_err(), Str::new("a seed twice"))?;
+    expect(PinnedCorpus::parse(Str::new("options\nseed 1 cryosmith-hash 1\n")).is_err(), Str::new("no generator line"))?;
+    expect(PinnedCorpus::parse(Str::new("generator 39\nseed 1 cryosmith-hash 1\n")).is_err(), Str::new("no options line"))?;
+    expect(PinnedCorpus::parse(Str::new("generator 39\noptions\n")).is_err(), Str::new("no seed"))?;
+    return expect(PinnedCorpus::parse(Str::new("generator 39\noptions\nseed 1 hash 1\n")).is_err(), Str::new("not a hash line"));
+}
+
+![test]
+function a_pinned_corpus_is_checked_by_the_generator_it_was_pinned_at() -> Result<(), TestError> {
+    const corpus: PinnedCorpus = PinnedCorpus::parse(three_seeds()).unwrap();
+    expect(corpus.version_problem(Str::new("cryosmith 39\n")).is_none(), Str::new("the pinned version"))?;
+    const newer: Option<String> = corpus.version_problem(Str::new("cryosmith 40\n"));
+    expect(newer.is_some() && newer.unwrap() == String::from_str(Str::new("cryosmith is generator version 40 and the corpus was pinned at version 39: re-pin it with `make smith-corpus-pin`")), Str::new("another version"))?;
+    return expect(corpus.version_problem(Str::new("")).is_some(), Str::new("no version printed"));
+}
+
 ![test]
 function a_failed_build_quotes_six_non_blank_lines_errors_first() -> Result<(), TestError> {
     const quoted: String = CorpusJudge::first_lines(Str::new("e1\n\n  e2  \n"), Str::new("o1\no2\no3\no4\no5\n"));
     return expect(quoted == String::from_str(Str::new(" | e1 | e2 | o1 | o2 | o3 | o4")), quoted.as_str());
+}
+
+/// A header of version 39, seed 16, three features, 5 functions, size 24.
+private function sample_header() -> Str {
+    return Str::new("// cryosmith 39 seed 16 features booleans,structs,maps functions 5 size 24\nfunction main() -> i32 { return 0; }\n");
+}
+
+![test]
+function a_header_reads_back_into_the_options_that_rebuild_it() -> Result<(), TestError> {
+    const header: ProgramHeader = ProgramHeader::parse(sample_header()).unwrap();
+    expect(header.generator == 39 && header.seed == 16 && header.functions == 5 && header.size == 24 && header.features.length() == 3, Str::new("every field"))?;
+    const options: String = Text::joined(&header.options(), Str::new(" "));
+    expect(options.as_str() == Str::new("--features booleans,structs,maps --functions 5 --size 24"), options.as_str())?;
+    expect(ProgramHeader::parse(Str::new("// cryosmith 39 seed 16\n")).is_err(), Str::new("a short header"))?;
+    expect(ProgramHeader::parse(Str::new("function main() -> i32 { return 0; }\n")).is_err(), Str::new("no header"))?;
+    return expect(ProgramHeader::parse(Str::new("// cryosmith 39 seed x features a functions 1 size 2\n")).is_err(), Str::new("a seed that is not a number"));
+}
+
+![test]
+function the_candidates_are_smaller_and_tried_smallest_first() -> Result<(), TestError> {
+    const header: ProgramHeader = ProgramHeader::parse(sample_header()).unwrap();
+    mut functions: Array<String> = Array::<String>::new();
+    for (candidate in header.fewer_functions().iterate_references()) { functions.push(f"{candidate.functions}"); }
+    expect(Text::joined(&functions, Str::new(" ")).as_str() == Str::new("0 1 2 3 4"), Text::joined(&functions, Str::new(" ")).as_str())?;
+    mut sizes: Array<String> = Array::<String>::new();
+    for (candidate in header.smaller_sizes().iterate_references()) { sizes.push(f"{candidate.size}"); }
+    expect(Text::joined(&sizes, Str::new(" ")).as_str() == Str::new("1 2 3 4 6 8 12 16"), Text::joined(&sizes, Str::new(" ")).as_str())?;
+    const without: ProgramHeader = header.without(Str::new("structs")).unwrap();
+    expect(Text::joined(&without.features, Str::new(",")).as_str() == Str::new("booleans,maps") && without.size == 24, Str::new("one feature left out"))?;
+    expect(without.change_from(&header).as_str() == Str::new("feature structs off"), without.change_from(&header).as_str())?;
+    return expect(header.without(Str::new("closures")).is_none(), Str::new("a feature it does not hold"));
+}
+
+![test]
+function a_bug_draft_names_the_signature_the_options_and_the_repro() -> Result<(), TestError> {
+    const before: ProgramHeader = ProgramHeader::parse(sample_header()).unwrap();
+    const after: ProgramHeader = before.without(Str::new("maps")).unwrap();
+    const draft: BugDraft = BugDraft {
+        kind:         String::from_str(Str::new("mismatch")),
+        signature:    String::from_str(Str::new("mismatch [tree -O0, tree -O2 | reference -O0, reference -O2]")),
+        detail:       String::from_str(Str::new("tree -O0, tree -O2 printed `cryosmith-hash 1` | reference -O0, reference -O2 printed `cryosmith-hash 2`")),
+        before:       before,
+        after:        after,
+        lines_before: 1755,
+        lines_after:  40,
+        source:       String::from_str(Str::new("function main() -> i32 { return 0; }")),
+        command:      String::from_str(Str::new("cryogate smith-diff --cryo c")),
+        by_text:      false,
+    };
+    const text: String = draft.text();
+    expect(text.as_str().starts_with(&Str::new("# mismatch found by smith-diff (seed 16)\n")), text.as_str())?;
+    expect(text.as_str().contains(&Str::new("`--features booleans,structs --functions 5 --size 24`")), Str::new("the reduced options"))?;
+    expect(text.as_str().contains(&Str::new("1755 lines to 40")), Str::new("the sizes"))?;
+    return expect(text.as_str().ends_with(&Str::new("function main() -> i32 { return 0; }\n```\n")), Str::new("the repro, fenced"));
+}
+
+/// The compiler under test and one reference, each at -O0 and -O2.
+private function four_compiled() -> Array<Configuration> {
+    mut configurations: Array<Configuration> = Array::<Configuration>::new();
+    configurations.push(Configuration::compiled(Str::new("tree"), Str::new(""), Str::new("cryo"), Str::new("0")));
+    configurations.push(Configuration::compiled(Str::new("tree"), Str::new(""), Str::new("cryo"), Str::new("2")));
+    configurations.push(Configuration::compiled(Str::new("reference 1"), Str::new("reference1"), Str::new("pin"), Str::new("0")));
+    configurations.push(Configuration::compiled(Str::new("reference 1"), Str::new("reference1"), Str::new("pin"), Str::new("2")));
+    return configurations;
+}
+
+/// `count` compiled configurations, named `c0 -O0`, `c1 -O0`, ...
+private function numbered(count: i64) -> Array<Configuration> {
+    mut configurations: Array<Configuration> = Array::<Configuration>::new();
+    mut index: i64 = 0;
+    while (index < count) {
+        configurations.push(Configuration::compiled(f"c{index}".as_str(), f"c{index}".as_str(), Str::new("cryo"), Str::new("0")));
+        index++;
+    }
+    return configurations;
+}
+
+/// The finding `verdict` holds, or why it holds none.
+private function found(verdict: SmithVerdict) -> Result<SmithFinding, TestError> {
+    return match (verdict) {
+        SmithVerdict::Found(finding) => { Result::Ok(finding) }
+        SmithVerdict::Agreed(line)   => { Result::Err(TestError::other(f"agreed on `{line.as_str()}`, not a finding".as_str())) }
+    };
+}
+
+/// An observation of the finding class ranked `rank`, before a mismatch.
+private function of_rank(rank: i64) -> Observation {
+    return match (rank) {
+        0 => { Observation::CompileCrash(String::from_str(Str::new("signal 11"))) }
+        1 => { Observation::CompileHang }
+        2 => { Observation::InternalError(String::from_str(Str::new("E0900"))) }
+        3 => { Observation::Refused(String::from_str(Str::new("E0201"))) }
+        4 => { Observation::RunCrash(String::from_str(Str::new("exit 3"))) }
+        _ => { Observation::RunHang }
+    };
+}
+
+![test]
+function a_configuration_names_its_files_apart_from_every_other() -> Result<(), TestError> {
+    const configurations: Array<Configuration> = four_compiled();
+    expect(configurations[0].key.as_str() == Str::new("O0") && configurations[1].key.as_str() == Str::new("O2"), Str::new("the compiler under test keeps corpus-check's names"))?;
+    expect(configurations[3].key.as_str() == Str::new("reference1-O2") && configurations[3].name.as_str() == Str::new("reference 1 -O2"), configurations[3].key.as_str())?;
+    const interpreted: Configuration = Configuration::interpreted(Str::new("tree"), Str::new("cryo"));
+    return expect(interpreted.level.is_none() && interpreted.name.as_str() == Str::new("tree interpreted"), interpreted.name.as_str());
+}
+
+![test]
+function a_build_is_observed_as_a_crash_a_hang_an_internal_error_or_a_refusal() -> Result<(), TestError> {
+    expect(Observation::of_build(&Outcome::Exited(0), Str::new("")).is_none(), Str::new("a build that succeeded"))?;
+    const refused: Option<Observation> = Observation::of_build(&Outcome::Exited(1), Str::new("error[E0201]: no\n --> a.cryo:1:1\nerror[E0300]: also\n"));
+    expect(refused.is_some() && refused.unwrap().detail() == String::from_str(Str::new("E0201")), Str::new("the first code"))?;
+    const broken: Option<Observation> = Observation::of_build(&Outcome::Exited(1), Str::new("error[E0201]: no\nerror[E0900]: internal\n"));
+    expect(broken.is_some() && broken.unwrap().kind().unwrap().rank() == FindingClass::InternalError.rank(), Str::new("an E09xx anywhere is internal"))?;
+    const codeless: Option<Observation> = Observation::of_build(&Outcome::Exited(1), Str::new("linking failed\n"));
+    expect(codeless.is_some() && codeless.unwrap().kind().unwrap().rank() == FindingClass::CompileCrash.rank(), Str::new("exit 1 with no diagnostic"))?;
+    const odd: Option<Observation> = Observation::of_build(&Outcome::Exited(3), Str::new("error[E0201]: no\n"));
+    expect(odd.is_some() && odd.unwrap().detail() == String::from_str(Str::new("exit 3")), Str::new("another exit code is a crash"))?;
+    const signalled: Option<Observation> = Observation::of_build(&Outcome::Signalled(11), Str::new(""));
+    expect(signalled.is_some() && signalled.unwrap().detail() == String::from_str(Str::new("signal 11")), Str::new("a signal"))?;
+    const hung: Option<Observation> = Observation::of_build(&Outcome::TimedOut, Str::new(""));
+    return expect(hung.is_some() && hung.unwrap().kind().unwrap().rank() == FindingClass::CompileHang.rank(), Str::new("past the build limit"));
+}
+
+![test]
+function an_internal_error_is_told_apart_by_its_headline_names_left_out() -> Result<(), TestError> {
+    const verifier: Str = Str::new("error[E0900]: LLVM module verification failed for Main\n====\n note: LLVM reports: GEP base pointer is not a vector\n  %fieldptr = getelementptr\n");
+    const verified: String = Observation::of_build(&Outcome::Exited(1), verifier).unwrap().detail();
+    expect(verified.as_str() == Str::new("E0900 LLVM module verification failed for Main: GEP base pointer is not a vector"), verified.as_str())?;
+    const unresolved: Str = Str::new("error[E0900]: internal: call to `new` in `h0` reached codegen with no resolved function (written at a.cryo:759)\n");
+    const resolved: String = Observation::of_build(&Outcome::Exited(1), unresolved).unwrap().detail();
+    expect(resolved.as_str() == Str::new("E0900 internal: call to `_` in `_` reached codegen with no resolved function"), resolved.as_str())?;
+    const linked: String = Observation::of_build(&Outcome::Exited(1), Str::new("error[E0900]: linker invocation failed (cc exited with 1): cc -o x\n")).unwrap().detail();
+    return expect(linked.as_str() == Str::new("E0900 linker invocation failed"), linked.as_str());
+}
+
+![test]
+function a_run_is_observed_as_its_line_a_crash_or_a_hang() -> Result<(), TestError> {
+    expect(Observation::of_run(&Outcome::Exited(0), Str::new("cryosmith-hash 9\n")).detail() == String::from_str(Str::new("cryosmith-hash 9")), Str::new("the line"))?;
+    expect(Observation::of_run(&Outcome::Exited(0), Str::new("hello\n")).detail() == String::from_str(Str::new("printed no hash line")), Str::new("another line"))?;
+    expect(Observation::of_run(&Outcome::Exited(5), Str::new("cryosmith-hash 9\n")).detail() == String::from_str(Str::new("exit 5")), Str::new("a non-zero exit"))?;
+    return expect(Observation::of_run(&Outcome::TimedOut, Str::new("")).kind().unwrap().rank() == FindingClass::RunHang.rank(), Str::new("past the run limit"));
+}
+
+![test]
+function an_interpretation_not_covering_the_program_is_named_and_no_finding() -> Result<(), TestError> {
+    const uncovered: Observation = Observation::of_interpretation(&Outcome::Exited(Observation::NOT_COVERED), Str::new("interpret: not covered: a u128 cast at p.cryo:4\n"), Str::new(""));
+    expect(uncovered.kind().is_none() && uncovered.detail() == String::from_str(Str::new("a u128 cast at p.cryo:4")), Str::new("the construct"))?;
+    const unnamed: Observation = Observation::of_interpretation(&Outcome::Exited(Observation::NOT_COVERED), Str::new("panic\n"), Str::new(""));
+    expect(unnamed.detail() == f"exit {Observation::NOT_COVERED}", Str::new("the exit without the construct named is a crash"))?;
+    return expect(Observation::of_interpretation(&Outcome::Exited(0), Str::new(""), Str::new("cryosmith-hash 9\n")).detail() == String::from_str(Str::new("cryosmith-hash 9")), Str::new("its line"));
+}
+
+![test]
+function configurations_printing_one_line_agree_and_one_not_covered_is_left_out() -> Result<(), TestError> {
+    mut configurations: Array<Configuration> = four_compiled();
+    configurations.push(Configuration::interpreted(Str::new("tree"), Str::new("cryo")));
+    mut observations: Array<Observation> = Array::<Observation>::new();
+    mut index: i64 = 0;
+    while (index < 4) { observations.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 7")))); index++; }
+    observations.push(Observation::NotCovered(String::from_str(Str::new("a map"))));
+    const verdict: SmithVerdict = SmithDecision::decide(&configurations, &observations);
+    const agreed: boolean = match (&verdict) {
+        SmithVerdict::Agreed(line) => { line.as_str() == Str::new("cryosmith-hash 7") }
+        SmithVerdict::Found(_)     => { false }
+    };
+    expect(agreed, Str::new("the line every covering configuration printed"))?;
+    mut none: Array<Observation> = Array::<Observation>::new();
+    none.push(Observation::NotCovered(String::from_str(Str::new("a map"))));
+    const uncompared: SmithFinding = found(SmithDecision::decide(&numbered(1), &none))?;
+    return expect(uncompared.kind.rank() == FindingClass::Uncompared.rank(), uncompared.detail.as_str());
+}
+
+![test]
+function a_mismatch_names_the_groups_that_agree_and_no_hash_in_its_signature() -> Result<(), TestError> {
+    mut observations: Array<Observation> = Array::<Observation>::new();
+    observations.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 1"))));
+    observations.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 1"))));
+    observations.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 2"))));
+    observations.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 2"))));
+    const finding: SmithFinding = found(SmithDecision::decide(&four_compiled(), &observations))?;
+    expect(finding.kind.rank() == FindingClass::Mismatch.rank(), finding.detail.as_str())?;
+    expect(finding.signature.as_str() == Str::new("mismatch [tree -O0, tree -O2 | reference 1 -O0, reference 1 -O2]"), finding.signature.as_str())?;
+    expect(finding.detail.as_str() == Str::new("tree -O0, tree -O2 printed `cryosmith-hash 1` | reference 1 -O0, reference 1 -O2 printed `cryosmith-hash 2`"), finding.detail.as_str())?;
+    mut levels: Array<Observation> = Array::<Observation>::new();
+    levels.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 5"))));
+    levels.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 6"))));
+    levels.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 5"))));
+    levels.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 6"))));
+    const between_levels: SmithFinding = found(SmithDecision::decide(&four_compiled(), &levels))?;
+    return expect(between_levels.signature.as_str() == Str::new("mismatch [tree -O0, reference 1 -O0 | tree -O2, reference 1 -O2]"), between_levels.signature.as_str());
+}
+
+![test]
+function each_finding_class_outranks_every_class_after_it() -> Result<(), TestError> {
+    const classes: i64 = 6;
+    mut start: i64 = 0;
+    while (start <= classes) {
+        // The classes from `start` on, last first, then two lines that differ.
+        mut observations: Array<Observation> = Array::<Observation>::new();
+        mut index: i64 = classes - 1;
+        while (index >= start) { observations.push(of_rank(index)); index--; }
+        observations.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 1"))));
+        observations.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 2"))));
+        const finding: SmithFinding = found(SmithDecision::decide(&numbered(observations.length()), &observations))?;
+        expect(finding.kind.rank() == start, finding.signature.as_str())?;
+        start++;
+    }
+    return Result::Ok(());
+}
+
+![test]
+function a_finding_names_every_configuration_of_its_class_and_the_first_detail() -> Result<(), TestError> {
+    mut observations: Array<Observation> = Array::<Observation>::new();
+    observations.push(Observation::RunCrash(String::from_str(Str::new("exit 3"))));
+    observations.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 1"))));
+    observations.push(Observation::Refused(String::from_str(Str::new("E0201"))));
+    observations.push(Observation::Refused(String::from_str(Str::new("E0300"))));
+    const refusal: SmithFinding = found(SmithDecision::decide(&four_compiled(), &observations))?;
+    expect(refusal.signature.as_str() == Str::new("refusal [reference 1 -O0, reference 1 -O2] E0201"), refusal.signature.as_str())?;
+    expect(refusal.detail.as_str() == Str::new("refusal: reference 1 -O0, reference 1 -O2: E0201"), refusal.detail.as_str())?;
+    mut hang: Array<Observation> = Array::<Observation>::new();
+    hang.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 1"))));
+    hang.push(Observation::RunHang);
+    const run_hang: SmithFinding = found(SmithDecision::decide(&numbered(2), &hang))?;
+    return expect(run_hang.signature.as_str() == Str::new("run hang [c1 -O0]"), run_hang.signature.as_str());
+}
+
+/// A known-compiler-bug list at generator version 40: seed 9 meets bug 0001
+/// with the builds printing 5 and the interpreter 6, at the default options.
+private function known_list() -> KnownBugs {
+    return KnownBugs::parse(Str::new("# known\ngenerator 40\nbug 0001 seed 9 O0 5 O2 5 interpreted 6 options\n\nbug 0002 seed 9 O0 1 O2 2 options --features default\n")).unwrap();
+}
+
+/// What the list says of seed 9 at the default options, under the
+/// configurations `of_compilers` makes of `references` compilers and the
+/// interpreter, observed printing `cryosmith-hash <word>` for each word of
+/// `hashes` in order.
+private function printing(references: i64, hashes: Str) -> KnownBugMatch {
+    mut compilers: Array<String> = Array::<String>::new();
+    mut added: i64 = 0;
+    while (added < references) { compilers.push(String::from_str(Str::new("ref"))); added++; }
+    const configurations: Array<Configuration> = Configuration::of_compilers(Str::new("tree"), &compilers, true);
+    mut observations: Array<Observation> = Array::<Observation>::new();
+    for (hash in hashes.split_whitespace()) { observations.push(Observation::Printed(f"cryosmith-hash {hash}")); }
+    return known_list().of(9, &Array::<String>::new(), &configurations, &observations);
+}
+
+/// Whether `seen` names bug `bug` as `reproduced` (otherwise as missed).
+private function names_bug(seen: KnownBugMatch, bug: Str, reproduced: boolean) -> boolean {
+    return match (seen) {
+        KnownBugMatch::Reproduces(number) => { reproduced && number.as_str() == bug }
+        KnownBugMatch::Missed(number)     => { !reproduced && number.as_str() == bug }
+        KnownBugMatch::Unlisted           => { false }
+    };
+}
+
+![test]
+function a_known_bug_list_reads_its_version_and_each_entry_and_refuses_a_malformed_one() -> Result<(), TestError> {
+    const list: KnownBugs = known_list();
+    expect(list.generator == 40 && list.bugs.length() == 2, Str::new("version and entries"))?;
+    expect(list.bugs[0].bug.as_str() == Str::new("0001") && list.bugs[0].seed == 9 && list.bugs[0].keys.length() == 3 && list.bugs[0].options.is_empty(), Str::new("the first entry"))?;
+    expect(list.bugs[0].lines[2].as_str() == Str::new("cryosmith-hash 6") && list.bugs[1].options.length() == 2, Str::new("lines and options"))?;
+    expect(KnownBugs::parse(Str::new("bug 0001 seed 9 O0 5 options\n")).is_err(), Str::new("no generator line"))?;
+    expect(KnownBugs::parse(Str::new("generator 40\nbug 0001 seed 9 O0 5\n")).is_err(), Str::new("no options word"))?;
+    expect(KnownBugs::parse(Str::new("generator 40\nbug 0001 seed 9 options\n")).is_err(), Str::new("no hash"))?;
+    expect(KnownBugs::parse(Str::new("generator 40\nbug 0001 seed 9 O0 5 O0 5 options\n")).is_err(), Str::new("a key twice"))?;
+    expect(KnownBugs::parse(Str::new("generator 40\nbug 0001 seed 9 O0 x options\n")).is_err(), Str::new("no hash number"))?;
+    return expect(KnownBugs::parse(Str::new("generator 40\nbug 0001 seed 9 O0 5 options\nbug 0002 seed 9 O2 5 options\n")).is_err(), Str::new("a seed twice at one set of options"));
+}
+
+![test]
+function a_signature_entry_names_its_bug_beside_the_seed_entries() -> Result<(), TestError> {
+    const list: KnownBugs = KnownBugs::parse(Str::new("generator 40\nbug 0364 signature internal error [drop-argument] E0900 Incorrect number of arguments\nbug 0001 seed 9 O0 5 options\nbug 0366 signature  mismatch [tree -O0 | tree -O2]\n")).unwrap();
+    expect(list.bugs.length() == 1 && list.signatures.length() == 2, Str::new("one seed entry and two signature entries"))?;
+    expect(list.bug_with_signature(Str::new("internal error [drop-argument] E0900 Incorrect number of arguments")).unwrap_or(String::new()).as_str() == Str::new("0364"), Str::new("0364 by its whole signature"))?;
+    expect(list.bug_with_signature(Str::new("mismatch [tree -O0 | tree -O2]")).unwrap_or(String::new()).as_str() == Str::new("0366"), Str::new("the space after `signature` is not the signature's"))?;
+    expect(list.bug_with_signature(Str::new("internal error [drop-argument] E0900")).is_none(), Str::new("a shorter signature is another finding"))?;
+    expect(KnownBugs::parse(Str::new("generator 40\nbug 0364 signature\n")).is_err(), Str::new("no signature"))?;
+    expect(KnownBugs::parse(Str::new("generator 40\nbug x signature run crash [tree -O0]\n")).is_err(), Str::new("no bug number"))?;
+    return expect(KnownBugs::parse(Str::new("generator 40\nbug 0001 signature run crash [tree -O0]\nbug 0002 signature run crash [tree -O0]\n")).is_err(), Str::new("a signature twice"));
+}
+
+![test]
+function a_listed_seed_is_its_bug_only_when_every_configuration_prints_its_recorded_line() -> Result<(), TestError> {
+    expect(names_bug(printing(0, Str::new("5 5 6")), Str::new("0001"), true), Str::new("the recorded lines"))?;
+    // Another disagreement on a listed seed is not the bug.
+    expect(names_bug(printing(0, Str::new("5 5 7")), Str::new("0001"), false), Str::new("the interpreter printing a third line"))?;
+    expect(names_bug(printing(0, Str::new("5 6 6")), Str::new("0001"), false), Str::new("-O2 printing the interpreter's line"))?;
+    expect(names_bug(printing(0, Str::new("6 6 6")), Str::new("0001"), false), Str::new("every configuration agreeing"))?;
+    // A configuration the entry does not record prints one of its lines.
+    expect(names_bug(printing(1, Str::new("5 5 6 6 6")), Str::new("0001"), true), Str::new("a reference printing the right line"))?;
+    expect(names_bug(printing(1, Str::new("5 5 5 8 6")), Str::new("0001"), false), Str::new("a reference printing another line"))?;
+    const list: KnownBugs = known_list();
+    const configurations: Array<Configuration> = Configuration::of_compilers(Str::new("tree"), &Array::<String>::new(), true);
+    mut uncovered: Array<Observation> = Array::<Observation>::new();
+    uncovered.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 5"))));
+    uncovered.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 5"))));
+    uncovered.push(Observation::NotCovered(String::from_str(Str::new("a cast"))));
+    expect(names_bug(list.of(9, &Array::<String>::new(), &configurations, &uncovered), Str::new("0001"), false), Str::new("an interpretation not covering it"))?;
+    mut compiled: Array<Configuration> = Array::<Configuration>::new();
+    compiled.push(configurations[0].clone());
+    compiled.push(configurations[1].clone());
+    mut builds: Array<Observation> = Array::<Observation>::new();
+    builds.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 5"))));
+    builds.push(Observation::Printed(String::from_str(Str::new("cryosmith-hash 5"))));
+    expect(names_bug(list.of(9, &Array::<String>::new(), &compiled, &builds), Str::new("0001"), true), Str::new("the builds alone printing their recorded line"))?;
+    mut other: Array<String> = Array::<String>::new();
+    other.push(String::from_str(Str::new("--features")));
+    other.push(String::from_str(Str::new("default")));
+    expect(names_bug(list.of(9, &other, &compiled, &builds), Str::new("0002"), false), Str::new("the entry at the seed's options"))?;
+    const unlisted: boolean = match (list.of(10, &Array::<String>::new(), &compiled, &builds)) {
+        KnownBugMatch::Unlisted => { true }
+        _                       => { false }
+    };
+    return expect(unlisted, Str::new("another seed"));
 }

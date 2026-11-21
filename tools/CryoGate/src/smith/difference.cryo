@@ -1,0 +1,519 @@
+///! smith-diff's decisions: the configurations a program is built and run
+///! under, what one configuration made of one program, and a program's
+///! verdict from every configuration's observation.  Pure over the
+///! outcomes and text handed in; it starts nothing.
+///!
+///! Every generated program is valid and terminates within its cost
+///! budget, so a configuration that does not print the program's hash line
+///! is a finding - a refusal as much as a crash - and so are two
+///! configurations that print different lines.
+
+namespace cryogate::smith::difference;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::clone::{ Clone };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+import cryogate::core::child::{ Outcome };
+import cryogate::core::text::{ Text };
+import cryogate::core::wsl::{ WslMapping };
+import cryogate::smith::corpus::{ CorpusJudge };
+
+/// One way of getting a program's hash line: a compiler building it at one
+/// optimisation level and the build run, or a compiler's interpreter
+/// evaluating it.
+public type struct Configuration {
+    /// The name a report gives it: `tree -O0`, `reference 1 -O2`,
+    /// `tree interpreted`.
+    public name: String;
+    /// The part of its files' names that tells them from another
+    /// configuration's: `O0`, `reference1-O2`, `interpreted`.
+    public key: String;
+    /// The compiler it runs.
+    public compiler: String;
+    /// The optimisation level it builds at; `None` for the interpreter.
+    public level: Option<String>;
+    /// Where the work directory is inside WSL, for a configuration that
+    /// builds and runs there; `None` for one on the host itself.
+    public wsl: Option<WslMapping>;
+    /// The stdlib its compiler is given in place of the run's: a Linux
+    /// compiler inside WSL cannot read a Windows path.
+    public stdlib: Option<String>;
+
+    /// `compiler` building at optimisation `level` (`0`, `2`).  `label`
+    /// names the compiler in reports (`tree`, `reference 1`) and `prefix`
+    /// in file names (empty for the compiler under test, `reference1`).
+    public static compiled(label: Str, prefix: Str, compiler: Str, level: Str) -> Configuration {
+        const key: String = if (prefix.is_empty()) { f"O{level}" } else { f"{prefix}-O{level}" };
+        return Configuration {
+            name:     f"{label} -O{level}",
+            key:      key,
+            compiler: String::from_str(compiler),
+            level:    Option::Some(String::from_str(level)),
+            wsl:      Option::None,
+            stdlib:   Option::None,
+        };
+    }
+
+    /// The Linux compiler `compiler`, a path inside WSL, building at
+    /// optimisation `level` inside WSL, the work directory reached there
+    /// through `mapping`, given `stdlib` (a path inside WSL) when named:
+    /// `linux -O0`, keyed `linux-O0`.
+    public static linux(compiler: Str, stdlib: Option<Str>, level: Str, mapping: &WslMapping) -> Configuration {
+        mut configuration: Configuration = Configuration::compiled(Str::new("linux"), Str::new("linux"), compiler, level);
+        configuration.wsl = Option::Some(mapping.clone());
+        match (stdlib) {
+            Option::Some(path) => { configuration.stdlib = Option::Some(String::from_str(path)); }
+            Option::None       => { }
+        }
+        return configuration;
+    }
+
+    /// What `outcome`, a build or run of this configuration's, means: as
+    /// it is, except that inside WSL, where each child runs under
+    /// `timeout`, its exit 124 is the hang it reports.
+    public outcome_of(&this, outcome: &Outcome) -> Outcome {
+        if (this.wsl.is_some()) {
+            match (outcome.exit_code()) {
+                Option::Some(code) => {
+                    if (code == Configuration::TIMEOUT_EXIT) { return Outcome::TimedOut; }
+                }
+                Option::None => { }
+            }
+        }
+        return outcome.clone();
+    }
+
+    /// The exit of `timeout` when the command it ran was stopped for
+    /// running past the limit.
+    public const TIMEOUT_EXIT: i32 = 124;
+
+    /// The configurations of a differential run: the compiler under test
+    /// `tree` at `-O0` and `-O2`, each of `references` at both (named
+    /// `reference`, or `reference 1`, `reference 2`, ... when there are
+    /// several), and the tree's interpreter when `interpret`.
+    public static of_compilers(tree: Str, references: &Array<String>, interpret: boolean) -> Array<Configuration> {
+        mut configurations: Array<Configuration> = Array::<Configuration>::new();
+        configurations.push(Configuration::compiled(Str::new("tree"), Str::new(""), tree, Str::new("0")));
+        configurations.push(Configuration::compiled(Str::new("tree"), Str::new(""), tree, Str::new("2")));
+        mut number: i64 = 1;
+        for (reference in references.iterate_references()) {
+            const label: String = if (references.length() == 1) { String::from_str(Str::new("reference")) } else { f"reference {number}" };
+            const prefix: String = if (references.length() == 1) { String::from_str(Str::new("reference")) } else { f"reference{number}" };
+            configurations.push(Configuration::compiled(label.as_str(), prefix.as_str(), reference.as_str(), Str::new("0")));
+            configurations.push(Configuration::compiled(label.as_str(), prefix.as_str(), reference.as_str(), Str::new("2")));
+            number++;
+        }
+        if (interpret) { configurations.push(Configuration::interpreted(Str::new("tree"), tree)); }
+        return configurations;
+    }
+
+    /// `compiler`'s `cryo interpret`, named after `label`.
+    public static interpreted(label: Str, compiler: Str) -> Configuration {
+        return Configuration {
+            name:     f"{label} interpreted",
+            key:      String::from_str(Str::new("interpreted")),
+            compiler: String::from_str(compiler),
+            level:    Option::None,
+            wsl:      Option::None,
+            stdlib:   Option::None,
+        };
+    }
+}
+
+/// A configuration copied whole: each of a reduction's trials runs under
+/// the same ones.
+implement trait Clone for Configuration {
+    clone(&this) -> Configuration {
+        return Configuration {
+            name: this.name.clone(), key: this.key.clone(), compiler: this.compiler.clone(), level: this.level.clone(),
+            wsl: this.wsl.clone(), stdlib: this.stdlib.clone(),
+        };
+    }
+}
+
+/// What one configuration made of one program.
+public type enum Observation {
+    /// It printed this hash line and exited 0.
+    Printed(String);
+    /// The interpreter does not run a construct the program uses; the
+    /// construct.  Not a finding: the configuration is left out of the
+    /// comparison.
+    NotCovered(String);
+    /// The compiler died by a signal, exited with a code other than 0 and
+    /// 1, exited 1 with no error diagnostic, or could not be started; how.
+    CompileCrash(String);
+    /// The compiler ran past the build limit.
+    CompileHang;
+    /// The compiler refused the program with an internal error; the first
+    /// `E09xx` code it reported.
+    InternalError(String);
+    /// The compiler refused the program; the first error code it reported.
+    Refused(String);
+    /// The program, or the interpreter, exited non-zero, died by a signal,
+    /// or printed something other than one hash line; which.
+    RunCrash(String);
+    /// The program, or the interpreter, ran past its limit.
+    RunHang;
+}
+
+implement enum Observation {
+    /// What a build that ended with `outcome` and wrote `output` (both
+    /// streams) observed; `None` when it succeeded.
+    public static of_build(outcome: &Outcome, output: Str) -> Option<Observation> {
+        match (outcome) {
+            Outcome::Exited(code) => {
+                if (code == 0) { return Option::None; }
+                if (code == 1) {
+                    const codes: Array<String> = Text::error_codes(output);
+                    for (found in codes.iterate_references()) {
+                        if (found.as_str().starts_with(&Str::new("E09"))) { return Option::Some(Observation::InternalError(Observation::internal_error(found.as_str(), output))); }
+                    }
+                    if (!codes.is_empty()) { return Option::Some(Observation::Refused(codes[0].clone())); }
+                    return Option::Some(Observation::CompileCrash(String::from_str(Str::new("exit 1 with no error diagnostic"))));
+                }
+                return Option::Some(Observation::CompileCrash(f"exit {code}"));
+            }
+            Outcome::TimedOut => { return Option::Some(Observation::CompileHang); }
+            _                 => { return Option::Some(Observation::CompileCrash(outcome.describe())); }
+        }
+    }
+
+    /// An internal error's detail: its `code`, then what the first
+    /// diagnostic of that code in `output` says it is, every backquoted
+    /// name in it written `` `_` `` and cut at its first ` (`, then, when
+    /// the build printed one, the first reason LLVM reports.  Every
+    /// internal error shares the code, so the code alone would make one
+    /// defect of any two; the names would make many of one defect reached
+    /// through different programs.
+    private static internal_error(code: Str, output: Str) -> String {
+        const opening: String = f"error[{code}]: ";
+        mut detail: String = String::from_str(code);
+        mut described: boolean = false;
+        for (line in Text::lines(output).iterate_references()) {
+            const trimmed: Str = line.as_str().trim();
+            if (!described && trimmed.starts_with(&opening.as_str())) {
+                const headline: Str = trimmed.byte_substring(opening.length(), trimmed.length());
+                const cut: Str = match (headline.find(&Str::new(" ("))) {
+                    Option::Some(at) => { headline.byte_substring(0, at) }
+                    Option::None     => { headline }
+                };
+                mut abstracted: String = String::new();
+                mut quoted: boolean = false;
+                for (piece in cut.split(&Str::new("`"))) {
+                    if (quoted) { abstracted.push(Str::new("`_`")); } else { abstracted.push(piece); }
+                    quoted = !quoted;
+                }
+                detail.push(f" {abstracted.as_str()}".as_str());
+                described = true;
+            }
+            match (trimmed.strip_prefix(&Str::new("note: LLVM reports: "))) {
+                Option::Some(reason) => {
+                    detail.push(f": {reason}".as_str());
+                    return detail;
+                }
+                Option::None => { }
+            }
+        }
+        return detail;
+    }
+
+    /// What a run of a built program that ended with `outcome` and printed
+    /// `output` observed.
+    public static of_run(outcome: &Outcome, output: Str) -> Observation {
+        match (outcome) {
+            Outcome::TimedOut => { return Observation::RunHang; }
+            _                 => { }
+        }
+        if (!outcome.succeeded()) { return Observation::RunCrash(outcome.describe()); }
+        return match (CorpusJudge::hash_line(Str::new("the program"), output)) {
+            Result::Ok(line) => { Observation::Printed(line) }
+            Result::Err(_)   => { Observation::RunCrash(String::from_str(Str::new("printed no hash line"))) }
+        };
+    }
+
+    /// What a `cryo interpret` run that ended with `outcome`, printing
+    /// `output` and writing `errors`, observed: a run's observation, except
+    /// that the exit `NOT_COVERED` with the construct named is not covered.
+    public static of_interpretation(outcome: &Outcome, errors: Str, output: Str) -> Observation {
+        match (outcome.exit_code()) {
+            Option::Some(code) => {
+                if (code == Observation::NOT_COVERED) {
+                    for (line in Text::lines(errors).iterate_references()) {
+                        match (line.as_str().strip_prefix(&Str::new("interpret: not covered: "))) {
+                            Option::Some(construct) => { return Observation::NotCovered(String::from_str(construct)); }
+                            Option::None            => { }
+                        }
+                    }
+                }
+            }
+            Option::None => { }
+        }
+        return Observation::of_run(outcome, output);
+    }
+
+    /// The finding this observation is, `None` for a printed line or a
+    /// program not covered.
+    public kind(&this) -> Option<FindingClass> {
+        return match (&this) {
+            Observation::Printed(_)       => { Option::None }
+            Observation::NotCovered(_)    => { Option::None }
+            Observation::CompileCrash(_)  => { Option::Some(FindingClass::CompileCrash) }
+            Observation::CompileHang      => { Option::Some(FindingClass::CompileHang) }
+            Observation::InternalError(_) => { Option::Some(FindingClass::InternalError) }
+            Observation::Refused(_)       => { Option::Some(FindingClass::Refusal) }
+            Observation::RunCrash(_)      => { Option::Some(FindingClass::RunCrash) }
+            Observation::RunHang          => { Option::Some(FindingClass::RunHang) }
+        };
+    }
+
+    /// What tells two findings of one class apart in a signature: the
+    /// code, or how the child ended; empty for a hang.
+    public detail(&this) -> String {
+        return match (&this) {
+            Observation::Printed(line)        => { line.clone() }
+            Observation::NotCovered(what)     => { what.clone() }
+            Observation::CompileCrash(how)    => { how.clone() }
+            Observation::CompileHang          => { String::new() }
+            Observation::InternalError(code)  => { code.clone() }
+            Observation::Refused(code)        => { code.clone() }
+            Observation::RunCrash(how)        => { how.clone() }
+            Observation::RunHang              => { String::new() }
+        };
+    }
+
+    /// The exit code of a `cryo interpret` run that met a construct it does
+    /// not run yet, the construct named on its error stream after
+    /// `interpret: not covered: `.
+    public const NOT_COVERED: i32 = 71;
+}
+
+/// An observation copied whole: a program's verdict is decided over the
+/// observations its attempts hold.
+implement trait Clone for Observation {
+    clone(&this) -> Observation {
+        return match (&this) {
+            Observation::Printed(line)       => { Observation::Printed(line.clone()) }
+            Observation::NotCovered(what)    => { Observation::NotCovered(what.clone()) }
+            Observation::CompileCrash(how)   => { Observation::CompileCrash(how.clone()) }
+            Observation::CompileHang         => { Observation::CompileHang }
+            Observation::InternalError(code) => { Observation::InternalError(code.clone()) }
+            Observation::Refused(code)       => { Observation::Refused(code.clone()) }
+            Observation::RunCrash(how)       => { Observation::RunCrash(how.clone()) }
+            Observation::RunHang             => { Observation::RunHang }
+        };
+    }
+}
+
+/// What an interpretation made of one program, against the line its
+/// compiled builds agreed on: corpus-check's verdict on the interpreted
+/// configuration.
+public type enum Interpretation {
+    /// It printed the builds' hash line and exited 0.
+    Agrees;
+    /// It does not run a construct the program uses; the construct and
+    /// where it is written.  Never counted as agreeing.
+    NotCovered(String);
+    /// It printed another line, stopped on a violation, a panic or its
+    /// limit, or failed otherwise; why.
+    Fails(String);
+}
+
+implement enum Interpretation {
+    /// The interpretation that observed `observation` of a program whose
+    /// builds printed `compiled`; `reason` is what its attempt says of an
+    /// ending other than a printed line.  A `pinned` program, one of a
+    /// corpus checked against its pinned lines or being pinned, must be
+    /// interpreted: a construct the interpreter does not run fails it, since
+    /// a gate that skipped the seed would pass whatever the interpreter
+    /// left out.
+    public static of(observation: &Observation, compiled: Str, reason: Str, pinned: boolean) -> Interpretation {
+        match (observation) {
+            Observation::Printed(line) => {
+                if (line.as_str() == compiled) { return Interpretation::Agrees; }
+                return Interpretation::Fails(f"the builds printed `{compiled}`, the interpreter printed `{line.as_str()}`");
+            }
+            Observation::NotCovered(construct) => {
+                if (pinned) { return Interpretation::Fails(f"the interpreter does not cover {construct.as_str()}, and a pinned program must be interpreted"); }
+                return Interpretation::NotCovered(construct.clone());
+            }
+            _                                  => { }
+        }
+        return Interpretation::Fails(String::from_str(reason));
+    }
+}
+
+/// The kinds of finding, in the order a program's verdict picks between
+/// them: a compiler that does not finish says more than one that refuses,
+/// and either says more than the runs of what was built.
+public type enum FindingClass {
+    CompileCrash;
+    CompileHang;
+    InternalError;
+    Refusal;
+    RunCrash;
+    RunHang;
+    /// Configurations printed different lines.
+    Mismatch;
+    /// No configuration printed a line: every one was not covered.
+    Uncompared;
+    /// The compiler accepted a program the crash fuzzer's mutation made
+    /// invalid: an edit CryoSmith marked as one the compiler must refuse.
+    /// No build of a generated program is judged into it, so it never
+    /// competes for a program's verdict.
+    Acceptance;
+}
+
+implement enum FindingClass {
+    /// Its place in the order; the lowest present is the verdict.
+    public rank(&this) -> i64 {
+        return match (&this) {
+            FindingClass::CompileCrash  => { 0 }
+            FindingClass::CompileHang   => { 1 }
+            FindingClass::InternalError => { 2 }
+            FindingClass::Refusal       => { 3 }
+            FindingClass::RunCrash      => { 4 }
+            FindingClass::RunHang       => { 5 }
+            FindingClass::Mismatch      => { 6 }
+            FindingClass::Uncompared    => { 7 }
+            FindingClass::Acceptance    => { 8 }
+        };
+    }
+
+    /// Its name in a report and a signature.
+    public name(&this) -> Str {
+        return match (&this) {
+            FindingClass::CompileCrash  => { Str::new("compile crash") }
+            FindingClass::CompileHang   => { Str::new("compile hang") }
+            FindingClass::InternalError => { Str::new("internal error") }
+            FindingClass::Refusal       => { Str::new("refusal") }
+            FindingClass::RunCrash      => { Str::new("run crash") }
+            FindingClass::RunHang       => { Str::new("run hang") }
+            FindingClass::Mismatch      => { Str::new("mismatch") }
+            FindingClass::Uncompared    => { Str::new("uncompared") }
+            FindingClass::Acceptance    => { Str::new("acceptance") }
+        };
+    }
+}
+
+/// A program's finding.
+public type struct SmithFinding {
+    /// Its kind.
+    public kind: FindingClass;
+    /// What the report says of it: the configurations it involves and what
+    /// they observed.
+    public detail: String;
+    /// What two findings share when they are the same defect: the class,
+    /// the configurations involved, and the first code or how the child
+    /// ended - never a hash, which every program has its own of.
+    public signature: String;
+}
+
+/// A program's verdict.
+public type enum SmithVerdict {
+    /// Every configuration covering it printed this line.
+    Agreed(String);
+    /// It is a finding.
+    Found(SmithFinding);
+}
+
+/// The verdict of one program from each configuration's observation.
+public type struct SmithDecision {
+    /// The verdict of a program that `configurations[i]` observed as
+    /// `observations[i]`: the lowest-ranked finding class any configuration
+    /// observed, with every configuration that observed it; otherwise a
+    /// mismatch when the lines printed differ, its groups the
+    /// configurations printing each line in the order they first appear;
+    /// otherwise the one line printed.
+    public static decide(configurations: &Array<Configuration>, observations: &Array<Observation>) -> SmithVerdict {
+        mut worst: Option<FindingClass> = Option::None;
+        for (observation in observations.iterate_references()) {
+            match (observation.kind()) {
+                Option::Some(kind) => {
+                    const lower: boolean = match (&worst) {
+                        Option::Some(held) => { kind.rank() < held.rank() }
+                        Option::None       => { true }
+                    };
+                    if (lower) { worst = Option::Some(kind); }
+                }
+                Option::None => { }
+            }
+        }
+        match (worst) {
+            Option::Some(kind) => { return SmithVerdict::Found(SmithDecision::finding(kind,configurations, observations)); }
+            Option::None        => { }
+        }
+        // Each distinct line printed, and which of them each configuration
+        // printed (-1: none).
+        mut lines: Array<String> = Array::<String>::new();
+        mut printed: Array<i64> = Array::<i64>::new();
+        mut index: i64 = 0;
+        while (index < observations.length()) {
+            match (&observations[index]) {
+                Observation::Printed(line) => {
+                    mut at: i64 = 0;
+                    while (at < lines.length() && lines[at].as_str() != line.as_str()) { at++; }
+                    if (at == lines.length()) { lines.push(line.clone()); }
+                    printed.push(at);
+                }
+                _ => { printed.push(-1); }
+            }
+            index++;
+        }
+        if (lines.is_empty()) {
+            return SmithVerdict::Found(SmithFinding {
+                kind:      FindingClass::Uncompared,
+                detail:    String::from_str(Str::new("no configuration covers the program")),
+                signature: String::from_str(Str::new("uncompared")),
+            });
+        }
+        if (lines.length() == 1) { return SmithVerdict::Agreed(lines[0].clone()); }
+        mut detail: String = String::new();
+        mut shape: Array<String> = Array::<String>::new();
+        index = 0;
+        while (index < lines.length()) {
+            mut group: Array<String> = Array::<String>::new();
+            mut member: i64 = 0;
+            while (member < printed.length()) {
+                if (printed[member] == index) { group.push(configurations[member].name.clone()); }
+                member++;
+            }
+            const names: String = Text::joined(&group, Str::new(", "));
+            if (index > 0) { detail.push(Str::new(" | ")); }
+            detail.push(f"{names.as_str()} printed `{lines[index].as_str()}`".as_str());
+            shape.push(names);
+            index++;
+        }
+        return SmithVerdict::Found(SmithFinding {
+            kind:      FindingClass::Mismatch,
+            detail:    detail,
+            signature: f"mismatch [{Text::joined(&shape, Str::new(" | ")).as_str()}]",
+        });
+    }
+
+    /// The finding of `kind`: every configuration that observed it, and
+    /// the first one's detail.
+    private static finding(kind: FindingClass, configurations: &Array<Configuration>, observations: &Array<Observation>) -> SmithFinding {
+        mut names: Array<String> = Array::<String>::new();
+        mut first: String = String::new();
+        mut index: i64 = 0;
+        while (index < observations.length()) {
+            const same: boolean = match (observations[index].kind()) {
+                Option::Some(held) => { held.rank() == kind.rank() }
+                Option::None       => { false }
+            };
+            if (same) {
+                if (names.is_empty()) { first = observations[index].detail(); }
+                names.push(configurations[index].name.clone());
+            }
+            index++;
+        }
+        const involved: String = Text::joined(&names, Str::new(", "));
+        const detail: String = if (first.is_empty()) { f"{kind.name()}: {involved.as_str()}" } else { f"{kind.name()}: {involved.as_str()}: {first.as_str()}" };
+        const signature: String = if (first.is_empty()) { f"{kind.name()} [{involved.as_str()}]" } else { f"{kind.name()} [{involved.as_str()}] {first.as_str()}" };
+        return SmithFinding { kind: kind, detail: detail, signature: signature };
+    }
+}

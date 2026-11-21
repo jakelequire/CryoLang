@@ -39,6 +39,7 @@ import compiler::resolver::res::{ DefId, Res, ResSlot };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound::{ PointerType, ReferenceType };
 import compiler::types::generic::{ InstantiatedType };
+import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ EnumType, EnumVariantInfo };
@@ -57,6 +58,8 @@ type struct MatchSubjectInfo {
     tag_val:     LValue;    // i32 discriminant extracted from subject
     subject_ty:  TypeRef;   // Cryo type of the match subject (pre-unwrap);
                             // drives integer-pattern width + signedness
+    in_place:    boolean;   // subject_ptr is a local matched by value, which
+                            // the arm itself may assign
 }
 
 
@@ -91,6 +94,7 @@ type struct PatternEmitter {
             subject_ptr: subject,
             tag_val:     LValue::null(),
             subject_ty:  subj_ref,
+            in_place:    false,
         };
 
         // Unwrap Reference/Pointer/InstantiatedType to find the enum type.
@@ -164,6 +168,7 @@ type struct PatternEmitter {
             // mid-arm (e.g. `String::as_c_string`) updates only the copy, leaving
             // the drop to free the original's stale pointer (double free).
             info.subject_ptr = subject_addr;
+            info.in_place = true;
         } else {
             // The scratch copy's slot is hoisted to the entry block, while the
             // store below stays here, where the subject value is live. A `match`
@@ -203,10 +208,9 @@ type struct PatternEmitter {
     /// Extract enum variant payload bindings into named values in the current scope.
     /// No-op unless the arm's pattern is an enum pattern with bindings.
     ///
-    /// Registers each binding as a pointer to its payload slot.  `codegen_identifier`
-    /// treats named values as lvalues, so `codegen_rvalue` loads through the ptr.
-    /// Pointing at the payload inside the subject needs no storage of its own,
-    /// so an arm binding costs no stack slot however many times it is reached.
+    /// Registers each binding as a pointer to its storage (`binding_place`).
+    /// `codegen_identifier` treats named values as lvalues, so `codegen_rvalue`
+    /// loads through the ptr.
     bind_arm_enum_payloads(mut &this, arm: MatchArmNode*, minfo: MatchSubjectInfo) -> void {
         if (minfo.enum_type == null || !minfo.subject_ptr.is_valid()) { return; }
         if (!minfo.enum_llvm.is_valid()) { return; }
@@ -218,12 +222,35 @@ type struct PatternEmitter {
             if (epat == null || !epat.has_bindings()) { continue; }
 
             this.bind_enum_payloads_rec(epat, minfo.enum_type, minfo.enum_llvm,
-                                        minfo.subject_ptr);
+                                        minfo.subject_ptr, minfo.in_place);
 
             // Only bind for the first enum pattern in this arm (multi-pattern
             // arms with different variants can't share bindings anyway).
             return;
         }
+    }
+
+    /// The storage a binding of the value at `place` (of type `ty`, LLVM type
+    /// `value_llvm`) names.  A binding taken from a local matched by value
+    /// (`in_place`) whose value is `Copy` and which is not written `mut` is a
+    /// copy made when the arm is entered, in a slot of its own, so assigning
+    /// the local inside the arm leaves the binding as it was.  Every other
+    /// binding names the value where it lies: a `mut` binding writes the
+    /// subject, a binding of a value that is not `Copy` shares the slot the
+    /// subject's drop releases, and a match through a borrow or a pointer binds
+    /// inside the referent.  The slot is hoisted to the entry block; one serves
+    /// every pass through the arm because the copy is stored before any read.
+    binding_place(mut &this, place: LValue, ty: TypeRef, value_llvm: LType,
+                  written_mut: boolean, in_place: boolean) -> LValue {
+        if (!in_place || written_mut || !ty.is_valid()) { return place; }
+        if (!OwnershipQuery::is_copy(this.cg.get_arena(), this.cg.ctx.generic_registry,
+                                     this.cg.get_intern(), ty)) {
+            return place;
+        }
+        const slot: LValue = this.cg.flow.temp_slot(value_llvm, "match.copy");
+        const value: LValue = this.cg.builder.build_load(value_llvm, place, "match.copy.value");
+        this.cg.builder.build_store(value, slot);
+        return slot;
     }
 
     /// Byte offset of each payload field of `variant`.  Delegates to the
@@ -272,11 +299,11 @@ type struct PatternEmitter {
 
     /// Recursively bind an enum pattern's payload elements to named lvalues,
     /// descending through nested sub-patterns (`Some(Some(n))`). `subject_ptr`
-    /// points to a value of `enum_type` (LLVM type `enum_llvm`). Reads through
-    /// each registered binding load via `codegen_rvalue` using the binding's
-    /// resolved_type.
+    /// points to a value of `enum_type` (LLVM type `enum_llvm`), inside a local
+    /// matched by value when `in_place`. Reads through each registered binding
+    /// load via `codegen_rvalue` using the binding's resolved_type.
     bind_enum_payloads_rec(mut &this, epat: EnumPattern*, enum_type: EnumType*,
-                           enum_llvm: LType, subject_ptr: LValue) -> void {
+                           enum_llvm: LType, subject_ptr: LValue, in_place: boolean) -> void {
         if (enum_type == null || !subject_ptr.is_valid() || !enum_llvm.is_valid()) {
             return;
         }
@@ -303,14 +330,15 @@ type struct PatternEmitter {
             if (!field_ptr.is_valid()) { continue; }
 
             if (pb != null) {
-                this.cg.values.set(pb.sym_id, field_ptr);
+                this.cg.values.set(pb.sym_id, this.binding_place(field_ptr, pb.resolved_type,
+                    field_llvm, pb.written_mut, in_place));
             } else if (sub != null && sub.enum_payload() != null) {
                 // Nested enum sub-pattern: recurse using the payload field as
                 // the new subject pointer and its concrete enum type.
                 const nested_ty: EnumType* = this.payload_enum_type(field_ref);
                 if (nested_ty != null) {
                     this.bind_enum_payloads_rec(sub.enum_payload(), nested_ty,
-                                                field_llvm, field_ptr);
+                                                field_llvm, field_ptr, in_place);
                 }
             }
         }
@@ -337,13 +365,16 @@ type struct PatternEmitter {
             if (!minfo.subject_ptr.is_valid()) { continue; }
 
             // Already an addressable slot (e.g. an ADT enum's alloca/ptr): bind
-            // directly. Otherwise spill the value into a fresh slot of the
-            // subject's type.
+            // it as `binding_place` says. Otherwise spill the value into a
+            // fresh slot of the subject's type.
             mut slot: LValue = minfo.subject_ptr;
             const sp_ty: mut void* = llvm::LLVMTypeOf(minfo.subject_ptr.raw);
             const is_ptr: boolean = sp_ty != null
                 && LType::kind_of(sp_ty) == LTypeKind::Pointer;
-            if (!is_ptr) {
+            if (is_ptr && minfo.in_place) {
+                slot = this.binding_place(minfo.subject_ptr, binding.binding_type,
+                    this.cg.type_mapper.map_type(binding.binding_type), false, true);
+            } else if (!is_ptr) {
                 const vty: LType = this.cg.type_mapper.map_type(minfo.subject_ty);
                 if (!vty.is_valid()) { continue; }
                 // Hoisted like `match.subj` above: a `match` in a loop body

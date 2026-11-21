@@ -32,7 +32,7 @@ import compiler::ast::declaration::{
     AssocTypeDeclNode, DeclarationNode, DeclKind, DestructureBinding,
     DestructureDecl, EnumDecl, EnumVariant, ExternBlock, FieldDecl,
     FunctionDecl, GenericParamDecl, ImplBlock, ImportDecl,
-    IntrinsicDecl, MethodDecl, ModuleDecl, ReceiverForm,
+    IntrinsicDecl, KindKeyword, MethodDecl, ModuleDecl, ReceiverForm,
     StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
@@ -124,7 +124,9 @@ implement struct Parser {
                 this.check(TokenType::KwStatic) &&
                 this.peek_at(1).kind == TokenType::KwMatch;
             if (this.is_declaration_start() && !is_static_match) {
-                const item: Stmt* = Parser::block_item(this.parse_declaration(Visibility::Private,""));
+                const no_directives: [DirectiveNode*] = [];
+                const item: Stmt* = Parser::block_item(this.parse_declaration(Visibility::Private, "",
+                    &no_directives, SourceSpan::none()));
                 if (item != null) {
                     body.add_statement(item);
                 }
@@ -185,17 +187,22 @@ implement struct Parser {
         return null;
     }
 
-    /// Record a leading modifier keyword (`public` / `private`) on a
-    /// declaration that has just been parsed.  The keyword is consumed
+    /// The node of `declaration`, just parsed, carrying what was written
+    /// before it: the `![...]` directives above it, and the span of the
+    /// visibility keyword (`public` / `internal` / `private`) that opened it,
+    /// `SourceSpan::none()` when none was written.  The keyword is consumed
     /// before the declaration's own parse begins, so it falls outside the
     /// node's `span`; `DeclarationNode::outer_span` folds it back in for
-    /// consumers that need the full written extent.  An item that can't
-    /// carry one (a recovery null, a non-declaration) is ignored, as it is
-    /// for attached directives.
-    static note_decl_modifier(node: Node, span: SourceSpan) -> void {
-        const decl: mut DeclarationNode* = node.as_decl();
-        if (decl == null) { return; }
-        decl.note_modifier_span(span);
+    /// consumers that need the full written extent.  A recovery null carries
+    /// neither; the caller keeps its directives as items of their own.
+    static declared(declaration: mut DeclarationNode*, directives: &[DirectiveNode*], modifier: SourceSpan) -> Node {
+        if (declaration != null) {
+            for (mut i: i64 = 0; i < directives.length(); i++) {
+                declaration.add_directive(directives[i]);
+            }
+            declaration.note_modifier_span(modifier);
+        }
+        return Node::Decl(declaration);
     }
 
 
@@ -259,14 +266,10 @@ implement struct Parser {
                 continue;
             }
 
-            const node: Node = this.parse_top_level();
+            const node: Node = this.parse_top_level(&pending);
             if (!node.is_null()) {
-                const decl: mut DeclarationNode* = node.as_decl();
-                if (pending.length() > 0 && decl != null) {
-                    for (mut i: i64 = 0; i < pending.length(); i++) {
-                        decl.add_directive(pending[i]);
-                    }
-                } else {
+                const decl: DeclarationNode* = node.as_decl();
+                if (decl == null) {
                     for (mut i: i64 = 0; i < pending.length(); i++) {
                         program.add_statement(Node::Directive(pending[i]));
                     }
@@ -344,8 +347,9 @@ implement struct Parser {
     // Top-Level Dispatch
 
     /// Dispatch to the appropriate declaration or statement parser based on
-    /// the current token.
-    parse_top_level(mut &this) -> Node {
+    /// the current token.  A declaration carries `directives`, the ones
+    /// written above it.
+    parse_top_level(mut &this, directives: &[DirectiveNode*]) -> Node {
         if (Log::enabled(LogArea::Parse, LogLevel::Trace)) {
             Log::trace(LogArea::Parse, f"top-level item at '{this.current().lexeme}'");
         }
@@ -360,7 +364,7 @@ implement struct Parser {
             if (ns != null && doc != "") {
                 ns.set_documentation(doc);
             }
-            return Node::Decl(ns);
+            return Parser::declared(ns, directives, SourceSpan::none());
         }
 
         // A written visibility: `public`, `internal` or `private`.
@@ -373,12 +377,9 @@ implement struct Parser {
                 if (marked != null && doc != "") {
                     marked.set_documentation(doc);
                 }
-                Parser::note_decl_modifier(Node::Decl(marked), vis_span);
-                return Node::Decl(marked);
+                return Parser::declared(marked, directives, vis_span);
             }
-            const decl: Node = this.parse_declaration(Parser::written_visibility(tok.kind), doc);
-            Parser::note_decl_modifier(decl, vis_span);
-            return decl;
+            return this.parse_declaration(Parser::written_visibility(tok.kind), doc, directives, vis_span);
         }
 
         // Import declaration
@@ -387,7 +388,7 @@ implement struct Parser {
             if (imp != null && doc != "") {
                 imp.set_documentation(doc);
             }
-            return Node::Decl(imp);
+            return Parser::declared(imp, directives, SourceSpan::none());
         }
 
         // Export declaration (symbol re-export).
@@ -396,7 +397,7 @@ implement struct Parser {
             if (exp != null && doc != "") {
                 exp.set_documentation(doc);
             }
-            return Node::Decl(exp);
+            return Parser::declared(exp, directives, SourceSpan::none());
         }
 
         // Extern block, or the C-header import form `extern module name := "C"`.
@@ -406,13 +407,13 @@ implement struct Parser {
                 if (cext != null && doc != "") {
                     cext.set_documentation(doc);
                 }
-                return Node::Decl(cext);
+                return Parser::declared(cext, directives, SourceSpan::none());
             }
             const ext: mut DeclarationNode* = this.parse_extern_block(Visibility::Public);
             if (ext != null && doc != "") {
                 ext.set_documentation(doc);
             }
-            return Node::Decl(ext);
+            return Parser::declared(ext, directives, SourceSpan::none());
         }
 
         // Implement block
@@ -421,7 +422,7 @@ implement struct Parser {
             if (impl_blk != null && doc != "") {
                 impl_blk.set_documentation(doc);
             }
-            return Node::Decl(impl_blk);
+            return Parser::declared(impl_blk, directives, SourceSpan::none());
         }
 
         // Directive: ![name] or ![name(args)]
@@ -439,7 +440,7 @@ implement struct Parser {
         }
 
         // A declaration with no visibility written is public.
-        return this.parse_declaration(Visibility::Public, doc);
+        return this.parse_declaration(Visibility::Public, doc, directives, SourceSpan::none());
     }
 
     /// The visibility a modifier keyword writes: `public`, `internal` or
@@ -452,8 +453,11 @@ implement struct Parser {
         };
     }
 
-    /// Parse a declaration based on the current token.
-    parse_declaration(mut &this, visibility: Visibility, doc_text: string) -> Node {
+    /// Parse a declaration based on the current token; it carries
+    /// `directives` and the visibility keyword's span `modifier`, as
+    /// `Parser::declared` records them.
+    parse_declaration(mut &this, visibility: Visibility, doc_text: string,
+                      directives: &[DirectiveNode*], modifier: SourceSpan) -> Node {
         const doc: string = doc_text;
         if (Log::enabled(LogArea::Parse, LogLevel::Trace)) {
             Log::trace(LogArea::Parse, f"declaration at '{this.current().lexeme}'");
@@ -467,7 +471,7 @@ implement struct Parser {
             if (func != null && doc != "") {
                 func_decl.set_documentation(doc_text);
             }
-            return Node::Decl(func_decl);
+            return Parser::declared(func_decl, directives, modifier);
         }
 
         // `async function` - an async fn is parsed as an ordinary function
@@ -483,7 +487,7 @@ implement struct Parser {
                 func_decl.note_modifier_span(async_span);
                 if (doc != "") { func_decl.set_documentation(doc_text); }
             }
-            return Node::Decl(func_decl);
+            return Parser::declared(func_decl, directives, modifier);
         }
 
         // Variable declaration: const or mut.  If the next-after token is `{`
@@ -492,7 +496,7 @@ implement struct Parser {
         // the VarDecl form.
         if (tok.kind == TokenType::KwConst || tok.kind == TokenType::KwMut) {
             if (this.peek_at(1).kind == TokenType::LBrace && this.scope_depth > 0) {
-                return Node::Decl(this.parse_destructure_decl());
+                return Parser::declared(this.parse_destructure_decl(), directives, modifier);
             }
             const vd: mut DeclarationNode* = this.parse_variable_declaration();
             if (vd != null) {
@@ -502,7 +506,7 @@ implement struct Parser {
                     DeclarationNode::var_of(vd).visibility = visibility;
                 }
             }
-            return Node::Decl(vd);
+            return Parser::declared(vd, directives, modifier);
         }
 
         // `struct Name` / `trait Name` written without `type`.  Those keywords
@@ -512,7 +516,7 @@ implement struct Parser {
         if (Parser::names_a_type_kind(tok.kind) && tok.kind != TokenType::KwClass
                 && this.peek_at(1).kind == TokenType::Identifier) {
             const errors_before: int = this.error_count;
-            const declaration: Node = this.parse_type_declaration(tok, visibility, doc_text);
+            const declaration: Node = this.parse_type_declaration(tok, visibility, doc_text, directives, modifier);
             const rest_parsed: boolean = this.error_count == errors_before;
             const keyword_span: SourceSpan = this.span_from_token(tok);
             this.error_count += 1;
@@ -535,14 +539,14 @@ implement struct Parser {
         if (tok.kind == TokenType::KwType) {
             const next: Token = this.peek_at(1);
             if (Parser::names_a_type_kind(next.kind)) {
-                return this.parse_type_declaration(next, visibility, doc_text);
+                return this.parse_type_declaration(next, visibility, doc_text, directives, modifier);
             }
 
             // Type alias: type Alias = Target;
             const ad: mut DeclarationNode* = this.parse_type_alias_declaration();
             if (ad != null && DeclarationNode::alias_of(ad) != null) { DeclarationNode::alias_of(ad).visibility = visibility; }
             if (ad != null && doc_text != "") { ad.set_documentation(doc_text); }
-            return Node::Decl(ad);
+            return Parser::declared(ad, directives, modifier);
         }
 
         // Static keyword before function
@@ -556,7 +560,7 @@ implement struct Parser {
                 func_decl.note_modifier_span(static_span);
                 if (doc != "") { func_decl.set_documentation(doc_text); }
             }
-            return Node::Decl(func_decl);
+            return Parser::declared(func_decl, directives, modifier);
         }
 
         // Intrinsic function declaration
@@ -565,11 +569,11 @@ implement struct Parser {
                 const gi_decl: mut DeclarationNode* = this.parse_generic_intrinsic_declaration();
                 const gi: FunctionDecl* = DeclarationNode::fn_of(gi_decl);
                 if (gi != null && doc != "") { gi_decl.set_documentation(doc_text); }
-                return Node::Decl(gi_decl);
+                return Parser::declared(gi_decl, directives, modifier);
             }
             const intr: mut DeclarationNode* = this.parse_intrinsic_declaration();
             if (intr != null && doc != "") { intr.set_documentation(doc_text); }
-            return Node::Decl(intr);
+            return Parser::declared(intr, directives, modifier);
         }
 
         // Fall through to statement
@@ -591,14 +595,17 @@ implement struct Parser {
 
     /// Parse a struct, union, enum or trait declaration whose kind keyword is
     /// `kind`; the cursor is at its `type`, or at `kind` when `type` is missing.
-    parse_type_declaration(mut &this, kind: Token, visibility: Visibility, doc_text: string) -> Node {
+    /// It carries `directives` and the visibility keyword's span `modifier`,
+    /// as `Parser::declared` records them.
+    parse_type_declaration(mut &this, kind: Token, visibility: Visibility, doc_text: string,
+                           directives: &[DirectiveNode*], modifier: SourceSpan) -> Node {
         if (kind.kind == TokenType::KwStruct || kind.kind == TokenType::KwClass) {
             const sd: mut DeclarationNode* = this.parse_struct_declaration();
             if (sd != null) {
                 DeclarationNode::struct_of(sd).visibility = visibility;
                 if (doc_text != "") { sd.set_documentation(doc_text); }
             }
-            return Node::Decl(sd);
+            return Parser::declared(sd, directives, modifier);
         }
         if (kind.kind == TokenType::KwUnion) {
             const ud: mut DeclarationNode* = this.parse_union_declaration();
@@ -606,7 +613,7 @@ implement struct Parser {
                 DeclarationNode::union_of(ud).visibility = visibility;
                 if (doc_text != "") { ud.set_documentation(doc_text); }
             }
-            return Node::Decl(ud);
+            return Parser::declared(ud, directives, modifier);
         }
         if (kind.kind == TokenType::KwEnum) {
             const ed: mut DeclarationNode* = this.parse_enum_declaration();
@@ -614,14 +621,14 @@ implement struct Parser {
                 DeclarationNode::enum_of(ed).visibility = visibility;
                 if (doc_text != "") { ed.set_documentation(doc_text); }
             }
-            return Node::Decl(ed);
+            return Parser::declared(ed, directives, modifier);
         }
         const td: mut DeclarationNode* = this.parse_trait_declaration();
         if (td != null) {
             if (DeclarationNode::trait_of(td) != null) { DeclarationNode::trait_of(td).visibility = visibility; }
             if (doc_text != "") { td.set_documentation(doc_text); }
         }
-        return Node::Decl(td);
+        return Parser::declared(td, directives, modifier);
     }
 
 
@@ -676,7 +683,7 @@ implement struct Parser {
 
     /// Parse a struct destructure declaration: `const { f1, f2: alias, mut f3 }: T = expr;`.
     /// Caller has confirmed the next-after-const/mut token is `{`.
-    parse_destructure_decl(mut &this) -> DeclarationNode* {
+    parse_destructure_decl(mut &this) -> mut DeclarationNode* {
         const start: Token = this.current();
         const is_mutable: boolean = this.current().kind == TokenType::KwMut;
         this.advance(); // consume 'const' or 'mut'
@@ -2357,8 +2364,11 @@ implement struct Parser {
             target_reference = true;
         }
 
-        // Optional type keyword (enum, struct, union); `class` is refused
-        // and the head read on as `struct`'s.
+        // Optional kind keyword (enum, struct, union), kept for the check
+        // that the target is of that kind; `class` is refused and the head
+        // read on as `struct`'s.
+        mut kind_keyword: Option<KindKeyword> = Option::None;
+        mut kind_keyword_span: SourceSpan = SourceSpan::none();
         if (this.check(TokenType::KwClass)) {
             const tag: Token = this.advance();
             if (trait_ann == null) {
@@ -2370,7 +2380,13 @@ implement struct Parser {
             }
         } else if (this.check(TokenType::KwEnum) || this.check(TokenType::KwStruct)
             || this.check(TokenType::KwUnion)) {
-            this.advance();
+            const tag: Token = this.advance();
+            kind_keyword_span = this.span_from_token(tag);
+            kind_keyword = Option::Some(match (tag.kind) {
+                TokenType::KwEnum  => { KindKeyword::Enum }
+                TokenType::KwUnion => { KindKeyword::Union }
+                _                  => { KindKeyword::Struct }
+            });
         }
 
         // Accept identifier, primitive type keyword, or the empty tuple
@@ -2408,6 +2424,8 @@ implement struct Parser {
         const node: mut ImplBlock* = ImplBlock::new(type_name);
         const decl: mut DeclarationNode* = DeclarationNode::of(DeclKind::Impl(node), this.span_from_token(start));
         node.target_type_span = this.span_from_token(type_tok);
+        node.kind_keyword = kind_keyword;
+        node.kind_keyword_span = kind_keyword_span;
         // References are implemented for through a parameter of the head's
         // own, so that the head covers every type of the referent's kind;
         // a reference to one named type is not a target.
@@ -3455,7 +3473,9 @@ implement struct Parser {
                 this.check(TokenType::KwStatic) &&
                 this.peek_at(1).kind == TokenType::KwMatch;
             if (this.is_declaration_start() && !is_static_match) {
-                const item: Stmt* = Parser::block_item(this.parse_declaration(Visibility::Private,doc));
+                const no_directives: [DirectiveNode*] = [];
+                const item: Stmt* = Parser::block_item(this.parse_declaration(Visibility::Private, doc,
+                    &no_directives, SourceSpan::none()));
                 if (item != null) {
                     body.add_statement(item);
                 }
@@ -3678,7 +3698,7 @@ implement struct Parser {
         // `Option::Some(x) => { body }`
         const some_pat: mut Pattern* = this.lang_variant_pattern(LangItem::Option, "Some", iter_span);
         some_pat.generated = true;
-        const pb: PatternBinding* = new PatternBinding {
+        const pb: mut PatternBinding* = new PatternBinding {
             name: user_name, span: iter_span, sym_id: SymbolID::invalid(),
             resolved_type: TypeRef::invalid(), written_mut: false, aliases_caller: false
         };

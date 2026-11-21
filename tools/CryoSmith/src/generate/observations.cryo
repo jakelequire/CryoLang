@@ -4,14 +4,19 @@
 ///! by observing its parameters and a method's receiver.  A scalar is folded
 ///! directly; a struct field by field, nested structs through their own
 ///! fields; a struct a call returns is bound to a local first, so the call
-///! runs once.
+///! runs once.  An owned struct is observed field by field as a struct is,
+///! and through a reference parameter alike; one moved out of is no longer
+///! in scope, and is not observed.  A holder of one is observed as
+///! `observe_holder` says.  A reference a call returns is observed
+///! by its first field, read where the call stands, since no local holds a
+///! reference.
 
 namespace cryosmith::generate::observations;
 
 import std::collections::array::{ Array };
 
 import cryosmith::generate::generator::{ Generator };
-import cryosmith::model::{ ExpressionKind, StatementKind, Structure, ValueType };
+import cryosmith::model::{ ExpressionKind, OwnedStructure, StatementKind, Structure, ValueType, VariableRole };
 
 implement struct Generator {
     /// Observe every local declared in the scope since `start`.
@@ -22,16 +27,75 @@ implement struct Generator {
     }
 
     /// Observe a place: a scalar is folded into `observed`, a struct is
-    /// observed field by field.
+    /// observed field by field, a closure local by a call of it, and a `T`
+    /// value by a call of its bound trait's first method, every one of
+    /// which returns a scalar - and where `T` is bounded by no trait, not at
+    /// all, since nothing converts it to a `u64`.
     internal observe_place(mut &this, place: i64, statements: mut &Array<i64>) -> void {
         const value_type: ValueType = this.program.expression_at(place).value_type;
-        if (!value_type.is_record()) {
+        if (value_type.same(ValueType::TypeParameter)) {
+            const bounding: i64 = this.genericity.bounding_trait();
+            if (bounding >= 0) { this.observe_value(this.trait_call(place, this.program.trait_at(bounding).first_method, 0), statements); }
+            return;
+        }
+        if (value_type.object_trait() >= 0) {
+            this.observe_value(this.trait_call(place, this.program.trait_at(value_type.object_trait()).first_method, 0), statements);
+            return;
+        }
+        if (value_type.is_enumeration()) {
+            statements.push(this.observation(this.variant_number(place)));
+            return;
+        }
+        if (value_type.is_function()) {
+            match (this.program.expression_at(place).kind) {
+                ExpressionKind::Variable(variable) => {
+                    match (this.program.variable_at(variable).role) {
+                        VariableRole::Local => {
+                            this.observe_value(this.closure_call(this.closure_held_by(variable), 0), statements);
+                        }
+                        _ => { this.observe_value(this.invoke_value(place, 0), statements); }
+                    }
+                }
+                _ => { }
+            }
+            return;
+        }
+        if (value_type.is_holder()) {
+            this.observe_holder(place, statements);
+            return;
+        }
+        if (value_type.is_array() || value_type.is_slice() || value_type.is_dynamic_array() || value_type.is_text() || value_type.is_map()) {
+            match (this.program.expression_at(place).kind) {
+                ExpressionKind::Variable(variable) => {
+                    if (value_type.is_text()) {
+                        this.observe_text(variable, statements);
+                    } else if (value_type.is_map()) {
+                        this.observe_map(variable, statements);
+                    } else {
+                        this.observe_elements(variable, statements);
+                    }
+                }
+                _ => { }
+            }
+            return;
+        }
+        if (!value_type.is_record() && !value_type.is_owned() && !value_type.is_reference()) {
             statements.push(this.observation(place));
             return;
         }
-        const declared: Structure = this.program.structure_at(value_type.structure());
-        mut field: i64 = declared.first_field;
-        while (field < declared.first_field + declared.field_count) {
+        mut first_field: i64 = 0;
+        mut field_count: i64 = 0;
+        if (value_type.is_owned() || value_type.is_reference()) {
+            const owned: OwnedStructure = this.program.owned_at(if (value_type.is_owned()) { value_type.owned() } else { value_type.referent() });
+            first_field = owned.first_field;
+            field_count = owned.field_count;
+        } else {
+            const declared: Structure = this.program.structure_at(value_type.structure());
+            first_field = declared.first_field;
+            field_count = declared.field_count;
+        }
+        mut field: i64 = first_field;
+        while (field < first_field + field_count) {
             const field_place: i64 = this.node(ExpressionKind::Field(place, field), this.program.field_at(field).value_type);
             this.observe_place(field_place, statements);
             field = field + 1;
@@ -39,10 +103,29 @@ implement struct Generator {
     }
 
     /// Observe a value: a scalar directly, a struct by binding it to a
-    /// local first, so it is computed once.
+    /// local first, so it is computed once.  A `T` value - a call of a
+    /// closure returning `T` - is evaluated and not observed, since nothing
+    /// converts it to a `u64`.
     internal observe_value(mut &this, value: i64, statements: mut &Array<i64>) -> void {
         const value_type: ValueType = this.program.expression_at(value).value_type;
-        if (!value_type.is_record()) {
+        if (value_type.same(ValueType::TypeParameter)) {
+            statements.push(this.program.statement(StatementKind::Evaluate(value)));
+            return;
+        }
+        if (value_type.is_enumeration()) {
+            statements.push(this.observation(this.variant_number(value)));
+            return;
+        }
+        if (value_type.is_function()) {
+            this.observe_value(this.invoke_value(value, 0), statements);
+            return;
+        }
+        if (value_type.is_reference()) {
+            const first_field: i64 = this.program.owned_at(value_type.referent()).first_field;
+            statements.push(this.observation(this.node(ExpressionKind::Field(value, first_field), this.program.field_at(first_field).value_type)));
+            return;
+        }
+        if (!value_type.is_record() && !value_type.moves()) {
             statements.push(this.observation(value));
             return;
         }

@@ -39,7 +39,7 @@ import compiler::ast::expression::{
     TupleExpr, TypeofExpr, UnaryExpr, YieldExpr
 };
 import compiler::ast::pattern::{
-    EnumPattern, MatchArmNode, Pattern, PatternKind, StaticMatchArmNode
+    BindingPattern, EnumPattern, MatchArmNode, Pattern, PatternKind, StaticMatchArmNode
 };
 import compiler::ast::statement::{ MatchStmt, StaticMatchStmt, Stmt };
 import compiler::resolver::intern_table::{ InternTable };
@@ -999,9 +999,10 @@ implement trait Walk for struct ASTTypeSubstituter {
         for (mut j: i64 = 0; j < arm.patterns.length(); j++) {
             const pat: mut Pattern* = arm.patterns[j];
             match (pat.kind) {
-                PatternKind::Enum(n) => { this.walk_enum_pattern(pat, n); }
-                // Other pattern kinds have no type annotations to substitute
-                _                    => { }
+                PatternKind::Enum(n)    => { this.walk_enum_pattern(pat, n); }
+                PatternKind::Binding(b) => { this.walk_binding_pattern(pat, b); }
+                // Other pattern kinds hold no type to substitute
+                _                       => { }
             }
         }
         this.walk_stmt(arm.body);
@@ -1105,18 +1106,33 @@ implement trait Walk for struct ASTTypeSubstituter {
         // Recurse into nested sub-patterns (`Some(Some(n))`, `Branch(Leaf(x),
         // r)`) so their enum_name is substituted too. Without this, a nested
         // pattern in a generic body kept the unsubstituted (template) name.
+        // Each binding's decided type is the payload's as this copy sees it.
         for (mut i: i64 = 0; i < node.elements.length(); i++) {
             match (node.elements[i]) {
                 PatternElement::Sub(sub) => {
                     if (sub.pattern != null) {
                         match (sub.pattern.kind) {
-                            PatternKind::Enum(n) => { this.walk_enum_pattern(sub.pattern, n); }
-                            _                    => { }
+                            PatternKind::Enum(n)    => { this.walk_enum_pattern(sub.pattern, n); }
+                            PatternKind::Binding(b) => { this.walk_binding_pattern(sub.pattern, b); }
+                            _                       => { }
                         }
+                    }
+                }
+                PatternElement::Binding(pb) => {
+                    if (this.subst != null && pb.resolved_type.is_valid()) {
+                        pb.resolved_type = this.in_copy(pb.resolved_type);
                     }
                 }
                 _ => { }
             }
+        }
+    }
+
+    /// A pattern binding the whole subject: its decided type as this copy
+    /// sees it.
+    walk_binding_pattern(mut &this, p: mut Pattern*, node: mut BindingPattern*) -> void {
+        if (this.subst != null && node.binding_type.is_valid()) {
+            node.binding_type = this.in_copy(node.binding_type);
         }
     }
 

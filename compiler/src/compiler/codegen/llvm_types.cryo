@@ -16,8 +16,7 @@ import std::core::hash::{ Hasher };
 import std::core::slice::{ Slice };
 import compiler::resolver::mangled_name::{ MangledName };
 import compiler::const_table::{ FoldedInteger };
-import compiler::toolchain::{ ExecutablePath };
-import compiler::codegen::passes::{ LinkerConfig };
+import compiler::toolchain::{ HostTriple };
 import utils::log::{ Log, LogArea, LogLevel };
 
 
@@ -1758,24 +1757,6 @@ type struct LTargetMachine {
         return Result::Ok(LTargetMachine { raw: tm });
     }
 
-    static pick_windows_default_triple(raw_text: string) -> string {
-        const raw: string = raw_text;
-        // Never return null: the result is cached and re-measured via strlen.
-        if (raw == null) { return "x86_64-pc-windows-gnu"; }
-        if (!raw.contains("windows-msvc")) { return raw; }
-        // The host build links with a mingw driver, so when that driver is
-        // there the objects must have its ABI, whatever else is on `PATH`.
-        if (LinkerConfig::host_driver_present()) {
-            return "x86_64-pc-windows-gnu";
-        }
-        // Otherwise honour an installed MSVC linker so codegen emits MSVC-ABI
-        // objects (the user links them with their own toolchain).
-        if (ExecutablePath::find("lld-link").length() > 0 || ExecutablePath::find("link").length() > 0) {
-            return raw;
-        }
-        return "x86_64-pc-windows-gnu";
-    }
-
     /// Resolve the effective triple for codegen: returns `requested` when it
     /// is non-empty, otherwise the host triple.  Centralizes the precedence
     /// rule so both IR generation and the linker decision read the same
@@ -1801,18 +1782,9 @@ type struct LTargetMachine {
     /// cannot be linked by mingw - the most visible mismatch is the stack-probe
     /// symbol: MSVC emits `__chkstk` while mingw provides `___chkstk_ms`, so a
     /// mingw `cryo build` of MSVC-ABI code fails with `undefined reference to
-    /// __chkstk`.  So when LLVM reports msvc we pick the ABI from the linker
-    /// that is actually there, rather than assuming one:
-    ///   - the driver the host link runs (`LinkerConfig::link_driver`: `CRYO_CC`,
-    ///     else `cc`/`gcc`/`clang` on `PATH`) present -> `x86_64-pc-windows-gnu`
-    ///     (the only link path the port supports today; preferred when both are
-    ///     installed, so an unrelated `link` on `PATH` cannot turn the objects
-    ///     into ones that driver cannot link);
-    ///   - else an MSVC linker (`lld-link`/`link.exe`) present -> keep the
-    ///     `windows-msvc` triple, so codegen emits MSVC-ABI objects for the
-    ///     user's own toolchain to link;
-    ///   - else -> `x86_64-pc-windows-gnu` (mingw is the default we ship for).
-    /// The probe runs once per process and is cached.  An explicit `--target=`
+    /// __chkstk`.  So the ABI is picked from the linker that will run
+    /// (`HostTriple::on_windows`).  The probe runs once per process and is
+    /// cached.  An explicit `--target=`
     /// bypasses all of this (see `resolve_effective_triple`).
     ![target(unix)]
     static get_default_triple() -> string {
@@ -1825,7 +1797,7 @@ type struct LTargetMachine {
             return g_win_default_triple;
         }
         const raw: string = llvm::LLVMGetDefaultTargetTriple() as string;
-        g_win_default_triple = LTargetMachine::pick_windows_default_triple(raw);
+        g_win_default_triple = HostTriple::on_windows(raw);
         return g_win_default_triple;
     }
 

@@ -1,0 +1,206 @@
+///! `cryogate smith-crash --cryo <compiler> --work <directory> [--smith
+///! <cryosmith>] [--stdlib <directory>] [--first-seed N] [--count K]
+///! [--mutations J] [--jobs N] [--build-limit S] [-- <generation
+///! options>...]`: CryoSmith's programs mutated into near-valid ones and
+///! built, the crash fuzzer.
+///!
+///! For each mutation number from 0 below J, CryoSmith writes the K seeds'
+///! programs with that mutation made (`--mutation`) into a directory of
+///! its own under the work directory, and each is built once with the
+///! compiler under test at `-O0`, killed past `--build-limit` seconds
+///! (default 300).  A refusal with an error code and an acceptance are
+///! both what a near-valid program may get; a compile crash, a compile
+///! hang, an internal error and a refusal with no code are findings
+///! (`smith/crash.cryo`), and so is an acceptance of a program CryoSmith
+///! marked as one the compiler must refuse (`smith-<seed>.must-refuse`
+///! beside it).  A program the compiler accepted is run under a short
+///! limit, as every build on the shared runner is, and its run is not
+///! judged.
+///!
+///! The report is one line per finding, in mutation then seed order; then
+///! each distinct signature with its count and first program; then the
+///! verdict line.  A finding's program and build directory stay in the
+///! work directory; an accepted program's executable and a refused one's
+///! build directory are removed.  Exit 0 when nothing was
+///! found, 1 on a finding, 2 on a usage error.
+
+namespace cryogate::gates::smith_crash;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::time::duration::{ Duration };
+
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::smith::corpus::{ CorpusLayout };
+import cryogate::smith::crash::{ CrashDecision, CrashFinding };
+import cryogate::smith::difference::{ Configuration, Observation };
+import cryogate::smith::run::programs::{ Attempt, SmithRun, Stage };
+
+/// How long an accepted mutated program may run before it is stopped; its
+/// run is not judged.
+const ACCEPTED_RUN_LIMIT: u64 = 10;
+
+/// `cryogate smith-crash`.
+public type struct SmithCrash {
+    /// Run `cryogate smith-crash` with `arguments` from index `first`; 0
+    /// when nothing was found, 1 on a finding, 2 on a usage error.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate smith-crash --cryo <compiler> --work <directory> [--smith <cryosmith>] [--stdlib <directory>] [--first-seed N] [--count K] [--mutations J] [--jobs N] [--build-limit S] [-- <generation options>...]"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--work"));
+        options.valued(Str::new("--smith"));
+        options.valued(Str::new("--stdlib"));
+        options.valued(Str::new("--first-seed"));
+        options.valued(Str::new("--count"));
+        options.valued(Str::new("--mutations"));
+        options.valued(Str::new("--jobs"));
+        options.valued(Str::new("--build-limit"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-crash: {reason.as_str()}"); return 2; }
+        };
+        const compiler: Option<Str> = parsed.value(Str::new("--cryo"));
+        const work: Option<Str> = parsed.value(Str::new("--work"));
+        if (compiler.is_none() || work.is_none() || !parsed.positionals().is_empty()) {
+            fmt::eprintln(f"cryogate smith-crash: usage: {options.usage()}");
+            return 2;
+        }
+        const first_seed: u64 = match (parsed.number(Str::new("--first-seed"), 1, 0)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-crash: {reason.as_str()}"); return 2; }
+        };
+        const count: u64 = match (parsed.number(Str::new("--count"), 24, 1)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-crash: {reason.as_str()}"); return 2; }
+        };
+        const mutations: u64 = match (parsed.number(Str::new("--mutations"), 4, 1)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-crash: {reason.as_str()}"); return 2; }
+        };
+        // 0, the default, leaves the scheduler's own count.
+        const jobs: u64 = match (parsed.number(Str::new("--jobs"), 0, 1)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-crash: {reason.as_str()}"); return 2; }
+        };
+        const build_limit: u64 = match (parsed.number(Str::new("--build-limit"), 300, 1)) {
+            Result::Ok(value)   => { value }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-crash: {reason.as_str()}"); return 2; }
+        };
+        const tree: String = Host::absolute(compiler.unwrap());
+        mut configurations: Array<Configuration> = Array::<Configuration>::new();
+        configurations.push(Configuration::compiled(Str::new("tree"), Str::new(""), tree.as_str(), Str::new("0")));
+        const default_smith: PathBuf = repository.join(Str::new("tools/CryoSmith/build"));
+        const smith: String = match (parsed.value(Str::new("--smith"))) {
+            Option::Some(path) => { Host::absolute(path) }
+            Option::None       => { Host::executable_name(default_smith.as_path().join(Str::new("cryosmith")).as_path().as_str()) }
+        };
+        const work_path: PathBuf = PathBuf::from(Host::absolute(work.unwrap()).as_str());
+        mut findings: Array<CrashFinding> = Array::<CrashFinding>::new();
+        mut found_at: Array<String> = Array::<String>::new();
+        mut refused: u64 = 0;
+        mut accepted: u64 = 0;
+        mut mutation: u64 = 0;
+        while (mutation < mutations) {
+            const directory: PathBuf = work_path.as_path().join(f"mutation-{mutation}".as_str());
+            match (Directory::create_all(directory.as_path())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { fmt::eprintln(f"cryogate smith-crash: cannot create {directory.as_path().as_str()}: {error.describe()}"); return 1; }
+            }
+            const programs: SmithRun = SmithRun {
+                configurations: configurations.clone(),
+                layout:         CorpusLayout::new(directory.as_path()),
+                work:           PathBuf::from(directory.as_path().as_str()),
+                stdlib:         match (parsed.value(Str::new("--stdlib"))) {
+                    Option::Some(stdlib) => { Option::Some(String::from_str(stdlib)) }
+                    Option::None         => { Option::None }
+                },
+                build_limit:    Option::Some(Duration::from_seconds(build_limit)),
+                run_limit:      Option::Some(Duration::from_seconds(ACCEPTED_RUN_LIMIT)),
+                jobs:           jobs as i64,
+                log_prefix:     f"smith-crash-{mutation}",
+            };
+            mut generation: Array<String> = parsed.rest().clone();
+            generation.push(String::from_str(Str::new("--mutation")));
+            generation.push(f"{mutation}");
+            match (programs.write_programs(smith.as_str(), first_seed, count, &generation, logs)) {
+                Result::Ok(_)       => { }
+                Result::Err(reason) => { fmt::println(f"smith-crash: FAIL ({reason.as_str()})"); return 1; }
+            }
+            const attempts: Array<Array<Attempt>> = programs.attempts(first_seed, count, logs);
+            mut offset: u64 = 0;
+            while (offset < count) {
+                const seed: u64 = first_seed.wrapping_add(offset);
+                const attempt: &Attempt = &attempts[offset as i64][0];
+                const source: String = match (File::read_text(programs.layout.source(seed).as_path())) {
+                    Result::Ok(text) => { text }
+                    Result::Err(_)   => { String::new() }
+                };
+                const operator: String = CrashDecision::operator_of(source.as_str());
+                const built: boolean = match (attempt.stage) {
+                    Stage::Build => { false }
+                    _            => { true }
+                };
+                const observation: Option<Observation> = if (built) { Option::None } else { Option::Some(attempt.observation.clone()) };
+                const must_refuse: boolean = programs.layout.refusal_mark(seed).as_path().is_file();
+                match (CrashDecision::decide(operator.as_str(), must_refuse, &observation)) {
+                    Option::Some(finding) => {
+                        fmt::println(f"FAIL  seed {seed} mutation {mutation}: {finding.signature.as_str()}");
+                        found_at.push(f"seed {seed} mutation {mutation}");
+                        findings.push(finding);
+                    }
+                    Option::None => {
+                        if (built) {
+                            accepted = accepted + 1;
+                            match (programs.remove_executables(seed)) {
+                                Result::Ok(_)       => { }
+                                Result::Err(reason) => { fmt::println(f"smith-crash: FAIL ({reason.as_str()})"); return 1; }
+                            }
+                        } else {
+                            refused = refused + 1;
+                            const left: PathBuf = programs.layout.build_directory(seed, programs.configurations[0].key.as_str());
+                            match (Directory::remove_all(left.as_path())) {
+                                Result::Ok(_)      => { }
+                                Result::Err(error) => { fmt::println(f"smith-crash: FAIL (cannot remove {left.as_path().as_str()}: {error.describe()})"); return 1; }
+                            }
+                        }
+                    }
+                }
+                offset = offset + 1;
+            }
+            mutation = mutation + 1;
+        }
+        const programs_built: u64 = count * mutations;
+        if (findings.is_empty()) {
+            fmt::println(f"smith-crash: OK ({programs_built} programs, {refused} refused, {accepted} accepted)");
+            return 0;
+        }
+        mut signatures: Array<String> = Array::<String>::new();
+        for (finding in findings.iterate_references()) {
+            if (!signatures.contains(&finding.signature)) { signatures.push(finding.signature.clone()); }
+        }
+        for (signature in signatures.iterate_references()) {
+            mut seen: i64 = 0;
+            mut first_at: String = String::new();
+            mut index: i64 = 0;
+            while (index < findings.length()) {
+                if (findings[index].signature.as_str() == signature.as_str()) {
+                    if (seen == 0) { first_at = found_at[index].clone(); }
+                    seen++;
+                }
+                index++;
+            }
+            fmt::println(f"signature {signature.as_str()}: {seen} programs, first {first_at.as_str()}");
+        }
+        fmt::println(f"smith-crash: FAIL ({findings.length()} findings in {programs_built} programs, {signatures.length()} signatures; {refused} refused, {accepted} accepted)");
+        return 1;
+    }
+}
