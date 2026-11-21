@@ -53,6 +53,27 @@ implement struct Interpreter {
                 this.drop_place(target, element, span)?;
                 Result::Ok(Operand::Nothing)
             }
+            // The value is taken out by its bits: a value that is not `Copy`
+            // leaves its storage moved-from, which only a `write` or a free
+            // may meet without a fault.
+            IntrinsicKind::PointerRead => {
+                const element: TypeRef = this.layout.pointee(values[0].argument_type);
+                const source: Address = this.reach(this.address_argument(&values, 0, span)?, element, span)?;
+                this.taken(this.operand_at(source, element, span)?, element, span)
+            }
+            // The storage is filled whatever it held, and nothing is released.
+            IntrinsicKind::PointerWrite => {
+                const element: TypeRef = this.layout.pointee(values[0].argument_type);
+                if (values.length() < 2) { return Result::Ok(Operand::Nothing); }
+                const target: Address = this.reach(this.address_argument(&values, 0, span)?, element, span)?;
+                const written: Operand = if (this.layout.is_aggregate(element)) {
+                    Operand::Place(this.address_argument(&values, 1, span)?)
+                } else {
+                    Operand::Value(values[1].value)
+                };
+                this.store_operand(target, element, written, values[1].argument_type, span)?;
+                Result::Ok(Operand::Nothing)
+            }
             IntrinsicKind::Trap        => { Result::Err(Stop::panic(String::from_str(Str::new("trap")), span)) }
             IntrinsicKind::Bswap16     => { this.integer_result(IntegerKind::new(16, false).byte_swapped(this.integer_argument(&values, 0, span)?), result, span) }
             IntrinsicKind::Bswap32     => { this.integer_result(IntegerKind::new(32, false).byte_swapped(this.integer_argument(&values, 0, span)?), result, span) }
