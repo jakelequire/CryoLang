@@ -1,0 +1,85 @@
+// E0453: `unsafe` relaxes no check it does not name, and a by-value read
+// through a pointer or reference is a copy wherever it is written - the
+// storage it is read from still releases the value, so it is released twice.
+// Each shape the checks refuse outside `unsafe` is refused inside it: `*p`,
+// a field through a pointer, a whole value through a reference, and a
+// method that consumes its receiver called through a pointer.  A take is
+// written as one, `pointer::read`, and the controls each do that.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::UnsafeDoesNotPermitATake;
+
+import std::core::pointer;
+import std::collections::string::{ String };
+
+type struct Holder {
+    text: String;
+
+    whole(&this) -> Holder {
+        unsafe { return this; }
+        //~^ ERROR[E0453] cannot move `this` out through a reference
+    }
+
+    // Control.
+    taken(&this) -> Holder {
+        unsafe { return pointer::read(&this); }
+    }
+
+    consume(this) -> i64 { return this.text.length(); }
+}
+
+function through_deref(p: String*) -> i64 {
+    unsafe {
+        const copy: String = *p;
+        //~^ ERROR[E0453] cannot move a value that owns a destructor out of a pointer
+        return copy.length();
+    }
+}
+
+function through_field(h: Holder*) -> i64 {
+    unsafe {
+        const copy: String = h.text;
+        //~^ ERROR[E0453] cannot move field `text` out through a pointer or reference
+        return copy.length();
+    }
+}
+
+function through_consuming_method(h: Holder*) -> i64 {
+    unsafe {
+        return h.consume();
+        //~^ ERROR[E0453] cannot move a value that owns a destructor out of a pointer
+    }
+}
+
+// Controls: each take written as one, its storage refilled.
+function deref_control(p: mut String*) -> i64 {
+    unsafe {
+        const taken: String = pointer::read(p);
+        pointer::write(p, String::from("refilled"));
+        return taken.length();
+    }
+}
+
+function field_control(h: mut Holder*) -> i64 {
+    unsafe {
+        const taken: String = pointer::read(&h.text);
+        pointer::write(&h.text, String::from("refilled"));
+        return taken.length();
+    }
+}
+
+function method_control(h: mut Holder*) -> i64 {
+    unsafe {
+        const length: i64 = pointer::read(h).consume();
+        pointer::write(h, Holder { text: String::from("refilled") });
+        return length;
+    }
+}
+
+function main() -> i32 {
+    mut text: String = String::from("owned");
+    mut holder: Holder = Holder { text: String::from("held") };
+    const total: i64 = through_deref(&text) + through_field(&holder) + through_consuming_method(&holder)
+        + deref_control(&text) + field_control(&holder) + method_control(&holder);
+    return total as i32;
+}

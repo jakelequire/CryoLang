@@ -363,24 +363,6 @@ type struct MoveChecker {
     assigned_member_keys: [u64];
     assigned_members:     [u64];
 
-    /// Depth of enclosing `unsafe` blocks.
-    ///
-    /// `unsafe` does NOT turn the pass off - a use-after-move is a
-    /// use-after-move wherever it is written, and the two things this pass
-    /// shares with drop_insertion (the move set and the partial-move set) have
-    /// to stay in agreement inside an `unsafe` block as much as outside one.
-    /// What it marks is narrower: the programmer taking responsibility for
-    /// ownership the compiler cannot follow, which in a language without
-    /// lifetimes means exactly the ownership reached through a raw pointer.
-    /// Only `check_deref_move_out` consults it.
-    ///
-    /// Before this existed the pass had no `UnsafeBlockStatement` case at all,
-    /// so it never descended and `unsafe` silently disabled move checking
-    /// wholesale - while drop_insertion, which does walk the block, went on
-    /// suppressing drops for moves this pass never saw.  That divergence is
-    /// the leak-or-double-free both passes' comments warn about.
-    unsafe_depth: i64;
-
     /// Set while walking an argument whose parameter sema could NOT resolve.
     ///
     /// The move set and the raw-pointer rejection want OPPOSITE defaults for
@@ -523,7 +505,6 @@ type struct MoveChecker {
             declaration_depths: HashMap::<SymbolKey, i64, GlobalAllocator, FnvHasher>::new(),
             loop_repeat:        false,
             repeat_declarations_start: 0,
-            unsafe_depth:        0,
             arg_binding_unknown: false,
             drop_receiver:       SymbolID::invalid(),
             capture_alias_keys:    [],
@@ -581,7 +562,6 @@ type struct MoveChecker {
         this.declaration_depths = HashMap::<SymbolKey, i64, GlobalAllocator, FnvHasher>::new();
         this.loop_repeat        = false;
         this.repeat_declarations_start = 0;
-        this.unsafe_depth       = 0;
         this.arg_binding_unknown = false;
         this.drop_receiver       = SymbolID::invalid();
         this.capture_alias_keys    = [];
@@ -1569,12 +1549,10 @@ type struct MoveChecker {
                 }
             }
             StmtKind::UnsafeBlock(u) => {
-                // Walked like any other block, with `unsafe_depth` raised so
-                // the raw-pointer rules stand down inside it.  Everything else
-                // this pass checks stays in force.
-                this.unsafe_depth += 1;
+                // Walked like any other block: `unsafe` allows the unchecked
+                // operations and relaxes nothing this pass checks.  A take
+                // through a pointer is written `pointer::read`.
                 this.walk_stmt(u.block);
-                this.unsafe_depth -= 1;
             }
             StmtKind::Return(r) => {
                 if (r.expression != null) {
@@ -3280,18 +3258,23 @@ type struct MoveChecker {
     /// into a second owner - the binding, the caller, the callee, the match's
     /// temporary - while the storage `h` names still holds the field and
     /// drops it again.  It is the `*p` read `check_deref_move_out` refuses,
-    /// one projection further, with the same `unsafe` escape for a
-    /// deliberate take.  An owning array field is
+    /// one projection further; a deliberate take is written
+    /// `pointer::read(&h.slot)`.  An owning array field is
     /// `check_array_field_move_out`'s, and a destructor's own receiver
     /// `check_destructor_field_move_out`'s.
     check_field_read_through_pointer(mut &this, e: ExpressionNode*, ma: MemberAccessExpr*,
                                      field_ty: TypeRef, site: FieldReadSite) -> void {
-        if (this.unsafe_depth > 0 || this.arg_binding_unknown) { return; }
+        if (this.arg_binding_unknown) { return; }
         if (!this.type_needs_drop(field_ty) || this.is_owning_array(field_ty)) { return; }
         if (this.drop_receiver.is_valid() && this.is_receiver_value_place(ma.object)) { return; }
         if (!this.reaches_through_pointer(ma.object)) { return; }
         if (this.suppress_emit) { return; }
         const field: string = this.intern.resolve(ma.member);
+        const named: IdentifierExpr* = ExpressionNode::identifier_of(ma.object);
+        const owner_text: string = if (named != null) { this.intern.resolve(named.name) } else { "owner" };
+        const take_example: String = fmt::format(
+            "const taken = pointer::read(&%s.%s);\npointer::write(&%s.%s, <a value to leave behind>);",
+            owner_text, field, owner_text, field);
         const diag: Diagnostic = match (site) {
             FieldReadSite::MatchSubject => {
                 Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
@@ -3305,7 +3288,10 @@ type struct MoveChecker {
                     fmt::format("cannot move field `%s` out through a pointer or reference", field))
                     .at_with_label(e.span,
                         "this copies the field's owning handle into a second owner; the storage it is in still drops it too (double free)")
-                    .help("borrow the field or clone it; if this really is a take, swap a replacement in with `core::mem::swap`, or take it by value from an owned receiver (`mut this`)")
+                    .help("borrow the field or clone it; or take it by value from an owned receiver (`mut this`)")
+                    .help_with_example(
+                        "if this really is a take, take it with `pointer::read` and write a new value over the storage it leaves",
+                        take_example)
             }
         };
         this.ctx.emit_diagnostic(diag);
@@ -3404,12 +3390,11 @@ type struct MoveChecker {
     /// Cryo has no lifetimes, so the pointer carries no record of who owns the
     /// storage it names; the pass cannot tell a take (the owner is finished
     /// with it, or is about to be overwritten) from a copy (the owner will
-    /// still drop it), and the two are spelled identically.  That judgement
-    /// belongs to the programmer, and `unsafe` is where they make it: inside
-    /// one, this rule stands down and the destructive read is written plainly
-    /// as `*p`.  The block is the right granularity because the argument for
-    /// soundness usually spans more than the read - in `mem::swap` it is the
-    /// store that immediately replaces what was taken.
+    /// still drop it), and `*p` reads the same either way.  A take is
+    /// written as one, `pointer::read(p)`, so `*p` in a by-value position is
+    /// always a copy and always refused, inside `unsafe` too; what makes the
+    /// take sound - in `mem::swap` the `pointer::write` that refills the
+    /// storage - is the program's to keep.
     ///
     /// Only reached from a storage-duplicating (`real`) position, so a borrow
     /// - `p.field`, `p.method()`, `&*p`, an argument bound to a `&T`/`T*`
@@ -3418,7 +3403,6 @@ type struct MoveChecker {
     /// looked like a by-value transfer, this rule fired on arguments the callee
     /// never takes.
     check_deref_move_out(mut &this, expr: ExpressionNode*) -> void {
-        if (this.unsafe_depth > 0) { return; }
         const u: UnaryExpr* = ExpressionNode::unary_of(expr);
         if (u == null) { return; }
         if (this.arg_binding_unknown) { return; }
@@ -3439,11 +3423,11 @@ type struct MoveChecker {
     /// `return this;` in a `&this` or `mut &this` method reads the receiver
     /// by its implicit dereference: the caller gets a second owner of the
     /// storage the receiver names, and both are released.  It is the read
-    /// `check_deref_move_out` refuses for a written `*p`, with the same
-    /// `unsafe` escape for a deliberate take.  A by-value `this` is not a
-    /// reference, so its `return this;` is an ordinary move.
+    /// `check_deref_move_out` refuses for a written `*p`; a deliberate take
+    /// is `pointer::read(this)`.  A by-value `this` is not a reference, so
+    /// its `return this;` is an ordinary move.
     check_reference_binding_move_out(mut &this, expr: ExpressionNode*) -> void {
-        if (this.unsafe_depth > 0 || this.arg_binding_unknown) { return; }
+        if (this.arg_binding_unknown) { return; }
         const id: IdentifierExpr* = ExpressionNode::identifier_of(expr);
         if (id == null) { return; }
         const sym: SymbolID = id.res.local_sym();
@@ -3470,9 +3454,10 @@ type struct MoveChecker {
     /// destructor: the call dereferences the receiver implicitly and moves
     /// the pointee into the method, which releases it, while the storage it
     /// was read from still releases it too.  It is the move `check_deref_move_out`
-    /// refuses for a written `(*p).method()`, with the same `unsafe` escape.
+    /// refuses for a written `(*p).method()`; a deliberate take calls the
+    /// method on `pointer::read(p)`.
     check_consumed_through_indirection(mut &this, receiver: ExpressionNode*) -> void {
-        if (this.unsafe_depth > 0 || this.arg_binding_unknown) { return; }
+        if (this.arg_binding_unknown) { return; }
         if (receiver == null) { return; }
         const written: TypeRef = receiver.resolved_type;
         if (!written.is_valid() || !this.is_ptr_or_ref(written)) { return; }
@@ -3488,7 +3473,12 @@ type struct MoveChecker {
         diag = diag.at_with_label(receiver.span,
             "the method takes its receiver by value, so the call reads the pointee out by value; the storage this points at is still dropped by its owner (double free)");
         diag = diag.help(
-            "call a method that borrows its receiver (`&this`) instead, or clone the value first; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");
+            "call a method that borrows its receiver (`&this`) instead, or clone the value first");
+        const named: IdentifierExpr* = ExpressionNode::identifier_of(receiver);
+        const pointer_text: string = if (named != null) { this.intern.resolve(named.name) } else { "p" };
+        diag = diag.help_with_example(
+            "if this really is a take - the storage is yours to empty, or you overwrite it straight after - take the value with `pointer::read` and call the method on it",
+            fmt::format("pointer::read(%s).<method>(...)", pointer_text));
         this.ctx.emit_diagnostic(diag);
         this.fired += 1;
         this.fatal += 1;
@@ -3500,7 +3490,13 @@ type struct MoveChecker {
         diag = diag.at_with_label(expr.span,
             "reading the pointee by value copies its owning handle; the storage this points at is still dropped by its owner (double free)");
         diag = diag.help(
-            "borrow it instead (read a field, or call a method that borrows its receiver with `&this`), or clone it; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");
+            "borrow it instead (read a field, or call a method that borrows its receiver with `&this`), or clone it");
+        const u: UnaryExpr* = ExpressionNode::unary_of(expr);
+        const named: IdentifierExpr* = if (u != null) { ExpressionNode::identifier_of(u.operand) } else { null as IdentifierExpr* };
+        const pointer_text: string = if (named != null) { this.intern.resolve(named.name) } else { "p" };
+        diag = diag.help_with_example(
+            "if this really is a take - the storage is yours to empty, or you overwrite it straight after - write it as one with `pointer::read`",
+            fmt::format("const taken = pointer::read(%s);", pointer_text));
         this.ctx.emit_diagnostic(this.with_clone_hint(diag, expr.resolved_type, expr.span, expr));
         this.fired += 1;
         this.fatal += 1;

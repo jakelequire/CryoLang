@@ -4510,6 +4510,21 @@ type struct DropInserter {
     read_call(mut &this, e: ExpressionNode*, c: mut CallExpr*) -> void {
         if (c == null) { return; }
         this.lower_drop_in_place(e, c);
+        // A take with `pointer::read` leaves its storage holding bits the
+        // value's new owner releases: a store through the reference it was
+        // taken from behind releases nothing afterwards, as after a `*r`
+        // moved out (`record_reference_store`).
+        if (c.resolved_callee.intrinsic_kind(this.ctx.decl_index) == IntrinsicKind::PointerRead
+                && c.arguments.length() == 1 && c.arguments[0] != null) {
+            const source: ExpressionNode* = c.arguments[0];
+            const address: UnaryExpr* = ExpressionNode::unary_of(source);
+            const named: IdentifierExpr* = ExpressionNode::identifier_of(source);
+            if (address != null && !address.is_postfix && address.op.kind == TokenType::Amp) {
+                this.note_reference_move(address.operand);
+            } else if (named != null && this.is_reference(this.lookup_type(named.res.local_sym()))) {
+                this.reference_moved_roots.push(named.res.local_sym().key());
+            }
+        }
         // `--panic=unwind`: open a pending-arg frame for this call. Each
         // bare-identifier owning argument moved below is recorded on it; a panic
         // origin nested in a LATER argument drops them (the callee never ran).

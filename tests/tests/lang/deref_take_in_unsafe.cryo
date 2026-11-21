@@ -1,27 +1,22 @@
-// `unsafe` is where the programmer takes responsibility for ownership the
-// compiler cannot follow - which, in a language without lifetimes, means
-// ownership reached through a raw pointer.
+// A take of ownership reached through a raw pointer is written as one:
+// `pointer::read(p)` takes the value out by its bits, and the program keeps
+// the storage from releasing it again - `pointer::write` refills it, or it is
+// freed unreleased.
 //
-// A by-value read of `*p` is rejected in safe code (E0453: the pointee is
-// duplicated into an independently-dropped place while whoever owns that
-// storage keeps its own claim, so the destructor runs twice - see
-// negative/E0453_deref_move_out.cryo). Inside an `unsafe` block the same read
-// is permitted, because the block is the programmer stating the storage is
-// theirs to empty. Every case here PROVES that by counting destructor runs: a
-// take leaves exactly one, a duplication would leave two.
-//
-// `unsafe` is NOT a move-checking off-switch. It stands down the raw-pointer
-// rule and nothing else; a use-after-move written inside one is still E0452.
-// That mattered: before this, the pass had no `UnsafeBlockStatement` case at
-// all, so it never descended and `unsafe` silently disabled move checking
-// wholesale - while drop insertion, which does walk the block, went on
-// suppressing drops for moves the checker never saw.
+// A by-value read of `*p` is refused, inside `unsafe` as outside it (E0453:
+// the pointee is duplicated into an independently-dropped place while
+// whoever owns that storage keeps its own claim, so the destructor runs
+// twice - see negative/E0453_deref_move_out.cryo and
+// negative/E0453_unsafe_does_not_permit_a_take.cryo). Every case here PROVES
+// a take by counting destructor runs: a take leaves exactly one, a
+// duplication would leave two.
 ![config(testing)]
 namespace CryoTests::Tests::Lang::DerefTakeInUnsafe;
 
 import std::test;
 import std::core::result::{ Result };
 import std::core::mem;
+import std::core::pointer;
 import std::test::assert::{ expect_equal };
 import std::test::error::{ TestError };
 
@@ -41,9 +36,52 @@ implement trait Drop for struct Res {
 // drop it, so exactly one owner exists at every moment.
 function take_and_refill(slot: mut Res*, replacement: Res) -> Res {
     mut previous: Res;
-    unsafe { previous = *slot; }
-    *slot = replacement;
+    unsafe { previous = pointer::read(slot); }
+    pointer::write(slot, replacement);
     return previous;
+}
+
+type struct Cell {
+    item: Res;
+
+    // The member is taken out from behind the receiver and a new one stored
+    // through it: the store releases nothing, since the storage holds the
+    // bits of the value the take's temporary owns and releases.
+    renumber(mut &this, offset: i64) -> void {
+        unsafe { this.item = Res::new(pointer::read(&this.item).id + offset); }
+    }
+}
+
+![test]
+function a_store_after_a_take_through_a_reference_releases_nothing() -> Result<(), TestError> {
+    g_drops = 0;
+    mut seen: i64 = 0;
+    if (true) {
+        mut cell: Cell = Cell { item: Res::new(7) };
+        cell.renumber(100);
+        seen = cell.item.id;
+        // The taken value was released when its statement ended.
+        if (g_drops != 1) { return expect_equal(g_drops, 1 as i64); }
+    }
+    if (seen != 107) { return expect_equal(seen, 107 as i64); }
+    return expect_equal(g_drops, 2 as i64);
+}
+
+![test]
+function a_value_is_written_over_storage_holding_nothing() -> Result<(), TestError> {
+    g_drops = 0;
+    if (true) {
+        mut held: Res = Res::new(1);
+        const taken: Res = take_and_refill(&held, Res::new(2));
+        const fresh: Res = Res::new(3);
+        // `held`'s storage is emptied again and refilled: the take's value
+        // is released by its new owner, the refill by `held`.
+        const second: Res = take_and_refill(&held, fresh);
+        if (taken.id + second.id + held.id != 6) {
+            return expect_equal(taken.id + second.id + held.id, 6 as i64);
+        }
+    }
+    return expect_equal(g_drops, 3 as i64);
 }
 
 ![test]
