@@ -1097,16 +1097,6 @@ type struct MethodBinding {
         return args;
     }
 
-    /// The projected member name of a projection type-annotation, or empty for
-    /// any other annotation shape.
-    projection_ann_member(&this, ann: TypeAnnotation*) -> SymbolStr {
-        if (ann == null) { return SymbolStr::empty(); }
-        match (*ann) {
-            TypeAnnotation::Projection(pj) => { return pj.member; }
-            _ => { return SymbolStr::empty(); }
-        }
-    }
-
     /// Whether the written projection `ann` (a bound's subject, `This::Item`)
     /// names the associated type `proj` is a projection of: the same trait,
     /// and the same position there once the `assoc-type` door has placed the
@@ -1124,106 +1114,46 @@ type struct MethodBinding {
         }
     }
 
-    /// The registered type a written argument names, off its stamp: a
-    /// declaration's type (its template, for an instantiation), a
-    /// primitive's.  Invalid for a type parameter, a projection, or a shape
-    /// that names no registered type.
-    item_type_of(&this, ann: TypeAnnotation*) -> TypeRef {
-        if (ann == null) { return TypeRef::invalid(); }
-        return match (*ann) {
-            TypeAnnotation::Named(n) => {
-                match (n.res.require("method_binding:item annotation")) {
-                    Res::Def(d)    => { this.ctx.decl_index.type_of_def(d) }
-                    Res::PrimTy(p) => { this.ctx.type_resolver.resolve_primitive(p) }
-                    _              => { TypeRef::invalid() }
-                }
-            }
-            TypeAnnotation::Primitive(p) => { this.ctx.type_resolver.resolve_primitive(p.name) }
-            TypeAnnotation::Generic(g)   => { this.item_type_of(g.base) }
-            TypeAnnotation::Reference(r) => { this.item_type_of(r.inner) }
-            TypeAnnotation::Pointer(p)   => { this.item_type_of(p.inner) }
-            _ => { TypeRef::invalid() }
-        };
-    }
-
     /// True when a projection-bounded trait-DEFAULT method `method_name`
     /// (`min`/`max` with `where This::Item: Ord`) is NOT applicable to the
     /// concrete receiver `recv_type` because its Item does not implement a bound
     /// trait. This lets sema reject `nonOrdIter.min()` cleanly (a normal
     /// "no method" E0358) instead of resolving it via the trait default and
-    /// leaving it to fail at codegen (E0636). Mirrors the synthesize-time
-    /// default-filter applicability check, but on the CALL side. Returns false
-    /// (do not block) for symbolic receivers or symbolic Item types.
+    /// leaving it to fail at codegen (E0636).  Asks the question the
+    /// default's synthesis and each monomorphization ask,
+    /// `TraitChecker::projected_member_unmet_trait`.
     projection_default_unavailable(&this, recv_type: TypeRef, method_name: SymbolStr) -> boolean {
-        if (!method_name.is_valid()) { return false; }
-        // The WRITTEN heads: the Item is read off the head's positional trait
-        // arguments, which a placed clone has already substituted.
+        mut member: TypeRef = TypeRef::invalid();
+        mut associated: SymbolStr = SymbolStr::empty();
+        mut trait_def: DefId = DefId::invalid();
+        return this.projection_default_unmet(recv_type, method_name, &member, &associated, &trait_def) != null;
+    }
+
+    /// The bound that keeps the trait default `method_name` off
+    /// `recv_type`, as `projection_default_unavailable` finds it: the
+    /// trait the bound names, with the associated type it is written on in
+    /// `out_associated`, that type's binding, which lacks the trait, in
+    /// `out_member`, and the trait that declares the default in
+    /// `out_trait`.  Null when the default applies or `recv_type` has none.
+    projection_default_unmet(&this, recv_type: TypeRef, method_name: SymbolStr,
+                             out_member: mut TypeRef*, out_associated: mut SymbolStr*,
+                             out_trait: mut DefId*) -> const TraitRef* {
+        if (!method_name.is_valid()) { return null; }
         const blocks: [DeclarationNode*] = this.ctx.generic_registry.template_trait_impls_of(recv_type, this.intern);
         for (mut ti: i64 = 0; ti < blocks.length(); ti++) {
             const dimpl: ImplBlock* = DeclarationNode::impl_of(blocks[ti]);
-            const tdecl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(dimpl.trait_def);
-            if (tdecl == null) { continue; }
             // The trait's default-bodied method of this name, if projection-bounded.
             const mfunc_decl: DeclarationNode* = this.ctx.generic_registry.trait_method_by_leaf(dimpl.trait_def, method_name);
             const mfunc: FunctionDecl* = DeclarationNode::fn_of(mfunc_decl);
             if (mfunc == null || !mfunc.has_body()) { continue; }
-            if (this.projection_bound_fails(mfunc_decl, dimpl, tdecl)) { return true; }
-        }
-        return false;
-    }
-
-    /// Whether any projection-subject where-bound on `mfunc` has a CONCRETE Item
-    /// (drawn from `impl_node`'s positional trait args) that fails the bound
-    /// trait. Symbolic Item (a projection, or an impl generic param) -> false.
-    projection_bound_fails(&this, mfunc_decl: DeclarationNode*, impl_node: ImplBlock*,
-                           tdecl: TraitDecl*) -> boolean {
-        const mfunc: FunctionDecl* = DeclarationNode::fn_of(mfunc_decl);
-        if (mfunc == null || impl_node == null || tdecl == null) { return false; }
-        if (impl_node.trait_annotation == null) { return false; }
-        // The impl's positional trait-arg annotations.
-        mut has_args: boolean = false;
-        mut arg_len: i64 = 0;
-        match (*impl_node.trait_annotation) {
-            TypeAnnotation::Generic(g) => { has_args = true; arg_len = g.args.length(); }
-            _ => { }
-        }
-        if (!has_args) { return false; }
-        for (mut bi: i64 = 0; bi < mfunc.trait_bounds.length(); bi++) {
-            const b: TraitBound* = &mfunc.trait_bounds[bi];
-            if (!b.has_projection_subject()) { continue; }
-            const member: SymbolStr = this.projection_ann_member(b.subject);
-            if (!member.is_valid()) { continue; }
-            const assoc_idx: i64 = tdecl.assoc_type_index(member);
-            if (assoc_idx < 0) { continue; }
-            const arg_idx: i64 = tdecl.generic_params.length() + assoc_idx;
-            if (arg_idx < 0 || arg_idx >= arg_len) { continue; }
-            mut item_ann: TypeAnnotation* = null;
-            match (*impl_node.trait_annotation) {
-                TypeAnnotation::Generic(g) => { item_ann = g.args[arg_idx]; }
-                _ => { }
-            }
-            if (item_ann == null) { continue; }
-            // Symbolic Item (projection or impl-declared param) -> undecidable, keep.
-            match (*item_ann) {
-                TypeAnnotation::Projection(_) => { continue; }
-                _ => { }
-            }
-            // A concrete Item - its registered type, off the stamp - must
-            // implement every bound trait, asked of the trait's IDENTITY and
-            // the type: a leaf answers for every module's trait and type of
-            // that leaf, and `.min()` on an iterator of one module's `Rank`
-            // was admitted because another module's `Rank` is `Ord`.
-            const item_ty: TypeRef = this.item_type_of(item_ann);
-            if (!item_ty.is_valid()) { continue; }
-            for (mut ri: i64 = 0; ri < b.trait_refs.length(); ri++) {
-                const tr: const TraitRef* = &b.trait_refs[ri];
-                if (tr.path.length() == 0) { continue; }
-                if (this.ctx.generic_registry.select_trait_impl(tr.definition(), item_ty, this.intern) == null) {
-                    return true;
-                }
+            const unmet: const TraitRef* = this.trait_checker().unmet_projection_bound(
+                mfunc_decl, recv_type, out_member, out_associated);
+            if (unmet != null) {
+                *out_trait = dimpl.trait_def;
+                return unmet;
             }
         }
-        return false;
+        return null;
     }
 
     /// Scan registered trait decls for one that defines `method_name`; returns the

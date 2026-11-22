@@ -17,8 +17,8 @@
 namespace compiler::types::trait_checker;
 
 import compiler::ast::{
-    declaration, expression, node, ObjectForm, pattern, statement, TraitBound, TraitRef,
-    TypeAnnotation, Visibility
+    declaration, expression, node, ObjectForm, pattern, ProjectionAnnotation, statement,
+    TraitBound, TraitRef, TypeAnnotation, Visibility
 };
 import compiler::types::{
     generic, user_defined, compound, type_base, arena, type_ref,
@@ -45,7 +45,7 @@ import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
-import compiler::types::resolver::{ TypeResolver };
+import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 
 
 /// Read-only trait-satisfaction query engine. See file header.
@@ -1051,6 +1051,77 @@ type struct TraitChecker {
             if (this.unmet_parameter_trait(bound, concrete, subst, depth) != null) { return false; }
         }
         return true;
+    }
+
+    /// Whether every bound `func_decl` writes on an associated type of its
+    /// trait (`min`'s `where This::Item: Ord`) holds for `this_type`, read
+    /// off `this_type`'s implementation of that trait.  A trait default whose
+    /// bound does not hold is no method of the implementation.
+    projection_bounds_hold(&this, func_decl: DeclarationNode*, this_type: TypeRef) -> boolean {
+        mut member: TypeRef = TypeRef::invalid();
+        mut associated: SymbolStr = SymbolStr::empty();
+        return this.unmet_projection_bound(func_decl, this_type, &member, &associated) == null;
+    }
+
+    /// The trait of the first bound `projection_bounds_hold` finds unmet,
+    /// with the associated type it is written on in `out_associated` and
+    /// that type's binding, which lacks the trait, in `out_member`; null
+    /// when every bound holds.
+    unmet_projection_bound(&this, func_decl: DeclarationNode*, this_type: TypeRef,
+                           out_member: mut TypeRef*, out_associated: mut SymbolStr*) -> const TraitRef* {
+        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
+        if (func == null || !this_type.is_valid()) { return null; }
+        for (mut bi: i64 = 0; bi < func.trait_bounds.length(); bi++) {
+            const bound: TraitBound* = &func.trait_bounds[bi];
+            const projection: ProjectionAnnotation* = bound.projection_subject();
+            if (projection == null) { continue; }
+            const trait_ty: TypeRef = this.type_resolver.projection_trait(projection);
+            const trait_decl: TraitDecl* = this.type_resolver.trait_decl_of(trait_ty);
+            if (trait_decl == null) { continue; }
+            mut unbound: ResolutionContext = ResolutionContext::new("");
+            const trait_args: [TypeRef] = this.type_resolver.projection_trait_arguments(projection, trait_ty, &unbound);
+            const member: TypeRef = this.type_resolver.concrete_projection(
+                this_type, trait_decl.assoc_type_index(projection.member), trait_ty, &trait_args);
+            const unmet: const TraitRef* = this.projected_member_unmet_trait(bound, member);
+            if (unmet != null) {
+                *out_member = member;
+                *out_associated = projection.member;
+                return unmet;
+            }
+        }
+        return null;
+    }
+
+    /// The trait `bound` names that `member`, the type an implementation
+    /// binds the associated type `bound` is written on to, lacks; null when
+    /// it has them all.  A member still unknown, or that is itself a type
+    /// parameter or another projection, is decided by the copy that binds
+    /// it, and lacks nothing here.  A member that names a parameter inside
+    /// it (`Pair<u64, A>`, `&T`) lacks a trait only when no implementation
+    /// of it could be for any type of its shape, and a structural marker
+    /// until a copy has a shape to walk lacks nothing.  A reference has the
+    /// traits an implementation for references gives it, as any type does,
+    /// not its referent's.
+    projected_member_unmet_trait(&this, bound: TraitBound*, member: TypeRef) -> const TraitRef* {
+        const member_type: Type* = this.arena.lookup(member);
+        if (member_type == null || member_type.kind == TypeKind::GenericParam
+                || member_type.kind == TypeKind::AssocProjection) {
+            return null;
+        }
+        const names_parameter: boolean = this.arena.contains_generic_param(member);
+        for (mut ti: i64 = 0; ti < bound.trait_refs.length(); ti++) {
+            const trait_ref: const TraitRef* = &bound.trait_refs[ti];
+            if (trait_ref.path.length() == 0 || trait_ref.refused) { continue; }
+            const trait_def: DefId = trait_ref.definition();
+            const has: boolean = if (names_parameter) {
+                this.is_structural_marker(trait_def)
+                    || this.generic_registry.heads_for(trait_def, member, this.intern_table).length() > 0
+            } else {
+                this.type_implements_trait(member, trait_def, 0)
+            };
+            if (!has) { return trait_ref; }
+        }
+        return null;
     }
 
     /// Returns true when a function's own where-bounds are satisfiable under
