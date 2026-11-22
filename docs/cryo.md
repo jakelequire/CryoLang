@@ -2574,6 +2574,19 @@ type struct Loose<I> { f: () -> I::Item; }   // error[E0203]: associated type `I
 
 A projection may be the subject of a bound itself: `where C: Source, C::Item: Put` gives a value of type `C::Item` the methods of `Put` in the body, and each copy of the body calls the implementation of `Put` for its own `Item`, which may be an implementation for every reference (`implement<T> trait Put for mut &T where T: Put`) when `Item` is one. Such a bound is checked where a call binds the parameters, as a bound on a parameter is: `store(&plain)` with `plain`'s `Item` an `i64` is refused there (E0306, "the trait bound `i64: Put` is not satisfied").
 
+A trait's default method may bound one of the trait's own associated types: `Iterator`'s `min` and `max` are written `where This::Item: Ord`. Such a default is a method of exactly the implementations whose binding has the trait, and of no other: its body is copied into, and checked for, only those, so an implementation whose binding lacks the trait is accepted and has no such method. A reference has the traits an implementation for references gives it, not its referent's, so an iterator of `&i64` has no `min` although `i64` is `Ord`, and a call of it is refused where it is written (E0358), with the bound and the binding that fails it:
+
+```cryo
+type struct Each { values: &Slice<i64>; position: i64; }
+
+implement trait Iterator<&i64> for struct Each {          // fine: no `min` or `max` here
+    next(mut &this) -> Option<&i64> { ... }
+}
+
+each.min();                                                // error[E0358]: no method named `min` found on type `Each`
+each.map((value: &i64) -> i64 { return *value; }).min();   // fine: an iterator of `i64`
+```
+
 **A trait with parameters.** A type may implement a trait that has generic
 parameters more than once, at different arguments, and each implementation
 binds the trait's associated types for itself. A projection is taken at the

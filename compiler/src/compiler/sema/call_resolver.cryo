@@ -6391,9 +6391,17 @@ type struct CallResolver {
             }
         }
         const owning_trait: DeclName = this.binding.lookup_trait_defining_method(member.member);
+        mut unmet_member: TypeRef = TypeRef::invalid();
+        mut unmet_associated: SymbolStr = SymbolStr::empty();
+        mut unmet_owner: DefId = DefId::invalid();
+        const unmet_bound: const TraitRef* = this.binding.projection_default_unmet(
+            obj_type, member.member, &unmet_member, &unmet_associated, &unmet_owner);
         if (instance_head != "") {
             diag = diag.with_note(fmt::format("the method `%s` is declared for `%s` only, and `%s` is not one of those instances",
                 method_name, instance_head, type_display));
+        } else if (unmet_bound != null) {
+            diag = this.explain_unmet_projection_bound(diag, method_name, type_display, unmet_bound,
+                unmet_member, unmet_associated, unmet_owner);
         } else if (owning_trait.is_valid()) {
             const trait_str: string = this.intern.shown(owning_trait);
             diag = diag.with_note(fmt::format("the method `%s` is defined on trait `%s`", method_name, trait_str));
@@ -6447,6 +6455,39 @@ type struct CallResolver {
             unwrap_depth += 1;
         }
         return lookup_ref;
+    }
+
+    /// `diag`, a call's E0358 for a trait default that a bound on one of the
+    /// trait's associated types keeps off the receiver, with the bound and
+    /// the binding that fails it.  Its help shows the fix where one is
+    /// certain: an item that is a reference to a built-in value type with
+    /// the trait is compared through `map`, which copies the values out; an
+    /// item of any other type that is no reference needs the trait.
+    explain_unmet_projection_bound(&this, diag: Diagnostic, method_name: string, type_display: string,
+                                   unmet: const TraitRef*, member: TypeRef, associated: SymbolStr,
+                                   owner: DefId) -> Diagnostic {
+        const owner_name: Str = QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(owner)));
+        const bound_name: Str = QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(unmet.definition())));
+        const associated_name: string = this.intern.resolve(associated);
+        const member_t: Type* = this.arena.lookup(member);
+        const member_display: string = if (member_t != null) { this.arena.format_display(member_t) } else { "" };
+        mut explained: Diagnostic = diag.with_note(
+            f"`{method_name}` is a method of `{owner_name}` only where `This::{associated_name}: {bound_name}`, and `{type_display}` binds `{associated_name}` to `{member_display}`, which does not implement `{bound_name}`");
+        if (member_t == null || member_t.kind != TypeKind::Reference) {
+            return explained.help(f"implement `{bound_name}` for `{member_display}`");
+        }
+        const referent: TypeRef = member_t.as_reference().referent;
+        const referent_t: Type* = this.arena.lookup(referent);
+        const built_in: boolean = referent_t != null && (referent_t.kind == TypeKind::Int
+            || referent_t.kind == TypeKind::Float || referent_t.kind == TypeKind::Bool
+            || referent_t.kind == TypeKind::Char);
+        if (built_in && this.trait_checker().type_implements_trait(referent, unmet.definition(), 0)) {
+            const referent_display: string = this.arena.format_display(referent_t);
+            return explained.help(
+                f"a reference implements only what an implementation for references gives it, not what `{referent_display}` implements; call `{method_name}` on the values: `.map((value: {member_display}) -> {referent_display} {{ return *value; }}).{method_name}()`");
+        }
+        return explained.help(
+            f"a reference implements only what an implementation for references gives it, whatever it refers to");
     }
 
     /// What a call of the method `selected` chose returns on the receiver
