@@ -1,0 +1,220 @@
+///! The heavy-run lock: one heavy proof (a full suite, verify, selfhost, a
+///! pin build) on the machine at a time, across every checkout.
+///!
+///! The lock is a file, created only if absent, holding who took it and
+///! when.  Its default place is beside the MAIN checkout, in the directory
+///! holding it, so every worktree of the repository takes one file wherever
+///! the worktree was made, and it is the file people taking the lock by hand
+///! use too; `CRYOGATE_HEAVY_LOCK` names another file.  The holder
+///! deletes it when done, but a holder killed from outside cannot, so the
+///! file names the holder's process id: a waiter that finds that process
+///! no longer running takes the lock over.  A lock naming no process (one
+///! taken by hand) and older than `STALE_SECONDS` is not waited for and
+///! not taken: it is reported, because a run that died holding it and a
+///! run still going look the same from outside.
+
+namespace cryogate::core::lock;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::drop::{ Drop };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env;
+import std::fmt;
+import std::fs::file::{ File, OpenOptions };
+import std::fs::path::{ Path, PathBuf };
+import std::io::error::{ IoError };
+import std::io::traits::{ Write };
+import std::process;
+import std::time::clock::{ SystemTime };
+import std::time::datetime::{ DateTime };
+import std::time::duration::{ Duration };
+
+import cryogate::core::host::{ Host };
+
+/// What stands in the way of taking the lock.
+public type enum Holder {
+    /// Nobody: the file is absent.
+    Free;
+    /// Someone, with what the file says about them.
+    Held(String);
+    /// A file older than `STALE_SECONDS`, with what it says.
+    Stale(String);
+    /// A file naming a process that is no longer running, with what it
+    /// says: its holder was killed before it could delete it.
+    Abandoned(String);
+}
+
+/// A held heavy-run lock; dropping it deletes the file.
+public type struct HeavyLock {
+    path: PathBuf;
+    held: boolean;
+
+    /// The lock file this checkout uses.
+    public static default_path(repository: Path) -> Result<PathBuf, String> {
+        match (env::var(Str::new("CRYOGATE_HEAVY_LOCK"))) {
+            Option::Some(path) => { return Result::Ok(PathBuf::from(path.as_str())); }
+            Option::None       => { }
+        }
+        return match (Host::main_checkout(repository)) {
+            Result::Ok(main)    => { HeavyLock::beside(main.as_path()) }
+            Result::Err(reason) => { Result::Err(reason) }
+        };
+    }
+
+    /// The lock of every worktree whose main checkout is `main`: in the
+    /// directory holding that checkout.
+    public static beside(main: Path) -> Result<PathBuf, String> {
+        return match (main.parent()) {
+            Option::Some(parent) => { Result::Ok(parent.join(Str::new("cryo-heavy-run.lock"))) }
+            Option::None         => { Result::Err(f"the main checkout {main.as_str()} is a root directory: there is no directory beside it for the heavy-run lock") }
+        };
+    }
+
+    /// Who holds the lock at `path`, judged at `now` (Unix seconds).
+    public static holder(path: Path, now: i64) -> Holder {
+        if (!path.exists()) { return Holder::Free; }
+        const text: String = match (File::read_text(path)) {
+            Result::Ok(text) => { String::from_str(text.trim()) }
+            Result::Err(_)   => { String::from_str(Str::new("(unreadable)")) }
+        };
+        match (HeavyLock::holder_process(text.as_str())) {
+            Option::Some(pid) => {
+                if (!Host::process_running(pid)) { return Holder::Abandoned(text); }
+                return Holder::Held(text);
+            }
+            Option::None => { }
+        }
+        const modified: i64 = match (path.metadata()) {
+            Result::Ok(metadata) => { metadata.modified_seconds() }
+            Result::Err(_)       => { now }
+        };
+        if (HeavyLock::is_stale(modified, now)) { return Holder::Stale(text); }
+        return Holder::Held(text);
+    }
+
+    /// The process id a lock's `text` names (`... - pid <N> - started
+    /// ...`); none for a lock taken by hand, which names none.
+    public static holder_process(text: Str) -> Option<i32> {
+        const marker: Str = Str::new(" - pid ");
+        const at: i64 = match (text.find(&marker)) {
+            Option::Some(at) => { at }
+            Option::None     => { return Option::None; }
+        };
+        const rest: Str = text.byte_substring(at + marker.length(), text.length());
+        mut end: i64 = 0;
+        while (end < rest.length() && rest.byte_at(end).unwrap().is_digit()) { end++; }
+        if (end == 0) { return Option::None; }
+        return match (i32::try_from(rest.byte_substring(0, end))) {
+            Result::Ok(pid) => { Option::Some(pid) }
+            Result::Err(_)  => { Option::None }
+        };
+    }
+
+    /// Whether a lock written at `modified` is stale at `now`.
+    public static is_stale(modified: i64, now: i64) -> boolean {
+        return now - modified > HeavyLock::STALE_SECONDS;
+    }
+
+    /// Take the lock at `path` for `owner`.  With `wait`, a held lock is
+    /// waited for, polled every `POLL_SECONDS`, and its holder named once;
+    /// without, it is refused.  A stale lock is always refused.
+    public static acquire(path: Path, owner: Str, wait: boolean) -> Result<HeavyLock, String> {
+        mut announced: boolean = false;
+        loop {
+            match (HeavyLock::try_create(path, owner)) {
+                Result::Ok(lock)   => { return Result::Ok(lock); }
+                Result::Err(error) => {
+                    if (path.exists() == false) { return Result::Err(error); }
+                }
+            }
+            match (HeavyLock::holder(path, SystemTime::now().unix_seconds())) {
+                Holder::Free => { }
+                Holder::Abandoned(text) => {
+                    match (HeavyLock::take_over(path, text.as_str())) {
+                        Result::Ok(_)       => { fmt::eprintln(f"cryogate: took over the heavy-run lock {path.as_str()}, whose holder is no longer running: {text.as_str()}"); }
+                        Result::Err(reason) => { return Result::Err(reason); }
+                    }
+                }
+                Holder::Stale(text) => {
+                    return Result::Err(f"the heavy-run lock {path.as_str()} is older than {HeavyLock::STALE_SECONDS / 3600} hours and is not taken: {text.as_str()}; delete it once nobody holds it");
+                }
+                Holder::Held(text) => {
+                    if (!wait) {
+                        return Result::Err(f"the heavy-run lock {path.as_str()} is held: {text.as_str()}");
+                    }
+                    if (!announced) {
+                        fmt::eprintln(f"cryogate: waiting for the heavy-run lock {path.as_str()}: {text.as_str()}");
+                        announced = true;
+                    }
+                    std::time::clock::sleep(Duration::from_seconds(HeavyLock::POLL_SECONDS));
+                }
+            }
+        }
+    }
+
+    /// Remove the abandoned lock at `path` that said `text`, so that it may
+    /// be taken again.  It is first renamed aside, which only one of two
+    /// waiters can do; the one that did checks that what it moved is still
+    /// the abandoned lock, and puts back a lock another waiter took in the
+    /// meantime.  Why it could not.
+    private static take_over(path: Path, text: Str) -> Result<(), String> {
+        const aside: PathBuf = PathBuf::from(f"{path.as_str()}.abandoned-{process::id()}".as_str());
+        match (path.rename_to(aside.as_path())) {
+            Result::Ok(_)  => { }
+            // Another waiter moved it first; the loop looks again.
+            Result::Err(_) => { return Result::Ok(()); }
+        }
+        const moved: String = match (File::read_text(aside.as_path())) {
+            Result::Ok(moved) => { String::from_str(moved.trim()) }
+            Result::Err(_)    => { String::new() }
+        };
+        if (moved.as_str() != text) {
+            return match (aside.as_path().rename_to(path)) {
+                Result::Ok(_)      => { Result::Ok(()) }
+                Result::Err(error) => { Result::Err(f"moved a live heavy-run lock aside to {aside.as_path().as_str()} while taking over an abandoned one, and could not put it back: {error.describe()}") }
+            };
+        }
+        return match (File::remove(aside.as_path())) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot remove the abandoned heavy-run lock {aside.as_path().as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// Create the file only if it is absent, so two runs racing for it
+    /// cannot both win.
+    private static try_create(path: Path, owner: Str) -> Result<HeavyLock, String> {
+        mut options: OpenOptions = OpenOptions::new();
+        options.write(true);
+        options.create_new(true);
+        mut file: File = match (options.open(path)) {
+            Result::Ok(file)   => { file }
+            Result::Err(error) => { return Result::Err(f"cannot create the heavy-run lock {path.as_str()}: {error.describe()}"); }
+        };
+        const line: String = f"{owner} - pid {process::id()} - started {DateTime::now()}\n";
+        match (file.write(line.as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => {
+                // The write's failure is the one reported.
+                const _: Result<(), IoError> = File::remove(path);
+                return Result::Err(f"cannot write the heavy-run lock {path.as_str()}: {error.describe()}");
+            }
+        }
+        return Result::Ok(HeavyLock { path: PathBuf::from(path.as_str()), held: true });
+    }
+
+    const STALE_SECONDS: i64 = 3 * 3600;
+    const POLL_SECONDS: u64 = 60;
+}
+
+implement trait Drop for HeavyLock {
+    drop(mut &this) -> void {
+        if (this.held) {
+            // A lock left behind is taken over once its process is gone; a
+            // drop has no one to report to.
+            const _: Result<(), IoError> = File::remove(this.path.as_path());
+            this.held = false;
+        }
+    }
+}

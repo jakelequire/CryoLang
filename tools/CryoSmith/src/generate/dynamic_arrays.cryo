@@ -1,0 +1,149 @@
+///! Dynamic arrays (stage 8): `[i16]` locals, the standard library's
+///! `Array<i16>`.
+///!
+///! With `dynamic-arrays`, a function declares dynamic array locals, built
+///! by a literal, a repeat, empty or as a clone of another of the same type;
+///! appends an integer to a `mut` one, pops its last element, and assigns
+///! it a new array whole.  The environment carries the fewest elements each
+///! holds (`Environment::fewest_elements`), and an element is read or
+///! written, and an array given `&v` for a slice, only where that is at
+///! least one, at an index reduced below it, `(e % K)`: so no index is out
+///! of range and no pop finds the array empty.  A dynamic array is never
+///! read by value - never copied, moved, passed or returned - so it needs no
+///! ownership state of its own; a statement changing one lends it
+///! exclusively, so nothing else there names it, and no element is ever
+///! held by reference, only read or written where it stands.  One is
+///! observed by its length and by a `for` over its elements, in order.
+
+namespace cryosmith::generate::dynamic_arrays;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature, FeatureSet };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::model::{ ExpressionKind, MOST_ELEMENTS, StatementKind, ValueType, Variable, VariableRole };
+import cryosmith::typing::{ TypeChoice };
+
+implement struct Generator {
+    /// Whether dynamic arrays are generated: `dynamic-arrays` is on, and so
+    /// are `division`, since every index is reduced by `%`, and `loops`,
+    /// since one is observed by a `for` over its elements.
+    internal makes_dynamic_arrays(&this) -> boolean {
+        const features: FeatureSet = this.options.features;
+        return features.has(Feature::DynamicArrays) && features.has(Feature::Division) && features.has(Feature::Loops);
+    }
+
+    /// `const` or `mut` local of a dynamic array of a drawn integer, with
+    /// its initial value, sized by the elements the value holds.
+    internal dynamic_declaration(mut &this) -> i64 {
+        const value_type: ValueType = ValueType::DynamicArray(TypeChoice::integer(&this.random).integer_place());
+        const value: i64 = this.dynamic_value(value_type, this.depth());
+        const mutable: boolean = this.random.chance(60);
+        const variable: i64 = this.environment.declare_local(&this.program, value_type, mutable);
+        this.environment.size(variable, this.made_length(value));
+        return this.program.statement(StatementKind::Declare(variable, value));
+    }
+
+    /// A new dynamic array of `wanted`: a literal of 1 to `MOST_ELEMENTS`
+    /// elements, a repeat of one value as many times, an empty one, or a
+    /// clone of a dynamic array local in scope, lent shared.
+    private dynamic_value(mut &this, wanted: ValueType, depth: i64) -> i64 {
+        const next: i64 = if (depth > 0) { depth - 1 } else { 0 };
+        const copies: Array<i64> = this.duplicable(wanted);
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(5);
+        weights.push(3);
+        weights.push(2);
+        weights.push(if (copies.length() > 0) { 2 } else { 0 });
+        const form: i64 = this.random.pick(&weights);
+        if (form == 3) {
+            const source: i64 = copies.get(this.random.below(copies.length())).unwrap();
+            this.environment.lend(source, false);
+            return this.node(ExpressionKind::Duplicate(source), wanted);
+        }
+        if (form == 2) { return this.node(ExpressionKind::EmptyArray, wanted); }
+        const count: i64 = 1 + this.random.below(MOST_ELEMENTS);
+        if (form == 1) { return this.node(ExpressionKind::DynamicRepeat(this.typed_place(wanted.element(), next), count), wanted); }
+        mut elements: Array<i64> = Array::<i64>::new();
+        while (elements.length() < count) { elements.push(this.typed_place(wanted.element(), next)); }
+        const first: i64 = this.program.list_run(&elements);
+        return this.node(ExpressionKind::ArrayLiteral(first, count), wanted);
+    }
+
+    /// How many elements the dynamic array `value` makes certainly holds.
+    private made_length(&this, value: i64) -> i64 {
+        return match (this.program.expression_at(value).kind) {
+            ExpressionKind::ArrayLiteral(_, count)  => { count }
+            ExpressionKind::DynamicRepeat(_, count) => { count }
+            ExpressionKind::Duplicate(source)       => { this.environment.fewest_elements(source) }
+            _                                       => { 0 }
+        };
+    }
+
+    /// The dynamic array locals in scope of `wanted` a clone may be taken
+    /// of here: any not lent exclusively.
+    private duplicable(&this, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.in_scope().iter()) {
+            const declared: Variable = this.program.variable_at(variable);
+            const local: boolean = match (declared.role) {
+                VariableRole::Local => { true }
+                _                   => { false }
+            };
+            if (local && declared.value_type.same(wanted) && !this.environment.is_lent_exclusively(variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// The `mut` dynamic array locals in scope that may be appended to
+    /// here: any not lent by the statement.
+    internal appendable(&this) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.assignable(&this.program).iter()) {
+            if (this.program.variable_at(variable).value_type.is_dynamic_array() && !this.environment.is_lent(variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// Of `appendable`, those a statement here may leave fewer elements:
+    /// declared where the statement runs once per declaration
+    /// (`Environment::once_per_declaration`), and with `holding`, holding
+    /// at least one element.
+    internal shrinkable(&this, appendable: &Array<i64>, holding: boolean) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in appendable.iter()) {
+            if (holding && this.environment.fewest_elements(variable) == 0) { continue; }
+            if (this.environment.once_per_declaration(variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// `v.push(value);` on one of `appendable`, lent exclusively first, so
+    /// the value never reads it: an integer value of its element type.
+    internal append(mut &this, appendable: &Array<i64>) -> i64 {
+        const variable: i64 = appendable.get(this.random.below(appendable.length())).unwrap();
+        this.environment.lend(variable, true);
+        const value: i64 = this.typed_place(this.program.variable_at(variable).value_type.element(), this.depth());
+        this.environment.set_fewest(variable, this.environment.fewest_elements(variable) + 1);
+        return this.program.statement(StatementKind::Evaluate(this.node(ExpressionKind::Append(variable, value), ValueType::Void)));
+    }
+
+    /// The last element of one of `poppable`, removed and observed:
+    /// `v.pop().unwrap()`, the array lent exclusively.
+    internal pop(mut &this, poppable: &Array<i64>) -> i64 {
+        const variable: i64 = poppable.get(this.random.below(poppable.length())).unwrap();
+        this.environment.lend(variable, true);
+        this.environment.set_fewest(variable, this.environment.fewest_elements(variable) - 1);
+        return this.observation(this.node(ExpressionKind::Pop(variable), this.program.variable_at(variable).value_type.element()));
+    }
+
+    /// `v = ..;`, one of `reassignable` given a new dynamic array whole, lent
+    /// exclusively first, so the new one is never its own clone.
+    internal dynamic_assignment(mut &this, reassignable: &Array<i64>) -> i64 {
+        const variable: i64 = reassignable.get(this.random.below(reassignable.length())).unwrap();
+        this.environment.lend(variable, true);
+        const value: i64 = this.dynamic_value(this.program.variable_at(variable).value_type, this.depth());
+        this.environment.set_fewest(variable, this.made_length(value));
+        return this.program.statement(StatementKind::Assign(this.target(variable), value));
+    }
+}

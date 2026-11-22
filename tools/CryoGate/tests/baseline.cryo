@@ -1,0 +1,131 @@
+///! The baseline's listings and keys: what git lists, the files a project's
+///! cryoconfig reaches outside its directory, and the record keys.
+![config(testing)]
+namespace cryogate::tests::baseline;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::path::{ PathBuf };
+import std::fs::temporary::{ TemporaryDirectory };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect };
+
+import std::collections::pair::{ Pair };
+import std::fs::directory::{ Directory };
+
+import cryogate::baseline::cache::{ BaselineCache };
+import cryogate::baseline::listing::{ Listing };
+import cryogate::core::text::{ Text };
+import cryogate::core::git::{ Git };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+
+![test]
+function git_s_listing_is_split_on_the_nul_byte() -> Result<(), TestError> {
+    mut text: String = String::from_str(Str::new("a.cryo"));
+    text.push_byte(0);
+    text.push(Str::new("b/c d.cryo"));
+    text.push_byte(0);
+    text.push_byte(0);
+    const entries: Array<String> = Listing::entries(text.as_str());
+    expect(entries.length() == 2, Str::new("two entries, the empty one dropped"))?;
+    expect(entries.get_reference(1).unwrap().as_str() == Str::new("b/c d.cryo"), Str::new("a space is part of a name"))?;
+    return expect(Listing::entries(Str::new("one")).length() == 1, Str::new("text with no NUL is one entry"));
+}
+
+![test]
+function a_quoted_value_runs_from_one_quote_to_the_next() -> Result<(), TestError> {
+    const values: Array<String> = Listing::quoted(Str::new("x = \"a\"\ny = \"\" z \"b"));
+    expect(values.length() == 2, Str::new("an empty pair is no value, and its second quote opens the next"))?;
+    expect(values.get_reference(0).unwrap().as_str() == Str::new("a"), Str::new("the first value"))?;
+    return expect(values.get_reference(1).unwrap().as_str() == Str::new(" z "), Str::new("the run after the empty pair"));
+}
+
+![test]
+function a_value_is_read_as_a_path_from_the_project_directory() -> Result<(), TestError> {
+    expect(Listing::within(Str::new("tests/p"), Str::new("../q/shelf")) == Option::Some(String::from_str(Str::new("tests/q/shelf"))), Str::new("a sibling"))?;
+    expect(Listing::within(Str::new("tests/p"), Str::new("./src")) == Option::Some(String::from_str(Str::new("tests/p/src"))), Str::new("inside"))?;
+    expect(Listing::within(Str::new("p"), Str::new("..")).is_none(), Str::new("the checkout's root is not a reached path"))?;
+    expect(Listing::within(Str::new("p"), Str::new("../..")).is_none(), Str::new("above the root"))?;
+    expect(Listing::within(Str::new("p"), Str::new("/usr/lib")).is_none(), Str::new("absolute"))?;
+    return expect(Listing::within(Str::new("p"), Str::new("C:/lib")).is_none(), Str::new("absolute, with a drive"));
+}
+
+![test]
+function the_most_recently_used_baselines_are_kept_ties_by_name() -> Result<(), TestError> {
+    mut homes: Array<Pair<String, i64>> = Array::<Pair<String, i64>>::new();
+    homes.push(Pair::new(String::from_str(Str::new("a")), 0));
+    homes.push(Pair::new(String::from_str(Str::new("b")), 30));
+    homes.push(Pair::new(String::from_str(Str::new("c")), 20));
+    homes.push(Pair::new(String::from_str(Str::new("d")), 30));
+    homes.push(Pair::new(String::from_str(Str::new("e")), 10));
+    const three: Array<String> = BaselineCache::kept(&homes, 3, Str::new(""));
+    expect(Text::joined(&three, Str::new(",")) == String::from_str(Str::new("b,d,c")), Str::new("newest first, a tie by name"))?;
+    const current: Array<String> = BaselineCache::kept(&homes, 3, Str::new("a"));
+    expect(Text::joined(&current, Str::new(",")) == String::from_str(Str::new("a,b,d")), Str::new("the home in use first, within the count, whatever its stamp"))?;
+    const all: Array<String> = BaselineCache::kept(&homes, 10, Str::new(""));
+    return expect(Text::joined(&all, Str::new(",")) == String::from_str(Str::new("b,d,c,e,a")), Str::new("a never-stamped home counts as oldest"));
+}
+
+![test]
+function pruning_leaves_the_kept_count_of_baselines() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = match (TemporaryDirectory::create()) {
+        Result::Ok(directory) => { directory }
+        Result::Err(error)    => { return Result::Err(TestError::other(error.describe())); }
+    };
+    mut index: i64 = 0;
+    while (index < BaselineCache::KEPT + 2) {
+        const home: PathBuf = scratch.path().join(f"h{index}".as_str());
+        match (Directory::create(home.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(TestError::other(error.describe())); }
+        }
+        index++;
+    }
+    const newest: PathBuf = scratch.path().join(f"h{BaselineCache::KEPT + 1}".as_str());
+    match (BaselineCache::mark(newest.as_path())) {
+        Result::Ok(_)       => { }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    }
+    const deleted: Array<String> = match (BaselineCache::prune(scratch.path(), Str::new(""))) {
+        Result::Ok(deleted) => { deleted }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    expect(deleted.length() == 2, Str::new("two over the bound"))?;
+    expect(newest.as_path().is_directory(), Str::new("the one just used survives"))?;
+    return expect(!scratch.path().join(f"h{BaselineCache::KEPT}".as_str()).as_path().exists(), Str::new("an unstamped home sorting last goes"));
+}
+
+![test]
+function a_projects_inputs_hold_the_package_its_cryoconfig_reaches_by_path() -> Result<(), TestError> {
+    const root: PathBuf = match (Host::repository()) {
+        Result::Ok(root)    => { root }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    // git's logs go to scratch: a run directory under the checkout's
+    // build-logs would prune the checkout's own.
+    const scratch: TemporaryDirectory = match (TemporaryDirectory::create()) {
+        Result::Ok(directory) => { directory }
+        Result::Err(error)    => { return Result::Err(TestError::other(error.describe())); }
+    };
+    const logs: RunLogs = match (RunLogs::open(scratch.path())) {
+        Result::Ok(logs)    => { logs }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    const git: Git = Git::new(root.as_path(), &logs);
+    mut seen: Array<String> = Array::<String>::new();
+    const reached: Array<String> = match (Listing::reached_outside(root.as_path(), &git,
+            Str::new("tests/tests/projects/visibility_internal_names"), &seen)) {
+        Result::Ok(files)   => { files }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    mut shelf: i64 = 0;
+    for (file in reached.iterate_references()) {
+        if (file.as_str().starts_with(&Str::new("tests/tests/projects/visibility_internal/shelf/"))) { shelf++; }
+    }
+    expect(shelf > 0, Str::new("the shelf package's files"))?;
+    return expect(shelf == reached.length(), Str::new("nothing else: its own directory is not outside it"));
+}

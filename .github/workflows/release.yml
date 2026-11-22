@@ -1,15 +1,23 @@
 name: Release
 
-# Tag-triggered. Push a tag like `v1.0.0` (matching VERSION in
-# compiler/src/main.cryo) to build + publish the distributable archives.
+# Builds, checks and publishes the distributable archives of one version.
 #
-# Release-candidate tags (`v1.0.0-rc1`, `v1.0.0-rc.2`, ...) are supported as
-# end-to-end dry runs: the base version must still match VERSION, and the
-# GitHub Release is marked as a prerelease. Push one to exercise this whole
-# workflow before pushing the real tag.
+# The version is compiler/src/main.cryo's VERSION, and while its PRERELEASE
+# is set (`alpha` until 1.0 ships), `<VERSION>-<PRERELEASE>.<N>`, N being
+# the count of commits in the history of the commit built - the number the
+# shipped compiler's `cryo version` prints.  A pre-release is published
+# from `main` only, as a GitHub pre-release; a release (PRERELEASE "")
+# from a tag naming VERSION.
+#
+#   - Run this workflow by hand on `main` (Actions > Release > Run
+#     workflow, or `gh workflow run release.yml --ref main`): it publishes
+#     the alpha of main's head, tagging it `v<VERSION>-<PRERELEASE>.<N>`.
+#   - Or push that tag to a commit of main yourself.
+#   - A release: push `v<VERSION>` once PRERELEASE is "".
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,7 +32,7 @@ jobs:
   # FUTURE (fully-static MUSL, runs on Alpine too): switch this job to
   #   container: alpine:3.20
   # and `apk add llvm20-static llvm20-dev clang lld musl-dev g++ make
-  # python3 tar bash gcompat`, then build with the musl static-link knobs:
+  # tar bash gcompat`, then build with the musl static-link knobs:
   #   CRYO_LLVM_CONFIG=llvm-config CRYO_CC=clang scripts/build-release.sh linux
   # The one fragile step is running the committed glibc bin/cryo under gcompat
   # to seed the build; if that proves flaky, keep this glibc-static job.
@@ -34,7 +42,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # The whole history: a pre-release is numbered by its commit count.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
 
       - name: Restore the LLVM toolchain cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -48,8 +59,18 @@ jobs:
       - name: Verify the committed pins are clean & reproducible (release gate)
         run: make verify-pin-clean
 
+      # The static link takes LLVM's compression and XML libraries as
+      # archives, which only their -dev packages ship.
+      - name: Install the static link's system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzstd-dev zlib1g-dev libxml2-dev
+
       - name: Build static release tarball
         run: ./scripts/build-release.sh linux
+
+      - name: Build the Debian package from the tarball
+        run: ./scripts/build-deb.sh dist/cryo-*-linux-x86_64.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -58,6 +79,8 @@ jobs:
           path: |
             dist/cryo-*-linux-x86_64.tar.gz
             dist/cryo-*-linux-x86_64.tar.gz.sha256
+            dist/cryo_*_amd64.deb
+            dist/cryo_*_amd64.deb.sha256
 
   # ---------------------------------------------------------------------------
   # Windows x86_64 - cross-built cryo.exe + bundled LLVM-C.dll (not static;
@@ -68,7 +91,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
+      # The whole history: a pre-release is numbered by its commit count.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
 
       - name: Restore the LLVM toolchain cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -86,7 +112,7 @@ jobs:
       - name: Install the mingw-w64 cross toolchain + wine
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zip wine
+          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zip wine wixl msitools
 
       - name: Restore the windows LLVM bits cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -106,6 +132,12 @@ jobs:
           WINEDLLOVERRIDES: "mscoree,mshtml="
         run: ./scripts/build-release.sh windows
 
+      - name: Build the MSI from the zip, and its winget manifests
+        run: |
+          ./scripts/build-msi.sh dist/cryo-*-windows-x86_64.zip
+          ./scripts/check-msi.sh dist/cryo-*-windows-x86_64.msi dist/cryo-*-windows-x86_64.zip
+          ./scripts/build-winget.sh dist/cryo-*-windows-x86_64.msi
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -113,6 +145,9 @@ jobs:
           path: |
             dist/cryo-*-windows-x86_64.zip
             dist/cryo-*-windows-x86_64.zip.sha256
+            dist/cryo-*-windows-x86_64.msi
+            dist/cryo-*-windows-x86_64.msi.sha256
+            dist/winget/
 
   # ---------------------------------------------------------------------------
   # Verify - re-run the correctness suite on the tagged commit itself, so a tag
@@ -126,13 +161,12 @@ jobs:
   # `publish` - and it is the one place where a green turns into bytes other
   # people download.  It now carries the gates that say something about the
   # ARTIFACT: the roster, the suite with its counts asserted, the runtime the
-  # archive actually ships, and the examples.
+  # archive actually ships, the language server it ships, and the examples.
   #
   # Deliberately NOT here:
-  #   lsp-check              tools/CryoLSP is not in the release archive.
-  #   api-index-check        docs/stdlib-api.txt is not in it either.
-  # Both exclusions are decisions rather than oversights; reverse them if
-  # either starts shipping.
+  #   api-index-check        docs/stdlib-api.txt is not in the archive.
+  # The exclusion is a decision rather than an oversight; reverse it if the
+  # index starts shipping.
   # ---------------------------------------------------------------------------
   test:
     name: verify suite on the tagged commit
@@ -141,7 +175,10 @@ jobs:
     # runtime and the examples.
     timeout-minutes: 50
     steps:
+      # The whole history: a pre-release is numbered by its commit count.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
 
       - name: Restore the LLVM toolchain cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -180,6 +217,9 @@ jobs:
       - name: Freestanding runtime acceptance (linux arm; windows needs wine)
         run: make verify-freestanding ARGS=--allow-skipped-arm
 
+      - name: The language server builds with this compiler and passes its checks
+        run: make lsp-check
+
       - name: Build the example projects (examples/*/ smoke gate)
         run: make examples
 
@@ -197,20 +237,39 @@ jobs:
     permissions:
       contents: write   # create the GitHub Release + upload assets
     steps:
+      # The whole history: a pre-release is numbered by its commit count.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
 
-      - name: Verify the tag matches VERSION
+      - name: Name the version, and check the tag or the branch against it
         id: gate
         run: |
-          VER=$(grep -oE 'const VERSION:[[:space:]]*string[[:space:]]*=[[:space:]]*"[^"]+"' \
-                  compiler/src/main.cryo | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="${GITHUB_REF_NAME#v}"
-          BASE="${TAG%%-rc*}"   # v1.0.0-rc1 -> 1.0.0; plain v1.0.0 unchanged
-          echo "VERSION=$VER  tag=$TAG  base=$BASE"
-          if [ "$VER" != "$BASE" ]; then
-            echo "::error::tag '$GITHUB_REF_NAME' does not match VERSION '$VER' in compiler/src/main.cryo"
-            exit 1
+          constant() {
+            grep -oE "const $1:[[:space:]]*string[[:space:]]*=[[:space:]]*\"[^\"]*\"" \
+              compiler/src/main.cryo | sed -E 's/.*"([^"]*)".*/\1/'
+          }
+          VER="$(constant VERSION)"
+          PRE="$(constant PRERELEASE)"
+          FULL="$VER"
+          [ -z "$PRE" ] || FULL="${VER}-${PRE}.$(git rev-list --count HEAD)"
+          echo "VERSION=$VER  PRERELEASE=$PRE  version=$FULL  event=$GITHUB_EVENT_NAME  ref=$GITHUB_REF"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            [ "$GITHUB_REF" = refs/heads/main ] \
+              || { echo "::error::a pre-release is published from main, not $GITHUB_REF"; exit 1; }
+            [ -n "$PRE" ] \
+              || { echo "::error::PRERELEASE is empty: a release is published by pushing its tag v$VER"; exit 1; }
+          else
+            [ "${GITHUB_REF_NAME#v}" = "$FULL" ] \
+              || { echo "::error::tag '$GITHUB_REF_NAME' does not name this commit's version v$FULL"; exit 1; }
           fi
+          if [ -n "$PRE" ]; then
+            git merge-base --is-ancestor HEAD origin/main \
+              || { echo "::error::v$FULL is a pre-release of a commit that is not on main"; exit 1; }
+          fi
+          echo "version=$FULL" >> "$GITHUB_OUTPUT"
+          echo "base=$VER" >> "$GITHUB_OUTPUT"
+          echo "deb_version=$(printf '%s' "$FULL" | sed 's/-/~/')" >> "$GITHUB_OUTPUT"
           # Version single-source-of-truth: the latest CHANGELOG header must
           # match VERSION, so a code bump that forgets the changelog can't ship.
           CHLOG=$(grep -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | head -1 | sed -E 's/.*\[([0-9.]+)\].*/\1/')
@@ -219,12 +278,11 @@ jobs:
             echo "::error::CHANGELOG latest version '[$CHLOG]' does not match VERSION '$VER' in compiler/src/main.cryo"
             exit 1
           fi
-          if [ "$TAG" != "$BASE" ]; then
+          if [ -n "$PRE" ]; then
             echo "prerelease=true"  >> "$GITHUB_OUTPUT"
           else
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -241,6 +299,19 @@ jobs:
         run: |
           cd dist
           sha256sum -c ./*.sha256
+          # Every artifact is named by the version the gate named.
+          FULL="${{ steps.gate.outputs.version }}"
+          DEB="${{ steps.gate.outputs.deb_version }}"
+          for artifact in "cryo-${FULL}-linux-x86_64.tar.gz" "cryo-${FULL}-windows-x86_64.zip" \
+                          "cryo-${FULL}-windows-x86_64.msi" "cryo_${DEB}-1_amd64.deb"; do
+            test -f "$artifact" || { echo "::error::no $artifact among the built artifacts"; exit 1; }
+          done
+          # The shipped compiler reports that version.
+          tar -xzf "cryo-${FULL}-linux-x86_64.tar.gz" -C /tmp
+          case "$(/tmp/cryo-${FULL}-linux-x86_64/bin/cryo --version)" in
+            "cryo version ${FULL}+"*) ;;
+            *) echo "::error::the shipped cryo reports $(/tmp/cryo-${FULL}-linux-x86_64/bin/cryo --version), not ${FULL}"; exit 1 ;;
+          esac
 
           mkdir -p /tmp/relcheck
           tar -xzf cryo-*-linux-x86_64.tar.gz -C /tmp/relcheck
@@ -248,13 +319,15 @@ jobs:
           # A staging regression that dropped the stdlib or a metadata file
           # would otherwise only surface at user install time; assert the
           # expected layout here, mirroring the windows zip check below.
-          for f in bin/cryo stdlib/lib.cryo VERSION LICENSE; do
+          for f in bin/cryo bin/cryolsp stdlib/lib.cryo stdlib/.bin/shipped runtime/lib.cryo \
+                   runtime/.bin/shipped install-dependencies.sh VERSION LICENSE; do
             test -e /tmp/relcheck/cryo-*/"$f" \
               || { echo "::error::linux tarball is missing $f"; exit 1; }
           done
 
           unzip -q -d /tmp/relcheck-win cryo-*-windows-x86_64.zip
-          for f in bin/cryo.exe bin/LLVM-C.dll stdlib/lib.cryo VERSION; do
+          for f in bin/cryo.exe bin/cryolsp.exe bin/LLVM-C.dll bin/libclang.dll stdlib/lib.cryo \
+                   stdlib/.bin/shipped runtime/lib.cryo runtime/.bin/shipped install-dependencies.ps1 user-setup.ps1 VERSION; do
             test -e /tmp/relcheck-win/cryo-*/"$f" \
               || { echo "::error::windows zip is missing $f"; exit 1; }
           done
@@ -268,34 +341,57 @@ jobs:
               || { echo "::error::$(basename "$tree") ships $n stdlib archives, expected 2"; exit 1; }
           done
 
+          # The .deb holds the tarball's tree under /usr/lib/cryo, the
+          # /usr/bin links, and depends on the C toolchain and nothing the
+          # static binary does not need.
+          deb="$(ls cryo_*_amd64.deb)"
+          dpkg-deb -c "$deb" | grep -q ' ./usr/lib/cryo/bin/cryo$' || { echo "::error::$deb holds no /usr/lib/cryo/bin/cryo"; exit 1; }
+          dpkg-deb -c "$deb" | grep -q ' ./usr/bin/cryo -> ../lib/cryo/bin/cryo$' || { echo "::error::$deb links no /usr/bin/cryo"; exit 1; }
+          [ "$(dpkg-deb -f "$deb" Depends)" = "gcc, libc6-dev" ] || { echo "::error::$deb depends on: $(dpkg-deb -f "$deb" Depends)"; exit 1; }
+
+          # The MSI: its files, its actions and their sequences, its wizard.
+          cd .. && sudo apt-get install -y msitools
+          ./scripts/check-msi.sh dist/cryo-*-windows-x86_64.msi dist/cryo-*-windows-x86_64.zip
+          cd dist
+          test -f winget/manifests/c/CryoLang/Cryo/*/CryoLang.Cryo.installer.yaml \
+            || { echo "::error::no winget installer manifest"; exit 1; }
+
       # Curated body: install one-liners + platform matrix, then the
       # CHANGELOG section for this version. The auto-generated "what's
       # changed" PR list is appended after it by gh-release.
       - name: Compose the release body
         run: |
           BASE="${{ steps.gate.outputs.base }}"
+          FULL="${{ steps.gate.outputs.version }}"
+          DEB="${{ steps.gate.outputs.deb_version }}"
           {
+            if [ "${{ steps.gate.outputs.prerelease }}" = true ]; then
+              echo "A pre-release of ${BASE}, built from \`main\` at ${GITHUB_SHA}. \`cryo version\` prints \`${FULL}+${GITHUB_SHA:0:8}\`."
+              echo
+            fi
             cat <<EOF
           ## Install
 
           **Linux x86_64**
           \`\`\`bash
-          curl -fsSL https://cryo-lang.org/install.sh | bash
+          curl -fsSL https://cryolang.org/install.sh | bash
           \`\`\`
 
           **Windows x86_64** (PowerShell)
           \`\`\`powershell
-          irm https://cryo-lang.org/install.ps1 | iex
+          irm https://cryolang.org/install.ps1 | iex
           \`\`\`
 
           Or download an archive below and verify it with \`sha256sum -c <archive>.sha256\`.
 
           | Platform | Artifact | Notes |
           | --- | --- | --- |
-          | Linux x86_64 (any glibc distro) | \`cryo-${BASE}-linux-x86_64.tar.gz\` | Fully static binary - no LLVM or other runtime dependencies. |
-          | Windows 10+ x86_64 | \`cryo-${BASE}-windows-x86_64.zip\` | \`cryo.exe\` + bundled \`LLVM-C.dll\`; linking your programs needs a mingw-w64 gcc on PATH. |
+          | Linux x86_64 (any glibc distro) | \`cryo-${FULL}-linux-x86_64.tar.gz\` | Fully static binary - no LLVM or other runtime dependencies. |
+          | Debian / Ubuntu x86_64 | \`cryo_${DEB}-1_amd64.deb\` | \`sudo apt install ./cryo_${DEB}-1_amd64.deb\`; pulls in gcc and the C library headers. |
+          | Windows 10+ x86_64 | \`cryo-${FULL}-windows-x86_64.zip\` | \`cryo.exe\` + bundled \`LLVM-C.dll\`; the installer offers llvm-mingw for the link. |
+          | Windows 10+ x86_64 | \`cryo-${FULL}-windows-x86_64.msi\` | Setup wizard; a per-user install, \`%USERPROFILE%\\.cryo\` by default, added to PATH. |
 
-          Compiling your programs shells out to a system C compiler for the final link (\`gcc\`/\`clang\` on Linux, mingw-w64 \`gcc\` on Windows). macOS, ARM64 and musl/Alpine prebuilts are not part of v1 - build from source with \`./install.sh --dev\`.
+          Compiling your programs shells out to a system C compiler for the final link (\`gcc\`/\`clang\` on Linux, llvm-mingw or mingw-w64 \`gcc\` on Windows); a build that finds none stops with E0705 and names the install's \`install-dependencies\` step. The winget manifests for \`CryoLang.Cryo\` are attached for the winget package repository. macOS, ARM64 and musl/Alpine prebuilts are not part of v1 - build from source with \`./install.sh --dev\`.
 
           ## Changelog
 
@@ -313,6 +409,9 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           body_path: /tmp/release-body.md
+          # A dispatched run tags the commit it built; a tag push names it.
+          tag_name: v${{ steps.gate.outputs.version }}
+          target_commitish: ${{ github.sha }}
           prerelease: ${{ steps.gate.outputs.prerelease }}
           generate_release_notes: true
           files: |
@@ -320,3 +419,8 @@ jobs:
             dist/cryo-*-linux-x86_64.tar.gz.sha256
             dist/cryo-*-windows-x86_64.zip
             dist/cryo-*-windows-x86_64.zip.sha256
+            dist/cryo_*_amd64.deb
+            dist/cryo_*_amd64.deb.sha256
+            dist/cryo-*-windows-x86_64.msi
+            dist/cryo-*-windows-x86_64.msi.sha256
+            dist/winget/manifests/c/CryoLang/Cryo/*/*.yaml

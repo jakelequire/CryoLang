@@ -1,0 +1,291 @@
+///! An audit of the model's dynamic arrays, reading every function's uses
+///! (`UseWalk`) and following, apart from the generator, the fewest
+///! elements each holds: a declaration's or a whole assignment's value
+///! counts them, a push adds one and a pop takes one, and a nested block
+///! that ends leaves each array the fewer of what it held entering and what
+///! it holds at the block's end.  Every element read or written is at an
+///! index `(e % K)` with `K` from 1 to that count; a pop and a borrow for a
+///! slice find at least one element; a pop and a whole assignment stand
+///! in the loop the array was declared in, or outside every loop; a
+///! dynamic array is a local, written only where `mut`; and no statement
+///! changes an array inside a `for` over its elements.  The loan audit
+///! reads the same uses: each change lends its array exclusively, so
+///! nothing else in its statement names it.
+
+namespace cryosmith::selftest::dynamic_arrays;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+import cryosmith::model::{ BinaryOperator, ExpressionKind, Program, ValueType, Variable, VariableRole };
+import cryosmith::selftest::runner::{ SelfTest };
+import cryosmith::selftest::uses::{ Use, UseKind, UseWalk };
+
+/// How many programs the dynamic array audit reads.
+const DYNAMIC_ARRAY_AUDITED_PROGRAMS: u64 = 200;
+
+/// What the dynamic array audit counted over the programs it read.
+internal type struct DynamicArrayCounts {
+    /// Elements read.
+    internal reads: i64;
+    /// Elements written.
+    internal stores: i64;
+    /// Pushes.
+    internal pushes: i64;
+    /// Pops.
+    internal pops: i64;
+    /// Clones taken.
+    internal clones: i64;
+    /// Arrays borrowed for a slice.
+    internal borrows: i64;
+    /// Whole assignments.
+    internal assignments: i64;
+}
+
+/// The fewest elements each dynamic array declared so far in one function
+/// holds where the walk stands.
+internal type struct LengthState {
+    /// The dynamic arrays, in declaration order.
+    private arrays: Array<i64>;
+    /// Beside each, the fewest elements it holds.
+    private fewest: Array<i64>;
+    /// Beside each, how many loops enclosed its declaration.
+    private loops: Array<i64>;
+
+    /// No array declared.
+    internal static new() -> LengthState {
+        return LengthState { arrays: Array::<i64>::new(), fewest: Array::<i64>::new(), loops: Array::<i64>::new() };
+    }
+
+    /// The fewest elements `variable` holds; -1 for no dynamic array
+    /// declared.
+    internal fewest_of(&this, variable: i64) -> i64 {
+        return match (this.arrays.index_of(&variable)) {
+            Option::Some(place) => { this.fewest.get(place).unwrap() }
+            Option::None        => { -1 }
+        };
+    }
+
+    /// How many loops enclosed `variable`'s declaration.
+    internal loops_of(&this, variable: i64) -> i64 { return this.loops.get(this.arrays.index_of(&variable).unwrap()).unwrap(); }
+
+    /// Record `variable` declared holding `length` elements inside `loops`
+    /// loops.
+    internal declare(mut &this, variable: i64, length: i64, loops: i64) -> void {
+        this.arrays.push(variable);
+        this.fewest.push(length);
+        this.loops.push(loops);
+    }
+
+    /// Record that `variable` now holds at least `length` elements.
+    internal set(mut &this, variable: i64, length: i64) -> void { this.fewest.set(this.arrays.index_of(&variable).unwrap(), length); }
+
+    /// The fewest elements of every array, where a nested block begins.
+    internal entering(&this) -> Array<i64> { return this.fewest.clone(); }
+
+    /// End a nested block entered where the arrays held `entered`.
+    internal leave(mut &this, entered: &Array<i64>) -> void {
+        this.arrays.truncate(entered.length());
+        this.fewest.truncate(entered.length());
+        this.loops.truncate(entered.length());
+        mut place: i64 = 0;
+        while (place < entered.length()) {
+            if (entered.get(place).unwrap() < this.fewest.get(place).unwrap()) { this.fewest.set(place, entered.get(place).unwrap()); }
+            place = place + 1;
+        }
+    }
+}
+
+/// The audit of one program's dynamic arrays.
+internal type struct DynamicArrayAudit {
+    /// Add one program's dynamic arrays to `counts`, each within the rules;
+    /// or the first that breaks one.
+    internal static check(program: &Program, counts: mut &DynamicArrayCounts) -> Result<i64, String> {
+        for (declared in program.variables.iter()) {
+            const local: boolean = match (declared.role) {
+                VariableRole::Local => { true }
+                _                   => { false }
+            };
+            if (declared.value_type.is_dynamic_array() && !local) { return Result::Err(String::from_str(Str::new("a variable other than a local holds a dynamic array"))); }
+        }
+        mut index: i64 = 0;
+        while (index < program.functions.length()) {
+            const verdict: Result<i64, String> = DynamicArrayAudit::function(program, &UseWalk::of(program, program.function_at(index)), counts);
+            if (verdict.is_err()) { return Result::Err(f"function {index}: {verdict.unwrap_err().as_str()}"); }
+            index = index + 1;
+        }
+        return Result::Ok(0);
+    }
+
+    /// Follow one function's `uses`, or the first rule broken.
+    private static function(program: &Program, uses: &Array<Use>, counts: mut &DynamicArrayCounts) -> Result<i64, String> {
+        mut state: LengthState = LengthState::new();
+        mut entered: Array<Array<i64>> = Array::<Array<i64>>::new();
+        mut iterating: Array<i64> = Array::<i64>::new();
+        mut iterated_at: Array<i64> = Array::<i64>::new();
+        mut loops: i64 = 0;
+        for (used in uses.iter()) {
+            const variable: i64 = used.variable;
+            const dynamic: boolean = variable >= 0 && program.variable_at(variable).value_type.is_dynamic_array();
+            match (used.kind) {
+                UseKind::LoopEntered => { loops = loops + 1; }
+                UseKind::LoopLeft => { loops = loops - 1; }
+                UseKind::BlockEntered => { entered.push(state.entering()); }
+                UseKind::BlockLeft => {
+                    const saved: Array<i64> = entered.pop().unwrap();
+                    state.leave(&saved);
+                    while (iterated_at.length() > 0 && iterated_at.get(iterated_at.length() - 1).unwrap() >= entered.length()) {
+                        iterated_at.truncate(iterated_at.length() - 1);
+                        iterating.truncate(iterating.length() - 1);
+                    }
+                }
+                UseKind::Iterated => {
+                    iterating.push(variable);
+                    iterated_at.push(entered.length());
+                }
+                UseKind::Declared => {
+                    if (dynamic) {
+                        const length: i64 = DynamicArrayAudit::made(program, &state, used.node);
+                        if (length < 0) { return Result::Err(f"dynamic array {variable} is declared with no new array"); }
+                        state.declare(variable, length, loops);
+                    }
+                }
+                UseKind::Assigned => {
+                    if (dynamic && program.expression_at(used.node).value_type.is_dynamic_array()) {
+                        DynamicArrayAudit::changes(program, &state, variable, loops, &iterating)?;
+                        const length: i64 = DynamicArrayAudit::made(program, &state, used.node);
+                        if (length < 0) { return Result::Err(f"dynamic array {variable} is assigned no new array"); }
+                        state.set(variable, length);
+                        counts.assignments = counts.assignments + 1;
+                    }
+                }
+                UseKind::Named => {
+                    if (dynamic && used.node >= 0) {
+                        DynamicArrayAudit::in_range(program, &state, variable, used.node)?;
+                        counts.reads = counts.reads + 1;
+                    }
+                }
+                UseKind::SharedBorrow => {
+                    if (dynamic && used.node >= 0) {
+                        match (program.expression_at(used.node).kind) {
+                            ExpressionKind::Borrow(_) => {
+                                if (state.fewest_of(variable) < 1) { return Result::Err(f"dynamic array {variable} is borrowed for a slice where it may hold no element"); }
+                                counts.borrows = counts.borrows + 1;
+                            }
+                            _ => { counts.clones = counts.clones + 1; }
+                        }
+                    }
+                }
+                UseKind::ExclusiveBorrow => {
+                    if (dynamic && used.node >= 0) {
+                        match (program.expression_at(used.node).kind) {
+                            ExpressionKind::Element(_, _) => {
+                                DynamicArrayAudit::changes(program, &state, variable, -1, &iterating)?;
+                                DynamicArrayAudit::in_range(program, &state, variable, used.node)?;
+                                counts.stores = counts.stores + 1;
+                            }
+                            ExpressionKind::Append(_, _) => {
+                                DynamicArrayAudit::changes(program, &state, variable, -1, &iterating)?;
+                                state.set(variable, state.fewest_of(variable) + 1);
+                                counts.pushes = counts.pushes + 1;
+                            }
+                            ExpressionKind::Pop(_) => {
+                                if (state.fewest_of(variable) < 1) { return Result::Err(f"dynamic array {variable} is popped where it may hold no element"); }
+                                DynamicArrayAudit::changes(program, &state, variable, loops, &iterating)?;
+                                state.set(variable, state.fewest_of(variable) - 1);
+                                counts.pops = counts.pops + 1;
+                            }
+                            _ => { return Result::Err(f"dynamic array {variable} is lent exclusively by no element store, push or pop"); }
+                        }
+                    }
+                }
+                _ => { }
+            }
+        }
+        return Result::Ok(0);
+    }
+
+    /// Whether `variable` may be changed here: a `mut` local not iterated
+    /// by an enclosing `for`, and with `loops` at least 0, a change that may
+    /// leave it fewer elements, standing inside exactly as many loops as
+    /// its declaration.
+    private static changes(program: &Program, state: &LengthState, variable: i64, loops: i64, iterating: &Array<i64>) -> Result<i64, String> {
+        const declared: Variable = program.variable_at(variable);
+        if (!declared.mutable) { return Result::Err(f"`const` dynamic array {variable} is changed"); }
+        if (iterating.contains(&variable)) { return Result::Err(f"dynamic array {variable} is changed inside a `for` over its elements"); }
+        if (loops >= 0 && state.loops_of(variable) != loops) { return Result::Err(f"dynamic array {variable} is left fewer elements inside a loop it was declared outside"); }
+        return Result::Ok(0);
+    }
+
+    /// Whether the element `node`, `v[(e % K)]`, has `K` from 1 to the
+    /// fewest elements `variable` holds.
+    private static in_range(program: &Program, state: &LengthState, variable: i64, node: i64) -> Result<i64, String> {
+        const index: i64 = match (program.expression_at(node).kind) {
+            ExpressionKind::Element(_, index) => { index }
+            _                                 => { -1 }
+        };
+        const bound: i64 = if (index < 0) { -1 } else { DynamicArrayAudit::reduced_by(program, index) };
+        if (bound < 1 || bound > state.fewest_of(variable)) {
+            return Result::Err(f"an index into dynamic array {variable} is reduced by {bound}, where it holds at least {state.fewest_of(variable)}");
+        }
+        return Result::Ok(0);
+    }
+
+    /// The literal `index` is reduced by, `(e % K)`; -1 for any other
+    /// index.
+    private static reduced_by(program: &Program, index: i64) -> i64 {
+        match (program.expression_at(index).kind) {
+            ExpressionKind::Binary(operator, _, divisor) => {
+                if (operator != BinaryOperator::Remainder) { return -1; }
+                match (program.expression_at(divisor).kind) {
+                    ExpressionKind::IntegerLiteral(length, negative) => {
+                        if (!negative) { return length as i64; }
+                    }
+                    _ => { }
+                }
+            }
+            _ => { }
+        }
+        return -1;
+    }
+
+    /// How many elements the dynamic array `value` makes holds: a
+    /// literal's, a repeat's count, none for an empty one, and as many as
+    /// the array a clone is taken of; -1 for any other value.
+    private static made(program: &Program, state: &LengthState, value: i64) -> i64 {
+        return match (program.expression_at(value).kind) {
+            ExpressionKind::ArrayLiteral(_, count)  => { count }
+            ExpressionKind::DynamicRepeat(_, count) => { count }
+            ExpressionKind::EmptyArray              => { 0 }
+            ExpressionKind::Duplicate(source)       => { state.fewest_of(source) }
+            _                                       => { -1 }
+        };
+    }
+}
+
+implement struct SelfTest {
+    /// Every dynamic array keeps the rules, and the audit finds element
+    /// reads and stores, pushes, pops, clones, slice borrows and whole
+    /// assignments to check.
+    internal dynamic_array_audit(mut &this) -> void {
+        mut counts: DynamicArrayCounts = DynamicArrayCounts { reads: 0, stores: 0, pushes: 0, pops: 0, clones: 0, borrows: 0, assignments: 0 };
+        mut seed: u64 = 1;
+        while (seed <= DYNAMIC_ARRAY_AUDITED_PROGRAMS) {
+            match (DynamicArrayAudit::check(this.default_model(seed), &counts)) {
+                Result::Ok(_)       => { }
+                Result::Err(reason) => { this.expect(false, f"seed {seed}: {reason.as_str()}"); }
+            }
+            seed = seed + 1;
+        }
+        this.expect(counts.reads > 0, String::from_str(Str::new("the dynamic array audit found no element read")));
+        this.expect(counts.stores > 0, String::from_str(Str::new("the dynamic array audit found no element written")));
+        this.expect(counts.pushes > 0, String::from_str(Str::new("the dynamic array audit found no push")));
+        this.expect(counts.pops > 0, String::from_str(Str::new("the dynamic array audit found no pop")));
+        this.expect(counts.clones > 0, String::from_str(Str::new("the dynamic array audit found no clone")));
+        this.expect(counts.borrows > 0, String::from_str(Str::new("the dynamic array audit found no dynamic array borrowed for a slice")));
+        this.expect(counts.assignments > 0, String::from_str(Str::new("the dynamic array audit found no whole assignment")));
+    }
+}

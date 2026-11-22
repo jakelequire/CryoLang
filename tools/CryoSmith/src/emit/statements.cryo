@@ -1,0 +1,258 @@
+///! Statements and blocks, each statement on a line of its own.
+
+namespace cryosmith::emit::statements;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+import cryosmith::emit::printer::{ Printer };
+import cryosmith::guarantees::{ Observation };
+import cryosmith::model::{ ExpressionKind, ExpressionNode, LoopShape, Program, StatementKind, StatementNode, ValueType, Variable };
+
+implement struct Printer {
+    /// The statements of the block starting at `first`, at `indent`.
+    internal block(mut &this, program: &Program, first: i64, indent: i64) -> void {
+        mut current: i64 = first;
+        while (current >= 0) {
+            const node: StatementNode = program.statement_at(current);
+            this.statement(program, node.kind, indent);
+            current = node.next;
+        }
+    }
+
+    /// The observations of the block starting at `first` on the line being
+    /// written, each followed by a space: an expression's `match` arm runs
+    /// them before its value.
+    internal inline_observations(mut &this, program: &Program, first: i64) -> void {
+        mut current: i64 = first;
+        while (current >= 0) {
+            const node: StatementNode = program.statement_at(current);
+            match (node.kind) {
+                StatementKind::Observe(value) => {
+                    if (program.runs_code(value)) {
+                        const local: String = this.bind_observed(program, value);
+                        this.text.push(f" observed = mix(observed, {local.as_str()}); ");
+                    } else {
+                        this.text.push(Str::new("observed = mix(observed, "));
+                        this.as_hash_input(program, value);
+                        this.text.push(Str::new("); "));
+                    }
+                }
+                _ => { }
+            }
+            current = node.next;
+        }
+    }
+
+    /// `{`, the block, and `}` on its own line at `indent`.
+    private braced(mut &this, program: &Program, first: i64, indent: i64) -> void {
+        this.text.push(Str::new("{\n"));
+        this.block(program, first, indent + 1);
+        this.indent(indent);
+        this.text.push(Str::new("}"));
+    }
+
+    /// One statement at `indent`, with its line's end.
+    private statement(mut &this, program: &Program, kind: StatementKind, indent: i64) -> void {
+        this.indent(indent);
+        match (kind) {
+            StatementKind::Declare(variable, value) => {
+                const declared: Variable = program.variable_at(variable);
+                this.text.push(if (declared.mutable) { Str::new("mut ") } else { Str::new("const ") });
+                this.name(program, variable);
+                if (!program.holds_capturing_closure(value)) {
+                    this.text.push(f": {program.type_name(declared.value_type).as_str()}");
+                }
+                this.text.push(Str::new(" = "));
+                this.expression(program, value);
+                this.text.push(Str::new(";\n"));
+            }
+            StatementKind::Assign(place, value) => {
+                this.expression(program, place);
+                this.text.push(Str::new(" = "));
+                this.expression(program, value);
+                this.text.push(Str::new(";\n"));
+            }
+            StatementKind::Compound(operator, place, value) => {
+                this.expression(program, place);
+                this.text.push(f" {operator.symbol()}= ");
+                this.expression(program, value);
+                this.text.push(Str::new(";\n"));
+            }
+            StatementKind::Observe(value) => {
+                if (program.runs_code(value)) {
+                    const local: String = this.bind_observed(program, value);
+                    this.text.push(Str::new("\n"));
+                    this.indent(indent);
+                    this.text.push(f"observed = mix(observed, {local.as_str()});\n");
+                } else {
+                    this.text.push(Str::new("observed = mix(observed, "));
+                    this.as_hash_input(program, value);
+                    this.text.push(Str::new(");\n"));
+                }
+            }
+            StatementKind::Evaluate(value) => {
+                this.expression(program, value);
+                this.text.push(Str::new(";\n"));
+            }
+            StatementKind::Release(variable) => {
+                this.text.push(Str::new("mem::drop("));
+                this.name(program, variable);
+                this.text.push(Str::new(");\n"));
+            }
+            StatementKind::Branch(condition, then_block, else_block) => {
+                this.text.push(Str::new("if ("));
+                this.expression(program, condition);
+                this.text.push(Str::new(") "));
+                this.braced(program, then_block, indent);
+                if (else_block >= 0) {
+                    this.text.push(Str::new(" else "));
+                    this.braced(program, else_block, indent);
+                }
+                this.text.push(Str::new("\n"));
+            }
+            StatementKind::Loop(shape, counter, trips, body) => {
+                const counter_type: String = program.type_name(program.variable_at(counter).value_type);
+                match (shape) {
+                    LoopShape::Counted => {
+                        this.text.push(Str::new("for (mut "));
+                        this.name(program, counter);
+                        this.text.push(f": {counter_type.as_str()} = 0; ");
+                        this.name(program, counter);
+                        this.text.push(f" < {trips}; ");
+                        this.name(program, counter);
+                        this.text.push(Str::new(" = "));
+                        this.name(program, counter);
+                        this.text.push(Str::new(" + 1) "));
+                        this.braced(program, body, indent);
+                    }
+                    LoopShape::Conditioned => {
+                        this.text.push(Str::new("mut "));
+                        this.name(program, counter);
+                        this.text.push(f": {counter_type.as_str()} = 0;\n");
+                        this.indent(indent);
+                        this.text.push(Str::new("while ("));
+                        this.name(program, counter);
+                        this.text.push(f" < {trips}) ");
+                        this.text.push(Str::new("{\n"));
+                        this.indent(indent + 1);
+                        this.name(program, counter);
+                        this.text.push(Str::new(" = "));
+                        this.name(program, counter);
+                        this.text.push(Str::new(" + 1;\n"));
+                        this.block(program, body, indent + 1);
+                        this.indent(indent);
+                        this.text.push(Str::new("}"));
+                    }
+                    LoopShape::Ranged => {
+                        this.text.push(Str::new("for ("));
+                        this.name(program, counter);
+                        this.text.push(f" in 0..{trips}) ");
+                        this.braced(program, body, indent);
+                    }
+                }
+                this.text.push(Str::new("\n"));
+            }
+            StatementKind::Exit(is_break, condition) => {
+                this.text.push(Str::new("if ("));
+                this.expression(program, condition);
+                this.text.push(if (is_break) { Str::new(") { break; }\n") } else { Str::new(") { continue; }\n") });
+            }
+            StatementKind::ReturnIf(condition, value) => {
+                this.text.push(Str::new("if ("));
+                this.expression(program, condition);
+                if (value < 0) {
+                    this.text.push(Str::new(") { return; }\n"));
+                } else {
+                    this.text.push(Str::new(") { return "));
+                    this.expression(program, value);
+                    this.text.push(Str::new("; }\n"));
+                }
+            }
+            StatementKind::Return(value) => {
+                this.text.push(Str::new("return "));
+                this.expression(program, value);
+                this.text.push(Str::new(";\n"));
+            }
+            StatementKind::Match(subject, first, count) => {
+                this.text.push(Str::new("match ("));
+                this.expression(program, subject);
+                this.text.push(Str::new(") {\n"));
+                mut arm: i64 = first;
+                while (arm < first + count) {
+                    if (program.omits_arm(program.expression_at(subject).value_type, program.arm_at(arm))) {
+                        arm = arm + 1;
+                        continue;
+                    }
+                    this.indent(indent + 1);
+                    this.pattern(program, program.expression_at(subject).value_type, program.arm_at(arm));
+                    this.text.push(Str::new(" => "));
+                    this.braced(program, program.arm_at(arm).body, indent + 1);
+                    this.text.push(Str::new("\n"));
+                    arm = arm + 1;
+                }
+                this.indent(indent);
+                this.text.push(Str::new("}\n"));
+            }
+            StatementKind::Each(variable, binding, body) => {
+                this.text.push(Str::new("for ("));
+                this.name(program, binding);
+                this.text.push(Str::new(" in "));
+                this.name(program, variable);
+                if (program.variable_at(variable).value_type.is_text()) { this.text.push(Str::new(".as_bytes()")); }
+                if (program.variable_at(variable).value_type.is_map()) { this.text.push(Str::new(".keys()")); }
+                this.text.push(Str::new(") "));
+                this.braced(program, body, indent);
+                this.text.push(Str::new("\n"));
+            }
+            StatementKind::Finish => {
+                this.text.push(Str::new("fmt::println(f\""));
+                this.text.push(Observation::hash_line_prefix());
+                this.text.push(Str::new("{observed}\");\n"));
+                this.indent(indent);
+                this.text.push(Str::new("return 0;\n"));
+            }
+        }
+    }
+
+    /// A value as `mix` takes it: an integer converted to `u64`, a boolean
+    /// as 1 or 2.  A `u64` `match`, an enum's variant number, is passed as
+    /// it is, so its literal arms are typed by `mix`'s parameter.
+    /// `const o<N>: u64 = <value as a hash input>;`, a fresh local the
+    /// observation then folds in: `observed = mix(observed, h0(..))` would
+    /// read `observed` before the call and overwrite whatever the call folds
+    /// in while it runs.  The local's name, unique in the program.
+    private bind_observed(mut &this, program: &Program, value: i64) -> String {
+        const local: String = f"o{this.observation_locals}";
+        this.observation_locals = this.observation_locals + 1;
+        this.text.push(f"const {local.as_str()}: u64 = ");
+        this.as_hash_input(program, value);
+        this.text.push(Str::new(";"));
+        return local;
+    }
+
+    internal as_hash_input(mut &this, program: &Program, value: i64) -> void {
+        const observed: ExpressionNode = program.expression_at(value);
+        match (observed.kind) {
+            ExpressionKind::Match(_, _, _) => {
+                if (observed.value_type.same(ValueType::U64)) {
+                    this.expression(program, value);
+                    return;
+                }
+            }
+            _ => { }
+        }
+        match (observed.value_type) {
+            ValueType::Boolean => {
+                this.text.push(Str::new("if ("));
+                this.expression(program, value);
+                this.text.push(Str::new(") { 1 } else { 2 }"));
+            }
+            _ => {
+                this.text.push(Str::new("("));
+                this.expression(program, value);
+                this.text.push(Str::new(" as u64)"));
+            }
+        }
+    }
+}

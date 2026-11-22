@@ -83,8 +83,10 @@ type struct TypeArena {
     defs: DefTable*;
     // -- Ownership --
     types:   [Type*];           // All types (indexed by allocation order)
-    // True for the duration of a symbolic generic-body walk (sema sets it around
-    // `symbolic_check_body`). While set, `create_instantiation` tags every new
+    // True while instantiations are built without being demanded: during a
+    // walk of a template's own body (sema's `symbolic_check_body`, MoveCheck's
+    // walk of a template's methods) and while a type is substituted without
+    // demand.  While set, `create_instantiation` tags every new
     // InstantiatedType `is_symbolic`, so concrete instantiations that exist only
     // inside a never-instantiated template (resolved by the walk but never
     // monomorphized) are excluded from GenericValidation's E0900 check. The
@@ -1029,6 +1031,29 @@ public:
             return null;
         }
         return this.types[index];
+    }
+
+    /// The type a non-generic alias names, through any chain of aliases, so
+    /// that nothing downstream sees an alias where a type was written: an
+    /// alias is a name for its target, and "is this an enum?" or "does this
+    /// type have field X?" is answered by the target.  A generic alias
+    /// (`type Stack<T> = Array<T>`) is kept, since it is expanded where it
+    /// is instantiated and needs its template intact.  An alias whose target
+    /// is not recorded yet, and any other type, is answered as itself; the
+    /// chain is followed to a bounded depth, so a self-referential alias
+    /// stops.
+    follow_alias(&this, ty: TypeRef) -> TypeRef {
+        mut current: TypeRef = ty;
+        mut depth: i32 = 0;
+        while (depth < 8) {
+            const t: Type* = this.lookup(current);
+            if (t == null || t.kind != TypeKind::TypeAlias) { return current; }
+            const alias: TypeAliasType* = t.as_alias();
+            if (alias.is_generic || !alias.has_target()) { return current; }
+            current = alias.target;
+            depth += 1;
+        }
+        return current;
     }
 
     /// The type parameter `ty` is, or null when `ty` is any other type.

@@ -1,0 +1,169 @@
+///! `cryogate lsp --cryo <compiler> [--build-dir DIR] [--min-modules N]
+///! [--min-checks N] [--keep] [--no-run]`: build tools/CryoLSP with the
+///! compiler under test, then run the server it linked through every
+///! behavioural check (`lsp/run/smoke`).
+///!
+///! The server links the compiler as a library, so a fully green set of
+///! other gates is no evidence that it builds.  The gate never writes where
+///! a server runs from: it builds into its own directory (`build/gate`
+///! below the project) and installs nothing, since an editor holding the
+///! installed server open would fail the install for a reason unrelated to
+///! the code.  It starts cold - the build directory removed first - and
+///! counts the build only when the compiler stated the population it built
+///! and that population clears `--min-modules` (`lsp/build`); an `up to
+///! date` build is a refusal, not a pass.  The behavioural run must report
+///! no failure and at least `--min-checks` passing checks, so a run that
+///! lost its fixtures is a refusal too.  `--no-run` builds alone.
+///! `--keep` keeps the build directory, only to exercise the refusal an
+///! incremental build triggers.
+///!
+///! Exit: 0 when the server built and passed its checks; 1 otherwise; 2 on
+///! a usage error.
+
+namespace cryogate::gates::lsp;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::path::{ Path, PathBuf };
+import std::io::error::{ IoError };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::lsp::build::{ LspBuild };
+import cryogate::lsp::run::smoke::{ Smoke, Tally };
+
+/// The language server gate.
+public type struct LspGate {
+    /// Run `cryogate lsp` with `arguments` from index `first`.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate lsp --cryo <compiler> [--build-dir DIR] [--min-modules N] [--min-checks N] [--keep] [--no-run]"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--build-dir"));
+        options.valued(Str::new("--min-modules"));
+        options.valued(Str::new("--min-checks"));
+        options.flag(Str::new("--keep"));
+        options.flag(Str::new("--no-run"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate lsp: {reason.as_str()}"); return 2; }
+        };
+        const compiler_option: Option<Str> = parsed.value(Str::new("--cryo"));
+        if (compiler_option.is_none() || !parsed.positionals().is_empty() || parsed.separated()) {
+            fmt::eprintln(f"cryogate lsp: usage: {options.usage()}");
+            return 2;
+        }
+        const minimum_modules: i64 = match (LspGate::count(&parsed, Str::new("--min-modules"), 200)) {
+            Option::Some(count) => { count }
+            Option::None        => { return 2; }
+        };
+        const minimum_checks: i64 = match (LspGate::count(&parsed, Str::new("--min-checks"), 182)) {
+            Option::Some(count) => { count }
+            Option::None        => { return 2; }
+        };
+        const build_directory: Str = parsed.value(Str::new("--build-dir")).unwrap_or(Str::new("build/gate"));
+
+        const compiler: String = Host::absolute(compiler_option.unwrap());
+        if (!Path::from(compiler.as_str()).is_file()) { return LspGate::fail(f"compiler binary not found: {compiler.as_str()}"); }
+        const project: PathBuf = repository.join(Str::new("tools/CryoLSP"));
+        if (!project.as_path().join(Str::new("cryoconfig")).as_path().is_file()) {
+            return LspGate::fail(f"no cryoconfig at {project.as_path().as_str()}; nothing to build");
+        }
+        const output: PathBuf = project.as_path().join(build_directory);
+        if (!parsed.has(Str::new("--keep"))) {
+            if (output.as_path().exists()) { const _: Result<(), IoError> = Directory::remove_all(output.as_path()); }
+            if (output.as_path().is_directory()) {
+                return LspGate::fail(f"could not clear {output.as_path().as_str()}; a warm build compiles nothing and reports success");
+            }
+        }
+
+        // The stdlib is pinned to the tree's: the compiler under test finds
+        // its library relative to its own place, which is not this project's.
+        mut job: Job = Job::new(compiler.as_str());
+        job.argument(Str::new("build"));
+        job.argument(f"--build-dir={build_directory}".as_str());
+        job.directory(project.as_path().as_str());
+        job.set_variable(Str::new("CRYO_STDLIB"), repository.join(Str::new("stdlib")).as_path().as_str());
+        job.default_c_compiler();
+        job.log_to(logs.file(Str::new("lsp-build")).as_str());
+        const built: Completion = job.run();
+        const build: LspBuild = LspBuild::read(built.output().as_str());
+
+        match (built.outcome.exit_code()) {
+            Option::Some(0) => { }
+            _ => {
+                fmt::println(String::from_str(Str::new("lsp-gate: the LSP does not compile against this compiler source")));
+                if (build.errors.is_empty()) {
+                    const start: i64 = if (build.lines.length() > 25) { build.lines.length() - 25 } else { 0 };
+                    for (mut index: i64 = start; index < build.lines.length(); index++) { fmt::println(f"        | {build.lines.get_reference(index).unwrap().as_str()}"); }
+                } else {
+                    for (mut index: i64 = 0; index < build.errors.length() && index < 40; index++) { fmt::println(f"        | {build.errors.get_reference(index).unwrap().as_str()}"); }
+                }
+                const ended: String = match (built.outcome.exit_code()) {
+                    Option::Some(code) => { f"exited {code}" }
+                    Option::None       => { built.outcome.describe() }
+                };
+                return LspGate::fail(f"build {ended.as_str()} with {build.errors.length()} error line(s)");
+            }
+        }
+        if (!build.counted) {
+            fmt::println(String::from_str(Str::new("lsp-gate: the build reported no population.  The first line was:")));
+            fmt::println(f"        | {if (build.lines.is_empty()) { Str::new("<no output>") } else { build.lines.get_reference(0).unwrap().as_str() }}");
+            return LspGate::fail(String::from_str(Str::new("nothing was compiled; an incremental build that skipped the tree has not gated it")));
+        }
+        if (build.total() < minimum_modules) {
+            return LspGate::fail(f"compiled {build.total()} module(s), expected at least {minimum_modules}");
+        }
+        if (build.binary.is_empty()) { return LspGate::fail(f"compiled {build.total()} module(s) but linked no binary"); }
+        const binary: String = if (Path::from(build.binary.as_str()).is_absolute()) {
+            build.binary.clone()
+        } else {
+            String::from_str(project.as_path().join(build.binary.as_str()).as_path().as_str())
+        };
+        if (!Path::from(binary.as_str()).is_file()) { return LspGate::fail(f"build named {build.binary.as_str()} but no such file exists"); }
+
+        const described: String = build.described();
+        if (parsed.has(Str::new("--no-run"))) {
+            fmt::println(f"lsp-gate: OK -- {described.as_str()}; behavioural checks NOT run (--no-run)");
+            return 0;
+        }
+        const tally: Tally = Smoke::run(repository, binary.as_str(), Option::None, false);
+        if (!tally.succeeded()) {
+            fmt::println(String::from_str(Str::new("lsp-gate: the server built, and its behavioural run failed")));
+            for (line in tally.lines.iterate_references()) {
+                if (!line.as_str().starts_with(&Str::new("  ok "))) { fmt::println(f"        | {line.as_str()}"); }
+            }
+            return LspGate::fail(f"{tally.failed} of {tally.passed + tally.failed} behavioural check(s) failed");
+        }
+        if (tally.passed < minimum_checks) {
+            return LspGate::fail(f"the behavioural run passed {tally.passed} check(s) over {tally.fixtures} fixture(s); expected at least {minimum_checks}");
+        }
+        fmt::println(f"lsp-gate: OK -- {described.as_str()}; {tally.passed} behavioural check(s) passed over {tally.fixtures} fixture(s)");
+        return 0;
+    }
+
+    /// The count `name` gives, or `fallback` when it is not given; `None`
+    /// (with the reason printed) when it is not a count.
+    private static count(parsed: &Parsed, name: Str, fallback: i64) -> Option<i64> {
+        return match (parsed.value(name)) {
+            Option::Some(text) => {
+                match (i64::try_from(text)) {
+                    Result::Ok(count) => { Option::Some(count) }
+                    Result::Err(_)    => { fmt::eprintln(f"cryogate lsp: {name} takes a count, not {text}"); Option::None }
+                }
+            }
+            Option::None => { Option::Some(fallback) }
+        };
+    }
+
+    private static fail(reason: String) -> i32 {
+        fmt::println(f"lsp-gate: FAIL -- {reason.as_str()}");
+        return 1;
+    }
+}

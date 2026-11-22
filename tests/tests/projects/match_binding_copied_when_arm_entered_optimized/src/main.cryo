@@ -1,0 +1,104 @@
+namespace Main;
+import std::fmt;
+
+// A binding of a `Copy` payload, taken from a local matched by value and not
+// written `mut`, is a copy made when the arm is entered: assigning the local
+// inside the arm leaves it as it was, and writing it leaves the local alone.
+// A `mut` binding names the payload inside the local.
+
+type enum Inner { A(u64, u32); B(i8); }
+type enum Outer { X(u8, Inner); Y(i64); }
+
+function inner_value(i: Inner) -> u64 {
+    return match (i) { Inner::A(x, y) => { x + (y as u64) } Inner::B(z) => { 100 + (z as u64) } };
+}
+
+function first_byte(v: Outer) -> u64 {
+    return match (v) { Outer::X(a, _) => { a as u64 } Outer::Y(n) => { 1000 + (n as u64) } };
+}
+
+// The repro: a nested binding read after the subject is reassigned.
+function reassigned_in_arm() -> u64 {
+    mut v: Outer = Outer::X(7, Inner::A(11, 13));
+    mut seen: u64 = 0;
+    match (v) {
+        Outer::X(a, b) => {
+            v = Outer::Y(1);
+            const n: u64 = match (b) { Inner::A(x, y) => { x + (y as u64) } Inner::B(z) => { 100 + (z as u64) } };
+            seen = (a as u64) * 1000 + n;
+        }
+        Outer::Y(_) => { }
+    }
+    return seen;
+}
+
+// The same in a match expression's arm.
+function reassigned_in_expression_arm() -> u64 {
+    mut v: Outer = Outer::X(5, Inner::B(3));
+    return match (v) {
+        Outer::X(a, b) => { v = Outer::Y(2); (a as u64) * 1000 + inner_value(b) }
+        Outer::Y(n) => { n as u64 }
+    };
+}
+
+// A name binding the whole subject is a copy too.
+function whole_subject_binding() -> u64 {
+    mut v: Outer = Outer::X(9, Inner::A(1, 2));
+    mut seen: u64 = 0;
+    match (v) {
+        Outer::Y(_) => { }
+        whole => { v = Outer::Y(4); seen = first_byte(whole); }
+    }
+    return seen;
+}
+
+// A `mut` binding writes the subject.
+function mut_binding_writes_subject() -> u64 {
+    mut v: Outer = Outer::X(7, Inner::B(1));
+    match (v) {
+        Outer::X(mut a, _) => { a = 42; }
+        Outer::Y(_) => { }
+    }
+    return first_byte(v);
+}
+
+// Writing a binding not written `mut` writes its copy.
+function plain_binding_write_is_local() -> u64 {
+    mut v: Outer = Outer::X(7, Inner::B(1));
+    mut written: u64 = 0;
+    match (v) {
+        Outer::X(a, _) => { a = 42; written = a as u64; }
+        Outer::Y(_) => { }
+    }
+    return written * 1000 + first_byte(v);
+}
+
+// The binding a guard reads is the one the body reads.
+function guarded_arm() -> u64 {
+    mut v: Outer = Outer::X(7, Inner::B(1));
+    mut seen: u64 = 0;
+    match (v) {
+        Outer::X(a, _) if (a == 7) => { v = Outer::Y(3); seen = a as u64; }
+        Outer::X(_, _) => { seen = 1; }
+        Outer::Y(_) => { seen = 2; }
+    }
+    return seen;
+}
+
+// One slot serves every pass through an arm in a loop.
+function in_a_loop() -> u64 {
+    mut v: Outer = Outer::X(1, Inner::B(0));
+    mut total: u64 = 0;
+    for (mut i: u64 = 0; i < 4; i++) {
+        match (v) {
+            Outer::X(a, _) => { v = Outer::X(a + 1, Inner::B(0)); total = total * 10 + (a as u64); }
+            Outer::Y(_) => { }
+        }
+    }
+    return total;
+}
+
+function main() -> i32 {
+    fmt::println(f"match bindings: {reassigned_in_arm()} {reassigned_in_expression_arm()} {whole_subject_binding()} {mut_binding_writes_subject()} {plain_binding_write_is_local()} {guarded_arm()} {in_a_loop()}");
+    return 0;
+}

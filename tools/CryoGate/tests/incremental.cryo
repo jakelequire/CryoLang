@@ -1,0 +1,126 @@
+///! The incremental-build matrix's decisions: the edits' text, a build's
+///! snapshot and the comparison of an incremental build with a clean one.
+![config(testing)]
+namespace cryogate::tests::incremental;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::fs::temporary::{ TemporaryDirectory };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect };
+
+import cryogate::incremental::edits::{ EditKind, SourceEdit };
+import cryogate::incremental::snapshots::{ BuildSnapshot, SnapshotComparison };
+
+type struct Fixture {
+    /// A snapshot of the program digest `program` and the objects named
+    /// `path=digest`, separated by spaces, in the order given.
+    private static snapshot(program: Str, objects: Str) -> BuildSnapshot {
+        mut listed: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        for (word in objects.split_whitespace()) {
+            const parts: Pair<Str, Str> = word.split_once(&Str::new("=")).unwrap();
+            listed.push(Pair::new(String::from_str(parts.first), String::from_str(parts.second)));
+        }
+        return BuildSnapshot { program: String::from_str(program), objects: listed };
+    }
+
+    /// Write `text` to `relative` below `root`, creating its directories.
+    private static put(root: Path, relative: Str, text: Str) -> Result<(), TestError> {
+        const path: PathBuf = root.join(relative);
+        match (path.as_path().parent()) {
+            Option::Some(parent) => {
+                match (Directory::create_all(parent)) {
+                    Result::Ok(_)      => { }
+                    Result::Err(error) => { return Result::Err(TestError::other(error.describe())); }
+                }
+            }
+            Option::None => { }
+        }
+        return match (File::write_text(path.as_path(), text)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(TestError::other(error.describe())) }
+        };
+    }
+}
+
+![test]
+function an_append_adds_a_comment_line_and_a_shift_inserts_one_after_the_first_line() -> Result<(), TestError> {
+    const append: SourceEdit = SourceEdit::new(Str::new("a"), Str::new("a.cryo"), EditKind::Append);
+    expect(append.applied(Str::new("one\ntwo\n")) == String::from_str(Str::new("one\ntwo\n\n// incremental-check: appended comment\n")), Str::new("appended after the last line"))?;
+    const shift: SourceEdit = SourceEdit::new(Str::new("s"), Str::new("s.cryo"), EditKind::ShiftLines);
+    expect(shift.applied(Str::new("one\ntwo\n")) == String::from_str(Str::new("one\n// incremental-check: inserted line (shifts line numbers)\ntwo\n")), Str::new("inserted after the first line"))?;
+    return expect(shift.kind_name() == Str::new("shift lines") && append.kind_name() == Str::new("append"), Str::new("the kinds as the report names them"));
+}
+
+![test]
+function the_compiler_matrix_edits_a_leaf_a_widely_used_module_and_the_generic_registry() -> Result<(), TestError> {
+    const edits: Array<SourceEdit> = SourceEdit::compiler_matrix();
+    expect(edits.length() == 3, Str::new("three edits"))?;
+    expect(edits.get_reference(0).unwrap().relative.as_str() == Str::new("CLI/commands.cryo"), Str::new("the leaf"))?;
+    expect(edits.get_reference(1).unwrap().kind_name() == Str::new("shift lines"), Str::new("the widely used module's lines shift"))?;
+    return expect(SourceEdit::compiler_header() == Str::new("llvm_bindings.h"), Str::new("the header the extern block includes"));
+}
+
+![test]
+function builds_with_the_same_objects_are_identical_and_the_program_counts_only_where_links_reproduce() -> Result<(), TestError> {
+    const clean: BuildSnapshot = Fixture::snapshot(Str::new("p1"), Str::new("release/a.o=1 release/b.o=2"));
+    const same: SnapshotComparison = SnapshotComparison::of(&Fixture::snapshot(Str::new("p1"), Str::new("release/a.o=1 release/b.o=2")), &clean);
+    expect(same.identical(true) && same.objects == 2, Str::new("identical, two objects"))?;
+    const relinked: SnapshotComparison = SnapshotComparison::of(&Fixture::snapshot(Str::new("p2"), Str::new("release/a.o=1 release/b.o=2")), &clean);
+    expect(relinked.program_differs && relinked.identical(false), Str::new("a different program is identical when programs are not compared"))?;
+    return expect(!relinked.identical(true), Str::new("and not when they are"));
+}
+
+![test]
+function an_object_that_differs_or_is_in_one_build_only_is_named() -> Result<(), TestError> {
+    const clean: BuildSnapshot = Fixture::snapshot(Str::new("p"), Str::new("release/a.o=1 release/b.o=2 release/c.o=3"));
+    const stale: SnapshotComparison = SnapshotComparison::of(&Fixture::snapshot(Str::new("p"), Str::new("release/a.o=1 release/b.o=9 release/d.o=4")), &clean);
+    expect(!stale.identical(false), Str::new("refused whatever the programs"))?;
+    expect(stale.object_problems.length() == 3, f"three problems, got {stale.object_problems.length()}".as_str())?;
+    expect(stale.object_problems.get_reference(0).unwrap().as_str() == Str::new("object release/b.o differs"), Str::new("the differing object"))?;
+    expect(stale.object_problems.get_reference(1).unwrap().as_str() == Str::new("object release/c.o is in the clean build only"), Str::new("the missing object"))?;
+    return expect(stale.object_problems.get_reference(2).unwrap().as_str() == Str::new("object release/d.o is in the incremental build only"), Str::new("the extra object"));
+}
+
+![test]
+function another_profiles_objects_left_in_the_incremental_build_are_not_compared() -> Result<(), TestError> {
+    const clean: BuildSnapshot = Fixture::snapshot(Str::new("p"), Str::new("debug/a.o=1"));
+    const warm: SnapshotComparison = SnapshotComparison::of(&Fixture::snapshot(Str::new("p"), Str::new("debug/a.o=1 release/a.o=7")), &clean);
+    return expect(warm.identical(true) && warm.objects == 1, Str::new("the release objects of an earlier build are left out"));
+}
+
+![test]
+function a_clean_build_with_no_object_is_refused() -> Result<(), TestError> {
+    const empty: BuildSnapshot = Fixture::snapshot(Str::new("p"), Str::new(""));
+    const nothing: SnapshotComparison = SnapshotComparison::of(&Fixture::snapshot(Str::new("p"), Str::new("")), &empty);
+    return expect(!nothing.identical(true), Str::new("a comparison over nothing does not hold"));
+}
+
+![test]
+function a_snapshot_keys_every_object_below_target_and_digests_the_program() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = match (TemporaryDirectory::create()) {
+        Result::Ok(directory) => { directory }
+        Result::Err(error)    => { return Result::Err(TestError::other(error.describe())); }
+    };
+    const root: Path = scratch.path();
+    Fixture::put(root, Str::new("build/program"), Str::new("linked"))?;
+    Fixture::put(root, Str::new("build/target/release/host/local/deps/a.o"), Str::new("a"))?;
+    Fixture::put(root, Str::new("build/target/release/host/local/incremental/cryo.fp"), Str::new("not an object"))?;
+    Fixture::put(root, Str::new("build/target/release/host/std/deps/std/b.o"), Str::new("b"))?;
+    const snapshot: BuildSnapshot = match (BuildSnapshot::take(root.join(Str::new("build")).as_path(), root.join(Str::new("build/program")).as_path())) {
+        Result::Ok(snapshot) => { snapshot }
+        Result::Err(reason)  => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    expect(snapshot.objects.length() == 2, f"two objects, got {snapshot.objects.length()}".as_str())?;
+    expect(snapshot.objects.get_reference(0).unwrap().first.as_str() == Str::new("release/host/local/deps/a.o"), Str::new("keyed below target/"))?;
+    expect(snapshot.objects.get_reference(0).unwrap().second.as_str() == Str::new("ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"), Str::new("the sha256 of the object's bytes"))?;
+    const missing: Result<BuildSnapshot, String> = BuildSnapshot::take(root.join(Str::new("build")).as_path(), root.join(Str::new("build/none")).as_path());
+    return expect(missing.is_err(), Str::new("a program that is not there is an error"));
+}

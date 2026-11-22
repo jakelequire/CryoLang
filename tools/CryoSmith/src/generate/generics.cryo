@@ -1,0 +1,232 @@
+///! Generic functions: `g<N><T>`, `where T: Copy` or `where T: Eq + Copy`,
+///! and their calls with the type argument written, `g0::<u16>(a, b)`.
+///! `Copy` lets a body pass, store and select one `T` value as often as it
+///! likes; without it each of those would move the value.
+///!
+///! A generic function is declared after the structs and their methods and
+///! before the free functions, each from its own stream, so with the
+///! feature off no draw is taken and every other part's text is unchanged.
+///! Its first two parameters are `T`, the rest `T` or a value type.  A `T`
+///! value is only read, passed to a generic call, returned, selected between
+///! by an `if` expression and, under `Eq`, compared: it is never observed,
+///! since nothing converts a `T` to a `u64` - except under a trait bound,
+///! where a call of the trait's first method observes it.  Its value-typed parameters and
+///! locals are observed as any function's are, and every call is observed
+///! where its value is.
+///!
+///! With `callable-bounds` a generic function sometimes takes one more
+///! parameter last, of a second type parameter bounded by a function type
+///! over the scalars and `T`, `g1<T, F>(p0: T, p1: T, p2: F) -> T where T:
+///! Copy, F: (u8, T) -> T`.  The body calls it wherever a value of its
+///! return type is wanted, as it calls a function-typed parameter, and
+///! observes it by one call; each call of the function gives it a closure
+///! written there, at the call's type argument, which may capture.  A
+///! closure local or a parameter is never given, since passing one moves it.
+
+namespace cryosmith::generate::generics;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::guarantees::{ CostBudget };
+import cryosmith::model::{
+    BinaryOperator, ExpressionKind, Function, Genericity, Receiver, StatementKind, TypeArgumentSpelling, ValueType,
+    Variable, VariableRole
+};
+import cryosmith::random::{ RandomStream };
+import cryosmith::typing::{ TypeChoice };
+
+/// How often, in a hundred, a generic function takes a callable-bounded
+/// parameter last.
+const CALLABLE_CHANCE: i64 = 40;
+
+implement struct Generator {
+    /// Declare the program's generic functions, one to three, from a
+    /// stream of their own.
+    internal declare_generics(mut &this) -> void {
+        mut counting: RandomStream = RandomStream::for_generics(this.options.seed);
+        const count: i64 = 1 + counting.below(3);
+        mut number: i64 = 0;
+        while (number < count) {
+            this.define_generic(number);
+            number = number + 1;
+        }
+    }
+
+    /// Generate generic function `number` from its own stream, bounded by
+    /// `Copy` or by `Eq + Copy`.
+    private define_generic(mut &this, number: i64) -> void {
+        this.random = RandomStream::for_generic(this.options.seed, number);
+        const genericity: Genericity = if (this.random.chance(50)) { Genericity::Equatable } else { Genericity::Copyable };
+        this.generic_function(number, genericity);
+    }
+
+    /// Generate a generic function numbered `number` whose `T` is bounded
+    /// by `genericity`, from the stream already chosen: two to four
+    /// parameters, the first two `T`, sometimes a callable-bounded one
+    /// last, and `T` returned.
+    internal generic_function(mut &this, number: i64, genericity: Genericity) -> void {
+        this.environment.enter_function();
+        this.loop_depth = 0;
+        this.block_depth = 0;
+        this.budget = CostBudget::for_function(false);
+        this.statements_left = (this.options.size + 1) / 2;
+        this.in_main = false;
+        this.genericity = genericity;
+        this.returns = ValueType::TypeParameter;
+        const first_parameter: i64 = this.program.lists.length();
+        const value_count: i64 = 2 + this.random.below(3);
+        mut index: i64 = 0;
+        while (index < value_count) {
+            const value_type: ValueType = if (index < 2 || this.random.chance(30)) { ValueType::TypeParameter } else { this.any_type() };
+            this.bind_parameter(index, value_type);
+            index = index + 1;
+        }
+        const callable: ValueType = if (this.makes_callable_bounds() && this.random.chance(CALLABLE_CHANCE)) { this.closure_signature() } else { ValueType::Void };
+        if (callable.is_function()) { this.bind_parameter(value_count, callable); }
+        const parameter_count: i64 = if (callable.is_function()) { value_count + 1 } else { value_count };
+        mut statements: Array<i64> = Array::<i64>::new();
+        const body_start: i64 = this.environment.mark();
+        this.fill(&statements, true);
+        this.observe_declared(body_start, &statements);
+        index = 0;
+        while (index < parameter_count) {
+            const parameter: i64 = this.program.list_at(first_parameter + index);
+            const observable: boolean = !this.program.variable_at(parameter).value_type.same(ValueType::TypeParameter)
+                || this.genericity.bounding_trait() >= 0;
+            if (observable) { this.observe_place(this.read(parameter), &statements); }
+            index = index + 1;
+        }
+        const value: i64 = this.typed_place(ValueType::TypeParameter, this.depth());
+        statements.push(this.program.statement(StatementKind::Return(value)));
+        const body: i64 = this.program.block(&statements);
+        this.program.functions.push(Function {
+            number: number, is_main: false, owner: ValueType::Void, receiver: Receiver::Free, first_parameter: first_parameter,
+            parameter_count: parameter_count, returns: ValueType::TypeParameter, body: body, cost: this.budget.spent(),
+            genericity: this.genericity, callable: callable, implements: -1,
+        });
+    }
+
+    /// Declare parameter `p<number>` of `value_type` and bring it into scope.
+    private bind_parameter(mut &this, number: i64, value_type: ValueType) -> void {
+        const parameter: i64 = this.program.variable(Variable { role: VariableRole::Parameter, number: number, value_type: value_type, mutable: false });
+        this.program.lists.push(parameter);
+        this.environment.bind(parameter);
+    }
+
+    /// Whether generic functions take callable-bounded parameters: the
+    /// feature is on, and so are `closures` and `generic-closures`, since
+    /// each call gives such a parameter a closure written there, generic
+    /// over `T` where the caller is a generic body.
+    internal makes_callable_bounds(&this) -> boolean {
+        return this.options.features.has(Feature::CallableBounds) && this.options.features.has(Feature::Closures)
+            && this.options.features.has(Feature::GenericClosures);
+    }
+
+    /// An expression of the generic function's or generic struct's `T`: a
+    /// read of a `T` name, an `if` expression over two, a call of an
+    /// earlier generic function or static method at `T` whose bound `T`
+    /// satisfies, or a `T` field of `this`.  A generic function has two `T`
+    /// parameters and a generic struct's method a `this` with a `T` field,
+    /// so there is always a form to take.
+    internal type_parameter_expression(mut &this, depth: i64) -> i64 {
+        const deeper: boolean = depth > 0;
+        const next: i64 = if (deeper) { depth - 1 } else { 0 };
+        const variables: Array<i64> = this.environment.variables_of(&this.program, ValueType::TypeParameter);
+        const generic_callees: Array<i64> = this.generic_callees(ValueType::TypeParameter);
+        const roots: Array<i64> = this.environment.field_roots(&this.program, ValueType::TypeParameter);
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(if (variables.length() > 0) { 10 } else { 0 });
+        weights.push(if (this.options.features.has(Feature::IfExpressions) && deeper) { 3 } else { 0 });
+        weights.push(if (generic_callees.length() > 0 && deeper) { 3 } else { 0 });
+        weights.push(if (roots.length() > 0) { 8 } else { 0 });
+        const form: i64 = this.random.pick(&weights);
+        if (form == 0) { return this.read(variables.get(this.random.below(variables.length())).unwrap()); }
+        if (form == 1) {
+            const condition: i64 = this.condition(next);
+            const then_value: i64 = this.type_parameter_expression(next);
+            const else_value: i64 = this.type_parameter_expression(next);
+            return this.node(ExpressionKind::Conditional(condition, then_value, else_value), ValueType::TypeParameter);
+        }
+        if (form == 2) {
+            return this.generic_call(generic_callees.get(this.random.below(generic_callees.length())).unwrap(), ValueType::TypeParameter, next);
+        }
+        return this.place(roots.get(this.random.below(roots.length())).unwrap(), ValueType::TypeParameter);
+    }
+
+    /// The `T` names a comparison may read: those in scope in a generic
+    /// function bounded by `Eq`, and none anywhere else.
+    internal comparable_type_parameters(&this) -> Array<i64> {
+        if (!this.genericity.compares()) { return Array::<i64>::new(); }
+        return this.environment.variables_of(&this.program, ValueType::TypeParameter);
+    }
+
+    /// `(a == b)` or `(a != b)` over two `T` values, `T` bounded by `Eq`.
+    internal type_parameter_comparison(mut &this, depth: i64) -> i64 {
+        const operator: BinaryOperator = if (this.random.chance(50)) { BinaryOperator::Equal } else { BinaryOperator::NotEqual };
+        const left: i64 = this.type_parameter_expression(depth);
+        const right: i64 = this.type_parameter_expression(depth);
+        return this.node(ExpressionKind::Binary(operator, left, right), ValueType::Boolean);
+    }
+
+    /// The earlier generic functions and generic structs' static methods
+    /// that may be called at `wanted` from the function being generated
+    /// and that keep its work under its limit.  Each returns `T`.
+    internal generic_callees(&this, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        mut index: i64 = 0;
+        while (index < this.program.functions.length()) {
+            const candidate: Function = this.program.function_at(index);
+            if (candidate.receiver.is_called_by_name() && this.program.admits(candidate.genericity, wanted, this.genericity)
+                    && this.budget.affordable(candidate.cost)) {
+                found.push(index);
+            }
+            index = index + 1;
+        }
+        return found;
+    }
+
+    /// A call of generic function `callee` at `type_argument`, with
+    /// arguments for its parameters; where the type argument is left to
+    /// inference, the arguments for `T` decide it.  A callable-bounded `F`
+    /// is always left to inference, `g1::<u8, _>(..)`, and a list with a
+    /// `_` in it is inferred with the written arguments already bound, so a
+    /// narrower argument for `T` conflicts there rather than widening: the
+    /// arguments for `T` are deciding values however `T` is spelled.
+    internal generic_call(mut &this, callee: i64, type_argument: ValueType, depth: i64) -> i64 {
+        const called: Function = this.program.function_at(callee);
+        const spelling: TypeArgumentSpelling = this.type_argument_spelling();
+        const first: i64 = this.instantiated_arguments(called, type_argument, spelling.is_inferred() || called.takes_callable(), depth);
+        return this.node(ExpressionKind::GenericCall(callee, type_argument, spelling, first, called.parameter_count), type_argument);
+    }
+
+    /// A type argument a function of `genericity` admits: an integer or
+    /// `boolean` under `Eq`, one of the structs or enums implementing the
+    /// trait under a trait bound, and otherwise any value type.
+    private drawn_type_argument(mut &this, genericity: Genericity) -> ValueType {
+        const bounding: i64 = genericity.bounding_trait();
+        if (bounding >= 0) {
+            const implementors: Array<ValueType> = this.program.implementors(bounding);
+            return implementors.get(this.random.below(implementors.length())).unwrap();
+        }
+        if (genericity.compares()) {
+            return if (this.random.chance(20)) { ValueType::Boolean } else { TypeChoice::integer(&this.random) };
+        }
+        return this.any_type();
+    }
+
+    /// In `main`: observe one call of each generic function and generic
+    /// struct's static method the cost model allows, at a type its bound
+    /// admits.
+    internal observe_generic_calls(mut &this, statements: mut &Array<i64>) -> void {
+        mut index: i64 = 0;
+        while (index < this.program.functions.length()) {
+            const called: Function = this.program.function_at(index);
+            if (called.receiver.is_called_by_name() && called.genericity.is_generic() && this.budget.affordable(called.cost)) {
+                this.observe_value(this.generic_call(index, this.drawn_type_argument(called.genericity), 2), statements);
+            }
+            index = index + 1;
+        }
+    }
+}

@@ -121,9 +121,11 @@ implement struct StampSlot {
 /// The fields of a stamp.  Each is "" when the binary was not stamped.
 /// `fingerprint` is the binary's digest with its stamp text read as zeros,
 /// and `bytes` its size, both when it was stamped; they are recorded inside
-/// or outside a checkout.
+/// or outside a checkout.  `commits` is the number of commits in the
+/// commit's history, which numbers a pre-release.
 type struct BuildStamp {
     commit:      String;
+    commits:     String;
     date:        String;
     branch:      String;
     describe:    String;
@@ -136,7 +138,7 @@ type struct BuildStamp {
 implement struct BuildStamp {
     static empty() -> BuildStamp {
         return BuildStamp {
-            commit: String::new(), date: String::new(), branch: String::new(),
+            commit: String::new(), commits: String::new(), date: String::new(), branch: String::new(),
             describe: String::new(), dirty: String::new(), profile: String::new(),
             fingerprint: String::new(), bytes: String::new(),
         };
@@ -172,6 +174,7 @@ implement struct BuildStamp {
                     const key: Str = field.first;
                     const value: Str = field.second;
                     if (key == Str::new("commit")) { stamp.commit = String::from_str(value); }
+                    else if (key == Str::new("commits")) { stamp.commits = String::from_str(value); }
                     else if (key == Str::new("date")) { stamp.date = String::from_str(value); }
                     else if (key == Str::new("branch")) { stamp.branch = String::from_str(value); }
                     else if (key == Str::new("describe")) { stamp.describe = String::from_str(value); }
@@ -192,7 +195,7 @@ implement struct BuildStamp {
     render(&this) -> String {
         mut text: String = String::new();
         if (this.is_stamped()) {
-            text.push(f"commit={this.commit}\ndate={this.date}\nbranch={this.branch}\n");
+            text.push(f"commit={this.commit}\ncommits={this.commits}\ndate={this.date}\nbranch={this.branch}\n");
             text.push(f"describe={this.describe}\ndirty={this.dirty}\nprofile={this.profile}\n");
         }
         if (!this.fingerprint.is_empty()) {
@@ -205,14 +208,20 @@ implement struct BuildStamp {
         return !this.commit.is_empty();
     }
 
-    /// `core`, then `-prerelease` when there is one, then the build: the
+    /// `core`, then `-prerelease` when there is one, numbered `.<commits>`
+    /// when the stamp counted them (`1.0.0-alpha.4073`: one pre-release per
+    /// commit, ordered as the history is), then the build: `+` and the
     /// commit's first eight hex digits, `-dirty` when tracked files differed
-    /// from it, or `unknown` when the binary was not stamped.
+    /// from it, or `+unknown` when the binary was not stamped.
     version(&this, core: Str, prerelease: Str) -> String {
         mut v: String = String::from_str(core);
         if (!prerelease.is_empty()) {
             v.push("-");
             v.push(prerelease);
+            if (!this.commits.is_empty()) {
+                v.push(".");
+                v.push(this.commits.as_str());
+            }
         }
         if (!this.is_stamped()) {
             v.push("+unknown");
@@ -235,7 +244,8 @@ implement struct BuildStamp {
         mut stamp: BuildStamp = BuildStamp::empty();
         stamp.commit = BuildStamp::git_line(["rev-parse", "HEAD"]);
         if (stamp.commit.length() == 0) { return stamp; }
-        stamp.date     = BuildStamp::git_line(["log", "-1", "--format=%cs", "HEAD"]);
+        stamp.commits  = BuildStamp::git_line(["rev-list", "--count", "HEAD"]);
+        stamp.date    = BuildStamp::git_line(["log", "-1", "--format=%cs", "HEAD"]);
         stamp.branch   = BuildStamp::git_line(["rev-parse", "--abbrev-ref", "HEAD"]);
         stamp.describe = BuildStamp::git_line(["describe", "--always", "--tags"]);
         stamp.profile  = String::from_str(profile);

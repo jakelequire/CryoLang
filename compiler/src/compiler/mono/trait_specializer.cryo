@@ -12,7 +12,7 @@
 namespace compiler::mono::trait_specializer;
 
 import compiler::ast::{
-    declaration, expression, node, statement, substituter, ProjectionAnnotation, TraitBound,
+    declaration, expression, node, statement, substituter, TraitBound,
     TraitRef, TypeAnnotation
 };
 import compiler::types::{
@@ -398,7 +398,7 @@ type struct MonoTraitSpecializer {
             const m_decl: DeclarationNode* = decl.methods[i];
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
             if (m == null || m.func == null) { kept.push(m_decl); continue; }
-            if (this.method_projection_bounds_hold(m.func, this_type)) {
+            if (this.trait_checker.projection_bounds_hold(m.func, this_type)) {
                 kept.push(m_decl);
             }
         }
@@ -414,51 +414,6 @@ type struct MonoTraitSpecializer {
             if (func.trait_bounds[bi].has_projection_subject()) { return true; }
         }
         return false;
-    }
-
-    /// True unless some projection-subject where-bound on `func` is concretely
-    /// violated by `this_type`'s corresponding associated type.
-    method_projection_bounds_hold(mut &this, func_decl: DeclarationNode*,
-                                  this_type: TypeRef) -> boolean {
-        const func: FunctionDecl* = DeclarationNode::fn_of(func_decl);
-        if (func == null) { return true; }
-        for (mut bi: i64 = 0; bi < func.trait_bounds.length(); bi++) {
-            const b: TraitBound* = &func.trait_bounds[bi];
-            if (!b.has_projection_subject()) { continue; }
-            const pj: ProjectionAnnotation* = this.projection_ann(b.subject);
-            if (pj == null) { continue; }
-            const trait_ty: TypeRef = this.type_resolver.projection_trait(pj);
-            const tdecl: TraitDecl* = this.type_resolver.trait_decl_of(trait_ty);
-            if (tdecl == null) { continue; }
-            mut unbound: ResolutionContext = ResolutionContext::new("");
-            const trait_args: [TypeRef] = this.type_resolver.projection_trait_arguments(pj, trait_ty, &unbound);
-            const item: TypeRef = this.type_resolver.concrete_projection(
-                this_type, tdecl.assoc_type_index(pj.member), trait_ty, &trait_args);
-            if (!item.is_valid()) { continue; }   // unreducible -> keep (conservative)
-            for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
-                const tr: TraitRef* = &b.trait_refs[ti];
-                if (tr.path.length() == 0) { continue; }
-                if (!this.type_implements_trait(item, tr.definition(), 0)) {
-                    return false;   // Item concretely fails the bound -> drop method
-                }
-            }
-        }
-        return true;
-    }
-
-    /// The projection a type-annotation is, or null when it is not one.
-    projection_ann(&this, ann: TypeAnnotation*) -> ProjectionAnnotation* {
-        if (ann == null) { return null; }
-        match (*ann) {
-            TypeAnnotation::Projection(pj) => { return pj; }
-            _ => { return null; }
-        }
-    }
-
-    /// Recursively check whether a concrete TypeRef implements a trait.  Forwards
-    /// to the standalone `TraitChecker`.
-    type_implements_trait(&this, ty: TypeRef, trait_name: DefId, depth: i32) -> boolean {
-        return this.trait_checker.type_implements_trait(ty, trait_name, depth);
     }
 
     /// The replacement `subst` holds for the parameter whose declaration

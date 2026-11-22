@@ -1,0 +1,307 @@
+///! `cryogate census --cryo <compiler> [--verbose] [-- <cryo test flags>...]`:
+///! run the test suite and assert it ran the whole corpus, not just some of
+///! it.
+///!
+///! `make test` passes on an exit code, and every suite the runner drives
+///! reports a zero the way it reports success: silently.  A pattern that
+///! matches nothing suppresses the compile-fail and project sections with no
+///! word, and the run ends `OVERALL PASS` with exit 0; so does broken
+///! discovery, a negative directory that failed to open, and a project whose
+///! marker went missing.  So the run is reconciled against the entries the
+///! roster golden pins, each as an identity, not a floor:
+///!
+///!     unit          passed + failed + ignored + filtered == pinned unit
+///!                   entries, less those gated to another OS
+///!     unit          every pinned unit test RAN, by name, and no other did
+///!     compile-fail  passed + failed == pinned negative files
+///!     projects      passed + failed + skipped + ignored == pinned projects
+///!     projects      every pinned project was REACHED, by name
+///!     projects      every collect project that passed ran at least one test
+///!
+///! A suite whose summary block never printed is refused: that is the zero
+///! this exists to see.  The suite's output goes to the run's log; the log
+///! is printed with `--verbose`, and its tail when the suite or the census
+///! fails.  Exit: the suite's own, unless the census fails (then 1).
+///!
+///! `cryogate census --read <log>` reads a log the runner wrote and prints
+///! the parse as one JSON record (the line the first summary opens on, the
+///! unit summary, the unit tests that ran and the ones the roster pins on
+///! this host, the unit suite's build warnings, each project's build
+///! warnings and whether the runner lists them), for a gate that runs the
+///! suite itself.
+
+namespace cryogate::gates::census;
+
+import std::collections::array::{ Array };
+import std::collections::hashset::{ HashSet };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::json::serializer;
+import std::json::value::{ JsonObject, JsonValue };
+
+import cryogate::core::child::{ Completion, Job, Outcome };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
+import cryogate::corpus::census::{ CensusReading, Pinned };
+import cryogate::corpus::roster::{ TestGates };
+
+/// `cryogate census`: the suite run, and its reading reconciled with what
+/// the roster pins.
+public type struct Census {
+    /// Every way `reading` fails to account for what `pinned` pins.
+    public static judge(pinned: &Pinned, reading: &CensusReading) -> Array<String> {
+        mut problems: Array<String> = Array::<String>::new();
+        if (!reading.unit.printed) {
+            problems.push(f"unit: no summary block was printed at all.  A suite that ran nothing prints exactly this, and so does one that could not be reached; {pinned.unit.length()} entries are pinned.");
+        } else {
+            const total: i64 = reading.unit.passed + reading.unit.failed + reading.unit.ignored + reading.unit.filtered;
+            if (total != pinned.unit.length()) {
+                problems.push(f"unit: accounted for {total} of {pinned.unit.length()} pinned (passed {reading.unit.passed}, failed {reading.unit.failed}, ignored {reading.unit.ignored}, filtered {reading.unit.filtered})");
+            }
+            // By NAME as well: a renamed test, or one deleted beside one
+            // added, keeps the count and is a different corpus.
+            const ran: Array<String> = Text::sorted_distinct(reading.unit_names.clone());
+            for (name in Census::without(&pinned.unit, &ran).iterate_references()) {
+                problems.push(f"unit: {name.as_str()} is pinned but did not run");
+            }
+            for (name in Census::without(&ran, &pinned.unit).iterate_references()) {
+                problems.push(f"unit: {name.as_str()} ran but is not pinned; re-pin the roster");
+            }
+        }
+        if (!reading.compile_fail.printed) {
+            problems.push(f"compile-fail: no summary block was printed at all.  A suite that ran nothing prints exactly this, and so does one that could not be reached; {pinned.negatives} entries are pinned.");
+        } else {
+            const total: i64 = reading.compile_fail.passed + reading.compile_fail.failed;
+            if (total != pinned.negatives) {
+                problems.push(f"compile-fail: accounted for {total} of {pinned.negatives} pinned (passed {reading.compile_fail.passed}, failed {reading.compile_fail.failed})");
+            }
+        }
+        if (!reading.projects.printed) {
+            problems.push(f"projects: no summary block was printed at all.  A projects directory the runner could not open prints exactly this; {pinned.projects.length()} projects are pinned.");
+            return problems;
+        }
+        // Skipped and ignored projects are not in the runner's summary, so
+        // they are counted off the per-project lines: a project gated to
+        // another OS is skipped HERE and run elsewhere.
+        const total: i64 = reading.projects.passed + reading.projects.failed + reading.skipped.length() + reading.ignored;
+        if (total != pinned.projects.length()) {
+            problems.push(f"projects: accounted for {total} of {pinned.projects.length()} pinned (passed {reading.projects.passed}, failed {reading.projects.failed}, skipped {reading.skipped.length()}, ignored {reading.ignored})");
+        }
+        // By NAME as well as by count: one project added and another
+        // dropped nets to zero.
+        const reached: Array<String> = Text::sorted_distinct(reading.reached.clone());
+        for (name in Census::without(&pinned.projects, &reached).iterate_references()) {
+            problems.push(f"projects: {name.as_str()} is pinned but the runner never reached it");
+        }
+        for (name in Census::without(&reached, &pinned.projects).iterate_references()) {
+            problems.push(f"projects: {name.as_str()} ran but is not pinned; re-pin the roster");
+        }
+        // A collect project is judged on its exit code, and a run whose
+        // discovery found nothing exits 0 too; the count it ran is the only
+        // thing that tells the two apart.
+        for (name in pinned.collect.iterate_references()) {
+            match (reading.passed_counts.get_reference(name)) {
+                Option::Some(count) => {
+                    if (*count < 1) { problems.push(f"projects: {name.as_str()} passed on its exit code with no tests run"); }
+                }
+                Option::None => { }
+            }
+        }
+        return problems;
+    }
+
+    /// The sorted `from` less every entry of the sorted `taken`.
+    private static without(from: &Array<String>, taken: &Array<String>) -> Array<String> {
+        mut removed: HashSet<String> = HashSet::<String>::new();
+        for (entry in taken.iterate_references()) { removed.insert(entry.clone()); }
+        mut left: Array<String> = Array::<String>::new();
+        for (entry in from.iterate_references()) {
+            if (!removed.contains(entry)) { left.push(entry.clone()); }
+        }
+        return left;
+    }
+
+    /// Run the gate over the checkout `repository` with the command line's
+    /// `arguments` from index `first`; the process's exit code.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate census --cryo <compiler> [--verbose] [-- <cryo test flags>...] | --read <log>"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--read"));
+        options.flag(Str::new("--verbose"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate census: {reason.as_str()}"); return 2; }
+        };
+        const tests: PathBuf = repository.join(Str::new("tests"));
+        const gates: TestGates = match (TestGates::read(tests.join(Str::new("tests")).as_path())) {
+            Result::Ok(gates)   => { gates }
+            Result::Err(reason) => { fmt::eprintln(f"test-census: cannot read the test sources: {reason.as_str()}"); return 1; }
+        };
+        const pinned: Pinned = match (Pinned::read(tests.join(Str::new("test-roster.txt")).as_path(), &gates)) {
+            Result::Ok(pinned)  => { pinned }
+            Result::Err(reason) => { fmt::eprintln(f"test-census: {reason.as_str()}"); return 1; }
+        };
+        match (parsed.value(Str::new("--read"))) {
+            Option::Some(log) => { return Census::read(log, &pinned); }
+            Option::None      => { }
+        }
+        const compiler: String = match (parsed.value(Str::new("--cryo"))) {
+            Option::Some(path) => { Host::absolute(path) }
+            Option::None       => { fmt::eprintln(f"cryogate census: --cryo is required; usage: {options.usage()}"); return 2; }
+        };
+        // `--format=plain` is fixed, not defaulted: the project cryoconfig
+        // asks for `pretty`, whose skip line the census does not read.  A
+        // caller's own --format, --quiet or name pattern would change what
+        // the census can see, so each is refused rather than overridden.
+        mut forwarded: Array<String> = Array::<String>::new();
+        for (argument in parsed.rest().iterate_references()) {
+            if (argument.as_str() != Str::new("--")) { forwarded.push(argument.clone()); }
+        }
+        for (pattern in parsed.positionals().iterate_references()) { forwarded.push(pattern.clone()); }
+        for (argument in forwarded.iterate_references()) {
+            const text: Str = argument.as_str();
+            if (text.starts_with(&Str::new("--format"))) {
+                fmt::eprintln(String::from_str(Str::new("test-census: --format is fixed at plain; the census parses the runner output and cannot certify a format it was not written against")));
+                return 1;
+            }
+            if (text == Str::new("-q") || text == Str::new("--quiet")) {
+                fmt::eprintln(String::from_str(Str::new("test-census: --quiet drops the per-test lines the census reconciles unit tests by name against")));
+                return 1;
+            }
+            if (!text.starts_with(&Str::new("-"))) {
+                fmt::eprintln(String::from_str(Str::new("test-census: a test-name PATTERN filters all three suites, which is the exact shape of the hole this checks for; run the census unfiltered")));
+                return 1;
+            }
+        }
+
+        const log: String = logs.file(Str::new("census"));
+        mut job: Job = Job::new(compiler.as_str());
+        job.argument(Str::new("test"));
+        job.argument(Str::new("--format=plain"));
+        // A discarded result fails the unit suite's build and every
+        // project's (the runner hands `-Werror=` to each project's own
+        // build): the corpus is held to handling what it is given.  The
+        // compile-fail files are checked without it, since one of them
+        // asserts the warning itself.  verify's baseline census runs with
+        // the same flags.
+        job.argument(Str::new("-Werror=W0017"));
+        for (argument in forwarded.iterate_references()) { job.argument(argument.as_str()); }
+        job.directory(tests.as_path().as_str());
+        job.log_to(log.as_str());
+        const done: Completion = job.run();
+        const exit: i32 = match (&done.outcome) {
+            Outcome::Exited(code) => { code }
+            _                     => { 1 }
+        };
+        const lines: Array<String> = Text::lines(done.output().as_str());
+        if (parsed.has(Str::new("--verbose"))) {
+            for (line in lines.iterate_references()) { fmt::println(line.clone()); }
+        }
+
+        const reading: CensusReading = CensusReading::of(&lines);
+        const problems: Array<String> = Census::judge(&pinned, &reading);
+
+        if (!problems.is_empty() || exit != 0) { Census::print_tail(&lines, &done); }
+        fmt::println(String::new());
+        fmt::println(f"test-census: roster pins {pinned.unit.length()} unit, {pinned.negatives} compile-fail, {pinned.projects.length()} project(s)");
+        for (line in pinned.elsewhere.iterate_references()) {
+            const name: Str = match (line.as_str().split_once_from_end(&Str::new(": test"))) {
+                Option::Some(pair) => { pair.first }
+                Option::None       => { line.as_str() }
+            };
+            fmt::println(f"  gated    {name} (not built on this host)");
+        }
+        for (skip in reading.skipped.iterate_references()) {
+            fmt::println(f"  skipped  {skip.first.as_str():<40} requires {skip.second.as_str()}");
+        }
+        if (reading.ignored > 0) { fmt::println(f"  ignored  {reading.ignored} project(s)"); }
+        fmt::println(f"  log      {log.as_str()}");
+
+        if (!problems.is_empty()) {
+            for (problem in problems.iterate_references()) { fmt::eprintln(f"test-census: {problem.as_str()}"); }
+            fmt::eprintln(String::from_str(Str::new(
+                "test-census: the suite did not account for the pinned corpus.  A\n"
+                "  suite that ran nothing reports the same green as one that ran\n"
+                "  everything, so this fails even when the run exited 0.  Re-pin\n"
+                "  the roster (make roster-check ARGS=--merge) only if the\n"
+                "  corpus genuinely changed.")));
+            return 1;
+        }
+        fmt::println(f"test-census: OK -- every pinned entry accounted for; suite exited {exit}");
+        return exit;
+    }
+
+    /// Every line of the suite's output that gives a failing verdict (a
+    /// unit test's `FAIL  <name>`, a negative file's or a project's
+    /// `... FAILED`), then its last lines, or why there is none.
+    private static print_tail(lines: &Array<String>, done: &Completion) -> void {
+        if (lines.is_empty()) {
+            fmt::println(f"  | {done.outcome.describe().as_str()}");
+            return;
+        }
+        for (line in lines.iterate_references()) {
+            const stripped: Str = line.as_str().trim();
+            if (stripped.starts_with(&Str::new("FAIL ")) || stripped.contains(&Str::new("... FAILED"))) {
+                fmt::println(f"  failed   {stripped}");
+            }
+        }
+        const skipped: i64 = if (lines.length() > Census::TAIL_LINES) { lines.length() - Census::TAIL_LINES } else { 0 };
+        mut position: i64 = 0;
+        for (line in lines.iterate_references()) {
+            if (position >= skipped) { fmt::println(f"  | {line.as_str()}"); }
+            position++;
+        }
+    }
+
+    /// `--read <log>`: the parse of a runner's log as one JSON record.
+    private static read(log: Str, pinned: &Pinned) -> i32 {
+        const text: String = match (File::read_text(Path::from(log))) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { fmt::eprintln(f"cryogate census: cannot read {log}: {error.describe()}"); return 1; }
+        };
+        const reading: CensusReading = CensusReading::of(&Text::lines(text.as_str()));
+        mut record: JsonObject = JsonObject::new();
+        record.insert(String::from_str(Str::new("first_summary")), JsonValue::integer_value(reading.first_summary));
+        if (reading.unit.printed) {
+            mut unit: JsonObject = JsonObject::new();
+            unit.insert(String::from_str(Str::new("passed")), JsonValue::integer_value(reading.unit.passed));
+            unit.insert(String::from_str(Str::new("failed")), JsonValue::integer_value(reading.unit.failed));
+            unit.insert(String::from_str(Str::new("ignored")), JsonValue::integer_value(reading.unit.ignored));
+            unit.insert(String::from_str(Str::new("filtered")), JsonValue::integer_value(reading.unit.filtered));
+            record.insert(String::from_str(Str::new("unit")), JsonValue::Object(unit));
+        } else {
+            record.insert(String::from_str(Str::new("unit")), JsonValue::Null);
+        }
+        record.insert(String::from_str(Str::new("unit_ran")), Census::string_list(&reading.unit_names));
+        record.insert(String::from_str(Str::new("unit_pinned")), Census::string_list(&pinned.unit));
+        record.insert(String::from_str(Str::new("warnings")), Census::string_list(&reading.warnings));
+        mut by_project: JsonObject = JsonObject::new();
+        for (listed in reading.project_warnings.iterate_references()) {
+            mut warnings: Array<String> = Array::<String>::new();
+            for (other in reading.project_warnings.iterate_references()) {
+                if (other.first.as_str() == listed.first.as_str()) { warnings.push(other.second.clone()); }
+            }
+            by_project.insert(listed.first.clone(), Census::string_list(&warnings));
+        }
+        record.insert(String::from_str(Str::new("project_warnings")), JsonValue::Object(by_project));
+        record.insert(String::from_str(Str::new("project_warnings_listed")), JsonValue::Bool(reading.project_warnings_listed));
+        fmt::println(serializer::stringify(&JsonValue::Object(record)));
+        return 0;
+    }
+
+    private static string_list(items: &Array<String>) -> JsonValue {
+        mut list: Array<JsonValue> = Array::<JsonValue>::new();
+        for (item in items.iterate_references()) { list.push(JsonValue::String(item.clone())); }
+        return JsonValue::Array(list);
+    }
+
+    /// The lines of a failing run's output that are printed.
+    const TAIL_LINES: i64 = 40;
+}

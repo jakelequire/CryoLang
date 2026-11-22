@@ -1,0 +1,182 @@
+///! `Omission`: one thing a reducer took out of a generated program, and the
+///! path that names it on a command line and in a program's header.
+///!
+///! Every node and item is named by its place in its arena, which the same
+///! seed and options always give the same number, so a list of paths
+///! applied to the same generated program in order reproduces the reduced
+///! one.  A path is a letter and a number:
+///!
+///!   s<N>        statement N, unlinked from its block
+///!   e<N>        expression N, replaced by a literal of its type
+///!   f<N>        function N
+///!   i<T>r<N>    trait T's implementation for struct N
+///!   i<T>n<N>    trait T's implementation for enum N
+///!   t<N>        trait N, with its default bodies
+///!   r<N>        struct N
+///!   b<N>        generic struct N
+///!   k<N>        field N
+///!   n<N>        enum N
+///!   g<N>        generic enum N
+///!   v<N>        variant N, by its place among the program's variants
+///!   d<N>        owned struct N
+
+namespace cryosmith::model::omissions;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::convert::{ TryFrom };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+import cryosmith::model::types::{ ValueType };
+
+/// One thing taken out of a program.
+public type enum Omission {
+    /// A statement, unlinked from its block.
+    Statement(i64);
+    /// An integer or boolean expression, replaced by a literal of its type.
+    Expression(i64);
+    /// A function or method, printed nowhere.
+    Function(i64);
+    /// A trait's implementation for a struct or an enum: the trait, and the
+    /// implementing type.
+    Implementation(i64, ValueType);
+    /// A trait, with its default bodies.
+    Trait(i64);
+    /// A declared struct.
+    Structure(i64);
+    /// A generic struct.
+    Template(i64);
+    /// A declared struct's field.
+    Field(i64);
+    /// A declared enum.
+    Enumeration(i64);
+    /// A generic enum.
+    EnumerationTemplate(i64);
+    /// A declared enum's variant, by its place among the program's
+    /// variants.
+    Variant(i64);
+    /// An owned struct, with its `Drop` implementation.
+    Owned(i64);
+}
+
+implement enum Omission {
+    /// The path naming it.
+    public path(&this) -> String {
+        return match (&this) {
+            Omission::Statement(index)           => { f"s{index}" }
+            Omission::Expression(index)          => { f"e{index}" }
+            Omission::Function(index)            => { f"f{index}" }
+            Omission::Implementation(index, implementor) => {
+                const path: String = if (implementor.is_record()) { f"i{index}r{implementor.structure()}" } else { f"i{index}n{implementor.enumeration()}" };
+                path
+            }
+            Omission::Trait(index)               => { f"t{index}" }
+            Omission::Structure(index)           => { f"r{index}" }
+            Omission::Template(index)            => { f"b{index}" }
+            Omission::Field(index)               => { f"k{index}" }
+            Omission::Enumeration(index)         => { f"n{index}" }
+            Omission::EnumerationTemplate(index) => { f"g{index}" }
+            Omission::Variant(index)             => { f"v{index}" }
+            Omission::Owned(index)               => { f"d{index}" }
+        };
+    }
+
+    /// The omission `path` names; why it names none.
+    public static parse(path: Str) -> Result<Omission, String> {
+        if (path.length() < 2) { return Result::Err(f"`{path}` is not an omission's path"); }
+        const letter: Str = path.byte_substring(0, 1);
+        const rest: Str = path.byte_substring(1, path.length());
+        if (letter == Str::new("i")) {
+            const kind: Str = if (rest.find(&Str::new("r")).is_some()) { Str::new("r") } else { Str::new("n") };
+            const split: i64 = match (rest.find(&kind)) {
+                Option::Some(at) => { at }
+                Option::None     => { return Result::Err(f"`{path}` is not an omission's path"); }
+            };
+            const index: i64 = Omission::number(path, rest.byte_substring(0, split))?;
+            const implementor: i64 = Omission::number(path, rest.byte_substring(split + 1, rest.length()))?;
+            return Result::Ok(Omission::Implementation(index, if (kind == Str::new("r")) { ValueType::Record(implementor) } else { ValueType::Enumeration(implementor) }));
+        }
+        const index: i64 = Omission::number(path, rest)?;
+        if (letter == Str::new("s")) { return Result::Ok(Omission::Statement(index)); }
+        if (letter == Str::new("e")) { return Result::Ok(Omission::Expression(index)); }
+        if (letter == Str::new("f")) { return Result::Ok(Omission::Function(index)); }
+        if (letter == Str::new("t")) { return Result::Ok(Omission::Trait(index)); }
+        if (letter == Str::new("r")) { return Result::Ok(Omission::Structure(index)); }
+        if (letter == Str::new("b")) { return Result::Ok(Omission::Template(index)); }
+        if (letter == Str::new("k")) { return Result::Ok(Omission::Field(index)); }
+        if (letter == Str::new("n")) { return Result::Ok(Omission::Enumeration(index)); }
+        if (letter == Str::new("g")) { return Result::Ok(Omission::EnumerationTemplate(index)); }
+        if (letter == Str::new("v")) { return Result::Ok(Omission::Variant(index)); }
+        if (letter == Str::new("d")) { return Result::Ok(Omission::Owned(index)); }
+        return Result::Err(f"`{path}` is not an omission's path");
+    }
+
+    /// Whether `other` is the same omission.
+    public same(&this, other: &Omission) -> boolean {
+        return this.kind_number() == other.kind_number() && this.index() == other.index() && this.implementor_identity() == other.implementor_identity();
+    }
+
+    /// The node or item it takes out, by its place in its arena.
+    public index(&this) -> i64 {
+        return match (&this) {
+            Omission::Statement(index)           => { index }
+            Omission::Expression(index)          => { index }
+            Omission::Function(index)            => { index }
+            Omission::Implementation(index, _)   => { index }
+            Omission::Trait(index)               => { index }
+            Omission::Structure(index)           => { index }
+            Omission::Template(index)            => { index }
+            Omission::Field(index)               => { index }
+            Omission::Enumeration(index)         => { index }
+            Omission::EnumerationTemplate(index) => { index }
+            Omission::Variant(index)             => { index }
+            Omission::Owned(index)               => { index }
+        };
+    }
+
+    /// Which kind of omission it is, numbered in the order the kinds are
+    /// declared.
+    private kind_number(&this) -> i64 {
+        return match (&this) {
+            Omission::Statement(_)           => { 0 }
+            Omission::Expression(_)          => { 1 }
+            Omission::Function(_)            => { 2 }
+            Omission::Implementation(_, _)   => { 3 }
+            Omission::Trait(_)               => { 4 }
+            Omission::Structure(_)           => { 5 }
+            Omission::Template(_)            => { 6 }
+            Omission::Field(_)               => { 7 }
+            Omission::Enumeration(_)         => { 8 }
+            Omission::EnumerationTemplate(_) => { 9 }
+            Omission::Variant(_)             => { 10 }
+            Omission::Owned(_)               => { 11 }
+        };
+    }
+
+    /// An implementation's implementing type's identity; -1 for any other
+    /// omission.
+    private implementor_identity(&this) -> i64 {
+        return match (&this) {
+            Omission::Implementation(_, implementor) => { implementor.identity() }
+            _                                        => { -1 }
+        };
+    }
+
+    /// Whether it takes a node out of a body rather than an item out of the
+    /// program.
+    public is_node(&this) -> boolean {
+        return match (&this) {
+            Omission::Statement(_)  => { true }
+            Omission::Expression(_) => { true }
+            _                       => { false }
+        };
+    }
+
+    private static number(path: Str, digits: Str) -> Result<i64, String> {
+        return match (u64::try_from(digits)) {
+            Result::Ok(value) => { Result::Ok(value as i64) }
+            Result::Err(_)    => { Result::Err(f"`{path}` is not an omission's path") }
+        };
+    }
+}

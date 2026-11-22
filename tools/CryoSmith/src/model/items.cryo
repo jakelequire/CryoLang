@@ -1,0 +1,359 @@
+///! The named things a program declares: variables, struct fields, structs
+///! and functions.
+
+namespace cryosmith::model::items;
+
+import cryosmith::model::types::{ ValueType };
+
+/// How a variable is named and what may be done to it.
+public type enum VariableRole {
+    /// The program's global hash state, `observed`.
+    Observed;
+    /// A function's parameter, `p<N>`: read only.
+    Parameter;
+    /// A local, `v<N>`.
+    Local;
+    /// A loop counter, `n<N>`: read only.  No name a program declares is
+    /// spelled like a type (`i8`, `f32`): a value of that name would stand
+    /// in front of the type in `i8::MIN`.
+    Counter;
+    /// A method's receiver, `this`: its fields may be written when the
+    /// method takes `mut &this`, and it is never assigned whole.
+    Receiver;
+    /// A `match` arm's binding of a payload value, `b<N>`: read only, in
+    /// scope in its arm.
+    Binding;
+    /// A closure's parameter, `q<N>`: read only, in scope in its body.
+    ClosureParameter;
+}
+
+/// A function type: its parameter types are a run of the program's
+/// signature types.
+public type struct Signature {
+    /// The first parameter type's place in the program's signature types.
+    public first_parameter: i64;
+    /// How many parameters it takes.
+    public parameter_count: i64;
+    /// What it returns.
+    public returns: ValueType;
+}
+
+/// A closure, `(q0: u8) -> i32 { return .. }`, and the `const` local that
+/// holds it.  One that captures is a value of its own type, so its local is
+/// declared without one; the function type is its signature.
+public type struct Closure {
+    /// Its signature, a function type.
+    public function_type: ValueType;
+    /// Its parameters, a run of the index lists.
+    public first_parameter: i64;
+    /// How many parameters it takes.
+    public parameter_count: i64;
+    /// The enclosing function's variables it captures, a run of the index
+    /// lists.
+    public first_capture: i64;
+    /// How many variables it captures.
+    public capture_count: i64;
+    /// The statements its body runs before its value, which observe its
+    /// captures, as a block; -1 for none.
+    public observations: i64;
+    /// The value its body returns.
+    public body: i64;
+    /// The work one call does, charged at every call.
+    public cost: u64;
+    /// The local holding it, or -1 for one written where it is passed or
+    /// returned.
+    public local: i64;
+}
+
+/// A named value.
+public type struct Variable {
+    /// How it is named and what may be done to it.
+    public role: VariableRole;
+    /// The number in its name, counted per function and role.
+    public number: i64;
+    /// Its type.
+    public value_type: ValueType;
+    /// Whether it may be written: declared `mut`, or a `mut &this`.
+    public mutable: boolean;
+}
+
+/// One field of a generated struct, `f<N>`.
+public type struct Field {
+    /// The number in its name, counted per struct.
+    public number: i64;
+    /// Its type: an integer, `boolean`, or an earlier struct.
+    public value_type: ValueType;
+    /// Its default value, an expression, or -1 for none.
+    public default_value: i64;
+}
+
+/// One generated struct: its fields are a run of the program's fields, and
+/// its methods are the functions it owns.  It is a declared struct `S<N>`,
+/// a generic struct `B<N><T>` whose fields may be of type `T`, or an
+/// instance of one at a type argument, `B<N><u16>`, whose fields are the
+/// generic struct's with `T` replaced by the argument.
+public type struct Structure {
+    /// The number in its name; an instance's is its own place among the
+    /// structures, and its generic struct's number names it.
+    public number: i64;
+    /// The first field's place in the program's fields.
+    public first_field: i64;
+    /// How many fields it has.
+    public field_count: i64;
+    /// For an instance, its generic struct's place in the program's
+    /// generic structs; -1 for any other struct.
+    public template: i64;
+    /// For an instance, the type `T` stands for; `void` for any other
+    /// struct.
+    public argument: ValueType;
+
+    /// A struct declared as it is written, not generic: `S<N>`, or a
+    /// generic struct itself.
+    public static declared(number: i64, first_field: i64, field_count: i64) -> Structure {
+        return Structure { number: number, first_field: first_field, field_count: field_count, template: -1, argument: ValueType::Void };
+    }
+
+    /// Whether this is an instance of a generic struct.
+    public is_instance(&this) -> boolean { return this.template >= 0; }
+
+    /// Whether this is a generic struct at its own parameter, `B0<T>`: the
+    /// type of `this` in the generic struct's methods, and of no other
+    /// value.
+    public is_own_instance(&this) -> boolean { return this.is_instance() && this.argument.same(ValueType::TypeParameter); }
+}
+
+/// How a function takes its receiver.
+public type enum Receiver {
+    /// A free function: no receiver.
+    Free;
+    /// A static method: called through its struct, no receiver.
+    Static;
+    /// `&this`: reads the receiver.
+    Shared;
+    /// `mut &this`: may write the receiver's fields.
+    Exclusive;
+}
+
+implement enum Receiver {
+    /// Whether a call names the function through a type or as a free
+    /// function (`h2(..)`, `S1::m0(..)`) rather than on a value.
+    public is_called_by_name(&this) -> boolean {
+        return match (&this) {
+            Receiver::Free   => { true }
+            Receiver::Static => { true }
+            _                => { false }
+        };
+    }
+
+    /// Whether the method may write its receiver's fields: `mut &this`.
+    public writes_receiver(&this) -> boolean {
+        return match (&this) {
+            Receiver::Exclusive => { true }
+            _                   => { false }
+        };
+    }
+}
+
+/// Whether a function is generic, and what its type parameter `T` is
+/// bound by.  Every generic function and method is bounded by `Copy`: a
+/// `T` value is copied wherever it is passed, stored or selected, rather
+/// than moved, so a body may use one any number of times.  Every value
+/// type a program has is `Copy` but an owned struct's, which is never a
+/// type argument.
+public type enum Genericity {
+    /// Not generic.
+    Concrete;
+    /// `<T>` with `where T: Copy`: instantiated at any type a value may
+    /// have.
+    Copyable;
+    /// `<T>` with `where T: Eq + Copy`: its `T` values are also compared,
+    /// so it is instantiated only at an integer type or `boolean`.
+    Equatable;
+    /// `<T>` with `where T: Tr<N> + Copy`, the trait by its place among
+    /// the program's traits: its `T` values' methods of that trait are
+    /// called, so it is instantiated only at a struct implementing it.
+    Implementing(i64);
+    /// The default body of a trait's method, the trait and the method by
+    /// their places: `this` is the implementing type, `T` in the model,
+    /// bounded by the trait alone and not `Copy`.  It has no type parameter
+    /// to write, and calls only methods declared before its own on `this`.
+    Defaulting(i64, i64);
+}
+
+implement enum Genericity {
+    /// Whether the function has a type parameter.
+    public is_generic(&this) -> boolean {
+        return match (&this) {
+            Genericity::Concrete         => { false }
+            Genericity::Defaulting(_, _) => { false }
+            _                            => { true }
+        };
+    }
+
+    /// The trait method whose default body is being generated, or -1
+    /// anywhere else.
+    public defaulted_method(&this) -> i64 {
+        return match (&this) {
+            Genericity::Defaulting(_, method) => { method }
+            _                                 => { -1 }
+        };
+    }
+
+    /// Whether `T` may be compared with `==` and `!=`.
+    public compares(&this) -> boolean {
+        return match (&this) {
+            Genericity::Equatable => { true }
+            _                     => { false }
+        };
+    }
+
+    /// The trait `T` is bounded by, or -1 for none.
+    public bounding_trait(&this) -> i64 {
+        return match (&this) {
+            Genericity::Implementing(index)  => { index }
+            Genericity::Defaulting(index, _) => { index }
+            _                                => { -1 }
+        };
+    }
+}
+
+/// An enum and its variants `V0` to `V<count - 1>`: a declared enum
+/// `E<N>`, a generic enum `G<N><T>` whose payloads may be of type `T`, or
+/// an instance of one at a type argument, `G<N><u16>`, whose variants are
+/// the generic enum's with `T` replaced by the argument.
+public type struct Enumeration {
+    /// The number in its name; an instance's generic enum's number names
+    /// it.
+    public number: i64;
+    /// How many variants it has, at least two.
+    public variant_count: i64;
+    /// The first variant's place in the program's variants.
+    public first_variant: i64;
+    /// For an instance, its generic enum's place in the program's generic
+    /// enums; -1 for any other enum.
+    public template: i64;
+    /// For an instance, the type `T` stands for; `void` for any other enum.
+    public argument: ValueType;
+
+    /// An enum declared as it is written: `E<N>`, or a generic enum itself.
+    public static declared(number: i64, variant_count: i64, first_variant: i64) -> Enumeration {
+        return Enumeration { number: number, variant_count: variant_count, first_variant: first_variant, template: -1, argument: ValueType::Void };
+    }
+
+    /// Whether this is an instance of a generic enum.
+    public is_instance(&this) -> boolean { return this.template >= 0; }
+}
+
+/// One variant of an enum: the run of the program's payload types it
+/// carries, none for a unit variant (`V0`), one or two for `V1(u8, i32)`.
+public type struct VariantDeclaration {
+    /// The first payload type's place in the program's payload types.
+    public first_payload: i64;
+    /// How many values it carries.
+    public payload_count: i64;
+}
+
+/// One function: a free function, `main`, or a method of a struct.
+public type struct Function {
+    /// The number in its name: `h<N>`, or `m<N>` for a method; `main` has
+    /// none.
+    public number: i64;
+    /// Whether this is `main`.
+    public is_main: boolean;
+    /// The type a method belongs to: the struct owning it, `Record`, or for
+    /// a method of a trait's implementation, the implementing struct or
+    /// `Enumeration`; `void` for a free function and a trait method's
+    /// default body.  A generic struct's method is owned by its own
+    /// instance, `B0<T>`.
+    public owner: ValueType;
+    /// How it takes its receiver.
+    public receiver: Receiver;
+    /// The first parameter's place in the index lists.
+    public first_parameter: i64;
+    /// How many parameters it takes, not counting the receiver.
+    public parameter_count: i64;
+    /// What it returns.
+    public returns: ValueType;
+    /// The first statement of its body.
+    public body: i64;
+    /// The most work one call can do, in the cost model's units.
+    public cost: u64;
+    /// Whether it is generic, `g<N><T>`, and its bound.
+    public genericity: Genericity;
+    /// For a generic function whose last parameter is of a second type
+    /// parameter `F`, the function type `F` is bound by, `F: (T) -> T`;
+    /// `void` for any other function.  That parameter's variable holds the
+    /// function type.
+    public callable: ValueType;
+
+    /// For a method of a trait's implementation, or a trait method's
+    /// default body, the trait method it implements, by its place among the
+    /// program's trait methods, and whose number it is named by, `t<N>`; -1
+    /// for any other function.
+    public implements: i64;
+
+    /// Whether its last parameter is of a callable-bounded type parameter.
+    public takes_callable(&this) -> boolean { return this.callable.is_function(); }
+
+    /// Whether it is a trait method's default body, written in the trait.
+    public is_default(&this) -> boolean { return this.is_unowned() && this.implements >= 0; }
+
+    /// Whether it belongs to no type: a free function, `main`, or a trait
+    /// method's default body.
+    public is_unowned(&this) -> boolean { return this.owner.same(ValueType::Void); }
+
+    /// Whether `other` is spelled with the same name: the same owner and
+    /// number, both `main` or neither, both generic or neither, both a
+    /// trait's method or neither.  Two such functions are one overload set.
+    public shares_name_with(&this, other: &Function) -> boolean {
+        return this.owner.same(other.owner) && this.number == other.number && this.is_main == other.is_main
+            && this.genericity.is_generic() == other.genericity.is_generic()
+            && (this.implements >= 0) == (other.implements >= 0);
+    }
+}
+
+/// A struct owning a destructor, `D<N>`: scalar fields, and an
+/// implementation of `Drop` whose `drop` folds the struct's number and each
+/// field into the hash, so the order and the count of drops reach the
+/// output.
+public type struct OwnedStructure {
+    /// The number in its name.
+    public number: i64;
+    /// The first field's place in the program's fields.
+    public first_field: i64;
+    /// How many fields it has, at least one.
+    public field_count: i64;
+    /// The body of its `drop`, a block observing the number and each field
+    /// of `this`.
+    public drop_body: i64;
+}
+
+/// A trait, `Tr<N>`: its methods are a run of the program's trait methods.
+public type struct TraitDeclaration {
+    /// The number in its name.
+    public number: i64;
+    /// The first method's place among the program's trait methods.
+    public first_method: i64;
+    /// How many methods it declares, at least one.
+    public method_count: i64;
+    /// The trait it is declared over, `type trait Tr1 : Tr0`, by its place
+    /// among the traits, always an earlier one; -1 for none.
+    public supertrait: i64;
+}
+
+/// A method a trait declares, `t<N>(&this, p0: u8) -> i32;`, with no body,
+/// so every implementation writes one, or with a default body, which an
+/// implementation may leave out.  Numbered across the program, so no two
+/// traits declare one name and a struct implementing both has one method
+/// of each name.
+public type struct TraitMethod {
+    /// The number in its name.
+    public number: i64;
+    /// Its parameters after the receiver and its return type, as a
+    /// function type.
+    public function_type: ValueType;
+    /// The trait declaring it, by its place among the traits.
+    public declared_by: i64;
+    /// Whether it has a default body.  A trait's first method never has.
+    public defaulted: boolean;
+}

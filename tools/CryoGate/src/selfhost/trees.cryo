@@ -1,0 +1,131 @@
+///! Two stages' per-module output trees compared file by file: the IR a
+///! compiler stage writes with `--emit-llvm` (`ir/`, `.ll`), and the objects
+///! of a stdlib archive (`deps/`, `.o`).
+///!
+///! A per-module file lives in a directory per namespace below its kind's
+///! directory (`ir/std/core/error.ll`), so a file is keyed by its path below
+///! the last directory of that name, never by its file name alone:
+///! `core/error.ll` and `io/error.ll` share one.  The directories above it
+///! (the profile, the target's bucket, the package) are not part of the key,
+///! so two builds that resolved to different buckets still compare.
+
+namespace cryogate::selfhost::trees;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::file::{ File };
+import std::fs::path::{ Path };
+
+import cryogate::core::tree::{ Tree };
+
+/// How much two matching trees hold.
+public type struct TreeSize {
+    /// The files compared, one per module.
+    public modules: i64;
+    /// Their bytes, on one side.
+    public bytes: i64;
+}
+
+/// What comparing two trees found.
+public type enum TreeComparison {
+    /// Both trees hold the same modules, each byte-identical.
+    Same(TreeSize);
+    /// The key of the first module, in key order, whose bytes differ.
+    Differs(String);
+    /// The trees cannot be compared, and why: one holds no module, the two
+    /// hold different modules, or one module is held twice.
+    NotComparable(String);
+}
+
+/// One module's file in a tree: its key and its path relative to the root.
+type struct ModuleFile {
+    key: String;
+    path: String;
+}
+
+/// The comparison of two per-module trees.
+public type struct ModuleTrees {
+    /// Compare the trees at `first` and `second`: every file whose name ends
+    /// with `suffix` and which has a directory named `below` above it.
+    public static compare(first: Path, second: Path, below: Str, suffix: Str) -> TreeComparison {
+        const left: Array<ModuleFile> = match (ModuleTrees::modules(first, below, suffix)) {
+            Result::Ok(found)   => { found }
+            Result::Err(reason) => { return TreeComparison::NotComparable(reason); }
+        };
+        const right: Array<ModuleFile> = match (ModuleTrees::modules(second, below, suffix)) {
+            Result::Ok(found)   => { found }
+            Result::Err(reason) => { return TreeComparison::NotComparable(reason); }
+        };
+        if (left.is_empty() || right.is_empty()) {
+            return TreeComparison::NotComparable(f"no per-module {suffix} files found under {below}/");
+        }
+        mut same_keys: boolean = left.length() == right.length();
+        mut index: i64 = 0;
+        while (same_keys && index < left.length()) {
+            same_keys = left.get_reference(index).unwrap().key == right.get_reference(index).unwrap().key;
+            index++;
+        }
+        if (!same_keys) {
+            return TreeComparison::NotComparable(f"module sets differ ({left.length()} vs {right.length()})");
+        }
+        mut bytes: i64 = 0;
+        index = 0;
+        while (index < left.length()) {
+            const key: Str = left.get_reference(index).unwrap().key.as_str();
+            const one: Str = left.get_reference(index).unwrap().path.as_str();
+            const other: Str = right.get_reference(index).unwrap().path.as_str();
+            const left_bytes: Array<u8> = match (File::read_bytes(first.join(one).as_path())) {
+                Result::Ok(data)   => { data }
+                Result::Err(error) => { return TreeComparison::NotComparable(f"cannot read {one}: {error.describe()}"); }
+            };
+            const right_bytes: Array<u8> = match (File::read_bytes(second.join(other).as_path())) {
+                Result::Ok(data)   => { data }
+                Result::Err(error) => { return TreeComparison::NotComparable(f"cannot read {other}: {error.describe()}"); }
+            };
+            if (left_bytes != right_bytes) { return TreeComparison::Differs(String::from_str(key)); }
+            bytes = bytes + left_bytes.length();
+            index++;
+        }
+        return TreeComparison::Same(TreeSize { modules: left.length(), bytes: bytes });
+    }
+
+    /// The module files of the tree at `root`, sorted by key.  A root that
+    /// does not exist holds none.
+    private static modules(root: Path, below: Str, suffix: Str) -> Result<Array<ModuleFile>, String> {
+        mut found: Array<ModuleFile> = Array::<ModuleFile>::new();
+        if (!root.is_directory()) { return Result::Ok(found); }
+        const files: Array<String> = Tree::files(root, &Array::<String>::new())?;
+        // `<key>` NUL `<path>`: sorting these sorts by key, and a key held
+        // twice sits beside its twin.
+        mut keyed: Array<String> = Array::<String>::new();
+        const marker: String = f"/{below}/";
+        for (path in files.iterate_references()) {
+            if (!path.as_str().ends_with(&suffix)) { continue; }
+            const rooted: String = f"/{path.as_str()}";
+            match (rooted.as_str().find_last(&marker.as_str())) {
+                Option::Some(at) => {
+                    mut line: String = String::from_str(rooted.as_str().byte_substring(at + marker.length(), rooted.length()));
+                    line.push_byte(0);
+                    line.push(path.as_str());
+                    keyed.push(line);
+                }
+                Option::None => { }
+            }
+        }
+        keyed.sort();
+        for (line in keyed.iterate_references()) {
+            const at: i64 = line.as_str().find_byte(0).unwrap();
+            const key: String = String::from_str(line.as_str().byte_substring(0, at));
+            const path: String = String::from_str(line.as_str().byte_substring(at + 1, line.length()));
+            if (!found.is_empty() && found.get_reference(found.length() - 1).unwrap().key == key) {
+                const twin: Str = found.get_reference(found.length() - 1).unwrap().path.as_str();
+                return Result::Err(f"module {key.as_str()} is held twice below {root.as_str()}: {twin} and {path.as_str()}");
+            }
+            found.push(ModuleFile { key: key, path: path });
+        }
+        return Result::Ok(found);
+    }
+}

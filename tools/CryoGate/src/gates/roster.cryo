@@ -1,0 +1,204 @@
+///! `cryogate roster --cryo <compiler> [--merge | --update]`: the tests the
+///! three suites hold, against the golden `tests/test-roster.txt`.
+///!
+///! A change that silently broke `![test]` discovery would otherwise stay
+///! green, because "0 of 0 tests failed" is a pass, so the whole sorted
+///! roster is pinned.  `cryo test --list` enumerates the unit suite only;
+///! the other two are read off the filesystem by `Roster`
+///! (`cryogate::corpus::roster`), which also says what each entry pins and
+///! which states are refused outright instead of pinned.
+///!
+///! The golden is a union across hosts.  The check excuses a golden unit
+///! entry whose test is `![target]`-gated to another OS, read from the
+///! source; a test gated to this host, or to none, still fails when it
+///! disappears.  `--merge` adds what this host discovered and keeps what it
+///! cannot see; `--update` rewrites the golden from this host but keeps the
+///! entries whose test is still gated elsewhere in the source.
+
+namespace cryogate::gates::roster;
+
+import std::collections::array::{ Array };
+import std::collections::hashset::{ HashSet };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
+import cryogate::corpus::roster::{ Discovered, Merge, Roster, TestGates };
+
+/// `cryogate roster`: the discovered roster checked against the golden, or
+/// merged into it, or written over it.
+public type struct RosterGate {
+    /// Run the gate over the checkout `repository` with the command line's
+    /// `arguments` from index `first`; the process's exit code.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate roster --cryo <compiler> [--merge | --update]"));
+        options.valued(Str::new("--cryo"));
+        options.flag(Str::new("--merge"));
+        options.flag(Str::new("--update"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate roster: {reason.as_str()}"); return 2; }
+        };
+        const merge: boolean = parsed.has(Str::new("--merge"));
+        const update: boolean = parsed.has(Str::new("--update"));
+        if (!parsed.positionals().is_empty() || parsed.separated() || (merge && update)) {
+            fmt::eprintln(f"cryogate roster: usage: {options.usage()}");
+            return 2;
+        }
+        const compiler: String = match (parsed.value(Str::new("--cryo"))) {
+            Option::Some(path) => { Host::absolute(path) }
+            Option::None       => { fmt::eprintln(f"cryogate roster: --cryo is required; usage: {options.usage()}"); return 2; }
+        };
+        const tests: PathBuf = repository.join(Str::new("tests"));
+        const source: PathBuf = tests.join(Str::new("tests"));
+        const golden_path: PathBuf = tests.join(Str::new("test-roster.txt"));
+
+        // The two suites `--list` cannot reach are read first, and their
+        // refusals reported before the compiler runs.  --update does not
+        // silence them: writing them into the golden keeps the silence they
+        // cause.
+        const projects: Discovered = Roster::projects(source.join(Str::new("projects")).as_path());
+        const negatives: Discovered = Roster::negatives(source.join(Str::new("negative")).as_path());
+        for (error in projects.errors.iterate_references()) { fmt::eprintln(f"roster-check: REFUSED  {error.as_str()}"); }
+        for (error in negatives.errors.iterate_references()) { fmt::eprintln(f"roster-check: REFUSED  {error.as_str()}"); }
+        if (!projects.errors.is_empty() || !negatives.errors.is_empty()) {
+            fmt::eprintln(f"roster-check: {projects.errors.length() + negatives.errors.length()} unrunnable test(s) found; fix them rather than pinning them.");
+            return 1;
+        }
+
+        mut units: Array<String> = match (RosterGate::listed(compiler.as_str(), tests.as_path(), logs)) {
+            Result::Ok(units)   => { units }
+            Result::Err(reason) => { fmt::eprintln(reason); return 1; }
+        };
+        for (entry in projects.entries.iterate_references()) { units.push(entry.clone()); }
+        for (entry in negatives.entries.iterate_references()) { units.push(entry.clone()); }
+        const entries: Array<String> = Text::sorted_distinct(units);
+        const gates: TestGates = match (TestGates::read(source.as_path())) {
+            Result::Ok(gates)   => { gates }
+            Result::Err(reason) => { fmt::eprintln(f"roster-check: cannot read the test sources: {reason.as_str()}"); return 1; }
+        };
+
+        if (merge) {
+            const result: Merge = Roster::merge(&entries, &Roster::golden(golden_path.as_path()), &gates);
+            match (RosterGate::write_golden(golden_path.as_path(), &result.merged)) {
+                Result::Ok(_)       => { }
+                Result::Err(reason) => { fmt::eprintln(reason); return 1; }
+            }
+            fmt::println(f"roster-check: merged -> {result.merged.length()} entries ({result.added.length()} added, {result.replaced.length()} replaced)");
+            for (line in result.added.iterate_references()) { fmt::println(f"  + {line.as_str()}"); }
+            for (pair in result.replaced.iterate_references()) { fmt::println(f"  - {pair.first.as_str()}\n  + {pair.second.as_str()}"); }
+            // Kept, not dropped: this host cannot run them, which is not
+            // the same as their having been deleted.
+            fmt::println(f"roster-check: {result.other_platform.length()} golden-only entry(ies) KEPT (other platform):");
+            for (line in result.other_platform.iterate_references()) { fmt::println(f"  = {line.as_str()}"); }
+            // Kept too, so the check goes on failing on them: a deletion is
+            // --update's to make.
+            if (!result.absent.is_empty()) {
+                fmt::println(f"roster-check: {result.absent.length()} golden-only entry(ies) KEPT but NOT FOUND here (deleted? use --update):");
+                for (line in result.absent.iterate_references()) { fmt::println(f"  ? {line.as_str()}"); }
+            }
+            return 0;
+        }
+
+        mut discovered: HashSet<String> = HashSet::<String>::new();
+        for (entry in entries.iterate_references()) { discovered.insert(entry.clone()); }
+
+        if (update) {
+            // The waiver is read from the source, so a test genuinely
+            // deleted stops being gated elsewhere the moment its
+            // `![target(...)]` goes with it, and is dropped here.
+            mut kept: Array<String> = Array::<String>::new();
+            for (line in Roster::golden(golden_path.as_path()).iterate_references()) {
+                if (gates.elsewhere(line.as_str()) && !discovered.contains(line)) { kept.push(line.clone()); }
+            }
+            mut written: Array<String> = entries.clone();
+            for (line in kept.iterate_references()) { written.push(line.clone()); }
+            const merged: Array<String> = Text::sorted_distinct(written);
+            match (RosterGate::write_golden(golden_path.as_path(), &merged)) {
+                Result::Ok(_)       => { }
+                Result::Err(reason) => { fmt::eprintln(reason); return 1; }
+            }
+            fmt::println(f"roster-check: wrote {merged.length()} entries to {golden_path.as_path().as_str()}");
+            for (line in kept.iterate_references()) {
+                fmt::println(f"  kept  {line.as_str()} (gated to {gates.target_of(Roster::leaf_name(line.as_str())).unwrap_or(Str::new(""))}; absent here by design)");
+            }
+            return 0;
+        }
+
+        if (!golden_path.as_path().is_file()) {
+            fmt::eprintln(f"roster-check: golden {golden_path.as_path().as_str()} missing; run once with --update");
+            return 1;
+        }
+        const pinned_entries: Array<String> = Roster::golden(golden_path.as_path());
+        mut pinned: HashSet<String> = HashSet::<String>::new();
+        for (line in pinned_entries.iterate_references()) { pinned.insert(line.clone()); }
+        mut missing: Array<String> = Array::<String>::new();
+        mut waived: Array<String> = Array::<String>::new();
+        for (line in pinned_entries.iterate_references()) {
+            if (discovered.contains(line)) { continue; }
+            if (gates.elsewhere(line.as_str())) { waived.push(line.clone()); } else { missing.push(line.clone()); }
+        }
+        mut extra: Array<String> = Array::<String>::new();
+        for (entry in entries.iterate_references()) {
+            if (!pinned.contains(entry)) { extra.push(entry.clone()); }
+        }
+        for (line in waived.iterate_references()) { fmt::println(f"roster-check: gated   {line.as_str()} (not built on {Host::os()})"); }
+        if (missing.is_empty() && extra.is_empty()) {
+            fmt::println(f"roster-check: OK ({entries.length()} entries: {entries.length() - projects.entries.length() - negatives.entries.length()} unit, {projects.entries.length()} project, {negatives.entries.length()} negative; {waived.length()} gated to another platform)");
+            return 0;
+        }
+        for (line in missing.iterate_references()) { fmt::eprintln(f"roster-check: MISSING  {line.as_str()}"); }
+        for (line in extra.iterate_references()) { fmt::eprintln(f"roster-check: NEW      {line.as_str()}"); }
+        fmt::eprintln(f"roster-check: roster drifted ({missing.length()} missing, {extra.length()} new vs {pinned_entries.length()} pinned).");
+        fmt::eprintln(String::from_str(Str::new(
+            "  Added tests?   make roster-check ARGS=--merge\n"
+            "  Removed tests? make roster-check ARGS=--update\n"
+            "  (--update rewrites the golden from THIS host and keeps only the\n"
+            "   other platform's entries still gated in the source; --merge keeps\n"
+            "   every pinned entry.)")));
+        return 1;
+    }
+
+    /// The unit suite's roster: the `: test` lines `cryo test --list` prints
+    /// in `tests`, sorted, once.  Refused when the listing fails or lists
+    /// nothing, which is what broken discovery looks like.
+    private static listed(compiler: Str, tests: Path, logs: &RunLogs) -> Result<Array<String>, String> {
+        mut job: Job = Job::new(compiler);
+        job.argument(Str::new("test"));
+        job.argument(Str::new("--list"));
+        job.directory(tests.as_str());
+        job.log_to(logs.file(Str::new("roster-list")).as_str());
+        const done: Completion = job.run();
+        const output: String = done.output();
+        if (!done.outcome.succeeded()) {
+            return Result::Err(f"{output.as_str()}roster-check: `cryo test --list` ended with {done.outcome.describe().as_str()}");
+        }
+        mut entries: Array<String> = Array::<String>::new();
+        for (line in Text::lines(output.as_str()).iterate_references()) {
+            if (line.as_str().contains(&Str::new(": test"))) { entries.push(String::from_str(line.as_str().trim())); }
+        }
+        if (entries.is_empty()) {
+            return Result::Err(f"{output.as_str()}roster-check: --list produced no test entries; discovery is broken");
+        }
+        return Result::Ok(Text::sorted_distinct(entries));
+    }
+
+    /// Write the golden, one entry per line, with line feeds on every host.
+    private static write_golden(path: Path, entries: &Array<String>) -> Result<(), String> {
+        mut text: String = Text::joined(entries, Str::new("\n"));
+        text.push(Str::new("\n"));
+        return match (File::write_text(path, text.as_str())) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"roster-check: cannot write {path.as_str()}: {error.describe()}") }
+        };
+    }
+}

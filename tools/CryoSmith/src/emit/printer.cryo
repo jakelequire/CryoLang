@@ -1,0 +1,368 @@
+///! `Printer`: one program's text - the header, the prelude, the structs
+///! with their methods, the generic structs, and the free functions with
+///! `main` last.
+
+namespace cryosmith::emit::printer;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+import cryosmith::configuration::{ GENERATOR_VERSION, GenerationOptions, Plant };
+import cryosmith::guarantees::{ Observation };
+import cryosmith::model::{
+    Enumeration, Field, Function, Omission, OwnedStructure, Program, Receiver, Signature, StatementKind, Structure, TraitDeclaration,
+    TraitMethod, ValueType, Variable, VariableRole, VariantDeclaration
+};
+
+/// Writes one program's text.
+public type struct Printer {
+    /// The text written so far.
+    internal text: String;
+    /// The deliberate defect the program is printed with, or none.
+    private plant: Plant;
+    /// How many observed values have been bound to a local `o<N>`.
+    internal observation_locals: i64;
+
+    /// The source of `program`, generated with `options`.
+    public static print(program: &Program, options: &GenerationOptions) -> String {
+        mut printer: Printer = Printer { text: String::new(), plant: options.plant, observation_locals: 0 };
+        if (options.header) { printer.header(program, options); }
+        printer.prelude(program);
+        mut index: i64 = 0;
+        while (index < program.enumerations.length()) {
+            const declared: Enumeration = program.enumeration_at(index);
+            if (!declared.is_instance() && !program.omits(Omission::Enumeration(index))) {
+                const name: String = f"E{declared.number}";
+                printer.enumeration(program, declared, name.as_str());
+            }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.enumeration_templates.length()) {
+            const generic: Enumeration = program.enumeration_templates.get(index).unwrap();
+            if (!program.omits(Omission::EnumerationTemplate(index))) {
+                const name: String = f"G{generic.number}<T>";
+                printer.enumeration(program, generic, name.as_str());
+            }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.structures.length()) {
+            const declared: Structure = program.structure_at(index);
+            if (!declared.is_instance() && !program.omits(Omission::Structure(index))) { printer.structure(program, declared, f"S{declared.number}", index); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.templates.length()) {
+            const declared: Structure = program.template_at(index);
+            if (!program.omits(Omission::Template(index))) { printer.structure(program, declared, f"B{declared.number}<T>", program.own_instance(index)); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.owned_structures.length()) {
+            if (!program.omits(Omission::Owned(index))) { printer.owned_structure(program, program.owned_at(index)); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.traits.length()) {
+            if (!program.omits(Omission::Trait(index))) { printer.trait_declaration(program, program.trait_at(index)); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.traits.length()) {
+            const implementors: Array<ValueType> = program.implementors(index);
+            for (implementor in implementors.iter()) { printer.implementation(program, index, implementor); }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.functions.length()) {
+            const defined: Function = program.function_at(index);
+            if (defined.is_unowned() && !defined.is_default() && !program.omits_function(index)) { printer.definition(program, defined, 0); }
+            index = index + 1;
+        }
+        return printer.text;
+    }
+
+    /// `type struct D<N> { .. }` and its `implement trait Drop for struct
+    /// D<N> { drop(mut &this) -> void { .. } }`.
+    private owned_structure(mut &this, program: &Program, declared: OwnedStructure) -> void {
+        this.text.push(f"\ntype struct D{declared.number} ");
+        this.text.push(Str::new("{\n"));
+        mut field: i64 = declared.first_field;
+        while (field < declared.first_field + declared.field_count) {
+            const named: Field = program.field_at(field);
+            this.indent(1);
+            this.text.push(f"f{named.number}: {program.type_name(named.value_type).as_str()};\n");
+            field = field + 1;
+        }
+        this.text.push(Str::new("}\n"));
+        this.text.push(f"\nimplement trait Drop for struct D{declared.number} ");
+        this.text.push(Str::new("{\n"));
+        this.indent(1);
+        this.text.push(Str::new("drop(mut &this) -> void {\n"));
+        this.block(program, declared.drop_body, 2);
+        this.indent(1);
+        this.text.push(Str::new("}\n}\n"));
+    }
+
+    /// `type trait Tr<N> { .. }`, or `type trait Tr<N> : Tr<M> { .. }` over
+    /// a supertrait: a line per method, its signature with no body, or its
+    /// default body's definition.
+    private trait_declaration(mut &this, program: &Program, declared: TraitDeclaration) -> void {
+        this.text.push(f"\ntype trait Tr{declared.number} ");
+        if (declared.supertrait >= 0) { this.text.push(f": Tr{program.trait_at(declared.supertrait).number} "); }
+        this.text.push(Str::new("{\n"));
+        mut method: i64 = declared.first_method;
+        while (method < declared.first_method + declared.method_count) {
+            const named: TraitMethod = program.trait_method_at(method);
+            const signature: Signature = program.signature_of(named.function_type);
+            if (named.defaulted) {
+                this.definition(program, program.function_at(program.default_of(method)), 1);
+                method = method + 1;
+                continue;
+            }
+            this.indent(1);
+            this.text.push(f"t{named.number}(&this");
+            mut position: i64 = 0;
+            while (position < signature.parameter_count) {
+                this.text.push(f", p{position}: {program.type_name(program.signature_parameter(signature, position)).as_str()}");
+                position = position + 1;
+            }
+            this.text.push(f") -> {program.type_name(signature.returns).as_str()};\n");
+            method = method + 1;
+        }
+        this.text.push(Str::new("}\n"));
+    }
+
+    /// `implement trait Tr<N> for struct S<M> { .. }`, or `for enum E<M>`:
+    /// the methods belonging to `implementor` that implement trait
+    /// `index`'s.
+    private implementation(mut &this, program: &Program, index: i64, implementor: ValueType) -> void {
+        const declared: TraitDeclaration = program.trait_at(index);
+        const kind: Str = if (implementor.is_record()) { Str::new("struct") } else { Str::new("enum") };
+        this.text.push(f"\nimplement trait Tr{declared.number} for {kind} {program.type_name(implementor).as_str()} ");
+        this.text.push(Str::new("{\n"));
+        mut member: i64 = 0;
+        while (member < program.functions.length()) {
+            const defined: Function = program.function_at(member);
+            if (defined.owner.same(implementor) && defined.implements >= declared.first_method
+                    && defined.implements < declared.first_method + declared.method_count && !program.omits_function(member)) {
+                this.definition(program, defined, 1);
+            }
+            member = member + 1;
+        }
+        this.text.push(Str::new("}\n"));
+    }
+
+    /// The comment that reproduces the program: the generator version,
+    /// every option it was generated with, and the paths of what a reducer
+    /// took out of it, in the order taken.
+    private header(mut &this, program: &Program, options: &GenerationOptions) -> void {
+        this.text.push(f"// cryosmith {GENERATOR_VERSION} seed {options.seed} features {options.features.canonical().as_str()} functions {options.function_count()} size {options.size}");
+        if (options.plant.is_planted()) { this.text.push(f" plant {options.plant.name()}"); }
+        if (!program.omissions.is_empty()) { this.text.push(f" omit {program.omission_paths().as_str()}"); }
+        this.text.push(Str::new("\n\n"));
+    }
+
+    /// The namespace, the import of `fmt` - of `Array`, `HashMap` and
+    /// `String` where a local holds one, and of `mem` where a value is
+    /// released by `mem::drop` - and the hash state `observed` with the
+    /// `mix` that folds a value into it.
+    private prelude(mut &this, program: &Program) -> void {
+        this.text.push(Str::new("namespace Main;\n\nimport std::fmt;\n"));
+        for (declared in program.variables.iter()) {
+            if (declared.value_type.is_dynamic_array()) {
+                this.text.push(Str::new("import std::collections::array::{ Array };\n"));
+                break;
+            }
+        }
+        for (declared in program.variables.iter()) {
+            if (declared.value_type.is_map()) {
+                this.text.push(Str::new("import std::collections::hashmap::{ HashMap };\n"));
+                break;
+            }
+        }
+        for (declared in program.variables.iter()) {
+            if (declared.value_type.is_text()) {
+                this.text.push(Str::new("import std::collections::string::{ String };\n"));
+                break;
+            }
+        }
+        for (node in program.statements.iter()) {
+            const releases: boolean = match (node.kind) {
+                StatementKind::Release(_) => { true }
+                _                         => { false }
+            };
+            if (releases) {
+                this.text.push(Str::new("import std::core::mem;\n"));
+                break;
+            }
+        }
+        this.text.push(Str::new("\n"));
+        this.text.push(f"mut observed: u64 = {Observation::initial_state()};\n\n");
+        this.text.push(Str::new("function mix(state: u64, value: u64) -> u64 {\n"));
+        this.text.push(f"    return (state.wrapping_multiply({Observation::multiplier()}) ^ value).wrapping_multiply({Observation::multiplier()}).wrapping_add({Observation::increment()});\n");
+        this.text.push(Str::new("}\n"));
+    }
+
+    /// The declaration of `declared` under `name`, `E<N>` or `G<N><T>`, and
+    /// a line per variant, `V0;` or with its payload's types,
+    /// `V1(u8, T);`.
+    private enumeration(mut &this, program: &Program, declared: Enumeration, name: Str) -> void {
+        this.text.push(f"\ntype enum {name} ");
+        this.text.push(Str::new("{\n"));
+        mut variant: i64 = 0;
+        while (variant < declared.variant_count) {
+            if (program.omits(Omission::Variant(declared.first_variant + variant))) {
+                variant = variant + 1;
+                continue;
+            }
+            this.indent(1);
+            this.text.push(f"V{variant}");
+            const shape: VariantDeclaration = program.variants.get(declared.first_variant + variant).unwrap();
+            if (shape.payload_count > 0) {
+                this.text.push(Str::new("("));
+                mut position: i64 = 0;
+                while (position < shape.payload_count) {
+                    if (position > 0) { this.text.push(Str::new(", ")); }
+                    this.text.push(program.type_name(program.payload_type(shape, position)).as_str());
+                    position = position + 1;
+                }
+                this.text.push(Str::new(")"));
+            }
+            this.text.push(Str::new(";\n"));
+            variant = variant + 1;
+        }
+        this.text.push(Str::new("}\n"));
+    }
+
+    /// A struct's declaration under `name`: its fields, then the methods of
+    /// the structure at `owner` - a generic struct's own instance owns its
+    /// methods - or none for -1.
+    private structure(mut &this, program: &Program, declared: Structure, name: String, owner: i64) -> void {
+        this.text.push(f"\ntype struct {name.as_str()} ");
+        this.text.push(Str::new("{\n"));
+        mut index: i64 = declared.first_field;
+        while (index < declared.first_field + declared.field_count) {
+            if (program.omits(Omission::Field(index))) {
+                index = index + 1;
+                continue;
+            }
+            const field: Field = program.field_at(index);
+            this.indent(1);
+            this.text.push(f"f{field.number}: {program.type_name(field.value_type).as_str()}");
+            if (field.default_value >= 0) {
+                this.text.push(Str::new(" = "));
+                this.expression(program, field.default_value);
+            }
+            this.text.push(Str::new(";\n"));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < program.functions.length()) {
+            const defined: Function = program.function_at(index);
+            if (owner >= 0 && defined.owner.structure() == owner && defined.implements < 0 && !program.omits_function(index)) { this.definition(program, defined, 1); }
+            index = index + 1;
+        }
+        this.text.push(Str::new("}\n"));
+    }
+
+    /// A function or method's signature and body, at `indent`.
+    private definition(mut &this, program: &Program, defined: Function, indent: i64) -> void {
+        this.text.push(Str::new("\n"));
+        this.indent(indent);
+        if (defined.is_main) {
+            this.text.push(Str::new("function main() -> i32 {\n"));
+        } else {
+            mut separate: boolean = false;
+            match (defined.receiver) {
+                Receiver::Free      => {
+                    if (defined.takes_callable()) {
+                        this.text.push(f"function {Printer::generic_prefix(&defined)}{defined.number}<T, F>(");
+                    } else if (defined.genericity.is_generic()) {
+                        this.text.push(f"function {Printer::generic_prefix(&defined)}{defined.number}<T>(");
+                    } else {
+                        this.text.push(f"function h{defined.number}(");
+                    }
+                }
+                Receiver::Static    => { this.text.push(f"static m{defined.number}("); }
+                Receiver::Shared    => { this.text.push(f"{Printer::method_prefix(&defined)}{defined.number}(&this"); separate = true; }
+                Receiver::Exclusive => { this.text.push(f"m{defined.number}(mut &this"); separate = true; }
+            }
+            mut index: i64 = 0;
+            while (index < defined.parameter_count) {
+                if (separate) { this.text.push(Str::new(", ")); }
+                separate = true;
+                const parameter: i64 = program.list_at(defined.first_parameter + index);
+                this.name(program, parameter);
+                if (defined.takes_callable() && index == defined.parameter_count - 1) {
+                    this.text.push(Str::new(": F"));
+                } else {
+                    this.text.push(f": {program.type_name(program.variable_at(parameter).value_type).as_str()}");
+                }
+                index = index + 1;
+            }
+            this.text.push(f") -> {program.type_name(defined.returns).as_str()} ");
+            if (defined.genericity.is_generic()) { this.bound(program, defined); }
+            this.text.push(Str::new("{\n"));
+        }
+        this.block(program, defined.body, indent + 1);
+        this.indent(indent);
+        this.text.push(Str::new("}\n"));
+    }
+
+    /// A generic signature's bounds: on `T`, `where T: Copy`, or `where T:
+    /// Eq + Copy` when it compares, the uncopied-type-parameter plant
+    /// dropping `Copy`; then on `F`, its function type, `F: (u8, T) -> T`.
+    private bound(mut &this, program: &Program, defined: Function) -> void {
+        const bounding: i64 = defined.genericity.bounding_trait();
+        const compares: boolean = defined.genericity.compares();
+        const copies: boolean = this.plant.keeps_copy_bound();
+        mut written: boolean = true;
+        if (bounding >= 0) {
+            this.text.push(f"where T: Tr{program.trait_at(bounding).number}");
+            if (copies) { this.text.push(Str::new(" + Copy")); }
+        }
+        if (bounding < 0 && compares && copies) { this.text.push(Str::new("where T: Eq + Copy")); }
+        if (bounding < 0 && compares && !copies) { this.text.push(Str::new("where T: Eq")); }
+        if (bounding < 0 && !compares && copies) { this.text.push(Str::new("where T: Copy")); }
+        if (bounding < 0 && !compares && !copies) { written = false; }
+        if (defined.takes_callable()) {
+            this.text.push(if (written) { Str::new(", F: ") } else { Str::new("where F: ") });
+            this.text.push(program.type_name(defined.callable).as_str());
+            written = true;
+        }
+        if (written) { this.text.push(Str::new(" ")); }
+    }
+
+    /// The letter a generic free function's name starts with: `k` for one
+    /// bounded by a trait, `g` for any other.
+    internal static generic_prefix(defined: &Function) -> Str {
+        return if (defined.genericity.bounding_trait() >= 0) { Str::new("k") } else { Str::new("g") };
+    }
+
+    /// The letter a method's name starts with: `t` for a trait's method,
+    /// `m` for a struct's own.
+    internal static method_prefix(defined: &Function) -> Str {
+        return if (defined.implements >= 0) { Str::new("t") } else { Str::new("m") };
+    }
+
+    /// A variable's name: `observed`, `p<N>`, `v<N>`, `n<N>`, `this`,
+    /// `b<N>` or `q<N>`.
+    internal name(mut &this, program: &Program, variable: i64) -> void {
+        const named: Variable = program.variable_at(variable);
+        match (named.role) {
+            VariableRole::Observed  => { this.text.push(Str::new("observed")); }
+            VariableRole::Parameter => { this.text.push(f"p{named.number}"); }
+            VariableRole::Local     => { this.text.push(f"v{named.number}"); }
+            VariableRole::Counter   => { this.text.push(f"n{named.number}"); }
+            VariableRole::Receiver  => { this.text.push(Str::new("this")); }
+            VariableRole::Binding   => { this.text.push(f"b{named.number}"); }
+            VariableRole::ClosureParameter => { this.text.push(f"q{named.number}"); }
+        }
+    }
+
+    /// Four spaces per level of `depth`.
+    internal indent(mut &this, depth: i64) -> void { this.text.push_repeated(' ', depth * 4); }
+}

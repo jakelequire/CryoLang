@@ -1,0 +1,112 @@
+///! Generic structs: `B<N><T>`, and their instances at type arguments.
+///!
+///! One or two generic structs are declared after the structs and their
+///! methods, from a stream of their own, so with the feature off no draw is
+///! taken and every other part's text is unchanged.  A generic struct's
+///! first field is of type `T`, the rest `T` or a scalar; a scalar field may
+///! have a default.  Each is instantiated at one to three type arguments: a
+///! scalar, a declared struct, or an earlier instance, so an instance may
+///! hold another (`B1<B0<u16>>`).  An instance is a structure of its own
+///! whose fields are the generic struct's with `T` replaced, so a value of
+///! it is made, read, passed, written and observed as any struct's is; a
+///! literal writes its type argument, `B0::<u16> { f0: .. }`.  With
+///! `generic-methods`, a generic struct has methods of its own
+///! (`generic_methods`), declared once every instance is made.
+
+namespace cryosmith::generate::generic_structures;
+
+import cryosmith::configuration::{ Feature };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::model::{ ExpressionKind, Field, Structure, ValueType };
+import cryosmith::random::{ RandomStream };
+import cryosmith::typing::{ TypeChoice };
+
+/// The most generic structs a program declares.
+const MOST_TEMPLATES: i64 = 2;
+
+/// The most fields a generic struct has.
+const MOST_TEMPLATE_FIELDS: i64 = 3;
+
+/// The most type arguments one generic struct is instantiated at.
+const MOST_INSTANCES: i64 = 3;
+
+implement struct Generator {
+    /// Declare the generic structs, then their instances, from the generic
+    /// structs' own stream.
+    internal declare_generic_structures(mut &this) -> void {
+        this.random = RandomStream::for_generic_structures(this.options.seed);
+        const declared_structures: i64 = this.program.structures.length();
+        const count: i64 = 1 + this.random.below(MOST_TEMPLATES);
+        mut index: i64 = 0;
+        while (index < count) {
+            const first_field: i64 = this.program.fields.length();
+            const field_count: i64 = 1 + this.random.below(MOST_TEMPLATE_FIELDS);
+            mut number: i64 = 0;
+            while (number < field_count) {
+                const value_type: ValueType = if (number == 0 || this.random.chance(40)) {
+                    ValueType::TypeParameter
+                } else {
+                    TypeChoice::scalar(&this.random, this.options.features)
+                };
+                mut default_value: i64 = -1;
+                if (!value_type.same(ValueType::TypeParameter) && this.random.chance(30)) {
+                    default_value = match (value_type) {
+                        ValueType::Boolean => { this.node(ExpressionKind::BooleanLiteral(this.random.chance(50)), ValueType::Boolean) }
+                        _                  => { this.literal(value_type) }
+                    };
+                }
+                this.program.fields.push(Field { number: number, value_type: value_type, default_value: default_value });
+                number = number + 1;
+            }
+            this.program.templates.push(Structure::declared(index, first_field, field_count));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < count) {
+            const instances: i64 = 1 + this.random.below(MOST_INSTANCES);
+            mut made: i64 = 0;
+            while (made < instances) {
+                this.instantiate(index, this.type_argument(declared_structures));
+                made = made + 1;
+            }
+            index = index + 1;
+        }
+        if (this.options.features.has(Feature::GenericMethods)) { this.declare_generic_methods(); }
+    }
+
+    /// A type argument: a declared struct (one of the first
+    /// `declared_structures`), an instance made before, or a scalar.
+    private type_argument(mut &this, declared_structures: i64) -> ValueType {
+        const instances: i64 = this.program.structures.length() - declared_structures;
+        const roll: i64 = this.random.below(10);
+        if (roll < 2 && declared_structures > 0) { return ValueType::Record(this.random.below(declared_structures)); }
+        if (roll < 4 && instances > 0) { return ValueType::Record(declared_structures + this.random.below(instances)); }
+        return TypeChoice::scalar(&this.random, this.options.features);
+    }
+
+    /// The instance of generic struct `template` at `argument`, made once:
+    /// its fields are the generic struct's, `T` replaced by `argument`; its
+    /// place among the structures.
+    internal instantiate(mut &this, template: i64, argument: ValueType) -> i64 {
+        mut index: i64 = 0;
+        while (index < this.program.structures.length()) {
+            const existing: Structure = this.program.structure_at(index);
+            if (existing.template == template && existing.argument.same(argument)) { return index; }
+            index = index + 1;
+        }
+        const generic: Structure = this.program.template_at(template);
+        const first_field: i64 = this.program.fields.length();
+        mut field: i64 = generic.first_field;
+        while (field < generic.first_field + generic.field_count) {
+            mut copied: Field = this.program.field_at(field);
+            if (copied.value_type.same(ValueType::TypeParameter)) { copied.value_type = argument; }
+            this.program.fields.push(copied);
+            field = field + 1;
+        }
+        const number: i64 = this.program.structures.length();
+        this.program.structures.push(Structure {
+            number: number, first_field: first_field, field_count: generic.field_count, template: template, argument: argument,
+        });
+        return number;
+    }
+}

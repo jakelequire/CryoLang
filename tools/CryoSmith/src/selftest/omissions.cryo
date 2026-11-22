@@ -1,0 +1,157 @@
+///! The omission check: a program with every candidate of each class taken
+///! out in turn - statements, then expressions, then items - still passes
+///! the static audit, its header's list rebuilds it byte for byte, and what
+///! is still needed is refused; and a program whose expressions are
+///! replaced innermost first passes the audit all the way.
+
+namespace cryosmith::selftest::omissions;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+
+import cryosmith::configuration::{ GenerationOptions };
+import cryosmith::emit::{ Printer };
+import cryosmith::generate::{ Generator };
+import cryosmith::model::{ Function, Omission, Program, StatementKind };
+import cryosmith::reduce::{ Omitter };
+import cryosmith::selftest::audit::{ Audit };
+import cryosmith::selftest::runner::{ SelfTest };
+
+/// How many seeds' default programs have every candidate taken out.
+const OMITTED_PROGRAMS: u64 = 4;
+
+/// How many seeds' programs, of `INNERMOST_SIZE`, have their expressions
+/// replaced innermost first, the text audited after every
+/// `INNERMOST_STRIDE`.
+const INNERMOST_PROGRAMS: u64 = 6;
+const INNERMOST_SIZE: i64 = 8;
+const INNERMOST_STRIDE: i64 = 4;
+
+implement struct SelfTest {
+    /// The omission check, a unit per program, so parts share it.
+    internal omission_audits(mut &this) -> void {
+        mut seed: u64 = 1;
+        while (seed <= OMITTED_PROGRAMS) {
+            if (this.owns()) { this.omission_audit(seed); }
+            seed = seed + 1;
+        }
+        seed = 1;
+        while (seed <= INNERMOST_PROGRAMS) {
+            if (this.owns()) { this.innermost_first(seed); }
+            seed = seed + 1;
+        }
+    }
+
+    /// Take every candidate of each class out of the default program of
+    /// `seed` and hold the result to the audit, its header and the
+    /// refusals.
+    private omission_audit(mut &this, seed: u64) -> void {
+        mut taken: Array<i64> = [0, 0, 0];
+        const options: GenerationOptions = GenerationOptions::new(seed);
+        mut program: Program = Generator::generate(options);
+        mut group: i64 = 0;
+        while (group < 3) {
+            const candidates: Array<Omission> = Omitter::candidates(&program);
+            for (candidate in candidates.iter()) {
+                if (SelfTest::omission_group(candidate) != group) { continue; }
+                match (Omitter::apply(&program, candidate)) {
+                    Result::Ok(_)       => { taken.set(group, taken[group] + 1); }
+                    Result::Err(reason) => { this.expect(false, f"seed {seed}: a listed candidate refused: {reason.as_str()}"); }
+                }
+            }
+            group = group + 1;
+        }
+        const text: String = Printer::print(&program, &options);
+        match (Audit::check(text.as_str())) {
+            Result::Ok(_)       => { this.expect(true, String::new()); }
+            Result::Err(reason) => { this.expect(false, f"seed {seed} with every candidate taken out: {reason.as_str()}"); }
+        }
+        this.expect(SelfTest::rebuilt(&program, options).as_str() == text.as_str(), f"seed {seed}: the header's omit list does not rebuild the program");
+        this.refusals(seed, &program);
+        this.expect(Printer::print(&program, &options).as_str() == text.as_str(), f"seed {seed}: a refused omission changed the program");
+        this.expect(taken[0] > 0, f"seed {seed}: no statement was taken out");
+        this.expect(taken[1] > 0, f"seed {seed}: no expression was replaced");
+        this.expect(taken[2] > 0, f"seed {seed}: no item was taken out");
+    }
+
+    /// Replace the expressions of `seed`'s program innermost first - the
+    /// candidates in the reverse of their printed order, so an operand
+    /// goes before what applies it - and audit the text every few: a guard
+    /// replaced by a value it was there to keep out is printed while its
+    /// operator still stands.  Taking every candidate outermost first never
+    /// shows it, since the operator is replaced whole before its operand is
+    /// reached.
+    private innermost_first(mut &this, seed: u64) -> void {
+        mut audited: i64 = 0;
+        mut options: GenerationOptions = GenerationOptions::new(seed);
+        options.size = INNERMOST_SIZE;
+        mut program: Program = Generator::generate(options);
+        const candidates: Array<Omission> = Omitter::candidates(&program);
+        mut position: i64 = candidates.length() - 1;
+        mut applied: i64 = 0;
+        while (position >= 0) {
+            const candidate: Omission = candidates[position];
+            if (SelfTest::omission_group(candidate) == 1) {
+                match (Omitter::apply(&program, candidate)) {
+                    Result::Ok(_)       => { applied = applied + 1; }
+                    Result::Err(reason) => { this.expect(false, f"seed {seed} innermost first: a listed candidate refused: {reason.as_str()}"); }
+                }
+                if (applied % INNERMOST_STRIDE == 0) {
+                    match (Audit::check(Printer::print(&program, &options).as_str())) {
+                        Result::Ok(_)       => { audited = audited + 1; }
+                        Result::Err(reason) => { this.expect(false, f"seed {seed} after {applied} expressions replaced innermost first: {reason.as_str()}"); }
+                    }
+                }
+            }
+            position = position - 1;
+        }
+        this.expect(audited > 0, f"seed {seed}: innermost first audited no text");
+    }
+
+    /// The class a reduction tries `omission` in: 0 a statement, 1 an
+    /// expression, 2 an item.
+    private static omission_group(omission: Omission) -> i64 {
+        return match (omission) {
+            Omission::Statement(_)  => { 0 }
+            Omission::Expression(_) => { 1 }
+            _                       => { 2 }
+        };
+    }
+
+    /// The text of the program `options` generate with `reduced`'s
+    /// omissions applied afresh, each read back from its path.
+    private static rebuilt(reduced: &Program, options: GenerationOptions) -> String {
+        mut program: Program = Generator::generate(options);
+        for (taken in reduced.omissions.iter()) {
+            match (Omission::parse(taken.path().as_str())) {
+                Result::Ok(omission) => {
+                    match (Omitter::apply(&program, omission)) {
+                        Result::Ok(_)  => { }
+                        Result::Err(_) => { return String::new(); }
+                    }
+                }
+                Result::Err(_) => { return String::new(); }
+            }
+        }
+        return Printer::print(&program, &options);
+    }
+
+    /// `main` and its last statement, which prints the hash, are always
+    /// needed: taking either out is refused, and a refusal leaves the
+    /// program as it was.
+    private refusals(mut &this, seed: u64, program: mut &Program) -> void {
+        const main: i64 = program.functions.length() - 1;
+        const defined: Function = program.function_at(main);
+        mut last: i64 = defined.body;
+        while (program.statement_at(last).next >= 0) { last = program.statement_at(last).next; }
+        const finishes: boolean = match (program.statement_at(last).kind) {
+            StatementKind::Finish => { true }
+            _                     => { false }
+        };
+        this.expect(defined.is_main && finishes, f"seed {seed}: main's last statement is not its end");
+        this.expect(Omitter::apply(program, Omission::Statement(last)).is_err(), f"seed {seed}: main's end taken out");
+        this.expect(Omitter::apply(program, Omission::Function(main)).is_err(), f"seed {seed}: main taken out");
+    }
+}

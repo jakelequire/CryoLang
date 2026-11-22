@@ -83,12 +83,13 @@ A member position is never a declaration or an operator, so the keyword is unamb
 
 The exceptions are the keywords a member position reads *first*: `public`, `internal` and `private` open a visibility label, `static` and `async` are member modifiers, and `protected`, `virtual` and `override` are read there to be refused (`E0117`). A field with one of those eight names cannot be declared, and a C struct carrying one still needs a `![repr(C)]` shadow struct.
 
-A **binding** is the other way round. A statement that begins with a keyword opening a declaration is parsed as that declaration, so a local named by one could never be assigned or called through: `module = q;` is not an assignment. The 20 keywords that open a declaration - `function`, `const`, `mut`, `type`, `struct`, `class`, `enum`, `trait`, `import`, `module`, `extern`, `implement`, `public`, `internal`, `private`, `protected`, `namespace`, `intrinsic`, `static`, `async` - therefore cannot name a variable, a parameter, a pattern binding or a destructured local (`E0100`): a keyword is never an identifier. The same holds for the 23 keywords a statement or an expression begins with - `if`, `while`, `do`, `loop`, `for`, `match`, `return`, `break`, `continue`, `unsafe`, `asm`, `true`, `false`, `null`, `this`, `new`, `sizeof`, `alignof`, `typeof`, `delete`, `await`, `yield`, `move` - since every bare use of such a name reads as the keyword: `delete()` is the delete operator and `match;` the head of a match. A **free function** is named bare too, so neither group names one; a method, reached only after `.` or `::`, may take any of them (`Router.delete`). `this` stays a parameter name: it is the by-value receiver. Keywords that open nothing (`default`, `string`) remain legal names, and a destructuring shorthand over a field named by one of these keywords needs a rename: `const { type: t }: S = s;`.
+A **binding** is the other way round. A statement that begins with a keyword opening a declaration is parsed as that declaration, so a local named by one could never be assigned or called through: `module = q;` is not an assignment. The 20 keywords that open a declaration - `function`, `const`, `mut`, `type`, `struct`, `class`, `enum`, `trait`, `import`, `module`, `extern`, `implement`, `public`, `internal`, `private`, `protected`, `namespace`, `intrinsic`, `static`, `async` - therefore cannot name a variable, a parameter, a pattern binding or a destructured local (`E0100`): a keyword is never an identifier. The same holds for the 23 keywords a statement or an expression begins with - `if`, `while`, `do`, `loop`, `for`, `match`, `return`, `break`, `continue`, `unsafe`, `asm`, `true`, `false`, `null`, `this`, `new`, `sizeof`, `alignof`, `typeof`, `delete`, `await`, `yield`, `move` - since every bare use of such a name reads as the keyword: `delete()` is the delete operator and `match;` the head of a match. A **free function** is named bare too, so neither group names one; a method, reached only after `.` or `::`, may take any of them (`Router.delete`). `this` stays a parameter name: it is the by-value receiver. A scalar type's name - `i8` through `i128`, `u8` through `u128`, `isize`, `usize`, `f32`, `f64`, `char`, `boolean` - names no variable, parameter, pattern binding or destructured local either (`E0100`): such a value would stand in front of the type wherever the type is written bare, so `i8::MIN` would look its path up in the value, and a type's name always means the type. Keywords that open nothing (`default`, `string`) remain legal names, and so do the alias keywords (`int`, `float`, ...), which also name modules; a destructuring shorthand over a field named by one of these keywords needs a rename: `const { type: t }: S = s;`.
 
 ```cryo
 const module: i32 = 42;                  // E0100: expected a variable name, found `module`, which is a reserved word
 match (r) { R::D(static) => { .. } }     // E0100: expected a binding name
 function delete() -> i32 { .. }          // E0100: expected a function name, found `delete`, which is a reserved word
+mut i8: i16 = 3;                         // E0100: expected a variable name, found `i8`, which names a primitive type
 router.delete(Str::new("/items"), on_delete);   // a method: named after `.`
 ```
 
@@ -161,7 +162,7 @@ Integer literals support four bases. Underscores are visual separators that the 
 
 **Type suffixes:** `u8` `u16` `u32` `u64` `u128` `i8` `i16` `i32` `i64` `i128` `usize` `isize` `f32` `f64`
 
-A literal stored where an integer of a written type is - a constant's or a variable's initializer, an assignment's value, a call's argument - takes that type, and must hold its value there.  So must an expression made only of literals: its value is what the arithmetic gives, and a type that does not hold it is refused (`E0010`) rather than wrapped.  A value is held up to the type's unsigned maximum (a bit pattern) and, for a signed type, down to its minimum. `usize` and `isize` are 32 bits on a 32-bit target, so they hold a literal only where it is the same value on every target: a `usize` up to `u32`'s maximum, an `isize` in `i32`'s range, with no bit pattern past it. A wider value is written in a 64-bit type and converted with `as`.
+A literal stored where an integer of a written type is - a constant's or a variable's initializer, an assignment's value, a call's argument, a returned value - takes that type, and must hold its value there.  So must an expression made only of literals: its value is what the arithmetic gives, computed exactly at compile time, so an intermediate value the type does not hold changes nothing (`(200 + 100) / 2` stored in a `u8` is 150, and `300 - 100` is 200), and a type that does not hold the value is refused (`E0010`) rather than wrapped.  A literal with a type suffix keeps that type inside such an expression, so the expression has it too: `1u64 << 40` passed to a generic parameter binds it to `u64`, and beside a `u8`, `(7u16 + 1u16)` is a `u16` operand.  A value is held up to the type's unsigned maximum (a bit pattern) and, for a signed type, down to its minimum. `usize` and `isize` are 32 bits on a 32-bit target, so they hold a literal only where it is the same value on every target: a `usize` up to `u32`'s maximum, an `isize` in `i32`'s range, with no bit pattern past it. A wider value is written in a 64-bit type and converted with `as`.
 
 ```cryo
 const a: u8 = 100 + 100;   // 200: held
@@ -169,9 +170,9 @@ const b: u8 = 200 + 100;   // error: 300 does not fit `u8`, and would silently t
 const c: i8 = 0 - 128;     // -128: held
 ```
 
-A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value. An argument is held to its parameter the same way, including a parameter whose type the call's expected type decides: `const h: Holder<i16> = Holder::make(-3);` passes `-3` as an `i16`, while `-129` for an `i8` or `-3` for a `u16` is refused (`E0214`).
+A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. An operand made only of literals beside one that is not - outside a shift - and a compound assignment's value made only of literals are their exact value, computed first, and take the other operand's type only where that type holds the value: with `x: i8`, `x + (200 / 2)` adds 100. Where the type does not hold it, the value keeps its default type and the operation widens the other operand to it, as an implicit conversion does: with `w: u8`, `w + (1 << 20)` is the `i32` 1048577, and `w + (200 + 100)` is an `i32` sum, which a `u8` place does not take (`E0200`). A negated literal is held the same way by a signed operand: beside an `i8`, `-129` keeps its default type rather than wrapping to 127, so `x + -129` is an `i32` sum. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value. A complement of a literal beside an unsigned operand is that operand's bit pattern, not a negative number: with `x: u32`, `x & ~0xFF` clears the low eight bits of `x`. An argument is held to its parameter the same way, including a parameter whose type the call's expected type decides: `const h: Holder<i16> = Holder::make(-3);` passes `-3` as an `i16`, while `-129` for an `i8` or `-3` for a `u16` is refused (`E0214`). An argument made only of literals passes its exact value and is held by its parameter as that value's literal would be: `take_i8(-(100 + 28))` passes -128, and `take_u8(200 + 100)` is refused (`E0214`).
 
-A shift's amount does not type the value shifted: a literal shifted by an amount not made only of literals takes the integer type expected of the result, where one is - an initializer's, an assignment's, an argument's or a return's - so `const p: u64 = 1 << (u64::BITS - 1);` shifts at 64 bits, not at the `u32` amount's 32.  A shift's result is always the shifted value's type, and the amount's type never changes it: `b << n` with `b: u8` and `n: u64` is a `u8`.  Where no integer type is expected, a shifted literal takes the amount's type.
+A shift's amount does not type the value shifted: a literal shifted by an amount not made only of literals takes the integer type expected of the result, where one is - an initializer's, an assignment's, an argument's or a return's - so `const p: u64 = 1 << (u64::BITS - 1);` shifts at 64 bits, not at the `u32` amount's 32.  A shift's result is always the shifted value's type, and the amount's type never changes it: `b << n` with `b: u8` and `n: u64` is a `u8`.  Where no integer type is expected, a shifted literal takes the amount's type, and must be held by it as a literal stored at that type is: with `u: u8` and `n: i8`, `300 << u` and `-129 << n` are refused (`E0010`) rather than shifted as 44 and 127.
 
 An integer literal stored where a `char` is takes `char`, and must be at most `0x10FFFF`, the largest Unicode scalar value: `const c: char = 0x110000;` is refused (`E0010`).
 
@@ -398,7 +399,7 @@ const &int         // the same type as &int
 
 The receiver shape on a method is part of its signature: a `&this` method may not modify the receiver; a `mut &this` method may. Callers see this distinction without reading the body.
 
-**Read-only places.** A place reached through a read-only borrow - a `&T`, a `virtual &Trait`, or `this` in a `&this` method - or through a read-only pointer `T*` is not written: assigning it, giving it a compound assignment (`+=` and the rest) and calling a `mut &this` method on it are each refused (`E0250`). The last indirection on the way to a place decides, so `r.x = 1` with `r: &(mut Foo*)` writes through the writable pointer, and `r.scale(2)` with `r: &virtual mut &Shape` through the writable object, while `p.x = 1` with `p: Foo*` is refused. A `*` strips one level, so the place `*p` is decided by the outermost indirection of `p` alone: `*p = q` with `p: &(mut Foo*)` writes the borrowed pointer and is refused, and with `p: mut (&Foo)*` writes the borrow the pointer points at. Indexing a pointer is the same, since `p[i]` is `*(p + i)`: `p[0] = q` with `p: mut (u8*)*` writes the writable outer level, and with `p: (mut u8*)*` is refused. A `mut &this` method is not called on a `const` binding either. A binding a `match` makes follows the value it matched: a match on a writable value, a `mut &T`, a `mut T*` or `&x` of a writable `x` binds writable names, and a match on a `&T`, a `T*` or a `const` binding read-only ones; a `mut` written before the name does not change that.
+**Read-only places.** A place reached through a read-only borrow - a `&T`, a `virtual &Trait`, or `this` in a `&this` method - or through a read-only pointer `T*` is not written: assigning it, giving it a compound assignment (`+=` and the rest) and calling a `mut &this` method on it are each refused (`E0250`). The last indirection on the way to a place decides, so `r.x = 1` with `r: &(mut Foo*)` writes through the writable pointer, and `r.scale(2)` with `r: &virtual mut &Shape` through the writable object, while `p.x = 1` with `p: Foo*` is refused. A `*` strips one level, so the place `*p` is decided by the outermost indirection of `p` alone: `*p = q` with `p: &(mut Foo*)` writes the borrowed pointer and is refused, and with `p: mut (&Foo)*` writes the borrow the pointer points at. Indexing a pointer is the same, since `p[i]` is `*(p + i)`: `p[0] = q` with `p: mut (u8*)*` writes the writable outer level, and with `p: (mut u8*)*` is refused. A `mut &this` method is not called on a `const` binding either. A binding a `match` makes follows the value it matched: a match on a writable value, a `mut &T`, a `mut T*` or `&x` of a writable `x` binds writable names, and a match on a `&T`, a `T*` or a `const` binding read-only ones; a `mut` written before the name does not change that. What a write to a binding reaches - the matched value or a copy of its own - is said in [section 7.2](#72-enum-destructuring).
 
 **Write access is not made from read access.** `&x` takes its mutability from what is wanted of it and from `x`: where a value that writes is wanted - a `mut &T`, a `virtual mut &Trait`, or a `mut T*`, as a parameter, a declared type, a `return` or an assigned place - `&x` is a writable borrow, and is refused (`E0251`) when `x` is a read-only place (held by a `const` binding, or reached through a `&T`, a `virtual &Trait`, a `T*` or a `&this` receiver). With nothing such wanted, `&x` is exactly as writable as `x`. So a writable borrow is written `&x` too, and `&mut x` is refused at the `mut` (`E0101`). A `&T` value converts to a `T*` and never to a `mut T*` or a `mut &T`: passing one where those are wanted is refused (`E0251`), and `as` is the one way to a writable pointer from it. `mut &T` converts to `&T`, and to `mut T*` and `T*`. `&a[i]` and `&*b` borrowed for writing go through `index_mutable` and `deref_mutable` ([section 10.6](#106-operator-overloading)).
 
@@ -700,7 +701,13 @@ parameter or slot is different: it holds a function pointer, which has no room
 for the closure's captures. One function-typed parameter takes a capturing
 closure - a non-generic free function's, when the function is declared in the
 same module: that function is copied for each closure type passed to it, with
-the parameter retyped to the closure. Everything else is refused at compile
+the parameter retyped to the closure. In the copy the parameter holds the
+closure, so passing it on to another such function passes the closure, and
+that function is copied for it in turn. The call's other arguments are
+checked against the copy's parameters as any call's are against its
+callee's: a value given for a trait object parameter becomes the object
+there, and an argument of a type its parameter does not take is refused
+(**E0214**). Everything else is refused at compile
 time with **E0458** rather than compiled to a call through a pointer that is
 not one:
 
@@ -846,7 +853,7 @@ A path through an alias names what the same path through its target names, type 
 
 ### 2.9 Casting with `as`
 
-Cryo never inserts a conversion that can change a value, and never an implicit pointer conversion. A number converts implicitly - at an initializer, an assignment, a compound assignment, an argument, a return, a struct literal's field, an array or tuple literal's element (to the element type the literal is expected to have: `[x, x]` with `x: f32` written where a `[f64; 2]` is expected) and a two-branch expression's arm - only to a type that holds every value of its own:
+Cryo never inserts a conversion that can change a value, and never an implicit pointer conversion. A number converts implicitly - at an initializer, an assignment, a compound assignment, an argument, a return, a struct literal's field, an array or tuple literal's element (to the element type the literal is expected to have: `[x, x]` with `x: f32` written where a `[f64; 2]` is expected), a two-branch expression's arm and a `match` expression's arm - only to a type that holds every value of its own:
 
 - an integer to a wider integer of the same signedness, or an unsigned integer to a wider signed one (`u32` to `i64`);
 - `usize` and `isize`, which are as wide as a pointer - 32 or 64 bits by target - only where the conversion keeps every value on every target: into `usize` from an unsigned type of at most 32 bits, into `isize` from a signed type of at most 32 bits or an unsigned one of at most 16; out of `usize` into an unsigned type of at least 64 bits or a signed one wider than 64, out of `isize` into a signed type of at least 64. A `u64` is not a `usize`, nor an `isize` an `i64`;
@@ -1456,6 +1463,33 @@ From **lowest** to **highest**:
 
 The range operators `..` / `..=` bind looser than every arithmetic and comparison operator, so `a + 1 .. b * 2` is `(a + 1) .. (b * 2)`. They desugar at parse time to `Range::new` / `RangeInclusive::new` (see [section 6.3](#63-for-loops)). A range may leave an end open where the next token cannot start its operand - `]`, `)`, `,`, `;` or `}`: `a..` is `RangeFrom::new(a)`, `..b` is `RangeTo::new(b)` and a bare `..` is `RangeFull::new()`, the forms a slice takes ([section 10.6](#106-operator-overloading)). `RangeFrom` is an endless iterator over a `Step` type: `for (n in 5..)` counts up until the loop breaks. A range passed for a parameter whose type is the method's own type parameter, bound by a trait written with arguments, takes its element type from that bound: `map.range(10..20)` on a `BTreeMap<i64, V>`, whose `range<R>` requires `R: RangeBounds<K>`, passes a `Range<i64>`. The same holds for any static call written there without its owner's type arguments: the owner's implementation of the bound's trait at those arguments decides them (`Wrap::new(5000000000)` for `R: Measures<i64>` with `implement<T> Measures<T> for Wrap<T>` is a `Wrap<i64>`). An argument of a type of its own keeps it, and is checked against the bound.
 
+### 5.8 Evaluation Order
+
+**Operands are evaluated left to right.** Each operand is evaluated completely, its calls and their effects included, before the next one begins:
+
+- a binary operator's left operand before its right one; `&&`, `||` and `??` evaluate the right operand only when the left one does not decide the result;
+- an assignment's place before its value, for `=` and every compound assignment ([section 5.5](#55-assignment)): the calls and indexes that locate the place run first, so `slots[note(1)] = note(2)` and `pair_at(note(1)).second += note(2)` both run `note(1)` before `note(2)`;
+- a call's arguments in the order they are written, each before the function is entered;
+- an array literal's elements in the order they are written, and a repeat `[value; count]`'s value before its count, so `[note(1); note(2)]` runs `note(1)` before `note(2)`;
+- a method call's receiver before its arguments.
+
+The order is part of a program's meaning, so it is the same at every optimisation level. Precedence decides only how operands group, not when they run: in `note(1) + note(2) * note(3)` the three calls run in the order written, and the product is formed before the sum.
+
+```cryo
+mut trace: u64 = 0;
+
+function note(digit: u64) -> u64 {
+    trace = trace * 10 + digit;
+    return digit;
+}
+
+function main() -> i32 {
+    const s: u64 = note(1) + note(2) * note(3);   // trace is 123
+    const c: u64 = combine(note(4), note(5));     // trace is 12345
+    return 0;
+}
+```
+
 ---
 
 ## 6. Control Flow
@@ -1476,7 +1510,7 @@ if (x > 0) {
 }
 ```
 
-`if` may also be used as an **expression** that evaluates to the value of the chosen branch. When used this way, both arms are required and must produce the same type. An arm that is `null` converts to any pointer, so the expression has the other arm's type, whichever arm the `null` is in: `if (c) { null } else { b }` is a `B*` for `b: B*`, and is refused where an unrelated pointer type is declared. The conditional form `c ? x : y` follows the same rule.
+`if` may also be used as an **expression** that evaluates to the value of the chosen branch. When used this way, both arms are required and must produce the same type. An arm that is `null` converts to any pointer, so the expression has the other arm's type, whichever arm the `null` is in: `if (c) { null } else { b }` is a `B*` for `b: B*`, and is refused where an unrelated pointer type is declared. Likewise, an arm that constructs a variant of a generic enum without naming its instance, `Option::None` or a `Result::Ok(x)` whose payload binds only some of the enum's parameters, takes the instance of that enum another arm has, so `if (c) { Option::None } else { Option::Some(4) }` is an `Option<i32>` where no type is expected of it. An arm of another type names no instance for it, and a variant no arm, payload or expected type names one for is refused (E0307). The conditional form `c ? x : y` follows the same rules, and so do the arms of a `match` expression.
 
 ```cryo
 const is_even: boolean = if (n % 2 == 0) { true } else { false };
@@ -1514,7 +1548,7 @@ for (mut i: int = 0; i < 10; i++) {
 }
 ```
 
-`for (x in <expr>)` iterates a sequence. The expression is evaluated exactly once and bound to a hidden mutable local; the parser lowers the loop to a `loop { match (iter.next()) { Some(x) => { ... } None => break; } }`, where `next` is `std::core::iter::Iterator`'s and `Some`/`None` are `std::core::option::Option`'s - a module that declares its own `Option` or `Iterator` changes nothing about the loop. The expression is an iterator when its type implements `Iterator`; a type parameter does when a `where` bound in scope - the function's, the implementation's or the owner declaration's - gives it `Iterator` or a trait `Iterator` is a supertrait of, so `for (x in parts)` with `parts: I` under `where I: Iterator<i32>` iterates each copy's `I`. `break`, `continue`, and `return` inside the body bind to the synthesised loop, and the iterator binding is dropped at the end of the enclosing block.
+`for (x in <expr>)` iterates a sequence. The expression is evaluated exactly once and bound to a hidden mutable local; the parser lowers the loop to a `loop { match (iter.next()) { Some(x) => { ... } None => break; } }`, where `next` is `std::core::iter::Iterator`'s and `Some`/`None` are `std::core::option::Option`'s - a module that declares its own `Option` or `Iterator` changes nothing about the loop. The expression is an iterator when its type implements `Iterator`; a type parameter does when a `where` bound in scope - the function's, the implementation's or the owner declaration's - gives it `Iterator` or a trait `Iterator` is a supertrait of, so `for (x in parts)` with `parts: I` under `where I: Iterator<i32>` iterates each copy's `I`. `break`, `continue`, and `return` inside the body bind to the synthesised loop, and the iterator binding is dropped at the end of the enclosing block. A temporary the expression makes lives until the loop ends, so the body may read through an iterator that borrows it (see the borrowed-temporary rule in [section 15.2](#152-the-drop-trait)).
 
 The scrutinee may be:
 
@@ -1595,7 +1629,7 @@ There is no fallthrough between arms. See [section 7](#7-pattern-matching) for t
 
 ### 6.8 Match: Expression Form
 
-Used as an expression, `match` evaluates to the value of the matching arm. All arms must produce the same type.
+Used as an expression, `match` evaluates to the value of the matching arm. All arms must produce the same type, and that type is the expression's: its arms are unified as an `if` expression's branches are. The type expected where the `match` stands - an initializer's, an argument's parameter, a return's - reaches each arm's value as it reaches an `if` expression's branches, so a literal arm takes it (`take_u64(match (e) { E::A => { 4000000000 } _ => { 1 } })` passes `u64`s); it never types the `match` itself, which then converts where it stands as any value does. The subject is matched as the value it is: nothing is expected of it, so a `match` as another's subject is typed by its own arms.
 
 ```cryo
 const name: string = match (n) {
@@ -1771,6 +1805,23 @@ function describe(s: Shape) -> void {
 ```
 
 In each arm, the variables are introduced for the payload of that variant. The compiler enforces that the count and types match the variant's declaration.
+
+**A binding of a `Copy` value is a copy taken when the arm is entered.** In a `match` on a variable by value, a binding not written `mut` whose payload is `Copy` holds the payload as it was when the arm was chosen: assigning the variable inside the arm does not change the binding, and writing the binding (where the variable is writable) does not change the variable. A name binding the whole subject (`whole => ..`) is the same. A binding written `mut`, and a binding of a payload that is not `Copy`, names the payload where it lies in the variable: a write to it writes the variable, and assigning the variable is seen through it. A `match` through a borrow or a pointer (`match (&x)`, `match (&this)`, `match (p)` with `p: T*`) binds every name inside the value it reaches, so `&value` of a binding points into that value.
+
+```cryo
+mut v: Outer = Outer::X(7, Inner::A(11, 13));
+match (v) {
+    Outer::X(a, b) => {
+        v = Outer::Y(1);
+        // `a` is still 7 and `b` still Inner::A(11, 13)
+    }
+    Outer::Y(_) => { }
+}
+match (v) {
+    Outer::Y(mut n) => { n = 5; }   // writes v: it is now Outer::Y(5)
+    Outer::X(_, _) => { }
+}
+```
 
 If you don't need a payload, use `_`: `Option::Some(_) => { ... }`.
 
@@ -2017,7 +2068,7 @@ const strs: Pair<string> = Pair::<string>::new("hello", "world");
 
 `Pair<int>` and `Pair<string>` are independent types. See [section 11.6](#116-monomorphisation).
 
-A generic struct's literal written without type arguments is one instance of it: the one its expected type names, or else the one its field values bind. Inside a generic body that instance may be over the body's own parameters, so `return Pair { first: a, second: b };` in `new` above is a `Pair<T>`, and `Holder { f: f }` returned from `function hold<F>(f: F) -> Holder<F>` is a `Holder<F>`. The owner's own literal follows the same rule: in a method of `type struct Two<A, B>` declared `-> Two<B, A>`, `return Two { a: this.b, b: this.a };` builds a `Two<B, A>`, not the `Two<A, B>` the method belongs to.
+A generic struct's literal written without type arguments is one instance of it: the one its expected type names, or else the one its field values bind. Inside a generic body that instance may be over the body's own parameters, so `return Pair { first: a, second: b };` in `new` above is a `Pair<T>`, and `Holder { f: f }` returned from `function hold<F>(f: F) -> Holder<F>` is a `Holder<F>`. The owner's own literal follows the same rule: in a method of `type struct Two<A, B>` declared `-> Two<B, A>`, `return Two { a: this.b, b: this.a };` builds a `Two<B, A>`, not the `Two<A, B>` the method belongs to. With nothing expected, its fields decide it there as anywhere: in a method of `type struct Box<T> { f0: T; }`, `Box { f0: x }` with `x: u16` is a `Box<u16>`, and in `Box::make(Box { f0: p })`, the owner's arguments left to the call, the literal is a `Box<Pixel>` for `p: Pixel` and the call's owner `Box<Box<Pixel>>`; `Box { f0: this.f0 }` is the body's own `Box<T>`.
 
 Where the field values bind the instance, a value in a field written over the struct's parameters is typed on its own, as a generic function's argument is: `Holder { inner: 3, peeked: Option::Some(2) }` is a `Holder<i32>` because `3` and `Some(2)` say so, and a variant's payload binds the parameters it carries (`Result::Ok(5)` binds the `T` of a field `Result<T, E>`, leaving `E` to the other fields). A value that only its field can type - `Option::None`, an empty `[]` - takes the instance's field once the other values have bound it. Every value is then checked against the instance's field, so `Pair { a: 1, b: true }` for `type struct Pair<T> { a: T; b: T; }` is refused (E0200) at `true`.
 
@@ -2192,7 +2243,7 @@ const r: Result<string, int>  = Result::Ok("success");
 
 Each instantiation is an independent type at the machine level; `Option<int>` and `Option<string>` share no runtime representation.
 
-A variant constructs one instantiation, and something must say which: type arguments written on the path (`Option::<i32>::None`, `Result::Ok::<i32, i32>(4)`), the expected type (an annotation, a parameter, a return type), or the variant's own arguments (`Option::Some(42)` is an `Option<i32>`). A variant nothing instantiates - `const n = Option::None;`, or `Result::Ok(1)` with `E` unbound - is refused (`E0307`). A variant's arguments are checked against its payloads in the instantiation it constructs, as a call's are against its parameters, however that instantiation is named and in a non-generic enum too: `Result::<i32, i32>::Ok("x")`, `Option::Some(w)` where an `Option<i64>` is expected and `w` is a struct, and `Slot::Full(w)` for a `Full(i64)` payload are refused (`E0214`). An argument converts there as it does at a parameter, so `Option::Some(&c)` where an `Option<virtual &Shape>` is expected holds a trait object ([section 10.7](#107-trait-objects)), and in `Option::<u8>::Some(200)` the literal is a `u8`.
+A variant constructs one instantiation, and something must say which: type arguments written on the path (`Option::<i32>::None`, `Result::Ok::<i32, i32>(4)`), the expected type (an annotation, a parameter, a return type), or the variant's own arguments (`Option::Some(42)` is an `Option<i32>`). The expected type reaches each arm of an `if`, `?:` or `match` expression standing where it is expected, so in `take(if (c) { Option::None } else { found })` the `None` is the instance `take`'s parameter names, as it is in an annotated declaration's initializer. A variant nothing instantiates - `const n = Option::None;`, or `Result::Ok(1)` with `E` unbound - is refused (`E0307`). A variant's arguments are checked against its payloads in the instantiation it constructs, as a call's are against its parameters, however that instantiation is named and in a non-generic enum too: `Result::<i32, i32>::Ok("x")`, `Option::Some(w)` where an `Option<i64>` is expected and `w` is a struct, and `Slot::Full(w)` for a `Full(i64)` payload are refused (`E0214`). An argument converts there as it does at a parameter, so `Option::Some(&c)` where an `Option<virtual &Shape>` is expected holds a trait object ([section 10.7](#107-trait-objects)), and in `Option::<u8>::Some(200)` the literal is a `u8`.
 
 ### 9.4 Methods on Enums
 
@@ -2522,6 +2573,19 @@ type struct Loose<I> { f: () -> I::Item; }   // error[E0203]: associated type `I
 ```
 
 A projection may be the subject of a bound itself: `where C: Source, C::Item: Put` gives a value of type `C::Item` the methods of `Put` in the body, and each copy of the body calls the implementation of `Put` for its own `Item`, which may be an implementation for every reference (`implement<T> trait Put for mut &T where T: Put`) when `Item` is one. Such a bound is checked where a call binds the parameters, as a bound on a parameter is: `store(&plain)` with `plain`'s `Item` an `i64` is refused there (E0306, "the trait bound `i64: Put` is not satisfied").
+
+A trait's default method may bound one of the trait's own associated types: `Iterator`'s `min` and `max` are written `where This::Item: Ord`. Such a default is a method of exactly the implementations whose binding has the trait, and of no other: its body is copied into, and checked for, only those, so an implementation whose binding lacks the trait is accepted and has no such method. A reference has the traits an implementation for references gives it, not its referent's, so an iterator of `&i64` has no `min` although `i64` is `Ord`, and a call of it is refused where it is written (E0358), with the bound and the binding that fails it:
+
+```cryo
+type struct Each { values: &Slice<i64>; position: i64; }
+
+implement trait Iterator<&i64> for struct Each {          // fine: no `min` or `max` here
+    next(mut &this) -> Option<&i64> { ... }
+}
+
+each.min();                                                // error[E0358]: no method named `min` found on type `Each`
+each.map((value: &i64) -> i64 { return *value; }).min();   // fine: an iterator of `i64`
+```
 
 **A trait with parameters.** A type may implement a trait that has generic
 parameters more than once, at different arguments, and each implementation
@@ -3184,6 +3248,8 @@ Generic bodies are type-checked once, as templates, **before** monomorphisation:
 
 Every copy is analysed - its diagnostics do not depend on whether anything calls it - but an executable emits only the copies its code can reach. Once analysis is done, the compiler walks from every function that is not a copy, through every call and every function named as a value, and through what code generation calls with no call written: a trait-object table's methods, a type's `Drop` and `Allocate` implementations, an operator's, an index's and a `?`'s method, and the releases drop insertion adds. A copy the walk never reaches is left out of every object. The standard library's archive is walked the same way, from the archive's own functions: a copy its build does not reach is left out of it and not listed in its manifest, and a program linking the archive defines every copy it needs that the manifest does not list in its own objects. Any other library, and a single object, assembly or IR file (`-o` naming one), keeps every copy, since what calls them is not in the build. The walk is in [`codegen/reachable_instances.cryo`](../compiler/src/compiler/codegen/reachable_instances.cryo); a reference code generation makes to a copy the walk left out is an internal error (E0900) naming the copy.
 
+Each copy a build emits is defined in one module's object, chosen from the modules declaring each named type its type arguments are built from (through pointers, references, arrays, tuples, function types and instantiations, and into the arguments of an instantiated type, which come before the instantiated type's own module, but not into a type's fields), in argument order, and then the template's module: the first of these that none of the others depends on, directly or through its own dependencies. A module depends on the modules it imports, except where imports form a cycle, as the standard library's modules do among themselves: there the build order the compiler chose decides which of two modules depends on the other. When one of them depends on all the others, it is the one chosen, so the object holding the copy references nothing its module does not already depend on: a copy of a program's own generic function, or of a standard-library template over a program's type, is defined in the program's module, and `Array<i64>` in `collections::array`'s object, never in the allocator's, which its default allocator argument merely names. When none depends on all the others, a type argument's module is chosen before the template's: `Result<TlsStream, IoError>` is defined with `TlsStream`, so `core::result`'s object, which nearly every program links, does not reference the TLS library. The choice depends on the template and its arguments alone, not on which module uses the copy or in what order. A copy of a method with type parameters of its own is placed by the same rule, its own type arguments first, then its receiver as one more type argument (the receiver's arguments, then its module), then the module declaring the method: `Array<i64>::sort_by_key` given a program's closure, and `String::push` given a program's type, are defined in the program's module, wherever `Array<i64>` and `String` themselves are; a trait implementation's method is placed the same way. The exception is an instance asked for on an instantiation the compiler has not made yet (the receiver of a chained call, `xs.iterate().map(f).map(g)`): it is copied with that instantiation when it is made, and defined with it. An implementation an instantiation carries that was written in another module than its template's is placed by the same rule with the module it was written in a candidate just ahead of the template's: a program's `implement trait Measure for struct Slice<i32>` of its own `Measure` is defined in the program's module, not with `Slice<i32>`, and the standard library's `Display` for a `Pair` is defined beside `Display`, keeping the `Pair` object free of formatting. Every other object that calls the copy refers to it by name, and every copy is linked as one definition the linker may meet more than once (the archive and a program can each define it), keeping one.
+
 ### 11.7 `static match` — Compile-Time Type Dispatch
 
 `static match` selects a body by inspecting a type parameter *at compile time*. It is the mechanism that lets one generic function accept several unrelated types without a trait bound and without runtime dispatch.
@@ -3312,6 +3378,10 @@ A bound of one says, in the signature, which types a generic accepts - a call wi
 ## 12. Implement Blocks
 
 `implement` adds methods to a type without modifying its original declaration. There are three forms.
+
+The type a head names may be written after a kind keyword, `struct`, `enum` or `union` (`implement struct Point`, `implement trait Eq for enum Color`). The keyword is optional, and when written it names the kind of that type: `struct` a struct, `enum` an enum, `union` a union, and an alias the type it names. A keyword naming another kind is refused (E0319), with the type's own keyword as the fix; a type that is none of the three, such as a primitive, takes no keyword, and the fix removes it.
+
+A head may name the type through an alias, since an alias is the type it names: with `type PointAlias = Point;`, `implement trait Measure for PointAlias` implements `Measure` for `Point`, and `implement PointAlias { .. }` gives `Point` its methods. They are reached through either name - on a `Point` value, on a `PointAlias` value, as `Point::at(..)` or `PointAlias::at(..)`, through a bound and through a trait object - and an alias of an alias reaches the same type. The alias must reach a type a head names by its declaration, a struct, an enum, a union or a primitive; one naming a generic instance (`type WideWrapper = Wrapper<i64>;`), a pointer, an array or a function type is refused (E0320). A generic instance is implemented for by writing it after `for` (`implement trait Widen for Wrapper<i64>`).
 
 ### 12.1 Inherent Implementation
 
@@ -3701,7 +3771,19 @@ Two candidates are ambiguous only within one tier: two wildcards offering one na
 
 Nothing outside the tiers is reachable. A name declared exactly once in the whole program still does not resolve where nothing brings it into scope, and a path whose first segment no tier binds is not found, however fully it is spelled: `std::math::power(2.0, 3.0)` in a file that imports no `std::math` is E0203.
 
-A path resolves one segment at a time. Its first segment is a bare name, looked up as above; each later segment is looked up in what the segment before it named. A module is found only among those the file can see - its own and the ones it imports, spelled as [section 13.6](#136-modules-and-types-share-one-namespace) allows - never by searching the program for its spelling, so what a path means never depends on which other modules exist in the program. A path that does not resolve is an error, with a suggestion where one exists.
+A path resolves one segment at a time. Its first segment is a bare name, looked up as above in the type namespace, since it names what owns the rest of the path - a type or a module, never a function or a variable; each later segment is looked up in what the segment before it named. A first segment spelled like a primitive type (`u16`, `boolean`, `string`) names that type before any tier is asked, as it does in a type annotation, so a function named `u16` neither hides `u16::MAX` nor is reached by it, and a plain call `u16()` still names the function:
+
+```cryo
+function u16() -> i32 { return 7; }
+
+function main() -> i32 {
+    const top: u16 = u16::MAX;            // the primitive's constant
+    const next: u16 = u16::wrapping_add(top, 2);
+    return u16();                         // the function
+}
+```
+
+A function sharing its name with a type of the same scope leaves the path through the type: `Limits::make()` is the type's static method beside a `function Limits()`. A module is found only among those the file can see - its own and the ones it imports, spelled as [section 13.6](#136-modules-and-types-share-one-namespace) allows - never by searching the program for its spelling, so what a path means never depends on which other modules exist in the program. A path that does not resolve is an error, with a suggestion where one exists.
 
 ---
 
@@ -3880,11 +3962,13 @@ Implementing `Drop` declares "I own resources that must be released." The compil
 - **Scope exit**, in reverse declaration order, at every exit from the declaring scope (block end, early `return`, `break`, `continue`).
 - **Assignment over a live value**: `x = new_value` releases whatever `x` held. Without this every reassignment of an owning type leaks the previous value, without bound in a loop.
 - **A discarded result**: an expression statement whose value is owning - a call result nobody binds, such as the option `o.replace(v)` hands back - releases it at the end of the statement.
-- **A borrowed temporary**: a call result or struct literal that is only borrowed - `f(&make())`, `make()` passed to a `&T` parameter, `make().len()` with a borrowing receiver, an f-string hole `f"{make()}"`, a `Copy` field read off it through any number of fields `make().inner.tag` - releases it at the end of the statement that made it, after every call that borrows it has returned. The condition of an `if`, `while`, `do`-`while` or `for` is a statement of its own for this rule: its temporaries are released before the branch, at every test of a loop. A `match` statement keeps its subject's temporaries until the whole `match` ends. A `return`, `break` or `continue` that leaves a statement early releases the temporaries made so far, and one made on a path that was not taken (`ready && f(&make())`) is not released at all.
+- **A borrowed temporary**: a call result or struct literal that is only borrowed - `f(&make())`, `make()` passed to a `&T` parameter, `make().len()` with a borrowing receiver, an f-string hole `f"{make()}"`, a `Copy` field read off it through any number of fields `make().inner.tag` - releases it at the end of the statement that made it, after every call that borrows it has returned. The condition of an `if`, `while`, `do`-`while` or `for` is a statement of its own for this rule: its temporaries are released before the branch, at every test of a loop. A `match` statement keeps its subject's temporaries until the whole `match` ends, and a `for (x in <expr>)` loop keeps its iterable's until the loop ends: the iterator may borrow one (`for (word in make().iterate_references())`), so they are released after the loop, on every way out of it - in an `async` function too, where a body that suspends runs the loop across several polls and the function's frame holds them until the loop ends. A `return`, `break` or `continue` that leaves a statement early releases the temporaries made so far, and one made on a path that was not taken (`ready && f(&make())`) is not released at all.
 
 The last three are released at the statement that performs them, and every statement counts as one wherever it stands: a braceless loop body or `if` branch, and a `for` loop's update clause, release exactly as they would inside braces.
 
-A reference into a borrowed temporary does not outlive its statement: `const s: Str = make_string().as_str();` leaves `s` pointing at released storage. Bind the value first (`const text: String = make_string();`) and borrow the binding.
+A statement's temporaries are released in reverse order of creation, and a discarded result counts as the last one created: it is released first, before any temporary it may borrow. `watch(&make());`, where `watch` returns a value holding the reference it was given, releases what `watch` returned while `make()`'s value is still alive, then `make()`'s value; `watch_two(&make(1), &make(2));` releases the result, then `make(2)`'s value, then `make(1)`'s. A temporary is created when its value is complete, after the temporaries its own members made: `peek(&(T { f: peek(&(T { f: 0 })) }))` releases the outer `T` first, then the inner one. The value an assignment displaces - what its destination held before the store - is older than every value its statement makes, so it is released last, after all of the statement's temporaries: `v = combine(&make(1), &make(2));` releases `make(2)`'s value, then `make(1)`'s, then the value `v` held. Such an assignment stores between the two: the right side is evaluated, the statement's temporaries are released, the new value is stored, and the displaced value is released last, so a temporary's release that reads the destination still finds the value it held before the statement. An assignment whose destination has nothing to release - its type has no destructor, as an `i64` has none - stores its value as soon as the right side is evaluated, before the statement's temporaries are released, so a temporary's release that reads that destination finds the new value: in `plain = plain_make(2, &(PlainWatcher { target: plain_pointer }));`, where `plain` is an `i64` holding 1, `plain_pointer` points at it and the watcher's release reads `*target`, the watcher reads 2.
+
+A reference into a borrowed temporary does not outlive its statement: `const s: Str = make_string().as_str();` would leave `s` pointing at released storage, and is refused (`E0460`). Bind the value first (`const text: String = make_string();`) and borrow the binding. The compiler cannot see what a call's result points into, so it refuses a local declaration whose initializer borrows an owning temporary - a borrowing method's receiver, an argument passed by reference, the operand of `&`, or the value a field of one is read from - when the local's type has room for an address and owns nothing, and the borrow reaches it through results of such types (`make_words().get_reference(0).unwrap().as_str()`). An assignment to an existing local is a statement of its own whose temporaries are released when it ends, so it is refused the same way (`s = make_string().as_str();`), whether the local was declared with a value or without one. So is an assignment to a place that outlives the statement as a local does - a field (`holder.s = make_string().as_str();`), a field reached through a pointer, an array's element, or what a pointer points at (`*p = ...`). A result that owns something is a value of its own (`make_string().clone()`), and a scalar holds no address (`make_words().length()`), so neither is refused; a type that is still generic is not judged. A method that returns a view of something other than its receiver (a string literal, say) is refused all the same when called on a temporary: bind the temporary first.
 
 Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations, and members of such a local reached by field or constant-index access (`x.f`, `x[0]`). It does **not** yet cover pattern bindings (`match` arms).
 
@@ -3903,6 +3987,10 @@ The destinations below do *not* release what they overwrite, because nothing vis
 | `p.f = v` where `p` is a raw pointer | the same: whatever `p` addresses may not have been initialised |
 | `xs[i] = v` with a run-time `i` | no single member for the compiler to track |
 | a module-level global | globals are never auto-dropped |
+
+A local whose value the assignment's own right-hand side takes holds nothing to release: `t = takes_it(t)` releases nothing, and `t = if (c) { t } else { make() }` releases the old value exactly when `c` is false, the branch that left it in place.
+
+What is released is what the destination holds once the right-hand side has run. A right-hand side may change the destination through a reference first - `v = D { f: set(&v) }`, where `set` assigns a member of what it is given - and the assignment then releases the value `set` left there, not the one `v` held before the statement began.
 
 A store through a reference also releases nothing when the function moved a value out from behind the same binding earlier, or the store's own right-hand side does (`this.f = wrap(this.f)` inside an `unsafe` block, where such a move is not refused): the place still holds the bits of a value its new owner releases.
 
@@ -4020,7 +4108,7 @@ use(a);                // error E0452: use of moved value `a`
 
 Two move/ownership hazards that are unambiguous memory errors, called out as their own hard-error classes for clearer diagnostics, are:
 
-- **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.  A loop's condition, and a `for`'s update, run again at every back edge, so a value or field moved in them is refused, even when the body assigns it a new one, unless the body always leaves the loop with `break` or `return`.
+- **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.  A loop's condition, and a `for`'s update, run again at every back edge, so a value or field moved in them is refused, even when the body assigns it a new one, unless the body always leaves the loop with `break` or `return`.  A binding the condition or update declares itself - the residual a `?` in `while (f()?)` binds, a `match` arm's payload inside the condition - is made afresh at every test, so moving it is not carried; a binding an enclosing loop's body declares is the same binding at every test of an inner loop, and moving it there is refused.
 - **Returning the address of a local** (`E0455`) - `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine - those are caller-backed.)
 - **A field moved out on some paths only** (`E0453`) - a field moved out of a local runs its owner's release without that field at scope exit, which is sound only when the move certainly happened.  So a field may be moved out of a local of a struct with no destructor in straight-line code, and is refused inside an `if`, `match` or loop body, on the right of `&&` or `||`, and in an arm of `?:` or of an `if` expression - each runs on some paths only.  The refusal names the local and the field ("cannot move field 'a' out of `h` on only some paths"); a field moved out of a value whose type implements `Drop` is refused as owning a destructor, and one out of any other value the partial move does not track (a tuple, a pattern binding, a field of a field) as a value that drops it at scope exit.
 - **A reference to a value with a field moved out** (`E0452`) - a reference names the whole value, and a store through it releases what it displaces, so `&p`, `p` passed where a reference is taken, and a method called on `p` are refused once a field has been moved out of `p`, until that field is given a new value.  The fields that remain may still be read and borrowed (`&p.b`).
@@ -5028,7 +5116,14 @@ cryo test --list                   # discover only; print and exit
 cryo test --ignored                # also run ![ignore]-marked tests
 cryo test --exact                  # treat the filter as an exact match
 cryo test -q, --quiet              # suppress per-test ok / ignored lines
+cryo test --suite=projects         # one suite alone: unit, compile-fail or projects
 ```
+
+A project's `cryo test` runs three suites in order: its unit tests, the
+compile-fail files under `tests/negative/`, and the projects under
+`tests/projects/`. `--suite=` runs one of them alone, so separate runs can
+proceed side by side; a run of the compile-fail or project suite builds no unit
+test binary and finds the standard library the way that build would.
 
 ### Output format
 
@@ -5167,9 +5262,11 @@ target_triple = ""                  # cross-compile triple; empty => build for h
 stdlib_root   = ""                  # project-pinned stdlib root (see section 23.3)
 ```
 
-`entry_point`, `source_dir` and a relative `output_dir` are paths in the project's directory, the one holding its cryoconfig, wherever the build is started from: `cryo build app/` writes `app/build/`. A `--build-dir=PATH` given on the command line is read against the directory the command runs in.
+`entry_point`, `source_dir` and a relative `output_dir` are paths in the project's directory, the one holding its cryoconfig, wherever the build is started from: `cryo build app/` writes `app/build/`. A single file built on its own (`cryo build app/main.cryo`) is a project rooted at the file's directory and writes `app/build/` the same way. A `--build-dir=PATH` given on the command line, for a project or a single file, replaces that directory and is read against the directory the command runs in.
 
 `target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and selects the target ABI and toolchain. For `x86_64-pc-windows-gnu` the build drives a full mingw-w64 link to a `.exe`: from a Linux host with `clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld` over the mingw-w64 sysroot (binutils' GNU ld for mingw relocates thread-local offsets, so a program it links faults on its first thread-local access once Windows moves the image), and the environment variable `CRYO_CC` names another driver.  The driver is found by searching `PATH`, not by starting it; what it answers about its toolchain (whether it unwinds through libgcc) is kept in the stdlib's `.bin/<triple>/toolchain/` and asked again only for a driver that resolves to another program, or to the same program with another size or modification time.  For other x86-64 triples without a known toolchain (windows-msvc, ...) the host link step is skipped and the object files are left for a manual link. The compiler's LLVM carries the x86-64 backend only: a triple for another architecture (aarch64, riscv64, ...) is refused with `E0647`, which gives LLVM's reason, and so is an object file LLVM cannot write. The CLI `--target=TRIPLE` overrides it.
+
+With no `target_triple` and no `--target`, a build targets the host. On Windows the host's ABI follows the C driver the link will run: `x86_64-pc-windows-gnu` when `CRYO_CC` names a gcc (the program it starts, without its directory and `.exe`, is `gcc` or ends in `-gcc`), whether or not that gcc is on `PATH`; otherwise `x86_64-pc-windows-gnu` when `x86_64-w64-mingw32-gcc` is on `PATH`; otherwise `x86_64-pc-windows-msvc` when `lld-link` or `link` is on `PATH`, whose objects are left for a manual link; otherwise `x86_64-pc-windows-gnu`. `cryo version --triple` prints the answer.
 
 ### 23.2 `[compiler]`
 
@@ -5389,6 +5486,16 @@ static = ["helpers/libhelpers-windows.a"]
 system = ["ws2_32"]                  # winsock, windows targets only
 ```
 
+`[link.release-static]` carries the same three keys and is read only by a `--release-static` build, which links it in place of `[link.unix]`: the unix overlay names the host's shared libraries, which a fully static link refuses, and this section names their static equivalents. The compiler's own project uses it for the static libclang archive its release links; LLVM's static archives come from `llvm-config` either way.
+
+```ini
+[link.unix]
+static = ["/usr/lib/llvm-20/lib/libclang-20.so.1"]
+
+[link.release-static]
+static = ["../.toolchains/libclang-static/libclang.a"]
+```
+
 > Migrating from pre-1.0: `link_libs` -> `[link] system`, `link_paths` -> `[link] search` (or `[link] static` for a local archive). The old `[compiler] args = ["--emit-llvm"]` flag-smuggling is gone - set `emit_llvm = true`. `[compiler] include_paths` -> `[project] source_paths`. `[project] target` -> `[project] target_triple`.
 
 ### 23.4 Multi-target: `[lib]` and `[[bin]]`
@@ -5470,6 +5577,7 @@ color  = "auto"                     # auto | always | never
 | `cryo run`               | Build the project and run the resulting executable.                                                                 |
 | `cryo test [pattern]`    | Build and run the project's `![test]` functions.                                                                    |
 | `cryo check <file>`      | Front-end + semantic analysis only; no codegen.                                                                     |
+| `cryo interpret <file>`  | Analyse the file as `check` does, then run its `main` by interpreting the typed program, checking memory and ownership as it goes (`tools/CryoSmith/INTERPRETER.md`). |
 | `cryo init [dir]`        | Scaffold a new project (`cryoconfig` + `main.cryo`).                                                                |
 | `cryo demangle <sym>`    | Decode a mangled symbol to its source form.                                                                         |
 | `cryo api-index write\|check <root> <file>` | Write, or check that `<file>` already holds, the one-line-per-declaration index of the standard library under `<root>`. |
@@ -5480,7 +5588,7 @@ color  = "auto"                     # auto | always | never
 
 Running `cryo <file.cryo>` with no command compiles that file directly.
 
-**The version string.** `cryo -v`, `cryo version` and the banner `cryo` prints with no arguments give the release number, its pre-release label, and after a `+` the build: the first eight hex digits of the commit the compiler was built from, with `-dirty` when tracked files differed from that commit (`cryo version 1.0.0-alpha+3f9c2a1b`). Pre-release labels order the way the release number reads (`1.0.0-alpha` comes before `1.0.0`); the build part identifies a binary and does not order it. The release number and the label are `VERSION` and `PRERELEASE` in `compiler/src/main.cryo`.
+**The version string.** `cryo -v`, `cryo version` and the banner `cryo` prints with no arguments give the release number, its pre-release label numbered by the count of commits in the history of the commit the compiler was built from, and after a `+` the build: the first eight hex digits of that commit, with `-dirty` when tracked files differed from it (`cryo version 1.0.0-alpha.4073+3f9c2a1b`). Pre-releases order the way the release number reads (`1.0.0-alpha.4073` comes before `1.0.0-alpha.4074`, and both before `1.0.0`); the build part identifies a binary and does not order it. A release (no label) carries no count. The release number and the label are `VERSION` and `PRERELEASE` in `compiler/src/main.cryo`; the count is recorded by `cryo stamp`, and a binary stamped by a `cryo stamp` that does not record it prints the label unnumbered. Every release artifact is named by the version without its build part (`cryo-1.0.0-alpha.4073-linux-x86_64.tar.gz`), and is published from `main` as a pre-release while `PRERELEASE` is set.
 
 The build part is not compiled in. A compiler binary holds a reserved region that `cryo stamp <binary>` rewrites after linking, from the git checkout in the current directory, so stamping changes no code and nothing the compiler emits; `make cryo`, `make cryo-exe` and the release build stamp the compilers they link, with the pinned compiler. An unstamped binary, or one built outside a git checkout, prints `+unknown`. `cryo stamp` is not listed in `cryo help`; `cryo help stamp` describes it. `cryo version --verbose` prints, beneath the version line, the binary's path and size, the full commit, its date, the branch, `git describe`, whether the tree was dirty, the build profile (all from the stamp), and the LLVM version, the default target triple and the stdlib root a build would use. A compiler's build cache key reads the region as zeros, so restamping a compiler does not invalidate what it built. `cryo stamp` also records that key, the digest of the binary with its region read as zeros, and the binary's size, inside or outside a checkout; a build reads the recorded key instead of hashing the compiler while the binary still has that size, and hashes it otherwise.
 
@@ -5505,7 +5613,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--opt-level=N`       | Optimization level `0`..`3`; overrides the profile and `[compiler] optimize`.                                                           |
 | `-g`, `--debug-info`  | Emit DWARF debug info.                                                                                                                  |
 | `--release`           | Build with the `release` profile (O2, no debug info).                                                                                   |
-| `--release-static`    | Static-link libLLVM + the C++ runtime into a self-contained binary for distribution (Linux host only; implies `--release`).             |
+| `--release-static`    | Static-link libLLVM + the C++ runtime into a self-contained binary for distribution, with `[link.release-static]` in place of `[link.unix]` (Linux host only; implies `--release`). |
 | `--dev`               | Build with the `debug` profile (O0 + DWARF).                                                                                            |
 | `--profile=NAME`      | Build with a named profile (cache under `build/target/NAME/`).                                                                          |
 | `--no-incremental`    | Force a full build: skip the up-to-date short-circuit and the manifest/fingerprint write.                                               |
@@ -5515,7 +5623,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--apply-fixes`       | Make every machine-applicable suggestion the build reports in the project's own files (never the stdlib's or a vendor binding's), then build again once; a suggestion overlapping one already made is left for the next build. |
 | `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable).           |
 
-Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
+Test-only flags: `--suite=NAME`, `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
 
 **Compiler logging.** The compiler logs what it does, for whoever is working on the compiler; it is off unless switched on, by `CRYO_LOG=SPEC` in the environment or `--log=SPEC` (or `--debug`, meaning `--log=debug`), or by `debug = true` in cryoconfig. `--debug` switches logging on and does nothing else: the AST is `--ast`'s and the IR `--emit-llvm`'s. The command line is applied after the environment, so a flag wins; `debug = true` sets `debug` only in the areas neither of them set, so `--log=off` or `CRYO_LOG=off` silences a project that asks for logging, and `debug = false` switches nothing off. A spec is a comma-separated list of items: an area, `driver`, which logs that area at `debug`; `area=level`; or a level alone, which sets every area. A later item overrides an earlier one, so `CRYO_LOG=sema,codegen` logs two areas and `--log=debug,parse=off` logs all but one. The areas are `driver`, `loader`, `lex`, `parse`, `resolve`, `types`, `sema`, `mono`, `drop`, `codegen`, `link`, `bindgen`, `deps`, `diag`, `lsp` and `time`; the levels, from least to most said, `off`, `error`, `warn`, `info`, `debug` and `trace`. An item naming neither is reported on stderr and the rest of the spec still applies. Lines go to stderr, or appended to the file `CRYO_LOG_FILE` or `--log-file` names, each as `[level area] file:line function: message`, the place being where in the compiler's source the line was written. The `time` area at `info` reports how long each stage of a build took, at its end. The language server takes no flags, so it reads `CRYO_LOG` and `CRYO_LOG_FILE` alone, and with them unset it logs nothing.
 

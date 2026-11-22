@@ -1,0 +1,71 @@
+///! Termination within a budget.
+///!
+///! Every loop counts a read-only counter from 0 to a literal trip count, no
+///! function calls itself or a later function, and a cost model bounds what
+///! one call can do: a statement costs its expressions' nodes, a loop its
+///! trip count times its body, a call the callee's cost.  A call is
+///! generated only while the caller's cost stays under its limit.
+
+namespace cryosmith::guarantees::termination;
+
+/// The largest trip count of a loop.
+public const MOST_TRIPS: i64 = 6;
+
+/// How deep loops nest.
+public const MOST_LOOPS: i64 = 3;
+
+/// The most work one call of a helper function or a method may do.
+const HELPER_COST_LIMIT: u64 = 20000;
+
+/// The most work `main` may do.
+const MAIN_COST_LIMIT: u64 = 2000000;
+
+/// The most work one call of a function value may do: a closure or a
+/// function passed to a function-typed parameter or returned as a value
+/// costs no more, so a call through a parameter or through a returned value
+/// is charged this much.
+public const FUNCTION_VALUE_COST_LIMIT: u64 = 1000;
+
+/// The work one function has done so far, and what it may still do.
+public type struct CostBudget {
+    private used: u64;
+    private limit: u64;
+    private multiplier: u64;
+
+    /// A fresh budget for one function: `main`'s limit or a helper's.
+    public static for_function(is_main: boolean) -> CostBudget {
+        return CostBudget { used: 0, limit: if (is_main) { MAIN_COST_LIMIT } else { HELPER_COST_LIMIT }, multiplier: 1 };
+    }
+
+    /// A budget for the body of a closure written where it is passed or
+    /// returned: its calls stay under half the function-value limit, which
+    /// leaves the rest for the nodes of a body generated at depth 1 and the
+    /// observations of its captures.  The self-test holds every such
+    /// closure's cost to the limit.
+    public static for_function_value() -> CostBudget {
+        return CostBudget { used: 0, limit: FUNCTION_VALUE_COST_LIMIT / 2, multiplier: 1 };
+    }
+
+    /// Charge `units` of work, once per trip of every enclosing loop.
+    public charge(mut &this, units: u64) -> void { this.used = this.used + units * this.multiplier; }
+
+    /// Whether one more call of a function costing `cost` keeps the work
+    /// under the limit.
+    public affordable(&this, cost: u64) -> boolean {
+        return this.used + this.multiplier * (cost + 1) <= this.limit;
+    }
+
+    /// The work done so far: a finished function's cost.
+    public spent(&this) -> u64 { return this.used; }
+
+    /// Enter a loop of `trips` trips: what is charged inside it is charged
+    /// once per trip.  The multiplier to give back to `leave_loop`.
+    public enter_loop(mut &this, trips: i64) -> u64 {
+        const outer: u64 = this.multiplier;
+        this.multiplier = outer * (if (trips > 0) { trips as u64 } else { 1 });
+        return outer;
+    }
+
+    /// Leave a loop, restoring the multiplier `enter_loop` returned.
+    public leave_loop(mut &this, outer: u64) -> void { this.multiplier = outer; }
+}

@@ -11,6 +11,8 @@ import compiler::{ compilation_context, instance, project_config };
 import compiler::codegen::{ llvm_types };
 import compiler::deps::dep_resolver;
 import compiler::resolver::demangler;
+import compiler::interpret::interpreter::{ Interpreter };
+import compiler::interpret::outcome::{ Stop };
 import cli::api_index;
 import compiler::vendor::registry;
 import compiler::bindgen::generator;
@@ -67,11 +69,14 @@ const VENDOR_BOX_WIDTH:   i64 = 76;   // '+' to '+' inclusive
 const VENDOR_LABEL_WIDTH: i64 = 12;
 const VENDOR_VALUE_WIDTH: i64 = 58;   // BOX_WIDTH - 2 bars - 4 padding - LABEL
 
-/// Tally returned by the compile-fail suite so `cmd_test`'s unified
-/// OVERALL footer can quote it alongside the unit-suite outcome.
+/// Tally returned by the compile-fail and project suites so `cmd_test`'s
+/// unified OVERALL footer can quote it alongside the unit-suite outcome.
 type struct NegSuiteResult {
     ran:      i32;
     failures: i32;
+    /// The build warnings the project suite listed; none for the
+    /// compile-fail suite, whose diagnostics are its subject.
+    warnings: i32;
 }
 
 /// One `//~` expectation parsed from a negative-test source file: the compiler
@@ -86,17 +91,19 @@ type struct NegExpect {
     msg:      String;
 }
 
-/// One diagnostic parsed back out of `cryo check`'s rendered output: `severity`
+/// One diagnostic parsed back out of a build's rendered output: `severity`
 /// and `code` from the `error[Exxxx]:` / `warning[Wxxxx]:` header, `message` the
-/// remainder of that header line, and `line` the source line from the following
-/// `--> file:line:col` arrow.  Only diagnostics anchored in the test file itself
-/// are collected (an arrow pointing elsewhere - e.g. into the stdlib - is not the
-/// test's concern), so `//~` exhaustiveness is scoped to the file under test.
+/// remainder of that header line, and `file` and `line` the place the following
+/// `--> file:line:col` arrow names.  A negative test collects only diagnostics
+/// anchored in the test file itself (an arrow pointing elsewhere - e.g. into the
+/// stdlib - is not the test's concern), so `//~` exhaustiveness is scoped to the
+/// file under test; a project's build warnings are collected wherever they are.
 type struct NegDiag {
     line:     i64;
     severity: string;
     code:     String;
     message:  String;
+    file:     String;
 }
 
 /// Parsed `test.json` for a multi-module test project (see
@@ -108,7 +115,9 @@ type struct NegDiag {
 /// `output_contains`.
 type struct ProjSpec {
     /// FIXTURE: 0 = collect (run the project's own `cryo test`), 1 = build
-    /// (`cryo build`), 2 = run (`cryo run`), 3 = command (`command`).  The fixture (what is set up) and
+    /// (`cryo build`), 2 = run (`cryo run`), 3 = interpret (`cryo
+    /// interpret`, given the file `arguments` names), 4 = command
+    /// (`command`).  The fixture (what is set up) and
     /// the ASSERTION (what is checked, via the `expect` fields below) are
     /// orthogonal: `compile_fail` is simply `build` + `expect.fails`.
     outcome:    i32;
@@ -184,6 +193,18 @@ type struct ProjSpec {
     /// source and exit with `applied.exit_code` (default 0).
     applied: boolean;
     applied_exit_code: i64;
+    /// test.json `rebuild`: the project is built twice into one build
+    /// directory.  A copy of it is built once, which must succeed; then each
+    /// `rebuild_files[k]` in the copy is overwritten with the project's own
+    /// `rebuild_sources[k]`, and the copy is run again, with
+    /// `rebuild_arguments` instead of `arguments` when
+    /// `rebuild_sets_arguments`.  Everything else in the spec judges that
+    /// second run.
+    rebuild: boolean;
+    rebuild_files: [String];
+    rebuild_sources: [String];
+    rebuild_arguments: [String];
+    rebuild_sets_arguments: boolean;
 
     static empty() -> ProjSpec {
         return ProjSpec {
@@ -192,8 +213,26 @@ type struct ProjSpec {
             environment: [], arguments: [], command: [], steps: [], fixtures: [], stderr_contains: [], stderr_excludes: [],
             stdout_line_prefixes: [], stderr_line_prefixes: [],
             file: String::new(), file_contains: [], file_excludes: [],
-            applied: false, applied_exit_code: 0
+            applied: false, applied_exit_code: 0,
+            rebuild: false, rebuild_files: [], rebuild_sources: [], rebuild_arguments: [],
+            rebuild_sets_arguments: false
         };
+    }
+
+    /// What the first build of a `rebuild` project is held to: a build (a
+    /// run fixture's program is not run; a collect fixture builds through
+    /// its own `cryo test`), in this project's environment and with its
+    /// arguments, exiting 0 with nothing else asserted.
+    first_build(&this) -> ProjSpec {
+        mut first: ProjSpec = ProjSpec::empty();
+        first.outcome = if (this.outcome == 0) { 0 } else { 1 };
+        for (mut i: i64 = 0; i < this.environment.length(); i++) {
+            first.environment.push(this.environment[i].clone());
+        }
+        for (mut i: i64 = 0; i < this.arguments.length(); i++) {
+            first.arguments.push(this.arguments[i].clone());
+        }
+        return first;
     }
 
     /// What the copy with its fixes applied is held to: it runs, with
@@ -247,6 +286,16 @@ type struct StepWrite {
 }
 
 implement enum SuiteAction {
+    /// Perform `actions` in order until one fails; the status of the last
+    /// performed, 0 when every one succeeded.
+    static perform_all(actions: &[SuiteAction]) -> i32 {
+        mut code: i32 = 0;
+        for (mut a: i64 = 0; code == 0 && a < actions.length(); a++) {
+            code = actions[a].perform();
+        }
+        return code;
+    }
+
     /// Perform the action; its status, 0 on success.  A write step's
     /// failure says why in its log.
     perform(&this) -> i32 {
@@ -399,11 +448,7 @@ type struct ShellJobs {
         loop {
             const k: u64 = (*this.cursor).fetch_add(1, MemoryOrder::Relaxed);
             if (k >= this.n) { break; }
-            mut code: i32 = 0;
-            for (mut a: i64 = 0; code == 0 && a < this.jobs[k].length(); a++) {
-                code = this.jobs[k][a].perform();
-            }
-            this.status[k] = code;
+            this.status[k] = SuiteAction::perform_all(&this.jobs[k]);
             this.done[k].store(1, MemoryOrder::Release);
         }
     }
@@ -424,6 +469,7 @@ type enum CommandKind {
     Run;
     Test;
     Check;
+    Interpret;
     Demangle;
     ApiIndex;
     Fetch;
@@ -443,6 +489,7 @@ implement enum CommandKind {
             CommandKind::Run     => { "run"     }
             CommandKind::Test    => { "test"    }
             CommandKind::Check   => { "check"   }
+            CommandKind::Interpret => { "interpret" }
             CommandKind::Demangle => { "demangle" }
             CommandKind::ApiIndex => { "api-index" }
             CommandKind::Fetch    => { "fetch"    }
@@ -462,6 +509,7 @@ implement enum CommandKind {
             CommandKind::Run      => { "Build the project and run the resulting binary" }
             CommandKind::Test     => { "Build and run the project's tests"             }
             CommandKind::Check    => { "Check a file for errors (no codegen)"         }
+            CommandKind::Interpret => { "Run a file by interpreting it (no codegen)"  }
             CommandKind::Demangle => { "Decode a mangled symbol to its source form"   }
             CommandKind::ApiIndex => { "Write or check the standard library's one-line-per-declaration index" }
             CommandKind::Fetch    => { "Fetch dependencies and write cryoconfig.lock" }
@@ -481,6 +529,7 @@ implement enum CommandKind {
             CommandKind::Run      => { "cryo run [flags]"                 }
             CommandKind::Test     => { "cryo test [pattern] [flags]"       }
             CommandKind::Check    => { "cryo check <file> [flags]"       }
+            CommandKind::Interpret => { "cryo interpret <file> [flags]"  }
             CommandKind::Demangle => { "cryo demangle <mangled-symbol>"  }
             CommandKind::ApiIndex => { "cryo api-index write|check <stdlib root> <index file>" }
             CommandKind::Fetch    => { "cryo fetch"                        }
@@ -511,10 +560,11 @@ implement enum CommandKind {
             CommandKind::Version => {
                 fmt::printf("Prints the compiler's name and version string, then exits.\n");
                 fmt::printf("Equivalent to the global `--version` / `-v` flag.\n\n");
-                fmt::printf("The version is the release number, its pre-release label, and after\n");
-                fmt::printf("a `+` the first eight hex digits of the commit the compiler was built\n");
-                fmt::printf("from, with `-dirty` when tracked files differed from that commit:\n");
-                fmt::printf("  cryo version 1.0.0-alpha+3f9c2a1b\n");
+                fmt::printf("The version is the release number, its pre-release label numbered by\n");
+                fmt::printf("the commits in its history, and after a `+` the first eight hex digits\n");
+                fmt::printf("of the commit the compiler was built from, with `-dirty` when tracked\n");
+                fmt::printf("files differed from that commit:\n");
+                fmt::printf("  cryo version 1.0.0-alpha.4073+3f9c2a1b\n");
                 fmt::printf("A compiler that was never stamped (see `cryo help stamp`) prints\n");
                 fmt::printf("`+unknown` there.\n\n");
                 fmt::printf("Flags:\n");
@@ -592,8 +642,10 @@ implement enum CommandKind {
                 fmt::printf("  --build-dir=PATH   Override cryoconfig's output_dir\n");
                 fmt::printf("  --stdlib=PATH      Standard library root for this run\n");
                 fmt::printf("  --target=TRIPLE    Cross-compile for the given LLVM target triple\n");
+                fmt::printf("  --suite=NAME       Run one suite alone: unit, compile-fail or\n");
+                fmt::printf("                     projects (default: all three, in that order)\n");
                 fmt::printf("  --ignored          Run only tests marked ignored\n");
-                fmt::printf("  --list             List matching tests without running them\n");
+                fmt::printf("  --list             List matching unit tests without running them\n");
                 fmt::printf("  --exact            Match [pattern] exactly instead of by substring\n");
                 fmt::printf("  -q, --quiet        Reduce test-runner output\n");
                 fmt::printf("  --jobs=N           Worker threads (0/auto = CPU count; 1 = sequential)\n");
@@ -615,6 +667,22 @@ implement enum CommandKind {
                 fmt::printf("  --ast            Dump the AST after parsing\n");
                 fmt::printf("  --stdlib=PATH    Standard library root for this run\n");
                 fmt::printf("  --target=TRIPLE  Cross-compile for the given LLVM target triple\n");
+            }
+            CommandKind::Interpret => {
+                fmt::printf("Analyses <file> as `check` does, then runs its `main` by walking\n");
+                fmt::printf("the typed program instead of generating code.  The program's\n");
+                fmt::printf("output is written as a build of it would write it, and the exit\n");
+                fmt::printf("code is what `main` returns.  The interpreter keeps its own\n");
+                fmt::printf("account of every value's place, and reports a read of an\n");
+                fmt::printf("uninitialised or moved value, an access out of bounds or to\n");
+                fmt::printf("freed memory, a division by zero, an over-wide shift, or a leak\n");
+                fmt::printf("at exit, as a violation (exit 70).  A construct it does not run\n");
+                fmt::printf("yet is reported as not covered (exit 71), a program panic exits\n");
+                fmt::printf("101, and a run past the step limit exits 72.\n\n");
+                fmt::printf("Flags:\n");
+                fmt::printf("  --stdlib=PATH      Standard library root for this run\n");
+                fmt::printf("  --target=TRIPLE    Interpret as for the given LLVM target triple\n");
+                fmt::printf("  --step-limit=N     Stop after N steps (default 200000000)\n");
             }
             CommandKind::Demangle => {
                 fmt::printf("Decodes a mangled symbol back to its source-level form.\n");
@@ -798,7 +866,7 @@ implement enum FlagKind {
                 fmt::printf("source.  This is the highest-priority entry in the stdlib lookup\n");
                 fmt::printf("order, ahead of $CRYO_STDLIB, $CRYO_HOME/stdlib, the\n");
                 fmt::printf("binary-relative path and any cryoconfig setting.\n\n");
-                fmt::printf("Accepted by: build, run, test, check\n");
+                fmt::printf("Accepted by: build, run, test, check, interpret\n");
             }
             FlagKind::BuildDir => {
                 fmt::printf("--build-dir=PATH - Override cryoconfig's output_dir\n\n");
@@ -811,7 +879,7 @@ implement enum FlagKind {
                 fmt::printf("Cross-compiles for the given LLVM target triple (for example\n");
                 fmt::printf("x86_64-pc-windows-gnu), overriding cryoconfig's `target` setting.\n");
                 fmt::printf("Produces object files only - link them manually.\n\n");
-                fmt::printf("Accepted by: build, run, test, check\n");
+                fmt::printf("Accepted by: build, run, test, check, interpret\n");
             }
             FlagKind::Output => {
                 fmt::printf("-o, --output PATH - Redirect single-file build output\n\n");
@@ -874,6 +942,9 @@ type struct Executor {
 
         const check: CommandKind = CommandKind::Check;
         runner.add_command(cli::Command::new(check.name(), check.description(), check.usage()));
+
+        const interpret: CommandKind = CommandKind::Interpret;
+        runner.add_command(cli::Command::new(interpret.name(), interpret.description(), interpret.usage()));
 
         const demangle: CommandKind = CommandKind::Demangle;
         runner.add_command(cli::Command::new(demangle.name(), demangle.description(), demangle.usage()));
@@ -1040,6 +1111,7 @@ type struct Executor {
             "run"      => { CommandKind::Run }
             "test"     => { CommandKind::Test }
             "check"    => { CommandKind::Check }
+            "interpret" => { CommandKind::Interpret }
             "demangle" => { CommandKind::Demangle }
             "api-index" => { CommandKind::ApiIndex }
             "fetch"    => { CommandKind::Fetch }
@@ -1084,6 +1156,7 @@ type struct Executor {
             CommandKind::Run     => { return Executor::cmd_run(args); }
             CommandKind::Test    => { return Executor::cmd_test(args); }
             CommandKind::Check   => { return Executor::cmd_check(args); }
+            CommandKind::Interpret => { return Executor::cmd_interpret(args); }
             CommandKind::Demangle => { return Executor::cmd_demangle(args); }
             CommandKind::ApiIndex => {
                 if (args.positional_count() != 3) {
@@ -1219,7 +1292,7 @@ type struct Executor {
         fmt::printf("                      own files, then build again\n");
         fmt::printf("  -o, --output PATH   Redirect output (single-file builds; kind inferred\n");
         fmt::printf("                      from the extension: .o .s .ll or an executable)\n\n");
-        fmt::printf("Test-only flags: --ignored, --list, --exact, -q/--quiet.\n");
+        fmt::printf("Test-only flags: --suite=NAME, --ignored, --list, --exact, -q/--quiet.\n");
         fmt::printf("Run `cryo help <flag>` for detail on any one flag.\n");
     }
 
@@ -1698,7 +1771,8 @@ type struct Executor {
     /// plus the test-runner flags forwarded to the produced binary:
     /// optional positional pattern, `--ignored`, `--list`, `--exact`,
     /// `-q` / `--quiet`, and every option the compiler declares no flag
-    /// for, which the runner judges.
+    /// for, which the runner judges.  The compile-fail and project suites
+    /// follow the unit suite; `--suite=NAME` runs one of the three alone.
     static cmd_test(args: cli::ParsedArgs) -> int {
         Log::debug(LogArea::Driver, "building the test binary");
 
@@ -1708,6 +1782,23 @@ type struct Executor {
             fmt::eprintf("Usage: cryo test [pattern] [flags]   (run from a Cryo project)\n");
             return 1;
         }
+
+        // `--suite=` runs one of the three suites alone, so a caller can run
+        // them side by side; with none, all three run in order.  `--list`
+        // enumerates the unit suite only, so beside another suite it would
+        // run nothing at all, and is refused.
+        const suite: string = if (args.has_arg("suite")) { args.get_value("suite") } else { "" };
+        if (!(suite == "" || suite == "unit" || suite == "compile-fail" || suite == "projects")) {
+            fmt::eprintf("Error: --suite=%s names no suite; the suites are unit, compile-fail and projects.\n", suite);
+            return 1;
+        }
+        const runs_unit: boolean = suite == "" || suite == "unit";
+        if (!runs_unit && args.has_flag("list")) {
+            fmt::eprintf("Error: --list enumerates the unit suite, which --suite=%s does not run.\n", suite);
+            return 1;
+        }
+        const runs_negative: boolean = !args.has_flag("list") && (suite == "" || suite == "compile-fail");
+        const runs_projects: boolean = !args.has_flag("list") && (suite == "" || suite == "projects");
 
         mut config: instance::CompilerConfig = instance::CompilerConfig::default();
         if (args.has_arg("build-dir")) {
@@ -1721,25 +1812,41 @@ type struct Executor {
         }
         if (!Executor::apply_profile_flags(&config, &args)) { return 1; }
         config.test_mode = true;
+        const no_std_requested: boolean = config.no_std;
 
         mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
-        const result: instance::CompilationResult = compiler.compile_project(config_path);
-
-        if (!result.success) {
-            fmt::eprintf("Test build failed (%u errors, %u warnings)\n",
-                result.error_count, result.warning_count);
-            return 1;
-        }
-        if (result.output_path.as_path().is_empty()) {
-            fmt::eprintf("Error: target produced no test executable; `cryo test` requires an executable project.\n");
-            return 1;
+        // The compile-fail and project suites run this compiler against the
+        // stdlib the unit build reads; without the unit build, it is found
+        // the same way, and nothing is compiled.
+        mut stdlib_abs: string = "";
+        mut test_binary: String = String::new();
+        if (runs_unit) {
+            const result: instance::CompilationResult = compiler.compile_project(config_path);
+            if (!result.success) {
+                fmt::eprintf("Test build failed (%u errors, %u warnings)\n",
+                    result.error_count, result.warning_count);
+                return 1;
+            }
+            if (result.output_path.as_path().is_empty()) {
+                fmt::eprintf("Error: target produced no test executable; `cryo test` requires an executable project.\n");
+                return 1;
+            }
+            stdlib_abs = result.stdlib_root;
+            test_binary = String::from_str(result.output_path.as_str());
+        } else {
+            const project: project_config::ProjectConfig = project_config::ProjectConfig::parse(config_path);
+            if (project.error_count > 0) { return 1; }
+            if (!(no_std_requested || project.no_std)) {
+                stdlib_abs = compiler.locate_stdlib(&project);
+                if (stdlib_abs.length() == 0) { return 1; }
+            }
         }
 
         // Build the command for the produced test binary, forwarding the
         // pattern (first positional) and the runner-side flags.  The leading
         // binary path is host-normalized (`/`->`\` on Windows) so `cmd` can
         // execute it; the appended flags carry no path separators.
-        mut cmd: String = exec_path(result.output_path.as_str());
+        mut cmd: String = exec_path(test_binary.as_str());
         if (args.positional_count() > 0) {
             cmd.push(fmt::format(" %s", args.input_file()).as_str());
         }
@@ -1791,34 +1898,36 @@ type struct Executor {
         // compile-fail cases under tests/negative/ - `cmd_test` runs this
         // very compiler on each of those files.
         const self_exe: String = env::current_executable().unwrap_or(String::new());
-        const stdlib_abs: string = result.stdlib_root;
 
-        Log::debug(LogArea::Driver, f"running {cmd.as_str()}");
-        // Flush parent stdio before spawning so the build's own output lands
-        // before the child's.  Same precaution as `cmd_run`.
-        libc::fflush(null);
-        const status: i32 = Command::shell(cmd.as_str());
-        if (status < 0) {
-            fmt::eprintln(f"Error: failed to spawn '{result.output_path.as_str()}'");
-            return 1;
+        mut exit_code: int = 0;
+        mut unit_ok: boolean = true;
+        if (runs_unit) {
+            Log::debug(LogArea::Driver, f"running {cmd.as_str()}");
+            // Flush parent stdio before spawning so the build's own output lands
+            // before the child's.  Same precaution as `cmd_run`.
+            libc::fflush(null);
+            const status: i32 = Command::shell(cmd.as_str());
+            if (status < 0) {
+                fmt::eprintln(f"Error: failed to spawn '{test_binary.as_str()}'");
+                return 1;
+            }
+            exit_code = status as int;
+            unit_ok = exit_code == 0;
         }
-        mut exit_code: int = status as int;
-        const unit_ok: boolean = exit_code == 0;
 
         // Compile-fail suite: run each tests/negative/*.cryo file through
         // `cryo check` and assert it fails with its declared error code.
-        // Skipped under --list (which only enumerates the runtime tests).
+        const proj_root: string = Executor::dir_of(config_path);
+        mut pattern: string = "";
+        if (args.positional_count() > 0) { pattern = args.input_file(); }
+        mut jobs_value: string = "";
+        if (args.has_arg("jobs")) { jobs_value = args.get_value("jobs"); }
+        const jobs: u32 = Executor::suite_jobs(jobs_value);
         mut neg_ran: i32 = 0;
         mut neg_failures: i32 = 0;
         mut proj_ran: i32 = 0;
         mut proj_failures: i32 = 0;
-        if (!args.has_flag("list")) {
-            const proj_root: string = Executor::dir_of(config_path);
-            mut pattern: string = "";
-            if (args.positional_count() > 0) { pattern = args.input_file(); }
-            mut jobs_value: string = "";
-            if (args.has_arg("jobs")) { jobs_value = args.get_value("jobs"); }
-            const jobs: u32 = Executor::suite_jobs(jobs_value);
+        if (runs_negative) {
             const neg_dir: path::PathBuf = path::Path::from(proj_root).join("tests/negative");
             const neg_res: NegSuiteResult =
                 Executor::run_negative_suite(self_exe.as_str(), stdlib_abs, neg_dir.as_path(),
@@ -1828,13 +1937,15 @@ type struct Executor {
             if (neg_failures > 0 && exit_code == 0) {
                 exit_code = 1;
             }
+        }
 
-            // Multi-module test projects: each is a real Cryo package under
-            // tests/projects/ carrying a test.json. Driven via this compiler
-            // as a subprocess (collect / build / run). Absent dir is a
-            // clean no-op.
-            // `-Werror=` reaches every project's build; `-Werror` does not,
-            // since a project may assert the warnings it reports.
+        // Multi-module test projects: each is a real Cryo package under
+        // tests/projects/ carrying a test.json. Driven via this compiler
+        // as a subprocess (collect / build / run). Absent dir is a
+        // clean no-op.
+        // `-Werror=` reaches every project's build; `-Werror` does not,
+        // since a project may assert the warnings it reports.
+        if (runs_projects) {
             const promoted_names: string = args.get_value("Werror");
             const promoted: String = if (args.has_arg("Werror")) {
                 f" -Werror={promoted_names}"
@@ -1850,10 +1961,12 @@ type struct Executor {
             }
         }
 
-        // Unified OVERALL footer: a single verdict line that quotes both
-        // suites at once, sitting beneath the per-suite summary blocks the
-        // unit runner and `run_negative_suite` already printed. Skipped
-        // under --list (no real run happened).
+        // Unified OVERALL footer: a single verdict line that quotes every
+        // suite the run selected, sitting beneath the per-suite summary
+        // blocks the suites already printed.  A suite is quoted when it
+        // ran anything, and always when `--suite` named it, so a run of one
+        // suite that found nothing says so.  Skipped under --list (no real
+        // run happened).
         if (!args.has_flag("list")) {
             const overall_pass: boolean =
                 unit_ok && (neg_failures == 0) && (proj_failures == 0);
@@ -1866,17 +1979,21 @@ type struct Executor {
             } else {
                 fmt::printf("  OVERALL  %s", if (overall_pass) { "PASS" } else { "FAIL" });
             }
-            const unit_label: string = if (unit_ok) { "ok" } else { "failed" };
-            fmt::printf("  (unit: %s", unit_label);
-            if (neg_ran > 0) {
-                fmt::printf("; compile-fail: %d passed", neg_ran - neg_failures);
-                if (neg_failures > 0) { fmt::printf(", %d failed", neg_failures); }
+            mut quoted: String = String::new();
+            if (runs_unit) {
+                const unit_label: string = if (unit_ok) { "ok" } else { "failed" };
+                quoted.push(fmt::format("; unit: %s", unit_label).as_str());
             }
-            if (proj_ran > 0) {
-                fmt::printf("; projects: %d passed", proj_ran - proj_failures);
-                if (proj_failures > 0) { fmt::printf(", %d failed", proj_failures); }
+            if (neg_ran > 0 || suite == "compile-fail") {
+                quoted.push(fmt::format("; compile-fail: %d passed", neg_ran - neg_failures).as_str());
+                if (neg_failures > 0) { quoted.push(fmt::format(", %d failed", neg_failures).as_str()); }
             }
-            fmt::printf(")\n");
+            if (proj_ran > 0 || suite == "projects") {
+                quoted.push(fmt::format("; projects: %d passed", proj_ran - proj_failures).as_str());
+                if (proj_failures > 0) { quoted.push(fmt::format(", %d failed", proj_failures).as_str()); }
+            }
+            const listed: Str = quoted.as_str().strip_prefix(&Str::new("; ")).unwrap_or(quoted.as_str());
+            fmt::printf("  (%.*s)\n", listed.length() as i32, listed.as_pointer());
             fmt::printf("%s\n", TEST_RULE_HEAVY);
         }
         return exit_code;
@@ -1925,19 +2042,23 @@ type struct Executor {
         return String::from_str(arguments.unwrap().first.trim());
     }
 
-    /// The source LINE of a `--> file:line:col` arrow line: the number between
-    /// its last two colons.  Read from the tail, so a drive-letter colon
-    /// (`C:\...`) sits earlier and never becomes one of the final two.  -1 if
+    /// The FILE and source LINE of a `--> file:line:col` arrow line: the line
+    /// is the number between its last two colons, the file what precedes them
+    /// after the arrow.  Read from the tail, so a drive-letter colon (`C:\...`)
+    /// sits earlier and never becomes one of the final two.  The line is -1 if
     /// unparseable.
-    static neg_arrow_line(arrow: str::Str) -> i64 {
+    static neg_arrow_site(arrow: str::Str) -> Pair<str::Str, i64> {
         const colon: str::Str = str::Str::new(":");
         const column: Option<Pair<str::Str, str::Str>> = arrow.split_once_from_end(&colon);
-        if (column.is_none()) { return -1; }
+        if (column.is_none()) { return Pair::new(str::Str::new(""), -1); }
         const line: Option<Pair<str::Str, str::Str>> = column.unwrap().first.split_once_from_end(&colon);
-        if (line.is_none()) { return -1; }
-        return match (u64::parse_radix(line.unwrap().second.as_bytes(), 10)) {
-            Option::Some(number) => { number as i64 }
-            Option::None         => { -1 }
+        if (line.is_none()) { return Pair::new(str::Str::new(""), -1); }
+        const place: Pair<str::Str, str::Str> = line.unwrap();
+        const after_arrow: str::Str = place.first.trim_start();
+        const file: str::Str = after_arrow.strip_prefix(&str::Str::new("-->")).unwrap_or(after_arrow).trim();
+        return match (u64::parse_radix(place.second.as_bytes(), 10)) {
+            Option::Some(number) => { Pair::new(file, number as i64) }
+            Option::None         => { Pair::new(file, -1) }
         };
     }
 
@@ -2005,10 +2126,11 @@ type struct Executor {
         return f"error[{expected}]";
     }
 
-    /// Enumerate the diagnostics `cryo check` rendered into `out` that are
-    /// anchored in the test file `fname` (its basename must appear in the `-->`
-    /// arrow line).  Scoping to the file keeps `//~` exhaustiveness from tripping
-    /// on stdlib-internal diagnostics.
+    /// Enumerate the diagnostics rendered into `out` that are anchored in the
+    /// file `file_name` (its basename must appear in the `-->` arrow line), or
+    /// in any file when `file_name` is empty.  Scoping to the file keeps `//~`
+    /// exhaustiveness from tripping on stdlib-internal diagnostics.  A
+    /// diagnostic with no arrow has no place, and is not enumerated.
     static parse_diagnostics(out: Str, file_name: Str) -> [NegDiag] {
         mut diags: [NegDiag] = [];
         const newline: str::Str = str::Str::new("\n");
@@ -2029,11 +2151,12 @@ type struct Executor {
             if (stacked.is_some()) {
                 if (line.trim_start().starts_with(&arrow)) {
                     const head: i64 = stacked.unwrap();
-                    const site_line: i64 = Executor::neg_arrow_line(line);
-                    if (line.contains(&file_name) && site_line >= 0) {
-                        const site: NegDiag = NegDiag { line: site_line, severity: diags[head].severity,
+                    const place: Pair<str::Str, i64> = Executor::neg_arrow_site(line);
+                    if ((file_name.is_empty() || line.contains(&file_name)) && place.second >= 0) {
+                        const site: NegDiag = NegDiag { line: place.second, severity: diags[head].severity,
                                                         code: diags[head].code.clone(),
-                                                        message: diags[head].message.clone() };
+                                                        message: diags[head].message.clone(),
+                                                        file: String::from_str(place.first) };
                         diags.push(site);
                     }
                     continue;
@@ -2054,15 +2177,18 @@ type struct Executor {
                 message = message.strip_prefix(&colon).unwrap_or(message);
                 pending = Option::Some(NegDiag { line: -1, severity: severity,
                                                  code: String::from_str(code),
-                                                 message: String::from_str(message.trim_start()) });
+                                                 message: String::from_str(message.trim_start()),
+                                                 file: String::new() });
                 continue;
             }
             // The diagnostic's first arrow places it, and binds it to the test
             // file only when that arrow's own line names the file.
             if (pending.is_none() || !line.trim_start().starts_with(&arrow)) { continue; }
             mut diagnostic: NegDiag = pending.take().unwrap();
-            if (!line.contains(&file_name)) { continue; }
-            diagnostic.line = Executor::neg_arrow_line(line);
+            if (!file_name.is_empty() && !line.contains(&file_name)) { continue; }
+            const place: Pair<str::Str, i64> = Executor::neg_arrow_site(line);
+            diagnostic.line = place.second;
+            diagnostic.file = String::from_str(place.first);
             if (diagnostic.line >= 0) {
                 stacked = Option::Some(diags.length());
                 diags.push(diagnostic);
@@ -2249,7 +2375,7 @@ type struct Executor {
             Result::Err(_) => { }
         }
         if (names.length() == 0) {
-            return NegSuiteResult { ran: 0, failures: 0 };
+            return NegSuiteResult { ran: 0, failures: 0, warnings: 0 };
         }
 
         const is_pretty:  boolean = fmt_choice == "pretty";
@@ -2361,7 +2487,7 @@ type struct Executor {
                 }
                 ran += 1;
             }
-            return NegSuiteResult { ran: ran, failures: failures };
+            return NegSuiteResult { ran: ran, failures: failures, warnings: 0 };
         });
         const failures: i32 = tally.failures;
         const ran: i32 = tally.ran;
@@ -2390,7 +2516,7 @@ type struct Executor {
             }
             fmt::printf("%s\n", TEST_RULE_HEAVY);
         }
-        return NegSuiteResult { ran: ran, failures: failures };
+        return NegSuiteResult { ran: ran, failures: failures, warnings: 0 };
     }
 
     /// The first `requires` token NOT satisfied in this environment, or "" when
@@ -2493,6 +2619,7 @@ type struct Executor {
         const build_str: str::Str = str::Str::new("build");
         const cf_str:    str::Str = str::Str::new("compile_fail");
         const run_str:   str::Str = str::Str::new("run");
+        const interpret_str: str::Str = str::Str::new("interpret");
         const command_str: str::Str = str::Str::new("command");
         match (root.get(str::Str::new("outcome"))) {
             Option::Some(vp) => {
@@ -2501,7 +2628,8 @@ type struct Executor {
                         if (os.equals(&build_str))    { spec.outcome = 1; }
                         else if (os.equals(&cf_str))  { spec.outcome = 1; spec.fails = true; }
                         else if (os.equals(&run_str)) { spec.outcome = 2; }
-                        else if (os.equals(&command_str)) { spec.outcome = 3; }
+                        else if (os.equals(&interpret_str)) { spec.outcome = 3; }
+                        else if (os.equals(&command_str)) { spec.outcome = 4; }
                     }
                     Option::None => { }
                 }
@@ -2626,6 +2754,43 @@ type struct Executor {
             }
             Option::None => { }
         }
+        // A `rebuild` that replaces no file and changes no argument would
+        // build the same project twice and prove nothing about the second
+        // build, and a replacement missing either side names nothing to
+        // copy: both make the test.json malformed.
+        mut rebuild_malformed: boolean = false;
+        match (root.get(str::Str::new("rebuild"))) {
+            Option::Some(rp) => {
+                spec.rebuild = true;
+                if (!rp.is_object()) { rebuild_malformed = true; }
+                match (rp.get(str::Str::new("replace"))) {
+                    Option::Some(list) => {
+                        if (!list.is_array()) { rebuild_malformed = true; }
+                        for (mut i: i64 = 0; i < list.length(); i++) {
+                            const entry: value::JsonValue* = list.at(i).unwrap();
+                            const target: Option<str::Str> = match (entry.get(str::Str::new("file"))) {
+                                Option::Some(fp) => { fp.as::<str::Str>() }
+                                Option::None     => { Option::None }
+                            };
+                            const source: Option<str::Str> = match (entry.get(str::Str::new("with"))) {
+                                Option::Some(wp) => { wp.as::<str::Str>() }
+                                Option::None     => { Option::None }
+                            };
+                            if (target.is_none() || source.is_none()) { rebuild_malformed = true; continue; }
+                            spec.rebuild_files.push(String::from_str(target.unwrap()));
+                            spec.rebuild_sources.push(String::from_str(source.unwrap()));
+                        }
+                    }
+                    Option::None => { }
+                }
+                if (rp.get(str::Str::new("arguments")).is_some()) {
+                    spec.rebuild_sets_arguments = true;
+                    Executor::read_strings(rp, "arguments", &spec.rebuild_arguments);
+                }
+                if (spec.rebuild_files.length() == 0 && !spec.rebuild_sets_arguments) { rebuild_malformed = true; }
+            }
+            Option::None => { }
+        }
         match (root.get(str::Str::new("expect"))) {
             Option::Some(ep) => {
                 match (ep.get(str::Str::new("exit_code"))) {
@@ -2692,10 +2857,10 @@ type struct Executor {
             Option::None => { }
         }
         mem::drop(root);
-        if (malformed_step) { return Option::None; }
+        if (malformed_step || rebuild_malformed) { return Option::None; }
         // A `command` project with nothing to run, or a `command` given to
         // another outcome, would judge a command the file does not describe.
-        if ((spec.outcome == 3) != (spec.command.length() > 0)) { return Option::None; }
+        if ((spec.outcome == 4) != (spec.command.length() > 0)) { return Option::None; }
         return Option::Some(spec);
     }
 
@@ -2743,7 +2908,8 @@ type struct Executor {
         //   verdict_of[i]: 0 run job_of[i], 1 malformed test.json, 2 ignored,
         //                  3 unknown requirement, 4 unmet requirement,
         //                  5 project directory missing, 6 an earlier run's
-        //                  `expect.file` that could not be removed
+        //                  `expect.file` that could not be removed, 7 a
+        //                  `rebuild` whose first build or replacement failed
         const tmp: path::PathBuf = neg_tmp_path();
         const filter: str::Str = str::Str::new(pattern);
         mut names:      [String]   = [];
@@ -2753,14 +2919,15 @@ type struct Executor {
         //   applied_job_of[i]: the job running the copy of project i with its
         //                      fixes applied, or -1 when it has no `applied`
         mut applied_job_of: [i64]  = [];
+        //   copy_of[i]: the copy project i runs in - the one holding its git
+        //               fixtures, or the one a `rebuild` project was built
+        //               twice in - or empty when it runs in place
+        mut copy_of:    [String]   = [];
         mut specs:      [ProjSpec] = [];
         mut cmds:       [[SuiteAction]] = [];
-        //   run_dirs[i]: where project i's commands run - its own directory,
-        //                or the copy that holds its git fixtures
-        mut run_dirs:   [String]   = [];
         const entries: DirectoryEntries = match (Directory::entries(projects_dir)) {
             Result::Ok(listing) => { listing }
-            Result::Err(_)      => { return NegSuiteResult { ran: 0, failures: 0 }; }
+            Result::Err(_)      => { return NegSuiteResult { ran: 0, failures: 0, warnings: 0 }; }
         };
         for (entry in entries) {
             const name: str::Str = entry.name();
@@ -2807,16 +2974,33 @@ type struct Executor {
                 }
             }
             // A project with git fixtures runs in a copy of itself, which
-            // names its fixtures' repositories; every other runs in place.
-            mut run_dir: String = String::from_str(proj_dir.as_path().as_str());
+            // names its fixtures' repositories.  A `rebuild` project's job is
+            // its second build, in the copy its first build ran in.  Either
+            // way its project directory is that copy from here on; a copy
+            // that cannot be prepared, or a first build that failed, fails
+            // the project (7).  Every other project runs in place.
+            mut copy_text: String = String::new();
             if (verdict == 0 && spec.fixtures.length() > 0) {
-                const copy_text: String = f"{tmp.as_path().as_str()}.fixtures.{names.length()}";
+                copy_text = f"{tmp.as_path().as_str()}.fixtures.{names.length()}";
                 match (Executor::prepare_fixture_copy(proj_dir.as_path(), copy_text.as_str(), &spec)) {
-                    Result::Ok(_)    => { run_dir = copy_text; }
+                    Result::Ok(_)    => { }
                     Result::Err(why) => { verdict = 7; reason = why; }
                 }
+            } else if (verdict == 0 && spec.rebuild) {
+                copy_text = f"{tmp.as_path().as_str()}.rebuild.{cmds.length()}";
+                const failure: String = Executor::build_first(self_exe, stdlib_abs, proj_dir.as_path(),
+                    path::Path::from(copy_text.as_str()), &spec, build_flags);
+                if (failure.length() > 0) {
+                    verdict = 7; reason = failure;
+                } else if (spec.rebuild_sets_arguments) {
+                    spec.arguments = [];
+                    for (mut k: i64 = 0; k < spec.rebuild_arguments.length(); k++) {
+                        spec.arguments.push(spec.rebuild_arguments[k].clone());
+                    }
+                }
             }
-            run_dirs.push(run_dir.clone());
+            copy_of.push(copy_text.clone());
+            const run_dir: path::PathBuf = if (copy_text.length() > 0) { path::PathBuf::from(copy_text.as_str()) } else { path::PathBuf::from(proj_dir.as_path().as_str()) };
             names.push(String::from_str(name));
             verdict_of.push(verdict);
             reason_of.push(reason);
@@ -2830,7 +3014,7 @@ type struct Executor {
                     Executor::remove_capture(path::Path::from(out_path.as_str()));
                     Executor::remove_capture(path::Path::from(Executor::steps_path(out_path.as_str()).as_str()));
                 }
-                cmds.push(Executor::project_command(self_exe, stdlib_abs, path::Path::from(run_dir.as_str()), &spec,
+                cmds.push(Executor::project_command(self_exe, stdlib_abs, run_dir.as_path(), &spec,
                     out_path.as_str(), build_flags));
                 // The fixes are made in a copy, never in the tree's own
                 // sources; the copy's build output is left behind so its
@@ -2864,7 +3048,7 @@ type struct Executor {
         }
 
         if (names.length() == 0) {
-            return NegSuiteResult { ran: 0, failures: 0 };
+            return NegSuiteResult { ran: 0, failures: 0, warnings: 0 };
         }
         const is_pretty:  boolean = fmt_choice == "pretty";
         const is_compact: boolean = fmt_choice == "compact";
@@ -2897,6 +3081,7 @@ type struct Executor {
         const tally: NegSuiteResult = thread::scope((scope: mut &thread::Scope) -> NegSuiteResult {
             mut failures: i32 = 0;
             mut ran: i32 = 0;
+            mut warnings: i32 = 0;
             mut w: u32 = 0;
             while (w < jobs && (w as u64) < n_jobs) {
                 scope.spawn(move () -> void { batch.run(); });
@@ -2946,15 +3131,19 @@ type struct Executor {
                     Executor::proj_report(is_pretty, is_compact, color_on, false, stale.as_str());
                     failures += 1; ran += 1; continue;
                 }
+                // A copy left behind is removed before the next run copies
+                // the project there, or fails that project.
+                const copy_text: str::Str = copy_of[i].as_str();
                 if (verdict == 7) {
                     Executor::proj_report(is_pretty, is_compact, color_on, false, reason);
+                    match (Directory::remove_all(path::Path::from(copy_text))) { Result::Ok(_) => { } Result::Err(_) => { } }
                     failures += 1; ran += 1; continue;
                 }
 
                 const k: u64 = job_of[i] as u64;
                 Executor::wait_job(done.as_pointer(), k);
                 const out_path: String = Executor::job_tmp_path(tmp.as_path(), k);
-                const proj_dir: path::PathBuf = path::PathBuf::from(run_dirs[i].as_str());
+                const proj_dir: path::PathBuf = if (copy_text.length() > 0) { path::PathBuf::from(copy_text) } else { projects_dir.join(name) };
                 mut res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path.as_str(), proj_dir.as_path());
                 const steps_output: String = Executor::steps_path(out_path.as_str());
                 if (specs[i].steps.length() > 0 && !path::Path::from(out_path.as_str()).exists()) {
@@ -3010,17 +3199,13 @@ type struct Executor {
                         if (err.length() > 0) { fmt::printf("%.*s\n", err.length() as i32, err.as_str().as_pointer()); }
                     }
                 }
+                warnings += Executor::list_build_warnings(out_path.as_str(), !is_compact);
                 const out_error: String = Executor::stderr_path(out_path.as_str());
                 Executor::remove_capture(path::Path::from(out_path.as_str()));
                 Executor::remove_capture(path::Path::from(out_error.as_str()));
                 Executor::remove_capture(path::Path::from(steps_output.as_str()));
-                if (specs[i].fixtures.length() > 0) {
-                    match (Directory::remove_all(proj_dir.as_path())) {
-                        Result::Ok(_)  => { }
-                        // A copy left behind is removed before the next run
-                        // copies the project there, or fails that project.
-                        Result::Err(_) => { }
-                    }
+                if (copy_text.length() > 0) {
+                    match (Directory::remove_all(path::Path::from(copy_text))) { Result::Ok(_) => { } Result::Err(_) => { } }
                 }
                 if (applied_out.length() > 0) {
                     const applied_error: String = Executor::stderr_path(applied_out.as_str());
@@ -3029,7 +3214,7 @@ type struct Executor {
                 }
                 ran += 1;
             }
-            return NegSuiteResult { ran: ran, failures: failures };
+            return NegSuiteResult { ran: ran, failures: failures, warnings: warnings };
         });
         const failures: i32 = tally.failures;
         const ran: i32 = tally.ran;
@@ -3046,6 +3231,9 @@ type struct Executor {
             fmt::printf("%s\n", TEST_RULE_THIN);
             fmt::printf("    %-9s%6d\n", "passed", ran - failures);
             fmt::printf("    %-9s%6d\n", "failed", failures);
+            // Printed whatever the count, so a reader can tell a runner that
+            // lists build warnings and found none from one that lists none.
+            fmt::printf("    %-9s%6d\n", "warnings", tally.warnings);
             fmt::printf("%s\n", TEST_RULE_THIN);
             if (color_on && failures == 0) {
                 fmt::printf("    result   %s%s%s\n", NEG_ANSI_GREEN, verdict, NEG_ANSI_RESET);
@@ -3056,7 +3244,37 @@ type struct Executor {
             }
             fmt::printf("%s\n", TEST_RULE_HEAVY);
         }
-        return NegSuiteResult { ran: ran, failures: failures };
+        return NegSuiteResult { ran: ran, failures: failures, warnings: tally.warnings };
+    }
+
+    /// The warnings a project's build reported in its captured output at
+    /// `capture` and the stderr captured beside it, each listed under the
+    /// project's verdict line when `shown`, as `    warning <code>
+    /// <file>:<line>`: a passing project's output is not echoed, and its
+    /// warnings are seen there or nowhere.  A warning with no span has no
+    /// place and is not listed.  Returns how many there were.
+    static list_build_warnings(capture: Str, shown: boolean) -> i32 {
+        const output: String = Executor::read_file_or_empty(path::Path::from(capture));
+        const error_path: String = Executor::stderr_path(capture);
+        const errors: String = Executor::read_file_or_empty(path::Path::from(error_path.as_str()));
+        const from_output: [NegDiag] = Executor::parse_diagnostics(output.as_str(), str::Str::new(""));
+        const from_errors: [NegDiag] = Executor::parse_diagnostics(errors.as_str(), str::Str::new(""));
+        return Executor::list_warnings_of(&from_output, shown) + Executor::list_warnings_of(&from_errors, shown);
+    }
+
+    /// The warnings among `diagnostics`, listed when `shown`; their count.
+    static list_warnings_of(diagnostics: &[NegDiag], shown: boolean) -> i32 {
+        mut count: i32 = 0;
+        for (mut d: i64 = 0; d < diagnostics.length(); d++) {
+            const found: const NegDiag* = &diagnostics[d];
+            if (found.severity != "warning") { continue; }
+            count += 1;
+            if (shown) {
+                const listed: String = f"    warning {found.code} {found.file}:{found.line}";
+                fmt::printf("%.*s\n", listed.length() as i32, listed.as_str().as_pointer());
+            }
+        }
+        return count;
     }
 
     /// Print one project's PASS/FAIL line in the active format. `detail` is
@@ -3083,6 +3301,15 @@ type struct Executor {
         }
     }
 
+    /// The `cryo` command a project's fixture runs; a `command` project's
+    /// comes from its own `command` list instead.
+    static fixture_verb(outcome: i32) -> string {
+        if (outcome == 1) { return "build"; }
+        if (outcome == 2) { return "run"; }
+        if (outcome == 3) { return "interpret"; }
+        return "test --format=plain";
+    }
+
     /// The actions that drive one project to its declared outcome: its steps,
     /// then this compiler run in the project directory, its output captured
     /// in `tmp`.  The directory is set inside each command's own shell, never
@@ -3091,9 +3318,10 @@ type struct Executor {
     /// `stdlib_abs`, `tmp`) are absolute so the changed cwd doesn't break them.
     static project_command(self_exe: Str, stdlib_abs: Str, proj_dir: path::Path,
                            spec: &ProjSpec, tmp: Str, build_flags: str::Str) -> [SuiteAction] {
-        // FIXTURE build (`cryo build`), run (`cryo run`) or collect (the
-        // project's own `cryo test`).  Stdout and stderr are captured apart so
-        // the ASSERTIONS in `project_outcome` can tell the streams apart.
+        // FIXTURE build (`cryo build`), run (`cryo run`), interpret (`cryo
+        // interpret`), the `command` given, or collect (the project's own
+        // `cryo test`).  Stdout and stderr are captured apart so the
+        // ASSERTIONS in `project_outcome` can tell the streams apart.
         mut environment: String = String::new();
         for (mut i: i64 = 0; i < spec.environment.length(); i++) {
             environment.push(shell_set_environment(spec.environment[i].as_str()));
@@ -3124,15 +3352,14 @@ type struct Executor {
         // A `command` project's command is a step's, judged as the fixture:
         // its own arguments and the suite's `--stdlib`, none of the build's
         // flags.
-        if (spec.outcome == 3) {
+        if (spec.outcome == 4) {
             command.push(self_exe);
             for (mut a: i64 = 0; a < spec.command.length(); a++) {
                 command.push(f" \"{spec.command[a]}\"");
             }
             if (stdlib_abs.length() > 0) { command.push(f" --stdlib={stdlib_abs}"); }
         } else {
-            const verb: string = if (spec.outcome == 1) { "build" }
-                else { if (spec.outcome == 2) { "run" } else { "test --format=plain" } };
+            const verb: string = Executor::fixture_verb(spec.outcome);
             command.push(f"{self_exe} {verb}");
             if (stdlib_abs.length() > 0) { command.push(f" --stdlib={stdlib_abs}"); }
             command.push(build_flags);
@@ -3144,6 +3371,43 @@ type struct Executor {
         command.push(Executor::stderr_path(tmp));
         actions.push(SuiteAction::Shell(shell_in_dir(proj_dir.as_str(), command.as_str())));
         return actions;
+    }
+
+    /// A `rebuild` project's first build, in a fresh copy of it at
+    /// `copy_dir` without its `build/`, then its replacements made in the
+    /// copy, which its second build then reads.  Empty when the copy is ready
+    /// for the second build, else why it is not.  The first build runs here,
+    /// before the worker pool starts, since the second must follow it.
+    static build_first(self_exe: Str, stdlib_abs: Str, proj_dir: path::Path, copy_dir: path::Path,
+                       spec: &ProjSpec, build_flags: str::Str) -> String {
+        const fresh: boolean = !copy_dir.exists() || Directory::remove_all(copy_dir).is_ok();
+        if (!fresh || Directory::copy_all(proj_dir, copy_dir).is_err()) {
+            return String::from_str(str::Str::new("the project could not be copied to build it twice"));
+        }
+        const copied_build: path::PathBuf = copy_dir.join(str::Str::new("build"));
+        if (copied_build.as_path().exists() && Directory::remove_all(copied_build.as_path()).is_err()) {
+            return String::from_str(str::Str::new("the copy's build directory could not be cleared"));
+        }
+        const first: ProjSpec = spec.first_build();
+        const capture: String = f"{copy_dir.as_str()}.first";
+        const status: i32 = SuiteAction::perform_all(&Executor::project_command(self_exe, stdlib_abs, copy_dir, &first,
+            capture.as_str(), build_flags));
+        const outcome: ProjOutcome = Executor::project_outcome(&first, status, capture.as_str(), copy_dir);
+        const capture_error: String = Executor::stderr_path(capture.as_str());
+        Executor::remove_capture(path::Path::from(capture.as_str()));
+        Executor::remove_capture(path::Path::from(capture_error.as_str()));
+        if (!outcome.passed) { return f"the first build: {outcome.detail}"; }
+        for (mut k: i64 = 0; k < spec.rebuild_files.length(); k++) {
+            const source: path::PathBuf = proj_dir.join(spec.rebuild_sources[k].as_str());
+            const target: path::PathBuf = copy_dir.join(spec.rebuild_files[k].as_str());
+            if (File::copy(source.as_path(), target.as_path()).is_err()) {
+                return f"cannot replace {spec.rebuild_files[k]} with {spec.rebuild_sources[k]}";
+            }
+        }
+        if (!Executor::remove_project_file(copy_dir, spec)) {
+            return f"cannot remove the {spec.file} the first build wrote";
+        }
+        return String::new();
     }
 
     /// Remove the file a project's expectations read (`expect.file`), if any,
@@ -3390,10 +3654,8 @@ type struct Executor {
         // runner exit codes that converts failures into passes flips the
         // canary's exit to 0 and fails the canary project (and the suite)
         // instead of shipping silently.
-        const verb: string = if (spec.outcome == 1) { "build" } else {
-            if (spec.outcome == 2) { "run" } else {
-                if (spec.outcome == 3) { "the command" } else { "project tests" }
-            }
+        const verb: string = if (spec.outcome == 0) { "project tests" } else {
+            if (spec.outcome == 4) { "the command" } else { Executor::fixture_verb(spec.outcome) }
         };
         const ec: i64 = st as i64;
         if (spec.fails) {
@@ -3556,6 +3818,50 @@ type struct Executor {
         return 1;
     }
 
+    /// `cryo interpret <file>`: the `check` front end, then the program's
+    /// `main` run by the interpreter.  The program's output is written as
+    /// it would write it; the exit code is `main`'s, the front end's
+    /// refusal's (1), or the interpreter's for a stop (one line on stderr).
+    static cmd_interpret(args: cli::ParsedArgs) -> int {
+        const file: string = args.input_file();
+        if (file == "") {
+            fmt::eprintf("Error: No input file specified.\nUsage: cryo interpret <file> [flags]\n");
+            return 1;
+        }
+        mut config: instance::CompilerConfig = instance::CompilerConfig::default();
+        if (args.has_arg("stdlib")) {
+            config.stdlib_path_override = args.get_value("stdlib");
+        }
+        if (args.has_arg("target")) {
+            config.target_triple_override = args.get_value("target");
+        }
+        mut step_limit: u64 = Interpreter::DEFAULT_STEP_LIMIT;
+        if (args.has_arg("step-limit")) {
+            match (u64::try_from(str::Str::new(args.get_value("step-limit")))) {
+                Result::Ok(limit) => { step_limit = limit; }
+                Result::Err(_) => {
+                    fmt::eprintf("Error: --step-limit takes a count of steps\n");
+                    return 1;
+                }
+            }
+        }
+        mut compiler: instance::CompilerInstance = instance::CompilerInstance::new(config);
+        const build: instance::ProjectBuild = compiler.compile_for_interpret(file);
+        if (!build.result.success || build.ctx == null) {
+            return 1;
+        }
+        mut interpreter: Interpreter = Interpreter::new(build.ctx, step_limit);
+        const ending: Result<i32, Stop> = interpreter.run();
+        fmt::print(interpreter.output.clone());
+        return match (ending) {
+            Result::Ok(code) => { code as int }
+            Result::Err(stop) => {
+                stop.report();
+                stop.exit_code() as int
+            }
+        };
+    }
+
     /// `cryo demangle <symbol>`: decode a mangled symbol to its
     /// source-level form (per docs/cryo-mangling-spec.md).  With no
     /// argument, reads newline-separated symbols from stdin.
@@ -3691,6 +3997,9 @@ type struct Executor {
         }
         if (args.has_flag("emit-llvm")) {
             config.emit_llvm = true;
+        }
+        if (args.has_arg("build-dir")) {
+            config.output_dir_override = args.get_value("build-dir");
         }
         if (args.has_arg("stdlib")) {
             config.stdlib_path_override = args.get_value("stdlib");

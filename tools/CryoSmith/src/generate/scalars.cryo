@@ -1,0 +1,267 @@
+///! Scalars: integer and boolean expressions, literals, and the guarded
+///! operators.
+///!
+///! Every integer form is defined for every value under both overflow
+///! rules: the wrapping methods, the bitwise operators, and plain `+`, `-`,
+///! `*`, negation, shifts and division over operands masked by
+///! `ArithmeticGuard`.  A form a feature adds is weighted 0, and so takes no
+///! draw, where the feature is off.
+
+namespace cryosmith::generate::scalars;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature, FeatureSet, Plant };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::generate::structs::{ MethodCandidate };
+import cryosmith::guarantees::{ ArithmeticGuard };
+import cryosmith::model::{ BinaryOperator, ExpressionKind, UnaryOperator, ValueType, WrappingOperator };
+import cryosmith::typing::{ TypeChoice };
+
+implement struct Generator {
+    /// An integer expression of `wanted`.
+    internal integer_expression(mut &this, wanted: ValueType, depth: i64, reads_name: boolean) -> i64 {
+        const features: FeatureSet = this.options.features;
+        const deeper: boolean = depth > 0;
+        const next: i64 = depth - 1;
+        const variables: Array<i64> = this.environment.variables_of(&this.program, wanted);
+        const callees: Array<i64> = this.callees(wanted);
+        const roots: Array<i64> = this.environment.field_roots(&this.program, wanted);
+        const methods: Array<MethodCandidate> = this.method_calls(wanted, false);
+        const others: Array<i64> = this.environment.integers_except(&this.program, wanted);
+        const generic_callees: Array<i64> = this.generic_callees(wanted);
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(if (reads_name) { 0 } else { 10 });
+        weights.push(1);
+        weights.push(if (variables.length() > 0) { 14 } else { 0 });
+        weights.push(if (features.has(Feature::Casts) && (deeper || others.length() > 0)) { 6 } else { 0 });
+        weights.push(if (features.has(Feature::Wrapping) && deeper) { 10 } else { 0 });
+        weights.push(if (features.has(Feature::Guarded) && deeper) { 10 } else { 0 });
+        weights.push(if (features.has(Feature::Bitwise) && deeper) { 8 } else { 0 });
+        weights.push(if (features.has(Feature::Shifts) && deeper) { 5 } else { 0 });
+        weights.push(if (features.has(Feature::Division) && deeper) { 5 } else { 0 });
+        weights.push(if (features.has(Feature::Guarded) && wanted.is_signed() && deeper) { 3 } else { 0 });
+        weights.push(if (features.has(Feature::IfExpressions) && deeper) { 3 } else { 0 });
+        weights.push(if (callees.length() > 0 && deeper) { 6 } else { 0 });
+        weights.push(if (roots.length() > 0) { 10 } else { 0 });
+        weights.push(if (methods.length() > 0 && deeper) { 6 } else { 0 });
+        weights.push(if (generic_callees.length() > 0 && deeper) { 6 } else { 0 });
+        const elements: Array<i64> = this.element_sources(wanted);
+        weights.push(if (elements.length() > 0) { 10 } else { 0 });
+        const slices: Array<i64> = if (wanted.same(ValueType::I64)) { this.measurable() } else { Array::<i64>::new() };
+        weights.push(if (slices.length() > 0) { 3 } else { 0 });
+        const maps: Array<i64> = this.readable_maps(wanted);
+        weights.push(if (maps.length() > 0) { 8 } else { 0 });
+        const form: i64 = this.random.pick(&weights);
+        if (form == 0) { return this.literal(wanted); }
+        if (form == 1) { return this.node(ExpressionKind::Limit(this.random.chance(50)), wanted); }
+        if (form == 2) { return this.read(variables.get(this.random.below(variables.length())).unwrap()); }
+        if (form == 3) {
+            if (!deeper) {
+                return this.node(ExpressionKind::Cast(this.read(others.get(this.random.below(others.length())).unwrap())), wanted);
+            }
+            mut source: ValueType = TypeChoice::integer(&this.random);
+            while (source.same(wanted)) { source = TypeChoice::integer(&this.random); }
+            return this.node(ExpressionKind::Cast(this.expression(source, next, true)), wanted);
+        }
+        if (form == 4) {
+            const operator: WrappingOperator = match (this.random.below(3)) {
+                0 => { WrappingOperator::Add }
+                1 => { WrappingOperator::Subtract }
+                _ => { WrappingOperator::Multiply }
+            };
+            const receiver: i64 = this.expression(wanted, next, true);
+            const argument: i64 = if (this.constant_wanted(wanted)) { this.constant(wanted) } else { this.expression(wanted, next, false) };
+            return this.node(ExpressionKind::Wrapping(operator, receiver, argument), wanted);
+        }
+        if (form == 5) { return this.guarded(wanted, next); }
+        if (form == 6) {
+            if (this.random.chance(25)) {
+                return this.node(ExpressionKind::Unary(UnaryOperator::Complement, this.expression(wanted, next, true)), wanted);
+            }
+            const operator: BinaryOperator = this.bitwise_operator();
+            const left: i64 = this.expression(wanted, next, true);
+            const right: i64 = this.expression(wanted, next, false);
+            return this.node(ExpressionKind::Binary(operator, left, right), wanted);
+        }
+        if (form == 7) {
+            const operator: BinaryOperator = if (this.random.chance(50)) { BinaryOperator::ShiftLeft } else { BinaryOperator::ShiftRight };
+            const value: i64 = this.expression(wanted, next, true);
+            const amount: i64 = this.shift_amount(wanted, next);
+            return this.node(ExpressionKind::Binary(operator, value, amount), wanted);
+        }
+        if (form == 8) {
+            const operator: BinaryOperator = if (this.random.chance(50)) { BinaryOperator::Divide } else { BinaryOperator::Remainder };
+            const dividend: i64 = this.expression(wanted, next, true);
+            const divisor: i64 = this.divisor(wanted, next);
+            return this.node(ExpressionKind::Binary(operator, dividend, divisor), wanted);
+        }
+        if (form == 9) {
+            const operand: i64 = this.masked(this.expression(wanted, next, true), ArithmeticGuard::negation_mask(wanted), wanted);
+            return this.node(ExpressionKind::Unary(UnaryOperator::Negate, operand), wanted);
+        }
+        if (form == 10) {
+            const condition: i64 = this.condition(next);
+            const then_value: i64 = this.expression(wanted, next, true);
+            const else_value: i64 = this.expression(wanted, next, true);
+            return this.node(ExpressionKind::Conditional(condition, then_value, else_value), wanted);
+        }
+        if (form == 11) { return this.call(callees.get(this.random.below(callees.length())).unwrap(), next); }
+        if (form == 12) { return this.place(roots.get(this.random.below(roots.length())).unwrap(), wanted); }
+        if (form == 13) { return this.method_call(methods.get(this.random.below(methods.length())).unwrap(), next); }
+        if (form == 14) { return this.generic_call(generic_callees.get(this.random.below(generic_callees.length())).unwrap(), wanted, next); }
+        if (form == 15) { return this.element_read(&elements, if (deeper) { next } else { 0 }); }
+        if (form == 17) { return this.map_lookup(&maps, if (deeper) { next } else { 0 }); }
+        return this.slice_length(&slices);
+    }
+
+    /// A boolean expression.
+    internal boolean_expression(mut &this, depth: i64, reads_name: boolean) -> i64 {
+        const features: FeatureSet = this.options.features;
+        const deeper: boolean = depth > 0 && features.has(Feature::Booleans);
+        const next: i64 = if (depth > 0) { depth - 1 } else { 0 };
+        const variables: Array<i64> = this.environment.variables_of(&this.program, ValueType::Boolean);
+        const callees: Array<i64> = this.callees(ValueType::Boolean);
+        const roots: Array<i64> = this.environment.field_roots(&this.program, ValueType::Boolean);
+        const methods: Array<MethodCandidate> = this.method_calls(ValueType::Boolean, false);
+        const generic_callees: Array<i64> = this.generic_callees(ValueType::Boolean);
+        const comparable: Array<i64> = this.comparable_type_parameters();
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(if (reads_name || !features.has(Feature::Booleans)) { 0 } else { 2 });
+        weights.push(if (variables.length() > 0) { 10 } else { 0 });
+        weights.push(12);
+        weights.push(if (features.has(Feature::Booleans)) { 4 } else { 0 });
+        weights.push(if (deeper) { 6 } else { 0 });
+        weights.push(if (deeper) { 3 } else { 0 });
+        weights.push(if (deeper) { 2 } else { 0 });
+        weights.push(if (callees.length() > 0 && depth > 0) { 4 } else { 0 });
+        weights.push(if (roots.length() > 0) { 8 } else { 0 });
+        weights.push(if (methods.length() > 0 && depth > 0) { 4 } else { 0 });
+        weights.push(if (generic_callees.length() > 0 && depth > 0) { 4 } else { 0 });
+        weights.push(if (comparable.length() > 0) { 8 } else { 0 });
+        const texts: Array<i64> = this.texts();
+        weights.push(if (texts.length() > 0) { 6 } else { 0 });
+        const maps: Array<i64> = this.readable_maps(ValueType::Void);
+        weights.push(if (maps.length() > 0) { 5 } else { 0 });
+        const form: i64 = this.random.pick(&weights);
+        if (form == 0) { return this.node(ExpressionKind::BooleanLiteral(this.random.chance(50)), ValueType::Boolean); }
+        if (form == 1) { return this.read(variables.get(this.random.below(variables.length())).unwrap()); }
+        if (form == 2) {
+            const value_type: ValueType = TypeChoice::integer(&this.random);
+            const left: i64 = this.expression(value_type, next, true);
+            const right: i64 = this.expression(value_type, next, false);
+            return this.node(ExpressionKind::Binary(this.comparison(), left, right), ValueType::Boolean);
+        }
+        if (form == 3) {
+            const left_type: ValueType = TypeChoice::integer(&this.random);
+            mut right_type: ValueType = TypeChoice::integer(&this.random);
+            while (right_type.same(left_type)) { right_type = TypeChoice::integer(&this.random); }
+            const left: i64 = this.expression(left_type, next, true);
+            const right: i64 = this.expression(right_type, next, true);
+            return this.node(ExpressionKind::Binary(this.comparison(), left, right), ValueType::Boolean);
+        }
+        if (form == 4) {
+            const operator: BinaryOperator = if (this.random.chance(50)) { BinaryOperator::And } else { BinaryOperator::Or };
+            const left: i64 = this.boolean_expression(next, reads_name);
+            const right: i64 = this.boolean_expression(next, false);
+            return this.node(ExpressionKind::Binary(operator, left, right), ValueType::Boolean);
+        }
+        if (form == 5) {
+            return this.node(ExpressionKind::Unary(UnaryOperator::Not, this.boolean_expression(next, true)), ValueType::Boolean);
+        }
+        if (form == 6) {
+            const operator: BinaryOperator = if (this.random.chance(50)) { BinaryOperator::Equal } else { BinaryOperator::NotEqual };
+            const left: i64 = this.boolean_expression(next, true);
+            const right: i64 = this.boolean_expression(next, false);
+            return this.node(ExpressionKind::Binary(operator, left, right), ValueType::Boolean);
+        }
+        if (form == 7) { return this.call(callees.get(this.random.below(callees.length())).unwrap(), next); }
+        if (form == 8) { return this.place(roots.get(this.random.below(roots.length())).unwrap(), ValueType::Boolean); }
+        if (form == 9) { return this.method_call(methods.get(this.random.below(methods.length())).unwrap(), next); }
+        if (form == 10) { return this.generic_call(generic_callees.get(this.random.below(generic_callees.length())).unwrap(), ValueType::Boolean, next); }
+        if (form == 11) { return this.type_parameter_comparison(next); }
+        if (form == 13) { return this.map_contains(&maps, next); }
+        const left: i64 = this.read(texts.get(this.random.below(texts.length())).unwrap());
+        const right: i64 = this.read(texts.get(this.random.below(texts.length())).unwrap());
+        return this.node(ExpressionKind::Binary(this.comparison(), left, right), ValueType::Boolean);
+    }
+
+    /// A literal of `wanted`: small values, 1, the largest magnitude, or a
+    /// random one; never past `i64::MAX`, and negative only for a signed
+    /// type, never its minimum.
+    internal literal(mut &this, wanted: ValueType) -> i64 {
+        const maximum: u64 = ArithmeticGuard::largest_literal(wanted);
+        const roll: i64 = this.random.below(10);
+        mut magnitude: u64 = this.random.bits() & maximum;
+        if (roll < 3) { magnitude = this.random.below(17) as u64; }
+        if (roll == 3) { magnitude = 1; }
+        if (roll == 4) { magnitude = maximum; }
+        const negative: boolean = wanted.is_signed() && magnitude != 0 && this.random.chance(40);
+        return this.node(ExpressionKind::IntegerLiteral(magnitude, negative), wanted);
+    }
+
+    /// One of `&`, `|` and `^`.
+    internal bitwise_operator(mut &this) -> BinaryOperator {
+        return match (this.random.below(3)) {
+            0 => { BinaryOperator::BitAnd }
+            1 => { BinaryOperator::BitOr }
+            _ => { BinaryOperator::BitXor }
+        };
+    }
+
+    /// A shift amount for a `value_type` value: `(e & (W - 1))`.
+    internal shift_amount(mut &this, value_type: ValueType, depth: i64) -> i64 {
+        return this.masked(this.expression(value_type, depth, true), ArithmeticGuard::shift_mask(value_type), value_type);
+    }
+
+    /// A divisor for a `value_type` dividend: `((e & M) | 1)`, never zero
+    /// and never negative.  The unguarded-division plant leaves the `| 1`
+    /// out.
+    internal divisor(mut &this, value_type: ValueType, depth: i64) -> i64 {
+        const bounded: i64 = this.masked(this.expression(value_type, depth, true), ArithmeticGuard::operand_mask(value_type), value_type);
+        match (this.options.plant) {
+            Plant::UnguardedDivision => { return bounded; }
+            _                        => { }
+        }
+        return this.node(ExpressionKind::Binary(BinaryOperator::BitOr, bounded, this.integer(ArithmeticGuard::divisor_floor(), value_type)), value_type);
+    }
+
+    /// A plain `+`, `-` or `*` over operands masked so that the result fits
+    /// `wanted`.
+    private guarded(mut &this, wanted: ValueType, depth: i64) -> i64 {
+        const left: i64 = this.expression(wanted, depth, true);
+        const right: i64 = this.expression(wanted, depth, true);
+        const choice: i64 = this.random.below(3);
+        if (choice == 0) {
+            const mask: u64 = ArithmeticGuard::operand_mask(wanted);
+            return this.node(ExpressionKind::Binary(BinaryOperator::Add, this.masked(left, mask, wanted), this.masked(right, mask, wanted)), wanted);
+        }
+        if (choice == 1) {
+            const mask: u64 = ArithmeticGuard::operand_mask(wanted);
+            if (wanted.is_signed()) {
+                return this.node(ExpressionKind::Binary(BinaryOperator::Subtract, this.masked(left, mask, wanted), this.masked(right, mask, wanted)), wanted);
+            }
+            const raised: i64 = this.node(ExpressionKind::Binary(BinaryOperator::BitOr, left, this.integer(ArithmeticGuard::minuend_bit(wanted), wanted)), wanted);
+            return this.node(ExpressionKind::Binary(BinaryOperator::Subtract, raised, this.masked(right, mask, wanted)), wanted);
+        }
+        const mask: u64 = ArithmeticGuard::product_mask(wanted);
+        return this.node(ExpressionKind::Binary(BinaryOperator::Multiply, this.masked(left, mask, wanted), this.masked(right, mask, wanted)), wanted);
+    }
+
+    /// `(value & mask)`.
+    private masked(mut &this, value: i64, mask: u64, value_type: ValueType) -> i64 {
+        return this.node(ExpressionKind::Binary(BinaryOperator::BitAnd, value, this.integer(mask, value_type)), value_type);
+    }
+
+    /// One of the six comparison operators.
+    private comparison(mut &this) -> BinaryOperator {
+        return match (this.random.below(6)) {
+            0 => { BinaryOperator::Equal }
+            1 => { BinaryOperator::NotEqual }
+            2 => { BinaryOperator::Less }
+            3 => { BinaryOperator::LessEqual }
+            4 => { BinaryOperator::Greater }
+            _ => { BinaryOperator::GreaterEqual }
+        };
+    }
+}

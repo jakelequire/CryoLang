@@ -1,0 +1,156 @@
+///! Maps (stage 8): `HashMap<u8, i32>` locals, the standard library's hash
+///! map of integers to integers.
+///!
+///! With `maps`, a function declares `mut` map locals, built empty; inserts
+///! into one and removes from it, observing the value the key held or a
+///! default where it held none; looks a key up wherever a value of the
+///! map's value type is wanted, with a default; asks whether it holds a key
+///! wherever a boolean is wanted; reads its length wherever an `i64` is;
+///! and assigns it a new empty map.  Every key is reduced to eight values,
+///! `(e & 7)`, so inserts, lookups and removals meet keys already there.
+///! No `unwrap` is written: a missing key gives its default.  A map is
+///! never read by value, so it needs no ownership state; a statement
+///! changing one lends it exclusively, so nothing else there names it, and
+///! no value is ever held by reference.  The standard library promises no
+///! iteration order - the default hasher is keyed per map from a random
+///! seed - so a map is observed by its length and by a sum over its
+///! entries, each entry's key and value mixed and added modulo 2^62, which
+///! no order changes.
+
+namespace cryosmith::generate::maps;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature, FeatureSet };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::model::{ BinaryOperator, ExpressionKind, StatementKind, ValueType, Variable, VariableRole };
+import cryosmith::typing::{ TypeChoice };
+
+/// The keys a map's operations reduce theirs to: `(e & KEY_MASK)`.
+const KEY_MASK: u64 = 7;
+
+/// The modulus less one of the sum a map's entries fold into, `2^62 - 1`:
+/// two terms below 2^62 add without overflow under either overflow rule.
+const ENTRY_SUM_MASK: u64 = 4611686018427387903;
+
+/// The first state of each entry's mix, apart from a match's arms'.
+const ENTRY_SALT: u64 = 9;
+
+implement struct Generator {
+    /// Whether maps are generated: `maps` is on, and so is `loops`, since
+    /// one is observed by a `for` over its keys.
+    internal makes_maps(&this) -> boolean {
+        const features: FeatureSet = this.options.features;
+        return features.has(Feature::Maps) && features.has(Feature::Loops);
+    }
+
+    /// `mut v: HashMap<K, V> = HashMap::new();` of drawn integer types.
+    internal map_declaration(mut &this) -> i64 {
+        const key: ValueType = TypeChoice::integer(&this.random);
+        const value: ValueType = TypeChoice::integer(&this.random);
+        const map_type: ValueType = ValueType::map(key, value);
+        const variable: i64 = this.environment.declare_local(&this.program, map_type, true);
+        return this.program.statement(StatementKind::Declare(variable, this.node(ExpressionKind::EmptyMap, map_type)));
+    }
+
+    /// The map locals in scope that may be read here, of value type
+    /// `value`, or of any with `void`: any not lent exclusively.
+    internal readable_maps(&this, value: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.in_scope().iter()) {
+            const declared: Variable = this.program.variable_at(variable);
+            const local: boolean = match (declared.role) {
+                VariableRole::Local => { true }
+                _                   => { false }
+            };
+            const typed: boolean = value.same(ValueType::Void) || declared.value_type.map_value().same(value);
+            if (local && declared.value_type.is_map() && typed && !this.environment.is_lent_exclusively(variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// The map locals in scope that may be changed here: any not lent by
+    /// the statement.
+    internal writable_maps(&this) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.assignable(&this.program).iter()) {
+            if (this.program.variable_at(variable).value_type.is_map() && !this.environment.is_lent(variable)) { found.push(variable); }
+        }
+        return found;
+    }
+
+    /// A key of the map `variable` holds: `(e & KEY_MASK)`, `e` of its key
+    /// type reading a name.
+    private map_key(mut &this, variable: i64, depth: i64) -> i64 {
+        const key: ValueType = this.program.variable_at(variable).value_type.map_key();
+        const operand: i64 = this.expression(key, depth, true);
+        return this.node(ExpressionKind::Binary(BinaryOperator::BitAnd, operand, this.integer(KEY_MASK, key)), key);
+    }
+
+    /// An insert into or a removal from one of `writable`, lent exclusively
+    /// first, observed: `v.insert(key, value).unwrap_or(d)` or, with
+    /// `removing`, `v.remove(&key).unwrap_or(d)`.
+    internal map_change(mut &this, writable: &Array<i64>, removing: boolean) -> i64 {
+        const variable: i64 = writable.get(this.random.below(writable.length())).unwrap();
+        this.environment.lend(variable, true);
+        const value: ValueType = this.program.variable_at(variable).value_type.map_value();
+        const depth: i64 = this.depth();
+        const key: i64 = this.map_key(variable, depth);
+        if (removing) {
+            return this.observation(this.node(ExpressionKind::Removal(variable, key, this.literal(value)), value));
+        }
+        const inserted: i64 = this.typed_place(value, depth);
+        return this.observation(this.node(ExpressionKind::Insert(variable, key, inserted, this.literal(value)), value));
+    }
+
+    /// `v = HashMap::new();`, one of `writable` emptied by a new map, lent
+    /// exclusively.
+    internal map_reset(mut &this, writable: &Array<i64>) -> i64 {
+        const variable: i64 = writable.get(this.random.below(writable.length())).unwrap();
+        this.environment.lend(variable, true);
+        const map_type: ValueType = this.program.variable_at(variable).value_type;
+        return this.program.statement(StatementKind::Assign(this.target(variable), this.node(ExpressionKind::EmptyMap, map_type)));
+    }
+
+    /// `v.get(&key).unwrap_or(d)` of one of `maps`, lent shared.
+    internal map_lookup(mut &this, maps: &Array<i64>, depth: i64) -> i64 {
+        const variable: i64 = maps.get(this.random.below(maps.length())).unwrap();
+        this.environment.lend(variable, false);
+        const value: ValueType = this.program.variable_at(variable).value_type.map_value();
+        const key: i64 = this.map_key(variable, depth);
+        return this.node(ExpressionKind::Lookup(variable, key, this.literal(value)), value);
+    }
+
+    /// `v.contains_key(&key)` of one of `maps`, lent shared.
+    internal map_contains(mut &this, maps: &Array<i64>, depth: i64) -> i64 {
+        const variable: i64 = maps.get(this.random.below(maps.length())).unwrap();
+        this.environment.lend(variable, false);
+        return this.node(ExpressionKind::Contains(variable, this.map_key(variable, depth)), ValueType::Boolean);
+    }
+
+    /// Observe the map `variable` holds: its length, then a sum over its
+    /// keys of each key mixed with its value, added modulo 2^62 into a
+    /// fresh local, then that sum.  No draw is taken.
+    internal observe_map(mut &this, variable: i64, statements: mut &Array<i64>) -> void {
+        statements.push(this.observation(this.node(ExpressionKind::Length(variable), ValueType::I64)));
+        const map_type: ValueType = this.program.variable_at(variable).value_type;
+        const sum: i64 = this.environment.declare_local(&this.program, ValueType::U64, true);
+        statements.push(this.program.statement(StatementKind::Declare(sum, this.integer(0, ValueType::U64))));
+        const mark: i64 = this.environment.mark();
+        const key: i64 = this.environment.declare_counter(&this.program, map_type.map_key());
+        const looked_up: i64 = this.node(ExpressionKind::Lookup(variable, this.read(key), this.integer(0, map_type.map_value())), map_type.map_value());
+        const salted: i64 = this.node(ExpressionKind::Mix(this.integer(ENTRY_SALT, ValueType::U64), this.read(key)), ValueType::U64);
+        const entry: i64 = this.node(ExpressionKind::Mix(salted, looked_up), ValueType::U64);
+        const total: i64 = this.node(ExpressionKind::Binary(BinaryOperator::Add, this.entry_term(this.read(sum)), this.entry_term(entry)), ValueType::U64);
+        mut body: Array<i64> = Array::<i64>::new();
+        body.push(this.program.statement(StatementKind::Assign(this.target(sum), this.entry_term(total))));
+        this.environment.leave(mark);
+        statements.push(this.program.statement(StatementKind::Each(variable, key, this.program.block(&body))));
+        statements.push(this.observation(this.read(sum)));
+    }
+
+    /// `(value & ENTRY_SUM_MASK)`, a term of a map's entry sum.
+    private entry_term(mut &this, value: i64) -> i64 {
+        return this.node(ExpressionKind::Binary(BinaryOperator::BitAnd, value, this.integer(ENTRY_SUM_MASK, ValueType::U64)), ValueType::U64);
+    }
+}

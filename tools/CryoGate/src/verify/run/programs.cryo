@@ -1,0 +1,396 @@
+///! The baseline, one program at a time: which programs have no record
+///! under their key and so must run, the runs that record them, and the
+///! object lists and census verdict the records add up to.
+
+namespace cryogate::verify::run::programs;
+
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::time::clock::{ Instant };
+
+import cryogate::baseline::keys::{ Program, ProgramKeys, Programs };
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::git::{ Git };
+import cryogate::core::text::{ Text };
+import cryogate::verify::declarations::{ DeclarationKind, Declarations };
+import cryogate::verify::gates::{ GateCommand };
+import cryogate::verify::hashing::{ ObjectHashes };
+import cryogate::verify::judges::{ BaselineCensus };
+import cryogate::verify::objects::{ ObjectOwner, ObjectPopulation };
+import cryogate::verify::record::{ BaselineRecord };
+import cryogate::verify::run::children::{ GateRun, PopulationRun, VerifyChild };
+import cryogate::verify::run::compiler::{ BaselineCompiler };
+import cryogate::verify::runtime::{ RuntimeArchives };
+
+/// Which programs a baseline run must run: those with no record under
+/// their key.
+public type struct BaselinePlan {
+    /// How many records were found.
+    public recorded: i64;
+    /// Every program and archive record to make, sorted, then the unit
+    /// suite when only the census's archives lack a record.
+    public missing: Array<String>;
+    /// The examples to run: the sweep runs every one.
+    public examples: Array<String>;
+    /// The census-side programs to run: the unit suite, test projects and
+    /// compile-fail files.
+    public census: Array<String>;
+    /// Whether `census` is every census-side program, so one unfiltered
+    /// census run records them all.
+    public everything: boolean;
+
+    /// The plan over the record names `keyed` (every program and the two
+    /// archive records) of which `recorded` have a record.  The archives a
+    /// sweep links are built by the programs that link them, so a sweep
+    /// whose archives have no record runs again: every example, or the
+    /// unit suite when no census-side program runs otherwise.
+    public static of(keyed: &Array<String>, recorded: &Array<String>) -> BaselinePlan {
+        mut examples: Array<String> = Array::<String>::new();
+        mut census_side: Array<String> = Array::<String>::new();
+        mut missing: Array<String> = Array::<String>::new();
+        for (name in keyed.iterate_references()) {
+            const archive: boolean = name.as_str().starts_with(&Str::new("archives/"));
+            if (name.as_str().starts_with(&Str::new("examples/"))) { examples.push(name.clone()); }
+            else if (!archive) { census_side.push(name.clone()); }
+            if (!recorded.contains(name)) { missing.push(name.clone()); }
+        }
+        const example_archives: String = String::from_str(Programs::example_archives());
+        if (missing.contains(&example_archives)) {
+            for (name in examples.iterate_references()) { missing.push(name.clone()); }
+        }
+        missing = Text::sorted_distinct(missing);
+        mut census_missing: boolean = false;
+        for (name in census_side.iterate_references()) { if (missing.contains(name)) { census_missing = true; } }
+        if (missing.contains(&String::from_str(Programs::census_archives())) && !census_missing) {
+            missing.push(String::from_str(Programs::unit_suite()));
+        }
+        mut run_examples: Array<String> = Array::<String>::new();
+        mut run_census: Array<String> = Array::<String>::new();
+        for (name in missing.iterate_references()) {
+            if (examples.contains(name)) { run_examples.push(name.clone()); }
+            if (census_side.contains(name)) { run_census.push(name.clone()); }
+        }
+        const everything: boolean = Text::sorted_distinct(run_census.clone()) == Text::sorted_distinct(census_side.clone());
+        return BaselinePlan {
+            recorded: keyed.length() - missing.length(), missing: missing, examples: run_examples, census: run_census,
+            everything: everything,
+        };
+    }
+
+    /// The plan's line in verify's report.  The unit suite is a project by
+    /// its declaration name's kind, so it is counted among the projects.
+    public line(&this) -> String {
+        mut projects: i64 = 0;
+        mut negatives: i64 = 0;
+        for (name in this.census.iterate_references()) {
+            match (Declarations::kind(name.as_str())) {
+                DeclarationKind::Project  => { projects++; }
+                DeclarationKind::Negative => { negatives++; }
+                _                         => { }
+            }
+        }
+        const unit_suite: Str = if (this.census.contains(&String::from_str(Programs::unit_suite()))) { Str::new("yes") } else { Str::new("no") };
+        return f"verify: baseline programs: {this.recorded} recorded, {this.missing.length()} to run (unit suite {unit_suite}, {projects} project(s), {negatives} compile-fail file(s), {this.examples.length()} example(s))";
+    }
+
+    /// The filter each census run is given: none, for one run over
+    /// everything; else one run per program - the unit suite's tests by
+    /// their namespace, which no project or compile-fail file name holds, a
+    /// compile-fail file by its file name, a project by its name.
+    public patterns(&this) -> Array<String> {
+        mut patterns: Array<String> = Array::<String>::new();
+        if (this.everything) { patterns.push(String::new()); return patterns; }
+        for (name in Text::sorted_distinct(this.census.clone()).iterate_references()) {
+            if (name.as_str() == Programs::unit_suite()) { patterns.push(String::from_str(Str::new("CryoTests::"))); continue; }
+            match (name.as_str().strip_prefix(&Str::new("negative/"))) {
+                Option::Some(file) => { patterns.push(String::from_str(file)); }
+                Option::None       => { patterns.push(name.clone()); }
+            }
+        }
+        return patterns;
+    }
+
+    /// An example's line in the examples sweep's log, `ok` or `FAIL` then
+    /// `examples/<name>`, leading space allowed: the example, and whether
+    /// it failed.
+    public static example_verdict(line: Str) -> Option<Pair<String, boolean>> {
+        mut words: Array<String> = Array::<String>::new();
+        for (word in line.split_whitespace()) { words.push(String::from_str(word)); }
+        if (words.length() < 2 || !words[1].as_str().starts_with(&Str::new("examples/"))) { return Option::None; }
+        if (words[0].as_str() == Str::new("ok")) { return Option::Some(Pair::new(words[1].clone(), false)); }
+        if (words[0].as_str() == Str::new("FAIL")) { return Option::Some(Pair::new(words[1].clone(), true)); }
+        return Option::None;
+    }
+}
+
+/// What the baseline's records add up to.
+public type struct BaselineTotals {
+    /// The census verdict the judges read.
+    public census: BaselineCensus;
+    /// Each population's rows, in `ObjectPopulation::all`'s order.
+    public lists: Array<Array<String>>;
+    /// Every program's record.
+    public records: Array<BaselineRecord>;
+
+    /// The totals over `records` and the runtime rows `runtime`: each
+    /// record's rows go to its population (an archive record's to the
+    /// stdlib's, an example's to the examples', the rest to the tests'),
+    /// and two records naming one object must agree on its bytes.  The
+    /// unit suite's record is required: the census verdict counts its
+    /// failed tests.
+    public static of(records: Array<BaselineRecord>, runtime: Array<String>) -> Result<BaselineTotals, String> {
+        // tests, examples, stdlib: path to row.
+        mut maps: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
+        maps.push(HashMap::<String, String>::new());
+        maps.push(HashMap::<String, String>::new());
+        maps.push(HashMap::<String, String>::new());
+        mut failed: Array<String> = Array::<String>::new();
+        mut negatives_failed: i64 = 0;
+        mut unit_failed: Option<i64> = Option::None;
+        for (record in records.iterate_references()) {
+            const name: Str = record.name.as_str();
+            const into: i64 = if (name.starts_with(&Str::new("archives/"))) { 2 } else { if (name.starts_with(&Str::new("examples/"))) { 1 } else { 0 } };
+            for (row in record.rows.iterate_references()) {
+                const path: String = BaselineTotals::path_of(row.as_str());
+                const agrees: boolean = match (maps[into].get_reference(&path)) {
+                    Option::Some(held) => { held.as_str() == row.as_str() }
+                    Option::None       => { true }
+                };
+                if (!agrees) { return Result::Err(f"two baseline records disagree on {path.as_str()}"); }
+                maps[into].insert(path, row.clone());
+            }
+            const is_failed: boolean = record.verdict.as_str() == Str::new("FAILED");
+            if (name == Programs::unit_suite()) {
+                for (test in record.unit_failed.iterate_references()) { failed.push(test.clone()); }
+                const counts: Array<i64> = record.unit_counts.clone().unwrap_or(Array::<i64>::new());
+                const count: i64 = if (counts.length() > 1) { counts[1] } else { 0 };
+                unit_failed = Option::Some(count);
+                continue;
+            }
+            if (is_failed) { failed.push(record.name.clone()); }
+            if (is_failed && name.starts_with(&Str::new("negative/"))) { negatives_failed++; }
+        }
+        const unit_failed_count: i64 = match (unit_failed) {
+            Option::Some(count) => { count }
+            Option::None        => { return Result::Err(String::from_str(Str::new("the baseline has no record of the unit suite"))); }
+        };
+        mut lists: Array<Array<String>> = Array::<Array<String>>::new();
+        for (map in maps.iterate_references()) { lists.push(BaselineTotals::rows_of(map)); }
+        lists.push(runtime);
+        return Result::Ok(BaselineTotals {
+            census: BaselineCensus { accounted: true, unit_failed: unit_failed_count, negatives_failed: negatives_failed, failed: Text::sorted_distinct(failed) },
+            lists: lists, records: records,
+        });
+    }
+
+    /// An archive record made again by a run over some programs, which
+    /// builds only the archives those link, merged with the record it
+    /// replaces: the record keeps every archive object either names, and
+    /// an object built again with other bytes is refused.
+    public static merged(fresh: &BaselineRecord, held: &BaselineRecord) -> Result<BaselineRecord, String> {
+        mut merged: BaselineRecord = fresh.clone();
+        merged.rows = held.rows.clone();
+        for (row in fresh.rows.iterate_references()) {
+            const path: String = BaselineTotals::path_of(row.as_str());
+            mut found: boolean = false;
+            for (kept in held.rows.iterate_references()) {
+                if (BaselineTotals::path_of(kept.as_str()) != path) { continue; }
+                found = true;
+                if (kept.as_str() != row.as_str()) { return Result::Err(f"the baseline built {path.as_str()} again with other bytes"); }
+            }
+            if (!found) { merged.rows.push(row.clone()); }
+        }
+        return Result::Ok(merged);
+    }
+
+    /// The path a `<digest>  <path>` row names.
+    private static path_of(row: Str) -> String {
+        return if (row.length() > 66) { String::from_str(row.byte_substring(66, row.length())) } else { String::new() };
+    }
+
+    private static rows_of(rows: &HashMap<String, String>) -> Array<String> {
+        mut listed: Array<String> = Array::<String>::new();
+        for (entry in rows.entries()) { listed.push((*entry.second).clone()); }
+        return listed;
+    }
+}
+
+/// The baseline's programs, recorded and run.
+public type struct BaselinePrograms {
+    /// The records of every program for `baseline` in the checkout
+    /// `repository`, the missing ones run first and stored; their object
+    /// lists are written to `directory` as `base.<population>.sha256`.
+    /// `unit_pinned` is the unit tests the roster pins on this host,
+    /// `cryogate` the gate runner the examples sweep runs under.
+    public static record(repository: Path, git: &Git, baseline: &BaselineCompiler, directory: Path,
+                         unit_pinned: &Array<String>, cryogate: Str) -> Result<BaselineTotals, String> {
+        const programs: Array<Program> = Programs::discover(repository, git)?;
+        const keys: Array<Pair<String, String>> = ProgramKeys::of(repository, git, baseline.compiler.as_path(),
+            baseline.runtime_home.as_path(), &programs)?;
+        const store: PathBuf = baseline.home.join(Str::new("programs"));
+        match (Directory::create_all(store.as_path())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot create {store.as_path().as_str()}: {error.describe()}"); }
+        }
+        mut held: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+        mut keyed: Array<String> = Array::<String>::new();
+        mut recorded: Array<String> = Array::<String>::new();
+        for (key in keys.iterate_references()) {
+            keyed.push(key.first.clone());
+            match (File::read_text(store.join(key.second.as_str()).as_path())) {
+                Result::Ok(text) => {
+                    mut record: BaselineRecord = BaselineRecord::read(text.as_str());
+                    record.name = key.first.clone();
+                    held.push(record);
+                    recorded.push(key.first.clone());
+                }
+                Result::Err(_) => { }
+            }
+        }
+        const plan: BaselinePlan = BaselinePlan::of(&keyed, &recorded);
+        fmt::println(plan.line());
+        ObjectHashes::wipe(repository)?;
+        const runtime: Str = baseline.runtime_home.as_path().as_str();
+        mut fresh: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+        if (!plan.examples.is_empty()) {
+            mut sweep: Array<String> = Array::<String>::new();
+            sweep.push(String::from_str(Str::new("examples")));
+            const runs: Array<GateRun> = PopulationRun::gates(repository, &GateCommand::table(cryogate), &sweep,
+                baseline.compiler.as_path().as_str(), directory, runtime, true);
+            fmt::println(runs[0].report(repository));
+            const log: String = match (File::read_text(Path::from(runs[0].log.as_str()))) {
+                Result::Ok(text) => { text }
+                Result::Err(_)   => { String::new() }
+            };
+            mut built: Array<String> = Array::<String>::new();
+            mut failed: Array<String> = Array::<String>::new();
+            const lines: Array<String> = Text::lines(log.as_str());
+            for (line in lines.iterate_references()) {
+                match (BaselinePlan::example_verdict(line.as_str())) {
+                    Option::Some(seen) => { if (seen.second) { failed.push(seen.first.clone()); } else { built.push(seen.first.clone()); } }
+                    Option::None       => { }
+                }
+            }
+            // The sweep builds every example; each it gave a verdict is
+            // recorded, a failure winning over a success.
+            for (program in programs.iterate_references()) {
+                if (failed.contains(&program.name)) { fresh.push(BaselineRecord::new(program.name.as_str(), Str::new("FAILED"))); }
+                else if (built.contains(&program.name)) { fresh.push(BaselineRecord::new(program.name.as_str(), Str::new("ok"))); }
+            }
+            BaselinePrograms::attach(&fresh, &ObjectHashes::rows(repository, &ObjectPopulation::Examples, Path::from(""))?);
+            mut archives: BaselineRecord = BaselineRecord::new(Programs::example_archives(), Str::new("ok"));
+            archives.rows = ObjectHashes::rows(repository, &ObjectPopulation::Stdlib, Path::from(""))?;
+            fresh.push(archives);
+            ObjectHashes::clear_archives(repository)?;
+        }
+        if (!plan.census.is_empty()) {
+            const started: Instant = Instant::now();
+            const patterns: Array<String> = plan.patterns();
+            mut logs: Array<Array<String>> = Array::<Array<String>>::new();
+            for (index in 0..patterns.length()) {
+                mut job: Job = VerifyChild::job(baseline.compiler.as_path().as_str(), runtime);
+                job.argument(Str::new("test"));
+                job.argument(Str::new("--format=plain"));
+                job.argument(Str::new("-Werror=W0017"));
+                if (!patterns[index].is_empty()) { job.argument(patterns[index].as_str()); }
+                job.directory(repository.join(Str::new("tests")).as_path().as_str());
+                job.log_to(directory.join(f"census-{index:03}.log".as_str()).as_path().as_str());
+                // The runner's exit is not the verdict: its lines are.
+                const done: Completion = job.run();
+                logs.push(Text::lines(done.output().as_str()));
+            }
+            fmt::println(f"  census    {logs.length()} run(s) in {started.elapsed().as_seconds_f64():.1} s");
+            const rows: Array<String> = ObjectHashes::rows(repository, &ObjectPopulation::Tests, Path::from(""))?;
+            if (plan.everything) {
+                for (record in BaselineRecord::of_census(&logs[0], &plan.census, &rows, unit_pinned).iterate_references()) { fresh.push(record.clone()); }
+            } else {
+                const names: Array<String> = Text::sorted_distinct(plan.census.clone());
+                for (index in 0..names.length()) {
+                    mut one: Array<String> = Array::<String>::new();
+                    one.push(names[index].clone());
+                    for (record in BaselineRecord::of_census(&logs[index], &one, &rows, unit_pinned).iterate_references()) { fresh.push(record.clone()); }
+                }
+            }
+            mut archives: BaselineRecord = BaselineRecord::new(Programs::census_archives(), Str::new("ok"));
+            archives.rows = ObjectHashes::rows(repository, &ObjectPopulation::Stdlib, Path::from(""))?;
+            fresh.push(archives);
+        }
+        mut unanswered: Array<String> = Array::<String>::new();
+        for (name in plan.missing.iterate_references()) {
+            mut answered: boolean = false;
+            for (record in fresh.iterate_references()) { if (record.name.as_str() == name.as_str()) { answered = true; } }
+            if (!answered) { unanswered.push(name.clone()); }
+        }
+        if (!unanswered.is_empty()) {
+            mut shown: Array<String> = Array::<String>::new();
+            for (index in 0..unanswered.length()) { if (index < 10) { shown.push(unanswered[index].clone()); } }
+            return Result::Err(f"the baseline run gave no verdict for {unanswered.length()} program(s): {Text::joined(&shown, Str::new(" ")).as_str()}");
+        }
+        for (index in 0..fresh.length()) {
+            const name: Str = fresh[index].name.as_str();
+            if (!name.starts_with(&Str::new("archives/"))) { continue; }
+            for (record in held.iterate_references()) {
+                if (record.name.as_str() == name) { fresh[index] = BaselineTotals::merged(&fresh[index], record)?; }
+            }
+        }
+        for (record in fresh.iterate_references()) {
+            for (key in keys.iterate_references()) {
+                if (key.first.as_str() != record.name.as_str()) { continue; }
+                BaselinePrograms::store(store.join(key.second.as_str()).as_path(), record)?;
+            }
+        }
+        mut every: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+        for (record in held.iterate_references()) {
+            mut replaced: boolean = false;
+            for (made in fresh.iterate_references()) { if (made.name.as_str() == record.name.as_str()) { replaced = true; } }
+            if (!replaced) { every.push(record.clone()); }
+        }
+        for (record in fresh.iterate_references()) { every.push(record.clone()); }
+        const totals: BaselineTotals = BaselineTotals::of(every, RuntimeArchives::rows(baseline.runtime_archives.as_path())?)?;
+        mut index: i64 = 0;
+        for (population in ObjectPopulation::all().iterate_references()) {
+            PopulationRun::write_list(directory.join(f"base.{population.name()}.sha256".as_str()).as_path(), &totals.lists[index])?;
+            index++;
+        }
+        fmt::println(f"verify: baseline objects  tests {totals.lists[0].length()}  examples {totals.lists[1].length()}  stdlib {totals.lists[2].length()}  runtime {totals.lists[3].length()}");
+        return Result::Ok(totals);
+    }
+
+    /// Each of `rows` added to the record in `records` of the program that
+    /// owns its object, when there is one.
+    private static attach(records: mut &Array<BaselineRecord>, rows: &Array<String>) -> void {
+        for (row in rows.iterate_references()) {
+            const path: Str = if (row.length() > 66) { row.as_str().byte_substring(66, row.length()) } else { Str::new("") };
+            const owner: String = match (ObjectOwner::of(path)) {
+                Option::Some(owner) => { owner }
+                Option::None        => { continue; }
+            };
+            for (index in 0..records.length()) {
+                if (records[index].name.as_str() == owner.as_str()) { records[index].rows.push(row.clone()); }
+            }
+        }
+    }
+
+    /// `record` written to `path` through a temporary beside it, renamed
+    /// into place, so a record is never read half-written.
+    private static store(path: Path, record: &BaselineRecord) -> Result<(), String> {
+        const temporary: String = f"{path.as_str()}.tmp";
+        match (File::write_text(Path::from(temporary.as_str()), record.text().as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot write {temporary.as_str()}: {error.describe()}"); }
+        }
+        return match (Path::from(temporary.as_str()).rename_to(path)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot replace {path.as_str()}: {error.describe()}") }
+        };
+    }
+}

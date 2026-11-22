@@ -11,10 +11,17 @@
 ///! whole.  Each use rewrites the directory's `last-use`, and a build that
 ///! makes a new archive removes the least recently used beyond the few a
 ///! machine runs at once.
+///!
+///! A source tree keeps its archives in its own `.bin`, except a tree a
+///! release shipped, whose `.bin` holds the file `shipped`: an installed
+///! tree may belong to another user or be replaced by the next upgrade, so
+///! it is only read.  Its shipped archives link as they are, and an archive
+///! it lacks is built in the user's cache instead (`home`).
 
 namespace compiler::prebuilt_cache;
 
 import compiler::build_manifest::{ ContentHasher, Manifest };
+import compiler::deps::cache::{ Cache };
 import compiler::utils::log::{ Log, LogArea };
 import compiler::utils::directory_lock::{ DirectoryLock };
 import std::fmt;
@@ -42,6 +49,11 @@ const ARCHIVE_IDLE_SECONDS: i64 = 3600;
 /// The file an archive's every use rewrites, so its time is the last use.
 const LAST_USE_NAME: string = "last-use";
 
+/// The file in a source tree's `.bin` that marks the tree as shipped by a
+/// release, and so only read.
+const SHIPPED_NAME: string = "shipped";
+
+
 /// One archive's place: its directory, the key that names it, its
 /// manifest's file name, and what it is, for messages ("the stdlib
 /// archive").
@@ -53,6 +65,24 @@ type struct PrebuiltCache {
 
     static new(directory: string, key: string, manifest_name: string, what: string) -> PrebuiltCache {
         return PrebuiltCache { directory: directory, key: key, manifest_name: manifest_name, what: what };
+    }
+
+    /// Whether the source tree at `root` was shipped by a release, so its
+    /// archives are only read.
+    static shipped(root: string) -> boolean {
+        return Path::from(root).join(".bin").join(SHIPPED_NAME).as_path().exists();
+    }
+
+    /// Where archives of the source tree at `root` are built and kept: the
+    /// tree's own `.bin`, or for a shipped tree `<cache root>/archives/<tree>`,
+    /// `tree` naming the sources they are built from (`stdlib`, `runtime`).
+    /// An archive's key names every input that decides its bytes, so the
+    /// trees of different releases share that directory without colliding.
+    static home(root: string, tree: string) -> PathBuf {
+        if (PrebuiltCache::shipped(root)) {
+            return Cache::cache_root().join("archives").join(tree);
+        }
+        return Path::from(root).join(".bin");
     }
 
     /// Whether the directory's manifest is there and records this key: the

@@ -20,7 +20,7 @@ import compiler::diag::{
 import compiler::module_graph::{ ModuleGraph, ModuleInfo, ModulePath };
 import compiler::ast::{
     cloner, declaration, expression, GenericAnnotation, NamedAnnotation, node,
-    pattern, statement, TraitBound, TraitRef, TypeAnnotation, Visibility
+    pattern, ProjectionAnnotation, statement, TraitBound, TraitRef, TypeAnnotation, Visibility
 };
 import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context::{ CompilationContext };
@@ -43,7 +43,7 @@ import compiler::ast::walk::{ Walk };
 import compiler::ast::declaration::{
     AssocTypeDeclNode, DeclarationNode, DestructureDecl, EnumDecl,
     EnumVariant, FieldDecl, FunctionDecl, GenericParamDecl,
-    DeclKind, ImplBlock, MethodDecl, StructDecl,
+    DeclKind, ImplBlock, KindKeyword, MethodDecl, StructDecl,
     TraitDecl, TypeAliasDecl, UnionDecl, VarDecl
 };
 import compiler::ast::expression::{
@@ -433,7 +433,7 @@ type struct TypeResolutionRunner {
         if (!trait_id.is_valid()) { return; }
         const decl: TraitDecl* = this.ctx.generic_registry.get_trait_decl(trait_id);
         if (decl == null) { return; }
-        const owner: TypeRef = this.ctx.decl_index.impl_owner(impl_node, "type_resolution/impl conformance");
+        const owner: TypeRef = this.ctx.decl_index.impl_owner(impl_node, this.ctx.type_arena, "type_resolution/impl conformance");
         if (!owner.is_valid()) { return; }
         const intern: InternTable* = this.ctx.get_intern_table();
         const trait_name: string = intern.resolve(
@@ -772,6 +772,87 @@ type struct TypeResolutionRunner {
             d = d.at_with_label(head_span, "`new` of this type never calls an `Allocate` implementation");
             this.ctx.emit_diagnostic(d);
         }
+    }
+
+    /// The kind keyword an `implement` head writes before its target
+    /// against the kind of the type the head names (E0319): `struct` names
+    /// a struct, `enum` an enum, `union` a union, and a type of any other
+    /// kind takes no keyword.  An alias is the type it names.  The fix is
+    /// certain either way: the keyword is the kind's own, or none.
+    check_implement_kind_keyword(&this, impl_node: ImplBlock*) -> void {
+        const written: KindKeyword = match (impl_node.kind_keyword) {
+            Option::Some(keyword) => { keyword }
+            Option::None          => { return; }
+        };
+        const owner: TypeRef = this.ctx.decl_index.impl_owner(impl_node, this.arena,
+            "type_resolution/implement kind keyword");
+        if (!owner.is_valid()) { return; }
+        const t: Type* = this.arena.lookup(owner);
+        // A generic alias is still an alias after `follow_alias`, which
+        // leaves it to be expanded where it is instantiated: its kind is not
+        // known here, so it gets no verdict.
+        if (t == null || t.kind == TypeKind::Error || t.kind == TypeKind::TypeAlias) { return; }
+        mut actual: Option<KindKeyword> = Option::None;
+        if (t.kind == TypeKind::Enum) { actual = Option::Some(KindKeyword::Enum); }
+        if (t.kind == TypeKind::Struct) {
+            actual = Option::Some(if (t.as_struct().is_union) { KindKeyword::Union } else { KindKeyword::Struct });
+        }
+        const keyword_span: SourceSpan = impl_node.kind_keyword_span;
+        const shown: string = this.shown_type(owner);
+        const d: Diagnostic = match (actual) {
+            Option::Some(kind) => {
+                if (kind == written) { return; }
+                Diagnostic::error(ErrorCode::E0319_IMPLEMENT_KIND_MISMATCH,
+                    fmt::format("`%s` is %s, not %s", shown, kind.described(), written.described()))
+                    .at_with_label(keyword_span, fmt::format("`%s` names %s", written.spelling(), written.described()))
+                    .help(fmt::format("the keyword before the type names its kind, so %s is written after `%s`",
+                        kind.described(), kind.spelling()))
+                    .suggest(Suggestion::machine_applicable(keyword_span, kind.spelling(),
+                        fmt::format("write `%s`", kind.spelling())))
+            }
+            Option::None => {
+                Diagnostic::error(ErrorCode::E0319_IMPLEMENT_KIND_MISMATCH,
+                    fmt::format("`%s` is not a struct, an enum or a union, so no kind keyword names it", shown))
+                    .at_with_label(keyword_span, fmt::format("`%s` names %s", written.spelling(), written.described()))
+                    .help("only a struct, an enum or a union is written after a kind keyword; any other type is written alone")
+                    .suggest(Suggestion::machine_applicable(
+                        SourceSpan::covering(keyword_span, impl_node.target_type_span.start_point()), "",
+                        fmt::format("remove `%s`", written.spelling())))
+            }
+        };
+        this.ctx.emit_diagnostic(d);
+    }
+
+    /// An implement head naming an alias is for the type the alias names,
+    /// which must be a type a head names by its declaration - a struct, an
+    /// enum, a union or a primitive - so that the alias reaches nothing a
+    /// head written without it could not (E0320).  A generic instance is
+    /// written out in the head instead; a pointer, an array or a function
+    /// type is implemented for by no head.  A generic alias, still an alias
+    /// after `follow_alias`, is expanded where it is instantiated and is not
+    /// judged here.
+    check_implement_alias_target(&this, impl_node: ImplBlock*) -> void {
+        const named: DefId = impl_node.target_def();
+        if (!named.is_valid()) { return; }
+        const written: TypeRef = this.ctx.decl_index.type_of_def(named);
+        const alias: Type* = this.arena.lookup(written);
+        if (alias == null || alias.kind != TypeKind::TypeAlias) { return; }
+        const owner: TypeRef = this.arena.follow_alias(written);
+        const target: Type* = this.arena.lookup(owner);
+        if (target == null || target.kind == TypeKind::Error || target.kind == TypeKind::TypeAlias) { return; }
+        if (this.ctx.decl_index.registered_def(owner).is_valid()) { return; }
+        const alias_shown: string = this.shown_type(written);
+        const target_shown: string = this.shown_type(owner);
+        const help: string = if (target.kind == TypeKind::InstantiatedType) {
+            fmt::format("write the instance itself after `for`, `%s`, in place of its alias", target_shown).into_raw()
+        } else {
+            "an alias in an implement head names a struct, an enum, a union or a primitive type"
+        };
+        this.ctx.emit_diagnostic(Diagnostic::error(ErrorCode::E0320_IMPLEMENT_ALIAS_TARGET,
+                fmt::format("`%s` is an alias of `%s`, which an implement head cannot name through an alias",
+                    alias_shown, target_shown))
+            .at_with_label(impl_node.target_type_span, fmt::format("names `%s`", target_shown))
+            .help(help));
     }
 
     report_conformance<T>(&this, span: SourceSpan, message: T) -> void where T: Display {
@@ -1905,7 +1986,7 @@ type struct TypeResolutionPasses {
                 // registered here alone.
                 ctx.generic_registry.register_trait_impl(
                     node.trait_def,
-                    ctx.decl_index.impl_owner(node, "type_resolution/trait impl"), decl);
+                    ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/trait impl"), decl);
             }
         }
         // A head whose target is a parameter of its own (`implement<T> trait
@@ -1970,7 +2051,7 @@ type struct TypeResolutionPasses {
                 // at one named type that fails it (`overlap_excused`);
                 // nothing here can prove two bounds on a parameter disjoint.
                 const unified: [DeclarationNode*] = ctx.generic_registry.overlapping_heads(
-                    node.trait_def, ctx.decl_index.impl_owner(node, "type_resolution/overlap"), node);
+                    node.trait_def, ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/overlap"), node);
                 mut over: DeclarationNode* = null;
                 for (mut oi: i64 = 0; oi < unified.length() && over == null; oi++) {
                     if (!TypeResolutionPasses::overlap_excused(node, DeclarationNode::impl_of(unified[oi]), ctx)) {
@@ -1991,7 +2072,7 @@ type struct TypeResolutionPasses {
         // in the owner's parameters.
         mut head: TypeSubstitution = TypeResolutionPasses::impl_params_to_owner(node, ctx, arena);
         ctx.decl_index.register_methods_through(
-            ctx.decl_index.impl_owner(node, "type_resolution/register impl methods"),
+            ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/register impl methods"),
             node.methods, &head, &node.trait_arg_types, ctx.intern_table, arena,
             "type_resolution/register impl methods");
     }
@@ -2691,92 +2772,35 @@ type struct TypeResolutionPasses {
         }
     }
 
-    /// The projected member (`Item`) of a projection type-annotation, else empty.
-    static projection_member_of(ann: TypeAnnotation*) -> SymbolStr {
-        if (ann == null) { return SymbolStr::empty(); }
-        return match (*ann) {
-            TypeAnnotation::Projection(pj) => { pj.member }
-            _ => { SymbolStr::empty() }
-        };
-    }
-
-    /// Whether `ann` is an associated-type projection annotation (`I::Item`).
-    static is_projection_annotation(ann: TypeAnnotation*) -> boolean {
-        if (ann == null) { return false; }
-        return match (*ann) {
-            TypeAnnotation::Projection(_) => { true }
-            _ => { false }
-        };
-    }
-
-    /// The registered type a written argument names, off its stamp: a
-    /// declaration's type (its template, for an instantiation), a
-    /// primitive's.  Invalid for a type parameter, a projection, or a shape
-    /// that names no registered type.
-    static item_type_of(ann: TypeAnnotation*, ctx: CompilationContext*) -> TypeRef {
-        if (ann == null) { return TypeRef::invalid(); }
-        return match (*ann) {
-            TypeAnnotation::Named(n) => {
-                match (n.res.require("type_resolution:item annotation")) {
-                    Res::Def(d)    => { ctx.decl_index.type_of_def(d) }
-                    Res::PrimTy(p) => { ctx.type_resolver.resolve_primitive(p) }
-                    _              => { TypeRef::invalid() }
-                }
-            }
-            TypeAnnotation::Primitive(p) => { ctx.type_resolver.resolve_primitive(p.name) }
-            TypeAnnotation::Generic(g)   => { TypeResolutionPasses::item_type_of(g.base, ctx) }
-            TypeAnnotation::Reference(r) => { TypeResolutionPasses::item_type_of(r.inner, ctx) }
-            TypeAnnotation::Pointer(p)   => { TypeResolutionPasses::item_type_of(p.inner, ctx) }
-            _ => { TypeRef::invalid() }
-        };
-    }
-
-    /// Whether a projection-bounded trait-default method (`min where This::Item:
-    /// Ord`) is applicable to THIS impl. Returns false ONLY when the impl's
-    /// concrete Item type definitively does not implement a bound trait - the
-    /// case that must be filtered so the default's body is never synthesized
-    /// (and then type-checked) for it (e.g. `EnumerateIterator`/`ZipIterator` whose Item
-    /// is `Pair`, which is never `Ord`). A SYMBOLIC Item - a bare impl generic
-    /// param (`A`), or an `I::Item` projection - is undecidable here and kept;
-    /// its applicability is settled at the trait-level symbolic pass or per
-    /// monomorphization. `args_ref` is the impl's trait-arg annotations.
+    /// Whether a trait default bounded on one of the trait's associated
+    /// types (`min` with `where This::Item: Ord`) is a method of the
+    /// implementation `impl_node`: false when the type the implementation
+    /// binds that associated type to lacks a bound trait, so the default's
+    /// body is never copied in and checked for it (`EnumerateIterator`
+    /// yields `Pair`, which is never `Ord`; an iterator of `&Slice<u8>` yields
+    /// a reference, which has no `Ord` whatever its referent has).  The
+    /// binding is resolved in `impl_context`, the block's own parameters;
+    /// one that still names them is settled by each monomorphization.
     static default_method_applies_to_impl(tfunc_decl: DeclarationNode*,
-                                          impl_node: ImplBlock*,
+                                          impl_node: mut ImplBlock*,
                                           trait_decl: TraitDecl*,
-                                          args_ref: &[mut TypeAnnotation*],
+                                          impl_context: ResolutionContext*,
                                           ctx: CompilationContext*) -> boolean {
         const tfunc: FunctionDecl* = DeclarationNode::fn_of(tfunc_decl);
         if (tfunc == null || impl_node == null || trait_decl == null) { return true; }
+        const checker: TraitChecker = TraitChecker::new(ctx.type_arena, ctx.generic_registry,
+                                                        ctx.intern_table, ctx.diagnostics, ctx.type_resolver);
         for (mut bi: i64 = 0; bi < tfunc.trait_bounds.length(); bi++) {
-            const b: TraitBound* = &tfunc.trait_bounds[bi];
-            if (!b.has_projection_subject()) { continue; }
-            const member: SymbolStr =
-                TypeResolutionPasses::projection_member_of(b.subject);
-            if (!member.is_valid()) { continue; }
-            // Position of `member` among the trait's associated types, then in
-            // the impl's positional trait-arg list (generic params first).
-            const assoc_idx: i64 = trait_decl.assoc_type_index(member);
-            if (assoc_idx < 0) { continue; }
-            const arg_idx: i64 = trait_decl.generic_params.length() + assoc_idx;
-            if (arg_idx < 0 || arg_idx >= args_ref.length()) { continue; }
-            const item_ann: TypeAnnotation* = args_ref[arg_idx];
-            if (item_ann == null) { continue; }
-            // A symbolic Item - a projection or an impl-declared parameter -
-            // names no registered type: keep.
-            if (TypeResolutionPasses::is_projection_annotation(item_ann)) { continue; }
-            // A concrete Item - its registered type, off the stamp - must
-            // implement every bound trait, or the default cannot apply here.
-            // Asked of the trait's IDENTITY and the type: a leaf answers for
-            // every module's trait and type of that leaf.
-            const item_ty: TypeRef = TypeResolutionPasses::item_type_of(item_ann, ctx);
-            if (!item_ty.is_valid()) { continue; }
-            for (mut ti: i64 = 0; ti < b.trait_refs.length(); ti++) {
-                const tr: TraitRef* = &b.trait_refs[ti];
-                if (tr.path.length() == 0) { continue; }
-                if (ctx.generic_registry.select_trait_impl(tr.definition(), item_ty, ctx.intern_table) == null) {
-                    return false;
-                }
-            }
+            const bound: TraitBound* = &tfunc.trait_bounds[bi];
+            const projection: ProjectionAnnotation* = bound.projection_subject();
+            if (projection == null) { continue; }
+            const assoc_index: i64 = trait_decl.assoc_type_index(projection.member);
+            if (assoc_index < 0) { continue; }
+            const binding: TypeAnnotation* = impl_node.trait_slot_annotation(
+                trait_decl, trait_decl.generic_params.length() + assoc_index);
+            if (binding == null) { continue; }
+            const member: TypeRef = ctx.type_resolver.resolve(binding, impl_context);
+            if (checker.projected_member_unmet_trait(bound, member) != null) { return false; }
         }
         return true;
     }
@@ -3010,8 +3034,11 @@ type struct TypeResolutionPasses {
     }
 
     /// Clone every default-bodied trait method that `impl_node` doesn't
-    /// override. Returns the number of methods added.
+    /// override, except one bounded on an associated type the block binds
+    /// to a type that lacks the bound, read in `impl_context`. Returns the
+    /// number of methods added.
     static synthesize_default_trait_methods(impl_decl: DeclarationNode*, impl_node: mut ImplBlock*,
+                                             impl_context: ResolutionContext*,
                                              ctx: CompilationContext*) -> i64 {
         if (impl_node == null) { return 0; }
         if (!impl_node.is_trait_impl()) { return 0; }
@@ -3097,16 +3124,8 @@ type struct TypeResolutionPasses {
                 ctx.generic_registry.writes_trait_item(impl_node, trait_name, ti);
             if (already_present) { continue; }
 
-            // Skip cloning a projection-bounded default (`min`/`max` with
-            // `where This::Item: Ord`) into an impl whose CONCRETE Item type
-            // definitively lacks the bound trait - e.g. `EnumerateIterator`/`ZipIterator`
-            // yield `Pair`, which is never `Ord`. Without this the default body
-            // would be synthesized and then type-checked against a `Pair`
-            // receiver (`.compare()`), a spurious E0358. Symbolic Item types
-            // (a param `A`, or an `I::Item` projection) are kept and decided
-            // later.
             if (!TypeResolutionPasses::default_method_applies_to_impl(
-                    tfunc_decl, impl_node, trait_decl, args_ref, ctx)) {
+                    tfunc_decl, impl_node, trait_decl, impl_context, ctx)) {
                 continue;
             }
 
@@ -3257,7 +3276,7 @@ type struct TypeResolutionPasses {
     /// module.
     static sync_impl_methods(node: ImplBlock*, ctx: CompilationContext*, arena: mut TypeArena*) -> void {
         if (node.is_generic()) { return; }
-        const tgt: TypeRef = ctx.decl_index.impl_owner(node, "type_resolution/struct field sync");
+        const tgt: TypeRef = ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/struct field sync");
         if (!tgt.is_valid()) { return; }
         const tgt_t: Type* = arena.lookup(tgt);
         if (tgt_t == null) { return; }
@@ -3377,8 +3396,10 @@ type struct TypeResolutionPasses {
     /// does not override copied in first; answers how many it resolved.
     static impl_signatures(runner: mut &TypeResolutionRunner, decl: DeclarationNode*,
                            node: mut ImplBlock*, ctx: CompilationContext*) -> i64 {
+        mut impl_ctx: ResolutionContext = runner.make_generic_context(
+            node.generic_params, &runner.res_ctx);
         const _added: i64 = TypeResolutionPasses::synthesize_default_trait_methods(
-            decl, node, ctx);
+            decl, node, &impl_ctx, ctx);
 
         if (Log::enabled(LogArea::Types, LogLevel::Trace)) {
             const target: string = ctx.intern_table.resolve(node.target_type);
@@ -3389,8 +3410,6 @@ type struct TypeResolutionPasses {
                 }
             }
         }
-        mut impl_ctx: ResolutionContext = runner.make_generic_context(
-            node.generic_params, &runner.res_ctx);
         // Trait impls: bind the trait's outer generic params to the impl's
         // trait args (e.g. `Item -> T` for an `implement<T> Iterator<T> for
         // Bar<T>`).  Cloned default-method bodies reference these names
@@ -3411,7 +3430,7 @@ type struct TypeResolutionPasses {
         const impl_args: [TypeRef] = runner.impl_owner_args(node, &impl_ctx);
         runner.bind_parameter_head_this(node, &impl_ctx);
         runner.resolve_method_signatures(node.methods, &impl_ctx,
-            ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def(), &impl_args);
+            ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/impl methods"), node.target_def(), &impl_args);
         return node.methods.length();
     }
 
@@ -3871,8 +3890,10 @@ type struct TypeResolutionPasses {
                     // FuncSig phase above.
                     const impl_args: [TypeRef] = runner.impl_owner_args(node, &impl_ctx);
                     runner.resolve_method_signatures(node.methods, &impl_ctx,
-                        ctx.decl_index.impl_owner(node, "type_resolution/impl methods"), node.target_def(), &impl_args);
+                        ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/impl methods"), node.target_def(), &impl_args);
                     runner.emit_method_signature_diagnostics(node.methods);
+                    runner.check_implement_kind_keyword(node);
+                    runner.check_implement_alias_target(node);
                     runner.check_impl_conformance(stmt, node, &impl_ctx);
                     resolver.resolve_written_bounds(&node.where_bounds, &impl_ctx);
                 }
@@ -4013,7 +4034,7 @@ type struct TypeResolutionPasses {
                             node.generic_params, &runner.res_ctx);
                         runner.bind_trait_args_for_impl(node, &impl_ctx);
                         const impl_args: [TypeRef] = runner.impl_owner_args(node, &impl_ctx);
-                        const impl_owner: TypeRef = ctx.decl_index.impl_owner(node, "type_resolution/impl bodies");
+                        const impl_owner: TypeRef = ctx.decl_index.impl_owner(node, ctx.type_arena, "type_resolution/impl bodies");
                         if (impl_owner.is_valid()) {
                             impl_ctx.set_this_type(runner.resolver.owner_this_type(impl_owner, &impl_args, &impl_ctx));
                         }

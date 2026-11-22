@@ -1,0 +1,273 @@
+///! A verify run's own decisions: which baseline programs run, what their
+///! records add up to, which declared lines ask for a build, and the lines
+///! the run prints.
+![config(testing)]
+namespace cryogate::tests::run;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::path::{ Path, PathBuf };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_equal };
+
+import cryogate::core::host::{ Host };
+import cryogate::core::text::{ Text };
+import cryogate::verify::declarations::{ Declaration };
+import cryogate::verify::record::{ BaselineRecord };
+import cryogate::verify::run::children::{ PopulationRun };
+import cryogate::verify::run::declared::{ DeclaredBuilds };
+import cryogate::verify::run::programs::{ BaselinePlan, BaselineTotals };
+import cryogate::verify::run::session::{ VerifySession };
+
+/// Inputs written as text: a list as names joined by `,`, a row as a
+/// digit repeated 64 times, two spaces and a path.
+private type struct Given {
+    private static list(text: Str) -> Array<String> {
+        mut out: Array<String> = Array::<String>::new();
+        for (part in text.split_nonempty(&Str::new(","))) { out.push(String::from_str(part)); }
+        return out;
+    }
+
+    private static row(digit: Str, path: Str) -> String {
+        mut row: String = String::new();
+        while (row.length() < 64) { row.push(digit); }
+        row.push(Str::new("  "));
+        row.push(path);
+        return row;
+    }
+
+    private static record(name: Str, verdict: Str, rows: Array<String>) -> BaselineRecord {
+        mut record: BaselineRecord = BaselineRecord::new(name, verdict);
+        record.rows = rows;
+        return record;
+    }
+
+    private static unit_suite(failed: Str, count: i64) -> BaselineRecord {
+        mut record: BaselineRecord = BaselineRecord::new(Str::new("unit suite"), if (failed.is_empty()) { Str::new("ok") } else { Str::new("FAILED") });
+        record.unit_failed = Given::list(failed);
+        mut counts: Array<i64> = Array::<i64>::new();
+        counts.push(10);
+        counts.push(count);
+        counts.push(0);
+        counts.push(0);
+        record.unit_counts = Option::Some(counts);
+        return record;
+    }
+
+    private static checkout() -> Result<PathBuf, TestError> {
+        return match (Host::repository()) {
+            Result::Ok(root)    => { Result::Ok(root) }
+            Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
+        };
+    }
+
+    private static step(name: Str, fixed: boolean) -> Result<String, TestError> {
+        const root: PathBuf = Given::checkout()?;
+        return match (DeclaredBuilds::step(root.as_path(), name, fixed)) {
+            Result::Ok(build)    => { Result::Ok(String::from_str(if (build) { Str::new("build") } else { Str::new("no build") })) }
+            Result::Err(problem) => { Result::Ok(problem) }
+        };
+    }
+}
+
+const KEYED: Str = "unit suite,p,q,negative/n.cryo,examples/e,examples/f,archives/census,archives/examples";
+
+![test]
+function every_record_found_runs_nothing() -> Result<(), TestError> {
+    const plan: BaselinePlan = BaselinePlan::of(&Given::list(KEYED), &Given::list(KEYED));
+    expect_equal(plan.missing.length(), 0)?;
+    expect_equal(plan.census.length() + plan.examples.length(), 0)?;
+    return expect_equal(plan.line().as_str(),
+        Str::new("verify: baseline programs: 8 recorded, 0 to run (unit suite no, 0 project(s), 0 compile-fail file(s), 0 example(s))"));
+}
+
+![test]
+function a_new_project_runs_alone_through_a_filter() -> Result<(), TestError> {
+    const plan: BaselinePlan = BaselinePlan::of(&Given::list(KEYED), &Given::list(Str::new("unit suite,p,negative/n.cryo,examples/e,examples/f,archives/census,archives/examples")));
+    expect_equal(Text::joined(&plan.census, Str::new(",")).as_str(), Str::new("q"))?;
+    expect(!plan.everything, Str::new("one project of four is not everything"))?;
+    return expect_equal(Text::joined(&plan.patterns(), Str::new(",")).as_str(), Str::new("q"));
+}
+
+![test]
+function the_examples_archives_unrecorded_run_every_example() -> Result<(), TestError> {
+    const plan: BaselinePlan = BaselinePlan::of(&Given::list(KEYED), &Given::list(Str::new("unit suite,p,q,negative/n.cryo,examples/e,examples/f,archives/census")));
+    expect_equal(Text::joined(&plan.examples, Str::new(",")).as_str(), Str::new("examples/e,examples/f"))?;
+    return expect_equal(plan.census.length(), 0);
+}
+
+![test]
+function the_census_archives_unrecorded_run_the_unit_suite_alone() -> Result<(), TestError> {
+    const plan: BaselinePlan = BaselinePlan::of(&Given::list(KEYED), &Given::list(Str::new("unit suite,p,q,negative/n.cryo,examples/e,examples/f,archives/examples")));
+    expect_equal(Text::joined(&plan.missing, Str::new(",")).as_str(), Str::new("archives/census,unit suite"))?;
+    expect_equal(Text::joined(&plan.patterns(), Str::new(",")).as_str(), Str::new("CryoTests::"))?;
+    // The unit suite's declaration kind is a project's, so the report
+    // counts it among the projects.
+    return expect_equal(plan.line().as_str(),
+        Str::new("verify: baseline programs: 6 recorded, 2 to run (unit suite yes, 1 project(s), 0 compile-fail file(s), 0 example(s))"));
+}
+
+![test]
+function nothing_recorded_runs_one_census_over_everything() -> Result<(), TestError> {
+    const plan: BaselinePlan = BaselinePlan::of(&Given::list(KEYED), &Array::<String>::new());
+    expect(plan.everything, Str::new("every census-side program runs"))?;
+    expect_equal(plan.patterns().length(), 1)?;
+    expect_equal(plan.patterns()[0].as_str(), Str::new(""))?;
+    return expect_equal(plan.line().as_str(),
+        Str::new("verify: baseline programs: 0 recorded, 8 to run (unit suite yes, 3 project(s), 1 compile-fail file(s), 2 example(s))"));
+}
+
+![test]
+function a_compile_fail_file_is_filtered_by_its_file_name() -> Result<(), TestError> {
+    const plan: BaselinePlan = BaselinePlan::of(&Given::list(KEYED), &Given::list(Str::new("unit suite,p,q,examples/e,examples/f,archives/census,archives/examples")));
+    return expect_equal(Text::joined(&plan.patterns(), Str::new(",")).as_str(), Str::new("n.cryo"));
+}
+
+![test]
+function an_examples_line_names_the_example_and_its_verdict() -> Result<(), TestError> {
+    const built: Option<Pair<String, boolean>> = BaselinePlan::example_verdict(Str::new("  ok    examples/01-hello"));
+    expect(built.is_some(), Str::new("an ok line"))?;
+    expect_equal(built.unwrap().second, false)?;
+    const failed: Option<Pair<String, boolean>> = BaselinePlan::example_verdict(Str::new("  FAIL  examples/02-x"));
+    expect_equal(failed.unwrap().first.as_str(), Str::new("examples/02-x"))?;
+    expect(BaselinePlan::example_verdict(Str::new("examples-gate: OK -- 2 project(s) built")).is_none(), Str::new("the verdict line"))?;
+    return expect(BaselinePlan::example_verdict(Str::new("  ok    tests/x")).is_none(), Str::new("not an example"));
+}
+
+![test]
+function records_add_up_to_each_populations_rows_and_the_census_verdict() -> Result<(), TestError> {
+    mut records: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+    mut unit: BaselineRecord = Given::unit_suite(Str::new("A::U::t"), 1);
+    unit.rows.push(Given::row(Str::new("1"), Str::new("tests/build/deps/A.o")));
+    records.push(unit);
+    mut p_rows: Array<String> = Array::<String>::new();
+    p_rows.push(Given::row(Str::new("2"), Str::new("tests/tests/projects/p/build/a.o")));
+    records.push(Given::record(Str::new("p"), Str::new("FAILED"), p_rows));
+    records.push(Given::record(Str::new("negative/n.cryo"), Str::new("FAILED"), Array::<String>::new()));
+    mut e_rows: Array<String> = Array::<String>::new();
+    e_rows.push(Given::row(Str::new("3"), Str::new("examples/e/build/m.o")));
+    records.push(Given::record(Str::new("examples/e"), Str::new("ok"), e_rows));
+    mut archive_rows: Array<String> = Array::<String>::new();
+    archive_rows.push(Given::row(Str::new("4"), Str::new("stdlib-archive/t/O2/deps/std/io.o")));
+    records.push(Given::record(Str::new("archives/census"), Str::new("ok"), archive_rows.clone()));
+    records.push(Given::record(Str::new("archives/examples"), Str::new("ok"), archive_rows));
+    mut runtime: Array<String> = Array::<String>::new();
+    runtime.push(Given::row(Str::new("5"), Str::new("runtime/hosted-unwind/00-a.o")));
+    const totals: BaselineTotals = match (BaselineTotals::of(records, runtime)) {
+        Result::Ok(totals)  => { totals }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    expect_equal(totals.lists[0].length(), 2)?;
+    expect_equal(totals.lists[1].length(), 1)?;
+    // Two sweeps linking one archive name its objects once.
+    expect_equal(totals.lists[2].length(), 1)?;
+    expect_equal(totals.lists[3].length(), 1)?;
+    expect_equal(totals.census.unit_failed, 1)?;
+    expect_equal(totals.census.negatives_failed, 1)?;
+    return expect_equal(Text::joined(&totals.census.failed, Str::new(",")).as_str(), Str::new("A::U::t,negative/n.cryo,p"));
+}
+
+![test]
+function two_records_naming_one_object_with_other_bytes_are_refused() -> Result<(), TestError> {
+    mut records: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+    records.push(Given::unit_suite(Str::new(""), 0));
+    mut first: Array<String> = Array::<String>::new();
+    first.push(Given::row(Str::new("1"), Str::new("stdlib-archive/t/O2/deps/std/io.o")));
+    mut second: Array<String> = Array::<String>::new();
+    second.push(Given::row(Str::new("2"), Str::new("stdlib-archive/t/O2/deps/std/io.o")));
+    records.push(Given::record(Str::new("archives/census"), Str::new("ok"), first));
+    records.push(Given::record(Str::new("archives/examples"), Str::new("ok"), second));
+    return match (BaselineTotals::of(records, Array::<String>::new())) {
+        Result::Ok(_)       => { Result::Err(TestError::other(Str::new("two records disagreeing were accepted"))) }
+        Result::Err(reason) => { expect_equal(reason.as_str(), Str::new("two baseline records disagree on stdlib-archive/t/O2/deps/std/io.o")) }
+    };
+}
+
+![test]
+function records_without_the_unit_suite_are_refused() -> Result<(), TestError> {
+    return match (BaselineTotals::of(Array::<BaselineRecord>::new(), Array::<String>::new())) {
+        Result::Ok(_)       => { Result::Err(TestError::other(Str::new("no unit suite record was accepted"))) }
+        Result::Err(reason) => { expect_equal(reason.as_str(), Str::new("the baseline has no record of the unit suite")) }
+    };
+}
+
+![test]
+function an_archive_record_made_again_keeps_every_object_of_both() -> Result<(), TestError> {
+    mut held: Array<String> = Array::<String>::new();
+    held.push(Given::row(Str::new("1"), Str::new("stdlib-archive/t/O0/deps/std/io.o")));
+    mut fresh: Array<String> = Array::<String>::new();
+    fresh.push(Given::row(Str::new("1"), Str::new("stdlib-archive/t/O0/deps/std/io.o")));
+    fresh.push(Given::row(Str::new("2"), Str::new("stdlib-archive/t/O2/deps/std/io.o")));
+    const merged: BaselineRecord = match (BaselineTotals::merged(&Given::record(Str::new("archives/census"), Str::new("ok"), fresh),
+                                                                 &Given::record(Str::new("archives/census"), Str::new("ok"), held))) {
+        Result::Ok(merged)  => { merged }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    return expect_equal(merged.rows.length(), 2);
+}
+
+![test]
+function an_archive_object_built_again_with_other_bytes_is_refused() -> Result<(), TestError> {
+    mut held: Array<String> = Array::<String>::new();
+    held.push(Given::row(Str::new("1"), Str::new("stdlib-archive/t/O0/deps/std/io.o")));
+    mut fresh: Array<String> = Array::<String>::new();
+    fresh.push(Given::row(Str::new("3"), Str::new("stdlib-archive/t/O0/deps/std/io.o")));
+    return match (BaselineTotals::merged(&Given::record(Str::new("archives/census"), Str::new("ok"), fresh),
+                                         &Given::record(Str::new("archives/census"), Str::new("ok"), held))) {
+        Result::Ok(_)       => { Result::Err(TestError::other(Str::new("other bytes were merged"))) }
+        Result::Err(reason) => { expect_equal(reason.as_str(), Str::new("the baseline built stdlib-archive/t/O0/deps/std/io.o again with other bytes")) }
+    };
+}
+
+![test]
+function a_record_written_reads_back_the_same() -> Result<(), TestError> {
+    mut record: BaselineRecord = Given::unit_suite(Str::new("A::U::t"), 1);
+    record.warnings.push(String::from_str(Str::new("W0002 tests/tests/a.cryo:3")));
+    record.warnings_listed = true;
+    record.rows.push(Given::row(Str::new("1"), Str::new("tests/build/deps/A.o")));
+    const again: BaselineRecord = BaselineRecord::read(record.text().as_str());
+    expect_equal(again.name.as_str(), Str::new("unit suite"))?;
+    return expect(record.difference(&again).is_none(), Str::new("every field reads back"));
+}
+
+![test]
+function a_declared_line_must_name_a_program_of_its_kind() -> Result<(), TestError> {
+    expect_equal(Given::step(Str::new("negative/no_such_file.cryo"), true)?.as_str(),
+        Str::new("negative/no_such_file.cryo: declared in tests/started-passing but tests/tests/negative/no_such_file.cryo does not exist"))?;
+    expect_equal(Given::step(Str::new("no_such_project"), false)?.as_str(),
+        Str::new("no_such_project: declared in tests/started-compiling but tests/tests/projects/no_such_project is not a test project"))?;
+    expect_equal(Given::step(Str::new("moved-archive:std::time::clock"), false)?.as_str(),
+        Str::new("moved-archive:std::time::clock: a standard-library module's moved objects are declared in tests/started-passing, not tests/started-compiling"))?;
+    expect_equal(Given::step(Str::new("moved:examples/no-such-example"), true)?.as_str(),
+        Str::new("moved:examples/no-such-example: declared in tests/started-passing but examples/no-such-example is not an example project"))?;
+    return expect_equal(Given::step(Str::new("moved-runtime:hosted-unwind/no-o"), true)?.as_str(),
+        Str::new("moved-runtime:hosted-unwind/no-o: declared in tests/started-passing but hosted-unwind/no-o is not <configuration>/<member>.o"));
+}
+
+![test]
+function only_a_project_a_change_makes_compile_or_corrects_is_built() -> Result<(), TestError> {
+    expect_equal(Given::step(Str::new("visibility_internal_names"), false)?.as_str(), Str::new("build"))?;
+    expect_equal(Given::step(Str::new("visibility_internal_names"), true)?.as_str(), Str::new("build"))?;
+    expect_equal(Given::step(Str::new("moved:visibility_internal_names"), true)?.as_str(), Str::new("no build"))?;
+    expect_equal(Given::step(Str::new("moved:examples/01-hello"), true)?.as_str(), Str::new("no build"))?;
+    return expect_equal(Given::step(Str::new("moved-archive:std::time::clock"), true)?.as_str(), Str::new("no build"));
+}
+
+![test]
+function a_path_below_the_checkout_is_shown_relative_to_it() -> Result<(), TestError> {
+    expect_equal(PopulationRun::relative(Path::from("C:/r/x"), Str::new("C:\\r\\x\\.verify\\runs\\1")).as_str(), Str::new(".verify/runs/1"))?;
+    return expect_equal(PopulationRun::relative(Path::from("C:/r/x"), Str::new("D:/elsewhere")).as_str(), Str::new("D:/elsewhere"));
+}
+
+![test]
+function the_declared_lines_are_listed_in_name_order_under_their_count() -> Result<(), TestError> {
+    mut declared: Array<Declaration> = Array::<Declaration>::new();
+    declared.push(Declaration { name: String::from_str(Str::new("q")), reason: String::from_str(Str::new("second")) });
+    declared.push(Declaration { name: String::from_str(Str::new("p")), reason: String::from_str(Str::new("first")) });
+    return expect_equal(VerifySession::declared_line(&declared, Str::new("HEAD"), Str::new("pass")).as_str(),
+        Str::new("verify: 2 program(s) declared as starting to pass since HEAD\n      p -- first\n      q -- second"));
+}

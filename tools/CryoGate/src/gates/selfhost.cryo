@@ -1,0 +1,189 @@
+///! `cryogate selfhost [--no-windows] [--allow-skipped-arm]`: the compiler's
+///! fixed point.  Each arm builds the compiler three times from the current
+///! source, starting from a pin, and requires the third build to emit IR
+///! byte-identical to the second's, the last compiler to run and answer as
+///! the one before it, and the two stdlib archives the stage compilers built
+///! to hold byte-identical objects (`selfhost/`).
+///!
+///! On a Linux host the Linux arm runs from `bin/cryo`, then - once its
+///! fixed point holds, since a broken Linux arm makes the Windows one
+///! uninformative - the Windows arm runs `bin/cryo.exe` under wine with the
+///! fetched Windows toolchain.  `--no-windows` declines the Windows arm: the
+///! caller runs it itself.  An arm that cannot run here fails the run unless
+///! `--allow-skipped-arm` says that this environment verifies fewer arms.
+///!
+///! On a Windows host both arms run at the same time: the Linux arm inside
+///! WSL (started first, since a rebooted host has it stopped), from a
+///! digest-checked copy of its sources on WSL's own filesystem, where
+///! cryogate is built by the copy's pin and runs `selfhost --no-windows`;
+///! the Windows arm natively from `bin/cryo.exe`, its stage compilers run
+///! with every `PATH` directory holding `LLVM-C.dll` or `libclang.dll` left
+///! out, so a stage compiler starts only with the libraries beside it, as on
+///! a machine that has nothing but a release; the C driver and the archiver
+///! the stages run are named by their absolute paths, since a directory left
+///! out may be where they live.
+///!
+///! The run ends with the arms table and a `selfhost-check: OK` or
+///! `selfhost-check: FAIL` line; stage logs go to the run's log directory.
+///!
+///! `cryogate selfhost --digest [<root>]`: the digest of the sources the
+///! Linux arm reads (the pin and the compiler, runtime, stdlib and scripts
+///! trees, less their build outputs), below `<root>` or the checkout,
+///! printed as `<sha256>  (<N> files)`.
+
+namespace cryogate::gates::selfhost;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
+import cryogate::core::wsl::{ Wsl };
+import cryogate::selfhost::arms::{ Arm, ArmStatus, ArmsVerdict };
+import cryogate::selfhost::digest::{ TreeDigest };
+import cryogate::selfhost::run::arm::{ ArmRun };
+import cryogate::selfhost::run::wsl::{ WslArm };
+import cryogate::selfhost::stages::{ ArmPlan };
+
+/// The selfhost gate.
+public type struct SelfhostGate {
+    /// Run `cryogate selfhost` with `arguments` from index `first`.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate selfhost [--no-windows] [--allow-skipped-arm] | --digest [<root>]"));
+        options.flag(Str::new("--digest"));
+        options.flag(Str::new("--no-windows"));
+        options.flag(Str::new("--allow-skipped-arm"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate selfhost: {reason.as_str()}"); return 2; }
+        };
+        const positionals: &Array<String> = parsed.positionals();
+        if (parsed.has(Str::new("--digest"))) {
+            if (positionals.length() > 1 || parsed.separated() || parsed.has(Str::new("--no-windows")) || parsed.has(Str::new("--allow-skipped-arm"))) {
+                fmt::eprintln(f"cryogate selfhost: usage: {options.usage()}");
+                return 2;
+            }
+            const root: Path = if (positionals.is_empty()) { repository } else { Path::from(positionals.get_reference(0).unwrap().as_str()) };
+            return SelfhostGate::print_digest(root);
+        }
+        if (!positionals.is_empty() || parsed.separated()) {
+            fmt::eprintln(f"cryogate selfhost: usage: {options.usage()}");
+            return 2;
+        }
+        const allow_skipped: boolean = parsed.has(Str::new("--allow-skipped-arm"));
+        if (Host::os() == Str::new("windows")) {
+            if (parsed.has(Str::new("--no-windows"))) {
+                fmt::eprintln(String::from_str(Str::new("cryogate selfhost: --no-windows declines the Windows arm for a Linux host's caller; a Windows host runs that arm itself")));
+                return 2;
+            }
+            return SelfhostGate::windows_host(repository, logs, allow_skipped);
+        }
+        return SelfhostGate::linux_host(repository, logs, parsed.has(Str::new("--no-windows")), allow_skipped);
+    }
+
+    /// The Linux arm inside WSL and the Windows arm natively, at the same
+    /// time: the two share no directory.  This is the host that runs both
+    /// arms, so it is the one whose pass says the fixed point holds on both.
+    private static windows_host(repository: Path, logs: &RunLogs, allow_skipped: boolean) -> i32 {
+        fmt::println(String::from_str(Str::new("selfhost-check - byte-identity gate, both arms (boot: bin/cryo inside WSL, bin/cryo.exe natively)")));
+        fmt::println(f"  root: {repository.as_str()}");
+        fmt::println(f"  logs: {logs.directory().as_str()}");
+        const started: Completion = Wsl::start(logs);
+        if (!started.outcome.succeeded()) {
+            fmt::println(f"wsl.exe could not start WSL ({started.outcome.describe().as_str()}); see {started.log.as_str()}");
+            fmt::println(String::from_str(Str::new("  A Windows host runs the Linux arm inside WSL: install it with 'wsl --install' and a distribution with cryo's toolchain.")));
+            return 2;
+        }
+        const root: String = match (Wsl::path(repository.as_str(), logs)) {
+            Result::Ok(root) => { root }
+            Result::Err(done) => {
+                fmt::println(f"could not resolve a WSL path for {repository.as_str()} ({done.outcome.describe().as_str()}); is the checkout visible inside WSL?");
+                return 2;
+            }
+        };
+        mut linux: Result<WslArm, Arm> = WslArm::start(repository, root.as_str(), logs, allow_skipped);
+        const windows: Arm = ArmRun::run(repository, &ArmPlan::windows(repository, false), logs);
+        mut arms: Array<Arm> = Array::<Arm>::new();
+        arms.push(match (linux) {
+            Result::Ok(mut running) => { running.finish() }
+            Result::Err(arm)        => { arm }
+        });
+        arms.push(windows);
+        return SelfhostGate::finish(&arms, allow_skipped);
+    }
+
+    /// The Linux arm, then the Windows arm under wine unless declined.
+    private static linux_host(repository: Path, logs: &RunLogs, no_windows: boolean, allow_skipped: boolean) -> i32 {
+        const pin: PathBuf = repository.join(Str::new("bin/cryo"));
+        if (!pin.as_path().is_file()) {
+            fmt::println(f"pinned boot not found: {pin.as_path().as_str()}");
+            fmt::println(String::from_str(Str::new("  Build a fresh self-hosted compiler and run `make pin`, or check out a revision that has bin/cryo committed.")));
+            return 2;
+        }
+        fmt::println(String::from_str(Str::new("selfhost-check - byte-identity gate (boot: bin/cryo)")));
+        fmt::println(f"  root: {repository.as_str()}");
+        fmt::println(f"  logs: {logs.directory().as_str()}");
+        mut arms: Array<Arm> = Array::<Arm>::new();
+        const linux: Arm = ArmRun::run(repository, &ArmPlan::linux(repository), logs);
+        const linux_failed: boolean = match (&linux.status) {
+            ArmStatus::Verified => { false }
+            _                   => { true }
+        };
+        arms.push(linux);
+        if (!linux_failed) {
+            if (no_windows) {
+                arms.push(Arm::new(Str::new("windows"), ArmStatus::Declined, Str::new("--no-windows: run natively by the caller")));
+            } else {
+                arms.push(SelfhostGate::windows_under_wine(repository, logs));
+            }
+        }
+        return SelfhostGate::finish(&arms, allow_skipped);
+    }
+
+    /// The Windows arm under wine, skipped when wine or the fetched Windows
+    /// toolchain is missing: a stage links a runnable cryo.exe, which wine
+    /// can do only with the toolchain's C driver, archiver and libraries.
+    private static windows_under_wine(repository: Path, logs: &RunLogs) -> Arm {
+        mut missing: Array<String> = Array::<String>::new();
+        mut wine: Job = Job::new(Str::new("wine"));
+        wine.argument(Str::new("--version"));
+        wine.log_to(logs.file(Str::new("selfhost-wine-version")).as_str());
+        const answered: Completion = wine.run();
+        if (!answered.outcome.succeeded()) { missing.push(f"wine ({answered.outcome.describe().as_str()})"); }
+        const toolchain: Array<String> = ArmPlan::wine_toolchain_missing(repository);
+        for (path in toolchain.iterate_references()) { missing.push(f"{path.as_str()} (scripts/fetch-windows-llvm.sh)"); }
+        if (missing.is_empty()) { return ArmRun::run(repository, &ArmPlan::windows(repository, true), logs); }
+        fmt::println(String::new());
+        fmt::println(String::from_str(Str::new("==> windows arm: skipped, it cannot self-host under wine here:")));
+        for (item in missing.iterate_references()) { fmt::println(f"      - {item.as_str()}"); }
+        const listed: String = Text::joined(&missing, Str::new(", "));
+        return Arm::new(Str::new("windows"), ArmStatus::Skipped, f"missing {listed.as_str()}".as_str());
+    }
+
+    /// Print the arms table and return the run's exit status.
+    private static finish(arms: &Array<Arm>, allow_skipped: boolean) -> i32 {
+        const verdict: ArmsVerdict = ArmsVerdict::of(arms, allow_skipped);
+        for (line in verdict.lines.iterate_references()) { fmt::println(line.clone()); }
+        return verdict.exit;
+    }
+
+    private static print_digest(root: Path) -> i32 {
+        return match (TreeDigest::of(root)) {
+            Result::Ok(digest) => {
+                fmt::println(f"{digest.digest.as_str()}  ({digest.files} files)");
+                0
+            }
+            Result::Err(reason) => {
+                fmt::eprintln(f"cryogate selfhost: {reason.as_str()}");
+                1
+            }
+        };
+    }
+}

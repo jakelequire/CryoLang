@@ -1,0 +1,182 @@
+///! Moves (stage 7): owned structs, `type struct D0 { f0: u8; }`, each
+///! implementing `Drop` with a `drop` that folds the struct's number and
+///! fields into the hash, and their values moved between locals, into
+///! calls and out of returns.
+///!
+///! One or two owned structs of one to three scalar fields are declared
+///! from a stream of their own after the traits.  A value of one is not
+///! `Copy`: it is written as a literal, moved out of a parameter or local
+///! (the variable holds nothing afterwards, and the environment keeps it
+///! out of every query from there on), returned by a call, or chosen by an
+///! `if` expression whose branches are each one of these.  Owned values are
+///! held by `const` locals, taken by free functions' parameters three times
+///! in ten and returned by them about one time in seven.  A variable is
+///! moved only inside the loop it was declared in, so no move is repeated
+///! by a loop's next trip.  Each value is dropped once, where its last
+///! owner's scope ends, and its `drop` folds into the hash then, so the
+///! order and the count of drops are checked by both optimisation levels
+///! agreeing.
+
+namespace cryosmith::generate::moves;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::model::{ ExpressionKind, Field, OwnedStructure, StatementKind, ValueType, Variable, VariableRole };
+import cryosmith::random::{ RandomStream };
+import cryosmith::typing::{ TypeChoice };
+
+/// The most owned structs a program declares.
+const MOST_OWNED: i64 = 2;
+
+/// The most fields an owned struct has.
+const MOST_OWNED_FIELDS: i64 = 3;
+
+/// How often, in a hundred, a free function takes an owned value.
+const OWNED_PARAMETER_CHANCE: i64 = 30;
+
+/// How often, in a hundred, a free function returns an owned value.
+const OWNED_RETURN_CHANCE: i64 = 15;
+
+/// What a `drop` folds into the hash before its fields: this plus the
+/// struct's number, so each struct's drops are told apart.
+const DROP_TAG: u64 = 7001;
+
+implement struct Generator {
+    /// Declare the owned structs and their `drop` bodies, from their own
+    /// stream: none without `moves`.
+    internal declare_owned_structures(mut &this) -> void {
+        if (!this.options.features.has(Feature::Moves)) { return; }
+        this.random = RandomStream::for_owned(this.options.seed);
+        const count: i64 = 1 + this.random.below(MOST_OWNED);
+        while (this.program.owned_structures.length() < count) {
+            const index: i64 = this.program.owned_structures.length();
+            const first_field: i64 = this.program.fields.length();
+            const field_count: i64 = 1 + this.random.below(MOST_OWNED_FIELDS);
+            while (this.program.fields.length() < first_field + field_count) {
+                const number: i64 = this.program.fields.length() - first_field;
+                this.program.fields.push(Field { number: number, value_type: TypeChoice::scalar(&this.random, this.options.features), default_value: -1 });
+            }
+            const drop_body: i64 = this.drop_body(index, first_field, field_count);
+            this.program.owned_structures.push(OwnedStructure { number: index, first_field: first_field, field_count: field_count, drop_body: drop_body });
+        }
+    }
+
+    /// The body of owned struct `index`'s `drop`: `observed` folds the
+    /// struct's tag, then each field of `this`.  Not charged to any
+    /// function: a drop does a fixed amount of work, once per value made.
+    private drop_body(mut &this, index: i64, first_field: i64, field_count: i64) -> i64 {
+        const owned: ValueType = ValueType::Owned(index);
+        const receiver: i64 = this.program.variable(Variable { role: VariableRole::Receiver, number: 0, value_type: owned, mutable: true });
+        mut statements: Array<i64> = Array::<i64>::new();
+        const tag: i64 = this.program.expression(ExpressionKind::IntegerLiteral(DROP_TAG + (index as u64), false), ValueType::U64);
+        statements.push(this.program.statement(StatementKind::Observe(tag)));
+        mut field: i64 = first_field;
+        while (field < first_field + field_count) {
+            const base: i64 = this.program.expression(ExpressionKind::Variable(receiver), owned);
+            const read: i64 = this.program.expression(ExpressionKind::Field(base, field), this.program.field_at(field).value_type);
+            statements.push(this.program.statement(StatementKind::Observe(read)));
+            field = field + 1;
+        }
+        return this.program.block(&statements);
+    }
+
+    /// Whether owned values are generated: `moves` is on, and so the
+    /// program has owned structs.
+    internal makes_owned(&this) -> boolean {
+        return this.options.features.has(Feature::Moves) && this.program.owned_structures.length() > 0;
+    }
+
+    /// An owned parameter for a free function, sometimes: with `moves`,
+    /// `OWNED_PARAMETER_CHANCE` times in a hundred, a type whose values
+    /// move added to `parameter_types`.  No draw without the feature.
+    /// Whether one was added.
+    internal add_owned_parameter(mut &this, parameter_types: mut &Array<ValueType>) -> boolean {
+        if (!this.makes_owned() || !this.random.chance(OWNED_PARAMETER_CHANCE)) { return false; }
+        parameter_types.push(this.drawn_moving());
+        return true;
+    }
+
+    /// A type whose values move for a free function to return, sometimes:
+    /// with `moves`, `OWNED_RETURN_CHANCE` times in a hundred; `void`
+    /// otherwise.  No draw without the feature.
+    internal owned_return_type(mut &this) -> ValueType {
+        if (!this.makes_owned() || !this.random.chance(OWNED_RETURN_CHANCE)) { return ValueType::Void; }
+        return this.drawn_moving();
+    }
+
+    /// `const v<N>: D<M> = ..;`, a local holding an owned value or a
+    /// holder of one, or with references on sometimes `mut v<N>`.  A
+    /// `const` option or result declared with a value built holding one
+    /// certainly holds it.
+    internal owned_declaration(mut &this) -> i64 {
+        const value_type: ValueType = this.drawn_moving();
+        const value: i64 = this.moving_expression(value_type, this.depth());
+        const mutable: boolean = this.mutable_owned();
+        const variable: i64 = this.environment.declare_local(&this.program, value_type, mutable);
+        const built_holding: boolean = match (this.program.expression_at(value).kind) {
+            ExpressionKind::Hold(_, _) => { true }
+            _                          => { false }
+        };
+        if (value_type.may_be_absent() && built_holding && !mutable) { this.environment.mark_present(variable); }
+        return this.program.statement(StatementKind::Declare(variable, value));
+    }
+
+    /// A value of the owned type `wanted`, moved to where it stands: a
+    /// literal, a parameter or local moved out of, a call returning one,
+    /// an `if` expression each of whose branches is one of these, and with
+    /// `options` the value of an option or a result certainly holding one,
+    /// unwrapped, or one a `?` takes out.  A variable moved out of holds
+    /// nothing from here on.
+    internal owned_expression(mut &this, wanted: ValueType, depth: i64) -> i64 {
+        const deeper: boolean = depth > 0;
+        const next: i64 = if (deeper) { depth - 1 } else { 0 };
+        const movable: Array<i64> = this.environment.movable(&this.program, wanted);
+        const callees: Array<i64> = this.callees(wanted);
+        const unwrappable: Array<i64> = this.unwrappable(wanted.owned());
+        const propagated: ValueType = this.propagated_type(wanted.owned());
+        const absent_sources: Array<i64> = if (propagated.is_holder()) { this.environment.movable(&this.program, propagated) } else { Array::<i64>::new() };
+        const absent_callees: Array<i64> = if (propagated.is_holder() && deeper) { this.callees(propagated) } else { Array::<i64>::new() };
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(6);
+        weights.push(if (movable.length() > 0) { 10 } else { 0 });
+        weights.push(if (callees.length() > 0 && deeper) { 5 } else { 0 });
+        weights.push(if (this.options.features.has(Feature::IfExpressions) && deeper) { 2 } else { 0 });
+        weights.push(if (unwrappable.length() > 0) { 6 } else { 0 });
+        weights.push(if (deeper && this.propagates(propagated, &absent_sources, &absent_callees)) { 4 } else { 0 });
+        const form: i64 = this.random.pick(&weights);
+        if (form == 0) { return this.owned_literal(wanted, next); }
+        if (form == 1) {
+            const variable: i64 = movable.get(this.random.below(movable.length())).unwrap();
+            this.environment.move_out(variable);
+            return this.node(ExpressionKind::Move(variable), wanted);
+        }
+        if (form == 2) { return this.call(callees.get(this.random.below(callees.length())).unwrap(), next); }
+        if (form == 4) { return this.unwrapped(&unwrappable, wanted); }
+        if (form == 5) { return this.propagated(propagated, &absent_sources, &absent_callees, next, wanted); }
+        const condition: i64 = this.condition(next);
+        const then_value: i64 = this.owned_expression(wanted, next);
+        const else_value: i64 = this.owned_expression(wanted, next);
+        return this.node(ExpressionKind::Conditional(condition, then_value, else_value), wanted);
+    }
+
+    /// `D<N> { f1: a, f0: b }`, every field written, in a drawn order.
+    internal owned_literal(mut &this, wanted: ValueType, depth: i64) -> i64 {
+        const declared: OwnedStructure = this.program.owned_at(wanted.owned());
+        mut order: Array<i64> = Array::<i64>::new();
+        mut field: i64 = declared.first_field;
+        while (field < declared.first_field + declared.field_count) {
+            order.push(field);
+            field = field + 1;
+        }
+        this.shuffle(&order);
+        mut entries: Array<i64> = Array::<i64>::new();
+        for (written in order.iter()) {
+            entries.push(written);
+            entries.push(this.typed_place(this.program.field_at(written).value_type, depth));
+        }
+        const first: i64 = this.program.list_run(&entries);
+        return this.node(ExpressionKind::OwnedLiteral(wanted.owned(), first, declared.field_count), wanted);
+    }
+}

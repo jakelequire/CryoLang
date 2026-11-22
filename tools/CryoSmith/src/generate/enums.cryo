@@ -1,0 +1,401 @@
+///! Enums and `match`: enums `E<N>` with variants `V<N>`, their values,
+///! and `match` over them as an expression and as a statement.
+///!
+///! The enums are declared first, before the structs, from a stream of
+///! their own, so with the feature off no draw is taken.  With
+///! `enum-payloads` a variant carries up to two scalar values,
+///! `V1(u8, i32)`; a value of an enum type is then `Copy`, as each of its
+///! payload's types is.  An enum is a type a value may have: a local, a
+///! parameter, a return type, a generic function's type argument.  A value
+///! of one is a variant (`E0::V1`, `E0::V2(a, b)` with a value of each
+///! payload type), a variable, a call, an `if` expression or a `match`
+///! expression, so it always reads a name.  A `match` covers every variant
+///! once, by its own arm or by a `_` written last (`Exhaustiveness`), its
+///! arms in a shuffled order; an expression's arms read a name, since an
+///! arm, as an `if` expression's, gives a bare literal no type.  An arm
+///! over a payload variant binds each value, `E0::V2(b0, b1)`, and every
+///! binding reaches the hash: a statement's arm observes them at the end of
+///! its block, an integer expression's arm folds its value and them by
+///! `mix`, and any other expression's arm observes them by statements
+///! before its value.  An enum value is
+///! observed by the `match` the printer folds it with, which folds a
+///! payload into its variant's number.
+
+namespace cryosmith::generate::enums;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::generate::structs::{ MethodCandidate };
+import cryosmith::guarantees::{ Exhaustiveness };
+import cryosmith::model::{ Enumeration, ExpressionKind, MatchArm, PatternElement, StatementKind, TypeArgumentSpelling, ValueType, VariantDeclaration };
+import cryosmith::random::{ RandomStream };
+import cryosmith::typing::{ TypeChoice };
+
+/// The most enums a program declares.
+const MOST_ENUMERATIONS: i64 = 2;
+
+/// The most variants an enum has; it has at least two.
+const MOST_VARIANTS: i64 = 4;
+
+/// The most values a variant's payload holds.
+const MOST_PAYLOAD_VALUES: i64 = 2;
+
+/// The most generic enums a program declares.
+const MOST_GENERIC_ENUMERATIONS: i64 = 2;
+
+/// The most type arguments one generic enum is instantiated at.
+const MOST_ENUMERATION_INSTANCES: i64 = 2;
+
+/// How often, in a hundred, a `match` statement with `subject-assignments`
+/// matches on a `mut` enum local, when one is in scope.
+const SUBJECT_CHANCE: i64 = 50;
+
+/// How often, in a hundred, an arm of a `match` statement on a `mut` local
+/// opens by assigning the local another variant.
+const SUBJECT_ASSIGNMENT_CHANCE: i64 = 60;
+
+implement struct Generator {
+    /// Declare the program's enums, one or two, from their own stream.
+    internal declare_enumerations(mut &this) -> void {
+        mut declaring: RandomStream = RandomStream::for_enumerations(this.options.seed);
+        const count: i64 = 1 + declaring.below(MOST_ENUMERATIONS);
+        while (this.program.enumerations.length() < count) {
+            const variant_count: i64 = 2 + declaring.below(MOST_VARIANTS - 1);
+            const first_variant: i64 = this.program.variants.length();
+            while (this.program.variants.length() < first_variant + variant_count) {
+                const first_payload: i64 = this.program.payload_types.length();
+                const payload_count: i64 = if (this.options.features.has(Feature::EnumPayloads)) { declaring.below(MOST_PAYLOAD_VALUES + 1) } else { 0 };
+                while (this.program.payload_types.length() < first_payload + payload_count) {
+                    // With `nested-patterns` a payload value may be of an
+                    // enum declared before this one, which a pattern can
+                    // match by its variant.
+                    const earlier: i64 = this.program.enumerations.length();
+                    const nested: boolean = this.options.features.has(Feature::NestedPatterns) && earlier > 0 && declaring.chance(50);
+                    this.program.payload_types.push(if (nested) { ValueType::Enumeration(declaring.below(earlier)) } else { TypeChoice::scalar(&declaring, this.options.features) });
+                }
+                this.program.variants.push(VariantDeclaration { first_payload: first_payload, payload_count: payload_count });
+            }
+            this.program.enumerations.push(Enumeration::declared(this.program.enumerations.length(), variant_count, first_variant));
+        }
+        // A generic enum's `T` is carried only by payloads, so it needs them.
+        if (this.options.features.has(Feature::GenericEnums) && this.options.features.has(Feature::EnumPayloads)) {
+            this.declare_generic_enumerations(&declaring);
+        }
+    }
+
+    /// Declare one or two generic enums `G<N><T>` from the enums' stream,
+    /// each with a payload of type `T` in variant 1 and in others half the
+    /// time, and instantiate each at one or two scalar type arguments.
+    private declare_generic_enumerations(mut &this, declaring: mut &RandomStream) -> void {
+        const count: i64 = 1 + declaring.below(MOST_GENERIC_ENUMERATIONS);
+        while (this.program.enumeration_templates.length() < count) {
+            const variant_count: i64 = 2 + declaring.below(MOST_VARIANTS - 1);
+            const first_variant: i64 = this.program.variants.length();
+            while (this.program.variants.length() < first_variant + variant_count) {
+                const variant: i64 = this.program.variants.length() - first_variant;
+                const first_payload: i64 = this.program.payload_types.length();
+                const payload_count: i64 = if (variant == 1) { 1 + declaring.below(MOST_PAYLOAD_VALUES) } else { declaring.below(MOST_PAYLOAD_VALUES + 1) };
+                while (this.program.payload_types.length() < first_payload + payload_count) {
+                    const forced: boolean = variant == 1 && this.program.payload_types.length() == first_payload;
+                    this.program.payload_types.push(if (forced || declaring.chance(50)) { ValueType::TypeParameter } else { TypeChoice::scalar(declaring, this.options.features) });
+                }
+                this.program.variants.push(VariantDeclaration { first_payload: first_payload, payload_count: payload_count });
+            }
+            const template: i64 = this.program.enumeration_templates.length();
+            this.program.enumeration_templates.push(Enumeration::declared(template, variant_count, first_variant));
+            const instance_count: i64 = 1 + declaring.below(MOST_ENUMERATION_INSTANCES);
+            mut made: i64 = 0;
+            while (made < instance_count) {
+                this.instantiate_enumeration(template, TypeChoice::scalar(declaring, this.options.features));
+                made = made + 1;
+            }
+        }
+    }
+
+    /// The instance of generic enum `template` at `argument`: its variants
+    /// the generic enum's, each payload of type `T` of type `argument`.
+    private instantiate_enumeration(mut &this, template: i64, argument: ValueType) -> void {
+        const generic: Enumeration = this.program.enumeration_templates.get(template).unwrap();
+        const first_variant: i64 = this.program.variants.length();
+        mut variant: i64 = 0;
+        while (variant < generic.variant_count) {
+            const declared: VariantDeclaration = this.program.variants.get(generic.first_variant + variant).unwrap();
+            const first_payload: i64 = this.program.payload_types.length();
+            mut position: i64 = 0;
+            while (position < declared.payload_count) {
+                const payload: ValueType = this.program.payload_type(declared, position);
+                this.program.payload_types.push(if (payload.same(ValueType::TypeParameter)) { argument } else { payload });
+                position = position + 1;
+            }
+            this.program.variants.push(VariantDeclaration { first_payload: first_payload, payload_count: declared.payload_count });
+            variant = variant + 1;
+        }
+        this.program.enumerations.push(Enumeration {
+            number: this.program.enumerations.length(), variant_count: generic.variant_count, first_variant: first_variant,
+            template: template, argument: argument,
+        });
+    }
+
+    /// A value of the enum type `wanted`: a variant, a variable, a call, a
+    /// method call or an `if` expression.
+    internal enumeration_expression(mut &this, wanted: ValueType, depth: i64) -> i64 {
+        const deeper: boolean = depth > 0;
+        const next: i64 = if (deeper) { depth - 1 } else { 0 };
+        const variables: Array<i64> = this.environment.variables_of(&this.program, wanted);
+        const callees: Array<i64> = this.callees(wanted);
+        const methods: Array<MethodCandidate> = this.method_calls(wanted, false);
+        const generic_callees: Array<i64> = this.generic_callees(wanted);
+        mut weights: Array<i64> = Array::<i64>::new();
+        weights.push(8);
+        weights.push(if (variables.length() > 0) { 10 } else { 0 });
+        weights.push(if (callees.length() > 0 && deeper) { 5 } else { 0 });
+        weights.push(if (methods.length() > 0 && deeper) { 4 } else { 0 });
+        weights.push(if (this.options.features.has(Feature::IfExpressions) && deeper) { 2 } else { 0 });
+        weights.push(if (generic_callees.length() > 0 && deeper) { 3 } else { 0 });
+        const form: i64 = this.random.pick(&weights);
+        if (form == 0) {
+            const variants: i64 = this.program.enumeration_at(wanted.enumeration()).variant_count;
+            return this.variant_value(wanted, this.random.below(variants), next);
+        }
+        if (form == 1) { return this.read(variables.get(this.random.below(variables.length())).unwrap()); }
+        if (form == 2) { return this.call(callees.get(this.random.below(callees.length())).unwrap(), next); }
+        if (form == 3) { return this.method_call(methods.get(this.random.below(methods.length())).unwrap(), next); }
+        if (form == 4) {
+            const condition: i64 = this.condition(next);
+            const then_value: i64 = this.enumeration_expression(wanted, next);
+            const else_value: i64 = this.enumeration_expression(wanted, next);
+            return this.node(ExpressionKind::Conditional(condition, then_value, else_value), wanted);
+        }
+        return this.generic_call(generic_callees.get(this.random.below(generic_callees.length())).unwrap(), wanted, next);
+    }
+
+    /// Variant `variant` of the enum type `wanted`, with a value of each of
+    /// its payload's types: `E0::V0`, `E0::V1(a, b)`.  An instance's
+    /// variant with a payload of type `T` may leave the type argument to
+    /// inference (`G0::V1(a)`, `G0::<_>::V1(a)`), and then gives a deciding
+    /// value for each such payload; one with none writes it,
+    /// `G0::<u16>::V0`, since nothing else would say which instance.
+    private variant_value(mut &this, wanted: ValueType, variant: i64, depth: i64) -> i64 {
+        const shape: VariantDeclaration = this.program.variant_of(wanted.enumeration(), variant);
+        mut decides: boolean = false;
+        mut position: i64 = 0;
+        while (position < shape.payload_count) {
+            if (this.program.payload_is_type_argument(wanted.enumeration(), variant, position)) { decides = true; }
+            position = position + 1;
+        }
+        const spelling: TypeArgumentSpelling = if (decides) { this.type_argument_spelling() } else { TypeArgumentSpelling::Written };
+        mut values: Array<i64> = Array::<i64>::new();
+        position = 0;
+        while (position < shape.payload_count) {
+            const payload: ValueType = this.program.payload_type(shape, position);
+            if (spelling.is_inferred() && this.program.payload_is_type_argument(wanted.enumeration(), variant, position)) {
+                values.push(this.deciding_value(payload, depth));
+            } else {
+                values.push(this.typed_place(payload, depth));
+            }
+            position = position + 1;
+        }
+        const first: i64 = this.program.list_run(&values);
+        return this.node(ExpressionKind::Variant(variant, spelling, first, shape.payload_count), wanted);
+    }
+
+    /// Whether a `match` may be generated here: the feature is on and the
+    /// program has an enum to match on.
+    internal matches_enumerations(&this) -> boolean {
+        return this.options.features.has(Feature::Enums) && this.program.enumerations.length() > 0;
+    }
+
+    /// `match (subject) { .. }` whose arms are values of `wanted`, each
+    /// reading a name, an arm over a payload variant observing its bindings
+    /// first.
+    internal match_expression(mut &this, wanted: ValueType, depth: i64) -> i64 {
+        const subject: i64 = this.match_subject(depth);
+        const matched: ValueType = this.program.expression_at(subject).value_type;
+        mut patterns: Array<i64> = this.match_patterns(matched);
+        mut arms: Array<MatchArm> = Array::<MatchArm>::new();
+        mut position: i64 = 0;
+        while (position < patterns.length()) {
+            const pattern: i64 = patterns.get(position).unwrap();
+            const scope: i64 = this.environment.mark();
+            mut bindings: Array<i64> = Array::<i64>::new();
+            const elements: Array<i64> = this.payload_elements(matched, pattern, this.options.features.has(Feature::NestedPatterns), &bindings);
+            // An integer arm folds its value and then its bindings by `mix`,
+            // converted back to its type: an observation in the arm is
+            // overwritten when the `match` is part of a value being
+            // observed, `observed = mix(observed, h0(..))` having read
+            // `observed` before the arm ran.
+            mut observations: Array<i64> = Array::<i64>::new();
+            if (!wanted.is_integer()) {
+                for (binding in bindings.iter()) { this.observe_place(this.read(binding), &observations); }
+            }
+            const enclosing: boolean = this.making_arm_value;
+            this.making_arm_value = true;
+            mut body: i64 = this.expression(wanted, depth, true);
+            this.making_arm_value = enclosing;
+            if (wanted.is_integer() && bindings.length() > 0) {
+                const start: i64 = this.node(ExpressionKind::Mix(this.integer((position + 1) as u64, ValueType::U64), body), ValueType::U64);
+                body = this.node(ExpressionKind::Cast(this.folded_bindings(&bindings, start)), wanted);
+            }
+            this.environment.leave(scope);
+            const first_element: i64 = this.program.list_run(&elements);
+            if (this.program.elements_refutable(first_element, elements.length()) && patterns.get(patterns.length() - 1).unwrap() >= 0) { patterns.push(-1); }
+            arms.push(MatchArm {
+                pattern: pattern, first_element: first_element, element_count: elements.length(),
+                observations: this.program.block(&observations), body: body, subject_assignment: -1,
+            });
+            position = position + 1;
+        }
+        const first: i64 = this.program.arm_run(&arms);
+        return this.node(ExpressionKind::Match(subject, first, arms.length()), wanted);
+    }
+
+    /// `match (subject) { .. }` whose arms are blocks, each observing its
+    /// arm's bindings last.
+    internal match_statement(mut &this) -> i64 {
+        const assigned: i64 = this.assignable_subject();
+        const subject: i64 = if (assigned >= 0) { this.read(assigned) } else { this.match_subject(this.depth()) };
+        const matched: ValueType = this.program.expression_at(subject).value_type;
+        mut patterns: Array<i64> = this.match_patterns(matched);
+        mut arms: Array<MatchArm> = Array::<MatchArm>::new();
+        mut position: i64 = 0;
+        while (position < patterns.length()) {
+            const pattern: i64 = patterns.get(position).unwrap();
+            const scope: i64 = this.environment.mark();
+            mut bindings: Array<i64> = Array::<i64>::new();
+            const elements: Array<i64> = this.payload_elements(matched, pattern, this.options.features.has(Feature::NestedPatterns), &bindings);
+            mut opening: Array<i64> = Array::<i64>::new();
+            if (assigned >= 0 && pattern >= 0 && this.random.chance(SUBJECT_ASSIGNMENT_CHANCE)) {
+                opening.push(this.subject_assignment(assigned, pattern));
+            }
+            const body: i64 = this.block_opening(&opening, &bindings);
+            this.environment.leave(scope);
+            const first_element: i64 = this.program.list_run(&elements);
+            if (this.program.elements_refutable(first_element, elements.length()) && patterns.get(patterns.length() - 1).unwrap() >= 0) { patterns.push(-1); }
+            arms.push(MatchArm {
+                pattern: pattern, first_element: first_element, element_count: elements.length(),
+                observations: -1, body: body, subject_assignment: if (opening.length() > 0) { opening.get(0).unwrap() } else { -1 },
+            });
+            position = position + 1;
+        }
+        const first: i64 = this.program.arm_run(&arms);
+        return this.program.statement(StatementKind::Match(subject, first, arms.length()));
+    }
+
+    /// With `subject-assignments`, sometimes a `mut` local of an enum type
+    /// for a `match` statement to match on, whose arms may then assign it;
+    /// -1 otherwise.  No draw without the feature.
+    private assignable_subject(mut &this) -> i64 {
+        if (!this.options.features.has(Feature::SubjectAssignments)) { return -1; }
+        mut candidates: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.assignable(&this.program).iter()) {
+            if (this.program.variable_at(variable).value_type.is_enumeration()) { candidates.push(variable); }
+        }
+        if (candidates.length() == 0 || !this.random.chance(SUBJECT_CHANCE)) { return -1; }
+        return candidates.get(this.random.below(candidates.length())).unwrap();
+    }
+
+    /// `v<N> = E<M>::V<K>(..);` opening an arm matching variant `pattern`
+    /// of the local `subject`: a variant other than `pattern`, so the value
+    /// the arm was entered with is gone from the local, and the arm's
+    /// bindings, which it observes at its end, must hold their own copies.
+    private subject_assignment(mut &this, subject: i64, pattern: i64) -> i64 {
+        const matched: ValueType = this.program.variable_at(subject).value_type;
+        mut other: i64 = this.random.below(this.program.enumeration_at(matched.enumeration()).variant_count - 1);
+        if (other >= pattern) { other = other + 1; }
+        const value: i64 = this.variant_value(matched, other, this.depth());
+        return this.program.statement(StatementKind::Assign(this.target(subject), value));
+    }
+
+    /// A value of one of the program's enums to match on, itself sometimes
+    /// a `match` expression.
+    private match_subject(mut &this, depth: i64) -> i64 {
+        const matched: ValueType = ValueType::Enumeration(this.random.below(this.program.enumerations.length()));
+        return this.expression(matched, depth, true);
+    }
+
+    /// `match (value) { E0::V0 => { 1 } E0::V1(b0) => { mix(2, b0) } .. }`,
+    /// an arm per variant giving its number plus one, as a literal the
+    /// `u64` it is passed as types, with each payload value folded in by
+    /// `mix`.  An enum value is observed through it.
+    internal variant_number(mut &this, value: i64) -> i64 {
+        const matched: ValueType = this.program.expression_at(value).value_type;
+        mut arms: Array<MatchArm> = Array::<MatchArm>::new();
+        while (arms.length() < this.program.enumeration_at(matched.enumeration()).variant_count) {
+            const scope: i64 = this.environment.mark();
+            mut bindings: Array<i64> = Array::<i64>::new();
+            const elements: Array<i64> = this.payload_elements(matched, arms.length(), false, &bindings);
+            const folded: i64 = this.folded_bindings(&bindings, this.integer((arms.length() + 1) as u64, ValueType::U64));
+            this.environment.leave(scope);
+            arms.push(MatchArm {
+                pattern: arms.length(), first_element: this.program.list_run(&elements), element_count: elements.length(),
+                observations: -1, body: folded, subject_assignment: -1,
+            });
+        }
+        const first: i64 = this.program.arm_run(&arms);
+        return this.node(ExpressionKind::Match(value, first, arms.length()), ValueType::U64);
+    }
+
+    /// `mix(.. mix(state, b0) .., bN)`, a `u64` the `u64` `state` and every
+    /// binding's value reach: a scalar directly, an enum through its
+    /// variant number.
+    private folded_bindings(mut &this, bindings: &Array<i64>, state: i64) -> i64 {
+        mut folded: i64 = state;
+        for (binding in bindings.iter()) {
+            const place: i64 = this.read(binding);
+            const folding: i64 = if (this.program.variable_at(binding).value_type.is_enumeration()) { this.variant_number(place) } else { place };
+            folded = this.node(ExpressionKind::Mix(folded, folding), ValueType::U64);
+        }
+        return folded;
+    }
+
+    /// The elements of a pattern over variant `variant` of the enum type
+    /// `matched`, one per payload value, as places among the program's
+    /// pattern elements; none for `_` (-1) or a unit variant.  A value is
+    /// bound, its binding in scope and added to `bindings`.  When `nests`
+    /// (`nested-patterns`), a value of an enum is instead matched by a
+    /// variant pattern of its own two times in five, which makes the arm
+    /// refutable, and any value by `_` a fifth of the time.
+    private payload_elements(mut &this, matched: ValueType, variant: i64, nests: boolean, bindings: mut &Array<i64>) -> Array<i64> {
+        mut elements: Array<i64> = Array::<i64>::new();
+        if (variant < 0) { return elements; }
+        const shape: VariantDeclaration = this.program.variant_of(matched.enumeration(), variant);
+        while (elements.length() < shape.payload_count) {
+            const payload: ValueType = this.program.payload_type(shape, elements.length());
+            if (nests && payload.is_enumeration() && this.random.chance(40)) {
+                const inner_variant: i64 = this.random.below(this.program.enumeration_at(payload.enumeration()).variant_count);
+                const inner: Array<i64> = this.payload_elements(payload, inner_variant, nests, bindings);
+                const inner_first: i64 = this.program.list_run(&inner);
+                elements.push(this.program.pattern_element(PatternElement::Variant(payload, inner_variant, inner_first, inner.length())));
+            } else if (nests && this.random.chance(20)) {
+                elements.push(this.program.pattern_element(PatternElement::Wildcard));
+            } else {
+                const binding: i64 = this.environment.declare_binding(&this.program, payload);
+                bindings.push(binding);
+                elements.push(this.program.pattern_element(PatternElement::Binding(binding)));
+            }
+        }
+        return elements;
+    }
+
+    /// A `match`'s patterns over the enum type `matched`: one to all of its
+    /// variants in a shuffled order, then `_` when one is left.
+    private match_patterns(mut &this, matched: ValueType) -> Array<i64> {
+        const variant_count: i64 = this.program.enumeration_at(matched.enumeration()).variant_count;
+        mut order: Array<i64> = Array::<i64>::new();
+        while (order.length() < variant_count) { order.push(order.length()); }
+        mut position: i64 = variant_count - 1;
+        while (position > 0) {
+            const other: i64 = this.random.below(position + 1);
+            const held: i64 = order.get(position).unwrap();
+            order.set(position, order.get(other).unwrap());
+            order.set(other, held);
+            position = position - 1;
+        }
+        const covered_count: i64 = 1 + this.random.below(variant_count);
+        mut covered: Array<i64> = Array::<i64>::new();
+        while (covered.length() < covered_count) { covered.push(order.get(covered.length()).unwrap()); }
+        return Exhaustiveness::patterns(&covered, variant_count);
+    }
+}

@@ -1,0 +1,251 @@
+///! Expression nodes.  An expression is what it is - a literal, a read, an
+///! operator over operands, a call, a field, a struct literal - and its
+///! type; its operands are other nodes, named by index.
+
+namespace cryosmith::model::expressions;
+
+import cryosmith::model::operators::{ BinaryOperator, UnaryOperator, WrappingOperator };
+import cryosmith::model::types::{ ValueType };
+
+/// What an expression node is.  Indices name other nodes of the same
+/// program: expressions, variables, fields, structures, functions, or a run
+/// of the program's index lists.
+public type enum ExpressionKind {
+    /// An integer literal: its magnitude and whether it is negative.
+    IntegerLiteral(u64, boolean);
+    /// `true` or `false`.
+    BooleanLiteral(boolean);
+    /// The type's named limit: `T::MAX` when true, `T::MIN` when false.
+    Limit(boolean);
+    /// A read of a variable.
+    Variable(i64);
+    /// A unary operator and its operand.
+    Unary(UnaryOperator, i64);
+    /// A binary operator and its two operands.
+    Binary(BinaryOperator, i64, i64);
+    /// `receiver.wrapping_<operation>(argument)`.
+    Wrapping(WrappingOperator, i64, i64);
+    /// `operand as T`, `T` the node's own type.
+    Cast(i64);
+    /// A narrower operand where the node's type is wanted, converted
+    /// implicitly; printed as the operand alone.
+    Widen(i64);
+    /// `if (condition) { a } else { b }`.
+    Conditional(i64, i64, i64);
+    /// A call of a free function or a static method: the function, the
+    /// first argument's place in the index lists, and the argument count.
+    Call(i64, i64, i64);
+    /// A call of a generic function or a generic struct's static method at
+    /// a type argument, spelled `g0::<u16>(a, b)`, `g0::<_>(a, b)` or
+    /// `g0(a, b)` (`B0::<u16>::m0(a)`, ...): the function, the
+    /// type argument, its spelling, the first argument's place in the index
+    /// lists, and the argument count.
+    GenericCall(i64, ValueType, TypeArgumentSpelling, i64, i64);
+    /// `receiver.method(arguments)`: the receiver, a place; the method; the
+    /// first argument's place in the index lists, and the argument count.
+    MethodCall(i64, i64, i64, i64);
+    /// `receiver.t<N>(arguments)` on a value whose type is known only by a
+    /// trait bound: the receiver, the trait method, the first argument's
+    /// place in the index lists, and the argument count.  Which
+    /// implementation runs is decided by the type the receiver has in each
+    /// instance.
+    TraitCall(i64, i64, i64, i64);
+    /// `&v`: a variable borrowed as the node's type, a trait object or a
+    /// reference to an owned value - a shared one, or an exclusive one of
+    /// a `mut` local - given to a parameter of that type.
+    Borrow(i64);
+    /// `base.field`: the base expression and the field.
+    Field(i64, i64);
+    /// A struct literal: the structure, how an instance's literal spells
+    /// its type argument, the first entry's place in the index lists, and
+    /// the number of fields written.  Each entry is two indices: the field,
+    /// then its value.
+    StructureLiteral(i64, TypeArgumentSpelling, i64, i64);
+    /// A variant of the node's enum type, by its number, with a value for
+    /// each of its payload's: `E0::V0`, `E0::V1(a, b)`, `G0::<u16>::V1(a)`.
+    /// How an instance's variant spells its type argument, the first
+    /// value's place in the index lists, and the value count.
+    Variant(i64, TypeArgumentSpelling, i64, i64);
+    /// `match (subject) { pattern => { value } ... }`: the subject, the
+    /// first arm's place among the program's arms, and the arm count; each
+    /// arm's body is an expression of the node's type.
+    Match(i64, i64, i64);
+    /// `mix(state, value)`, a `u64`: the hash step, the state a `u64` and
+    /// the value folded as an observation folds it.
+    Mix(i64, i64);
+    /// A closure, by its place among the program's closures.
+    Closure(i64);
+    /// A call of the value of a function type, `v3(a, b)`: the value, the
+    /// first argument's place in the index lists, and the argument count.
+    Invoke(i64, i64, i64);
+    /// A variable whose owned value is moved out where the node stands,
+    /// spelled as its name: nothing reads the variable afterwards.
+    Move(i64);
+    /// `&(value)`: an owned value no variable holds, a literal or a call's
+    /// result, borrowed as the node's shared reference type and released
+    /// when the statement ends.
+    BorrowTemporary(i64);
+    /// `*p`: the value an exclusive reference parameter refers to, as a
+    /// store's target.
+    Dereference(i64);
+    /// An owned struct's literal, `D0 { f1: a, f0: b }`: the owned struct,
+    /// the first entry's place in the index lists, and the number of
+    /// fields, each entry the field, then its value.
+    OwnedLiteral(i64, i64, i64);
+    /// An owned value moved into a holder of the node's type:
+    /// `Box::new(v)`, `Rc::new(v)`, `Option::Some(v)`, `Result::Ok(v)`;
+    /// an option's or a result's variant spells its type arguments when
+    /// `Written` (`Option::<D0>::Some(v)`), where nothing expected decides
+    /// them.
+    Hold(i64, TypeArgumentSpelling);
+    /// An option or a result holding no value, of the node's type:
+    /// `Option::None` (the operand -1), or `Result::Err(code)` with the
+    /// error code's expression, spelling its type arguments when
+    /// `Written`.
+    Absent(i64, TypeArgumentSpelling);
+    /// `v.clone()`: another owner of the value a variable of a shared
+    /// owner type shares, the variable borrowed, not moved.
+    Share(i64);
+    /// `v.strong_count()`, a `u64`: how many owners share the value the
+    /// shared owner expression refers to.
+    Count(i64);
+    /// `v.unwrap()`: the value of a variable holding an option or a result
+    /// that certainly holds one, the variable moved out.
+    Unwrap(i64);
+    /// `(value)?`: the value an option or a result holds, the function
+    /// returning its none or its error where it holds none.
+    Propagate(i64);
+    /// `(match (v) { Option::Some(b0) => { present } Option::None => {
+    /// absent } })`, a `u64` observing an option or a result in place: the
+    /// subject, the binding of its value, the arm's value when it holds
+    /// one, the binding of a result's error code (-1 for an option), and
+    /// the arm's value when it holds none.
+    Presence(i64, i64, i64, i64, i64);
+    /// `[a, b, c]`, a value of the node's fixed or dynamic array type: the
+    /// first element's place in the index lists, and the element count.
+    ArrayLiteral(i64, i64);
+    /// `[value; N]`, the node's fixed array type with every element the
+    /// value: the value.
+    ArrayRepeat(i64);
+    /// `v[index]`: an element of the fixed array, the slice or the dynamic
+    /// array a variable holds, the index reduced into the length by the
+    /// generator.
+    Element(i64, i64);
+    /// `v.length()`, an `i64`: how many elements the slice a variable
+    /// holds views or its dynamic array holds, or how many bytes its
+    /// `String` holds.
+    Length(i64);
+    /// `String::from("ab7")`: a `String` of the text a number spells
+    /// (`Program::text_of`).
+    TextLiteral(u64);
+    /// `String::from(value)`: a `String` of an integer value's digits.
+    TextOf(i64);
+    /// `String::new()`, the empty `String`.
+    EmptyText;
+    /// `"ab7"`, the text a number spells, given where any displayable
+    /// value is taken.
+    StrLiteral(u64);
+    /// `v.as_str()`: a view of the text a `String` variable holds, given
+    /// to a call that ends with the statement.
+    AsStr(i64);
+    /// `v.push(value)`: the value's text appended to the `String` a `mut`
+    /// local holds, the value an integer, a string literal or another
+    /// `String`'s view.
+    Push(i64, i64);
+    /// `Array::new()`, the empty dynamic array of the node's type.
+    EmptyArray;
+    /// `[value; N]`, a dynamic array of the node's type holding `N` copies
+    /// of the value: the value, and `N`.
+    DynamicRepeat(i64, i64);
+    /// `v.clone()`: a dynamic array holding the elements a dynamic array
+    /// variable holds, the variable borrowed, not moved.
+    Duplicate(i64);
+    /// `v.push(value)`: the integer value appended to the dynamic array a
+    /// `mut` local holds.
+    Append(i64, i64);
+    /// `v.pop().unwrap()`: the last element of the dynamic array a `mut`
+    /// local holds, removed; the generator knows it holds one.
+    Pop(i64);
+    /// `HashMap::new()`, the empty map of the node's type.
+    EmptyMap;
+    /// `v.insert(key, value).unwrap_or(default)`, of the map's value type:
+    /// the value the key held before, or the default where it held none;
+    /// the map, the key, the value and the default.
+    Insert(i64, i64, i64, i64);
+    /// `v.get(&key).unwrap_or(default)`, of the map's value type: the
+    /// value the key holds, or the default; the map, the key and the
+    /// default.
+    Lookup(i64, i64, i64);
+    /// `v.remove(&key).unwrap_or(default)`, of the map's value type: the
+    /// value the key held, removed, or the default; the map, the key and
+    /// the default.
+    Removal(i64, i64, i64);
+    /// `v.contains_key(&key)`, a `boolean`: the map and the key.
+    Contains(i64, i64);
+}
+
+/// What a pattern matches one payload value with.
+public type enum PatternElement {
+    /// `b<N>`: binds the value to the variable.
+    Binding(i64);
+    /// `_`: matches any value and binds nothing.
+    Wildcard;
+    /// A variant of the value's enum type with its own payload's
+    /// elements, `E0::V1(b0, _)`: the enum type, the variant, the first
+    /// element's place in the index lists, and the element count.
+    Variant(ValueType, i64, i64, i64);
+}
+
+/// One arm of a `match`: its pattern and its body, an expression in a
+/// `match` expression and a block in a `match` statement.
+public type struct MatchArm {
+    /// The variant the arm matches, by its number, or -1 for `_`.
+    public pattern: i64;
+    /// The first of the elements the pattern gives the variant's payload,
+    /// one per value, as places among the program's pattern elements, in
+    /// the index lists.
+    public first_element: i64;
+    /// How many elements the pattern has: none for `_` or a unit variant.
+    public element_count: i64;
+    /// The statements an expression's arm runs before its value, which
+    /// observe its bindings, as a block; -1 for none.  A statement's arm
+    /// observes them at the end of its body.
+    public observations: i64;
+    /// The arm's body.
+    public body: i64;
+    /// In a `match` statement over a `mut` local, the statement opening
+    /// the arm's body that assigns the local a variant other than the
+    /// arm's own, `v2 = E0::V1(7);`, after which the arm's bindings still
+    /// hold the values the arm was entered with; -1 for none.
+    public subject_assignment: i64;
+}
+
+/// How a generic call or an instance's struct literal spells its type
+/// argument.
+public type enum TypeArgumentSpelling {
+    /// Written out: `g0::<u16>(..)`, `B0::<u16> { .. }`.
+    Written;
+    /// Left to inference with a placeholder: `g0::<_>(..)`, `B0::<_> { .. }`.
+    Placeholder;
+    /// Left out, so inferred: `g0(..)`, `B0 { .. }`.
+    Omitted;
+}
+
+implement enum TypeArgumentSpelling {
+    /// Whether the type argument is inferred rather than written, so the
+    /// values given for `T` decide it.
+    public is_inferred(&this) -> boolean {
+        return match (&this) {
+            TypeArgumentSpelling::Written => { false }
+            _                             => { true }
+        };
+    }
+}
+
+/// One expression: what it is and its type.
+public type struct ExpressionNode {
+    /// What the expression is.
+    public kind: ExpressionKind;
+    /// The expression's type.
+    public value_type: ValueType;
+}

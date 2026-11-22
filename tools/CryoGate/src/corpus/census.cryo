@@ -1,0 +1,394 @@
+///! A census run read back: what a runner's `--format=plain` output says
+///! ran (`CensusReading`), and what the roster golden pins as this host
+///! owes it (`Pinned`).  Both are pure readings of text handed in; the
+///! census gate reconciles one with the other, and verify reads its
+///! baseline census through the same reading.
+
+namespace cryogate::corpus::census;
+
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::file::{ File };
+import std::fs::path::{ Path };
+
+import cryogate::core::text::{ Scanner, Text };
+import cryogate::corpus::roster::{ Roster, TestGates };
+
+/// One suite's summary block: whether it printed, and its rows.
+public type struct Summary {
+    public printed: boolean;
+    public passed: i64;
+    public failed: i64;
+    public ignored: i64;
+    public filtered: i64;
+
+    public static none() -> Summary { return Summary { printed: false, passed: 0, failed: 0, ignored: 0, filtered: 0 }; }
+
+    /// Record the row `key` (`passed`, `failed`, `ignored`, `filtered`).
+    public set(mut &this, key: Str, value: i64) -> void {
+        if (key == Str::new("passed")) { this.passed = value; }
+        if (key == Str::new("failed")) { this.failed = value; }
+        if (key == Str::new("ignored")) { this.ignored = value; }
+        if (key == Str::new("filtered")) { this.filtered = value; }
+    }
+}
+
+/// What a runner's `--format=plain` output says ran.
+///
+/// The SUMMARY blocks are read rather than the per-test lines counted: the
+/// per-test line differs by format and the summary does not.  The unit and
+/// compile-fail summaries print before the first project runs, so one that
+/// opens after a project line is a failing project echoing its own run's
+/// output, and is not read.  A project's verdict is found wherever it lands
+/// on its line rather than as the line's tail: a requirement probe that
+/// writes to the console can push it onto the next line.
+public type struct CensusReading {
+    /// The index of the first line that opens a summary block; the line
+    /// count when none does.
+    public first_summary: i64;
+    public unit: Summary;
+    public compile_fail: Summary;
+    public projects: Summary;
+    /// The projects the runner reached, in order.
+    public reached: Array<String>;
+    /// The unit tests that ran or were ignored, before the unit summary.
+    public unit_names: Array<String>;
+    /// (project, requirement) for each project skipped for a requirement.
+    public skipped: Array<Pair<String, String>>;
+    /// The number of ignored projects.
+    public ignored: i64;
+    /// Each passing project's verdict count: a collect project's `ok (12
+    /// tests)`, 0 for a bare `ok`.
+    public passed_counts: HashMap<String, i64>;
+    /// The warnings printed before the first summary - the unit suite's
+    /// build, which every run makes - each as `<code> <file>:<line>`, or
+    /// `<code> <message>` for one with no span.  A project's are in
+    /// `project_warnings`.
+    public warnings: Array<String>;
+    /// (project, `<code> <file>:<line>`) for each build warning the runner
+    /// lists under a project's verdict line, `    warning <code>
+    /// <file>:<line>`, in the order listed.
+    public project_warnings: Array<Pair<String, String>>;
+    /// Whether the projects summary has a `warnings` row.  A runner that
+    /// lists project build warnings prints it whatever the count, so its
+    /// absence means the runner listed none, not that there were none.
+    public project_warnings_listed: boolean;
+
+    public static of(lines: &Array<String>) -> CensusReading {
+        mut reading: CensusReading = CensusReading {
+            first_summary: lines.length(),
+            unit: Summary::none(),
+            compile_fail: Summary::none(),
+            projects: Summary::none(),
+            reached: Array::<String>::new(),
+            unit_names: Array::<String>::new(),
+            skipped: Array::<Pair<String, String>>::new(),
+            ignored: 0,
+            passed_counts: HashMap::<String, i64>::new(),
+            warnings: Array::<String>::new(),
+            project_warnings: Array::<Pair<String, String>>::new(),
+            project_warnings_listed: false,
+        };
+        mut last_project: Option<String> = Option::None;
+        mut current: String = String::new();
+        // (code, message) of a warning whose span line comes next.
+        mut open_warning: Option<Pair<String, String>> = Option::None;
+        mut index: i64 = 0;
+        for (raw in lines.iterate_references()) {
+            const line: Str = raw.as_str();
+            const stripped: Str = line.trim();
+            const position: i64 = index;
+            index++;
+            if (reading.first_summary == lines.length()) {
+                match (&open_warning) {
+                    Option::Some(warning) => {
+                        reading.warnings.push(CensusReading::warning_key(warning, stripped.strip_prefix(&Str::new("-->"))));
+                    }
+                    Option::None => { }
+                }
+                open_warning = CensusReading::warning(line);
+                if (open_warning.is_some()) { continue; }
+            }
+            if (!reading.unit.printed) {
+                match (CensusReading::unit_line(stripped)) {
+                    Option::Some(name) => { reading.unit_names.push(String::from_str(name)); }
+                    Option::None       => { }
+                }
+            }
+            match (CensusReading::block(line)) {
+                Option::Some(kind) => {
+                    if (reading.first_summary == lines.length()) { reading.first_summary = position; }
+                    if (kind != Str::new("projects") && last_project.is_some()) {
+                        current = String::new();
+                        continue;
+                    }
+                    current = String::from_str(kind);
+                    reading.summary(kind).printed = true;
+                    continue;
+                }
+                Option::None => { }
+            }
+            match (CensusReading::project_line(stripped)) {
+                Option::Some(name) => {
+                    last_project = Option::Some(String::from_str(name));
+                    reading.reached.push(String::from_str(name));
+                }
+                Option::None => { }
+            }
+            match (stripped.strip_prefix(&Str::new("warning "))) {
+                Option::Some(warning) => {
+                    match (&last_project) {
+                        Option::Some(name) => {
+                            reading.project_warnings.push(Pair::new(name.clone(), String::from_str(warning)));
+                            continue;
+                        }
+                        Option::None => { }
+                    }
+                }
+                Option::None => { }
+            }
+            match (CensusReading::skip_reason(stripped)) {
+                Option::Some(reason) => {
+                    const project: String = match (&last_project) {
+                        Option::Some(name) => { name.clone() }
+                        Option::None       => { String::from_str(Str::new("<unknown>")) }
+                    };
+                    reading.skipped.push(Pair::new(project, String::from_str(reason)));
+                    continue;
+                }
+                Option::None => { }
+            }
+            if (stripped == Str::new("ignored") || stripped.ends_with(&Str::new("... ignored"))) {
+                reading.ignored++;
+                continue;
+            }
+            match (CensusReading::passed_count(stripped)) {
+                Option::Some(count) => {
+                    match (&last_project) {
+                        Option::Some(name) => {
+                            reading.passed_counts.insert(name.clone(), count);
+                            continue;
+                        }
+                        Option::None => { }
+                    }
+                }
+                Option::None => { }
+            }
+            if (!current.is_empty()) {
+                match (CensusReading::row(line)) {
+                    Option::Some(row) => {
+                        if (row.first == Str::new("warnings")) {
+                            if (current.as_str() == Str::new("projects")) { reading.project_warnings_listed = true; }
+                        } else {
+                            reading.summary(current.as_str()).set(row.first, row.second);
+                        }
+                    }
+                    Option::None      => {
+                        if (stripped.starts_with(&Str::new("result"))) { current = String::new(); }
+                    }
+                }
+            }
+        }
+        match (&open_warning) {
+            Option::Some(warning) => { reading.warnings.push(CensusReading::warning_key(warning, Option::None)); }
+            Option::None          => { }
+        }
+        return reading;
+    }
+
+    /// The (code, message) of a `warning[<code>]: <message>` line.
+    public static warning(line: Str) -> Option<Pair<String, String>> {
+        const rest: Str = match (line.strip_prefix(&Str::new("warning["))) {
+            Option::Some(rest) => { rest }
+            Option::None       => { return Option::None; }
+        };
+        return match (rest.split_once(&Str::new("]: "))) {
+            Option::Some(parts) => { Option::Some(Pair::new(String::from_str(parts.first), String::from_str(parts.second))) }
+            Option::None        => { Option::None }
+        };
+    }
+
+    /// A warning as the census compares it: its code and the file and line
+    /// of its span (`location`, the text after `-->`, column dropped), or its
+    /// message when the line after it is not a span.
+    public static warning_key(warning: &Pair<String, String>, location: Option<Str>) -> String {
+        const code: Str = warning.first.as_str();
+        return match (location) {
+            Option::Some(span) => {
+                match (span.trim().split_once_from_end(&Str::new(":"))) {
+                    Option::Some(parts) => { f"{code} {parts.first}" }
+                    Option::None        => { f"{code} {span.trim()}" }
+                }
+            }
+            Option::None => { f"{code} {warning.second.as_str()}" }
+        };
+    }
+
+    /// The summary block named `kind`.
+    public summary(mut &this, kind: Str) -> mut Summary* {
+        if (kind == Str::new("unit test")) { return &this.unit; }
+        if (kind == Str::new("compile-fail")) { return &this.compile_fail; }
+        return &this.projects;
+    }
+
+    /// The suite a line opens the summary of: `unit test`, `compile-fail`
+    /// or `projects`, in a `<suite> summary` line.
+    public static block(line: Str) -> Option<Str> {
+        const trimmed: Str = line.trim();
+        if (trimmed == Str::new("unit test summary")) { return Option::Some(Str::new("unit test")); }
+        if (trimmed == Str::new("compile-fail summary")) { return Option::Some(Str::new("compile-fail")); }
+        if (trimmed == Str::new("projects summary")) { return Option::Some(Str::new("projects")); }
+        return Option::None;
+    }
+
+    /// The unit test a trimmed line says ran or was ignored: `ok    <name>`
+    /// (or `FAIL`, `skip`) from the parallel runner, `test <name> ...` from
+    /// the sequential one.  The negative and project lines carry a
+    /// parenthesised kind after `test` and are not unit lines.
+    public static unit_line(stripped: Str) -> Option<Str> {
+        mut scanner: Scanner = Scanner::new(stripped);
+        if (scanner.literal(Str::new("ok")) || scanner.literal(Str::new("FAIL")) || scanner.literal(Str::new("skip"))) {
+            if (scanner.skip_whitespace() == 0) { return Option::None; }
+            return scanner.token();
+        }
+        if (!scanner.literal(Str::new("test "))) { return Option::None; }
+        if (scanner.rest().starts_with(&Str::new("("))) { return Option::None; }
+        const name: Str = match (scanner.token()) {
+            Option::Some(name) => { name }
+            Option::None       => { return Option::None; }
+        };
+        if (!scanner.literal(Str::new(" ..."))) { return Option::None; }
+        return Option::Some(name);
+    }
+
+    /// The project a trimmed `test (project) <name> ...` line names.
+    public static project_line(stripped: Str) -> Option<Str> {
+        mut scanner: Scanner = Scanner::new(stripped);
+        if (!scanner.literal(Str::new("test (project) "))) { return Option::None; }
+        const name: Str = match (scanner.token()) {
+            Option::Some(name) => { name }
+            Option::None       => { return Option::None; }
+        };
+        if (!scanner.literal(Str::new(" ..."))) { return Option::None; }
+        return Option::Some(name);
+    }
+
+    /// The requirement of a trimmed line ending `skipped (requires <x>)`.
+    public static skip_reason(stripped: Str) -> Option<Str> {
+        const marker: Str = Str::new("skipped (requires ");
+        const at: i64 = match (stripped.find(&marker)) {
+            Option::Some(at) => { at }
+            Option::None     => { return Option::None; }
+        };
+        const rest: Str = stripped.byte_substring(at + marker.length(), stripped.length());
+        if (rest.length() < 2 || !rest.ends_with(&Str::new(")"))) { return Option::None; }
+        return Option::Some(rest.byte_substring(0, rest.length() - 1));
+    }
+
+    /// The test count of a trimmed line ending in a passing verdict:
+    /// `... ok` (0) or a collect project's `... ok (12 tests)`.
+    public static passed_count(stripped: Str) -> Option<i64> {
+        if (stripped == Str::new("ok") || stripped.ends_with(&Str::new("... ok"))) { return Option::Some(0); }
+        const pair: Pair<Str, Str> = match (stripped.split_once_from_end(&Str::new("ok ("))) {
+            Option::Some(pair) => { pair }
+            Option::None       => { return Option::None; }
+        };
+        if (!pair.first.is_empty() && !pair.first.ends_with(&Str::new("... "))) { return Option::None; }        const count: Str = match (pair.second.strip_suffix(&Str::new(" tests)"))) {
+            Option::Some(count) => { count }
+            Option::None        => {
+                match (pair.second.strip_suffix(&Str::new(" test)"))) {
+                    Option::Some(count) => { count }
+                    Option::None        => { return Option::None; }
+                }
+            }
+        };
+        if (!Text::is_digits(count)) { return Option::None; }
+        return Option::Some(i64::try_from(count).unwrap_or(0));
+    }
+
+    /// A summary row, `    passed        2113`: its key and number.
+    public static row(line: Str) -> Option<Pair<Str, i64>> {
+        mut scanner: Scanner = Scanner::new(line.trim());
+        const key: Str = match (scanner.word()) {
+            Option::Some(key) => { key }
+            Option::None      => { return Option::None; }
+        };
+        if (key != Str::new("passed") && key != Str::new("failed") && key != Str::new("ignored") && key != Str::new("filtered")
+                && key != Str::new("warnings")) { return Option::None; }
+        if (scanner.skip_whitespace() == 0) { return Option::None; }
+        const number: Str = scanner.rest();
+        if (!Text::is_digits(number)) { return Option::None; }
+        return Option::Some(Pair::new(key, i64::try_from(number).unwrap_or(0)));
+    }
+}
+
+/// What the roster golden pins, as this host owes it.
+public type struct Pinned {
+    /// The unit tests owed here, by name: the golden's unit entries less
+    /// those gated to another OS.
+    public unit: Array<String>;
+    public negatives: i64;
+    public projects: Array<String>;
+    /// The golden's unit entries gated to another OS, in golden order.
+    public elsewhere: Array<String>;
+    /// The projects whose fixture is `collect`.
+    public collect: Array<String>;
+
+    /// Read the golden at `golden` with the gates of `gates`.
+    public static read(golden: Path, gates: &TestGates) -> Result<Pinned, String> {
+        const text: String = match (File::read_text(golden)) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read {golden.as_str()}: {error.describe()}"); }
+        };
+        mut pinned: Pinned = Pinned {
+            unit: Array::<String>::new(),
+            negatives: 0,
+            projects: Array::<String>::new(),
+            elsewhere: Array::<String>::new(),
+            collect: Array::<String>::new(),
+        };
+        mut unit: Array<String> = Array::<String>::new();
+        mut projects: Array<String> = Array::<String>::new();
+        mut collect: Array<String> = Array::<String>::new();
+        for (raw in Text::lines(text.as_str()).iterate_references()) {
+            const line: Str = raw.as_str().trim();
+            if (line.is_empty()) { continue; }
+            if (line.starts_with(&Str::new("negative "))) {
+                pinned.negatives++;
+                continue;
+            }
+            match (line.strip_prefix(&Str::new("project "))) {
+                Option::Some(rest) => {
+                    const name: Str = match (rest.trim_start().split_once(&Str::new(":"))) {
+                        Option::Some(pair) => { pair.first }
+                        Option::None       => { rest.trim_start() }
+                    };
+                    projects.push(String::from_str(name));
+                    if (line.contains(&Str::new(" outcome=collect "))) { collect.push(String::from_str(name)); }
+                    continue;
+                }
+                Option::None => { }
+            }
+            if (!Roster::is_unit(line)) { continue; }
+            if (gates.elsewhere(line)) {
+                pinned.elsewhere.push(String::from_str(line));
+                continue;
+            }
+            const name: Str = match (line.split_once_from_end(&Str::new(": test"))) {
+                Option::Some(pair) => { pair.first }
+                Option::None       => { line }
+            };
+            unit.push(String::from_str(name));
+        }
+        pinned.unit = Text::sorted_distinct(unit);
+        pinned.projects = Text::sorted_distinct(projects);
+        pinned.collect = Text::sorted_distinct(collect);
+        return Result::Ok(pinned);
+    }
+}
+

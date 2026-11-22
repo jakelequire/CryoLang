@@ -23,7 +23,7 @@ import compiler::decl_index;
 import compiler::ast::{ declaration, node, TypeAnnotation };
 import compiler::passes::{ pass_id, type_resolution };
 import compiler::compilation_context::{ CompilationContext };
-import compiler::module_graph::{ ModulePath };
+import compiler::module_graph::{ ModuleGraph, ModulePath };
 import compiler::types::{
     arena, compound, generic, generic_registry, type_base, type_ref, TypeKind,
     user_defined
@@ -38,7 +38,7 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::node::{ Node, ProgramNode };
 import compiler::mono::monomorphizer::{ Monomorphizer };
-import compiler::mono::state::{ SpecializationEntry };
+import compiler::mono::state::{ BlockPlacement, SpecializationEntry };
 import compiler::passes::pass_id::{ PassResult };
 import compiler::sema::sema::{ SemaVisitor };
 import compiler::passes::type_resolution::{ TypeResolutionPasses };
@@ -281,7 +281,7 @@ type struct SpecializationPasses {
         if (root != null) {
             loop {
                 const before_specs: i64 = mono_ptr.spec_count();
-                const before_methods: i64 = mono_ptr.spec_owner_file_count();
+                const before_methods: i64 = mono_ptr.method_instance_count();
                 mono_ptr.specialize_calls_in_module(root);
                 // Drain the pending worklist for any new instantiations queued
                 // by the walk.  We deliberately don't re-enter `process_all`
@@ -291,16 +291,16 @@ type struct SpecializationPasses {
                 const post_success: boolean = mono_ptr.drain_pending_worklist();
                 if (success) { success = post_success; }
                 // Fixpoint on BOTH progress metrics.  A pass whose only progress
-                // is materializing a generic-METHOD spec (pinning a static
-                // generic-owner call whose owner instantiation drained on the
-                // previous pass, or an adapter-chain receiver) grows
-                // `spec_owner_file_count` but leaves `spec_count` unchanged;
+                // is a method instance (pinning a static generic-owner call
+                // whose owner instantiation drained on the previous pass, or an
+                // adapter-chain receiver's default) grows
+                // `method_instance_count` but may leave `spec_count` unchanged;
                 // breaking on `spec_count` alone stops before the call that
-                // method spec unblocks gets re-walked.  Both metrics are
-                // monotonic and bounded - each spec is recorded exactly once,
+                // instance unblocks gets re-walked.  Both metrics are
+                // monotonic and bounded - each instance is made exactly once,
                 // behind the `method_instance` guard - so this terminates.
                 if (mono_ptr.spec_count() == before_specs
-                        && mono_ptr.spec_owner_file_count() == before_methods) {
+                        && mono_ptr.method_instance_count() == before_methods) {
                     break;
                 }
             }
@@ -327,7 +327,7 @@ type struct SpecializationPasses {
     // calls against already-created specs.  It deliberately does NOT place the
     // spec's AST into a ProgramNode root - physical placement is deferred to
     // Phase 6a-iii (`route_specializations_to_owners`), which injects each spec
-    // into its DETERMINISTIC owner module (the template's defining module),
+    // into its DETERMINISTIC owner module (`owner_module_for_spec`),
     // independent of demand order.  Splitting registration (here, per demander)
     // from placement (there, per owner) keeps discovery unchanged while
     // making a spec's object-file home a function of its template.
@@ -356,155 +356,93 @@ type struct SpecializationPasses {
                 SpecializationPasses::register_spec(ctx, mono, entry);
             }
             mono.advance_injection_cursor();
-            const before_methods: i64 = mono.spec_owner_file_count();
+            const before_methods: i64 = mono.method_instance_count();
             mono.bind_queued_calls();
             if (!mono.drain_pending_worklist()) { break; }
-            if (mono.spec_count() == reg_end && mono.spec_owner_file_count() == before_methods) { break; }
+            if (mono.spec_count() == reg_end && mono.method_instance_count() == before_methods) { break; }
         }
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
 
-    /// Resolve the module that should own a specialization: the one that owns
-    /// the concrete type argument forcing it.  The rule is that a
-    /// monomorphization is emitted where it is instantiated; we cannot use the
-    /// literally-demanding module (the monomorphizer materializes its whole
-    /// worklist while `ctx` is still loaded to the first module, so every spec
-    /// would pile into that one object), but the type argument IS the thing that
-    /// forced the instantiation, and routing by it is both deterministic and
-    /// demand-order independent.
+    /// The module a specialization is emitted in.  The candidates are the
+    /// template's module and the module declaring each named type the type
+    /// arguments are built from (`InstanceOwner::consider_type`), in that
+    /// order, with the template's module last.  The owner is the first of
+    /// them that no other candidate depends on.  When one candidate depends
+    /// on all the others it is the only such module, and its object
+    /// references nothing its module does not already import: an instance
+    /// of a program's template, or over a program's type, is emitted in the
+    /// program's module, never in a standard-library module one of its type
+    /// arguments merely names (the allocator a `String` carries).  When no
+    /// candidate depends on all the others, a type argument's module is
+    /// taken before the template's: `Result<TlsStream, IoError>` and
+    /// `block_on` of a TLS handshake are emitted in `net::tls::stream`,
+    /// which keeps `core::result`'s and `std::future`'s objects - and so
+    /// the link line of anything returning a `Result` or awaiting a future
+    /// - free of the TLS library.  The answer is a function of the template
+    /// and its arguments, never of which module asked for the instance: the
+    /// monomorphizer materializes its whole worklist while `ctx` is loaded
+    /// to the first module, so the asking module is not known here.
     ///
-    /// Walk the InstantiatedType's type arguments and return the source-file
-    /// path of the first whose enclosing namespace names an in-build module.
-    /// `Result<TlsStream, IoError>` then lands in `net/tls/stream.o` rather than
-    /// in `core/result.o` alongside every other `Result<T,E>` in the program - 
-    /// which is what keeps `result.o` from referencing `TlsStream::drop` and
-    /// dragging `net::tls` (and `SSL_*`) onto the link line of anything that
-    /// merely returns a `Result`.
+    /// An instance of a method with type parameters of its own is placed by
+    /// the same rule, its own type arguments considered first, then its
+    /// receiver as a type argument, then the module declaring the method.
     ///
-    /// Returns an invalid SymbolStr when no argument resolves to an in-build
-    /// module - a purely primitive instantiation such as `Option<i64>`, or a
-    /// FUNCTION spec (`mem::offset<T>`), which carries no InstantiatedType.  The
-    /// caller then falls back to the template's defining module.
-    static type_arg_owner_for_spec(ctx: CompilationContext*,
-                                   entry: SpecializationEntry*) -> SymbolStr {
-        if (!entry.instantiated_type.is_valid()
-                || ctx.module_graph == null) {
-            return SymbolStr::empty();
+    /// An implementation block an instantiation carries that was written
+    /// in another module than the template's is placed by the same rule
+    /// with the module it was written in (`written_in`, none for the
+    /// instantiation itself) a candidate just ahead of the template's: a
+    /// program's implementation of its own trait for a standard-library
+    /// instantiation is emitted in the program, which depends on the
+    /// instantiation's module, and one module's implementation of its
+    /// trait for an instantiation of a template it imports is emitted
+    /// beside the trait, keeping the template's object free of it.
+    ///
+    /// Invalid when no candidate is a module of the build.
+    static owner_module_for_spec(ctx: CompilationContext*, entry: SpecializationEntry*,
+                                 written_in: ModulePath) -> ModulePath {
+        mut owner: InstanceOwner = InstanceOwner::new();
+        if (ctx.module_graph == null) { return ModulePath::none(); }
+        for (mut i: i64 = 0; i < entry.method_arguments.length(); i++) {
+            owner.consider_type(ctx, entry.method_arguments[i], 0);
         }
-        const arena: TypeArena* = ctx.type_arena;
-        // `inst_*` answers for a pre-mono wrapper AND a post-mono concrete alike
-        // (single-id identity puts the concrete at the wrapper's id, carrying its
-        // own base + args).  A bare `kind == InstantiatedType` test here would be
-        // false for every monomorphized spec, collapsing placement onto the
-        // template's defining module.
-        const n_args: i64 = arena.inst_type_arg_count(entry.instantiated_type);
-        for (mut i: i64 = 0; i < n_args; i++) {
-            const src: SymbolStr = SpecializationPasses::owner_of_type(
-                ctx, arena.inst_type_arg_at(entry.instantiated_type, i), 0);
-            if (src.is_valid()) { return src; }
+        if (entry.is_method_instance()) {
+            owner.consider_type(ctx, entry.specialized_type, 0);
         }
-        return SymbolStr::empty();
+        if (entry.instantiated_type.is_valid()) {
+            const arena: TypeArena* = ctx.type_arena;
+            // `inst_*` answers for a pre-mono wrapper AND a post-mono concrete
+            // alike (single-id identity puts the concrete at the wrapper's id,
+            // carrying its own base + args).  A bare `kind == InstantiatedType`
+            // test here would be false for every monomorphized spec.
+            const n_args: i64 = arena.inst_type_arg_count(entry.instantiated_type);
+            for (mut i: i64 = 0; i < n_args; i++) {
+                owner.consider_type(ctx, arena.inst_type_arg_at(entry.instantiated_type, i), 0);
+            }
+        }
+        owner.consider(ctx.module_graph, written_in);
+        owner.consider(ctx.module_graph, entry.template_module);
+        return owner.chosen(ctx.module_graph);
     }
 
-    /// The in-build module owning the first SOURCE-DECLARED type reachable from
-    /// `tref`, or an invalid SymbolStr.
-    ///
-    /// A hand-written named type answers directly.  Everything else is walked
-    /// through, because a type argument is usually a compound wrapping the type
-    /// that actually forced the instantiation:
-    ///
-    ///   * type CONSTRUCTORS (pointer, reference, array, tuple, function,
-    ///     instantiation).  `Option<fn(Request) -> Response>` has a function
-    ///     type as its sole argument, which carries no qualified name at all.
-    ///   * MONOMORPHS.  A spec struct's qualified name lives in its TEMPLATE's
-    ///     namespace (`std::core::option::6Option$L...RequestOnStream...$G`), so
-    ///     stopping at it would route `Result<Option<RequestOnStream>, IoError>`
-    ///     to `core::option` - whose object then references
-    ///     `RequestOnStream::drop` and pulls `net::http2`, `net::tls` and
-    ///     `SSL_*` onto the link line of any program that merely uses an
-    ///     `Option`.  The `$` in the leaf is the marker; recurse into the
-    ///     instantiation it resolves, and only fall back to its template's
-    ///     namespace when nothing inside names a module.
-    ///
-    /// Field types are deliberately NOT traversed: a source-declared type
-    /// terminates the walk, which both keeps the answer stable and makes cycles
-    /// impossible.
-    static owner_of_type(ctx: CompilationContext*, tref: TypeRef,
-                         depth: i64) -> SymbolStr {
-        if (depth > 8 || !tref.is_valid()) { return SymbolStr::empty(); }
-        const arena: TypeArena* = ctx.type_arena;
-        const t: Type* = arena.lookup(tref);
-        if (t == null) { return SymbolStr::empty(); }
 
-        // Constructors: nothing to name here, so walk straight through.
-        match (t.kind) {
-            TypeKind::Pointer => {
-                return SpecializationPasses::owner_of_type(
-                    ctx, t.as_pointer().pointee, depth + 1);
-            }
-            TypeKind::Reference => {
-                return SpecializationPasses::owner_of_type(
-                    ctx, t.as_reference().referent, depth + 1);
-            }
-            TypeKind::Array => {
-                return SpecializationPasses::owner_of_type(
-                    ctx, t.as_array().element, depth + 1);
-            }
-            TypeKind::Optional => {
-                return SpecializationPasses::owner_of_type(
-                    ctx, t.as_optional().wrapped, depth + 1);
-            }
-            TypeKind::Tuple => {
-                const tp: TupleType* = t.as_tuple();
-                for (mut i: i64 = 0; i < tp.elements.length(); i++) {
-                    const s: SymbolStr = SpecializationPasses::owner_of_type(
-                        ctx, tp.elements[i], depth + 1);
-                    if (s.is_valid()) { return s; }
-                }
-                return SymbolStr::empty();
-            }
-            TypeKind::Function => {
-                const ft: FunctionType* = t.as_function();
-                for (mut i: i64 = 0; i < ft.param_types.length(); i++) {
-                    const s: SymbolStr = SpecializationPasses::owner_of_type(
-                        ctx, ft.param_types[i], depth + 1);
-                    if (s.is_valid()) { return s; }
-                }
-                return SpecializationPasses::owner_of_type(
-                    ctx, ft.return_type, depth + 1);
-            }
-            TypeKind::InstantiatedType => {
-                const inst: InstantiatedType* = t.as_instantiated();
-                for (mut i: i64 = 0; i < inst.type_args.length(); i++) {
-                    const s: SymbolStr = SpecializationPasses::owner_of_type(
-                        ctx, inst.type_args[i], depth + 1);
-                    if (s.is_valid()) { return s; }
-                }
-                return SymbolStr::empty();
-            }
-            _ => { }
-        }
-
-        if (!arena.get_qualified_name(tref).is_valid()) { return SymbolStr::empty(); }
-        // The file of the module the type is declared in, as its record holds
-        // it - a monomorph's record holds its template's module.
-        const fallback: SymbolStr = ctx.module_graph.source_file_of(
-            arena.declared_in(t), ctx.intern_table);
-        // A source-declared type: its module IS the answer.
-        const is_monomorph: boolean = arena.inst_generic_base(tref).is_valid();
-        if (!is_monomorph) { return fallback; }
-
-        // A monomorph.  Its name only tells us where the TEMPLATE lives; look
-        // inside its type ARGUMENTS for a source-declared type.  Read straight off
-        // the spec's intrinsic identity - no carrier, and no arena scan.
-        const n_args: i64 = arena.inst_type_arg_count(tref);
-        for (mut i: i64 = 0; i < n_args; i++) {
-            const s: SymbolStr = SpecializationPasses::owner_of_type(
-                ctx, arena.inst_type_arg_at(tref, i), depth + 1);
-            if (s.is_valid()) { return s; }
-        }
-        return fallback;
+    /// The source file of the module the block `impl_nodes[block]` of
+    /// `entry` is emitted in: the entry's own when the entry is no
+    /// instantiation (a method instance, or a blanket or object
+    /// implementation, whose one block the entry was made to place) or the
+    /// block was written in the template's module, else the owner of the
+    /// block written in its module (`owner_module_for_spec`).
+    static block_owner_source(ctx: CompilationContext*, entry: SpecializationEntry*,
+                              block: i64) -> SymbolStr {
+        if (entry.ast_node == null) { return entry.owner_source; }
+        const written_in: ModulePath = ctx.module_of_file(entry.impl_nodes[block].source_file);
+        if (!written_in.is_valid() || written_in.equals(entry.template_module)) { return entry.owner_source; }
+        const owner: ModulePath = SpecializationPasses::owner_module_for_spec(ctx, entry, written_in);
+        // Candidates that all depend on one another choose none, as for the
+        // instantiation itself; the block then stays with the instantiation.
+        if (!owner.is_valid()) { return entry.owner_source; }
+        return ctx.module_graph.source_file_of(owner, ctx.intern_table);
     }
 
     /// Register a single specialization into the DeclarationIndex, scope-tag its
@@ -516,30 +454,28 @@ type struct SpecializationPasses {
         const arena: TypeArena* = ctx.type_arena;
         const module_sym: SymbolStr = ctx.intern(ctx.source_file);
 
-        // Resolve this spec's OWNER module.  Both DI ownership (here) and AST
-        // placement key off `owner_source`, so they always agree: the
-        // module DI names as owner is the one whose root holds the
-        // definition, and every other module declares the symbol extern.
+        // A method instance's template is the method, whose module is the
+        // one its file declares; only the module graph knows which that is.
+        if (entry.is_method_instance()) {
+            entry.template_module = ctx.module_of_file(entry.impl_nodes[0].source_file);
+        }
+
+        // Resolve this spec's OWNER module (`owner_module_for_spec`).  Both DI
+        // ownership (here) and AST placement key off `owner_source`, so they
+        // always agree: the module DI names as owner is the one whose root
+        // holds the definition, and every other module declares the symbol
+        // extern.
         //
-        // A spec is owned by the module that owns the concrete TYPE ARGUMENT
-        // forcing it - the rule that a monomorphization is codegen'd where
-        // it is instantiated, expressed through the one piece of the
-        // instantiation that is stable and demand-order independent.  (The
-        // literally-demanding module is unusable: the monomorphizer materializes
-        // its entire worklist while `ctx` is still loaded to the FIRST module,
-        // so every spec in the program would pile into that one object.)
+        // Keying on the template's module alone would make `core::result`
+        // define every `Result<T,E>` spec of the stdlib, so `result.o` would
+        // reference `TlsStream::drop`, `JsonValue::drop`, `Child::drop`, ...
+        // A static archive is pulled one whole member at a time, so linking a
+        // hello-world against a prebuilt stdlib would drag in `net::tls` -
+        // and therefore `SSL_*` - merely because the allocator returns a
+        // `Result`.
         //
-        // Routing by type argument avoids aggregating every instantiation of a
-        // generic into a single object.  Keying on the template's defining module
-        // would make `core::result` define all 855 `Result<T,E>` specs in the
-        // stdlib, so `result.o` would reference `TlsStream::drop`, `JsonValue::drop`,
-        // `Child::drop`, ...  A static archive is pulled one whole member at a
-        // time, so linking a hello-world against a prebuilt stdlib would drag in
-        // `net::tls` - and therefore `SSL_*` - merely because the allocator
-        // returns a `Result`.
-        //
-        // Two modules that instantiate the same generic now each emit it.  That
-        // is sound because a monomorph is a pure function of (template,
+        // A program and the stdlib archive it links may each emit one spec.
+        // That is sound because a monomorph is a pure function of (template,
         // type-args): both clone the same template source into the same symbol.
         // `FunctionDecl::is_specialization` makes codegen give the definition
         // `linkonce_odr` linkage, so the linker keeps one and discards the rest.
@@ -554,22 +490,22 @@ type struct SpecializationPasses {
         //     the DI registration and codegen's definition both derive, so
         //     relocating the definition never diverges the names.
         //
-        // Fallback, when no type argument names an in-build module (a purely
-        // primitive `Option<i64>`, or a FUNCTION spec, which carries no
-        // InstantiatedType): the template's defining module.  Such a
-        // spec's arguments are primitives, so its object can only reference the
-        // template's own dependencies and cannot aggregate the world.
-        mut owner_module_sym: SymbolStr = module_sym;
-        const arg_owner: SymbolStr =
-            SpecializationPasses::type_arg_owner_for_spec(ctx, entry);
-        if (arg_owner.is_valid()) {
-            owner_module_sym = arg_owner;
-        } else if (entry.template_module.is_valid() && ctx.module_graph != null) {
-            const owner_path: SymbolStr = ctx.module_graph.source_file_of(
-                entry.template_module, ctx.intern_table);
-            if (owner_path.is_valid()) { owner_module_sym = owner_path; }
+        // A spec none of whose candidates is a module of the build stays with
+        // the module registering it.
+        const owner_module: ModulePath =
+            SpecializationPasses::owner_module_for_spec(ctx, entry, ModulePath::none());
+        entry.owner_source = if (owner_module.is_valid()) {
+            ctx.module_graph.source_file_of(owner_module, ctx.intern_table)
+        } else {
+            module_sym
+        };
+        entry.block_placements = [];
+        for (mut j: i64 = 0; j < entry.impl_nodes.length(); j++) {
+            entry.block_placements.push(BlockPlacement {
+                owner_source: SpecializationPasses::block_owner_source(ctx, entry, j),
+                injected:     false,
+            });
         }
-        entry.owner_source = owner_module_sym;
 
         // Scope-tag the main AST with its template module origin in the
         // CompilationContext's node-identity side table.  A FUNCTION spec's
@@ -609,6 +545,9 @@ type struct SpecializationPasses {
                     ctx.decl_index.registered_def(entry.specialized_type), entry.instantiated_type);
             }
         }
+        // A method instance's block was made for its receiver, and its one
+        // method registered under the receiver, when the instance was made.
+        if (entry.is_method_instance()) { return; }
         // Each cloned impl block is rewritten to target the specialization
         // by its qualified name and recorded as a head under the
         // specialization's type; its methods were registered under the type
@@ -659,13 +598,11 @@ type struct SpecializationPasses {
     ///
     /// Placement keys off `entry.owner_source` - the resolved owner module's
     /// source-file path that `register_spec` ALSO used for DI ownership - so AST
-    /// placement and DI ownership always agree.  The owner is the template's
-    /// defining module (deterministic, demand-order independent) for every spec
-    /// whose template module resolves to a module in the build; specs with no
-    /// template module fall back to their creating module.  This is sound for
-    /// type specs (named by location-independent arena qname) AND function /
-    /// method-generic specs (named by `spec_base_name`, which folds the template
-    /// module).  Each spec is placed exactly once, guarded by `entry.injected`.
+    /// placement and DI ownership always agree.  The owner is chosen by
+    /// `owner_module_for_spec`.  Placement is sound for type specs (named by
+    /// location-independent arena qname) AND function / method-generic specs
+    /// (named under the template's module whatever object holds them).  Each
+    /// spec is placed exactly once, guarded by `entry.injected`.
     /// Tag every function/method carried by a placed specialization so codegen
     /// can give it `linkonce_odr` linkage.  This is the one funnel through
     /// which a monomorph's AST reaches an owner module, so tagging here is
@@ -694,6 +631,39 @@ type struct SpecializationPasses {
         }
     }
 
+    /// How the placement trace names `entry`'s instance: its instantiation,
+    /// or for a method instance its receiver, method and type arguments
+    /// (`Array<i64>::sort_by_key<i64, ...>`).
+    static instance_shown(ctx: CompilationContext*, entry: SpecializationEntry*) -> string {
+        const arena: TypeArena* = ctx.type_arena;
+        if (!entry.is_method_instance()) {
+            const shown: TypeRef = if (entry.instantiated_type.is_valid()) {
+                entry.instantiated_type
+            } else {
+                entry.specialized_type
+            };
+            return arena.resolve_display_name(shown);
+        }
+        const method: MethodDecl* = DeclarationNode::method_of(DeclarationNode::impl_of(entry.impl_nodes[0]).methods[0]);
+        mut shown: string = arena.resolve_display_name(entry.specialized_type).append("::")
+            .append(ctx.intern_table.resolve(DeclarationNode::fn_of(method.func).name)).append("<");
+        for (mut i: i64 = 0; i < entry.method_arguments.length(); i++) {
+            if (i > 0) { shown = shown.append(", "); }
+            shown = shown.append(arena.resolve_display_name(entry.method_arguments[i]));
+        }
+        return shown.append(">");
+    }
+
+    /// How the placement trace names block `block` of `entry`: its trait
+    /// and the instantiation (`Shapes::Measure for Slice<i32>`), or the
+    /// instantiation alone for a block that implements no trait.
+    static block_shown(ctx: CompilationContext*, entry: SpecializationEntry*, block: i64) -> string {
+        const shown: string = SpecializationPasses::instance_shown(ctx, entry);
+        const implementation: ImplBlock* = DeclarationNode::impl_of(entry.impl_nodes[block]);
+        if (!implementation.is_trait_impl()) { return shown; }
+        return ctx.intern_table.shown(ctx.defs.path_of(implementation.trait_def)).append(" for ").append(shown);
+    }
+
     static route_specializations_to_owners(ctx: mut CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
 
@@ -709,19 +679,27 @@ type struct SpecializationPasses {
         mut place_count: i64 = 0;
         for (mut i: i64 = 0; i < total; i++) {
             mut entry: mut SpecializationEntry* = mono.spec_entry_at(i);
-            if (entry.injected) { continue; }
-            if (!entry.owner_source.is_valid()) { continue; }
-            if (!entry.owner_source.equals(my_src)) { continue; }
-            entry.injected = true;
-            if (entry.ast_node != null) {
-                SpecializationPasses::mark_specialized(entry.ast_node);
-                root.add_statement(Node::Decl(entry.ast_node));
+            if (!entry.injected && entry.owner_source.is_valid() && entry.owner_source.equals(my_src)) {
+                entry.injected = true;
+                if (Log::enabled(LogArea::Mono, LogLevel::Trace)) {
+                    Log::trace(LogArea::Mono, f"instance {SpecializationPasses::instance_shown(ctx, entry)} placed in {ctx.intern_table.shown(ctx.unit_module.decl_name())}");
+                }
+                if (entry.ast_node != null) {
+                    SpecializationPasses::mark_specialized(entry.ast_node);
+                    root.add_statement(Node::Decl(entry.ast_node));
+                }
+                place_count += 1;
             }
             for (mut j: i64 = 0; j < entry.impl_nodes.length(); j++) {
+                const placement: mut BlockPlacement* = &entry.block_placements[j];
+                if (placement.injected || !placement.owner_source.equals(my_src)) { continue; }
+                placement.injected = true;
+                if (!placement.owner_source.equals(entry.owner_source) && Log::enabled(LogArea::Mono, LogLevel::Trace)) {
+                    Log::trace(LogArea::Mono, f"implementation {SpecializationPasses::block_shown(ctx, entry, j)} placed in {ctx.intern_table.shown(ctx.unit_module.decl_name())}");
+                }
                 SpecializationPasses::mark_specialized(entry.impl_nodes[j]);
                 root.add_statement(Node::Decl(entry.impl_nodes[j]));
             }
-            place_count += 1;
         }
 
         if (Log::enabled(LogArea::Mono, LogLevel::Debug)) {
@@ -905,7 +883,7 @@ type struct SpecializationPasses {
             // type the head names - a declared type's, a primitive's - which
             // is what every reader holds as a receiver.
             registry.register_inherent_impl_block(
-                ctx.decl_index.impl_owner(node, "specialization/inherent impl"), decl);
+                ctx.decl_index.impl_owner(node, ctx.type_arena, "specialization/inherent impl"), decl);
             // A generic static method on a non-generic target needs its own
             // template entry, exactly as when it is written inside the type's
             // body (see the struct arm of `run_template_registration`).
@@ -930,7 +908,7 @@ type struct SpecializationPasses {
         if (node.is_trait_impl()) {
             registry.register_trait_impl(
                 TypeAnnotation::trait_def(node.trait_annotation),
-                ctx.decl_index.impl_owner(node, "specialization/trait impl"), decl);
+                ctx.decl_index.impl_owner(node, ctx.type_arena, "specialization/trait impl"), decl);
         }
     }
 
@@ -1006,5 +984,112 @@ type struct SpecializationPasses {
         }
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+}
+
+/// The modules a specialization's owner is chosen from, in the order they
+/// were considered (`SpecializationPasses::owner_module_for_spec`).
+type struct InstanceOwner {
+    /// Each candidate once, as a module of the build.
+    modules: [ModulePath];
+    /// The graph index of each of `modules`.
+    indices: [i64];
+
+    static new() -> InstanceOwner {
+        return InstanceOwner { modules: [], indices: [] };
+    }
+
+    /// Add `m` when it is a module of the build not already a candidate.
+    consider(mut &this, graph: ModuleGraph*, m: ModulePath) -> void {
+        if (!m.is_valid()) { return; }
+        const index: i64 = graph.find_module_index(m);
+        if (index < 0) { return; }
+        for (mut i: i64 = 0; i < this.indices.length(); i++) {
+            if (this.indices[i] == index) { return; }
+        }
+        this.modules.push(m);
+        this.indices.push(index);
+    }
+
+    /// The first candidate no other candidate depends on; none when there
+    /// is no candidate.
+    chosen(&this, graph: ModuleGraph*) -> ModulePath {
+        for (mut i: i64 = 0; i < this.indices.length(); i++) {
+            mut beneath_another: boolean = false;
+            for (mut j: i64 = 0; j < this.indices.length(); j++) {
+                if (graph.depends_on(this.indices[j], this.indices[i])) { beneath_another = true; }
+            }
+            if (!beneath_another) { return this.modules[i]; }
+        }
+        return ModulePath::none();
+    }
+
+    /// Consider the module declaring each named type `tref` is built from.
+    /// Pointers, references, arrays, optionals, tuples, function types and
+    /// instantiations are walked through, since a type argument is usually
+    /// a compound wrapping the type that forced the instance:
+    /// `Option<fn(Request) -> Response>`'s sole argument is a function type,
+    /// which names no module.  A named type's own module is a candidate; a
+    /// monomorph's arguments are candidates before it, since a monomorph is
+    /// declared in its TEMPLATE's module (`BufferedStream<TlsStream>` in
+    /// `io::buffered`, which every buffered reader links) and its arguments
+    /// name the module that forced it.  A named type's fields are not
+    /// walked, which keeps the answer stable and makes cycles impossible.
+    consider_type(mut &this, ctx: CompilationContext*, tref: TypeRef, depth: i64) -> void {
+        if (depth > 8 || !tref.is_valid()) { return; }
+        const arena: TypeArena* = ctx.type_arena;
+        const t: Type* = arena.lookup(tref);
+        if (t == null) { return; }
+
+        match (t.kind) {
+            TypeKind::Pointer => {
+                this.consider_type(ctx, t.as_pointer().pointee, depth + 1);
+                return;
+            }
+            TypeKind::Reference => {
+                this.consider_type(ctx, t.as_reference().referent, depth + 1);
+                return;
+            }
+            TypeKind::Array => {
+                this.consider_type(ctx, t.as_array().element, depth + 1);
+                return;
+            }
+            TypeKind::Optional => {
+                this.consider_type(ctx, t.as_optional().wrapped, depth + 1);
+                return;
+            }
+            TypeKind::Tuple => {
+                const tp: TupleType* = t.as_tuple();
+                for (mut i: i64 = 0; i < tp.elements.length(); i++) {
+                    this.consider_type(ctx, tp.elements[i], depth + 1);
+                }
+                return;
+            }
+            TypeKind::Function => {
+                const ft: FunctionType* = t.as_function();
+                for (mut i: i64 = 0; i < ft.param_types.length(); i++) {
+                    this.consider_type(ctx, ft.param_types[i], depth + 1);
+                }
+                this.consider_type(ctx, ft.return_type, depth + 1);
+                return;
+            }
+            TypeKind::InstantiatedType => {
+                const inst: InstantiatedType* = t.as_instantiated();
+                for (mut i: i64 = 0; i < inst.type_args.length(); i++) {
+                    this.consider_type(ctx, inst.type_args[i], depth + 1);
+                }
+                return;
+            }
+            _ => { }
+        }
+
+        if (!arena.get_qualified_name(tref).is_valid()) { return; }
+        if (arena.inst_generic_base(tref).is_valid()) {
+            const n_args: i64 = arena.inst_type_arg_count(tref);
+            for (mut i: i64 = 0; i < n_args; i++) {
+                this.consider_type(ctx, arena.inst_type_arg_at(tref, i), depth + 1);
+            }
+        }
+        this.consider(ctx.module_graph, arena.declared_in(t));
     }
 }

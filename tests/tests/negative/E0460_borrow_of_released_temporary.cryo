@@ -1,0 +1,59 @@
+// E0460: a local that would point into a temporary its own declaration made.
+//
+// A value made in a statement and only borrowed there is released when the
+// statement ends. A local declared by that statement outlives it, so a borrow
+// of the temporary kept in the local would read released storage. Each case
+// reaches the temporary a different way: a borrowing method's receiver, a
+// chain of results that carry the borrow on, a field of a temporary, an
+// argument passed by reference, and a borrowed view passed on by value. The
+// permitted side - an owned result, a scalar, a borrow of a binding, a `for`
+// loop over a temporary - is lang/borrowed_temporary_bindings.cryo.
+![config(testing)]
+![config(negative, E0460)]
+namespace CryoTests::Negative::BorrowOfReleasedTemporary;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+type struct Holder {
+    words: Array<String>;
+}
+
+function make_words() -> Array<String> {
+    mut words: Array<String> = Array::<String>::new();
+    words.push(String::from_str(Str::new("hello")));
+    return words;
+}
+
+function make_string() -> String {
+    return String::from_str(Str::new("text"));
+}
+
+function make_holder() -> Holder {
+    return Holder { words: make_words() };
+}
+
+function view(text: &String) -> Str {
+    return text.as_str();
+}
+
+function passed_on(text: Str) -> Str {
+    return text;
+}
+
+function main() -> int {
+    const plain: Str = make_string().as_str();
+    //~^ ERROR[E0460] `plain` would point into a temporary that is released at the end of its declaration
+    const first: Str = make_words().get_reference(0).unwrap().as_str();
+    //~^ ERROR[E0460] `first` would point into a temporary that is released at the end of its declaration
+    const words = make_words().iterate_references();
+    //~^ ERROR[E0460] `words` would point into a temporary that is released at the end of its declaration
+    const held = make_holder().words.iterate_references();
+    //~^ ERROR[E0460] `held` would point into a temporary that is released at the end of its declaration
+    const viewed: Str = view(make_string());
+    //~^ ERROR[E0460] `viewed` would point into a temporary that is released at the end of its declaration
+    const carried: Str = passed_on(make_string().as_str());
+    //~^ ERROR[E0460] `carried` would point into a temporary that is released at the end of its declaration
+    return (plain.length() + first.length() + viewed.length() + carried.length()) as int;
+}

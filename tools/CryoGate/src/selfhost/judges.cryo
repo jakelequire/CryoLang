@@ -1,0 +1,141 @@
+///! An arm's two judgements, over what its run found: the fixed point
+///! (stage 3 and stage 4 emit byte-identical IR, and both run and answer
+///! alike) and the stage archives (stage 2's and stage 3's stdlib objects are
+///! byte-identical).
+///!
+///! Byte-identical IR is a claim about what stage 3 emitted; that the stage-4
+///! compiler it built runs is another claim, and stage 4 is otherwise only
+///! linked, never run.  So a stage 4 that cannot start fails the fixed
+///! point, and so does one that answers differently from stage 3: they are
+///! meant to be the same compiler, so neither needs a version to compare
+///! against.
+///!
+///! The linked `cryo.ll` is one file against the whole per-module tree, so
+///! matching it is necessary and nowhere near sufficient: a name bound
+///! differently in any other module does not show in it.  The tree is
+///! compared whatever the linked file says.
+
+namespace cryogate::selfhost::judges;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+
+import cryogate::selfhost::archives::{ ArchiveComparison };
+import cryogate::selfhost::trees::{ TreeComparison, TreeSize };
+
+/// What comparing the stages' linked `cryo.ll` found.
+public type enum LinkedIr {
+    /// The arm's builds write no linked file.
+    NotCompared;
+    /// These linked files are missing.
+    Missing(Array<String>);
+    /// The two differ.
+    Differs;
+    /// The two are byte-identical: their sha256 and their length.
+    Same(String, i64);
+}
+
+/// One judgement: the lines to print, and whether it passed and why.
+public type struct ArmJudgement {
+    /// The report's lines.
+    public lines: Array<String>;
+    /// Whether the judgement passed.
+    public passed: boolean;
+    /// Why, for the arms table.
+    public reason: String;
+}
+
+/// The judgements over an arm's results.
+public type struct ArmJudge {
+    /// The fixed point of the arm `name`: its linked IR, its per-module IR
+    /// trees, and what the stage-3 and stage-4 compilers answered when run
+    /// (`None`: it did not run).
+    public static fixed_point(name: Str, linked: &LinkedIr, tree: &TreeComparison,
+                              third: &Option<String>, fourth: &Option<String>) -> ArmJudgement {
+        mut lines: Array<String> = Array::<String>::new();
+        mut linked_matches: boolean = false;
+        match (linked) {
+            LinkedIr::Missing(paths) => {
+                for (path in paths.iterate_references()) { lines.push(f"  missing: {path.as_str()}"); }
+                return ArmJudgement { lines: lines, passed: false, reason: f"{name} linked cryo.ll is missing" };
+            }
+            LinkedIr::Differs => {
+                lines.push(f"  FIXED POINT BROKEN  {name} stage-3 and stage-4 IR differ");
+                return ArmJudgement { lines: lines, passed: false, reason: f"{name} linked cryo.ll differs" };
+            }
+            LinkedIr::Same(_, _) => { linked_matches = true; }
+            LinkedIr::NotCompared => { }
+        }
+        const size: TreeSize = match (tree) {
+            TreeComparison::NotComparable(reason) => {
+                lines.push(f"  cannot compare {name} IR tree: {reason.as_str()}");
+                return ArmJudgement { lines: lines, passed: false, reason: f"{name} IR could not be compared" };
+            }
+            TreeComparison::Differs(first) => {
+                const which: Str = if (linked_matches) { Str::new("linked cryo.ll matches but per-module IR differs; ") } else { Str::new("") };
+                lines.push(f"  FIXED POINT BROKEN  {name} {which}first differing module: {first.as_str()}");
+                return ArmJudgement { lines: lines, passed: false, reason: f"first differing module: {first.as_str()}" };
+            }
+            TreeComparison::Same(found) => { TreeSize { modules: found.modules, bytes: found.bytes } }
+        };
+        match (fourth) {
+            Option::None => {
+                lines.push(f"  FIXED POINT BROKEN  {name} stage-4 IR matches stage-3 but the stage-4 binary does not run");
+                return ArmJudgement { lines: lines, passed: false, reason: f"{name} stage-4 binary does not run" };
+            }
+            Option::Some(_) => { }
+        }
+        if (third != fourth) {
+            lines.push(f"  FIXED POINT BROKEN  {name} stage-3 says {ArmJudge::quoted(third).as_str()}, stage-4 says {ArmJudge::quoted(fourth).as_str()}");
+            return ArmJudgement { lines: lines, passed: false, reason: f"{name} stage-3 and stage-4 disagree when run" };
+        }
+        lines.push(f"  FIXED POINT OK  {name} stage-3 and stage-4 produce byte-identical IR");
+        match (linked) {
+            LinkedIr::Same(digest, bytes) => { lines.push(f"  IR sha256: {digest.as_str()}  (cryo.ll, {bytes} bytes)"); }
+            _                             => { }
+        }
+        lines.push(f"  modules: {size.modules}");
+        lines.push(f"  IR size: {size.bytes} bytes");
+        lines.push(f"  stage-4 runs: {ArmJudge::quoted(fourth).as_str()}");
+        return ArmJudgement { lines: lines, passed: true, reason: f"{size.modules} modules byte-identical" };
+    }
+
+    /// The stage archives of the arm `name`.
+    public static archives(name: Str, comparison: &ArchiveComparison) -> ArmJudgement {
+        mut lines: Array<String> = Array::<String>::new();
+        mut passed: boolean = false;
+        match (comparison) {
+            ArchiveComparison::Shared => {
+                lines.push(f"  STDLIB ARCHIVES OK  {name} stage-2 and stage-3 are byte-identical compilers, so they link one archive");
+                passed = true;
+            }
+            ArchiveComparison::Compared(compared) => {
+                match (compared) {
+                    TreeComparison::Same(size) => {
+                        lines.push(f"  STDLIB ARCHIVES OK  {name} stage-2 and stage-3 built byte-identical stdlib objects ({size.modules} modules, {size.bytes} bytes)");
+                        passed = true;
+                    }
+                    TreeComparison::Differs(first) => {
+                        lines.push(f"  STDLIB ARCHIVES DIFFER  {name} first differing module: {first.as_str()}");
+                    }
+                    TreeComparison::NotComparable(reason) => {
+                        lines.push(f"  cannot compare {name} stdlib archives: {reason.as_str()}");
+                    }
+                }
+            }
+        }
+        const reason: Str = if (passed) { Str::new("stage-2 and stage-3 stdlib archives byte-identical") } else { Str::new("the stage-2 and stage-3 stdlib archives differ or are missing") };
+        return ArmJudgement { lines: lines, passed: passed, reason: String::from_str(reason) };
+    }
+
+    /// A compiler's answer as the report quotes it, `'...'`, or `nothing`
+    /// when it did not run.
+    private static quoted(answer: &Option<String>) -> String {
+        return match (answer) {
+            Option::Some(text) => { f"'{text.as_str()}'" }
+            Option::None       => { String::from_str(Str::new("nothing")) }
+        };
+    }
+}

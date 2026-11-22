@@ -2402,71 +2402,6 @@ type struct AsyncLower {
         }
     }
 
-    /// True when a value of `ty` has no room to store an address, so carrying
-    /// one across a suspend cannot keep a frame address alive.
-    ///
-    /// A scalar has none, and an aggregate has none when none of its parts
-    /// has: a struct's or union's fields, an enum's payloads, a tuple's or an
-    /// array's elements, an instance's components with its arguments put in.
-    /// A pointer, a reference, a function value, a trait object, anything
-    /// still generic and a type that failed to resolve could hold one, and
-    /// answer false.
-    type_cannot_hold_address(mut &this, ty: TypeRef) -> boolean {
-        return this.type_cannot_hold_address_at_depth(ty, 0);
-    }
-
-    type_cannot_hold_address_at_depth(mut &this, ty: TypeRef, depth: i32) -> boolean {
-        if (depth >= 32 || !ty.is_valid()) { return false; }
-        const t: Type* = this.arena.lookup(ty);
-        if (t == null) { return false; }
-        const k: TypeKind = t.kind;
-        if (k == TypeKind::Int || k == TypeKind::Bool || k == TypeKind::Float
-                || k == TypeKind::Char || k == TypeKind::Unit || k == TypeKind::Void) {
-            return true;
-        }
-        if (k == TypeKind::Array) {
-            return this.type_cannot_hold_address_at_depth(t.as_array().element, depth + 1);
-        }
-        if (k == TypeKind::Optional) {
-            return this.type_cannot_hold_address_at_depth(t.as_optional().wrapped, depth + 1);
-        }
-        if (k == TypeKind::Tuple) {
-            return this.no_part_can_hold_address(&t.as_tuple().elements, depth + 1);
-        }
-        if (k == TypeKind::Struct) {
-            const fields: &[FieldInfo] = &t.as_struct().fields;
-            for (mut i: i64 = 0; i < fields.length(); i++) {
-                if (!this.type_cannot_hold_address_at_depth(fields[i].field_type, depth + 1)) { return false; }
-            }
-            return true;
-        }
-        if (k == TypeKind::Enum) {
-            const et: EnumType* = t.as_enum();
-            for (mut i: i64 = 0; i < et.variants.length(); i++) {
-                if (!this.no_part_can_hold_address(&et.variants[i].payload_types, depth + 1)) { return false; }
-            }
-            return true;
-        }
-        if (k == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t.as_instantiated();
-            if (inst.has_resolved_type()) {
-                return this.type_cannot_hold_address_at_depth(inst.resolved_type, depth + 1);
-            }
-            match (OwnershipQuery::instance_components(this.arena, this.ctx.generic_registry, inst)) {
-                Option::Some(components) => { return this.no_part_can_hold_address(&components, depth + 1); }
-                Option::None => { return false; }
-            }
-        }
-        return false;
-    }
-
-    no_part_can_hold_address(mut &this, parts: &[TypeRef], depth: i32) -> boolean {
-        for (mut i: i64 = 0; i < parts.length(); i++) {
-            if (!this.type_cannot_hold_address_at_depth(parts[i], depth)) { return false; }
-        }
-        return true;
-    }
-
     zeroable_kind(&this, k: TypeKind) -> boolean {
         return k == TypeKind::Int || k == TypeKind::Bool
             || k == TypeKind::Float || k == TypeKind::Pointer;
@@ -5561,11 +5496,13 @@ type struct AsyncLower {
     /// to a predicate and keeping its `boolean` answer across a suspend carries
     /// nothing, and neither does an `Option<Instant>` computed from `&limit`.
     /// A value with no room for a pointer anywhere in it
-    /// (`type_cannot_hold_address`) provably lost the address with the call
-    /// that consumed it. Every other type stays conservative.
+    /// (`OwnershipQuery::cannot_hold_address`) provably lost the address with
+    /// the call that consumed it. Every other type stays conservative.
     reject_frame_addr_carry(mut &this, sm: mut PollSm*, vd_decl: DeclarationNode*, key: SymbolID) -> boolean {
         const vd: VarDecl* = DeclarationNode::var_of(vd_decl);
-        if (this.type_cannot_hold_address(vd.resolved_type)) { return false; }
+        if (OwnershipQuery::cannot_hold_address(this.arena, this.ctx.generic_registry, vd.resolved_type)) {
+            return false;
+        }
         mut root: ExpressionNode* = this.frame_addr_root_expr(sm, vd.initializer);
         if (root == null) {
             for (mut b: i64 = 0; b < sm.blocks.length(); b++) {
@@ -6043,6 +5980,16 @@ type struct AsyncLower {
     /// every check downstream, the address-of-across-suspend one included,
     /// treats a temp exactly as it treats a local the user wrote.
     mint_temp(mut &this, base: string) -> MintedLocal {
+        const minted: MintedLocal = this.mint_block_local(base);
+        this.temp_keys.push(minted.sym);
+        return minted;
+    }
+
+    /// A fresh frame local the lowering declares for a value that lives until
+    /// its block ends, as a local the user wrote does: a scope split across
+    /// states carries it in the frame and releases it at the scope's end,
+    /// where a temporary (`mint_temp`) stands for part of one statement.
+    mint_block_local(mut &this, base: string) -> MintedLocal {
         const idx: u64 = this.counter;
         this.counter += 1;
         const fresh: SymbolStr = this.intern.intern(fmt::format("%s$H%llu", base, idx).as_str());
@@ -6054,7 +6001,6 @@ type struct AsyncLower {
         // which the rename has already run past.
         this.frame_locals.push(sym);
         this.frame_local_src.push(fresh);
-        this.temp_keys.push(sym);
         return MintedLocal { name: fresh, sym: sym };
     }
 
@@ -6493,9 +6439,94 @@ type struct AsyncLower {
     hoist_block(mut &this, blk: mut BlockStmt*) -> void {
         mut acc: HoistPre = HoistPre { stmts: [] };
         for (mut i: i64 = 0; i < blk.statements.length(); i++) {
+            if (this.temporaries_cross_suspend(blk, i)) {
+                match (blk.statements[i].kind) {
+                    StmtKind::Decl(ds) => {
+                        this.set_decl_stmt_init(ds, this.anchor_borrowed(this.decl_stmt_init(ds), &acc));
+                    }
+                    _ => {}
+                }
+            }
             this.hoist_stmt(blk.statements[i], &acc);
         }
         blk.statements = acc.stmts;
+    }
+
+    /// Whether statement `i` of `blk` keeps its temporaries until the block
+    /// ends (a `for` loop's iterator) and a later statement of the block
+    /// suspends. Such temporaries would otherwise live in the stack of the
+    /// poll that made them and be released when that poll returns, while
+    /// the loop still reads through them in the next one.
+    temporaries_cross_suspend(&this, blk: BlockStmt*, i: i64) -> boolean {
+        match (blk.statements[i].kind) {
+            StmtKind::Decl(ds) => {
+                if (!ds.temporaries_outlive_statement) { return false; }
+            }
+            _ => { return false; }
+        }
+        for (mut j: i64 = i + 1; j < blk.statements.length(); j++) {
+            if (this.stmt_await_count(blk.statements[j]) > 0) { return true; }
+        }
+        return false;
+    }
+
+    /// Rewrite `e` so every value it makes and borrows on the spot - a
+    /// method's receiver, an argument, the operand of `&` - is held by a
+    /// frame local declared ahead of it in `pre`. A frame local lives until
+    /// its block ends, in whichever poll that is.
+    anchor_borrowed(mut &this, e: mut ExpressionNode*, pre: mut HoistPre*) -> mut ExpressionNode* {
+        if (e == null) { return null; }
+        if (ExpressionNode::call_of(e) != null) {
+            mut c: mut CallExpr* = ExpressionNode::call_of(e);
+            if (ExpressionNode::member_access_of(c.callee) != null) {
+                mut receiver: mut MemberAccessExpr* = ExpressionNode::member_access_of(c.callee);
+                receiver.object = this.anchor_place(receiver.object, pre);
+            }
+            for (mut i: i64 = 0; i < c.arguments.length(); i++) {
+                c.arguments[i] = this.anchor_place(c.arguments[i], pre);
+            }
+            return e;
+        }
+        if (ExpressionNode::member_access_of(e) != null) {
+            mut m: mut MemberAccessExpr* = ExpressionNode::member_access_of(e);
+            m.object = this.anchor_borrowed(m.object, pre);
+            return e;
+        }
+        mut un: mut UnaryExpr* = ExpressionNode::unary_of(e);
+        if (un != null) {
+            if (un.op.kind == TokenType::Amp) {
+                un.operand = this.anchor_place(un.operand, pre);
+            } else {
+                un.operand = this.anchor_borrowed(un.operand, pre);
+            }
+            return e;
+        }
+        mut cast: mut CastExpr* = ExpressionNode::cast_of(e);
+        if (cast != null) {
+            cast.expression = this.anchor_borrowed(cast.expression, pre);
+            return e;
+        }
+        return e;
+    }
+
+    /// `e`, which may be borrowed, rewritten so a value it makes is held by a
+    /// frame local. A field of a value is reached through the local that
+    /// holds the whole value: lifting the field alone would move it out of a
+    /// value that is then released around it.
+    anchor_place(mut &this, e: mut ExpressionNode*, pre: mut HoistPre*) -> mut ExpressionNode* {
+        if (e == null) { return null; }
+        if (ExpressionNode::member_access_of(e) != null) {
+            mut m: mut MemberAccessExpr* = ExpressionNode::member_access_of(e);
+            m.object = this.anchor_place(m.object, pre);
+            return e;
+        }
+        mut r: mut ExpressionNode* = this.anchor_borrowed(e, pre);
+        if (this.await_transparent(r)) { return r; }
+        const ty: TypeRef = r.resolved_type;
+        if (!ty.is_valid()) { return r; }
+        const t: MintedLocal = this.mint_block_local("__iterable");
+        pre.push(this.var_decl_stmt_bound(t.name, t.sym, false, ty, r, r.span));
+        return this.ident_bound(t.name, t.sym, ty, r.span);
     }
 
     /// A branch body (a block, a bare statement, or an `else if`) rewritten into

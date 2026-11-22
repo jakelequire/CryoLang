@@ -234,7 +234,8 @@ cryo test [PATTERN] [FLAGS]
 
 | Flag | Effect |
 | --- | --- |
-| `--list` | List matching tests without running them |
+| `--suite=unit\|compile-fail\|projects` | Run one suite alone; without it all three run, in that order |
+| `--list` | List matching unit tests without running them (refused beside `--suite=compile-fail` or `--suite=projects`) |
 | `--ignored` | Run only the `![ignore]`-marked tests |
 | `--exact` | Treat `PATTERN` as an exact name, not a substring |
 | `-q`, `--quiet` | Terse output |
@@ -371,7 +372,7 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 
 | `test.json` field | Meaning |
 | --- | --- |
-| `"outcome"` | `"collect"` (default) / `"build"` / `"compile_fail"` / `"run"` / `"command"` |
+| `"outcome"` | `"collect"` (default) / `"build"` / `"compile_fail"` / `"run"` / `"interpret"` / `"command"` |
 | `"command"` | the compiler command a `"command"` project runs, verb first (below) |
 | `"ignore"` | `true` skips the project (reported as ignored) |
 | `"expect"` | per-outcome assertions (below) |
@@ -382,6 +383,12 @@ hands to every project's build too: a unit test or a project that discards a
 `![must_use]` result fails to build there, and `make examples` holds every
 example to the same.  A project that wants to show the warning asserts it
 from a compile-fail file instead, which is checked without the flag.
+
+A project's build output is echoed only when the project fails, so the runner
+lists each warning its build reported under the project's line, passing or
+not, as `    warning <code> <file>:<line>` (a warning with no span has no
+place and is not listed).  The projects summary counts them in a `warnings`
+row, printed whatever the count.
 
 ### Outcomes
 
@@ -425,6 +432,17 @@ from a compile-fail file instead, which is checked without the flag.
   { "outcome": "run", "expect": { "exit_code": 0, "stdout_contains": "ready" } }
   ```
 
+- **`interpret`** - run the file `arguments` names with `cryo interpret`
+  (tools/CryoSmith/INTERPRETER.md); the assertions judge the interpreter's
+  exit and its streams, as `run`'s judge the program's.  The interpreter's
+  own tests are these: what a program prints when interpreted, and the
+  line and exit code of each ending it reports (a violation, a construct
+  not covered, a panic).
+
+  ```json
+  { "outcome": "interpret", "arguments": ["main.cryo"], "expect": { "exit_code": 70 } }
+  ```
+
 - **`command`** - run the compiler command `command` names (a list of
   arguments, its verb first, as a step is written) and judge it by `expect`
   as a build is judged: its exit, its streams and the file it writes. It gets
@@ -461,6 +479,33 @@ with no second copy of the program written by hand:
 
 The roster golden records the `applied` exit code on the project's line
 (`applied=0`), so dropping the field from a `test.json` is a roster change.
+
+A project that tests what a SECOND build does - an incremental build after
+an edit, or after a change of input - says so with `rebuild`. The runner
+copies the project (outside the tree, without its `build/`), builds the copy
+once (`cryo build`, or the project's own `cryo test` for a collect
+fixture), which must exit 0; then overwrites each `replace` entry's `file`
+in the copy with the project's own `with` file, and runs the project's
+outcome again in the same copy, so the second build finds the first one's
+build directory. `rebuild.arguments`, when given, replace the project's
+`arguments` for the second run. `expect` judges the second run only. A
+`rebuild` that replaces nothing and changes no argument, or a replacement
+missing `file` or `with`, makes the `test.json` malformed. A `with` file
+outside `src/` is never compiled by the first build, since module discovery
+is import-driven:
+
+```json
+{
+  "outcome": "run",
+  "rebuild": {
+    "replace": [ { "file": "src/value.cryo", "with": "edits/value.cryo" } ]
+  },
+  "expect": { "exit_code": 2, "output_contains": ["reusing 1 cached object(s)"] }
+}
+```
+
+The roster golden records the number of replaced files on the project's
+line (`rebuild=1`).
 
 A project can also drive the compiler itself, for a test of what `cryo`
 writes rather than what the program does. `environment` sets variables for
@@ -609,7 +654,8 @@ the comparison reads:
   must pass it, its objects are left out of the comparison, and at least one
   of them must have moved; a declared project whose objects are all
   unchanged fails, and so does any object that moved in a project nothing
-  declares.
+  declares.  `moved:examples/<name>` says the same of an example both
+  compilers build, judged in the examples' comparison.
 - `moved-archive:<module>` in `tests/started-passing` - a standard-library
   module, written by its full name (`moved-archive:std::time::clock`), whose
   objects in the stdlib archives the change moves on purpose: a compiler
@@ -621,6 +667,15 @@ the comparison reads:
   SOURCE never needs it: verify builds this tree's stdlib with both
   compilers, so a source edit moves nothing there by construction - prove one
   by building the library before and after at one path.
+- `moved-instances:<module>` in `tests/started-passing` - a standard-library
+  module, by its full name, whose object in the unit suite's own build the
+  change moves on purpose.  That object holds the generic instances of the
+  module the unit tests use and no archive holds, so a compiler change to how
+  generic code compiles moves it whether or not it moves the module's archive
+  objects.  The unit suite's object of the module is left out of the tests'
+  comparison and must have moved; a declared module the unit suite built no
+  object of, or whose object is unchanged, fails.  A project's object of the
+  same module is the project's, declared with `moved:<project>`.
 - `moved-runtime:<configuration>/<member>` in `tests/started-passing` - a
   member of the runtime archive of one configuration (`freestanding`,
   `hosted-abort` or `hosted-unwind`), written by the configuration and the
@@ -641,12 +696,28 @@ A line stays once committed: against a later baseline it is inert.
 Rewriting a line into another form with its reason kept declares nothing
 again.
 
+A baseline run also fails on a NEW warning.  The warnings the unit suite's
+build prints in the census are compared with the baseline's as sets of code,
+file and line, so one warning traded for another fails as surely as one
+added; a warning the change removes passes.  There is no declaration for a
+new warning: a change that introduces one fixes it.  Each project's own build
+warnings, which the runner lists under its line (see the projects suite
+above), are compared the same way, project by project, and a warning only the
+tree's build of a project reports fails the run; a project declared in
+`tests/started-compiling` or `tests/started-passing` is left out, since the
+change is declared to alter its build.  A baseline whose runner predates that
+listing has none to compare against - its projects summary has no `warnings`
+row, which is how "none listed" is told from "no warnings" - so its run prints
+`project build warnings  not compared` instead.
+
 ## 9. The language server's tests
 
-`make lsp-check` builds `tools/CryoLSP` with the compiler under test and then
-drives the binary it linked through `tools/CryoLSP/tests/smoke.py`, over
-stdio, the way an editor does. The gate passes only when no check fails and
-at least `--min-checks` pass; a run that lost its fixtures is a refusal.
+`make lsp-check` (`cryogate lsp`) builds `tools/CryoLSP` with the compiler
+under test and then drives the binary it linked through its behavioural
+checks, over stdio, the way an editor does. The gate passes only when no
+check fails and at least `--min-checks` pass; a run that lost its fixtures is
+a refusal. `cryogate lsp-smoke [<server>] [--fixture NAME]` runs the checks
+alone against a server already built.
 
 A fixture is a directory under `tools/CryoLSP/tests/fixtures/`: a real
 project (a `cryoconfig` and its sources) that compiles, so the expected
@@ -665,12 +736,88 @@ A check refers to a marker as `file@name`. A missing marker fails the run, so
 editing a fixture cannot quietly move a check onto another token. A comment
 between the segments of an import's path stops the import compiling, so a
 marker on an import's last segment is written after it, `import
-Probe::B/*^name*/;`. The check
-kinds and the `edit` field (ask about an unsaved, half-typed buffer) are
-described at the top of `smoke.py`.
+Probe::B/*^name*/;`. A reference may add `+N` columns
+(`src/main.cryo@fstr+5`), for a position inside a string, where no comment
+can sit.
+
+`checks.json` names the documents opened, in order, and the checks:
+
+```
+{
+  "open":   ["src/main.cryo", ...],
+  "checks": [
+    {"name": "...", "method": "definition", "at": "src/main.cryo@marker",
+     "expect": "src/b.cryo@marker" | null},
+    {"name": "...", "method": "hover" | "expandHover", "at": "...",
+     "contains": ["..."], "excludes": ["..."]}       or "expect": null
+    {"name": "...", "method": "completion", "at": "...",
+     "includes": ["..."], "excludes": ["..."]},
+    {"name": "...", "method": "diagnostics", "file": "src/main.cryo",
+     "expect": [{"code": "W0001", "at": "src/main.cryo@marker",
+                 "message": "part of the text"}]},
+    {"name": "...", "method": "references" | "documentHighlight",
+     "at": "...", "declaration": true, "expect": ["src/b.cryo@marker", ...]},
+    {"name": "...", "method": "documentSymbol", "file": "src/b.cryo",
+     "includes": ["Item", "Item/get"], "excludes": ["..."]},
+    {"name": "...", "method": "workspaceSymbol", "query": "...",
+     "includes": ["..."], "excludes": ["..."]},
+    {"name": "...", "method": "semanticTokens", "file": "src/main.cryo",
+     "expect": {"src/main.cryo@marker": "variable.readonly", "...": null}},
+    {"name": "...", "method": "inlayHints", "file": "src/main.cryo",
+     "expect": {"src/main.cryo@marker+4": ": i32", "...": null}},
+    {"name": "...", "method": "signatureHelp", "at": "...", "contains": [...],
+     "excludes": [...], "active": 1, "param": "b: i32", "count": 2}  or "expect": null
+    {"name": "...", "method": "prepareRename", "at": "...",
+     "expect": "src/main.cryo@marker", "placeholder": "name"},
+    {"name": "...", "method": "rename", "at": "...", "new_name": "...",
+     "old": "name", "expect": ["src/main.cryo@marker", ...]},
+    {"name": "...", "method": "rename" | "prepareRename", "at": "...",
+     "new_name": "...", "refused": "part of the reason"},
+    {"name": "...", "method": "codeAction", "at": "...", "code": "W0001",
+     "old": "x", "new_text": "_x", "fix_at": "...", "fix_old": ""}
+  ]
+}
+```
+
+- A diagnostic's `message` is optional; `"code": null` is one with no code,
+  the server's own notice of a file not analysed.
+- A references, highlight or rename check compares the set of starts with the
+  markers'; every rename edit must replace exactly `old`'s width with
+  `new_name`, and a refusal passes only on an error reply holding `refused`.
+- A symbol check names a nested symbol by its path, `Parent/child`, and a
+  document symbol check also fails on a symbol whose `selectionRange` is not
+  inside its `range` (an editor refuses the whole answer otherwise).
+- A semantic-tokens check names, per position, the token that must start
+  there - its type, then modifiers it must carry (it may carry more) - or
+  `null` for none; an inlay-hints check names the hint's label there.
+- A signature check reads the active signature's label, the active
+  parameter's index, that parameter's label as its offsets cut it, and
+  `count`, how many signatures (every overload) the answer offers.
+- A code-action check waits for a diagnostic of `code` underlining `old` at
+  `at`, asks for its actions, and passes when one quickfix replaces exactly
+  `old`'s width there with `new_text`; a fix that edits elsewhere names that
+  place with `fix_at` and the text it replaces there with `fix_old`.
+- A completion check may carry `"details": {"label": "text"}` (the item's
+  detail holds the text) and `"trigger": ":"` (sent as the editor sends one
+  the typed character triggered).
+- Any check may carry `"edit": {"file", "from", "to"}`: the document is
+  changed by replacing the first `from` with `to`, the check runs against the
+  changed text and its markers, and the document is changed back; with
+  `"save": true` each change is followed by a save.
+- A position check may carry `"quiet_stderr": true`: it then also fails when
+  the server writes to its error stream while answering.
+- A fixture may name vendored libraries, `"vendor": {"Widgets":
+  "bindings/Widgets.cryo"}`: each is registered, with that file as its
+  bindings, in a registry under a temporary `CRYO_HOME`, and the fixture runs
+  from a copy; a check naming the bindings file means the copy an analysis
+  writes into the build folder.
+
+The protocol checks - the lifecycle, the error replies, requests behind an
+analysis, a file outside any project, a jump into the standard library - are
+written in `tools/CryoGate/src/lsp/run/smoke.cryo`.
 
 Adding a check: write the marker, add the check, run
-`python tools/CryoLSP/tests/smoke.py <server> --fixture <name>`, and show
-the check failing on the server from before the change. Raise
-`--min-checks` in `scripts/lsp-gate.py` to the new passing count in the same
+`cryogate lsp-smoke <server> --fixture <name>`, and show the check failing on
+the server from before the change. Raise `--min-checks`' default in
+`tools/CryoGate/src/gates/lsp.cryo` to the new passing count in the same
 commit.

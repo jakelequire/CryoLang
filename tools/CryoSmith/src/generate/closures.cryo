@@ -1,0 +1,193 @@
+///! Closures: `const` locals holding a closure, `const v3: (u8, i32) ->
+///! boolean = (q0: u8, q1: i32) -> boolean { return .. };`, and calls of
+///! them, `v3(a, b)`.
+///!
+///! A closure's body is the value it returns, generated in a scope of its
+///! own (`Environment::enter_closure`) holding its parameters and what it
+///! captures; it may call the functions generated before it.  With
+///! `closure-captures` it captures one or two of the enclosing function's
+///! values (`Capture::admits`), each copied where the closure is made, and
+///! its body observes each before its value, `{ observed = mix(observed,
+///! (v1 as u64)); return .. }`, so every captured value reaches the hash at
+///! every call; its local then has no annotation, since it holds a value of
+///! the closure's own type.  Its work is measured on a budget of its own and
+///! charged to the enclosing function at every call.  A closure local is
+///! never `mut`, so it is never assigned, and it is observed by a call of
+///! it, as every value reaches the hash.
+///!
+///! With `generic-closures` a generic function or a generic struct's method
+///! declares closures too, generic over its `T`: a parameter or the return
+///! type may be `T`, and a closure returning `T` may capture a `T` value,
+///! which its value then selects, `if (c) { p0 } else { .. }`.  A closure
+///! returning `T` is called where it would be observed, its value unused.
+
+namespace cryosmith::generate::closures;
+
+import std::collections::array::{ Array };
+
+import cryosmith::configuration::{ Feature };
+import cryosmith::generate::generator::{ Generator };
+import cryosmith::guarantees::{ Capture, CostBudget };
+import cryosmith::model::{ Closure, ExpressionKind, Signature, StatementKind, ValueType };
+import cryosmith::typing::{ TypeChoice };
+
+/// The most parameters a closure takes.
+const MOST_CLOSURE_PARAMETERS: i64 = 2;
+
+/// The most values a closure captures.
+const MOST_CAPTURES: i64 = 2;
+
+/// How often, in a hundred, a closure captures when there is a value to
+/// capture.
+const CAPTURE_CHANCE: i64 = 60;
+
+/// How often, in a hundred, a closure declared in a generic body takes or
+/// returns the body's `T` in one place of its signature.
+const TYPE_PARAMETER_CHANCE: i64 = 40;
+
+implement struct Generator {
+    /// Whether a closure may be declared here: the feature is on, and the
+    /// body is not generic or `generic-closures` is on too.
+    internal declares_closures(&this) -> boolean {
+        return this.options.features.has(Feature::Closures)
+            && (!this.genericity.is_generic() || this.options.features.has(Feature::GenericClosures));
+    }
+
+    /// `const v<N>: (..) -> R = (q0: ..) -> R { return .. };`: a closure of
+    /// zero to two parameters returning a value, each a scalar or, in a
+    /// generic body, sometimes `T`; one that captures is held by `const
+    /// v<N> = ..`.
+    internal closure_declaration(mut &this) -> i64 {
+        const function_type: ValueType = this.closure_signature();
+        const captures: Array<i64> = this.captures(this.program.signature_of(function_type).returns);
+        const depth: i64 = this.depth();
+        mut closure: Closure = this.closure_body(function_type, &captures, CostBudget::for_function(false), depth);
+        closure.local = this.environment.declare_local(&this.program, function_type, false);
+        this.program.closures.push(closure);
+        const value: i64 = this.node(ExpressionKind::Closure(this.program.closures.length() - 1), function_type);
+        return this.program.statement(StatementKind::Declare(closure.local, value));
+    }
+
+    /// A function type of zero to two parameters returning a value, each a
+    /// scalar or, in a generic body, `T` `TYPE_PARAMETER_CHANCE` times in a
+    /// hundred.  A closure returning `T` takes a `T` too, one more parameter
+    /// when none was drawn, since inside its body the enclosing function's
+    /// `T` values are out of reach and a `T` value is only ever read.
+    internal closure_signature(mut &this) -> ValueType {
+        const count: i64 = this.random.below(MOST_CLOSURE_PARAMETERS + 1);
+        mut parameter_types: Array<ValueType> = Array::<ValueType>::new();
+        mut takes_type_parameter: boolean = false;
+        while (parameter_types.length() < count) {
+            const parameter_type: ValueType = this.closure_value_type();
+            if (parameter_type.same(ValueType::TypeParameter)) { takes_type_parameter = true; }
+            parameter_types.push(parameter_type);
+        }
+        const returns: ValueType = this.closure_value_type();
+        if (returns.same(ValueType::TypeParameter) && !takes_type_parameter) { parameter_types.push(ValueType::TypeParameter); }
+        return this.program.function_type(&parameter_types, returns);
+    }
+
+    /// A closure's parameter or return type: a scalar, or in a generic body
+    /// sometimes `T`.  Outside one, no draw beyond the scalar's.
+    private closure_value_type(mut &this) -> ValueType {
+        if (this.genericity.is_generic() && this.random.chance(TYPE_PARAMETER_CHANCE)) { return ValueType::TypeParameter; }
+        return TypeChoice::scalar(&this.random, this.options.features);
+    }
+
+    /// A closure of `function_type` capturing `captures`, its body's value
+    /// generated at `depth` on `budget` in a scope of its own, and its
+    /// captures observed before it; held by no local yet.
+    internal closure_body(mut &this, function_type: ValueType, captures: &Array<i64>, budget: CostBudget, depth: i64) -> Closure {
+        const signature: Signature = this.program.signature_of(function_type);
+        const outer_floor: i64 = this.environment.enter_closure();
+        for (captured in captures.iter()) { this.environment.bind(captured); }
+        mut parameters: Array<i64> = Array::<i64>::new();
+        while (parameters.length() < signature.parameter_count) {
+            const parameter_type: ValueType = this.program.signature_parameter(signature, parameters.length());
+            parameters.push(this.environment.declare_closure_parameter(&this.program, parameter_type));
+        }
+        const first_parameter: i64 = this.program.list_run(&parameters);
+        const outer_budget: CostBudget = this.budget;
+        this.budget = budget;
+        mut body: i64 = this.typed_place(signature.returns, depth);
+        for (captured in captures.iter()) {
+            if (this.program.variable_at(captured).value_type.same(ValueType::TypeParameter)) {
+                const condition: i64 = this.condition(0);
+                body = this.node(ExpressionKind::Conditional(condition, this.read(captured), body), ValueType::TypeParameter);
+            }
+        }
+        mut observations: Array<i64> = Array::<i64>::new();
+        for (captured in captures.iter()) { this.observe_place(this.read(captured), &observations); }
+        const cost: u64 = this.budget.spent();
+        this.budget = outer_budget;
+        this.environment.leave_closure(outer_floor);
+        return Closure {
+            function_type: function_type, first_parameter: first_parameter, parameter_count: signature.parameter_count,
+            first_capture: this.program.list_run(captures), capture_count: captures.length(),
+            observations: this.program.block(&observations), body: body, cost: cost, local: -1,
+        };
+    }
+
+    /// The values a closure returning `returns` made here captures: none
+    /// without `closure-captures`, and with it, one or two distinct names in
+    /// scope that `Capture::admits`, `CAPTURE_CHANCE` times in a hundred.  No
+    /// draw is taken without the feature or with nothing to capture.  A `T`
+    /// capture is read by an `if` expression around the closure's value
+    /// (`closure_body`), so it is taken only with `if-expressions`.
+    internal captures(mut &this, returns: ValueType) -> Array<i64> {
+        mut chosen: Array<i64> = Array::<i64>::new();
+        if (!this.options.features.has(Feature::ClosureCaptures)) { return chosen; }
+        const selects: boolean = returns.same(ValueType::TypeParameter) && this.options.features.has(Feature::IfExpressions);
+        mut candidates: Array<i64> = Array::<i64>::new();
+        for (variable in this.environment.in_scope().iter()) {
+            if (Capture::admits(this.program.variable_at(variable), selects)) { candidates.push(variable); }
+        }
+        if (candidates.length() == 0 || !this.random.chance(CAPTURE_CHANCE)) { return chosen; }
+        const most: i64 = if (candidates.length() < MOST_CAPTURES) { candidates.length() } else { MOST_CAPTURES };
+        const wanted: i64 = 1 + this.random.below(most);
+        const first: i64 = this.random.below(candidates.length());
+        chosen.push(candidates.get(first).unwrap());
+        if (wanted > 1) {
+            const second: i64 = (first + 1 + this.random.below(candidates.length() - 1)) % candidates.length();
+            chosen.push(candidates.get(second).unwrap());
+        }
+        return chosen;
+    }
+
+    /// The closures whose locals are in scope, returning `wanted`, that one
+    /// more call of keeps this function's work under its limit.
+    internal closure_calls(&this, wanted: ValueType) -> Array<i64> {
+        mut found: Array<i64> = Array::<i64>::new();
+        mut index: i64 = 0;
+        while (index < this.program.closures.length()) {
+            const closure: Closure = this.program.closure_at(index);
+            if (this.program.signature_of(closure.function_type).returns.same(wanted)
+                    && this.environment.holds(closure.local) && this.budget.affordable(closure.cost)) {
+                found.push(index);
+            }
+            index = index + 1;
+        }
+        return found;
+    }
+
+    /// A call of closure `index` through its local, its work charged, with
+    /// an argument for each parameter.
+    internal closure_call(mut &this, index: i64, depth: i64) -> i64 {
+        const closure: Closure = this.program.closure_at(index);
+        const signature: Signature = this.program.signature_of(closure.function_type);
+        this.budget.charge(closure.cost);
+        mut arguments: Array<i64> = Array::<i64>::new();
+        while (arguments.length() < signature.parameter_count) {
+            arguments.push(this.typed_place(this.program.signature_parameter(signature, arguments.length()), depth));
+        }
+        const first: i64 = this.program.list_run(&arguments);
+        return this.node(ExpressionKind::Invoke(this.read(closure.local), first, signature.parameter_count), signature.returns);
+    }
+
+    /// The closure the local `variable` holds.
+    internal closure_held_by(&this, variable: i64) -> i64 {
+        mut index: i64 = 0;
+        while (this.program.closure_at(index).local != variable) { index = index + 1; }
+        return index;
+    }
+}

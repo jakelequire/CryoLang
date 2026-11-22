@@ -1,0 +1,267 @@
+///! verify's comparison of the baseline's objects with the tree's, one
+///! population at a time: the objects the declarations account for are
+///! judged and left out, the rest are counted as moved or in one run only,
+///! and the report lines are written.
+
+namespace cryogate::verify::comparison;
+
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+
+import cryogate::core::text::{ Text };
+import cryogate::verify::declarations::{ DeclarationKind, Declarations, DeclaredChanges };
+import cryogate::verify::judges::{ VerifyJudges };
+import cryogate::verify::objects::{ ObjectOwner, ObjectPopulation };
+
+/// What a comparison found: the lines it reports, the problems with the
+/// declared moves, and how many objects differ (moved, or in one run
+/// only, not counting those the tree takes from the archive).
+public type struct Compared {
+    /// The report, line by line, as verify prints it.
+    public lines: Array<String>;
+    /// The problems with the declared moves, each worded as one.
+    public problems: Array<String>;
+    /// The number of objects that differ.
+    public changed: i64;
+}
+
+/// verify's comparison of the baseline's objects with the tree's.
+public type struct ObjectComparison {
+    /// An object list's text, one `<sha256 digest>  <path>` row per line,
+    /// as a map from path to digest.
+    public static read_list(text: Str) -> HashMap<String, String> {
+        mut hashes: HashMap<String, String> = HashMap::<String, String>::new();
+        for (line in Text::lines(text).iterate_references()) {
+            const row: Str = line.as_str();
+            if (row.is_empty()) { continue; }
+            const path: Str = if (row.length() > 66) { row.byte_substring(66, row.length()) } else { Str::new("") };
+            const digest: Str = if (row.length() > 64) { row.byte_substring(0, 64) } else { row };
+            hashes.insert(String::from_str(path), String::from_str(digest));
+        }
+        return hashes;
+    }
+
+    /// Every population's comparison against the baseline built from
+    /// `revision`: `baseline` and `tree` hold the maps of each population
+    /// of `ObjectPopulation::all()`, in that order, read from the lists in
+    /// the run directory `run`.  An object only the baseline has is one the
+    /// tree takes from the archive when the tree's programs linked one.
+    /// The `archive:` declarations are judged by the archive's moves last.
+    public static against(revision: Str, changes: &DeclaredChanges, baseline: Array<HashMap<String, String>>,
+                          tree: Array<HashMap<String, String>>, limit: i64, run: Str) -> Compared {
+        mut compared: Compared = Compared { lines: Array::<String>::new(), problems: Array::<String>::new(), changed: 0 };
+        for (problem in changes.problems.iterate_references()) { compared.problems.push(problem.clone()); }
+        compared.lines.push(f"verify: objects against {revision}");
+        const populations: Array<ObjectPopulation> = ObjectPopulation::all();
+        mut archive_linked: boolean = false;
+        for (mut i: i64 = 0; i < populations.length(); i++) {
+            if (populations[i].is_stdlib() && !tree[i].is_empty()) { archive_linked = true; }
+        }
+        mut archive_changed: i64 = 0;
+        for (mut i: i64 = 0; i < populations.length(); i++) {
+            const baseline_list: String = populations[i].baseline_list(run);
+            const tree_list: String = populations[i].tree_list(run);
+            const changed: i64 = ObjectComparison::population(&populations[i], baseline[i].clone(), tree[i].clone(), changes,
+                archive_linked, limit, baseline_list.as_str(), tree_list.as_str(), &compared);
+            compared.changed = compared.changed + changed;
+            if (populations[i].is_stdlib()) { archive_changed = changed; }
+        }
+        for (problem in VerifyJudges::archive_moves(&changes.archive_files, archive_changed).iterate_references()) {
+            compared.problems.push(problem.clone());
+        }
+        return compared;
+    }
+
+    /// One population's comparison, its lines and problems added to
+    /// `compared`; the count of objects that differ.  The declared unit-test
+    /// objects, `moved-instances:` modules and `moved:` projects are judged
+    /// in the tests, `moved:`
+    /// examples in the examples, the
+    /// `moved-archive:` modules in the stdlib; the declared projects' and
+    /// examples' objects are left out; and in the stdlib, an archive only
+    /// one run built came from a gate only that run ran, and is left out.
+    private static population(population: &ObjectPopulation, baseline: HashMap<String, String>, tree: HashMap<String, String>,
+                      changes: &DeclaredChanges, archive_linked: boolean, limit: i64, baseline_list: Str, tree_list: Str,
+                      compared: mut &Compared) -> i64 {
+        const tag: Str = population.name();
+        mut a: HashMap<String, String> = baseline;
+        mut b: HashMap<String, String> = tree;
+        const tests: boolean = match (population) { ObjectPopulation::Tests => { true } _ => { false } };
+        const stdlib: boolean = population.is_stdlib();
+        const runtime: boolean = match (population) { ObjectPopulation::Runtime => { true } _ => { false } };
+        if (runtime) {
+            const layout_a: String = ObjectComparison::runtime_layouts(&a);
+            const layout_b: String = ObjectComparison::runtime_layouts(&b);
+            if (layout_a.as_str() != layout_b.as_str()) {
+                // No member of a runtime built per tier has a counterpart in
+                // one built per configuration; the census links and runs
+                // every program against the tree's, and the `abi` gate reads
+                // its exports.
+                compared.lines.push(f"  {tag:<9} baseline {a.length():>5}  tree {b.length():>5}  NOT COMPARED: the baseline's runtime is laid out as {layout_a.as_str()}, the tree's as {layout_b.as_str()}");
+                return 0;
+            }
+            if (!changes.moved_members.is_empty()) {
+                const found: Array<String> = VerifyJudges::runtime_moves(&changes.moved_members, &a, &b);
+                compared.lines.push(f"  {tag:<9} declared moved runtime members left out: {changes.moved_members.length()}, {found.length()} problem(s)");
+                for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+            }
+        }
+        if (tests && !changes.units.is_empty()) {
+            const found: Array<String> = VerifyJudges::unit_moves(&changes.units, &a, &b);
+            compared.lines.push(f"  {tag:<9} declared unit-test objects left out: {changes.units.length()}, {found.length()} problem(s)");
+            for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+        }
+        if (tests && !changes.moved_instances.is_empty()) {
+            const found: Array<String> = VerifyJudges::instance_moves(&changes.moved_instances, &a, &b);
+            compared.lines.push(f"  {tag:<9} declared moved unit-suite module objects left out: {changes.moved_instances.length()}, {found.length()} problem(s)");
+            for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+        }
+        if (tests && !changes.moved_projects.is_empty()) {
+            const found: Array<String> = VerifyJudges::project_moves(&changes.moved_projects, &a, &b);
+            compared.lines.push(f"  {tag:<9} declared moved projects left out: {changes.moved_projects.length()}, {found.length()} problem(s)");
+            for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+        }
+        const examples: boolean = match (population) { ObjectPopulation::Examples => { true } _ => { false } };
+        if (examples && !changes.moved_examples.is_empty()) {
+            const found: Array<String> = VerifyJudges::project_moves(&changes.moved_examples, &a, &b);
+            compared.lines.push(f"  {tag:<9} declared moved examples left out: {changes.moved_examples.length()}, {found.length()} problem(s)");
+            for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+        }
+        mut prefixes: Array<String> = Array::<String>::new();
+        for (name in changes.names.iterate_references()) {
+            match (Declarations::kind(name.as_str())) {
+                DeclarationKind::Example => { prefixes.push(f"{name.as_str()}/"); }
+                DeclarationKind::Project => { prefixes.push(f"tests/tests/projects/{name.as_str()}/"); }
+                _                        => { }
+            }
+        }
+        if (!prefixes.is_empty()) {
+            const dropped_a: Array<String> = ObjectComparison::paths_under(&a, &prefixes);
+            const dropped_b: Array<String> = ObjectComparison::paths_under(&b, &prefixes);
+            for (path in dropped_a.iterate_references()) { a.remove(path); }
+            for (path in dropped_b.iterate_references()) { b.remove(path); }
+            if (!dropped_a.is_empty() || !dropped_b.is_empty()) {
+                compared.lines.push(f"  {tag:<9} declared projects' objects left out: baseline {dropped_a.length()}, tree {dropped_b.length()}");
+            }
+        }
+        if (stdlib) {
+            mut unpaired: i64 = 0;
+            mut paired_a: HashMap<String, String> = HashMap::<String, String>::new();
+            mut paired_b: HashMap<String, String> = HashMap::<String, String>::new();
+            const archives_a: Array<String> = ObjectComparison::archives(&a);
+            const archives_b: Array<String> = ObjectComparison::archives(&b);
+            for (entry in a.entries()) {
+                if (archives_b.contains(&ObjectComparison::archive_of(entry.first.as_str()))) {
+                    paired_a.insert(entry.first.clone(), entry.second.clone());
+                } else {
+                    unpaired++;
+                }
+            }
+            for (entry in b.entries()) {
+                if (archives_a.contains(&ObjectComparison::archive_of(entry.first.as_str()))) {
+                    paired_b.insert(entry.first.clone(), entry.second.clone());
+                } else {
+                    unpaired++;
+                }
+            }
+            a = paired_a;
+            b = paired_b;
+            if (unpaired > 0) {
+                compared.lines.push(f"  {tag:<9} archive objects of a stdlib root only one run used, left out: {unpaired}");
+            }
+            if (!changes.moved_modules.is_empty()) {
+                const found: Array<String> = VerifyJudges::archive_module_moves(&changes.moved_modules, &a, &b);
+                compared.lines.push(f"  {tag:<9} declared moved modules left out: {changes.moved_modules.length()}, {found.length()} problem(s)");
+                for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+            }
+        }
+        mut moved: Array<String> = Array::<String>::new();
+        mut only_a: Array<String> = Array::<String>::new();
+        mut replaced: Array<String> = Array::<String>::new();
+        mut only_b: Array<String> = Array::<String>::new();
+        for (entry in a.entries()) {
+            const path: String = entry.first.clone();
+            match (b.get_reference(&path)) {
+                Option::Some(digest) => { if (digest.as_str() != entry.second.as_str()) { moved.push(path.clone()); } }
+                Option::None         => {
+                    if (ObjectOwner::replaced_by_archive(path.as_str(), archive_linked)) { replaced.push(path.clone()); }
+                    else { only_a.push(path.clone()); }
+                }
+            }
+        }
+        for (entry in b.entries()) {
+            const path: String = entry.first.clone();
+            if (!a.contains_key(&path)) { only_b.push(path.clone()); }
+        }
+        const moved_sorted: Array<String> = Text::sorted_distinct(moved);
+        const only_a_sorted: Array<String> = Text::sorted_distinct(only_a);
+        const only_b_sorted: Array<String> = Text::sorted_distinct(only_b);
+        compared.lines.push(f"  {tag:<9} baseline {a.length():>5}  tree {b.length():>5}  moved {moved_sorted.length()}  only-baseline {only_a_sorted.length()}  only-tree {only_b_sorted.length()}  replaced by the archive {replaced.length()}");
+        ObjectComparison::list(Str::new("moved"), &moved_sorted, limit, baseline_list, tree_list, compared);
+        ObjectComparison::list(Str::new("only-baseline"), &only_a_sorted, limit, baseline_list, tree_list, compared);
+        ObjectComparison::list(Str::new("only-tree"), &only_b_sorted, limit, baseline_list, tree_list, compared);
+        return moved_sorted.length() + only_a_sorted.length() + only_b_sorted.length();
+    }
+
+    /// The first `limit` of `paths` under `label`, then how many more
+    /// there are and where the full lists are.
+    private static list(label: Str, paths: &Array<String>, limit: i64, baseline_list: Str, tree_list: Str, compared: mut &Compared) -> void {
+        for (mut i: i64 = 0; i < paths.length() && i < limit; i++) {
+            compared.lines.push(f"      {label:<13} {paths[i].as_str()}");
+        }
+        if (paths.length() > limit) {
+            compared.lines.push(f"      ... {paths.length() - limit} more {label} (full lists: {baseline_list}, {tree_list})");
+        }
+    }
+
+    /// The paths of `hashes` that start with one of `prefixes`.
+    private static paths_under(hashes: &HashMap<String, String>, prefixes: &Array<String>) -> Array<String> {
+        mut paths: Array<String> = Array::<String>::new();
+        for (entry in hashes.entries()) {
+            for (prefix in prefixes.iterate_references()) {
+                if (entry.first.as_str().starts_with(&prefix.as_str())) { paths.push(entry.first.clone()); break; }
+            }
+        }
+        return paths;
+    }
+
+    /// The archive an archive object's path names: its second and third
+    /// components, `<triple>/<options>`, of
+    /// `stdlib-archive/<triple>/<options>/...`.
+    public static archive_of(path: Str) -> String {
+        mut parts: Array<Str> = Array::<Str>::new();
+        for (part in path.split(&Str::new("/"))) { parts.push(part); }
+        mut archive: String = String::new();
+        for (mut i: i64 = 1; i < parts.length() && i < 3; i++) {
+            if (i > 1) { archive.push('/'); }
+            archive.push(parts[i]);
+        }
+        return archive;
+    }
+
+    /// How the runtime archives the paths of `hashes` name are laid out,
+    /// each layout once, sorted and joined by `/`: "tiers" for a member of
+    /// a `libcryort-*.a` per tier, "configurations" for one of a
+    /// configuration's archive; empty for no member.
+    public static runtime_layouts(hashes: &HashMap<String, String>) -> String {
+        mut layouts: Array<String> = Array::<String>::new();
+        for (entry in hashes.entries()) {
+            const archive: Str = match (entry.first.as_str().split_once(&Str::new("/"))) {
+                Option::Some(parts) => { parts.second }
+                Option::None        => { Str::new("") }
+            };
+            layouts.push(String::from_str(if (archive.starts_with(&Str::new("libcryort"))) { Str::new("tiers") } else { Str::new("configurations") }));
+        }
+        return Text::joined(&Text::sorted_distinct(layouts), Str::new("/"));
+    }
+
+    /// The archives the paths of `hashes` name.
+    private static archives(hashes: &HashMap<String, String>) -> Array<String> {
+        mut archives: Array<String> = Array::<String>::new();
+        for (entry in hashes.entries()) { archives.push(ObjectComparison::archive_of(entry.first.as_str())); }
+        return Text::sorted_distinct(archives);
+    }
+}

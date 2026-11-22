@@ -1,0 +1,145 @@
+///! `SelfTest`: runs every check, counts them and reports the failures; the
+///! default programs the checks share, each generated once; and the parts a
+///! run is split into.
+///!
+///! A run is a sequence of units - each check, and each feature switch on
+///! its own - numbered in the order they run.  `--part i/N` runs the units
+///! whose number leaves `i` divided by `N`, so N processes run them all
+///! between them, each unit once, and every part counts the same total.
+
+namespace cryosmith::selftest::runner;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::fmt;
+
+import cryosmith::configuration::{ GenerationOptions };
+import cryosmith::emit::{ Printer };
+import cryosmith::generate::{ Generator };
+import cryosmith::model::{ Program };
+
+/// The self-test's checks and their failures.
+public type struct SelfTest {
+    private checks: i64;
+    private failures: Array<String>;
+    /// This run's part, below `parts`.
+    private part: i64;
+    private parts: i64;
+    /// The units numbered so far, and how many of them this part ran.
+    private units: i64;
+    private owned: i64;
+    /// The default program of seed `n` at `n - 1`: its model, and its text.
+    private programs: Array<Program>;
+    private texts: Array<String>;
+
+    /// Run every check, or with `parts` above 1 the units of part `part`;
+    /// 0 when all it ran passed, 1 otherwise.  A part reports how many
+    /// units it ran of how many there are.
+    public static run(part: i64, parts: i64) -> i32 {
+        mut test: SelfTest = SelfTest {
+            checks:   0,
+            failures: Array::<String>::new(),
+            part:     part,
+            parts:    parts,
+            units:    0,
+            owned:    0,
+            programs: Array::<Program>::new(),
+            texts:    Array::<String>::new(),
+        };
+        if (test.owns()) { test.determinism(); }
+        if (test.owns()) { test.function_prefix(); }
+        if (test.owns()) { test.feature_lists(); }
+        test.feature_switches();
+        test.borrow_coverage();
+        if (test.owns()) { test.enum_implementation_coverage(); }
+        if (test.owns()) { test.audit(); }
+        if (test.owns()) { test.copy_bound_audit(); }
+        if (test.owns()) { test.binding_audit(); }
+        if (test.owns()) { test.observation_audit(); }
+        if (test.owns()) { test.capture_audit(); }
+        if (test.owns()) { test.function_value_audit(); }
+        if (test.owns()) { test.default_audit(); }
+        if (test.owns()) { test.move_audit(); }
+        if (test.owns()) { test.loan_audit(); }
+        if (test.owns()) { test.subject_assignment_audit(); }
+        if (test.owns()) { test.holder_audit(); }
+        if (test.owns()) { test.array_audit(); }
+        if (test.owns()) { test.text_audit(); }
+        if (test.owns()) { test.dynamic_array_audit(); }
+        if (test.owns()) { test.map_audit(); }
+        test.omission_audits();
+        if (test.owns()) { test.mutation_check(); }
+        if (parts > 1) { fmt::println(f"cryosmith selftest: part {part}/{parts} ran {test.owned} of {test.units} units"); }
+        for (failure in test.failures.iterate_references()) { fmt::eprintln(f"cryosmith selftest: FAIL {failure.as_str()}"); }
+        // A part owning no unit (more parts than units) has nothing to run;
+        // one owning units that ran no check is broken.
+        if (test.checks == 0 && test.owned > 0) {
+            fmt::eprintln(String::from_str(Str::new("cryosmith selftest: FAIL no check ran")));
+            return 1;
+        }
+        if (test.failures.length() > 0) {
+            fmt::eprintln(f"cryosmith selftest: FAIL ({test.failures.length()} of {test.checks} checks)");
+            return 1;
+        }
+        fmt::println(f"cryosmith selftest: OK ({test.checks} checks)");
+        return 0;
+    }
+
+    /// Number the next unit; whether this part runs it.
+    internal owns(mut &this) -> boolean {
+        const mine: boolean = this.units % this.parts == this.part;
+        this.units = this.units + 1;
+        if (mine) { this.owned = this.owned + 1; }
+        return mine;
+    }
+
+    /// Count one check, and record `description` when it does not hold.
+    internal expect(mut &this, holds: boolean, description: String) -> void {
+        this.checks = this.checks + 1;
+        if (!holds) { this.failures.push(description); }
+    }
+
+    /// The model of the default program of `seed`, generated once.  The
+    /// checks only read it.
+    internal default_model(mut &this, seed: u64) -> &Program {
+        while (this.programs.length() < seed as i64) {
+            this.programs.push(Generator::generate(GenerationOptions::new((this.programs.length() + 1) as u64)));
+        }
+        return &this.programs[(seed - 1) as i64];
+    }
+
+    /// The text of the default program of `seed`, printed once from its
+    /// model.
+    internal default_text(mut &this, seed: u64) -> String {
+        while (this.texts.length() < seed as i64) {
+            const next: u64 = (this.texts.length() + 1) as u64;
+            const options: GenerationOptions = GenerationOptions::new(next);
+            const text: String = Printer::print(this.default_model(next), &options);
+            this.texts.push(text);
+        }
+        return this.texts[(seed - 1) as i64].clone();
+    }
+
+    /// The text of the program `options` describe, generated afresh.
+    internal static program(options: GenerationOptions) -> String {
+        return Printer::print(&Generator::generate(options), &options);
+    }
+
+    /// The program after its prelude: everything past `mix`'s closing brace.
+    internal static body(text: Str) -> Str {
+        return match (text.split_once(&Str::new("\n}\n"))) {
+            Option::Some(parts) => { parts.second }
+            Option::None        => { text }
+        };
+    }
+
+    /// The text from `start` up to `end`, if both are there in that order.
+    internal static between(text: Str, start: Str, end: Str) -> Option<Str> {
+        const from: i64 = text.find(&start)?;
+        const rest: Str = text.byte_substring(from, text.length());
+        const length: i64 = rest.find(&end)?;
+        return Option::Some(rest.byte_substring(0, length));
+    }
+}

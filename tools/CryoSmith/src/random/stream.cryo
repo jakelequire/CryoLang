@@ -1,0 +1,168 @@
+///! `RandomStream`: the draws generation makes, over the standard library's
+///! `Rng::from_seed`, whose sequence is fixed for every version of the
+///! library.
+///!
+///! Each part of a program has its own stream: the structs, every method
+///! and every free function.  A part's stream is seeded from the program's
+///! seed and the part's place, so a change in how one part spends draws does
+///! not reshuffle the next part's choices.
+
+namespace cryosmith::random::stream;
+
+import std::collections::array::{ Array };
+import std::random::generator::{ Rng };
+import std::random::source::{ RandomSource };
+
+/// The spacing between the seeds of two functions' streams.
+const STREAM_SPACING: u64 = 0x9E3779B97F4A7C15;
+
+/// Mixed into the seed of the stream the structs are declared from.
+const STRUCTURE_STREAM: u64 = 0xD1B54A32D192ED03;
+
+/// Mixed into the seed of every method's stream, so no method shares a
+/// stream with a free function.
+const METHOD_STREAM: u64 = 0x94D049BB133111EB;
+
+/// Mixed into the seed of the generic functions' streams, so none shares a
+/// stream with a free function or a method.
+const GENERIC_STREAM: u64 = 0xBF58476D1CE4E5B9;
+
+/// Mixed into the seed of the stream the generic structs are declared from.
+const GENERIC_STRUCTURE_STREAM: u64 = 0x2545F4914F6CDD1D;
+
+/// Mixed into the seed of the generic structs' methods' streams.
+const GENERIC_METHOD_STREAM: u64 = 0x85EBCA77C2B2AE63;
+
+/// Mixed into the seed of the overload sets' streams.
+const OVERLOAD_STREAM: u64 = 0xC2B2AE3D27D4EB4F;
+
+/// Mixed into the seed of the stream the enums are declared from.
+const ENUMERATION_STREAM: u64 = 0x165667B19E3779F9;
+
+/// Mixed into the seed of the stream the traits are declared from.
+const TRAIT_STREAM: u64 = 0x27D4EB2F165667C5;
+
+/// Mixed into the seed of the trait-bounded generic functions' streams.
+const BOUNDED_STREAM: u64 = 0x9FB21C651E98DF25;
+
+/// Mixed into the seed of the stream the owned structs are declared from.
+const OWNED_STREAM: u64 = 0xC2B2AE3D27D4EB4F;
+
+/// Mixed into the seed of a mutation's stream, so none shares a stream with
+/// any part of the program it mutates.
+const MUTATION_STREAM: u64 = 0x4CF5AD432745937F;
+
+/// One seeded sequence of draws.
+public type struct RandomStream {
+    private source: Rng;
+
+    /// The stream of the program's own choices, made before any part's:
+    /// how many helper functions it has.
+    public static for_program(seed: u64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed) };
+    }
+
+    /// The stream the program's structs and their fields are declared from.
+    public static for_structures(seed: u64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ STRUCTURE_STREAM) };
+    }
+
+    /// The stream of free function `number` (`main` is the one after the
+    /// last helper).
+    public static for_function(seed: u64, number: i64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ ((number as u64) + 1).wrapping_multiply(STREAM_SPACING)) };
+    }
+
+    /// The stream of the method generated at `ordinal` among the methods.
+    public static for_method(seed: u64, ordinal: i64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ METHOD_STREAM ^ ((ordinal as u64) + 1).wrapping_multiply(STREAM_SPACING)) };
+    }
+
+    /// The stream that decides how many generic functions the program has.
+    public static for_generics(seed: u64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ GENERIC_STREAM) };
+    }
+
+    /// The stream of generic function `number`.
+    public static for_generic(seed: u64, number: i64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ GENERIC_STREAM ^ ((number as u64) + 1).wrapping_multiply(STREAM_SPACING)) };
+    }
+
+    /// The stream the program's generic structs and their instances are
+    /// declared from.
+    public static for_generic_structures(seed: u64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ GENERIC_STRUCTURE_STREAM) };
+    }
+
+    /// The stream that decides the generic structs' methods: how many each
+    /// has, and how each takes its receiver.
+    public static for_generic_methods(seed: u64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ GENERIC_METHOD_STREAM) };
+    }
+
+    /// The stream of the generic struct method generated at `ordinal`
+    /// among them.
+    public static for_generic_method(seed: u64, ordinal: i64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ GENERIC_METHOD_STREAM ^ ((ordinal as u64) + 1).wrapping_multiply(STREAM_SPACING)) };
+    }
+
+    /// The stream the program's enums and their variants are declared
+    /// from.
+    public static for_enumerations(seed: u64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ ENUMERATION_STREAM) };
+    }
+
+    /// The stream the traits and which structs implement them are drawn
+    /// from.
+    public static for_traits(seed: u64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ TRAIT_STREAM) };
+    }
+
+    /// The stream the owned structs and their fields are declared from.
+    public static for_owned(seed: u64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ OWNED_STREAM) };
+    }
+
+    /// The stream trait-bounded generic function `number` is generated
+    /// from.
+    public static for_bounded(seed: u64, number: i64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ BOUNDED_STREAM ^ ((number as u64) + 1).wrapping_multiply(STREAM_SPACING)) };
+    }
+
+    /// The stream of member `member` of the overload set named by free
+    /// function `number` (`owner` -1) or by method `number` of struct
+    /// `owner`; member 0 decides how many members the set gains.
+    public static for_overload(seed: u64, owner: i64, number: i64, member: i64) -> RandomStream {
+        const ordinal: u64 = ((((owner + 1) as u64) * 64 + (number as u64)) * 4 + (member as u64)) + 1;
+        return RandomStream { source: Rng::from_seed(seed ^ OVERLOAD_STREAM ^ ordinal.wrapping_multiply(STREAM_SPACING)) };
+    }
+
+    /// The stream mutation `number` of the program of `seed` is chosen
+    /// from: its operator and its site.
+    public static for_mutation(seed: u64, number: u64) -> RandomStream {
+        return RandomStream { source: Rng::from_seed(seed ^ MUTATION_STREAM ^ (number + 1).wrapping_multiply(STREAM_SPACING)) };
+    }
+
+    /// 64 random bits.
+    public bits(mut &this) -> u64 { return this.source.next_64(); }
+
+    /// A number in `[0, bound)`.
+    public below(mut &this, bound: i64) -> i64 { return this.source.next_below(bound); }
+
+    /// True `percent` times in a hundred.
+    public chance(mut &this, percent: i64) -> boolean { return this.below(100) < percent; }
+
+    /// An index into `weights`, chosen in proportion to its weight.
+    public pick(mut &this, weights: &Array<i64>) -> i64 {
+        const total: i64 = weights.iter().sum();
+        mut roll: i64 = this.below(total);
+        mut index: i64 = 0;
+        while (index < weights.length()) {
+            const weight: i64 = weights.get(index).unwrap();
+            if (roll < weight) { return index; }
+            roll = roll - weight;
+            index = index + 1;
+        }
+        return weights.length() - 1;
+    }
+}

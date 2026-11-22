@@ -569,6 +569,80 @@ type struct OwnershipQuery {
         return OwnershipQuery::needs_drop_at_depth(arena, registry, intern, ty, 0);
     }
 
+    /// True when a value of `ty` has no room to store an address, so it
+    /// cannot point into anything.
+    ///
+    /// A scalar has none, and an aggregate has none when none of its parts
+    /// has: a struct's or union's fields, an enum's payloads, a tuple's or an
+    /// array's elements, an instance's components with its arguments put in.
+    /// A pointer, a reference, a function value, a trait object, anything
+    /// still generic and a type that failed to resolve could hold one, and
+    /// answer false.
+    static cannot_hold_address(arena: mut TypeArena*, registry: GenericRegistry*,
+                               ty: TypeRef) -> boolean {
+        return OwnershipQuery::cannot_hold_address_at_depth(arena, registry, ty, 0);
+    }
+
+    static cannot_hold_address_at_depth(arena: mut TypeArena*, registry: GenericRegistry*,
+                                        ty: TypeRef, depth: i32) -> boolean {
+        if (depth >= 32 || !ty.is_valid()) { return false; }
+        const t: Type* = arena.lookup(ty);
+        if (t == null) { return false; }
+        const k: TypeKind = t.kind;
+        if (k == TypeKind::Int || k == TypeKind::Bool || k == TypeKind::Float
+                || k == TypeKind::Char || k == TypeKind::Unit || k == TypeKind::Void) {
+            return true;
+        }
+        if (k == TypeKind::Array) {
+            return OwnershipQuery::cannot_hold_address_at_depth(arena, registry, t.as_array().element, depth + 1);
+        }
+        if (k == TypeKind::Optional) {
+            return OwnershipQuery::cannot_hold_address_at_depth(arena, registry, t.as_optional().wrapped, depth + 1);
+        }
+        if (k == TypeKind::Tuple) {
+            return OwnershipQuery::no_part_can_hold_address(arena, registry, &t.as_tuple().elements, depth + 1);
+        }
+        if (k == TypeKind::Struct) {
+            const fields: &[FieldInfo] = &t.as_struct().fields;
+            for (mut i: i64 = 0; i < fields.length(); i++) {
+                if (!OwnershipQuery::cannot_hold_address_at_depth(arena, registry, fields[i].field_type, depth + 1)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (k == TypeKind::Enum) {
+            const et: EnumType* = t.as_enum();
+            for (mut i: i64 = 0; i < et.variants.length(); i++) {
+                if (!OwnershipQuery::no_part_can_hold_address(arena, registry, &et.variants[i].payload_types, depth + 1)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (k == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t.as_instantiated();
+            if (inst.has_resolved_type()) {
+                return OwnershipQuery::cannot_hold_address_at_depth(arena, registry, inst.resolved_type, depth + 1);
+            }
+            match (OwnershipQuery::instance_components(arena, registry, inst)) {
+                Option::Some(components) => {
+                    return OwnershipQuery::no_part_can_hold_address(arena, registry, &components, depth + 1);
+                }
+                Option::None => { return false; }
+            }
+        }
+        return false;
+    }
+
+    static no_part_can_hold_address(arena: mut TypeArena*, registry: GenericRegistry*,
+                                    parts: &[TypeRef], depth: i32) -> boolean {
+        for (mut i: i64 = 0; i < parts.length(); i++) {
+            if (!OwnershipQuery::cannot_hold_address_at_depth(arena, registry, parts[i], depth)) { return false; }
+        }
+        return true;
+    }
+
     static needs_drop_at_depth(arena: mut TypeArena*, registry: GenericRegistry*,
                                intern: mut InternTable*, ty: TypeRef,
                                depth: i32) -> boolean {

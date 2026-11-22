@@ -1,0 +1,157 @@
+///! `cryogate release-smoke <staged-dir> <exe-name> [runner ...]`: compile
+///! and run a program with a STAGED release tree, before it is packaged.
+///!
+///! The staged compiler `<staged-dir>/bin/<exe-name>` builds a hello-world
+///! (`release/smoke.cryo`) against the staged stdlib and the staged runtime
+///! - `CRYO_STDLIB` and `CRYO_RUNTIME` name them, so a compiler that would
+///! otherwise resolve against the checkout it was built in cannot pass on a
+///! tree that ships neither - once per default profile, runs it, and checks
+///! what it printed and that it exited 7.  `runner` runs a foreign binary
+///! (`wine`), and is omitted when the archive is native to this host.
+///!
+///! Exit: 0 when the program compiled, ran and said what it should under
+///! both profiles; 1 otherwise; 2 on a usage error.
+
+namespace cryogate::gates::release_smoke;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::fs::temporary::{ TemporaryDirectory };
+import std::io::error::{ IoError };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::text::{ Text };
+import cryogate::release::smoke::{ ReleaseSmoke, SmokeRun };
+
+/// The release smoke.
+public type struct ReleaseSmokeGate {
+    /// Run `cryogate release-smoke` with `arguments` from index `first`.
+    public static run(logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        if (arguments.length() - first < 2) {
+            fmt::eprintln(String::from_str(Str::new("usage: cryogate release-smoke <staged-dir> <exe-name> [runner ...]")));
+            return 2;
+        }
+        const staged: Path = Path::from(arguments.get_reference(first).unwrap().as_str());
+        if (!staged.is_directory()) { return ReleaseSmokeGate::fail(f"no such staging dir {staged.as_str()}"); }
+        // Absolute before anything changes directory: the build runs in a
+        // scratch project, where a relative path names nothing.
+        const stage: String = Host::absolute(staged.as_str());
+        const exe: Str = arguments.get_reference(first + 1).unwrap().as_str();
+        mut runner: Array<String> = Array::<String>::new();
+        mut index: i64 = first + 2;
+        while (index < arguments.length()) {
+            runner.push(arguments.get_reference(index).unwrap().clone());
+            index++;
+        }
+        const root: Path = Path::from(stage.as_str());
+        const compiler: PathBuf = root.join(Str::new("bin")).as_path().join(exe);
+        if (!compiler.as_path().is_file()) { return ReleaseSmokeGate::fail(f"no compiler at {compiler.as_path().as_str()}"); }
+        if (!root.join(Str::new("stdlib")).as_path().is_directory()) {
+            return ReleaseSmokeGate::fail(String::from_str(Str::new("the archive ships no stdlib/; nothing could compile")));
+        }
+        if (!root.join(Str::new("runtime/lib.cryo")).as_path().is_file()) {
+            return ReleaseSmokeGate::fail(String::from_str(Str::new("the archive ships no runtime/; every link would fail on __cryo_panic")));
+        }
+
+        const work: TemporaryDirectory = match (TemporaryDirectory::create()) {
+            Result::Ok(directory) => { directory }
+            Result::Err(error)    => { return ReleaseSmokeGate::fail(f"cannot create a scratch directory: {error.describe()}"); }
+        };
+        const application: PathBuf = work.path().join(Str::new("app"));
+        const written: boolean = Directory::create_all(application.as_path().join(Str::new("src")).as_path()).is_ok()
+            && File::write_text(application.as_path().join(Str::new("cryoconfig")).as_path(), ReleaseSmoke::configuration()).is_ok()
+            && File::write_text(application.as_path().join(Str::new("src/main.cryo")).as_path(), ReleaseSmoke::source()).is_ok();
+        if (!written) { return ReleaseSmokeGate::fail(f"cannot write the hello-world in {application.as_path().as_str()}"); }
+
+        const profiles: Array<String> = ReleaseSmoke::profiles();
+        for (profile in profiles.iterate_references()) {
+            fmt::println(f"release-smoke: building a hello-world with {compiler.as_path().as_str()} ({profile.as_str()})");
+            const build_directory: PathBuf = application.as_path().join(Str::new("build"));
+            if (build_directory.as_path().exists()) { const _: Result<(), IoError> = Directory::remove_all(build_directory.as_path()); }
+            mut build: Job = ReleaseSmokeGate::started(&runner, compiler.as_path().as_str());
+            build.argument(Str::new("build"));
+            if (profile.as_str() == Str::new("dev")) { build.argument(Str::new("--dev")); }
+            build.directory(application.as_path().as_str());
+            build.set_variable(Str::new("CRYO_STDLIB"), root.join(Str::new("stdlib")).as_path().as_str());
+            build.set_variable(Str::new("CRYO_RUNTIME"), root.join(Str::new("runtime")).as_path().as_str());
+            build.log_to(logs.file(f"release-smoke-build-{profile.as_str()}".as_str()).as_str());
+            const built: Completion = build.run();
+
+            const program: String = ReleaseSmokeGate::program(application.as_path());
+            mut ran: SmokeRun = SmokeRun {
+                profile:        profile.clone(),
+                build_exit:     built.outcome.exit_code(),
+                program_exists: !program.is_empty(),
+                run_exit:       Option::None,
+                printed:        String::new(),
+            };
+            if (built.outcome.succeeded() && ran.program_exists) {
+                mut execution: Job = ReleaseSmokeGate::started(&runner, program.as_str());
+                execution.log_to(logs.file(f"release-smoke-run-{profile.as_str()}".as_str()).as_str());
+                const done: Completion = execution.run();
+                ran.run_exit = done.outcome.exit_code();
+                ran.printed = String::from_str(done.output().as_str().trim());
+            }
+            match (ReleaseSmoke::judge(&ran)) {
+                Option::Some(reason) => {
+                    if (!built.outcome.succeeded()) { ReleaseSmokeGate::print_tail(built.output().as_str()); }
+                    return ReleaseSmokeGate::fail(reason);
+                }
+                Option::None => { }
+            }
+        }
+        fmt::println(String::from_str(Str::new("release-smoke: OK -- built, ran, printed and exited 7 under both default profiles using only the staged tree")));
+        return 0;
+    }
+
+    /// A job running `program` through `runner`, or directly when there is
+    /// none.
+    private static started(runner: &Array<String>, program: Str) -> Job {
+        if (runner.is_empty()) { return Job::new(program); }
+        mut job: Job = Job::new(runner.get_reference(0).unwrap().as_str());
+        mut index: i64 = 1;
+        while (index < runner.length()) {
+            job.argument(runner.get_reference(index).unwrap().as_str());
+            index++;
+        }
+        job.argument(program);
+        return job;
+    }
+
+    /// The program the build left in `application`'s `build/`, whichever
+    /// OS it was built for; empty when there is none.
+    private static program(application: Path) -> String {
+        const windows: PathBuf = application.join(Str::new("build/release-smoke.exe"));
+        if (windows.as_path().is_file()) { return String::from_str(windows.as_path().as_str()); }
+        const posix: PathBuf = application.join(Str::new("build/release-smoke"));
+        if (posix.as_path().is_file()) { return String::from_str(posix.as_path().as_str()); }
+        return String::new();
+    }
+
+    private static print_tail(output: Str) -> void {
+        const lines: Array<String> = Text::lines(output);
+        mut index: i64 = if (lines.length() > ReleaseSmokeGate::TAIL_LINES) { lines.length() - ReleaseSmokeGate::TAIL_LINES } else { 0 };
+        fmt::println(String::from_str(Str::new("--- build output ---")));
+        while (index < lines.length()) {
+            fmt::println(lines.get_reference(index).unwrap().clone());
+            index++;
+        }
+    }
+
+    private static fail(reason: String) -> i32 {
+        fmt::println(f"release-smoke: FAIL -- {reason.as_str()}");
+        return 1;
+    }
+
+    /// How many lines of a failed build's output are printed.
+    const TAIL_LINES: i64 = 30;
+}

@@ -4,6 +4,7 @@
 namespace compiler::toolchain;
 
 import compiler::build_manifest::{ ContentHasher, Manifest };
+import compiler::prebuilt_cache::{ PrebuiltCache };
 import compiler::utils::log::{ Log, LogArea };
 import std::env;
 import std::fmt;
@@ -57,9 +58,23 @@ type struct ExecutablePath {
     /// first word, which a driver written with its options
     /// (`clang-20 --target=...`) is followed by - or "" when it is not there.
     static of_command(command_text: string) -> string {
+        return ExecutablePath::find(ExecutablePath::program_word(command_text));
+    }
+
+    /// Whether the command line `command` starts a gcc driver: the file
+    /// stem of the program it starts is `gcc` or ends in `-gcc`
+    /// (`C:\msys64\mingw64\bin\gcc.exe`, `x86_64-w64-mingw32-gcc`).  Read
+    /// from the text alone; the program need not be there.
+    static starts_gcc(command_text: string) -> boolean {
+        const program: string = ExecutablePath::program_word(command_text).stem();
+        return program == "gcc" || program.ends_with("-gcc");
+    }
+
+    /// The first word of the command line `command`: the program it starts.
+    static program_word(command_text: string) -> string {
         const command: string = command_text;
         const space: i64 = command.find(" ");
-        return ExecutablePath::find(if (space < 0) { command } else { command.substring(0, space) });
+        return if (space < 0) { command } else { command.substring(0, space) };
     }
 
     /// `path` when a file is there; on Windows, `path` + `.exe` when only
@@ -89,6 +104,43 @@ type struct ExecutablePath {
     static implied_suffix() -> string { return ""; }
 }
 
+/// The triple a build with no `--target` emits for, where the host's LLVM
+/// does not settle it.
+type struct HostTriple {
+    /// The triple a Windows host targets, given the one its LLVM reports.
+    /// The Windows LLVM reports `x86_64-pc-windows-msvc`, but mingw cannot
+    /// link MSVC-ABI objects (they probe the stack through `__chkstk`, which
+    /// mingw does not provide), so the ABI follows the C driver the link
+    /// will run:
+    ///   - `CRYO_CC` names a gcc (`ExecutablePath::starts_gcc`), on `PATH`
+    ///     or not -> `x86_64-pc-windows-gnu`;
+    ///   - a mingw gcc on `PATH` -> `x86_64-pc-windows-gnu`, the only link
+    ///     the port drives, preferred when an MSVC linker is there too;
+    ///   - an MSVC linker (`lld-link`, `link`) on `PATH` -> the reported
+    ///     triple, whose objects the user links with that toolchain;
+    ///   - else `x86_64-pc-windows-gnu`.
+    /// A reported triple that is not msvc is kept.  Never null: the caller
+    /// caches the answer.
+    static on_windows(reported_text: string) -> string {
+        const reported: string = reported_text;
+        if (reported == null) { return "x86_64-pc-windows-gnu"; }
+        if (!reported.contains("windows-msvc")) { return reported; }
+        match (env::var(Str::new("CRYO_CC"))) {
+            Option::Some(v) => {
+                if (ExecutablePath::starts_gcc(v.into_raw())) { return "x86_64-pc-windows-gnu"; }
+            }
+            Option::None => {}
+        }
+        if (ExecutablePath::find("x86_64-w64-mingw32-gcc").length() > 0) {
+            return "x86_64-pc-windows-gnu";
+        }
+        if (ExecutablePath::find("lld-link").length() > 0 || ExecutablePath::find("link").length() > 0) {
+            return reported;
+        }
+        return "x86_64-pc-windows-gnu";
+    }
+}
+
 /// What a C driver answered about its toolchain, kept on disk beside the
 /// prebuilt stdlib archives so a later build need not launch the driver to
 /// ask again.  A file is trusted only for the same driver text resolving to
@@ -99,12 +151,12 @@ type struct DriverFacts {
     unwinds_with_libgcc: boolean;
 
     /// The directory driver facts are kept in for builds for `triple`
-    /// against the stdlib at `stdlib_root`: beside its prebuilt archives,
-    /// the one place every project's build already shares.  "" with no
-    /// stdlib, and then nothing is kept.
+    /// against the stdlib at `stdlib_root`: beside the archives it builds
+    /// (`PrebuiltCache::home`), the one place every project's build already
+    /// shares.  "" with no stdlib, and then nothing is kept.
     static directory_for(stdlib_root: string, triple: string) -> string {
         if (stdlib_root.length() == 0 || triple.length() == 0) { return ""; }
-        return Path::from(stdlib_root).join(".bin").join(triple).join("toolchain").into_raw();
+        return PrebuiltCache::home(stdlib_root, "stdlib").as_path().join(triple).join("toolchain").into_raw();
     }
 
     /// The facts `directory` holds for `driver`, or none when it holds none

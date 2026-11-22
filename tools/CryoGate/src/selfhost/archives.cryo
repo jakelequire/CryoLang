@@ -1,0 +1,139 @@
+///! The stdlib archive each stage compiler builds, and stage 2's compared
+///! with stage 3's.
+///!
+///! Every program links the stdlib from an archive its compiler builds on
+///! first use, keyed by that compiler's bytes, so each stage compiler builds
+///! one while it builds the next stage.  The stdlib's code is checked here,
+///! where stage 3's and stage 4's IR no longer holds it, and object by
+///! object: an archive is linked by its objects, so IR that agrees is not
+///! enough.
+///!
+///! An archive is attributed to the stage that was running when it appeared
+///! under `stdlib/.bin/<triple>/prebuilt/<key>`: the stages run one at a time,
+///! and nothing else may build in the checkout while they do (a selfhost run
+///! holds the heavy-run lock).
+
+namespace cryogate::selfhost::archives;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::tree::{ Tree };
+import cryogate::selfhost::trees::{ ModuleTrees, TreeComparison };
+
+/// What comparing stage 2's archive with stage 3's found.
+public type enum ArchiveComparison {
+    /// Stage 2 and stage 3 are byte-identical compilers: they share one key,
+    /// so stage 3 linked stage 2's archive and built none.
+    Shared;
+    /// Each built one, and this is what comparing their objects found.
+    Compared(TreeComparison);
+}
+
+/// The archives one stage built.
+type struct StageBuilt {
+    via: String;
+    homes: Array<String>;
+}
+
+/// The archives the stages have built, by stage.
+public type struct StageArchives {
+    /// The stdlib whose archives are watched.
+    stdlib: PathBuf;
+    /// Every archive seen so far.
+    seen: Array<String>;
+    built: Array<StageBuilt>;
+
+    /// Start watching the archives below `stdlib`; those already there
+    /// belong to no stage.
+    public static start(stdlib: Path) -> Result<StageArchives, String> {
+        return Result::Ok(StageArchives {
+            stdlib: PathBuf::from(stdlib.as_str()),
+            seen:   StageArchives::homes(stdlib)?,
+            built:  Array::<StageBuilt>::new(),
+        });
+    }
+
+    /// After the stage `via`: the archives that appeared since the last
+    /// stage are the ones it built.
+    public record(mut &this, via: Str) -> Result<(), String> {
+        const now: Array<String> = StageArchives::homes(this.stdlib.as_path())?;
+        mut appeared: Array<String> = Array::<String>::new();
+        for (home in now.iterate_references()) {
+            if (!this.seen.contains(home)) { appeared.push(home.clone()); }
+        }
+        this.built.push(StageBuilt { via: String::from_str(via), homes: appeared });
+        this.seen = now;
+        return Result::Ok(());
+    }
+
+    /// The archives the stage `via` built, as their directories; none when
+    /// it was not recorded.
+    public built_by(&this, via: Str) -> Array<String> {
+        for (stage in this.built.iterate_references()) {
+            if (stage.via.as_str() == via) { return stage.homes.clone(); }
+        }
+        return Array::<String>::new();
+    }
+
+    /// Compare the archive stage 2 built with the one stage 3 built;
+    /// `second` and `third` are the stage-2 and stage-3 compilers.  Each must
+    /// have built exactly one, unless the two compilers are byte-identical
+    /// and stage 3 built none.
+    public compare(&this, second: Path, third: Path) -> ArchiveComparison {
+        const by_second: Array<String> = this.built_by(Str::new("stage-2"));
+        const by_third: Array<String> = this.built_by(Str::new("stage-3"));
+        if (by_second.length() == 1 && by_third.is_empty() && StageArchives::identical(second, third)) {
+            return ArchiveComparison::Shared;
+        }
+        if (by_second.length() != 1 || by_third.length() != 1) {
+            return ArchiveComparison::Compared(TreeComparison::NotComparable(
+                f"stage-2 built {by_second.length()} stdlib archive(s) and stage-3 {by_third.length()}; each builds its own"));
+        }
+        return ArchiveComparison::Compared(ModuleTrees::compare(Path::from(by_second.get_reference(0).unwrap().as_str()),
+                                                                Path::from(by_third.get_reference(0).unwrap().as_str()),
+                                                                Str::new("deps"), Str::new(".o")));
+    }
+
+    /// The archive directories below `stdlib`, `.bin/<triple>/prebuilt/<key>`,
+    /// sorted; an archive's `<key>.lock` and other names with a dot are not
+    /// archives.
+    public static homes(stdlib: Path) -> Result<Array<String>, String> {
+        mut found: Array<String> = Array::<String>::new();
+        const bin: PathBuf = stdlib.join(Str::new(".bin"));
+        if (!bin.as_path().is_directory()) { return Result::Ok(found); }
+        const none: Array<String> = Array::<String>::new();
+        const triples: Array<String> = Tree::names(bin.as_path(), &none)?;
+        for (triple in triples.iterate_references()) {
+            const prebuilt: PathBuf = bin.as_path().join(triple.as_str()).as_path().join(Str::new("prebuilt"));
+            if (!prebuilt.as_path().is_directory()) { continue; }
+            const keys: Array<String> = Tree::names(prebuilt.as_path(), &none)?;
+            for (key in keys.iterate_references()) {
+                const home: PathBuf = prebuilt.as_path().join(key.as_str());
+                if (home.as_path().is_directory() && !key.as_str().contains(&Str::new("."))) {
+                    found.push(String::from_str(home.as_path().as_str()));
+                }
+            }
+        }
+        return Result::Ok(found);
+    }
+
+    /// Whether the files `first` and `second` both exist and hold the same
+    /// bytes.
+    private static identical(first: Path, second: Path) -> boolean {
+        if (!first.is_file() || !second.is_file()) { return false; }
+        return match (File::read_bytes(first)) {
+            Result::Ok(one) => {
+                match (File::read_bytes(second)) {
+                    Result::Ok(other) => { one == other }
+                    Result::Err(_)    => { false }
+                }
+            }
+            Result::Err(_) => { false }
+        };
+    }
+}

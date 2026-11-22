@@ -1,0 +1,115 @@
+// An iterator whose Item is a reference is an iterator like any other: a
+// reference has no `Ord` of its own, so `min`/`max` are no methods of it,
+// and the implementation is accepted without them (their bodies are never
+// checked against the reference).  The negative test
+// E0358_iter_min_reference_item pins the refused call.
+![config(testing)]
+namespace CryoTests::Tests::Projects::IteratorReferenceItem;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::iter::{ Iterator };
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_equal };
+
+type struct EachValue {
+    values: &Slice<i64>;
+    position: i64;
+
+    static over(values: &Slice<i64>) -> EachValue {
+        return EachValue { values: values, position: 0 };
+    }
+}
+
+implement trait Iterator<&i64> for struct EachValue {
+    next(mut &this) -> Option<&i64> {
+        if (this.position >= this.values.length()) { return Option::None; }
+        const at: i64 = this.position;
+        this.position = this.position + 1;
+        return Option::Some(&this.values[at]);
+    }
+}
+
+// The bytes in two pieces, front half then back half.
+type struct Halves {
+    bytes: &Slice<u8>;
+    taken: i64;
+
+    static of(bytes: &Slice<u8>) -> Halves {
+        return Halves { bytes: bytes, taken: 0 };
+    }
+}
+
+implement trait Iterator<&Slice<u8>> for struct Halves {
+    next(mut &this) -> Option<&Slice<u8>> {
+        if (this.taken >= 2) { return Option::None; }
+        const middle: i64 = this.bytes.length() / 2;
+        const piece: &Slice<u8> = if (this.taken == 0) {
+            this.bytes.subslice(0, middle)
+        } else {
+            this.bytes.subslice(middle, this.bytes.length())
+        };
+        this.taken = this.taken + 1;
+        return Option::Some(piece);
+    }
+}
+
+![test]
+function reference_item_map_filter_count() -> Result<(), TestError> {
+    mut values: Array<i64> = Array::new();
+    values.push(3);
+    values.push(10);
+    values.push(7);
+    const doubled: i64 = EachValue::over(values.as_slice())
+        .map((value: &i64) -> i64 { return *value * 2; })
+        .fold(0, (total: i64, value: i64) -> i64 { return total + value; });
+    expect_equal(doubled, 40)?;
+    const large: i64 = EachValue::over(values.as_slice())
+        .filter((value: &&i64) -> boolean { return **value > 5; })
+        .count();
+    expect_equal(large, 2)?;
+    mut all: EachValue = EachValue::over(values.as_slice());
+    expect_equal(all.count(), 3)?;
+    mut sum: i64 = 0;
+    for (value in EachValue::over(values.as_slice())) { sum = sum + *value; }
+    return expect_equal(sum, 20);
+}
+
+![test]
+function reference_item_min_through_map() -> Result<(), TestError> {
+    mut values: Array<i64> = Array::new();
+    values.push(9);
+    values.push(4);
+    values.push(6);
+    mut smallest: i64 = -1;
+    match (EachValue::over(values.as_slice()).map((value: &i64) -> i64 { return *value; }).min()) {
+        Option::Some(found) => { smallest = found; }
+        Option::None => { }
+    }
+    return expect_equal(smallest, 4);
+}
+
+![test]
+function slice_item_map_filter_count() -> Result<(), TestError> {
+    mut storage: Array<u8> = Array::new();
+    storage.push(1);
+    storage.push(2);
+    storage.push(3);
+    storage.push(4);
+    storage.push(5);
+    const lengths: i64 = Halves::of(storage.as_slice())
+        .map((piece: &Slice<u8>) -> i64 { return piece.length(); })
+        .fold(0, (digits: i64, length: i64) -> i64 { return digits * 10 + length; });
+    expect_equal(lengths, 23)?;
+    const long_pieces: i64 = Halves::of(storage.as_slice())
+        .filter((piece: &&Slice<u8>) -> boolean { return piece.length() > 2; })
+        .count();
+    expect_equal(long_pieces, 1)?;
+    mut pieces: Halves = Halves::of(storage.as_slice());
+    expect_equal(pieces.count(), 2)?;
+    mut first_bytes: i64 = 0;
+    for (piece in Halves::of(storage.as_slice())) { first_bytes = first_bytes * 10 + piece[0] as i64; }
+    return expect_equal(first_bytes, 13);
+}

@@ -1,0 +1,72 @@
+///! Asking git about the checkout a gate runs in.
+
+namespace cryogate::core::git;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::fs::path::{ Path };
+
+import cryogate::core::child::{ Completion, Job, Outcome };
+import cryogate::core::log::{ RunLogs };
+
+/// git, run in one checkout, its output read back from the run's logs.
+public type struct Git {
+    repository: String;
+    output_log: String;
+    error_log: String;
+
+    /// git for the checkout at `repository`, logging to `logs`.
+    public static new(repository: Path, logs: &RunLogs) -> Git {
+        return Git {
+            repository: String::from_str(repository.as_str()),
+            output_log: logs.file(Str::new("git")),
+            error_log:  logs.file(Str::new("git-errors")),
+        };
+    }
+
+    /// Run `git -C <repository> <arguments>`, its error stream kept out of
+    /// its output.
+    public run(&this, arguments: &Array<Str>) -> Completion {
+        mut job: Job = Job::new(Str::new("git"));
+        job.argument(Str::new("-C"));
+        job.argument(this.repository.as_str());
+        for (argument in arguments.iterate_references()) { job.argument(*argument); }
+        job.log_to(this.output_log.as_str());
+        job.errors_to(this.error_log.as_str());
+        return job.run();
+    }
+
+    /// The trimmed output of a git command that succeeded, or `unknown`
+    /// when git cannot be run or the command fails.
+    public answer(&this, arguments: &Array<Str>) -> String {
+        const done: Completion = this.run(arguments);
+        if (!done.outcome.succeeded()) { return String::from_str(Str::new("unknown")); }
+        return String::from_str(done.output().as_str().trim());
+    }
+
+    /// Whether anything tracked outside the paths `excluded` differs from
+    /// `HEAD`.  The index's cached file times are refreshed first: a build
+    /// rewrites a source's time without changing its bytes, and a stale
+    /// cache reads that as a change.  A checkout git cannot be run in reads
+    /// as clean.
+    public changed_outside(&this, excluded: &Array<Str>) -> boolean {
+        mut refresh: Array<Str> = Array::<Str>::new();
+        refresh.push(Str::new("update-index"));
+        refresh.push(Str::new("-q"));
+        refresh.push(Str::new("--refresh"));
+        // Exits 1 when it refreshed an entry, which is what it is run for.
+        const _: Completion = this.run(&refresh);
+        mut compare: Array<Str> = Array::<Str>::new();
+        compare.push(Str::new("diff-index"));
+        compare.push(Str::new("--quiet"));
+        compare.push(Str::new("HEAD"));
+        compare.push(Str::new("--"));
+        for (path in excluded.iterate_references()) { compare.push(*path); }
+        const done: Completion = this.run(&compare);
+        return match (&done.outcome) {
+            Outcome::CouldNotStart(_) => { false }
+            _                         => { !done.outcome.succeeded() }
+        };
+    }
+}

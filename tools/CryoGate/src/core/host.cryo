@@ -1,0 +1,168 @@
+///! The machine cryogate runs on, and where the repository is on it.
+
+namespace cryogate::core::host;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::env;
+import std::ffi::libc;
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::sys::syscall;
+
+public type struct Host {
+    /// The operating system this binary was built for, spelled as a
+    /// `![target(...)]` directive names it.
+    ![target(windows)]
+    public static os() -> Str { return Str::new("windows"); }
+    ![target(linux)]
+    public static os() -> Str { return Str::new("linux"); }
+
+    /// Whether a `![target(<name>)]` gate includes this host.  `unix` names
+    /// every POSIX host.
+    public static builds_target(name: Str) -> boolean {
+        if (name == Host::os()) { return true; }
+        return name == Str::new("unix") && Host::os() != Str::new("windows");
+    }
+
+    /// Whether a process with id `pid` is running on this machine: one the
+    /// system can open and that has not exited.  A pid the system has
+    /// handed to a newer process reads as running.
+    ![target(windows)]
+    public static process_running(pid: i32) -> boolean {
+        if (pid <= 0) { return false; }
+        // PROCESS_QUERY_LIMITED_INFORMATION
+        const handle: u8* = syscall::OpenProcess(0x1000, 0, pid as u32);
+        if (handle == null) { return false; }
+        mut code: u32 = 0;
+        const asked: i32 = syscall::GetExitCodeProcess(handle, &code);
+        syscall::CloseHandle(handle);
+        // STILL_ACTIVE: the process has no exit code yet.
+        return asked != 0 && code == 259;
+    }
+    /// Whether a process with id `pid` is running on this machine: one
+    /// signal 0 reaches.
+    ![target(unix)]
+    public static process_running(pid: i32) -> boolean {
+        if (pid <= 0) { return false; }
+        return libc::kill(pid, 0) == 0;
+    }
+
+    /// Whether the user has a full-screen application in front or is
+    /// presenting, as the shell answers it; a locked screen or a screen
+    /// saver is neither.  When the shell cannot answer, none is in front.
+    ![target(windows)]
+    public static full_screen_in_front() -> boolean {
+        mut state: i32 = 0;
+        if (syscall::SHQueryUserNotificationState(&state) != 0) { return false; }
+        return state == syscall::QUNS_BUSY || state == syscall::QUNS_RUNNING_D3D_FULL_SCREEN || state == syscall::QUNS_PRESENTATION_MODE;
+    }
+    /// Whether the user has a full-screen application in front: a POSIX
+    /// host has no one shell to ask, so never.
+    ![target(unix)]
+    public static full_screen_in_front() -> boolean { return false; }
+
+    /// The file name an executable called `stem` has on this host.
+    ![target(windows)]
+    public static executable_name(stem: Str) -> String { return f"{stem}.exe"; }
+    ![target(unix)]
+    public static executable_name(stem: Str) -> String { return String::from_str(stem); }
+
+    /// `path` made absolute against the current directory, which cryogate
+    /// never changes, so a path given on its command line still names the
+    /// same file for a child run in another directory.
+    public static absolute(path: Str) -> String {
+        if (Path::is_absolute_str(path)) { return String::from_str(path); }
+        return match (env::current_directory()) {
+            Option::Some(here) => { String::from_str(PathBuf::from(here.as_str()).join(path).as_path().as_str()) }
+            Option::None       => { String::from_str(path) }
+        };
+    }
+
+    /// The repository's stdlib directory as every gate names it to a
+    /// compiler: with forward slashes on every host, so two gates building
+    /// one program give the compiler the same command line and environment.
+    public static stdlib_directory(repository: Path) -> String {
+        return Host::stdlib_spelling(repository.join(Str::new("stdlib")).as_path().as_str());
+    }
+
+    /// A stdlib directory given on a command line, spelled the same way:
+    /// absolute, with forward slashes.
+    public static stdlib_spelling(directory: Str) -> String {
+        return Host::absolute(directory).as_str().replace(&Str::new("\\"), &Str::new("/"));
+    }
+
+    /// The repository this binary was built from: cryogate is built into
+    /// `tools/CryoGate/build/`, so the root is three directories above the
+    /// executable.  Refused unless that directory holds the pinned compiler
+    /// and the stdlib, so a copied binary names its problem instead of
+    /// judging some other tree.
+    public static repository() -> Result<PathBuf, String> {
+        const exe: String = match (env::current_executable()) {
+            Option::Some(path) => { path }
+            Option::None       => { return Result::Err(String::from_str(Str::new("cannot read the path of the running executable"))); }
+        };
+        mut root: PathBuf = PathBuf::from(exe.as_str());
+        mut climbed: i64 = 0;
+        while (climbed < 4) {
+            if (!root.pop()) {
+                return Result::Err(f"{exe} is not inside a repository's tools/CryoGate/build/");
+            }
+            climbed++;
+        }
+        const pin: PathBuf = root.join(Str::new("bin"));
+        const stdlib: PathBuf = root.join(Str::new("stdlib"));
+        if (!pin.as_path().is_directory() || !stdlib.as_path().is_directory()) {
+            return Result::Err(f"{exe} is not inside a repository's tools/CryoGate/build/: {root.as_path().as_str()} holds no bin/ and stdlib/");
+        }
+        return Result::Ok(root);
+    }
+
+    /// The main checkout of `repository`, spelled absolute with forward
+    /// slashes: the repository itself, or for a linked worktree the checkout
+    /// holding the object store its `.git` file leads to (`gitdir:`, then
+    /// that directory's `commondir`).  Every worktree of one repository
+    /// answers the same, wherever it was made.
+    public static main_checkout(repository: Path) -> Result<PathBuf, String> {
+        const marker: PathBuf = repository.join(Str::new(".git"));
+        if (!marker.as_path().is_file()) { return Host::resolved(repository); }
+        const text: String = match (File::read_text(marker.as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read {marker.as_path().as_str()}: {error.describe()}"); }
+        };
+        const linked: Str = match (text.as_str().trim().strip_prefix(&Str::new("gitdir:"))) {
+            Option::Some(rest) => { rest.trim() }
+            Option::None       => { return Result::Err(f"{marker.as_path().as_str()} holds no `gitdir:` line"); }
+        };
+        const git_directory: PathBuf = repository.join(linked);
+        if (!git_directory.as_path().is_directory()) {
+            return Result::Err(f"{marker.as_path().as_str()} names {linked}, which is not a directory on this host");
+        }
+        const common_file: PathBuf = git_directory.as_path().join(Str::new("commondir"));
+        if (!common_file.as_path().is_file()) {
+            return Result::Err(f"{git_directory.as_path().as_str()} holds no commondir: {repository.as_str()} is not a linked worktree");
+        }
+        const common_text: String = match (File::read_text(common_file.as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read {common_file.as_path().as_str()}: {error.describe()}"); }
+        };
+        const common: PathBuf = match (git_directory.as_path().join(common_text.as_str().trim()).as_path().canonicalize()) {
+            Result::Ok(path)   => { path }
+            Result::Err(error) => { return Result::Err(f"cannot resolve the object store {git_directory.as_path().as_str()} names: {error.describe()}"); }
+        };
+        return match (common.as_path().parent()) {
+            Option::Some(main) => { Host::resolved(main) }
+            Option::None       => { Result::Err(f"the object store {common.as_path().as_str()} has no parent directory") }
+        };
+    }
+
+    /// `path` made absolute, spelled with forward slashes.
+    private static resolved(path: Path) -> Result<PathBuf, String> {
+        return match (path.canonicalize()) {
+            Result::Ok(absolute) => { Result::Ok(absolute) }
+            Result::Err(error)   => { Result::Err(f"cannot resolve {path.as_str()}: {error.describe()}") }
+        };
+    }
+}

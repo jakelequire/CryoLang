@@ -17,15 +17,17 @@ import compiler::types::type_base::{ Type };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::compound;
 import compiler::lex;
+import compiler::lex::{ Token, TokenType };
 import compiler::lex::lexer::{ Lexer };
 import compiler::ast::{ LiteralKind, ObjectForm };
-import compiler::ast::expression::{ BinaryExpr, ExpressionNode, LiteralExpr, UnaryExpr };
+import compiler::ast::expression::{ ExpressionNode, LiteralExpr };
+import compiler::const_table::{ ConstEval };
 import compiler::diag::{ ErrorCode };
 import compiler::compilation_context::{ CompilationContext };
 import compiler::sema::state::{ SemaState };
 import compiler::sema::helpers::{
     int_literal_exceeds, is_constant_numeric_expr, is_negative_numeric_literal_expr, is_numeric_literal_expr, sema_default_int_type,
-    sema_int_unsigned_bound, sema_numeric_suffix_type, try_fold_const_integer
+    sema_expr_has_numeric_suffix, sema_int_unsigned_bound, sema_numeric_suffix_type, try_fold_const_integer
 };
 import std::fmt;
 import compiler::diag::diagnostic::{ Diagnostic };
@@ -341,16 +343,65 @@ type struct LiteralResolver {
         return !int_literal_exceeds(lit, max_mag);
     }
 
-    /// Whether a constant integer expression (`8 * 10000 + 64 * 100`) keeps
-    /// its value at `target`'s width: every sub-expression folds to a value
-    /// `target` holds, so computing it at that width gives what computing it
-    /// at the default width would.  Such an expression adopts the parameter's
-    /// type as a single literal that fits does; one that does not stays at
-    /// its default width and meets the parameter's narrowing check.
-    const_expr_fits_target(&this, expr: ExpressionNode*, target: TypeRef) -> boolean {
+    /// An expression made only of integer literals (`(200 + 100) / 2`,
+    /// `-(100 + 28)`) written as the literal of the value its arithmetic
+    /// gives (`150`, `-128`), computed exactly and at no width.  Stored in a
+    /// typed place - a call's argument, or an initializer or assigned value
+    /// whose type holds it - such an expression means that value, so the one
+    /// literal rule then types it: it adopts the type of the place when the
+    /// type holds it and is refused where it does not.  Computed at the
+    /// place's width instead, an intermediate the type does not hold would
+    /// change the result (`(200 + 100) / 2` in a `u8` was 22).  `expr` itself
+    /// when it is already a literal or a negated literal, when it is not made
+    /// only of integer literals, or when no integer type holds its value; and
+    /// when a literal in it carries a type suffix, since the suffix names the
+    /// expression's type (`1u64 << 40` is a `u64`) and the literal of its
+    /// value would name none, so a type parameter it binds would take the
+    /// default width instead.
+    literal_of_value(&this, expr: mut ExpressionNode*) -> mut ExpressionNode* {
+        if (expr == null) { return expr; }
+        if (ExpressionNode::binary_of(expr) == null && ExpressionNode::unary_of(expr) == null) { return expr; }
+        if (is_negative_numeric_literal_expr(expr) || !is_constant_numeric_expr(expr)) { return expr; }
+        if (sema_expr_has_numeric_suffix(expr)) { return expr; }
+        match (ConstEval::literals_only().fold(expr)) {
+            Option::Some(value) => {
+                const magnitude: mut ExpressionNode* = ExpressionNode::literal(
+                    value.magnitude().to_decimal_string(), LiteralKind::Integer, expr.span);
+                if (!value.negative) { return magnitude; }
+                const minus: Token = Token::new(TokenType::Minus, "-",
+                    expr.span.start_line as int, expr.span.start_col as int);
+                return ExpressionNode::unary_expr(minus, magnitude, expr.span);
+            }
+            Option::None => { return expr; }
+        }
+    }
+
+    /// `literal_of_value(expr)` when `target` is an integer type that holds
+    /// the value `expr` computes; `expr` itself otherwise, so a value the
+    /// type does not hold is refused with the value it computes
+    /// (`refuse_narrowing_constant`).
+    held_literal_of_value(&this, expr: mut ExpressionNode*, target: TypeRef) -> mut ExpressionNode* {
+        if (expr == null || !target.is_valid()) { return expr; }
         const t: Type* = this.arena.lookup(target);
-        if (t == null || t.kind != TypeKind::Int) { return false; }
-        return LiteralResolver::const_expr_fits_int(expr, t.int_kind());
+        if (t == null || t.kind != TypeKind::Int) { return expr; }
+        const it: IntegerKind = t.int_kind();
+        if (sema_int_unsigned_bound(it.narrowest_bit_width()) == 0) { return expr; }
+        const folded: Option<i128> = try_fold_const_integer(expr);
+        if (folded.is_none() || !LiteralResolver::holds_value(it, folded.unwrap())) { return expr; }
+        return this.literal_of_value(expr);
+    }
+
+    /// Whether the integer type `it`, at most 64 bits wide, holds `v` as a
+    /// single literal is held: up to the width's unsigned maximum (a bit
+    /// pattern), or down to a signed type's minimum, and a pointer-sized
+    /// signed type no further than its signed range.
+    static holds_value(it: IntegerKind, v: i128) -> boolean {
+        const max_mag: u64 = sema_int_unsigned_bound(it.narrowest_bit_width());
+        if (v >= 0) {
+            if (it.is_pointer_sized() && it.is_signed()) { return v <= (max_mag / 2) as i128; }
+            return v <= max_mag as i128;
+        }
+        return it.is_signed() && v >= -((max_mag / 2) as i128) - 1;
     }
 
     /// Refuse an expression made only of literals (`200 + 100`, `-200`)
@@ -372,42 +423,12 @@ type struct LiteralResolver {
         const folded: Option<i128> = try_fold_const_integer(expr);
         if (folded.is_none()) { return false; }
         const v: i128 = folded.unwrap();
-        const held: boolean = if (v >= 0) {
-            if (it.is_pointer_sized() && it.is_signed()) { v <= (max_mag / 2) as i128 } else { v <= max_mag as i128 }
-        } else {
-            it.is_signed() && v >= -((max_mag / 2) as i128) - 1
-        };
-        if (held) { return false; }
+        if (LiteralResolver::holds_value(it, v)) { return false; }
         this.ctx.emit_error_at(
             ErrorCode::E0010_NUMBER_TOO_LARGE,
             fmt::format("this value is %s, which `%s` does not hold: it narrows the value and would silently truncate; add an explicit `as` cast",
                 v.to_decimal_string(), it.to_string()),
             expr.span);
-        return true;
-    }
-
-    static const_expr_fits_int(expr: ExpressionNode*, it: IntegerKind) -> boolean {
-        if (expr == null) { return false; }
-        const folded: Option<i128> = try_fold_const_integer(expr);
-        if (folded.is_none()) { return false; }
-        const v: i128 = folded.unwrap();
-        const max_mag: u64 = sema_int_unsigned_bound(it.narrowest_bit_width());
-        if (max_mag == 0) { return false; }
-        if (it.is_signed()) {
-            const hi: i128 = (max_mag / 2) as i128;
-            if (v > hi || v < -hi - 1) { return false; }
-        } else {
-            if (v < 0 || v > max_mag as i128) { return false; }
-        }
-        const u: UnaryExpr* = ExpressionNode::unary_of(expr);
-        if (u != null) {
-            return LiteralResolver::const_expr_fits_int(u.operand, it);
-        }
-        const b: BinaryExpr* = ExpressionNode::binary_of(expr);
-        if (b != null) {
-            return LiteralResolver::const_expr_fits_int(b.left, it)
-                && LiteralResolver::const_expr_fits_int(b.right, it);
-        }
         return true;
     }
 
@@ -418,5 +439,47 @@ type struct LiteralResolver {
         const t: Type* = this.arena.lookup(ty);
         if (t == null || t.kind != TypeKind::Int) { return false; }
         return t.int_kind().is_signed();
+    }
+
+    /// Whether a negated integer literal argument (`-128`) may adopt the
+    /// parameter type `ty`: a signed integer type holding the negation.  One
+    /// it does not hold (`-129` for an `i8`) keeps its default width and
+    /// meets the parameter's narrowing check, since adopting the type would
+    /// negate the literal's bit pattern at that width and pass another
+    /// number (127).  A 128-bit type's literals are bounded where they are
+    /// typed.
+    holds_negated_literal(&this, arg: ExpressionNode*, ty: TypeRef) -> boolean {
+        if (!this.is_signed_int_type(ty)) { return false; }
+        const it: IntegerKind = this.arena.lookup(ty).int_kind();
+        if (sema_int_unsigned_bound(it.narrowest_bit_width()) == 0) { return true; }
+        return this.int_literal_fits_target(arg, ty);
+    }
+
+    /// The type an operand made only of integer literals (`(200 / 2)`,
+    /// `-129`) is typed with beside an operand of the integer type `peer`,
+    /// once it is written as the literal of its exact value
+    /// (`literal_of_value`): `peer` where `peer` holds the value, so with
+    /// `x: i8`, `x + (200 / 2)` adds 100 where computing the operand at `i8`
+    /// added -28; no type where it does not, so the literal keeps its default
+    /// type and the operation widens `peer` or is refused, where adopting
+    /// `peer` would compute another number (`-129` beside an `i8` is 127).
+    /// None when `operand` is not made only of integer literals or `peer` is
+    /// not an integer type, and when the value is negative and `peer`
+    /// unsigned: a complement of a literal there (`x & ~0xFF` with `x: u32`)
+    /// is a bit pattern of `peer`'s width rather than a negative number, and
+    /// is typed as any other constant operand is.  None as well when a
+    /// literal in `operand` carries a type suffix: the suffix types it.
+    operand_type_of_literal_value(&this, operand: ExpressionNode*, peer: TypeRef) -> Option<TypeRef> {
+        if (!is_constant_numeric_expr(operand) || sema_expr_has_numeric_suffix(operand)) { return Option::None; }
+        const folded: Option<i128> = try_fold_const_integer(operand);
+        if (folded.is_none() || !peer.is_valid()) { return Option::None; }
+        const t: Type* = this.arena.lookup(peer);
+        if (t == null || t.kind != TypeKind::Int) { return Option::None; }
+        const it: IntegerKind = t.int_kind();
+        const value: i128 = folded.unwrap();
+        if (value < 0 && !it.is_signed()) { return Option::None; }
+        const held: boolean = sema_int_unsigned_bound(it.narrowest_bit_width()) == 0
+            || LiteralResolver::holds_value(it, value);
+        return Option::Some(if (held) { peer } else { TypeRef::invalid() });
     }
 }

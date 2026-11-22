@@ -1,0 +1,803 @@
+///! verify's decisions over the declaration files and the object lists:
+///! every case each must refuse and every case it must allow.
+![config(testing)]
+namespace cryogate::tests::verify;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_equal };
+
+import std::collections::hashmap::{ HashMap };
+import std::collections::pair::{ Pair };
+
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::core::host::{ Host };
+import cryogate::core::text::{ Text };
+import cryogate::verify::comparison::{ Compared, ObjectComparison };
+import cryogate::verify::declarations::{ DeclaredChanges, Declaration, Declarations, DeclarationKind, RuntimeMember };
+import cryogate::verify::gates::{ GateCommand, GateVerdict };
+import cryogate::verify::hashing::{ ObjectHashes };
+import cryogate::verify::judges::{ BaselineCensus, VerifyJudges };
+import cryogate::verify::objects::{ ObjectOwner };
+import cryogate::verify::record::{ BaselineRecord };
+import cryogate::verify::runtime::{ RuntimeArchives };
+import std::encoding::sha256::{ Sha256 };
+
+/// The judges' inputs written as text: a list as names joined by `,`, a
+/// map as `key=value` entries joined by `;`.  Each answers how many
+/// problems its judge finds.
+type struct Judged {
+    private static list(text: Str) -> Array<String> {
+        mut out: Array<String> = Array::<String>::new();
+        for (part in text.split_nonempty(&Str::new(","))) { out.push(String::from_str(part)); }
+        return out;
+    }
+
+    private static map(text: Str) -> HashMap<String, String> {
+        mut out: HashMap<String, String> = HashMap::<String, String>::new();
+        for (entry in text.split_nonempty(&Str::new(";"))) {
+            match (entry.split_once(&Str::new("="))) {
+                Option::Some(parts) => { out.insert(String::from_str(parts.first), String::from_str(parts.second)); }
+                Option::None        => { }
+            }
+        }
+        return out;
+    }
+
+    private static census(declared: Str, accounted: boolean, unit_failed: i64, negatives_failed: i64, failed: Str,
+                  fixed: Str, namespaces: Str) -> i64 {
+        const census: BaselineCensus = BaselineCensus {
+            accounted: accounted, unit_failed: unit_failed, negatives_failed: negatives_failed,
+            failed: Judged::list(failed),
+        };
+        const held: HashMap<String, String> = Judged::map(namespaces);
+        return VerifyJudges::baseline_census(&census, &Judged::list(declared), &Judged::list(fixed), &held).length();
+    }
+
+    private static unit_moves(file: Str, suffix: Str, a: Str, b: Str) -> i64 {
+        mut suffixes: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        suffixes.push(Pair::new(String::from_str(file), String::from_str(suffix)));
+        mut left: HashMap<String, String> = Judged::map(a);
+        mut right: HashMap<String, String> = Judged::map(b);
+        return VerifyJudges::unit_moves(&suffixes, &left, &right).length();
+    }
+
+    private static project_moves(names: Str, a: Str, b: Str) -> i64 {
+        mut left: HashMap<String, String> = Judged::map(a);
+        mut right: HashMap<String, String> = Judged::map(b);
+        return VerifyJudges::project_moves(&Judged::list(names), &left, &right).length();
+    }
+
+    private static archive_module_moves(names: Str, a: Str, b: Str) -> i64 {
+        mut left: HashMap<String, String> = Judged::map(a);
+        mut right: HashMap<String, String> = Judged::map(b);
+        return VerifyJudges::archive_module_moves(&Judged::list(names), &left, &right).length();
+    }
+
+    private static instance_moves(names: Str, a: Str, b: Str) -> i64 {
+        mut left: HashMap<String, String> = Judged::map(a);
+        mut right: HashMap<String, String> = Judged::map(b);
+        return VerifyJudges::instance_moves(&Judged::list(names), &left, &right).length();
+    }
+
+    private static runtime_moves(names: Str, a: Str, b: Str) -> i64 {
+        mut left: HashMap<String, String> = Judged::map(a);
+        mut right: HashMap<String, String> = Judged::map(b);
+        return VerifyJudges::runtime_moves(&Judged::list(names), &left, &right).length();
+    }
+
+    /// A passing project's record, its warnings (joined by `,`) listed or
+    /// not.
+    private static project(name: Str, listed: boolean, warnings: Str) -> BaselineRecord {
+        mut record: BaselineRecord = BaselineRecord::new(name, Str::new("ok"));
+        record.warnings_listed = listed;
+        record.warnings = Judged::list(warnings);
+        return record;
+    }
+
+    private static new_warnings(base: Str, tree: Str) -> i64 {
+        return VerifyJudges::new_warnings(&Judged::list(base), &Judged::list(tree)).length();
+    }
+
+    private static builds(base_exit: i32, base_output: Str, tree_exit: i32, tree_output: Str, fixed: boolean) -> i64 {
+        return VerifyJudges::builds(Str::new("p"), base_exit, base_output, tree_exit, tree_output, fixed).length();
+    }
+
+    /// The records a census run's `lines` (joined by `|`) give `names`,
+    /// each as `name=verdict:rows` joined by `;`, in the order of `names`.
+    private static records(lines: Str, names: Str, rows: Str) -> String {
+        mut output: Array<String> = Array::<String>::new();
+        for (line in lines.split_nonempty(&Str::new("|"))) { output.push(String::from_str(line)); }
+        const records: Array<BaselineRecord> = BaselineRecord::of_census(&output, &Judged::list(names),
+            &Judged::list(rows), &Array::<String>::new());
+        mut shown: Array<String> = Array::<String>::new();
+        for (record in records.iterate_references()) {
+            shown.push(f"{record.name.as_str()}={record.verdict.as_str()}:{record.rows.length()}");
+        }
+        return Text::joined(&shown, Str::new(";"));
+    }
+}
+
+/// The checkout the test binary was built in, for the cases that read the
+/// real tree.
+type struct Checkout {
+    private static root() -> Result<PathBuf, TestError> {
+        return match (Host::repository()) {
+            Result::Ok(root)    => { Result::Ok(root) }
+            Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
+        };
+    }
+}
+
+![test]
+function a_started_compiling_project_is_refused_by_the_baseline_and_built_by_the_tree() -> Result<(), TestError> {
+    expect_equal(Judged::builds(1, Str::new("error[E0203]: x"), 0, Str::new(""), false), 0)?;
+    expect_equal(Judged::builds(0, Str::new(""), 0, Str::new(""), false), 1)?;
+    expect_equal(Judged::builds(3, Str::new("segfault"), 0, Str::new(""), false), 1)?;
+    return expect_equal(Judged::builds(1, Str::new("error[E0203]: x"), 1, Str::new("error[E0203]: x"), false), 1);
+}
+
+![test]
+function a_stdlib_archive_is_labelled_by_its_manifests_options() -> Result<(), TestError> {
+    expect_equal(ObjectHashes::options_label(Str::new("key 1\noptions -O2 --panic=unwind\n")).as_str(), Str::new("-O2_--panic_unwind"))?;
+    expect_equal(ObjectHashes::options_label(Str::new("options a,  b\n")).as_str(), Str::new("a_b"))?;
+    return expect_equal(ObjectHashes::options_label(Str::new("key 1\n")).as_str(), Str::new("_"));
+}
+
+![test]
+function a_gate_passes_on_its_exit_code_and_its_own_verdict_line() -> Result<(), TestError> {
+    const gates: Array<GateCommand> = GateCommand::table(Str::new("cryogate"));
+    const census: &GateCommand = &gates[0];
+    expect_equal(GateVerdict::of(census, Str::new("x\ntest-census: OK -- all\n"), 0).ok, true)?;
+    expect_equal(GateVerdict::of(census, Str::new("x\ntest-census: OK -- all\n"), 1).ok, false)?;
+    expect_equal(GateVerdict::of(census, Str::new("everything fine\n"), 0).ok, false)?;
+    expect_equal(GateVerdict::of(census, Str::new("test-census: OK\ntest-census: FAIL -- two\n"), 0).ok, false)?;
+    expect_equal(GateVerdict::of(census, Str::new("  test-census: OK -- indented\n"), 0).ok, false)?;
+    const fast: &GateCommand = &gates[8];
+    expect_equal(fast.name.as_str(), Str::new("fast"))?;
+    const quoted: GateVerdict = GateVerdict::of(fast, Str::new("\"check-fast: OK (all)\"\n"), 0);
+    expect_equal(quoted.line.as_str(), Str::new("check-fast: OK (all)"))?;
+    return expect_equal(quoted.ok, true);
+}
+
+![test]
+function a_gate_reports_its_time_in_tenths_and_its_log_when_it_printed_no_verdict() -> Result<(), TestError> {
+    const gates: Array<GateCommand> = GateCommand::table(Str::new("cryogate"));
+    const passed: GateVerdict = GateVerdict::of(&gates[0], Str::new("test-census: OK -- all\n"), 0);
+    expect_equal(passed.report(Str::new("census"), 1171.049, Str::new("c.log")).as_str(), Str::new("  census    ok   1171.0 s  test-census: OK -- all"))?;
+    const silent: GateVerdict = GateVerdict::of(&gates[0], Str::new(""), 0);
+    return expect_equal(silent.report(Str::new("census"), 0.96, Str::new("c.log")).as_str(), Str::new("  census    FAIL    1.0 s  <no verdict line; see c.log>"));
+}
+
+![test]
+function a_gates_command_line_fills_in_the_compiler_and_the_stdlib() -> Result<(), TestError> {
+    const gates: Array<GateCommand> = GateCommand::table(Str::new("cryogate"));
+    expect_equal(Text::joined(&gates[1].command(Str::new("C"), Str::new("S")), Str::new(" ")).as_str(),
+        Str::new("cryogate examples --cryo C --stdlib S"))?;
+    expect_equal(Text::joined(&gates[2].command(Str::new("C"), Str::new("S")), Str::new(" ")).as_str(),
+        Str::new("cryogate lsp --cryo C"))?;
+    expect_equal(Text::joined(&gates[6].command(Str::new("C"), Str::new("S")), Str::new(" ")).as_str(),
+        Str::new("cryogate abi --cryo C"))?;
+    expect_equal(gates[7].name.as_str(), Str::new("smith"))?;
+    return expect_equal(Text::joined(&gates[7].command(Str::new("C"), Str::new("S")), Str::new(" ")).as_str(),
+        Str::new("cryogate corpus-check --cryo C --stdlib S --work .verify/smith-corpus --expect tests/smith-corpus --interpret"));
+}
+
+![test]
+function a_list_file_ends_each_row_and_an_empty_one_is_empty() -> Result<(), TestError> {
+    mut rows: Array<String> = Array::<String>::new();
+    expect_equal(ObjectHashes::text(&rows).as_str(), Str::new(""))?;
+    rows.push(String::from_str(Str::new("a")));
+    rows.push(String::from_str(Str::new("b")));
+    return expect_equal(ObjectHashes::text(&rows).as_str(), Str::new("a\nb\n"));
+}
+
+![test]
+function a_started_passing_project_builds_are_not_judged() -> Result<(), TestError> {
+    expect_equal(Judged::builds(0, Str::new(""), 0, Str::new(""), true), 0)?;
+    return expect_equal(Judged::builds(1, Str::new("error[E0900]: x"), 1, Str::new("error[E0900]: x"), true), 0);
+}
+
+![test]
+function only_a_whole_error_code_is_a_refusal() -> Result<(), TestError> {
+    expect_equal(Judged::builds(1, Str::new("note: error[E12]: x"), 0, Str::new(""), false), 1)?;
+    expect_equal(Judged::builds(1, Str::new("error[Exxxx] error[E1234 error[E0001]"), 0, Str::new(""), false), 0)?;
+    return expect_equal(Judged::builds(1, Str::new("warning[W0001]: x"), 0, Str::new(""), false), 1);
+}
+
+![test]
+function a_census_run_records_a_failed_project_and_a_passing_negative_file() -> Result<(), TestError> {
+    const zeros: String = Str::new("0").repeat(64);
+    const ones: String = Str::new("1").repeat(64);
+    const rows: String = f"{zeros.as_str()}  tests/tests/projects/p/build/a.o,{ones.as_str()}  tests/tests/projects/q/build/b.o";
+    const shown: String = Judged::records(Str::new("test (project) p ... FAILED (exit 1, expected 0)|test (negative) E1_x.cryo ... ok"),
+        Str::new("p,negative/E1_x.cryo"), rows.as_str());
+    return expect_equal(shown.as_str(), Str::new("p=FAILED:1;negative/E1_x.cryo=ok:0"));
+}
+
+![test]
+function a_program_the_run_printed_no_verdict_for_has_no_record() -> Result<(), TestError> {
+    const shown: String = Judged::records(Str::new("test (project) other ... ok"), Str::new("p"), Str::new(""));
+    expect_equal(shown.as_str(), Str::new(""))?;
+    const indented: String = Judged::records(Str::new(" test (project) p ... ok"), Str::new("p"), Str::new(""));
+    return expect_equal(indented.as_str(), Str::new(""));
+}
+
+![test]
+function a_record_file_reads_back_every_field() -> Result<(), TestError> {
+    const record: BaselineRecord = BaselineRecord::read(Str::new(
+        "name unit suite\nverdict FAILED\nunit-failed A::U::t\nunit-counts 5 1 0 2\nwarnings-listed\nwarning W0001 ./a.cryo:3\nrow d  tests/build/x.o\n"));
+    expect(record.warnings_listed, Str::new("warnings-listed, a tag with no value"))?;
+    expect_equal(record.name.as_str(), Str::new("unit suite"))?;
+    expect_equal(record.verdict.as_str(), Str::new("FAILED"))?;
+    expect_equal(record.unit_failed.length(), 1)?;
+    expect_equal(record.warnings[0].as_str(), Str::new("W0001 ./a.cryo:3"))?;
+    expect_equal(record.rows[0].as_str(), Str::new("d  tests/build/x.o"))?;
+    const counts: Array<i64> = record.unit_counts.unwrap_or(Array::<i64>::new());
+    return expect(counts.length() == 4 && counts[0] == 5 && counts[3] == 2, Str::new("unit-counts 5 1 0 2"));
+}
+
+![test]
+function another_projects_moved_object_is_still_compared() -> Result<(), TestError> {
+    const p: Str = Str::new("tests/tests/projects/p/");
+    const q: Str = Str::new("tests/tests/projects/q/");
+    mut left: HashMap<String, String> = Judged::map(f"{p}a.o=1;{q}a.o=1".as_str());
+    mut right: HashMap<String, String> = Judged::map(f"{p}a.o=2;{q}a.o=2".as_str());
+    expect_equal(VerifyJudges::project_moves(&Judged::list(Str::new("moved:p")), &left, &right).length(), 0)?;
+    const kept: String = f"{q}a.o";
+    return expect(left.length() == 1 && right.length() == 1 && left.contains_key(&kept) && right.contains_key(&kept),
+        Str::new("only the declared project's objects are removed"));
+}
+
+![test]
+function a_moved_archive_module_needs_its_source_below_std() -> Result<(), TestError> {
+    const root: PathBuf = Checkout::root()?;
+    expect(Declarations::archive_module_source(root.as_path(), Str::new("moved-archive:std::no_such_module_here")).is_none(),
+        Str::new("no such module"))?;
+    expect(Declarations::archive_module_source(root.as_path(), Str::new("moved-archive:fmt::display")).is_none(),
+        Str::new("not below std::"))?;
+    return expect(Declarations::archive_module_source(root.as_path(), Str::new("moved-archive:std::time::clock")).is_some(),
+        Str::new("std::time::clock"));
+}
+
+![test]
+function a_unit_test_file_names_its_object_by_its_namespace() -> Result<(), TestError> {
+    const root: PathBuf = Checkout::root()?;
+    const suffix: String = Declarations::unit_object_suffix(root.as_path(), Str::new("archive:lang/slice_reference_two_words.cryo"))
+        .unwrap_or(String::new());
+    expect_equal(suffix.as_str(), Str::new("/deps/CryoTests/Tests/Lang/SliceReferenceTwoWords.o"))?;
+    return expect(Declarations::unit_object_suffix(root.as_path(), Str::new("lang/no_such_file_here.cryo")).is_none(),
+        Str::new("no such file"));
+}
+
+/// A comparison over maps written as `Judged::map` text, the populations
+/// in the order tests, examples, stdlib, runtime.
+type struct Comparing {
+    private static of(changes: &DeclaredChanges, baseline: Array<Str>, tree: Array<Str>, limit: i64) -> Compared {
+        mut a: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
+        mut b: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
+        for (text in baseline.iterate_references()) { a.push(Judged::map(*text)); }
+        for (text in tree.iterate_references()) { b.push(Judged::map(*text)); }
+        return ObjectComparison::against(Str::new("HEAD"), changes, a, b, limit, Str::new("run"));
+    }
+
+    private static nothing_declared() -> DeclaredChanges {
+        return DeclaredChanges {
+            names: Array::<String>::new(), units: Array::<Pair<String, String>>::new(),
+            moved_projects: Array::<String>::new(), moved_examples: Array::<String>::new(),
+            moved_modules: Array::<String>::new(), moved_instances: Array::<String>::new(),
+            moved_members: Array::<String>::new(),
+            archive_files: Array::<String>::new(), problems: Array::<String>::new(),
+        };
+    }
+
+    private static populations(tests: Str, examples: Str, stdlib: Str, runtime: Str) -> Array<Str> {
+        mut out: Array<Str> = Array::<Str>::new();
+        out.push(tests);
+        out.push(examples);
+        out.push(stdlib);
+        out.push(runtime);
+        return out;
+    }
+}
+
+![test]
+function the_comparison_reports_each_population_as_verify_does() -> Result<(), TestError> {
+    const changes: DeclaredChanges = Comparing::nothing_declared();
+    const compared: Compared = Comparing::of(&changes,
+        Comparing::populations(Str::new("t/build/a.o=1;t/build/b.o=1;t/build/x/std/deps/std/io.o=1"), Str::new(""),
+            Str::new("stdlib-archive/w/O0/x.o=1;stdlib-archive/w/O2/x.o=1"), Str::new("runtime/freestanding/00-Sys.o=1")),
+        Comparing::populations(Str::new("t/build/a.o=2;t/build/c.o=1"), Str::new(""),
+            Str::new("stdlib-archive/w/O0/x.o=1"), Str::new("runtime/freestanding/00-Sys.o=2")), 1);
+    const shown: String = Text::joined(&compared.lines, Str::new("\n"));
+    expect_equal(shown.as_str(), Str::new(
+        "verify: objects against HEAD\n"
+        "  tests     baseline     3  tree     2  moved 1  only-baseline 1  only-tree 1  replaced by the archive 1\n"
+        "      moved         t/build/a.o\n"
+        "      only-baseline t/build/b.o\n"
+        "      only-tree     t/build/c.o\n"
+        "  examples  baseline     0  tree     0  moved 0  only-baseline 0  only-tree 0  replaced by the archive 0\n"
+        "  stdlib    archive objects of a stdlib root only one run used, left out: 1\n"
+        "  stdlib    baseline     1  tree     1  moved 0  only-baseline 0  only-tree 0  replaced by the archive 0\n"
+        "  runtime   baseline     1  tree     1  moved 1  only-baseline 0  only-tree 0  replaced by the archive 0\n"
+        "      moved         runtime/freestanding/00-Sys.o"))?;
+    return expect_equal(compared.changed, 4);
+}
+
+![test]
+function a_long_list_names_how_many_more_and_where() -> Result<(), TestError> {
+    const changes: DeclaredChanges = Comparing::nothing_declared();
+    const compared: Compared = Comparing::of(&changes,
+        Comparing::populations(Str::new("a.o=1;b.o=1;c.o=1"), Str::new(""), Str::new(""), Str::new("")),
+        Comparing::populations(Str::new("a.o=2;b.o=2;c.o=2"), Str::new(""), Str::new(""), Str::new("")), 2);
+    return expect_equal(compared.lines[4].as_str(),
+        Str::new("      ... 1 more moved (full lists: run/baseline/base.tests.sha256, run/tree.tests.sha256)"));
+}
+
+![test]
+function a_declared_projects_objects_are_left_out_of_the_comparison() -> Result<(), TestError> {
+    mut changes: DeclaredChanges = Comparing::nothing_declared();
+    changes.names.push(String::from_str(Str::new("p")));
+    changes.names.push(String::from_str(Str::new("examples/e")));
+    changes.archive_files.push(String::from_str(Str::new("archive:lang/u.cryo")));
+    const compared: Compared = Comparing::of(&changes,
+        Comparing::populations(Str::new("tests/tests/projects/p/build/a.o=1;tests/tests/projects/pq/build/a.o=1"),
+            Str::new("examples/e/build/m.o=1"), Str::new(""), Str::new("")),
+        Comparing::populations(Str::new("tests/tests/projects/p/build/a.o=2;tests/tests/projects/pq/build/a.o=1"),
+            Str::new("examples/e/build/m.o=2"), Str::new(""), Str::new("")), 40);
+    expect_equal(compared.lines[1].as_str(), Str::new("  tests     declared projects' objects left out: baseline 1, tree 1"))?;
+    expect_equal(compared.lines[3].as_str(), Str::new("  examples  declared projects' objects left out: baseline 1, tree 1"))?;
+    expect_equal(compared.changed, 0)?;
+    // No archive object moved, so the file declared through the archive is a problem.
+    return expect_equal(compared.problems.length(), 1);
+}
+
+![test]
+function the_baseline_census_fails_on_declared_programs_only() -> Result<(), TestError> {
+    expect_equal(Judged::census(Str::new("p"), true, 0, 0, Str::new("p"), Str::new(""), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new(""), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new("p"), true, 0, 0, Str::new("p,q"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new("p,q"), true, 0, 0, Str::new("p"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new("p"), true, 1, 0, Str::new("p"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new("p"), false, 0, 0, Str::new("p"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new("q"), Str::new("q"), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("q"), Str::new("")), 1)?;
+    return expect_equal(Judged::census(Str::new("q"), true, 0, 0, Str::new("q"), Str::new("q"), Str::new("")), 1);
+}
+
+![test]
+function the_baseline_census_judges_negative_files_and_examples_by_name() -> Result<(), TestError> {
+    expect_equal(Judged::census(Str::new(""), true, 0, 1, Str::new("negative/n.cryo"), Str::new("negative/n.cryo"), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 1, Str::new("negative/n.cryo"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("negative/n.cryo"), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 2, Str::new("negative/n.cryo"), Str::new("negative/n.cryo"), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new("examples/e"), Str::new("examples/e"), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new("examples/e"), Str::new(""), Str::new("")), 1)?;
+    return expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("examples/e"), Str::new("")), 1);
+}
+
+![test]
+function a_unit_failure_must_be_held_by_a_declared_unit_test_file() -> Result<(), TestError> {
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("lang/u.cryo"), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 1, 0, Str::new(""), Str::new("lang/u.cryo"), Str::new("lang/u.cryo=A::U")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 1, 0, Str::new("A::U::t"), Str::new("lang/u.cryo"), Str::new("lang/u.cryo=A::U")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 1, 0, Str::new("A::V::t"), Str::new("lang/u.cryo"), Str::new("lang/u.cryo=A::U")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 1, 0, Str::new("A::U::t"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::census(Str::new(""), true, 1, 0, Str::new("A::U::t"), Str::new("archive:lang/u.cryo"), Str::new("archive:lang/u.cryo=A::U")), 0)?;
+    return expect_equal(Judged::census(Str::new(""), true, 1, 0, Str::new("A::V::t"), Str::new("archive:lang/u.cryo"), Str::new("archive:lang/u.cryo=A::U")), 1);
+}
+
+![test]
+function a_program_declared_moved_is_one_the_baseline_passes() -> Result<(), TestError> {
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("moved:p"), Str::new("")), 0)?;
+    expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new("p"), Str::new("moved:p"), Str::new("")), 1)?;
+    return expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("moved-archive:std::m"), Str::new("")), 0);
+}
+
+![test]
+function a_declared_unit_test_object_must_move() -> Result<(), TestError> {
+    expect_equal(Judged::unit_moves(Str::new("u"), Str::new("/U.o"), Str::new("x/U.o=1"), Str::new("x/U.o=2")), 0)?;
+    expect_equal(Judged::unit_moves(Str::new("u"), Str::new("/U.o"), Str::new("x/U.o=1"), Str::new("x/U.o=1")), 1)?;
+    return expect_equal(Judged::unit_moves(Str::new("u"), Str::new("/U.o"), Str::new(""), Str::new("")), 1);
+}
+
+![test]
+function a_project_declared_moved_must_move_one_of_its_objects() -> Result<(), TestError> {
+    const prefix: Str = Str::new("tests/tests/projects/p/");
+    expect_equal(Judged::project_moves(Str::new("moved:p"), f"{prefix}a.o=1;{prefix}b.o=1".as_str(), f"{prefix}a.o=1;{prefix}b.o=2".as_str()), 0)?;
+    expect_equal(Judged::project_moves(Str::new("moved:p"), f"{prefix}a.o=1".as_str(), f"{prefix}a.o=1".as_str()), 1)?;
+    expect_equal(Judged::project_moves(Str::new("moved:p"), Str::new(""), Str::new("")), 1)?;
+    return expect_equal(Judged::project_moves(Str::new("moved:p"), f"{prefix}a.o=1".as_str(), f"{prefix}a.o=1;{prefix}b.o=1".as_str()), 0);
+}
+
+![test]
+function an_example_declared_moved_must_move_one_of_its_objects() -> Result<(), TestError> {
+    const prefix: Str = Str::new("examples/e/build/");
+    expect_equal(Judged::project_moves(Str::new("moved:examples/e"), f"{prefix}a.o=1;{prefix}b.o=1".as_str(), f"{prefix}a.o=1;{prefix}b.o=2".as_str()), 0)?;
+    expect_equal(Judged::project_moves(Str::new("moved:examples/e"), f"{prefix}a.o=1".as_str(), f"{prefix}a.o=1".as_str()), 1)?;
+    // A test project of the same name is not the example.
+    return expect_equal(Judged::project_moves(Str::new("moved:examples/e"),
+        Str::new("tests/tests/projects/examples/e/a.o=1"), Str::new("tests/tests/projects/examples/e/a.o=2")), 1);
+}
+
+![test]
+function a_module_declared_moved_archive_must_move_an_archive_object() -> Result<(), TestError> {
+    expect_equal(Judged::archive_module_moves(Str::new("moved-archive:std::m"),
+        Str::new("stdlib-archive/t/O0/x/deps/std/m.o=1;stdlib-archive/t/O2/x/deps/std/m.o=1"),
+        Str::new("stdlib-archive/t/O0/x/deps/std/m.o=1;stdlib-archive/t/O2/x/deps/std/m.o=2")), 0)?;
+    expect_equal(Judged::archive_module_moves(Str::new("moved-archive:std::m"),
+        Str::new("stdlib-archive/t/O0/x/deps/std/m.o=1"), Str::new("stdlib-archive/t/O0/x/deps/std/m.o=1")), 1)?;
+    expect_equal(Judged::archive_module_moves(Str::new("moved-archive:std::m"), Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::archive_module_moves(Str::new("moved-archive:std::m"),
+        Str::new("stdlib-archive/t/O0/x/deps/std/am.o=1"), Str::new("stdlib-archive/t/O0/x/deps/std/am.o=2")), 1)?;
+    // Another module's moved object stays in both maps, to be compared.
+    mut left: HashMap<String, String> = Judged::map(Str::new("s/x/deps/std/m.o=1;s/x/deps/std/n.o=1"));
+    mut right: HashMap<String, String> = Judged::map(Str::new("s/x/deps/std/m.o=2;s/x/deps/std/n.o=2"));
+    expect_equal(VerifyJudges::archive_module_moves(&Judged::list(Str::new("moved-archive:std::m")), &left, &right).length(), 0)?;
+    return expect(left.length() == 1 && right.length() == 1
+        && left.contains_key(&String::from_str(Str::new("s/x/deps/std/n.o"))), Str::new("only the declared module's objects are removed"));
+}
+
+![test]
+function a_module_declared_moved_instances_must_move_the_unit_suite_object() -> Result<(), TestError> {
+    const declared: Str = Str::new("moved-instances:std::m");
+    const unit: Str = Str::new("tests/build/target/release/h/std/deps/std/m.o");
+    expect_equal(Judged::instance_moves(declared, f"{unit}=1".as_str(), f"{unit}=2".as_str()), 0)?;
+    expect_equal(Judged::instance_moves(declared, f"{unit}=1".as_str(), f"{unit}=1".as_str()), 1)?;
+    expect_equal(Judged::instance_moves(declared, Str::new(""), Str::new("")), 1)?;
+    // A project's object of the module is not the unit suite's.
+    const project: Str = Str::new("tests/tests/projects/p/build/target/release/h/std/deps/std/m.o");
+    expect_equal(Judged::instance_moves(declared, f"{project}=1".as_str(), f"{project}=2".as_str()), 1)?;
+    // Another module's moved object, and the project's, stay in both maps.
+    const other: Str = Str::new("tests/build/target/release/h/std/deps/std/n.o");
+    mut left: HashMap<String, String> = Judged::map(f"{unit}=1;{other}=1;{project}=1".as_str());
+    mut right: HashMap<String, String> = Judged::map(f"{unit}=2;{other}=2;{project}=2".as_str());
+    expect_equal(VerifyJudges::instance_moves(&Judged::list(declared), &left, &right).length(), 0)?;
+    return expect(left.length() == 2 && right.length() == 2
+        && left.contains_key(&String::from_str(other)) && left.contains_key(&String::from_str(project)),
+        Str::new("only the unit suite's object of the declared module is removed"));
+}
+
+![test]
+function the_moved_runtime_form_is_its_own_kind_naming_configuration_and_member() -> Result<(), TestError> {
+    const name: Str = Str::new("moved-runtime:hosted-unwind/Sys.o");
+    expect(match (Declarations::kind(name)) { DeclarationKind::MovedRuntime => { true } _ => { false } }, Str::new("kind moved-runtime"))?;
+    expect_equal(Declarations::program_of(name), Str::new("hosted-unwind/Sys.o"))?;
+    const member: RuntimeMember = RuntimeMember::of(name).unwrap();
+    expect_equal(member.configuration.as_str(), Str::new("hosted-unwind"))?;
+    expect_equal(member.member.as_str(), Str::new("Sys.o"))?;
+    expect(RuntimeMember::of(Str::new("moved-runtime:Sys.o")).is_none(), Str::new("no configuration"))?;
+    expect(RuntimeMember::of(Str::new("moved-runtime:libcryort-core.a/Sys.o")).is_none(), Str::new("a tier is no configuration"))?;
+    return expect(RuntimeMember::of(Str::new("moved-runtime:hosted/Sys.o")).is_none(), Str::new("hosted is no configuration"));
+}
+
+![test]
+function a_runtime_member_declared_moved_asks_nothing_of_the_baseline_census() -> Result<(), TestError> {
+    return expect_equal(Judged::census(Str::new(""), true, 0, 0, Str::new(""), Str::new("moved-runtime:hosted-unwind/Sys.o"), Str::new("")), 0);
+}
+
+![test]
+function a_declared_runtime_member_must_move_in_its_own_configuration() -> Result<(), TestError> {
+    const sys: Str = Str::new("moved-runtime:hosted-unwind/Sys.o");
+    // Moved, at the same place and at a new one.
+    expect_equal(Judged::runtime_moves(sys, Str::new("runtime/hosted-unwind/00-Sys.o=1"), Str::new("runtime/hosted-unwind/00-Sys.o=2")), 0)?;
+    expect_equal(Judged::runtime_moves(sys, Str::new("runtime/hosted-unwind/00-Sys.o=1"), Str::new("runtime/hosted-unwind/01-Sys.o=2")), 0)?;
+    // Not moved; in no archive; moved only in another configuration.
+    expect_equal(Judged::runtime_moves(sys, Str::new("runtime/hosted-unwind/00-Sys.o=1"), Str::new("runtime/hosted-unwind/00-Sys.o=1")), 1)?;
+    expect_equal(Judged::runtime_moves(sys, Str::new(""), Str::new("")), 1)?;
+    expect_equal(Judged::runtime_moves(sys, Str::new("runtime/hosted-abort/00-Sys.o=1"), Str::new("runtime/hosted-abort/00-Sys.o=2")), 1)?;
+    // Another member's move stays in both maps, to be compared.
+    mut left: HashMap<String, String> = Judged::map(Str::new("runtime/hosted-unwind/00-Sys.o=1;runtime/hosted-unwind/01-Entry.o=1"));
+    mut right: HashMap<String, String> = Judged::map(Str::new("runtime/hosted-unwind/00-Sys.o=2;runtime/hosted-unwind/01-Entry.o=2"));
+    expect_equal(VerifyJudges::runtime_moves(&Judged::list(sys), &left, &right).length(), 0)?;
+    return expect(left.length() == 1 && right.length() == 1
+        && right.contains_key(&String::from_str(Str::new("runtime/hosted-unwind/01-Entry.o"))), Str::new("only the declared member is removed"));
+}
+
+![test]
+function a_runtime_built_per_tier_is_a_layout_of_its_own() -> Result<(), TestError> {
+    const tiers: String = ObjectComparison::runtime_layouts(&Judged::map(Str::new("runtime/libcryort-core.a/00-Sys.o=1")));
+    const configurations: String = ObjectComparison::runtime_layouts(&Judged::map(Str::new("runtime/freestanding/00-Sys.o=1")));
+    expect_equal(tiers.as_str(), Str::new("tiers"))?;
+    return expect_equal(configurations.as_str(), Str::new("configurations"));
+}
+
+![test]
+function runtimes_laid_out_differently_are_not_compared_and_their_declarations_not_judged() -> Result<(), TestError> {
+    mut changes: DeclaredChanges = Comparing::nothing_declared();
+    changes.moved_members.push(String::from_str(Str::new("moved-runtime:hosted-unwind/Sys.o")));
+    const compared: Compared = Comparing::of(&changes,
+        Comparing::populations(Str::new(""), Str::new(""), Str::new(""), Str::new("runtime/libcryort-core.a/00-Sys.o=1")),
+        Comparing::populations(Str::new(""), Str::new(""), Str::new(""), Str::new("runtime/hosted-unwind/00-Sys.o=2;runtime/hosted-unwind/01-Entry.o=1")), 40);
+    expect_equal(compared.lines[compared.lines.length() - 1].as_str(), Str::new(
+        "  runtime   baseline     1  tree     2  NOT COMPARED: the baseline's runtime is laid out as tiers, the tree's as configurations"))?;
+    expect_equal(compared.problems.length(), 0)?;
+    return expect_equal(compared.changed, 0);
+}
+
+![test]
+function a_declared_runtime_member_is_judged_before_the_runtime_is_compared() -> Result<(), TestError> {
+    mut changes: DeclaredChanges = Comparing::nothing_declared();
+    changes.moved_members.push(String::from_str(Str::new("moved-runtime:hosted-unwind/Sys.o")));
+    const compared: Compared = Comparing::of(&changes,
+        Comparing::populations(Str::new(""), Str::new(""), Str::new(""), Str::new("runtime/hosted-unwind/00-Sys.o=1;runtime/hosted-unwind/01-Entry.o=1")),
+        Comparing::populations(Str::new(""), Str::new(""), Str::new(""), Str::new("runtime/hosted-unwind/00-Sys.o=2;runtime/hosted-unwind/01-Entry.o=1")), 40);
+    const shown: String = Text::joined(&compared.lines, Str::new("\n"));
+    expect(shown.as_str().ends_with(&Str::new(
+        "  runtime   declared moved runtime members left out: 1, 0 problem(s)\n"
+        "  runtime   baseline     1  tree     1  moved 0  only-baseline 0  only-tree 0  replaced by the archive 0")), Str::new("the runtime's lines"))?;
+    return expect_equal(compared.changed, 0);
+}
+
+/// Archive bytes built from text: a string literal ends at its first NUL,
+/// so the NULs an archive holds are pushed as bytes.
+type struct Archived {
+    /// A member's 60-byte header.
+    private static header(name: Str, size: i64) -> String {
+        return f"{name:<16}                                {size:<10}`\n";
+    }
+
+    private static push(data: mut &Array<u8>, text: Str) -> void {
+        for (byte in text.as_bytes().iter()) { data.push(byte); }
+    }
+
+    private static push_nuls(data: mut &Array<u8>, count: i64) -> void {
+        for (mut i: i64 = 0; i < count; i++) { data.push(0); }
+    }
+}
+
+![test]
+function an_archives_members_are_named_by_the_long_name_table_and_the_bsd_form_alike() -> Result<(), TestError> {
+    mut data: Array<u8> = Array::<u8>::new();
+    Archived::push(&data, Str::new("!<arch>\n"));
+    Archived::push(&data, Archived::header(Str::new("/"), 4).as_str());
+    Archived::push_nuls(&data, 4);
+    Archived::push(&data, Archived::header(Str::new("//"), 20).as_str());
+    Archived::push(&data, Str::new("long_member_name.o/\n"));
+    Archived::push(&data, Archived::header(Str::new("/0"), 3).as_str());
+    Archived::push(&data, Str::new("abc\n"));
+    Archived::push(&data, Archived::header(Str::new("Sys.o/"), 2).as_str());
+    Archived::push(&data, Str::new("xy"));
+    Archived::push(&data, Archived::header(Str::new("#1/8"), 10).as_str());
+    Archived::push(&data, Str::new("Bsd.o"));
+    Archived::push_nuls(&data, 3);
+    Archived::push(&data, Str::new("zz"));
+    expect_equal(Archived::header(Str::new("/"), 4).length(), 60)?;
+    const members: Array<Pair<String, String>> = RuntimeArchives::members(data.as_slice()).unwrap();
+    expect_equal(members.length(), 3)?;
+    expect_equal(members[0].first.as_str(), Str::new("long_member_name.o"))?;
+    expect_equal(members[0].second.as_str(), Str::new("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"))?;
+    expect_equal(members[1].first.as_str(), Str::new("Sys.o"))?;
+    expect_equal(members[1].second.as_str(), Sha256::digest(Str::new("xy").as_bytes()).to_hex().as_str())?;
+    expect_equal(members[2].first.as_str(), Str::new("Bsd.o"))?;
+    expect_equal(members[2].second.as_str(), Sha256::digest(Str::new("zz").as_bytes()).to_hex().as_str())?;
+    // An archive cut short reads up to its end.
+    expect_equal(RuntimeArchives::members(data.as_slice().subslice(0, data.length() - 1)).unwrap().length(), 3)?;
+    return expect(RuntimeArchives::members(Str::new("not an archive").as_bytes()).is_none(), Str::new("not an archive"));
+}
+
+![test]
+function an_archive_declared_unit_test_file_needs_an_archive_object_to_move() -> Result<(), TestError> {
+    expect_equal(VerifyJudges::archive_moves(&Judged::list(Str::new("archive:lang/u.cryo")), 0).length(), 1)?;
+    expect_equal(VerifyJudges::archive_moves(&Judged::list(Str::new("archive:lang/u.cryo")), 2).length(), 0)?;
+    return expect_equal(VerifyJudges::archive_moves(&Judged::list(Str::new("")), 0).length(), 0);
+}
+
+![test]
+function a_warning_only_the_tree_reports_is_new() -> Result<(), TestError> {
+    expect_equal(Judged::new_warnings(Str::new("W0001 ./a.cryo:3"), Str::new("W0001 ./a.cryo:3")), 0)?;
+    expect_equal(Judged::new_warnings(Str::new("W0001 ./a.cryo:3"), Str::new("W0001 ./a.cryo:3,E0619 ./b.cryo:9")), 1)?;
+    expect_equal(Judged::new_warnings(Str::new("W0001 ./a.cryo:3"), Str::new("W0001 ./a.cryo:4")), 1)?;
+    return expect_equal(Judged::new_warnings(Str::new("W0001 ./a.cryo:3,W0009 ./c.cryo:1"), Str::new("W0001 ./a.cryo:3")), 0);
+}
+
+![test]
+function a_project_warning_only_the_tree_lists_is_new() -> Result<(), TestError> {
+    mut tree: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+    tree.push(Pair::new(String::from_str(Str::new("p")), String::from_str(Str::new("W0001 src/main.cryo:7"))));
+    const none: Array<String> = Array::<String>::new();
+
+    mut same: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+    same.push(Judged::project(Str::new("p"), true, Str::new("W0001 src/main.cryo:7")));
+    expect_equal(VerifyJudges::new_project_warnings(&same, &tree, &none).length(), 0)?;
+
+    mut added: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+    added.push(Judged::project(Str::new("p"), true, Str::new("")));
+    added.push(Judged::project(Str::new("q"), true, Str::new("")));
+    const found: Array<String> = VerifyJudges::new_project_warnings(&added, &tree, &none);
+    expect_equal(found.length(), 1)?;
+    expect_equal(found[0].as_str(), Str::new("the tree's build of p reports a warning the baseline's does not: W0001 src/main.cryo:7"))?;
+
+    mut not_listed: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+    not_listed.push(Judged::project(Str::new("p"), false, Str::new("")));
+    not_listed.push(Judged::project(Str::new("q"), true, Str::new("")));
+    expect_equal(VerifyJudges::new_project_warnings(&not_listed, &tree, &none).length(), 0)?;
+
+    return expect_equal(VerifyJudges::new_project_warnings(&added, &tree, &Judged::list(Str::new("p"))).length(), 0);
+}
+
+![test]
+function a_census_run_records_the_unit_suites_build_warnings() -> Result<(), TestError> {
+    const lines: Array<String> = Text::lines(Str::new(
+        "warning[W0001]: unused variable `p`; prefix it with `_` to silence this warning\r\n"
+        " --> ./tests/lang/a.cryo:113:5\r\n"
+        "ok    A::one\r\n"
+        "  unit test summary\r\n"
+        "    passed 1\r\n"));
+    const records: Array<BaselineRecord> = BaselineRecord::of_census(&lines, &Judged::list(Str::new("unit suite")),
+        &Array::<String>::new(), &Judged::list(Str::new("A::one")));
+    expect_equal(records.length(), 1)?;
+    expect_equal(records[0].warnings.length(), 1)?;
+    expect_equal(records[0].warnings[0].as_str(), Str::new("W0001 ./tests/lang/a.cryo:113"))?;
+    return expect(!records[0].warnings_listed, Str::new("the unit suite's warnings are not a project's listing"));
+}
+
+![test]
+function a_census_run_records_each_projects_listed_build_warnings() -> Result<(), TestError> {
+    const lines: Array<String> = Text::lines(Str::new(
+        "test (negative) E1_x.cryo ... ok\r\n"
+        "test (project) quiet ... ok\r\n"
+        "test (project) noisy ... ok\r\n"
+        "    warning W0002 src/other.cryo:12\r\n"
+        "    warning W0001 src/main.cryo:3\r\n"
+        "  projects summary\r\n"
+        "    passed        2\r\n"
+        "    failed        0\r\n"
+        "    warnings      2\r\n"
+        "    result   PASS\r\n"));
+    const records: Array<BaselineRecord> = BaselineRecord::of_census(&lines,
+        &Judged::list(Str::new("noisy,quiet,negative/E1_x.cryo")), &Array::<String>::new(), &Array::<String>::new());
+    expect_equal(records.length(), 3)?;
+    expect(records[0].warnings_listed && records[0].warnings.length() == 2, Str::new("noisy lists two"))?;
+    expect_equal(records[0].warnings[0].as_str(), Str::new("W0001 src/main.cryo:3"))?;
+    expect(records[1].warnings_listed && records[1].warnings.is_empty(), Str::new("quiet lists none, and says so"))?;
+    expect(!records[2].warnings_listed, Str::new("a compile-fail file lists no build warnings"))?;
+    const older: Array<String> = Text::lines(Str::new(
+        "test (project) noisy ... ok\r\n"
+        "  projects summary\r\n"
+        "    passed        1\r\n"
+        "    failed        0\r\n"
+        "    result   PASS\r\n"));
+    const unlisted: Array<BaselineRecord> = BaselineRecord::of_census(&older, &Judged::list(Str::new("noisy")),
+        &Array::<String>::new(), &Array::<String>::new());
+    return expect(!unlisted[0].warnings_listed, Str::new("a runner that prints no warnings row lists none"));
+}
+
+type struct Fixture {
+    /// The declarations as `name=reason` entries joined by `;`, in order.
+    private static shown(declarations: &Array<Declaration>) -> String {
+        mut out: String = String::new();
+        for (mut i: i64 = 0; i < declarations.length(); i++) {
+            if (i > 0) { out.push(';'); }
+            out.push(declarations[i].name.as_str());
+            out.push('=');
+            out.push(declarations[i].reason.as_str());
+        }
+        return out;
+    }
+
+    private static between(tree: Str, base: Str) -> String {
+        const applied: Array<Declaration> = Declarations::between(tree, base);
+        return Fixture::shown(&applied);
+    }
+
+    private static owner(path: Str) -> String {
+        return match (ObjectOwner::of(path)) {
+            Option::Some(name) => { name }
+            Option::None       => { String::from_str(Str::new("<none>")) }
+        };
+    }
+}
+
+![test]
+function parse_skips_comments_and_blank_lines() -> Result<(), TestError> {
+    const parsed: Array<Declaration> = Declarations::parse(Str::new("# c\n\np why\nq\n"));
+    const shown: String = Fixture::shown(&parsed);
+    return expect_equal(shown.as_str(), Str::new("p=why;q="));
+}
+
+![test]
+function a_name_written_twice_keeps_its_place_and_takes_the_later_reason() -> Result<(), TestError> {
+    const parsed: Array<Declaration> = Declarations::parse(Str::new("p a\nq b\np c\n"));
+    const shown: String = Fixture::shown(&parsed);
+    return expect_equal(shown.as_str(), Str::new("p=c;q=b"));
+}
+
+![test]
+function a_new_line_applies() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new("p a\nq b\n"), Str::new("p a\n"));
+    return expect_equal(applied.as_str(), Str::new("q=b"));
+}
+
+![test]
+function an_unchanged_line_does_not_apply() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new("p a\n"), Str::new("p a\n"));
+    return expect_equal(applied.as_str(), Str::new(""));
+}
+
+![test]
+function a_rewritten_reason_applies_again() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new("p b\n"), Str::new("p a\n"));
+    return expect_equal(applied.as_str(), Str::new("p=b"));
+}
+
+![test]
+function a_removed_line_declares_nothing() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new(""), Str::new("p a\n"));
+    return expect_equal(applied.as_str(), Str::new(""));
+}
+
+![test]
+function a_line_rewritten_into_the_archive_form_with_its_reason_kept_declares_nothing() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new("archive:p a\n"), Str::new("p a\n"));
+    return expect_equal(applied.as_str(), Str::new(""));
+}
+
+![test]
+function a_new_line_in_the_archive_form_applies() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new("archive:p a\n"), Str::new(""));
+    return expect_equal(applied.as_str(), Str::new("archive:p=a"));
+}
+
+![test]
+function a_line_rewritten_into_the_moved_form_with_its_reason_kept_declares_nothing() -> Result<(), TestError> {
+    const applied: String = Fixture::between(Str::new("moved:p a\n"), Str::new("p a\n"));
+    return expect_equal(applied.as_str(), Str::new(""));
+}
+
+![test]
+function the_moved_archive_form_is_its_own_kind_naming_the_module() -> Result<(), TestError> {
+    const name: Str = Str::new("moved-archive:std::a::b");
+    const kind: DeclarationKind = Declarations::kind(name);
+    expect(match (kind) { DeclarationKind::MovedArchive => { true } _ => { false } }, Str::new("kind moved-archive"))?;
+    expect_equal(Declarations::program_of(name), Str::new("std::a::b"))?;
+    const suffix: String = Declarations::archive_module_suffix(name);
+    return expect_equal(suffix.as_str(), Str::new("/deps/std/a/b.o"));
+}
+
+![test]
+function each_form_names_its_kind() -> Result<(), TestError> {
+    expect(match (Declarations::kind(Str::new("archive:lang/u.cryo"))) { DeclarationKind::Archive => { true } _ => { false } }, Str::new("archive"))?;
+    expect(match (Declarations::kind(Str::new("moved:p"))) { DeclarationKind::Moved => { true } _ => { false } }, Str::new("moved"))?;
+    expect(match (Declarations::kind(Str::new("moved-instances:std::a"))) { DeclarationKind::MovedInstances => { true } _ => { false } }, Str::new("moved-instances"))?;
+    expect_equal(Declarations::program_of(Str::new("moved-instances:std::a")), Str::new("std::a"))?;
+    expect(match (Declarations::kind(Str::new("negative/E1_x.cryo"))) { DeclarationKind::Negative => { true } _ => { false } }, Str::new("negative before unit"))?;
+    expect(match (Declarations::kind(Str::new("examples/01-hello"))) { DeclarationKind::Example => { true } _ => { false } }, Str::new("example"))?;
+    expect(match (Declarations::kind(Str::new("lang/u.cryo"))) { DeclarationKind::Unit => { true } _ => { false } }, Str::new("unit"))?;
+    return expect(match (Declarations::kind(Str::new("p"))) { DeclarationKind::Project => { true } _ => { false } }, Str::new("project"));
+}
+
+![test]
+function an_object_outside_every_program_build_belongs_to_none() -> Result<(), TestError> {
+    const outside: String = Fixture::owner(Str::new("tests/tests/lang/build/x.o"));
+    expect_equal(outside.as_str(), Str::new("<none>"))?;
+    const unit: String = Fixture::owner(Str::new("tests/build/deps/A.o"));
+    expect_equal(unit.as_str(), Str::new("unit suite"))?;
+    const project: String = Fixture::owner(Str::new("tests/tests/projects/p/build/a.o"));
+    expect_equal(project.as_str(), Str::new("p"))?;
+    const example: String = Fixture::owner(Str::new("examples/01-hello/build/m.o"));
+    return expect_equal(example.as_str(), Str::new("examples/01-hello"));
+}
+
+![test]
+function a_stdlib_object_the_tree_takes_from_the_archive_is_replaced() -> Result<(), TestError> {
+    return expect(ObjectOwner::replaced_by_archive(Str::new("p/build/x/std/deps/std/io.o"), true),
+        Str::new("a stdlib module's object, archive linked"));
+}
+
+![test]
+function a_program_object_missing_from_the_tree_is_not_replaced() -> Result<(), TestError> {
+    return expect(!ObjectOwner::replaced_by_archive(Str::new("p/build/x/local/deps/main.o"), true),
+        Str::new("a program's own object"));
+}
+
+![test]
+function a_stdlib_object_missing_when_no_archive_was_linked_is_not_replaced() -> Result<(), TestError> {
+    return expect(!ObjectOwner::replaced_by_archive(Str::new("p/build/x/std/deps/std/io.o"), false),
+        Str::new("no archive linked"));
+}

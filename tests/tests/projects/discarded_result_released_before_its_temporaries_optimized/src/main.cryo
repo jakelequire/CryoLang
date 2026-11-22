@@ -1,0 +1,63 @@
+namespace DiscardedResultReleasedBeforeItsTemporariesOptimized;
+
+import std::core::drop::{ Drop };
+import std::fmt;
+
+// The release order of discarded_result_released_before_its_temporaries,
+// built optimized: a statement's temporaries are released when it ends, the
+// newest first, and a result the statement discards is the newest of them,
+// so a result that borrows one of them still finds it alive in its
+// destructor.
+//
+// Each release appends a digit to `g_order`: a resource its id, a watcher 9
+// when the resource it borrows is still alive and 8 when it was released
+// first.
+
+mut g_order: i64 = 0;
+
+type struct Resource {
+    id: i64;
+    live: boolean;
+
+    watch(&this) -> Watcher { return Watcher { first: &this, second: &this }; }
+}
+
+implement trait Drop for struct Resource {
+    drop(mut &this) -> void {
+        g_order = g_order * 10 + this.id;
+        this.live = false;
+    }
+}
+
+type struct Watcher {
+    first: &Resource;
+    second: &Resource;
+}
+
+implement trait Drop for struct Watcher {
+    drop(mut &this) -> void {
+        const seen: i64 = if (this.first.live && this.second.live) { 9 } else { 8 };
+        g_order = g_order * 10 + seen;
+    }
+}
+
+function make(id: i64) -> Resource { return Resource { id: id, live: true }; }
+
+function watch(resource: &Resource) -> Watcher { return Watcher { first: resource, second: resource }; }
+
+function watch_two(first: &Resource, second: &Resource) -> Watcher {
+    return Watcher { first: first, second: second };
+}
+
+function main() -> i32 {
+    watch(&make(1));
+    const one: i64 = g_order;
+    g_order = 0;
+    watch_two(&make(4), &make(5));
+    const two: i64 = g_order;
+    g_order = 0;
+    make(6).watch();
+    const three: i64 = g_order;
+    fmt::println(f"order: {one} {two} {three}");
+    return 0;
+}

@@ -1,0 +1,411 @@
+///! verify-pin's checks, driven through fixtures they must accept and
+///! refuse.  The failure this guards against is silence: a check that stops
+///! comparing still prints `ok`, so every refusal is a fixture that differs
+///! from an accepted one in the one field that check reads, and must be
+///! refused with the line naming that check.
+![config(testing)]
+namespace cryogate::tests::pin;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::fs::temporary::{ TemporaryDirectory };
+import std::io::error::{ IoError };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_false };
+
+import cryogate::core::git::{ Git };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::text::{ Text };
+import cryogate::gates::pin::{ PinIntegrity, PinRefresh, PinVerdict };
+
+/// Fixture pins: stamp regions, PE32+ images and sidecars.
+type struct PinFixture {
+    private static append(bytes: mut &Array<u8>, text: Str) -> void {
+        for (byte in text.as_bytes().iter()) { bytes.push(byte); }
+    }
+
+    private static zeros(bytes: mut &Array<u8>, count: i64) -> void {
+        mut index: i64 = 0;
+        while (index < count) { bytes.push(0); index++; }
+    }
+
+    private static little(bytes: mut &Array<u8>, value: u64, width: i64) -> void {
+        mut index: i64 = 0;
+        while (index < width) {
+            bytes.push(((value >> (8 * (index as u64))) & 0xFF) as u8);
+            index++;
+        }
+    }
+
+    /// The stamp marker, then `text`, NUL-padded to the stamp's length.
+    private static region(bytes: mut &Array<u8>, text: Str) -> void {
+        mut index: i64 = 0;
+        while (index < 16) { bytes.push(PinIntegrity::STAMP_MARKER[index]); index++; }
+        PinFixture::append(bytes, text);
+        PinFixture::zeros(bytes, PinIntegrity::STAMP_TEXT_LENGTH - text.length());
+    }
+
+    private static stamped(bytes: mut &Array<u8>, commit: Str) -> void {
+        const text: String = f"commit={commit}\ndate=2026-10-12\ndirty=no\nprofile=release\n";
+        PinFixture::region(bytes, text.as_str());
+    }
+
+    /// An ELF-looking pin holding `body`.
+    private static elf(body: &Array<u8>) -> Array<u8> {
+        mut bytes: Array<u8> = Array::<u8>::new();
+        PinFixture::little(&bytes, 0x7F, 1);
+        PinFixture::append(&bytes, Str::new("ELF"));
+        for (byte in body.iter()) { bytes.push(byte); }
+        PinFixture::zeros(&bytes, 64);
+        return bytes;
+    }
+
+    /// A PE32+ image based at `base`: headers, then one section holding one
+    /// base relocation block with an entry of each type in `types`.
+    private static portable(types: &Array<u64>, base: u64) -> Array<u8> {
+        mut entries: Array<u8> = Array::<u8>::new();
+        mut index: u64 = 0;
+        for (kind in types.iter()) {
+            PinFixture::little(&entries, (kind << 12) | (8 * index), 2);
+            index++;
+        }
+        mut block: Array<u8> = Array::<u8>::new();
+        PinFixture::little(&block, 0x1000, 4);
+        PinFixture::little(&block, (8 + entries.length()) as u64, 4);
+        for (byte in entries.iter()) { block.push(byte); }
+        const block_size: u64 = block.length() as u64;
+
+        mut optional: Array<u8> = Array::<u8>::new();
+        PinFixture::little(&optional, 0x20B, 2);
+        PinFixture::zeros(&optional, 22);
+        PinFixture::little(&optional, base, 8);
+        PinFixture::zeros(&optional, 76);
+        PinFixture::little(&optional, 16, 4);
+        PinFixture::zeros(&optional, 8 * 5);
+        PinFixture::little(&optional, 0x2000, 4);
+        PinFixture::little(&optional, block_size, 4);
+        PinFixture::zeros(&optional, 8 * 10);
+
+        mut image: Array<u8> = Array::<u8>::new();
+        PinFixture::append(&image, Str::new("MZ"));
+        PinFixture::zeros(&image, 0x3A);
+        PinFixture::little(&image, 0x40, 4);
+        PinFixture::append(&image, Str::new("PE"));
+        PinFixture::zeros(&image, 2);
+        PinFixture::little(&image, 0x8664, 2);
+        PinFixture::little(&image, 1, 2);
+        PinFixture::zeros(&image, 12);
+        PinFixture::little(&image, optional.length() as u64, 2);
+        PinFixture::zeros(&image, 2);
+        for (byte in optional.iter()) { image.push(byte); }
+        PinFixture::append(&image, Str::new(".reloc"));
+        PinFixture::zeros(&image, 2);
+        PinFixture::little(&image, block_size, 4);
+        PinFixture::little(&image, 0x2000, 4);
+        PinFixture::little(&image, block_size, 4);
+        PinFixture::little(&image, 0x200, 4);
+        PinFixture::zeros(&image, 16);
+        PinFixture::zeros(&image, 0x200 - image.length());
+        for (byte in block.iter()) { image.push(byte); }
+        return image;
+    }
+
+    /// Write `bytes` as `name` in `directory` with the sidecar `sidecar`
+    /// (where `{sha}` stands for the bytes' own digest), and check it.
+    private static judge(directory: Path, name: Str, bytes: &Array<u8>, sidecar: Str, require_clean: boolean) -> Result<PinVerdict, TestError> {
+        const pin: PathBuf = directory.join(name);
+        if (File::write_bytes(pin.as_path(), bytes.as_slice()).is_err()) { return Result::Err(TestError::other(Str::new("could not write the pin"))); }
+        const text: String = sidecar.replace(&Str::new("{sha}"), &PinIntegrity::digest_of(bytes).as_str());
+        if (File::write_text(PinIntegrity::sidecar_of(pin.as_path()).as_path(), text.as_str()).is_err()) { return Result::Err(TestError::other(Str::new("could not write the sidecar"))); }
+        return Result::Ok(PinIntegrity::verify_one(pin.as_path(), require_clean));
+    }
+
+    /// The verdict's lines as one text.
+    private static said(verdict: &PinVerdict) -> String {
+        return Text::joined(&verdict.lines, Str::new("\n"));
+    }
+
+    /// The commit the fixtures' sidecars name.
+    private static commit() -> Str { return Str::new("6b2997d649dbbbce6adf1c509ddb1dd082347086"); }
+    /// Another commit, differing from `commit` in its first eight digits.
+    private static other() -> Str { return Str::new("975faa5d49dbbbce6adf1c509ddb1dd082347086"); }
+}
+
+/// A fresh scratch directory for one test.
+function scratch() -> Result<TemporaryDirectory, TestError> {
+    return match (TemporaryDirectory::create()) {
+        Result::Ok(directory) => { Result::Ok(directory) }
+        Result::Err(error)    => { Result::Err(TestError::other(error.describe())) }
+    };
+}
+
+/// An ELF pin stamped with `stamp_commit`, judged against a sidecar naming
+/// `sidecar_commit` (none when empty) and recording `worktree`.
+private function elf_case(stamp_commit: Str, sidecar_commit: Str, worktree: Str, require_clean: boolean) -> Result<PinVerdict, TestError> {
+    const directory: TemporaryDirectory = scratch()?;
+    mut body: Array<u8> = Array::<u8>::new();
+    PinFixture::stamped(&body, stamp_commit);
+    const digest_line: Str = Str::new("sha256:       {sha}\n");
+    mut sidecar: String = f"{digest_line}worktree:     {worktree}\n";
+    if (!sidecar_commit.is_empty()) { sidecar = f"{sidecar.as_str()}git-commit:   {sidecar_commit}\n"; }
+    return PinFixture::judge(directory.path(), Str::new("cryo"), &PinFixture::elf(&body), sidecar.as_str(), require_clean);
+}
+
+![test]
+function a_stamp_naming_the_sidecars_commit_is_accepted() -> Result<(), TestError> {
+    const verdict: PinVerdict = elf_case(PinFixture::commit(), PinFixture::commit(), Str::new("clean"), false)?;
+    expect(verdict.ok, PinFixture::said(&verdict).as_str())?;
+    return expect(PinFixture::said(&verdict).as_str().starts_with(&Str::new("  [ ok ] cryo: sha256 and stamp match  ")), Str::new("the ok line"));
+}
+
+![test]
+function a_clean_pin_is_accepted_under_require_clean() -> Result<(), TestError> {
+    const verdict: PinVerdict = elf_case(PinFixture::commit(), PinFixture::commit(), Str::new("clean"), true)?;
+    expect(verdict.ok, PinFixture::said(&verdict).as_str())?;
+    return expect(PinFixture::said(&verdict).as_str().contains(&Str::new("match (clean)")), Str::new("the clean note"));
+}
+
+![test]
+function a_stamp_naming_another_commit_is_refused() -> Result<(), TestError> {
+    const verdict: PinVerdict = elf_case(PinFixture::other(), PinFixture::commit(), Str::new("clean"), false)?;
+    expect_false(verdict.ok, Str::new("refused"))?;
+    return expect(PinFixture::said(&verdict).as_str().contains(&Str::new("stamped with a different commit than its sidecar names")), PinFixture::said(&verdict).as_str());
+}
+
+![test]
+function a_sidecar_with_no_git_commit_is_refused() -> Result<(), TestError> {
+    const verdict: PinVerdict = elf_case(PinFixture::commit(), Str::new(""), Str::new("clean"), false)?;
+    expect_false(verdict.ok, Str::new("refused"))?;
+    return expect(PinFixture::said(&verdict).as_str().contains(&Str::new("sidecar: <absent>")), PinFixture::said(&verdict).as_str());
+}
+
+![test]
+function a_pin_never_stamped_is_refused() -> Result<(), TestError> {
+    const directory: TemporaryDirectory = scratch()?;
+    mut body: Array<u8> = Array::<u8>::new();
+    PinFixture::region(&body, Str::new(""));
+    const verdict: PinVerdict = PinFixture::judge(directory.path(), Str::new("cryo"), &PinFixture::elf(&body), Str::new("sha256: {sha}\ngit-commit: 6b2997d649dbbbce6adf1c509ddb1dd082347086\n"), false)?;
+    expect_false(verdict.ok, Str::new("refused"))?;
+    return expect(PinFixture::said(&verdict).as_str().contains(&Str::new("was never stamped")), PinFixture::said(&verdict).as_str());
+}
+
+![test]
+function a_pin_with_no_stamp_region_is_refused() -> Result<(), TestError> {
+    const directory: TemporaryDirectory = scratch()?;
+    mut body: Array<u8> = Array::<u8>::new();
+    PinFixture::append(&body, Str::new("no region here"));
+    const verdict: PinVerdict = PinFixture::judge(directory.path(), Str::new("cryo"), &PinFixture::elf(&body), Str::new("sha256: {sha}\ngit-commit: 6b2997d649dbbbce6adf1c509ddb1dd082347086\n"), false)?;
+    expect_false(verdict.ok, Str::new("refused"))?;
+    return expect(PinFixture::said(&verdict).as_str().contains(&Str::new("holds 0 stamp regions, not one")), PinFixture::said(&verdict).as_str());
+}
+
+![test]
+function a_pin_with_two_stamp_regions_is_refused() -> Result<(), TestError> {
+    const directory: TemporaryDirectory = scratch()?;
+    mut body: Array<u8> = Array::<u8>::new();
+    PinFixture::stamped(&body, PinFixture::commit());
+    PinFixture::stamped(&body, PinFixture::commit());
+    const verdict: PinVerdict = PinFixture::judge(directory.path(), Str::new("cryo"), &PinFixture::elf(&body), Str::new("sha256: {sha}\ngit-commit: 6b2997d649dbbbce6adf1c509ddb1dd082347086\n"), false)?;
+    expect_false(verdict.ok, Str::new("refused"))?;
+    return expect(PinFixture::said(&verdict).as_str().contains(&Str::new("holds 2 stamp regions, not one")), PinFixture::said(&verdict).as_str());
+}
+
+![test]
+function a_dirty_pin_is_refused_under_require_clean() -> Result<(), TestError> {
+    const verdict: PinVerdict = elf_case(PinFixture::commit(), PinFixture::commit(), Str::new("dirty"), true)?;
+    expect_false(verdict.ok, Str::new("refused"))?;
+    return expect(PinFixture::said(&verdict).as_str().contains(&Str::new("pinned from a dirty worktree (git-describe: ?)")), PinFixture::said(&verdict).as_str());
+}
+
+![test]
+function a_sha256_that_differs_from_the_sidecar_is_refused() -> Result<(), TestError> {
+    const directory: TemporaryDirectory = scratch()?;
+    mut bytes: Array<u8> = Array::<u8>::new();
+    PinFixture::stamped(&bytes, PinFixture::commit());
+    const verdict: PinVerdict = PinFixture::judge(directory.path(), Str::new("cryo"), &bytes, Str::new("sha256: 0000000000000000000000000000000000000000000000000000000000000000\ngit-commit: 6b2997d649dbbbce6adf1c509ddb1dd082347086\n"), false)?;
+    expect_false(verdict.ok, Str::new("refused"))?;
+    return expect(PinFixture::said(&verdict).as_str().contains(&Str::new("sha256 mismatch")), PinFixture::said(&verdict).as_str());
+}
+
+/// A Windows pin: the stamp after a PE32+ image whose base relocation
+/// table holds `types`.
+private function portable_case(types: &Array<u64>, base: u64) -> Result<PinVerdict, TestError> {
+    const directory: TemporaryDirectory = scratch()?;
+    mut bytes: Array<u8> = PinFixture::portable(types, base);
+    PinFixture::stamped(&bytes, PinFixture::commit());
+    return PinFixture::judge(directory.path(), Str::new("cryo.exe"), &bytes, Str::new("sha256: {sha}\ngit-commit: 6b2997d649dbbbce6adf1c509ddb1dd082347086\n"), false);
+}
+
+![test]
+function a_pe_image_with_64_bit_base_relocations_only_is_accepted() -> Result<(), TestError> {
+    mut types: Array<u64> = Array::<u64>::new();
+    types.push(10);
+    types.push(10);
+    const verdict: PinVerdict = portable_case(&types, 0x140000000)?;
+    return expect(verdict.ok, PinFixture::said(&verdict).as_str());
+}
+
+![test]
+function a_32_bit_base_relocation_above_4_gib_is_refused() -> Result<(), TestError> {
+    mut types: Array<u64> = Array::<u64>::new();
+    types.push(10);
+    types.push(PinIntegrity::HIGHLOW);
+    const verdict: PinVerdict = portable_case(&types, 0x140000000)?;
+    expect_false(verdict.ok, Str::new("refused"))?;
+    return expect(PinFixture::said(&verdict).as_str().contains(&Str::new("1 32-bit base relocation(s) in a 64-bit image based above 4 GiB, first at RVA 0x1008")), PinFixture::said(&verdict).as_str());
+}
+
+![test]
+function a_32_bit_base_relocation_below_4_gib_is_accepted() -> Result<(), TestError> {
+    mut types: Array<u64> = Array::<u64>::new();
+    types.push(10);
+    types.push(PinIntegrity::HIGHLOW);
+    const verdict: PinVerdict = portable_case(&types, 0x400000)?;
+    return expect(verdict.ok, PinFixture::said(&verdict).as_str());
+}
+
+/// Two pins whose sidecars name `first` and `second`.
+private function pair_case(first: Str, second: Str) -> Result<PinVerdict, TestError> {
+    const directory: TemporaryDirectory = scratch()?;
+    mut pins: Array<String> = Array::<String>::new();
+    const names: Str = Str::new("cryo cryo.exe");
+    mut index: i64 = 0;
+    for (name in names.split(&Str::new(" "))) {
+        const pin: PathBuf = directory.path().join(name);
+        if (File::write_text(pin.as_path(), Str::new("pin")).is_err()) { return Result::Err(TestError::other(Str::new("could not write a pin"))); }
+        const commit: Str = if (index == 0) { first } else { second };
+        if (File::write_text(PinIntegrity::sidecar_of(pin.as_path()).as_path(), f"git-commit: {commit}\n".as_str()).is_err()) { return Result::Err(TestError::other(Str::new("could not write a sidecar"))); }
+        pins.push(String::from_str(pin.as_path().as_str()));
+        index++;
+    }
+    return Result::Ok(PinIntegrity::verify_pair(&pins));
+}
+
+![test]
+function a_pair_built_from_one_commit_is_accepted() -> Result<(), TestError> {
+    const verdict: PinVerdict = pair_case(PinFixture::commit(), PinFixture::commit())?;
+    expect(verdict.ok, PinFixture::said(&verdict).as_str())?;
+    return expect(PinFixture::said(&verdict) == String::from_str(Str::new("  [ ok ] pair: both pins built from 6b2997d649db")), PinFixture::said(&verdict).as_str());
+}
+
+![test]
+function a_pair_built_from_two_commits_is_refused() -> Result<(), TestError> {
+    const verdict: PinVerdict = pair_case(PinFixture::commit(), PinFixture::other())?;
+    expect_false(verdict.ok, Str::new("refused"))?;
+    expect(PinFixture::said(&verdict).as_str().contains(&Str::new("           cryo         6b2997d649dbbbce6adf1c509ddb1dd082347086")), PinFixture::said(&verdict).as_str())?;
+    return expect(PinFixture::said(&verdict).as_str().contains(&Str::new("           cryo.exe     975faa5d49dbbbce6adf1c509ddb1dd082347086")), PinFixture::said(&verdict).as_str());
+}
+
+/// A git checkout holding one committed source file and one committed pin,
+/// and the sidecar `pin` writes for that pin.
+type struct PinCheckout {
+    directory: TemporaryDirectory;
+    logs: RunLogs;
+    private git: Git;
+
+    private static create() -> Result<PinCheckout, TestError> {
+        const directory: TemporaryDirectory = scratch()?;
+        const logs: RunLogs = match (RunLogs::open(directory.path())) {
+            Result::Ok(logs)    => { logs }
+            Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+        };
+        const git: Git = Git::new(directory.path(), &logs);
+        // The logs the commands write are ignored, as the repository's are.
+        PinCheckout::write(directory.path(), Str::new(".gitignore"), Str::new("build-logs/\n"))?;
+        PinCheckout::write(directory.path(), Str::new("source.txt"), Str::new("one\n"))?;
+        PinCheckout::write(directory.path(), Str::new("bin/cryo"), Str::new("pin\n"))?;
+        PinCheckout::git_must(&git, Str::new("init -q"))?;
+        PinCheckout::git_must(&git, Str::new("add -A"))?;
+        PinCheckout::git_must(&git, Str::new("-c user.name=pin -c user.email=pin@localhost commit -q -m start"))?;
+        return Result::Ok(PinCheckout { directory: directory, logs: logs, git: git });
+    }
+
+    private static write(root: Path, name: Str, text: Str) -> Result<(), TestError> {
+        const path: PathBuf = root.join(name);
+        match (path.as_path().parent()) {
+            Option::Some(parent) => { const _: Result<(), IoError> = Directory::create_all(parent); }
+            Option::None         => { }
+        }
+        return match (File::write_text(path.as_path(), text)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(TestError::other(error.describe())) }
+        };
+    }
+
+    /// Run git with the space-separated `words`, refusing a failure.
+    private static git_must(git: &Git, words: Str) -> Result<(), TestError> {
+        mut arguments: Array<Str> = Array::<Str>::new();
+        for (word in words.split(&Str::new(" "))) { arguments.push(word); }
+        if (!git.run(&arguments).outcome.succeeded()) { return Result::Err(TestError::other(f"git {words} failed".as_str())); }
+        return Result::Ok(());
+    }
+
+    /// The sidecar's fields for a pin holding `data`.
+    fields(&this, data: &Array<u8>) -> Array<Pair<String, String>> {
+        const text: String = PinRefresh::sidecar_text(&this.git, &this.logs, Str::new("bin/cryo"), Str::new("compiler/build/bin/cryo"), data, true);
+        return PinIntegrity::sidecar_fields(text.as_str());
+    }
+
+    private static value(fields: &Array<Pair<String, String>>, key: Str) -> String {
+        mut found: String = String::new();
+        for (entry in fields.iterate_references()) {
+            if (entry.first.as_str() == key) { found = entry.second.clone(); }
+        }
+        return found;
+    }
+}
+
+![test]
+function a_pin_made_in_a_clean_checkout_records_its_commit_and_digest() -> Result<(), TestError> {
+    const checkout: PinCheckout = PinCheckout::create()?;
+    mut data: Array<u8> = Array::<u8>::new();
+    PinFixture::append(&data, Str::new("pinned bytes"));
+    const fields: Array<Pair<String, String>> = checkout.fields(&data);
+    mut head: Array<Str> = Array::<Str>::new();
+    head.push(Str::new("rev-parse"));
+    head.push(Str::new("HEAD"));
+    const commit: String = checkout.git.answer(&head);
+    expect(commit.as_str().length() == 40, commit.as_str())?;
+    expect(PinCheckout::value(&fields, Str::new("git-commit")).as_str() == commit.as_str(), Str::new("git-commit is HEAD"))?;
+    expect(PinCheckout::value(&fields, Str::new("sha256")).as_str() == PinIntegrity::digest_of(&data).as_str(), Str::new("sha256 of the pin's bytes"))?;
+    expect(PinCheckout::value(&fields, Str::new("size")).as_str() == Str::new("12 bytes"), Str::new("size"))?;
+    expect(PinCheckout::value(&fields, Str::new("stripped")).as_str() == Str::new("yes"), Str::new("stripped"))?;
+    expect(PinCheckout::value(&fields, Str::new("worktree")).as_str() == Str::new("clean"), Str::new("worktree clean"))?;
+    return expect_false(PinCheckout::value(&fields, Str::new("git-describe")).as_str().ends_with(&Str::new("-dirty")), Str::new("describe not dirty"));
+}
+
+![test]
+function rewriting_the_pins_leaves_the_checkout_clean() -> Result<(), TestError> {
+    // A refresh rewrites the pin before it writes the sidecar; that must not
+    // read as a change to the checkout.
+    const checkout: PinCheckout = PinCheckout::create()?;
+    PinCheckout::write(checkout.directory.path(), Str::new("bin/cryo"), Str::new("a new pin\n"))?;
+    PinCheckout::write(checkout.directory.path(), Str::new("bin/cryo.pin.txt"), Str::new("a new sidecar\n"))?;
+    const fields: Array<Pair<String, String>> = checkout.fields(&Array::<u8>::new());
+    return expect(PinCheckout::value(&fields, Str::new("worktree")).as_str() == Str::new("clean"), Str::new("worktree clean"));
+}
+
+![test]
+function a_pin_made_from_a_changed_checkout_is_recorded_dirty() -> Result<(), TestError> {
+    const checkout: PinCheckout = PinCheckout::create()?;
+    PinCheckout::write(checkout.directory.path(), Str::new("source.txt"), Str::new("two\n"))?;
+    const fields: Array<Pair<String, String>> = checkout.fields(&Array::<u8>::new());
+    expect(PinCheckout::value(&fields, Str::new("worktree")).as_str() == Str::new("dirty"), Str::new("worktree dirty"))?;
+    return expect(PinCheckout::value(&fields, Str::new("git-describe")).as_str().ends_with(&Str::new("-dirty")), Str::new("describe dirty"));
+}
+
+![test]
+function a_sidecar_records_when_it_was_made_in_whole_seconds() -> Result<(), TestError> {
+    const checkout: PinCheckout = PinCheckout::create()?;
+    const at: String = PinCheckout::value(&checkout.fields(&Array::<u8>::new()), Str::new("built-at"));
+    // `YYYY-MM-DDTHH:MM:SSZ`
+    expect(at.as_str().length() == 20, at.as_str())?;
+    return expect(at.as_str().ends_with(&Str::new("Z")) && at.as_str().byte_substring(10, 11) == Str::new("T"), at.as_str());
+}

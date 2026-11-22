@@ -1,0 +1,427 @@
+///! The features a program may use, named, and the set a command line
+///! enables.
+///!
+///! A feature list is comma-separated: `default` is every feature of the
+///! current stage, a name adds one, `no-<name>` removes one, read left to
+///! right.  The canonical spelling, written into a program's header, lists
+///! the enabled names in declaration order.
+
+namespace cryosmith::configuration::features;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+
+/// One generation feature.
+public type enum Feature {
+    /// Boolean values, comparisons and logic beyond loop and branch
+    /// conditions' own.
+    Booleans;
+    /// `wrapping_add`, `wrapping_subtract`, `wrapping_multiply`.
+    Wrapping;
+    /// Plain `+`, `-`, `*` and negation over masked operands.
+    Guarded;
+    /// `&`, `|`, `^`, `~`.
+    Bitwise;
+    /// `<<` and `>>` by a masked amount.
+    Shifts;
+    /// `/` and `%` by a divisor guarded to be at least 1.
+    Division;
+    /// `as` between integer types.
+    Casts;
+    /// A narrower value where the language converts it implicitly.
+    Widening;
+    /// `if` expressions.
+    IfExpressions;
+    /// `if` / `else` statements.
+    Branches;
+    /// Bounded loops.
+    Loops;
+    /// `break` and `continue`.
+    LoopExits;
+    /// Calls to earlier functions.
+    Calls;
+    /// `if (c) { return e; }` before a function's end.
+    EarlyReturns;
+    /// Structs: fields, defaults, literals, field reads and writes, and
+    /// methods, static and taking `&this` or `mut &this`.
+    Structs;
+    /// An argument made only of literals (`(19371 & 32767)`), which the
+    /// parameter it is passed to types.
+    Constants;
+    /// Generic functions over one type parameter `T`, bounded by `Copy` or
+    /// by `Eq + Copy`, called with their type argument written.
+    Generics;
+    /// Generic structs `B<N><T>` and their instances at type arguments
+    /// written, `B0::<u16> { f0: .. }`, as the types of values.
+    GenericStructs;
+    /// A generic call or an instance's literal that leaves its type
+    /// argument to inference, `g0(a, b)`, `B0::<_> { f0: .. }`.
+    InferredTypeArguments;
+    /// A generic struct's own methods - static, taking `&this` or taking
+    /// `mut &this` - and their calls on its instances.
+    GenericMethods;
+    /// Overload sets: free functions and methods sharing a name, their
+    /// parameters different, each call choosing exactly one.
+    Overloads;
+    /// Enums with unit variants, as the types of values, and `match` over
+    /// them as a statement and as an expression.
+    Enums;
+    /// Enum variants carrying a payload, `V1(u8, i32)`: constructed with
+    /// their values, and matched with a binding for each.
+    EnumPayloads;
+    /// Generic enums `G<N><T>`, whose payloads may be of type `T`, and
+    /// their instances at type arguments as the types of values.
+    GenericEnums;
+    /// Patterns inside a payload: `_` for a value, and a variant pattern
+    /// for a value of an enum an enum carries, `E1::V2(E0::V1(b0), _)`.
+    NestedPatterns;
+    /// Closures that capture nothing, `(q0: u8) -> i32 { return .. }`,
+    /// held by `const` locals of their function type and called.
+    Closures;
+    /// Closures that capture locals, parameters, counters and bindings of
+    /// the enclosing function, held by `const` locals of their own type.
+    ClosureCaptures;
+    /// Function values: free functions taking a function-typed parameter or
+    /// returning a function type, given closures and named functions.
+    FunctionValues;
+    /// Closures declared in generic functions and generic structs' methods,
+    /// whose parameters, return type and captures may be the body's `T`.
+    GenericClosures;
+    /// Generic functions taking a last parameter of a second type
+    /// parameter bounded by a function type, `F: (T) -> T`, called in the
+    /// body and given a closure written at each call.
+    CallableBounds;
+    /// Traits declaring methods, `type trait Tr0 { t0(&this) -> u8; }`,
+    /// implemented for structs and called on their values.
+    Traits;
+    /// Generic functions bounded by a trait, `k0<T>(..) where T: Tr0 +
+    /// Copy`, calling its methods on their `T` values.
+    TraitBounds;
+    /// Free functions taking a trait object, `p1: virtual &Tr0`, calling
+    /// its methods through the value's table, given `&v` of an
+    /// implementing struct's variable.
+    TraitObjects;
+    /// Trait methods with a default body over `This`, calling the trait's
+    /// earlier methods on `this`, which an implementation may leave out.
+    TraitDefaults;
+    /// A trait declared over another, `type trait Tr1 : Tr0`, whose
+    /// implementors implement both and whose bounds and objects call both
+    /// traits' methods.
+    Supertraits;
+    /// Traits implemented for the declared enums, `implement trait Tr0 for
+    /// enum E0`, whose methods match on `this`, called on the enum's values,
+    /// through a bound at the enum and through an object borrowing one.
+    EnumImplementations;
+    /// Owned structs `D0` with a destructor that folds into the hash,
+    /// moved between locals, into calls and out of returns.
+    Moves;
+    /// `match` statements on a `mut` enum local whose arms assign it a
+    /// variant other than the arm's, then observe the arm's bindings.
+    SubjectAssignments;
+    /// `&D0` and `mut &D0` parameters given borrows of owned values, a
+    /// `&D0` returned from a function's reference parameters, fields
+    /// written through `mut &D0`.
+    References;
+    /// Owned values released before their scope ends: `mem::drop(v)`, a
+    /// discarded result, a borrowed temporary, a store through `mut &D0`.
+    Drops;
+    /// `Box<D0>` values owning one owned value, read and written through
+    /// it, and `Rc<D0>` values sharing one, cloned and counted.
+    Boxes;
+    /// `Option<D0>` and `Result<D0, u32>` values, matched, unwrapped where
+    /// they certainly hold a value, and propagated with `?`; with `enums`
+    /// and `enum-payloads` only, since a `match` observes them.
+    Options;
+    /// A `?`'s `if` operand leaves a variant's type arguments out where its
+    /// sibling arm names the instance: `Option::None` beside
+    /// `Option::Some(D0 { .. })`, and one of `Result::Ok(..)` and
+    /// `Result::Err(..)` beside the other written in full.
+    SiblingVariants;
+    /// Fixed arrays of integers, `[i16; 3]`, built by a literal or a
+    /// repeat, their elements read and written at an index reduced into
+    /// the length, and `&Slice<i16>` parameters given `&v` of one, read
+    /// the same way; each observed element by element in order.  With
+    /// `division` and `loops` only, since an index is reduced by `%` and an
+    /// array is observed by a `for`.
+    Arrays;
+    /// `String` locals built from a literal, an integer's digits or
+    /// nothing, grown by `push`, compared and measured, and observed by
+    /// their length and their bytes.  With `loops` only, since the bytes
+    /// are observed by a `for`.
+    Strings;
+    /// Dynamic arrays of integers, `[i16]`, built by a literal, a repeat,
+    /// empty or as another's clone, grown by `push`, shrunk by `pop`, their
+    /// elements read and written at an index below the fewest elements the
+    /// generator knows they hold, given `&v` for a slice, and observed by
+    /// their length and element by element in order.  With `loops` only,
+    /// since the elements are observed by a `for`.
+    DynamicArrays;
+    /// Hash maps of integers to integers, `HashMap<u8, i32>`, built empty,
+    /// inserted into and removed from at small keys, looked up, asked
+    /// whether they hold a key and measured, and observed by their length
+    /// and a sum over their entries, which no iteration order changes.
+    /// With `loops` only, since the entries are observed by a `for`.
+    Maps;
+}
+
+implement enum Feature {
+    /// Every feature, in declaration order.
+    public static all() -> Array<Feature> {
+        mut every: Array<Feature> = Array::<Feature>::new();
+        every.push(Feature::Booleans);
+        every.push(Feature::Wrapping);
+        every.push(Feature::Guarded);
+        every.push(Feature::Bitwise);
+        every.push(Feature::Shifts);
+        every.push(Feature::Division);
+        every.push(Feature::Casts);
+        every.push(Feature::Widening);
+        every.push(Feature::IfExpressions);
+        every.push(Feature::Branches);
+        every.push(Feature::Loops);
+        every.push(Feature::LoopExits);
+        every.push(Feature::Calls);
+        every.push(Feature::EarlyReturns);
+        every.push(Feature::Structs);
+        every.push(Feature::Constants);
+        every.push(Feature::Generics);
+        every.push(Feature::GenericStructs);
+        every.push(Feature::InferredTypeArguments);
+        every.push(Feature::GenericMethods);
+        every.push(Feature::Overloads);
+        every.push(Feature::Enums);
+        every.push(Feature::EnumPayloads);
+        every.push(Feature::GenericEnums);
+        every.push(Feature::NestedPatterns);
+        every.push(Feature::Closures);
+        every.push(Feature::ClosureCaptures);
+        every.push(Feature::FunctionValues);
+        every.push(Feature::GenericClosures);
+        every.push(Feature::CallableBounds);
+        every.push(Feature::Traits);
+        every.push(Feature::TraitBounds);
+        every.push(Feature::TraitObjects);
+        every.push(Feature::TraitDefaults);
+        every.push(Feature::Supertraits);
+        every.push(Feature::EnumImplementations);
+        every.push(Feature::Moves);
+        every.push(Feature::SubjectAssignments);
+        every.push(Feature::References);
+        every.push(Feature::Drops);
+        every.push(Feature::Boxes);
+        every.push(Feature::Options);
+        every.push(Feature::SiblingVariants);
+        every.push(Feature::Arrays);
+        every.push(Feature::Strings);
+        every.push(Feature::DynamicArrays);
+        every.push(Feature::Maps);
+        return every;
+    }
+
+    /// The feature's name on a command line.
+    public name(&this) -> Str {
+        return match (&this) {
+            Feature::Booleans      => { Str::new("booleans") }
+            Feature::Wrapping      => { Str::new("wrapping") }
+            Feature::Guarded       => { Str::new("guarded") }
+            Feature::Bitwise       => { Str::new("bitwise") }
+            Feature::Shifts        => { Str::new("shifts") }
+            Feature::Division      => { Str::new("division") }
+            Feature::Casts         => { Str::new("casts") }
+            Feature::Widening      => { Str::new("widening") }
+            Feature::IfExpressions => { Str::new("if-expressions") }
+            Feature::Branches      => { Str::new("branches") }
+            Feature::Loops         => { Str::new("loops") }
+            Feature::LoopExits     => { Str::new("loop-exits") }
+            Feature::Calls         => { Str::new("calls") }
+            Feature::EarlyReturns  => { Str::new("early-returns") }
+            Feature::Structs       => { Str::new("structs") }
+            Feature::Constants     => { Str::new("constants") }
+            Feature::Generics      => { Str::new("generics") }
+            Feature::GenericStructs => { Str::new("generic-structs") }
+            Feature::InferredTypeArguments => { Str::new("inferred-type-arguments") }
+            Feature::GenericMethods => { Str::new("generic-methods") }
+            Feature::Overloads     => { Str::new("overloads") }
+            Feature::Enums         => { Str::new("enums") }
+            Feature::EnumPayloads  => { Str::new("enum-payloads") }
+            Feature::GenericEnums  => { Str::new("generic-enums") }
+            Feature::NestedPatterns => { Str::new("nested-patterns") }
+            Feature::Closures      => { Str::new("closures") }
+            Feature::ClosureCaptures => { Str::new("closure-captures") }
+            Feature::FunctionValues => { Str::new("function-values") }
+            Feature::GenericClosures => { Str::new("generic-closures") }
+            Feature::CallableBounds => { Str::new("callable-bounds") }
+            Feature::Traits        => { Str::new("traits") }
+            Feature::TraitBounds   => { Str::new("trait-bounds") }
+            Feature::TraitObjects  => { Str::new("trait-objects") }
+            Feature::TraitDefaults => { Str::new("trait-defaults") }
+            Feature::Supertraits   => { Str::new("supertraits") }
+            Feature::EnumImplementations => { Str::new("enum-implementations") }
+            Feature::Moves         => { Str::new("moves") }
+            Feature::SubjectAssignments => { Str::new("subject-assignments") }
+            Feature::References    => { Str::new("references") }
+            Feature::Drops         => { Str::new("drops") }
+            Feature::Boxes         => { Str::new("boxes") }
+            Feature::Options       => { Str::new("options") }
+            Feature::SiblingVariants => { Str::new("sibling-variants") }
+            Feature::Arrays        => { Str::new("arrays") }
+            Feature::Strings       => { Str::new("strings") }
+            Feature::DynamicArrays => { Str::new("dynamic-arrays") }
+            Feature::Maps          => { Str::new("maps") }
+        };
+    }
+
+    /// The stage that added the feature.
+    public stage(&this) -> i64 {
+        return match (&this) {
+            Feature::Structs   => { 2 }
+            Feature::Constants => { 2 }
+            Feature::Generics  => { 3 }
+            Feature::GenericStructs => { 3 }
+            Feature::InferredTypeArguments => { 3 }
+            Feature::GenericMethods => { 3 }
+            Feature::Overloads     => { 3 }
+            Feature::Enums         => { 4 }
+            Feature::EnumPayloads  => { 4 }
+            Feature::GenericEnums  => { 4 }
+            Feature::NestedPatterns => { 4 }
+            Feature::Closures      => { 5 }
+            Feature::ClosureCaptures => { 5 }
+            Feature::FunctionValues => { 5 }
+            Feature::GenericClosures => { 5 }
+            Feature::CallableBounds => { 5 }
+            Feature::Traits        => { 6 }
+            Feature::TraitBounds   => { 6 }
+            Feature::TraitObjects  => { 6 }
+            Feature::TraitDefaults => { 6 }
+            Feature::Supertraits   => { 6 }
+            Feature::EnumImplementations => { 6 }
+            Feature::Moves         => { 7 }
+            Feature::SubjectAssignments => { 7 }
+            Feature::References    => { 7 }
+            Feature::Drops         => { 7 }
+            Feature::Boxes         => { 7 }
+            Feature::Options       => { 7 }
+            Feature::SiblingVariants => { 7 }
+            Feature::Arrays        => { 8 }
+            Feature::Strings       => { 8 }
+            Feature::DynamicArrays => { 8 }
+            Feature::Maps          => { 8 }
+            _             => { 1 }
+        };
+    }
+
+    /// The feature's bit in a `FeatureSet`.
+    public bit(&this) -> u64 {
+        const position: u64 = match (&this) {
+            Feature::Booleans      => { 0 }
+            Feature::Wrapping      => { 1 }
+            Feature::Guarded       => { 2 }
+            Feature::Bitwise       => { 3 }
+            Feature::Shifts        => { 4 }
+            Feature::Division      => { 5 }
+            Feature::Casts         => { 6 }
+            Feature::Widening      => { 7 }
+            Feature::IfExpressions => { 8 }
+            Feature::Branches      => { 9 }
+            Feature::Loops         => { 10 }
+            Feature::LoopExits     => { 11 }
+            Feature::Calls         => { 12 }
+            Feature::EarlyReturns  => { 13 }
+            Feature::Structs       => { 14 }
+            Feature::Constants     => { 15 }
+            Feature::Generics      => { 16 }
+            Feature::GenericStructs => { 17 }
+            Feature::InferredTypeArguments => { 18 }
+            Feature::GenericMethods => { 19 }
+            Feature::Overloads     => { 20 }
+            Feature::Enums         => { 21 }
+            Feature::EnumPayloads  => { 22 }
+            Feature::GenericEnums  => { 23 }
+            Feature::NestedPatterns => { 24 }
+            Feature::Closures      => { 25 }
+            Feature::ClosureCaptures => { 26 }
+            Feature::FunctionValues => { 27 }
+            Feature::GenericClosures => { 28 }
+            Feature::CallableBounds => { 29 }
+            Feature::Traits        => { 30 }
+            Feature::TraitBounds   => { 31 }
+            Feature::TraitObjects  => { 32 }
+            Feature::TraitDefaults => { 33 }
+            Feature::Supertraits   => { 34 }
+            Feature::Moves         => { 35 }
+            Feature::SubjectAssignments => { 36 }
+            Feature::References    => { 37 }
+            Feature::Drops         => { 38 }
+            Feature::Boxes         => { 39 }
+            Feature::Options       => { 40 }
+            Feature::EnumImplementations => { 41 }
+            Feature::SiblingVariants => { 42 }
+            Feature::Arrays        => { 43 }
+            Feature::Strings       => { 44 }
+            Feature::DynamicArrays => { 45 }
+            Feature::Maps          => { 46 }
+        };
+        return 1 << position;
+    }
+
+    /// The feature named `name`, if there is one.
+    public static named(name: Str) -> Option<Feature> {
+        for (feature in Feature::all().iter()) {
+            if (feature.name() == name) { return Option::Some(feature); }
+        }
+        return Option::None;
+    }
+}
+
+/// A set of enabled features.
+public type struct FeatureSet {
+    private bits: u64;
+
+    /// Every feature of the current stage.
+    public static default_set() -> FeatureSet {
+        mut set: FeatureSet = FeatureSet { bits: 0 };
+        for (feature in Feature::all().iter()) { set.bits = set.bits | feature.bit(); }
+        return set;
+    }
+
+    /// Read a feature list.  The refusal names the word it could not read.
+    public static parse(list: Str) -> Result<FeatureSet, String> {
+        mut set: FeatureSet = FeatureSet { bits: 0 };
+        for (word in list.split(&Str::new(","))) {
+            const name: Str = word.trim();
+            if (name == Str::new("default")) {
+                set.bits = set.bits | FeatureSet::default_set().bits;
+                continue;
+            }
+            const removed: Option<Str> = name.strip_prefix(&Str::new("no-"));
+            const removing: boolean = removed.is_some();
+            match (Feature::named(removed.unwrap_or(name))) {
+                Option::Some(feature) => {
+                    if (removing) { set.bits = set.bits & (~feature.bit()); } else { set.bits = set.bits | feature.bit(); }
+                }
+                Option::None => { return Result::Err(f"unknown feature `{name}`; `cryosmith features` lists them"); }
+            }
+        }
+        return Result::Ok(set);
+    }
+
+    /// Whether `feature` is enabled.
+    public has(&this, feature: Feature) -> boolean { return (this.bits & feature.bit()) != 0; }
+
+    /// The enabled features' names, comma-separated, in declaration order;
+    /// `none` when no feature is enabled.
+    public canonical(&this) -> String {
+        mut text: String = String::new();
+        for (feature in Feature::all().iter()) {
+            if (!this.has(feature)) { continue; }
+            if (text.length() != 0) { text.push(Str::new(",")); }
+            text.push(feature.name());
+        }
+        if (text.length() == 0) { text.push(Str::new("none")); }
+        return text;
+    }
+}

@@ -1,0 +1,586 @@
+///! What each kind of check in a fixture's `checks.json` requires of the
+///! server's answer.  Every judgement is pure: it is handed the fixture, the
+///! check and the answer (or the notification) and says whether it passes,
+///! with the detail a failure prints.  Asking the server is `lsp/run/`'s.
+///!
+///! The kinds: `definition`, `hover` and `expandHover`, `completion`,
+///! `references` and `documentHighlight` (a set of location starts),
+///! `diagnostics` (the published set, by code and start, with optional
+///! message text), `documentSymbol` and `workspaceSymbol` (names, nested
+///! ones as `Parent/child`; a document symbol must also select inside its
+///! own range), `semanticTokens` (the token starting at each marker, with
+///! the modifiers it must carry), `inlayHints` (the label at each marker),
+///! `signatureHelp`, `prepareRename` and `rename` (edit starts, each
+///! replacing exactly the old name), and `codeAction` (a quickfix making
+///! one exact replacement).
+
+namespace cryogate::lsp::judges;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::slice::{ Slice };
+import std::json::value::{ JsonExtract, JsonValue };
+
+import cryogate::core::text::{ Text };
+import cryogate::lsp::fixture::{ Fixture };
+import cryogate::lsp::reading::{ Reading };
+import cryogate::lsp::wire::{ Locations, Position };
+
+/// A check's outcome: whether it passed, and what a failure prints after
+/// its name.
+public type struct Judgement {
+    public passed: boolean;
+    public detail: String;
+
+    /// A pass.
+    public static pass() -> Judgement { return Judgement { passed: true, detail: String::new() }; }
+
+    /// A failure saying `detail`.
+    public static fail(detail: String) -> Judgement { return Judgement { passed: false, detail: detail }; }
+
+    /// A pass when `passed`, otherwise a failure saying `detail`.
+    public static when(passed: boolean, detail: String) -> Judgement { return Judgement { passed: passed, detail: detail }; }
+}
+
+/// The judgements.
+public type struct Judges {
+    /// A `definition` check: `expect` null wants no location; a marker
+    /// wants the single location starting there.
+    public static definition(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*) -> Result<Judgement, String> {
+        if (!Reading::present(check, Str::new("expect"))) {
+            const empty: boolean = result.is_null() || (result.is_array() && result.length() == 0);
+            return Result::Ok(Judgement::when(empty, f"got {Judges::describe_location(result).as_str()}"));
+        }
+        const expected: Str = Reading::text(check, Str::new("expect"));
+        const matches: boolean = Judges::location_matches(fixture, result, expected)?;
+        return Result::Ok(Judgement::when(matches, f"want {expected}, got {Judges::describe_location(result).as_str()}"));
+    }
+
+    /// Whether `result` is one location starting at the marker `expected`.
+    public static location_matches(fixture: mut &Fixture, result: JsonValue*, expected: Str) -> Result<boolean, String> {
+        mut location: JsonValue* = result;
+        if (result.is_array()) {
+            if (result.length() != 1) { return Result::Ok(false); }
+            location = result.at(0).unwrap();
+        }
+        if (!Reading::has_text(location, Str::new("uri"))) { return Result::Ok(false); }
+        const place: Pair<String, Position> = fixture.at(expected)?;
+        const uri: String = fixture.uri(place.first.as_str());
+        return Result::Ok(Locations::same_uri(Reading::text(location, Str::new("uri")), uri.as_str())
+                          && place.second.matches(Reading::at(location, Str::new("range.start"))));
+    }
+
+    /// A location (or the first of a list) as `file:line:column`.
+    public static describe_location(result: JsonValue*) -> String {
+        if (result.is_null()) { return String::from_str(Str::new("null")); }
+        mut location: JsonValue* = result;
+        if (result.is_array() && result.length() > 0) { location = result.at(0).unwrap(); }
+        if (!Reading::has_text(location, Str::new("uri"))) { return Reading::shown(Option::Some(result)); }
+        const uri: Str = Reading::text(location, Str::new("uri"));
+        const name: Str = match (uri.split_once_from_end(&Str::new("/"))) {
+            Option::Some(parts) => { parts.second }
+            Option::None        => { uri }
+        };
+        const start: Position = Position::read(Reading::at(location, Str::new("range.start"))).unwrap_or(Position { line: -1, character: -1 });
+        return f"{name}:{start.shown().as_str()}";
+    }
+
+    /// A hover's text: the contents' value, a list's values on their own
+    /// lines, or `None` for no hover.
+    public static hover_text(result: JsonValue*) -> Option<String> {
+        if (result.is_null()) { return Option::None; }
+        const contents: JsonValue* = match (Reading::at(result, Str::new("contents"))) {
+            Option::Some(found) => { found }
+            Option::None        => { return Option::Some(String::new()); }
+        };
+        if (contents.is_object()) { return Option::Some(String::from_str(Reading::text(contents, Str::new("value")))); }
+        if (contents.is_array()) {
+            mut parts: Array<String> = Array::<String>::new();
+            for (mut index: i64 = 0; index < contents.length(); index++) {
+                const part: JsonValue* = contents.at(index).unwrap();
+                parts.push(if (part.is_object()) { String::from_str(Reading::text(part, Str::new("value"))) } else { String::from_str(part.as::<Str>().unwrap_or(Str::new(""))) });
+            }
+            return Option::Some(Text::joined(&parts, Str::new("\n")));
+        }
+        return Option::Some(String::from_str(contents.as::<Str>().unwrap_or(Str::new(""))));
+    }
+
+    /// A `hover` or `expandHover` check: `expect` null wants no hover;
+    /// otherwise every `contains` text is in it and no `excludes` text is.
+    public static hover(check: JsonValue*, result: JsonValue*) -> Judgement {
+        const text: Option<String> = Judges::hover_text(result);
+        const shown: String = match (&text) {
+            Option::Some(found) => { f"'{found.as_str()}'" }
+            Option::None        => { String::from_str(Str::new("None")) }
+        };
+        if (Reading::at(check, Str::new("expect")).is_some() && !Reading::present(check, Str::new("expect"))) {
+            return Judgement::when(text.is_none(), f"got {shown.as_str()}");
+        }
+        const body: Str = match (&text) {
+            Option::Some(found) => { found.as_str() }
+            Option::None        => { Str::new("") }
+        };
+        mut missing: Array<String> = Array::<String>::new();
+        for (wanted in Reading::texts(check, Str::new("contains")).iterate_references()) {
+            if (text.is_none() || !body.contains(&wanted.as_str())) { missing.push(wanted.clone()); }
+        }
+        mut unwanted: Array<String> = Array::<String>::new();
+        for (refused in Reading::texts(check, Str::new("excludes")).iterate_references()) {
+            if (text.is_some() && body.contains(&refused.as_str())) { unwanted.push(refused.clone()); }
+        }
+        return Judgement::when(missing.is_empty() && unwanted.is_empty(),
+                               f"hover {shown.as_str()}; missing {Judges::listed(&missing).as_str()}, unwanted {Judges::listed(&unwanted).as_str()}");
+    }
+
+    /// The labels of a completion answer, a list or a `{items}` object.
+    public static completion_labels(result: JsonValue*) -> Array<String> {
+        mut labels: Array<String> = Array::<String>::new();
+        for (item in Judges::completion_items(result).iterate_references()) {
+            labels.push(String::from_str(Reading::text(*item, Str::new("label"))));
+        }
+        return labels;
+    }
+
+    private static completion_items(result: JsonValue*) -> Array<JsonValue*> {
+        if (result.is_object()) { return Reading::elements(result, Str::new("items")); }
+        return Reading::elements(result, Str::new(""));
+    }
+
+    /// A `completion` check: every `includes` label offered, no `excludes`
+    /// label, and each `details` label's detail holding its text.
+    public static completion(check: JsonValue*, result: JsonValue*) -> Judgement {
+        const labels: Array<String> = Judges::completion_labels(result);
+        mut missing: Array<String> = Array::<String>::new();
+        for (wanted in Reading::texts(check, Str::new("includes")).iterate_references()) {
+            if (!Judges::holds(&labels, wanted.as_str())) { missing.push(wanted.clone()); }
+        }
+        mut unwanted: Array<String> = Array::<String>::new();
+        for (refused in Reading::texts(check, Str::new("excludes")).iterate_references()) {
+            if (Judges::holds(&labels, refused.as_str())) { unwanted.push(refused.clone()); }
+        }
+        mut wrong: Array<String> = Array::<String>::new();
+        const items: Array<JsonValue*> = Judges::completion_items(result);
+        for (label in Reading::keys(check, Str::new("details")).iterate_references()) {
+            const wanted: Str = Reading::text(Reading::at(check, Str::new("details")).unwrap(), label.as_str());
+            mut detail: Str = Str::new("");
+            for (item in items.iterate_references()) {
+                if (Reading::text(*item, Str::new("label")) == label.as_str()) { detail = Reading::text(*item, Str::new("detail")); }
+            }
+            if (!detail.contains(&wanted)) { wrong.push(f"{label.as_str()}: detail '{detail}', want it to hold '{wanted}'"); }
+        }
+        return Judgement::when(missing.is_empty() && unwanted.is_empty() && wrong.is_empty(),
+                               f"items {Judges::listed_first(&labels, 30).as_str()}; missing {Judges::listed(&missing).as_str()}, unwanted {Judges::listed(&unwanted).as_str()}; {Text::joined(&wrong, Str::new("; ")).as_str()}");
+    }
+
+    /// A `references` or `documentHighlight` check: the set of location
+    /// starts equals the markers'.  A location with no URI is in `relative`.
+    public static locations(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*, relative: Str) -> Result<Judgement, String> {
+        const fallback: String = fixture.uri(relative);
+        mut got: Array<String> = Array::<String>::new();
+        for (location in Reading::elements(result, Str::new("")).iterate_references()) {
+            const uri: Str = if (Reading::has_text(*location, Str::new("uri"))) { Reading::text(*location, Str::new("uri")) } else { fallback.as_str() };
+            const start: Position = Position::read(Reading::at(*location, Str::new("range.start"))).unwrap_or(Position { line: -1, character: -1 });
+            got.push(Locations::position_key(uri, start.line, start.character));
+        }
+        const want: Array<String> = Judges::marker_keys(fixture, check, Str::new("expect"))?;
+        const sorted_got: Array<String> = Judges::sorted(got);
+        return Result::Ok(Judgement::when(sorted_got == want, f"want {Judges::listed(&want).as_str()}, got {Judges::listed(&sorted_got).as_str()}"));
+    }
+
+    /// The position keys of the markers listed under `key`, sorted.
+    public static marker_keys(fixture: mut &Fixture, check: JsonValue*, key: Str) -> Result<Array<String>, String> {
+        mut keys: Array<String> = Array::<String>::new();
+        for (reference in Reading::texts(check, key).iterate_references()) {
+            const place: Pair<String, Position> = fixture.at(reference.as_str())?;
+            const uri: String = fixture.uri(place.first.as_str());
+            keys.push(Locations::position_key(uri.as_str(), place.second.line, place.second.character));
+        }
+        return Result::Ok(Judges::sorted(keys));
+    }
+
+    /// The published diagnostics' `code:line:character` keys, sorted; a
+    /// diagnostic with no code reads `null`.
+    public static diagnostic_keys(params: JsonValue*) -> Array<String> {
+        mut keys: Array<String> = Array::<String>::new();
+        for (diagnostic in Reading::elements(params, Str::new("diagnostics")).iterate_references()) {
+            keys.push(Judges::diagnostic_key(*diagnostic));
+        }
+        return Judges::sorted(keys);
+    }
+
+    private static diagnostic_key(diagnostic: JsonValue*) -> String {
+        const code: Str = if (Reading::has_text(diagnostic, Str::new("code"))) { Reading::text(diagnostic, Str::new("code")) } else { Str::new("null") };
+        const start: Position = Position::read(Reading::at(diagnostic, Str::new("range.start"))).unwrap_or(Position { line: -1, character: -1 });
+        return f"{code}:{start.line}:{start.character}";
+    }
+
+    /// The diagnostics a `diagnostics` check expects, as sorted keys, and
+    /// the message text each one with a `message` must hold.
+    public static expected_diagnostics(fixture: mut &Fixture, check: JsonValue*) -> Result<Pair<Array<String>, Array<Pair<String, String>>>, String> {
+        mut keys: Array<String> = Array::<String>::new();
+        mut texts: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        for (expected in Reading::elements(check, Str::new("expect")).iterate_references()) {
+            const place: Pair<String, Position> = fixture.at(Reading::text(*expected, Str::new("at")))?;
+            const code: Str = if (Reading::has_text(*expected, Str::new("code"))) { Reading::text(*expected, Str::new("code")) } else { Str::new("null") };
+            const key: String = f"{code}:{place.second.line}:{place.second.character}";
+            if (Reading::has_text(*expected, Str::new("message"))) {
+                texts.push(Pair::new(key.clone(), String::from_str(Reading::text(*expected, Str::new("message")))));
+            }
+            keys.push(key);
+        }
+        return Result::Ok(Pair::new(Judges::sorted(keys), texts));
+    }
+
+    /// Whether a published set is exactly the expected one, each message
+    /// holding its text.
+    public static diagnostics_hold(params: JsonValue*, keys: &Array<String>, texts: &Array<Pair<String, String>>) -> boolean {
+        if (Judges::diagnostic_keys(params) != *keys) { return false; }
+        for (wanted in texts.iterate_references()) {
+            mut said: boolean = false;
+            for (diagnostic in Reading::elements(params, Str::new("diagnostics")).iterate_references()) {
+                if (Judges::diagnostic_key(*diagnostic) == wanted.first
+                        && Reading::text(*diagnostic, Str::new("message")).contains(&wanted.second.as_str())) { said = true; }
+            }
+            if (!said) { return false; }
+        }
+        return true;
+    }
+
+    /// A published set as a failure prints it: each diagnostic's key and
+    /// message.
+    public static described_diagnostics(params: Option<JsonValue*>) -> String {
+        const published: JsonValue* = match (params) {
+            Option::Some(found) => { found }
+            Option::None        => { return String::from_str(Str::new("None")); }
+        };
+        mut shown: Array<String> = Array::<String>::new();
+        for (diagnostic in Reading::elements(published, Str::new("diagnostics")).iterate_references()) {
+            shown.push(f"{Judges::diagnostic_key(*diagnostic).as_str()} '{Reading::text(*diagnostic, Str::new("message"))}'");
+        }
+        return Judges::listed(&shown);
+    }
+
+    /// Every symbol's name, a nested one as `Parent/child`.
+    public static symbol_names(symbols: &Array<JsonValue*>, prefix: Str) -> Array<String> {
+        mut names: Array<String> = Array::<String>::new();
+        for (symbol in symbols.iterate_references()) {
+            const full: String = f"{prefix}{Reading::text(*symbol, Str::new("name"))}";
+            names.push(full.clone());
+            const below: Array<String> = Judges::symbol_names(&Reading::elements(*symbol, Str::new("children")), f"{full.as_str()}/".as_str());
+            for (name in below.iterate_references()) { names.push(name.clone()); }
+        }
+        return names;
+    }
+
+    /// Every document symbol whose selection is not inside its range, as
+    /// `Parent/child`: the protocol requires it, and an editor refuses the
+    /// whole answer otherwise.
+    public static selection_outside(symbols: &Array<JsonValue*>, prefix: Str) -> Array<String> {
+        mut outside: Array<String> = Array::<String>::new();
+        for (symbol in symbols.iterate_references()) {
+            const full: String = f"{prefix}{Reading::text(*symbol, Str::new("name"))}";
+            const range_start: Option<Position> = Position::read(Reading::at(*symbol, Str::new("range.start")));
+            const range_end: Option<Position> = Position::read(Reading::at(*symbol, Str::new("range.end")));
+            const selection_start: Option<Position> = Position::read(Reading::at(*symbol, Str::new("selectionRange.start")));
+            const selection_end: Option<Position> = Position::read(Reading::at(*symbol, Str::new("selectionRange.end")));
+            if (range_start.is_some() && range_end.is_some() && selection_start.is_some() && selection_end.is_some()) {
+                if (Judges::before(&selection_start.unwrap(), &range_start.unwrap()) || Judges::before(&range_end.unwrap(), &selection_end.unwrap())) {
+                    outside.push(full.clone());
+                }
+            }
+            const below: Array<String> = Judges::selection_outside(&Reading::elements(*symbol, Str::new("children")), f"{full.as_str()}/".as_str());
+            for (name in below.iterate_references()) { outside.push(name.clone()); }
+        }
+        return outside;
+    }
+
+    /// A `documentSymbol` or `workspaceSymbol` check.
+    public static symbols(check: JsonValue*, result: JsonValue*, document: boolean) -> Judgement {
+        const listed: Array<JsonValue*> = Reading::elements(result, Str::new(""));
+        const names: Array<String> = Judges::symbol_names(&listed, Str::new(""));
+        mut missing: Array<String> = Array::<String>::new();
+        for (wanted in Reading::texts(check, Str::new("includes")).iterate_references()) {
+            if (!Judges::holds(&names, wanted.as_str())) { missing.push(wanted.clone()); }
+        }
+        mut unwanted: Array<String> = Array::<String>::new();
+        for (refused in Reading::texts(check, Str::new("excludes")).iterate_references()) {
+            if (Judges::holds(&names, refused.as_str())) { unwanted.push(refused.clone()); }
+        }
+        const outside: Array<String> = if (document) { Judges::selection_outside(&listed, Str::new("")) } else { Array::<String>::new() };
+        return Judgement::when(missing.is_empty() && unwanted.is_empty() && outside.is_empty(),
+                               f"symbols {Judges::listed_first(&names, 40).as_str()}; missing {Judges::listed(&missing).as_str()}, unwanted {Judges::listed(&unwanted).as_str()}, selection outside its range {Judges::listed(&outside).as_str()}");
+    }
+
+    /// A `semanticTokens` check: at each marker the token starting there,
+    /// as `type.modifier...` (it may carry more modifiers), or none.
+    public static semantic_tokens(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*) -> Result<Judgement, String> {
+        const data: Array<JsonValue*> = Reading::elements(result, Str::new("data"));
+        mut starts: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        mut line: i64 = 0;
+        mut start: i64 = 0;
+        mut index: i64 = 0;
+        while (index + 4 < data.length()) {
+            const delta_line: i64 = Reading::integer(*data.get_reference(index).unwrap(), Str::new("")).unwrap_or(0);
+            const delta_start: i64 = Reading::integer(*data.get_reference(index + 1).unwrap(), Str::new("")).unwrap_or(0);
+            const kind: i64 = Reading::integer(*data.get_reference(index + 3).unwrap(), Str::new("")).unwrap_or(0);
+            const bits: i64 = Reading::integer(*data.get_reference(index + 4).unwrap(), Str::new("")).unwrap_or(0);
+            line = line + delta_line;
+            start = if (delta_line == 0) { start + delta_start } else { delta_start };
+            const type_name: String = if (kind < fixture.token_types.length()) { fixture.token_types.get_reference(kind).unwrap().clone() } else { f"{kind}" };
+            mut modifiers: Array<String> = Array::<String>::new();
+            for (mut bit: i64 = 0; bit < fixture.token_modifiers.length(); bit++) {
+                if ((bits & (1 << bit)) != 0) { modifiers.push(fixture.token_modifiers.get_reference(bit).unwrap().clone()); }
+            }
+            mut spelled: Array<String> = Array::<String>::new();
+            spelled.push(type_name);
+            for (modifier in Judges::sorted(modifiers).iterate_references()) { spelled.push(modifier.clone()); }
+            starts.push(Pair::new(f"{line}:{start}", Text::joined(&spelled, Str::new("."))));
+            index = index + 5;
+        }
+        mut bad: Array<String> = Array::<String>::new();
+        for (reference in Reading::keys(check, Str::new("expect")).iterate_references()) {
+            const place: Pair<String, Position> = fixture.at(reference.as_str())?;
+            const key: String = f"{place.second.line}:{place.second.character}";
+            mut got: Option<String> = Option::None;
+            for (token in starts.iterate_references()) {
+                if (token.first == key) { got = Option::Some(token.second.clone()); }
+            }
+            const expectation: JsonValue* = Reading::at(check, Str::new("expect")).unwrap().get(reference.as_str()).unwrap();
+            const shown: String = match (&got) {
+                Option::Some(token) => { token.clone() }
+                Option::None        => { String::from_str(Str::new("None")) }
+            };
+            if (expectation.is_null()) {
+                if (got.is_some()) { bad.push(f"{reference.as_str()}: want no token, got {shown.as_str()}"); }
+                continue;
+            }
+            const want: Str = expectation.as::<Str>().unwrap_or(Str::new(""));
+            if (!Judges::token_carries(&got, want)) { bad.push(f"{reference.as_str()}: want {want}, got {shown.as_str()}"); }
+        }
+        return Result::Ok(Judgement::when(bad.is_empty(), Text::joined(&bad, Str::new("; "))));
+    }
+
+    /// Whether the token `got` (`type.modifier...`) is of `want`'s type and
+    /// carries each of `want`'s modifiers.
+    private static token_carries(got: &Option<String>, want: Str) -> boolean {
+        const token: Str = match (got) {
+            Option::Some(spelled) => { spelled.as_str() }
+            Option::None          => { return false; }
+        };
+        mut got_parts: Array<String> = Array::<String>::new();
+        for (part in token.split(&Str::new("."))) { got_parts.push(String::from_str(part)); }
+        mut first: boolean = true;
+        for (part in want.split(&Str::new("."))) {
+            if (first) {
+                if (got_parts.get_reference(0).unwrap().as_str() != part) { return false; }
+                first = false;
+                continue;
+            }
+            mut carried: boolean = false;
+            for (mut index: i64 = 1; index < got_parts.length(); index++) {
+                if (got_parts.get_reference(index).unwrap().as_str() == part) { carried = true; }
+            }
+            if (!carried) { return false; }
+        }
+        return true;
+    }
+
+    /// An `inlayHints` check: at each marker the label of the hint there,
+    /// or none.
+    public static inlay_hints(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*) -> Result<Judgement, String> {
+        mut bad: Array<String> = Array::<String>::new();
+        for (reference in Reading::keys(check, Str::new("expect")).iterate_references()) {
+            const place: Pair<String, Position> = fixture.at(reference.as_str())?;
+            mut got: Option<String> = Option::None;
+            for (hint in Reading::elements(result, Str::new("")).iterate_references()) {
+                if (place.second.matches(Reading::at(*hint, Str::new("position")))) {
+                    got = Option::Some(String::from_str(Reading::text(*hint, Str::new("label"))));
+                }
+            }
+            const expectation: JsonValue* = Reading::at(check, Str::new("expect")).unwrap().get(reference.as_str()).unwrap();
+            const want: Option<String> = if (expectation.is_null()) { Option::None } else { Option::Some(String::from_str(expectation.as::<Str>().unwrap_or(Str::new("")))) };
+            if (got != want) {
+                bad.push(f"{reference.as_str()}: want {Judges::maybe(&want).as_str()}, got {Judges::maybe(&got).as_str()}");
+            }
+        }
+        return Result::Ok(Judgement::when(bad.is_empty(), Text::joined(&bad, Str::new("; "))));
+    }
+
+    /// A `signatureHelp` check: the active signature's label holds every
+    /// `contains` text and no `excludes` one, the active parameter is
+    /// `active`, its label (as its offsets cut it) is `param`, and `count`
+    /// signatures are offered; `expect` null wants no help.
+    public static signature_help(check: JsonValue*, result: JsonValue*) -> Judgement {
+        if (Reading::at(check, Str::new("expect")).is_some() && !Reading::present(check, Str::new("expect"))) {
+            return Judgement::when(result.is_null(), f"got {Reading::shown(Option::Some(result)).as_str()}");
+        }
+        const signatures: Array<JsonValue*> = Reading::elements(result, Str::new("signatures"));
+        if (signatures.is_empty()) { return Judgement::fail(f"no signature: {Reading::shown(Option::Some(result)).as_str()}"); }
+        const chosen: i64 = Reading::integer(result, Str::new("activeSignature")).unwrap_or(0);
+        if (chosen < 0 || chosen >= signatures.length()) { return Judgement::fail(f"no signature {chosen}: {Reading::shown(Option::Some(result)).as_str()}"); }
+        const signature: JsonValue* = *signatures.get_reference(chosen).unwrap();
+        const label: Str = Reading::text(signature, Str::new("label"));
+        const active: i64 = Reading::integer(result, Str::new("activeParameter")).unwrap_or(0);
+        mut bad: Array<String> = Array::<String>::new();
+        for (wanted in Reading::texts(check, Str::new("contains")).iterate_references()) {
+            if (!label.contains(&wanted.as_str())) { bad.push(wanted.clone()); }
+        }
+        for (refused in Reading::texts(check, Str::new("excludes")).iterate_references()) {
+            if (label.contains(&refused.as_str())) { bad.push(f"has '{refused.as_str()}'"); }
+        }
+        match (Reading::integer(check, Str::new("count"))) {
+            Option::Some(count) => {
+                if (signatures.length() != count) {
+                    mut labels: Array<String> = Array::<String>::new();
+                    for (each in signatures.iterate_references()) { labels.push(String::from_str(Reading::text(*each, Str::new("label")))); }
+                    bad.push(f"{signatures.length()} signature(s), want {count}: {Judges::listed(&labels).as_str()}");
+                }
+            }
+            Option::None => { }
+        }
+        const wanted_active: i64 = Reading::integer(check, Str::new("active")).unwrap_or(-1);
+        if (active != wanted_active) { bad.push(f"active parameter {active}, want {wanted_active}"); }
+        if (Reading::has_text(check, Str::new("param"))) {
+            const parameters: Array<JsonValue*> = Reading::elements(signature, Str::new("parameters"));
+            mut got: Option<String> = Option::None;
+            if (active >= 0 && active < parameters.length()) {
+                const offsets: Array<JsonValue*> = Reading::elements(*parameters.get_reference(active).unwrap(), Str::new("label"));
+                if (offsets.length() == 2) {
+                    const low: i64 = Reading::integer(*offsets.get_reference(0).unwrap(), Str::new("")).unwrap_or(0);
+                    const high: i64 = Reading::integer(*offsets.get_reference(1).unwrap(), Str::new("")).unwrap_or(0);
+                    got = Option::Some(Judges::code_point_slice(label, low, high));
+                }
+            }
+            const want: String = String::from_str(Reading::text(check, Str::new("param")));
+            if (got != Option::Some(want.clone())) { bad.push(f"active parameter's label {Judges::maybe(&got).as_str()}, want '{want.as_str()}'"); }
+        }
+        return Judgement::when(bad.is_empty(), f"label '{label}': {Text::joined(&bad, Str::new("; ")).as_str()}");
+    }
+
+    /// The characters `low` to `high` of `text`, counted in code points.
+    private static code_point_slice(text: Str, low: i64, high: i64) -> String {
+        const bytes: &Slice<u8> = text.as_bytes();
+        mut start: i64 = text.length();
+        mut end: i64 = text.length();
+        mut counted: i64 = 0;
+        for (mut index: i64 = 0; index < bytes.length(); index++) {
+            // A byte of the form 10xxxxxx continues a code point.
+            if ((bytes.get(index).unwrap() & 0xC0) == 0x80) { continue; }
+            if (counted == low) { start = index; }
+            if (counted == high) { end = index; }
+            counted++;
+        }
+        if (start > end) { return String::new(); }
+        return String::from_str(text.byte_substring(start, end));
+    }
+
+    /// A `prepareRename` check: the range starts at `expect` and the
+    /// placeholder is `placeholder`.
+    public static prepare_rename(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*) -> Result<Judgement, String> {
+        const place: Pair<String, Position> = fixture.at(Reading::text(check, Str::new("expect")))?;
+        const placeholder: Str = Reading::text(check, Str::new("placeholder"));
+        const passed: boolean = place.second.matches(Reading::at(result, Str::new("range.start")))
+            && Reading::text(result, Str::new("placeholder")) == placeholder;
+        return Result::Ok(Judgement::when(passed, f"want {Reading::text(check, Str::new("expect"))} '{placeholder}', got {Reading::shown(Option::Some(result)).as_str()}"));
+    }
+
+    /// A `rename` check: the edits start exactly at the markers, and each
+    /// replaces `old`'s width on one line with `new_name`.
+    public static rename(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*) -> Result<Judgement, String> {
+        const old: Str = Reading::text(check, Str::new("old"));
+        const new_name: Str = Reading::text(check, Str::new("new_name"));
+        mut got: Array<String> = Array::<String>::new();
+        mut bad: Array<String> = Array::<String>::new();
+        for (uri in Reading::keys(result, Str::new("changes")).iterate_references()) {
+            const edits: Array<JsonValue*> = Reading::elements(Reading::at(result, Str::new("changes")).unwrap().get(uri.as_str()).unwrap(), Str::new(""));
+            for (edit in edits.iterate_references()) {
+                const start: Position = Position::read(Reading::at(*edit, Str::new("range.start"))).unwrap_or(Position { line: -1, character: -1 });
+                const end: Position = Position::read(Reading::at(*edit, Str::new("range.end"))).unwrap_or(Position { line: -2, character: -1 });
+                got.push(Locations::position_key(uri.as_str(), start.line, start.character));
+                if (end.line != start.line || end.character - start.character != old.char_count() || Reading::text(*edit, Str::new("newText")) != new_name) {
+                    bad.push(Reading::shown(Option::Some(*edit)));
+                }
+            }
+        }
+        const want: Array<String> = Judges::marker_keys(fixture, check, Str::new("expect"))?;
+        const sorted_got: Array<String> = Judges::sorted(got);
+        return Result::Ok(Judgement::when(sorted_got == want && bad.is_empty(),
+                                          f"want {Judges::listed(&want).as_str()}, got {Judges::listed(&sorted_got).as_str()}; edits not replacing '{old}': {Judges::listed(&bad).as_str()}"));
+    }
+
+    /// Whether `diagnostic` is of `code` and underlines exactly `width`
+    /// characters from `start`.
+    public static underlines(diagnostic: JsonValue*, code: Str, start: &Position, width: i64) -> boolean {
+        const end: Position = Position { line: start.line, character: start.character + width };
+        return Reading::text(diagnostic, Str::new("code")) == code
+            && start.matches(Reading::at(diagnostic, Str::new("range.start")))
+            && end.matches(Reading::at(diagnostic, Str::new("range.end")));
+    }
+
+    /// A `codeAction` check's answer: one quickfix edit in `uri` starting at
+    /// `fix_at`, on that line, replacing `replaced`'s width with `new_text`.
+    public static code_action(result: JsonValue*, uri: Str, fix_at: &Position, replaced: Str, new_text: Str) -> Judgement {
+        mut found: boolean = false;
+        mut fixes: Array<String> = Array::<String>::new();
+        for (action in Reading::elements(result, Str::new("")).iterate_references()) {
+            if (Reading::text(*action, Str::new("kind")) != Str::new("quickfix")) { continue; }
+            for (edit_uri in Reading::keys(*action, Str::new("edit.changes")).iterate_references()) {
+                const edits: Array<JsonValue*> = Reading::elements(Reading::at(*action, Str::new("edit.changes")).unwrap().get(edit_uri.as_str()).unwrap(), Str::new(""));
+                for (edit in edits.iterate_references()) {
+                    const end: Position = Position::read(Reading::at(*edit, Str::new("range.end"))).unwrap_or(Position { line: -1, character: -1 });
+                    const same_file: boolean = Locations::same_uri(edit_uri.as_str(), uri);
+                    const at_start: boolean = fix_at.matches(Reading::at(*edit, Str::new("range.start")));
+                    const width: i64 = end.character - fix_at.character;
+                    const text: Str = Reading::text(*edit, Str::new("newText"));
+                    fixes.push(f"({same_file}, {at_start}, {end.line == fix_at.line}, {width}, '{text}')");
+                    if (same_file && at_start && end.line == fix_at.line && width == replaced.char_count() && text == new_text) { found = true; }
+                }
+            }
+        }
+        return Judgement::when(found, f"want a quickfix replacing '{replaced}' with '{new_text}', got {Judges::listed(&fixes).as_str()}");
+    }
+
+    /// Whether `names` holds `name`.
+    public static holds(names: &Array<String>, name: Str) -> boolean {
+        for (each in names.iterate_references()) {
+            if (each.as_str() == name) { return true; }
+        }
+        return false;
+    }
+
+    /// `items` sorted.
+    public static sorted(items: Array<String>) -> Array<String> {
+        mut ordered: Array<String> = items;
+        ordered.sort();
+        return ordered;
+    }
+
+    /// `items` as a failure prints a list: `['a', 'b']`.
+    public static listed(items: &Array<String>) -> String {
+        return Judges::listed_first(items, items.length());
+    }
+
+    /// The first `count` of `items` as a list.
+    public static listed_first(items: &Array<String>, count: i64) -> String {
+        mut quoted: Array<String> = Array::<String>::new();
+        for (mut index: i64 = 0; index < items.length() && index < count; index++) {
+            quoted.push(f"'{items.get_reference(index).unwrap().as_str()}'");
+        }
+        return f"[{Text::joined(&quoted, Str::new(", ")).as_str()}]";
+    }
+
+    private static maybe(value: &Option<String>) -> String {
+        return match (value) {
+            Option::Some(text) => { f"'{text.as_str()}'" }
+            Option::None       => { String::from_str(Str::new("None")) }
+        };
+    }
+
+    private static before(a: &Position, b: &Position) -> boolean {
+        return a.line < b.line || (a.line == b.line && a.character < b.character);
+    }
+}

@@ -495,7 +495,14 @@ type struct CallResolver {
             return this.binding.param_types_through_param_bounds(
                 base_t.as_generic_param(), member.member, arg_count);
         } else {
-            return [];
+            // A primitive's methods are its `implement` blocks', not a
+            // method list.  Left without them, an argument of
+            // `x.wrapping_subtract(-(19371 & 32767))` with `x: i16` is
+            // typed at its default width before its parameter is seen.
+            mut cands: ArgCandidates = ArgCandidates::new(arg_count);
+            this.collect_on_primitive(visitor, call, member, base_ref, &cands);
+            if (cands.count == 1) { *chosen = cands.declarations[0]; }
+            return this.agreed_candidate_params(&cands);
         }
 
         if (found.length() == 0) { return []; }
@@ -639,8 +646,13 @@ type struct CallResolver {
     /// argument's move/borrow classification from them, so substituting in place
     /// would flip classifications for every call on a generic owner in the
     /// program.  Only a substitution the propagation consumes is recorded - an
-    /// adoptable numeric type, or an array type an array-literal argument lands
-    /// on - so no other consumer of the call's typing can observe this.
+    /// adoptable numeric type, an array type an array-literal argument lands
+    /// on, or the type a struct-literal argument lands on - so no other
+    /// consumer of the call's typing can observe this.  A generic struct's
+    /// literal written without type arguments is the instance its slot names,
+    /// and only the owner's arguments name it: inside the owner's own body the
+    /// parameter spelled alone is the body's own, so `Box::<Box<u8>>::make(
+    /// Box { f0: x })` there would build a `Box<T>`.
     ///
     /// Owner parameters are matched by NAME against the template's declared
     /// list, never by `param_index`: a METHOD-level parameter carries an index
@@ -716,7 +728,8 @@ type struct CallResolver {
                 // symbolic parameter, which is not numeric - so the body's own
                 // literals keep defaulting, exactly as before.
                 if (is_adoptable_numeric_type(this.arena, owner_args[p])
-                        || this.array_literal_into_array(call, i, owner_args[p])) {
+                        || this.array_literal_into_array(call, i, owner_args[p])
+                        || (i < call.arguments.length() && ExpressionNode::struct_of(call.arguments[i]) != null)) {
                     out[i] = owner_args[p];
                 }
                 break;
@@ -1218,20 +1231,22 @@ type struct CallResolver {
                 // literals - is width-polymorphic exactly like the bare literal
                 // handled below, so a concrete slot has to reach the whole
                 // expression before its operands settle on a default width.
-                // The int side is deliberately narrow: SIGNED for a negation, so
-                // `-1` cannot adopt an unsigned slot and turn huge; for the rest,
-                // a WIDE slot, or one that holds every value the expression
-                // computes on the way (`take_u32(8 * 10000 + 64 * 100)`), as a
-                // single literal adopts a slot it fits - one that does not
-                // keeps its default width and meets the narrowing check, so a
-                // genuine narrowing is still flagged.  Neither hazard
+                // The int side is deliberately narrow: a SIGNED slot holding the
+                // negation, so `-1` cannot adopt an unsigned slot and turn huge
+                // and `-129` cannot adopt an `i8` and pass 127; for the rest,
+                // a WIDE slot.  An expression made only of integer literals
+                // that folds reaches here as the literal of its value
+                // (`SemaVisitor::resolve_written_call`), so what is left is one
+                // holding a float or one no integer type holds, and a narrow
+                // integer slot keeps it at its default width, where it meets
+                // the narrowing check.  Neither hazard
                 // exists for a float slot, and a float that misses its slot is
                 // not merely imprecise: there is no float width coercion at the
                 // call boundary, so an f64-defaulted value reaches an `f32`
                 // parameter as a `double` against a `float` signature and the
                 // module fails verification with no source location.
                 } else if (is_negative_numeric_literal_expr(arg)
-                        && (this.literals.is_signed_int_type(slot)
+                        && (this.literals.holds_negated_literal(arg, slot)
                             || is_narrow_float_type(this.arena, slot))) {
                     push_expected = true;
                 } else if ((ExpressionNode::binary_of(arg_node) != null
@@ -1239,8 +1254,7 @@ type struct CallResolver {
                         && is_constant_numeric_expr(arg)
                         && !is_negative_numeric_literal_expr(arg)
                         && (is_wide_int_type(this.arena, slot)
-                            || is_narrow_float_type(this.arena, slot)
-                            || this.literals.const_expr_fits_target(arg, slot))) {
+                            || is_narrow_float_type(this.arena, slot))) {
                     push_expected = true;
                 } else if (is_shift_of_constant_numeric_expr(arg_node)
                         && !is_constant_numeric_expr(arg)
@@ -1266,13 +1280,15 @@ type struct CallResolver {
                     // type kind, so the argument's own type still selects the
                     // specialization.
                     push_expected = true;
-                } else if ((ExpressionNode::if_of(arg_node) != null
-                            || ExpressionNode::ternary_of(arg_node) != null)
-                        && is_adoptable_numeric_type(this.arena, slot)) {
-                    // A two-branch expression's value is one of its arms', so
-                    // the parameter's type reaches each arm as it reaches a
-                    // literal argument: `take_u64(if (c) { 1 } else { 0 })`
-                    // computes a `u64`.
+                } else if (ExpressionNode::if_of(arg_node) != null
+                        || ExpressionNode::ternary_of(arg_node) != null
+                        || ExpressionNode::match_of(arg_node) != null) {
+                    // A branching expression's value is one of its arms', so
+                    // the parameter's type reaches each arm as an annotation's
+                    // reaches an initializer's arms: `take_u64(if (c) { 1 }
+                    // else { 0 })` computes a `u64`, and in
+                    // `take(if (c) { Option::None } else { other })` the
+                    // `None` is the instance the parameter names.
                     push_expected = true;
                 } else if (this.sema_arg_is_null_literal(arg)
                         && this.types.is_function_type(slot)) {
@@ -1350,7 +1366,25 @@ type struct CallResolver {
 
         const ident: IdentifierExpr* = ExpressionNode::identifier_of(callee_node);
         if (ident != null) {
+            const pinned_before: boolean = call.resolved_callee.is_some();
             this.lambda.try_specialize_for_closure_args(call, ident, this.closure_call_entry(call, ident));
+            // A call the closure specialization pins here has had its
+            // arguments resolved and nothing more, and the pinned call's
+            // return below converts none of them: they are checked against
+            // the copy's parameters now, as an unpinned call's are against
+            // its callee's, so an argument for a trait object becomes the
+            // object and one of another type is refused.
+            if (!pinned_before) {
+                match (&call.resolved_callee) {
+                    CalleePin::Decl(entry) => {
+                        const copy_signature: Type* = this.arena.lookup(this.ctx.decl_index.entry_signature(entry));
+                        if (copy_signature != null && copy_signature.kind == TypeKind::Function) {
+                            this.check_args_against_params(visitor, &call.arguments, copy_signature.as_function().param_types.as_slice());
+                        }
+                    }
+                    _ => { }
+                }
+            }
 
             mut type_arguments_refused: boolean = false;
             const inferred_generic_ret: TypeRef = this.check_generic_free_call(call_e, call, ident, &type_arguments_refused);
@@ -2215,7 +2249,7 @@ type struct CallResolver {
 
     /// The path naming a variant when `arg` is one - `E::V` or `E::V(..)` -
     /// and null for any other argument.
-    static variant_scope_of(arg: ExpressionNode*) -> mut ExpressionNode* {
+    static variant_scope_of(arg: ExpressionNode*) -> ExpressionNode* {
         mut path: ExpressionNode* = null;
         if (ExpressionNode::scope_resolution_of(arg) != null) {
             path = arg;
@@ -2311,13 +2345,15 @@ type struct CallResolver {
     /// that the position it stands in names, once that is known: a generic
     /// call's parameter after the call's bindings, a generic literal's field
     /// after its instance.  A `want` of another type, or still over
-    /// parameters, leaves it as it is.
+    /// parameters, leaves it as it is.  A variant written with a payload is a
+    /// call whose callee is the variant's path, which takes the type too.
     retype_generic_variant(mut &this, arg: mut ExpressionNode*, want: TypeRef) -> void {
         if (!want.is_valid() || this.types.contains_generic_param(want)) { return; }
         if (!this.ctx.decl_index.def_of(want, this.ctx.type_arena)
                 .equals(this.ctx.decl_index.def_of(arg.resolved_type, this.ctx.type_arena))) { return; }
         arg.set_resolved_type(want);
-        CallResolver::variant_scope_of(arg).set_resolved_type(want);
+        const call: mut CallExpr* = ExpressionNode::call_of(arg);
+        if (call != null) { call.callee.set_resolved_type(want); }
     }
 
     /// When `call` is an EXPLICIT generic free call (`f<i32>(...)` on a bare
@@ -3729,6 +3765,29 @@ type struct CallResolver {
             this.select_on_template(visitor, call, member, tmpl, &no_args, DefId::invalid(), true, true, &sel);
         }
         return true;
+    }
+
+    /// Record in `found` the candidates the selection tries for `call` on
+    /// the primitive `receiver`: the methods of its inherent `implement`
+    /// blocks, then, when none has the member's name, those of the trait
+    /// impls selected for it.
+    collect_on_primitive(mut &this, visitor: SemaVisitor*, call: CallExpr*,
+                         member: MemberAccessExpr*, receiver: TypeRef, found: mut ArgCandidates*) -> void {
+        mut sel: Selection = Selection::none();
+        sel.recv = receiver;
+        sel.collect = found;
+        const no_args: [TypeRef] = [];
+        const inherent: [DeclarationNode*] = this.ctx.generic_registry.inherent_impl_blocks(receiver);
+        for (mut bi: i64 = 0; bi < inherent.length(); bi++) {
+            this.bind_on_impl_block(visitor, call, member, DeclarationNode::impl_of(inherent[bi]), &no_args, false, &sel);
+            this.bind_on_impl_block(visitor, call, member, DeclarationNode::impl_of(inherent[bi]), &no_args, true, &sel);
+        }
+        if (found.name_seen > 0) { return; }
+        const blocks: [ImplBlock*] = this.trait_checker().impls_of(receiver);
+        for (mut ti: i64 = 0; ti < blocks.length(); ti++) {
+            this.bind_on_impl_block(visitor, call, member, blocks[ti], &no_args, false, &sel);
+            this.bind_on_impl_block(visitor, call, member, blocks[ti], &no_args, true, &sel);
+        }
     }
 
     /// Record in `found` a candidate method the selection tried, with its
@@ -6332,9 +6391,17 @@ type struct CallResolver {
             }
         }
         const owning_trait: DeclName = this.binding.lookup_trait_defining_method(member.member);
+        mut unmet_member: TypeRef = TypeRef::invalid();
+        mut unmet_associated: SymbolStr = SymbolStr::empty();
+        mut unmet_owner: DefId = DefId::invalid();
+        const unmet_bound: const TraitRef* = this.binding.projection_default_unmet(
+            obj_type, member.member, &unmet_member, &unmet_associated, &unmet_owner);
         if (instance_head != "") {
             diag = diag.with_note(fmt::format("the method `%s` is declared for `%s` only, and `%s` is not one of those instances",
                 method_name, instance_head, type_display));
+        } else if (unmet_bound != null) {
+            diag = this.explain_unmet_projection_bound(diag, method_name, type_display, unmet_bound,
+                unmet_member, unmet_associated, unmet_owner);
         } else if (owning_trait.is_valid()) {
             const trait_str: string = this.intern.shown(owning_trait);
             diag = diag.with_note(fmt::format("the method `%s` is defined on trait `%s`", method_name, trait_str));
@@ -6388,6 +6455,39 @@ type struct CallResolver {
             unwrap_depth += 1;
         }
         return lookup_ref;
+    }
+
+    /// `diag`, a call's E0358 for a trait default that a bound on one of the
+    /// trait's associated types keeps off the receiver, with the bound and
+    /// the binding that fails it.  Its help shows the fix where one is
+    /// certain: an item that is a reference to a built-in value type with
+    /// the trait is compared through `map`, which copies the values out; an
+    /// item of any other type that is no reference needs the trait.
+    explain_unmet_projection_bound(&this, diag: Diagnostic, method_name: string, type_display: string,
+                                   unmet: const TraitRef*, member: TypeRef, associated: SymbolStr,
+                                   owner: DefId) -> Diagnostic {
+        const owner_name: Str = QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(owner)));
+        const bound_name: Str = QualifiedName::leaf_of(this.intern.shown(this.ctx.defs.path_of(unmet.definition())));
+        const associated_name: string = this.intern.resolve(associated);
+        const member_t: Type* = this.arena.lookup(member);
+        const member_display: string = if (member_t != null) { this.arena.format_display(member_t) } else { "" };
+        mut explained: Diagnostic = diag.with_note(
+            f"`{method_name}` is a method of `{owner_name}` only where `This::{associated_name}: {bound_name}`, and `{type_display}` binds `{associated_name}` to `{member_display}`, which does not implement `{bound_name}`");
+        if (member_t == null || member_t.kind != TypeKind::Reference) {
+            return explained.help(f"implement `{bound_name}` for `{member_display}`");
+        }
+        const referent: TypeRef = member_t.as_reference().referent;
+        const referent_t: Type* = this.arena.lookup(referent);
+        const built_in: boolean = referent_t != null && (referent_t.kind == TypeKind::Int
+            || referent_t.kind == TypeKind::Float || referent_t.kind == TypeKind::Bool
+            || referent_t.kind == TypeKind::Char);
+        if (built_in && this.trait_checker().type_implements_trait(referent, unmet.definition(), 0)) {
+            const referent_display: string = this.arena.format_display(referent_t);
+            return explained.help(
+                f"a reference implements only what an implementation for references gives it, not what `{referent_display}` implements; call `{method_name}` on the values: `.map((value: {member_display}) -> {referent_display} {{ return *value; }}).{method_name}()`");
+        }
+        return explained.help(
+            f"a reference implements only what an implementation for references gives it, whatever it refers to");
     }
 
     /// What a call of the method `selected` chose returns on the receiver
@@ -8835,26 +8935,17 @@ type struct CallResolver {
     }
 
     /// E0214 for a static call no entry of the family `entries` accepts
-    /// (`refuse_unmatched_family_call`).  A family with one entry of the
-    /// call's arity that is not generic is left to the argument check, which
-    /// compares the arguments with that one signature; a generic one's
-    /// parameters are its own type parameters there, which that check
-    /// cannot judge.
+    /// (`refuse_unmatched_family_call`), as for a free function's family.  An
+    /// argument of an overloaded name fits its parameter exactly, with no
+    /// conversion, so an argument that would only widen to the one entry of
+    /// the call's arity is refused here: the argument check, which compares
+    /// with one signature, widens, and would leave the call bound to no entry.
     refuse_unmatched_static_call(mut &this, call_e: ExpressionNode*, call: CallExpr*, entries: &[OverloadId],
                                  arg_types: &[TypeRef], leaf: SymbolStr) -> void {
         mut overloads: [TypeRef] = [];
-        mut same_arity: i64 = 0;
-        mut generic: boolean = false;
         for (mut i: i64 = 0; i < entries.length(); i++) {
-            const sig: TypeRef = this.ctx.decl_index.entry_signature(entries[i]);
-            overloads.push(sig);
-            const ft: Type* = this.arena.lookup(sig);
-            if (ft == null || ft.kind != TypeKind::Function) { continue; }
-            if (ft.as_function().param_types.length() != arg_types.length()) { continue; }
-            same_arity = same_arity + 1;
-            if (this.static_entry_template(entries[i]) != null) { generic = true; }
+            overloads.push(this.ctx.decl_index.entry_signature(entries[i]));
         }
-        if (same_arity == 1 && !generic) { return; }
         this.refuse_unmatched_family_call(call_e, call, this.intern.resolve(leaf), &overloads, arg_types);
     }
 

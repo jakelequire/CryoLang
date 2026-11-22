@@ -1,0 +1,119 @@
+///! `cryogate smith-selftest --smith <cryosmith> [--jobs N]`: CryoSmith's
+///! self-test, its checks split into as many parts as the scheduler runs
+///! at once (`--jobs`, `CRYOGATE_JOBS`, or the logical CPUs), each part a
+///! `cryosmith selftest --part I/N` of its own.
+///!
+///! The parts' reports are judged as one whole run (`smith/selftest.cryo`)
+///! and the gate prints the whole run's verdict line, so it is the same
+///! bytes for any count: `cryosmith selftest: OK (C checks)`, or each
+///! part's failures in part order and then `FAIL (F of C checks)`.  The
+///! parts must together run every unit of the self-test exactly once.
+
+namespace cryogate::gates::smith_selftest;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::file::{ File };
+import std::fs::path::{ Path };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::schedule::{ Cost, Scheduler };
+import cryogate::core::text::{ Text };
+import cryogate::smith::selftest::{ PartReport, SelfTestParts };
+
+/// CryoSmith's self-test, run in parts.
+public type struct SmithSelfTest {
+    /// Run `cryogate smith-selftest` with `arguments` from index `first`; 0
+    /// when every check passed, 1 when one failed or the parts do not make
+    /// a whole run, 2 on a usage error.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate smith-selftest --smith <cryosmith> [--jobs N]"));
+        options.valued(Str::new("--smith"));
+        options.valued(Str::new("--jobs"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate smith-selftest: {reason.as_str()}"); return 2; }
+        };
+        const smith: Option<Str> = parsed.value(Str::new("--smith"));
+        if (smith.is_none() || !parsed.positionals().is_empty()) {
+            fmt::eprintln(f"cryogate smith-selftest: usage: {options.usage()}");
+            return 2;
+        }
+        mut scheduler: Scheduler = Scheduler::new();
+        match (parsed.value(Str::new("--jobs"))) {
+            Option::Some(text) => {
+                match (i64::try_from(text)) {
+                    Result::Ok(value) => {
+                        if (value < 1) { fmt::eprintln(f"cryogate smith-selftest: --jobs takes a count of at least 1, not `{text}`"); return 2; }
+                        scheduler.set_slots(value);
+                    }
+                    Result::Err(_) => { fmt::eprintln(f"cryogate smith-selftest: --jobs takes a number, not `{text}`"); return 2; }
+                }
+            }
+            Option::None => { }
+        }
+        const program: String = Host::absolute(smith.unwrap());
+        const parts: i64 = scheduler.slots();
+        mut part: i64 = 0;
+        while (part < parts) {
+            mut job: Job = Job::new(program.as_str());
+            job.argument(Str::new("selftest"));
+            job.argument(Str::new("--part"));
+            job.argument(f"{part}/{parts}".as_str());
+            job.directory(repository.as_str());
+            job.log_to(logs.file(f"smith-selftest-{part}".as_str()).as_str());
+            job.errors_to(logs.file(f"smith-selftest-{part}-errors".as_str()).as_str());
+            scheduler.add(job, Cost::Light);
+            part = part + 1;
+        }
+        const done: Array<Completion> = scheduler.run();
+        mut reports: Array<PartReport> = Array::<PartReport>::new();
+        part = 0;
+        while (part < parts) {
+            const errors: String = SmithSelfTest::read(logs.file(f"smith-selftest-{part}-errors".as_str()).as_str());
+            reports.push(PartReport::new(part, done[part].output().as_str(), errors.as_str()));
+            part = part + 1;
+        }
+        return match (SelfTestParts::verdict(&reports)) {
+            Result::Ok(line) => {
+                if (line.as_str().starts_with(&Str::new("cryosmith selftest: OK"))) {
+                    fmt::println(line);
+                    return 0;
+                }
+                SmithSelfTest::print_failures(&reports);
+                fmt::eprintln(line);
+                1
+            }
+            Result::Err(reason) => {
+                SmithSelfTest::print_failures(&reports);
+                fmt::eprintln(f"cryosmith selftest: FAIL (the parts make no whole run: {reason.as_str()})");
+                1
+            }
+        };
+    }
+
+    /// Each part's failed checks, in part order.
+    private static print_failures(reports: &Array<PartReport>) -> void {
+        for (report in reports.iterate_references()) {
+            for (line in Text::lines(report.errors.as_str()).iterate_references()) {
+                if (line.as_str().starts_with(&Str::new("cryosmith selftest: FAIL ")) && !line.as_str().starts_with(&Str::new("cryosmith selftest: FAIL ("))) {
+                    fmt::eprintln(line.clone());
+                }
+            }
+        }
+    }
+
+    private static read(path: Str) -> String {
+        return match (File::read_text(Path::from(path))) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { String::new() }
+        };
+    }
+}

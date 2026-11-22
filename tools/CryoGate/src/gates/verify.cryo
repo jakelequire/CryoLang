@@ -1,0 +1,357 @@
+///! `cryogate verify`: the command line over verify's layer
+///! (`cryogate::verify`) and its baseline (`cryogate::baseline`).  Each
+///! option reads files and prints a result; the decisions themselves live in
+///! those layers.
+
+namespace cryogate::gates::verify;
+
+import std::collections::array::{ Array };
+import std::collections::hashmap::{ HashMap };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::baseline::cache::{ BaselineCache };
+import cryogate::baseline::clone::{ BaselineClone };
+import cryogate::baseline::keys::{ BaselineKey, Program, ProgramKeys, Programs };
+import cryogate::core::child::{ Completion };
+import cryogate::core::host::{ Host };
+import cryogate::core::git::{ Git };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+import cryogate::core::text::{ Text };
+import cryogate::core::tree::{ Tree };
+import cryogate::corpus::census::{ Pinned };
+import cryogate::corpus::roster::{ TestGates };
+import cryogate::verify::comparison::{ Compared };
+import cryogate::verify::declarations::{ Declaration, DeclaredChanges };
+import cryogate::verify::hashing::{ ObjectHashes };
+import cryogate::verify::objects::{ ObjectPopulation };
+import cryogate::verify::record::{ BaselineRecord };
+import cryogate::verify::run::session::{ VerifySession, VerifySettings };
+import cryogate::verify::runtime::{ RuntimeArchives };
+
+/// `cryogate verify`, which `make verify` runs, and the pieces of a run on
+/// their own:
+///
+/// - `--cryo <compiler> [--baseline <rev> [--require-identical]] [--only
+///   <gate>,...] [--list-limit <n>] [--sequential]`: a whole verify run -
+///   the gates over the compiler under test, and with a baseline, the
+///   object comparison against the compiler built from `rev`;
+/// - `--declared-since <rev>`: the lines each declaration file declares
+///   against the commit `rev`, printed as verify prints them before its
+///   baseline run;
+/// - `--compare <run> --against <rev>`: the object comparison of a verify
+///   run directory's recorded lists, printed as verify printed it after
+///   that run, with the declarations made against `rev`;
+/// - `--records <run> --programs <directory>`: each census-side record
+///   verify stored in `directory`, derived again from the run's baseline
+///   census log and object list; every record that differs is named;
+/// - `--runtime-list <directory>`: the runtime population's rows of the
+///   archives one target's runtime directory (`runtime/.bin/<triple>`)
+///   holds, as verify lists them in `tree.runtime.sha256`;
+/// - `--baseline-key <rev>`: the directory, `.verify/baseline/<key>`, of the
+///   baseline compiler verify builds from `rev` and this working tree;
+/// - `--keys <home>`: every program's record key computed over the working
+///   tree for the baseline compiler in `home` (a `.verify/baseline/<key>`
+///   directory), each of which must name a record of that program in the
+///   home's store; every one that does not is named;
+/// - `--sync <clone> --at <rev>`: make `clone` the checkout verify builds a
+///   baseline compiler from `rev` in;
+/// - `--baselines <directory> [--current <name>]`: the baseline homes in
+///   `directory` the bounded cache keeps, most recently used first, with
+///   `current` among them as the home in use;
+/// - `--hash <population> [--runtime <directory>]`: the rows of one object
+///   population (`tests`, `examples`, `stdlib`, or `runtime`, read from one
+///   target's runtime `directory`) as verify lists them after a run.
+public type struct VerifyGate {
+    /// Run the subcommand over the checkout `repository` with the command
+    /// line's `arguments` from index `first`; the process's exit code.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new(
+            "cryogate verify --cryo <compiler> [--baseline <rev> [--require-identical]] [--only <gate>,...] [--list-limit <n>] [--sequential] | --declared-since <rev> | --compare <run> --against <rev> [--list-limit <n>] | --records <run> --programs <directory> | --runtime-list <directory> | --baseline-key <rev> | --keys <home> | --sync <clone> --at <rev> | --baselines <directory> [--current <name>] | --hash <population> [--runtime <directory>]"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--baseline"));
+        options.flag(Str::new("--require-identical"));
+        options.valued(Str::new("--only"));
+        options.flag(Str::new("--sequential"));
+        options.valued(Str::new("--declared-since"));
+        options.valued(Str::new("--compare"));
+        options.valued(Str::new("--against"));
+        options.valued(Str::new("--list-limit"));
+        options.valued(Str::new("--records"));
+        options.valued(Str::new("--programs"));
+        options.valued(Str::new("--runtime-list"));
+        options.valued(Str::new("--baseline-key"));
+        options.valued(Str::new("--keys"));
+        options.valued(Str::new("--sync"));
+        options.valued(Str::new("--at"));
+        options.valued(Str::new("--baselines"));
+        options.valued(Str::new("--current"));
+        options.valued(Str::new("--hash"));
+        options.valued(Str::new("--runtime"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 2; }
+        };
+        const git: Git = Git::new(repository, logs);
+        mut limit: i64 = 40;
+        match (parsed.value(Str::new("--list-limit"))) {
+            Option::Some(text) => {
+                if (!Text::is_digits(text)) { fmt::eprintln(f"cryogate verify: --list-limit takes a count, not {text}"); return 2; }
+                limit = i64::try_from(text).unwrap_or(0);
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--cryo"))) {
+            Option::Some(cryo) => {
+                mut only: Array<String> = Array::<String>::new();
+                match (parsed.value(Str::new("--only"))) {
+                    Option::Some(list) => { for (name in list.split(&Str::new(","))) { only.push(String::from_str(name.trim())); } }
+                    Option::None       => { }
+                }
+                const baseline: Option<String> = match (parsed.value(Str::new("--baseline"))) {
+                    Option::Some(revision) => { Option::Some(String::from_str(revision)) }
+                    Option::None           => { Option::None }
+                };
+                const settings: VerifySettings = VerifySettings {
+                    cryo: String::from_str(cryo), baseline: baseline, require_identical: parsed.has(Str::new("--require-identical")),
+                    only: only, list_limit: limit, sequential: parsed.has(Str::new("--sequential")),
+                };
+                return VerifySession::run(repository, logs, &settings);
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--declared-since"))) {
+            Option::Some(revision) => {
+                const declared: Array<Declaration> = VerifySession::declared_since(repository, &git, revision,
+                    Str::new("tests/started-compiling"));
+                const fixed: Array<Declaration> = VerifySession::declared_since(repository, &git, revision,
+                    Str::new("tests/started-passing"));
+                fmt::println(VerifySession::declared_line(&declared, revision, Str::new("compile")));
+                fmt::println(VerifySession::declared_line(&fixed, revision, Str::new("pass")));
+                return 0;
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--compare"))) {
+            Option::Some(run) => {
+                const revision: Str = match (parsed.value(Str::new("--against"))) {
+                    Option::Some(revision) => { revision }
+                    Option::None           => { fmt::eprintln(f"cryogate verify: --compare needs --against; usage: {options.usage()}"); return 2; }
+                };
+                return VerifyGate::compare_run(repository, &git, run, revision, limit);
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--records"))) {
+            Option::Some(run) => {
+                const programs: Str = match (parsed.value(Str::new("--programs"))) {
+                    Option::Some(programs) => { programs }
+                    Option::None           => { fmt::eprintln(f"cryogate verify: --records needs --programs; usage: {options.usage()}"); return 2; }
+                };
+                return VerifyGate::rederive_records(repository, run, programs);
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--runtime-list"))) {
+            Option::Some(directory) => {
+                return match (RuntimeArchives::rows(repository.join(directory).as_path())) {
+                    Result::Ok(rows)    => { for (row in rows.iterate_references()) { fmt::println(row.clone()); } 0 }
+                    Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); 1 }
+                };
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--baseline-key"))) {
+            Option::Some(revision) => {
+                return match (BaselineKey::of(repository, &git, revision)) {
+                    Result::Ok(key)     => { fmt::println(f".verify/baseline/{key.as_str()}"); 0 }
+                    Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); 1 }
+                };
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--keys"))) {
+            Option::Some(home) => { return VerifyGate::check_keys(repository, &git, home); }
+            Option::None       => { }
+        }
+        match (parsed.value(Str::new("--sync"))) {
+            Option::Some(clone) => {
+                const revision: Str = match (parsed.value(Str::new("--at"))) {
+                    Option::Some(revision) => { revision }
+                    Option::None           => { fmt::eprintln(f"cryogate verify: --sync needs --at; usage: {options.usage()}"); return 2; }
+                };
+                return match (BaselineClone::sync(repository, logs, repository.join(clone).as_path(), revision)) {
+                    Result::Ok(_)       => { fmt::println(f"verify: {clone} synced to {revision}"); 0 }
+                    Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); 1 }
+                };
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--hash"))) {
+            Option::Some(name) => {
+                mut chosen: Option<ObjectPopulation> = Option::None;
+                for (population in ObjectPopulation::all().iterate_references()) {
+                    if (population.name() == name) { chosen = Option::Some(*population); }
+                }
+                const population: ObjectPopulation = match (chosen) {
+                    Option::Some(population) => { population }
+                    Option::None             => { fmt::eprintln(f"cryogate verify: --hash takes tests, examples, stdlib or runtime, not {name}"); return 2; }
+                };
+                const runtime: PathBuf = repository.join(parsed.value(Str::new("--runtime")).unwrap_or(Str::new("")));
+                return match (ObjectHashes::rows(repository, &population, runtime.as_path())) {
+                    Result::Ok(rows)    => { for (row in rows.iterate_references()) { fmt::println(row.clone()); } 0 }
+                    Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); 1 }
+                };
+            }
+            Option::None => { }
+        }
+        match (parsed.value(Str::new("--baselines"))) {
+            Option::Some(directory) => {
+                const current: Str = parsed.value(Str::new("--current")).unwrap_or(Str::new(""));
+                return match (BaselineCache::homes(repository.join(directory).as_path())) {
+                    Result::Ok(homes) => {
+                        for (home in BaselineCache::kept(&homes, BaselineCache::KEPT, current).iterate_references()) {
+                            fmt::println(home.clone());
+                        }
+                        0
+                    }
+                    Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); 1 }
+                };
+            }
+            Option::None => { }
+        }
+        fmt::eprintln(f"cryogate verify: usage: {options.usage()}");
+        return 2;
+    }
+
+    /// `--keys`: each program's key over the working tree, for the baseline
+    /// compiler and runtime in `home`, looked up in the home's record store.
+    /// A key with no record, or with another program's, is named.
+    private static check_keys(repository: Path, git: &Git, home: Str) -> i32 {
+        const base: PathBuf = repository.join(home);
+        const compiler: PathBuf = base.join(Host::executable_name(Str::new("cryo")).as_str());
+        const runtime: PathBuf = base.join(Str::new("runtime"));
+        const store: PathBuf = base.join(Str::new("programs"));
+        const programs: Array<Program> = match (Programs::discover(repository, git)) {
+            Result::Ok(programs) => { programs }
+            Result::Err(reason)  => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
+        };
+        const keys: Array<Pair<String, String>> = match (ProgramKeys::of(repository, git, compiler.as_path(), runtime.as_path(), &programs)) {
+            Result::Ok(keys)    => { keys }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
+        };
+        mut missing: i64 = 0;
+        mut differing: i64 = 0;
+        for (key in keys.iterate_references()) {
+            const record: PathBuf = store.join(key.second.as_str());
+            match (File::read_text(record.as_path())) {
+                Result::Ok(text) => {
+                    const stored: BaselineRecord = BaselineRecord::read(text.as_str());
+                    if (stored.name.as_str() != key.first.as_str()) {
+                        fmt::println(f"  differs  {key.first.as_str()}: its key {key.second.as_str()} holds the record of {stored.name.as_str()}");
+                        differing++;
+                    }
+                }
+                Result::Err(_) => {
+                    fmt::println(f"  missing  {key.first.as_str()}: no record {key.second.as_str()}");
+                    missing++;
+                }
+            }
+        }
+        fmt::println(f"verify: {keys.length()} program key(s) for {home}: {keys.length() - missing - differing} recorded, {missing} missing, {differing} differ");
+        return if (missing == 0 && differing == 0) { 0 } else { 1 };
+    }
+
+    /// `--compare`: the run directory `run`'s baseline and tree object
+    /// lists compared with the declarations made against `revision`.
+    private static compare_run(repository: Path, git: &Git, run: Str, revision: Str, limit: i64) -> i32 {
+        const declared: Array<Declaration> = VerifySession::declared_since(repository, git, revision, Str::new("tests/started-compiling"));
+        const fixed: Array<Declaration> = VerifySession::declared_since(repository, git, revision, Str::new("tests/started-passing"));
+        const changes: DeclaredChanges = DeclaredChanges::of(repository, &declared, &fixed);
+        const compared: Compared = match (VerifySession::compared(repository, revision, &changes, run, limit)) {
+            Result::Ok(compared) => { compared }
+            Result::Err(reason)  => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
+        };
+        for (line in compared.lines.iterate_references()) { fmt::println(line.clone()); }
+        for (problem in compared.problems.iterate_references()) { fmt::println(f"verify: FAIL -- {problem.as_str()}"); }
+        return if (compared.problems.is_empty()) { 0 } else { 1 };
+    }
+
+    /// `--records`: the census-side records stored in `programs` (every
+    /// record but an example's and an archive's), each derived again from
+    /// the run directory `run`'s baseline census log and its tests object
+    /// list.  The log must be the run's only one: a baseline census run in
+    /// parts gave each part its own records.
+    private static rederive_records(repository: Path, run: Str, programs: Str) -> i32 {
+        const log: String = f"{run}/baseline/census-000.log";
+        const second: String = f"{run}/baseline/census-001.log";
+        if (repository.join(second.as_str()).as_path().is_file()) {
+            fmt::eprintln(f"cryogate verify: {run}'s baseline census ran in parts; its records came from more than one log");
+            return 1;
+        }
+        const log_text: String = match (File::read_text(repository.join(log.as_str()).as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { fmt::eprintln(f"cryogate verify: cannot read {log.as_str()}: {error.describe()}"); return 1; }
+        };
+        const rows_list: String = f"{run}/baseline/base.tests.sha256";
+        const rows_text: String = match (File::read_text(repository.join(rows_list.as_str()).as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { fmt::eprintln(f"cryogate verify: cannot read {rows_list.as_str()}: {error.describe()}"); return 1; }
+        };
+        const tests: PathBuf = repository.join(Str::new("tests"));
+        const gates: TestGates = match (TestGates::read(tests.join(Str::new("tests")).as_path())) {
+            Result::Ok(gates)   => { gates }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate verify: cannot read the test sources: {reason.as_str()}"); return 1; }
+        };
+        const pinned: Pinned = match (Pinned::read(tests.join(Str::new("test-roster.txt")).as_path(), &gates)) {
+            Result::Ok(pinned)  => { pinned }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
+        };
+        const files: Array<String> = match (Tree::names(Path::from(programs), &Array::<String>::new())) {
+            Result::Ok(files)   => { files }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate verify: cannot list {programs}: {reason.as_str()}"); return 1; }
+        };
+        mut stored: Array<BaselineRecord> = Array::<BaselineRecord>::new();
+        mut names: Array<String> = Array::<String>::new();
+        for (file in files.iterate_references()) {
+            const path: PathBuf = Path::from(programs).join(file.as_str());
+            const text: String = match (File::read_text(path.as_path())) {
+                Result::Ok(text)   => { text }
+                Result::Err(error) => { fmt::eprintln(f"cryogate verify: cannot read {path.as_path().as_str()}: {error.describe()}"); return 1; }
+            };
+            const record: BaselineRecord = BaselineRecord::read(text.as_str());
+            const name: Str = record.name.as_str();
+            if (name.starts_with(&Str::new("examples/")) || name.starts_with(&Str::new("archives/"))) { continue; }
+            names.push(record.name.clone());
+            stored.push(record);
+        }
+        const lines: Array<String> = Text::lines(log_text.as_str());
+        const rows: Array<String> = Text::lines(rows_text.as_str());
+        const derived: Array<BaselineRecord> = BaselineRecord::of_census(&lines, &names, &rows, &pinned.unit);
+        mut differing: i64 = 0;
+        for (record in stored.iterate_references()) {
+            mut found: boolean = false;
+            for (again in derived.iterate_references()) {
+                if (again.name.as_str() != record.name.as_str()) { continue; }
+                found = true;
+                const difference: Option<String> = record.difference(again);
+                match (difference) {
+                    Option::Some(field) => { fmt::println(f"  differs  {record.name.as_str()}: {field.as_str()}"); differing++; }
+                    Option::None        => { }
+                }
+            }
+            if (!found) { fmt::println(f"  missing  {record.name.as_str()}: the log gives it no verdict"); differing++; }
+        }
+        fmt::println(f"verify: {stored.length()} census record(s) derived again from {log.as_str()}, {differing} differ");
+        // No record read is no comparison: a wrong directory reports the
+        // same zero differences as a faithful port.
+        return if (differing == 0 && !stored.is_empty()) { 0 } else { 1 };
+    }
+}

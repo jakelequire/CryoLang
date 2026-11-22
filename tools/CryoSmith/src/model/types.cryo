@@ -1,0 +1,412 @@
+///! `ValueType`: the type of a generated value - the eight integer types,
+///! `boolean`, `void` and a generated struct - and the facts about it that
+///! generation and printing read.  Its name is the program's to spell
+///! (`Program::type_name`), since an instance's names its type argument.
+
+namespace cryosmith::model::types;
+
+import std::collections::array::{ Array };
+
+/// The type of a generated value.
+public type enum ValueType {
+    /// `i8`.
+    I8;
+    /// `i16`.
+    I16;
+    /// `i32`.
+    I32;
+    /// `i64`.
+    I64;
+    /// `u8`.
+    U8;
+    /// `u16`.
+    U16;
+    /// `u32`.
+    U32;
+    /// `u64`.
+    U64;
+    /// `boolean`.
+    Boolean;
+    /// What a function that returns nothing returns.
+    Void;
+    /// A generated struct or an instance of a generic one, by its index in
+    /// the program's structures.
+    Record(i64);
+    /// A generated enum, by its index in the program's enums.
+    Enumeration(i64);
+    /// A generic function's type parameter, `T`: its values are read,
+    /// passed, returned, selected between and, under an `Eq` bound,
+    /// compared, and nothing else.
+    TypeParameter;
+    /// A function type, `(u8, i32) -> boolean`, by its index in the
+    /// program's signatures, where equal signatures share one index.
+    Function(i64);
+    /// A trait object borrowing a value of a struct implementing a trait,
+    /// `virtual &Tr0`, by the trait's place among the program's traits: a
+    /// parameter's type only, its methods called through the value's
+    /// table.
+    TraitObject(i64);
+    /// A struct owning a destructor, `D<N>`, by its place among the
+    /// program's owned structs: not `Copy`, so each pass, store or return
+    /// of a value moves it, and it is dropped once, where its last owner
+    /// leaves scope.
+    Owned(i64);
+    /// `&D<N>`, a shared reference to an owned struct's value, by the
+    /// owned struct's place: a parameter's or a return's type only, so it
+    /// never outlives the statement that borrows.
+    SharedReference(i64);
+    /// `mut &D<N>`, an exclusive reference to an owned struct's value, by
+    /// the owned struct's place: a parameter's type only, through which
+    /// the value's fields are written.
+    ExclusiveReference(i64);
+    /// `Box<D<N>>`, owning one value of an owned struct on the heap, by
+    /// the owned struct's place: its fields are read and written through
+    /// it, and dropping it drops the value.
+    Boxed(i64);
+    /// `Rc<D<N>>`, one of the owners sharing a value of an owned struct,
+    /// by the owned struct's place: cloned and counted, never read
+    /// through, and the value dropped with its last owner.
+    Counted(i64);
+    /// `Option<D<N>>`, a value of an owned struct or none, by the owned
+    /// struct's place.
+    Optional(i64);
+    /// `Result<D<N>, u32>`, a value of an owned struct or an error code,
+    /// by the owned struct's place.
+    Fallible(i64);
+    /// `[E; N]`, a fixed array of `N` integers of type `E`, by `8 * e + N
+    /// - 1`, `e` the element's place among `integers()` and `N` from 1 to
+    /// `MOST_ELEMENTS`: copied as its elements are, its elements read and
+    /// written in place.
+    FixedArray(i64);
+    /// `&Slice<E>`, a shared view of a fixed array's integers, by the
+    /// element's place among `integers()`: a parameter's type only, given
+    /// `&v` of an array, so it never outlives the statement that borrows.
+    SliceReference(i64);
+    /// `String`, owned text: a local's type only, built, grown in place,
+    /// compared and measured, never read by value, so it never moves.
+    Text;
+    /// `[E]`, a dynamic array of integers of type `E`, by the element's
+    /// place among `integers()`: a local's type only, built, grown and
+    /// shrunk in place, its elements read and written, never read by
+    /// value, so it never moves.
+    DynamicArray(i64);
+    /// `HashMap<K, V>`, a map of integers of type `K` to integers of type
+    /// `V`, by `8 * k + v`, `k` and `v` their places among `integers()`: a
+    /// `mut` local's type only, inserted into, removed from and looked up
+    /// in place, never read by value, so it never moves.
+    Map(i64);
+}
+
+/// The most elements a fixed array holds.
+public const MOST_ELEMENTS: i64 = 8;
+
+implement enum ValueType {
+    /// The integer types, narrowest first, signed before unsigned.
+    public static integers() -> Array<ValueType> {
+        mut all: Array<ValueType> = Array::<ValueType>::new();
+        all.push(ValueType::I8);
+        all.push(ValueType::I16);
+        all.push(ValueType::I32);
+        all.push(ValueType::I64);
+        all.push(ValueType::U8);
+        all.push(ValueType::U16);
+        all.push(ValueType::U32);
+        all.push(ValueType::U64);
+        return all;
+    }
+
+    /// A fixed array of `length` elements of the integer type `element`.
+    public static fixed_array(element: ValueType, length: i64) -> ValueType {
+        return ValueType::FixedArray(element.integer_place() * MOST_ELEMENTS + length - 1);
+    }
+
+    /// The place of an integer type among `integers()`, or -1 for any
+    /// other type.
+    public integer_place(this) -> i64 {
+        return match (this) {
+            ValueType::I8  => { 0 }
+            ValueType::I16 => { 1 }
+            ValueType::I32 => { 2 }
+            ValueType::I64 => { 3 }
+            ValueType::U8  => { 4 }
+            ValueType::U16 => { 5 }
+            ValueType::U32 => { 6 }
+            ValueType::U64 => { 7 }
+            _              => { -1 }
+        };
+    }
+
+    /// The element type of a fixed array, a slice or a dynamic array;
+    /// `void` for any other type.
+    public element(this) -> ValueType {
+        const place: i64 = match (this) {
+            ValueType::FixedArray(index)     => { index / MOST_ELEMENTS }
+            ValueType::SliceReference(index) => { index }
+            ValueType::DynamicArray(index)   => { index }
+            _                                => { -1 }
+        };
+        if (place < 0) { return ValueType::Void; }
+        return ValueType::integers().get(place).unwrap();
+    }
+
+    /// How many elements a fixed array holds; 0 for any other type.
+    public array_length(this) -> i64 {
+        return match (this) {
+            ValueType::FixedArray(index) => { index % MOST_ELEMENTS + 1 }
+            _                            => { 0 }
+        };
+    }
+
+    /// Whether this is a fixed array type.
+    public is_array(&this) -> boolean { return this.array_length() > 0; }
+
+    /// Whether this is a slice reference, `&Slice<E>`.
+    public is_slice(this) -> boolean {
+        return match (this) {
+            ValueType::SliceReference(_) => { true }
+            _                            => { false }
+        };
+    }
+
+    /// Whether this is a dynamic array, `[E]`.
+    public is_dynamic_array(this) -> boolean {
+        return match (this) {
+            ValueType::DynamicArray(_) => { true }
+            _                          => { false }
+        };
+    }
+
+    /// A map of the integer type `key` to the integer type `value`.
+    public static map(key: ValueType, value: ValueType) -> ValueType {
+        return ValueType::Map(key.integer_place() * 8 + value.integer_place());
+    }
+
+    /// The key type of a map; `void` for any other type.
+    public map_key(this) -> ValueType {
+        return match (this) {
+            ValueType::Map(index) => { ValueType::integers().get(index / 8).unwrap() }
+            _                     => { ValueType::Void }
+        };
+    }
+
+    /// The value type of a map; `void` for any other type.
+    public map_value(this) -> ValueType {
+        return match (this) {
+            ValueType::Map(index) => { ValueType::integers().get(index % 8).unwrap() }
+            _                     => { ValueType::Void }
+        };
+    }
+
+    /// Whether this is a map, `HashMap<K, V>`.
+    public is_map(&this) -> boolean { return !this.map_key().same(ValueType::Void); }
+
+    /// Whether this is `String`.
+    public is_text(this) -> boolean {
+        return match (this) {
+            ValueType::Text => { true }
+            _               => { false }
+        };
+    }
+
+    /// A number that is the same for two values exactly when they are the
+    /// same type: the twelve types without an index below 12, and each
+    /// indexed kind on its own residue of fifteen above them.
+    public identity(this) -> i64 {
+        return match (this) {
+            ValueType::I8            => { 0 }
+            ValueType::I16           => { 1 }
+            ValueType::I32           => { 2 }
+            ValueType::I64           => { 3 }
+            ValueType::U8            => { 4 }
+            ValueType::U16           => { 5 }
+            ValueType::U32           => { 6 }
+            ValueType::U64           => { 7 }
+            ValueType::Boolean       => { 8 }
+            ValueType::Void          => { 9 }
+            ValueType::TypeParameter => { 10 }
+            ValueType::Text          => { 11 }
+            ValueType::Record(index) => { 12 + 15 * index }
+            ValueType::Enumeration(index) => { 13 + 15 * index }
+            ValueType::Function(index) => { 14 + 15 * index }
+            ValueType::TraitObject(index) => { 15 + 15 * index }
+            ValueType::Owned(index) => { 16 + 15 * index }
+            ValueType::SharedReference(index) => { 17 + 15 * index }
+            ValueType::ExclusiveReference(index) => { 18 + 15 * index }
+            ValueType::Boxed(index) => { 19 + 15 * index }
+            ValueType::Counted(index) => { 20 + 15 * index }
+            ValueType::Optional(index) => { 21 + 15 * index }
+            ValueType::Fallible(index) => { 22 + 15 * index }
+            ValueType::FixedArray(index) => { 23 + 15 * index }
+            ValueType::SliceReference(index) => { 24 + 15 * index }
+            ValueType::DynamicArray(index) => { 25 + 15 * index }
+            ValueType::Map(index) => { 26 + 15 * index }
+        };
+    }
+
+    /// The owned struct a box, a shared owner, an option or a result holds
+    /// a value of, or -1 for any other type.
+    public held(this) -> i64 {
+        return match (this) {
+            ValueType::Boxed(index)    => { index }
+            ValueType::Counted(index)  => { index }
+            ValueType::Optional(index) => { index }
+            ValueType::Fallible(index) => { index }
+            _                          => { -1 }
+        };
+    }
+
+    /// Whether this holds an owned struct's value: a box, a shared owner,
+    /// an option or a result of one.
+    public is_holder(&this) -> boolean { return this.held() >= 0; }
+
+    /// Whether values of this type move rather than copy: an owned struct
+    /// and every type holding one.
+    public moves(&this) -> boolean { return this.is_owned() || this.is_holder(); }
+
+    /// Whether a value of this type must be used: a result, which a
+    /// statement may not discard (W0017).
+    public must_be_used(this) -> boolean {
+        return match (this) {
+            ValueType::Fallible(_) => { true }
+            _                      => { false }
+        };
+    }
+
+    /// Whether this is an option or a result, which may hold no value.
+    public may_be_absent(this) -> boolean {
+        return match (this) {
+            ValueType::Optional(_) => { true }
+            ValueType::Fallible(_) => { true }
+            _                      => { false }
+        };
+    }
+
+    /// The owned struct a reference refers to a value of, or -1 for any
+    /// other type.
+    public referent(this) -> i64 {
+        return match (this) {
+            ValueType::SharedReference(index)    => { index }
+            ValueType::ExclusiveReference(index) => { index }
+            _                                    => { -1 }
+        };
+    }
+
+    /// Whether this is a reference, shared or exclusive.
+    public is_reference(&this) -> boolean { return this.referent() >= 0; }
+
+    /// Whether this is an exclusive reference, `mut &D<N>`.
+    public is_exclusive(this) -> boolean {
+        return match (this) {
+            ValueType::ExclusiveReference(_) => { true }
+            _                                => { false }
+        };
+    }
+
+    /// The owned struct an owned type names, or -1 for any other type.
+    public owned(this) -> i64 {
+        return match (this) {
+            ValueType::Owned(index) => { index }
+            _                       => { -1 }
+        };
+    }
+
+    /// Whether this is an owned struct's type, whose values move.
+    public is_owned(&this) -> boolean { return this.owned() >= 0; }
+
+    /// The trait a trait object borrows its value as, or -1 for any other
+    /// type.
+    public object_trait(this) -> i64 {
+        return match (this) {
+            ValueType::TraitObject(index) => { index }
+            _                             => { -1 }
+        };
+    }
+
+    /// The signature a function type names, or -1 for any other type.
+    public signature(this) -> i64 {
+        return match (this) {
+            ValueType::Function(index) => { index }
+            _                          => { -1 }
+        };
+    }
+
+    /// Whether this is a function type.
+    public is_function(&this) -> boolean { return this.signature() >= 0; }
+
+    /// The struct a record type names, or -1 for any other type.
+    public structure(this) -> i64 {
+        return match (this) {
+            ValueType::Record(index) => { index }
+            _                        => { -1 }
+        };
+    }
+
+    /// The enum an enum type names, or -1 for any other type.
+    public enumeration(this) -> i64 {
+        return match (this) {
+            ValueType::Enumeration(index) => { index }
+            _                             => { -1 }
+        };
+    }
+
+    /// Whether this is an enum type.
+    public is_enumeration(&this) -> boolean { return this.enumeration() >= 0; }
+
+    /// Whether a `match` expression may produce a value of this type: an
+    /// integer, `boolean` or enum type.
+    public is_matchable(&this) -> boolean {
+        return this.is_integer() || this.same(ValueType::Boolean) || this.is_enumeration();
+    }
+
+    /// The width in bits of an integer type; 0 for any other type.
+    public width(&this) -> u64 {
+        return match (&this) {
+            ValueType::I8  => { 8 }
+            ValueType::I16 => { 16 }
+            ValueType::I32 => { 32 }
+            ValueType::I64 => { 64 }
+            ValueType::U8  => { 8 }
+            ValueType::U16 => { 16 }
+            ValueType::U32 => { 32 }
+            ValueType::U64 => { 64 }
+            _              => { 0 }
+        };
+    }
+
+    /// Whether the type is a signed integer.
+    public is_signed(&this) -> boolean {
+        return match (&this) {
+            ValueType::I8  => { true }
+            ValueType::I16 => { true }
+            ValueType::I32 => { true }
+            ValueType::I64 => { true }
+            _              => { false }
+        };
+    }
+
+    /// Whether the type is an integer.
+    public is_integer(&this) -> boolean { return this.width() != 0; }
+
+    /// Whether the type is a generated struct.
+    public is_record(&this) -> boolean { return this.structure() >= 0; }
+
+    /// Whether the type is the same type as `other`.
+    public same(&this, other: ValueType) -> boolean { return this.identity() == other.identity(); }
+
+    /// Whether the language converts a value of this type to `wider`
+    /// implicitly: to a wider integer of the same signedness, or from an
+    /// unsigned integer to a wider signed one.
+    public widens_to(&this, wider: ValueType) -> boolean {
+        if (!this.is_integer() || !wider.is_integer()) { return false; }
+        if (this.width() >= wider.width()) { return false; }
+        return this.is_signed() == wider.is_signed() || !this.is_signed();
+    }
+
+    /// The largest value of an integer type, as a magnitude.
+    public maximum(&this) -> u64 {
+        const width: u64 = this.width();
+        if (this.is_signed()) { return (1 << (width - 1)) - 1; }
+        if (width == 64) { return u64::MAX; }
+        return (1 << width) - 1;
+    }
+}
