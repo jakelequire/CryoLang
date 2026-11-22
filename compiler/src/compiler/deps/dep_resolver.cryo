@@ -35,7 +35,7 @@ import compiler::deps::git::{ Git };
 import compiler::deps::git_url::{ GitUrl };
 import compiler::module_graph::{ PackageDeclaration };
 import compiler::deps::lockfile::{ LockedDep, LockedVendor, Lockfile };
-import compiler::deps::semver::{ Constraint };
+import compiler::deps::semver::{ Requirement, Version };
 import compiler::utils::directory_lock::{ DirectoryLock };
 
 
@@ -282,6 +282,10 @@ type struct DepResolver {
             outcome.failed = true;
             return;
         }
+        if (DepResolver::library_version(dep, &dep_cfg, dep_root.as_path(), String::new()).is_none()) {
+            outcome.failed = true;
+            return;
+        }
         // The loader prefixes a relative root with the program's project
         // root itself, so a path dependency's roots are handed over relative
         // to it (or absolute, below a git dependency).
@@ -344,12 +348,13 @@ type struct DepResolver {
                 return;
             }
         }
-        const pinned: Option<String> = DepResolver::cached_commit(dep, mode, existing, new_lock);
+        const pinned: Option<LockedDep> = DepResolver::cached_commit(dep, mode, existing);
         lock.release();
-        match (pinned) {
-            Option::Some(commit) => { sha = commit; }
-            Option::None         => { outcome.failed = true; return; }
-        }
+        mut entry: LockedDep = match (pinned) {
+            Option::Some(found) => { found }
+            Option::None        => { outcome.failed = true; return; }
+        };
+        sha = entry.commit.clone();
 
         const checkout: PathBuf = Cache::extraction_dir_for(dep.git_url.as_str(), sha.as_str());
         const dep_root: PathBuf = if (dep.subdir.length() > 0) {
@@ -365,6 +370,25 @@ type struct DepResolver {
             return;
         }
 
+        // Every entry naming the repository is checked and locked, whichever
+        // reaches its package first.
+        const dep_cfg: ProjectConfig = ProjectConfig::parse(dep_cryo.into_raw());
+        if (dep_cfg.error_count > 0) {
+            fmt::eprintln(f"error: dependency '{dep.name}' has invalid cryoconfig at {dep_root.as_path().as_str()}");
+            outcome.failed = true;
+            return;
+        }
+        match (DepResolver::library_version(dep, &dep_cfg, dep_root.as_path(), sha.clone())) {
+            Option::Some(version) => { entry.version = version; }
+            Option::None          => { outcome.failed = true; return; }
+        }
+        if (mode != ResolveMode::Build) {
+            const ref_key: str::Str = GitRefKind::key_name(dep.ref_kind);
+            const selected: String = if (ref_key.length() > 0) { f"{ref_key} {dep.ref_val}" } else { String::from_str(str::Str::new("default branch")) };
+            fmt::println(f"[deps] {dep.name} {entry.version} from {dep.git_url} ({selected}, commit {sha.as_str().byte_substring(0, 12)})");
+            new_lock.packages.push(entry);
+        }
+
         // Cycle detection: one package directory is one checkout of one
         // commit, so this is scoped to the URL, the commit and the subdir.
         const found: Option<DepKey> = DepResolver::key_declared_by(declarer, dep, dep_root.as_path(), outcome);
@@ -372,12 +396,6 @@ type struct DepResolver {
         const key: DepKey = found.unwrap();
         if (visited.contains(&key)) { return; }
         visited.push(key.clone());
-        const dep_cfg: ProjectConfig = ProjectConfig::parse(dep_cryo.into_raw());
-        if (dep_cfg.error_count > 0) {
-            fmt::eprintln(f"error: dependency '{dep.name}' has invalid cryoconfig at {dep_root.as_path().as_str()}");
-            outcome.failed = true;
-            return;
-        }
         // Harvest using the absolute checkout path so source roots are
         // self-contained; the consumer's project_root is irrelevant for
         // git deps.
@@ -385,15 +403,17 @@ type struct DepResolver {
         DepResolver::walk_deps(&dep_cfg, key.val.as_str(), dep_root.as_path(), local_repository, mode, existing, new_lock, visited, outcome);
     }
 
-    /// The commit of git dependency `dep` whose files are extracted in the
-    /// cache, its repository's lock held.  A build takes it from the lock
-    /// file, re-extracts it from the bare clone when its files are missing,
-    /// and checks them against the recorded content hash; a fetch or update
-    /// resolves the ref when it must, extracts what no longer matches, and
-    /// records the entry in `new_lock`.  `None` once the failure is
-    /// reported.
-    static cached_commit(dep: const Dependency*, mode: ResolveMode, existing: Lockfile*,
-                         new_lock: mut Lockfile*) -> Option<String> {
+    /// The lock entry of git dependency `dep`, whose commit's files are
+    /// extracted in the cache, its repository's lock held.  A build takes it
+    /// from the lock file, re-extracts it from the bare clone when its files
+    /// are missing, and checks them against the recorded content hash.  A
+    /// fetch keeps the locked commit while the entry's ref is unchanged and
+    /// its recorded version meets the `version` requirement; an update, or a
+    /// fetch that cannot keep it, resolves the ref again.  Either extracts
+    /// what no longer matches and answers a new entry, whose `version` the
+    /// caller fills in from the commit's cryoconfig.  `None` once the
+    /// failure is reported.
+    static cached_commit(dep: const Dependency*, mode: ResolveMode, existing: Lockfile*) -> Option<LockedDep> {
         mut sha: String = String::new();
         const url: str::Str = dep.git_url.as_str();
         const ref_kind: str::Str = GitRefKind::key_name(dep.ref_kind);
@@ -440,15 +460,18 @@ type struct DepResolver {
                         return Option::None;
                     }
                 }
+                return Option::Some(locked.clone());
             }
             _ => {
                 // Fetch/Update: reuse the locked commit if (Fetch only) the
-                // dep's ref is unchanged; otherwise resolve again.
+                // dep's ref is unchanged and its version is still accepted;
+                // otherwise resolve again.
                 mut reused: boolean = false;
                 mut recorded: String = String::new();
                 if (mode == ResolveMode::Fetch) {
                     const locked: const LockedDep* = existing.find(url, ref_kind, dep.ref_val.as_str());
-                    if (locked != null && GitUrl::is_commit_id(locked.commit.as_str())) {
+                    if (locked != null && GitUrl::is_commit_id(locked.commit.as_str())
+                            && DepResolver::accepts(dep, locked.version.as_str())) {
                         sha      = locked.commit.clone();
                         recorded = locked.content.clone();
                         reused   = true;
@@ -466,7 +489,7 @@ type struct DepResolver {
                     return Option::None;
                 }
                 if (!reused) {
-                    sha = DepResolver::resolve_to_sha(dep);
+                    sha = Git::resolve_ref_to_sha(url, dep.ref_kind, dep.ref_val.as_str());
                     if (sha.length() == 0) {
                         return Option::None;
                     }
@@ -481,56 +504,105 @@ type struct DepResolver {
                         return Option::None;
                     }
                 };
-                new_lock.packages.push(LockedDep {
+                return Option::Some(LockedDep {
                     url:      dep.git_url.clone(),
                     ref_kind: String::from_str(ref_kind),
                     ref_val:  dep.ref_val.clone(),
-                    commit:   sha.clone(),
+                    commit:   sha,
                     content:  content,
+                    version:  String::new(),
                 });
             }
         }
-        return Option::Some(sha);
     }
 
-
-    /// Resolve a git dep's ref-spec to a 40-char SHA.  Handles each
-    /// `GitRefKind` flavour; returns "" on failure (and prints).
-    static resolve_to_sha(dep: const Dependency*) -> String {
-        match (dep.ref_kind) {
-            GitRefKind::Version => {
-                const c: Constraint = Constraint::parse(dep.ref_val.as_str());
-                if (!c.valid) {
-                    fmt::eprintln(f"error: dependency '{dep.name}' has invalid version constraint '{dep.ref_val}'");
-                    return String::new();
+    /// Whether `version`, a library's `[lib] version` as written, meets
+    /// `dep`'s `version` requirement; true when `dep` writes none, and false
+    /// for an empty or malformed version when it does.
+    static accepts(dep: const Dependency*, version: str::Str) -> boolean {
+        if (dep.version_requirement.length() == 0) { return true; }
+        match (Requirement::parse(dep.version_requirement.as_str())) {
+            Option::Some(requirement) => {
+                match (Version::parse(version)) {
+                    Option::Some(parsed) => { return requirement.satisfied_by(&parsed); }
+                    Option::None         => { return false; }
                 }
-                const tags: [String] = Git::list_tags(dep.git_url.as_str());
-                const best: String = Constraint::select_best_tag(c, &tags);
-                if (best.length() == 0) {
-                    fmt::eprintln(f"error: no tag in {dep.git_url} satisfies version '{dep.ref_val}'");
-                    return String::new();
-                }
-                return Git::resolve_ref_to_sha(
-                    dep.git_url.as_str(), GitRefKind::Tag, best.as_str());
             }
-            GitRefKind::Tag => {
-                return Git::resolve_ref_to_sha(
-                    dep.git_url.as_str(), GitRefKind::Tag, dep.ref_val.as_str());
-            }
-            GitRefKind::Branch => {
-                return Git::resolve_ref_to_sha(
-                    dep.git_url.as_str(), GitRefKind::Branch, dep.ref_val.as_str());
-            }
-            GitRefKind::Rev => {
-                return Git::resolve_ref_to_sha(
-                    dep.git_url.as_str(), GitRefKind::Rev, dep.ref_val.as_str());
-            }
-            GitRefKind::None => {
-                // parse_inline_table_into_dep would have flagged this.
-                return String::new();
-            }
+            Option::None => { return false; }
         }
     }
+
+    /// The version of the library `dep` names, whose cryoconfig is
+    /// `dep_cfg` in `directory`, held to what `dep` asks of it; `None` once
+    /// the failure is reported.  A dependency is a library: its cryoconfig
+    /// has a `[lib]`.  A git dependency's library says its version, and
+    /// so does a path dependency's when `dep` writes a `version`
+    /// requirement, which the version must meet.  A git dependency pinned
+    /// by a tag that names a version, `v0.2.0`, must find that version in
+    /// the tagged commit's cryoconfig.  `commit` is the git dependency's
+    /// commit, and empty for a path dependency.
+    static library_version(dep: const Dependency*, dep_cfg: const ProjectConfig*, directory: Path,
+                           commit: String) -> Option<String> {
+        const config_path: PathBuf = directory.join("cryoconfig");
+        const shown: String = if (commit.length() > 0) { f"{dep.git_url} at commit {commit.as_str().byte_substring(0, 12)}" }
+            else { String::from_str(directory.as_str()) };
+        if (!dep_cfg.lib.is_present()) {
+            fmt::eprintln(f"error: dependency '{dep.name}' is not a library: {config_path.as_path().as_str()} has no [lib] section");
+            fmt::eprintln(f"  help: a library's cryoconfig names it, its sources and its version:");
+            fmt::eprintln(f"        [lib]");
+            fmt::eprintln(f"        name = \"{dep.name}\"");
+            fmt::eprintln(f"        source_dir = \"src\"");
+            fmt::eprintln(f"        version = \"0.1.0\"");
+            return Option::None;
+        }
+        const version: String = String::from_str(str::Str::from(dep_cfg.lib.version));
+        if (version.length() == 0) {
+            if (commit.length() == 0 && dep.version_requirement.length() == 0) { return Option::Some(version); }
+            fmt::eprintln(f"error: dependency '{dep.name}' ({shown}) does not say its version");
+            if (commit.length() > 0) {
+                fmt::eprintln("  help: the library's cryoconfig says it under [lib]: `version = \"0.1.0\"`; commit that to the repository, then run `cryo update`");
+            } else {
+                fmt::eprintln(f"  help: the library's cryoconfig says it under [lib]: add `version = \"0.1.0\"` to {config_path.as_path().as_str()}");
+            }
+            return Option::None;
+        }
+        if (!DepResolver::accepts(dep, version.as_str())) {
+            fmt::eprintln(f"error: dependency '{dep.name}' requires version {dep.version_requirement}, and {shown} is version {version}");
+            // The requirement that accepts this version and every later one
+            // that does not break it: its major, or below 1.0.0 its minor too.
+            mut accepted: String = version.clone();
+            match (Version::parse(version.as_str())) {
+                Option::Some(parsed) => {
+                    accepted = f"{parsed.major}";
+                    if (parsed.major == 0) { accepted.push(f".{parsed.minor}"); }
+                }
+                Option::None => { }
+            }
+            mut source: String = if (commit.length() > 0) { f"git = \"{dep.git_url}\"" } else { f"path = \"{dep.path}\"" };
+            const ref_key: str::Str = GitRefKind::key_name(dep.ref_kind);
+            if (ref_key.length() > 0) { source.push(f", {ref_key} = \"{dep.ref_val}\""); }
+            fmt::eprintln(f"  help: to accept version {version}, write `{dep.name} = {{ {source}, version = \"{accepted}\" }}`; or name a `branch`, `tag` or `rev` whose cryoconfig says a version that meets {dep.version_requirement}");
+            return Option::None;
+        }
+        match (dep.ref_kind) {
+            GitRefKind::Tag => {
+                match (Version::of_tag(dep.ref_val.as_str())) {
+                    Option::Some(tagged) => {
+                        const said: Option<Version> = Version::parse(version.as_str());
+                        if (said.is_none() || said.unwrap().compare(&tagged) != 0) {
+                            fmt::eprintln(f"error: dependency '{dep.name}' names the tag `{dep.ref_val}`, and the library's cryoconfig at that tag says version {version}");
+                            fmt::eprintln(f"  help: a tag that names a version must agree with `[lib] version`; to take this commit anyway, write `rev = \"{commit}\"` in place of `tag = \"{dep.ref_val}\"`");
+                            return Option::None;
+                        }
+                    }
+                    Option::None => { }
+                }
+            }
+            _ => { }
+        }
+        return Option::Some(version);
+    }
+
 
     /// Harvest a dep's published source roots into `outcome.roots`, each
     /// joined onto `base`: the form the loader expects, relative for a path

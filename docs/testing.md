@@ -545,9 +545,12 @@ read:
 `git_fixtures` gives a project git repositories with no network. Each
 fixture names a repository, a directory of the project (`from`) and its
 commits in order; each commit holds exactly the files of one directory below
-`from` (`tree`) and carries a tag. The project then runs in a copy of
+`from` (`tree`) and carries a tag, and the commits follow one another on the
+branch `main`, the repository's default. The project then runs in a copy of
 itself outside the tree: the runner builds each repository there with a
-fixed author and date and no user or system git configuration, writes its
+fixed author and date and no user or system git configuration, so a
+commit's id is the same on every host and a test may write it in a `rev`,
+writes its
 `file://` URL wherever a cryoconfig of the copy says `{fixture:<name>}` (a
 fixture's own commits included, so one fixture package can depend on
 another), and sets `CRYO_HOME` to a cache of the copy's own. A step then

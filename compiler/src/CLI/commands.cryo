@@ -1386,26 +1386,53 @@ type struct Executor {
             }
         }
 
-        const ns_name: String = Executor::derive_namespace(name.as_str());
+        // A library's namespace is its name, which every program that uses
+        // it imports; an executable's is its name capitalized.
+        const ns_name: String = Executor::derive_namespace(name.as_str(), !is_library);
         const source_path: path::PathBuf = src_path.join(if (is_library) { "lib.cryo" } else { "main.cryo" });
         const source_text: String = if (is_library) {
             Executor::library_source(name.as_str(), ns_name.as_str())
         } else {
             Executor::program_source(ns_name.as_str())
         };
+        // A library also gets a test of its function and a README saying
+        // how a program depends on it.  Every file is checked before any
+        // is written, so a refusal leaves the directory as it was.
+        const tests_path: path::PathBuf = path::Path::from(Str::new(target_dir)).join("tests");
+        const test_path: path::PathBuf = tests_path.join(f"{ns_name}_tests.cryo".as_str());
+        const readme_path: path::PathBuf = path::Path::from(Str::new(target_dir)).join("README.md");
         if (!Executor::refuse_existing_scaffold_file(source_path.as_path())) { return 1; }
+        if (is_library && (!Executor::refuse_existing_scaffold_file(test_path.as_path())
+                || !Executor::refuse_existing_scaffold_file(readme_path.as_path()))) { return 1; }
         if (!Executor::write_scaffold_file(source_path.as_path(), source_text.as_str())) { return 1; }
+        if (is_library) {
+            match (Directory::create_all(tests_path.as_path())) {
+                Result::Ok(_)  => { }
+                // A directory that cannot be made is reported by the write.
+                Result::Err(_) => { }
+            }
+            if (!Executor::write_scaffold_file(test_path.as_path(), Executor::library_test_source(ns_name.as_str()).as_str())) { return 1; }
+            if (!Executor::write_scaffold_file(readme_path.as_path(), Executor::library_readme(name.as_str(), ns_name.as_str()).as_str())) { return 1; }
+        }
 
         if (!Executor::write_cryoconfig(config_path.as_path(), name.as_str(), src_dir.as_str(),
                                         out_dir.as_str(), is_library)) { return 1; }
 
         fmt::print(f"\n  Created {config_path.as_str()}\n");
         fmt::print(f"  Created {source_path.as_str()}\n");
+        if (is_library) {
+            fmt::print(f"  Created {test_path.as_str()}\n");
+            fmt::print(f"  Created {readme_path.as_str()}\n");
+        }
         fmt::printf("\nNext steps:\n");
         if (target_dir != ".") {
             fmt::printf("  cd %s\n", target_dir);
         }
-        fmt::printf("  cryo %s\n", if (is_library) { "build" } else { "run" });
+        if (is_library) {
+            fmt::printf("  cryo build\n  cryo test\n");
+        } else {
+            fmt::printf("  cryo run\n");
+        }
         return 0;
     }
 
@@ -1494,6 +1521,37 @@ type struct Executor {
         return text;
     }
 
+    /// A new library's first test, of the function `library_source` writes:
+    /// a file under `tests/`, which `cryo test` builds with the library.
+    static library_test_source(ns_name: Str) -> String {
+        mut text: String = String::new();
+        text.push(f"![config(testing)]\nnamespace {ns_name}_tests;\n\n");
+        text.push(f"import {ns_name};\n");
+        text.push("import std::test::assert::{ expect_equal };\n");
+        text.push("import std::test::error::{ TestError };\n\n");
+        text.push("![test]\n");
+        text.push("function add_sums_its_arguments() -> Result<(), TestError> {\n");
+        text.push(f"    return expect_equal({ns_name}::add(2, 3), 5);\n");
+        text.push("}\n");
+        return text;
+    }
+
+    /// A new library's README: what it is, and how a program depends on it
+    /// and imports it.
+    static library_readme(name: Str, ns_name: Str) -> String {
+        mut text: String = String::new();
+        text.push(f"# {name}\n\nA Cryo library.\n\n");
+        text.push("## Use\n\nA program names it in its cryoconfig, by the git repository it is\n");
+        text.push("published in (or by a `path` on this machine), with the versions it accepts:\n\n");
+        text.push(f"```\n[dependencies]\n{name} = {{ git = \"https://example.com/you/{name}\", version = \"0.1\" }}\n```\n\n");
+        text.push(f"and imports it by its namespace, `{ns_name}`:\n\n");
+        text.push(f"```\nimport {ns_name};\n\nconst sum: int = {ns_name}::add(2, 3);\n```\n\n");
+        text.push("## Version\n\nThe library's version is the `version` under `[lib]` in its cryoconfig.\n");
+        text.push("A program that writes `version = \"0.1\"` accepts 0.1.0 and every later 0.1.x.\n\n");
+        text.push("## Develop\n\n```\ncryo build\ncryo test\n```\n");
+        return text;
+    }
+
     /// Whether `path`, a file `cryo init` would write, is free; when a file
     /// is already there, says so, naming it, and false.  Init never
     /// overwrites a file: a project's cryoconfig and sources are the user's.
@@ -1515,10 +1573,11 @@ type struct Executor {
         }
     }
 
-    /// Derive a PascalCase namespace identifier from a project name.
+    /// Derive a namespace identifier from a project name, its first letter
+    /// upper-case when `capitalized`.
     ///
-    /// Examples:  `hello` -> `Hello`, `my-app` -> `My_app`,
-    /// `123foo` -> `Foo` (leading non-letters dropped),
+    /// Examples:  `hello` -> `Hello` (or `hello`), `my-app` -> `My_app`
+    /// (or `my_app`), `123foo` -> `Foo` (leading non-letters dropped),
     /// `--` -> `Main` (no usable chars -> fallback).
     ///
     /// The first emitted byte is always an ASCII letter; subsequent bytes
@@ -1526,14 +1585,14 @@ type struct Executor {
     /// Anything else is dropped.  The output compiles as-is even when the
     /// input contains characters the Cryo parser would reject in an
     /// identifier.
-    static derive_namespace(name: Str) -> String {
+    static derive_namespace(name: Str, capitalized: boolean) -> String {
         mut out: String = String::with_capacity(name.length());
         for (byte in name.as_bytes().iter()) {
             const ch: char = byte as char;
             if (out.is_empty()) {
-                // First byte: only letters allowed; lowercase gets upcased.
-                // Digits, symbols and hyphens at the start are skipped.
-                if (ch.is_alpha()) { out.push_byte(ch.to_ascii_uppercase() as u8); }
+                // First byte: only letters allowed.  Digits, symbols and
+                // hyphens at the start are skipped.
+                if (ch.is_alpha()) { out.push_byte(if (capitalized) { ch.to_ascii_uppercase() as u8 } else { ch as u8 }); }
             } else if (ch.is_alphanumeric() || ch == '_') {
                 out.push_byte(ch as u8);
             } else if (ch == '-' || ch == ' ') {
@@ -1557,6 +1616,7 @@ type struct Executor {
             text.push("\n[lib]\n");
             text.push(f"name = \"{name}\"\n");
             text.push(f"source_dir = \"{src_dir}\"\n");
+            text.push("version = \"0.1.0\"\n");
         } else {
             text.push("target_type = \"executable\"\n");
             text.push(f"source_dir = \"{src_dir}\"\n");
@@ -3535,8 +3595,9 @@ type struct Executor {
         return true;
     }
 
-    /// Build the bare repository `<repositories>/<name>.git` of `fixture`:
-    /// one commit per entry, in order, each holding exactly the files of
+    /// Build the bare repository `<repositories>/<name>.git` of `fixture`,
+    /// whose default branch is `main`: one commit per entry, in order, each
+    /// holding exactly the files of
     /// `<copy>/<from>/<tree>` and carrying its tag.  Every git command runs
     /// with a fixed author, committer and date and with no system or user
     /// configuration, so a fixture's commits do not depend on who runs it.
@@ -3546,7 +3607,7 @@ type struct Executor {
         if (Directory::create_all(repository.as_path()).is_err()) { return false; }
         const no_config: path::PathBuf = repositories.join(str::Str::new("no-user-config"));
         const git_dir: String = f"--git-dir={repository.as_path().as_str()}";
-        if (!Executor::fixture_git(no_config.as_path(), [str::Str::new("init"), str::Str::new("--bare"), str::Str::new("-q"), repository.as_path().as_str()])) {
+        if (!Executor::fixture_git(no_config.as_path(), [str::Str::new("init"), str::Str::new("--bare"), str::Str::new("-q"), str::Str::new("--initial-branch=main"), repository.as_path().as_str()])) {
             return false;
         }
         for (mut c: i64 = 0; c < fixture.commits.length(); c++) {
@@ -3554,6 +3615,10 @@ type struct Executor {
             if (!tree.as_path().is_directory()) { return false; }
             const work_tree: String = f"--work-tree={tree.as_path().as_str()}";
             const tag: str::Str = fixture.commits[c].tag.as_str();
+            // The index is emptied first: it holds the previous tree's
+            // entries, and a file of this tree with the same size and time
+            // as one of those would be taken for it, unread.
+            if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), str::Str::new("read-tree"), str::Str::new("--empty")])) { return false; }
             if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), work_tree.as_str(), str::Str::new("add"), str::Str::new("-A")])) { return false; }
             if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), work_tree.as_str(), str::Str::new("commit"), str::Str::new("-q"), str::Str::new("--allow-empty"), str::Str::new("-m"), tag])) { return false; }
             if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), str::Str::new("tag"), tag])) { return false; }
@@ -4219,7 +4284,7 @@ type struct Executor {
             Option::None       => { String::new() }
         };
         const name: String = registry::VendorRegistry::text_field(&root, Str::new("name"),
-            Executor::derive_namespace(key.as_str()).as_str());
+            Executor::derive_namespace(key.as_str(), true).as_str());
 
         mut entry: registry::VendorEntry = registry::VendorEntry {
             key:            key.clone(),

@@ -654,7 +654,9 @@ public:
             };
             mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0509_LIBRARY_DECLARES_NO_NAMESPACE, message);
             diag = diag.with_note("a library's namespace is the one its `lib.cryo` declares, and a program imports the library by it");
-            diag = diag.help(f"begin {file} with `namespace <Name>;`, naming the library's namespace");
+            // A dependency's name is the one a program knows it by.
+            const name: Str = if (library.package.origin_name.length() > 0) { library.package.origin_name.as_str() } else { Str::new("<name>") };
+            diag = diag.help(f"begin {file} with `namespace {name};`, the namespace a program imports the library by");
             sink.emit(diag);
         }
         return all_named;
@@ -684,7 +686,11 @@ public:
                 mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0510_NAMESPACE_OUTSIDE_LIBRARY,
                     f"the namespace `{declared}` is outside `{own}`, the namespace of {package_text}");
                 diag = diag.with_note(f"{file} declares it");
-                diag = diag.help(f"every file of a library declares its `lib.cryo`'s namespace or one below it (`{own}::<name>`)");
+                const last: Str = match (declared.split_once_from_end(&Str::new("::"))) {
+                    Option::Some(parts) => { parts.second }
+                    Option::None        => { declared }
+                };
+                diag = diag.help(f"every file of a library declares its `lib.cryo`'s namespace or one below it; write `namespace {own}::{last};` in {file}");
                 sink.emit(diag);
             }
         }
@@ -959,6 +965,28 @@ public:
         match (suggestion) {
             Option::Some(name) => { diag = diag.with_note(f"did you mean `{name}`?"); }
             Option::None => { }
+        }
+        // A path below a library's namespace names one of that library's
+        // modules, so the help lists the ones it has.
+        const top: Str = match (Str::new(path).split_once(&Str::new("::"))) {
+            Option::Some(parts) => { parts.first }
+            Option::None        => { Str::new(path) }
+        };
+        for (mut i: i64 = 0; i < this.package_roots.libraries.length(); i++) {
+            const library: &PackageLibrary = &this.package_roots.libraries[i];
+            if (library.namespace.as_str() != top) { continue; }
+            const below: String = f"{top}::";
+            mut modules: [String] = [];
+            for (name in this.ns_map.key_references()) {
+                if (name.as_str() == top || name.as_str().starts_with(below.as_str())) { modules.push(name.clone()); }
+            }
+            modules.sort();
+            mut listed: String = String::new();
+            for (mut m: i64 = 0; m < modules.length(); m++) {
+                if (m > 0) { listed.push(", "); }
+                listed.push(f"`{modules[m]}`");
+            }
+            return diag.help(f"`{top}` is the namespace of {library.package.describe()}, which has the modules {listed}; import one of them, as `import {modules[0]};`");
         }
         return diag.help(
             "imports resolve against the project root, the entry-point directory, and the standard library; module paths are case-sensitive");

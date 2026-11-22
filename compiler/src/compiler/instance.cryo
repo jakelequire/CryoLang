@@ -696,9 +696,17 @@ type struct CompilerInstance {
         if (base.lib.is_present() && base.bins.length() == 0) {
             Log::debug(LogArea::Driver, f"building lib '{base.lib.name}' from {base.lib.source_dir}");
             // Clone so `base` survives for the per-bin views below.
-            const lib_view: ProjectConfig = CompilerInstance::make_lib_view(base.clone());
+            mut lib_view: ProjectConfig = CompilerInstance::make_lib_view(base.clone());
+            // `cryo test` runs a library's tests from an executable: the
+            // library's files, from its lib.cryo, and the project's tests,
+            // with the test main.
+            if (this.config.test_mode) {
+                lib_view.target_type = TargetType::Executable;
+                lib_view.entry_point = Path::from(lib_view.source_dir).join("lib.cryo").into_raw();
+            }
             const r: CompilationResult = this.compile_project_with_config(lib_view);
             if (!r.success) { return r; }
+            if (!r.output_path.as_path().is_empty()) { last_output = PathBuf::from(r.output_path.as_str()); }
         }
 
         for (mut i: i64 = 0; i < base.bins.length(); i++) {
@@ -1850,9 +1858,11 @@ type struct CompilerInstance {
                         ModuleOrigin::Vendor => { n_vendor += 1; }
                     }
                 }
-                fmt::printf(
-                    "Building %s [%s]: %u local",
-                    config.project_name, config.profile, n_local);
+                // A library's build names its version beside its name.
+                const versioned: boolean = config.lib.version.length() > 0 && config.project_name.eq(config.lib.name);
+                fmt::printf("Building %s", config.project_name);
+                if (versioned) { fmt::printf(" %s", config.lib.version); }
+                fmt::printf(" [%s]: %u local", config.profile, n_local);
                 if (n_std > 0) { fmt::printf(", %u std", n_std); }
                 if (n_dep > 0) { fmt::printf(", %u dep", n_dep); }
                 if (n_vendor > 0) { fmt::printf(", %u vendor", n_vendor); }

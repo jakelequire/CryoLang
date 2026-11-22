@@ -63,7 +63,8 @@ type struct Git {
             mut clone: Command = Git::command(transport);
             clone.argument("clone").argument("--bare").argument("--quiet").argument("--").argument(url).argument(dir.as_path().as_str());
             if (Git::run(&clone) != 0) {
-                fmt::eprintln(f"error: git clone failed for {url}");
+                fmt::eprintln(f"error: cannot fetch {url}: git could not clone it (its own message is above)");
+                fmt::eprintln(f"  help: check the `git` URL in the cryoconfig; `git ls-remote {url}` shows whether this machine can reach the repository");
                 return false;
             }
             return true;
@@ -71,10 +72,14 @@ type struct Git {
 
         if (refresh) {
             fmt::println(f"[deps] refreshing {url}");
+            // A bare clone records no refspec, so the branches and tags are
+            // named: each local branch is the remote's, moved forward or not.
             mut fetch: Command = Git::on_bare_clone(&dir, transport);
-            fetch.argument("fetch").argument("--quiet").argument("--tags").argument("--prune").argument("--all");
+            fetch.argument("fetch").argument("--quiet").argument("--prune").argument("--force")
+                .argument("--").argument(url)
+                .argument("+refs/heads/*:refs/heads/*").argument("+refs/tags/*:refs/tags/*");
             if (Git::run(&fetch) != 0) {
-                fmt::eprintln(f"warning: git fetch failed for {url} (using stale refs)");
+                fmt::eprintln(f"warning: cannot reach {url}; using the branches and tags fetched before");
                 // Soft-fail: an offline build with a populated cache is
                 // still useful, and an unreachable remote shouldn't kill
                 // a project that was already pinned.
@@ -94,12 +99,15 @@ type struct Git {
     /// doesn't track local branches, so we look at the remote-tracking
     /// `refs/heads/<branch>` ref directly.
     static resolve_ref_to_sha(url: Str, ref_kind: GitRefKind, ref_value: Str) -> String {
-        match (GitUrl::ref_refusal(ref_value)) {
-            Option::Some(reason) => {
-                fmt::eprintln(f"error: refusing to resolve `{ref_value}` inside {url}: the value {reason}");
-                return String::new();
+        // The default branch takes no value; any other ref's reaches git.
+        if (GitRefKind::key_name(ref_kind).length() > 0) {
+            match (GitUrl::ref_refusal(ref_value)) {
+                Option::Some(reason) => {
+                    fmt::eprintln(f"error: refusing to resolve `{ref_value}` inside {url}: the value {reason}");
+                    return String::new();
+                }
+                Option::None => { }
             }
-            Option::None => { }
         }
         const dir: PathBuf = Cache::git_dir_for(url);
 
@@ -122,15 +130,10 @@ type struct Git {
             GitRefKind::Rev => {
                 candidates.push(String::from_str(ref_value));
             }
-            GitRefKind::Version => {
-                // Caller resolves Version -> tag separately via list_tags;
-                // by the time we land here it should have been rewritten.
-                fmt::eprintf("internal error: resolve_ref_to_sha called with raw Version ref\n");
-                return String::new();
-            }
             GitRefKind::None => {
-                fmt::eprintf("internal error: resolve_ref_to_sha called with no ref\n");
-                return String::new();
+                // The clone's HEAD names the remote's default branch, whose
+                // ref every refresh moves.
+                candidates.push(String::from_str(Str::new("HEAD")));
             }
         }
 
@@ -145,18 +148,15 @@ type struct Git {
             }
         }
 
-        fmt::eprintln(f"error: could not resolve '{ref_value}' inside {url}");
+        const ref_key: Str = GitRefKind::key_name(ref_kind);
+        if (ref_key.length() == 0) {
+            fmt::eprintln(f"error: {url} has no default branch to take the dependency from");
+            fmt::eprintln(f"  help: name a branch, tag or commit: `branch = \"main\"`; `git ls-remote --heads --tags {url}` lists them");
+        } else {
+            fmt::eprintln(f"error: {url} has no {ref_key} `{ref_value}`");
+            fmt::eprintln(f"  help: name a {ref_key} the repository has; `git ls-remote --heads --tags {url}` lists its branches and tags");
+        }
         return String::new();
-    }
-
-    /// List every tag in the bare clone for `url`, one per element.
-    /// Used for semver-range resolution against `version = "..."`.
-    /// Returns an empty list on failure (and prints a diagnostic).
-    static list_tags(url: Str) -> [String] {
-        const dir: PathBuf = Cache::git_dir_for(url);
-        mut list: Command = Git::on_bare_clone(&dir, GitTransport::File);
-        list.argument("tag").argument("--list");
-        return Git::capture(&list);
     }
 
 
