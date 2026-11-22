@@ -6460,9 +6460,12 @@ type struct CallResolver {
     /// `diag`, a call's E0358 for a trait default that a bound on one of the
     /// trait's associated types keeps off the receiver, with the bound and
     /// the binding that fails it.  Its help shows the fix where one is
-    /// certain: an item that is a reference to a built-in value type with
-    /// the trait is compared through `map`, which copies the values out; an
-    /// item of any other type that is no reference needs the trait.
+    /// certain: an item of a type that is no reference needs the trait, and
+    /// so does the referent of a reference that an implementation for
+    /// references gives the trait where its referent has it (`Ord for &T
+    /// where T: Ord`); a reference to a built-in value type with the trait,
+    /// which no such implementation gives it, is compared through `map`,
+    /// which copies the values out.
     explain_unmet_projection_bound(&this, diag: Diagnostic, method_name: string, type_display: string,
                                    unmet: const TraitRef*, member: TypeRef, associated: SymbolStr,
                                    owner: DefId) -> Diagnostic {
@@ -6478,6 +6481,12 @@ type struct CallResolver {
         }
         const referent: TypeRef = member_t.as_reference().referent;
         const referent_t: Type* = this.arena.lookup(referent);
+        if (referent_t != null && this.trait_checker().reference_head_follows_referent(unmet.definition(), member)) {
+            const followed_display: string = this.arena.format_display(referent_t);
+            explained = explained.with_note(
+                f"a reference implements `{bound_name}` where the type it refers to does, and `{followed_display}` does not");
+            return explained.help(f"implement `{bound_name}` for `{followed_display}`");
+        }
         const built_in: boolean = referent_t != null && (referent_t.kind == TypeKind::Int
             || referent_t.kind == TypeKind::Float || referent_t.kind == TypeKind::Bool
             || referent_t.kind == TypeKind::Char);

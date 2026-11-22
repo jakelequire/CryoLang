@@ -22,7 +22,7 @@ import compiler::ast::{
 };
 import compiler::types::{
     generic, user_defined, compound, type_base, arena, type_ref,
-    substitution, inference, generic_registry, ownership, TypeKind
+    substitution, inference, generic_registry, ownership, TypeKind, RefMutability
 };
 import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::resolver::{ intern_table, symbol_str };
@@ -691,6 +691,31 @@ type struct TraitChecker {
         if (head == null) { return false; }
         const no_trait_args: [TypeRef] = [];
         return this.impl_applies_at(head, head.trait_def, &no_trait_args, subject, depth);
+    }
+
+    /// Whether a head for the references of `reference`'s mutability
+    /// implements `trait_def` exactly where the referent does, its
+    /// where-clause bounding its own parameter by that trait
+    /// (`implement<T> trait Ord for &T where T: Ord`): then the reference
+    /// lacks the trait because what it refers to does.
+    reference_head_follows_referent(&this, trait_def: DefId, reference: TypeRef) -> boolean {
+        const t: Type* = this.arena.lookup(reference);
+        if (t == null || t.kind != TypeKind::Reference || this.generic_registry == null) { return false; }
+        const mutable: boolean = t.as_reference().mutability == RefMutability::Mutable;
+        const heads: [DeclarationNode*] = this.generic_registry.blanket_heads_of(trait_def);
+        for (mut h: i64 = 0; h < heads.length(); h++) {
+            const head: ImplBlock* = DeclarationNode::impl_of(heads[h]);
+            if (head == null || !head.target_reference || head.target_reference_mutable != mutable) { continue; }
+            const param: SymbolID = head.target_param();
+            for (mut b: i64 = 0; b < head.where_bounds.length(); b++) {
+                const bound: TraitBound* = &head.where_bounds[b];
+                if (!bound.subject_param().equals(param)) { continue; }
+                for (mut r: i64 = 0; r < bound.trait_refs.length(); r++) {
+                    if (bound.trait_refs[r].definition().equals(trait_def)) { return true; }
+                }
+            }
+        }
+        return false;
     }
 
     /// The implementation for references that gives a method call its
