@@ -17,10 +17,17 @@
 .PARAMETER RemoveArchives
     Delete the archives the install built in the user's cache (the
     compiler's cache root, below which `archives` holds them).
+
+.PARAMETER CacheRoot
+    The compiler's cache root, for -RemoveArchives, when the caller knows
+    it: the MSI names the user's LocalAppData folder, since its actions
+    run with the Windows Installer service's environment rather than the
+    user's.  Without it, the root is read from the environment, as the
+    compiler reads it.
 #>
 
 [CmdletBinding()]
-param([switch]$AddToPath, [switch]$RemoveFromPath, [switch]$RemoveArchives)
+param([switch]$AddToPath, [switch]$RemoveFromPath, [switch]$RemoveArchives, [string]$CacheRoot)
 
 $ErrorActionPreference = "Stop"
 $bindir = Join-Path $PSScriptRoot "bin"
@@ -53,10 +60,12 @@ if ($RemoveFromPath) {
 }
 
 if ($RemoveArchives) {
-    $cacheRoot = if ($env:CRYO_HOME) { Join-Path $env:CRYO_HOME "cache" }
-                 elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "cryo" }
-                 else { Join-Path $env:USERPROFILE ".cache\cryo" }
-    $archives = Join-Path $cacheRoot "archives"
+    if (-not $CacheRoot) {
+        $CacheRoot = if ($env:CRYO_HOME) { Join-Path $env:CRYO_HOME "cache" }
+                     elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "cryo" }
+                     else { Join-Path $env:USERPROFILE ".cache\cryo" }
+    }
+    $archives = Join-Path $CacheRoot "archives"
     if (Test-Path $archives) {
         Remove-Item -Recurse -Force $archives
         Write-Host "[ok]    removed $archives"

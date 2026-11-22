@@ -18,6 +18,9 @@
 #     fails on every machine whose toolchain is on the user's PATH.  It
 #     belongs in the wizard's sequence, after the files are in place, as the
 #     script action that leaves its outcome to the finish page;
+#   - removes the user's cache archives in the install's own sequence
+#     without naming the user's cache root ([LocalAppDataFolder]cryo), for
+#     the same reason: that environment's LOCALAPPDATA is not the user's;
 #   - has no wizard: no license, location, toolchain or finish page, or a
 #     finish page that does not show the dependency step's report.
 #
@@ -79,6 +82,8 @@ step_type="$(printf '%s\n' "$actions" | awk -F'\t' '$1 == "DependencyStep" { pri
 for action in $(table InstallExecuteSequence | cut -f1); do
     printf '%s\n' "$actions" | awk -F'\t' -v action="$action" '$1 == action && $4 ~ /install-dependencies/ { found = 1 } END { exit !found }' \
         && refuse "the MSI's InstallExecuteSequence action ${action} runs install-dependencies.ps1"
+    printf '%s\n' "$actions" | awk -F'\t' -v action="$action" '$1 == action && $4 ~ /-RemoveArchives/ && $4 !~ /-CacheRoot "\[LocalAppDataFolder\]cryo"/ { found = 1 } END { exit !found }' \
+        && refuse "the MSI's InstallExecuteSequence action ${action} removes the cache archives without naming the user's cache root"
 done
 
 dialogs="$(table Dialog | cut -f1)"
