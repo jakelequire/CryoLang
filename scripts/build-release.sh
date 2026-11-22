@@ -66,10 +66,25 @@ case "$PLATFORM" in
     *) echo "usage: build-release.sh <linux|windows> [--allow-unsmoked] [--dynamic]" >&2; exit 1 ;;
 esac
 
-# Single source of truth for the version.
-VER="$(grep -oE 'const VERSION:[[:space:]]*string[[:space:]]*=[[:space:]]*"[^"]+"' \
-        "${ROOT}/compiler/src/main.cryo" | sed -E 's/.*"([^"]+)".*/\1/')"
+. "${ROOT}/scripts/llvm-version.env"
+
+# The version every artifact is named by, from compiler/src/main.cryo:
+# VERSION, and while PRERELEASE is set, `-<PRERELEASE>.<commits>`, the count
+# of commits in HEAD's history - the number `cryo stamp` records and `cryo
+# version` prints, which orders the pre-releases as main's history does.  A
+# shallow clone counts only what it fetched, so it is refused.
+read_constant() {
+    grep -oE "const $1:[[:space:]]*string[[:space:]]*=[[:space:]]*\"[^\"]*\"" \
+        "${ROOT}/compiler/src/main.cryo" | sed -E 's/.*"([^"]*)".*/\1/'
+}
+VER="$(read_constant VERSION)"
 [ -n "$VER" ] || { echo "error: could not read VERSION from compiler/src/main.cryo" >&2; exit 1; }
+PRERELEASE="$(read_constant PRERELEASE)"
+if [ -n "$PRERELEASE" ]; then
+    [ "$(git -C "$ROOT" rev-parse --is-shallow-repository)" = false ] \
+        || { echo "error: a shallow clone cannot number a pre-release; fetch the whole history (git fetch --unshallow)" >&2; exit 1; }
+    VER="${VER}-${PRERELEASE}.$(git -C "$ROOT" rev-list --count HEAD)"
+fi
 
 echo "[build-release] cryo v${VER} -> ${PLATFORM}-x86_64"
 mkdir -p "$DIST"
@@ -135,6 +150,13 @@ smoke_stage() {
             exit 1
         fi
     fi
+    # The staged compiler reports the version the archive is named by.
+    local reported
+    reported="$(env "${smoke_env[@]}" "${runner[@]}" "${stage}/bin/${exe}" --version | tr -d '\r')"
+    case "$reported" in
+        "cryo version ${VER}+"*) ;;
+        *) echo "error: the staged ${exe} reports '${reported}', not version ${VER}" >&2; exit 1 ;;
+    esac
     # The first smoke builds the stdlib archives of the default profiles, and
     # the runtime archive of the default configuration, with the staged
     # compiler; they ship, and the trees are then marked shipped, so an
@@ -201,6 +223,31 @@ trim_stdlib_archives() {
     # What the smoke's link driver answered about itself describes the
     # build machine's toolchain, not the user's.
     rm -rf "${stage}"/stdlib/.bin/*/toolchain
+}
+
+stamp_compiler() {
+    # $1 = the staged compiler.  Stamped with the checkout it was built
+    # from, for `cryo version`, by the compiler this tree built: its stamp
+    # holds every field the shipped compiler reads, where the pin, an older
+    # compiler, writes only those it knows.  Stamped after stripping: the
+    # stamp records the size and digest of the bytes that ship, which the
+    # compiler then reads instead of hashing itself.
+    local stamper="${ROOT}/compiler/build/cryo"
+    if host_is windows; then stamper="${stamper}.exe"; fi
+    ( cd "$ROOT" && "$stamper" stamp "$1" --profile=release )
+}
+
+stage_clang_headers() {
+    # $1 = staging dir, $2 = the clang resource directory to ship from.
+    # libclang reads its builtin headers (stddef.h, stdint.h, ...) from its
+    # resource directory, and a shipped compiler names <tree>/lib/clang/<major>
+    # as that, since no user's machine need have clang's own; without them
+    # a C import takes every `size_t` for an `int`.
+    local stage="$1" source="$2"
+    [ -f "${source}/include/stddef.h" ] \
+        || { echo "error: no clang builtin headers at ${source}/include" >&2; exit 1; }
+    mkdir -p "${stage}/lib/clang/${LLVM_MAJOR}"
+    cp -R "${source}/include" "${stage}/lib/clang/${LLVM_MAJOR}/include"
 }
 
 stage_lsp() {
@@ -272,11 +319,7 @@ build_linux() {
     [ -x "$out" ] || { echo "error: static cryo not produced at $out" >&2; exit 1; }
     cp "$out" "${stage}/bin/cryo"
     strip "${stage}/bin/cryo" 2>/dev/null || true
-    # The checkout it was built from, for `cryo version`; `make cryo` and
-    # `make cryo-exe` stamp the binaries they link the same way.  Stamped
-    # after stripping: the stamp records the size and digest of the bytes
-    # that ship, which the compiler then reads instead of hashing itself.
-    ( cd "$ROOT" && "${ROOT}/bin/cryo" stamp "${stage}/bin/cryo" --profile=release )
+    stamp_compiler "${stage}/bin/cryo"
 
     stage_lsp "$stage" "${ROOT}/compiler/build/cryo" cryolsp "${link[@]}"
     strip "${stage}/bin/cryolsp" 2>/dev/null || true
@@ -300,6 +343,7 @@ build_linux() {
 
     stage_common "$stage"
     stage_runtime "$stage"
+    stage_clang_headers "$stage" "$("${CRYO_LLVM_CONFIG:-llvm-config-${LLVM_MAJOR}}" --libdir)/clang/${LLVM_MAJOR}"
     cp "${ROOT}/scripts/install-dependencies.sh" "${stage}/install-dependencies.sh"
     chmod +x "${stage}/install-dependencies.sh"
 
@@ -329,12 +373,14 @@ build_windows() {
         make -C "$ROOT" cryo >/dev/null
         [ -f "$exe" ] || { echo "error: cryo.exe not produced at $exe" >&2; exit 1; }
         cp "$exe" "${stage}/bin/cryo.exe"
+        stamp_compiler "${stage}/bin/cryo.exe"
         stage_lsp "$stage" "$exe" cryolsp.exe
     else
         echo "[build-release] cross-building cryo.exe"
         make -C "$ROOT" cryo-exe >/dev/null
         [ -f "$exe" ] || { echo "error: cryo.exe not produced at $exe" >&2; exit 1; }
         cp "$exe" "${stage}/bin/cryo.exe"
+        stamp_compiler "${stage}/bin/cryo.exe"
         CRYO_CC="clang-20 --target=x86_64-w64-mingw32 -fuse-ld=lld" \
             stage_lsp "$stage" "${ROOT}/compiler/build/cryo" cryolsp.exe --target=x86_64-pc-windows-gnu
     fi
@@ -344,6 +390,7 @@ build_windows() {
 
     stage_common "$stage"
     stage_runtime "$stage"
+    stage_clang_headers "$stage" "${ROOT}/.toolchains/llvm-win/lib/clang/${LLVM_MAJOR}"
     cp "${ROOT}/scripts/install-dependencies.ps1" "${stage}/install-dependencies.ps1"
     cp "${ROOT}/scripts/user-setup.ps1" "${stage}/user-setup.ps1"
 

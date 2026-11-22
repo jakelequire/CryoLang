@@ -28,7 +28,9 @@
 #
 # Usage: install.sh [options]
 #   PRODUCTION:
-#       --version=X.Y.Z   Install a specific version (default: latest release)
+#       --version=X.Y.Z   Install a specific version, a release (1.0.0) or a
+#                         pre-release (1.0.0-alpha.4081); default: the latest
+#                         release, and until the first, the latest alpha
 #       --archive=FILE    Install this local release tarball (a sibling
 #                         FILE.sha256, when present, is checked)
 #       --prefix=DIR      Install root (default: ~/.cryo)
@@ -93,7 +95,7 @@ print_banner() {
 }
 
 usage() {
-    sed -n '3,46p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,48p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -142,13 +144,25 @@ prod_detect_target() {
 }
 
 prod_latest_version() {
-    # Resolve the latest release tag from the GitHub API; strip a leading 'v'.
+    # The newest release, and until the first one is published, the newest
+    # pre-release (an alpha built from main): GitHub answers releases/latest
+    # with 404 while only pre-releases exist, and lists releases newest
+    # first.  Strips the tag's leading 'v'.
     command -v curl >/dev/null 2>&1 || die "curl is required to resolve the latest version (or pass --version=X.Y.Z)."
-    local tag
-    tag="$(curl -fsSL "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null \
-            | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 \
+    local api="https://api.github.com/repos/${REPO_SLUG}/releases" answer status tag
+    answer="$(curl -sSL -w '\n%{http_code}' "${api}/latest" 2>/dev/null)" \
+        || die "could not reach GitHub to resolve the latest release. Pass --version=X.Y.Z explicitly."
+    status="${answer##*$'\n'}"
+    answer="${answer%$'\n'*}"
+    case "$status" in
+        200) ;;
+        404) answer="$(curl -fsSL "${api}?per_page=1" 2>/dev/null)" \
+                 || die "could not list the releases on GitHub. Pass --version=X.Y.Z explicitly." ;;
+        *)   die "GitHub answered ${status} for the latest release. Pass --version=X.Y.Z explicitly." ;;
+    esac
+    tag="$(printf '%s\n' "$answer" | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 \
             | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
-    [ -n "$tag" ] || die "could not resolve the latest release tag from GitHub. Pass --version=X.Y.Z explicitly."
+    [ -n "$tag" ] || die "GitHub lists no release of Cryo yet. Pass --version=X.Y.Z explicitly."
     echo "${tag#v}"
 }
 

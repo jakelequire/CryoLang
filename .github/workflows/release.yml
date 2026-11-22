@@ -1,15 +1,23 @@
 name: Release
 
-# Tag-triggered. Push a tag like `v1.0.0` (matching VERSION in
-# compiler/src/main.cryo) to build + publish the distributable archives.
+# Builds, checks and publishes the distributable archives of one version.
 #
-# Release-candidate tags (`v1.0.0-rc1`, `v1.0.0-rc.2`, ...) are supported as
-# end-to-end dry runs: the base version must still match VERSION, and the
-# GitHub Release is marked as a prerelease. Push one to exercise this whole
-# workflow before pushing the real tag.
+# The version is compiler/src/main.cryo's VERSION, and while its PRERELEASE
+# is set (`alpha` until 1.0 ships), `<VERSION>-<PRERELEASE>.<N>`, N being
+# the count of commits in the history of the commit built - the number the
+# shipped compiler's `cryo version` prints.  A pre-release is published
+# from `main` only, as a GitHub pre-release; a release (PRERELEASE "")
+# from a tag naming VERSION.
+#
+#   - Run this workflow by hand on `main` (Actions > Release > Run
+#     workflow, or `gh workflow run release.yml --ref main`): it publishes
+#     the alpha of main's head, tagging it `v<VERSION>-<PRERELEASE>.<N>`.
+#   - Or push that tag to a commit of main yourself.
+#   - A release: push `v<VERSION>` once PRERELEASE is "".
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -34,7 +42,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # The whole history: a pre-release is numbered by its commit count.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
 
       - name: Restore the LLVM toolchain cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -80,7 +91,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
+      # The whole history: a pre-release is numbered by its commit count.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
 
       - name: Restore the LLVM toolchain cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -161,7 +175,10 @@ jobs:
     # runtime and the examples.
     timeout-minutes: 50
     steps:
+      # The whole history: a pre-release is numbered by its commit count.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
 
       - name: Restore the LLVM toolchain cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -220,20 +237,39 @@ jobs:
     permissions:
       contents: write   # create the GitHub Release + upload assets
     steps:
+      # The whole history: a pre-release is numbered by its commit count.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
 
-      - name: Verify the tag matches VERSION
+      - name: Name the version, and check the tag or the branch against it
         id: gate
         run: |
-          VER=$(grep -oE 'const VERSION:[[:space:]]*string[[:space:]]*=[[:space:]]*"[^"]+"' \
-                  compiler/src/main.cryo | sed -E 's/.*"([^"]+)".*/\1/')
-          TAG="${GITHUB_REF_NAME#v}"
-          BASE="${TAG%%-rc*}"   # v1.0.0-rc1 -> 1.0.0; plain v1.0.0 unchanged
-          echo "VERSION=$VER  tag=$TAG  base=$BASE"
-          if [ "$VER" != "$BASE" ]; then
-            echo "::error::tag '$GITHUB_REF_NAME' does not match VERSION '$VER' in compiler/src/main.cryo"
-            exit 1
+          constant() {
+            grep -oE "const $1:[[:space:]]*string[[:space:]]*=[[:space:]]*\"[^\"]*\"" \
+              compiler/src/main.cryo | sed -E 's/.*"([^"]*)".*/\1/'
+          }
+          VER="$(constant VERSION)"
+          PRE="$(constant PRERELEASE)"
+          FULL="$VER"
+          [ -z "$PRE" ] || FULL="${VER}-${PRE}.$(git rev-list --count HEAD)"
+          echo "VERSION=$VER  PRERELEASE=$PRE  version=$FULL  event=$GITHUB_EVENT_NAME  ref=$GITHUB_REF"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            [ "$GITHUB_REF" = refs/heads/main ] \
+              || { echo "::error::a pre-release is published from main, not $GITHUB_REF"; exit 1; }
+            [ -n "$PRE" ] \
+              || { echo "::error::PRERELEASE is empty: a release is published by pushing its tag v$VER"; exit 1; }
+          else
+            [ "${GITHUB_REF_NAME#v}" = "$FULL" ] \
+              || { echo "::error::tag '$GITHUB_REF_NAME' does not name this commit's version v$FULL"; exit 1; }
           fi
+          if [ -n "$PRE" ]; then
+            git merge-base --is-ancestor HEAD origin/main \
+              || { echo "::error::v$FULL is a pre-release of a commit that is not on main"; exit 1; }
+          fi
+          echo "version=$FULL" >> "$GITHUB_OUTPUT"
+          echo "base=$VER" >> "$GITHUB_OUTPUT"
+          echo "deb_version=$(printf '%s' "$FULL" | sed 's/-/~/')" >> "$GITHUB_OUTPUT"
           # Version single-source-of-truth: the latest CHANGELOG header must
           # match VERSION, so a code bump that forgets the changelog can't ship.
           CHLOG=$(grep -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | head -1 | sed -E 's/.*\[([0-9.]+)\].*/\1/')
@@ -242,12 +278,11 @@ jobs:
             echo "::error::CHANGELOG latest version '[$CHLOG]' does not match VERSION '$VER' in compiler/src/main.cryo"
             exit 1
           fi
-          if [ "$TAG" != "$BASE" ]; then
+          if [ -n "$PRE" ]; then
             echo "prerelease=true"  >> "$GITHUB_OUTPUT"
           else
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -264,6 +299,19 @@ jobs:
         run: |
           cd dist
           sha256sum -c ./*.sha256
+          # Every artifact is named by the version the gate named.
+          FULL="${{ steps.gate.outputs.version }}"
+          DEB="${{ steps.gate.outputs.deb_version }}"
+          for artifact in "cryo-${FULL}-linux-x86_64.tar.gz" "cryo-${FULL}-windows-x86_64.zip" \
+                          "cryo-${FULL}-windows-x86_64.msi" "cryo_${DEB}-1_amd64.deb"; do
+            test -f "$artifact" || { echo "::error::no $artifact among the built artifacts"; exit 1; }
+          done
+          # The shipped compiler reports that version.
+          tar -xzf "cryo-${FULL}-linux-x86_64.tar.gz" -C /tmp
+          case "$(/tmp/cryo-${FULL}-linux-x86_64/bin/cryo --version)" in
+            "cryo version ${FULL}+"*) ;;
+            *) echo "::error::the shipped cryo reports $(/tmp/cryo-${FULL}-linux-x86_64/bin/cryo --version), not ${FULL}"; exit 1 ;;
+          esac
 
           mkdir -p /tmp/relcheck
           tar -xzf cryo-*-linux-x86_64.tar.gz -C /tmp/relcheck
@@ -314,7 +362,13 @@ jobs:
       - name: Compose the release body
         run: |
           BASE="${{ steps.gate.outputs.base }}"
+          FULL="${{ steps.gate.outputs.version }}"
+          DEB="${{ steps.gate.outputs.deb_version }}"
           {
+            if [ "${{ steps.gate.outputs.prerelease }}" = true ]; then
+              echo "A pre-release of ${BASE}, built from \`main\` at ${GITHUB_SHA}. \`cryo version\` prints \`${FULL}+${GITHUB_SHA:0:8}\`."
+              echo
+            fi
             cat <<EOF
           ## Install
 
@@ -332,10 +386,10 @@ jobs:
 
           | Platform | Artifact | Notes |
           | --- | --- | --- |
-          | Linux x86_64 (any glibc distro) | \`cryo-${BASE}-linux-x86_64.tar.gz\` | Fully static binary - no LLVM or other runtime dependencies. |
-          | Debian / Ubuntu x86_64 | \`cryo_${BASE}-1_amd64.deb\` | \`sudo apt install ./cryo_${BASE}-1_amd64.deb\`; pulls in gcc and the C library headers. |
-          | Windows 10+ x86_64 | \`cryo-${BASE}-windows-x86_64.zip\` | \`cryo.exe\` + bundled \`LLVM-C.dll\`; the installer offers llvm-mingw for the link. |
-          | Windows 10+ x86_64 | \`cryo-${BASE}-windows-x86_64.msi\` | Per-user install into \`%USERPROFILE%\\.cryo\`, added to PATH. |
+          | Linux x86_64 (any glibc distro) | \`cryo-${FULL}-linux-x86_64.tar.gz\` | Fully static binary - no LLVM or other runtime dependencies. |
+          | Debian / Ubuntu x86_64 | \`cryo_${DEB}-1_amd64.deb\` | \`sudo apt install ./cryo_${DEB}-1_amd64.deb\`; pulls in gcc and the C library headers. |
+          | Windows 10+ x86_64 | \`cryo-${FULL}-windows-x86_64.zip\` | \`cryo.exe\` + bundled \`LLVM-C.dll\`; the installer offers llvm-mingw for the link. |
+          | Windows 10+ x86_64 | \`cryo-${FULL}-windows-x86_64.msi\` | Setup wizard; a per-user install, \`%USERPROFILE%\\.cryo\` by default, added to PATH. |
 
           Compiling your programs shells out to a system C compiler for the final link (\`gcc\`/\`clang\` on Linux, llvm-mingw or mingw-w64 \`gcc\` on Windows); a build that finds none stops with E0705 and names the install's \`install-dependencies\` step. The winget manifests for \`CryoLang.Cryo\` are attached for the winget package repository. macOS, ARM64 and musl/Alpine prebuilts are not part of v1 - build from source with \`./install.sh --dev\`.
 
@@ -355,6 +409,9 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           body_path: /tmp/release-body.md
+          # A dispatched run tags the commit it built; a tag push names it.
+          tag_name: v${{ steps.gate.outputs.version }}
+          target_commitish: ${{ github.sha }}
           prerelease: ${{ steps.gate.outputs.prerelease }}
           generate_release_notes: true
           files: |

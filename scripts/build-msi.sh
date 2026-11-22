@@ -8,8 +8,15 @@
 # The MSI holds the zip's tree, unchanged, and installs it for the current
 # user into %USERPROFILE%\.cryo (scripts/packaging/cryo.wxs says what it does
 # beyond its files, through the tree's own user-setup.ps1).  wixl-heat harvests the
-# tree into components; wixl compiles both.  An MSI version is numeric, so a
-# pre-release's suffix is dropped from it (1.0.0-alpha -> 1.0.0).
+# tree into components; wixl compiles both.
+#
+# An MSI's version is three numbers (major and minor up to 255, build up to
+# 65535) compared in order, and an upgrade must find the newer one larger.
+# A release X.Y.Z is itself.  A pre-release of X.Y.0, `X.Y.0-<label>.N`,
+# must sort below X.Y.0 and above the pre-releases numbered below N, so it
+# takes the place just below X.Y.0: X.(Y-1).N, or (X-1).255.N when Y is 0
+# (1.0.0-alpha.4081 -> 0.255.4081).  A pre-release of a patch release has
+# no such place and is refused.
 #
 # Needs wixl, wixl-heat and unzip (Debian/Ubuntu: wixl, unzip); run on Linux.
 
@@ -34,6 +41,22 @@ for required in bin/cryo.exe bin/cryolsp.exe bin/LLVM-C.dll bin/libclang.dll std
 done
 
 release="$(cat "${tree}/VERSION")"
+core="${release%%-*}"
+IFS=. read -r major minor patch <<< "$core"
+if [ "$core" = "$release" ]; then
+    product_version="$core"
+else
+    number="${release##*.}"
+    case "$number" in ''|*[!0-9]*) echo "error: the pre-release ${release} is not numbered (<label>.<N>)" >&2; exit 1 ;; esac
+    [ "$patch" -eq 0 ] || { echo "error: ${release} is a pre-release of a patch release, which has no MSI version below ${core}" >&2; exit 1; }
+    [ "$number" -le 65535 ] || { echo "error: ${release} is numbered past an MSI version's 65535" >&2; exit 1; }
+    if [ "$minor" -gt 0 ]; then
+        product_version="${major}.$((minor - 1)).${number}"
+    else
+        [ "$major" -gt 0 ] || { echo "error: ${release} is a pre-release of 0.0.0" >&2; exit 1; }
+        product_version="$((major - 1)).255.${number}"
+    fi
+fi
 find "$tree" -type f | sort \
     | wixl-heat -p "${tree}/" --directory-ref INSTALLDIR --component-group CryoFiles --var var.SourceDir --win64 \
     > "${work}/files.wxs"
@@ -48,7 +71,7 @@ find "$tree" -type f | sort \
 
 mkdir -p "$DIST"
 msi="${DIST}/$(basename "$tree").msi"
-wixl -a x64 --ext ui -D Win64=yes -D SourceDir="$tree" -D Version="${release%%-*}" \
+wixl -a x64 --ext ui -D Win64=yes -D SourceDir="$tree" -D Version="${product_version}" \
     -D LicenseRtf="${work}/License.rtf" -D DependencyStepScript="${ROOT}/scripts/packaging/dependency-step.js" \
     -o "$msi" "${ROOT}/scripts/packaging/cryo.wxs" "${ROOT}/scripts/packaging/cryo-ui.wxs" "${work}/files.wxs"
 ( cd "$DIST" && sha256sum "$(basename "$msi")" > "$(basename "$msi").sha256" )

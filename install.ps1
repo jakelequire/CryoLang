@@ -28,7 +28,9 @@
     (install-dependencies.ps1, shipped in the install).
 
 .PARAMETER Version
-    Install a specific version (e.g. 1.0.0). Default: latest GitHub release.
+    Install a specific version, a release (1.0.0) or a pre-release
+    (1.0.0-alpha.4081).  Default: the latest GitHub release, and until the
+    first one, the latest pre-release (an alpha built from main).
 
 .PARAMETER Archive
     Install this local release zip instead of downloading one.  A sibling
@@ -123,13 +125,24 @@ try {
         if ($Version) {
             $ver = $Version.TrimStart('v')
         } else {
+            # The newest release, and until the first one is published, the
+            # newest pre-release: GitHub answers releases/latest with 404
+            # while only pre-releases exist, and lists releases newest first.
             Info "resolving latest release..."
+            $api = "https://api.github.com/repos/$RepoSlug/releases"
+            $headers = @{ "User-Agent" = "cryo-install" }
+            $rel = $null
             try {
-                $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoSlug/releases/latest" -Headers @{ "User-Agent" = "cryo-install" }
-                $ver = ($rel.tag_name).TrimStart('v')
+                $rel = Invoke-RestMethod -Uri "$api/latest" -Headers $headers
             } catch {
-                Die "could not resolve the latest release. Pass -Version X.Y.Z explicitly."
+                $status = $null
+                if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+                if ($status -ne 404) { Die "could not resolve the latest release ($($_.Exception.Message)). Pass -Version X.Y.Z explicitly." }
+                try { $rel = @(Invoke-RestMethod -Uri "$api`?per_page=1" -Headers $headers)[0] }
+                catch { Die "could not list the releases on GitHub. Pass -Version X.Y.Z explicitly." }
             }
+            if (-not $rel -or -not $rel.tag_name) { Die "GitHub lists no release of Cryo yet. Pass -Version X.Y.Z explicitly." }
+            $ver = ($rel.tag_name).TrimStart('v')
         }
         $zip = "cryo-$ver-$target.zip"
         $url = "https://github.com/$RepoSlug/releases/download/v$ver/$zip"
