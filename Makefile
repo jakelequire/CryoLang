@@ -197,7 +197,7 @@ EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 .DEFAULT_GOAL := help
 .PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check incremental-runtime-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-abi-check pin \
         pin-impl pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
-        install uninstall clean lsp install-lsp cryogate cryosmith cryosmith-selftest smith-corpus-pin release release-linux release-windows
+        install uninstall clean lsp install-lsp cryogate cryosmith cryosmith-selftest smith-corpus-pin release release-linux release-windows install-check
 
 # The help text is printed by make itself (`$(info)`), not by a shell, so it
 # reads the same under cmd and sh.  A target added to this Makefile is added
@@ -322,7 +322,16 @@ Pins and release
   make verify-pin-clean  The same, and the pins were built from a clean tree.
   make release           Alias of release-linux.
   make release-linux     dist/ tarball with a static, stamped cryo (POSIX).
-  make release-windows   dist/ zip (POSIX host, cross-built).
+  make release-windows   dist/ zip (cross-built on a POSIX host; Git Bash
+                         builds it natively on Windows).
+  make install-check ARCHIVE=<file>
+                         The host OS's installer over a release archive, in a
+                         scratch home: install, build and run a two-module
+                         program, the install's files the archive's byte for
+                         byte after the installer, after builds (one needing
+                         archives it does not ship) and after an upgrade, a
+                         build with no C toolchain refused with E0705,
+                         uninstall (`cryogate install-check`).
   make install           Symlink bin/cryo and the stdlib into a prefix (POSIX).
   make uninstall         Remove those symlinks.
   make clean             Remove every build output in the tree: compiler,
@@ -1091,10 +1100,24 @@ release-linux:
 release-windows:
 	@./scripts/build-release.sh windows
 
+# A release archive of this host's OS put in place by this checkout's
+# installer and used, upgraded and removed in a scratch home (`cryogate
+# install-check`).  ARCHIVE names it: scripts/build-release.sh builds one
+# (`linux --dynamic` on a host without the static LLVM libraries; Git Bash
+# runs it on Windows).  Run by hand; it installs nothing outside the scratch
+# home, and a host with no C toolchain fails it at the install.
+install-check: $(CRYOGATE)
+ifeq ($(ARCHIVE),)
+	@echo "usage: make install-check ARCHIVE=dist/cryo-<version>-<os>-x86_64.<zip|tar.gz>"
+	@exit 2
+else
+	@$(CRYOGATE_COMMAND) install-check --archive "$(ARCHIVE)" $(ARGS)
+endif
+
 # ---- dev install via symlink (the repo-local toolchain) ----------------
 # `make install` is the DEV install: symlink the committed bin/cryo +
 # stdlib into a prefix.  End users instead run the production downloader:
-#   curl -fsSL https://cryo-lang.org/install.sh | bash
+#   curl -fsSL https://cryolang.org/install.sh | bash
 install:
 	@./install.sh --dev
 

@@ -5473,6 +5473,16 @@ static = ["helpers/libhelpers-windows.a"]
 system = ["ws2_32"]                  # winsock, windows targets only
 ```
 
+`[link.release-static]` carries the same three keys and is read only by a `--release-static` build, which links it in place of `[link.unix]`: the unix overlay names the host's shared libraries, which a fully static link refuses, and this section names their static equivalents. The compiler's own project uses it for the static libclang archive its release links; LLVM's static archives come from `llvm-config` either way.
+
+```ini
+[link.unix]
+static = ["/usr/lib/llvm-20/lib/libclang-20.so.1"]
+
+[link.release-static]
+static = ["../.toolchains/libclang-static/libclang.a"]
+```
+
 > Migrating from pre-1.0: `link_libs` -> `[link] system`, `link_paths` -> `[link] search` (or `[link] static` for a local archive). The old `[compiler] args = ["--emit-llvm"]` flag-smuggling is gone - set `emit_llvm = true`. `[compiler] include_paths` -> `[project] source_paths`. `[project] target` -> `[project] target_triple`.
 
 ### 23.4 Multi-target: `[lib]` and `[[bin]]`
@@ -5538,7 +5548,7 @@ color  = "auto"                     # auto | always | never
 
 Running `cryo <file.cryo>` with no command compiles that file directly.
 
-**The version string.** `cryo -v`, `cryo version` and the banner `cryo` prints with no arguments give the release number, its pre-release label, and after a `+` the build: the first eight hex digits of the commit the compiler was built from, with `-dirty` when tracked files differed from that commit (`cryo version 1.0.0-alpha+3f9c2a1b`). Pre-release labels order the way the release number reads (`1.0.0-alpha` comes before `1.0.0`); the build part identifies a binary and does not order it. The release number and the label are `VERSION` and `PRERELEASE` in `compiler/src/main.cryo`.
+**The version string.** `cryo -v`, `cryo version` and the banner `cryo` prints with no arguments give the release number, its pre-release label numbered by the count of commits in the history of the commit the compiler was built from, and after a `+` the build: the first eight hex digits of that commit, with `-dirty` when tracked files differed from it (`cryo version 1.0.0-alpha.4073+3f9c2a1b`). Pre-releases order the way the release number reads (`1.0.0-alpha.4073` comes before `1.0.0-alpha.4074`, and both before `1.0.0`); the build part identifies a binary and does not order it. A release (no label) carries no count. The release number and the label are `VERSION` and `PRERELEASE` in `compiler/src/main.cryo`; the count is recorded by `cryo stamp`, and a binary stamped by a `cryo stamp` that does not record it prints the label unnumbered. Every release artifact is named by the version without its build part (`cryo-1.0.0-alpha.4073-linux-x86_64.tar.gz`), and is published from `main` as a pre-release while `PRERELEASE` is set.
 
 The build part is not compiled in. A compiler binary holds a reserved region that `cryo stamp <binary>` rewrites after linking, from the git checkout in the current directory, so stamping changes no code and nothing the compiler emits; `make cryo`, `make cryo-exe` and the release build stamp the compilers they link, with the pinned compiler. An unstamped binary, or one built outside a git checkout, prints `+unknown`. `cryo stamp` is not listed in `cryo help`; `cryo help stamp` describes it. `cryo version --verbose` prints, beneath the version line, the binary's path and size, the full commit, its date, the branch, `git describe`, whether the tree was dirty, the build profile (all from the stamp), and the LLVM version, the default target triple and the stdlib root a build would use. A compiler's build cache key reads the region as zeros, so restamping a compiler does not invalidate what it built. `cryo stamp` also records that key, the digest of the binary with its region read as zeros, and the binary's size, inside or outside a checkout; a build reads the recorded key instead of hashing the compiler while the binary still has that size, and hashes it otherwise.
 
@@ -5563,7 +5573,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--opt-level=N`       | Optimization level `0`..`3`; overrides the profile and `[compiler] optimize`.                                                           |
 | `-g`, `--debug-info`  | Emit DWARF debug info.                                                                                                                  |
 | `--release`           | Build with the `release` profile (O2, no debug info).                                                                                   |
-| `--release-static`    | Static-link libLLVM + the C++ runtime into a self-contained binary for distribution (Linux host only; implies `--release`).             |
+| `--release-static`    | Static-link libLLVM + the C++ runtime into a self-contained binary for distribution, with `[link.release-static]` in place of `[link.unix]` (Linux host only; implies `--release`). |
 | `--dev`               | Build with the `debug` profile (O0 + DWARF).                                                                                            |
 | `--profile=NAME`      | Build with a named profile (cache under `build/target/NAME/`).                                                                          |
 | `--no-incremental`    | Force a full build: skip the up-to-date short-circuit and the manifest/fingerprint write.                                               |

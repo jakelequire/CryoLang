@@ -5,7 +5,9 @@
 ///! a program links is the project built with that program's kind of link:
 ///! freestanding, or hosted under the program's panic strategy.  Each is
 ///! built by the compiler that links it, on first use, into
-///! `<runtime root>/.bin/<triple>/<configuration>/<key>/libcryort.a`; the key
+///! `<home>/<triple>/<configuration>/<key>/libcryort.a`, the home being the
+///! root's `.bin` or, for a shipped root, the user's cache
+///! (`PrebuiltCache::home`); the key
 ///! is the compiler's own bytes, every runtime source by its path below the
 ///! root, the target and the configuration, so a change to any of them names
 ///! a directory that does not exist yet (`PrebuiltCache`).
@@ -82,10 +84,11 @@ type struct PrebuiltRuntime {
         return Manifest::hex128(h.finish128());
     }
 
-    /// The directory the archive with `key` lives in.
-    static directory_for(root: string, triple: string, configuration: RuntimeConfiguration,
+    /// The directory the archive with `key` lives in, below `home`
+    /// (`PrebuiltCache::home`).
+    static directory_for(home: PathBuf, triple: string, configuration: RuntimeConfiguration,
                          key: string) -> string {
-        return Path::from(root).join(".bin").join(triple).join(configuration.name()).join(key).into_raw();
+        return home.as_path().join(triple).join(configuration.name()).join(key).into_raw();
     }
 
     /// The archive a link names.
@@ -117,7 +120,17 @@ type struct PrebuiltRuntime {
     static ensure(root: string, triple: string, configuration: RuntimeConfiguration,
                   warnings_as_errors: boolean) -> Result<PrebuiltRuntime, String> {
         const key: string = PrebuiltRuntime::key_of(root, triple, configuration);
-        const directory: string = PrebuiltRuntime::directory_for(root, triple, configuration, key);
+        // A shipped tree's own archive links as it is, and its use is not
+        // recorded: the tree is only read.
+        if (PrebuiltCache::shipped(root)) {
+            match (PrebuiltRuntime::open(PrebuiltRuntime::directory_for(Path::from(root).join(".bin"), triple,
+                                                                        configuration, key), key)) {
+                Option::Some(found) => { return Result::Ok(found); }
+                Option::None        => { }
+            }
+        }
+        const directory: string = PrebuiltRuntime::directory_for(PrebuiltCache::home(root, "runtime"), triple,
+                                                                 configuration, key);
         match (PrebuiltRuntime::open(directory, key)) {
             Option::Some(found) => {
                 PrebuiltCache::record_use(found.directory);

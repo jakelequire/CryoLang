@@ -1,0 +1,432 @@
+///! `cryogate install-check --archive <file> [--installer <script>]`: a
+///! release archive put in place by the release installer on this host, then
+///! used, upgraded and removed as a user would, in a scratch directory that
+///! is the user's home and cache, so nothing of the host's own is read or
+///! changed.
+///!
+///! The installer is `install.sh` (Linux) or `install.ps1` (Windows) from
+///! the checkout unless `--installer` names another, and is never allowed to
+///! change PATH outside the scratch home.  In order:
+///!
+///!   install    the installer exits 0, its own dependency step included,
+///!              the install holds every file an install must, and its
+///!              files are the archive's, byte for byte
+///!   dependency (Windows) the install's dependency step run as the MSI's
+///!              wizard runs it - the same PowerShell, no one to answer,
+///!              told to install nothing, its report written to a file -
+///!              from a process whose PATH holds no toolchain and no winget,
+///!              as an installer's environment is not the user's: the step
+///!              reads the PATH a new terminal gets, so it links a program
+///!              wherever the install step did
+///!   version   `cryo version --verbose` names the installed compiler
+///!   program    a two-module program builds from outside any project and
+///!              runs, printing what it should and exiting 7; one module
+///!              binds C's `strlen` through a header import and takes its
+///!              `size_t` result as a `u64`, which needs clang's builtin
+///!              headers from the install
+///!   shipped    a build under a profile whose archives the install does
+///!              not ship builds them in the user's cache, and the install's
+///!              files are still the archive's
+///!   toolchain  with nothing on PATH, so no C toolchain to link with, the
+///!              build is refused with E0705, naming the install's
+///!              dependency step
+///!   upgrade    installing again replaces the install with the archive's
+///!              files and keeps the cache
+///!   uninstall  removes the install and the archives it built, and leaves
+///!              the shell's rc file as it was before the install
+///!
+///! Exit: 0 when every step passed; 1 at the first that failed; 2 on a
+///! usage error.
+
+namespace cryogate::gates::install_check;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::encoding::sha256::{ Sha256 };
+import std::env;
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::fs::temporary::{ TemporaryDirectory };
+import std::io::error::{ IoError };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::tree::{ Tree };
+import cryogate::release::install::{ InstallLayout };
+
+/// The install check, over one scratch directory.
+public type struct InstallCheck {
+    archive: String;
+    installer: String;
+    /// The install root the installer is given.
+    prefix: String;
+    /// The user's home and cache for every child.
+    home: String;
+    cache: String;
+    /// The project the check builds.
+    program: String;
+    /// An empty directory: the whole PATH of a build with no C toolchain.
+    empty: String;
+    /// Where the check extracts the archive itself, to know its files.
+    unpacked: String;
+
+    /// Run `cryogate install-check` with `arguments` from index `first`.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut archive: String = String::new();
+        mut installer: String = String::new();
+        mut index: i64 = first;
+        while (index < arguments.length()) {
+            const name: Str = arguments.get_reference(index).unwrap().as_str();
+            if (index + 1 >= arguments.length()) { return InstallCheck::usage(); }
+            const value: String = arguments.get_reference(index + 1).unwrap().clone();
+            if (name == Str::new("--archive")) { archive = value; }
+            else if (name == Str::new("--installer")) { installer = value; }
+            else { return InstallCheck::usage(); }
+            index += 2;
+        }
+        if (archive.is_empty()) { return InstallCheck::usage(); }
+        if (installer.is_empty()) {
+            const script: Str = if (Host::os() == Str::new("windows")) { Str::new("install.ps1") } else { Str::new("install.sh") };
+            installer = String::from_str(repository.join(script).as_path().as_str());
+        }
+        if (!Path::from(archive.as_str()).is_file()) { return InstallCheck::fail(f"no archive at {archive.as_str()}"); }
+        if (!Path::from(installer.as_str()).is_file()) { return InstallCheck::fail(f"no installer at {installer.as_str()}"); }
+
+        const work: TemporaryDirectory = match (TemporaryDirectory::create()) {
+            Result::Ok(directory) => { directory }
+            Result::Err(error)    => { return InstallCheck::fail(f"cannot create a scratch directory: {error.describe()}"); }
+        };
+        const root: String = Host::absolute(work.path().as_str());
+        const check: InstallCheck = InstallCheck {
+            archive:   Host::absolute(archive.as_str()),
+            installer: Host::absolute(installer.as_str()),
+            prefix:    f"{root.as_str()}/prefix",
+            home:      f"{root.as_str()}/home",
+            cache:     f"{root.as_str()}/cache",
+            program:   f"{root.as_str()}/program",
+            empty:     f"{root.as_str()}/empty",
+            unpacked:  f"{root.as_str()}/unpacked",
+        };
+        return match (check.steps(logs)) {
+            Result::Ok(_) => {
+                fmt::println(String::from_str(Str::new(
+                    "install-check: OK -- installed, built and ran a program, kept the install read-only, refused a build with no toolchain, upgraded and uninstalled")));
+                0
+            }
+            Result::Err(reason) => { InstallCheck::fail(reason) }
+        };
+    }
+
+    private steps(&this, logs: &RunLogs) -> Result<(), String> {
+        const rc_before: String = f"# the shell's own settings\n";
+        const written: boolean = Directory::create_all(Path::from(this.home.as_str())).is_ok()
+            && Directory::create_all(Path::from(this.cache.as_str())).is_ok()
+            && Directory::create_all(Path::from(this.empty.as_str())).is_ok()
+            && File::write_text(this.rc_file().as_path(), rc_before.as_str()).is_ok()
+            && Directory::create_all(Path::from(this.program.as_str()).join(Str::new("src")).as_path()).is_ok()
+            && File::write_text(Path::from(this.program.as_str()).join(Str::new("cryoconfig")).as_path(), InstallLayout::configuration()).is_ok()
+            && File::write_text(Path::from(this.program.as_str()).join(Str::new("src/main.cryo")).as_path(), InstallLayout::main_source()).is_ok()
+            && File::write_text(Path::from(this.program.as_str()).join(Str::new("src/greeting.cryo")).as_path(), InstallLayout::greeting_source()).is_ok();
+        if (!written) { return Result::Err(f"cannot set up the scratch home and program below {this.home.as_str()}"); }
+        // The archive's own files are what the install must hold, and hold
+        // still: the installer's dependency step already builds with the
+        // installed compiler, so a snapshot taken after it would take in
+        // anything that build wrote.
+        const shipped: Array<Pair<String, String>> = this.archive_listing(logs)?;
+
+        // install
+        this.install(logs,Str::new("install"))?;
+        for (file in InstallLayout::required(Host::os()).iterate_references()) {
+            if (!Path::from(this.prefix.as_str()).join(file.as_str()).as_path().exists()) {
+                return Result::Err(f"the install holds no {file.as_str()}");
+            }
+        }
+        if (Host::os() != Str::new("windows")) {
+            const rc: String = InstallCheck::read(this.rc_file().as_path())?;
+            if (!rc.as_str().contains(&InstallLayout::path_marker()) || !rc.as_str().contains(&this.prefix.as_str())) {
+                return Result::Err(String::from_str(Str::new("the install wrote no PATH block naming its bin/ into the shell's rc file")));
+            }
+        }
+        this.holds_the_archive(&shipped, Str::new("after the installer ran"))?;
+        fmt::println(f"install-check: install ok -- {this.prefix.as_str()}");
+
+        // dependency
+        if (Host::os() == Str::new("windows")) {
+            const report: String = f"{this.home.as_str()}/install-dependencies.log";
+            const system_root: String = match (env::var(Str::new("SystemRoot"))) {
+                Option::Some(directory) => { directory }
+                Option::None => { return Result::Err(String::from_str(Str::new("no SystemRoot in the environment, to find the PowerShell the MSI runs"))); }
+            };
+            mut step: Job = this.isolated(Job::new(f"{system_root.as_str()}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".as_str()));
+            step.argument(Str::new("-NoProfile"));
+            step.argument(Str::new("-NonInteractive"));
+            step.argument(Str::new("-ExecutionPolicy"));
+            step.argument(Str::new("Bypass"));
+            step.argument(Str::new("-File"));
+            step.argument(f"{this.prefix.as_str()}/install-dependencies.ps1".as_str());
+            step.argument(Str::new("-No"));
+            step.argument(Str::new("-Log"));
+            step.argument(report.as_str());
+            step.directory(this.empty.as_str());
+            step.set_variable(Str::new("PATH"), this.empty.as_str());
+            const stepped: Completion = this.ran(logs, step, Str::new("dependency"));
+            if (!stepped.outcome.succeeded()) {
+                return Result::Err(f"the install's dependency step, run as the MSI runs it with no toolchain or winget on its own PATH, failed ({stepped.outcome.describe().as_str()}); its log: {stepped.log.as_str()}");
+            }
+            if (!InstallCheck::read(Path::from(report.as_str()))?.as_str().contains(&Str::new("[ok]"))) {
+                return Result::Err(f"the install's dependency step exited 0 and wrote no [ok] to its report {report.as_str()}");
+            }
+            fmt::println(String::from_str(Str::new("install-check: dependency ok -- run as the MSI runs it, it read the user's PATH and linked a program")));
+        }
+
+        // version
+        mut version: Job = this.compiler_job();
+        version.argument(Str::new("version"));
+        version.argument(Str::new("--verbose"));
+        const reported: Completion = this.ran(logs,version, Str::new("version"));
+        if (!reported.outcome.succeeded()) { return Result::Err(String::from_str(Str::new("`cryo version --verbose` failed"))); }
+        if (!InstallLayout::names_root(reported.output().as_str(), this.prefix.as_str(), Host::os())) {
+            return Result::Err(f"`cryo version --verbose` does not name the install at {this.prefix.as_str()}");
+        }
+        fmt::println(String::from_str(Str::new("install-check: version ok")));
+
+        // program
+        this.build_and_run(logs,Str::new("program"), Option::None)?;
+        fmt::println(String::from_str(Str::new("install-check: program ok -- two modules built from outside any project, ran, exited 7")));
+
+        // shipped
+        this.build_and_run(logs,Str::new("shipped"), Option::Some(Str::new("--panic=abort")))?;
+        if (!this.archives().as_path().is_directory()) {
+            return Result::Err(f"a --panic=abort build left no archive in the user's cache at {this.archives().as_path().as_str()}");
+        }
+        this.holds_the_archive(&shipped, Str::new("after builds with it; a shipped tree must only be read"))?;
+        fmt::println(String::from_str(Str::new("install-check: shipped ok -- archives built in the user's cache, the install unchanged")));
+
+        // toolchain
+        mut refused: Job = this.compiler_job();
+        refused.argument(Str::new("build"));
+        refused.directory(this.program.as_str());
+        refused.set_variable(Str::new("PATH"), this.empty.as_str());
+        const without: Completion = this.ran(logs,refused, Str::new("toolchain"));
+        match (InstallLayout::judge_no_toolchain(without.outcome.exit_code(), without.output().as_str())) {
+            Option::Some(reason) => { return Result::Err(reason); }
+            Option::None => { }
+        }
+        fmt::println(String::from_str(Str::new("install-check: toolchain ok -- refused with E0705, naming the dependency step")));
+
+        // upgrade
+        this.install(logs,Str::new("upgrade"))?;
+        this.holds_the_archive(&shipped, Str::new("after installing the same archive again"))?;
+        if (!this.archives().as_path().is_directory()) {
+            return Result::Err(String::from_str(Str::new("an upgrade removed the archives in the user's cache")));
+        }
+        fmt::println(String::from_str(Str::new("install-check: upgrade ok -- the install replaced, the cache kept")));
+
+        // uninstall
+        mut removal: Job = this.installer_job();
+        if (Host::os() == Str::new("windows")) {
+            removal.argument(Str::new("-Uninstall"));
+            removal.argument(Str::new("-Prefix"));
+            removal.argument(this.prefix.as_str());
+            removal.argument(Str::new("-NoModifyPath"));
+        } else {
+            removal.argument(Str::new("--uninstall"));
+            removal.argument(f"--prefix={this.prefix.as_str()}".as_str());
+        }
+        if (!this.ran(logs,removal, Str::new("uninstall")).outcome.succeeded()) { return Result::Err(String::from_str(Str::new("the uninstall failed"))); }
+        if (Path::from(this.prefix.as_str()).exists()) { return Result::Err(String::from_str(Str::new("the uninstall left the install in place"))); }
+        if (this.archives().as_path().exists()) { return Result::Err(String::from_str(Str::new("the uninstall left the archives in the user's cache"))); }
+        if (InstallCheck::read(this.rc_file().as_path())? != rc_before) {
+            return Result::Err(String::from_str(Str::new("the uninstall left the shell's rc file changed")));
+        }
+        fmt::println(String::from_str(Str::new("install-check: uninstall ok -- the install, its archives and its PATH block removed")));
+        return Result::Ok(());
+    }
+
+    /// Run the installer over the archive; `step` names its log.
+    private install(&this, logs: &RunLogs, step: Str) -> Result<(), String> {
+        mut job: Job = this.installer_job();
+        if (Host::os() == Str::new("windows")) {
+            job.argument(Str::new("-Archive"));
+            job.argument(this.archive.as_str());
+            job.argument(Str::new("-Prefix"));
+            job.argument(this.prefix.as_str());
+            job.argument(Str::new("-NoModifyPath"));
+        } else {
+            job.argument(f"--archive={this.archive.as_str()}".as_str());
+            job.argument(f"--prefix={this.prefix.as_str()}".as_str());
+        }
+        const done: Completion = this.ran(logs,job, step);
+        if (done.outcome.succeeded()) { return Result::Ok(()); }
+        return Result::Err(f"the installer failed ({step}, {done.outcome.describe().as_str()}); its log: {done.log.as_str()}");
+    }
+
+    /// Build the program with the installed compiler, `option` added, then
+    /// run it; `step` names the logs.
+    private build_and_run(&this, logs: &RunLogs, step: Str, option: Option<Str>) -> Result<(), String> {
+        const build_directory: PathBuf = Path::from(this.program.as_str()).join(Str::new("build"));
+        if (build_directory.as_path().exists()) { const _: Result<(), IoError> = Directory::remove_all(build_directory.as_path()); }
+        mut build: Job = this.compiler_job();
+        build.argument(Str::new("build"));
+        match (option) {
+            Option::Some(value) => { build.argument(value); }
+            Option::None => { }
+        }
+        build.directory(this.program.as_str());
+        const built: Completion = this.ran(logs,build, step);
+        if (!built.outcome.succeeded()) {
+            return Result::Err(f"the installed compiler could not build the program ({step}); its log: {built.log.as_str()}");
+        }
+        const program: PathBuf = build_directory.as_path().join(Host::executable_name(Str::new("install_check")).as_str());
+        const execution: Job = Job::new(program.as_path().as_str());
+        const ran: Completion = this.ran(logs,execution, f"{step}-run".as_str());
+        if (!ran.output().as_str().contains(&InstallLayout::greeting())) {
+            return Result::Err(f"the program did not print `{InstallLayout::greeting()}` ({step}); its log: {ran.log.as_str()}");
+        }
+        match (ran.outcome.exit_code()) {
+            Option::Some(code) => { if (code == 7) { return Result::Ok(()); } }
+            Option::None => { }
+        }
+        return Result::Err(f"the program did not exit 7 ({step}, {ran.outcome.describe().as_str()})");
+    }
+
+    /// A job running the installed compiler.
+    private compiler_job(&this) -> Job {
+        const compiler: PathBuf = Path::from(this.prefix.as_str()).join(Str::new("bin")).as_path()
+            .join(Host::executable_name(Str::new("cryo")).as_str());
+        return this.isolated(Job::new(compiler.as_path().as_str()));
+    }
+
+    /// A job running the installer, with nothing to answer its questions.
+    private installer_job(&this) -> Job {
+        if (Host::os() == Str::new("windows")) {
+            mut job: Job = this.isolated(Job::new(Str::new("powershell")));
+            job.argument(Str::new("-NoProfile"));
+            job.argument(Str::new("-NonInteractive"));
+            job.argument(Str::new("-ExecutionPolicy"));
+            job.argument(Str::new("Bypass"));
+            job.argument(Str::new("-File"));
+            job.argument(this.installer.as_str());
+            return job;
+        }
+        mut job: Job = this.isolated(Job::new(Str::new("bash")));
+        job.argument(this.installer.as_str());
+        return job;
+    }
+
+    /// `job` with the scratch home and cache as the user's, and none of the
+    /// variables that would point a compiler at another tree or driver.
+    private isolated(&this, job: Job) -> Job {
+        mut result: Job = job;
+        if (Host::os() == Str::new("windows")) {
+            result.set_variable(Str::new("LOCALAPPDATA"), this.cache.as_str());
+        } else {
+            result.set_variable(Str::new("HOME"), this.home.as_str());
+            result.set_variable(Str::new("XDG_CACHE_HOME"), this.cache.as_str());
+            result.set_variable(Str::new("SHELL"), Str::new("/bin/bash"));
+        }
+        result.remove_variable(Str::new("CRYO_HOME"));
+        result.remove_variable(Str::new("CRYO_STDLIB"));
+        result.remove_variable(Str::new("CRYO_RUNTIME"));
+        result.remove_variable(Str::new("CRYO_CC"));
+        result.remove_variable(Str::new("CRYO_AR"));
+        return result;
+    }
+
+    /// Run `job`, its output logged under `step`.
+    private ran(&this, logs: &RunLogs, job: Job, step: Str) -> Completion {
+        mut logged: Job = job;
+        logged.log_to(logs.file(f"install-check-{step}".as_str()).as_str());
+        return logged.run();
+    }
+
+    /// The shell rc file install.sh writes its PATH block into.
+    private rc_file(&this) -> PathBuf { return Path::from(this.home.as_str()).join(Str::new(".bashrc")); }
+
+    /// Where the install's on-demand archives are built.
+    private archives(&this) -> PathBuf { return Path::from(this.cache.as_str()).join(Str::new("cryo/archives")); }
+
+    /// Extract the archive into `unpacked` as the installer would (a zip
+    /// with PowerShell's Expand-Archive, a tarball with tar), and list the
+    /// files of its one top directory.
+    private archive_listing(&this, logs: &RunLogs) -> Result<Array<Pair<String, String>>, String> {
+        if (!Directory::create_all(Path::from(this.unpacked.as_str())).is_ok()) {
+            return Result::Err(f"cannot create {this.unpacked.as_str()}");
+        }
+        const windows: boolean = Host::os() == Str::new("windows");
+        mut unpack: Job = Job::new(if (windows) { Str::new("powershell") } else { Str::new("tar") });
+        if (windows) {
+            unpack.argument(Str::new("-NoProfile"));
+            unpack.argument(Str::new("-NonInteractive"));
+            unpack.argument(Str::new("-Command"));
+            unpack.argument(f"Expand-Archive -LiteralPath '{this.archive.as_str()}' -DestinationPath '{this.unpacked.as_str()}'".as_str());
+        } else {
+            unpack.argument(Str::new("-x"));
+            unpack.argument(Str::new("-z"));
+            unpack.argument(Str::new("-f"));
+            unpack.argument(this.archive.as_str());
+            unpack.argument(Str::new("-C"));
+            unpack.argument(this.unpacked.as_str());
+        }
+        const unpacked: Completion = this.ran(logs, unpack, Str::new("unpack"));
+        if (!unpacked.outcome.succeeded()) {
+            return Result::Err(f"cannot extract the archive ({unpacked.outcome.describe().as_str()}); its log: {unpacked.log.as_str()}");
+        }
+        const excluded: Array<String> = Array::<String>::new();
+        const tops: Array<String> = Tree::names(Path::from(this.unpacked.as_str()), &excluded)?;
+        if (tops.length() != 1) {
+            return Result::Err(f"the archive holds {tops.length()} top-level entries, not one directory");
+        }
+        return InstallCheck::listing(Path::from(this.unpacked.as_str()).join(tops.get_reference(0).unwrap().as_str()).as_path());
+    }
+
+    /// Fail unless the install's files are `shipped`, byte for byte; `when`
+    /// says at which point of the check.
+    private holds_the_archive(&this, shipped: &Array<Pair<String, String>>, when: Str) -> Result<(), String> {
+        const installed: Array<Pair<String, String>> = InstallCheck::listing(Path::from(this.prefix.as_str()))?;
+        return match (InstallLayout::first_difference(shipped, &installed)) {
+            Option::Some(difference) => { Result::Err(f"the install's files are not the archive's {when}: {difference.as_str()}") }
+            Option::None => { Result::Ok(()) }
+        };
+    }
+
+    /// Every file below `root`, its path below `root` with its sha256, in
+    /// the order the tree is walked.
+    private static listing(root: Path) -> Result<Array<Pair<String, String>>, String> {
+        const excluded: Array<String> = Array::<String>::new();
+        const files: Array<String> = Tree::files(root, &excluded)?;
+        mut listed: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        for (file in files.iterate_references()) {
+            const bytes: Array<u8> = match (File::read_bytes(root.join(file.as_str()).as_path())) {
+                Result::Ok(bytes)  => { bytes }
+                Result::Err(error) => { return Result::Err(f"cannot read {file.as_str()}: {error.describe()}"); }
+            };
+            listed.push(Pair::new(file.clone(), Sha256::digest(bytes.as_slice()).to_hex()));
+        }
+        return Result::Ok(listed);
+    }
+
+    private static read(path: Path) -> Result<String, String> {
+        return match (File::read_text(path)) {
+            Result::Ok(text)   => { Result::Ok(text) }
+            Result::Err(error) => { Result::Err(f"cannot read {path.as_str()}: {error.describe()}") }
+        };
+    }
+
+    private static usage() -> i32 {
+        fmt::eprintln(String::from_str(Str::new("usage: cryogate install-check --archive <file> [--installer <script>]")));
+        return 2;
+    }
+
+    private static fail(reason: String) -> i32 {
+        fmt::println(f"install-check: FAIL -- {reason.as_str()}");
+        return 1;
+    }
+}

@@ -62,26 +62,43 @@ The compiler is **self-hosted**: every line of Cryo you compile is compiled by C
 
 ### Quick install (recommended)
 
-One line installs a self-contained `cryo` (the compiler statically links LLVM, so there's no `libLLVM` runtime dependency) into `~/.cryo` and adds it to your `PATH`:
+One line installs `cryo`, the `cryolsp` language server, the standard library and the runtime into `~/.cryo` (`%USERPROFILE%\.cryo` on Windows) and adds its `bin` to your `PATH`:
 
 **Linux x86-64:**
 ```bash
-curl -fsSL https://cryo-lang.org/install.sh | bash
+curl -fsSL https://cryolang.org/install.sh | bash
 ```
 
 **Windows x86-64** (PowerShell):
 ```powershell
-irm https://cryo-lang.org/install.ps1 | iex
+irm https://cryolang.org/install.ps1 | iex
 ```
 
-Open a new shell, then `cryo --version`. To pin a version or remove the install:
+Compiling a program links it with a C toolchain. The installer checks that the installed compiler can build and run a program, and if it cannot, offers to install what is missing: `gcc` and the C library headers through your package manager on Linux, llvm-mingw for your user through `winget` on Windows. The same check runs again any time with `~/.cryo/install-dependencies.sh` (`install-dependencies.ps1` on Windows), and a build that finds no C toolchain stops with error E0705 naming that command.
+
+### Packages
+
+Each release also ships:
+
+- **Debian / Ubuntu:** `cryo_<version>-1_amd64.deb`. `sudo apt install ./cryo_<version>-1_amd64.deb` installs it into `/usr/lib/cryo` with `cryo` and `cryolsp` in `/usr/bin`, and pulls in `gcc` and the C library headers.
+- **Windows:** `cryo-<version>-windows-x86_64.msi`, a per-user install with a setup wizard: the license, the install location (`%USERPROFILE%\.cryo` unless you pick another), whether to install llvm-mingw if no C toolchain is found, and a last page that says whether the computer can link programs and, if not, why. It adds its `bin` to your `PATH`. `winget install CryoLang.Cryo` installs the MSI with llvm-mingw as its dependency.
+
+Open a new shell, then `cryo version --verbose`: it names the binary that runs and the standard library it uses, which tells you which install is on your `PATH`.
+
+Running the installer again upgrades: the new tree replaces the old one whole. To pin a version, or to uninstall (the install, its `PATH` entry, and the libraries it built in your cache):
 
 ```bash
-curl -fsSL https://cryo-lang.org/install.sh | bash -s -- --version=1.0.0
-~/.cryo/bin/cryo --version          # or: cryo --uninstall via the script
+curl -fsSL https://cryolang.org/install.sh | bash -s -- --version=1.0.0
+curl -fsSL https://cryolang.org/install.sh | bash -s -- --uninstall
+```
+```powershell
+& ([scriptblock]::Create((irm https://cryolang.org/install.ps1))) -Version 1.0.0
+& ([scriptblock]::Create((irm https://cryolang.org/install.ps1))) -Uninstall
 ```
 
-> **One runtime requirement:** compiling a program shells out to a system C compiler/linker for the final link. Install one if you don't have it - `gcc`/`clang` on Linux, a mingw-w64 `gcc` on Windows. The `cryo` binary itself needs nothing.
+A release archive downloaded by hand installs with `install.sh --archive=FILE` or `install.ps1 -Archive FILE`.
+
+An installed tree is only read: the libraries it ships link as they are, and any other one a build needs (another panic strategy, say) is built once into your cache (`~/.cache/cryo/archives`, `%LOCALAPPDATA%\cryo\archives`).
 
 ### From source / for compiler development
 
@@ -109,7 +126,7 @@ The **quick-install** binary is statically linked - it only needs a C compiler o
 | `python3`  | 3.8+               | Drives `make selfhost-check`.                                                                                                                            |
 | `glibc`    | 2.34+              | Floor of the committed pinned `bin/cryo` (Ubuntu 22.04+, Debian 12+, Fedora 35+). The quick-install binary is fully static and has no glibc requirement. |
 
-The pinned `bin/cryo` is an x86-64 Linux ELF dynamically linked against `libLLVM.so.20.1` (plus `libstdc++`, `libffi`, `libedit`, `libxml2`, `libicu`, `libz`, `libzstd`, `liblzma`, and glibc). On Debian/Ubuntu, `apt-get install llvm-20 clang-20` covers the runtime; rebuilding from source additionally needs `llvm-20-dev` (and `libpolly-20-dev` for a `--release-static` build). The first program a compiler builds compiles the standard library into an archive under `stdlib/.bin/` and the runtime into one under `runtime/.bin/` (both gitignored) and links them, so a clean checkout needs the build toolchain even when using the pinned binary.
+The pinned `bin/cryo` is an x86-64 Linux ELF dynamically linked against `libLLVM.so.20.1` (plus `libstdc++`, `libffi`, `libedit`, `libxml2`, `libicu`, `libz`, `libzstd`, `liblzma`, and glibc). On Debian/Ubuntu, `apt-get install llvm-20 clang-20` covers the runtime; rebuilding from source additionally needs `llvm-20-dev` (and `libpolly-20-dev`, `libclang-20-dev` and `libzstd-dev` for a release build, `make release`, which links libLLVM and libclang into one static binary). The first program a compiler builds compiles the standard library into an archive under `stdlib/.bin/` and the runtime into one under `runtime/.bin/` (both gitignored) and links them, so a clean checkout needs the build toolchain even when using the pinned binary.
 
 ---
 

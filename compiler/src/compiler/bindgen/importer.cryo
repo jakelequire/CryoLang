@@ -47,8 +47,10 @@ import std::fmt::float;
 import std::ffi::libc;
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
-import std::fs::path::{ Path };
+import std::fs::path::{ Path, PathBuf };
 import std::env;
+import compiler::codegen::llvm_types::{ LTargetMachine };
+import compiler::prebuilt_cache::{ PrebuiltCache };
 import std::core::mem;
 import compiler::ast::declaration::{
     BindingAccessor, DeclarationNode, DeclKind, EnumDecl, EnumVariant, ExternBlock,
@@ -2563,6 +2565,30 @@ type struct Importer {
         clang::clang_disposeString(fname);
     }
 
+    /// The resource directory of the release tree this compiler was shipped
+    /// in, `<tree>/lib/clang/<LLVM major>`, where every release puts clang's
+    /// builtin headers; "" for a compiler that is no release tree's (its
+    /// stdlib is not marked shipped), which leaves libclang its default.
+    /// libclang's default is where its own build put the headers - an
+    /// absolute path of the build machine's for a statically linked one,
+    /// beside the library for a shared one - which on a machine without
+    /// clang's development files does not exist, and an import that cannot
+    /// read stddef.h takes every `size_t` for an `int`.
+    static release_resource_directory() -> String {
+        const executable: String = env::current_executable().unwrap_or(String::new());
+        const directory: Option<Path> = Path::from(executable.as_str()).parent();
+        if (directory.is_none()) { return String::new(); }
+        const tree: PathBuf = directory.unwrap().join("..");
+        mut stdlib: String = String::from_str(tree.as_path().join("stdlib").as_path().as_str());
+        if (!PrebuiltCache::shipped(stdlib.as_c_string() as string)) { return String::new(); }
+        const version: Str = Str::new(LTargetMachine::llvm_version());
+        const major: Str = match (version.split_once(&Str::new("."))) {
+            Option::Some(parts) => { parts.first }
+            Option::None        => { version }
+        };
+        return String::from_str(tree.as_path().join("lib").as_path().join("clang").as_path().join(major).as_path().as_str());
+    }
+
     /// Build a libclang TU (forcing C with `-x c`), walk its top-level
     /// cursors, and emit function declarations.
     /// `unsaved`/`num_unsaved` carry an in-memory buffer for system headers
@@ -2583,12 +2609,11 @@ type struct Importer {
         // Force the source language.  C (`-x c`) is the default and reproduces the
         // old preprocess byte-for-byte; C++ (`-x c++ -std=<cpp_std>`) drives the
         // C++ binding generator (Strategy A: direct mangled-symbol binding).
-        // `CRYO_CLANG_RESOURCE_DIR`, when set, adds `-resource-dir <dir>` so
-        // libclang finds its builtin headers (stddef.h / stdint.h / ...) - needed on
-        // Windows, where the bundled libclang.dll is staged next to cryo.exe and
-        // so cannot locate its resource dir by the default
-        // `<dll>/../lib/clang/<v>` walk.  Unset on a normal host install (the
-        // system libclang resolves its own), so this is a no-op there.
+        // libclang reads its builtin headers (stddef.h, stdint.h, ...) from
+        // the resource directory `-resource-dir` names:
+        // `CRYO_CLANG_RESOURCE_DIR` when it is set, else the release tree's
+        // when this compiler is one (`release_resource_directory`), else
+        // libclang's own default.
         // `extra_args` carries the vendor generator's `-I<dir>` / `-D<def>` flags
         // (empty for the inline `#include` path).
         const is_cpp: boolean = lang == Str::new("c++");
@@ -2602,7 +2627,7 @@ type struct Importer {
         };
         mut resource_dir: String = match (env::var(Str::new("CRYO_CLANG_RESOURCE_DIR"))) {
             Option::Some(v) => { v }
-            Option::None    => { String::new() }
+            Option::None    => { Importer::release_resource_directory() }
         };
         mut args: [u8*] = [];
         args.push("-x" as u8*);
