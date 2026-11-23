@@ -1,0 +1,71 @@
+///! The identity of a repository however its URL is spelled, and the series
+///! of a version and of a requirement, asked of the resolver for each case.
+
+namespace RepositoryIdentity;
+
+import std::fmt;
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import compiler::deps::git_url::{ GitUrl };
+import compiler::deps::semver::{ Requirement, Version };
+
+type struct Checks {
+    run: i32;
+    failed: i32;
+
+    /// Count a case, and report it when `got` is not `want`.
+    record(mut &this, what: Str, got: Str, want: Str) -> void {
+        this.run = this.run + 1;
+        if (got != want) {
+            fmt::println(f"FAIL {what}: got `{got}`, want `{want}`");
+            this.failed = this.failed + 1;
+        }
+    }
+
+    /// The identity `GitUrl::canonical` gives `url` against `want`.
+    identity(mut &this, url: Str, want: Str) -> void {
+        const got: String = GitUrl::canonical(url);
+        this.record(url, got.as_str(), want);
+    }
+
+    /// The series of the version `version` against `want`.
+    version_series(mut &this, version: Str, want: Str) -> void {
+        const got: String = match (Version::parse(version)) {
+            Option::Some(parsed) => { parsed.series() }
+            Option::None         => { String::from_str(Str::new("<not a version>")) }
+        };
+        this.record(version, got.as_str(), want);
+    }
+
+    /// The series of the requirement `requirement` against `want`, which
+    /// is `<none>` for a requirement accepting every version below 1.0.0.
+    requirement_series(mut &this, requirement: Str, want: Str) -> void {
+        const got: String = match (Requirement::parse(requirement)) {
+            Option::Some(parsed) => { parsed.series().unwrap_or(String::from_str(Str::new("<none>"))) }
+            Option::None         => { String::from_str(Str::new("<not a requirement>")) }
+        };
+        this.record(requirement, got.as_str(), want);
+    }
+}
+
+function main() -> int {
+    mut checks: Checks = Checks { run: 0, failed: 0 };
+    checks.identity(Str::new("https://example.com/acme/json5"), Str::new("example.com/acme/json5"));
+    checks.identity(Str::new("https://Example.COM/acme/json5.git"), Str::new("example.com/acme/json5"));
+    checks.identity(Str::new("https://me@example.com/acme/json5.git/"), Str::new("example.com/acme/json5"));
+    checks.identity(Str::new("ssh://git@example.com/acme/json5.git"), Str::new("example.com/acme/json5"));
+    checks.identity(Str::new("git@example.com:acme/json5"), Str::new("example.com/acme/json5"));
+    checks.identity(Str::new("https://example.com/Acme/Json5"), Str::new("example.com/Acme/Json5"));
+    checks.identity(Str::new("https://example.com/acme/json5-extra"), Str::new("example.com/acme/json5-extra"));
+    checks.identity(Str::new("file:///srv/json5.git"), Str::new("/srv/json5"));
+    checks.version_series(Str::new("2.3.4"), Str::new("2"));
+    checks.version_series(Str::new("1.0.0-rc.1"), Str::new("1"));
+    checks.version_series(Str::new("0.2.9"), Str::new("0.2"));
+    checks.version_series(Str::new("0.0.3"), Str::new("0.0"));
+    checks.requirement_series(Str::new("^1.2"), Str::new("1"));
+    checks.requirement_series(Str::new("=1.2.3"), Str::new("1"));
+    checks.requirement_series(Str::new("~0.3"), Str::new("0.3"));
+    checks.requirement_series(Str::new("0"), Str::new("<none>"));
+    fmt::println(f"identity checks: {checks.failed} failed of {checks.run}");
+    return checks.failed;
+}

@@ -117,6 +117,46 @@ type struct GitUrl {
         return Result::Err(Str::new("is not an `https://`, `ssh://` or `file://` URL, nor `user@host:path`"));
     }
 
+    /// The identity of the repository `url` names, the same however the
+    /// URL spells it: the scheme and any `user@` removed, the host in lower
+    /// case, `user@host:path` written `host/path`, and a trailing `/` and
+    /// `.git` removed (`https://me@Example.com/acme/json5.git/` and
+    /// `git@example.com:acme/json5` are both `example.com/acme/json5`).  A
+    /// `file://` URL is its path, as written: a directory of this machine,
+    /// whose case may matter.  `url` is one `transport_of` accepts.
+    static canonical(url: Str) -> String {
+        mut rest: Str = url;
+        mut path: Str = Str::new("");
+        mut authority: Str = Str::new("");
+        match (url.strip_prefix(&Str::new("file://"))) {
+            Option::Some(local) => { path = local; }
+            Option::None => {
+                rest = url.strip_prefix(&Str::new("https://")).unwrap_or(
+                    url.strip_prefix(&Str::new("ssh://")).unwrap_or(url));
+                // The short form's authority ends at its first `:`; a URL's
+                // at its first `/`.
+                const separator: Str = if (rest.length() < url.length()) { Str::new("/") } else { Str::new(":") };
+                match (rest.split_once(&separator)) {
+                    Option::Some(parts) => { authority = parts.first; path = parts.second; }
+                    Option::None        => { authority = rest; }
+                }
+                authority = match (authority.split_once_from_end(&Str::new("@"))) {
+                    Option::Some(parts) => { parts.second }
+                    Option::None        => { authority }
+                };
+            }
+        }
+        while (path.ends_with(&Str::new("/"))) { path = path.byte_substring(0, path.length() - 1); }
+        path = path.strip_suffix(&Str::new(".git")).unwrap_or(path);
+        if (authority.is_empty()) { return String::from_str(path); }
+        mut out: String = authority.to_ascii_lowercase();
+        if (!path.is_empty()) {
+            out.push("/");
+            out.push(path.strip_prefix(&Str::new("/")).unwrap_or(path));
+        }
+        return out;
+    }
+
     /// Why a `tag`, `branch` or `rev` value is refused, or `None` when git
     /// may be given it: a phrase that completes "the value ...".
     static ref_refusal(value: Str) -> Option<Str> {

@@ -188,7 +188,7 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-11-16
 
-709. **A package's module paths name only the packages its own cryoconfig
+710. **A package's module paths name only the packages its own cryoconfig
      declares.**  A path written in an `import`, an `export` or a `module`
      line names a file of the writer's own package, of the standard
      library, of a vendored C library, or of a dependency the writer's
@@ -201,7 +201,7 @@ yet is recorded with the change that builds it, not here.
      are one package.  Supersedes the rule that let a dependency name any
      package but the program's.  (Jake)
 
-710. **A top-level namespace belongs to one package in a build.**  Two
+711. **A top-level namespace belongs to one package in a build.**  Two
      packages whose files declare the same first namespace segment - the
      program and a dependency, two dependencies, or any package and the
      standard library's `std` - are E0507 before any import is resolved,
@@ -211,7 +211,7 @@ yet is recorded with the change that builds it, not here.
      entry is refused: an import names a dependency by the namespace its
      files declare, and no entry renames it.  (Jake)
 
-711. **A library's namespace is the one its `lib.cryo` declares.**  A
+712. **A library's namespace is the one its `lib.cryo` declares.**  A
      dependency's `[lib]` has a `lib.cryo` in its `source_dir`, and the
      namespace that file declares is the library's, the one a program
      imports it by; no cryoconfig key names it, so nothing can disagree
@@ -220,14 +220,14 @@ yet is recorded with the change that builds it, not here.
      resolved.  `cryo init` writes a library's `lib.cryo` beginning with
      that namespace.  (Jake)
 
-712. **A library has one top-level namespace.**  Every file of a
+713. **A library has one top-level namespace.**  Every file of a
      dependency library declares its `lib.cryo`'s namespace or one below
      it, matched on whole segments; a file declaring any other is E0510
      before any import is resolved, naming the namespace, the library's and
-     the file.  The namespace rule (710) then compares one name per
+     the file.  The namespace rule (711) then compares one name per
      library.  (Jake)
 
-713. **A library's rules hold in its own project's build.**  711 and 712
+714. **A library's rules hold in its own project's build.**  712 and 713
      apply to a project's own `[lib]` in every build of it that indexes the
      library's directory, not only where a dependent compiles it, so a
      library is refused where it is written rather than where it is first

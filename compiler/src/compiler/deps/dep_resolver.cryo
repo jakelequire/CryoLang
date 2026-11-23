@@ -20,6 +20,11 @@
 ///! Recursion: the resolver follows the `[dependencies]` of every
 ///! dep it visits.  Cycles are broken by tracking visited project
 ///! roots; a duplicate is a no-op rather than an error.
+///!
+///! A build holds one version of each library.  Every entry naming a
+///! library makes a `LibraryRequest`; `choose` refuses requests for two
+///! major versions and takes the newest version every requirement accepts,
+///! and the graph is walked again until each library is built at its choice.
 
 namespace compiler::deps::dep_resolver;
 
@@ -71,6 +76,72 @@ type struct DepRoot {
     library: boolean;
 }
 
+/// One `[dependencies]` entry that names a library, as the walk found it:
+/// who writes it, what it accepts, and which version its own ref or path
+/// names.  A build holds one version of each library, so the requests for
+/// one library are settled together (`DepResolver::choose`).
+type struct LibraryRequest with [Clone] {
+    /// The library's identity: a git repository's `GitUrl::canonical` and
+    /// subdir, or a path package's `DepKey`.
+    library: String;
+    /// The name its `[lib]` gives it.
+    library_name: String;
+    /// The entry's table key.
+    name: String;
+    /// Who writes the entry: `the program`, or a package's name and version.
+    requester: String;
+    /// Whether the program's own cryoconfig writes the entry.
+    from_program: boolean;
+    /// The cryoconfig that writes the entry.
+    config: String;
+    /// The entry's source, as a cryoconfig writes it: `git = "<url>"` and its
+    /// ref, or `path = "<path>"`.
+    source: String;
+    /// Where the version was read: the URL and commit, or the directory.
+    shown: String;
+    /// The entry's `version` requirement; empty when it writes none.
+    requirement: String;
+    /// The `[lib] version` of what the entry's own ref or path names.
+    version: String;
+    /// The commit the entry's own ref names; empty for a path dependency.
+    commit: String;
+    /// The commit the walk built for it: the library's chosen one, once
+    /// there is a choice, else its own.
+    walked: String;
+
+    /// The series of versions this request accepts: its requirement's, or
+    /// when it writes none, the series of the version it names.  `None`
+    /// when either accepts every version below 1.0.0 or says no version.
+    series(&this) -> Option<String> {
+        if (this.requirement.length() > 0) {
+            match (Requirement::parse(this.requirement.as_str())) {
+                Option::Some(requirement) => { return requirement.series(); }
+                Option::None              => { return Option::None; }
+            }
+        }
+        match (Version::parse(this.version.as_str())) {
+            Option::Some(version) => { return Option::Some(version.series()); }
+            Option::None          => { return Option::None; }
+        }
+    }
+
+    /// The series of the version this request names, which a requirement
+    /// accepting it and every later version that does not break it writes;
+    /// the version as written when it does not parse.
+    version_series(&this) -> String {
+        match (Version::parse(this.version.as_str())) {
+            Option::Some(parsed) => { return parsed.series(); }
+            Option::None         => { return this.version.clone(); }
+        }
+    }
+
+    /// The entry, as its cryoconfig would write it to take `source` with the
+    /// requirement `requirement`.
+    rewritten(&this, source: str::Str, requirement: str::Str) -> String {
+        return f"{this.name} = {{ {source}, version = \"{requirement}\" }}";
+    }
+}
+
 type struct ResolveOutcome {
     /// Source roots the module loader should add to its scan list, each
     /// tagged with its owning dependency name.  Always populated even when
@@ -81,6 +152,9 @@ type struct ResolveOutcome {
     /// program's included, once per (declarer, declared) pair, each
     /// package named by its `DepKey`.
     declarations: [PackageDeclaration];
+    /// Every `[dependencies]` entry of every cryoconfig walked, in the
+    /// order the walk reached them.
+    requests: [LibraryRequest];
     /// True <=> at least one dep failed to resolve.
     failed: boolean;
     /// The lockfile produced by Fetch/Update.  In Build mode this is
@@ -91,6 +165,7 @@ type struct ResolveOutcome {
         return ResolveOutcome {
             roots:        [],
             declarations: [],
+            requests:     [],
             failed:       false,
             lock:         Lockfile::empty(),
         };
@@ -145,9 +220,6 @@ type struct DepResolver {
     static resolve(top_config: ProjectConfig*,
                      mode: ResolveMode,
                      lock_path: Path) -> ResolveOutcome {
-        mut outcome: ResolveOutcome = ResolveOutcome::empty();
-        mut visited: [DepKey] = [];
-
         // Existing lockfile drives Build mode and seeds Fetch mode's
         // "reuse the entry if spec unchanged" optimization.  Update
         // ignores it entirely.
@@ -155,9 +227,48 @@ type struct DepResolver {
             ResolveMode::Update => { Lockfile::empty() }
             _ => { Lockfile::read(lock_path) }
         };
+        // Every git entry pinned by this run, so that walking the graph
+        // again fetches and extracts nothing again.
+        mut pinned: Lockfile = Lockfile::empty();
+        // The request whose version each library is built at.
+        mut chosen: [LibraryRequest] = [];
+        mut outcome: ResolveOutcome = ResolveOutcome::empty();
         mut new_lock: Lockfile = Lockfile::empty();
 
-        DepResolver::walk_deps(top_config, str::Str::from(""), Path::from(""), true, mode, &existing, &new_lock, &visited, &outcome);
+        // A build holds one version of each library, and the version chosen
+        // decides which dependencies that library brings in.  So the graph
+        // is walked with the choices the walk before it made, until every
+        // library is built at the version chosen for it.  Each choice is the
+        // newest version some entry names, so a graph settles within as many
+        // walks as there are entries pinned, and one that does not is
+        // refused rather than walked for ever.
+        mut walks: i64 = 0;
+        while (true) {
+            outcome = ResolveOutcome::empty();
+            new_lock = Lockfile::empty();
+            mut visited: [DepKey] = [];
+            DepResolver::walk_deps(top_config, str::Str::from(""), Path::from(""), true, mode, &existing, &pinned, &chosen, &new_lock, &visited, &outcome);
+            // The requests a failed walk did make are settled too, so every
+            // refusal is reported at once.
+            match (DepResolver::choose(&outcome.requests)) {
+                Option::Some(choice) => { chosen = choice; }
+                Option::None         => { outcome.failed = true; }
+            }
+            if (outcome.failed) { break; }
+            const unsettled: Option<LibraryRequest> = DepResolver::built_elsewhere(&outcome.requests, &chosen);
+            if (unsettled.is_none()) { break; }
+            walks += 1;
+            if (walks > pinned.packages.length() + 1) {
+                const request: LibraryRequest = unsettled.unwrap();
+                fmt::eprintln(f"error: the dependencies do not settle on one version of `{request.library_name}`: each version chosen for it brings in entries that choose another");
+                fmt::eprintln(f"  help: name, in each cryoconfig that asks for `{request.library_name}`, a `branch`, `tag` or `rev` whose version meets every requirement on it");
+                outcome.failed = true;
+                break;
+            }
+        }
+        if (!outcome.failed && mode != ResolveMode::Build) {
+            DepResolver::report_unified(&outcome.requests, &chosen);
+        }
 
         // Write the lockfile only on the success path of Fetch/Update.
         // A failed Fetch leaves the on-disk lock untouched so the user's
@@ -213,12 +324,18 @@ type struct DepResolver {
     /// is not, and may not name a `file://` repository.
     ///
     /// Cycle detection keys deps by their directory; see `DepKey`.
+    ///
+    /// `pinned` holds every git entry this run has pinned, and `chosen` the
+    /// request each library's version is taken from, empty on the first
+    /// walk (see `resolve`).
     static walk_deps(cfg: const ProjectConfig*,
                        declarer: str::Str,
                        base: Path,
                        on_this_machine: boolean,
                        mode: ResolveMode,
                        existing: Lockfile*,
+                       pinned: mut Lockfile*,
+                       chosen: &[LibraryRequest],
                        new_lock: mut Lockfile*,
                        visited: mut [DepKey]*,
                        outcome: mut ResolveOutcome*) -> void {
@@ -233,13 +350,42 @@ type struct DepResolver {
                     outcome.failed = true;
                 }
                 DepKind::Path => {
-                    DepResolver::resolve_path_dep(cfg, declarer, base, on_this_machine, dep, mode, existing, new_lock, visited, outcome);
+                    DepResolver::resolve_path_dep(cfg, declarer, base, on_this_machine, dep, mode, existing, pinned, chosen, new_lock, visited, outcome);
                 }
                 DepKind::Git => {
-                    DepResolver::resolve_git_dep(cfg, declarer, on_this_machine, dep, mode, existing, new_lock, visited, outcome);
+                    DepResolver::resolve_git_dep(cfg, declarer, base, on_this_machine, dep, mode, existing, pinned, chosen, new_lock, visited, outcome);
                 }
             }
         }
+    }
+
+    /// The request `dep`, an entry of `cfg`, makes of the library
+    /// `library`, whose cryoconfig is `dep_cfg` and whose own ref names
+    /// `commit` (empty for a path dependency).  `declarer` and `base` are
+    /// `cfg`'s package, as `walk_deps` takes them.
+    static request_of(cfg: const ProjectConfig*, declarer: str::Str, base: Path, dep: const Dependency*,
+                      library: String, dep_cfg: const ProjectConfig*, shown: String, commit: String) -> LibraryRequest {
+        const requester: String = if (declarer.length() == 0) { String::from_str(str::Str::new("the program")) }
+            else { f"`{str::Str::from(cfg.lib.name)}` {str::Str::from(cfg.lib.version)}" };
+        const config: String = if (base.is_empty()) { String::from_str(str::Str::new("cryoconfig")) }
+            else { String::from_str(base.join("cryoconfig").as_path().as_str()) };
+        mut source: String = if (commit.length() > 0) { f"git = \"{dep.git_url}\"" } else { f"path = \"{dep.path}\"" };
+        const ref_key: str::Str = GitRefKind::key_name(dep.ref_kind);
+        if (ref_key.length() > 0) { source.push(f", {ref_key} = \"{dep.ref_val}\""); }
+        return LibraryRequest {
+            library:      library,
+            library_name: String::from_str(str::Str::from(dep_cfg.lib.name)),
+            name:         dep.name.clone(),
+            requester:    requester,
+            from_program: declarer.length() == 0,
+            config:      config,
+            source:       source,
+            shown:        shown,
+            requirement:  dep.version_requirement.clone(),
+            version:      String::from_str(str::Str::from(dep_cfg.lib.version)),
+            commit:       commit.clone(),
+            walked:       commit,
+        };
     }
 
     /// Path dep: resolved by joining the consumer's project root with
@@ -252,6 +398,8 @@ type struct DepResolver {
                               dep: const Dependency*,
                               mode: ResolveMode,
                               existing: Lockfile*,
+                              pinned: mut Lockfile*,
+                              chosen: &[LibraryRequest],
                               new_lock: mut Lockfile*,
                               visited: mut [DepKey]*,
                               outcome: mut ResolveOutcome*) -> void {
@@ -273,9 +421,9 @@ type struct DepResolver {
         const found: Option<DepKey> = DepResolver::key_declared_by(declarer, dep, dep_root.as_path(), outcome);
         if (found.is_none()) { return; }
         const key: DepKey = found.unwrap();
-        if (visited.contains(&key)) { return; }
-        visited.push(key.clone());
 
+        // Every entry naming the package makes its request, whichever
+        // reaches it first.
         const dep_cfg: ProjectConfig = ProjectConfig::parse(dep_config.into_raw());
         if (dep_cfg.error_count > 0) {
             fmt::eprintln(f"error: dependency '{dep.name}' has invalid cryoconfig at {dep_root.as_path().as_str()}");
@@ -286,13 +434,17 @@ type struct DepResolver {
             outcome.failed = true;
             return;
         }
+        outcome.requests.push(DepResolver::request_of(cfg, declarer, base, dep, key.val.clone(), &dep_cfg,
+            String::from_str(dep_root.as_path().as_str()), String::new()));
+        if (visited.contains(&key)) { return; }
+        visited.push(key.clone());
         // The loader prefixes a relative root with the program's project
         // root itself, so a path dependency's roots are handed over relative
         // to it (or absolute, below a git dependency).
         const package_base: PathBuf = if (base.is_empty()) { PathBuf::from(dep.path.as_str()) }
             else { base.join(dep.path.as_str()) };
         DepResolver::harvest_roots(&dep_cfg, package_base.as_path(), dep.name.as_str(), key.val.as_str(), outcome);
-        DepResolver::walk_deps(&dep_cfg, key.val.as_str(), package_base.as_path(), on_this_machine, mode, existing, new_lock, visited, outcome);
+        DepResolver::walk_deps(&dep_cfg, key.val.as_str(), package_base.as_path(), on_this_machine, mode, existing, pinned, chosen, new_lock, visited, outcome);
     }
 
     /// The identity of the package `dep` names, in `directory`, recorded as
@@ -317,16 +469,20 @@ type struct DepResolver {
     /// In Build mode we trust the lockfile completely; in Fetch/Update we
     /// (re)resolve the ref to a SHA, extract the commit's files, and write
     /// a fresh lockfile entry.
+    /// The walk enters the commit chosen for the library (`resolve`), which
+    /// is the entry's own until another entry names a newer version.
     static resolve_git_dep(cfg: const ProjectConfig*,
                              declarer: str::Str,
+                             base: Path,
                              on_this_machine: boolean,
                              dep: const Dependency*,
                              mode: ResolveMode,
                              existing: Lockfile*,
+                             pinned: mut Lockfile*,
+                             chosen: &[LibraryRequest],
                              new_lock: mut Lockfile*,
                              visited: mut [DepKey]*,
                              outcome: mut ResolveOutcome*) -> void {
-        mut sha: String = String::new();
         const local_repository: boolean = match (GitUrl::package_on_this_machine(on_this_machine, dep.git_url.as_str())) {
             Option::Some(local) => { local }
             Option::None => {
@@ -337,70 +493,128 @@ type struct DepResolver {
             }
         };
 
-        // Builds and tests running at once share the cache, so its entries
-        // for one repository are read and made under that repository's lock.
-        mut lock: DirectoryLock = Cache::repository_lock(dep.git_url.as_str());
-        match (lock.take()) {
-            Result::Ok(_)    => { }
-            Result::Err(why) => {
-                fmt::eprintln(f"error: dependency '{dep.name}': {why}");
-                outcome.failed = true;
-                return;
+        const url: str::Str = dep.git_url.as_str();
+        const ref_kind: str::Str = GitRefKind::key_name(dep.ref_kind);
+        // An entry this run has pinned already is not fetched, extracted or
+        // checked again.
+        const earlier: const LockedDep* = pinned.find(url, ref_kind, dep.ref_val.as_str());
+        mut found_entry: Option<LockedDep> = Option::None;
+        if (earlier != null) {
+            found_entry = Option::Some(earlier.clone());
+        } else {
+            // Builds and tests running at once share the cache, so its
+            // entries for one repository are read and made under that
+            // repository's lock.
+            mut lock: DirectoryLock = Cache::repository_lock(url);
+            match (lock.take()) {
+                Result::Ok(_)    => { }
+                Result::Err(why) => {
+                    fmt::eprintln(f"error: dependency '{dep.name}': {why}");
+                    outcome.failed = true;
+                    return;
+                }
             }
+            found_entry = DepResolver::cached_commit(dep, mode, existing);
+            lock.release();
         }
-        const pinned: Option<LockedDep> = DepResolver::cached_commit(dep, mode, existing);
-        lock.release();
-        mut entry: LockedDep = match (pinned) {
+        mut entry: LockedDep = match (found_entry) {
             Option::Some(found) => { found }
             Option::None        => { outcome.failed = true; return; }
         };
-        sha = entry.commit.clone();
+        const sha: String = entry.commit.clone();
 
-        const checkout: PathBuf = Cache::extraction_dir_for(dep.git_url.as_str(), sha.as_str());
-        const dep_root: PathBuf = if (dep.subdir.length() > 0) {
-            checkout.join(dep.subdir.as_str())
-        } else {
-            checkout
-        };
-
-        const dep_cryo: PathBuf = dep_root.join("cryoconfig");
-        if (!dep_cryo.as_path().exists()) {
-            fmt::eprintln(f"error: dependency '{dep.name}' has no cryoconfig at {dep_root.as_path().as_str()}");
-            outcome.failed = true;
-            return;
-        }
-
-        // Every entry naming the repository is checked and locked, whichever
-        // reaches its package first.
-        const dep_cfg: ProjectConfig = ProjectConfig::parse(dep_cryo.into_raw());
-        if (dep_cfg.error_count > 0) {
-            fmt::eprintln(f"error: dependency '{dep.name}' has invalid cryoconfig at {dep_root.as_path().as_str()}");
-            outcome.failed = true;
-            return;
-        }
+        // Every entry naming the repository is checked and makes its
+        // request, whichever reaches its package first.
+        const dep_root: PathBuf = DepResolver::package_directory(dep, sha.as_str());
+        const own: Option<ProjectConfig> = DepResolver::package_config(dep, dep_root.as_path());
+        if (own.is_none()) { outcome.failed = true; return; }
+        const dep_cfg: ProjectConfig = own.unwrap();
         match (DepResolver::library_version(dep, &dep_cfg, dep_root.as_path(), sha.clone())) {
             Option::Some(version) => { entry.version = version; }
             Option::None          => { outcome.failed = true; return; }
         }
-        if (mode != ResolveMode::Build) {
-            const ref_key: str::Str = GitRefKind::key_name(dep.ref_kind);
-            const selected: String = if (ref_key.length() > 0) { f"{ref_key} {dep.ref_val}" } else { String::from_str(str::Str::new("default branch")) };
-            fmt::println(f"[deps] {dep.name} {entry.version} from {dep.git_url} ({selected}, commit {sha.as_str().byte_substring(0, 12)})");
+        if (earlier == null) {
+            if (mode != ResolveMode::Build) {
+                const selected: String = if (ref_kind.length() > 0) { f"{ref_kind} {dep.ref_val}" } else { String::from_str(str::Str::new("default branch")) };
+                fmt::println(f"[deps] {dep.name} {entry.version} from {dep.git_url} ({selected}, commit {sha.as_str().byte_substring(0, 12)})");
+            }
+            pinned.packages.push(entry.clone());
+        }
+        if (mode != ResolveMode::Build && new_lock.find(url, ref_kind, dep.ref_val.as_str()) == null) {
             new_lock.packages.push(entry);
         }
 
-        // Cycle detection: one package directory is one checkout of one
-        // commit, so this is scoped to the URL, the commit and the subdir.
-        const found: Option<DepKey> = DepResolver::key_declared_by(declarer, dep, dep_root.as_path(), outcome);
+        // One repository's subdirectories are libraries of their own.
+        mut library: String = GitUrl::canonical(url);
+        if (dep.subdir.length() > 0) { library.push(f"//{dep.subdir}"); }
+        mut request: LibraryRequest = DepResolver::request_of(cfg, declarer, base, dep, library, &dep_cfg,
+            f"{dep.git_url} at commit {sha.as_str().byte_substring(0, 12)}", sha.clone());
+        for (mut i: i64 = 0; i < chosen.length(); i++) {
+            if (chosen[i].library == request.library) { request.walked = chosen[i].commit.clone(); }
+        }
+        const walked: String = request.walked.clone();
+        outcome.requests.push(request);
+        if (walked == sha) {
+            DepResolver::enter_git_package(declarer, local_repository, dep, dep_root.as_path(), &dep_cfg, mode, existing, pinned, chosen, new_lock, visited, outcome);
+            return;
+        }
+        const walked_root: PathBuf = DepResolver::package_directory(dep, walked.as_str());
+        match (DepResolver::package_config(dep, walked_root.as_path())) {
+            Option::Some(walked_cfg) => {
+                DepResolver::enter_git_package(declarer, local_repository, dep, walked_root.as_path(), &walked_cfg, mode, existing, pinned, chosen, new_lock, visited, outcome);
+            }
+            Option::None => { outcome.failed = true; }
+        }
+    }
+
+    /// The directory of the package git dependency `dep` names at `commit`:
+    /// the commit's extraction in the cache, and the entry's `subdir` below.
+    static package_directory(dep: const Dependency*, commit: str::Str) -> PathBuf {
+        const checkout: PathBuf = Cache::extraction_dir_for(dep.git_url.as_str(), commit);
+        if (dep.subdir.length() > 0) { return checkout.join(dep.subdir.as_str()); }
+        return checkout;
+    }
+
+    /// The cryoconfig of the package `dep` names, in `directory`; `None`
+    /// once the failure is reported, when it has none or it is malformed.
+    static package_config(dep: const Dependency*, directory: Path) -> Option<ProjectConfig> {
+        const config_path: PathBuf = directory.join("cryoconfig");
+        if (!config_path.as_path().exists()) {
+            fmt::eprintln(f"error: dependency '{dep.name}' has no cryoconfig at {directory.as_str()}");
+            return Option::None;
+        }
+        const parsed: ProjectConfig = ProjectConfig::parse(config_path.into_raw());
+        if (parsed.error_count > 0) {
+            fmt::eprintln(f"error: dependency '{dep.name}' has invalid cryoconfig at {directory.as_str()}");
+            return Option::None;
+        }
+        return Option::Some(parsed);
+    }
+
+    /// Walk into the package git dependency `dep` is built from, in
+    /// `directory` with the cryoconfig `dep_cfg`: once per directory, which
+    /// is one commit of one repository, its roots harvested by their
+    /// absolute paths, since the consumer's root says nothing about where
+    /// the cache is.
+    static enter_git_package(declarer: str::Str,
+                             local_repository: boolean,
+                             dep: const Dependency*,
+                             directory: Path,
+                             dep_cfg: const ProjectConfig*,
+                             mode: ResolveMode,
+                             existing: Lockfile*,
+                             pinned: mut Lockfile*,
+                             chosen: &[LibraryRequest],
+                             new_lock: mut Lockfile*,
+                             visited: mut [DepKey]*,
+                             outcome: mut ResolveOutcome*) -> void {
+        const found: Option<DepKey> = DepResolver::key_declared_by(declarer, dep, directory, outcome);
         if (found.is_none()) { return; }
         const key: DepKey = found.unwrap();
         if (visited.contains(&key)) { return; }
         visited.push(key.clone());
-        // Harvest using the absolute checkout path so source roots are
-        // self-contained; the consumer's project_root is irrelevant for
-        // git deps.
-        DepResolver::harvest_roots(&dep_cfg, dep_root.as_path(), dep.name.as_str(), key.val.as_str(), outcome);
-        DepResolver::walk_deps(&dep_cfg, key.val.as_str(), dep_root.as_path(), local_repository, mode, existing, new_lock, visited, outcome);
+        DepResolver::harvest_roots(dep_cfg, directory, dep.name.as_str(), key.val.as_str(), outcome);
+        DepResolver::walk_deps(dep_cfg, key.val.as_str(), directory, local_repository, mode, existing, pinned, chosen, new_lock, visited, outcome);
     }
 
     /// The lock entry of git dependency `dep`, whose commit's files are
@@ -471,7 +685,7 @@ type struct DepResolver {
                 if (mode == ResolveMode::Fetch) {
                     const locked: const LockedDep* = existing.find(url, ref_kind, dep.ref_val.as_str());
                     if (locked != null && GitUrl::is_commit_id(locked.commit.as_str())
-                            && DepResolver::accepts(dep, locked.version.as_str())) {
+                            && DepResolver::accepts(dep.version_requirement.as_str(), locked.version.as_str())) {
                         sha      = locked.commit.clone();
                         recorded = locked.content.clone();
                         reused   = true;
@@ -517,14 +731,14 @@ type struct DepResolver {
     }
 
     /// Whether `version`, a library's `[lib] version` as written, meets
-    /// `dep`'s `version` requirement; true when `dep` writes none, and false
-    /// for an empty or malformed version when it does.
-    static accepts(dep: const Dependency*, version: str::Str) -> boolean {
-        if (dep.version_requirement.length() == 0) { return true; }
-        match (Requirement::parse(dep.version_requirement.as_str())) {
-            Option::Some(requirement) => {
+    /// `requirement`, a `version` requirement as written; true when it is
+    /// empty, and false for an empty or malformed version when it is not.
+    static accepts(requirement: str::Str, version: str::Str) -> boolean {
+        if (requirement.length() == 0) { return true; }
+        match (Requirement::parse(requirement)) {
+            Option::Some(parsed_requirement) => {
                 match (Version::parse(version)) {
-                    Option::Some(parsed) => { return requirement.satisfied_by(&parsed); }
+                    Option::Some(parsed) => { return parsed_requirement.satisfied_by(&parsed); }
                     Option::None         => { return false; }
                 }
             }
@@ -533,14 +747,14 @@ type struct DepResolver {
     }
 
     /// The version of the library `dep` names, whose cryoconfig is
-    /// `dep_cfg` in `directory`, held to what `dep` asks of it; `None` once
-    /// the failure is reported.  A dependency is a library: its cryoconfig
-    /// has a `[lib]`.  A git dependency's library says its version, and
-    /// so does a path dependency's when `dep` writes a `version`
-    /// requirement, which the version must meet.  A git dependency pinned
-    /// by a tag that names a version, `v0.2.0`, must find that version in
-    /// the tagged commit's cryoconfig.  `commit` is the git dependency's
-    /// commit, and empty for a path dependency.
+    /// `dep_cfg` in `directory`; `None` once the failure is reported.  A
+    /// dependency is a library: its cryoconfig has a `[lib]`.  A git
+    /// dependency's library says its version, and so does a path
+    /// dependency's when `dep` writes a `version` requirement (which
+    /// `choose` holds it to, with every other request for the library).  A
+    /// git dependency pinned by a tag that names a version, `v0.2.0`, must
+    /// find that version in the tagged commit's cryoconfig.  `commit` is the
+    /// git dependency's commit, and empty for a path dependency.
     static library_version(dep: const Dependency*, dep_cfg: const ProjectConfig*, directory: Path,
                            commit: String) -> Option<String> {
         const config_path: PathBuf = directory.join("cryoconfig");
@@ -566,24 +780,6 @@ type struct DepResolver {
             }
             return Option::None;
         }
-        if (!DepResolver::accepts(dep, version.as_str())) {
-            fmt::eprintln(f"error: dependency '{dep.name}' requires version {dep.version_requirement}, and {shown} is version {version}");
-            // The requirement that accepts this version and every later one
-            // that does not break it: its major, or below 1.0.0 its minor too.
-            mut accepted: String = version.clone();
-            match (Version::parse(version.as_str())) {
-                Option::Some(parsed) => {
-                    accepted = f"{parsed.major}";
-                    if (parsed.major == 0) { accepted.push(f".{parsed.minor}"); }
-                }
-                Option::None => { }
-            }
-            mut source: String = if (commit.length() > 0) { f"git = \"{dep.git_url}\"" } else { f"path = \"{dep.path}\"" };
-            const ref_key: str::Str = GitRefKind::key_name(dep.ref_kind);
-            if (ref_key.length() > 0) { source.push(f", {ref_key} = \"{dep.ref_val}\""); }
-            fmt::eprintln(f"  help: to accept version {version}, write `{dep.name} = {{ {source}, version = \"{accepted}\" }}`; or name a `branch`, `tag` or `rev` whose cryoconfig says a version that meets {dep.version_requirement}");
-            return Option::None;
-        }
         match (dep.ref_kind) {
             GitRefKind::Tag => {
                 match (Version::of_tag(dep.ref_val.as_str())) {
@@ -601,6 +797,193 @@ type struct DepResolver {
             _ => { }
         }
         return Option::Some(version);
+    }
+
+
+    // One version of each library
+
+    /// The request each library is built at, one per library, in the order
+    /// the walk first reached it; `None` once every failure is reported.
+    static choose(requests: &[LibraryRequest]) -> Option<[LibraryRequest]> {
+        mut choice: [LibraryRequest] = [];
+        mut failed: boolean = false;
+        for (mut i: i64 = 0; i < requests.length(); i++) {
+            mut reached_before: boolean = false;
+            for (mut j: i64 = 0; j < i; j++) {
+                if (requests[j].library == requests[i].library) { reached_before = true; }
+            }
+            if (reached_before) { continue; }
+            mut group: [LibraryRequest] = [];
+            for (mut j: i64 = i; j < requests.length(); j++) {
+                if (requests[j].library == requests[i].library) { group.push(requests[j].clone()); }
+            }
+            match (DepResolver::choose_version(&group)) {
+                Option::Some(chosen) => { choice.push(chosen); }
+                Option::None         => { failed = true; }
+            }
+        }
+        if (failed) { return Option::None; }
+        return Option::Some(choice);
+    }
+
+    /// The request one library is built at, of `group`, every request for
+    /// it; `None` once the failure is reported.  A build holds one series of
+    /// a library (`Version::series`), so requests that ask for two are
+    /// refused, naming who asks for which.  Each request's own version must
+    /// meet its own requirement.  Of the versions the requests name, the
+    /// newest that every requirement accepts is chosen: the first request
+    /// naming it, when two commits say one version.
+    static choose_version(group: &[LibraryRequest]) -> Option<LibraryRequest> {
+        // The newest version a request names, which a refusal's help moves
+        // the others to.
+        mut newest: i64 = 0;
+        for (mut k: i64 = 1; k < group.length(); k++) {
+            if (DepResolver::version_order(group[k].version.as_str(), group[newest].version.as_str()) > 0) { newest = k; }
+        }
+        mut series: String = String::new();
+        for (mut k: i64 = 0; k < group.length(); k++) {
+            const asked: String = group[k].series().unwrap_or(String::new());
+            if (asked.length() == 0) { continue; }
+            if (series.length() == 0) {
+                series = asked;
+            } else if (series != asked) {
+                DepResolver::report_two_series(group, newest);
+                return Option::None;
+            }
+        }
+        mut refused: boolean = false;
+        for (mut k: i64 = 0; k < group.length(); k++) {
+            if (!DepResolver::accepts(group[k].requirement.as_str(), group[k].version.as_str())) {
+                DepResolver::report_unaccepted(&group[k]);
+                refused = true;
+            }
+        }
+        if (refused) { return Option::None; }
+        mut best: i64 = -1;
+        for (mut k: i64 = 0; k < group.length(); k++) {
+            mut accepted_by_all: boolean = true;
+            for (mut r: i64 = 0; r < group.length(); r++) {
+                if (!DepResolver::accepts(group[r].requirement.as_str(), group[k].version.as_str())) { accepted_by_all = false; }
+            }
+            if (accepted_by_all
+                    && (best < 0 || DepResolver::version_order(group[k].version.as_str(), group[best].version.as_str()) > 0)) {
+                best = k;
+            }
+        }
+        if (best < 0) {
+            DepResolver::report_no_common_version(group, newest);
+            return Option::None;
+        }
+        return Option::Some(group[best].clone());
+    }
+
+    /// Negative when the version `left` orders below `right`, zero when
+    /// they are the same, positive when above; a version that does not
+    /// parse orders below every one that does.
+    static version_order(left: str::Str, right: str::Str) -> i64 {
+        match (Version::parse(left)) {
+            Option::Some(parsed_left) => {
+                match (Version::parse(right)) {
+                    Option::Some(parsed_right) => { return parsed_left.compare(&parsed_right); }
+                    Option::None               => { return 1; }
+                }
+            }
+            Option::None => {
+                if (Version::parse(right).is_some()) { return -1; }
+                return 0;
+            }
+        }
+    }
+
+    /// The entry `request` names its library by, as its cryoconfig writes it.
+    static written_entry(request: const LibraryRequest*) -> String {
+        if (request.requirement.length() > 0) {
+            return request.rewritten(request.source.as_str(), request.requirement.as_str());
+        }
+        return f"{request.name} = {{ {request.source} }}";
+    }
+
+    /// The fix that moves `request` to `target`'s version, the newest one
+    /// asked for: the entry rewritten to name it and accept its series, in
+    /// the program's cryoconfig, or, for a request a dependency makes, the
+    /// entry a version of that dependency would write.
+    static report_move(request: const LibraryRequest*, target: const LibraryRequest*) -> void {
+        const target_series: String = target.version_series();
+        // An entry whose own ref already names the version keeps its source.
+        const source: str::Str = if (request.version == target.version) { request.source.as_str() } else { target.source.as_str() };
+        const entry: String = request.rewritten(source, target_series.as_str());
+        if (request.from_program) {
+            fmt::eprintln(f"  help: to build {target.library_name} {target.version}, write `{entry}` in {request.config}");
+        } else {
+            fmt::eprintln(f"  help: {request.requester} asks for another version; a version of it whose cryoconfig writes `{entry}` builds with {target.library_name} {target.version}");
+        }
+    }
+
+    /// Refuse `group`, the requests for one library, which ask for more
+    /// than one series of it; `newest` indexes the request naming the
+    /// newest version.
+    static report_two_series(group: &[LibraryRequest], newest: i64) -> void {
+        const target: const LibraryRequest* = &group[newest];
+        fmt::eprintln(f"error: the program needs more than one major version of `{target.library_name}` ({target.library}), and a build holds one version of each library");
+        for (mut k: i64 = 0; k < group.length(); k++) {
+            const asked: String = group[k].series().unwrap_or(group[k].version.clone());
+            fmt::eprintln(f"  note: {group[k].requester} asks for version {asked}: {group[k].config} writes `{DepResolver::written_entry(&group[k])}`, which names {group[k].library_name} {group[k].version}");
+        }
+        // The newest version's own series, whatever its request accepts.
+        const target_series: String = target.version_series();
+        for (mut k: i64 = 0; k < group.length(); k++) {
+            const asked: String = group[k].series().unwrap_or(String::new());
+            if (asked.length() > 0 && asked != target_series) { DepResolver::report_move(&group[k], target); }
+        }
+    }
+
+    /// Refuse `group`, the requests for one library, none of whose versions
+    /// every requirement accepts; `newest` indexes the request naming the
+    /// newest version.
+    static report_no_common_version(group: &[LibraryRequest], newest: i64) -> void {
+        const target: const LibraryRequest* = &group[newest];
+        fmt::eprintln(f"error: no version of `{target.library_name}` ({target.library}) meets every requirement on it");
+        for (mut k: i64 = 0; k < group.length(); k++) {
+            fmt::eprintln(f"  note: {group[k].requester} requires {group[k].requirement}: {group[k].config} writes `{DepResolver::written_entry(&group[k])}`, which names {group[k].library_name} {group[k].version}");
+        }
+        for (mut k: i64 = 0; k < group.length(); k++) {
+            if (!DepResolver::accepts(group[k].requirement.as_str(), target.version.as_str())) {
+                DepResolver::report_move(&group[k], target);
+            }
+        }
+    }
+
+    /// Refuse `request`, whose own version does not meet its own requirement.
+    static report_unaccepted(request: const LibraryRequest*) -> void {
+        fmt::eprintln(f"error: dependency '{request.name}' requires version {request.requirement}, and {request.shown} is version {request.version}");
+        const accepted: String = request.version_series();
+        fmt::eprintln(f"  help: to accept version {request.version}, write `{request.rewritten(request.source.as_str(), accepted.as_str())}`; or name a `branch`, `tag` or `rev` whose cryoconfig says a version that meets {request.requirement}");
+    }
+
+    /// The first git request in `requests` the walk did not build at the
+    /// commit `chosen` holds for its library, or `None` when every one was.
+    static built_elsewhere(requests: &[LibraryRequest], chosen: &[LibraryRequest]) -> Option<LibraryRequest> {
+        for (mut i: i64 = 0; i < requests.length(); i++) {
+            for (mut j: i64 = 0; j < chosen.length(); j++) {
+                if (chosen[j].library == requests[i].library && chosen[j].commit != requests[i].walked) {
+                    return Option::Some(requests[i].clone());
+                }
+            }
+        }
+        return Option::None;
+    }
+
+    /// Say, for each request in `requests` built at another entry's version
+    /// than its own, which version it is built at.
+    static report_unified(requests: &[LibraryRequest], chosen: &[LibraryRequest]) -> void {
+        for (mut i: i64 = 0; i < requests.length(); i++) {
+            if (requests[i].walked == requests[i].commit) { continue; }
+            for (mut j: i64 = 0; j < chosen.length(); j++) {
+                if (chosen[j].library == requests[i].library) {
+                    fmt::println(f"[deps] {requests[i].name}: {requests[i].requester} names {requests[i].library_name} {requests[i].version}, built at {chosen[j].version}, the newest version every entry for it accepts");
+                }
+            }
+        }
     }
 
 
