@@ -100,7 +100,7 @@ sweep.  Counted (`grep -E '^\s*implement(<[^>]*>)? (struct|union) '`):
   and `parser.cryo` are the split-type exception and stay; the one in
   `cursor.cryo`, the struct's own file, goes inline.  The others are
   `AsmPiece`, `InlineBodies`, `DirectiveRegistry`, and `StampSlot`,
-  `BuildStamp`, `VersionReport` in `utils/build_stamp.cryo`.
+  `BuildStamp`, `VersionReport` in `compiler/utils/build_stamp.cryo`.
 - standard library: 4.  Three are `BufferedStream<S>` extended from the
   HTTP/1.1, HTTP/2 and WebSocket modules, the split-type exception; one is
   `Array<T, A>`'s second block in its own file, to fold inline (its bound
@@ -648,6 +648,39 @@ language's features; each is a branch of its own after the merge.
   hand-written `match`, so every wire format with an enum (WebSocket's
   opcodes, HTTP/2's frame types) carries its own `op_from_u8`.  The
   conversion answers `Option` (or `TryFrom`) for a value no variant holds.
+
+## Two major versions of one library in a build
+
+For v1.0 a build holds one version of each library, and entries asking for
+two major versions are refused (`docs/cryo.md`, "One version of each
+library").  After v1.0, each package may take the major version it asks
+for, so a program whose dependencies need `gauge` 1 and `gauge` 2 builds
+both:
+
+- **Resolution per package, through the existing doors.**  A module path
+  written in a package already resolves against that package's own
+  `[dependencies]` (E0508's rule).  Two majors of one library become two
+  packages with one top-level namespace each, and the package-declaration
+  table, not the spelling, says which of them a package's `import gauge;`
+  names.  No lookup gains a second strategy; the doors take the declaring
+  package, which they already know.
+- **Versioned symbols.**  The mangled name of every symbol of a dependency
+  carries its package's major version, so `gauge::value` from 1.x and from
+  2.x link side by side (`docs/cryo-mangling-spec.md` gains the component).
+- **A rename key.**  An entry may name the library's namespace for its own
+  package, `gauge2 = { git = "...", version = "2", namespace = "gauge2" }`,
+  so one package can import both majors.  Without it, a package names the
+  one major its own cryoconfig asks for.
+
+The one-version rule then holds per package rather than per build: within
+one series, entries still unify to one version.
+
+## A package registry
+
+After v1.0: a registry that names a library and a version requirement
+without a URL (`json5 = "1.2"`), resolved to a repository and a commit the
+lock pins as it pins a git dependency today.  The `[lib] version` key stays
+the version's only source.
 
 ## Paths through generic type aliases
 

@@ -1,0 +1,311 @@
+///! `cryogate deps-flow --cryo <compiler> [--stdlib DIR]`: the dependency
+///! flow a user goes through, from `cryo init` to an offline build, with a
+///! git repository on this machine standing in for a remote one, so nothing
+///! is fetched over a network.
+///!
+///! Every step runs the compiler as a user would, with `CRYO_HOME` a scratch
+///! directory (the user's package cache) and git given no system or user
+///! configuration and a fixed identity.  In order:
+///!
+///!   remote          a bare repository whose default branch holds the
+///!                   library `gauge` at version 1.0.0
+///!   init library    `cryo init --type=library` makes `shapes`, and its own
+///!                   `cryo test` passes
+///!   init program    `cryo init --type=executable` makes the program, which
+///!                   names `shapes` by path and `gauge` by its repository,
+///!                   each with a version requirement
+///!   fetch           pins gauge 1.0.0 in `cryoconfig.lock`; the program runs
+///!                   and exits with gauge's value, and its tests pass
+///!   fetch keeps     gauge 1.1.0 is pushed; `cryo fetch` keeps the pin, so
+///!                   the program still exits with 1.0.0's value
+///!   update          `cryo update` moves the pin to 1.1.0, and the program
+///!                   exits with its value
+///!   offline         the repository is gone: a build still runs from the
+///!                   cache, `cryo fetch` keeps the pin, and `cryo update`
+///!                   says it cannot reach the repository, resolves from
+///!                   the branches fetched before, and leaves the lock as
+///!                   it was
+///!
+///! With no `--stdlib` the compiler finds its own standard library, as an
+///! installed one does.  Exit: 0 when every step passed; 1 at the first
+///! that failed; 2 on a usage error.
+
+namespace cryogate::gates::deps_flow;
+
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::fs::temporary::{ TemporaryDirectory };
+
+import cryogate::core::child::{ Completion, Job };
+import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
+import cryogate::core::options::{ Options, Parsed };
+
+/// The flow, over one scratch directory.
+public type struct DepsFlow {
+    compiler: String;
+    /// The standard library named to every compiler run; empty when the
+    /// compiler finds its own.
+    stdlib: String;
+    /// The user's package cache.
+    home: String;
+    /// The bare repository the program's git dependency names.
+    remote: String;
+    /// The directory a release of `gauge` is written in before it is
+    /// committed to `remote`.
+    release: String;
+    /// Where `cryo init` makes the library and the program.
+    projects: String;
+    /// A file that does not exist, given to git as its user configuration.
+    no_config: String;
+
+    /// Run `cryogate deps-flow` with `arguments` from index `first`.
+    public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
+        mut options: Options = Options::new(Str::new("cryogate deps-flow --cryo <compiler> [--stdlib DIR]"));
+        options.valued(Str::new("--cryo"));
+        options.valued(Str::new("--stdlib"));
+        const parsed: Parsed = match (options.parse(arguments, first)) {
+            Result::Ok(parsed)  => { parsed }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate deps-flow: {reason.as_str()}"); return 2; }
+        };
+        const compiler: String = match (parsed.value(Str::new("--cryo"))) {
+            Option::Some(path) => { Host::absolute(path) }
+            Option::None       => { fmt::eprintln(f"cryogate deps-flow: --cryo is required; usage: {options.usage()}"); return 2; }
+        };
+        const stdlib: String = match (parsed.value(Str::new("--stdlib"))) {
+            Option::Some(directory) => { Host::stdlib_spelling(directory) }
+            Option::None            => { String::new() }
+        };
+        if (!parsed.positionals().is_empty() || parsed.separated()) {
+            fmt::eprintln(f"cryogate deps-flow: usage: {options.usage()}");
+            return 2;
+        }
+        if (!Path::from(compiler.as_str()).is_file()) {
+            fmt::eprintln(f"deps-flow: FAIL - compiler not found at {compiler.as_str()} (run `make cryo` first)");
+            return 1;
+        }
+        const work: TemporaryDirectory = match (TemporaryDirectory::create()) {
+            Result::Ok(directory) => { directory }
+            Result::Err(error)    => { fmt::eprintln(f"deps-flow: FAIL - cannot create a scratch directory: {error.describe()}"); return 1; }
+        };
+        // git and the compiler read these paths; forward slashes on every
+        // host keep the repository's `file://` URL one spelling.
+        const root: String = Host::absolute(work.path().as_str()).as_str().replace(&Str::new("\\"), &Str::new("/"));
+        const flow: DepsFlow = DepsFlow {
+            compiler:  compiler,
+            stdlib:    stdlib,
+            home:      f"{root.as_str()}/home",
+            remote:    f"{root.as_str()}/gauge.git",
+            release:   f"{root.as_str()}/gauge-release",
+            projects:  f"{root.as_str()}/projects",
+            no_config: f"{root.as_str()}/no-git-config",
+        };
+        return match (flow.steps(logs)) {
+            Result::Ok(_) => {
+                fmt::println(String::from_str(Str::new(
+                    "deps-flow: OK -- init, fetch, run, test, a kept pin, update, and an offline build, fetch and update")));
+                0
+            }
+            Result::Err(reason) => {
+                fmt::eprintln(f"deps-flow: FAIL - {reason.as_str()}");
+                1
+            }
+        };
+    }
+
+    private steps(&this, logs: &RunLogs) -> Result<(), String> {
+        if (Directory::create_all(Path::from(this.home.as_str())).is_err()
+                || Directory::create_all(Path::from(this.projects.as_str())).is_err()) {
+            return Result::Err(f"cannot make the scratch directories below {this.projects.as_str()}");
+        }
+        mut init_remote: Job = this.git();
+        init_remote.argument(Str::new("init"));
+        init_remote.argument(Str::new("--bare"));
+        init_remote.argument(Str::new("-q"));
+        init_remote.argument(Str::new("--initial-branch=main"));
+        init_remote.argument(this.remote.as_str());
+        DepsFlow::exits(init_remote, logs, Str::new("remote"), 0)?;
+        this.publish(Str::new("1.0.0"), 10, logs)?;
+
+        mut init_library: Job = this.cryo(this.projects.as_str(), Str::new("init"));
+        init_library.argument(Str::new("shapes"));
+        init_library.argument(Str::new("--name=shapes"));
+        init_library.argument(Str::new("--type=library"));
+        init_library.argument(Str::new("--source-dir=src"));
+        init_library.argument(Str::new("--output-dir=build"));
+        DepsFlow::exits(init_library, logs, Str::new("init library"), 0)?;
+        const library: String = f"{this.projects.as_str()}/shapes";
+        const library_test: String = DepsFlow::exits(this.cryo(library.as_str(), Str::new("test")), logs, Str::new("library test"), 0)?;
+        DepsFlow::holds(library_test.as_str(), Str::new("add_sums_its_arguments"), Str::new("library test"))?;
+
+        mut init_program: Job = this.cryo(this.projects.as_str(), Str::new("init"));
+        init_program.argument(Str::new("program"));
+        init_program.argument(Str::new("--name=program"));
+        init_program.argument(Str::new("--type=executable"));
+        init_program.argument(Str::new("--source-dir=src"));
+        init_program.argument(Str::new("--output-dir=build"));
+        DepsFlow::exits(init_program, logs, Str::new("init program"), 0)?;
+        const program: String = f"{this.projects.as_str()}/program";
+        this.write_program(program.as_str())?;
+        const lock: PathBuf = PathBuf::from(program.as_str()).join(Str::new("cryoconfig.lock"));
+
+        DepsFlow::exits(this.cryo(program.as_str(), Str::new("fetch")), logs, Str::new("fetch"), 0)?;
+        DepsFlow::locks(lock.as_path(), Str::new("1.0.0"), Str::new("fetch"))?;
+        DepsFlow::exits(this.cryo(program.as_str(), Str::new("run")), logs, Str::new("run at 1.0.0"), 10)?;
+        const program_test: String = DepsFlow::exits(this.cryo(program.as_str(), Str::new("test")), logs, Str::new("program test"), 0)?;
+        DepsFlow::holds(program_test.as_str(), Str::new("gauge_says_a_release"), Str::new("program test"))?;
+
+        this.publish(Str::new("1.1.0"), 11, logs)?;
+        DepsFlow::exits(this.cryo(program.as_str(), Str::new("fetch")), logs, Str::new("fetch keeps"), 0)?;
+        DepsFlow::locks(lock.as_path(), Str::new("1.0.0"), Str::new("fetch keeps"))?;
+        DepsFlow::exits(this.cryo(program.as_str(), Str::new("run")), logs, Str::new("run at the kept pin"), 10)?;
+
+        DepsFlow::exits(this.cryo(program.as_str(), Str::new("update")), logs, Str::new("update"), 0)?;
+        DepsFlow::locks(lock.as_path(), Str::new("1.1.0"), Str::new("update"))?;
+        DepsFlow::exits(this.cryo(program.as_str(), Str::new("run")), logs, Str::new("run at 1.1.0"), 11)?;
+
+        const gone: String = f"{this.remote.as_str()}.gone";
+        match (Path::from(this.remote.as_str()).rename_to(Path::from(gone.as_str()))) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"offline: cannot move the repository away: {error.describe()}"); }
+        }
+        DepsFlow::exits(this.cryo(program.as_str(), Str::new("run")), logs, Str::new("offline run"), 11)?;
+        const pinned: String = DepsFlow::lock_text(lock.as_path(), Str::new("offline"))?;
+        DepsFlow::exits(this.cryo(program.as_str(), Str::new("fetch")), logs, Str::new("offline fetch"), 0)?;
+        DepsFlow::unchanged(lock.as_path(), &pinned, Str::new("offline fetch"))?;
+        const offline_update: String = DepsFlow::exits(this.cryo(program.as_str(), Str::new("update")), logs, Str::new("offline update"), 0)?;
+        DepsFlow::holds(offline_update.as_str(), Str::new("using the branches and tags fetched before"), Str::new("offline update"))?;
+        DepsFlow::unchanged(lock.as_path(), &pinned, Str::new("offline update"))?;
+        return Result::Ok(());
+    }
+
+    /// Commit a release of `gauge` saying `version`, whose `value()` is
+    /// `value`, to the default branch of the repository.
+    private publish(&this, version: Str, value: i64, logs: &RunLogs) -> Result<(), String> {
+        const sources: PathBuf = PathBuf::from(this.release.as_str()).join(Str::new("src"));
+        const configuration: String = f"[project]\nproject_name = \"gauge\"\noutput_dir = \"build\"\n\n[lib]\nname = \"gauge\"\nsource_dir = \"src\"\nversion = \"{version}\"\n\n[compiler]\n\n[dependencies]\n";
+        const library: String = f"namespace gauge;\n\n/// The value of release {version}.\npublic function value() -> int {{ return {value}; }}\n";
+        const written: boolean = Directory::create_all(sources.as_path()).is_ok()
+            && File::write_text(PathBuf::from(this.release.as_str()).join(Str::new("cryoconfig")).as_path(), configuration.as_str()).is_ok()
+            && File::write_text(sources.join(Str::new("lib.cryo")).as_path(), library.as_str()).is_ok();
+        if (!written) { return Result::Err(f"publish {version}: cannot write the release below {this.release.as_str()}"); }
+        const git_dir: String = f"--git-dir={this.remote.as_str()}";
+        const work_tree: String = f"--work-tree={this.release.as_str()}";
+        // The index is emptied first, so no entry of the last release is
+        // taken for a file of this one with the same size and time.
+        mut empty: Job = this.git();
+        empty.argument(git_dir.as_str());
+        empty.argument(Str::new("read-tree"));
+        empty.argument(Str::new("--empty"));
+        DepsFlow::exits(empty, logs, Str::new("publish"), 0)?;
+        mut add: Job = this.git();
+        add.argument(git_dir.as_str());
+        add.argument(work_tree.as_str());
+        add.argument(Str::new("add"));
+        add.argument(Str::new("-A"));
+        DepsFlow::exits(add, logs, Str::new("publish"), 0)?;
+        mut commit: Job = this.git();
+        commit.argument(git_dir.as_str());
+        commit.argument(work_tree.as_str());
+        commit.argument(Str::new("commit"));
+        commit.argument(Str::new("-q"));
+        commit.argument(Str::new("-m"));
+        commit.argument(version);
+        DepsFlow::exits(commit, logs, Str::new("publish"), 0)?;
+        return Result::Ok(());
+    }
+
+    /// Give the program `cryo init` made its dependencies, a `main` that
+    /// exits with gauge's value, and a test that reads it.
+    private write_program(&this, program: Str) -> Result<(), String> {
+        const remote: Str = this.remote.as_str();
+        const url: String = if (remote.starts_with(&Str::new("/"))) { f"file://{remote}" } else { f"file:///{remote}" };
+        const configuration: String = f"[project]\nproject_name = \"program\"\noutput_dir = \"build\"\ntarget_type = \"executable\"\nsource_dir = \"src\"\nentry_point = \"src/main.cryo\"\n\n[compiler]\n\n[dependencies]\nshapes = {{ path = \"../shapes\", version = \"0.1\" }}\ngauge  = {{ git = \"{url}\", version = \"1\" }}\n";
+        const main: Str = Str::new("namespace program;\n\nimport gauge;\nimport shapes;\n\nfunction main() -> int {\n    return shapes::add(gauge::value(), 0);\n}\n");
+        const test: Str = Str::new("![config(testing)]\nnamespace program_tests;\n\nimport gauge;\nimport std::test::assert::{ expect_true };\nimport std::test::error::{ TestError };\n\n![test]\nfunction gauge_says_a_release() -> Result<(), TestError> {\n    return expect_true(gauge::value() >= 10, \"gauge's value is a release's\");\n}\n");
+        const root: PathBuf = PathBuf::from(program);
+        const written: boolean = File::write_text(root.join(Str::new("cryoconfig")).as_path(), configuration.as_str()).is_ok()
+            && File::write_text(root.join(Str::new("src")).join(Str::new("main.cryo")).as_path(), main).is_ok()
+            && Directory::create_all(root.join(Str::new("tests")).as_path()).is_ok()
+            && File::write_text(root.join(Str::new("tests")).join(Str::new("program_tests.cryo")).as_path(), test).is_ok();
+        if (!written) { return Result::Err(f"init program: cannot write the program's files below {program}"); }
+        return Result::Ok(());
+    }
+
+    /// The compiler run as `cryo <verb>` in `directory`, with the user's
+    /// cache in the scratch directory.
+    private cryo(&this, directory: Str, verb: Str) -> Job {
+        mut job: Job = Job::new(this.compiler.as_str());
+        job.argument(verb);
+        job.directory(directory);
+        job.set_variable(Str::new("CRYO_HOME"), this.home.as_str());
+        if (!this.stdlib.is_empty()) { job.set_variable(Str::new("CRYO_STDLIB"), this.stdlib.as_str()); }
+        job.default_c_compiler();
+        return job;
+    }
+
+    /// git, reading no configuration of the system's or the user's, with
+    /// a fixed identity.
+    private git(&this) -> Job {
+        mut job: Job = Job::new(Str::new("git"));
+        job.set_variable(Str::new("GIT_CONFIG_NOSYSTEM"), Str::new("1"));
+        job.set_variable(Str::new("GIT_CONFIG_GLOBAL"), this.no_config.as_str());
+        job.set_variable(Str::new("GIT_AUTHOR_NAME"), Str::new("deps-flow"));
+        job.set_variable(Str::new("GIT_AUTHOR_EMAIL"), Str::new("deps-flow@cryo.invalid"));
+        job.set_variable(Str::new("GIT_COMMITTER_NAME"), Str::new("deps-flow"));
+        job.set_variable(Str::new("GIT_COMMITTER_EMAIL"), Str::new("deps-flow@cryo.invalid"));
+        return job;
+    }
+
+    /// Run `job` for the step `step`, its output logged; its output when
+    /// it exits `code`, else the failure naming the step.
+    private static exits(job: Job, logs: &RunLogs, step: Str, code: i32) -> Result<String, String> {
+        mut logged: Job = job;
+        logged.log_to(logs.file(f"deps-flow {step}".as_str().replace(&Str::new(" "), &Str::new("-")).as_str()).as_str());
+        const done: Completion = logged.run();
+        const output: String = done.output();
+        match (done.outcome.exit_code()) {
+            Option::Some(exited) => {
+                if (exited == code) { return Result::Ok(output); }
+            }
+            Option::None => { }
+        }
+        return Result::Err(f"{step}: `{logged.command_line().as_str()}` gave {done.outcome.describe().as_str()}, expected exit {code}\n{output.as_str().trim_end()}");
+    }
+
+    /// The failure of `step` unless `output` holds `text`.
+    private static holds(output: Str, text: Str, step: Str) -> Result<(), String> {
+        if (output.contains(&text)) { return Result::Ok(()); }
+        return Result::Err(f"{step}: the output does not name `{text}`\n{output.trim_end()}");
+    }
+
+    /// The text of the lock file at `lock`, or the failure of `step`.
+    private static lock_text(lock: Path, step: Str) -> Result<String, String> {
+        return match (File::read_text(lock)) {
+            Result::Ok(text) => { Result::Ok(text) }
+            Result::Err(_)   => { Result::Err(f"{step}: no lock file at {lock.as_str()}") }
+        };
+    }
+
+    /// The failure of `step` unless the lock at `lock` pins gauge's
+    /// `version`.
+    private static locks(lock: Path, version: Str, step: Str) -> Result<(), String> {
+        const text: String = DepsFlow::lock_text(lock, step)?;
+        if (text.as_str().contains(&f"\"version\": \"{version}\"".as_str())) { return Result::Ok(()); }
+        return Result::Err(f"{step}: the lock does not pin version {version}\n{text.as_str().trim_end()}");
+    }
+
+    /// The failure of `step` unless the lock at `lock` still reads `before`.
+    private static unchanged(lock: Path, before: &String, step: Str) -> Result<(), String> {
+        const after: String = DepsFlow::lock_text(lock, step)?;
+        if (after == *before) { return Result::Ok(()); }
+        return Result::Err(f"{step}: the lock changed\nbefore:\n{before.as_str().trim_end()}\nafter:\n{after.as_str().trim_end()}");
+    }
+}

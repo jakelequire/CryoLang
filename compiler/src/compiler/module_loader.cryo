@@ -11,15 +11,15 @@ import compiler::diag::{
     sink, diagnostic, source_span, edit_distance, ErrorCode
 };
 import compiler::resolver::{ symbol_str, intern_table };
-import compiler::module_graph::{ IndexedModule, LexedSource, ModuleGraph, ModuleInfo, ModulePackage, PackageRoots };
+import compiler::module_graph::{ IndexedModule, LexedSource, ModuleGraph, ModuleInfo, ModuleOrigin, ModulePackage, PackageLibrary, PackageRoots };
 import compiler::diag::config::{ DiagConfig };
 import compiler::lex::{ Token, TokenType };
 import compiler::lex::lexer::{ Lexer };
 import compiler::project_config::{ ProjectConfig, VendorPin };
 import compiler::vendor::registry::{ VendorRegistry };
 import compiler::deps::lockfile::{ LockedVendor };
-import utils::log::{ Log, LogArea, LogLevel };
-import utils::time_trace::{ TimeTrace };
+import compiler::utils::log::{ Log, LogArea, LogLevel };
+import compiler::utils::time_trace::{ TimeTrace };
 import std::fmt;
 import std::fs::{ Directory, DirectoryEntries, File, FileType, Path, PathBuf };
 import std::collections::{ pair };
@@ -165,8 +165,8 @@ type struct ModuleLoader {
 
     /// Extra source roots resolved relative to project_root.  Scanned
     /// alongside entry_dir so that imports targeting siblings of the
-    /// entry point (e.g. a library entry at `src/compiler/_module.cryo`
-    /// whose source imports `utils::*` from `src/utils`) resolve.
+    /// entry point (e.g. a dependency's library sources, beside the
+    /// program's own) resolve.
     extra_roots: [string];
 
     // Circular dependency detection.
@@ -255,9 +255,15 @@ public:
     vendor_build_root: PathBuf;
     /// The roots that tell which package a file is in.  A module path
     /// written in a file names only a file of a package the writer's may
-    /// name (`ModulePackage::may_name`).  Holds only the standard library's
+    /// name (`PackageRoots::may_name`).  Holds only the standard library's
     /// root until `set_package_roots`.
     package_roots: PackageRoots;
+    /// The first file the pre-scan found declaring each top-level
+    /// namespace (`Util` for `Util::text`), by that name.
+    namespace_owners: HashMap<String, string, GlobalAllocator, FnvHasher>;
+    /// Every file whose top-level namespace another package's file
+    /// declared first, one per (namespace, package): E0507 each.
+    namespace_clashes: [NamespaceClash];
 
     static new(project_root: string, entry_point: string,
                stdlib_root: string, no_std: boolean,
@@ -290,7 +296,12 @@ public:
                 stdlib_root: if (no_std) { PathBuf::new() } else { PathBuf::from(Str::new(stdlib_root)) },
                 dep_roots:   [],
                 dep_names:   [],
+                dep_identities: [],
+                declarations: [],
+                libraries: [],
             },
+            namespace_owners: HashMap::<String, string, GlobalAllocator, FnvHasher>::new(),
+            namespace_clashes: [],
         };
     }
 
@@ -404,6 +415,12 @@ public:
         }
 
         Log::debug(LogArea::Loader, f"pre-scan complete: {this.ns_map.length()} namespaces indexed");
+        // A library's namespace is what the namespace rule compares, so a
+        // library without one, or with files outside it, is reported alone.
+        const libraries_named: boolean = this.report_libraries_without_namespace(sink);
+        const libraries_whole: boolean = this.report_namespaces_outside_libraries(sink);
+        if (!libraries_named || !libraries_whole) { return false; }
+        if (!this.report_namespace_clashes(sink)) { return false; }
 
         return this.discover_module(intern, graph, sink, entry_path);
     }
@@ -550,6 +567,8 @@ public:
         if (this.index_cache_open) { this.index_cache.keep(relative, &declared, !cached); }
         if (declared.namespace_name.length() > 0) {
             this.ns_map.insert(String::from_str(declared.namespace_name.as_str()), file_path);
+            this.record_namespace_owner(declared.namespace_name.as_str(), file_path);
+            this.package_roots.note_declared_namespace(Str::new(file_path), declared.namespace_name.as_str());
         }
         for (mut s: i64 = 0; s < declared.module_paths.length(); s++) {
             this.module_lines.push(ModuleLine {
@@ -561,6 +580,121 @@ public:
                 resolved:    false,
             });
         }
+    }
+
+    /// Note that `file_path` declares `declared`, and record a clash when
+    /// a file of another package declared its top-level namespace first.
+    /// A top-level namespace is one package's: the mangled names of
+    /// everything under it are, so two packages sharing one would collide,
+    /// and an import of it would name whichever file was indexed last.
+    record_namespace_owner(mut &this, declared: Str, file_path: string) -> void {
+        const top: Str = match (declared.split_once(&Str::new("::"))) {
+            Option::Some(parts) => { parts.first }
+            Option::None        => { declared }
+        };
+        const key: String = String::from_str(top);
+        match (this.namespace_owners.get(&key)) {
+            Option::Some(first) => {
+                const first_package: ModulePackage = this.package_roots.package_of(Path::from(first));
+                const package: ModulePackage = this.package_roots.package_of(Path::from(file_path));
+                if (first_package.is(&package)) { return; }
+                for (mut i: i64 = 0; i < this.namespace_clashes.length(); i++) {
+                    if (this.namespace_clashes[i].namespace == key
+                            && this.package_roots.package_of(Path::from(this.namespace_clashes[i].second)).is(&package)) {
+                        return;
+                    }
+                }
+                this.namespace_clashes.push(NamespaceClash { namespace: key.clone(), first: first, second: file_path });
+            }
+            Option::None => { this.namespace_owners.insert(key, file_path); }
+        }
+    }
+
+    /// Report every namespace clash the pre-scan recorded (E0507), and
+    /// whether there was none.
+    report_namespace_clashes(&this, sink: mut DiagnosticSink*) -> boolean {
+        for (mut i: i64 = 0; i < this.namespace_clashes.length(); i++) {
+            const clash: &NamespaceClash = &this.namespace_clashes[i];
+            const first: ModulePackage = this.package_roots.package_of(Path::from(clash.first));
+            const second: ModulePackage = this.package_roots.package_of(Path::from(clash.second));
+            const first_text: String = first.describe();
+            const second_text: String = second.describe();
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0507_NAMESPACE_IN_TWO_PACKAGES,
+                f"the namespace `{clash.namespace}` is declared by both {first_text} and {second_text}");
+            diag = diag.with_note(f"{clash.first} declares it in {first_text}");
+            diag = diag.with_note(f"{clash.second} declares it in {second_text}");
+            if (first.origin == ModuleOrigin::Stdlib || second.origin == ModuleOrigin::Stdlib) {
+                diag = diag.help(f"`{clash.namespace}` is the standard library's namespace; declare these modules under a namespace of their own");
+            } else {
+                diag = diag.help("a top-level namespace belongs to one package in a build; rename it in one of the two packages");
+            }
+            sink.emit(diag);
+        }
+        return this.namespace_clashes.length() == 0;
+    }
+
+    /// Report every library, a dependency's or the program's own, whose
+    /// `lib.cryo` is missing or declares no namespace (E0509), and whether
+    /// there was none.  A
+    /// library's namespace is the one its `lib.cryo` declares and nothing
+    /// else, so without one the library has no name a program can import.
+    report_libraries_without_namespace(&this, sink: mut DiagnosticSink*) -> boolean {
+        mut all_named: boolean = true;
+        for (mut i: i64 = 0; i < this.package_roots.libraries.length(); i++) {
+            const library: &PackageLibrary = &this.package_roots.libraries[i];
+            if (library.namespace.length() > 0) { continue; }
+            all_named = false;
+            const package_text: String = library.package.describe();
+            const file: Str = library.file.as_path().as_str();
+            const message: String = if (library.file.as_path().exists()) {
+                f"the `lib.cryo` of {package_text} declares no namespace"
+            } else {
+                f"{package_text} has no `lib.cryo`"
+            };
+            mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0509_LIBRARY_DECLARES_NO_NAMESPACE, message);
+            diag = diag.with_note("a library's namespace is the one its `lib.cryo` declares, and a program imports the library by it");
+            // A dependency's name is the one a program knows it by.
+            const name: Str = if (library.package.origin_name.length() > 0) { library.package.origin_name.as_str() } else { Str::new("<name>") };
+            diag = diag.help(f"begin {file} with `namespace {name};`, the namespace a program imports the library by");
+            sink.emit(diag);
+        }
+        return all_named;
+    }
+
+    /// Report every namespace a library's file declares outside the
+    /// library's own (E0510), and whether there was none.  A library has
+    /// one top-level namespace, the one its `lib.cryo` declares: every file
+    /// of it declares that namespace or one below it, so the library's
+    /// public names are exactly what a program imports by it.
+    report_namespaces_outside_libraries(&this, sink: mut DiagnosticSink*) -> boolean {
+        mut all_inside: boolean = true;
+        for (entry in this.ns_map.entries()) {
+            const declared: Str = entry.first.as_str();
+            const file: string = *entry.second;
+            const package: ModulePackage = this.package_roots.package_of(Path::from(file));
+            for (mut i: i64 = 0; i < this.package_roots.libraries.length(); i++) {
+                const library: &PackageLibrary = &this.package_roots.libraries[i];
+                if (!library.covers(&package, Path::from(file)) || library.namespace.length() == 0) { continue; }
+                const own: Str = library.namespace.as_str();
+                const below: String = f"{own}::";
+                // A namespace that only begins with the library's (`CrateBoxes`
+                // for `CrateBox`) is another one: the match is on whole segments.
+                if (declared == own || declared.starts_with(below.as_str())) { continue; }
+                all_inside = false;
+                const package_text: String = package.describe();
+                mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0510_NAMESPACE_OUTSIDE_LIBRARY,
+                    f"the namespace `{declared}` is outside `{own}`, the namespace of {package_text}");
+                diag = diag.with_note(f"{file} declares it");
+                const last: Str = match (declared.split_once_from_end(&Str::new("::"))) {
+                    Option::Some(parts) => { parts.second }
+                    Option::None        => { declared }
+                };
+                diag = diag.help(f"every file of a library declares its `lib.cryo`'s namespace or one below it; write `namespace {own}::{last};` in {file}");
+                sink.emit(diag);
+            }
+        }
+        return all_inside;
     }
 
     /// Every module the pre-scan indexed, loaded or not, each in the package
@@ -636,7 +770,7 @@ public:
     /// Whether a module path written in `writer`'s package may name `file`.
     names_reachable_file(&this, writer: &ModulePackage, file: Str) -> boolean {
         const target: ModulePackage = this.package_roots.package_of(Path::from(file));
-        return writer.may_name(&target);
+        return this.package_roots.may_name(writer, &target);
     }
 
     /// `resolve_import_path`'s search before the writing file's directory.
@@ -816,6 +950,10 @@ public:
                 raw.start_line, raw.start_col,
                 raw.end_line, raw.end_col);
         }
+        match (this.undeclared_dependency(file_path, path)) {
+            Option::Some(target) => { return ModuleLoader::undeclared_dependency_diagnostic(&target, this.package_roots.package_of(Path::from(file_path)), path, span); }
+            Option::None => { }
+        }
         const suggestion: Option<String> = this.suggest_module(path);
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0500_MODULE_NOT_FOUND,
@@ -828,8 +966,67 @@ public:
             Option::Some(name) => { diag = diag.with_note(f"did you mean `{name}`?"); }
             Option::None => { }
         }
+        // A path below a library's namespace names one of that library's
+        // modules, so the help lists the ones it has.
+        const top: Str = match (Str::new(path).split_once(&Str::new("::"))) {
+            Option::Some(parts) => { parts.first }
+            Option::None        => { Str::new(path) }
+        };
+        for (mut i: i64 = 0; i < this.package_roots.libraries.length(); i++) {
+            const library: &PackageLibrary = &this.package_roots.libraries[i];
+            if (library.namespace.as_str() != top) { continue; }
+            const below: String = f"{top}::";
+            mut modules: [String] = [];
+            for (name in this.ns_map.key_references()) {
+                if (name.as_str() == top || name.as_str().starts_with(below.as_str())) { modules.push(name.clone()); }
+            }
+            modules.sort();
+            mut listed: String = String::new();
+            for (mut m: i64 = 0; m < modules.length(); m++) {
+                if (m > 0) { listed.push(", "); }
+                listed.push(f"`{modules[m]}`");
+            }
+            return diag.help(f"`{top}` is the namespace of {library.package.describe()}, which has the modules {listed}; import one of them, as `import {modules[0]};`");
+        }
         return diag.help(
             "imports resolve against the project root, the entry-point directory, and the standard library; module paths are case-sensitive");
+    }
+
+    /// The dependency holding the module `path` when that is why the file
+    /// `writer` cannot name it: a package's file declares the namespace,
+    /// and the writer's package does not declare that package as a
+    /// dependency.  `None` when no file declares `path`, or one does that
+    /// the writer may name, or one the writer may not name for another
+    /// reason (a package naming its program's file, the standard library
+    /// naming anything outside itself).
+    undeclared_dependency(&this, writer: string, path: string) -> Option<ModulePackage> {
+        match (this.ns_map.get(&String::from_string(path))) {
+            Option::Some(file) => {
+                const writer_package: ModulePackage = this.package_roots.package_of(Path::from(writer));
+                const target: ModulePackage = this.package_roots.package_of(Path::from(file));
+                if (target.origin != ModuleOrigin::Dep || writer_package.origin == ModuleOrigin::Stdlib) {
+                    return Option::None;
+                }
+                if (this.package_roots.declares(&writer_package, &target)) { return Option::None; }
+                return Option::Some(target);
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// E0508: the module `path`, written at `span` in a file of `writer`,
+    /// is in the dependency `target`, which `writer`'s cryoconfig does not
+    /// declare.
+    static undeclared_dependency_diagnostic(target: &ModulePackage, writer: ModulePackage,
+                                            path: string, span: SourceSpan) -> Diagnostic {
+        const writer_text: String = writer.describe();
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0508_UNDECLARED_DEPENDENCY,
+            f"`{path}` is in the package `{target.origin_name}`, which {writer_text} does not declare as a dependency");
+        if (span.has_location()) {
+            diag = diag.at_with_label(span, f"`{target.origin_name}` is not in this package's [dependencies]");
+        }
+        return diag.help(f"a package's imports name its own modules, the standard library's, and those of the dependencies its own cryoconfig declares; add `{target.origin_name}` to the [dependencies] of {writer_text}'s cryoconfig");
     }
 
     suggest_module(&this, import_path: string) -> Option<String> {
@@ -978,8 +1175,12 @@ public:
                 // import path doesn't map cleanly to the filesystem due to
                 // mixed-case directories (e.g., `compiler/AST/node.cryo`
                 // where `AST` is uppercase but `compiler` is lowercase).
+                // A module another package's file loaded is this file's only
+                // when its package may name that file, as for the search.
                 const already_idx: i64 = graph.find_module_index(graph.module_of_written_path(import_sym));
-                if (already_idx >= 0) {
+                const writer_package: ModulePackage = this.package_roots.package_of(Path::from(file_path));
+                if (already_idx >= 0
+                        && this.names_reachable_file(&writer_package, Str::new(graph.modules[already_idx].file_path))) {
                     // Module already in graph: use its recorded file path
                     resolved = graph.modules[already_idx].file_path;
                     if (Log::enabled(LogArea::Loader, LogLevel::Trace)) {
@@ -1903,4 +2104,13 @@ type struct ModuleLine {
     is_internal: boolean;
     target:      String;
     resolved:    boolean;
+}
+
+/// Two packages declaring one top-level namespace: `first` is the file
+/// the pre-scan found first declaring it, `second` a file of another
+/// package declaring it too.
+type struct NamespaceClash {
+    namespace: String;
+    first:     string;
+    second:    string;
 }

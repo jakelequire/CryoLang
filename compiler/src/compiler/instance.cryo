@@ -35,9 +35,9 @@ import compiler::diag::fix_applier::{ FixApplier };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ ProgramFileNames };
 import compiler::lex::lexer;
-import utils;
-import utils::log::{ Log, LogArea, LogLevel };
-import utils::time_trace::{ TimeTrace };
+import compiler::utils;
+import compiler::utils::log::{ Log, LogArea, LogLevel };
+import compiler::utils::time_trace::{ TimeTrace };
 import std::fmt;
 import std::fs::path::{ Path, PathBuf };
 import std::env;
@@ -68,7 +68,7 @@ import compiler::compilation_context::{
 };
 import compiler::compile_mode::{ CompileMode };
 import compiler::diag::{ ErrorCode };
-import compiler::module_graph::{ ModuleInfo, ModuleOrigin, ModulePackage, PackageRoots };
+import compiler::module_graph::{ ModuleInfo, ModuleOrigin, ModulePackage, PackageDeclaration, PackageLibrary, PackageRoots };
 import compiler::module_loader::{ ModuleLoader };
 import compiler::passes::pass_id::{ PassID, PassResult, Provision, ProvisionSet };
 import compiler::passes::pass_registry::{ PassRegistry };
@@ -81,7 +81,7 @@ import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::module_graph::{ ModulePath };
 import compiler::types::generic_registry;
 import compiler::resolver::lang_item::{ LangModule };
-import utils::worker_pool::{ WorkerPool };
+import compiler::utils::worker_pool::{ WorkerPool };
 
 // Default codegen worker count: the online CPU count.  Each module is emitted
 // on a worker thread in its own LLVM context (see the codegen loop).
@@ -335,6 +335,14 @@ type struct CompilerInstance {
         return String::from_str(Str::new(s)).into_raw();
     }
 
+    /// `path`, written relative to the project, in the form the loader
+    /// indexes the project's files by: as written when the project root is
+    /// the current directory, below the root otherwise.
+    static under_project_root(project_root: string, path: Str) -> PathBuf {
+        if (project_root.length() == 0 || project_root.eq(".")) { return PathBuf::from(path); }
+        return Path::from(project_root).join(path);
+    }
+
     /// Build a ProjectConfig view that compiles the `[lib]` half of a
     /// multi-target project as a Library.  Inherits debug/optimize/no_std/
     /// stdlib + linkage settings from the base config; overrides only the
@@ -538,7 +546,7 @@ type struct CompilerInstance {
         // LSP picks the view whose discovery graph actually reaches
         // the file the user is editing; picking the lib unconditionally
         // would miss bin entry points (e.g. `src/main.cryo`) that no
-        // module under the lib's `_module.cryo` imports.
+        // module under the lib's `lib.cryo` imports.
         //
         // Heuristic:
         //   1. If the focus is a `[[bin]]` entry_point, use that bin view.
@@ -688,9 +696,17 @@ type struct CompilerInstance {
         if (base.lib.is_present() && base.bins.length() == 0) {
             Log::debug(LogArea::Driver, f"building lib '{base.lib.name}' from {base.lib.source_dir}");
             // Clone so `base` survives for the per-bin views below.
-            const lib_view: ProjectConfig = CompilerInstance::make_lib_view(base.clone());
+            mut lib_view: ProjectConfig = CompilerInstance::make_lib_view(base.clone());
+            // `cryo test` runs a library's tests from an executable: the
+            // library's files, from its lib.cryo, and the project's tests,
+            // with the test main.
+            if (this.config.test_mode) {
+                lib_view.target_type = TargetType::Executable;
+                lib_view.entry_point = Path::from(lib_view.source_dir).join("lib.cryo").into_raw();
+            }
             const r: CompilationResult = this.compile_project_with_config(lib_view);
             if (!r.success) { return r; }
+            if (!r.output_path.as_path().is_empty()) { last_output = PathBuf::from(r.output_path.as_str()); }
         }
 
         for (mut i: i64 = 0; i < base.bins.length(); i++) {
@@ -952,8 +968,8 @@ type struct CompilerInstance {
         for (mut ip: i64 = 0; ip < config.source_paths.length(); ip++) {
             effective_roots.push(config.source_paths[ip]);
         }
-        // Build mode: read the lockfile, materialize any missing git
-        // checkouts, harvest source roots.  Failure here means the user
+        // Build mode: read the lockfile, extract any missing commit from
+        // its bare clone, harvest source roots.  Failure here means the user
         // hasn't run `cryo fetch` yet (or the lockfile is stale relative
         // to cryoconfig); we surface a hard error rather than dropping
         // dep roots and reporting confusing "namespace not found"
@@ -984,15 +1000,47 @@ type struct CompilerInstance {
             stdlib_root: if (config.no_std) { PathBuf::new() } else { PathBuf::from(Str::new(stdlib_root)) },
             dep_roots:   [],
             dep_names:   [],
+            dep_identities: [],
+            declarations: [],
+            libraries: [],
         };
-        for (mut drc: i64 = 0; drc < dep_outcome.roots.length(); drc++) {
-            const dr_path: Str = Str::new(dep_outcome.roots[drc].path);
-            roots.dep_roots.push(if (config.project_root.length() == 0 || config.project_root.eq(".")) {
-                PathBuf::from(dr_path)
-            } else {
-                Path::from(config.project_root).join(dr_path)
+        for (mut dd: i64 = 0; dd < dep_outcome.declarations.length(); dd++) {
+            roots.declarations.push(PackageDeclaration {
+                declarer: dep_outcome.declarations[dd].declarer.clone(),
+                declared: dep_outcome.declarations[dd].declared.clone(),
             });
+        }
+        for (mut drc: i64 = 0; drc < dep_outcome.roots.length(); drc++) {
+            roots.dep_roots.push(CompilerInstance::under_project_root(
+                config.project_root, Str::new(dep_outcome.roots[drc].path)));
             roots.dep_names.push(String::from_string(dep_outcome.roots[drc].name));
+            roots.dep_identities.push(dep_outcome.roots[drc].package.clone());
+            if (dep_outcome.roots[drc].library) {
+                roots.libraries.push(PackageLibrary {
+                    package: ModulePackage::of(ModuleOrigin::Dep,
+                        String::from_string(dep_outcome.roots[drc].name),
+                        dep_outcome.roots[drc].package.clone()),
+                    file: roots.dep_roots[drc].join(Str::new("lib.cryo")),
+                    namespace: String::new(),
+                });
+            }
+        }
+        // The program's own `[lib]` is held to a library's rules in every
+        // build that indexes it, not only where a dependent compiles it: its
+        // `lib.cryo` declares the library's one namespace, and every file
+        // under its directory declares that one or one below.  The pre-scan
+        // indexes the files under the entry point's directory, so a library
+        // outside it is not part of this build.
+        if (config.lib.is_present() && config.lib.source_dir.length() > 0) {
+            const library_directory: PathBuf = CompilerInstance::under_project_root(
+                config.project_root, Str::new(config.lib.source_dir));
+            if (library_directory.as_path().starts_with(Path::from(root_path.parent_directory()))) {
+                roots.libraries.push(PackageLibrary {
+                    package: ModulePackage::of(ModuleOrigin::Local, String::new(), String::new()),
+                    file: library_directory.join(Str::new("lib.cryo")),
+                    namespace: String::new(),
+                });
+            }
         }
         loader.set_package_roots(roots);
 
@@ -1810,9 +1858,11 @@ type struct CompilerInstance {
                         ModuleOrigin::Vendor => { n_vendor += 1; }
                     }
                 }
-                fmt::printf(
-                    "Building %s [%s]: %u local",
-                    config.project_name, config.profile, n_local);
+                // A library's build names its version beside its name.
+                const versioned: boolean = config.lib.version.length() > 0 && config.project_name.eq(config.lib.name);
+                fmt::printf("Building %s", config.project_name);
+                if (versioned) { fmt::printf(" %s", config.lib.version); }
+                fmt::printf(" [%s]: %u local", config.profile, n_local);
                 if (n_std > 0) { fmt::printf(", %u std", n_std); }
                 if (n_dep > 0) { fmt::printf(", %u dep", n_dep); }
                 if (n_vendor > 0) { fmt::printf(", %u vendor", n_vendor); }

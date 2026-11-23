@@ -1,0 +1,210 @@
+///! Git Dependency URLs
+///!
+///! The check every `git = "..."` value of a `[dependencies]` entry passes
+///! before anything is done with it, and the check every git ref
+///! (`tag`, `branch`, `rev`) passes.  A cryoconfig anywhere in the
+///! dependency graph writes these values, so they are untrusted: a value
+///! git would read as an option, or a transport that lets a URL run a
+///! command, never reaches a `git` argv.
+
+namespace compiler::deps::git_url;
+
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+
+
+/// The transport git uses to reach a dependency's repository.  Each git
+/// command the resolver starts permits exactly one transport, the one its
+/// URL names, and refuses every other (`-c protocol.allow=never`).
+type enum GitTransport with [Clone, Eq] {
+    /// `https://host/path`.
+    Https;
+    /// `ssh://[user@]host/path`, or `user@host:path`.
+    Ssh;
+    /// `file:///path`: a repository on this machine.  The resolver's own
+    /// work on its bare clones runs under this transport too.
+    File;
+}
+
+implement enum GitTransport {
+    /// The transport's name in git's `protocol.<name>.allow` setting.
+    static setting_name(transport: GitTransport) -> Str {
+        return match (transport) {
+            GitTransport::Https => { Str::new("https") }
+            GitTransport::Ssh   => { Str::new("ssh") }
+            GitTransport::File  => { Str::new("file") }
+        };
+    }
+}
+
+
+/// The URL and ref checks.  Stateless.
+type struct GitUrl {
+
+    /// Whether the package a git dependency names, at `url`, is on this
+    /// machine, given whether the package whose cryoconfig names it is
+    /// (`declarer_on_this_machine`): it is when both are and `url` is a
+    /// `file://` repository.  `None` when `url` is a `file://` repository
+    /// and the declarer was fetched from a remote: such a package names
+    /// only remote repositories, since a `file://` URL in its cryoconfig
+    /// would reach into this machine on the word of a repository its user
+    /// does not control.
+    static package_on_this_machine(declarer_on_this_machine: boolean, url: Str) -> Option<boolean> {
+        const local_repository: boolean = match (GitUrl::transport_of(url)) {
+            Result::Ok(transport) => { transport == GitTransport::File }
+            Result::Err(_)        => { false }
+        };
+        if (local_repository && !declarer_on_this_machine) { return Option::None; }
+        return Option::Some(local_repository);
+    }
+
+    /// The transport `url` names, or why it is refused: a phrase that
+    /// completes "the URL ...".  A URL is accepted only as `https://`,
+    /// `ssh://`, `user@host:path` or `file://`, with no byte git or a shell
+    /// would treat specially where it reads a host or an option.
+    static transport_of(url: Str) -> Result<GitTransport, Str> {
+        if (url.is_empty()) {
+            return Result::Err(Str::new("is empty"));
+        }
+        if (url.starts_with(&Str::new("-"))) {
+            return Result::Err(Str::new("begins with `-`, which git would read as an option"));
+        }
+        for (byte in url.as_bytes().iter()) {
+            if (byte <= 0x20 || byte == 0x7F) {
+                return Result::Err(Str::new("contains a space or a control character"));
+            }
+        }
+        match (url.strip_prefix(&Str::new("https://"))) {
+            Option::Some(rest) => {
+                if (GitUrl::authority_is_safe(rest)) { return Result::Ok(GitTransport::Https); }
+                return Result::Err(Str::new("names no host, or a host or user beginning with `-`"));
+            }
+            Option::None => { }
+        }
+        match (url.strip_prefix(&Str::new("ssh://"))) {
+            Option::Some(rest) => {
+                if (GitUrl::authority_is_safe(rest)) { return Result::Ok(GitTransport::Ssh); }
+                return Result::Err(Str::new("names no host, or a host or user beginning with `-`"));
+            }
+            Option::None => { }
+        }
+        match (url.strip_prefix(&Str::new("file://"))) {
+            Option::Some(rest) => {
+                if (rest.is_empty()) { return Result::Err(Str::new("names no path")); }
+                return Result::Ok(GitTransport::File);
+            }
+            Option::None => { }
+        }
+        if (url.starts_with(&Str::new("http://")) || url.starts_with(&Str::new("git://"))) {
+            return Result::Err(Str::new("uses a transport without encryption (`http://` or `git://`)"));
+        }
+        if (url.contains(&Str::new("://"))) {
+            return Result::Err(Str::new("uses a transport git dependencies do not accept"));
+        }
+        // `user@host:path`, git's short form of an ssh URL.  The part before
+        // the first `:` is the authority and holds no `/`; a local path such
+        // as `C:/repo` or `../repo` has no `@` there and is refused.
+        match (url.split_once(&Str::new(":"))) {
+            Option::Some(parts) => {
+                const authority: Str = parts.first;
+                if (authority.contains(&Str::new("@")) && !authority.contains(&Str::new("/"))
+                        && !parts.second.is_empty() && GitUrl::authority_is_safe(authority)) {
+                    return Result::Ok(GitTransport::Ssh);
+                }
+            }
+            Option::None => { }
+        }
+        return Result::Err(Str::new("is not an `https://`, `ssh://` or `file://` URL, nor `user@host:path`"));
+    }
+
+    /// The identity of the repository `url` names, the same however the
+    /// URL spells it: the scheme and any `user@` removed, the host in lower
+    /// case, `user@host:path` written `host/path`, and a trailing `/` and
+    /// `.git` removed (`https://me@Example.com/acme/json5.git/` and
+    /// `git@example.com:acme/json5` are both `example.com/acme/json5`).  A
+    /// `file://` URL is its path, as written: a directory of this machine,
+    /// whose case may matter.  `url` is one `transport_of` accepts.
+    static canonical(url: Str) -> String {
+        mut rest: Str = url;
+        mut path: Str = Str::new("");
+        mut authority: Str = Str::new("");
+        match (url.strip_prefix(&Str::new("file://"))) {
+            Option::Some(local) => { path = local; }
+            Option::None => {
+                rest = url.strip_prefix(&Str::new("https://")).unwrap_or(
+                    url.strip_prefix(&Str::new("ssh://")).unwrap_or(url));
+                // The short form's authority ends at its first `:`; a URL's
+                // at its first `/`.
+                const separator: Str = if (rest.length() < url.length()) { Str::new("/") } else { Str::new(":") };
+                match (rest.split_once(&separator)) {
+                    Option::Some(parts) => { authority = parts.first; path = parts.second; }
+                    Option::None        => { authority = rest; }
+                }
+                authority = match (authority.split_once_from_end(&Str::new("@"))) {
+                    Option::Some(parts) => { parts.second }
+                    Option::None        => { authority }
+                };
+            }
+        }
+        while (path.ends_with(&Str::new("/"))) { path = path.byte_substring(0, path.length() - 1); }
+        path = path.strip_suffix(&Str::new(".git")).unwrap_or(path);
+        if (authority.is_empty()) { return String::from_str(path); }
+        mut out: String = authority.to_ascii_lowercase();
+        if (!path.is_empty()) {
+            out.push("/");
+            out.push(path.strip_prefix(&Str::new("/")).unwrap_or(path));
+        }
+        return out;
+    }
+
+    /// Why a `tag`, `branch` or `rev` value is refused, or `None` when git
+    /// may be given it: a phrase that completes "the value ...".
+    static ref_refusal(value: Str) -> Option<Str> {
+        if (value.is_empty()) { return Option::Some(Str::new("is empty")); }
+        if (value.starts_with(&Str::new("-"))) {
+            return Option::Some(Str::new("begins with `-`, which git would read as an option"));
+        }
+        for (byte in value.as_bytes().iter()) {
+            if (byte <= 0x20 || byte == 0x7F) {
+                return Option::Some(Str::new("contains a space or a control character"));
+            }
+        }
+        return Option::None;
+    }
+
+    /// True when `value` is a full commit id: exactly 40 lower-case hex
+    /// digits.  A commit read back from a lock file is checked with this
+    /// before it names a directory or reaches git.
+    static is_commit_id(value: Str) -> boolean {
+        if (value.length() != 40) { return false; }
+        for (byte in value.as_bytes().iter()) {
+            const digit: boolean = byte >= 0x30 && byte <= 0x39;
+            const letter: boolean = byte >= 0x61 && byte <= 0x66;
+            if (!digit && !letter) { return false; }
+        }
+        return true;
+    }
+
+    /// The authority at the head of `rest` (up to its first `/`, or all of
+    /// it): a host, after an optional `user@`, that is not empty, and
+    /// neither the user nor the host beginning with `-`, which ssh would
+    /// read as an option.
+    static authority_is_safe(rest: Str) -> boolean {
+        const authority: Str = match (rest.split_once(&Str::new("/"))) {
+            Option::Some(parts) => { parts.first }
+            Option::None        => { rest }
+        };
+        match (authority.split_once(&Str::new("@"))) {
+            Option::Some(parts) => {
+                if (parts.first.starts_with(&Str::new("-"))) { return false; }
+                return GitUrl::host_is_safe(parts.second);
+            }
+            Option::None => { return GitUrl::host_is_safe(authority); }
+        }
+    }
+
+    /// True when `host` is not empty and does not begin with `-`.
+    static host_is_safe(host: Str) -> boolean {
+        return !host.is_empty() && !host.starts_with(&Str::new("-"));
+    }
+}

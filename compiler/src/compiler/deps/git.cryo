@@ -1,23 +1,31 @@
 ///! Dependency Git Operations
 ///!
 ///! Thin wrappers over the system `git` binary that the dep resolver
-///! drives.  Bare clones live under `cache/git/<sanitized>` and serve
-///! as the source-of-truth; working trees are materialised under
-///! `cache/checkouts/<sanitized>/<sha>` on demand.
+///! drives.  Bare clones live under `cache/git/<short id>` and serve as
+///! the source of truth; a commit's files are extracted, as git stores
+///! them, under `cache/src/<short id>/<sha>` on demand.
 ///!
 ///! All operations run the `git` binary via `std::process::Command` (argv,
 ///! no shell).  We rely on the user's git installation for protocol/auth
 ///! handling; nothing here is reimplemented in-process.
+///!
+///! A URL or ref reaches git only after `GitUrl` accepts it, always behind
+///! `--` or `--end-of-options`, and every command permits only the one
+///! transport its URL names.  So no value a cryoconfig writes is read as
+///! a git option, and no URL makes git run a command.
 
 namespace compiler::deps::git;
 
 import std::fs::directory::{ Directory };
-import std::fs::path::{ PathBuf };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
 import std::fmt;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::io::error::{ IoError, IoErrorKind };
 import std::process::command::{ Command, Output, Stdio };
 import compiler::deps::cache::{ Cache };
+import compiler::deps::git_url::{ GitTransport, GitUrl };
 import compiler::project_config::{ GitRefKind };
 
 
@@ -32,11 +40,19 @@ type struct Git {
     /// Ensure the bare clone for `url` exists and (when `refresh` is true)
     /// has the latest remote refs. Idempotent.  Returns true on success.
     static ensure_bare_clone(url: Str, refresh: boolean) -> boolean {
+        mut transport: GitTransport = GitTransport::File;
+        match (GitUrl::transport_of(url)) {
+            Result::Ok(accepted) => { transport = accepted; }
+            Result::Err(reason) => {
+                fmt::eprintln(f"error: refusing to fetch `{url}`: the URL {reason}");
+                return false;
+            }
+        }
         const dir: PathBuf = Cache::git_dir_for(url);
 
         if (!dir.as_path().exists()) {
-            // First-time clone.  `--bare` skips materialising a working
-            // tree (we make those on demand via `materialize_checkout`).
+            // First-time clone.  `--bare` makes no working tree: a commit's
+            // files are extracted from the clone on demand (`extract`).
             // `--quiet` keeps `cryo fetch` output focused on what's
             // happening across multiple deps.
             match (dir.as_path().parent()) {
@@ -44,10 +60,11 @@ type struct Git {
                 Option::None         => { }
             }
             fmt::println(f"[deps] cloning {url}");
-            mut clone: Command = Command::new("git");
-            clone.argument("clone").argument("--bare").argument("--quiet").argument(url).argument(dir.as_path().as_str());
+            mut clone: Command = Git::command(transport);
+            clone.argument("clone").argument("--bare").argument("--quiet").argument("--").argument(url).argument(dir.as_path().as_str());
             if (Git::run(&clone) != 0) {
-                fmt::eprintln(f"error: git clone failed for {url}");
+                fmt::eprintln(f"error: cannot fetch {url}: git could not clone it (its own message is above)");
+                fmt::eprintln(f"  help: check the `git` URL in the cryoconfig; `git ls-remote {url}` shows whether this machine can reach the repository");
                 return false;
             }
             return true;
@@ -55,10 +72,14 @@ type struct Git {
 
         if (refresh) {
             fmt::println(f"[deps] refreshing {url}");
-            mut fetch: Command = Git::on_bare_clone(&dir);
-            fetch.argument("fetch").argument("--quiet").argument("--tags").argument("--prune").argument("--all");
+            // A bare clone records no refspec, so the branches and tags are
+            // named: each local branch is the remote's, moved forward or not.
+            mut fetch: Command = Git::on_bare_clone(&dir, transport);
+            fetch.argument("fetch").argument("--quiet").argument("--prune").argument("--force")
+                .argument("--").argument(url)
+                .argument("+refs/heads/*:refs/heads/*").argument("+refs/tags/*:refs/tags/*");
             if (Git::run(&fetch) != 0) {
-                fmt::eprintln(f"warning: git fetch failed for {url} (using stale refs)");
+                fmt::eprintln(f"warning: cannot reach {url}; using the branches and tags fetched before");
                 // Soft-fail: an offline build with a populated cache is
                 // still useful, and an unreachable remote shouldn't kill
                 // a project that was already pinned.
@@ -78,6 +99,16 @@ type struct Git {
     /// doesn't track local branches, so we look at the remote-tracking
     /// `refs/heads/<branch>` ref directly.
     static resolve_ref_to_sha(url: Str, ref_kind: GitRefKind, ref_value: Str) -> String {
+        // The default branch takes no value; any other ref's reaches git.
+        if (GitRefKind::key_name(ref_kind).length() > 0) {
+            match (GitUrl::ref_refusal(ref_value)) {
+                Option::Some(reason) => {
+                    fmt::eprintln(f"error: refusing to resolve `{ref_value}` inside {url}: the value {reason}");
+                    return String::new();
+                }
+                Option::None => { }
+            }
+        }
         const dir: PathBuf = Cache::git_dir_for(url);
 
         // Build the candidate refspec list.  We try them in order; the
@@ -99,112 +130,208 @@ type struct Git {
             GitRefKind::Rev => {
                 candidates.push(String::from_str(ref_value));
             }
-            GitRefKind::Version => {
-                // Caller resolves Version -> tag separately via list_tags;
-                // by the time we land here it should have been rewritten.
-                fmt::eprintf("internal error: resolve_ref_to_sha called with raw Version ref\n");
-                return String::new();
-            }
             GitRefKind::None => {
-                fmt::eprintf("internal error: resolve_ref_to_sha called with no ref\n");
-                return String::new();
+                // The clone's HEAD names the remote's default branch, whose
+                // ref every refresh moves.
+                candidates.push(String::from_str(Str::new("HEAD")));
             }
         }
 
         for (mut i: i64 = 0; i < candidates.length(); i++) {
             mut commit: String = String::from_str(candidates[i].as_str());
             commit.push(Str::new("^{commit}"));
-            mut rev_parse: Command = Git::on_bare_clone(&dir);
-            rev_parse.argument("rev-parse").argument("--verify").argument("--quiet").argument(commit.as_str());
+            mut rev_parse: Command = Git::on_bare_clone(&dir, GitTransport::File);
+            rev_parse.argument("rev-parse").argument("--verify").argument("--quiet").argument("--end-of-options").argument(commit.as_str());
             const lines: [String] = Git::capture(&rev_parse);
             if (lines.length() > 0) {
                 return String::from_str(lines[0].as_str());
             }
         }
 
-        fmt::eprintln(f"error: could not resolve '{ref_value}' inside {url}");
+        const ref_key: Str = GitRefKind::key_name(ref_kind);
+        if (ref_key.length() == 0) {
+            fmt::eprintln(f"error: {url} has no default branch to take the dependency from");
+            fmt::eprintln(f"  help: name a branch, tag or commit: `branch = \"main\"`; `git ls-remote --heads --tags {url}` lists them");
+        } else {
+            fmt::eprintln(f"error: {url} has no {ref_key} `{ref_value}`");
+            fmt::eprintln(f"  help: name a {ref_key} the repository has; `git ls-remote --heads --tags {url}` lists its branches and tags");
+        }
         return String::new();
     }
 
-    /// List every tag in the bare clone for `url`, one per element.
-    /// Used for semver-range resolution against `version = "..."`.
-    /// Returns an empty list on failure (and prints a diagnostic).
-    static list_tags(url: Str) -> [String] {
-        const dir: PathBuf = Cache::git_dir_for(url);
-        mut list: Command = Git::on_bare_clone(&dir);
-        list.argument("tag").argument("--list");
-        return Git::capture(&list);
+
+    // Extraction
+
+    /// Whether the files of commit `sha` of `url` are extracted in the
+    /// cache.  An extraction is renamed into place only once every file is
+    /// written, so a directory there is a whole one.
+    static is_extracted(url: Str, sha: Str) -> boolean {
+        return Cache::extraction_dir_for(url, sha).as_path().exists();
     }
 
-
-    // Working-tree materialisation
-
-    /// Path to the working tree for (`url`, `sha`).  Does not check
-    /// existence; callers use `is_checkout_present` for that.
-    static checkout_path(url: Str, sha: Str) -> PathBuf {
-        return Cache::checkout_dir_for(url, sha);
-    }
-
-    /// True when the working tree at (`url`, `sha`) is fully materialised.
-    /// We probe for `.git` rather than the directory itself because an
-    /// interrupted clone may leave a half-populated dir behind.
-    static is_checkout_present(url: Str, sha: Str) -> boolean {
-        const dir: PathBuf = Cache::checkout_dir_for(url, sha);
-        if (!dir.as_path().exists()) { return false; }
-        return dir.join(".git").as_path().exists();
-    }
-
-    /// Clone the bare cache into a fresh working tree at `<checkout>/<sha>`,
-    /// then `checkout` the requested SHA.  `--local` uses hardlinks where
-    /// the filesystem permits, so per-SHA storage cost is dominated by the
-    /// working tree itself rather than the .git history.
-    static materialize_checkout(url: Str, sha: Str) -> boolean {
-        if (Git::is_checkout_present(url, sha)) { return true; }
-
-        const bare: PathBuf = Cache::git_dir_for(url);
-        const tree: PathBuf = Cache::checkout_dir_for(url, sha);
-        const tree_text: Str = tree.as_path().as_str();
-
-        match (tree.as_path().parent()) {
-            Option::Some(parent) => { Cache::create_directory(parent); }
-            Option::None         => { }
+    /// Write the files of commit `sha` of the bare clone for `url` into the
+    /// cache, as git stores them: each blob's bytes as they are, with no
+    /// line-ending conversion, no `.gitattributes` filter, no hook and no
+    /// `.git`, so one commit is the same bytes on every host.  Each file is
+    /// made read-only once written.  The files go
+    /// to a temporary sibling that is renamed into place once every one is
+    /// written, so an interrupted extraction never reads as extracted, and
+    /// one left behind is removed before the next starts.  A commit holding
+    /// a submodule, a symbolic link or a path that would leave the tree is
+    /// refused, naming the dependency `package`.  An extraction already
+    /// there is kept, unless `fresh`, which replaces it: `cryo fetch`
+    /// restores a tree that no longer holds its commit's files.  True on
+    /// success.
+    static extract(package: Str, url: Str, sha: Str, fresh: boolean) -> boolean {
+        if (!GitUrl::is_commit_id(sha)) {
+            fmt::eprintln(f"error: refusing to extract `{sha}` from {url}: it is not a full commit id");
+            return false;
         }
-
-        // If a previous run left a partial tree behind (e.g., crash
-        // mid-checkout), clear it so the clone starts from a clean slate.
-        if (tree.as_path().exists()) {
-            match (Directory::remove_all(tree.as_path())) {
+        if (!fresh && Git::is_extracted(url, sha)) { return true; }
+        const bare: PathBuf = Cache::git_dir_for(url);
+        if (!bare.as_path().exists()) {
+            fmt::eprintln(f"error: dependency '{package}' is not in the cache ({url} has not been fetched); run `cryo fetch`");
+            return false;
+        }
+        const tree: PathBuf = Cache::extraction_dir_for(url, sha);
+        const partial: PathBuf = PathBuf::from(f"{tree.as_path().as_str()}.partial".as_str());
+        if (partial.as_path().exists()) {
+            match (Directory::remove_all(partial.as_path())) {
                 Result::Ok(_)      => { }
                 Result::Err(error) => {
-                    fmt::eprintln(f"error: cannot clear the partial working tree at {tree_text}: {error}");
+                    fmt::eprintln(f"error: cannot remove the interrupted extraction at {partial.as_path().as_str()}: {error}");
                     return false;
                 }
             }
         }
+        Cache::create_directory(partial.as_path());
 
-        mut clone: Command = Command::new("git");
-        clone.argument("clone").argument("--local").argument("--quiet").argument(bare.as_path().as_str()).argument(tree_text);
-        if (Git::run(&clone) != 0) {
-            fmt::eprintln(f"error: failed to materialize working tree at {tree_text}");
+        mut list: Command = Git::on_bare_clone(&bare, GitTransport::File);
+        list.argument("ls-tree").argument("-r").argument("-z").argument("--full-tree").argument(sha);
+        list.stderr(Stdio::Null);
+        mut listing: Output = match (list.output()) {
+            Result::Ok(out)    => { out }
+            Result::Err(error) => { Git::report_spawn_failure(&error); return false; }
+        };
+        if (!listing.status().success()) {
+            fmt::eprintln(f"error: dependency '{package}': commit {sha} is not in the cache's copy of {url}; run `cryo fetch`");
             return false;
         }
-        mut checkout: Command = Command::new("git");
-        checkout.argument("-C").argument(tree_text).argument("checkout").argument("--quiet").argument("--detach").argument(sha);
-        if (Git::run(&checkout) != 0) {
-            fmt::eprintln(f"error: failed to checkout {sha} in {tree_text}");
+        const records: Str = match (Str::from_utf8(listing.stdout())) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => {
+                fmt::eprintln(f"error: dependency '{package}': commit {sha} of {url} names a file whose path is not UTF-8");
+                return false;
+            }
+        };
+        // `-z` ends each record with a NUL byte, so a path may hold any
+        // other byte, a newline or a tab included.
+        mut rest: Str = records;
+        while (rest.length() > 0) {
+            const end: i64 = rest.find_byte(0).unwrap_or(rest.length());
+            if (!Git::extract_entry(package, url, &bare, partial.as_path(), rest.byte_substring(0, end))) { return false; }
+            rest = rest.byte_substring(if (end < rest.length()) { end + 1 } else { end }, rest.length());
+        }
+        if (tree.as_path().exists()) {
+            match (Directory::remove_all(tree.as_path())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => {
+                    fmt::eprintln(f"error: cannot replace the extraction at {tree.as_path().as_str()}: {error}");
+                    return false;
+                }
+            }
+        }
+        match (partial.as_path().rename_to(tree.as_path())) {
+            Result::Ok(_)      => { return true; }
+            Result::Err(error) => {
+                fmt::eprintln(f"error: cannot move the extraction of {url} into place at {tree.as_path().as_str()}: {error}");
+                return false;
+            }
+        }
+    }
+
+    /// Write the file one `ls-tree -z` record names (`<mode> <type> <id>\t<path>`)
+    /// below `into`.  Only a regular file is extracted: a submodule (mode
+    /// 160000) has no files in this repository, a symbolic link (120000)
+    /// would point outside the tree on some host, and a path with an empty,
+    /// `.`, `..` or `.git` segment, or a `\` or `:`, would land outside it
+    /// or in git's own directory; each is refused naming the package.
+    static extract_entry(package: Str, url: Str, bare: &PathBuf, into: Path, record: Str) -> boolean {
+        const tab: i64 = record.find(&Str::new("\t")).unwrap_or(-1);
+        const space: i64 = record.find(&Str::new(" ")).unwrap_or(-1);
+        const last_space: i64 = record.byte_substring(0, if (tab < 0) { 0 } else { tab }).find_last(&Str::new(" ")).unwrap_or(-1);
+        if (tab < 0 || space < 0 || last_space <= space) {
+            fmt::eprintln(f"error: dependency '{package}': cannot read git's listing of {url}");
             return false;
         }
-        return true;
+        const mode: Str = record.byte_substring(0, space);
+        const id: Str = record.byte_substring(last_space + 1, tab);
+        const path: Str = record.byte_substring(tab + 1, record.length());
+        if (mode == Str::new("160000") || mode == Str::new("120000")) {
+            const what: Str = if (mode == Str::new("160000")) { Str::new("a submodule") } else { Str::new("a symbolic link") };
+            fmt::eprintln(f"error: dependency '{package}' holds {what} at `{path}`; a dependency's files are regular files");
+            return false;
+        }
+        for (segment in path.split(&Str::new("/"))) {
+            if (segment.length() == 0 || segment == Str::new(".") || segment == Str::new("..")
+                    || segment.equals_case_insensitive(&Str::new(".git"))
+                    || segment.contains(&Str::new("\\")) || segment.contains(&Str::new(":"))) {
+                fmt::eprintln(f"error: dependency '{package}' holds the path `{path}`, which would not stay inside the package's directory");
+                return false;
+            }
+        }
+        mut read: Command = Git::on_bare_clone(bare, GitTransport::File);
+        read.argument("cat-file").argument("blob").argument(id);
+        read.stderr(Stdio::Null);
+        mut blob: Output = match (read.output()) {
+            Result::Ok(out)    => { out }
+            Result::Err(error) => { Git::report_spawn_failure(&error); return false; }
+        };
+        if (!blob.status().success()) {
+            fmt::eprintln(f"error: dependency '{package}': cannot read `{path}` from the cache's copy of {url}; run `cryo fetch`");
+            return false;
+        }
+        const target: PathBuf = into.join(path);
+        match (target.as_path().parent()) {
+            Option::Some(parent) => { Cache::create_directory(parent); }
+            Option::None         => { }
+        }
+        match (File::write_bytes(target.as_path(), blob.stdout())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => {
+                fmt::eprintln(f"error: cannot write {target.as_path().as_str()}: {error}");
+                return false;
+            }
+        }
+        // A cached file is the commit's, so nothing writes it after this.
+        match (File::set_read_only(target.as_path(), true)) {
+            Result::Ok(_)      => { return true; }
+            Result::Err(error) => {
+                fmt::eprintln(f"error: cannot make {target.as_path().as_str()} read-only: {error}");
+                return false;
+            }
+        }
     }
 
 
     // Subprocess helpers (argv via std::process::Command, no shell)
 
-    /// `git --git-dir=<dir>`: a command on the bare clone at `dir`, which
-    /// the caller gives its arguments.
-    static on_bare_clone(dir: &PathBuf) -> Command {
-        const flag: String = f"--git-dir={dir.as_path().as_str()}";
+    /// `git -c protocol.allow=never -c protocol.<transport>.allow=always`:
+    /// a git command that may reach a repository only over `transport`,
+    /// which the caller gives its arguments.  A remote that redirects, or
+    /// a URL git would hand to another transport helper, is refused by git.
+    static command(transport: GitTransport) -> Command {
+        const allowed: String = f"protocol.{GitTransport::setting_name(transport)}.allow=always";
         mut command: Command = Command::new("git");
+        command.argument("-c").argument("protocol.allow=never").argument("-c").argument(allowed.as_str());
+        return command;
+    }
+
+    /// `git --git-dir=<dir>`: a command on the bare clone at `dir`, reaching
+    /// its remote only over `transport`, which the caller gives its arguments.
+    static on_bare_clone(dir: &PathBuf, transport: GitTransport) -> Command {
+        const flag: String = f"--git-dir={dir.as_path().as_str()}";
+        mut command: Command = Git::command(transport);
         command.argument(flag.as_str());
         return command;
     }
@@ -221,8 +348,23 @@ type struct Git {
                     Option::None       => { return -1; }
                 }
             }
-            Result::Err(_) => { return -1; }
+            Result::Err(error) => {
+                Git::report_spawn_failure(&error);
+                return -1;
+            }
         }
+    }
+
+    /// Say why `git` could not be started.  A git that is not installed or
+    /// not on `PATH` is named as such, since it otherwise reads as a failed
+    /// clone of whatever URL was being fetched.
+    static report_spawn_failure(error: &IoError) -> void {
+        if (error.kind == IoErrorKind::NotFound) {
+            fmt::eprintln("error: cannot run `git`: it is not installed, or not on PATH");
+            fmt::eprintln("  help: git dependencies are fetched with the git command-line tool; install git or add it to PATH, then run `cryo fetch` again");
+            return;
+        }
+        fmt::eprintln(f"error: cannot run `git`: {error}");
     }
 
     /// Run a `git` command, capturing stdout with stderr suppressed (the
@@ -246,7 +388,7 @@ type struct Git {
                     Result::Err(_) => { }
                 }
             }
-            Result::Err(_) => {}
+            Result::Err(error) => { Git::report_spawn_failure(&error); }
         }
         return out;
     }

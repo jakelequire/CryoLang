@@ -372,9 +372,11 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 
 | `test.json` field | Meaning |
 | --- | --- |
-| `"outcome"` | `"collect"` (default) / `"build"` / `"compile_fail"` / `"run"` / `"interpret"` |
+| `"outcome"` | `"collect"` (default) / `"build"` / `"compile_fail"` / `"run"` / `"interpret"` / `"command"` |
+| `"command"` | the compiler command a `"command"` project runs, verb first (below) |
 | `"ignore"` | `true` skips the project (reported as ignored) |
 | `"expect"` | per-outcome assertions (below) |
+| `"steps"` | commands of the compiler, and files the runner writes, before the outcome's own command (below) |
 
 `make test-census` runs the suite with `-Werror=W0017`, which `cryo test`
 hands to every project's build too: a unit test or a project that discards a
@@ -441,6 +443,24 @@ row, printed whatever the count.
   { "outcome": "interpret", "arguments": ["main.cryo"], "expect": { "exit_code": 70 } }
   ```
 
+- **`command`** - run the compiler command `command` names (a list of
+  arguments, its verb first, as a step is written) and judge it by `expect`
+  as a build is judged: its exit, its streams and the file it writes. It gets
+  the suite's `--stdlib` and none of the build's flags. For a test of a
+  command other than `build`, `run` and `test`, above all one that must
+  refuse: a step must exit 0, so only the judged command can be expected to
+  fail. `command` is written exactly when the outcome is `command`; anything
+  else makes the file malformed.
+
+  ```json
+  {
+    "outcome": "command",
+    "steps": [["init", "build/twice", "--name=first", "--type=library"]],
+    "command": ["init", "build/twice", "--name=second", "--type=library"],
+    "expect": { "fails": true, "stderr_contains": ["already exists"] }
+  }
+  ```
+
 A project whose report carries a machine-applicable suggestion proves the
 fix with `applied`: besides its own outcome, a copy of the project (outside
 the tree, without its `build/`) is run with `cryo run --apply-fixes`, which
@@ -504,6 +524,69 @@ kept apart, so `expect` can say which stream a line belongs on:
 - `file`, with `file_contains` / `file_excludes` - a file the command writes,
   relative to the project; it is removed before the command runs and after
   it is read, so what is checked is always this run's.
+
+`steps` runs other commands of the same compiler first, in order, in the
+project's directory: each is a list of arguments, its verb first, and each
+gets the suite's `--stdlib`. A step runs only once the one before it
+succeeded, and the project's own command only once every step has; a failing step
+fails the project and its output is shown. A project with steps starts from
+no `build/` folder, so a step that writes there (`cryo init build/lib ...`)
+leaves only this run's files for the build and the `file` assertions to
+read:
+
+```json
+{
+  "outcome": "run",
+  "steps": [["init", "build/tally", "--name=tally-lib", "--type=library"]],
+  "expect": { "exit_code": 0 }
+}
+```
+
+`git_fixtures` gives a project git repositories with no network. Each
+fixture names a repository, a directory of the project (`from`) and its
+commits in order; each commit holds exactly the files of one directory below
+`from` (`tree`) and carries a tag, and the commits follow one another on the
+branch `main`, the repository's default. The project then runs in a copy of
+itself outside the tree: the runner builds each repository there with a
+fixed author and date and no user or system git configuration, so a
+commit's id is the same on every host and a test may write it in a `rev`,
+writes its
+`file://` URL wherever a cryoconfig of the copy says `{fixture:<name>}` (a
+fixture's own commits included, so one fixture package can depend on
+another), and sets `CRYO_HOME` to a cache of the copy's own. A step then
+fetches (`["fetch"]`) before the outcome builds. Such a project
+`requires: ["git"]`, which holds when `git` is on `PATH`:
+
+```json
+{
+  "outcome": "run",
+  "requires": ["git"],
+  "git_fixtures": [
+    { "name": "greeter", "from": "fixtures/greeter",
+      "commits": [ { "tree": "v1.0.0", "tag": "v1.0.0" },
+                   { "tree": "v1.1.0", "tag": "v1.1.0" } ] }
+  ],
+  "steps": [["fetch"]],
+  "expect": { "exit_code": 0 }
+}
+```
+
+A step can also be a file the runner writes itself, between two commands:
+`{"write": <path>, "text": <text>}`, the path relative to the project
+unless absolute, its missing parent directories made first. With
+`"fails": true` the write must be refused instead, and the step fails if it
+is not. In a project with git fixtures, `{cache:<fixture>@<tag>}` in a
+step's arguments or in a write's path stands for the directory the copy's
+package cache extracts that commit of that fixture to, so a project can
+change the cache between a fetch and a build:
+
+```json
+"steps": [
+  ["fetch"],
+  { "write": "{cache:greeter@v1}/src/lib.cryo", "text": "...", "fails": true },
+  { "write": "{cache:greeter@v1}/src/extra.cryo", "text": "namespace Greeting;\n" }
+]
+```
 
 A `.cryo` file named in `arguments` makes a `build` project a single-file
 build of that file (the directory then needs no `cryoconfig`), so the flags

@@ -4,6 +4,8 @@ import std::fmt;
 import std::env;
 import std::fs::file::{ File };
 import std::fs::directory::{ Directory, DirectoryEntries };
+import std::io::error::{ IoError };
+import compiler::deps::cache::{ Cache };
 import std::io::stdio;
 import compiler::{ compilation_context, instance, project_config };
 import compiler::codegen::{ llvm_types };
@@ -14,8 +16,8 @@ import compiler::interpret::outcome::{ Stop };
 import cli::api_index;
 import compiler::vendor::registry;
 import compiler::bindgen::generator;
-import utils;
-import utils::log::{ Log, LogArea };
+import compiler::utils;
+import compiler::utils::log::{ Log, LogArea };
 import std::collections::string::{ String };
 import std::collections::str;
 import std::collections::str::{ Str };
@@ -38,8 +40,8 @@ import compiler::codegen::llvm_types;
 import compiler::compilation_context;
 import compiler::instance;
 import compiler::project_config;
-import utils::keyword::{ Keyword };
-import utils::build_stamp::{ BuildStamp, StampSlot, VersionReport };
+import compiler::utils::keyword::{ Keyword };
+import compiler::utils::build_stamp::{ BuildStamp, StampSlot, VersionReport };
 import compiler::build_manifest;
 import compiler::diag::{ ErrorCode };
 import compiler::toolchain::{ ExecutablePath };
@@ -106,7 +108,7 @@ type struct NegDiag {
 
 /// Parsed `test.json` for a multi-module test project (see
 /// `run_projects_suite`). The FIXTURE (`outcome`: 0 = collect, 1 = build,
-/// 2 = run), with its `environment` and `arguments`, and the ASSERTIONS (the
+/// 2 = run, 3 = command), with its `environment` and `arguments`, and the ASSERTIONS (the
 /// `expect` fields) are orthogonal.
 /// `compile_fail` is a recognized alias for `build` + `fails`, and
 /// `expect.diagnostic` is sugar for `fails` + an `error[<code>]` marker in
@@ -114,7 +116,8 @@ type struct NegDiag {
 type struct ProjSpec {
     /// FIXTURE: 0 = collect (run the project's own `cryo test`), 1 = build
     /// (`cryo build`), 2 = run (`cryo run`), 3 = interpret (`cryo
-    /// interpret`, given the file `arguments` names).  The fixture (what is set up) and
+    /// interpret`, given the file `arguments` names), 4 = command
+    /// (`command`).  The fixture (what is set up) and
     /// the ASSERTION (what is checked, via the `expect` fields below) are
     /// orthogonal: `compile_fail` is simply `build` + `expect.fails`.
     outcome:    i32;
@@ -139,7 +142,8 @@ type struct ProjSpec {
     /// where every token holds, and is otherwise SKIPPED with a reason (not a
     /// failure).  Recognized tokens: `"display"` (an X11/Wayland display is
     /// present), `"vendor:<Name>"` (that vendor library is registered with
-    /// host bindings), `"cxx"` (a C++ toolchain responds), and `"os:<name>"`
+    /// host bindings), `"cxx"` (a C++ toolchain responds), `"git"` (`git`
+    /// is on PATH, for a project with git fixtures), and `"os:<name>"`
     /// (the host OS is `linux`/`windows`/`macos` - for projects whose sources
     /// hard-use one platform's surface).  Lets a real integration test (e.g.
     /// the raylib window demo) stay live without turning a portable
@@ -151,6 +155,22 @@ type struct ProjSpec {
     /// Extra arguments (test.json `arguments`) given to the compiler after
     /// the fixture's own verb and flags.
     arguments:  [String];
+    /// The fixture of outcome 3 (test.json `command`): the compiler's
+    /// arguments, verb first, run as a step is and judged by the `expect`
+    /// fields as a build is.  Present exactly when the outcome is
+    /// `command`.
+    command:    [String];
+    /// Commands of the compiler (test.json `steps`), run in order in the
+    /// project's directory before the fixture's own; each must exit 0, or
+    /// the project fails with that step's output and the fixture never runs.
+    /// A project with steps starts from no `build/` folder, so what a step
+    /// writes there is that run's.
+    steps:      [ProjStep];
+    /// Git repositories (test.json `git_fixtures`) built before the steps
+    /// from directories the project commits.  A project with fixtures runs
+    /// in a copy of itself, outside the tree, whose cryoconfigs name each
+    /// repository as `{fixture:<name>}`, with its own `CRYO_HOME`.
+    fixtures:   [ProjFixture];
     /// Every entry must appear in the compiler's stderr alone; no entry of
     /// `stderr_excludes` may.
     stderr_contains: [String];
@@ -190,7 +210,7 @@ type struct ProjSpec {
         return ProjSpec {
             outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: String::new(),
             output_contains: [], output_excludes: [], output_in_order: [], requires: [],
-            environment: [], arguments: [], stderr_contains: [], stderr_excludes: [],
+            environment: [], arguments: [], command: [], steps: [], fixtures: [], stderr_contains: [], stderr_excludes: [],
             stdout_line_prefixes: [], stderr_line_prefixes: [],
             file: String::new(), file_contains: [], file_excludes: [],
             applied: false, applied_exit_code: 0,
@@ -229,6 +249,97 @@ type struct ProjSpec {
         run.output_contains.push(String::from_str(Str::new("building again")));
         return run;
     }
+}
+
+/// One of a project's `steps`: a command of the compiler, its arguments
+/// verb first (test.json `["fetch"]`), or a file the runner writes itself,
+/// its missing parent directories made first (test.json `{"write": <path>,
+/// "text": <text>}`), which with `"fails": true` must be refused instead.
+/// In a project with git fixtures, `{cache:<fixture>@<tag>}` in either
+/// stands for the directory the project's package cache extracts that
+/// commit of that fixture to.
+type struct ProjStep {
+    /// The compiler's arguments; empty for a step that writes a file.
+    arguments: [String];
+    /// The file a write step writes, relative to the project's directory
+    /// unless absolute, and what it writes there.
+    write: String;
+    text:  String;
+    /// The write must be refused: the step fails if it is not.
+    refused: boolean;
+}
+
+/// One action of a suite job, run in order until one fails: a shell
+/// command, or a file the runner writes itself between two of them.
+type enum SuiteAction {
+    Shell(String);
+    Write(StepWrite);
+}
+
+/// A write step as its job performs it: `path` absolute, and `log` the
+/// file its failure is reported in, after the steps before it.
+type struct StepWrite {
+    path:    String;
+    text:    String;
+    refused: boolean;
+    log:     String;
+}
+
+implement enum SuiteAction {
+    /// Perform `actions` in order until one fails; the status of the last
+    /// performed, 0 when every one succeeded.
+    static perform_all(actions: &[SuiteAction]) -> i32 {
+        mut code: i32 = 0;
+        for (mut a: i64 = 0; code == 0 && a < actions.length(); a++) {
+            code = actions[a].perform();
+        }
+        return code;
+    }
+
+    /// Perform the action; its status, 0 on success.  A write step's
+    /// failure says why in its log.
+    perform(&this) -> i32 {
+        match (this) {
+            SuiteAction::Shell(command) => { return Command::shell(command.as_str()); }
+            SuiteAction::Write(step) => {
+                const target: path::Path = path::Path::from(step.path.as_str());
+                match (target.parent()) {
+                    // A directory that cannot be made fails the write below.
+                    Option::Some(parent) => { mem::drop(Directory::create_all(parent)); }
+                    Option::None         => { }
+                }
+                const written: Result<(), IoError> = File::write_text(target, step.text.as_str());
+                if (written.is_ok() != step.refused) { return 0; }
+                mut log: String = Executor::read_file_or_empty(path::Path::from(step.log.as_str()));
+                match (written) {
+                    Result::Ok(_)      => { log.push(f"step: writing {step.path} succeeded; the step expects it refused\n"); }
+                    Result::Err(error) => { log.push(f"step: cannot write {step.path}: {error}\n"); }
+                }
+                // The step fails either way; a log that cannot be written
+                // loses only its explanation.
+                mem::drop(File::write_text(path::Path::from(step.log.as_str()), log.as_str()));
+                return 1;
+            }
+        }
+    }
+}
+
+/// One of a project's `git_fixtures`: a repository named `name`, whose
+/// commits are made in order, each holding exactly the files of one
+/// directory below `from` and tagged.
+type struct ProjFixture {
+    name:    String;
+    from:    String;
+    commits: [ProjFixtureCommit];
+}
+
+/// One commit of a git fixture: the directory below the fixture's `from`
+/// whose files it holds, and the tag it carries.
+type struct ProjFixtureCommit {
+    tree: String;
+    tag:  String;
+    /// The commit's id, once the fixture is built.
+    commit: String;
 }
 
 /// Result of dispatching one project: did it meet its declared outcome, and
@@ -317,26 +428,27 @@ function shell_set_environment(setting: Str) -> String {
     return f"export \"{setting}\" && ";
 }
 
-/// One batch of shell commands for a suite's worker pool, copied into each
-/// worker.  The pointers alias arrays the suite owns and keeps alive
-/// until its scope has joined every worker.  A worker takes the next index off
-/// `cursor`, runs that command, stores its exit status, and only then
-/// publishes `done` for it (release); the suite reads a result only after
-/// seeing `done` (acquire), and reads them strictly in index order, so what it
+/// One batch of jobs for a suite's worker pool, copied into each worker;
+/// a job is its actions, run in order until one fails.  The pointers
+/// alias arrays the suite owns and keeps alive until its scope has joined
+/// every worker.  A worker takes the next index off `cursor`, runs that
+/// job, stores the status of its last action, and only then publishes
+/// `done` for it (release); the suite reads a result only after seeing
+/// `done` (acquire), and reads them strictly in index order, so what it
 /// prints does not depend on which worker finished first.
 type struct ShellJobs {
     cursor: Atomic<u64>*;
-    cmds:   String*;
+    jobs:   [SuiteAction]*;
     n:      u64;
     status: mut i32*;
     done:   Atomic<u32>*;
 
-    /// A pool worker's body: run commands off the cursor until none is left.
+    /// A pool worker's body: run jobs off the cursor until none is left.
     run(&this) -> void {
         loop {
             const k: u64 = (*this.cursor).fetch_add(1, MemoryOrder::Relaxed);
             if (k >= this.n) { break; }
-            this.status[k] = Command::shell(this.cmds[k].as_str());
+            this.status[k] = SuiteAction::perform_all(&this.jobs[k]);
             this.done[k].store(1, MemoryOrder::Release);
         }
     }
@@ -463,13 +575,24 @@ implement enum CommandKind {
                 fmt::printf("  --triple    Print only the triple a build with no --target= uses\n");
             }
             CommandKind::Init => {
-                fmt::printf("Interactively scaffolds a new Cryo project.  Prompts for the\n");
-                fmt::printf("project name, source directory (default: src), output directory\n");
-                fmt::printf("(default: build) and target type (executable/library/stdlib),\n");
-                fmt::printf("then writes a `cryoconfig` and a starter `main.cryo`.\n\n");
-                fmt::printf("With a [dir] argument the directory is created if needed and its\n");
-                fmt::printf("name is offered as the default project name.  Pressing Enter at\n");
-                fmt::printf("every prompt accepts the bracketed default.\n");
+                fmt::printf("Scaffolds a new Cryo project.  Asks for the project name, source\n");
+                fmt::printf("directory (default: src), output directory (default: build) and\n");
+                fmt::printf("target type (executable or library), then writes a `cryoconfig` and\n");
+                fmt::printf("either a starter `main.cryo` (executable) or a `lib.cryo` (library).\n\n");
+                fmt::printf("A library's `lib.cryo` begins with its namespace, derived from the\n");
+                fmt::printf("project name (`my-lib` -> `my_lib`): that is the namespace a program\n");
+                fmt::printf("depending on the library imports.\n\n");
+                fmt::printf("With a [dir] argument the directory, and any missing parent, is\n");
+                fmt::printf("created and its name is offered as the default project name.\n");
+                fmt::printf("Pressing Enter at a prompt accepts the bracketed default.\n\n");
+                fmt::printf("Init never overwrites a file: in a directory that already has a\n");
+                fmt::printf("cryoconfig it asks nothing and writes nothing, and it stops before\n");
+                fmt::printf("writing a source file that is already there.\n\n");
+                fmt::printf("Flags (each answers its prompt, so giving all four reads nothing):\n");
+                fmt::printf("  --name=NAME         The project name\n");
+                fmt::printf("  --type=TYPE         executable or library\n");
+                fmt::printf("  --source-dir=DIR    The source directory\n");
+                fmt::printf("  --output-dir=DIR    The output directory\n");
             }
             CommandKind::Build => {
                 fmt::printf("  cryo build <file.cryo>   Compile a single source file directly.\n");
@@ -576,14 +699,18 @@ implement enum CommandKind {
             }
             CommandKind::Fetch => {
                 fmt::printf("Resolves every dependency declared in cryoconfig against its\n");
-                fmt::printf("remote, materializes missing checkouts, and writes\n");
-                fmt::printf("`cryoconfig.lock`.  Reuses existing lockfile entries when the\n");
-                fmt::printf("cryoconfig spec is unchanged.\n");
+                fmt::printf("remote, extracts the files of each pinned commit, and writes\n");
+                fmt::printf("`cryoconfig.lock`.  Keeps the commit the lock pins while the\n");
+                fmt::printf("entry's ref is unchanged and its version meets the requirement.\n\n");
+                fmt::printf("A build holds one version of each library: entries asking for\n");
+                fmt::printf("two major versions of one are refused, and compatible ones build\n");
+                fmt::printf("the newest version they name that every requirement accepts.\n");
             }
             CommandKind::Update => {
-                fmt::printf("Like `fetch`, but ignores the existing lockfile and re-resolves\n");
-                fmt::printf("every dependency from scratch - use it to bump pinned git SHAs\n");
-                fmt::printf("to the latest tag or branch tip.\n");
+                fmt::printf("Like `fetch`, but ignores the existing lockfile and resolves\n");
+                fmt::printf("every ref again: a `branch` dependency, or one on the default\n");
+                fmt::printf("branch, moves to the branch's newest commit.  A `tag` or `rev`\n");
+                fmt::printf("names the commit it named before.\n");
             }
             CommandKind::Vendor => {
                 fmt::printf("Registers a C library so its API is usable via `import vendor::Name`,\n");
@@ -1177,17 +1304,22 @@ type struct Executor {
 
     /// `cryo init [dir]`: scaffold a new Cryo project.
     ///
-    /// Interactively prompts for project_name (required) and three values
-    /// with defaults (source_dir = "src", output_dir = "build",
-    /// target_type = "executable"), then writes:
+    /// Asks for the project name and three values with defaults (source
+    /// directory "src", output directory "build", target type
+    /// "executable"), each unless its flag answers it (`--name=`,
+    /// `--source-dir=`, `--output-dir=`, `--type=`), so a run given all four
+    /// reads nothing from the terminal.  Then writes:
     ///   <dir>/cryoconfig
-    ///   <dir>/<source_dir>/main.cryo  (Hello-world boilerplate)
+    ///   <dir>/<source_dir>/main.cryo  an executable's hello world, or
+    ///   <dir>/<source_dir>/lib.cryo   a library's namespace and one public
+    ///                                 function
     ///
-    /// With no positional arg, scaffolds in CWD.  When `cryo init <dir>` is
-    /// passed, the directory is created and offered as the default for the
-    /// project-name prompt; pressing Enter at any prompt accepts the
-    /// default in brackets, so `cryo init hello && (echo; echo; echo)` is
-    /// effectively non-interactive.
+    /// With no positional argument, scaffolds in the current directory.
+    /// With `cryo init <dir>`, the directory and any missing parent are
+    /// created, and the directory's own name is the default project name.
+    /// A file already there is never overwritten: an existing cryoconfig
+    /// stops init before it asks anything, an existing source file before
+    /// it writes anything.
     static cmd_init(args: cli::ParsedArgs) -> int {
         const has_positional: boolean = args.positional_count() > 0;
         const target_dir: string = if (has_positional) {
@@ -1195,13 +1327,18 @@ type struct Executor {
         } else {
             "."
         };
-
-        // Create the target dir if it doesn't already exist.  493 = 0755.
-        // mkdir(2) returns -1 with errno=EEXIST when the dir is already
-        // there; we don't have errno-aware bindings yet, so just attempt
-        // and let the file writes below fail loudly if the dir is bogus.
+        // A directory that is already a project keeps its cryoconfig: init
+        // asks nothing and writes nothing there.
+        const config_path: path::PathBuf = path::Path::from(Str::new(target_dir)).join("cryoconfig");
+        if (!Executor::refuse_existing_scaffold_file(config_path.as_path())) { return 1; }
         if (target_dir != ".") {
-            libc::mkdir(target_dir, 493);
+            match (Directory::create_all(path::Path::from(Str::new(target_dir)))) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => {
+                    fmt::eprintln(f"Error: cannot create the directory {target_dir}");
+                    return 1;
+                }
+            }
         }
 
         // Read the interactive answers straight from fd 0 through the
@@ -1211,28 +1348,29 @@ type struct Executor {
 
         fmt::printf("Initializing Cryo project in %s\n\n", target_dir);
 
-        // When the user passed `cryo init <dir>`, offer the directory name
-        // as the default project name; `cryo init hello` + Enter at every
-        // prompt is the documented shortcut path.
-        const name: String = if (has_positional) {
-            Executor::prompt_default(&input, "Project name", Str::new(target_dir))
+        mut name: String = String::new();
+        if (args.has_arg("name")) {
+            name = String::from_str(Str::new(args.get_value("name")));
+        } else if (has_positional) {
+            const directory_name: Str = path::Path::from(Str::new(target_dir)).file_name()
+                .unwrap_or(Str::new(target_dir));
+            name = Executor::prompt_default(&input, "Project name", directory_name);
         } else {
-            Executor::prompt_required(&input, "Project name")
-        };
+            name = Executor::prompt_required(&input, "Project name");
+        }
         if (name.is_empty()) {
             fmt::eprintf("Error: project name is required\n");
             return 1;
         }
-        const src_dir: String = Executor::prompt_default(&input, "Source directory", Str::new("src"));
-        const out_dir: String = Executor::prompt_default(&input, "Output directory", Str::new("build"));
-        const ttype:   String = Executor::prompt_default(&input, "Target type (executable/library/stdlib)", Str::new("executable"));
+        const src_dir: String = Executor::answer_or_prompt(&args, "source-dir", &input, "Source directory", Str::new("src"));
+        const out_dir: String = Executor::answer_or_prompt(&args, "output-dir", &input, "Output directory", Str::new("build"));
+        const ttype:   String = Executor::answer_or_prompt(&args, "type", &input, "Target type (executable/library)", Str::new("executable"));
 
-        // Validate target_type; silently accepting "exe" or typos would
-        // produce a cryoconfig the parser can't load.
-        if (ttype.as_str() != Str::new("executable")
-                && ttype.as_str() != Str::new("library")
-                && ttype.as_str() != Str::new("stdlib")) {
-            fmt::eprintln(f"Error: target type must be one of: executable, library, stdlib (got '{ttype.as_str()}')");
+        // A typo ("exe", "lib") would write a cryoconfig the parser cannot
+        // load, so the type is one of the two spellings or nothing is written.
+        const is_library: boolean = ttype.as_str() == Str::new("library");
+        if (!is_library && ttype.as_str() != Str::new("executable")) {
+            fmt::eprintln(f"Error: target type must be executable or library (got '{ttype.as_str()}')");
             return 1;
         }
 
@@ -1252,22 +1390,63 @@ type struct Executor {
             }
         }
 
-        const main_path: path::PathBuf = src_path.join("main.cryo");
-        const ns_name: String = Executor::derive_namespace(name.as_str());
-        if (!Executor::write_main_cryo(main_path.as_path(), ns_name.as_str())) { return 1; }
+        // A library's namespace is its name, which every program that uses
+        // it imports; an executable's is its name capitalized.
+        const ns_name: String = Executor::derive_namespace(name.as_str(), !is_library);
+        const source_path: path::PathBuf = src_path.join(if (is_library) { "lib.cryo" } else { "main.cryo" });
+        const source_text: String = if (is_library) {
+            Executor::library_source(name.as_str(), ns_name.as_str())
+        } else {
+            Executor::program_source(ns_name.as_str())
+        };
+        // A library also gets a test of its function and a README saying
+        // how a program depends on it.  Every file is checked before any
+        // is written, so a refusal leaves the directory as it was.
+        const tests_path: path::PathBuf = path::Path::from(Str::new(target_dir)).join("tests");
+        const test_path: path::PathBuf = tests_path.join(f"{ns_name}_tests.cryo".as_str());
+        const readme_path: path::PathBuf = path::Path::from(Str::new(target_dir)).join("README.md");
+        if (!Executor::refuse_existing_scaffold_file(source_path.as_path())) { return 1; }
+        if (is_library && (!Executor::refuse_existing_scaffold_file(test_path.as_path())
+                || !Executor::refuse_existing_scaffold_file(readme_path.as_path()))) { return 1; }
+        if (!Executor::write_scaffold_file(source_path.as_path(), source_text.as_str())) { return 1; }
+        if (is_library) {
+            match (Directory::create_all(tests_path.as_path())) {
+                Result::Ok(_)  => { }
+                // A directory that cannot be made is reported by the write.
+                Result::Err(_) => { }
+            }
+            if (!Executor::write_scaffold_file(test_path.as_path(), Executor::library_test_source(ns_name.as_str()).as_str())) { return 1; }
+            if (!Executor::write_scaffold_file(readme_path.as_path(), Executor::library_readme(name.as_str(), ns_name.as_str()).as_str())) { return 1; }
+        }
 
-        const config_path: path::PathBuf = path::Path::from(Str::new(target_dir)).join("cryoconfig");
         if (!Executor::write_cryoconfig(config_path.as_path(), name.as_str(), src_dir.as_str(),
-                                        out_dir.as_str(), ttype.as_str())) { return 1; }
+                                        out_dir.as_str(), is_library)) { return 1; }
 
         fmt::print(f"\n  Created {config_path.as_str()}\n");
-        fmt::print(f"  Created {main_path.as_str()}\n");
+        fmt::print(f"  Created {source_path.as_str()}\n");
+        if (is_library) {
+            fmt::print(f"  Created {test_path.as_str()}\n");
+            fmt::print(f"  Created {readme_path.as_str()}\n");
+        }
         fmt::printf("\nNext steps:\n");
         if (target_dir != ".") {
             fmt::printf("  cd %s\n", target_dir);
         }
-        fmt::printf("  cryo run\n");
+        if (is_library) {
+            fmt::printf("  cryo build\n  cryo test\n");
+        } else {
+            fmt::printf("  cryo run\n");
+        }
         return 0;
+    }
+
+    /// The answer to one `cryo init` question: the value of its flag
+    /// `flag` when the command line gives it, otherwise what the user
+    /// types at the prompt `label`, with `def` on Enter.
+    static answer_or_prompt(args: &cli::ParsedArgs, flag: string, input: mut &stdio::Stdin,
+                            label: string, def: Str) -> String {
+        if (args.has_arg(flag)) { return String::from_str(Str::new(args.get_value(flag))); }
+        return Executor::prompt_default(input, label, def);
     }
 
     /// Read a line from `input`, returning `def` when the user
@@ -1317,7 +1496,8 @@ type struct Executor {
         return n;
     }
 
-    static write_main_cryo(path: path::Path, ns_name: Str) -> boolean {
+    /// A new executable's `main.cryo`: its namespace and a hello world.
+    static program_source(ns_name: Str) -> String {
         mut text: String = String::new();
         text.push("namespace ");
         text.push(ns_name);
@@ -1326,7 +1506,63 @@ type struct Executor {
         text.push("    fmt::printf(\"Hello, world!\\n\");\n");
         text.push("    return 0;\n");
         text.push("}\n");
-        return Executor::write_scaffold_file(path, text.as_str());
+        return text;
+    }
+
+    /// A new library's `lib.cryo`, for the project `name`: the namespace
+    /// line, which makes `ns_name` the library's namespace, and one
+    /// documented public function.
+    static library_source(name: Str, ns_name: Str) -> String {
+        mut text: String = String::new();
+        text.push(f"///! The `{name}` library.  A program that depends on it imports\n");
+        text.push(f"///! `{ns_name}`, the namespace this file declares; every other file of\n");
+        text.push(f"///! the library declares a namespace below it (`{ns_name}::<name>`).\n\n");
+        text.push(f"namespace {ns_name};\n\n");
+        text.push("/// The sum of `a` and `b`.\n");
+        text.push("public function add(a: int, b: int) -> int {\n");
+        text.push("    return a + b;\n");
+        text.push("}\n");
+        return text;
+    }
+
+    /// A new library's first test, of the function `library_source` writes:
+    /// a file under `tests/`, which `cryo test` builds with the library.
+    static library_test_source(ns_name: Str) -> String {
+        mut text: String = String::new();
+        text.push(f"![config(testing)]\nnamespace {ns_name}_tests;\n\n");
+        text.push(f"import {ns_name};\n");
+        text.push("import std::test::assert::{ expect_equal };\n");
+        text.push("import std::test::error::{ TestError };\n\n");
+        text.push("![test]\n");
+        text.push("function add_sums_its_arguments() -> Result<(), TestError> {\n");
+        text.push(f"    return expect_equal({ns_name}::add(2, 3), 5);\n");
+        text.push("}\n");
+        return text;
+    }
+
+    /// A new library's README: what it is, and how a program depends on it
+    /// and imports it.
+    static library_readme(name: Str, ns_name: Str) -> String {
+        mut text: String = String::new();
+        text.push(f"# {name}\n\nA Cryo library.\n\n");
+        text.push("## Use\n\nA program names it in its cryoconfig, by the git repository it is\n");
+        text.push("published in (or by a `path` on this machine), with the versions it accepts:\n\n");
+        text.push(f"```\n[dependencies]\n{name} = {{ git = \"https://example.com/you/{name}\", version = \"0.1\" }}\n```\n\n");
+        text.push(f"and imports it by its namespace, `{ns_name}`:\n\n");
+        text.push(f"```\nimport {ns_name};\n\nconst sum: int = {ns_name}::add(2, 3);\n```\n\n");
+        text.push("## Version\n\nThe library's version is the `version` under `[lib]` in its cryoconfig.\n");
+        text.push("A program that writes `version = \"0.1\"` accepts 0.1.0 and every later 0.1.x.\n\n");
+        text.push("## Develop\n\n```\ncryo build\ncryo test\n```\n");
+        return text;
+    }
+
+    /// Whether `path`, a file `cryo init` would write, is free; when a file
+    /// is already there, says so, naming it, and false.  Init never
+    /// overwrites a file: a project's cryoconfig and sources are the user's.
+    static refuse_existing_scaffold_file(path: path::Path) -> boolean {
+        if (!path.exists()) { return true; }
+        fmt::eprintln(f"Error: {path.as_str()} already exists; `cryo init` does not overwrite a file");
+        return false;
     }
 
     /// Write one file of a new project, reporting a failure the way every
@@ -1341,10 +1577,11 @@ type struct Executor {
         }
     }
 
-    /// Derive a PascalCase namespace identifier from a project name.
+    /// Derive a namespace identifier from a project name, its first letter
+    /// upper-case when `capitalized`.
     ///
-    /// Examples:  `hello` -> `Hello`, `my-app` -> `My_app`,
-    /// `123foo` -> `Foo` (leading non-letters dropped),
+    /// Examples:  `hello` -> `Hello` (or `hello`), `my-app` -> `My_app`
+    /// (or `my_app`), `123foo` -> `Foo` (leading non-letters dropped),
     /// `--` -> `Main` (no usable chars -> fallback).
     ///
     /// The first emitted byte is always an ASCII letter; subsequent bytes
@@ -1352,14 +1589,14 @@ type struct Executor {
     /// Anything else is dropped.  The output compiles as-is even when the
     /// input contains characters the Cryo parser would reject in an
     /// identifier.
-    static derive_namespace(name: Str) -> String {
+    static derive_namespace(name: Str, capitalized: boolean) -> String {
         mut out: String = String::with_capacity(name.length());
         for (byte in name.as_bytes().iter()) {
             const ch: char = byte as char;
             if (out.is_empty()) {
-                // First byte: only letters allowed; lowercase gets upcased.
-                // Digits, symbols and hyphens at the start are skipped.
-                if (ch.is_alpha()) { out.push_byte(ch.to_ascii_uppercase() as u8); }
+                // First byte: only letters allowed.  Digits, symbols and
+                // hyphens at the start are skipped.
+                if (ch.is_alpha()) { out.push_byte(if (capitalized) { ch.to_ascii_uppercase() as u8 } else { ch as u8 }); }
             } else if (ch.is_alphanumeric() || ch == '_') {
                 out.push_byte(ch as u8);
             } else if (ch == '-' || ch == ' ') {
@@ -1370,19 +1607,23 @@ type struct Executor {
         return out;
     }
 
+    /// A new project's cryoconfig.  An executable's names its entry point,
+    /// `<src_dir>/main.cryo`; a library's is a `[lib]` whose source
+    /// directory holds the `lib.cryo` that declares its namespace.
     static write_cryoconfig(path: path::Path, name: Str, src_dir: Str,
-                            out_dir: Str, target_type: Str) -> boolean {
-        // Build the entry_point as "<src_dir>/main.cryo" (or just
-        // "main.cryo" when source_dir is "." / empty).  Only emit the
-        // entry_point key for executables; libraries discover via
-        // <source_dir>/lib.cryo instead.
+                            out_dir: Str, is_library: boolean) -> boolean {
         mut text: String = String::new();
         text.push("[project]\n");
         text.push(f"project_name = \"{name}\"\n");
         text.push(f"output_dir = \"{out_dir}\"\n");
-        text.push(f"target_type = \"{target_type}\"\n");
-        text.push(f"source_dir = \"{src_dir}\"\n");
-        if (target_type == Str::new("executable")) {
+        if (is_library) {
+            text.push("\n[lib]\n");
+            text.push(f"name = \"{name}\"\n");
+            text.push(f"source_dir = \"{src_dir}\"\n");
+            text.push("version = \"0.1.0\"\n");
+        } else {
+            text.push("target_type = \"executable\"\n");
+            text.push(f"source_dir = \"{src_dir}\"\n");
             if (src_dir.is_empty() || src_dir == Str::new(".")) {
                 text.push("entry_point = \"main.cryo\"\n");
             } else {
@@ -2170,7 +2411,7 @@ type struct Executor {
         mut contents: [String] = [];
         mut expects:  [String] = [];
         mut job_of:   [i64]    = [];
-        mut cmds:     [String] = [];
+        mut cmds:     [[SuiteAction]] = [];
         match (Directory::entries(neg_dir)) {
             Result::Ok(entries) => {
                 for (entry in entries) {
@@ -2188,7 +2429,7 @@ type struct Executor {
                         mut command: String = f"{self_exe} check {full.as_path().as_str()}";
                         if (stdlib_abs.length() > 0) { command.push(f" --stdlib={stdlib_abs}"); }
                         command.push(f" > {out_path} 2>&1");
-                        cmds.push(command);
+                        cmds.push([SuiteAction::Shell(command)]);
                     }
                     names.push(String::from_str(name));
                     contents.push(content);
@@ -2230,7 +2471,7 @@ type struct Executor {
         // The workers share the job table through `batch`; `thread::scope`
         // joins them after the last verdict is read.
         const batch: ShellJobs = ShellJobs {
-            cursor: &cursor, cmds: cmds.as_pointer(), n: n_jobs,
+            cursor: &cursor, jobs: cmds.as_pointer(), n: n_jobs,
             status: status.as_mutable_pointer(), done: done.as_pointer()
         };
         const tally: NegSuiteResult = thread::scope((scope: mut &thread::Scope) -> NegSuiteResult {
@@ -2368,6 +2609,7 @@ type struct Executor {
         for (mut i: i64 = 0; i < reqs.length(); i++) {
             const r: Str = reqs[i].as_str();
             const known: boolean = r.equals(&Str::new("display")) || r.equals(&Str::new("cxx"))
+                || r.equals(&Str::new("git"))
                 || r.starts_with(&Str::new("vendor:")) || r.starts_with(&Str::new("os:"));
             if (!known) { return r; }
         }
@@ -2386,6 +2628,11 @@ type struct Executor {
                 Option::None => {}
             }
             return false;
+        }
+        if (req.equals(&Str::new("git"))) {
+            // `git` answers on PATH: a project with git fixtures builds its
+            // repositories with it, and `cryo fetch` reads them with it.
+            return ExecutablePath::find("git").length() > 0;
         }
         const vendor_prefix: Str = Str::new("vendor:");
         const os_prefix: Str = Str::new("os:");
@@ -2437,6 +2684,7 @@ type struct Executor {
         const cf_str:    str::Str = str::Str::new("compile_fail");
         const run_str:   str::Str = str::Str::new("run");
         const interpret_str: str::Str = str::Str::new("interpret");
+        const command_str: str::Str = str::Str::new("command");
         match (root.get(str::Str::new("outcome"))) {
             Option::Some(vp) => {
                 match (vp.as::<str::Str>()) {
@@ -2445,6 +2693,7 @@ type struct Executor {
                         else if (os.equals(&cf_str))  { spec.outcome = 1; spec.fails = true; }
                         else if (os.equals(&run_str)) { spec.outcome = 2; }
                         else if (os.equals(&interpret_str)) { spec.outcome = 3; }
+                        else if (os.equals(&command_str)) { spec.outcome = 4; }
                     }
                     Option::None => { }
                 }
@@ -2463,6 +2712,97 @@ type struct Executor {
         Executor::read_strings(&root, "requires", &spec.requires);
         Executor::read_strings(&root, "environment", &spec.environment);
         Executor::read_strings(&root, "arguments", &spec.arguments);
+        Executor::read_strings(&root, "command", &spec.command);
+        // A step is a list of strings, its verb first, or an object naming
+        // the file it writes and its text; anything else makes the file
+        // malformed rather than running a different command.
+        mut malformed_step: boolean = false;
+        match (root.get(str::Str::new("steps"))) {
+            Option::Some(sp) => {
+                for (mut i: i64 = 0; i < sp.length(); i++) {
+                    match (sp.at(i)) {
+                        Option::Some(step) => {
+                            mut one: ProjStep = ProjStep { arguments: [], write: String::new(), text: String::new(), refused: false };
+                            if (step.is_object()) {
+                                one.write = registry::VendorRegistry::text_field(step, str::Str::new("write"), str::Str::new(""));
+                                one.text = registry::VendorRegistry::text_field(step, str::Str::new("text"), str::Str::new(""));
+                                match (step.get(str::Str::new("fails"))) {
+                                    Option::Some(fp) => {
+                                        match (fp.as::<boolean>()) {
+                                            Option::Some(b) => { one.refused = b; }
+                                            Option::None    => { malformed_step = true; }
+                                        }
+                                    }
+                                    Option::None => { }
+                                }
+                                if (one.write.is_empty() || step.get(str::Str::new("text")).is_none()) { malformed_step = true; }
+                                spec.steps.push(one);
+                                continue;
+                            }
+                            for (mut j: i64 = 0; j < step.length(); j++) {
+                                match (step.at(j)) {
+                                    Option::Some(av) => {
+                                        match (av.as::<str::Str>()) {
+                                            Option::Some(a) => { one.arguments.push(String::from_str(a)); }
+                                            Option::None    => { malformed_step = true; }
+                                        }
+                                    }
+                                    Option::None => { }
+                                }
+                            }
+                            if (one.arguments.length() == 0) { malformed_step = true; }
+                            spec.steps.push(one);
+                        }
+                        Option::None => { }
+                    }
+                }
+            }
+            Option::None => { }
+        }
+        // A fixture needs a name, a directory and at least one commit, and
+        // each commit a tree and a tag; anything less makes the file
+        // malformed rather than building a repository the project did not
+        // describe.
+        match (root.get(str::Str::new("git_fixtures"))) {
+            Option::Some(fp) => {
+                for (mut i: i64 = 0; i < fp.length(); i++) {
+                    match (fp.at(i)) {
+                        Option::Some(fixture) => {
+                            mut one: ProjFixture = ProjFixture {
+                                name: registry::VendorRegistry::text_field(fixture, str::Str::new("name"), str::Str::new("")),
+                                from: registry::VendorRegistry::text_field(fixture, str::Str::new("from"), str::Str::new("")),
+                                commits: [],
+                            };
+                            match (fixture.get(str::Str::new("commits"))) {
+                                Option::Some(cp) => {
+                                    for (mut j: i64 = 0; j < cp.length(); j++) {
+                                        match (cp.at(j)) {
+                                            Option::Some(commit) => {
+                                                const made: ProjFixtureCommit = ProjFixtureCommit {
+                                                    tree: registry::VendorRegistry::text_field(commit, str::Str::new("tree"), str::Str::new("")),
+                                                    tag:  registry::VendorRegistry::text_field(commit, str::Str::new("tag"), str::Str::new("")),
+                                                    commit: String::new(),
+                                                };
+                                                if (made.tree.is_empty() || made.tag.is_empty()) { malformed_step = true; }
+                                                one.commits.push(made);
+                                            }
+                                            Option::None => { }
+                                        }
+                                    }
+                                }
+                                Option::None => { }
+                            }
+                            if (one.name.is_empty() || one.from.is_empty() || one.commits.length() == 0) {
+                                malformed_step = true;
+                            }
+                            spec.fixtures.push(one);
+                        }
+                        Option::None => { }
+                    }
+                }
+            }
+            Option::None => { }
+        }
         match (root.get(str::Str::new("applied"))) {
             Option::Some(ap) => {
                 spec.applied = true;
@@ -2581,7 +2921,10 @@ type struct Executor {
             Option::None => { }
         }
         mem::drop(root);
-        if (rebuild_malformed) { return Option::None; }
+        if (malformed_step || rebuild_malformed) { return Option::None; }
+        // A `command` project with nothing to run, or a `command` given to
+        // another outcome, would judge a command the file does not describe.
+        if ((spec.outcome == 4) != (spec.command.length() > 0)) { return Option::None; }
         return Option::Some(spec);
     }
 
@@ -2640,11 +2983,12 @@ type struct Executor {
         //   applied_job_of[i]: the job running the copy of project i with its
         //                      fixes applied, or -1 when it has no `applied`
         mut applied_job_of: [i64]  = [];
-        //   copy_of[i]: the copy a `rebuild` project was built twice in, or
-        //               empty
+        //   copy_of[i]: the copy project i runs in - the one holding its git
+        //               fixtures, or the one a `rebuild` project was built
+        //               twice in - or empty when it runs in place
         mut copy_of:    [String]   = [];
         mut specs:      [ProjSpec] = [];
-        mut cmds:       [String]   = [];
+        mut cmds:       [[SuiteAction]] = [];
         const entries: DirectoryEntries = match (Directory::entries(projects_dir)) {
             Result::Ok(listing) => { listing }
             Result::Err(_)      => { return NegSuiteResult { ran: 0, failures: 0, warnings: 0 }; }
@@ -2688,14 +3032,25 @@ type struct Executor {
                         verdict = 5; reason = String::from_str(proj_dir.as_path().as_str());
                     } else if (!Executor::remove_project_file(proj_dir.as_path(), &spec)) {
                         verdict = 6; reason = spec.file.clone();
+                    } else if (spec.steps.length() > 0 && !Executor::remove_build_folder(proj_dir.as_path())) {
+                        verdict = 6; reason = String::from_str(Str::new("build/"));
                     }
                 }
             }
-            // A `rebuild` project's job is its second build, in the copy its
-            // first build ran in; its project directory is that copy from
-            // here on.  A first build that failed fails the project (7).
+            // A project with git fixtures runs in a copy of itself, which
+            // names its fixtures' repositories.  A `rebuild` project's job is
+            // its second build, in the copy its first build ran in.  Either
+            // way its project directory is that copy from here on; a copy
+            // that cannot be prepared, or a first build that failed, fails
+            // the project (7).  Every other project runs in place.
             mut copy_text: String = String::new();
-            if (verdict == 0 && spec.rebuild) {
+            if (verdict == 0 && spec.fixtures.length() > 0) {
+                copy_text = f"{tmp.as_path().as_str()}.fixtures.{names.length()}";
+                match (Executor::prepare_fixture_copy(proj_dir.as_path(), copy_text.as_str(), &spec)) {
+                    Result::Ok(_)    => { }
+                    Result::Err(why) => { verdict = 7; reason = why; }
+                }
+            } else if (verdict == 0 && spec.rebuild) {
                 copy_text = f"{tmp.as_path().as_str()}.rebuild.{cmds.length()}";
                 const failure: String = Executor::build_first(self_exe, stdlib_abs, proj_dir.as_path(),
                     path::Path::from(copy_text.as_str()), &spec, build_flags);
@@ -2716,6 +3071,13 @@ type struct Executor {
             if (verdict == 0) {
                 const out_path: String = Executor::job_tmp_path(tmp.as_path(), cmds.length() as u64);
                 job_of.push(cmds.length() as i64);
+                // Whether the fixture's command ran is read off its capture
+                // being there, so none may be left from an earlier run; the
+                // steps add to their log, which starts empty.
+                if (spec.steps.length() > 0) {
+                    Executor::remove_capture(path::Path::from(out_path.as_str()));
+                    Executor::remove_capture(path::Path::from(Executor::steps_path(out_path.as_str()).as_str()));
+                }
                 cmds.push(Executor::project_command(self_exe, stdlib_abs, run_dir.as_path(), &spec,
                     out_path.as_str(), build_flags));
                 // The fixes are made in a copy, never in the tree's own
@@ -2777,7 +3139,7 @@ type struct Executor {
         // The workers share the job table through `batch`; `thread::scope`
         // joins them after the last verdict is read.
         const batch: ShellJobs = ShellJobs {
-            cursor: &cursor, cmds: cmds.as_pointer(), n: n_jobs,
+            cursor: &cursor, jobs: cmds.as_pointer(), n: n_jobs,
             status: status.as_mutable_pointer(), done: done.as_pointer()
         };
         const tally: NegSuiteResult = thread::scope((scope: mut &thread::Scope) -> NegSuiteResult {
@@ -2847,6 +3209,11 @@ type struct Executor {
                 const out_path: String = Executor::job_tmp_path(tmp.as_path(), k);
                 const proj_dir: path::PathBuf = if (copy_text.length() > 0) { path::PathBuf::from(copy_text) } else { projects_dir.join(name) };
                 mut res: ProjOutcome = Executor::project_outcome(&specs[i], status[k as i64], out_path.as_str(), proj_dir.as_path());
+                const steps_output: String = Executor::steps_path(out_path.as_str());
+                if (specs[i].steps.length() > 0 && !path::Path::from(out_path.as_str()).exists()) {
+                    res = ProjOutcome { passed: false,
+                        detail: String::from_str(str::Str::new("a step failed; its output follows")) };
+                }
                 if (!Executor::remove_project_file(proj_dir.as_path(), &specs[i]) && res.passed) {
                     res = ProjOutcome { passed: false,
                         detail: f"cannot remove the {specs[i].file} it wrote" };
@@ -2886,6 +3253,8 @@ type struct Executor {
                     // Surface the captured subprocess output on failure so the
                     // reason is visible (kept quiet on success).
                     if (!is_compact) {
+                        const steps_text: String = Executor::read_file_or_empty(path::Path::from(steps_output.as_str()));
+                        if (steps_text.length() > 0) { fmt::printf("%.*s\n", steps_text.length() as i32, steps_text.as_str().as_pointer()); }
                         const shown_path: str::Str = if (show_applied) { applied_out.as_str() } else { out_path.as_str() };
                         const out: String = Executor::read_file_or_empty(path::Path::from(shown_path));
                         if (out.length() > 0) { fmt::printf("%.*s\n", out.length() as i32, out.as_str().as_pointer()); }
@@ -2898,6 +3267,7 @@ type struct Executor {
                 const out_error: String = Executor::stderr_path(out_path.as_str());
                 Executor::remove_capture(path::Path::from(out_path.as_str()));
                 Executor::remove_capture(path::Path::from(out_error.as_str()));
+                Executor::remove_capture(path::Path::from(steps_output.as_str()));
                 if (copy_text.length() > 0) {
                     match (Directory::remove_all(path::Path::from(copy_text))) { Result::Ok(_) => { } Result::Err(_) => { } }
                 }
@@ -2995,7 +3365,8 @@ type struct Executor {
         }
     }
 
-    /// The `cryo` command a project's fixture runs.
+    /// The `cryo` command a project's fixture runs; a `command` project's
+    /// comes from its own `command` list instead.
     static fixture_verb(outcome: i32) -> string {
         if (outcome == 1) { return "build"; }
         if (outcome == 2) { return "run"; }
@@ -3003,32 +3374,67 @@ type struct Executor {
         return "test --format=plain";
     }
 
-    /// The shell command that drives one project to its declared outcome: this
-    /// compiler run in the project directory, its combined output captured in
-    /// `tmp`.  The directory is set inside the command's own shell, never by
-    /// `chdir`, because projects run concurrently and the process working
+    /// The actions that drive one project to its declared outcome: its steps,
+    /// then this compiler run in the project directory, its output captured
+    /// in `tmp`.  The directory is set inside each command's own shell, never
+    /// by `chdir`, because projects run concurrently and the process working
     /// directory is shared.  All paths handed to the subprocess (`self_exe`,
     /// `stdlib_abs`, `tmp`) are absolute so the changed cwd doesn't break them.
     static project_command(self_exe: Str, stdlib_abs: Str, proj_dir: path::Path,
-                           spec: &ProjSpec, tmp: Str, build_flags: str::Str) -> String {
+                           spec: &ProjSpec, tmp: Str, build_flags: str::Str) -> [SuiteAction] {
         // FIXTURE build (`cryo build`), run (`cryo run`), interpret (`cryo
-        // interpret`) or collect (the project's own `cryo test`).  Stdout and
-        // stderr are captured apart so the ASSERTIONS in `project_outcome` can
-        // tell the streams apart.
-        const verb: string = Executor::fixture_verb(spec.outcome);
-        mut command: String = String::new();
+        // interpret`), the `command` given, or collect (the project's own
+        // `cryo test`).  Stdout and stderr are captured apart so the
+        // ASSERTIONS in `project_outcome` can tell the streams apart.
+        mut environment: String = String::new();
         for (mut i: i64 = 0; i < spec.environment.length(); i++) {
-            command.push(shell_set_environment(spec.environment[i].as_str()));
+            environment.push(shell_set_environment(spec.environment[i].as_str()));
         }
-        command.push(f"{self_exe} {verb}");
-        if (stdlib_abs.length() > 0) { command.push(f" --stdlib={stdlib_abs}"); }
-        command.push(build_flags);
+        // Each step runs only once the one before it succeeded, and the
+        // fixture's command only once every step has.
+        mut actions: [SuiteAction] = [];
+        const steps_output: String = Executor::steps_path(tmp);
+        for (mut s: i64 = 0; s < spec.steps.length(); s++) {
+            if (spec.steps[s].arguments.length() == 0) {
+                const target: path::PathBuf = proj_dir.join(spec.steps[s].write.as_str());
+                actions.push(SuiteAction::Write(StepWrite {
+                    path: String::from_str(target.as_path().as_str()), text: spec.steps[s].text.clone(),
+                    refused: spec.steps[s].refused, log: steps_output.clone(),
+                }));
+                continue;
+            }
+            mut step: String = environment.clone();
+            step.push(self_exe);
+            for (mut a: i64 = 0; a < spec.steps[s].arguments.length(); a++) {
+                step.push(f" \"{spec.steps[s].arguments[a]}\"");
+            }
+            if (stdlib_abs.length() > 0) { step.push(f" --stdlib={stdlib_abs}"); }
+            step.push(f" >> {steps_output} 2>&1");
+            actions.push(SuiteAction::Shell(shell_in_dir(proj_dir.as_str(), step.as_str())));
+        }
+        mut command: String = environment;
+        // A `command` project's command is a step's, judged as the fixture:
+        // its own arguments and the suite's `--stdlib`, none of the build's
+        // flags.
+        if (spec.outcome == 4) {
+            command.push(self_exe);
+            for (mut a: i64 = 0; a < spec.command.length(); a++) {
+                command.push(f" \"{spec.command[a]}\"");
+            }
+            if (stdlib_abs.length() > 0) { command.push(f" --stdlib={stdlib_abs}"); }
+        } else {
+            const verb: string = Executor::fixture_verb(spec.outcome);
+            command.push(f"{self_exe} {verb}");
+            if (stdlib_abs.length() > 0) { command.push(f" --stdlib={stdlib_abs}"); }
+            command.push(build_flags);
+        }
         for (mut i: i64 = 0; i < spec.arguments.length(); i++) {
             command.push(f" \"{spec.arguments[i]}\"");
         }
         command.push(f" > {tmp} 2> ");
         command.push(Executor::stderr_path(tmp));
-        return shell_in_dir(proj_dir.as_str(), command.as_str());
+        actions.push(SuiteAction::Shell(shell_in_dir(proj_dir.as_str(), command.as_str())));
+        return actions;
     }
 
     /// A `rebuild` project's first build, in a fresh copy of it at
@@ -3048,8 +3454,8 @@ type struct Executor {
         }
         const first: ProjSpec = spec.first_build();
         const capture: String = f"{copy_dir.as_str()}.first";
-        const status: i32 = Command::shell(Executor::project_command(self_exe, stdlib_abs, copy_dir, &first,
-            capture.as_str(), build_flags).as_str());
+        const status: i32 = SuiteAction::perform_all(&Executor::project_command(self_exe, stdlib_abs, copy_dir, &first,
+            capture.as_str(), build_flags));
         const outcome: ProjOutcome = Executor::project_outcome(&first, status, capture.as_str(), copy_dir);
         const capture_error: String = Executor::stderr_path(capture.as_str());
         Executor::remove_capture(path::Path::from(capture.as_str()));
@@ -3075,6 +3481,203 @@ type struct Executor {
         if (spec.file.length() == 0) { return true; }
         const file_path: path::PathBuf = proj_dir.join(spec.file.as_str());
         return !file_path.as_path().exists() || File::remove(file_path.as_path()).is_ok();
+    }
+
+    /// Copy the project at `proj_dir` to `copy_text`, outside the tree and
+    /// without its `build/`, build its git fixtures there, write each
+    /// fixture's `file://` URL for `{fixture:<name>}` in every cryoconfig of
+    /// the copy (a fixture's own commits included, so one fixture package
+    /// can name another), and give the project's commands a `CRYO_HOME` of
+    /// their own in the copy.  `Err` says what could not be done.
+    static prepare_fixture_copy(proj_dir: path::Path, copy_text: Str, spec: mut &ProjSpec) -> Result<(), String> {
+        const copy: path::Path = path::Path::from(copy_text);
+        if (copy.exists() && Directory::remove_all(copy).is_err()) {
+            return Result::Err(f"cannot remove the earlier run's copy {copy_text}");
+        }
+        if (Directory::copy_all(proj_dir, copy).is_err()) {
+            return Result::Err(f"cannot copy the project to {copy_text}");
+        }
+        const build: path::PathBuf = copy.join(str::Str::new("build"));
+        if (build.as_path().exists() && Directory::remove_all(build.as_path()).is_err()) {
+            return Result::Err(f"cannot remove the copy's {build.as_path().as_str()}");
+        }
+        const repositories: path::PathBuf = build.join(str::Str::new("fixtures"));
+        mut urls: [String] = [];
+        for (mut i: i64 = 0; i < spec.fixtures.length(); i++) {
+            const repository: path::PathBuf = repositories.join(f"{spec.fixtures[i].name}.git".as_str());
+            const written: String = repository.as_path().as_str().replace(&str::Str::new("\\"), &str::Str::new("/"));
+            // An absolute path begins with `/` on Unix and with a drive on
+            // Windows; either way the URL's path is the whole of it.
+            urls.push(if (written.as_str().starts_with(str::Str::new("/"))) { f"file://{written}" } else { f"file:///{written}" });
+        }
+        if (!Executor::substitute_fixture_urls(copy, &spec.fixtures, &urls)) {
+            return Result::Err(f"cannot write the fixtures' URLs into the cryoconfigs of {copy_text}");
+        }
+        for (mut i: i64 = 0; i < spec.fixtures.length(); i++) {
+            if (!Executor::build_git_fixture(repositories.as_path(), copy, &spec.fixtures[i])) {
+                return Result::Err(f"cannot build the git fixture `{spec.fixtures[i].name}`");
+            }
+        }
+        const home: path::PathBuf = build.join(str::Str::new("cryo-home"));
+        const cache_root: path::PathBuf = Cache::root_in_home(home.as_path());
+        for (mut s: i64 = 0; s < spec.steps.length(); s++) {
+            for (mut a: i64 = 0; a < spec.steps[s].arguments.length(); a++) {
+                spec.steps[s].arguments[a] = Executor::resolve_cache_placeholders(spec.steps[s].arguments[a].as_str(),
+                    &spec.fixtures, &urls, cache_root.as_path())?;
+            }
+            spec.steps[s].write = Executor::resolve_cache_placeholders(spec.steps[s].write.as_str(),
+                &spec.fixtures, &urls, cache_root.as_path())?;
+        }
+        spec.environment.push(f"CRYO_HOME={home.as_path().as_str()}");
+        return Result::Ok(());
+    }
+
+    /// `text` with each `{cache:<fixture>@<tag>}` written as the directory
+    /// the package cache at `cache_root` extracts that commit of that
+    /// fixture to (`urls` beside `fixtures`).  `Err` names a placeholder
+    /// that is not closed or names no fixture's tag.
+    static resolve_cache_placeholders(text: Str, fixtures: &[ProjFixture], urls: &[String],
+                                      cache_root: path::Path) -> Result<String, String> {
+        const open: str::Str = str::Str::new("{cache:");
+        mut out: String = String::new();
+        mut rest: str::Str = text;
+        loop {
+            const at: i64 = rest.find(&open).unwrap_or(-1);
+            if (at < 0) { break; }
+            out.push(rest.byte_substring(0, at));
+            const after: str::Str = rest.byte_substring(at + open.length(), rest.length());
+            const close: i64 = after.find(&str::Str::new("}")).unwrap_or(-1);
+            if (close < 0) { return Result::Err(f"a cache placeholder in `{text}` is not closed"); }
+            const named: str::Str = after.byte_substring(0, close);
+            const separator: i64 = named.find(&str::Str::new("@")).unwrap_or(-1);
+            mut directory: String = String::new();
+            for (mut i: i64 = 0; separator > 0 && directory.is_empty() && i < fixtures.length(); i++) {
+                if (fixtures[i].name.as_str() != named.byte_substring(0, separator)) { continue; }
+                for (mut c: i64 = 0; c < fixtures[i].commits.length(); c++) {
+                    if (fixtures[i].commits[c].tag.as_str() == named.byte_substring(separator + 1, named.length())) {
+                        const extracted: path::PathBuf = Cache::extraction_dir_in(cache_root, urls[i].as_str(),
+                            fixtures[i].commits[c].commit.as_str());
+                        directory = String::from_str(extracted.as_path().as_str());
+                    }
+                }
+            }
+            if (directory.is_empty()) {
+                return Result::Err(f"`{named}` in `{text}` names no tag of a git fixture (write `<fixture>@<tag>`)");
+            }
+            out.push(directory.as_str());
+            rest = after.byte_substring(close + 1, after.length());
+        }
+        out.push(rest);
+        return Result::Ok(out);
+    }
+
+    /// Write each fixture's URL (`urls`, beside `fixtures`) for its
+    /// `{fixture:<name>}` in every file named `cryoconfig` below `directory`.
+    static substitute_fixture_urls(directory: path::Path, fixtures: &[ProjFixture], urls: &[String]) -> boolean {
+        const entries: DirectoryEntries = match (Directory::entries(directory)) {
+            Result::Ok(listing) => { listing }
+            Result::Err(_)      => { return false; }
+        };
+        for (entry in entries) {
+            const child: path::PathBuf = directory.join(entry.name());
+            if (entry.is_directory()) {
+                if (!Executor::substitute_fixture_urls(child.as_path(), fixtures, urls)) { return false; }
+            } else if (entry.name() == str::Str::new("cryoconfig")) {
+                mut text: String = match (File::read_text(child.as_path())) {
+                    Result::Ok(t)  => { t }
+                    Result::Err(_) => { return false; }
+                };
+                for (mut i: i64 = 0; i < fixtures.length(); i++) {
+                    mut placeholder: String = String::from_str(str::Str::new("{fixture:"));
+                    placeholder.push(fixtures[i].name.as_str());
+                    placeholder.push("}");
+                    text = text.as_str().replace(&placeholder.as_str(), &urls[i].as_str());
+                }
+                if (File::write_text(child.as_path(), text.as_str()).is_err()) { return false; }
+            }
+        }
+        return true;
+    }
+
+    /// Build the bare repository `<repositories>/<name>.git` of `fixture`,
+    /// whose default branch is `main`: one commit per entry, in order, each
+    /// holding exactly the files of
+    /// `<copy>/<from>/<tree>` and carrying its tag.  Every git command runs
+    /// with a fixed author, committer and date and with no system or user
+    /// configuration, so a fixture's commits do not depend on who runs it.
+    /// Each commit's id is recorded in `fixture`.
+    static build_git_fixture(repositories: path::Path, copy: path::Path, fixture: mut &ProjFixture) -> boolean {
+        const repository: path::PathBuf = repositories.join(f"{fixture.name}.git".as_str());
+        if (Directory::create_all(repository.as_path()).is_err()) { return false; }
+        const no_config: path::PathBuf = repositories.join(str::Str::new("no-user-config"));
+        const git_dir: String = f"--git-dir={repository.as_path().as_str()}";
+        if (!Executor::fixture_git(no_config.as_path(), [str::Str::new("init"), str::Str::new("--bare"), str::Str::new("-q"), str::Str::new("--initial-branch=main"), repository.as_path().as_str()])) {
+            return false;
+        }
+        for (mut c: i64 = 0; c < fixture.commits.length(); c++) {
+            const tree: path::PathBuf = copy.join(fixture.from.as_str()).join(fixture.commits[c].tree.as_str());
+            if (!tree.as_path().is_directory()) { return false; }
+            const work_tree: String = f"--work-tree={tree.as_path().as_str()}";
+            const tag: str::Str = fixture.commits[c].tag.as_str();
+            // The index is emptied first: it holds the previous tree's
+            // entries, and a file of this tree with the same size and time
+            // as one of those would be taken for it, unread.
+            if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), str::Str::new("read-tree"), str::Str::new("--empty")])) { return false; }
+            if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), work_tree.as_str(), str::Str::new("add"), str::Str::new("-A")])) { return false; }
+            if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), work_tree.as_str(), str::Str::new("commit"), str::Str::new("-q"), str::Str::new("--allow-empty"), str::Str::new("-m"), tag])) { return false; }
+            if (!Executor::fixture_git(no_config.as_path(), [git_dir.as_str(), str::Str::new("tag"), tag])) { return false; }
+            match (Executor::fixture_git_output(no_config.as_path(), [git_dir.as_str(), str::Str::new("rev-parse"), str::Str::new("HEAD")])) {
+                Option::Some(id) => { fixture.commits[c].commit = id; }
+                Option::None     => { return false; }
+            }
+        }
+        return true;
+    }
+
+    /// Run `git` with `arguments` for a fixture, its output kept, with a
+    /// fixed identity and date and no configuration but `no_config`, a
+    /// file that does not exist.  True when it exits 0.
+    static fixture_git(no_config: path::Path, arguments: [str::Str]) -> boolean {
+        return Executor::fixture_git_output(no_config, arguments).is_some();
+    }
+
+    /// What `fixture_git` prints on stdout, without its line ending, or
+    /// `None` when git does not exit 0.
+    static fixture_git_output(no_config: path::Path, arguments: [str::Str]) -> Option<String> {
+        mut git: Command = Command::new(str::Str::new("git"));
+        for (mut i: i64 = 0; i < arguments.length(); i++) { git.argument(arguments[i]); }
+        git.env(str::Str::new("GIT_CONFIG_NOSYSTEM"), str::Str::new("1"));
+        git.env(str::Str::new("GIT_CONFIG_GLOBAL"), no_config.as_str());
+        git.env(str::Str::new("GIT_AUTHOR_NAME"), str::Str::new("cryo fixture"));
+        git.env(str::Str::new("GIT_AUTHOR_EMAIL"), str::Str::new("fixture@cryo.invalid"));
+        git.env(str::Str::new("GIT_AUTHOR_DATE"), str::Str::new("2026-01-01T00:00:00Z"));
+        git.env(str::Str::new("GIT_COMMITTER_NAME"), str::Str::new("cryo fixture"));
+        git.env(str::Str::new("GIT_COMMITTER_EMAIL"), str::Str::new("fixture@cryo.invalid"));
+        git.env(str::Str::new("GIT_COMMITTER_DATE"), str::Str::new("2026-01-01T00:00:00Z"));
+        match (git.output()) {
+            Result::Ok(out) => {
+                if (!out.status().success()) { return Option::None; }
+                return match (str::Str::from_utf8(out.stdout())) {
+                    Result::Ok(text) => { Option::Some(String::from_str(text.trim())) }
+                    Result::Err(_)   => { Option::None }
+                };
+            }
+            Result::Err(_) => { return Option::None; }
+        }
+    }
+
+    /// Remove a project's `build/` folder, so what its steps write there is
+    /// this run's.  False when one is there that could not be removed.
+    static remove_build_folder(proj_dir: path::Path) -> boolean {
+        const build: path::PathBuf = proj_dir.join(str::Str::new("build"));
+        return !build.as_path().exists() || Directory::remove_all(build.as_path()).is_ok();
+    }
+
+    /// Where a project's steps capture their output, beside `stdout_path`.
+    /// The fixture's own command writes `stdout_path` only once every step
+    /// has exited 0, so its absence says a step failed.
+    static steps_path(stdout_path: Str) -> String {
+        return f"{stdout_path}.steps";
     }
 
     /// Where a project's command captures its stderr, beside `stdout_path`.
@@ -3120,7 +3723,9 @@ type struct Executor {
         // runner exit codes that converts failures into passes flips the
         // canary's exit to 0 and fails the canary project (and the suite)
         // instead of shipping silently.
-        const verb: string = if (spec.outcome == 0) { "project tests" } else { Executor::fixture_verb(spec.outcome) };
+        const verb: string = if (spec.outcome == 0) { "project tests" } else {
+            if (spec.outcome == 4) { "the command" } else { Executor::fixture_verb(spec.outcome) }
+        };
         const ec: i64 = st as i64;
         if (spec.fails) {
             passed = ec != 0;
@@ -3555,8 +4160,8 @@ type struct Executor {
         return 1;
     }
 
-    /// `cryo fetch`: resolve every dep against its remote, materialize
-    /// missing checkouts, and write `cryoconfig.lock`.  Reuses existing
+    /// `cryo fetch`: resolve every dep against its remote, extract the
+    /// files of each pinned commit, and write `cryoconfig.lock`.  Reuses existing
     /// lockfile entries when the cryoconfig spec is unchanged.
     static cmd_fetch(args: cli::ParsedArgs) -> int {
         return Executor::run_dep_resolve(args, dep_resolver::ResolveMode::Fetch);
@@ -3683,7 +4288,7 @@ type struct Executor {
             Option::None       => { String::new() }
         };
         const name: String = registry::VendorRegistry::text_field(&root, Str::new("name"),
-            Executor::derive_namespace(key.as_str()).as_str());
+            Executor::derive_namespace(key.as_str(), true).as_str());
 
         mut entry: registry::VendorEntry = registry::VendorEntry {
             key:            key.clone(),
