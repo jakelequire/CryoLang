@@ -27,6 +27,8 @@ import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::context::{ CodegenContext };
 import compiler::codegen::llvm_types::{ LBasicBlock, LIntPredicate, LType, LTypeKind, LValue };
 import compiler::types::compound::{ PointerType };
+import compiler::codegen::ops::expr_ops::{ OverflowOperation };
+import compiler::sema::helpers::{ is_negative_numeric_literal_expr };
 import compiler::types::type_base::{ Type };
 
 
@@ -206,7 +208,7 @@ type struct BinaryUnaryEmitter {
             const rhs: LValue = this.dispatch.codegen_rvalue(visitor, node.right);
             mut result: LValue = LValue::null();
             result = this.cg.expr_ops.codegen_binary(lhs_loaded, rhs, base_op, e.resolved_type, node.right.resolved_type,
-                node.append_entry, visitor, &node.unwind_cleanup, e.span);
+                e.resolved_type, node.append_entry, visitor, &node.unwind_cleanup, e.span);
             // Narrow-store fix: codegen_binary normalizes operand widths to
             // the wider of lhs/rhs, so when the LHS slot is a narrow int
             // (char / i8 / u8) and the RHS is wider, `result` is wider than
@@ -243,7 +245,7 @@ type struct BinaryUnaryEmitter {
         const rhs: LValue = this.dispatch.codegen_rvalue(visitor, node.right);
         mut result: LValue = LValue::null();
         result = this.cg.expr_ops.codegen_binary(lhs, rhs, op, node.left.resolved_type, node.right.resolved_type,
-            node.append_entry, visitor, &node.unwind_cleanup, e.span);
+            e.resolved_type, node.append_entry, visitor, &node.unwind_cleanup, e.span);
         out.value = result;
         out.is_lvalue = false;
         return out;
@@ -405,6 +407,11 @@ type struct BinaryUnaryEmitter {
                 updated = this.cg.builder.build_gep(
                     pointee_lty, old, buf, 1, "incdec.gep");
                 libc::free(buf);
+            } else if (this.cg.ctx.options.overflow_checks && op_t != null && op_t.kind == TypeKind::Int) {
+                const one: LValue = LType::const_int(ty, 1, false);
+                const step: OverflowOperation = if (op == TokenType::PlusPlus) { OverflowOperation::Add } else { OverflowOperation::Subtract };
+                updated = this.cg.expr_ops.emit_checked_arithmetic(step, old, one, op_t.int_kind().is_signed(),
+                    visitor, &node.unwind_cleanup, e.span);
             } else {
                 const one: LValue = LType::const_int(ty, 1, false);
                 updated = if (op == TokenType::PlusPlus) {
@@ -423,7 +430,11 @@ type struct BinaryUnaryEmitter {
         }
         const operand: LValue = this.dispatch.codegen_rvalue(visitor,node.operand);
         mut result: LValue = LValue::null();
-        result = this.cg.expr_ops.codegen_unary(operand, op, node.operand.resolved_type);
+        // A negated literal (`-128` as an `i8`) is one literal, whose range
+        // sema checked whole: no negation in it can overflow.
+        const checked: boolean = this.cg.ctx.options.overflow_checks && !is_negative_numeric_literal_expr(e);
+        result = this.cg.expr_ops.codegen_unary(operand, op, node.operand.resolved_type, checked,
+            visitor, &node.unwind_cleanup, e.span);
         out.value = result;
         out.is_lvalue = false;
         return out;

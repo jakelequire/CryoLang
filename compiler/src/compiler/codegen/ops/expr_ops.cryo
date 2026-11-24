@@ -37,6 +37,7 @@ import compiler::types::generic_registry::{ GenericRegistry };
 import compiler::resolver::lang_item::{ LangItem };
 import std::ffi::libc;
 import std::fmt;
+import std::collections::string::{ String };
 import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::codegen::abi::{ AbiClassifier, SignaturePlan };
 import compiler::codegen::llvm_types::{
@@ -63,6 +64,38 @@ import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ EnumType };
 import compiler::resolver::mangled_name::{ MangledName };
 
+
+/// An integer operation the build's `overflow_checks` checks, as
+/// `__cryo_panic_overflow` is told it: the runtime names the operation in
+/// its message by this code.
+type enum OverflowOperation {
+    Add;
+    Subtract;
+    Multiply;
+    Negate;
+}
+
+implement enum OverflowOperation {
+    /// The code `runtime/abi/lang_items.def` gives the operation.
+    code(&this) -> u32 {
+        return match (this) {
+            OverflowOperation::Add      => { 0 }
+            OverflowOperation::Subtract => { 1 }
+            OverflowOperation::Multiply => { 2 }
+            OverflowOperation::Negate   => { 3 }
+        };
+    }
+
+    /// The LLVM operation it is checked by; a negation is `0 - x`.
+    instruction(&this) -> string {
+        return match (this) {
+            OverflowOperation::Add      => { "add" }
+            OverflowOperation::Subtract => { "sub" }
+            OverflowOperation::Multiply => { "mul" }
+            OverflowOperation::Negate   => { "sub" }
+        };
+    }
+}
 
 type struct ExprOps {
     llvm_module: LModule*;
@@ -1491,24 +1524,19 @@ type struct ExprOps {
     /// comparison, logical short-circuit, and assignment operators.
     /// `append_entry` is the `append` a string `+` was bound to where it is
     /// written (`BinaryExpr::append_entry`).
+    /// `expression_type` is the type of the whole expression, the type an
+    /// overflow is judged against: an operand of another width or sign is
+    /// converted to it first.
     codegen_binary(mut &this, lhs_val: LValue, rhs_val: LValue, op_kind: TokenType, result_type: TypeRef, rhs_type: TypeRef,
-                   append_entry: OverloadId, visitor: mut IRGeneratorVisitor*, div_sched: [Stmt*]*, div_span: SourceSpan) -> LValue {
+                   expression_type: TypeRef, append_entry: OverloadId, visitor: mut IRGeneratorVisitor*,
+                   div_sched: [Stmt*]*, div_span: SourceSpan) -> LValue {
         mut out_value: LValue = LValue::null();
         if (!lhs_val.is_valid() || !rhs_val.is_valid()) {
             out_value = LValue::null();
             return out_value;
         }
         // Determine if this is integer, float, or pointer arithmetic.
-        // Follow InstantiatedType chain to get the concrete type.
-        mut t: Type* = this.arena_type(result_type);
-        mut bd: i32 = 0;
-        while (t != null && t.kind == TypeKind::InstantiatedType && bd < 5) {
-            const binst: InstantiatedType* = t.as_instantiated();
-            if (binst.has_resolved_type()) {
-                t = this.arena_type(binst.resolved_type);
-            } else { break; }
-            bd += 1;
-        }
+        const t: Type* = this.concrete_type(result_type);
         mut t_kind: TypeKind = TypeKind::Error;
         if (t != null) { t_kind = t.kind; }
 
@@ -1704,19 +1732,11 @@ type struct ExprOps {
         // RHS it must be zero-/sign-extended according to its own type, not
         // the left/result type's: pairing an unsigned narrow RHS (e.g. u16)
         // with a signed wider LHS (e.g. i32) and sign-extending it silently
-        // corrupts every value with the RHS's top bit set.  Follow the
-        // InstantiatedType chain exactly like `t` above so generic contexts
-        // behave identically to concrete ones.
+        // corrupts every value with the RHS's top bit set.  Read through the
+        // instantiation exactly like `t` above so generic contexts behave
+        // identically to concrete ones.
         mut rhs_is_signed: boolean = false;
-        mut rt: Type* = this.arena_type(rhs_type);
-        mut rbd: i32 = 0;
-        while (rt != null && rt.kind == TypeKind::InstantiatedType && rbd < 5) {
-            const rinst: InstantiatedType* = rt.as_instantiated();
-            if (rinst.has_resolved_type()) {
-                rt = this.arena_type(rinst.resolved_type);
-            } else { break; }
-            rbd += 1;
-        }
+        const rt: Type* = this.concrete_type(rhs_type);
         if (rt != null && rt.kind == TypeKind::Int) {
             const rint: IntegerKind = rt.int_kind();
             rhs_is_signed = rint.is_signed();
@@ -1826,28 +1846,49 @@ type struct ExprOps {
             return this.codegen_mixed_sign_compare(op_kind, is_signed, lhs, rhs);
         }
 
+        // Integer `+`, `-` and `*` of an integer type are checked for
+        // overflow where the build asks, against the whole expression's
+        // type and its sign; a pointer, `char` or boolean operand never
+        // reaches the check.
+        const et: Type* = this.concrete_type(expression_type);
+        const checked: boolean = this.ctx.options.overflow_checks && !is_float && t_kind == TypeKind::Int
+            && et != null && et.kind == TypeKind::Int
+            && LType::kind_of(llvm::LLVMTypeOf(lhs.raw)) == LTypeKind::Integer;
+        const checked_signed: boolean = checked && et.int_kind().is_signed();
         match (op_kind) {
             // Arithmetic
             TokenType::Plus => {
-                out_value = if (is_float) {
-                    this.builder.build_fadd(lhs, rhs, "addtmp")
+                if (checked) {
+                    out_value = this.emit_checked_arithmetic(OverflowOperation::Add, lhs, rhs, checked_signed, visitor, div_sched, div_span);
                 } else {
-                    this.builder.build_add(lhs, rhs, "addtmp")
-                };
+                    out_value = if (is_float) {
+                        this.builder.build_fadd(lhs, rhs, "addtmp")
+                    } else {
+                        this.builder.build_add(lhs, rhs, "addtmp")
+                    };
+                }
             }
             TokenType::Minus => {
-                out_value = if (is_float) {
-                    this.builder.build_fsub(lhs, rhs, "subtmp")
+                if (checked) {
+                    out_value = this.emit_checked_arithmetic(OverflowOperation::Subtract, lhs, rhs, checked_signed, visitor, div_sched, div_span);
                 } else {
-                    this.builder.build_sub(lhs, rhs, "subtmp")
-                };
+                    out_value = if (is_float) {
+                        this.builder.build_fsub(lhs, rhs, "subtmp")
+                    } else {
+                        this.builder.build_sub(lhs, rhs, "subtmp")
+                    };
+                }
             }
             TokenType::Star => {
-                out_value = if (is_float) {
-                    this.builder.build_fmul(lhs, rhs, "multmp")
+                if (checked) {
+                    out_value = this.emit_checked_arithmetic(OverflowOperation::Multiply, lhs, rhs, checked_signed, visitor, div_sched, div_span);
                 } else {
-                    this.builder.build_mul(lhs, rhs, "multmp")
-                };
+                    out_value = if (is_float) {
+                        this.builder.build_fmul(lhs, rhs, "multmp")
+                    } else {
+                        this.builder.build_mul(lhs, rhs, "multmp")
+                    };
+                }
             }
             TokenType::Slash => {
                 // Guard before the divide.  IEEE-754 fdiv is total
@@ -2111,6 +2152,49 @@ type struct ExprOps {
         this.builder.position_at_end(ok_bb);
     }
 
+    /// `ty` with any instantiation read through to the type it stands for.
+    concrete_type(&this, ty: TypeRef) -> Type* {
+        mut t: Type* = this.arena_type(ty);
+        mut depth: i32 = 0;
+        while (t != null && t.kind == TypeKind::InstantiatedType && depth < 5) {
+            const instance: InstantiatedType* = t.as_instantiated();
+            if (!instance.has_resolved_type()) { break; }
+            t = this.arena_type(instance.resolved_type);
+            depth += 1;
+        }
+        return t;
+    }
+
+    /// `lhs <operation> rhs` at the operands' width, checked: where the true
+    /// result leaves the range of the type (`is_signed` says which), the
+    /// runtime's `__cryo_panic_overflow` reports the operation and diverges;
+    /// otherwise the result.  A negation passes `0` as `lhs`.  Leaves the
+    /// builder at the block that continues with the result.
+    emit_checked_arithmetic(mut &this, operation: OverflowOperation, lhs: LValue, rhs: LValue, is_signed: boolean,
+                            visitor: mut IRGeneratorVisitor*, sched: [Stmt*]*, span: SourceSpan) -> LValue {
+        const ty: LType = LType { raw: llvm::LLVMTypeOf(lhs.raw) };
+        const width: u32 = llvm::LLVMGetIntTypeWidth(ty.raw);
+        mut name: String = fmt::format("llvm.%s%s.with.overflow.i%u",
+            if (is_signed) { "s" } else { "u" }, operation.instruction(), width);
+        const pair: LValue = this.intrinsics.emit_with_overflow(
+            MangledName::new(name.as_c_string() as string), ty, lhs, rhs);
+        const result: LValue = this.builder.build_extract_value(pair, 0, "ovf.value");
+        const overflowed: LValue = this.builder.build_extract_value(pair, 1, "ovf.flag");
+
+        const cur_bb: LBasicBlock = this.builder.get_insert_block();
+        const fn: LValue = cur_bb.get_parent();
+        const trap_bb: LBasicBlock = LBasicBlock::append(fn, "ovf.trap");
+        const ok_bb: LBasicBlock = LBasicBlock::append(fn, "ovf.ok");
+        this.builder.build_cond_br(overflowed, trap_bb, ok_bb);
+
+        this.builder.position_at_end(trap_bb);
+        mut ovf_ops: [LValue] = [LType::const_int(LType::i32(), operation.code() as u64, false)];
+        this.emit_check_failure(visitor, sched, span, MangledName::new("__cryo_panic_overflow"), &ovf_ops);
+
+        this.builder.position_at_end(ok_bb);
+        return result;
+    }
+
     /// Emit a runtime guard that aborts if `count * elem_size` - the byte
     /// count feeding an array `malloc` (`new T[n]`) - would overflow u64.
     /// A wrapped product mallocs a too-small block, after which the caller
@@ -2127,8 +2211,7 @@ type struct ExprOps {
     emit_array_mul_guard(mut &this, count_i64: LValue, elem_size: u64,
                          visitor: mut IRGeneratorVisitor*, ovf_sched: [Stmt*]*, ovf_span: SourceSpan) -> void {
         if (elem_size <= (1 as u64)) { return; }
-        const u64_max: u64 = (0 as u64) - (1 as u64);
-        const max_count: u64 = u64_max / elem_size;
+        const max_count: u64 = u64::MAX / elem_size;
         const max_val: LValue = LType::const_int(LType::i64(), max_count, false);
         const overflow: LValue = this.builder.build_icmp(
             LIntPredicate::UGT, count_i64, max_val, "new.arr.ovf");
@@ -2142,22 +2225,22 @@ type struct ExprOps {
         this.builder.build_cond_br(overflow, trap_bb, ok_bb);
 
         // Trap arm: the runtime's handler reports the failure and diverges,
-        // instead of a silently truncated allocation. `op` 2 = multiply: this
-        // guard is the array-size product, and the handler prints both
-        // operands, so it takes them raw rather than a pre-baked message.
+        // instead of a silently truncated allocation: the array's byte size
+        // is a multiplication that overflowed.
         this.builder.position_at_end(trap_bb);
-        mut ovf_ops: [LValue] = [
-            LType::const_int(LType::i32(), 2, false),
-            count_i64,
-            LType::const_int(LType::i64(), elem_size, false)
-        ];
+        const multiply: OverflowOperation = OverflowOperation::Multiply;
+        mut ovf_ops: [LValue] = [LType::const_int(LType::i32(), multiply.code() as u64, false)];
         this.emit_check_failure(visitor, ovf_sched, ovf_span, MangledName::new("__cryo_panic_overflow"), &ovf_ops);
 
         this.builder.position_at_end(ok_bb);
     }
 
     /// Generate IR for a unary expression.
-    codegen_unary(mut &this, operand: LValue, op_kind: TokenType, operand_type: TypeRef) -> LValue {
+    /// A negation of an integer type is checked for overflow where `checked`
+    /// says the build asks and the operand is no literal: `-MIN` of a signed
+    /// type, and `-x` of an unsigned one for every `x` but 0.
+    codegen_unary(mut &this, operand: LValue, op_kind: TokenType, operand_type: TypeRef, checked: boolean,
+                  visitor: mut IRGeneratorVisitor*, sched: [Stmt*]*, span: SourceSpan) -> LValue {
         mut out_value: LValue = LValue::null();
         const t: Type* = this.arena_type(operand_type);
         mut t_kind: TypeKind = TypeKind::Error;
@@ -2166,11 +2249,17 @@ type struct ExprOps {
 
         match (op_kind) {
             TokenType::Minus => {
-                out_value = if (is_float) {
-                    this.builder.build_fneg(operand, "negtmp")
+                if (checked && t_kind == TypeKind::Int) {
+                    const zero: LValue = LType::const_int(operand.type_of(), 0, false);
+                    out_value = this.emit_checked_arithmetic(OverflowOperation::Negate, zero, operand,
+                        t.int_kind().is_signed(), visitor, sched, span);
                 } else {
-                    this.builder.build_neg(operand, "negtmp")
-                };
+                    out_value = if (is_float) {
+                        this.builder.build_fneg(operand, "negtmp")
+                    } else {
+                        this.builder.build_neg(operand, "negtmp")
+                    };
+                }
             }
             TokenType::Exclaim => { out_value = this.builder.build_not(operand, "nottmp"); }
             TokenType::Tilde   => { out_value = this.builder.build_not(operand, "bnottmp"); }

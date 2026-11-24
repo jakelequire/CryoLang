@@ -16,7 +16,9 @@ import compiler::types::{ TypeKind };
 import compiler::types::arena::{ TypeArena };
 import compiler::types::type_base::{ Type };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::res::{ DefId, FamilyOwner, Res, ResBase, ResSlot };
+import std::fmt;
 import compiler::decl_index::{ DeclarationIndex, OverloadId };
 import compiler::intrinsic_kind::{ IntrinsicKind };
 import compiler::resolver::symbol_id::{ SymbolID };
@@ -407,6 +409,7 @@ type struct ExpressionNode {
             desugared_call:   null,
             desugar_by_bound: false,
             borrowed_as_pointer: false,
+            unwind_cleanup:   [],
         }), span);
     }
 
@@ -735,6 +738,40 @@ type struct ExpressionNode {
         };
     }
 
+    /// The source spelling of an expression the constant folder reads -
+    /// a literal, a name, a path, a cast, a prefix or a binary operator -
+    /// for a diagnostic that proposes a rewrite.  A binary operand is
+    /// parenthesized; a shape this does not spell reads as `..`.
+    static spell(e: ExpressionNode*, intern: InternTable*) -> string {
+        if (e == null) { return ".."; }
+        return match (e.kind) {
+            ExprKind::Literal(l)         => { l.value + l.suffix }
+            ExprKind::Identifier(i)      => { intern.resolve(i.name) }
+            ExprKind::ScopeResolution(s) => {
+                fmt::format("%s::%s", intern.resolve(s.scope_name), intern.resolve(s.member_name)).into_raw()
+            }
+            ExprKind::Cast(c) => {
+                fmt::format("(%s as %s)", ExpressionNode::spell_operand(c.expression, intern),
+                    TypeAnnotation::spell(c.target_annotation, intern)).into_raw()
+            }
+            ExprKind::Unary(u) => {
+                fmt::format("%s%s", u.op.kind.to_string(), ExpressionNode::spell_operand(u.operand, intern)).into_raw()
+            }
+            ExprKind::Binary(b) => {
+                fmt::format("%s %s %s", ExpressionNode::spell_operand(b.left, intern), b.op.kind.to_string(),
+                    ExpressionNode::spell_operand(b.right, intern)).into_raw()
+            }
+            _ => { ".." }
+        };
+    }
+
+    /// `spell`, parenthesized where `e` is a binary operator, so it reads
+    /// as one operand of another.
+    static spell_operand(e: ExpressionNode*, intern: InternTable*) -> string {
+        if (ExpressionNode::binary_of(e) == null) { return ExpressionNode::spell(e, intern); }
+        return fmt::format("(%s)", ExpressionNode::spell(e, intern)).into_raw();
+    }
+
     /// The `?` expression `e` is, or null.
     static try_of(e: ExpressionNode*) -> mut TryExpr* {
         if (e == null) { return null; }
@@ -1014,6 +1051,10 @@ type struct UnaryExpr {
     /// holds nothing yet, so the move check lets it name a local that is not
     /// initialised; a reference may not.
     borrowed_as_pointer: boolean;
+    /// `--panic=unwind` with overflow checks: the frame's local destructors
+    /// a checked `-`, `++` or `--` runs before its panic unwinds.  See
+    /// `CallExpr.unwind_cleanup`.
+    unwind_cleanup: [Stmt*];
 
     static walk_children<V>(n: UnaryExpr*, v: mut &V) -> void where V: Walk {
         v.walk_expr(n.operand);

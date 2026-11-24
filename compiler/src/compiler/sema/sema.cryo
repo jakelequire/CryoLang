@@ -3236,6 +3236,10 @@ type struct SemaVisitor {
                 if (bin.op.kind == TokenType::Equal) {
                     this.literals.refuse_narrowing_constant(bin.right, lhs);
                 }
+                if (bin.op.kind != TokenType::Equal
+                    && this.refuse_negative_operand_of_unsigned(bin.op.kind, bin.left, lhs, bin.right, false, e.span)) {
+                    return lhs;
+                }
             } else {
                 rhs = this.resolve_expr(bin.right);
             }
@@ -3520,6 +3524,7 @@ type struct SemaVisitor {
                     if (de != null) { bin.desugared_call = de; return de.resolved_type; }
                 }
                 this.pin_string_append(bin, bin.op.kind, lhs);
+                this.refuse_constant_overflow(e, bin.op.kind, bin.left, bin.right, result.result_type);
                 return result.result_type;
             }
             // Phase 1: `check_binary_op` rejected - a concrete user type with a
@@ -3552,7 +3557,10 @@ type struct SemaVisitor {
                 refused.help = this.value_beside_address_help(bin, lhs, rhs, map);
                 this.refuse_binary_operation(refused, e.span);
             } else {
-                this.refuse_binary_operation(result, e.span);
+                const negative_refused: boolean = !is_shift && !bin.op.kind.yields_boolean()
+                    && (this.refuse_negative_operand_of_unsigned(bin.op.kind, bin.left, lhs, bin.right, false, e.span)
+                        || this.refuse_negative_operand_of_unsigned(bin.op.kind, bin.right, rhs, bin.left, true, e.span));
+                if (!negative_refused) { this.refuse_binary_operation(result, e.span); }
             }
             // A refused operation computes no value, so what holds it
             // reports nothing more; a comparison is still a `boolean`.
@@ -3564,6 +3572,221 @@ type struct SemaVisitor {
         if (lhs.is_valid()) { return lhs; }
         if (rhs.is_valid()) { return rhs; }
         return TypeRef::invalid();
+    }
+
+    /// Refuse an operation `op` - a compound assignment (E0200) or a binary
+    /// operator (E0229) - between `unsigned_operand`, of the unsigned type
+    /// `unsigned_type`, and `negative`, a negative number made by arithmetic
+    /// on literals (`b += -1`, `x + (0 - 1)`): the number keeps its default
+    /// type, since no unsigned type holds it, and adopting the unsigned type
+    /// would make it a huge value that overflows where the written arithmetic
+    /// does not.  `negative_first` when `negative` is the left operand.  The
+    /// help writes the operation the program can mean.  True when it reported.
+    refuse_negative_operand_of_unsigned(mut &this, op: TokenType, unsigned_operand: ExpressionNode*, unsigned_type: TypeRef,
+                                        negative: ExpressionNode*, negative_first: boolean, span: SourceSpan) -> boolean {
+        const target: Type* = this.arena.lookup(unsigned_type);
+        if (target == null || target.kind != TypeKind::Int || target.int_kind().is_signed()) { return false; }
+        match (this.literals.operand_type_of_literal_value(negative, unsigned_type)) {
+            Option::Some(operand_type) => { if (operand_type.is_valid()) { return false; } }
+            Option::None => { return false; }
+        }
+        const folded: Option<i128> = try_fold_const_integer(negative);
+        if (folded.is_none() || folded.unwrap() >= 0) { return false; }
+        const compound: boolean = op.is_assignment_op();
+        const base: TokenType = if (compound) { op.compound_base() } else { op };
+        const value: string = folded.unwrap().to_decimal_string();
+        const magnitude: i128 = 0 - folded.unwrap();
+        const shown_magnitude: string = magnitude.to_decimal_string();
+        const type_name: string = this.types.type_display_name(unsigned_type);
+        const written: string = this.calls.place_text(unsigned_operand);
+        const place: string = if (written.length() > 0) { written } else { "value" };
+        mut refusal: Diagnostic = Diagnostic::error(
+            if (compound) { ErrorCode::E0200_TYPE_MISMATCH } else { ErrorCode::E0229_INVALID_BINARY_OP },
+            fmt::format("`%s` on a `%s` takes `%s`, a negative value no `%s` holds",
+                op.to_string(), type_name, value, type_name));
+        refusal = refusal.at_with_label(span, "a negative value beside an unsigned operand");
+        // The operation written with the magnitude: `b -= 1` for `b += -1`,
+        // `x - 1` for `x + -1`.  A negative value a number is subtracted
+        // from has no such form.
+        mut opposite: TokenType = match (base) {
+            TokenType::Plus           => { TokenType::Minus }
+            TokenType::Minus          => { TokenType::Plus }
+            TokenType::LessLess       => { TokenType::GreaterGreater }
+            TokenType::GreaterGreater => { TokenType::LessLess }
+            _                         => { TokenType::Unknown }
+        };
+        if (negative_first && base == TokenType::Minus) { opposite = TokenType::Unknown; }
+        if (opposite != TokenType::Unknown) {
+            const verb: string = match (opposite) {
+                TokenType::Minus    => { "subtract" }
+                TokenType::Plus     => { "add" }
+                TokenType::LessLess => { "shift left by" }
+                _                   => { "shift right by" }
+            };
+            refusal = refusal.help_with_example(fmt::format("to %s %s, write", verb, shown_magnitude),
+                if (compound) { fmt::format("%s %s= %s", place, opposite.to_string(), shown_magnitude) }
+                else { fmt::format("%s %s %s", place, opposite.to_string(), shown_magnitude) });
+        } else if (base == TokenType::Amp || base == TokenType::Pipe || base == TokenType::Caret) {
+            // A compound's operand is typed by its target; a binary operand
+            // names its type, which no surrounding expected type supplies.
+            const complement: string = (magnitude - 1).to_decimal_string();
+            refusal = refusal.help_with_example(
+                fmt::format("for the bits of %s at `%s`'s width, write its complement", value, type_name),
+                if (compound) { fmt::format("%s %s ~%s", place, op.to_string(), complement) }
+                else { fmt::format("%s %s ~(%s as %s)", place, op.to_string(), complement, type_name) });
+        } else if (base == TokenType::Star) {
+            refusal = refusal.help_with_example(
+                fmt::format("where the wrapped product is meant, say so: `wrapping_multiply` by the bit pattern of %s wraps in every profile", value),
+                if (compound) { fmt::format("%s = %s.wrapping_multiply(%s as %s)", place, place, value, type_name) }
+                else { fmt::format("%s.wrapping_multiply(%s as %s)", place, value, type_name) });
+        } else {
+            // The narrowest signed type holding every value of the target;
+            // a 128-bit target has none, so its sign is computed in `i128`.
+            const bits: u64 = target.int_kind().bit_width();
+            const signed_width: string = (if (bits >= 64) { 128 as u64 } else { bits * 2 }).to_decimal_string();
+            const signed_operand: string = fmt::format("(%s as i%s)", place, signed_width).into_raw();
+            const operation: string = if (negative_first) { fmt::format("%s %s %s", value, base.to_string(), signed_operand).into_raw() }
+                else { fmt::format("%s %s %s", signed_operand, base.to_string(), value).into_raw() };
+            refusal = refusal.help_with_example(
+                fmt::format("to compute with the sign, convert to `i%s`", signed_width),
+                if (compound) { fmt::format("%s = (%s) as %s", place, operation, type_name) } else { fmt::format("%s", operation) });
+        }
+        this.ctx.emit_diagnostic(refusal);
+        return true;
+    }
+
+    /// Refuse (E0465) an integer `+`, `-`, `*` or `/`, or a negation (`left`
+    /// null), of type `result` whose operands fold to constants and whose
+    /// true result `result` does not hold: it overflows whenever it runs, a
+    /// panic where the build checks for overflow and a wrapped value where it
+    /// does not, so it is refused in every profile.  A `%` is refused where
+    /// the division it is the remainder of overflows (`i32::MIN % -1`): its
+    /// true value 0 fits, but computing it panics in every profile.  An
+    /// operand its own type does not hold was refused where it was
+    /// computed, so it reports nothing more here; a division by a constant
+    /// zero is no overflow.
+    refuse_constant_overflow(&this, e: ExpressionNode*, op: TokenType, left: ExpressionNode*, right: ExpressionNode*,
+                             result: TypeRef) -> void {
+        if (op != TokenType::Plus && op != TokenType::Minus && op != TokenType::Star && op != TokenType::Slash
+            && op != TokenType::Percent) { return; }
+        const t: Type* = this.arena.lookup(result);
+        if (t == null || t.kind != TypeKind::Int) { return; }
+        // An expression made only of literals, stored where an integer is
+        // expected, is its exact value, which the literal rule judges whole
+        // against the place's type (E0010).
+        const expected: Type* = if (this.state.expected_type.is_valid()) { this.arena.lookup(this.state.expected_type) } else { null };
+        if (is_constant_numeric_expr(e) && expected != null && expected.kind == TypeKind::Int) { return; }
+        const evaluator: ConstEval = ConstEval::new(this.ctx.const_table, this.ctx.intern_table, null);
+        const operands: [ExpressionNode*] = if (left == null) { [right] } else { [left, right] };
+        mut values: [FoldedInteger] = [];
+        for (mut i: i64 = 0; i < operands.length(); i++) {
+            const operand_type: Type* = this.arena.lookup(operands[i].resolved_type);
+            if (operand_type == null || operand_type.kind != TypeKind::Int) { return; }
+            match (evaluator.fold(operands[i])) {
+                Option::Some(value) => {
+                    if (!value.held_in(operand_type.int_kind().bit_width(), operand_type.int_kind().is_signed())) { return; }
+                    values.push(value);
+                }
+                Option::None => { return; }
+            }
+        }
+        const width: u64 = t.int_kind().bit_width();
+        const signed: boolean = t.int_kind().is_signed();
+        // A remainder is computed by the division it is the remainder of,
+        // so that division's quotient is what must be held.
+        const remainder: boolean = op == TokenType::Percent;
+        const computed: Option<FoldedInteger> = if (left == null) { values[0].negate() }
+            else { values[0].apply(if (remainder) { TokenType::Slash } else { op }, values[1]) };
+        if ((op == TokenType::Slash || remainder) && computed.is_none()) { return; }
+        if (computed.is_some() && computed.unwrap().held_in(width, signed)) { return; }
+
+        const intern: InternTable* = this.ctx.intern_table;
+        const written: string = ExpressionNode::spell(e, intern);
+        const type_name: string = this.types.type_display_name(result);
+        if (remainder) {
+            // The quotient is one past the type's maximum, which the next
+            // wider type holds, and in it the remainder is computed without
+            // a panic; a 128-bit type has no wider one, so its remainder is
+            // written as the value it is.
+            const quotient: FoldedInteger = computed.unwrap();
+            mut panics: Diagnostic = Diagnostic::error(ErrorCode::E0465_CONSTANT_OVERFLOW,
+                fmt::format("`%s` always panics: the division it is the remainder of has the quotient %s, which `%s` does not hold",
+                    written, quotient.to_decimal_string(), type_name));
+            panics = panics.at_with_label(e.span, "this panics whenever it runs, so it is refused in every profile");
+            match (values[0].apply(op, values[1])) {
+                Option::Some(value) => {
+                    if (width < 128) {
+                        const wider: string = fmt::format("i%s", (width * 2).to_decimal_string()).into_raw();
+                        panics = panics.help_with_example(
+                            fmt::format("where the remainder %s is meant, compute it in `%s`, which holds the quotient",
+                                value.to_decimal_string(), wider),
+                            fmt::format("(%s as %s) %s %s", ExpressionNode::spell_operand(left, intern), wider,
+                                op.to_string(), ExpressionNode::spell_operand(right, intern)));
+                    } else {
+                        panics = panics.help_with_example(
+                            fmt::format("no integer type holds the quotient; where the remainder %s is meant, write it",
+                                value.to_decimal_string()),
+                            value.to_decimal_string());
+                    }
+                }
+                Option::None => { }
+            }
+            this.ctx.emit_diagnostic(panics);
+            return;
+        }
+        mut refusal: Diagnostic = Diagnostic::error(ErrorCode::E0465_CONSTANT_OVERFLOW,
+            if (computed.is_some()) {
+                fmt::format("`%s` overflows `%s`: its value is %s, which `%s` does not hold",
+                    written, type_name, computed.unwrap().to_decimal_string(), type_name)
+            } else {
+                fmt::format("`%s` overflows `%s`: its value is past the range of every integer type", written, type_name)
+            });
+        refusal = refusal.at_with_label(e.span, "this overflows whenever it runs, so it is refused in every profile");
+        // The value is kept by computing in the narrowest type that holds it
+        // and every value of `result`, so the other operand converts to it.
+        if (computed.is_some()) {
+            mut wider: string = "";
+            for (mut bits: u64 = width * 2; bits <= 128 && wider.is_empty(); bits = bits * 2) {
+                if (!signed && computed.unwrap().held_in(bits, false)) { wider = fmt::format("u%s", bits.to_decimal_string()).into_raw(); }
+                if (wider.is_empty() && computed.unwrap().held_in(bits, true)) { wider = fmt::format("i%s", bits.to_decimal_string()).into_raw(); }
+            }
+            if (!wider.is_empty()) {
+                refusal = refusal.help_with_example(
+                    fmt::format("where the value %s is meant, compute and keep it in `%s`, which holds it",
+                        computed.unwrap().to_decimal_string(), wider),
+                    if (left == null) {
+                        fmt::format("-(%s as %s)", ExpressionNode::spell_operand(right, intern), wider)
+                    } else {
+                        fmt::format("(%s as %s) %s %s", ExpressionNode::spell_operand(left, intern), wider, op.to_string(),
+                            ExpressionNode::spell_operand(right, intern))
+                    });
+            }
+        }
+        // A wrapped value is said so with the method that wraps in every
+        // profile, on a receiver of the expression's own type.
+        if (op != TokenType::Slash) {
+            const receiver_expression: ExpressionNode* = if (left == null) { right } else { left };
+            const named: boolean = ExpressionNode::identifier_of(receiver_expression) != null
+                || ExpressionNode::scope_resolution_of(receiver_expression) != null
+                || ExpressionNode::cast_of(receiver_expression) != null;
+            const receiver: string = if (named && receiver_expression.resolved_type.equals(result)) {
+                ExpressionNode::spell(receiver_expression, intern)
+            } else {
+                fmt::format("(%s as %s)", ExpressionNode::spell_operand(receiver_expression, intern), type_name).into_raw()
+            };
+            const method: string = if (left == null) { "wrapping_negate" } else {
+                match (op) {
+                    TokenType::Plus => { "wrapping_add" }
+                    TokenType::Star => { "wrapping_multiply" }
+                    _               => { "wrapping_subtract" }
+                }
+            };
+            refusal = refusal.help_with_example(
+                fmt::format("where the wrapped value is meant, say so: `%s` wraps in every profile", method),
+                if (left == null) { fmt::format("%s.%s()", receiver, method) }
+                else { fmt::format("%s.%s(%s)", receiver, method, ExpressionNode::spell(right, intern)) });
+        }
+        this.ctx.emit_diagnostic(refusal);
     }
 
     /// Whether a binary operation is decided by the pointer rules alone,
@@ -4265,6 +4488,10 @@ type struct SemaVisitor {
         if (unary.op.kind == TokenType::Amp && this.types.gives_write_access(this.state.expected_type)) {
             unary.operand = this.borrow_for_writing(unary.operand, e.span);
             return this.arena.get_reference_to(operand_type, RefMutability::Mutable);
+        }
+        // A negated literal is one literal, whose range is checked whole.
+        if (unary.op.kind == TokenType::Minus && !is_negative_numeric_literal_expr(e)) {
+            this.refuse_constant_overflow(e, TokenType::Minus, null, unary.operand, result.result_type);
         }
         return result.result_type;
     }

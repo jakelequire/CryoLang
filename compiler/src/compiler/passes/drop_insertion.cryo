@@ -4572,16 +4572,28 @@ type struct DropInserter {
         // cleanup landing pad runs them.  An operator-overloaded form
         // (desugared_call set) lowers instead to an ordinary call that carries
         // its own schedule.
-        if (this.ctx.options.unwinds() && b.desugared_call == null
-            && (b.op.kind == TokenType::Slash        || b.op.kind == TokenType::Percent
-             || b.op.kind == TokenType::SlashEqual   || b.op.kind == TokenType::PercentEqual)) {
+        // With overflow checks, `+`, `-`, `*` and their compound forms raise
+        // the same way.
+        const divides: boolean = b.op.kind == TokenType::Slash || b.op.kind == TokenType::Percent
+            || b.op.kind == TokenType::SlashEqual || b.op.kind == TokenType::PercentEqual;
+        const checked: boolean = this.ctx.options.overflow_checks
+            && (b.op.kind == TokenType::Plus      || b.op.kind == TokenType::Minus      || b.op.kind == TokenType::Star
+             || b.op.kind == TokenType::PlusEqual || b.op.kind == TokenType::MinusEqual || b.op.kind == TokenType::StarEqual);
+        if (this.ctx.options.unwinds() && b.desugared_call == null && (divides || checked)) {
             this.snapshot_unwind_cleanup(&b.unwind_cleanup);
         }
     }
 
-    read_unary(mut &this, u: UnaryExpr*) -> void {
+    read_unary(mut &this, u: mut UnaryExpr*) -> void {
         if (u == null) { return; }
         if (u.operand != null) { this.walk_expr_read(u.operand); }
+        // With overflow checks a `-`, `++` or `--` raises through
+        // `__cryo_panic` on overflow; snapshot the frame's live-local drops
+        // for its cleanup landing pad.
+        if (this.ctx.options.unwinds() && this.ctx.options.overflow_checks && u.desugared_call == null
+            && (u.op.kind == TokenType::Minus || u.op.kind == TokenType::PlusPlus || u.op.kind == TokenType::MinusMinus)) {
+            this.snapshot_unwind_cleanup(&u.unwind_cleanup);
+        }
     }
 
     read_member(mut &this, ma: MemberAccessExpr*) -> void {

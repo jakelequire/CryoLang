@@ -92,6 +92,46 @@ type struct IntegerKind {
         if (shift == 0) { return low; }
         return ((low << (shift as u128)) | (low >> ((this.width - shift) as u128))) & this.mask();
     }
+
+    /// Whether `left operation right`, both stored at this type, has a true
+    /// result outside the type's range: where the build checks for overflow,
+    /// a panic.  `wrapped` is the operation's result reduced to the width.
+    /// Only addition, subtraction and multiplication overflow; a negation is
+    /// `0 - x`.
+    overflowed(&this, operation: IntegerOperation, left: u128, right: u128, wrapped: u128) -> boolean {
+        // A signed sum or difference overflows exactly when it takes the sign
+        // its left operand does not have though the operands' signs allow no
+        // change: alike for a sum, unlike for a difference.
+        const sign_changed: boolean = this.is_negative(wrapped) != this.is_negative(left);
+        const signs_alike: boolean = this.is_negative(left) == this.is_negative(right);
+        match (operation) {
+            IntegerOperation::Add => {
+                if (this.signed) { return signs_alike && sign_changed; }
+                return wrapped < left;
+            }
+            IntegerOperation::Subtract => {
+                if (this.signed) { return !signs_alike && sign_changed; }
+                return right > left;
+            }
+            IntegerOperation::Multiply => { return this.product_overflowed(left, right); }
+            _ => { return false; }
+        }
+    }
+
+    /// Whether the true product of `left` and `right`, stored at this type,
+    /// is outside its range: the magnitudes' product past the bound of the
+    /// product's sign.
+    product_overflowed(&this, left: u128, right: u128) -> boolean {
+        const a: TrueValue = TrueValue::of(*this, left);
+        const b: TrueValue = TrueValue::of(*this, right);
+        if (a.magnitude == 0 || b.magnitude == 0) { return false; }
+        const magnitude: u128 = a.magnitude.wrapping_multiply(b.magnitude);
+        if (magnitude / a.magnitude != b.magnitude) { return true; }
+        if (!this.signed) { return magnitude > this.mask(); }
+        // The least value's magnitude is one past the greatest's.
+        const greatest: u128 = this.mask() >> 1;
+        return if (a.negative != b.negative) { magnitude > greatest + 1 } else { magnitude > greatest };
+    }
 }
 
 /// The value of a stored integer, as a sign and a magnitude, so two
@@ -111,7 +151,7 @@ type struct TrueValue {
     /// one beyond that range keeps its low 64 bits.
     signed_value(&this) -> i64 {
         const low: i64 = this.magnitude as i64;
-        if (this.negative) { return 0 - low; }
+        if (this.negative) { return low.wrapping_negate(); }
         return low;
     }
 
@@ -185,6 +225,17 @@ implement enum IntegerFault {
 }
 
 implement enum IntegerOperation {
+    /// The runtime's panic message where this operation overflows under the
+    /// build's overflow checks; `negated` for a negation, which is `0 - x`.
+    overflow_message(&this, negated: boolean) -> string {
+        if (negated) { return "attempt to negate with overflow"; }
+        return match (this) {
+            IntegerOperation::Add      => { "attempt to add with overflow" }
+            IntegerOperation::Subtract => { "attempt to subtract with overflow" }
+            _                          => { "attempt to multiply with overflow" }
+        };
+    }
+
     /// `left op right` at `kind`, both operands stored at `kind`.  Addition,
     /// subtraction and multiplication wrap: the exact result modulo 2^width
     /// is the low bits of the 128-bit result, which `reduce` keeps.
@@ -221,7 +272,7 @@ implement enum IntegerOperation {
         // the sign of the operands' product, the remainder the dividend's.
         const magnitude: u128 = if (remainder) { a.magnitude % b.magnitude } else { a.magnitude / b.magnitude };
         const negative: boolean = if (remainder) { a.negative } else { a.negative != b.negative };
-        const bits: u128 = if (negative) { (~magnitude) + 1 } else { magnitude };
+        const bits: u128 = if (negative) { magnitude.wrapping_negate() } else { magnitude };
         return IntegerResult::ok(kind.reduce(bits));
     }
 
