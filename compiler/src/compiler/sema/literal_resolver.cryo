@@ -20,7 +20,7 @@ import compiler::lex;
 import compiler::lex::{ Token, TokenType };
 import compiler::lex::lexer::{ Lexer };
 import compiler::ast::{ LiteralKind, ObjectForm };
-import compiler::ast::expression::{ ExpressionNode, LiteralExpr };
+import compiler::ast::expression::{ BinaryExpr, ExpressionNode, LiteralExpr, UnaryExpr };
 import compiler::const_table::{ ConstEval };
 import compiler::diag::{ ErrorCode };
 import compiler::compilation_context::{ CompilationContext };
@@ -464,11 +464,13 @@ type struct LiteralResolver {
     /// type and the operation widens `peer` or is refused, where adopting
     /// `peer` would compute another number (`-129` beside an `i8` is 127).
     /// None when `operand` is not made only of integer literals or `peer` is
-    /// not an integer type, and when the value is negative and `peer`
-    /// unsigned: a complement of a literal there (`x & ~0xFF` with `x: u32`)
-    /// is a bit pattern of `peer`'s width rather than a negative number, and
-    /// is typed as any other constant operand is.  None as well when a
-    /// literal in `operand` carries a type suffix: the suffix types it.
+    /// not an integer type, and when the value is negative, `peer` unsigned
+    /// and `operand` a bitwise operation: a complement of a literal there
+    /// (`x & ~0xFF` with `x: u32`) is a bit pattern of `peer`'s width rather
+    /// than a negative number, and is typed as any other constant operand
+    /// is.  A negative value made by arithmetic (`-1`, `0 - 1`) is a number
+    /// no unsigned type holds, so it keeps its default type.  None as well
+    /// when a literal in `operand` carries a type suffix: the suffix types it.
     operand_type_of_literal_value(&this, operand: ExpressionNode*, peer: TypeRef) -> Option<TypeRef> {
         if (!is_constant_numeric_expr(operand) || sema_expr_has_numeric_suffix(operand)) { return Option::None; }
         const folded: Option<i128> = try_fold_const_integer(operand);
@@ -477,7 +479,15 @@ type struct LiteralResolver {
         if (t == null || t.kind != TypeKind::Int) { return Option::None; }
         const it: IntegerKind = t.int_kind();
         const value: i128 = folded.unwrap();
-        if (value < 0 && !it.is_signed()) { return Option::None; }
+        if (value < 0 && !it.is_signed()) {
+            const negation: UnaryExpr* = ExpressionNode::unary_of(operand);
+            const operation: BinaryExpr* = ExpressionNode::binary_of(operand);
+            const arithmetic: boolean = (negation != null && negation.op.kind == TokenType::Minus)
+                || (operation != null && (operation.op.kind == TokenType::Plus || operation.op.kind == TokenType::Minus
+                    || operation.op.kind == TokenType::Star || operation.op.kind == TokenType::Slash
+                    || operation.op.kind == TokenType::Percent));
+            return if (arithmetic) { Option::Some(TypeRef::invalid()) } else { Option::None };
+        }
         const held: boolean = sema_int_unsigned_bound(it.narrowest_bit_width()) == 0
             || LiteralResolver::holds_value(it, value);
         return Option::Some(if (held) { peer } else { TypeRef::invalid() });

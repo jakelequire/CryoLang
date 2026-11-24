@@ -3236,6 +3236,10 @@ type struct SemaVisitor {
                 if (bin.op.kind == TokenType::Equal) {
                     this.literals.refuse_narrowing_constant(bin.right, lhs);
                 }
+                if (bin.op.kind != TokenType::Equal
+                    && this.refuse_negative_operand_of_unsigned(bin.op.kind, bin.left, lhs, bin.right, false, e.span)) {
+                    return lhs;
+                }
             } else {
                 rhs = this.resolve_expr(bin.right);
             }
@@ -3553,7 +3557,10 @@ type struct SemaVisitor {
                 refused.help = this.value_beside_address_help(bin, lhs, rhs, map);
                 this.refuse_binary_operation(refused, e.span);
             } else {
-                this.refuse_binary_operation(result, e.span);
+                const negative_refused: boolean = !is_shift && !bin.op.kind.yields_boolean()
+                    && (this.refuse_negative_operand_of_unsigned(bin.op.kind, bin.left, lhs, bin.right, false, e.span)
+                        || this.refuse_negative_operand_of_unsigned(bin.op.kind, bin.right, rhs, bin.left, true, e.span));
+                if (!negative_refused) { this.refuse_binary_operation(result, e.span); }
             }
             // A refused operation computes no value, so what holds it
             // reports nothing more; a comparison is still a `boolean`.
@@ -3565,6 +3572,87 @@ type struct SemaVisitor {
         if (lhs.is_valid()) { return lhs; }
         if (rhs.is_valid()) { return rhs; }
         return TypeRef::invalid();
+    }
+
+    /// Refuse an operation `op` - a compound assignment (E0200) or a binary
+    /// operator (E0229) - between `unsigned_operand`, of the unsigned type
+    /// `unsigned_type`, and `negative`, a negative number made by arithmetic
+    /// on literals (`b += -1`, `x + (0 - 1)`): the number keeps its default
+    /// type, since no unsigned type holds it, and adopting the unsigned type
+    /// would make it a huge value that overflows where the written arithmetic
+    /// does not.  `negative_first` when `negative` is the left operand.  The
+    /// help writes the operation the program can mean.  True when it reported.
+    refuse_negative_operand_of_unsigned(mut &this, op: TokenType, unsigned_operand: ExpressionNode*, unsigned_type: TypeRef,
+                                        negative: ExpressionNode*, negative_first: boolean, span: SourceSpan) -> boolean {
+        const target: Type* = this.arena.lookup(unsigned_type);
+        if (target == null || target.kind != TypeKind::Int || target.int_kind().is_signed()) { return false; }
+        match (this.literals.operand_type_of_literal_value(negative, unsigned_type)) {
+            Option::Some(operand_type) => { if (operand_type.is_valid()) { return false; } }
+            Option::None => { return false; }
+        }
+        const folded: Option<i128> = try_fold_const_integer(negative);
+        if (folded.is_none() || folded.unwrap() >= 0) { return false; }
+        const compound: boolean = op.is_assignment_op();
+        const base: TokenType = if (compound) { op.compound_base() } else { op };
+        const value: string = folded.unwrap().to_decimal_string();
+        const magnitude: i128 = 0 - folded.unwrap();
+        const shown_magnitude: string = magnitude.to_decimal_string();
+        const type_name: string = this.types.type_display_name(unsigned_type);
+        const written: string = this.calls.place_text(unsigned_operand);
+        const place: string = if (written.length() > 0) { written } else { "value" };
+        mut refusal: Diagnostic = Diagnostic::error(
+            if (compound) { ErrorCode::E0200_TYPE_MISMATCH } else { ErrorCode::E0229_INVALID_BINARY_OP },
+            fmt::format("`%s` on a `%s` takes `%s`, a negative value no `%s` holds",
+                op.to_string(), type_name, value, type_name));
+        refusal = refusal.at_with_label(span, "a negative value beside an unsigned operand");
+        // The operation written with the magnitude: `b -= 1` for `b += -1`,
+        // `x - 1` for `x + -1`.  A negative value a number is subtracted
+        // from has no such form.
+        mut opposite: TokenType = match (base) {
+            TokenType::Plus           => { TokenType::Minus }
+            TokenType::Minus          => { TokenType::Plus }
+            TokenType::LessLess       => { TokenType::GreaterGreater }
+            TokenType::GreaterGreater => { TokenType::LessLess }
+            _                         => { TokenType::Unknown }
+        };
+        if (negative_first && base == TokenType::Minus) { opposite = TokenType::Unknown; }
+        if (opposite != TokenType::Unknown) {
+            const verb: string = match (opposite) {
+                TokenType::Minus    => { "subtract" }
+                TokenType::Plus     => { "add" }
+                TokenType::LessLess => { "shift left by" }
+                _                   => { "shift right by" }
+            };
+            refusal = refusal.help_with_example(fmt::format("to %s %s, write", verb, shown_magnitude),
+                if (compound) { fmt::format("%s %s= %s", place, opposite.to_string(), shown_magnitude) }
+                else { fmt::format("%s %s %s", place, opposite.to_string(), shown_magnitude) });
+        } else if (base == TokenType::Amp || base == TokenType::Pipe || base == TokenType::Caret) {
+            // A compound's operand is typed by its target; a binary operand
+            // names its type, which no surrounding expected type supplies.
+            const complement: string = (magnitude - 1).to_decimal_string();
+            refusal = refusal.help_with_example(
+                fmt::format("for the bits of %s at `%s`'s width, write its complement", value, type_name),
+                if (compound) { fmt::format("%s %s ~%s", place, op.to_string(), complement) }
+                else { fmt::format("%s %s ~(%s as %s)", place, op.to_string(), complement, type_name) });
+        } else if (base == TokenType::Star) {
+            refusal = refusal.help_with_example(
+                fmt::format("where the wrapped product is meant, say so: `wrapping_multiply` by the bit pattern of %s wraps in every profile", value),
+                if (compound) { fmt::format("%s = %s.wrapping_multiply(%s as %s)", place, place, value, type_name) }
+                else { fmt::format("%s.wrapping_multiply(%s as %s)", place, value, type_name) });
+        } else {
+            // The narrowest signed type holding every value of the target;
+            // a 128-bit target has none, so its sign is computed in `i128`.
+            const bits: u64 = target.int_kind().bit_width();
+            const signed_width: string = (if (bits >= 64) { 128 as u64 } else { bits * 2 }).to_decimal_string();
+            const signed_operand: string = fmt::format("(%s as i%s)", place, signed_width).into_raw();
+            const operation: string = if (negative_first) { fmt::format("%s %s %s", value, base.to_string(), signed_operand).into_raw() }
+                else { fmt::format("%s %s %s", signed_operand, base.to_string(), value).into_raw() };
+            refusal = refusal.help_with_example(
+                fmt::format("to compute with the sign, convert to `i%s`", signed_width),
+                if (compound) { fmt::format("%s = (%s) as %s", place, operation, type_name) } else { fmt::format("%s", operation) });
+        }
+        this.ctx.emit_diagnostic(refusal);
+        return true;
     }
 
     /// Refuse (E0465) an integer `+`, `-`, `*` or `/`, or a negation (`left`
