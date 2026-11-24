@@ -24,6 +24,7 @@ import std::core::hash::{ Hash, Hasher };
 import std::core::iter::{ Iterator };
 import std::collections::string::{ String };
 import std::collections::pair::{ Pair };
+import std::encoding::utf8::{ Utf8, DecodedScalar };
 import std::ffi::libc;
 
 /// A read-only view of UTF-8 text owned elsewhere: a string literal, a
@@ -78,22 +79,31 @@ public type struct Str {
         };
     }
 
+    /// The scalar at byte `position` of `[bytes, bytes + length)` as
+    /// `chars` reads it: the well-formed scalar there, or U+FFFD over one
+    /// byte where the bytes are not UTF-8, so a reader advancing by its
+    /// length never stalls. Requires `position < length`.
+    private static lenient_scalar_at(bytes: u8*, length: i64, position: i64) -> DecodedScalar {
+        return match (Utf8::decode_at(Slice::from_raw(bytes, length), position)) {
+            Option::Some(decoded) => { decoded }
+            Option::None => { DecodedScalar { scalar: REPLACEMENT_SCALAR, length: 1 } }
+        };
+    }
+
     /// Borrow `bytes` as a `Str` if they are well-formed UTF-8: the checked
     /// constructor, where `from` and `from_raw` take the caller's word for
     /// it. Overlong forms, surrogate halves, scalars above U+10FFFF and a
-    /// sequence cut short are refused, and the error says where.
+    /// sequence cut short are refused (`Utf8::decode_at` decides), and the
+    /// error says where.
     public static from_utf8(bytes: &Slice<u8>) -> Result<Str, Utf8Error> {
         const start: u8* = bytes.as_pointer();
         const length: i64 = bytes.length();
         mut position: i64 = 0;
         while (position < length) {
-            const step: Pair<u32, i64> = decode_scalar(start, length, position);
-            // The decoder answers a malformed sequence with the replacement
-            // scalar over ONE byte; a real U+FFFD in the text spans three.
-            if (step.first == REPLACEMENT_SCALAR && step.second == 1) {
-                return Result::Err(Utf8Error::found_at(start, length, position));
+            match (Utf8::decode_at(bytes, position)) {
+                Option::Some(decoded) => { position = position + decoded.length; }
+                Option::None => { return Result::Err(Utf8Error::found_at(start, length, position)); }
             }
-            position = position + step.second;
         }
         return Result::Ok(Str { bytes: start, length: length });
     }
@@ -218,22 +228,12 @@ public type struct Str {
 
     /// Index of the first `byte`, or `None`.
     public find_byte(&this, byte: u8) -> Option<i64> {
-        mut i: i64 = 0;
-        while (i < this.length) {
-            if (this.bytes[i] == byte) { return Option::Some(i); }
-            i = i + 1;
-        }
-        return Option::None;
+        return this.as_bytes().index_of(&byte);
     }
 
     /// Index of the last `byte`, or `None`.
     public find_last_byte(&this, byte: u8) -> Option<i64> {
-        mut i: i64 = this.length - 1;
-        while (i >= 0) {
-            if (this.bytes[i] == byte) { return Option::Some(i); }
-            i = i - 1;
-        }
-        return Option::None;
+        return this.as_bytes().last_index_of(&byte);
     }
 
     /// The text before and after the first `separator`, or `None` when it
@@ -482,7 +482,7 @@ public type struct Str {
         mut count: i64 = 0;
         mut position: i64 = 0;
         while (position < this.length) {
-            position = position + decode_scalar(this.bytes, this.length, position).second;
+            position = position + Str::lenient_scalar_at(this.bytes, this.length, position).length;
             count = count + 1;
         }
         return count;
@@ -656,67 +656,6 @@ public type struct Utf8Error {
 /// sequence that is not well-formed UTF-8 during scalar decoding.
 private const REPLACEMENT_SCALAR: u32 = 0xFFFD;
 
-/// Decode one UTF-8 scalar beginning at byte `pos` of `[bytes, bytes+length)`.
-/// Returns `Pair { first: scalar, second: consumed }` where `consumed`
-/// is the number of bytes the scalar occupied (always `>= 1`, so callers
-/// that advance by it can never stall). Lenient per the `Str::chars`
-/// contract: any malformed sequence decodes to U+FFFD consuming exactly
-/// one byte. Precondition: `pos < length`.
-private function decode_scalar(bytes: u8*, length: i64, pos: i64) -> Pair<u32, i64> {
-    const lead: u8 = bytes[pos];
-
-    // ASCII fast path: one byte, value is the scalar.
-    if (lead < 0x80) {
-        return Pair::<u32, i64> { first: lead as u32, second: 1 };
-    }
-
-    // Continuation count and initial scalar bits from the lead byte's
-    // high prefix. `min` is the smallest scalar this length may legally
-    // encode; a decoded value below it is an overlong form.
-    mut needed: i64 = 0;
-    mut scalar: u32 = 0;
-    mut min: u32 = 0;
-    if ((lead & 0xE0) == 0xC0) {
-        needed = 1; scalar = (lead & 0x1F) as u32; min = 0x80;
-    } else if ((lead & 0xF0) == 0xE0) {
-        needed = 2; scalar = (lead & 0x0F) as u32; min = 0x800;
-    } else if ((lead & 0xF8) == 0xF0) {
-        needed = 3; scalar = (lead & 0x07) as u32; min = 0x10000;
-    } else {
-        // 10xxxxxx orphan continuation, or 11111xxx out of range.
-        return Pair::<u32, i64> { first: REPLACEMENT_SCALAR, second: 1 };
-    }
-
-    // The continuation bytes must all be present within the view.
-    if (pos + 1 + needed > length) {
-        return Pair::<u32, i64> { first: REPLACEMENT_SCALAR, second: 1 };
-    }
-
-    mut i: i64 = 1;
-    while (i <= needed) {
-        const b: u8 = bytes[pos + i];
-        if ((b & 0xC0) != 0x80) {
-            return Pair::<u32, i64> { first: REPLACEMENT_SCALAR, second: 1 };
-        }
-        scalar = (scalar << 6) | ((b & 0x3F) as u32);
-        i = i + 1;
-    }
-
-    // Reject overlong encodings, surrogate halves, and values above the
-    // Unicode range - each is malformed UTF-8.
-    if (scalar < min) {
-        return Pair::<u32, i64> { first: REPLACEMENT_SCALAR, second: 1 };
-    }
-    if (scalar >= 0xD800 && scalar <= 0xDFFF) {
-        return Pair::<u32, i64> { first: REPLACEMENT_SCALAR, second: 1 };
-    }
-    if (scalar > char::MAX as u32) {
-        return Pair::<u32, i64> { first: REPLACEMENT_SCALAR, second: 1 };
-    }
-
-    return Pair::<u32, i64> { first: scalar, second: 1 + needed };
-}
-
 /// Lazy UTF-8 scalar iterator over a `Str`; see `Str::chars`. Borrows
 /// from the source `Str`, which must outlive the iterator.
 internal type struct Chars {
@@ -728,9 +667,9 @@ internal type struct Chars {
 implement trait Iterator<u32> for struct Chars {
     next(mut &this) -> Option<u32> {
         if (this.pos >= this.length) { return Option::None; }
-        const step: Pair<u32, i64> = decode_scalar(this.bytes, this.length, this.pos);
-        this.pos = this.pos + step.second;
-        return Option::Some(step.first);
+        const decoded: DecodedScalar = Str::lenient_scalar_at(this.bytes, this.length, this.pos);
+        this.pos = this.pos + decoded.length;
+        return Option::Some(decoded.scalar);
     }
 }
 
@@ -746,9 +685,9 @@ implement trait Iterator<Pair<i64, u32>> for struct CharIndices {
     next(mut &this) -> Option<Pair<i64, u32>> {
         if (this.pos >= this.length) { return Option::None; }
         const start: i64 = this.pos;
-        const step: Pair<u32, i64> = decode_scalar(this.bytes, this.length, this.pos);
-        this.pos = this.pos + step.second;
-        return Option::Some(Pair::<i64, u32> { first: start, second: step.first });
+        const decoded: DecodedScalar = Str::lenient_scalar_at(this.bytes, this.length, this.pos);
+        this.pos = this.pos + decoded.length;
+        return Option::Some(Pair::<i64, u32> { first: start, second: decoded.scalar });
     }
 }
 

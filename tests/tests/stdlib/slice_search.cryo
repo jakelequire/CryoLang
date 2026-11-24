@@ -1,0 +1,164 @@
+///! Searching a `Slice<T>`: `binary_search` and `binary_search_by` answer
+///! the index of an equal element or the insertion point, `partition_point`
+///! the first element its predicate is false for, `index_of` the first
+///! equal element (a byte slice through `memchr`, an offset from the slice's
+///! own start) and `last_index_of` the last.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::SliceSearch;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::cmp::{ Eq, Ordering };
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_true, expect_equal };
+
+/// A found index as itself, an insertion point `p` as `-1 - p`.
+function searched(result: Result<i64, i64>) -> i64 {
+    return match (result) {
+        Result::Ok(index) => { index }
+        Result::Err(insert_at) => { -1 - insert_at }
+    };
+}
+
+/// The index an `Option` holds, or -1.
+function position(found: Option<i64>) -> i64 {
+    return found.unwrap_or(-1);
+}
+
+type struct Word {
+    letters: i64;
+    weight: i64;
+}
+
+implement trait Eq for Word {
+    equals(&this, other: &Word) -> boolean { return this.letters == other.letters; }
+}
+
+![test]
+function binary_search_finds_values_and_insertion_points() -> Result<(), TestError> {
+    mut items: Array<i64> = Array::new();
+    for (mut index: i64 = 0; index < 40; index++) { items.push(index * 2 * 100003); }
+    const values: &Slice<i64> = items.as_slice();
+    for (mut index: i64 = 0; index < 40; index++) {
+        const even: i64 = index * 2 * 100003;
+        const odd: i64 = even + 100003;
+        expect_equal(searched(values.binary_search(&even)), index)?;
+        expect_equal(searched(values.binary_search(&odd)), -1 - (index + 1))?;
+    }
+    const below: i64 = -5;
+    expect_equal(searched(values.binary_search(&below)), -1)?;
+    const empty: &Slice<i64> = values.subslice(0, 0);
+    expect_equal(searched(empty.binary_search(&below)), -1)?;
+    // A sub-slice answers in its own indices.
+    const tail: &Slice<i64> = values.subslice(10, 40);
+    const twelfth: i64 = 12 * 2 * 100003;
+    expect_equal(searched(tail.binary_search(&twelfth)), 2)?;
+    const target: i64 = 30 * 2 * 100003;
+    return expect_equal(searched(values.binary_search_by(
+        (element: &i64) -> Ordering { return element.compare(&target); })), 30);
+}
+
+![test]
+function binary_search_by_orders_by_the_callers_comparison() -> Result<(), TestError> {
+    // Sorted descending: the comparator says how an element orders against
+    // the one sought in that order.
+    const descending: [i64] = [90, 70, 50, 30, 10];
+    const sought: i64 = 30;
+    expect_equal(searched(descending.as_slice().binary_search_by(
+        (element: &i64) -> Ordering { return sought.compare(element); })), 3)?;
+    const missing: i64 = 60;
+    return expect_equal(searched(descending.as_slice().binary_search_by(
+        (element: &i64) -> Ordering { return missing.compare(element); })), -1 - 2);
+}
+
+![test]
+function partition_point_is_the_first_element_the_predicate_rejects() -> Result<(), TestError> {
+    const sorted: [i64] = [1, 3, 3, 3, 8, 13];
+    const values: &Slice<i64> = sorted.as_slice();
+    expect_equal(values.partition_point((x: &i64) -> boolean { return *x < 3; }), 1)?;
+    expect_equal(values.partition_point((x: &i64) -> boolean { return *x <= 3; }), 4)?;
+    expect_equal(values.partition_point((x: &i64) -> boolean { return *x < 0; }), 0)?;
+    expect_equal(values.partition_point((x: &i64) -> boolean { return *x < 100; }), 6)?;
+    const none: &Slice<i64> = values.subslice(2, 2);
+    expect_equal(none.partition_point((x: &i64) -> boolean { return true; }), 0)?;
+    // Every split of a longer run, so each step of the halving is taken.
+    mut long: Array<u32> = Array::new();
+    for (mut index: i64 = 0; index < 1000; index++) { long.push((index * 7) as u32); }
+    for (mut cut: i64 = 0; cut <= 1000; cut++) {
+        const bound: u32 = (cut * 7) as u32;
+        expect_equal(long.as_slice().partition_point((x: &u32) -> boolean { return *x < bound; }), cut)?;
+    }
+    return Result::Ok(());
+}
+
+![test]
+function index_of_bytes_answers_from_the_slices_own_start() -> Result<(), TestError> {
+    const text: Str = Str::new("a/b/c/d");
+    const bytes: &Slice<u8> = text.as_bytes();
+    const slash: u8 = 0x2F;
+    expect_equal(position(bytes.index_of(&slash)), 1)?;
+    expect_equal(position(bytes.last_index_of(&slash)), 5)?;
+    const tail: &Slice<u8> = bytes.subslice(2, 7);
+    expect_equal(position(tail.index_of(&slash)), 1)?;
+    expect_equal(position(tail.last_index_of(&slash)), 3)?;
+    const absent: u8 = 0x71;
+    expect_true(bytes.index_of(&absent).is_none(), Str::new("an absent byte is not found"))?;
+    expect_true(bytes.last_index_of(&absent).is_none(), Str::new("an absent byte is not found from the end"))?;
+    const empty: &Slice<u8> = bytes.subslice(3, 3);
+    expect_true(empty.index_of(&slash).is_none(), Str::new("an empty slice holds no byte"))?;
+    return expect_true(empty.last_index_of(&slash).is_none(), Str::new("an empty slice holds no byte from the end"));
+}
+
+![test]
+function index_of_finds_every_byte_value() -> Result<(), TestError> {
+    // Each value once, after a run of a different value, so neither a
+    // search that stops early nor one reading a byte as signed answers right.
+    mut all: Array<u8> = Array::new();
+    for (mut value: i64 = 0; value < 256; value++) {
+        all.push(((value + 1) % 256) as u8);
+    }
+    for (mut value: i64 = 0; value < 256; value++) {
+        const byte: u8 = value as u8;
+        const expected: i64 = (value + 255) % 256;
+        expect_equal(position(all.as_slice().index_of(&byte)), expected)?;
+        expect_equal(position(all.as_slice().last_index_of(&byte)), expected)?;
+    }
+    return Result::Ok(());
+}
+
+![test]
+function index_of_other_types_compares_with_equals() -> Result<(), TestError> {
+    const numbers: [i64] = [5, 9, 5, 2];
+    const five: i64 = 5;
+    const two: i64 = 2;
+    const seven: i64 = 7;
+    expect_equal(position(numbers.as_slice().index_of(&five)), 0)?;
+    expect_equal(position(numbers.as_slice().last_index_of(&five)), 2)?;
+    expect_equal(position(numbers.as_slice().index_of(&two)), 3)?;
+    expect_true(numbers.as_slice().index_of(&seven).is_none(), Str::new("7 is not there"))?;
+    // `Word` is equal by its letters alone, so the weight shows which
+    // element was found.
+    const words: [Word] = [Word { letters: 3, weight: 1 }, Word { letters: 4, weight: 2 }, Word { letters: 3, weight: 3 }];
+    const sought: Word = Word { letters: 3, weight: 0 };
+    expect_equal(position(words.as_slice().index_of(&sought)), 0)?;
+    return expect_equal(position(words.as_slice().last_index_of(&sought)), 2);
+}
+
+![test]
+function array_and_str_searches_agree_with_the_slice() -> Result<(), TestError> {
+    const numbers: [i64] = [4, 8, 15, 16, 23, 42];
+    const fifteen: i64 = 15;
+    const nine: i64 = 9;
+    expect_equal(position(numbers.index_of(&fifteen)), 2)?;
+    expect_true(numbers.contains(&fifteen), Str::new("15 is there"))?;
+    expect_true(!numbers.contains(&nine), Str::new("9 is not"))?;
+    expect_equal(searched(numbers.binary_search(&fifteen)), 2)?;
+    expect_equal(searched(numbers.binary_search(&nine)), -1 - 2)?;
+    const path: Str = Str::new("x.tar.gz");
+    expect_equal(position(path.find_byte(0x2E)), 1)?;
+    return expect_equal(position(path.find_last_byte(0x2E)), 5);
+}
