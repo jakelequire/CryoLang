@@ -2664,8 +2664,7 @@ type struct SemaVisitor {
         // exactly how `p == null` got miscompiled into `p.equals(&null)`).
         //
         // References ARE unwrapped, but ONLY when `deref_ref` is set: after the
-        // primitive `check_binary_op`/`check_unary_op` rejected the operands,
-        // and for a comparison of a reference with a pointer.  Reference +
+        // primitive `check_binary_op`/`check_unary_op` rejected the operands.  Reference +
         // numeric arithmetic (`&p + n`) keeps the primitive rule.  So `a + b` /
         // `-a` on a `&T` parameter (the common by-reference case) overloads
         // just like on a value, while the pointer-ish primitive paths are
@@ -2779,35 +2778,249 @@ type struct SemaVisitor {
         return desugared;
     }
 
-    /// True when a comparison (`== != < > <= >=`) should unwrap a reference
-    /// operand to reach a user `Eq`/`Ord` referent for value comparison: at least
-    /// one operand is `&T`, and NEITHER operand is void (a `null` literal), so
-    /// `ref == null` keeps its pointer null-check.  The user-vs-primitive decision
-    /// is left to `operator_overload_expr`, which fires only for a user referent.
-    comparison_unwraps_reference(&this, lhs: TypeRef, rhs: TypeRef) -> boolean {
-        const lt: Type* = this.arena.lookup(lhs);
-        const rt: Type* = this.arena.lookup(rhs);
-        if (lt == null || rt == null) { return false; }
-        if (lt.kind == TypeKind::Void || rt.kind == TypeKind::Void) { return false; }
-        return lt.kind == TypeKind::Reference || rt.kind == TypeKind::Reference;
-    }
-
     /// `a OP b` on two references: the values they refer to, compared by
     /// the referent's implementation of the comparison's trait (`Eq` for
     /// `==` and `!=`, `Ord` for `<`, `>`, `<=` and `>=`), whatever kind of
     /// type the referent is.  `&i64 == &i64` is `i64`'s `equals`, so the
     /// operator on references always agrees with `equals` and `compare`.
-    /// Null when the referent does not implement the trait: the references
-    /// then compare by identity.
+    /// Null when the referent does not implement the trait: the comparison
+    /// is refused (`refuse_reference_comparison`), since two references are
+    /// compared only by the values they refer to.
     referent_comparison_expr(mut &this, receiver: mut ExpressionNode*, ty: TypeRef,
                              rhs: mut ExpressionNode*, map: OperatorTraitMap,
                              op_tok: Token, span: SourceSpan) -> mut ExpressionNode* {
         const t: Type* = this.arena.lookup(ty);
         if (t == null || t.kind != TypeKind::Reference) { return null; }
         const trait_id: DefId = this.ctx.generic_registry.wellknown(map.lang);
-        if (!trait_id.is_valid()) { return null; }
-        if (this.trait_checker().select_impl(trait_id, t.as_reference().referent, 0) == null) { return null; }
+        if (!trait_id.is_valid() || this.trait_checker().select_impl(trait_id, t.as_reference().referent, 0) == null) {
+            this.refuse_reference_comparison(receiver, rhs, ty, map, op_tok.kind, span);
+            return null;
+        }
         return this.operator_desugar(receiver, rhs, map, trait_id, op_tok, span);
+    }
+
+    /// A comparison of a reference with a pointer or a function, refused
+    /// (E0229); true when it reported.  Two references compare the values
+    /// they refer to and a pointer compares addresses, so the program
+    /// writes which it means, and the help writes both: the values, both
+    /// operands dereferenced, and the addresses, the reference converted to
+    /// the pointer's type (a `void*` has no value to compare).  Beside a
+    /// function the help compares the function the reference refers to, and
+    /// a reference to anything else is shown what it compares with.  The
+    /// `null` literal is no address of anything, so a reference compares
+    /// with it whatever pointer type it was given.
+    reference_beside_address_refused(mut &this, bin: BinaryExpr*, lhs: TypeRef, rhs: TypeRef,
+                                     span: SourceSpan) -> boolean {
+        const map: OperatorTraitMap = OperatorTraitMap::for_binary(bin.op.kind);
+        if (map.lang != LangItem::Eq && map.lang != LangItem::Ord) { return false; }
+        const left_t: Type* = this.arena.lookup(lhs);
+        const right_t: Type* = this.arena.lookup(rhs);
+        if (left_t == null || right_t == null) { return false; }
+        const reference_left: boolean = left_t.kind == TypeKind::Reference;
+        if (reference_left == (right_t.kind == TypeKind::Reference)) { return false; }
+        const other_t: Type* = if (reference_left) { right_t } else { left_t };
+        const other: ExpressionNode* = if (reference_left) { bin.right } else { bin.left };
+        if (other_t.kind != TypeKind::Pointer && other_t.kind != TypeKind::Function) { return false; }
+        if (this.calls.sema_arg_is_null_literal(other)) { return false; }
+        const op_shown: string = bin.op.kind.to_string();
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0229_INVALID_BINARY_OP,
+            fmt::format("cannot compare `%s` with `%s`: a reference compares only with a reference or `null`",
+                this.arena.format_display(left_t), this.arena.format_display(right_t)).into_raw());
+        diag = diag.at(span);
+        const reference_expr: ExpressionNode* = if (reference_left) { bin.left } else { bin.right };
+        const r: string = this.reference_operand_text(reference_expr, "r", false);
+        const r_value: string = this.reference_operand_text(reference_expr, "r", true);
+        const other_written: string = this.calls.place_text(other);
+        if (other_t.kind == TypeKind::Function) {
+            const reference_t: Type* = if (reference_left) { left_t } else { right_t };
+            const referent_t: Type* = this.arena.lookup(reference_t.as_reference().referent);
+            const f: string = if (other_written.length() > 0) { other_written } else { "f" };
+            if (referent_t != null && referent_t.kind == TypeKind::Function) {
+                diag = diag.help(if (reference_left) {
+                    fmt::format("compare the function the reference refers to: `%s %s %s`", r_value, op_shown, f).into_raw()
+                } else {
+                    fmt::format("compare the function the reference refers to: `%s %s %s`", f, op_shown, r_value).into_raw()
+                });
+            } else {
+                const reference_shown: string = this.arena.format_display(reference_t);
+                diag = diag.help(fmt::format("`%s` refers to no function; compare `%s` with another `%s`, or with `null`",
+                    reference_shown, r, reference_shown).into_raw());
+            }
+            this.ctx.emit_diagnostic(diag);
+            return true;
+        }
+        const p: string = if (other_written.length() > 0) { other_written } else { "p" };
+        const pointer_shown: string = this.arena.format_display(other_t);
+        const addresses: string = if (reference_left) {
+            fmt::format("`(%s as %s) %s %s`", r, pointer_shown, op_shown, p).into_raw()
+        } else {
+            fmt::format("`%s %s (%s as %s)`", p, op_shown, r, pointer_shown).into_raw()
+        };
+        const pointee: Type* = this.arena.lookup(other_t.as_pointer().pointee);
+        if (pointee != null && pointee.kind == TypeKind::Void) {
+            diag = diag.help(fmt::format("compare the addresses, the reference converted to a pointer: %s",
+                addresses).into_raw());
+        } else {
+            const values: string = if (reference_left) {
+                fmt::format("`%s %s *%s`", r_value, op_shown, p).into_raw()
+            } else {
+                fmt::format("`*%s %s %s`", p, op_shown, r_value).into_raw()
+            };
+            diag = diag.help(fmt::format("compare the values with %s, or the addresses, the reference converted to a pointer, with %s",
+                values, addresses).into_raw());
+        }
+        this.ctx.emit_diagnostic(diag);
+        return true;
+    }
+
+    /// The help of the checker's refusal of a value compared with a pointer
+    /// or a function (E0229), written with the operands' own spellings.  A
+    /// value is never `null`, so beside the `null` literal the comparison
+    /// answers the same every time and is removed.  A function compares
+    /// only with a function or `null`.  Beside a pointer to its own type
+    /// the value is shown compared with the one the pointer points to,
+    /// `v == *p`, where that type compares, and its address compared,
+    /// `(&v as T*) == p`, where it is a place; beside a `void*` only its
+    /// address; beside a pointer to another type, what that pointer's
+    /// target compares with.
+    value_beside_address_help(&this, bin: BinaryExpr*, lhs: TypeRef, rhs: TypeRef,
+                              map: OperatorTraitMap) -> string {
+        const left_t: Type* = this.arena.lookup(lhs);
+        const address_left: boolean = left_t.kind == TypeKind::Pointer || left_t.kind == TypeKind::Function;
+        const address_t: Type* = if (address_left) { left_t } else { this.arena.lookup(rhs) };
+        const value: TypeRef = if (address_left) { rhs } else { lhs };
+        const value_shown: string = this.arena.format_display(this.arena.lookup(value));
+        const address_expr: ExpressionNode* = if (address_left) { bin.left } else { bin.right };
+        const value_expr: ExpressionNode* = if (address_left) { bin.right } else { bin.left };
+        const op_shown: string = bin.op.kind.to_string();
+        const value_spelled: string = this.calls.source_text(value_expr.span);
+        const v: string = if (value_spelled.length() > 0) { value_spelled } else { "x" };
+        const address_spelled: string = this.calls.source_text(address_expr.span);
+        const p: string = if (address_spelled.length() > 0) { address_spelled } else { "p" };
+        if (this.calls.sema_arg_is_null_literal(address_expr)) {
+            const written: string = if (address_left) {
+                fmt::format("%s %s %s", p, op_shown, v).into_raw()
+            } else {
+                fmt::format("%s %s %s", v, op_shown, p).into_raw()
+            };
+            if (bin.op.kind == TokenType::EqualEqual || bin.op.kind == TokenType::ExclaimEqual) {
+                return fmt::format("a `%s` value is never `null`, so `%s` is always `%s`; remove the comparison",
+                    value_shown, written, if (bin.op.kind == TokenType::EqualEqual) { "false" } else { "true" }).into_raw();
+            }
+            return fmt::format("a `%s` value is never `null`; remove the comparison `%s`", value_shown, written).into_raw();
+        }
+        const address_shown: string = this.arena.format_display(address_t);
+        if (address_t.kind == TypeKind::Function) {
+            return fmt::format("a `%s` value is no function; compare `%s` with another `%s`, or with `null`",
+                value_shown, p, address_shown).into_raw();
+        }
+        const place: string = this.calls.place_text(value_expr);
+        const named: string = if (place.length() > 0) { place } else { "x" };
+        const addresses: string = if (address_left) {
+            fmt::format("`%s %s (&%s as %s)`", p, op_shown, named, address_shown).into_raw()
+        } else {
+            fmt::format("`(&%s as %s) %s %s`", named, address_shown, op_shown, p).into_raw()
+        };
+        const pointee: TypeRef = address_t.as_pointer().pointee;
+        const pointee_t: Type* = this.arena.lookup(pointee);
+        if (pointee_t.kind == TypeKind::Void) {
+            if (place.length() > 0) {
+                return fmt::format("compare the addresses, the value's address converted to a pointer: %s", addresses).into_raw();
+            }
+            return fmt::format("bind the value to a name `x` and compare the addresses: %s", addresses).into_raw();
+        }
+        if (!pointee.equals(value)) {
+            return fmt::format("`%s` points to a `%s`, not a `%s`; compare `*%s` with a `%s`",
+                p, this.arena.format_display(pointee_t), value_shown, p, this.arena.format_display(pointee_t)).into_raw();
+        }
+        const trait_id: DefId = this.ctx.generic_registry.wellknown(map.lang);
+        const values_compare: boolean = this.checker.check_binary_op(bin.op.kind, value, value).success
+            || (trait_id.is_valid() && this.trait_checker().select_impl(trait_id, value, 0) != null);
+        const values: string = if (address_left) {
+            fmt::format("`*%s %s %s`", p, op_shown, v).into_raw()
+        } else {
+            fmt::format("`%s %s *%s`", v, op_shown, p).into_raw()
+        };
+        if (values_compare && place.length() > 0) {
+            return fmt::format("compare the values with %s, or the addresses, the value's address converted to a pointer, with %s",
+                values, addresses).into_raw();
+        }
+        if (values_compare) {
+            return fmt::format("compare the value with the one the pointer points to: %s", values).into_raw();
+        }
+        if (place.length() > 0) {
+            return fmt::format("compare the addresses, the value's address converted to a pointer: %s", addresses).into_raw();
+        }
+        return fmt::format("bind the value to a name `x` and compare the addresses: %s", addresses).into_raw();
+    }
+
+    /// `a OP b` on two references to a type that does not implement the
+    /// comparison's trait, refused (E0229): `==` and `!=` on them would
+    /// compare two addresses where the program reads two values, and an
+    /// order of two addresses says nothing about the values.  An ordering of
+    /// a user type is told to implement `Ord` (`emit_operator_missing_impl`).
+    /// Any other referent is shown the values compared, `*a OP *b`, where its
+    /// own operator compares them - a float besides by `total_compare`, the
+    /// total order it has.  Where nothing does, a user type beside `==` or
+    /// `!=` is shown both an implementation of `Eq`, which compares the
+    /// values, and the addresses, both references converted to pointers;
+    /// any other referent the addresses.
+    refuse_reference_comparison(mut &this, left: ExpressionNode*, right: ExpressionNode*,
+                                reference: TypeRef, map: OperatorTraitMap, op: TokenType,
+                                span: SourceSpan) -> void {
+        const equality: boolean = map.lang == LangItem::Eq;
+        if (!equality && this.emit_operator_missing_impl(reference, map, op, span)) { return; }
+        const referent: TypeRef = this.arena.lookup(reference).as_reference().referent;
+        const referent_t: Type* = this.arena.lookup(referent);
+        const shown: string = this.arena.format_display(referent_t);
+        const op_shown: string = op.to_string();
+        const a: string = this.reference_operand_text(left, "a", false);
+        const b: string = this.reference_operand_text(right, "b", false);
+        const a_value: string = this.reference_operand_text(left, "a", true);
+        const b_value: string = this.reference_operand_text(right, "b", true);
+        const addresses: string = fmt::format("`(%s as %s*) %s (%s as %s*)`", a, shown, op_shown, b, shown).into_raw();
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0229_INVALID_BINARY_OP, if (equality) {
+            fmt::format("`%s` does not implement `Eq`, so `%s` does not compare two references to it",
+                shown, op_shown).into_raw()
+        } else {
+            fmt::format("`%s` does not implement `Ord`, so `%s` does not order two references to it",
+                shown, op_shown).into_raw()
+        });
+        diag = diag.at(span);
+        const user_type: boolean = referent_t.kind == TypeKind::Struct || referent_t.kind == TypeKind::Enum
+            || referent_t.kind == TypeKind::InstantiatedType;
+        if (!equality && referent_t.kind == TypeKind::Float) {
+            const receiver: string = if (a.starts_with("&")) { fmt::format("(%s)", a).into_raw() } else { a };
+            diag = diag.help(fmt::format("%s; compare the values the references refer to, `%s %s %s`, or order them by `total_compare`, the IEEE-754 total order: `%s.total_compare(%s).%s()`",
+                TraitChecker::float_has_no_order(shown), a_value, op_shown, b_value, receiver, b, map.ord_pred).into_raw());
+        } else if (this.checker.check_binary_op(op, referent, referent).success) {
+            diag = diag.help(fmt::format("compare the values the references refer to: `%s %s %s`",
+                a_value, op_shown, b_value).into_raw());
+        } else if (user_type) {
+            diag = diag.help(fmt::format("compare the values by implementing `Eq` for it, `implement trait Eq ... for %s`, or compare the addresses, the references converted to pointers: %s",
+                shown, addresses).into_raw());
+        } else {
+            diag = diag.help(fmt::format("compare the addresses, the references converted to pointers: %s",
+                addresses).into_raw());
+        }
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// A reference operand as a help writes it: as the reference, or
+    /// `dereferenced`, as the value it refers to.  A borrowed place `&x` is
+    /// `&x` or `x`, a name or field path `r` is `r` or `*r`, and any other
+    /// operand is `placeholder` or `*placeholder`.
+    reference_operand_text(&this, e: ExpressionNode*, placeholder: string, dereferenced: boolean) -> string {
+        const borrow: UnaryExpr* = ExpressionNode::unary_of(e);
+        if (borrow != null && borrow.op.kind == TokenType::Amp) {
+            const place: string = this.calls.place_text(borrow.operand);
+            if (place.length() > 0) {
+                return if (dereferenced) { place } else { fmt::format("&%s", place).into_raw() };
+            }
+        }
+        const written: string = this.calls.place_text(e);
+        const shown: string = if (written.length() > 0) { written } else { placeholder };
+        return if (dereferenced) { fmt::format("*%s", shown).into_raw() } else { shown };
     }
 
     /// Reflected operator overloading for a PRIMITIVE left operand: `2 * vec`,
@@ -3275,6 +3488,9 @@ type struct SemaVisitor {
                         this.arena.format_display(this.arena.lookup(rhs))), e.span);
                 return this.arena.get_bool();
             }
+            if (this.reference_beside_address_refused(bin, lhs, rhs, e.span)) {
+                return this.arena.get_bool();
+            }
             const result: TypeCheckResult = this.checker.check_binary_op(bin.op.kind, lhs, rhs);
             const map: OperatorTraitMap = OperatorTraitMap::for_binary(bin.op.kind);
             if (result.success) {
@@ -3282,13 +3498,14 @@ type struct SemaVisitor {
                 // even though `check_binary_op` passed the generic param through.
                 // Concrete primitives fall straight through (no user impl).
                 if (map.valid && bin.desugared_call == null) {
-                    // `check_binary_op` passes any comparison of references as a
+                    // `check_binary_op` passes a comparison of two references,
+                    // or of a reference with `null` (any other pointer was
+                    // refused, `reference_beside_address_refused`), as a
                     // `boolean` of their identity.  Two references compare the
-                    // values they refer to instead, when the referent implements
-                    // the comparison's trait (`referent_comparison_expr`).  A
-                    // reference beside a pointer reaches a user referent's
-                    // implementation; a `null` operand keeps the pointer
-                    // null-check.
+                    // values they refer to instead, by the referent's
+                    // implementation of the comparison's trait, and are refused
+                    // where it has none (`referent_comparison_expr`); a `null`
+                    // operand keeps the pointer null-check.
                     const comparison: boolean = map.lang == LangItem::Eq || map.lang == LangItem::Ord;
                     const left_t: Type* = this.arena.lookup(lhs);
                     const right_t: Type* = this.arena.lookup(rhs);
@@ -3298,8 +3515,7 @@ type struct SemaVisitor {
                         if (comparison && two_references) {
                             this.referent_comparison_expr(bin.left, lhs, bin.right, map, bin.op, e.span)
                         } else {
-                            this.operator_overload_expr(bin.left, lhs, bin.right, map, bin.op, e.span,
-                                comparison && this.comparison_unwraps_reference(lhs, rhs))
+                            this.operator_overload_expr(bin.left, lhs, bin.right, map, bin.op, e.span, false)
                         };
                     if (de != null) { bin.desugared_call = de; return de.resolved_type; }
                 }
@@ -3308,7 +3524,15 @@ type struct SemaVisitor {
             }
             // Phase 1: `check_binary_op` rejected - a concrete user type with a
             // registered impl overloads; otherwise it is a genuine type error.
-            if (map.valid && bin.desugared_call == null) {
+            // `Eq` and `Ord` take their operand as `&This`, so a comparison
+            // with a pointer or a function on either side is answered by no
+            // implementation, and the checker's refusal is the error.
+            const left_kind: TypeKind = this.arena.lookup(lhs).kind;
+            const right_kind: TypeKind = this.arena.lookup(rhs).kind;
+            const beside_address: boolean = (map.lang == LangItem::Eq || map.lang == LangItem::Ord)
+                && (left_kind == TypeKind::Pointer || right_kind == TypeKind::Pointer
+                    || left_kind == TypeKind::Function || right_kind == TypeKind::Function);
+            if (map.valid && bin.desugared_call == null && !beside_address) {
                 const de: mut ExpressionNode* = this.operator_overload_expr(
                     bin.left, lhs, bin.right, map, bin.op, e.span, true);
                 if (de != null) { bin.desugared_call = de; return de.resolved_type; }
@@ -3323,7 +3547,13 @@ type struct SemaVisitor {
                     return TypeRef::invalid();
                 }
             }
-            this.refuse_binary_operation(result, e.span);
+            if (beside_address) {
+                mut refused: TypeCheckResult = result;
+                refused.help = this.value_beside_address_help(bin, lhs, rhs, map);
+                this.refuse_binary_operation(refused, e.span);
+            } else {
+                this.refuse_binary_operation(result, e.span);
+            }
             // A refused operation computes no value, so what holds it
             // reports nothing more; a comparison is still a `boolean`.
             if (!bin.op.kind.yields_boolean()) { return TypeRef::invalid(); }
