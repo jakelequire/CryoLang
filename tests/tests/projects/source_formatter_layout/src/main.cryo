@@ -1,0 +1,141 @@
+/// The layout `SourceFormatter::format` gives a file: each case is a source
+/// text and the exact text it must become, and the result formatted again
+/// must come back unchanged.  A refused case must be refused with a reason
+/// holding the text given.
+namespace main;
+
+import std::fmt;
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::result::{ Result };
+import compiler::format::{ SourceFormatter };
+
+type struct Checks {
+    passed: i32;
+    total: i32;
+
+    /// `input` lays out as `want`, and `want` as itself.
+    check(mut &this, name: string, input: string, want: string) -> void {
+        this.total = this.total + 1;
+        const first: String = Checks::laid_out(Str::new(input));
+        if (first.as_str() != Str::new(want)) {
+            fmt::print(f"FAIL {name}\n  got:  [{first.as_str()}]\n  want: [{want}]\n");
+            return;
+        }
+        const again: String = Checks::laid_out(Str::new(want));
+        if (again.as_str() != Str::new(want)) {
+            fmt::print(f"FAIL {name}: not stable\n  got:  [{again.as_str()}]\n  want: [{want}]\n");
+            return;
+        }
+        this.passed = this.passed + 1;
+    }
+
+    /// `input` is refused, for a reason holding `reason`.
+    refuse(mut &this, name: string, input: string, reason: string) -> void {
+        this.total = this.total + 1;
+        match (SourceFormatter::format(Str::new(input))) {
+            Result::Ok(text) => {
+                fmt::print(f"FAIL {name}: laid out as [{text.as_str()}]\n");
+            }
+            Result::Err(why) => {
+                if (why.as_str().contains(&Str::new(reason))) {
+                    this.passed = this.passed + 1;
+                } else {
+                    fmt::print(f"FAIL {name}: refused for [{why.as_str()}], want [{reason}]\n");
+                }
+            }
+        }
+    }
+
+    /// The text `source` lays out as, or the refusal's reason marked.
+    static laid_out(source: Str) -> String {
+        return match (SourceFormatter::format(source)) {
+            Result::Ok(text) => { text }
+            Result::Err(why) => { String::from(f"<refused: {why.as_str()}>") }
+        };
+    }
+}
+
+function main(argc: int, argv: string*) -> int {
+    mut c: Checks = Checks { passed: 0, total: 0 };
+
+    c.check("a block's lines go four spaces past its opening line",
+        "function f() -> int {\nreturn 1;\n}\n",
+        "function f() -> int {\n    return 1;\n}\n");
+    c.check("a continuation keeps its offset from the statement it continues",
+        "function f() -> int {\n  return add(1,\n             2);\n}\n",
+        "function f() -> int {\n    return add(1,\n               2);\n}\n");
+    c.check("spacing inside a line is left as written; trailing space goes",
+        "const a:   int =  1;   \n",
+        "const a:   int =  1;\n");
+    c.check("an access label lines up with its type's opening line",
+        "type struct P {\n  public:\n  x: int;\n}\n",
+        "type struct P {\npublic:\n    x: int;\n}\n");
+    c.check("a return type on its own line: the body is laid out from the signature",
+        "function f(a: int,\n           b: int)\n        -> int {\nreturn a;\n}\n",
+        "function f(a: int,\n           b: int)\n        -> int {\n    return a;\n}\n");
+    c.check("a where and a lone brace: the body is laid out from the signature",
+        "function f<T>(x: T) -> T\n    where T: Copy\n{\n        return x;\n}\n",
+        "function f<T>(x: T) -> T\n    where T: Copy\n{\n    return x;\n}\n");
+    c.check("a wrapped condition: the block is laid out from the if",
+        "function f() -> void {\n    if (a &&\n        b) {\n  c();\n    }\n}\n",
+        "function f() -> void {\n    if (a &&\n        b) {\n        c();\n    }\n}\n");
+    c.check("an else on its own line opens a block laid out from the brace above",
+        "function f() -> void {\n    if (a) {\n        b();\n    }\n    else {\n    c();\n    }\n}\n",
+        "function f() -> void {\n    if (a) {\n        b();\n    }\n    else {\n        c();\n    }\n}\n");
+    c.check("a block opened in a continuation is laid out by hand and kept",
+        "function f() -> int {\n    const v: int =\n        if (a) {\n            1\n        } else {\n            2\n        };\n    return v;\n}\n",
+        "function f() -> int {\n    const v: int =\n        if (a) {\n            1\n        } else {\n            2\n        };\n    return v;\n}\n");
+    c.check("a closure's body is laid out from the line of its call",
+        "function f() -> void {\n  run(|a| {\n    a;\n  });\n}\n",
+        "function f() -> void {\n    run(|a| {\n        a;\n    });\n}\n");
+    c.check("a struct literal aligned by hand keeps its alignment",
+        "function f() -> P {\n  return P { x: 1,\n             y: 2 };\n}\n",
+        "function f() -> P {\n    return P { x: 1,\n               y: 2 };\n}\n");
+    c.check("a comment under a line's trailing comment moves with that line",
+        "type struct P {\n  x: int;  // the x\n          // and more\n}\n",
+        "type struct P {\n    x: int;  // the x\n            // and more\n}\n");
+    c.check("a comment above a closing brace at its indentation stays with it",
+        "function f() -> void {\n    if (a) {\n        b();\n    // the other way\n    } else {\n        c();\n    }\n}\n",
+        "function f() -> void {\n    if (a) {\n        b();\n    // the other way\n    } else {\n        c();\n    }\n}\n");
+    c.check("an attribute ends an entry, so the declaration after it starts one",
+        "![test]\n  function t() -> void {\n  }\n",
+        "![test]\nfunction t() -> void {\n}\n");
+    c.check("an index's bracket does not end an entry",
+        "function f() -> int {\n    return xs[0]\n        + 1;\n}\n",
+        "function f() -> int {\n    return xs[0]\n        + 1;\n}\n");
+    c.check("a block comment's interior moves with its first line",
+        "function f() -> void {\n/* one\n   two */\n}\n",
+        "function f() -> void {\n    /* one\n       two */\n}\n");
+    c.check("a string's interior lines and its trailing spaces are never touched",
+        "function f() -> void {\nconst s: string = \"a  \n  b  \";\n}\n",
+        "function f() -> void {\n    const s: string = \"a  \n  b  \";\n}\n");
+    c.check("blank lines: none at either end, at most two in a row",
+        "\n\nconst a: int = 1;\n\n\n\n\nconst b: int = 2;\n\n\n",
+        "const a: int = 1;\n\n\nconst b: int = 2;\n");
+    c.check("a file is given its missing last line terminator",
+        "const a: int = 1;",
+        "const a: int = 1;\n");
+    c.check("each line keeps its own terminator",
+        "type struct P {\r\nx: int;\n}\r\n",
+        "type struct P {\r\n    x: int;\n}\r\n");
+    c.check("a tab that indents becomes spaces",
+        "type struct P {\n\tx: int;\n}\n",
+        "type struct P {\n    x: int;\n}\n");
+    c.check("a byte order mark is kept",
+        "\xEF\xBB\xBF  const a: int = 1;\n",
+        "\xEF\xBB\xBFconst a: int = 1;\n");
+    c.check("a laid-out file is unchanged",
+        "namespace main;\n\nfunction f() -> int {\n    return 1;\n}\n",
+        "namespace main;\n\nfunction f() -> int {\n    return 1;\n}\n");
+    c.refuse("a closing bracket that does not match its opener",
+        "function f() -> void {\n  g((;\n}\n", "does not match");
+    c.refuse("a bracket never closed",
+        "function f() -> void {\n", "never closed");
+    c.refuse("a file that does not lex",
+        "const s: string = \"open\n", "does not lex");
+
+    fmt::print(f"formatter checks: {c.passed} of {c.total} passed\n");
+    if (c.passed != c.total) { return 1; }
+    return 0;
+}

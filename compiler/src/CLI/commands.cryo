@@ -45,6 +45,7 @@ import compiler::utils::build_stamp::{ BuildStamp, StampSlot, VersionReport };
 import compiler::build_manifest;
 import compiler::diag::{ ErrorCode };
 import compiler::toolchain::{ ExecutablePath };
+import compiler::format::{ SourceFormatter };
 
 // Test-output framing (ASCII only). 80-column rules; kept in sync with the
 // unit runner's framing in stdlib/test/runner.cryo so the two suites read
@@ -469,6 +470,7 @@ type enum CommandKind {
     Run;
     Test;
     Check;
+    Fmt;
     Interpret;
     Demangle;
     ApiIndex;
@@ -489,6 +491,7 @@ implement enum CommandKind {
             CommandKind::Run     => { "run"     }
             CommandKind::Test    => { "test"    }
             CommandKind::Check   => { "check"   }
+            CommandKind::Fmt     => { "fmt"     }
             CommandKind::Interpret => { "interpret" }
             CommandKind::Demangle => { "demangle" }
             CommandKind::ApiIndex => { "api-index" }
@@ -509,6 +512,7 @@ implement enum CommandKind {
             CommandKind::Run      => { "Build the project and run the resulting binary" }
             CommandKind::Test     => { "Build and run the project's tests"             }
             CommandKind::Check    => { "Check a file for errors (no codegen)"         }
+            CommandKind::Fmt      => { "Lay out Cryo source files: indentation, trailing space, blank lines" }
             CommandKind::Interpret => { "Run a file by interpreting it (no codegen)"  }
             CommandKind::Demangle => { "Decode a mangled symbol to its source form"   }
             CommandKind::ApiIndex => { "Write or check the standard library's one-line-per-declaration index" }
@@ -529,6 +533,7 @@ implement enum CommandKind {
             CommandKind::Run      => { "cryo run [flags]"                 }
             CommandKind::Test     => { "cryo test [pattern] [flags]"       }
             CommandKind::Check    => { "cryo check <file> [flags]"       }
+            CommandKind::Fmt      => { "cryo fmt [file|dir ...] [--check]" }
             CommandKind::Interpret => { "cryo interpret <file> [flags]"  }
             CommandKind::Demangle => { "cryo demangle <mangled-symbol>"  }
             CommandKind::ApiIndex => { "cryo api-index write|check <stdlib root> <index file>" }
@@ -667,6 +672,21 @@ implement enum CommandKind {
                 fmt::printf("  --ast            Dump the AST after parsing\n");
                 fmt::printf("  --stdlib=PATH    Standard library root for this run\n");
                 fmt::printf("  --target=TRIPLE  Cross-compile for the given LLVM target triple\n");
+            }
+            CommandKind::Fmt => {
+                fmt::printf("Lays out each file named, and every .cryo file below each directory\n");
+                fmt::printf("named (directories starting with `.` skipped); with no argument, the\n");
+                fmt::printf("current directory.  Only where each line starts is decided: a line\n");
+                fmt::printf("that begins a statement or entry of a { } block is indented four\n");
+                fmt::printf("spaces past the line that opened the block, and any other line keeps\n");
+                fmt::printf("its offset from the line it continues.  Spacing inside a line is left\n");
+                fmt::printf("as written, so hand-aligned columns stay aligned.  Trailing\n");
+                fmt::printf("whitespace, blank lines at either end, and blank lines past two in a\n");
+                fmt::printf("row are removed.  String literals are never changed, and a file that\n");
+                fmt::printf("does not lex or whose brackets do not balance is left alone.\n\n");
+                fmt::printf("Flags:\n");
+                fmt::printf("  --check   Change nothing; list the files that would change and exit 1\n");
+                fmt::printf("            if there are any\n");
             }
             CommandKind::Interpret => {
                 fmt::printf("Analyses <file> as `check` does, then runs its `main` by walking\n");
@@ -947,6 +967,9 @@ type struct Executor {
         const check: CommandKind = CommandKind::Check;
         runner.add_command(cli::Command::new(check.name(), check.description(), check.usage()));
 
+        const format_command: CommandKind = CommandKind::Fmt;
+        runner.add_command(cli::Command::new(format_command.name(), format_command.description(), format_command.usage()));
+
         const interpret: CommandKind = CommandKind::Interpret;
         runner.add_command(cli::Command::new(interpret.name(), interpret.description(), interpret.usage()));
 
@@ -1067,6 +1090,69 @@ type struct Executor {
         fmt::printf("%.*s", rendered.length() as i32, rendered.as_str().as_pointer());
     }
 
+    /// `cryo fmt [file|dir ...] [--check]`: lay out the files named, and the
+    /// `.cryo` files below the directories named (the current directory when
+    /// none is).  Exits 1 when a file could not be laid out, or under
+    /// `--check` when one would change.
+    static cmd_fmt(args: cli::ParsedArgs) -> int {
+        const check_only: boolean = args.has_flag("check");
+        mut files: [String] = [];
+        mut roots: [String] = [];
+        for (mut i: int = 0; i < args.positional_count(); i++) {
+            roots.push(String::from_string(args.positional_at(i)));
+        }
+        if (roots.length() == 0) { roots.push(String::from_string(".")); }
+        for (mut i: i64 = 0; i < roots.length(); i++) {
+            match (SourceFormatter::collect_files(path::Path::from(roots[i].as_str()), &files)) {
+                Result::Ok(_) => {}
+                Result::Err(reason) => {
+                    fmt::eprintln(f"error: {reason}");
+                    return 1;
+                }
+            }
+        }
+
+        mut changed: i64 = 0;
+        mut refused: i64 = 0;
+        for (mut i: i64 = 0; i < files.length(); i++) {
+            const name: Str = files[i].as_str();
+            const text: String = match (File::read_text(path::Path::from(name))) {
+                Result::Ok(text) => { text }
+                Result::Err(error) => {
+                    fmt::eprintln(f"error: {name}: {error}");
+                    refused = refused + 1;
+                    continue;
+                }
+            };
+            match (SourceFormatter::format(text.as_str())) {
+                Result::Err(reason) => {
+                    fmt::eprintln(f"error: {name}: left as it is: {reason}");
+                    refused = refused + 1;
+                }
+                Result::Ok(laid_out) => {
+                    if (laid_out.as_str() == text.as_str()) { continue; }
+                    changed = changed + 1;
+                    if (check_only) {
+                        fmt::println(f"{name}");
+                        continue;
+                    }
+                    match (File::write_text(path::Path::from(name), laid_out.as_str())) {
+                        Result::Ok(_) => { fmt::println(f"formatted {name}"); }
+                        Result::Err(error) => {
+                            fmt::eprintln(f"error: {name}: {error}");
+                            refused = refused + 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        const verb: Str = if (check_only) { Str::new("would change") } else { Str::new("formatted") };
+        fmt::println(f"{changed} of {files.length()} files {verb}, {refused} left as they are");
+        if (refused > 0 || (check_only && changed > 0)) { return 1; }
+        return 0;
+    }
+
     /// `cryo stamp <binary>`: write the checkout in the current directory
     /// into the binary's stamp region.  Outside a checkout the region is
     /// cleared rather than left holding an earlier checkout's stamp.
@@ -1115,6 +1201,7 @@ type struct Executor {
             "run"      => { CommandKind::Run }
             "test"     => { CommandKind::Test }
             "check"    => { CommandKind::Check }
+            "fmt"      => { CommandKind::Fmt }
             "interpret" => { CommandKind::Interpret }
             "demangle" => { CommandKind::Demangle }
             "api-index" => { CommandKind::ApiIndex }
@@ -1160,6 +1247,7 @@ type struct Executor {
             CommandKind::Run     => { return Executor::cmd_run(args); }
             CommandKind::Test    => { return Executor::cmd_test(args); }
             CommandKind::Check   => { return Executor::cmd_check(args); }
+            CommandKind::Fmt     => { return Executor::cmd_fmt(args); }
             CommandKind::Interpret => { return Executor::cmd_interpret(args); }
             CommandKind::Demangle => { return Executor::cmd_demangle(args); }
             CommandKind::ApiIndex => {

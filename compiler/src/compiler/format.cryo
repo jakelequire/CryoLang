@@ -1,0 +1,583 @@
+///! Source layout: what `cryo fmt` and the language server's formatting do
+///! to a file.
+///!
+///! The layout is decided over the token stream, not over the syntax tree,
+///! and it decides only where each line starts.  Spacing inside a line is
+///! never touched, so columns lined up by hand stay lined up.  What changes:
+///!
+///!   - a line that starts a statement, declaration, field, variant, match
+///!     arm or list entry inside a `{ }` block is indented four spaces past
+///!     the line that opened the block, and the block's `}` lines up with
+///!     that line; an access label (`public:`) lines up with it too;
+///!   - any other line continues the one above it and keeps its offset
+///!     from the most recent line indented by the rule above, so a wrapped
+///!     argument list or a continuation aligned under an opening `(` moves
+///!     with its statement and keeps its shape;
+///!   - a block whose `{` has code after it on the same line is laid out by
+///!     hand, so its lines are continuations too;
+///!   - the interior lines of a block comment move with the line the
+///!     comment starts on; the interior lines of a string literal are never
+///!     touched, nor the trailing spaces of a line a string continues past;
+///!   - trailing whitespace goes, tabs that indent become spaces, blank lines
+///!     at the start and end of the file go, a run of more than two blank
+///!     lines becomes two, and the file ends with one line terminator.
+///!
+///! Each line keeps its own terminator (`\n` or `\r\n`).  A file the lexer
+///! refuses, or whose brackets do not balance, is left as it is.  Before a
+///! result is returned it is lexed again and must yield the same tokens,
+///! comments compared without their whitespace, so a layout defect refuses
+///! the file rather than changing what it means.
+
+namespace compiler::format;
+
+import compiler::lex::{ SourceLocation, Token, TokenType };
+import compiler::lex::lexer::{ Lexer };
+import compiler::diag::sink::{ DiagnosticSink };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::collections::array::{ Array };
+import std::fs::path::{ Path };
+import std::fs::directory::{ Directory, DirectoryEntries };
+
+/// Columns one block level indents by.
+const INDENT_WIDTH: i64 = 4;
+
+/// Blank lines kept in a row; a longer run is cut to this many.
+const MAX_BLANK_RUN: i64 = 2;
+
+/// How a line's indentation is decided.
+type enum LineRole {
+    /// Indented by the block it sits in.
+    Structural;
+    /// Keeps its offset from the most recent structural line.
+    Continuation;
+    /// Inside a block comment: moves with the comment's first line.
+    CommentInterior;
+    /// Inside a string literal: emitted byte for byte.
+    Verbatim;
+    /// Nothing but whitespace.
+    Blank;
+}
+
+/// One line of the source, as the layout sees it.
+type struct SourceLine {
+    /// Byte offset of the line's first byte.
+    start: i64;
+    /// Byte offset of the first byte past its text (before `\r\n` or `\n`).
+    text_end: i64;
+    /// Byte offset of its first byte that is not a space or a tab.
+    body_start: i64;
+    /// The column width of its leading whitespace, tabs expanded.
+    indent: i64;
+    /// Its terminator: `\r\n`, `\n`, or nothing on a last line without one.
+    terminator: Str;
+    role: LineRole;
+    /// A line a string literal continues past: its trailing whitespace is
+    /// the string's.
+    keeps_trailing: boolean;
+    /// For a comment's interior line, the line the comment starts on.
+    comment_start: i64;
+    /// A line holding nothing but a comment.
+    comment_only: boolean;
+    /// The indentation the layout gives it.
+    new_indent: i64;
+}
+
+/// An open bracket.
+type struct OpenBracket {
+    kind: TokenType;
+    /// For a `{`: the indentation of the line that opened its block, which
+    /// its `}` takes.
+    close_indent: i64;
+    /// For a `{`: nothing but comments follows it on its line, so its
+    /// contents are laid out as a block.
+    is_block: boolean;
+    /// Opened by `![`: the `]` closing it ends an entry.
+    is_attribute: boolean;
+}
+
+type struct SourceFormatter {
+    /// Lay out `source` (a whole file).  `Err` says why the file was left as
+    /// it is.
+    static format(source: Str) -> Result<String, String> {
+        mut sink: DiagnosticSink = DiagnosticSink::new();
+        mut lexer: Lexer = Lexer::new("<format>", String::with_null(source).into_raw(), &sink);
+        const tokens: [Token] = lexer.lex();
+        if (sink.has_errors()) {
+            return Result::Err(String::from("the file does not lex"));
+        }
+
+        const text_start: i64 = Lexer::text_start(source);
+        mut lines: [SourceLine] = SourceFormatter::split_lines(source, text_start);
+        SourceFormatter::mark_multiline_tokens(source, &tokens, &lines);
+
+        const laid_out: Result<boolean, String> = SourceFormatter::assign_indents(&tokens, &lines);
+        match (laid_out) {
+            Result::Err(reason) => { return Result::Err(reason); }
+            Result::Ok(_) => {}
+        }
+
+        const output: String = SourceFormatter::render(source, text_start, &lines);
+        if (!SourceFormatter::same_tokens(&tokens, output.as_str())) {
+            return Result::Err(String::from("formatting would change the file's tokens (a formatter defect)"));
+        }
+        return Result::Ok(output);
+    }
+
+    /// Add `root` to `files` when it is a file, or every `.cryo` file below
+    /// it, in name order, when it is a directory; a directory whose name
+    /// starts with `.` is not entered.
+    static collect_files(root: Path, files: mut &[String]) -> Result<boolean, String> {
+        if (root.is_file()) {
+            files.push(String::from_str(root.as_str()));
+            return Result::Ok(true);
+        }
+        if (!root.is_directory()) {
+            return Result::Err(String::from(f"{root.as_str()}: no such file or directory"));
+        }
+        mut entries: DirectoryEntries = match (Directory::entries(root)) {
+            Result::Ok(entries) => { entries }
+            Result::Err(error) => { return Result::Err(String::from(f"{root.as_str()}: {error}")); }
+        };
+        mut names: Array<String> = Array::new();
+        mut directories: Array<String> = Array::new();
+        loop {
+            match (entries.next()) {
+                Option::Some(entry) => {
+                    if (entry.is_directory()) {
+                        if (!entry.name().starts_with(&Str::new("."))) { directories.push(String::from_str(entry.name())); }
+                    } else if (entry.name().ends_with(&Str::new(".cryo"))) {
+                        names.push(String::from_str(entry.name()));
+                    }
+                }
+                Option::None => { break; }
+            }
+        }
+        names.sort();
+        directories.sort();
+        for (mut i: i64 = 0; i < names.length(); i++) {
+            files.push(String::from_str(root.join(names[i].as_str()).as_path().as_str()));
+        }
+        for (mut i: i64 = 0; i < directories.length(); i++) {
+            SourceFormatter::collect_files(root.join(directories[i].as_str()).as_path(), files)?;
+        }
+        return Result::Ok(true);
+    }
+
+    /// Every line of `source` past its byte order mark, with its extent and
+    /// leading whitespace measured.
+    static split_lines(source: Str, text_start: i64) -> [SourceLine] {
+        mut lines: [SourceLine] = [];
+        const p: u8* = source.as_pointer();
+        const len: i64 = source.length();
+        mut start: i64 = text_start;
+        while (start < len || (start == len && start == text_start)) {
+            mut end: i64 = start;
+            while (end < len && p[end] != 10) { end = end + 1; }
+            mut text_end: i64 = end;
+            mut terminator: Str = Str::new("");
+            if (end < len) {
+                if (end > start && p[end - 1] == 13) {
+                    text_end = end - 1;
+                    terminator = Str::new("\r\n");
+                } else {
+                    terminator = Str::new("\n");
+                }
+            }
+            mut body: i64 = start;
+            mut column: i64 = 1;
+            while (body < text_end && (p[body] == 32 || p[body] == 9)) {
+                column = SourceLocation::column_after(column, p[body]);
+                body = body + 1;
+            }
+            const role: LineRole = if (body == text_end) { LineRole::Blank } else { LineRole::Structural };
+            lines.push(SourceLine {
+                start:          start,
+                text_end:       text_end,
+                body_start:     body,
+                indent:         column - 1,
+                terminator:     terminator,
+                role:           role,
+                keeps_trailing: false,
+                comment_start:  -1,
+                comment_only:   false,
+                new_indent:     column - 1,
+            });
+            if (end >= len) { break; }
+            start = end + 1;
+        }
+        return lines;
+    }
+
+    /// Mark the lines a block comment or a string literal spans past its
+    /// first.
+    static mark_multiline_tokens(source: Str, tokens: &[Token], lines: mut &[SourceLine]) -> void {
+        const p: u8* = source.as_pointer();
+        for (mut i: i64 = 0; i < tokens.length(); i++) {
+            const t: Token = tokens[i];
+            const is_comment: boolean = t.kind == TokenType::Comment
+                || t.kind == TokenType::DocCommentBlock || t.kind == TokenType::DocCommentLine;
+            const is_string: boolean = t.kind == TokenType::StringLiteral || t.kind == TokenType::FStringLiteral;
+            if (!is_comment && !is_string) { continue; }
+
+            const first: i64 = (t.line as i64) - 1;
+            if (first < 0 || first >= lines.length()) { continue; }
+            const line_text: Str = source.byte_substring(lines[first].start, lines[first].text_end);
+            const begin: i64 = lines[first].start + SourceLocation::byte_of_column(line_text, t.column as i64);
+            const end: i64 = begin + (t.source_length as i64);
+
+            mut last: i64 = first;
+            for (mut b: i64 = begin; b < end; b++) {
+                if (p[b] == 10) { last = last + 1; }
+            }
+            if (last == first) { continue; }
+
+            if (is_string) { lines[first].keeps_trailing = true; }
+            for (mut l: i64 = first + 1; l <= last && l < lines.length(); l++) {
+                if (is_string) {
+                    lines[l].role = LineRole::Verbatim;
+                } else {
+                    lines[l].role = LineRole::CommentInterior;
+                    lines[l].comment_start = first;
+                }
+            }
+        }
+    }
+
+    /// Whether a code token ends what the line after it may begin as a new
+    /// statement or entry of a block.
+    static ends_entry(kind: TokenType) -> boolean {
+        return match (kind) {
+            TokenType::Semicolon => { true }
+            TokenType::LBrace    => { true }
+            TokenType::RBrace    => { true }
+            TokenType::Comma     => { true }
+            _                    => { false }
+        };
+    }
+
+    static is_comment(kind: TokenType) -> boolean {
+        return kind == TokenType::Comment || kind == TokenType::DocCommentBlock
+            || kind == TokenType::DocCommentLine;
+    }
+
+    static opens(kind: TokenType) -> boolean {
+        return kind == TokenType::LBrace || kind == TokenType::LParen || kind == TokenType::LSquare
+            || kind == TokenType::BangBracket;
+    }
+
+    static is_access_keyword(kind: TokenType) -> boolean {
+        return match (kind) {
+            TokenType::KwPublic    => { true }
+            TokenType::KwPrivate   => { true }
+            TokenType::KwInternal  => { true }
+            TokenType::KwProtected => { true }
+            _                      => { false }
+        };
+    }
+
+    /// Decide every line's indentation, walking the lines and the tokens
+    /// that start on them together.
+    static assign_indents(tokens: &[Token], lines: mut &[SourceLine]) -> Result<boolean, String> {
+        mut open: [OpenBracket] = [];
+        // The indentation the most recent structural line was given: the
+        // statement a `{` on a later line of it opens a block for.
+        mut statement_indent: i64 = 0;
+        mut last_delta: i64 = 0;
+        mut entry_starts: boolean = true;
+        // When the line above ends in a comment after code: that line's
+        // indentation, and how far it moved; else -1.
+        mut hanging_comment_floor: i64 = -1;
+        mut hanging_comment_shift: i64 = 0;
+        mut next: i64 = 0;
+
+        for (mut l: i64 = 0; l < lines.length(); l++) {
+            // The code tokens starting on this line: [first_token, past_tokens).
+            mut first_token: i64 = next;
+            while (first_token < tokens.length() && (tokens[first_token].line as i64) - 1 < l) {
+                first_token = first_token + 1;
+            }
+            mut past_tokens: i64 = first_token;
+            while (past_tokens < tokens.length() && tokens[past_tokens].kind != TokenType::EOF
+                   && (tokens[past_tokens].line as i64) - 1 == l) {
+                past_tokens = past_tokens + 1;
+            }
+            next = past_tokens;
+
+            const depth: i64 = open.length();
+            // A return type, a `where`, an `else` or a lone `{` starting a line
+            // continues the statement above it, which a `{` it opens belongs to.
+            mut continues_statement: boolean = false;
+            const role: LineRole = lines[l].role;
+            if (role == LineRole::Verbatim || role == LineRole::Blank) {
+                lines[l].new_indent = lines[l].indent;
+            } else if (role == LineRole::CommentInterior) {
+                const s: i64 = lines[l].comment_start;
+                const shifted: i64 = lines[l].indent + lines[s].new_indent - lines[s].indent;
+                lines[l].new_indent = if (shifted < 0) { 0 } else { shifted };
+            } else {
+                const code: i64 = SourceFormatter::first_code(tokens, first_token, past_tokens);
+                const first_kind: TokenType = if (code < past_tokens) { tokens[code].kind } else { TokenType::Unknown };
+                const in_block: boolean = depth == 0 || (open[depth - 1].kind == TokenType::LBrace && open[depth - 1].is_block);
+                const block_indent: i64 = if (depth == 0) { 0 } else { open[depth - 1].close_indent };
+
+                const comment_only: boolean = code == past_tokens;
+                // A comment-only line indented past a line that ends in a comment
+                // continues that comment, and moves with that line.
+                const continues_comment: boolean = comment_only && hanging_comment_floor >= 0
+                    && lines[l].indent > hanging_comment_floor;
+
+                mut structural: boolean = false;
+                mut indent: i64 = 0;
+                if (continues_comment) {
+                    structural = false;
+                } else if (first_kind == TokenType::RBrace) {
+                    if (depth > 0 && in_block) {
+                        structural = true;
+                        indent = block_indent;
+                    }
+                } else if (in_block && SourceFormatter::is_access_label(tokens, code, past_tokens)) {
+                    structural = true;
+                    indent = block_indent;
+                } else if (in_block && entry_starts && first_kind != TokenType::KwElse) {
+                    structural = true;
+                    indent = if (depth == 0) { 0 } else { block_indent + INDENT_WIDTH };
+                }
+
+                continues_statement = !structural && in_block
+                    && (first_kind == TokenType::Arrow || first_kind == TokenType::KwWhere
+                        || first_kind == TokenType::LBrace || first_kind == TokenType::KwElse);
+
+                if (structural) {
+                    lines[l].role = LineRole::Structural;
+                    last_delta = indent - lines[l].indent;
+                    statement_indent = indent;
+                } else if (continues_comment) {
+                    lines[l].role = LineRole::Continuation;
+                    indent = lines[l].indent + hanging_comment_shift;
+                } else {
+                    lines[l].role = LineRole::Continuation;
+                    indent = lines[l].indent + last_delta;
+                }
+                if (indent < 0) { indent = 0; }
+                lines[l].new_indent = indent;
+                lines[l].comment_only = comment_only;
+                if (first_kind == TokenType::RBrace && structural) {
+                    SourceFormatter::keep_comments_with(lines, l);
+                }
+
+                if (!continues_comment) {
+                    hanging_comment_floor = -1;
+                    if (!comment_only && past_tokens > first_token && SourceFormatter::is_comment(tokens[past_tokens - 1].kind)) {
+                        hanging_comment_floor = lines[l].indent;
+                        hanging_comment_shift = lines[l].new_indent - lines[l].indent;
+                    }
+                }
+            }
+            if (role == LineRole::Blank || role == LineRole::Verbatim || role == LineRole::CommentInterior) {
+                hanging_comment_floor = -1;
+            }
+
+            // Walk the line's tokens: brackets open and close, and the last
+            // code token says whether the next line may start an entry.
+            const structural_line: boolean = lines[l].role == LineRole::Structural;
+            mut open_at_start: [TokenType] = [];
+            for (mut o: i64 = 0; o < open.length(); o++) { open_at_start.push(open[o].kind); }
+            for (mut t: i64 = first_token; t < past_tokens; t++) {
+                const kind: TokenType = tokens[t].kind;
+                mut closes_attribute: boolean = false;
+                if (SourceFormatter::is_comment(kind)) { continue; }
+                if (SourceFormatter::opens(kind)) {
+                    const d: i64 = open.length();
+                    mut close_indent: i64 = 0;
+                    mut is_block: boolean = false;
+                    if (kind == TokenType::LBrace) {
+                        close_indent = statement_indent;
+                        // A `{` ending its line opens a block laid out by the rule
+                        // when its line starts or continues a statement, or began
+                        // inside a `(` or `[` closed before the `{`.  Any
+                        // other sits in a continuation laid out by hand, whose
+                        // lines keep their offsets.
+                        is_block = (structural_line || continues_statement || SourceFormatter::closes_a_list(&open_at_start, d))
+                            && SourceFormatter::ends_its_line(tokens, t);
+                    }
+                    // `![` opens an attribute and is closed by `]`.
+                    const opened: TokenType = if (kind == TokenType::BangBracket) { TokenType::LSquare } else { kind };
+                    open.push(OpenBracket { kind: opened, close_indent: close_indent, is_block: is_block,
+                                            is_attribute: kind == TokenType::BangBracket });
+                } else if (kind == TokenType::RBrace || kind == TokenType::RParen || kind == TokenType::RSquare) {
+                    if (open.length() == 0) {
+                        return Result::Err(String::from(f"an unmatched closing bracket on line {l + 1}"));
+                    }
+                    const opener: TokenType = open[open.length() - 1].kind;
+                    const matches: boolean = (kind == TokenType::RBrace && opener == TokenType::LBrace)
+                        || (kind == TokenType::RParen && opener == TokenType::LParen)
+                        || (kind == TokenType::RSquare && opener == TokenType::LSquare);
+                    if (!matches) {
+                        return Result::Err(String::from(f"a closing bracket on line {l + 1} does not match the one it closes"));
+                    }
+                    closes_attribute = open[open.length() - 1].is_attribute;
+                    open.pop();
+                }
+                entry_starts = SourceFormatter::ends_entry(kind) || closes_attribute;
+            }
+            if (SourceFormatter::is_access_label(tokens, SourceFormatter::first_code(tokens, first_token, past_tokens), past_tokens)) {
+                entry_starts = true;
+            }
+        }
+
+        if (open.length() > 0) {
+            return Result::Err(String::from("a bracket is never closed"));
+        }
+        return Result::Ok(true);
+    }
+
+    /// The comment-only lines directly above line `closer` (which starts with
+    /// `}`), written at its indentation, describe what follows the `}` - the
+    /// next `else` branch - so they keep its indentation rather than the
+    /// indentation of the block it closes.
+    static keep_comments_with(lines: mut &[SourceLine], closer: i64) -> void {
+        mut l: i64 = closer - 1;
+        while (l >= 0 && lines[l].comment_only && lines[l].indent == lines[closer].indent) {
+            lines[l].new_indent = lines[closer].new_indent;
+            l = l - 1;
+        }
+    }
+
+    /// Whether a line that began with the brackets `open_at_start` open has
+    /// closed the `(` or `[` that sat at depth `depth`: a `{` opened there
+    /// ends a wrapped parameter list or condition.
+    static closes_a_list(open_at_start: &[TokenType], depth: i64) -> boolean {
+        if (depth >= open_at_start.length()) { return false; }
+        return open_at_start[depth] == TokenType::LParen || open_at_start[depth] == TokenType::LSquare;
+    }
+
+    /// The first token in [from, past) that is not a comment, or `past`.
+    static first_code(tokens: &[Token], from: i64, past: i64) -> i64 {
+        mut t: i64 = from;
+        while (t < past && SourceFormatter::is_comment(tokens[t].kind)) { t = t + 1; }
+        return t;
+    }
+
+    /// Whether the code tokens from `code` to the end of the line are an
+    /// access label: `public:` and the like.
+    static is_access_label(tokens: &[Token], code: i64, past: i64) -> boolean {
+        if (code + 1 >= past || !SourceFormatter::is_access_keyword(tokens[code].kind)) { return false; }
+        if (tokens[code + 1].kind != TokenType::Colon) { return false; }
+        return SourceFormatter::first_code(tokens, code + 2, past) == past;
+    }
+
+    /// Whether only comments follow token `t` on its line.
+    static ends_its_line(tokens: &[Token], t: i64) -> boolean {
+        const line: int = tokens[t].line;
+        mut n: i64 = t + 1;
+        while (n < tokens.length() && tokens[n].line == line && SourceFormatter::is_comment(tokens[n].kind)) {
+            n = n + 1;
+        }
+        return n >= tokens.length() || tokens[n].kind == TokenType::EOF || tokens[n].line != line;
+    }
+
+    /// The laid-out file.
+    static render(source: Str, text_start: i64, lines: &[SourceLine]) -> String {
+        mut out: String = String::with_capacity(source.length() + 64);
+        out.push(source.byte_substring(0, text_start));
+
+        // The terminator a last line without one is given.
+        mut terminator: Str = Str::new("\n");
+        for (mut l: i64 = 0; l < lines.length(); l++) {
+            if (!lines[l].terminator.is_empty()) {
+                terminator = lines[l].terminator;
+                break;
+            }
+        }
+
+        // The last line that is not blank: everything after it goes.
+        mut last: i64 = lines.length() - 1;
+        while (last >= 0 && lines[last].role == LineRole::Blank) { last = last - 1; }
+
+        mut blank_run: i64 = 0;
+        mut started: boolean = false;
+        for (mut l: i64 = 0; l <= last; l++) {
+            const line: SourceLine = lines[l];
+            if (line.role == LineRole::Blank) {
+                if (!started) { continue; }
+                blank_run = blank_run + 1;
+                if (blank_run > MAX_BLANK_RUN) { continue; }
+                out.push(line.terminator);
+                continue;
+            }
+            started = true;
+            blank_run = 0;
+
+            if (line.role == LineRole::Verbatim) {
+                out.push(source.byte_substring(line.start, line.text_end));
+            } else {
+                mut end: i64 = line.text_end;
+                if (!line.keeps_trailing) {
+                    const p: u8* = source.as_pointer();
+                    while (end > line.body_start && (p[end - 1] == 32 || p[end - 1] == 9)) { end = end - 1; }
+                }
+                out.push_repeated(' ', line.new_indent);
+                out.push(source.byte_substring(line.body_start, end));
+            }
+            out.push(if (line.terminator.is_empty()) { terminator } else { line.terminator });
+        }
+        return out;
+    }
+
+    /// Whether `output` lexes to the tokens `before` holds, comments
+    /// compared with their whitespace removed.  End-of-file tokens are not
+    /// compared: the lexer gives a file ending in whitespace one more than
+    /// a file ending in a token.
+    static same_tokens(before: &[Token], output: Str) -> boolean {
+        mut sink: DiagnosticSink = DiagnosticSink::new();
+        mut lexer: Lexer = Lexer::new("<format>", String::with_null(output).into_raw(), &sink);
+        const after: [Token] = lexer.lex();
+        if (sink.has_errors()) { return false; }
+        mut i: i64 = 0;
+        mut j: i64 = 0;
+        loop {
+            while (i < after.length() && after[i].kind == TokenType::EOF) { i = i + 1; }
+            while (j < before.length() && before[j].kind == TokenType::EOF) { j = j + 1; }
+            if (i >= after.length() || j >= before.length()) { break; }
+            if (after[i].kind != before[j].kind) { return false; }
+            const a: Str = Str::new(after[i].lexeme);
+            const b: Str = Str::new(before[j].lexeme);
+            if (SourceFormatter::is_comment(after[i].kind)) {
+                if (!SourceFormatter::same_ignoring_whitespace(a, b)) { return false; }
+            } else if (after[i].kind == TokenType::StringLiteral) {
+                if (after[i].text_length != before[j].text_length) { return false; }
+                if (Str::from_raw(a.as_pointer(), after[i].text_length) != Str::from_raw(b.as_pointer(), before[j].text_length)) {
+                    return false;
+                }
+            } else if (a != b) {
+                return false;
+            }
+            i = i + 1;
+            j = j + 1;
+        }
+        return i >= after.length() && j >= before.length();
+    }
+
+    static same_ignoring_whitespace(a: Str, b: Str) -> boolean {
+        const pa: u8* = a.as_pointer();
+        const pb: u8* = b.as_pointer();
+        mut i: i64 = 0;
+        mut j: i64 = 0;
+        loop {
+            while (i < a.length() && SourceFormatter::is_space(pa[i])) { i = i + 1; }
+            while (j < b.length() && SourceFormatter::is_space(pb[j])) { j = j + 1; }
+            if (i >= a.length() || j >= b.length()) { break; }
+            if (pa[i] != pb[j]) { return false; }
+            i = i + 1;
+            j = j + 1;
+        }
+        return i >= a.length() && j >= b.length();
+    }
+
+    static is_space(b: u8) -> boolean {
+        return b == 32 || b == 9 || b == 10 || b == 13;
+    }
+}
