@@ -1,0 +1,84 @@
+///! UTF-8: reading one Unicode scalar at a byte position.
+///!
+///! `Utf8::decode_at` reads the scalar a position starts and
+///! `Utf8::decode_before` the one that ends there, each with the number of
+///! bytes it takes. Both are strict: a sequence that is not well-formed
+///! UTF-8 - a continuation byte where a scalar would start, an overlong
+///! form, a surrogate half, a value past U+10FFFF, or a sequence cut short -
+///! decodes to nothing, so a caller decides what a malformed byte means.
+///! `Str::from_utf8` refuses it; `Str::chars` reads it as U+FFFD.
+
+namespace std::encoding::utf8;
+
+import std::core::option::{ Option };
+import std::core::slice::{ Slice };
+
+/// One scalar read from UTF-8 bytes, and how many bytes encode it.
+public type struct DecodedScalar {
+    /// The Unicode scalar value, at most U+10FFFF and never a surrogate.
+    public scalar: u32;
+    /// The bytes its encoding takes: 1 to 4.
+    public length: i64;
+}
+
+/// The UTF-8 decoder. Stateless; its operations are statics.
+public type struct Utf8 {
+    /// The scalar whose encoding starts at byte `index` of `bytes`, or
+    /// `None` at or past the end, before the start, or where the bytes from
+    /// `index` are not one well-formed sequence. `[0xC3, 0xA9]` at 0 is
+    /// U+00E9 over 2 bytes; at 1, a continuation byte, it is `None`.
+    public static decode_at(bytes: &Slice<u8>, index: i64) -> Option<DecodedScalar> {
+        if (index < 0 || index >= bytes.length()) { return Option::None; }
+        const at: u8* = bytes.as_pointer() + index;
+        const lead: u8 = at[0];
+        if (lead < 0x80) {
+            return Option::Some(DecodedScalar { scalar: lead as u32, length: 1 });
+        }
+        // The continuation count and the scalar's bits in the lead byte.
+        // `least` is the smallest scalar the length may encode: a smaller
+        // one is an overlong form.
+        mut length: i64 = 0;
+        mut scalar: u32 = 0;
+        mut least: u32 = 0;
+        if ((lead & 0xE0) == 0xC0) {
+            length = 2; scalar = (lead & 0x1F) as u32; least = 0x80;
+        } else if ((lead & 0xF0) == 0xE0) {
+            length = 3; scalar = (lead & 0x0F) as u32; least = 0x800;
+        } else if ((lead & 0xF8) == 0xF0) {
+            length = 4; scalar = (lead & 0x07) as u32; least = 0x10000;
+        } else {
+            return Option::None;
+        }
+        if (index + length > bytes.length()) { return Option::None; }
+        for (mut offset: i64 = 1; offset < length; offset++) {
+            const continuation: u8 = at[offset];
+            if ((continuation & 0xC0) != 0x80) { return Option::None; }
+            scalar = (scalar << 6) | ((continuation & 0x3F) as u32);
+        }
+        if (scalar < least || scalar > 0x10FFFF || (scalar >= 0xD800 && scalar <= 0xDFFF)) {
+            return Option::None;
+        }
+        return Option::Some(DecodedScalar { scalar: scalar, length: length });
+    }
+
+    /// The scalar whose encoding ends just before byte `index` of `bytes`,
+    /// or `None` at or before the start, past the end, or where the bytes
+    /// before `index` do not end one well-formed sequence. `[0x61, 0xC3,
+    /// 0xA9]` before 3 is U+00E9 over 2 bytes; before 2 it is `None`.
+    public static decode_before(bytes: &Slice<u8>, index: i64) -> Option<DecodedScalar> {
+        if (index <= 0 || index > bytes.length()) { return Option::None; }
+        const at: u8* = bytes.as_pointer();
+        // A sequence is at most 4 bytes: its start is the nearest byte that
+        // is no continuation byte, at most 4 back.
+        const earliest: i64 = if (index >= 4) { index - 4 } else { 0 };
+        mut start: i64 = index - 1;
+        while (start > earliest && (at[start] & 0xC0) == 0x80) { start = start - 1; }
+        match (Utf8::decode_at(bytes, start)) {
+            Option::Some(decoded) => {
+                if (start + decoded.length == index) { return Option::Some(decoded); }
+                return Option::None;
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+}

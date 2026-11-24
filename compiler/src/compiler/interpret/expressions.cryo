@@ -246,6 +246,7 @@ implement struct Interpreter {
             ExprKind::Unary(unary) => {
                 if (unary.desugared_call != null) { return this.place_of(unary.desugared_call); }
                 if (unary.op.kind == TokenType::Star) {
+                    if (Interpreter::reads_receiver(expression, unary)) { return this.place_of(unary.operand); }
                     const target: Address = this.pointer_of(unary.operand)?;
                     return this.reach(target, expression.resolved_type, span);
                 }
@@ -841,6 +842,17 @@ implement struct Interpreter {
         };
     }
 
+    /// Whether `expression`, a `*` over `unary`'s operand, reads the
+    /// operand itself: `*this` on a by-reference receiver is typed as
+    /// `this`, the value the receiver names, and no dereference changes a
+    /// type to itself - code generation reads the receiver's own storage
+    /// there too.  When that value is a reference (a method an
+    /// implementation for references gives it), it is the reference that
+    /// is read, not what it points at.
+    static reads_receiver(expression: ExpressionNode*, unary: UnaryExpr*) -> boolean {
+        return expression.resolved_type.is_valid() && expression.resolved_type.equals(unary.operand.resolved_type);
+    }
+
     evaluate_unary(mut &this, expression: ExpressionNode*, unary: UnaryExpr*) -> Result<Operand, Stop> {
         const span: SourceSpan = expression.span;
         if (unary.desugared_call != null) { return this.evaluate(unary.desugared_call); }
@@ -853,6 +865,7 @@ implement struct Interpreter {
             return Result::Ok(Operand::Value(Scalar::Pointer(this.place_of(unary.operand)?)));
         }
         if (op == TokenType::Star) {
+            if (Interpreter::reads_receiver(expression, unary)) { return this.evaluate(unary.operand); }
             const target: Address = this.reach(this.pointer_of(unary.operand)?, expression.resolved_type, span)?;
             return this.operand_at(target, expression.resolved_type, span);
         }

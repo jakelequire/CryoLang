@@ -1,0 +1,278 @@
+///! `std::encoding::utf8`: `Utf8::decode_at` and `Utf8::decode_before` read
+///! one scalar and its length, strictly - nothing at either end, at a
+///! continuation byte, for an overlong form, a surrogate half, a value past
+///! U+10FFFF or a sequence cut short. `Str::from_utf8` refuses what they
+///! refuse, and `Str::chars` and `char_count` read it as U+FFFD over one
+///! byte, exactly as the lenient reading below does for every input tried.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::EncodingUtf8;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::slice::{ Slice };
+import std::core::iter::{ Iterator };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::pair::{ Pair };
+import std::encoding::utf8::{ Utf8, DecodedScalar };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_true, expect_equal };
+
+/// `decoded` as `scalar * 8 + length`, or -1 for `None`: one number to
+/// compare, naming both parts.
+function shown(decoded: Option<DecodedScalar>) -> i64 {
+    return match (decoded) {
+        Option::Some(scalar) => { (scalar.scalar as i64) * 8 + scalar.length }
+        Option::None => { -1 }
+    };
+}
+
+function at(bytes: &Array<u8>, index: i64) -> i64 {
+    return shown(Utf8::decode_at(bytes.as_slice(), index));
+}
+
+function before(bytes: &Array<u8>, index: i64) -> i64 {
+    return shown(Utf8::decode_before(bytes.as_slice(), index));
+}
+
+function expected(scalar: u32, length: i64) -> i64 {
+    return (scalar as i64) * 8 + length;
+}
+
+![test]
+function decode_at_reads_each_length() -> Result<(), TestError> {
+    // "a", U+00E9, U+20AC, U+1F600.
+    const text: [u8] = [0x61, 0xC3, 0xA9, 0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80];
+    expect_equal(at(&text, 0), expected(0x61, 1))?;
+    expect_equal(at(&text, 1), expected(0xE9, 2))?;
+    expect_equal(at(&text, 3), expected(0x20AC, 3))?;
+    expect_equal(at(&text, 6), expected(0x1F600, 4))?;
+    // A continuation byte starts nothing.
+    expect_equal(at(&text, 2), -1)?;
+    expect_equal(at(&text, 7), -1)?;
+    // Either end.
+    expect_equal(at(&text, 10), -1)?;
+    expect_equal(at(&text, -1), -1)?;
+    const empty: [u8] = [];
+    return expect_equal(at(&empty, 0), -1);
+}
+
+![test]
+function decode_at_reads_the_edges_of_each_length() -> Result<(), TestError> {
+    const edges: [u8] = [0x00, 0x7F, 0xC2, 0x80, 0xDF, 0xBF, 0xE0, 0xA0, 0x80, 0xEF, 0xBF, 0xBF,
+                         0xF0, 0x90, 0x80, 0x80, 0xF4, 0x8F, 0xBF, 0xBF, 0xED, 0x9F, 0xBF, 0xEE, 0x80, 0x80];
+    expect_equal(at(&edges, 0), expected(0x00, 1))?;
+    expect_equal(at(&edges, 1), expected(0x7F, 1))?;
+    expect_equal(at(&edges, 2), expected(0x80, 2))?;
+    expect_equal(at(&edges, 4), expected(0x7FF, 2))?;
+    expect_equal(at(&edges, 6), expected(0x800, 3))?;
+    expect_equal(at(&edges, 9), expected(0xFFFF, 3))?;
+    expect_equal(at(&edges, 12), expected(0x10000, 4))?;
+    // The last scalar, U+10FFFF, and either side of the surrogates.
+    expect_equal(at(&edges, 16), expected(0x10FFFF, 4))?;
+    expect_equal(at(&edges, 20), expected(0xD7FF, 3))?;
+    return expect_equal(at(&edges, 23), expected(0xE000, 3));
+}
+
+![test]
+function decode_at_refuses_overlong_forms() -> Result<(), TestError> {
+    // "/" as 2, 3 and 4 bytes; the largest overlong of each length; C0/C1.
+    const two: [u8] = [0xC0, 0xAF];
+    const three: [u8] = [0xE0, 0x80, 0xAF];
+    const four: [u8] = [0xF0, 0x80, 0x80, 0xAF];
+    const two_largest: [u8] = [0xC1, 0xBF];
+    const three_largest: [u8] = [0xE0, 0x9F, 0xBF];
+    const four_largest: [u8] = [0xF0, 0x8F, 0xBF, 0xBF];
+    expect_equal(at(&two, 0), -1)?;
+    expect_equal(at(&three, 0), -1)?;
+    expect_equal(at(&four, 0), -1)?;
+    expect_equal(at(&two_largest, 0), -1)?;
+    expect_equal(at(&three_largest, 0), -1)?;
+    return expect_equal(at(&four_largest, 0), -1);
+}
+
+![test]
+function decode_at_refuses_surrogates_and_values_past_the_last_scalar() -> Result<(), TestError> {
+    const first_surrogate: [u8] = [0xED, 0xA0, 0x80];
+    const last_surrogate: [u8] = [0xED, 0xBF, 0xBF];
+    const past_last: [u8] = [0xF4, 0x90, 0x80, 0x80];
+    const largest_form: [u8] = [0xF7, 0xBF, 0xBF, 0xBF];
+    expect_equal(at(&first_surrogate, 0), -1)?;
+    expect_equal(at(&last_surrogate, 0), -1)?;
+    expect_equal(at(&past_last, 0), -1)?;
+    expect_equal(at(&largest_form, 0), -1)?;
+    // Bytes no sequence starts with.
+    for (mut lead: i64 = 0xF8; lead < 256; lead++) {
+        const alone: [u8] = [lead as u8, 0x80, 0x80, 0x80];
+        expect_equal(at(&alone, 0), -1)?;
+    }
+    return Result::Ok(());
+}
+
+![test]
+function decode_at_refuses_a_sequence_cut_short() -> Result<(), TestError> {
+    const two: [u8] = [0xC3];
+    const three: [u8] = [0xE2, 0x82];
+    const four: [u8] = [0xF0, 0x9F, 0x98];
+    // A lead whose next byte is no continuation byte.
+    const broken: [u8] = [0xE2, 0x41, 0xAC];
+    expect_equal(at(&two, 0), -1)?;
+    expect_equal(at(&three, 0), -1)?;
+    expect_equal(at(&four, 0), -1)?;
+    expect_equal(at(&broken, 0), -1)?;
+    // The bytes are cut at the slice, not at the array behind it.
+    const whole: [u8] = [0xE2, 0x82, 0xAC];
+    return expect_equal(shown(Utf8::decode_at(whole.as_slice().subslice(0, 2), 0)), -1);
+}
+
+![test]
+function decode_before_reads_the_scalar_ending_there() -> Result<(), TestError> {
+    const text: [u8] = [0x61, 0xC3, 0xA9, 0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80];
+    expect_equal(before(&text, 1), expected(0x61, 1))?;
+    expect_equal(before(&text, 3), expected(0xE9, 2))?;
+    expect_equal(before(&text, 6), expected(0x20AC, 3))?;
+    expect_equal(before(&text, 10), expected(0x1F600, 4))?;
+    // Inside a sequence, and either end.
+    expect_equal(before(&text, 2), -1)?;
+    expect_equal(before(&text, 5), -1)?;
+    expect_equal(before(&text, 8), -1)?;
+    expect_equal(before(&text, 0), -1)?;
+    return expect_equal(before(&text, 11), -1);
+}
+
+![test]
+function decode_before_refuses_what_decode_at_refuses() -> Result<(), TestError> {
+    const overlong: [u8] = [0x61, 0xC0, 0xAF];
+    const surrogate: [u8] = [0xED, 0xA0, 0x80];
+    // More continuation bytes than a sequence holds.
+    const too_many: [u8] = [0xF0, 0x9F, 0x98, 0x80, 0x80];
+    const lone: [u8] = [0x80];
+    expect_equal(before(&overlong, 3), -1)?;
+    expect_equal(before(&surrogate, 3), -1)?;
+    expect_equal(before(&too_many, 5), -1)?;
+    return expect_equal(before(&lone, 1), -1);
+}
+
+![test]
+function from_utf8_refuses_what_decode_at_refuses() -> Result<(), TestError> {
+    const good: [u8] = [0x61, 0xEF, 0xBF, 0xBD, 0xF4, 0x8F, 0xBF, 0xBF];
+    expect_true(Str::from_utf8(good.as_slice()).is_ok(), Str::new("U+FFFD and U+10FFFF are well-formed"))?;
+    const surrogate: [u8] = [0x61, 0xED, 0xA0, 0x80];
+    match (Str::from_utf8(surrogate.as_slice())) {
+        Result::Ok(_) => { return Result::Err(TestError::failed(Str::new("a surrogate is refused"))); }
+        Result::Err(error) => {
+            expect_equal(error.valid_up_to, 1)?;
+            expect_equal(error.error_length.unwrap_or(-1), 1)?;
+        }
+    }
+    const cut: [u8] = [0x61, 0x62, 0xF0, 0x9F, 0x98];
+    match (Str::from_utf8(cut.as_slice())) {
+        Result::Ok(_) => { return Result::Err(TestError::failed(Str::new("a sequence cut short is refused"))); }
+        Result::Err(error) => {
+            expect_equal(error.valid_up_to, 2)?;
+            expect_true(error.error_length.is_none(), Str::new("a sequence cut short at the end is incomplete"))?;
+        }
+    }
+    return Result::Ok(());
+}
+
+/// The lenient reading `Str::chars` promises, written out on its own: the
+/// scalar at `position`, or U+FFFD over one byte where the bytes are not
+/// well-formed UTF-8.  Each check compares the library against it.
+function lenient(bytes: &Array<u8>, position: i64) -> DecodedScalar {
+    const lead: u8 = bytes[position];
+    if (lead < 0x80) { return DecodedScalar { scalar: lead as u32, length: 1 }; }
+    mut needed: i64 = 0;
+    mut scalar: u32 = 0;
+    mut least: u32 = 0;
+    if ((lead & 0xE0) == 0xC0) { needed = 1; scalar = (lead & 0x1F) as u32; least = 0x80; }
+    else if ((lead & 0xF0) == 0xE0) { needed = 2; scalar = (lead & 0x0F) as u32; least = 0x800; }
+    else if ((lead & 0xF8) == 0xF0) { needed = 3; scalar = (lead & 0x07) as u32; least = 0x10000; }
+    else { return DecodedScalar { scalar: 0xFFFD, length: 1 }; }
+    if (position + 1 + needed > bytes.length()) { return DecodedScalar { scalar: 0xFFFD, length: 1 }; }
+    for (mut offset: i64 = 1; offset <= needed; offset++) {
+        const next: u8 = bytes[position + offset];
+        if ((next & 0xC0) != 0x80) { return DecodedScalar { scalar: 0xFFFD, length: 1 }; }
+        scalar = (scalar << 6) | ((next & 0x3F) as u32);
+    }
+    if (scalar < least || (scalar >= 0xD800 && scalar <= 0xDFFF) || scalar > 0x10FFFF) {
+        return DecodedScalar { scalar: 0xFFFD, length: 1 };
+    }
+    return DecodedScalar { scalar: scalar, length: 1 + needed };
+}
+
+/// Whether `chars`, `char_indices` and `char_count` over `bytes` read
+/// exactly the scalars `lenient` reads.
+function reads_leniently(bytes: &Array<u8>) -> boolean {
+    const text: Str = Str::from(bytes.as_slice());
+    mut chars: implement Iterator<u32> = text.chars();
+    mut indices: implement Iterator<Pair<i64, u32>> = text.char_indices();
+    mut position: i64 = 0;
+    mut count: i64 = 0;
+    while (position < bytes.length()) {
+        const want: DecodedScalar = lenient(bytes, position);
+        match (chars.next()) {
+            Option::Some(scalar) => { if (scalar != want.scalar) { return false; } }
+            Option::None => { return false; }
+        }
+        match (indices.next()) {
+            Option::Some(pair) => { if (pair.first != position || pair.second != want.scalar) { return false; } }
+            Option::None => { return false; }
+        }
+        position = position + want.length;
+        count = count + 1;
+    }
+    return chars.next().is_none() && indices.next().is_none() && text.char_count() == count;
+}
+
+![test]
+function chars_read_every_two_byte_input_leniently() -> Result<(), TestError> {
+    for (mut first: i64 = 0; first < 256; first++) {
+        for (mut second: i64 = 0; second < 256; second++) {
+            const bytes: [u8] = [first as u8, second as u8];
+            if (!reads_leniently(&bytes)) {
+                return Result::Err(TestError::failed(Str::new("chars disagree with the lenient reading on two bytes")));
+            }
+        }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function chars_read_multi_byte_leads_leniently() -> Result<(), TestError> {
+    // Every lead from 0xC0 up, before each continuation boundary value and
+    // a non-continuation byte, then cut at every length.
+    const followers: [u8] = [0x00, 0x7F, 0x80, 0x8F, 0x90, 0x9F, 0xA0, 0xBF, 0xC0, 0xFF];
+    for (mut lead: i64 = 0xC0; lead < 256; lead++) {
+        for (mut a: i64 = 0; a < followers.length(); a++) {
+            for (mut b: i64 = 0; b < followers.length(); b++) {
+                for (mut c: i64 = 0; c < followers.length(); c++) {
+                    const bytes: [u8] = [lead as u8, followers[a], followers[b], followers[c], 0x41];
+                    if (!reads_leniently(&bytes)) {
+                        return Result::Err(TestError::failed(Str::new("chars disagree with the lenient reading after a lead byte")));
+                    }
+                    for (mut cut: i64 = 1; cut < 4; cut++) {
+                        mut shorter: Array<u8> = Array::new();
+                        for (mut index: i64 = 0; index < cut; index++) { shorter.push(bytes[index]); }
+                        if (!reads_leniently(&shorter)) {
+                            return Result::Err(TestError::failed(Str::new("chars disagree with the lenient reading on a cut sequence")));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function char_count_counts_a_malformed_byte_once() -> Result<(), TestError> {
+    // "a", a lone continuation byte, an overlong "/", a surrogate, "b".
+    const bytes: [u8] = [0x61, 0x80, 0xC0, 0xAF, 0xED, 0xA0, 0x80, 0x62];
+    const text: Str = Str::from(bytes.as_slice());
+    expect_equal(text.char_count(), 8)?;
+    mut replaced: i64 = 0;
+    for (scalar in text.chars()) { if (scalar == 0xFFFD) { replaced = replaced + 1; } }
+    return expect_equal(replaced, 6);
+}

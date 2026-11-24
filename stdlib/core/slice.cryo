@@ -18,7 +18,9 @@ import std::core::ops::{ Index, IndexMutable, IndexView, IndexViewMutable,
                          Range, RangeInclusive, RangeFrom, RangeTo, RangeFull };
 import std::core::iter::{ DoubleEndedIterator, Iterator };
 import std::core::option::{ Option };
+import std::core::result::{ Result };
 import std::core::mem;
+import std::ffi::libc;
 
 /// A container whose elements can be read as a slice. Where a `&Slice<T>`
 /// is wanted, a `&A` or `mut &A` of such a container is given as its
@@ -129,6 +131,79 @@ public type struct Slice<T> {
     /// owning `T`, walk by index with `length()` + `get_reference`.
     public iter(&this) -> implement Iterator<T> where T: Copy {
         return SliceIterator::<T> { ptr: this.ptr, remaining: this.length };
+    }
+
+    /// The index of the first element equal to `value`, or `None`. A slice
+    /// of bytes is searched with `memchr`.
+    public index_of(&this, value: &T) -> Option<i64> where T: Eq {
+        static match (T) {
+            u8 => {
+                if (this.length == 0) { return Option::None; }
+                const found: void* = libc::memchr(this.ptr as void*, *value as i32, this.length as u64);
+                if (found == null) { return Option::None; }
+                return Option::Some(((found as u64) - (this.ptr as u64)) as i64);
+            }
+            _ => {
+                for (mut index: i64 = 0; index < this.length; index++) {
+                    if (this.ptr[index].equals(value)) { return Option::Some(index); }
+                }
+                return Option::None;
+            }
+        }
+    }
+
+    /// The index of the last element equal to `value`, or `None`.
+    public last_index_of(&this, value: &T) -> Option<i64> where T: Eq {
+        for (mut index: i64 = this.length - 1; index >= 0; index--) {
+            if (this.ptr[index].equals(value)) { return Option::Some(index); }
+        }
+        return Option::None;
+    }
+
+    /// Find `value` in a slice sorted ascending: `Ok` with the index of an
+    /// element equal to it, or `Err` with the index it would be inserted at
+    /// to keep the order. On an unsorted slice the answer is some index,
+    /// not necessarily a meaningful one.
+    public binary_search(&this, value: &T) -> Result<i64, i64> where T: Ord {
+        return this.binary_search_by((element: &T) -> Ordering { return element.compare(value); });
+    }
+
+    /// Search a slice sorted in the order `compare` describes. `compare`
+    /// says how an element orders against the one sought: `Less` for an
+    /// element before it, `Greater` for one after it. Answers as
+    /// `binary_search` does.
+    public binary_search_by<F>(&this, compare: F) -> Result<i64, i64> where F: (&T) -> Ordering {
+        mut low: i64 = 0;
+        mut high: i64 = this.length;
+        while (low < high) {
+            const middle: i64 = low + (high - low) / 2;
+            match (compare(&this.ptr[middle])) {
+                Ordering::Less => { low = middle + 1; }
+                Ordering::Greater => { high = middle; }
+                Ordering::Equal => { return Result::Ok(middle); }
+            }
+        }
+        return Result::Err(low);
+    }
+
+    /// The index of the first element `before` is false for, in a slice
+    /// where every element it is true for comes before every element it is
+    /// false for; `length()` when it is true for all of them. In the sorted
+    /// `[1, 3, 3, 8]`, `(x: &i64) -> boolean { return *x < 3; }` answers 1,
+    /// where a 3 would be inserted ahead of the 3s. On a slice not split
+    /// that way the answer is some index, not necessarily a meaningful one.
+    public partition_point<F>(&this, before: F) -> i64 where F: (&T) -> boolean {
+        mut low: i64 = 0;
+        mut high: i64 = this.length;
+        while (low < high) {
+            const middle: i64 = low + (high - low) / 2;
+            if (before(&this.ptr[middle])) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        return low;
     }
 
     /// The element `xs[index]` names, in place: what `Index` and
