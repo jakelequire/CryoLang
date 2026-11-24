@@ -1288,7 +1288,7 @@ An overloaded name used as a value without a call is picked by its expected func
 
 Integer division truncates toward zero. The prefix forms `++x`, `--x` evaluate to the new value; the postfix forms `x++`, `x--` evaluate to the old value (C semantics).
 
-**Overflow.** An integer `+`, `-`, `*`, unary `-`, `++` or `--` (and the compound `+=`, `-=`, `*=`) *overflows* when its true result is outside its type's range, for signed and unsigned types alike. What an overflow does is the build profile's `overflow_checks`:
+**Overflow.** An integer `+`, `-`, `*`, unary `-`, `++` or `--` (and the compound `+=`, `-=`, `*=`) *overflows* when its true result is outside its type's range, for signed and unsigned types alike. A compound assignment's type is its target's, since the target holds the right side's type: with `b: i16` and `x: u8`, `b += x` overflows where `b + x` is outside `i16`'s range, whatever `x`'s width and sign. What an overflow does is the build profile's `overflow_checks`:
 
 - **Checked** (`overflow_checks = true`, the `debug` profile's default): the program panics, naming the operation - `attempt to add with overflow`, `attempt to subtract with overflow`, `attempt to multiply with overflow`, `attempt to negate with overflow` - at the operator's place.
 - **Wrapping** (`overflow_checks = false`, the `release` profile's default and every other profile's): the result is the true result reduced modulo 2<sup>N</sup> for an N-bit type, two's complement. This is a defined result, never undefined behavior.
@@ -1305,9 +1305,20 @@ The optimization level has no part in it: a profile names its own setting in its
 overflow_checks = true
 ```
 
-Code that means to wrap says so, and wraps in every profile: each integer type has `wrapping_add`, `wrapping_subtract`, `wrapping_multiply` and `wrapping_negate`. Code that must detect overflow asks `checked_add`, `checked_subtract` and `checked_multiply` (`None` where the true result does not fit), `overflowing_add` and its kin (the wrapped result and whether it wrapped), or clamps with `saturating_add` and its kin. There is no automatic widening; `as` between integer types truncates or extends and never overflows.
+Code that means to wrap says so, and wraps in every profile: each integer type has `wrapping_add`, `wrapping_subtract`, `wrapping_multiply`, `wrapping_negate` and `wrapping_power`. The methods that compute as the operators do overflow as they do: `power` as `*`, and a signed type's `abs` as unary `-`, so `i32::MIN.abs()` panics where checks are on and is `i32::MIN` where they are off. Code that must detect overflow asks `checked_add`, `checked_subtract`, `checked_multiply`, `checked_power` and `checked_abs` (`None` where the true result does not fit), `overflowing_add` and its kin (the wrapped result and whether it wrapped), or clamps with `saturating_add` and its kin. There is no automatic widening; `as` between integer types truncates or extends and never overflows.
 
 **Division and remainder** by zero panic in every profile (`attempt to divide by zero`), as do the signed `MIN / -1` and `MIN % -1`, whose quotient is one past the type's maximum.
+
+**A constant expression that overflows is refused** in every profile (`E0465`): an integer `+`, `-`, `*`, `/` or unary `-` whose operands are compile-time integers - literals, module constants and type constants such as `i32::MAX`, and expressions of them - and whose true result its type does not hold would overflow whenever it ran. The refusal names the value, and helps with a type that holds it and with the wrapping method:
+
+```cryo
+const SMALL: u8 = 200;
+const SUM: u8 = SMALL + 100;      // E0465: its value is 300, which `u8` does not hold
+const WIDE: u16 = (SMALL as u16) + 100;
+const WRAPPED: u8 = SMALL.wrapping_add(100);
+```
+
+An overflow inside a larger constant expression is refused where it happens, once. A negated literal is one literal, so `-128` as an `i8` holds; and an expression made only of literals stored in a typed place is its exact value, judged whole by the literal rule (`E0010`).
 
 ### 5.2 Comparison
 

@@ -922,7 +922,10 @@ Jake's answers to the test-infrastructure plan.
     `tools/CryoFuzz` project, sharing its library.
 16. **`legacy/` is frozen:** not ported, not deleted, not edited.
 17. **The wrapping arithmetic names** are `wrapping_add`,
-    `wrapping_subtract`, `wrapping_multiply` and `wrapping_negate`.
+    `wrapping_subtract`, `wrapping_multiply`, `wrapping_negate` and
+    `wrapping_power`.  `power` overflows as `*` does and a signed `abs` as
+    unary `-`; a compound assignment's overflow is judged at its target's
+    type.
 
 ## Open questions
 
