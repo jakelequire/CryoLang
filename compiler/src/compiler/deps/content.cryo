@@ -1,0 +1,63 @@
+///! The content hash of a dependency's files: what `cryoconfig.lock`
+///! records for each git dependency when `cryo fetch` extracts it, and what
+///! every build checks the extracted files against.
+
+namespace compiler::deps::content;
+
+import std::fs::directory::{ Directory, DirectoryEntries };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::encoding::sha256::{ Sha256 };
+
+
+/// The hash a lock records for a package's files.
+type struct PackageContent {
+
+    /// `sha256-<64 hex digits>`: the SHA-256 over every file below `root`,
+    /// in the byte order of their paths relative to it, written with `/`:
+    /// each path, a NUL byte, its length in decimal digits, a NUL byte and
+    /// its bytes.  The bytes are the ones git stores, so the hash is the
+    /// same on every host, and a path, a length or a byte changed anywhere
+    /// changes it.  `Err` says what could not be read; anything below
+    /// `root` that is neither a directory nor a regular file is refused,
+    /// since an extraction writes nothing else.
+    static of_directory(root: Path) -> Result<String, String> {
+        mut files: [String] = [];
+        mut directories: [String] = [String::new()];
+        for (mut d: i64 = 0; d < directories.length(); d++) {
+            const relative: String = directories[d].clone();
+            const directory: PathBuf = if (relative.is_empty()) { PathBuf::from(root.as_str()) } else { root.join(relative.as_str()) };
+            mut entries: DirectoryEntries = match (Directory::entries(directory.as_path())) {
+                Result::Ok(found)  => { found }
+                Result::Err(error) => { return Result::Err(f"cannot read {directory.as_path().as_str()}: {error}"); }
+            };
+            for (entry in entries) {
+                const name: String = if (relative.is_empty()) { String::from_str(entry.name()) } else { f"{relative}/{entry.name()}" };
+                if (entry.is_directory()) {
+                    directories.push(name);
+                } else if (entry.is_file()) {
+                    files.push(name);
+                } else {
+                    return Result::Err(f"{name} is not a regular file");
+                }
+            }
+        }
+        files.sort();
+        mut hasher: Sha256 = Sha256::new();
+        for (mut i: i64 = 0; i < files.length(); i++) {
+            const bytes: Array<u8> = match (File::read_bytes(root.join(files[i].as_str()).as_path())) {
+                Result::Ok(read)   => { read }
+                Result::Err(error) => { return Result::Err(f"cannot read {files[i]}: {error}"); }
+            };
+            mut header: String = files[i].clone();
+            header.push_byte(0);
+            header.push(f"{bytes.length()}");
+            header.push_byte(0);
+            hasher.update(header.as_bytes());
+            hasher.update(bytes.as_slice());
+        }
+        return Result::Ok(f"sha256-{hasher.finish().to_hex()}");
+    }
+}

@@ -22,17 +22,15 @@ namespace compiler::prebuilt_cache;
 
 import compiler::build_manifest::{ ContentHasher, Manifest };
 import compiler::deps::cache::{ Cache };
-import utils::log::{ Log, LogArea };
+import compiler::utils::log::{ Log, LogArea };
+import compiler::utils::directory_lock::{ DirectoryLock };
 import std::fmt;
 import std::env;
-import std::thread;
-import std::time::duration::{ Duration };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import std::fs::directory::{ Directory, DirectoryEntries };
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
-import std::io::error::{ IoErrorKind };
 import std::process::command::{ Command, Output };
 import std::time::clock::{ SystemTime };
 
@@ -55,9 +53,6 @@ const LAST_USE_NAME: string = "last-use";
 /// release, and so only read.
 const SHIPPED_NAME: string = "shipped";
 
-/// Lock attempts refused with the lock absent (200 ms apart) before the
-/// refusal is reported rather than waited out.
-const LOCK_REFUSALS_REPORTED: i64 = 25;
 
 /// One archive's place: its directory, the key that names it, its
 /// manifest's file name, and what it is, for messages ("the stdlib
@@ -108,11 +103,7 @@ type struct PrebuiltCache {
     /// Wait for the lock beside the directory.  Answers true holding it,
     /// with the archive still to build, or false when another build
     /// published the archive meanwhile (the lock is then not held).
-    /// Windows refuses to create a directory whose deletion is pending, so
-    /// a lock another build is releasing can fail to be taken with access
-    /// denied for a moment; only a failure that outlasts that is reported.
     take_lock(&this) -> Result<boolean, String> {
-        const lock: string = this.directory + ".lock";
         match (Path::from(this.directory).parent()) {
             Option::Some(parent) => {
                 match (Directory::create_all(parent)) {
@@ -124,58 +115,31 @@ type struct PrebuiltCache {
             }
             Option::None => { }
         }
-        mut refusals: i64 = 0;
+        mut lock: DirectoryLock = this.lock();
         loop {
-            match (Directory::create(Path::from(lock))) {
-                Result::Ok(_) => {
-                    // Another build may have finished it between the last
-                    // look and the lock.
-                    if (this.published()) {
-                        PrebuiltCache::release(lock);
-                        return Result::Ok(false);
-                    }
-                    return Result::Ok(true);
+            if (lock.attempt()?) {
+                // Another build may have finished it between the last look
+                // and the lock.
+                if (this.published()) {
+                    lock.release();
+                    return Result::Ok(false);
                 }
-                Result::Err(error) => {
-                    const held: boolean = match (error.kind) {
-                        IoErrorKind::AlreadyExists => { true }
-                        _                          => { Path::from(lock).exists() }
-                    };
-                    if (held) {
-                        refusals = 0;
-                    } else {
-                        refusals = refusals + 1;
-                        if (refusals > LOCK_REFUSALS_REPORTED) {
-                            return Result::Err(f"cannot take the lock {lock} to build {this.what}: {error}");
-                        }
-                    }
-                }
+                return Result::Ok(true);
             }
             if (this.published()) { return Result::Ok(false); }
-            // A lock older than any archive's build takes was left by one
-            // that died.
-            const expired: boolean = match (Path::from(lock).metadata()) {
-                Result::Ok(m)  => { SystemTime::now().unix_seconds() - m.modified_seconds() > LOCK_EXPIRY_SECONDS }
-                Result::Err(_) => { false }
-            };
-            if (expired) {
-                PrebuiltCache::release(lock);
-                continue;
-            }
-            thread::sleep(Duration::from_milliseconds(200));
+            lock.pause();
         }
     }
 
     /// Give up the lock `take_lock` took.
     unlock(&this) -> void {
-        PrebuiltCache::release(this.directory + ".lock");
+        this.lock().release();
     }
 
-    static release(lock: string) -> void {
-        match (Directory::remove_all(Path::from(lock))) {
-            Result::Ok(_)  => { }
-            Result::Err(_) => { }
-        }
+    /// The lock beside the directory.  One older than any archive's build
+    /// takes was left by a build that died.
+    lock(&this) -> DirectoryLock {
+        return DirectoryLock::new(Str::new(this.directory + ".lock"), f"to build {this.what}".as_str(), LOCK_EXPIRY_SECONDS);
     }
 
     /// Note that a build is about to link the archive in `directory`, so a

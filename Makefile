@@ -195,7 +195,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check incremental-runtime-check check-fast lsp-check cross-check vendor-check api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-abi-check pin \
+.PHONY: help cryo cryo-exe selfhost-check test test-list test-census verify roster-check verify-selftest incremental-instance-check incremental-runtime-check check-fast lsp-check cross-check vendor-check deps-flow api-index api-index-check doc-coverage-check doc-coverage-update examples examples-golden valgrind-check verify-freestanding warnings-check runtime-abi-check pin \
         pin-impl pin-linux-impl pin-windows-impl _pin-windows-do verify-pin verify-pin-clean incremental-check \
         install uninstall clean lsp install-lsp cryogate cryosmith cryosmith-selftest smith-corpus-pin release release-linux release-windows install-check
 
@@ -240,8 +240,8 @@ Tests and gates
   make verify            Build once; census, examples, lsp-check, cross-check,
                          incremental-instance-check, incremental-runtime-check,
                          runtime-abi-check, CryoSmith's pinned corpus
-                         (tests/smith-corpus, built in .verify/smith-corpus)
-                         and check-fast run
+                         (tests/smith-corpus, built in .verify/smith-corpus),
+                         deps-flow and check-fast run
                          concurrently and their objects are hashed
                          (ARGS="--baseline HEAD --require-identical";
                          --sequential runs them one at a time).
@@ -292,6 +292,10 @@ Tests and gates
                          is rebuilt with nothing else changed; writes
                          .verify/incremental-runtime.
   make vendor-check      Every constant shape survives `cryo vendor`.
+  make deps-flow         A library and a program made by `cryo init`, then
+                         fetch, run, test, a kept pin, update and an offline
+                         build against a git repository on this machine;
+                         the package cache is a scratch directory, removed.
   make verify-freestanding  The runtime's freestanding acceptance check
                          (from a Windows host, run inside WSL).
   make runtime-abi-check The lang-item registry (runtime/abi/lang_items.def)
@@ -838,10 +842,16 @@ endif
 vendor-check: $(STAGE2_FILE) $(CRYOGATE)
 	@$(CRYOGATE_COMMAND) vendor --cryo "$(STAGE2_FILE)"
 
+# The dependency flow from `cryo init` to an offline build, against a git
+# repository on this machine and a scratch package cache (`cryogate
+# deps-flow`).  Needs `git` on PATH.
+deps-flow: $(STAGE2_FILE) $(CRYOGATE)
+	@$(CRYOGATE_COMMAND) deps-flow --cryo "$(STAGE2_FILE)" --stdlib "$(ROOT)/stdlib"
+
 # ---- one verification run ----------------------------------------------
 # Build once, then run census, examples, lsp-check, cross-check,
 # incremental-instance-check, incremental-runtime-check, runtime-abi-check,
-# CryoSmith's pinned corpus (tests/smith-corpus) and check-fast at the same
+# CryoSmith's pinned corpus (tests/smith-corpus), deps-flow and check-fast at the same
 # time, and hash the objects the census and examples compiled.
 # ARGS="--baseline HEAD" also compares those objects against a compiler built
 # from HEAD's compiler/src (in a clone under .verify/, cached), which is the

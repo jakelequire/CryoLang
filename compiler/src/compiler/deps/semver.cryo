@@ -1,165 +1,256 @@
-///! Semver constraint matching for git deps.
+///! Versions and version requirements.
 ///!
-///! Parses a small subset of semver: `MAJOR.MINOR.PATCH` with an
-///! optional leading `v` and an optional `^` constraint operator.
-///! Pre-release suffixes (`-rc.1`, `+build.5`) are accepted at the
-///! parser level but ignored for ordering.
+///! A library's version is the `version` key of its cryoconfig's `[lib]`
+///! section: `MAJOR.MINOR.PATCH`, optionally followed by `-<pre-release>`
+///! and `+<build>`, each a dot-separated run of letters, digits and `-`.
+///! A consumer's `version = "..."` in `[dependencies]` is a requirement
+///! that version must meet:
 ///!
-///! Supported constraint forms:
+///!   "1.2.3", "^1.2.3"  1.2.3 or later, below 2.0.0
+///!   "0.2.3", "^0.2.3"  0.2.3 or later, below 0.3.0 (below 1.0.0, the
+///!                      minor version is the one that breaks)
+///!   "0.0.3"            0.0.3 only
+///!   "1.2", "1"         1.2.0 or later below 2.0.0; 1.0.0 or later below 2.0.0
+///!   "0.1"              0.1.0 or later, below 0.2.0
+///!   "~1.2.3", "~1.2"   1.2.3 (or 1.2.0) or later, below 1.3.0
+///!   "=1.2.3"           1.2.3 only
 ///!
-///!   "1.2.3"   exact match against a tag named `1.2.3` or `v1.2.3`
-///!   "^1.2.3"  highest tag X.Y.Z with X==1 and (Y > 2 or Y==2 and Z>=3)
-///!   "^0.2.3"  highest tag 0.Y.Z with Y==2 and Z>=3   (0.x: minor is major)
-///!   "^0.0.3"  highest tag 0.0.Z with Z==3            (0.0.x: exact)
-///!
-///! Tilde, hyphen, and explicit-comparator ranges (`>=`, `<`, `>`, ...)
-///! are not yet supported; we'd want them eventually but they're not
-///! load-bearing for the v1 use case.
+///! A pre-release version (`1.0.0-rc.1`) meets only a requirement that names
+///! a pre-release of the same `MAJOR.MINOR.PATCH`, and orders below the
+///! release.
 
 namespace compiler::deps::semver;
 
-import std::collections::str;
+import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::core::slice::{ Slice };
 
 
-/// Parsed `MAJOR.MINOR.PATCH`.  `valid == false` <=> the source string
-/// failed to parse; the numeric fields are meaningless in that case.
-type struct Version {
+/// A parsed version.  The build metadata after `+` is accepted and does not
+/// take part in any comparison.
+type struct Version with [Clone] {
     major: i64;
     minor: i64;
     patch: i64;
-    valid: boolean;
+    /// The text after `-`, empty for a release.
+    pre_release: String;
 
-    static invalid() -> Version {
-        return Version { major: 0, minor: 0, patch: 0, valid: false };
+    /// Parse `source` as a library's version: `MAJOR.MINOR.PATCH`, then an
+    /// optional `-<pre-release>` and `+<build>`.  `None` for anything else,
+    /// a leading `v` and surrounding spaces included.
+    static parse(source: Str) -> Option<Version> {
+        const parts: (Option<Version>, i64) = Version::parse_components(source);
+        if (parts.1 != 3) { return Option::None; }
+        return parts.0.clone();
     }
 
-    /// Lexicographic ordering on (major, minor, patch).  Returns
-    /// negative if `a < b`, 0 on equality, positive if `a > b`.
-    static cmp(a: Version, b: Version) -> i64 {
-        if (a.major != b.major) { return a.major - b.major; }
-        if (a.minor != b.minor) { return a.minor - b.minor; }
-        return a.patch - b.patch;
-    }
-
-    /// Parse `vX.Y.Z` or `X.Y.Z`.  Anything trailing the patch (e.g.
-    /// `-rc.1` or `+build`) is accepted but discarded.  Returns
-    /// `Version::invalid()` on malformed input.
-    static parse(source: str::Str) -> Version {
+    /// Parse one to three dot-separated components from the start of
+    /// `source` and the pre-release and build after them; the version
+    /// (missing components zero) and how many components were written.
+    /// `None` when `source` is not that shape: no component, more than
+    /// three, a component that is not a decimal number or has a leading
+    /// zero, or a pre-release or build that is empty or holds anything but
+    /// letters, digits, `-` and `.`.  A version writes all three; a
+    /// requirement may write fewer.
+    static parse_components(source: Str) -> (Option<Version>, i64) {
         const bytes: &Slice<u8> = source.as_bytes();
-        const len: i64 = bytes.length();
-        if (len == 0) { return Version::invalid(); }
-
+        const length: i64 = bytes.length();
+        mut values: [i64; 3] = [0; 3];
+        mut written: i64 = 0;
         mut i: i64 = 0;
-        if (bytes[0] == 'v' as u8 || bytes[0] == 'V' as u8) { i = 1; }
-
-        // MAJOR, MINOR and PATCH: each a run of decimal digits, the three
-        // joined by `.`.  A run too long for a u64 ends before a digit, and
-        // is malformed.
-        mut parts: [i64; 3] = [0; 3];
-        for (mut part: i64 = 0; part < 3; part++) {
-            if (part > 0) {
-                if (i >= len || bytes[i] != '.' as u8) { return Version::invalid(); }
+        while (written < 3) {
+            if (written > 0) {
+                if (i >= length || bytes[i] != '.' as u8) { break; }
                 i += 1;
             }
-            match (u64::parse_radix_prefix(bytes.subslice(i, len), 10)) {
-                Option::Some(run) => { parts[part] = run.0 as i64; i += run.1; }
-                Option::None      => { return Version::invalid(); }
+            const start: i64 = i;
+            match (u64::parse_radix_prefix(bytes.subslice(i, length), 10)) {
+                Option::Some(run) => { values[written] = run.0 as i64; i += run.1; }
+                Option::None      => { return (Option::None, 0); }
             }
-            if (i < len && bytes[i].is_digit()) { return Version::invalid(); }
+            // A number that does not fit stops before a digit; `01` is not
+            // a version component.
+            if (i < length && bytes[i].is_digit()) { return (Option::None, 0); }
+            if (i - start > 1 && bytes[start] == '0' as u8) { return (Option::None, 0); }
+            written += 1;
         }
-        // Trailing pre-release/build metadata is ignored for ordering.
-
-        return Version { major: parts[0], minor: parts[1], patch: parts[2], valid: true };
-    }
-}
-
-
-// Constraint
-
-/// Constraint operators we understand.
-type enum ConstraintOp {
-    Exact;   // "1.2.3"   - matches only the literal version
-    Caret;   // "^1.2.3"  - compatible versions, up to the next major
-}
-
-type struct Constraint {
-    op:    ConstraintOp;
-    bound: Version;
-    valid: boolean;
-
-    static invalid() -> Constraint {
-        return Constraint {
-            op:    ConstraintOp::Exact,
-            bound: Version::invalid(),
-            valid: false,
-        };
+        if (written == 0) { return (Option::None, 0); }
+        mut pre_release: String = String::new();
+        if (i < length && bytes[i] == '-' as u8) {
+            const start: i64 = i + 1;
+            i = Version::identifiers_end(bytes, start);
+            if (i == start) { return (Option::None, 0); }
+            pre_release = String::from_str(source.byte_substring(start, i));
+        }
+        if (i < length && bytes[i] == '+' as u8) {
+            const start: i64 = i + 1;
+            i = Version::identifiers_end(bytes, start);
+            if (i == start) { return (Option::None, 0); }
+        }
+        if (i != length) { return (Option::None, 0); }
+        return (Option::Some(Version {
+            major: values[0], minor: values[1], patch: values[2], pre_release: pre_release,
+        }), written);
     }
 
-    /// Parse a constraint string: the value the user wrote in
-    /// `version = "..."`.  The leading `^` selects caret semantics; absent
-    /// it, exact match.
-    static parse(source: str::Str) -> Constraint {
-        if (source.length() == 0) { return Constraint::invalid(); }
+    /// Where the run of letters, digits, `-` and `.` starting at `start`
+    /// in `bytes` ends.
+    static identifiers_end(bytes: &Slice<u8>, start: i64) -> i64 {
+        mut i: i64 = start;
+        while (i < bytes.length()
+                && (bytes[i].is_alpha() || bytes[i].is_digit() || bytes[i] == '-' as u8 || bytes[i] == '.' as u8)) {
+            i += 1;
+        }
+        return i;
+    }
 
-        const caret: str::Str = str::Str::new("^");
-        mut op:   ConstraintOp = ConstraintOp::Exact;
-        mut body: str::Str     = source;
-        match (source.strip_prefix(&caret)) {
-            Option::Some(rest) => { op = ConstraintOp::Caret; body = rest; }
+    /// The version a git tag names: the tag with one leading `v` or `V`
+    /// dropped, parsed as a version; `None` for a tag that names none
+    /// (`stable`, `release-2`).
+    static of_tag(tag: Str) -> Option<Version> {
+        match (tag.strip_prefix(&Str::new("v"))) {
+            Option::Some(rest) => { return Version::parse(rest); }
             Option::None       => { }
         }
-
-        const v: Version = Version::parse(body);
-        if (!v.valid) { return Constraint::invalid(); }
-        return Constraint { op: op, bound: v, valid: true };
+        match (tag.strip_prefix(&Str::new("V"))) {
+            Option::Some(rest) => { return Version::parse(rest); }
+            Option::None       => { }
+        }
+        return Version::parse(tag);
     }
 
-    /// Does `v` satisfy this constraint?
-    static satisfies(c: Constraint, v: Version) -> boolean {
-        if (!c.valid || !v.valid) { return false; }
-
-        return match (c.op) {
-            ConstraintOp::Exact => { Version::cmp(v, c.bound) == 0 }
-            ConstraintOp::Caret => { Constraint::caret_satisfies(c.bound, v) }
+    /// The version `source`, which `parse` refuses, was most likely written
+    /// for: the text with surrounding spaces and one leading `v` dropped and
+    /// any missing minor or patch zero (`v0.1` -> `0.1.0`); `None` when that
+    /// is not a version either.
+    static nearest(source: Str) -> Option<Version> {
+        const trimmed: Str = source.trim();
+        const body: Str = match (trimmed.strip_prefix(&Str::new("v"))) {
+            Option::Some(rest) => { rest }
+            Option::None       => { trimmed }
         };
+        const parts: (Option<Version>, i64) = Version::parse_components(body);
+        return parts.0.clone();
     }
 
-    /// Caret-range upper-bound check:
-    ///   ^1.2.3 => <2.0.0
-    ///   ^0.2.3 => <0.3.0
-    ///   ^0.0.3 => <0.0.4
-    static caret_satisfies(bound: Version, v: Version) -> boolean {
-        if (Version::cmp(v, bound) < 0) { return false; }
-        if (bound.major != 0) {
-            return v.major == bound.major;
-        }
-        if (bound.minor != 0) {
-            return v.major == 0 && v.minor == bound.minor;
-        }
-        return v.major == 0 && v.minor == 0 && v.patch == bound.patch;
+    /// The version written out: `MAJOR.MINOR.PATCH`, then `-<pre-release>`
+    /// when it has one.
+    text(&this) -> String {
+        mut written: String = f"{this.major}.{this.minor}.{this.patch}";
+        if (this.pre_release.length() > 0) { written.push(f"-{this.pre_release}"); }
+        return written;
     }
 
-    /// Given a list of candidate tag strings, pick the highest-versioned
-    /// one that satisfies `c`.  Returns "" when nothing matches.
-    ///
-    /// Tags that fail to parse as semver are silently skipped; projects
-    /// often have non-version refs like `latest` or `nightly` mixed in.
-    static select_best_tag(c: Constraint, tags: &[String]) -> String {
-        mut best_index: i64 = -1;
-        mut best_v: Version = Version::invalid();
+    /// Negative when this version orders below `other`, zero when they are
+    /// the same version, positive when above.  A pre-release orders below its
+    /// release; two pre-releases of one release order by their text.
+    compare(&this, other: &Version) -> i64 {
+        if (this.major != other.major) { return this.major - other.major; }
+        if (this.minor != other.minor) { return this.minor - other.minor; }
+        if (this.patch != other.patch) { return this.patch - other.patch; }
+        const mine: boolean = this.pre_release.length() > 0;
+        const theirs: boolean = other.pre_release.length() > 0;
+        if (mine != theirs) { return if (mine) { -1 } else { 1 }; }
+        if (this.pre_release.as_str() == other.pre_release.as_str()) { return 0; }
+        return if (this.pre_release.as_str() < other.pre_release.as_str()) { -1 } else { 1 };
+    }
 
-        for (mut i: i64 = 0; i < tags.length(); i++) {
-            const v: Version = Version::parse(tags[i].as_str());
-            if (!v.valid) { continue; }
-            if (!Constraint::satisfies(c, v)) { continue; }
-            if (!best_v.valid || Version::cmp(v, best_v) > 0) {
-                best_v     = v;
-                best_index = i;
+    /// The series this version belongs to, written out: the versions that
+    /// may replace it without breaking a program, which share its major
+    /// (`2`), or below 1.0.0 its minor too (`0.2`).  A build holds one
+    /// series of a library.
+    series(&this) -> String {
+        if (this.major > 0) { return f"{this.major}"; }
+        return f"0.{this.minor}";
+    }
+
+    /// Whether `other` has the same major, minor and patch.
+    same_release(&this, other: &Version) -> boolean {
+        return this.major == other.major && this.minor == other.minor && this.patch == other.patch;
+    }
+}
+
+
+/// How a requirement bounds the versions above its own.
+type enum RequirementKind {
+    /// No `^`, or `^`: up to the next version that may break.
+    Compatible;
+    /// `~`: up to the next minor version (the next major, when only the
+    /// major is written).
+    Close;
+    /// `=`: the written components exactly.
+    Exact;
+}
+
+/// A consumer's `version = "..."`: the versions of a library it accepts.
+type struct Requirement {
+    kind:    RequirementKind;
+    /// The written version, missing components zero.
+    lowest:  Version;
+    /// How many of `MAJOR.MINOR.PATCH` were written: 1 to 3.
+    written: i64;
+
+    /// Parse a requirement; `None` when `source` is not one of the forms
+    /// this module's header lists.
+    static parse(source: Str) -> Option<Requirement> {
+        mut kind: RequirementKind = RequirementKind::Compatible;
+        mut body: Str = source;
+        match (source.strip_prefix(&Str::new("^"))) {
+            Option::Some(rest) => { body = rest; }
+            Option::None       => { }
+        }
+        match (source.strip_prefix(&Str::new("~"))) {
+            Option::Some(rest) => { kind = RequirementKind::Close; body = rest; }
+            Option::None       => { }
+        }
+        match (source.strip_prefix(&Str::new("="))) {
+            Option::Some(rest) => { kind = RequirementKind::Exact; body = rest; }
+            Option::None       => { }
+        }
+        const parsed: (Option<Version>, i64) = Version::parse_components(body);
+        match (parsed.0.clone()) {
+            Option::Some(lowest) => {
+                return Option::Some(Requirement { kind: kind, lowest: lowest, written: parsed.1 });
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    /// The series (`Version::series`) every version this requirement
+    /// accepts belongs to; `None` for `0` and `~0`, which accept every
+    /// version below 1.0.0.
+    series(&this) -> Option<String> {
+        if (this.lowest.major == 0 && this.written == 1) { return Option::None; }
+        return Option::Some(this.lowest.series());
+    }
+
+    /// Whether `version` meets this requirement.
+    satisfied_by(&this, version: &Version) -> boolean {
+        // A pre-release is chosen only by naming one of its release.
+        if (version.pre_release.length() > 0
+                && !(this.lowest.pre_release.length() > 0 && this.lowest.same_release(version))) {
+            return false;
+        }
+        if (version.compare(&this.lowest) < 0) { return false; }
+        // The first component that may differ: every one before it must
+        // equal the requirement's.
+        mut fixed: i64 = 0;
+        match (this.kind) {
+            RequirementKind::Exact => { fixed = this.written; }
+            RequirementKind::Close => { fixed = if (this.written == 1) { 1 } else { 2 }; }
+            RequirementKind::Compatible => {
+                // Below 1.0.0 the first non-zero written component breaks;
+                // with every written one zero, the last written one does.
+                fixed = 1;
+                if (this.lowest.major == 0) {
+                    fixed = this.written;
+                    if (this.written >= 2 && this.lowest.minor != 0) { fixed = 2; }
+                }
             }
         }
-
-        if (best_index < 0) { return String::new(); }
-        return String::from_str(tags[best_index].as_str());
+        if (fixed >= 1 && version.major != this.lowest.major) { return false; }
+        if (fixed >= 2 && version.minor != this.lowest.minor) { return false; }
+        if (fixed >= 3 && version.patch != this.lowest.patch) { return false; }
+        return true;
     }
 }

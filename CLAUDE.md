@@ -25,7 +25,8 @@ make cryo                # build the self-hosted compiler (compiler/build/cryo)
 make test                # unit + compile-fail + project suites
 make test-census         # the same run, with the suite COUNTS and unit/project NAMES asserted
 make verify              # build once; census, examples, lsp, cross, incr, relink, abi, smith
-                         # (CryoSmith's pinned corpus, tests/smith-corpus), check-fast
+                         # (CryoSmith's pinned corpus, tests/smith-corpus), deps (the
+                         # dependency flow against a local git repository), check-fast
                          # CONCURRENTLY (ARGS="--sequential": one at a time, for a host short
                          # of memory), objects hashed (tests, examples, stdlib archives,
                          # runtime archive members); ARGS="--baseline HEAD --require-identical"
@@ -58,6 +59,9 @@ make cross-check         # runtime/stdlib/compiler/LSP/cryogate/cryosmith for th
                          # from WINDOWS only - a Linux host links the windows-gnu
                          # build and fails without mingw + the LLVM-C import lib
 make vendor-check        # every constant shape survives `cryo vendor`
+make deps-flow           # init a library and a program, fetch, run, test, update and build
+                         # offline against a local git repository, scratch cache (needs git);
+                         # a verify gate (`deps`)
 make api-index-check     # docs/stdlib-api.txt is not stale
 make doc-coverage-check  # the stdlib's undocumented public declarations are EXACTLY
                          # docs/doc-coverage.txt: a new undocumented one fails, and so

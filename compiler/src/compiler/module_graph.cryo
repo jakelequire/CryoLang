@@ -11,7 +11,7 @@ import compiler::types::{
 };
 import compiler::ast::node::{ ProgramNode };
 import compiler::decl_index;
-import utils::log::{ Log, LogArea, LogLevel };
+import compiler::utils::log::{ Log, LogArea, LogLevel };
 import std::collections::hashmap::{ HashMap };
 import std::ffi::libc;
 import std::fmt;
@@ -428,22 +428,70 @@ public:
 }
 
 /// The package a module's file is in: its origin and, for a dependency or a
-/// vendored library, its name.
+/// vendored library, its name; for a dependency, also its identity.
 type struct ModulePackage {
     origin:      ModuleOrigin;
     origin_name: String;
+    /// A dependency's identity, its canonical directory (the resolver's
+    /// `DepKey`); empty for every other origin.
+    identity:    String;
 
-    /// Whether a module path written in this package may name a file in
-    /// `other`: the program's own files may name any package's, a
-    /// dependency's or a vendored library's any but the program's, and the
-    /// standard library's only its own.  A package never depends on the
-    /// program that uses it, so a program's file of the same path or
-    /// namespace cannot stand in for one of the package's own.
-    may_name(&this, other: &ModulePackage) -> boolean {
+    static of(origin: ModuleOrigin, origin_name: String, identity: String) -> ModulePackage {
+        return ModulePackage { origin: origin, origin_name: origin_name, identity: identity };
+    }
+
+    /// Whether `other` is this same package: a dependency by its
+    /// identity, a vendored library by its name.
+    is(&this, other: &ModulePackage) -> boolean {
+        if (this.origin != other.origin) { return false; }
         return match (this.origin) {
-            ModuleOrigin::Local  => { true }
-            ModuleOrigin::Stdlib => { other.origin == ModuleOrigin::Stdlib }
-            _                    => { other.origin != ModuleOrigin::Local }
+            ModuleOrigin::Dep    => { this.identity == other.identity }
+            ModuleOrigin::Vendor => { this.origin_name == other.origin_name }
+            _                    => { true }
+        };
+    }
+
+    /// The package as a diagnostic names it: "the program", "the standard
+    /// library", "the package `depot`", "the vendored library `RayLib`".
+    describe(&this) -> String {
+        return match (this.origin) {
+            ModuleOrigin::Local  => { String::from_str(Str::new("the program")) }
+            ModuleOrigin::Stdlib => { String::from_str(Str::new("the standard library")) }
+            ModuleOrigin::Dep    => { f"the package `{this.origin_name}`" }
+            ModuleOrigin::Vendor => { f"the vendored library `{this.origin_name}`" }
+        };
+    }
+}
+
+/// One `[dependencies]` entry, as an edge between packages: the package
+/// whose cryoconfig writes it and the package it names, each by identity.
+/// The program's identity is the empty string.
+type struct PackageDeclaration {
+    declarer: String;
+    declared: String;
+}
+
+/// A package's `[lib]`, a dependency's or the program's own: the package,
+/// its `lib.cryo`, and the namespace that file declares - the library's
+/// own, the one a program imports it by.  `namespace` is empty until the
+/// pre-scan reads the file, and stays empty when the file is missing or
+/// declares none.
+type struct PackageLibrary {
+    package:   ModulePackage;
+    file:      PathBuf;
+    namespace: String;
+
+    /// Whether `file`, a file of `package`, is one of this library's.  A
+    /// dependency publishes every root of its package, so each of its
+    /// files is; the program's binaries are its own and not its library's,
+    /// so of the program's files only those under the library's directory
+    /// are.
+    covers(&this, package: &ModulePackage, file: Path) -> boolean {
+        if (!this.package.is(package)) { return false; }
+        if (package.origin != ModuleOrigin::Local) { return true; }
+        return match (this.file.as_path().parent()) {
+            Option::Some(directory) => { file.starts_with(directory) }
+            Option::None            => { false }
         };
     }
 }
@@ -451,7 +499,9 @@ type struct ModulePackage {
 /// The roots a module's file is classified by: under the vendored
 /// libraries' build folder, a vendored library; under the standard
 /// library's root, the standard library's; under a dependency's root, that
-/// dependency's; otherwise the program's own.
+/// dependency's; otherwise the program's own.  With them, every
+/// `[dependencies]` entry of the build, which decides what each package's
+/// module paths may name.
 type struct PackageRoots {
     /// `<profile_dir>/vendor`; empty when the build has no project.
     vendor_root: PathBuf;
@@ -459,6 +509,23 @@ type struct PackageRoots {
     stdlib_root: PathBuf;
     dep_roots:   [PathBuf];
     dep_names:   [String];
+    /// Each dependency root's package identity, beside `dep_roots`.
+    dep_identities: [String];
+    declarations: [PackageDeclaration];
+    /// Every dependency with a `[lib]`, once each, and the program's own
+    /// `[lib]` when the build indexes it.
+    libraries: [PackageLibrary];
+
+    /// Record that the file `file` declares the namespace `declared`: when
+    /// it is a library's `lib.cryo`, that is the library's.
+    note_declared_namespace(mut &this, file: Str, declared: Str) -> void {
+        const key: String = ModuleGraph::module_key(file);
+        for (mut i: i64 = 0; i < this.libraries.length(); i++) {
+            if (ModuleGraph::module_key(this.libraries[i].file.as_path().as_str()) == key) {
+                this.libraries[i].namespace = String::from_str(declared);
+            }
+        }
+    }
 
     /// The package `file` is in.
     package_of(&this, file: Path) -> ModulePackage {
@@ -468,17 +535,50 @@ type struct PackageRoots {
                 Option::Some(directory) => { directory.file_name().unwrap_or(Str::new("")) }
                 Option::None            => { Str::new("") }
             };
-            return ModulePackage { origin: ModuleOrigin::Vendor, origin_name: String::from_str(library) };
+            return ModulePackage::of(ModuleOrigin::Vendor, String::from_str(library), String::new());
         }
         if (!this.stdlib_root.is_empty() && file.starts_with(this.stdlib_root.as_path())) {
-            return ModulePackage { origin: ModuleOrigin::Stdlib, origin_name: String::new() };
+            return ModulePackage::of(ModuleOrigin::Stdlib, String::new(), String::new());
         }
         for (mut i: i64 = 0; i < this.dep_roots.length(); i++) {
             if (file.starts_with(this.dep_roots[i].as_path())) {
-                return ModulePackage { origin: ModuleOrigin::Dep, origin_name: this.dep_names[i].clone() };
+                return ModulePackage::of(ModuleOrigin::Dep, this.dep_names[i].clone(), this.dep_identities[i].clone());
             }
         }
-        return ModulePackage { origin: ModuleOrigin::Local, origin_name: String::new() };
+        return ModulePackage::of(ModuleOrigin::Local, String::new(), String::new());
+    }
+
+    /// Whether a module path written in `writer` may name a file in
+    /// `target`.  The standard library names only its own files.  Every
+    /// other package names its own, the standard library's, a vendored
+    /// library's, and those of the dependencies its own cryoconfig
+    /// declares (`declares`) and no others; a package never names the
+    /// program that uses it, so a program's file of the same path or
+    /// namespace cannot stand in for one of the package's own.
+    may_name(&this, writer: &ModulePackage, target: &ModulePackage) -> boolean {
+        return match (writer.origin) {
+            ModuleOrigin::Stdlib => { target.origin == ModuleOrigin::Stdlib }
+            _ => {
+                match (target.origin) {
+                    ModuleOrigin::Local  => { writer.origin == ModuleOrigin::Local }
+                    ModuleOrigin::Dep    => { this.declares(writer, target) }
+                    _                    => { true }
+                }
+            }
+        };
+    }
+
+    /// Whether `writer` is the dependency `target` or a package whose
+    /// cryoconfig declares it.  A vendored library declares nothing and
+    /// names any dependency.
+    declares(&this, writer: &ModulePackage, target: &ModulePackage) -> boolean {
+        if (writer.origin == ModuleOrigin::Vendor) { return true; }
+        if (writer.origin == ModuleOrigin::Dep && writer.identity == target.identity) { return true; }
+        for (mut i: i64 = 0; i < this.declarations.length(); i++) {
+            if (this.declarations[i].declarer == writer.identity
+                    && this.declarations[i].declared == target.identity) { return true; }
+        }
+        return false;
     }
 }
 

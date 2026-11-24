@@ -5245,7 +5245,7 @@ For the full grammar, including type and pattern productions, see [`grammar.md`]
 
 ## 23. Project Configuration (cryoconfig)
 
-A project is a directory containing a `cryoconfig` file. `cryo build`, `cryo run`, and `cryo test` search upward from the working directory for it, then build the project it describes. Scaffold a starter file with `cryo init`.
+A project is a directory containing a `cryoconfig` file. `cryo build`, `cryo run`, and `cryo test` search upward from the working directory for it, then build the project it describes. Scaffold a starter project with `cryo init [dir]`: it asks for the project name, the source and output directories and whether the project is an executable or a library, and writes a cryoconfig with a `main.cryo`, or for a library a cryoconfig whose `[lib]` says `version = "0.1.0"`, its `lib.cryo` (section 23.4), a test of it under `tests/` and a `README.md` saying how a program depends on it; the library's first `cryo build` and `cryo test` pass. `cryo test` builds a library-only project's tests into an executable with the library. Each question also has a flag that answers it (`--name=`, `--source-dir=`, `--output-dir=`, `--type=executable|library`), so a script giving all four reads nothing from the terminal. Init never overwrites a file: in a directory that already has a cryoconfig it fails naming it before asking anything, and it fails before writing a source file that is already there.
 
 `cryoconfig` is an INI-like file: `[section]` headers, `key = value` lines, `#` comments. List values use TOML-style arrays (`["a", "b"]`). Unknown keys are ignored with a warning; keys removed in 1.0 are a hard error that names the replacement.
 
@@ -5507,10 +5507,12 @@ A project can build a library and one or more executables from one source tree. 
 
 `cryo build` of a project with `[[bin]]` targets builds the executables only: its `[lib]` is what a project depending on it compiles (a dependency is compiled from its source, never linked from an archive). A project with a `[lib]` and no `[[bin]]` builds `lib<name>.a`.
 
+**A library's namespace is the one its `lib.cryo` declares.** The library's `source_dir` holds a `lib.cryo`, and the `namespace` line at its top names the library: a program depending on it imports that namespace (`import Json5;`). No cryoconfig key names it. A dependency whose `[lib]` has no `lib.cryo`, or whose `lib.cryo` declares no namespace, is E0509. A library has that one top-level namespace: every file of the package declares it or a namespace below it (`Json5::reader`), and a file declaring any other (`Helper`, or `Json5Extra`, which only begins with it) is E0510, so what a program can import from a library is exactly what lies under the name it imports. Both rules hold in the library's own project too, in every build of it that indexes the library's `source_dir`, so a library is refused where it is written rather than where it is first used; there the library's files are those under its `source_dir`, and a binary's entry point outside that directory is the program's (E0509 and E0510 name the package "the program"). `cryo init --type=library` writes a `lib.cryo` beginning with the library's name as its namespace (`regex` -> `namespace regex;`, `my-lib` -> `my_lib`).
+
 ```ini
 [lib]
 name       = "mylib"
-source_dir = "src"
+source_dir = "src/mylib"
 
 [[bin]]
 name        = "mytool"
@@ -5523,11 +5525,61 @@ Each entry is an inline table - a local path dependency or a git dependency. `cr
 
 ```ini
 [dependencies]
-mylib    = { path = "../mylib", alias = "MyLib" }
-remote   = { git = "https://example.com/lib.git", tag = "v0.1.0", alias = "Remote" }
+mylib    = { path = "../mylib", version = "0.1" }
+regex    = { git = "https://github.com/jakelequire/regex", version = "0.1" }
+pinned   = { git = "https://example.com/pinned.git", tag = "v2.0.1" }
+edge     = { git = "https://example.com/edge.git", branch = "next" }
+exact    = { git = "https://example.com/exact.git", rev = "4f1c0d2e9a7b3c5d6e8f0a1b2c3d4e5f6a7b8c9d" }
 ```
 
-A git dependency requires exactly one of `version`, `tag`, `branch`, or `rev`, and may set `subdir` (the path to the dependency's `cryoconfig` inside the repo). `alias` is the top-level namespace the consumer imports.
+A dependency is a library: its `cryoconfig` has a `[lib]` section, and the namespace its `lib.cryo` declares is the one a program imports it by. **A library's version is the `version` key of its `[lib]`** - `MAJOR.MINOR.PATCH`, optionally with a pre-release (`1.0.0-rc.1`) and build metadata after `+` - and nothing else: no git tag, branch name or lock entry says what version a library is. A cryoconfig whose `[lib] version` is not a version is refused when it is read. `cryo init --type=library` writes `version = "0.1.0"`, and a library's build names its version (`Building regex 0.1.0 [release]`).
+
+A git dependency names a commit by at most one of `tag`, `branch` or `rev` (a commit id); with none, it is the head of the repository's default branch. It may set `subdir` (the path to the dependency's `cryoconfig` inside the repo). Tags are never required, and Cryo never searches a repository's history or tags for a version. The name on the left is local to the cryoconfig that writes it: it labels the dependency in messages and names its output folder, and nothing else.
+
+**The version requirement.** Any dependency, path or git, may write `version = "<requirement>"`: the versions of the library it accepts, checked against the library's `[lib] version` by every `cryo fetch`, `cryo update` and build. A requirement that is not met fails, naming the requirement and the version found, and shows the entry that accepts the version found. A requirement is a version, whole or in part, after an optional operator:
+
+| requirement | accepts |
+|---|---|
+| `1.2.3`, `^1.2.3`, `1.2`, `1` | that version and later ones below the next major: below 2.0.0 |
+| `0.2.3`, `^0.2.3`, `0.2` | below 1.0.0 the minor version breaks: 0.2.3 (0.2.0) and later, below 0.3.0 |
+| `0.0.3` | 0.0.3 only |
+| `~1.2.3`, `~1.2` | below the next minor: below 1.3.0 |
+| `=1.2.3` | 1.2.3 only |
+
+A pre-release version is accepted only by a requirement that names a pre-release of the same `MAJOR.MINOR.PATCH`, and orders below its release. A git dependency's library must say its version; a path dependency's must when the entry writes a requirement. A git dependency pinned by a `tag` that names a version (`v0.2.0`, or `0.2.0`) must find that version in the tagged commit's `[lib] version`, or `cryo fetch` refuses it and shows the `rev` that takes the commit anyway; a tag that names no version (`stable`) is not compared.
+
+**One version of each library.** A build holds one version of each library, however many cryoconfigs in the dependency graph name it, the program's and every dependency's alike. A git library is its repository, the same however its URL is spelled (`https://Example.com/acme/json5.git/`, `https://example.com/acme/json5` and `git@example.com:acme/json5` are one repository: the scheme, a `user@`, a trailing `/` and `.git` dropped and the host in lower case; a `file://` URL is its path as written), with the `subdir` the entry names; a path library is its directory. Every entry naming a library takes part:
+
+- **One major version.** The versions that may replace one another without breaking a program share a major version (`2.x`), or below 1.0.0 a minor too (`0.2.x`). Each entry asks for one such series: its requirement's, or with none, that of the version its own ref names. Entries asking for two series are refused by `cryo fetch` and by every build, naming each entry, the cryoconfig that writes it and the version it names, and showing the change that builds the newest version named: the program's entry rewritten to name it, or the entry a version of the dependency asking for an older series would write.
+- **One version that meets every requirement.** Each entry's own version must meet its own requirement (the refusal above). Of the versions the entries name, the build takes the newest that every requirement accepts, for all of them: the program taking tag `v1.2.0` with `version = "1.2"` and a dependency taking tag `v1.5.0` with `version = "1.5"` both build 1.5.0, and `cryo fetch` says so. When no version named meets every requirement, it is refused, naming each requirement and the version its entry names, and showing the entries rewritten to accept the newest.
+
+The version chosen decides which dependencies the library brings in, so the graph is walked again with each choice until every library is built at the version chosen for it. The lock pins every entry's own ref, and every build makes the same choice from it.
+
+**Fetching and updating.** `cryo fetch` pins each git dependency to a commit: the one the lock already records while the entry's ref is unchanged and the recorded version still meets the requirement, otherwise the one the ref names now. `cryo update` takes the commit every ref names now, so a `branch` dependency, or one on the default branch, moves to the branch's newest commit, its version checked again.
+
+**The lock.** `cryoconfig.lock` (JSON, `schema_version` 3) pins each git dependency, found by its repository, however the URL is spelled, and the ref its entry writes (never by the name on the left): the library's `version`, the `commit` the ref resolved to, and the `content` hash of that commit's files, `sha256-<hex>` over every file in the byte order of its path, each as its path, a NUL, its length in decimal, a NUL and its bytes. The bytes are the ones git stores, so the hash is the same on every host. **Every build checks the cached files against `content`** and refuses a dependency whose files differ, naming it and the remedy: `cryo fetch` extracts the commit again. `cryo fetch` keeps an extraction that still matches, extracts any other afresh, and records the hash from what it extracted, so the lock's hash always comes from git. A schema 2 lock (no content) builds nothing until `cryo fetch` rewrites it; a build never writes the `packages` section.
+
+A path dependency names a directory holding a `cryoconfig`, relative to the cryoconfig that writes it. One that names a directory that does not exist, or one without a `cryoconfig`, fails the build and names the dependency.
+
+**How a program names a dependency's code.** An import names a dependency's modules by the namespaces its files declare (`import Json5;`), exactly as it names the program's own. A dependency entry takes no second name for them: `alias` is refused.
+
+- **A top-level namespace belongs to one package in a build.** Two packages declaring the same one (`Util` in the program and in a dependency, or in two dependencies) is E0507, naming both packages and a file of each; so is a package declaring `std`, the standard library's. The program counts as a package.
+- **A package names only what its own cryoconfig declares.** A module path written in a package names that package's own modules, the standard library's, a vendored C library's, and those of the dependencies its own `[dependencies]` lists. Naming a module of any other package in the build - one the program declares but the package does not, or one only a dependency of a dependency declares - is E0508, naming the package to add and the cryoconfig to add it to. This holds for the program too: it names its direct dependencies, not theirs. A package never names the program that uses it.
+
+**What a git dependency may name.** Every cryoconfig in the dependency graph writes these values, the dependencies' own included, so they are checked before anything is done with them, and a refused one fails as soon as its cryoconfig is read:
+
+- The URL is `https://host/path`, `ssh://[user@]host/path`, `user@host:path`, or `file:///path` for a repository on this machine. `http://` and `git://`, which carry no encryption, a local path written without `file://`, and any other transport are refused.
+- Neither the URL, its user, its host, nor a `tag`, `branch` or `rev` value may begin with `-`, and none may hold a space or a control character, so that no value is ever read by git or ssh as an option.
+- A commit read back from `cryoconfig.lock` must be a full 40-digit commit id.
+- A `file://` repository may be named by the program, and by a package that is itself on this machine: one reached from the program through path dependencies and `file://` repositories alone. A package fetched from an `https` or `ssh` repository, and every package below it, names only remote repositories, so a repository nobody on this machine controls cannot point the build at this machine's files.
+
+A git dependency's repository and the files of its pinned commits are cached under a directory named by the first 16 hex digits of the SHA-256 of its repository's identity (the URL with the spelling differences above removed) and that identity's last path segment (`<16 hex digits>-json5`), so every spelling of one repository shares an entry, two repositories never do, and a cached file's path stays the same length however long the URL is: the bare clone in `git/<id>`, a commit's files in `src/<id>/<commit>`.
+
+A commit's files are extracted from the bare clone as git stores them, each blob's bytes as they are: there is no working tree, so no line-ending conversion, no `.gitattributes` filter and no hook applies, and one commit is the same bytes on every host. Each file is made read-only once written, so an editor or a stray tool does not change a cached commit by accident (the content check refuses one changed on purpose). They are written beside their place and moved into it once all are there, so an interrupted extraction never reads as done, and the next one removes what it left. A commit holding a submodule, a symbolic link, or a path with an empty, `.`, `..` or `.git` segment, a `\` or a `:`, is refused, naming the dependency. A build whose extraction is missing makes it again from the bare clone, which is local; a build never fetches. Builds and tests running at once share the cache, so a process clones, fetches, extracts or checks a repository's entries only holding that repository's lock, the directory `git/<short id>.lock` beside its bare clone; a lock left by a process that died is cleared once it is an hour old.
+
+Each `git` process the build or `cryo fetch` starts may use only the transport its URL names (`-c protocol.allow=never` plus that one), and is given every URL and path after `--`.
+
+**Nothing runs at fetch or build time but `git` and the compiler.** A package has no build script, no fetch hook and no code generator that the build runs on its behalf: fetching a package copies files, and building it compiles them. A package's effect on a machine is therefore exactly the program it becomes, run when its user runs it. Cryo adds no mechanism that runs a package's code during `cryo fetch` or `cryo build`.
 
 ### 23.6 `[test]`
 
@@ -5558,7 +5610,7 @@ color  = "auto"                     # auto | always | never
 | `cryo demangle <sym>`    | Decode a mangled symbol to its source form.                                                                         |
 | `cryo api-index write\|check <root> <file>` | Write, or check that `<file>` already holds, the one-line-per-declaration index of the standard library under `<root>`. |
 | `cryo fetch`             | Fetch dependencies and write `cryoconfig.lock`.                                                                     |
-| `cryo update`            | Re-resolve every dependency, ignoring the lockfile.                                                                 |
+| `cryo update`            | Move every git dependency to the commit its ref names now, checking its version again, and rewrite the lock.       |
 | `cryo vendor <sub>`      | Manage the per-machine registry of vendored C libraries: `<path>` \| `list` \| `remove <name>` \| `rebuild [name]`. |
 | `cryo version`           | Print the compiler version; `--verbose` adds the build details, `--triple` prints only the default target triple.  |
 

@@ -6,8 +6,10 @@
 ///!
 ///! Layout under `<cache_root>/`:
 ///!
-///!   git/<sanitized-url>/                 - bare clone, refreshed by `git fetch`
-///!   checkouts/<sanitized-url>/<sha>/     - working tree at the resolved commit
+///!   git/<short id>/                 - bare clone, refreshed by `git fetch`
+///!   git/<short id>.lock/            - held while a process changes either
+///!   src/<short id>/<sha>/           - the files of the resolved commit, as
+///!                                     git stores them (no working tree)
 ///!
 ///! Cache root resolution (first match wins):
 ///!   1. $CRYO_HOME/cache             (explicit override for CI / sandboxes)
@@ -23,7 +25,13 @@ import std::fs::path::{ Path, PathBuf };
 import std::fmt;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::encoding::sha256::{ Sha256 };
+import compiler::utils::directory_lock::{ DirectoryLock };
+import compiler::deps::git_url::{ GitUrl };
 
+/// A repository's cache lock older than this was left by a process that
+/// died: an hour, longer than any fetch takes.
+const REPOSITORY_LOCK_EXPIRY_SECONDS: i64 = 3600;
 
 /// Stateless namespace for the per-machine dependency cache layout.
 /// All entry points are `static`; there is no instance state - the
@@ -43,8 +51,8 @@ type struct Cache {
     ///   3. a temp dir (warned) only when no user directory resolves at all.
     static cache_root() -> PathBuf {
         // An EMPTY env var counts as unset (Windows shells often export "").
-        const root: PathBuf = match (Cache::variable_with_suffix("CRYO_HOME", "/cache")) {
-            Option::Some(home) => { home }
+        const root: PathBuf = match (Cache::variable_with_suffix("CRYO_HOME", "")) {
+            Option::Some(home) => { Cache::root_in_home(home.as_path()) }
             Option::None       => { Cache::default_cache_root() }
         };
         Cache::create_directory(root.as_path());
@@ -116,50 +124,66 @@ type struct Cache {
         return PathBuf::from("/tmp/cryo-cache");
     }
 
-    /// `<cache_root>/git/<sanitized>`: bare clone for a given remote URL.
+    /// `<cache_root>/git/<short id>`: bare clone for a given remote URL.
     static git_dir_for(url: Str) -> PathBuf {
-        const sanitized: String = Cache::sanitize_url(url);
-        return Cache::cache_root().join("git").join(sanitized.as_str());
+        const id: String = Cache::short_id(url);
+        return Cache::cache_root().join("git").join(id.as_str());
     }
 
-    /// `<cache_root>/checkouts/<sanitized>/<sha>`: working tree at a
-    /// specific resolved commit.  Multiple SHAs from the same remote can
-    /// coexist (e.g., when two projects pin different versions).
-    static checkout_dir_for(url: Str, sha: Str) -> PathBuf {
-        const sanitized: String = Cache::sanitize_url(url);
-        return Cache::cache_root().join("checkouts").join(sanitized.as_str()).join(sha);
+    /// The lock of the cache's entries for `url`, `<cache_root>/git/<short
+    /// id>.lock`: held while one process clones or fetches that repository
+    /// or extracts one of its commits, since builds and tests running at
+    /// once share the cache.  One left by a process that died is cleared
+    /// after an hour, longer than any fetch takes.
+    static repository_lock(url: Str) -> DirectoryLock {
+        const git: PathBuf = Cache::cache_root().join("git");
+        Cache::create_directory(git.as_path());
+        const id: String = Cache::short_id(url);
+        const path: PathBuf = git.join(f"{id}.lock".as_str());
+        return DirectoryLock::new(path.as_path().as_str(), f"to fetch {url}".as_str(), REPOSITORY_LOCK_EXPIRY_SECONDS);
     }
 
+    /// `<cache_root>/src/<short id>/<sha>`: the files of one commit, as git
+    /// stores them.  Several commits of one remote can sit side by side
+    /// (two projects pinning different versions).
+    static extraction_dir_for(url: Str, sha: Str) -> PathBuf {
+        return Cache::extraction_dir_in(Cache::cache_root().as_path(), url, sha);
+    }
 
-    // URL sanitization
+    /// The cache root a `$CRYO_HOME` of `home` gives: `<home>/cache`.
+    static root_in_home(home: Path) -> PathBuf {
+        return home.join("cache");
+    }
 
-    /// Normalize a remote URL into a filesystem-safe directory name.
-    ///
-    /// Examples:
-    ///   https://github.com/foo/bar.git     ->  github.com_foo_bar
-    ///   git@github.com:foo/bar.git         ->  github.com_foo_bar
-    ///   ssh://git@github.com/foo/bar       ->  github.com_foo_bar
-    ///
-    /// Collisions between distinct URLs that normalize to the same name
-    /// are theoretically possible but vanishingly unlikely for real-world
-    /// remotes; we accept the risk for a much friendlier cache layout
-    /// than a raw hash would give.
-    static sanitize_url(url: Str) -> String {
-        // Stripped in this order, so `ssh://git@host` loses both.
-        const schemes: [Str; 5] = [Str::new("https://"), Str::new("http://"), Str::new("ssh://"),
-                                   Str::new("git://"), Str::new("git@")];
-        mut rest: Str = url;
-        for (mut i: i64 = 0; i < 5; i++) {
-            rest = rest.strip_prefix(&schemes[i]).unwrap_or(rest);
+    /// `<root>/src/<short id>/<sha>`: where the cache at `root` keeps the
+    /// files of commit `sha` of `url`.
+    static extraction_dir_in(root: Path, url: Str, sha: Str) -> PathBuf {
+        const id: String = Cache::short_id(url);
+        return root.join("src").join(id.as_str()).join(sha);
+    }
+
+    /// The directory name a repository's cache entries are kept under: the
+    /// first 16 hex digits of the SHA-256 of its identity
+    /// (`GitUrl::canonical`), then `-` and the identity's last path
+    /// segment, each byte outside letters, digits, `.`, `-` and `_` written
+    /// `_` (`https://example.com/acme/json5.git` -> `<16 hex digits>-json5`).
+    /// Every spelling of one repository's URL shares the entry, the digest
+    /// tells repositories apart, so two that end alike never share one, and
+    /// the length stays the same however long the URL is, which keeps a
+    /// cached file's path inside the operating system's limit.
+    static short_id(url: Str) -> String {
+        const identity: String = GitUrl::canonical(url);
+        mut out: String = Sha256::digest(identity.as_str().as_bytes()).to_hex();
+        out.truncate(16);
+        out.push("-");
+        const segment: Str = identity.as_str();
+        mut start: i64 = 0;
+        for (mut i: i64 = 0; i < segment.length(); i++) {
+            const byte: u8 = segment.byte_at(i).unwrap_or(0);
+            if (byte == '/' as u8 || byte == ':' as u8) { start = i + 1; }
         }
-        const git_suffix: Str = Str::new(".git");
-        rest = rest.strip_suffix(&git_suffix).unwrap_or(rest);
-
-        // Replace path-unfriendly bytes with '_'; a byte is kept as it is,
-        // so a name in UTF-8 stays the same bytes.
-        mut out: String = String::with_capacity(rest.length());
-        for (mut i: i64 = 0; i < rest.length(); i++) {
-            const byte: u8 = rest.byte_at(i).unwrap_or(0);
+        for (mut i: i64 = start; i < segment.length(); i++) {
+            const byte: u8 = segment.byte_at(i).unwrap_or(0);
             const c: char = byte as char;
             const safe: boolean = c.is_alphanumeric() || c == '.' || c == '-' || c == '_';
             out.push_byte(if (safe) { byte } else { '_' as u8 });

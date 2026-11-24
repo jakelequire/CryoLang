@@ -5,7 +5,7 @@
 
 namespace compiler::project_config;
 
-import utils::log::{ Log, LogArea };
+import compiler::utils::log::{ Log, LogArea };
 import std::fmt;
 import std::fs::file::{ File };
 import std::fs::file;
@@ -15,7 +15,10 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::ffi::libc;
 import std::core::mem;
-import utils::keyword::{ Keyword };
+import compiler::utils::keyword::{ Keyword };
+import compiler::deps::git_url::{ GitUrl };
+import compiler::deps::semver::{ Requirement, Version };
+import compiler::diag::edit_distance::{ find_best_candidate };
 
 
 // Native-build cache bucket, stamped at compile time per the OS this compiler
@@ -100,9 +103,13 @@ implement enum PanicStrategy {
 type struct LibTarget {
     name:       string;     // library archive name (libcompiler.a -> "compiler")
     source_dir: string;     // root of the library's source tree
+    /// The library's version, the `version` key as written; empty when the
+    /// section has none.  The cryoconfig is refused when it is not a
+    /// version (`Version::parse`).
+    version:    string;
 
     static empty() -> LibTarget {
-        return LibTarget { name: "", source_dir: "" };
+        return LibTarget { name: "", source_dir: "", version: "" };
     }
 
     is_present(&this) -> boolean {
@@ -136,14 +143,12 @@ type enum DepKind with [Clone] {
     Invalid;
 }
 
-/// Which kind of ref selects a git dep's commit.  At most one of
-/// `version`, `tag`, `branch`, `rev` may appear in the inline table.
-/// `None` is only valid for non-git deps.
+/// Which ref selects a git dep's commit.  At most one of `tag`, `branch`,
+/// `rev` may appear in the inline table; with none, the commit is the head
+/// of the repository's default branch.
 type enum GitRefKind with [Clone] {
+    /// The head of the default branch (and, for a path dep, no ref at all).
     None;
-    /// `version = "0.1.0"` or `version = "^0.1.0"`.  Resolves to the
-    /// highest matching tag at fetch time.
-    Version;
     /// `tag = "v0.1.0"`: exact match against a remote ref.
     Tag;
     /// `branch = "main"`: resolves to the tip of the branch.
@@ -152,11 +157,25 @@ type enum GitRefKind with [Clone] {
     Rev;
 }
 
+implement enum GitRefKind {
+    /// The `[dependencies]` key that selects `kind` (`"tag"`, `"branch"`,
+    /// `"rev"`), and `""` for `None`.  The lock file records a git
+    /// dependency's selector by this name.
+    static key_name(kind: GitRefKind) -> Str {
+        return match (kind) {
+            GitRefKind::Tag     => { Str::new("tag") }
+            GitRefKind::Branch  => { Str::new("branch") }
+            GitRefKind::Rev     => { Str::new("rev") }
+            GitRefKind::None    => { Str::new("") }
+        };
+    }
+}
+
 /// One entry in `[dependencies]`.  Two forms are accepted:
 ///
-///   <name> = { path = "<rel>" [, alias = "<NS>"] }
-///   <name> = { git  = "<url>", (version | tag | branch | rev) = "<v>"
-///              [, subdir = "<sub>"] [, alias = "<NS>"] }
+///   <name> = { path = "<rel>" [, version = "<requirement>"] }
+///   <name> = { git  = "<url>" [, (tag | branch | rev) = "<ref>"]
+///              [, version = "<requirement>"] [, subdir = "<sub>"] }
 ///
 /// **Path deps** are resolved against the consumer's project root and
 /// must contain their own `cryoconfig`.
@@ -166,13 +185,14 @@ type enum GitRefKind with [Clone] {
 /// time.  The dep's `cryoconfig` is expected at the repo root unless
 /// `subdir` overrides.
 ///
-/// `alias` is the top-level namespace the consumer expects, currently
-/// informational; a future warning fires if the dep's source declares
-/// a different one.
+/// `version` never selects a commit: it is a requirement the library's own
+/// `[lib] version` must meet, checked on every fetch and build.
+///
+/// The name is local to the cryoconfig that writes it: an import names a
+/// dependency's modules by the namespaces its files declare.
 type struct Dependency with [Clone] {
     name:  String;
     kind:  DepKind;
-    alias: String;
 
     // ---- Path deps ----
     /// Filesystem path relative to the consumer's project root.
@@ -182,11 +202,15 @@ type struct Dependency with [Clone] {
     // ---- Git deps ----
     /// `https://...`, `git@...:...`, etc.  Empty for path deps.
     git_url:  String;
-    /// Which of `version`/`tag`/`branch`/`rev` was supplied.
-    /// `None` for path deps.
+    /// Which of `tag`/`branch`/`rev` was supplied; `None` for none of them
+    /// (the default branch) and for path deps.
     ref_kind: GitRefKind;
     /// The literal value of whichever ref-key was supplied.
     ref_val:  String;
+    /// The `version` requirement as written; empty when there is none.  The
+    /// cryoconfig is refused when it is not a requirement
+    /// (`Requirement::parse`).
+    version_requirement: String;
     /// Subpath into the repo where the dep's `cryoconfig` lives.
     /// Empty <=> repo root.
     subdir:   String;
@@ -195,11 +219,11 @@ type struct Dependency with [Clone] {
         return Dependency {
             name:     String::from_str(name),
             kind:     DepKind::Path,  // overwritten by parse_inline_table_into_dep
-            alias:    String::new(),
             path:     String::new(),
             git_url:  String::new(),
             ref_kind: GitRefKind::None,
             ref_val:  String::new(),
+            version_requirement: String::new(),
             subdir:   String::new(),
         };
     }
@@ -767,6 +791,21 @@ type struct ProjectConfig {
                         match (key) {
                             "name"       => { config.lib.name = val; }
                             "source_dir" => { config.lib.source_dir = val; }
+                            "version"    => {
+                                config.lib.version = val;
+                                if (Version::parse(str::Str::from(val)).is_none()) {
+                                    fmt::eprintln(f"error: [lib] version \"{val}\" is not a version");
+                                    match (Version::nearest(str::Str::from(val))) {
+                                        Option::Some(meant) => {
+                                            fmt::eprintln(f"  help: write it as MAJOR.MINOR.PATCH: `version = \"{meant.text()}\"`");
+                                        }
+                                        Option::None => {
+                                            fmt::eprintln("  help: a version is MAJOR.MINOR.PATCH, optionally with a pre-release: `version = \"0.1.0\"`, `version = \"1.0.0-rc.1\"`");
+                                        }
+                                    }
+                                    config.error_count += 1;
+                                }
+                            }
                             _ => { ProjectConfig::report_unknown_key("lib", key); }
                         }
                     }
@@ -781,7 +820,7 @@ type struct ProjectConfig {
                     }
                 }
                 "dependencies" => {
-                    // KEY = { path = "...", alias = "..." }   (path dep)
+                    // KEY = { path = "..." }                  (path dep)
                     // KEY = { git = "...", version = "..." }  (git dep)
                     config.dependencies.push(Dependency::named(str::Str::from(key)));
                     const idx: i64 = config.dependencies.length() as i64 - 1;
@@ -1156,9 +1195,9 @@ type struct ProjectConfig {
     ///
     /// Accepted shapes:
     ///
-    ///   { path = "<rel>" [, alias = "<NS>"] }
+    ///   { path = "<rel>" }
     ///   { git  = "<url>", (version | tag | branch | rev) = "<v>"
-    ///                     [, subdir = "<sub>"] [, alias = "<NS>"] }
+    ///                     [, subdir = "<sub>"] }
     ///
     /// Unknown keys are a hard error, as is mixing `path` with any
     /// git-only key, supplying multiple ref selectors, or omitting the
@@ -1235,8 +1274,7 @@ type struct ProjectConfig {
                 dep.git_url = String::from_string(value);
                 saw_git = true;
             } else if (key.eq("version")) {
-                dep.ref_kind = GitRefKind::Version;
-                dep.ref_val  = String::from_string(value);
+                dep.version_requirement = String::from_string(value);
                 saw_version  = true;
             } else if (key.eq("tag")) {
                 dep.ref_kind = GitRefKind::Tag;
@@ -1254,10 +1292,17 @@ type struct ProjectConfig {
                 dep.subdir = String::from_string(value);
                 saw_subdir = true;
             } else if (key.eq("alias")) {
-                dep.alias = String::from_string(value);
+                fmt::eprintln(f"error: dependency '{dep.name}' uses the key `alias`, which a dependency does not take");
+                fmt::eprintln(f"  help: an import names a dependency's modules by the namespace its files declare; remove `alias = \"{value}\"`");
+                errors += 1;
             } else {
                 fmt::eprintln(f"error: dependency '{dep.name}' uses unknown key '{key}'");
-                fmt::eprintf("  recognized keys: path, git, version, tag, branch, rev, subdir, alias\n");
+                const known: [Str] = [Str::new("path"), Str::new("git"), Str::new("version"), Str::new("tag"),
+                                      Str::new("branch"), Str::new("rev"), Str::new("subdir")];
+                match (find_best_candidate(Str::from(key), &known)) {
+                    Option::Some(at) => { fmt::eprintln(f"  help: write `{known[at]} = \"{value}\"`; the keys are path, git, version, tag, branch, rev and subdir"); }
+                    Option::None     => { fmt::eprintln("  help: the keys are path, git, version, tag, branch, rev and subdir"); }
+                }
                 errors += 1;
             }
         }
@@ -1283,28 +1328,58 @@ type struct ProjectConfig {
         }
 
         mut ref_count: i64 = 0;
-        if (saw_version) { ref_count += 1; }
         if (saw_tag)     { ref_count += 1; }
         if (saw_branch)  { ref_count += 1; }
         if (saw_rev)     { ref_count += 1; }
 
+        if (saw_version && Requirement::parse(dep.version_requirement.as_str()).is_none()) {
+            fmt::eprintln(f"error: dependency '{dep.name}' has the version requirement \"{dep.version_requirement}\", which is not one");
+            match (Version::nearest(dep.version_requirement.as_str())) {
+                Option::Some(meant) => {
+                    fmt::eprintln(f"  help: write `version = \"{meant.text()}\"`, which accepts {meant.text()} and the later versions that do not break it");
+                }
+                Option::None => {
+                    fmt::eprintln("  help: a requirement is a version, whole or in part, after an optional `^`, `~` or `=`: `version = \"0.1\"`, `version = \"^1.2.3\"`, `version = \"~1.2\"`");
+                }
+            }
+            errors += 1;
+        }
+
         if (saw_git) {
             dep.kind = DepKind::Git;
-            if (ref_count == 0) {
-                fmt::eprintln(f"error: git dependency '{dep.name}' must specify one of `version`, `tag`, `branch`, or `rev`");
-                errors += 1;
-            } else if (ref_count > 1) {
-                fmt::eprintln(f"error: git dependency '{dep.name}' specifies more than one of `version`, `tag`, `branch`, `rev`; pick one");
+            if (ref_count > 1) {
+                fmt::eprintln(f"error: git dependency '{dep.name}' names more than one of `tag`, `branch`, `rev`");
+                fmt::eprintln("  help: keep one of them; with none, the dependency is the head of the repository's default branch");
                 errors += 1;
             }
             if (dep.git_url.length() == 0) {
                 fmt::eprintln(f"error: git dependency '{dep.name}' has empty `git` URL");
                 errors += 1;
+            } else {
+                match (GitUrl::transport_of(dep.git_url.as_str())) {
+                    Result::Ok(_) => { }
+                    Result::Err(reason) => {
+                        fmt::eprintln(f"error: git dependency '{dep.name}' is refused: its URL `{dep.git_url}` {reason}");
+                        fmt::eprintln("  help: a git dependency's URL is `https://host/path`, `ssh://host/path`, `user@host:path`, or `file:///path` for a repository on this machine");
+                        errors += 1;
+                    }
+                }
+            }
+            if (saw_tag || saw_branch || saw_rev) {
+                match (GitUrl::ref_refusal(dep.ref_val.as_str())) {
+                    Option::Some(reason) => {
+                        const ref_key: str::Str = GitRefKind::key_name(dep.ref_kind);
+                        fmt::eprintln(f"error: git dependency '{dep.name}' is refused: its `{ref_key}` value `{dep.ref_val}` {reason}");
+                        errors += 1;
+                    }
+                    Option::None => { }
+                }
             }
         } else if (saw_path) {
             dep.kind = DepKind::Path;
             if (ref_count > 0 || saw_subdir) {
-                fmt::eprintln(f"error: path dependency '{dep.name}' may not use `version`/`tag`/`branch`/`rev`/`subdir` (those are git-only)");
+                fmt::eprintln(f"error: path dependency '{dep.name}' may not use `tag`/`branch`/`rev`/`subdir` (those are git-only)");
+                fmt::eprintln(f"  help: a path dependency is the directory it names: `{dep.name} = {{ path = \"{dep.path}\" }}`");
                 errors += 1;
             }
         } else {

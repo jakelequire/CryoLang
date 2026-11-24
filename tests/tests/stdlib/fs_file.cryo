@@ -14,6 +14,7 @@ import std::core::slice::{ Slice };
 import std::core::drop;
 import std::core::mem;
 import std::collections::str::{ Str };
+import std::collections::string::{ String };
 import std::io::error::{ IoError };
 import std::io::traits::{ SeekFrom };
 import std::fs::{ File, OpenOptions, Path };
@@ -348,4 +349,73 @@ function share_delete_lets_an_open_file_be_removed() -> Result<(), TestError> {
     mem::drop(File::remove(p));
     return expect(removed == want_removal_while_unshared(),
                   Str::new("removing a file held without delete sharing"));
+}
+
+/// A read-only file is removed like any other, on every OS: whether it may
+/// go is its directory's to say.  Windows refuses to delete a file with the
+/// read-only attribute, which `chmod` without the write bit sets there.
+![test]
+function remove_deletes_a_read_only_file() -> Result<(), TestError> {
+    mut namebuf: [u8; 256];
+    const p: Path = temp_path(&namebuf[0], "read_only");
+    match (File::write_text(p, Str::new("kept read-only\n"))) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("File::write_text failed")); }
+    }
+    // 0444: read for everyone, write for no one.
+    if (libc::chmod(&namebuf[0] as u8*, 292) != 0) {
+        libc::unlink(&namebuf[0] as u8*);
+        return bail(Str::new("chmod failed"));
+    }
+    const removed: boolean = File::remove(p).is_ok();
+    const gone: boolean = !p.exists();
+    if (!gone) {
+        libc::chmod(&namebuf[0] as u8*, 438);
+        libc::unlink(&namebuf[0] as u8*);
+    }
+    match (expect(removed, Str::new("File::remove of a read-only file returns Ok"))) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(gone, Str::new("the read-only file is gone"));
+}
+
+/// A file made read-only refuses a write, and takes one again once it is
+/// made writable; its content is what the last accepted write left.
+![test]
+function set_read_only_refuses_a_write_until_cleared() -> Result<(), TestError> {
+    mut namebuf: [u8; 256];
+    const p: Path = temp_path(&namebuf[0], "set_read_only");
+    match (File::write_text(p, Str::new("first\n"))) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return bail(Str::new("File::write_text failed")); }
+    }
+    const marked: boolean = File::set_read_only(p, true).is_ok();
+    const refused: boolean = File::write_text(p, Str::new("second\n")).is_err();
+    const cleared: boolean = File::set_read_only(p, false).is_ok();
+    const accepted: boolean = File::write_text(p, Str::new("third\n")).is_ok();
+    const text: String = File::read_text(p).unwrap_or(String::new());
+    mem::drop(File::remove(p));
+    match (expect(marked, Str::new("File::set_read_only(true) returns Ok"))) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(refused, Str::new("a write to a read-only file is refused"))) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(cleared && accepted, Str::new("a file made writable again takes a write"))) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(text.as_str() == Str::new("third\n"), Str::new("the file holds the last accepted write"));
+}
+
+/// Marking a file that does not exist is an error, not a silent no-op.
+![test]
+function set_read_only_of_a_missing_file_is_an_error() -> Result<(), TestError> {
+    mut namebuf: [u8; 256];
+    const p: Path = temp_path(&namebuf[0], "set_read_only_missing");
+    mem::drop(File::remove(p));
+    return expect(File::set_read_only(p, true).is_err(), Str::new("File::set_read_only of a missing file returns Err"));
 }
