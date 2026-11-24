@@ -334,14 +334,6 @@ normalised before the comparison.
   `cryo stamp` on it, and a compiler from before the stamp has no slot to
   stamp: "it holds 0 stamp regions; expected exactly one".  A baseline
   build needs to skip the stamp step.
-- **verify builds the baseline's own stdlib, so stdlib-only object moves
-  are visible and declarable.**  Both sides compile every program against
-  the working tree's stdlib, so a change to the stdlib alone moves no
-  object verify compares and cannot be declared.  Until then such a change
-  is measured by hand: the stdlib built before and after at the same path
-  by the tree compiler, every object hashed, and the moved ones accounted
-  for with `llvm-nm` - each must define or reference what the change
-  touched, and none that does may stay unmoved.
 
 ## Associated constants
 

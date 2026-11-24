@@ -17,7 +17,7 @@ import std::fs::path::{ Path, PathBuf };
 
 import cryogate::baseline::cache::{ BaselineCache };
 import cryogate::baseline::clone::{ BaselineClone };
-import cryogate::baseline::keys::{ BaselineKey };
+import cryogate::baseline::keys::{ BaselineKey, ProgramStdlib };
 import cryogate::core::child::{ Completion, Job };
 import cryogate::core::git::{ Git };
 import cryogate::core::host::{ Host };
@@ -40,27 +40,36 @@ public type struct BaselineCompiler {
     public runtime_home: PathBuf;
     /// The directory the runtime archives its programs link are read from.
     public runtime_archives: PathBuf;
+    /// The stdlib its programs build against.
+    public stdlib: ProgramStdlib;
 
     /// The baseline compiler of `revision` in the checkout `repository`,
     /// for the target `triple`: the one in its home when that holds a
-    /// compiler and a runtime, else built afresh.  Either way the home is
-    /// stamped as used and the cache pruned to its most recently used.
-    public static obtain(repository: Path, logs: &RunLogs, git: &Git, revision: Str, triple: Str) -> Result<BaselineCompiler, String> {
+    /// compiler and a runtime (and, `stdlib_from_commit`, the commit's
+    /// stdlib), else built afresh.  With `stdlib_from_commit` the compiler
+    /// is built against the commit's stdlib and its programs build against
+    /// it; else both read the checkout's.  Either way the home is stamped
+    /// as used and the cache pruned to its most recently used.
+    public static obtain(repository: Path, logs: &RunLogs, git: &Git, revision: Str, triple: Str,
+                         stdlib_from_commit: boolean) -> Result<BaselineCompiler, String> {
         const commit: String = BaselineKey::commit(git, revision)?;
         const sources: String = BaselineKey::tree_of(git, commit.as_str(), Str::new("compiler/src"))?;
         const runtime: String = BaselineKey::tree_of(git, commit.as_str(), Str::new("runtime"))?;
-        const key: String = BaselineKey::of(repository, git, revision)?;
+        const key: String = BaselineKey::of(repository, git, revision, stdlib_from_commit)?;
         const state: PathBuf = repository.join(Str::new(".verify"));
         const homes: PathBuf = state.join(Str::new("baseline"));
         const home: PathBuf = homes.join(key.as_str());
         const compiler: PathBuf = home.join(Host::executable_name(Str::new("cryo")).as_str());
         const runtime_home: PathBuf = home.join(Str::new("runtime"));
+        const stdlib: ProgramStdlib = if (stdlib_from_commit) { ProgramStdlib::of_home(home.as_path()) } else { ProgramStdlib::of_checkout(repository) };
         const shown: String = PopulationRun::relative(repository, compiler.as_path().as_str());
-        if (compiler.as_path().is_file() && runtime_home.as_path().is_directory()) {
-            fmt::println(f"verify: baseline compiler for {revision} (compiler/src {BaselineCompiler::short(sources.as_str())}, runtime {BaselineCompiler::short(runtime.as_str())}) is cached: {shown.as_str()}");
+        const whose: Str = if (stdlib_from_commit) { Str::new("its own") } else { Str::new("the checkout's") };
+        const holds_stdlib: boolean = stdlib.directory.join(Str::new("lib.cryo")).as_path().is_file();
+        if (compiler.as_path().is_file() && runtime_home.as_path().is_directory() && holds_stdlib) {
+            fmt::println(f"verify: baseline compiler for {revision} (compiler/src {BaselineCompiler::short(sources.as_str())}, runtime {BaselineCompiler::short(runtime.as_str())}, {whose} stdlib) is cached: {shown.as_str()}");
         } else {
-            fmt::println(f"verify: building the baseline compiler for {revision} (compiler/src {BaselineCompiler::short(sources.as_str())}) in .verify/src");
-            BaselineCompiler::build(repository, logs, commit.as_str(), state.as_path(), home.as_path(), triple)?;
+            fmt::println(f"verify: building the baseline compiler for {revision} (compiler/src {BaselineCompiler::short(sources.as_str())}, {whose} stdlib) in .verify/src");
+            BaselineCompiler::build(repository, logs, commit.as_str(), state.as_path(), home.as_path(), triple, stdlib_from_commit)?;
         }
         BaselineCache::mark(home.as_path())?;
         const _: Array<String> = BaselineCache::prune(homes.as_path(), key.as_str())?;
@@ -73,6 +82,7 @@ public type struct BaselineCompiler {
         };
         return Result::Ok(BaselineCompiler {
             compiler: compiler, home: home, commit: commit, runtime_home: runtime_home, runtime_archives: archives,
+            stdlib: stdlib,
         });
     }
 
@@ -92,7 +102,7 @@ public type struct BaselineCompiler {
             Option::Some(file) => { file }
             Option::None       => { return false; }
         };
-        mut job: Job = VerifyChild::job(this.compiler.as_path().as_str(), this.runtime_home.as_path().as_str());
+        mut job: Job = VerifyChild::job(this.compiler.as_path().as_str(), this.runtime_home.as_path().as_str(), this.stdlib.variable().as_str());
         job.argument(Str::new("test"));
         job.argument(Str::new("--suite=compile-fail"));
         job.argument(Str::new("--format=plain"));
@@ -108,13 +118,16 @@ public type struct BaselineCompiler {
     }
 
     /// Build the compiler of `commit` in the clone `<state>/src` and
-    /// install it, its runtime and the libraries beside the pins in `home`.
-    /// The build is always clean: an incremental one can reuse a module
-    /// that owns a generic instance a changed module newly asks for, and
-    /// the link then fails or links stale code.
-    private static build(repository: Path, logs: &RunLogs, commit: Str, state: Path, home: Path, triple: Str) -> Result<(), String> {
+    /// install it, its runtime and the libraries beside the pins in `home`,
+    /// with the commit's stdlib, which the compiler is then built against,
+    /// when `stdlib_from_commit`.  The build is always clean: an
+    /// incremental one can reuse a module that owns a generic instance a
+    /// changed module newly asks for, and the link then fails or links
+    /// stale code.
+    private static build(repository: Path, logs: &RunLogs, commit: Str, state: Path, home: Path, triple: Str,
+                         stdlib_from_commit: boolean) -> Result<(), String> {
         const clone: PathBuf = state.join(Str::new("src"));
-        BaselineClone::sync(repository, logs, clone.as_path(), commit)?;
+        BaselineClone::sync(repository, logs, clone.as_path(), commit, stdlib_from_commit)?;
         BaselineCompiler::remove(clone.join(Str::new("compiler/build")).as_path())?;
         const tiered: boolean = clone.join(Str::new("runtime/hosted/cryoconfig")).as_path().is_file();
         const tiers: String = f".bin/{triple}";
@@ -132,7 +145,7 @@ public type struct BaselineCompiler {
             runtime_for_make = String::from_str(repository.join(Str::new("runtime")).as_path().as_str());
         }
         const log: PathBuf = state.join(Str::new("baseline-build.log"));
-        mut make: Job = VerifyChild::job(Str::new("make"), runtime_for_make.as_str());
+        mut make: Job = VerifyChild::job(Str::new("make"), runtime_for_make.as_str(), Str::new(""));
         make.argument(Str::new("--no-print-directory"));
         make.argument(Str::new("cryo"));
         make.directory(clone.as_path().as_str());
@@ -166,6 +179,15 @@ public type struct BaselineCompiler {
             excluded.push(String::from_str(Str::new(".bin")));
             Tree::copy(clone.join(Str::new("runtime")).as_path(), runtime_home.as_path(), &excluded)?;
         }
+        const stdlib_home: PathBuf = home.join(Str::new("stdlib"));
+        BaselineCompiler::remove(stdlib_home.as_path())?;
+        if (stdlib_from_commit) {
+            // The clone is synced again by the next baseline built, so the
+            // programs read a copy kept with the compiler.
+            mut excluded: Array<String> = Array::<String>::new();
+            excluded.push(String::from_str(Str::new(".bin")));
+            Tree::copy(clone.join(Str::new("stdlib")).as_path(), stdlib_home.as_path(), &excluded)?;
+        }
         const bin: PathBuf = repository.join(Str::new("bin"));
         for (name in Tree::names(bin.as_path(), &Array::<String>::new())?.iterate_references()) {
             if (name.as_str().to_ascii_lowercase().as_str().ends_with(&Str::new(".dll"))) {
@@ -178,7 +200,7 @@ public type struct BaselineCompiler {
     /// `pin build --no-incremental --build-dir=<output>` in `directory`,
     /// logged to `log`; refused unless it succeeds.
     private static step(pin: Str, directory: Path, output: Str, log: Path) -> Result<(), String> {
-        mut job: Job = VerifyChild::job(pin, Str::new(""));
+        mut job: Job = VerifyChild::job(pin, Str::new(""), Str::new(""));
         job.argument(Str::new("build"));
         job.argument(Str::new("--no-incremental"));
         job.argument(f"--build-dir={output}".as_str());

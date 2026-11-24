@@ -33,7 +33,8 @@ make verify              # build once; census, examples, lsp, cross, incr, relin
                          # proves a change moved no compiled output (baseline = REV's
                          # compiler/src AND runtime/, the rest from the tree; built in .verify/, cached;
                          # its results recorded per program in .verify/programs, so a new test
-                         # re-runs only itself; the tree's census records there too, under the
+                         # re-runs only itself - the programs missing a record run in ONE census,
+                         # a pattern each; the tree's census records there too, under the
                          # tree compiler's identity, so a later baseline built to the same
                          # compiler runs none of its census); the tree's gates are replayed from
                          # .verify/tree-runs only when EVERY input matches a passing run's: the
@@ -43,7 +44,10 @@ make verify              # build once; census, examples, lsp, cross, incr, relin
                          # tests/started-compiling (refused before, builds now); one that corrects
                          # a program the baseline built, in tests/started-passing; with a
                          # baseline it also FAILS on a unit-suite build warning the baseline's
-                         # build did not print (code, file, line, compared as sets)
+                         # build did not print (code, file, line, compared as sets);
+                         # ARGS="--baseline REV --baseline-stdlib": the baseline compiler and
+                         # its programs built against REV's OWN stdlib, so a stdlib change's
+                         # moved objects show (below, "stdlib-only change")
 make smith-corpus-pin    # re-pin tests/smith-corpus (verify's `smith` gate: seeds 1-24, each
                          # with the hash its program prints built at both levels and
                          # interpreted; a seed `cryo interpret` does not cover fails
@@ -233,6 +237,24 @@ not done. The remaining limits are here so nobody rediscovers them:
 
   The baseline's cache key is its trees, so a synthetic commit rebuilt
   later from the same files reuses the compiler already built.
+- **A stdlib-only change moves nothing verify compares by default** - both
+  sides build against the tree's stdlib.  `make verify ARGS="--baseline REV
+  --baseline-stdlib --require-identical"` builds the baseline compiler AND
+  its programs against REV's own stdlib (a home of its own in
+  `.verify/baseline/`, the stdlib copied into it), so each object the change
+  moves shows, in the archives and in the programs, and is declared as any
+  other (`moved-archive:<module>`, `moved:<project>`,
+  `moved-instances:<module>`).  This replaces building the stdlib before
+  and after at one path and hashing the objects by hand.  The cost: a tree
+  test that uses stdlib API REV lacks is refused by the baseline.  A
+  project is declared in `tests/started-compiling` (refused by REV with its
+  own stdlib, built by the tree), and its objects are left out.  The unit
+  suite is ONE build, so a unit test using the new API fails the baseline's
+  whole unit suite and nothing can declare that: run the option against a
+  REV that has the API (the commit that added it), or hold such a test in a
+  `collect` project.  A record made against REV's stdlib is keyed by that
+  stdlib's origin and text and is never read by a default run, nor the
+  reverse.
 
 Read the log's **own summary line**, not a chained exit code — `make test;
 echo $?; tail log` reports `tail`'s status.

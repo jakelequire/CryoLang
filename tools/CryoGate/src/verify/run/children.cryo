@@ -12,9 +12,9 @@ import std::core::result::{ Result };
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
 
+import cryogate::baseline::keys::{ ProgramStdlib };
 import cryogate::core::child::{ Completion, Job, Outcome };
 import cryogate::core::git::{ Git };
-import cryogate::core::host::{ Host };
 import cryogate::core::schedule::{ Cost, Scheduler };
 import cryogate::verify::gates::{ GateCommand, GateVerdict };
 import cryogate::verify::hashing::{ ObjectHashes };
@@ -22,16 +22,17 @@ import cryogate::verify::objects::{ ObjectPopulation };
 
 /// The environment every child of a verify run gets.
 public type struct VerifyChild {
-    /// A job running `program` with verify's environment.  An inherited
-    /// `CRYO_STDLIB` is removed: a compiler may embed the stdlib's path as
-    /// it was spelled, so each gate names the stdlib the way its own flow
-    /// always has.  `CRYO_RUNTIME` is `runtime` when one is given (the
-    /// baseline's programs link the commit's runtime) and removed otherwise,
-    /// so each compiler links the runtime it builds; `CRYO_CC` defaults to
-    /// `gcc` on Windows.
-    public static job(program: Str, runtime: Str) -> Job {
+    /// A job running `program` with verify's environment.  `CRYO_STDLIB`
+    /// is `stdlib` when one is given (the baseline's programs built against
+    /// the commit's own stdlib) and removed otherwise: a compiler may embed
+    /// the stdlib's path as it was spelled, so each gate names the
+    /// checkout's the way its own flow always has.  `CRYO_RUNTIME` is
+    /// `runtime` when one is given (the baseline's programs link the
+    /// commit's runtime) and removed otherwise, so each compiler links the
+    /// runtime it builds; `CRYO_CC` defaults to `gcc` on Windows.
+    public static job(program: Str, runtime: Str, stdlib: Str) -> Job {
         mut job: Job = Job::new(program);
-        job.remove_variable(Str::new("CRYO_STDLIB"));
+        if (stdlib.is_empty()) { job.remove_variable(Str::new("CRYO_STDLIB")); } else { job.set_variable(Str::new("CRYO_STDLIB"), stdlib); }
         if (runtime.is_empty()) { job.remove_variable(Str::new("CRYO_RUNTIME")); } else { job.set_variable(Str::new("CRYO_RUNTIME"), runtime); }
         job.default_c_compiler();
         return job;
@@ -74,7 +75,8 @@ public type struct PopulationRun {
     public static run(repository: Path, table: &Array<GateCommand>, names: &Array<String>, cryo: Str,
                       directory: Path, tag: Str, runtime: Path, sequential: boolean) -> Result<PopulationRun, String> {
         ObjectHashes::wipe(repository)?;
-        const gate_runs: Array<GateRun> = PopulationRun::gates(repository, table, names, cryo, directory, Str::new(""), sequential);
+        const gate_runs: Array<GateRun> = PopulationRun::gates(repository, table, names, cryo, directory, Str::new(""),
+            &ProgramStdlib::of_checkout(repository), sequential);
         mut counts: Array<i64> = Array::<i64>::new();
         for (population in ObjectPopulation::all().iterate_references()) {
             const rows: Array<String> = ObjectHashes::rows(repository, population, runtime)?;
@@ -87,11 +89,12 @@ public type struct PopulationRun {
     /// Run the gates of `table` named in `names`, in that order, over
     /// `cryo` in the checkout `repository`, each logged to
     /// `<directory>/<gate>.log`, with `runtime` as `VerifyChild::job` takes
-    /// it, and judge each run.  A name the table does not hold runs
-    /// nothing.
+    /// it and the programs built against `stdlib`, and judge each run.  A
+    /// name the table does not hold runs nothing.
     public static gates(repository: Path, table: &Array<GateCommand>, names: &Array<String>, cryo: Str,
-                        directory: Path, runtime: Str, sequential: boolean) -> Array<GateRun> {
-        const stdlib: String = Host::stdlib_directory(repository);
+                        directory: Path, runtime: Str, stdlib: &ProgramStdlib, sequential: boolean) -> Array<GateRun> {
+        const spelled: String = stdlib.spelling();
+        const variable: String = stdlib.variable();
         mut scheduler: Scheduler = Scheduler::new();
         scheduler.set_slots(if (sequential) { 1 } else { names.length() });
         mut logs: Array<String> = Array::<String>::new();
@@ -101,8 +104,8 @@ public type struct PopulationRun {
         }
         for (index in chosen.iterate_references()) {
             const gate: &GateCommand = &table[*index];
-            const command: Array<String> = gate.command(cryo, stdlib.as_str());
-            mut job: Job = VerifyChild::job(command[0].as_str(), runtime);
+            const command: Array<String> = gate.command(cryo, spelled.as_str());
+            mut job: Job = VerifyChild::job(command[0].as_str(), runtime, variable.as_str());
             for (index in 1..command.length()) { job.argument(command[index].as_str()); }
             job.directory(repository.as_str());
             const log: String = String::from_str(directory.join(f"{gate.name.as_str()}.log".as_str()).as_path().as_str());

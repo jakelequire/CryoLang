@@ -18,7 +18,7 @@ import std::fs::path::{ Path, PathBuf };
 
 import cryogate::baseline::cache::{ BaselineCache };
 import cryogate::baseline::clone::{ BaselineClone };
-import cryogate::baseline::keys::{ BaselineKey, HostToolchain, Program, ProgramKeys, Programs };
+import cryogate::baseline::keys::{ BaselineKey, HostToolchain, Program, ProgramKeys, Programs, ProgramStdlib };
 import cryogate::core::child::{ Completion };
 import cryogate::core::host::{ Host };
 import cryogate::core::git::{ Git };
@@ -39,10 +39,12 @@ import cryogate::verify::runtime::{ RuntimeArchives };
 /// `cryogate verify`, which `make verify` runs, and the pieces of a run on
 /// their own:
 ///
-/// - `--cryo <compiler> [--baseline <rev> [--require-identical]] [--only
-///   <gate>,...] [--list-limit <n>] [--sequential]`: a whole verify run -
-///   the gates over the compiler under test, and with a baseline, the
-///   object comparison against the compiler built from `rev`;
+/// - `--cryo <compiler> [--baseline <rev> [--baseline-stdlib]
+///   [--require-identical]] [--only <gate>,...] [--list-limit <n>]
+///   [--sequential]`: a whole verify run - the gates over the compiler
+///   under test, and with a baseline, the object comparison against the
+///   compiler built from `rev`; with `--baseline-stdlib` that compiler and
+///   its programs are built against `rev`'s own stdlib, not the checkout's;
 /// - `--declared-since <rev>`: the lines each declaration file declares
 ///   against the commit `rev`, printed as verify prints them before its
 ///   baseline run;
@@ -55,14 +57,16 @@ import cryogate::verify::runtime::{ RuntimeArchives };
 /// - `--runtime-list <directory>`: the runtime population's rows of the
 ///   archives one target's runtime directory (`runtime/.bin/<triple>`)
 ///   holds, as verify lists them in `tree.runtime.sha256`;
-/// - `--baseline-key <rev>`: the directory, `.verify/baseline/<key>`, of the
-///   baseline compiler verify builds from `rev` and this working tree;
+/// - `--baseline-key <rev> [--baseline-stdlib]`: the directory,
+///   `.verify/baseline/<key>`, of the baseline compiler verify builds from
+///   `rev` and this working tree (against `rev`'s stdlib, with the flag);
 /// - `--keys <home>`: every program's record key computed over the working
 ///   tree for the baseline compiler in `home` (a `.verify/baseline/<key>`
 ///   directory), each of which must name a record of that program in the
 ///   checkout's store, `.verify/programs`; every one that does not is named;
-/// - `--sync <clone> --at <rev>`: make `clone` the checkout verify builds a
-///   baseline compiler from `rev` in;
+/// - `--sync <clone> --at <rev> [--baseline-stdlib]`: make `clone` the
+///   checkout verify builds a baseline compiler from `rev` in (with `rev`'s
+///   stdlib, with the flag);
 /// - `--baselines <directory> [--current <name>]`: the baseline homes in
 ///   `directory` the bounded cache keeps, most recently used first, with
 ///   `current` among them as the home in use;
@@ -74,9 +78,10 @@ public type struct VerifyGate {
     /// line's `arguments` from index `first`; the process's exit code.
     public static run(repository: Path, logs: &RunLogs, arguments: &Array<String>, first: i64) -> i32 {
         mut options: Options = Options::new(Str::new(
-            "cryogate verify --cryo <compiler> [--baseline <rev> [--require-identical]] [--only <gate>,...] [--list-limit <n>] [--sequential] | --declared-since <rev> | --compare <run> --against <rev> [--list-limit <n>] | --records <run> --programs <directory> | --runtime-list <directory> | --baseline-key <rev> | --keys <home> | --sync <clone> --at <rev> | --baselines <directory> [--current <name>] | --hash <population> [--runtime <directory>]"));
+            "cryogate verify --cryo <compiler> [--baseline <rev> [--baseline-stdlib] [--require-identical]] [--only <gate>,...] [--list-limit <n>] [--sequential] | --declared-since <rev> | --compare <run> --against <rev> [--list-limit <n>] | --records <run> --programs <directory> | --runtime-list <directory> | --baseline-key <rev> [--baseline-stdlib] | --keys <home> | --sync <clone> --at <rev> [--baseline-stdlib] | --baselines <directory> [--current <name>] | --hash <population> [--runtime <directory>]"));
         options.valued(Str::new("--cryo"));
         options.valued(Str::new("--baseline"));
+        options.flag(Str::new("--baseline-stdlib"));
         options.flag(Str::new("--require-identical"));
         options.valued(Str::new("--only"));
         options.flag(Str::new("--sequential"));
@@ -100,6 +105,13 @@ public type struct VerifyGate {
             Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 2; }
         };
         const git: Git = Git::new(repository, logs);
+        const own_stdlib: boolean = parsed.has(Str::new("--baseline-stdlib"));
+        const takes_own_stdlib: boolean = parsed.value(Str::new("--baseline")).is_some() || parsed.value(Str::new("--baseline-key")).is_some()
+            || parsed.value(Str::new("--sync")).is_some();
+        if (own_stdlib && !takes_own_stdlib) {
+            fmt::eprintln(f"cryogate verify: --baseline-stdlib names the stdlib of a baseline commit, so it goes with --baseline <rev>, --baseline-key <rev> or --sync <clone> --at <rev>; usage: {options.usage()}");
+            return 2;
+        }
         mut limit: i64 = 40;
         match (parsed.value(Str::new("--list-limit"))) {
             Option::Some(text) => {
@@ -120,7 +132,8 @@ public type struct VerifyGate {
                     Option::None           => { Option::None }
                 };
                 const settings: VerifySettings = VerifySettings {
-                    cryo: String::from_str(cryo), baseline: baseline, require_identical: parsed.has(Str::new("--require-identical")),
+                    cryo: String::from_str(cryo), baseline: baseline, baseline_stdlib: own_stdlib,
+                    require_identical: parsed.has(Str::new("--require-identical")),
                     only: only, list_limit: limit, sequential: parsed.has(Str::new("--sequential")),
                 };
                 return VerifySession::run(repository, logs, &settings);
@@ -170,7 +183,7 @@ public type struct VerifyGate {
         }
         match (parsed.value(Str::new("--baseline-key"))) {
             Option::Some(revision) => {
-                return match (BaselineKey::of(repository, &git, revision)) {
+                return match (BaselineKey::of(repository, &git, revision, own_stdlib)) {
                     Result::Ok(key)     => { fmt::println(f".verify/baseline/{key.as_str()}"); 0 }
                     Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); 1 }
                 };
@@ -187,7 +200,7 @@ public type struct VerifyGate {
                     Option::Some(revision) => { revision }
                     Option::None           => { fmt::eprintln(f"cryogate verify: --sync needs --at; usage: {options.usage()}"); return 2; }
                 };
-                return match (BaselineClone::sync(repository, logs, repository.join(clone).as_path(), revision)) {
+                return match (BaselineClone::sync(repository, logs, repository.join(clone).as_path(), revision, own_stdlib)) {
                     Result::Ok(_)       => { fmt::println(f"verify: {clone} synced to {revision}"); 0 }
                     Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); 1 }
                 };
@@ -232,13 +245,16 @@ public type struct VerifyGate {
     }
 
     /// `--keys`: each program's key over the working tree, for the baseline
-    /// compiler and runtime in `home`, looked up in the checkout's record
-    /// store.  A key with no record that opens, or with another program's,
-    /// is named.
+    /// compiler and runtime in `home`, and the stdlib its programs build
+    /// against - the commit's copy it holds when it was built with its own,
+    /// else the checkout's - looked up in the checkout's record store.  A
+    /// key with no record that opens, or with another program's, is named.
     private static check_keys(repository: Path, git: &Git, home: Str) -> i32 {
         const base: PathBuf = repository.join(home);
         const compiler: PathBuf = base.join(Host::executable_name(Str::new("cryo")).as_str());
         const runtime: PathBuf = base.join(Str::new("runtime"));
+        const own: ProgramStdlib = ProgramStdlib::of_home(base.as_path());
+        const stdlib: ProgramStdlib = if (own.directory.join(Str::new("lib.cryo")).as_path().is_file()) { own } else { ProgramStdlib::of_checkout(repository) };
         const programs: Array<Program> = match (Programs::discover(repository, git)) {
             Result::Ok(programs) => { programs }
             Result::Err(reason)  => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
@@ -251,7 +267,7 @@ public type struct VerifyGate {
             Result::Ok(store)   => { store }
             Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
         };
-        const keys: Array<Pair<String, String>> = match (ProgramKeys::of(repository, git, compiler.as_path(), runtime.as_path(), &toolchain, &programs)) {
+        const keys: Array<Pair<String, String>> = match (ProgramKeys::of(repository, git, compiler.as_path(), runtime.as_path(), &stdlib, &toolchain, &programs)) {
             Result::Ok(keys)    => { keys }
             Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
         };
