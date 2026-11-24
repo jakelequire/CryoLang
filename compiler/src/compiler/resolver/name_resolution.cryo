@@ -299,7 +299,7 @@ type struct NameResolver {
         this.resolver.record_resolution(decl.span, sym_id);
         this.resolver.export_symbol(sym_id);
         node.def = this.resolver.get_symbol(sym_id).def;
-        if (!node.is_mutable) { this.record_const_value(this.resolver.get_symbol(sym_id).def, node); }
+        if (!node.is_mutable) { this.record_const_value(Res::Def(this.resolver.get_symbol(sym_id).def), node); }
         this.resolver.restore_scope(saved_module, saved_scope);
     }
 
@@ -361,7 +361,7 @@ type struct NameResolver {
                     fmt::format("the constant `%s` is declared twice on this type", leaf),
                     decl.name_span);
             }
-            this.record_const_value(constant.def, constant);
+            this.record_const_value(Res::Def(constant.def), constant);
             this.walk_decl(decl);
         }
     }
@@ -463,7 +463,7 @@ type struct NameResolver {
             // is refused where it is written.
             this.export_unless_private(sym_id, var_node.visibility);
             if (!var_node.is_mutable) {
-                this.record_const_value(this.resolver.get_symbol(sym_id).def, var_node);
+                this.record_const_value(Res::Def(this.resolver.get_symbol(sym_id).def), var_node);
             }
         } else if (var_node.is_global) {
             this.declare_c_imported_global(var_node.binding_namespace, decl, var_node);
@@ -2796,7 +2796,8 @@ type struct NameResolver {
         return path;
     }
 
-    /// Record a module-level `const NAME = expr;` so its value can be folded.
+    /// Record a `const NAME = expr;` - module-level, a type's, or local - so
+    /// its value can be folded.
     ///
     /// Fixed array sizes (`[u8; NAME]`) are resolved long before codegen turns a
     /// const into a runtime global, so the initializer has to be captured here
@@ -2809,20 +2810,23 @@ type struct NameResolver {
     /// too and simply never folds - only a use that needs the value reports
     /// anything.
     ///
-    /// Kept under `def`, the definition the constant was just declared as:
-    /// the one every use's stamp carries, a C-imported constant's in its
-    /// alias module as any other's in its own.
-    record_const_value(&this, def: DefId, node: VarDecl*) -> void {
+    /// Kept under `answer`, what the constant was just declared as: the
+    /// definition of a module's or a type's constant, a C-imported
+    /// constant's in its alias module as any other's in its own, or the
+    /// binding of a local `const` - the answer every use's stamp carries.
+    record_const_value(&this, answer: Res, node: VarDecl*) -> void {
         if (this.ctx == null || this.ctx.const_table == null) { return; }
         const intern: InternTable* = this.ctx.intern_table;
         if (intern == null) { return; }
         if (node.initializer == null) { return; }
         // The declared type travels with the initializer: it is what decides
         // whether `1 / 2` is this constant's 0 or its 0.5, and what the folded
-        // value wraps to, and the folder cannot recover it from the expression.
+        // value is computed in, and the folder cannot recover it from the
+        // expression.
         this.ctx.const_table.register(
-            def, node.initializer,
-            ConstantTable::declared_primitive(node.type_annotation, intern));
+            answer, node.initializer,
+            ConstantTable::declared_primitive(node.type_annotation, intern),
+            node.type_annotation != null);
     }
 
     /// Record a module-level enum so `Enum::Variant` folds to its discriminant
@@ -3803,6 +3807,10 @@ implement trait Walk for struct NameResolver {
             // Sema) can map the declaration's span -> SymbolID for type write-back.
             this.resolver.record_resolution(d.span, sym_id);
             node.set_sym_id(sym_id);
+            // A local `const` is a constant under its binding, which every
+            // use the scope rules give it is stamped with; a `mut` local is
+            // not one.
+            if (!node.is_mutable) { this.record_const_value(Res::Local(sym_id), node); }
         }
 
         // Visit initializer expression
