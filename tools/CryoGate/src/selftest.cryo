@@ -3,8 +3,10 @@
 ///!
 ///! First the child runner and the scheduler, against `cryogate probe`, a
 ///! child whose behaviour is known: exit codes, a timeout kill, both
-///! streams in one log, an inherited, a removed and an added variable, the
-///! working directory, a missing program, and the heavy-run lock.  A
+///! streams in one log, a log copied whole, a log that refuses a write, a
+///! process the child leaves holding its output, an inherited, a removed
+///! and an added variable, the working directory, a missing program, and
+///! the heavy-run lock.  A
 ///! process API that drops an argument or loses an exit code fails here,
 ///! before any gate's verdict is read.  Then cryogate's own unit tests, run
 ///! from the test binary `make cryogate` built with the pinned compiler.
@@ -129,6 +131,38 @@ public type struct SelfTest {
         moved.directory(logs.directory().as_str());
         const directory: i64 = scheduler.add(moved, Cost::Light);
 
+        // More than a pipe holds, so the copy into the log runs many times.
+        mut volume: Job = SelfTest::probe_job(probe.as_str(), logs, Str::new("volume"));
+        volume.argument(Str::new("count"));
+        volume.argument(Str::new("20000"));
+        const whole: i64 = scheduler.add(volume, Cost::Light);
+
+        // The log refuses a write: on Windows the child locks every byte of
+        // it, as another process can; elsewhere the log is a device that
+        // refuses every write.  The child would print for ten seconds.
+        const refusing: String = if (Host::os() == Str::new("windows")) { logs.file(Str::new("probe-refused")) } else { String::from_str(Str::new("/dev/full")) };
+        mut refused: Job = Job::new(probe.as_str());
+        refused.argument(Str::new("probe"));
+        if (Host::os() == Str::new("windows")) {
+            refused.argument(Str::new("lock"));
+            refused.argument(refusing.as_str());
+        }
+        refused.argument(Str::new("count"));
+        refused.argument(Str::new("2000"));
+        refused.argument(Str::new("sleep"));
+        refused.argument(Str::new("10000"));
+        refused.log_to(refusing.as_str());
+        const unwritable: i64 = scheduler.add(refused, Cost::Light);
+
+        // The child leaves a probe running for six seconds, holding its
+        // output.
+        mut leaving: Job = SelfTest::probe_job(probe.as_str(), logs, Str::new("left-running"));
+        leaving.argument(Str::new("print"));
+        leaving.argument(Str::new("before-leaving"));
+        leaving.argument(Str::new("leave-running"));
+        leaving.argument(Str::new("6000"));
+        const left_running: i64 = scheduler.add(leaving, Cost::Light);
+
         const absent_program: PathBuf = logs.directory().join(Str::new("no-such-program"));
         mut missing: Job = Job::new(absent_program.as_path().as_str());
         missing.log_to(logs.file(Str::new("probe-missing")).as_str());
@@ -158,6 +192,25 @@ public type struct SelfTest {
         this.expect(Str::new("the child runs in the directory it is given"),
                     !expected_directory.is_empty() && expected_directory == actual_directory,
                     f"expected {expected_directory.as_str()}, the child printed {actual_directory.as_str()}");
+        mut counted: String = String::new();
+        for (line in 1..20001) { counted.push(f"line {line}\n".as_str()); }
+        const copied: String = done[whole].output();
+        this.expect(Str::new("the log holds every byte the child wrote, in order"),
+                    copied == counted,
+                    f"the log held {copied.length()} bytes, the child wrote {counted.length()}");
+        const lost: &Completion = &done[unwritable];
+        const lost_described: String = lost.outcome.describe();
+        this.expect(Str::new("a write the log refuses fails the job, naming the log, the error and the fix"),
+                    lost_described.starts_with(&f"output lost: cannot write its log {refusing.as_str()}: ".as_str())
+                        && lost_described.contains(&Str::new("help: ")),
+                    lost_described.clone());
+        this.expect(Str::new("the job whose log refuses a write is stopped at once"), lost.seconds < 8.0, f"took {lost.seconds} s");
+        const left: &Completion = &done[left_running];
+        this.expect(Str::new("a process the child leaves holding its output is reported"), left.output_left_open, String::from_str(Str::new("not reported")));
+        this.expect(Str::new("and the job ends without waiting for it"),
+                    left.seconds < 5.0 && left.outcome.describe().as_str() == Str::new("exit 0"),
+                    f"{left.outcome.describe().as_str()} after {left.seconds} s");
+        this.expect_line(Str::new("and what the child wrote before it ended is in the log"), left, Str::new("before-leaving"));
         const never: &Completion = &done[could_not_start];
         this.expect(Str::new("a missing program could not start, not exit 1 or 127"),
                     match (&never.outcome) { Outcome::CouldNotStart(_) => { true } _ => { false } },

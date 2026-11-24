@@ -10,16 +10,26 @@ import std::collections::string::{ String };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::env;
+import std::ffi::libc;
 import std::fmt;
+import std::fs::file::{ File, OpenOptions };
+import std::fs::path::{ Path };
+import std::io::error::{ IoError };
+import std::process::command::{ Command, Stdio };
+import std::sys::syscall;
 import std::time::clock;
 import std::time::duration::{ Duration };
 
 public type struct Probe {
     /// Perform the actions in `arguments` from `first` on, in order:
     /// `exit N` ends with code N; `sleep MS` waits; `print TEXT` writes a
-    /// line to stdout and `error TEXT` one to stderr; `variable NAME` prints
-    /// the variable's value, or `<unset>`; `directory` prints the current
-    /// directory.  Without an `exit` the probe ends with 0.
+    /// line to stdout and `error TEXT` one to stderr; `count N` writes the
+    /// lines `line 1` to `line N` to stdout; `variable NAME` prints the
+    /// variable's value, or `<unset>`; `directory` prints the current
+    /// directory; `lock PATH` (Windows) locks every byte of the file PATH
+    /// against other handles until the probe ends; `leave-running MS`
+    /// starts another probe sleeping MS, holding this one's output, and
+    /// does not wait for it.  Without an `exit` the probe ends with 0.
     public static run(arguments: &Array<String>, first: i64) -> i32 {
         mut index: i64 = first;
         while (index < arguments.length()) {
@@ -49,8 +59,22 @@ public type struct Probe {
                 fmt::println(String::from_str(value));
             } else if (action == Str::new("error")) {
                 fmt::eprintln(String::from_str(value));
+            } else if (action == Str::new("count")) {
+                match (i64::try_from(value)) {
+                    Result::Ok(count) => { for (line in 1..(count + 1)) { fmt::println(f"line {line}"); } }
+                    Result::Err(_)    => { fmt::eprintln(f"cryogate probe: `{value}` is not a count"); return 2; }
+                }
             } else if (action == Str::new("variable")) {
                 fmt::println(env::var(value).unwrap_or(String::from_str(Str::new("<unset>"))));
+            } else if (action == Str::new("lock")) {
+                if (!Probe::lock(value)) { return 2; }
+            } else if (action == Str::new("leave-running")) {
+                mut sleeper: Command = Command::new(env::current_executable().unwrap_or(String::new()).as_str());
+                sleeper.argument(Str::new("probe")).argument(Str::new("sleep")).argument(value).stdin(Stdio::Null);
+                match (sleeper.spawn()) {
+                    Result::Ok(_)      => { }
+                    Result::Err(error) => { fmt::eprintln(f"cryogate probe: cannot start the probe to leave running: {error.describe()}"); return 2; }
+                }
             } else {
                 fmt::eprintln(f"cryogate probe: unknown action `{action}`");
                 return 2;
@@ -58,5 +82,30 @@ public type struct Probe {
             index += 2;
         }
         return 0;
+    }
+
+    /// Lock every byte of the file `path` against other handles, held by a
+    /// handle left open until the probe ends; false, reported, when it
+    /// cannot be.
+    ![target(windows)]
+    private static lock(path: Str) -> boolean {
+        mut options: OpenOptions = OpenOptions::new();
+        options.read(true);
+        options.share(true, true, true);
+        mut file: File = match (options.open(Path::from(path))) {
+            Result::Ok(file)   => { file }
+            Result::Err(error) => { fmt::eprintln(f"cryogate probe: cannot open {path}: {error.describe()}"); return false; }
+        };
+        const handle: i64 = libc::_get_osfhandle(file.into_descriptor());
+        if (syscall::LockFile(handle as u8*, 0, 0, 0xFFFFFFFF, 0xFFFFFFFF) == 0) {
+            fmt::eprintln(f"cryogate probe: cannot lock {path}: {IoError::last_os_error().describe()}");
+            return false;
+        }
+        return true;
+    }
+    ![target(unix)]
+    private static lock(path: Str) -> boolean {
+        fmt::eprintln(f"cryogate probe: `lock {path}`: a POSIX lock does not stop another process writing");
+        return false;
     }
 }
