@@ -351,6 +351,56 @@ public type struct File {
         }
     }
 
+    /// Give the file at `from` a second name, `to`. The two names are then
+    /// one file, its bytes stored once: a write through either is read
+    /// through the other, and removing one leaves the file under the
+    /// other. `from` must be a regular file: a directory fails with
+    /// `IsADirectory`. `to` must not exist, or the link fails with
+    /// `AlreadyExists` and nothing is replaced. Both names must be on one
+    /// volume: a link to another fails with `CrossesDevices`, and
+    /// `File::copy` is the way to put the file there. A filesystem that
+    /// holds no hard links (FAT) fails with `Unsupported`. A refused `to`
+    /// is the path the error names; every other failure names `from`.
+    public static hard_link(from: Path, to: Path) -> Result<(), IoError> {
+        const info: Metadata = from.metadata()?;
+        if (info.is_directory()) {
+            return Result::Err(IoError::new(IoErrorKind::IsADirectory, 0).with_context(IoOperation::HardLink, from));
+        }
+        return match (File::link_name(from, to)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => {
+                const named: Path = if (error.kind == IoErrorKind::AlreadyExists) { to } else { from };
+                Result::Err(error.with_context(IoOperation::HardLink, named))
+            }
+        };
+    }
+
+    /// `link(2)`. With `from` a regular file, `EPERM` and `EOPNOTSUPP` say
+    /// the filesystem makes no hard links.
+    ![target(unix)]
+    private static link_name(from: Path, to: Path) -> Result<(), IoError> {
+        mut c_from: String = String::with_null(from.as_str());
+        mut c_to: String = String::with_null(to.as_str());
+        const rc: i32 = libc::link(c_from.as_pointer(), c_to.as_pointer());
+        const err: i32 = libc::errno();
+        mem::drop(c_to);
+        mem::drop(c_from);
+        if (rc == 0) { return Result::Ok(()); }
+        if (err == libc::EPERM || err == libc::EOPNOTSUPP) { return Result::Err(IoError::new(IoErrorKind::Unsupported, err)); }
+        return Result::Err(IoError::from_errno(err));
+    }
+    /// `CreateHardLinkW`, which names the new link first.
+    /// `ERROR_INVALID_FUNCTION` says the filesystem makes no hard links.
+    ![target(windows)]
+    private static link_name(from: Path, to: Path) -> Result<(), IoError> {
+        const wide_from: Array<u16> = Utf16::encode(from.as_str());
+        const wide_to: Array<u16> = Utf16::encode(to.as_str());
+        if (syscall::CreateHardLinkW(wide_to.as_pointer(), wide_from.as_pointer(), null) != 0) { return Result::Ok(()); }
+        const code: u32 = syscall::GetLastError();
+        if (code == syscall::ERROR_INVALID_FUNCTION) { return Result::Err(IoError::new(IoErrorKind::Unsupported, code as i32)); }
+        return Result::Err(IoError::from_windows_error(code));
+    }
+
     /// Delete the file at `path`. A directory is refused; see
     /// `Directory::remove`. A read-only file is deleted too: whether a
     /// file may be removed is its directory's to say, not the file's own

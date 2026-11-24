@@ -440,3 +440,115 @@ function utf16_decode_lossy_replaces_each_lone_surrogate() -> Result<(), TestErr
     const text: String = Utf16::decode_lossy(Slice::<u16>::from_raw(&units[0], 6));
     return expect(text.as_str() == Str::new("\u{fffd}\u{fffd}b\u{1f600}\u{fffd}"), "each lone surrogate is U+FFFD and the pair is kept");
 }
+
+![test]
+function a_hard_link_is_the_file_under_a_second_name() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = TemporaryDirectory::create()?;
+    const original: PathBuf = scratch.path().join("original.txt");
+    const link: PathBuf = scratch.path().join("link.txt");
+    File::write_text(original.as_path(), "first")?;
+    File::hard_link(original.as_path(), link.as_path())?;
+    expect(File::read_text(link.as_path())?.as_str() == Str::new("first"), "the link reads the original's bytes")?;
+    // A copy would keep its own bytes; one file shows a write through
+    // either name under the other.
+    File::write_text(link.as_path(), "second")?;
+    expect(File::read_text(original.as_path())?.as_str() == Str::new("second"), "a write through the link is read through the original")?;
+    File::remove(original.as_path())?;
+    return expect(File::read_text(link.as_path())?.as_str() == Str::new("second"), "the file outlives its first name");
+}
+
+![test]
+function a_hard_link_over_an_existing_file_is_refused_and_names_it() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = TemporaryDirectory::create()?;
+    const original: PathBuf = scratch.path().join("original.txt");
+    const taken: PathBuf = scratch.path().join("taken.txt");
+    File::write_text(original.as_path(), "original")?;
+    File::write_text(taken.as_path(), "kept")?;
+    match (File::hard_link(original.as_path(), taken.as_path())) {
+        Result::Ok(_) => { return bail("a link replaced an existing file"); }
+        Result::Err(error) => {
+            expect(error.kind == IoErrorKind::AlreadyExists, "the refusal is AlreadyExists")?;
+            const expected: String = f"could not hard-link {taken.as_path().as_str()}: already exists";
+            expect(shown(&error).as_str() == expected.as_str(), "the error names the name already taken")?;
+        }
+    }
+    return expect(File::read_text(taken.as_path())?.as_str() == Str::new("kept"), "the existing file is left as it was");
+}
+
+![test]
+function a_hard_link_to_a_missing_file_is_not_found() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = TemporaryDirectory::create()?;
+    const missing: PathBuf = scratch.path().join("absent.txt");
+    const link: PathBuf = scratch.path().join("link.txt");
+    match (File::hard_link(missing.as_path(), link.as_path())) {
+        Result::Ok(_) => { return bail("linked a file that does not exist"); }
+        Result::Err(error) => { expect(error.kind == IoErrorKind::NotFound, "the failure is NotFound")?; }
+    }
+    return expect(!link.as_path().exists(), "no link is made");
+}
+
+![test]
+function a_hard_link_to_a_directory_is_refused() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = TemporaryDirectory::create()?;
+    const inner: PathBuf = scratch.path().join("inner");
+    Directory::create(inner.as_path())?;
+    const link: PathBuf = scratch.path().join("link");
+    match (File::hard_link(inner.as_path(), link.as_path())) {
+        Result::Ok(_) => { return bail("linked a directory"); }
+        Result::Err(error) => {
+            expect(error.kind == IoErrorKind::IsADirectory, "the refusal is IsADirectory")?;
+            expect(verb_of(&error) == Str::new("hard-link"), "the failure records the hard link")?;
+        }
+    }
+    return expect(!link.as_path().exists(), "no link is made");
+}
+
+/// A name for a link on a volume other than the one `directory` is on:
+/// the root of the first other drive mounted.
+![target(windows)]
+function on_another_volume(directory: Path) -> Option<String> {
+    const letters: Str = Str::new("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    const own: String = directory.as_str().byte_substring(0, 1).to_ascii_lowercase();
+    for (mut index: i64 = 0; index < letters.length(); index++) {
+        const letter: Str = letters.byte_substring(index, index + 1);
+        if (letter.to_ascii_lowercase().as_str() == own.as_str()) { continue; }
+        const root: String = f"{letter}:/";
+        if (Path::from(root.as_str()).is_directory()) { return Option::Some(f"{root.as_str()}cryo-hard-link-across-volumes.txt"); }
+    }
+    return Option::None;
+}
+
+/// A name for a link on a volume other than the one `directory` is on:
+/// the shared-memory filesystem, a mount of its own.
+![target(unix)]
+function on_another_volume(directory: Path) -> Option<String> {
+    if (directory.as_str().starts_with(&Str::new("/dev/shm")) || !Path::from("/dev/shm").is_directory()) { return Option::None; }
+    return Option::Some(String::from_str(Str::new("/dev/shm/cryo-hard-link-across-volumes.txt")));
+}
+
+![test]
+function a_hard_link_to_another_volume_crosses_devices() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = TemporaryDirectory::create()?;
+    const original: PathBuf = scratch.path().join("original.txt");
+    File::write_text(original.as_path(), "here")?;
+    const link: String = match (on_another_volume(scratch.path())) {
+        Option::Some(name) => { name }
+        Option::None => {
+            const needed: String = f"a link across volumes needs a second volume beside the one {scratch.path().as_str()} is on, and this host mounts none";
+            return bail(needed.as_str());
+        }
+    };
+    match (File::hard_link(original.as_path(), Path::from(link.as_str()))) {
+        Result::Ok(_) => {
+            File::remove(Path::from(link.as_str()))?;
+            const linked: String = f"linked across volumes to {link.as_str()}";
+            return bail(linked.as_str());
+        }
+        Result::Err(error) => {
+            expect(error.kind == IoErrorKind::CrossesDevices, "the refusal is CrossesDevices")?;
+            const expected: String = f"could not hard-link {original.as_path().as_str()}: the two paths are on different devices; copy the file instead";
+            expect(shown(&error).as_str() == expected.as_str(), "the error names the file and says to copy it")?;
+        }
+    }
+    return Result::Ok(());
+}
