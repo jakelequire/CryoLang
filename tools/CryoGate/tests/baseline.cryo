@@ -18,7 +18,7 @@ import std::fs::directory::{ Directory };
 import std::fs::file::{ File };
 
 import cryogate::baseline::cache::{ BaselineCache };
-import cryogate::baseline::keys::{ CompilerIdentity, HostToolchain };
+import cryogate::baseline::keys::{ BaselineKey, CompilerIdentity, HostToolchain, Program, ProgramKeys, ProgramStdlib };
 import cryogate::baseline::listing::{ Listing };
 import cryogate::core::text::{ Text };
 import cryogate::core::git::{ Git };
@@ -130,6 +130,96 @@ function a_projects_inputs_hold_the_package_its_cryoconfig_reaches_by_path() -> 
     }
     expect(shelf > 0, Str::new("the shelf package's files"))?;
     return expect(shelf == reached.length(), Str::new("nothing else: its own directory is not outside it"));
+}
+
+/// The record keys over the checkout `root` for a compiler, a runtime and
+/// one program written in `scratch`, the programs built against `stdlib`:
+/// the program's key.
+private type struct StdlibKeys {
+    private static of(root: Path, git: &Git, scratch: Path, stdlib: &ProgramStdlib) -> Result<String, TestError> {
+        const compiler: PathBuf = scratch.join(Str::new("cryo"));
+        const runtime: PathBuf = scratch.join(Str::new("runtime"));
+        StdlibKeys::written(runtime.join(Str::new("lib.cryo")).as_path(), Str::new("runtime"))?;
+        StdlibKeys::written(compiler.as_path(), Str::new("compiler"))?;
+        mut programs: Array<Program> = Array::<Program>::new();
+        programs.push(Program { name: String::from_str(Str::new("p")), files: Array::<String>::new() });
+        const toolchain: HostToolchain = HostToolchain { digest: String::from_str(Str::new("host")) };
+        return match (ProgramKeys::of(root, git, compiler.as_path(), runtime.as_path(), stdlib, &toolchain, &programs)) {
+            Result::Ok(keys)    => { Result::Ok(keys[0].second.clone()) }
+            Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
+        };
+    }
+
+    /// `text` written to `path`, its directory made first.
+    private static written(path: Path, text: Str) -> Result<(), TestError> {
+        match (path.parent()) {
+            Option::Some(parent) => {
+                match (Directory::create_all(parent)) {
+                    Result::Ok(_)      => { }
+                    Result::Err(error) => { return Result::Err(TestError::other(error.describe())); }
+                }
+            }
+            Option::None         => { }
+        }
+        return match (File::write_text(path, text)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(TestError::other(error.describe())) }
+        };
+    }
+}
+
+![test]
+function a_record_key_reads_which_stdlib_the_programs_build_against_and_its_text() -> Result<(), TestError> {
+    const root: PathBuf = match (Host::repository()) {
+        Result::Ok(root)    => { root }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    const scratch: TemporaryDirectory = match (TemporaryDirectory::create()) {
+        Result::Ok(directory) => { directory }
+        Result::Err(error)    => { return Result::Err(TestError::other(error.describe())); }
+    };
+    const logs: RunLogs = match (RunLogs::open(scratch.path().join(Str::new("logs")).as_path())) {
+        Result::Ok(logs)    => { logs }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    const git: Git = Git::new(root.as_path(), &logs);
+    const home: PathBuf = scratch.path().join(Str::new("home"));
+    const library: PathBuf = home.join(Str::new("stdlib/lib.cryo"));
+    StdlibKeys::written(library.as_path(), Str::new("namespace std;"))?;
+    const own: ProgramStdlib = ProgramStdlib::of_home(home.as_path());
+    const own_key: String = StdlibKeys::of(root.as_path(), &git, scratch.path(), &own)?;
+    expect(StdlibKeys::of(root.as_path(), &git, scratch.path(), &own)? == own_key, Str::new("the same stdlib reads the same"))?;
+    // The same files as the checkout's: a record made against the
+    // baseline's stdlib is never read for a run against the checkout's.
+    const same_text: ProgramStdlib = ProgramStdlib { directory: home.join(Str::new("stdlib")), from_baseline: false };
+    expect(StdlibKeys::of(root.as_path(), &git, scratch.path(), &same_text)? != own_key, Str::new("the stdlib's origin"))?;
+    expect(StdlibKeys::of(root.as_path(), &git, scratch.path(), &ProgramStdlib::of_checkout(root.as_path()))? != own_key,
+        Str::new("the checkout's stdlib"))?;
+    StdlibKeys::written(home.join(Str::new("stdlib/.bin/archive.a")).as_path(), Str::new("built"))?;
+    expect(StdlibKeys::of(root.as_path(), &git, scratch.path(), &own)? == own_key, Str::new("its build outputs are no input"))?;
+    StdlibKeys::written(library.as_path(), Str::new("namespace std; "))?;
+    return expect(StdlibKeys::of(root.as_path(), &git, scratch.path(), &own)? != own_key, Str::new("the stdlib's text"));
+}
+
+![test]
+function a_baseline_built_against_its_own_stdlib_has_a_home_of_its_own() -> Result<(), TestError> {
+    const root: PathBuf = match (Host::repository()) {
+        Result::Ok(root)    => { root }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    const scratch: TemporaryDirectory = match (TemporaryDirectory::create()) {
+        Result::Ok(directory) => { directory }
+        Result::Err(error)    => { return Result::Err(TestError::other(error.describe())); }
+    };
+    const logs: RunLogs = match (RunLogs::open(scratch.path())) {
+        Result::Ok(logs)    => { logs }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    const git: Git = Git::new(root.as_path(), &logs);
+    const checkout: Result<String, String> = BaselineKey::of(root.as_path(), &git, Str::new("HEAD"), false);
+    const own: Result<String, String> = BaselineKey::of(root.as_path(), &git, Str::new("HEAD"), true);
+    expect(checkout.is_ok() && own.is_ok(), Str::new("both keys"))?;
+    return expect(checkout.unwrap() != own.unwrap(), Str::new("the stdlib's origin"));
 }
 
 /// A compiler binary's bytes, made by hand: a PE header whose signature is

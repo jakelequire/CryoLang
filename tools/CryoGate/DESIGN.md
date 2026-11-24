@@ -92,6 +92,13 @@ The test files under `tests/` import whichever layer they test.
    `main.cryo`.
 4. A gate that runs a heavy job takes the heavy-run lock itself
    (`core::lock`); a caller never writes the lock for it.
-5. Wire the Makefile target to `$(CRYOGATE_COMMAND) <name> ...`, and
+5. A child's log is written by cryogate alone, from a pipe, every write
+   checked: a refused write fails the job as `OutputLost` rather than
+   leave the log short.  Read a log only from the job's `Completion`, and
+   expect the job to end once its child has ended and the child's pipes
+   have, or `Running::DRAIN_MILLISECONDS` after the child ended, whichever
+   comes first: a process the child leaves running with the pipe is
+   reported, not waited for.
+6. Wire the Makefile target to `$(CRYOGATE_COMMAND) <name> ...`, and
    delete the script it replaces in the same commit, once the port's
    side-by-side proof (PLAN.md section 9) is done.

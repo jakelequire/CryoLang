@@ -2,13 +2,33 @@
 ///! environment, where its output goes, how long it may take, and what
 ///! became of it.
 ///!
-///! Both output streams go to one log file, interleaved as written, or to
+///! Both output streams go to one log, interleaved as written, or to
 ///! cryogate's own console.  Output a gate needs to read is read back from
-///! the log: a file never fills and blocks the child the way an undrained
-///! pipe does.
+///! the log.
+///!
+///! cryogate is the only writer of a log.  The child writes into a pipe,
+///! and a thread of cryogate's copies the pipe into the log, checking
+///! every write: a write the system refuses (the log locked by another
+///! process, its drive full) stops the job and fails it as `OutputLost`,
+///! naming the log and the system's error.  A child writing straight into
+///! the log would lose the refused bytes without a word, and the log would
+///! read as a run that printed less.  The thread drains the pipe whether or
+///! not the job is being polled, so the pipe never fills and stalls the
+///! child.
+///!
+///! The pipe ends when every process holding it has closed it, and a
+///! process the child started inherits it.  So a job ends when its child
+///! has ended and its pipes have: once the child has ended, the job waits
+///! at most `Running::DRAIN_MILLISECONDS` for the pipes, then completes
+///! with the child's outcome and reports that a process the child started
+///! still holds the output; what that process writes later is dropped, not
+///! written to a log the gate is already reading.  A job past its limit is
+///! killed whole when it roots a tree, which closes every pipe it holds.
 
 namespace cryogate::core::child;
 
+import std::alloc::allocator::{ GlobalAllocator };
+import std::alloc::arc::{ Arc };
 import std::collections::array::{ Array };
 import std::collections::pair::{ Pair };
 import std::collections::str::{ Str };
@@ -16,16 +36,24 @@ import std::collections::string::{ String };
 import std::core::clone::{ Clone };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
+import std::core::slice::{ Slice };
 import std::env;
+import std::fmt;
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
 import std::io::error::{ IoError };
+import std::io::file_descriptor;
+import std::io::file_descriptor::{ BorrowedFileDescriptor };
+import std::io::traits::{ Read, Write };
 import std::process::child::{ Child, ExitStatus };
 import std::process::command::{ Command, Stdio };
+import std::sync::mutex::{ Mutex, MutexGuard };
+import std::thread;
 import std::time::clock::{ Instant };
 import std::time::duration::{ Duration };
 
 import cryogate::core::host::{ Host };
+import cryogate::core::text::{ Text };
 
 /// What became of a job.
 public type enum Outcome {
@@ -37,6 +65,9 @@ public type enum Outcome {
     TimedOut;
     /// The program never ran: the reason it could not be started.
     CouldNotStart(String);
+    /// Part of the program's output could not be written to its log, so
+    /// the program was stopped: the log, the system's error and what to do.
+    OutputLost(String);
 }
 
 implement enum Outcome {
@@ -57,13 +88,14 @@ implement enum Outcome {
     }
 
     /// The outcome as a report writes it: `exit 0`, `signal 9`,
-    /// `timed out`, `could not start: <reason>`.
+    /// `timed out`, `could not start: <reason>`, `output lost: <reason>`.
     public describe(&this) -> String {
         return match (&this) {
             Outcome::Exited(code)          => { f"exit {code}" }
             Outcome::Signalled(signal)     => { f"signal {signal}" }
             Outcome::TimedOut              => { String::from_str(Str::new("timed out")) }
             Outcome::CouldNotStart(reason) => { f"could not start: {reason.as_str()}" }
+            Outcome::OutputLost(reason)    => { f"output lost: {reason.as_str()}" }
         };
     }
 
@@ -88,6 +120,7 @@ implement trait Clone for Outcome {
             Outcome::Signalled(signal)     => { Outcome::Signalled(signal) }
             Outcome::TimedOut              => { Outcome::TimedOut }
             Outcome::CouldNotStart(reason) => { Outcome::CouldNotStart(reason.clone()) }
+            Outcome::OutputLost(reason)    => { Outcome::OutputLost(reason.clone()) }
         };
     }
 }
@@ -101,6 +134,10 @@ public type struct Completion {
     /// unless the job sent that elsewhere; empty when the job wrote to the
     /// console.
     public log: String;
+    /// Whether a process the child started still held the child's output
+    /// open when the job completed, `Running::DRAIN_MILLISECONDS` after the
+    /// child ended; the job reported it and did not wait for it.
+    public output_left_open: boolean;
 
     /// The job's whole output, as the log holds it.  Empty when the job
     /// wrote to the console or the log cannot be read.
@@ -113,6 +150,106 @@ public type struct Completion {
     }
 }
 
+/// One of a child's output pipes copied into a log: the state the thread
+/// copying it shares with the job waiting on it.
+type struct CopiedLog {
+    /// The log, open while the copy writes it.  Closed when the pipe ends,
+    /// when a write fails and when the job completes.
+    file: Option<File>;
+    path: String;
+    /// Why the copy failed, with what to do: the first failure.
+    failure: Option<String>;
+    /// Whether the pipe has ended: every process holding it closed it.
+    ended: boolean;
+
+    /// Append `bytes` to the log whole, or record why it could not be and
+    /// close the log.  Bytes arriving once the log is closed are dropped:
+    /// the failure has already stopped the job, or the job has completed.
+    append(mut &this, bytes: &Slice<u8>) -> void {
+        if (this.file.is_none()) { return; }
+        match (this.file.unwrap_pointer().write(bytes)) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => {
+                this.fail(f"cannot write its log {this.path.as_str()}: {error.describe()}; the job was stopped rather than leave the log missing output.  help: close whatever holds {this.path.as_str()} open or locked (an editor, a file indexer, an antivirus scan), make room on its drive if it is full, and run the gate again");
+            }
+        }
+    }
+
+    /// Record `reason` unless a failure came first, and close the log.
+    fail(mut &this, reason: String) -> void {
+        if (this.failure.is_none()) { this.failure = Option::Some(reason); }
+        this.file = Option::None;
+    }
+}
+
+/// One of a child's output pipes, copied into its log by a thread of its
+/// own, which ends when the pipe does.
+type struct LogCopy {
+    shared: Arc<Mutex<CopiedLog>>;
+    path: String;
+
+    /// Copy the pipe `descriptor`, which the thread takes over, into
+    /// `file`, the log at `path`.
+    static start(descriptor: i32, file: File, path: Str) -> LogCopy {
+        const shared: Arc<Mutex<CopiedLog>> = Arc::new(Mutex::new(CopiedLog {
+            file:    Option::Some(file),
+            path:    String::from_str(path),
+            failure: Option::None,
+            ended:   false,
+        }));
+        const copied: Arc<Mutex<CopiedLog>> = shared.clone();
+        thread::spawn(move () -> i32 { return LogCopy::copy(descriptor, &copied); }).detach();
+        return LogCopy { shared: shared, path: String::from_str(path) };
+    }
+
+    /// Why the copy failed, once it has.
+    failure(&this) -> Option<String> {
+        const held: MutexGuard<CopiedLog, GlobalAllocator> = this.shared.get_reference().lock();
+        return match (&held.as_pointer().failure) {
+            Option::Some(reason) => { Option::Some(reason.clone()) }
+            Option::None         => { Option::None }
+        };
+    }
+
+    /// Whether the pipe has ended.
+    ended(&this) -> boolean {
+        const held: MutexGuard<CopiedLog, GlobalAllocator> = this.shared.get_reference().lock();
+        return held.as_pointer().ended;
+    }
+
+    /// Close the log: once this returns nothing more is written to it.
+    stop(&this) -> void {
+        mut held: MutexGuard<CopiedLog, GlobalAllocator> = this.shared.get_reference().lock();
+        held.as_mutable_pointer().file = Option::None;
+    }
+
+    /// The thread's work: copy the pipe into the log until the pipe ends.
+    private static copy(descriptor: i32, shared: &Arc<Mutex<CopiedLog>>) -> i32 {
+        mut pipe: BorrowedFileDescriptor = BorrowedFileDescriptor::new(descriptor);
+        mut chunk: [u8; 65536];
+        loop {
+            match (pipe.read(&chunk[0], 65536)) {
+                Result::Ok(count) => {
+                    if (count == 0) { break; }
+                    mut held: MutexGuard<CopiedLog, GlobalAllocator> = shared.get_reference().lock();
+                    held.as_mutable_pointer().append(Slice::<u8>::from_raw(&chunk[0], count));
+                }
+                Result::Err(error) => {
+                    mut held: MutexGuard<CopiedLog, GlobalAllocator> = shared.get_reference().lock();
+                    const path: String = held.as_pointer().path.clone();
+                    held.as_mutable_pointer().fail(f"cannot read the output it sends to {path.as_str()}: {error.describe()}; the job was stopped rather than leave the log missing output.  help: run the gate again; if this recurs, the host is short of memory or handles - end what is using them first");
+                    break;
+                }
+            }
+        }
+        file_descriptor::close_file_descriptor(descriptor);
+        mut held: MutexGuard<CopiedLog, GlobalAllocator> = shared.get_reference().lock();
+        held.as_mutable_pointer().file = Option::None;
+        held.as_mutable_pointer().ended = true;
+        return 0;
+    }
+}
+
 /// A job that has been started and not yet finished.
 public type struct Running {
     child: Child;
@@ -121,29 +258,54 @@ public type struct Running {
     log: String;
     /// Whether the child roots a process tree, killed whole at the limit.
     tree: boolean;
+    /// The program and its arguments, for a report.
+    command: String;
+    /// The child's output pipes being copied into the job's logs; none for
+    /// a job writing to the console.
+    copies: Array<LogCopy>;
+    /// What became of the child once it has ended: the job then waits for
+    /// its pipes.
+    ended: Option<Outcome>;
+    /// When the child ended.
+    ended_at: Instant;
 
     /// The job's completion once it has finished, `None` while it runs.  A
     /// job past its limit is killed here, with every process it started
-    /// when it roots a tree, and completes as `TimedOut`.
+    /// when it roots a tree, and completes as `TimedOut`; one whose output
+    /// could not all be written to its log is killed the same way and
+    /// completes as `OutputLost`.
     public poll(mut &this) -> Option<Completion> {
-        match (this.child.try_wait()) {
-            Result::Ok(Option::Some(status)) => { return Option::Some(this.complete(Outcome::from_status(&status))); }
-            Result::Ok(Option::None)         => { }
-            Result::Err(error)               => { return Option::Some(this.complete(Outcome::CouldNotStart(f"waiting for it failed: {error.describe()}"))); }
-        }
-        match (this.limit) {
-            Option::Some(limit) => {
-                if (this.started.elapsed() >= limit) {
-                    // The verdict is `TimedOut` whatever the kill and the
-                    // reap report.
-                    const _: Result<(), IoError> = if (this.tree) { this.child.kill_tree() } else { this.child.kill() };
-                    const _: Result<ExitStatus, IoError> = this.child.wait();
-                    return Option::Some(this.complete(Outcome::TimedOut));
+        if (this.ended.is_none()) {
+            match (this.output_lost()) {
+                Option::Some(reason) => {
+                    this.end_child();
+                    return Option::Some(this.complete(Outcome::OutputLost(reason), false));
                 }
+                Option::None => { }
             }
-            Option::None => { }
+            match (this.child.try_wait()) {
+                Result::Ok(Option::Some(status)) => {
+                    this.ended = Option::Some(Outcome::from_status(&status));
+                    this.ended_at = Instant::now();
+                }
+                Result::Ok(Option::None)         => { }
+                Result::Err(error)               => { return Option::Some(this.complete(Outcome::CouldNotStart(f"waiting for it failed: {error.describe()}"), false)); }
+            }
         }
-        return Option::None;
+        if (this.ended.is_none()) {
+            match (this.limit) {
+                Option::Some(limit) => {
+                    if (this.started.elapsed() >= limit) {
+                        this.end_child();
+                        this.ended = Option::Some(Outcome::TimedOut);
+                        this.ended_at = Instant::now();
+                    }
+                }
+                Option::None => { }
+            }
+        }
+        if (this.ended.is_none()) { return Option::None; }
+        return this.drained();
     }
 
     /// Block until the job finishes.
@@ -156,16 +318,67 @@ public type struct Running {
         }
     }
 
-    private complete(&this, outcome: Outcome) -> Completion {
+    /// The completion once every pipe has ended, or once the child has
+    /// been gone `DRAIN_MILLISECONDS` with a pipe a process it started
+    /// still holds, which is reported then; `None` while the job waits.
+    private drained(&this) -> Option<Completion> {
+        mut open: Array<String> = Array::<String>::new();
+        for (copy in this.copies.iterate_references()) {
+            if (!copy.ended()) { open.push(copy.path.clone()); }
+        }
+        const ended: Outcome = match (&this.ended) {
+            Option::Some(outcome) => { outcome.clone() }
+            Option::None          => { return Option::None; }
+        };
+        if (open.is_empty()) { return Option::Some(this.complete(ended, false)); }
+        if (this.ended_at.elapsed() < Duration::from_milliseconds(Running::DRAIN_MILLISECONDS)) { return Option::None; }
+        fmt::eprintln(f"cryogate: warning: `{this.command.as_str()}` ended, but a process it started still holds its output open {Running::DRAIN_MILLISECONDS} ms later; the job is reported without waiting for it, and what it writes from now on is not in {Text::joined(&open, Str::new(", ")).as_str()}.\n  help: make the program end, or wait for, every process it starts before it exits");
+        return Option::Some(this.complete(ended, true));
+    }
+
+    /// Why a pipe's copy failed, the first copy's failure first.
+    private output_lost(&this) -> Option<String> {
+        for (copy in this.copies.iterate_references()) {
+            match (copy.failure()) {
+                Option::Some(reason) => { return Option::Some(reason); }
+                Option::None         => { }
+            }
+        }
+        return Option::None;
+    }
+
+    /// Kill the child, with every process it started when it roots a tree,
+    /// and reap it.  The job's verdict is already decided, whatever the
+    /// kill and the reap report.
+    private end_child(mut &this) -> void {
+        const _: Result<(), IoError> = if (this.tree) { this.child.kill_tree() } else { this.child.kill() };
+        const _: Result<ExitStatus, IoError> = this.child.wait();
+    }
+
+    /// The job's completion as `outcome`, its logs closed first, so a gate
+    /// reads them whole and nothing writes them after.  A pipe whose copy
+    /// failed makes it `OutputLost` whatever `outcome` was: the log does
+    /// not hold what the child wrote.
+    private complete(&this, outcome: Outcome, output_left_open: boolean) -> Completion {
+        for (copy in this.copies.iterate_references()) { copy.stop(); }
         return Completion {
-            outcome: outcome,
-            seconds: this.started.elapsed().as_seconds_f64(),
-            log:     this.log.clone(),
+            outcome:          match (this.output_lost()) {
+                                  Option::Some(reason) => { Outcome::OutputLost(reason) }
+                                  Option::None         => { outcome }
+                              },
+            seconds:          this.started.elapsed().as_seconds_f64(),
+            log:              this.log.clone(),
+            output_left_open: output_left_open,
         };
     }
 
     /// How often a waiting job is looked at.
     public const POLL_MILLISECONDS: u64 = 5;
+
+    /// How long a job waits for its output pipes once its child has ended.
+    /// The child's own end closes them at once unless a process it started
+    /// still holds one.
+    public const DRAIN_MILLISECONDS: u64 = 2000;
 }
 
 /// One program to run, and how.
@@ -228,6 +441,20 @@ public type struct Job {
     ![target(unix)]
     public default_c_compiler(mut &this) -> void { }
 
+    /// For a job running a compiler that keeps its libraries beside itself:
+    /// give it `LibrarySearch::variables()`, so a library missing there
+    /// stops the compiler starting instead of being loaded from a directory
+    /// on PATH.  A POSIX compiler is not searched for that way, and nothing
+    /// changes.
+    ![target(windows)]
+    public load_libraries_beside(mut &this) -> void {
+        for (variable in LibrarySearch::variables().iterate_references()) {
+            this.set_variable(variable.first.as_str(), variable.second.as_str());
+        }
+    }
+    ![target(unix)]
+    public load_libraries_beside(mut &this) -> void { }
+
     /// Write both output streams to the file `path`, created or truncated.
     public log_to(mut &this, path: Str) -> void { this.log = String::from_str(path); }
 
@@ -269,11 +496,14 @@ public type struct Job {
         this.build_environment(&command);
         command.stdin(Stdio::Null);
         if (this.tree) { command.group_descendants(); }
+        // One pipe carries both streams into the log, so they interleave
+        // as the child wrote them.
+        mut log: Option<File> = Option::None;
         if (!this.log.is_empty()) {
             match (File::create(Path::from(this.log.as_str()))) {
                 Result::Ok(file) => {
-                    mut owned: File = file;
-                    command.stdout(Stdio::Fd(owned.into_descriptor()));
+                    log = Option::Some(file);
+                    command.stdout(Stdio::Piped);
                     command.stderr(Stdio::SameAsStdout);
                 }
                 Result::Err(error) => {
@@ -281,25 +511,40 @@ public type struct Job {
                 }
             }
         }
+        mut errors: Option<File> = Option::None;
         if (!this.errors.is_empty()) {
             match (File::create(Path::from(this.errors.as_str()))) {
                 Result::Ok(file) => {
-                    mut owned: File = file;
-                    command.stderr(Stdio::Fd(owned.into_descriptor()));
+                    errors = Option::Some(file);
+                    command.stderr(Stdio::Piped);
                 }
                 Result::Err(error) => {
                     return Result::Err(this.never_ran(started, f"cannot create its error log {this.errors.as_str()}: {error.describe()}"));
                 }
             }
         }
-        return match (command.spawn()) {
-            Result::Ok(child) => {
-                Result::Ok(Running { child: child, started: started, limit: this.limit, log: this.log.clone(), tree: this.tree })
-            }
-            Result::Err(error) => {
-                Result::Err(this.never_ran(started, String::from_str(error.describe())))
-            }
+        mut child: Child = match (command.spawn()) {
+            Result::Ok(child)  => { child }
+            Result::Err(error) => { return Result::Err(this.never_ran(started, String::from_str(error.describe()))); }
         };
+        mut copies: Array<LogCopy> = Array::<LogCopy>::new();
+        if (log.is_some()) {
+            copies.push(LogCopy::start(child.stdout.unwrap_pointer().into_descriptor(), log.take().unwrap(), this.log.as_str()));
+        }
+        if (errors.is_some()) {
+            copies.push(LogCopy::start(child.stderr.unwrap_pointer().into_descriptor(), errors.take().unwrap(), this.errors.as_str()));
+        }
+        return Result::Ok(Running {
+            child:   child,
+            started: started,
+            limit:   this.limit,
+            log:     this.log.clone(),
+            tree:    this.tree,
+            command: this.command_line(),
+            copies:   copies,
+            ended:    Option::None,
+            ended_at: started,
+        });
     }
 
     /// Run the job to its end.
@@ -312,9 +557,10 @@ public type struct Job {
 
     private never_ran(&this, started: Instant, reason: String) -> Completion {
         return Completion {
-            outcome: Outcome::CouldNotStart(reason),
-            seconds: started.elapsed().as_seconds_f64(),
-            log:     this.log.clone(),
+            outcome:          Outcome::CouldNotStart(reason),
+            seconds:          started.elapsed().as_seconds_f64(),
+            log:              this.log.clone(),
+            output_left_open: false,
         };
     }
 
@@ -347,5 +593,98 @@ public type struct Job {
         }
         if (!has_separator) { return String::from_str(program); }
         return Host::absolute(program);
+    }
+}
+
+/// Where a Windows compiler that keeps `LLVM-C.dll` and `libclang.dll`
+/// beside itself finds them.  Windows looks for a library in the program's
+/// own directory and then on PATH, so a directory there holding either
+/// would let the compiler start without its own copy, against another
+/// build's.
+public type struct LibrarySearch {
+    /// The variables that leave a child only the copies beside its
+    /// compiler: `CRYO_CC` and `CRYO_AR`, the C driver and the archiver
+    /// named by the absolute path the inherited PATH gives them - they may
+    /// live in a directory holding a library (msys's mingw64\bin holds gcc,
+    /// ar and libclang.dll) - then `PATH`, the inherited one less every
+    /// directory holding either library.
+    public static variables() -> Array<Pair<String, String>> {
+        const inherited: String = match (env::var(Str::new("PATH"))) {
+            Option::Some(value) => { value }
+            Option::None        => { String::new() }
+        };
+        mut variables: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        mut drivers: Array<Str> = Array::<Str>::new();
+        drivers.push(Str::new("gcc"));
+        variables.push(Pair::new(String::from_str(Str::new("CRYO_CC")),
+                                 LibrarySearch::named_program(inherited.as_str(), Str::new("CRYO_CC"), &drivers)));
+        mut archivers: Array<Str> = Array::<Str>::new();
+        archivers.push(Str::new("ar"));
+        archivers.push(Str::new("llvm-ar"));
+        archivers.push(Str::new("llvm-ar-20"));
+        variables.push(Pair::new(String::from_str(Str::new("CRYO_AR")),
+                                 LibrarySearch::named_program(inherited.as_str(), Str::new("CRYO_AR"), &archivers)));
+        variables.push(Pair::new(String::from_str(Str::new("PATH")),
+                                 LibrarySearch::search_path_without(inherited.as_str(), Str::new(";"), &LibrarySearch::libraries())));
+        return variables;
+    }
+
+    /// The libraries a Windows compiler loads, by file name.
+    public static libraries() -> Array<Str> {
+        mut libraries: Array<Str> = Array::<Str>::new();
+        libraries.push(Str::new("LLVM-C.dll"));
+        libraries.push(Str::new("libclang.dll"));
+        return libraries;
+    }
+
+    /// The search path `search`, its directories separated by `separator`,
+    /// less every directory holding a file named in `libraries` and every
+    /// empty entry, in the order given.
+    public static search_path_without(search: Str, separator: Str, libraries: &Array<Str>) -> String {
+        mut kept: Array<String> = Array::<String>::new();
+        for (entry in search.split_nonempty(&separator)) {
+            mut supplies: boolean = false;
+            for (library in libraries.iterate_references()) {
+                if (Path::from(entry).join(*library).as_path().is_file()) { supplies = true; }
+            }
+            if (!supplies) { kept.push(String::from_str(entry)); }
+        }
+        return Text::joined(&kept, separator);
+    }
+
+    /// The program a compiler runs for the role the variable `variable`
+    /// names (`CRYO_CC`, `CRYO_AR`): the variable's own value when it is
+    /// set, else the first of `defaults` found, as the compiler tries them.
+    /// A bare name is given the absolute path of the first `;`-separated
+    /// directory of `search` holding it (with `.exe` when it names no
+    /// extension); a path, or a name found nowhere, is kept as it is, and
+    /// the compiler that cannot start it says so.
+    public static named_program(search: Str, variable: Str, defaults: &Array<Str>) -> String {
+        mut names: Array<String> = Array::<String>::new();
+        match (env::var(variable)) {
+            Option::Some(value) => { names.push(value); }
+            Option::None        => { for (name in defaults.iterate_references()) { names.push(String::from_str(*name)); } }
+        }
+        for (name in names.iterate_references()) {
+            match (LibrarySearch::located(search, name.as_str())) {
+                Option::Some(found) => { return found; }
+                Option::None        => { }
+            }
+        }
+        return names.get_reference(0).unwrap().clone();
+    }
+
+    /// The absolute path of the program `name` in the first `;`-separated
+    /// directory of `search` holding it, trying `name.exe` when `name` has
+    /// no extension; `None` for a name that is already a path, or one no
+    /// directory holds.
+    public static located(search: Str, name: Str) -> Option<String> {
+        if (name.contains(&Str::new("/")) || name.contains(&Str::new("\\"))) { return Option::None; }
+        const file: String = if (Path::from(name).extension().is_some()) { String::from_str(name) } else { f"{name}.exe" };
+        for (entry in search.split_nonempty(&Str::new(";"))) {
+            const candidate: PathBuf = Path::from(entry).join(file.as_str());
+            if (candidate.as_path().is_file()) { return Option::Some(String::from_str(candidate.as_path().as_str())); }
+        }
+        return Option::None;
     }
 }

@@ -27,11 +27,14 @@ public type struct BaselineClone {
     /// the clone holds and the working tree does not is removed, and one
     /// whose bytes differ is copied over.  The runtime's ignored files are
     /// removed: a checkout keeps the runtime/.bin of whatever the clone held
-    /// before, and the baseline builds its runtime afresh.  The ignored
-    /// inputs a build needs and git does not carry - the libraries beside
-    /// the pins, the import libraries under .toolchains/llvm-win/lib - are
-    /// copied when missing or of another length.
-    public static sync(repository: Path, logs: &RunLogs, clone: Path, revision: Str) -> Result<(), String> {
+    /// before, and the baseline builds its runtime afresh.  With
+    /// `stdlib_from_commit` the stdlib is the commit's too, and every file
+    /// the commit does not hold is removed from it, whatever an earlier
+    /// sync copied there.  The ignored inputs a build needs and git does not
+    /// carry - the libraries beside the pins, the import libraries under
+    /// .toolchains/llvm-win/lib - are copied when missing or of another
+    /// length.
+    public static sync(repository: Path, logs: &RunLogs, clone: Path, revision: Str, stdlib_from_commit: boolean) -> Result<(), String> {
         const git: Git = Git::new(repository, logs);
         // A fetch names the commit in full: another repository cannot read
         // an abbreviation, or a name only this checkout holds.
@@ -53,9 +56,10 @@ public type struct BaselineClone {
         BaselineClone::must(&cloned, Str::new("fetch --quiet"), repository.as_str(), commit)?;
         BaselineClone::must(&cloned, Str::new("checkout --quiet --force --detach"), commit, Str::new(""))?;
         BaselineClone::must(&cloned, Str::new("clean --quiet -fdx --"), Str::new("runtime"), Str::new(""))?;
+        if (stdlib_from_commit) { BaselineClone::must(&cloned, Str::new("clean --quiet -fdx --"), Str::new("stdlib"), Str::new(""))?; }
 
-        const wanted: Array<String> = BaselineKey::build_inputs(&git)?;
-        const held: Array<String> = BaselineKey::build_inputs(&cloned)?;
+        const wanted: Array<String> = BaselineKey::build_inputs(&git, stdlib_from_commit)?;
+        const held: Array<String> = BaselineKey::build_inputs(&cloned, stdlib_from_commit)?;
         for (file in held.iterate_references()) {
             if (wanted.contains(file)) { continue; }
             const path: PathBuf = clone.join(file.as_str());

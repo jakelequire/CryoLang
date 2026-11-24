@@ -25,6 +25,7 @@ import std::fs::path::{ Path, PathBuf };
 import cryogate::baseline::listing::{ Listing };
 import cryogate::core::child::{ Completion, Job };
 import cryogate::core::git::{ Git };
+import cryogate::core::host::{ Host };
 import cryogate::core::tree::{ Tree };
 
 /// One program the baseline's verdict and objects are recorded for, and
@@ -109,18 +110,53 @@ public type struct Programs {
     }
 }
 
+/// The standard library a side's programs build against: the checkout's,
+/// or, for a baseline asked to use its own, the copy of the baseline
+/// commit's that its home holds.
+public type struct ProgramStdlib {
+    /// The library's root directory.
+    public directory: PathBuf;
+    /// Whether it is the baseline commit's copy rather than the checkout's.
+    public from_baseline: boolean;
+
+    /// The checkout `repository`'s own stdlib.
+    public static of_checkout(repository: Path) -> ProgramStdlib {
+        return ProgramStdlib { directory: repository.join(Str::new("stdlib")), from_baseline: false };
+    }
+
+    /// The baseline commit's stdlib, copied into the baseline's `home`.
+    public static of_home(home: Path) -> ProgramStdlib {
+        return ProgramStdlib { directory: home.join(Str::new("stdlib")), from_baseline: true };
+    }
+
+    /// What a child's `CRYO_STDLIB` is set to: the baseline's copy, spelled
+    /// absolute with forward slashes; nothing for the checkout's, which each
+    /// gate names its own way.
+    public variable(&this) -> String {
+        return if (this.from_baseline) { Host::stdlib_spelling(this.directory.as_path().as_str()) } else { String::new() };
+    }
+
+    /// The directory as a command line names it: absolute, with forward
+    /// slashes.
+    public spelling(&this) -> String { return Host::stdlib_spelling(this.directory.as_path().as_str()); }
+}
+
 /// The keys the baseline's records are stored under.
 public type struct ProgramKeys {
     /// Each program's key, and the two archive records' keys, as
     /// `(name, key)` pairs: 32 hex digits of a sha256 seeded with the
     /// identity of the compiler `compiler` and the host's `toolchain`, fed
     /// the files of the runtime home `runtime` (all but its build outputs,
-    /// under `.bin`), then the inputs every program reads, then the
-    /// program's name and files.  Either side of a verify run computes them
-    /// over its own compiler and runtime, so a record one side made is the
-    /// other side's when the two compilers are one build.
-    public static of(repository: Path, git: &Git, compiler: Path, runtime: Path, toolchain: &HostToolchain,
-                     programs: &Array<Program>) -> Result<Array<Pair<String, String>>, String> {
+    /// under `.bin`), then which stdlib the programs build against -
+    /// `stdlib`'s origin and every file of it but its build outputs - then
+    /// the inputs every program reads, then the program's name and files.
+    /// Either side of a verify run computes them over its own compiler,
+    /// runtime and stdlib, so a record one side made is the other side's
+    /// when the two compilers are one build and the two stdlibs one origin
+    /// and one text; a record made against the baseline's own stdlib is
+    /// never read for a run against the checkout's, whatever the two hold.
+    public static of(repository: Path, git: &Git, compiler: Path, runtime: Path, stdlib: &ProgramStdlib,
+                     toolchain: &HostToolchain, programs: &Array<Program>) -> Result<Array<Pair<String, String>>, String> {
         mut linked: Sha256 = Sha256::new();
         linked.update(CompilerIdentity::of(compiler)?.as_str().as_bytes());
         linked.update(toolchain.digest.as_str().as_bytes());
@@ -129,6 +165,10 @@ public type struct ProgramKeys {
         mut runtime_files: Array<String> = Tree::files(runtime, &excluded)?;
         runtime_files.sort();
         Inputs::feed(&linked, runtime, &runtime_files)?;
+        Inputs::text(&linked, Str::new("stdlib"), if (stdlib.from_baseline) { Str::new("baseline") } else { Str::new("checkout") });
+        mut stdlib_files: Array<String> = Tree::files(stdlib.directory.as_path(), &excluded)?;
+        stdlib_files.sort();
+        Inputs::feed(&linked, stdlib.directory.as_path(), &stdlib_files)?;
         Inputs::feed(&linked, repository, &ProgramKeys::shared(git)?)?;
         const shared: String = linked.finish().to_hex();
 
@@ -148,14 +188,13 @@ public type struct ProgramKeys {
         return Result::Ok(keys);
     }
 
-    /// The files of the working tree every program's build reads: the
-    /// stdlib, the pins, the procedure that runs and hashes the builds (how
-    /// the stdlib is spelled to each run, which flags a build gets), and
-    /// what tests/ holds outside the test sources, less the files the census
-    /// reads to judge a run rather than to build one.
+    /// The files of the working tree every program's build reads besides
+    /// the stdlib: the pins, the procedure that runs and hashes the builds
+    /// (how the stdlib is spelled to each run, which flags a build gets),
+    /// and what tests/ holds outside the test sources, less the files the
+    /// census reads to judge a run rather than to build one.
     public static shared(git: &Git) -> Result<Array<String>, String> {
         mut roots: Array<Str> = Array::<Str>::new();
-        roots.push(Str::new("stdlib"));
         roots.push(Str::new("bin"));
         mut shared: Array<String> = Listing::of(git, &roots)?;
         for (path in ProgramKeys::procedure().iterate_references()) { shared.push(String::from_str(*path)); }
@@ -304,27 +343,35 @@ public type struct BaselineKey {
     /// 16 hex digits of the sha256 of the commit's compiler/src tree, its
     /// runtime tree and the hex digest of the working tree's build inputs:
     /// what a compiler build reads besides compiler/src and runtime/, which
-    /// come from the commit.  `git` runs in the checkout at `repository`.
-    /// Fails when `revision` names no commit.
-    public static of(repository: Path, git: &Git, revision: Str) -> Result<String, String> {
+    /// come from the commit.  With `stdlib_from_commit` the stdlib comes
+    /// from the commit too, and its tree follows the other two.  `git` runs
+    /// in the checkout at `repository`.  Fails when `revision` names no
+    /// commit.
+    public static of(repository: Path, git: &Git, revision: Str, stdlib_from_commit: boolean) -> Result<String, String> {
         const commit: String = BaselineKey::commit(git, revision)?;
         const sources: String = BaselineKey::parsed(git, f"{commit.as_str()}:compiler/src".as_str())?;
         const runtime: String = BaselineKey::parsed(git, f"{commit.as_str()}:runtime".as_str())?;
+        mut stdlib: String = String::new();
+        if (stdlib_from_commit) {
+            const tree: String = BaselineKey::tree_of(git, commit.as_str(), Str::new("stdlib"))?;
+            stdlib = f"stdlib {tree.as_str()}";
+        }
         mut inputs: Sha256 = Sha256::new();
-        Inputs::feed(&inputs, repository, &BaselineKey::build_inputs(git)?)?;
+        Inputs::feed(&inputs, repository, &BaselineKey::build_inputs(git, stdlib_from_commit)?)?;
         mut key: Sha256 = Sha256::new();
-        const text: String = f"{sources.as_str()}{runtime.as_str()}{inputs.finish().to_hex().as_str()}";
+        const text: String = f"{sources.as_str()}{runtime.as_str()}{stdlib.as_str()}{inputs.finish().to_hex().as_str()}";
         key.update(text.as_str().as_bytes());
         return Result::Ok(String::from_str(key.finish().to_hex().as_str().byte_substring(0, 16)));
     }
 
     /// The working tree's files a compiler build reads besides compiler/src
-    /// and runtime/: the stdlib, the pins, compiler/ outside its sources and
-    /// the Makefile.  The clone a baseline is built in is given exactly
-    /// these, so the key names the files the baseline was built from.
-    public static build_inputs(git: &Git) -> Result<Array<String>, String> {
+    /// and runtime/: the stdlib unless `stdlib_from_commit`, the pins,
+    /// compiler/ outside its sources and the Makefile.  The clone a
+    /// baseline is built in is given exactly these, so the key names the
+    /// files the baseline was built from.
+    public static build_inputs(git: &Git, stdlib_from_commit: boolean) -> Result<Array<String>, String> {
         mut roots: Array<Str> = Array::<Str>::new();
-        roots.push(Str::new("stdlib"));
+        if (!stdlib_from_commit) { roots.push(Str::new("stdlib")); }
         roots.push(Str::new("bin"));
         roots.push(Str::new("compiler"));
         roots.push(Str::new("Makefile"));

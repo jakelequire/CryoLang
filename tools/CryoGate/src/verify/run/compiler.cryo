@@ -8,20 +8,24 @@ namespace cryogate::verify::run::compiler;
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::fmt;
 import std::fs::directory::{ Directory };
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
+import std::io::error::{ IoErrorKind };
 
 import cryogate::baseline::cache::{ BaselineCache };
 import cryogate::baseline::clone::{ BaselineClone };
-import cryogate::baseline::keys::{ BaselineKey };
-import cryogate::core::child::{ Completion, Job };
+import cryogate::baseline::keys::{ BaselineKey, ProgramStdlib };
+import cryogate::core::child::{ Completion, Job, LibrarySearch };
 import cryogate::core::git::{ Git };
 import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
+import cryogate::core::text::{ Text };
 import cryogate::core::tree::{ Tree };
+import cryogate::verify::record::{ BaselineRecord };
 import cryogate::verify::run::children::{ PopulationRun, VerifyChild };
 import cryogate::verify::runtime::{ RuntimeArchives };
 
@@ -37,28 +41,38 @@ public type struct BaselineCompiler {
     public runtime_home: PathBuf;
     /// The directory the runtime archives its programs link are read from.
     public runtime_archives: PathBuf;
+    /// The stdlib its programs build against.
+    public stdlib: ProgramStdlib;
 
     /// The baseline compiler of `revision` in the checkout `repository`,
     /// for the target `triple`: the one in its home when that holds a
-    /// compiler and a runtime, else built afresh.  Either way the home is
-    /// stamped as used and the cache pruned to its most recently used.
-    public static obtain(repository: Path, logs: &RunLogs, git: &Git, revision: Str, triple: Str) -> Result<BaselineCompiler, String> {
+    /// compiler and a runtime (and, `stdlib_from_commit`, the commit's
+    /// stdlib), else built afresh.  With `stdlib_from_commit` the compiler
+    /// is built against the commit's stdlib and its programs build against
+    /// it; else both read the checkout's.  Either way the home is stamped
+    /// as used and the cache pruned to its most recently used.
+    public static obtain(repository: Path, logs: &RunLogs, git: &Git, revision: Str, triple: Str,
+                         stdlib_from_commit: boolean) -> Result<BaselineCompiler, String> {
         const commit: String = BaselineKey::commit(git, revision)?;
         const sources: String = BaselineKey::tree_of(git, commit.as_str(), Str::new("compiler/src"))?;
         const runtime: String = BaselineKey::tree_of(git, commit.as_str(), Str::new("runtime"))?;
-        const key: String = BaselineKey::of(repository, git, revision)?;
+        const key: String = BaselineKey::of(repository, git, revision, stdlib_from_commit)?;
         const state: PathBuf = repository.join(Str::new(".verify"));
         const homes: PathBuf = state.join(Str::new("baseline"));
         const home: PathBuf = homes.join(key.as_str());
         const compiler: PathBuf = home.join(Host::executable_name(Str::new("cryo")).as_str());
         const runtime_home: PathBuf = home.join(Str::new("runtime"));
+        const stdlib: ProgramStdlib = if (stdlib_from_commit) { ProgramStdlib::of_home(home.as_path()) } else { ProgramStdlib::of_checkout(repository) };
         const shown: String = PopulationRun::relative(repository, compiler.as_path().as_str());
-        if (compiler.as_path().is_file() && runtime_home.as_path().is_directory()) {
-            fmt::println(f"verify: baseline compiler for {revision} (compiler/src {BaselineCompiler::short(sources.as_str())}, runtime {BaselineCompiler::short(runtime.as_str())}) is cached: {shown.as_str()}");
+        const whose: Str = if (stdlib_from_commit) { Str::new("its own") } else { Str::new("the checkout's") };
+        const holds_stdlib: boolean = stdlib.directory.join(Str::new("lib.cryo")).as_path().is_file();
+        if (compiler.as_path().is_file() && runtime_home.as_path().is_directory() && holds_stdlib) {
+            fmt::println(f"verify: baseline compiler for {revision} (compiler/src {BaselineCompiler::short(sources.as_str())}, runtime {BaselineCompiler::short(runtime.as_str())}, {whose} stdlib) is cached: {shown.as_str()}");
         } else {
-            fmt::println(f"verify: building the baseline compiler for {revision} (compiler/src {BaselineCompiler::short(sources.as_str())}) in .verify/src");
-            BaselineCompiler::build(repository, logs, commit.as_str(), state.as_path(), home.as_path(), triple)?;
+            fmt::println(f"verify: building the baseline compiler for {revision} (compiler/src {BaselineCompiler::short(sources.as_str())}, {whose} stdlib) in .verify/src");
+            BaselineCompiler::build(repository, logs, commit.as_str(), state.as_path(), home.as_path(), triple, stdlib_from_commit)?;
         }
+        BaselineCompiler::starts(repository, logs, compiler.as_path(), home.as_path(), runtime_home.as_path(), &stdlib)?;
         BaselineCache::mark(home.as_path())?;
         const _: Array<String> = BaselineCache::prune(homes.as_path(), key.as_str())?;
         // A runtime its compiler builds for itself lands below its sources;
@@ -70,17 +84,52 @@ public type struct BaselineCompiler {
         };
         return Result::Ok(BaselineCompiler {
             compiler: compiler, home: home, commit: commit, runtime_home: runtime_home, runtime_archives: archives,
+            stdlib: stdlib,
         });
     }
 
+    /// Whether this compiler's `cryo test` selects by every pattern it is
+    /// given, and not only by its first, which it ignores the rest after.
+    /// Asked of its compile-fail suite alone, which builds nothing, in the
+    /// checkout `repository`'s tests: a pattern longer than any of the
+    /// compile-fail files `negatives` (`negative/<file>`) is named, so no
+    /// file holds it, then the first file's name.  Only a compiler that
+    /// reads the second pattern runs that file; one that refuses the
+    /// question gives it no verdict either.  The run is logged to `log`.
+    public takes_several_patterns(&this, repository: Path, negatives: &Array<String>, log: Path) -> boolean {
+        if (negatives.is_empty()) { return false; }
+        mut longest: Str = Str::new("");
+        for (name in negatives.iterate_references()) { if (name.length() > longest.length()) { longest = name.as_str(); } }
+        const file: Str = match (negatives[0].as_str().strip_prefix(&Str::new("negative/"))) {
+            Option::Some(file) => { file }
+            Option::None       => { return false; }
+        };
+        mut job: Job = VerifyChild::job(this.compiler.as_path().as_str(), this.runtime_home.as_path().as_str(), this.stdlib.variable().as_str(), true);
+        job.argument(Str::new("test"));
+        job.argument(Str::new("--suite=compile-fail"));
+        job.argument(Str::new("--format=plain"));
+        job.argument(f"{longest}-unmatched".as_str());
+        job.argument(file);
+        job.directory(repository.join(Str::new("tests")).as_path().as_str());
+        job.log_to(log.as_str());
+        const done: Completion = job.run();
+        mut asked: Array<String> = Array::<String>::new();
+        asked.push(negatives[0].clone());
+        return !BaselineRecord::of_census(&Text::lines(done.output().as_str()), &asked, &Array::<String>::new(),
+            &Array::<String>::new(), Str::new("")).is_empty();
+    }
+
     /// Build the compiler of `commit` in the clone `<state>/src` and
-    /// install it, its runtime and the libraries beside the pins in `home`.
-    /// The build is always clean: an incremental one can reuse a module
-    /// that owns a generic instance a changed module newly asks for, and
-    /// the link then fails or links stale code.
-    private static build(repository: Path, logs: &RunLogs, commit: Str, state: Path, home: Path, triple: Str) -> Result<(), String> {
+    /// install it, its runtime and the libraries beside the pins in `home`,
+    /// with the commit's stdlib, which the compiler is then built against,
+    /// when `stdlib_from_commit`.  The build is always clean: an
+    /// incremental one can reuse a module that owns a generic instance a
+    /// changed module newly asks for, and the link then fails or links
+    /// stale code.
+    private static build(repository: Path, logs: &RunLogs, commit: Str, state: Path, home: Path, triple: Str,
+                         stdlib_from_commit: boolean) -> Result<(), String> {
         const clone: PathBuf = state.join(Str::new("src"));
-        BaselineClone::sync(repository, logs, clone.as_path(), commit)?;
+        BaselineClone::sync(repository, logs, clone.as_path(), commit, stdlib_from_commit)?;
         BaselineCompiler::remove(clone.join(Str::new("compiler/build")).as_path())?;
         const tiered: boolean = clone.join(Str::new("runtime/hosted/cryoconfig")).as_path().is_file();
         const tiers: String = f".bin/{triple}";
@@ -98,7 +147,7 @@ public type struct BaselineCompiler {
             runtime_for_make = String::from_str(repository.join(Str::new("runtime")).as_path().as_str());
         }
         const log: PathBuf = state.join(Str::new("baseline-build.log"));
-        mut make: Job = VerifyChild::job(Str::new("make"), runtime_for_make.as_str());
+        mut make: Job = VerifyChild::job(Str::new("make"), runtime_for_make.as_str(), Str::new(""), false);
         make.argument(Str::new("--no-print-directory"));
         make.argument(Str::new("cryo"));
         make.directory(clone.as_path().as_str());
@@ -132,19 +181,81 @@ public type struct BaselineCompiler {
             excluded.push(String::from_str(Str::new(".bin")));
             Tree::copy(clone.join(Str::new("runtime")).as_path(), runtime_home.as_path(), &excluded)?;
         }
+        const stdlib_home: PathBuf = home.join(Str::new("stdlib"));
+        BaselineCompiler::remove(stdlib_home.as_path())?;
+        if (stdlib_from_commit) {
+            // The clone is synced again by the next baseline built, so the
+            // programs read a copy kept with the compiler.
+            mut excluded: Array<String> = Array::<String>::new();
+            excluded.push(String::from_str(Str::new(".bin")));
+            Tree::copy(clone.join(Str::new("stdlib")).as_path(), stdlib_home.as_path(), &excluded)?;
+        }
+        // Each library beside the pins is linked into the home, so the
+        // compiler loads one beside itself, as a home's own file, and the
+        // homes store its bytes once.  A linked file is one file under both
+        // names, so the home's is never written through: one already there
+        // is removed first, since a copy over it would rewrite the pin's.
+        // Where the filesystem makes no link the library is copied.
         const bin: PathBuf = repository.join(Str::new("bin"));
         for (name in Tree::names(bin.as_path(), &Array::<String>::new())?.iterate_references()) {
-            if (name.as_str().to_ascii_lowercase().as_str().ends_with(&Str::new(".dll"))) {
-                BaselineCompiler::copy(bin.join(name.as_str()).as_path(), home.join(name.as_str()).as_path())?;
+            if (!name.as_str().to_ascii_lowercase().as_str().ends_with(&Str::new(".dll"))) { continue; }
+            const library: PathBuf = bin.join(name.as_str());
+            const placed: PathBuf = home.join(name.as_str());
+            if (placed.as_path().exists()) {
+                match (File::remove(placed.as_path())) {
+                    Result::Ok(_)      => { }
+                    Result::Err(error) => { return Result::Err(f"cannot replace the baseline's {name.as_str()}: {error.describe()}; delete {PopulationRun::relative(repository, home.as_str()).as_str()} and run verify again"); }
+                }
+            }
+            match (File::hard_link(library.as_path(), placed.as_path())) {
+                Result::Ok(_) => { }
+                Result::Err(error) => {
+                    const unlinkable: boolean = error.kind == IoErrorKind::CrossesDevices || error.kind == IoErrorKind::Unsupported;
+                    if (!unlinkable) { return Result::Err(f"cannot link bin/{name.as_str()} into the baseline's home: {error.describe()}"); }
+                    fmt::println(f"verify: bin/{name.as_str()} is copied into the baseline's home, not linked ({error.kind.description()}); a checkout on one NTFS or POSIX volume stores it once");
+                    BaselineCompiler::copy(library.as_path(), placed.as_path())?;
+                }
             }
         }
         return BaselineCompiler::copy(built.as_path(), home.join(Host::executable_name(Str::new("cryo")).as_str()).as_path());
     }
 
+    /// Refused unless the home `home`'s compiler `compiler` starts as its
+    /// programs' runs start it, loading only the libraries in its home:
+    /// `cryo version`, with `runtime` and `stdlib` as they are given, logged
+    /// to the run's `baseline-version` log.  The refusal names each library
+    /// of `bin/` the home lacks, and shows the commands that restore it.
+    private static starts(repository: Path, logs: &RunLogs, compiler: Path, home: Path, runtime: Path, stdlib: &ProgramStdlib) -> Result<(), String> {
+        mut job: Job = VerifyChild::job(compiler.as_str(), runtime.as_str(), stdlib.variable().as_str(), true);
+        job.argument(Str::new("version"));
+        const log: String = logs.file(Str::new("baseline-version"));
+        job.log_to(log.as_str());
+        const done: Completion = job.run();
+        if (done.outcome.succeeded()) { return Result::Ok(()); }
+        const shown_home: String = PopulationRun::relative(repository, home.as_str());
+        const bin: PathBuf = repository.join(Str::new("bin"));
+        mut lacking: Array<String> = Array::<String>::new();
+        for (name in Tree::names(bin.as_path(), &Array::<String>::new())?.iterate_references()) {
+            if (!name.as_str().to_ascii_lowercase().as_str().ends_with(&Str::new(".dll"))) { continue; }
+            if (!home.join(name.as_str()).as_path().is_file()) { lacking.push(name.clone()); }
+        }
+        mut text: String = f"the baseline compiler {PopulationRun::relative(repository, compiler.as_str()).as_str()} does not start ({done.outcome.describe().as_str()}; see {PopulationRun::relative(repository, log.as_str()).as_str()})";
+        if (!lacking.is_empty()) {
+            text.push(f": its home lacks {Text::joined(&lacking, Str::new(", ")).as_str()}, and a baseline compiler loads its libraries from its home alone, never from PATH".as_str());
+        }
+        text.push(f"\n  help: remove the home, and the next run builds it again with bin/'s libraries linked into it:\n            rm -rf {shown_home.as_str()}".as_str());
+        if (Host::os() != Str::new("windows")) { return Result::Err(text); }
+        for (name in LibrarySearch::libraries().iterate_references()) {
+            if (bin.join(*name).as_path().is_file()) { continue; }
+            text.push(f"\n        bin/ lacks {*name} too; copy the fetched toolchain's into it first, as `make pin` does:\n            cp .toolchains/llvm-win/bin/{*name} bin/".as_str());
+        }
+        return Result::Err(text);
+    }
+
     /// `pin build --no-incremental --build-dir=<output>` in `directory`,
     /// logged to `log`; refused unless it succeeds.
     private static step(pin: Str, directory: Path, output: Str, log: Path) -> Result<(), String> {
-        mut job: Job = VerifyChild::job(pin, Str::new(""));
+        mut job: Job = VerifyChild::job(pin, Str::new(""), Str::new(""), false);
         job.argument(Str::new("build"));
         job.argument(Str::new("--no-incremental"));
         job.argument(f"--build-dir={output}".as_str());

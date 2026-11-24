@@ -50,8 +50,14 @@ public type struct ObjectComparison {
     /// the run directory `run`.  An object only the baseline has is one the
     /// tree takes from the archive when the tree's programs linked one.
     /// The `archive:` declarations are judged by the archive's moves last.
+    /// `moves_judged` is false for a run that cannot show every move the
+    /// change declares: one whose two sides build against one stdlib, when
+    /// the change edits that stdlib.  A move the edit makes shows only when
+    /// the baseline builds against its own commit's, so the change declares
+    /// it for that run; this one leaves out the declared modules', projects'
+    /// and examples' objects without requiring them to have moved.
     public static against(revision: Str, changes: &DeclaredChanges, baseline: Array<HashMap<String, String>>,
-                          tree: Array<HashMap<String, String>>, limit: i64, run: Str) -> Compared {
+                          tree: Array<HashMap<String, String>>, limit: i64, run: Str, moves_judged: boolean) -> Compared {
         mut compared: Compared = Compared { lines: Array::<String>::new(), problems: Array::<String>::new(), changed: 0 };
         for (problem in changes.problems.iterate_references()) { compared.problems.push(problem.clone()); }
         compared.lines.push(f"verify: objects against {revision}");
@@ -65,7 +71,7 @@ public type struct ObjectComparison {
             const baseline_list: String = populations[i].baseline_list(run);
             const tree_list: String = populations[i].tree_list(run);
             const changed: i64 = ObjectComparison::population(&populations[i], baseline[i].clone(), tree[i].clone(), changes,
-                archive_linked, limit, baseline_list.as_str(), tree_list.as_str(), &compared);
+                archive_linked, moves_judged, limit, baseline_list.as_str(), tree_list.as_str(), &compared);
             compared.changed = compared.changed + changed;
             if (populations[i].is_stdlib()) { archive_changed = changed; }
         }
@@ -83,9 +89,11 @@ public type struct ObjectComparison {
     /// `moved-archive:` modules in the stdlib; the declared projects' and
     /// examples' objects are left out; and in the stdlib, an archive only
     /// one run built came from a gate only that run ran, and is left out.
+    /// Unless `moves_judged`, the declared moves but the runtime's are left
+    /// out unjudged.
     private static population(population: &ObjectPopulation, baseline: HashMap<String, String>, tree: HashMap<String, String>,
-                      changes: &DeclaredChanges, archive_linked: boolean, limit: i64, baseline_list: Str, tree_list: Str,
-                      compared: mut &Compared) -> i64 {
+                      changes: &DeclaredChanges, archive_linked: boolean, moves_judged: boolean, limit: i64, baseline_list: Str,
+                      tree_list: Str, compared: mut &Compared) -> i64 {
         const tag: Str = population.name();
         mut a: HashMap<String, String> = baseline;
         mut b: HashMap<String, String> = tree;
@@ -115,20 +123,17 @@ public type struct ObjectComparison {
             for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
         }
         if (tests && !changes.moved_instances.is_empty()) {
-            const found: Array<String> = VerifyJudges::instance_moves(&changes.moved_instances, &a, &b);
-            compared.lines.push(f"  {tag:<9} declared moved unit-suite module objects left out: {changes.moved_instances.length()}, {found.length()} problem(s)");
-            for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+            ObjectComparison::declared_moves(tag, Str::new("unit-suite module objects"), changes.moved_instances.length(),
+                VerifyJudges::instance_moves(&changes.moved_instances, &a, &b), moves_judged, compared);
         }
         if (tests && !changes.moved_projects.is_empty()) {
-            const found: Array<String> = VerifyJudges::project_moves(&changes.moved_projects, &a, &b);
-            compared.lines.push(f"  {tag:<9} declared moved projects left out: {changes.moved_projects.length()}, {found.length()} problem(s)");
-            for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+            ObjectComparison::declared_moves(tag, Str::new("projects"), changes.moved_projects.length(),
+                VerifyJudges::project_moves(&changes.moved_projects, &a, &b), moves_judged, compared);
         }
         const examples: boolean = match (population) { ObjectPopulation::Examples => { true } _ => { false } };
         if (examples && !changes.moved_examples.is_empty()) {
-            const found: Array<String> = VerifyJudges::project_moves(&changes.moved_examples, &a, &b);
-            compared.lines.push(f"  {tag:<9} declared moved examples left out: {changes.moved_examples.length()}, {found.length()} problem(s)");
-            for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+            ObjectComparison::declared_moves(tag, Str::new("examples"), changes.moved_examples.length(),
+                VerifyJudges::project_moves(&changes.moved_examples, &a, &b), moves_judged, compared);
         }
         mut prefixes: Array<String> = Array::<String>::new();
         for (name in changes.names.iterate_references()) {
@@ -173,9 +178,8 @@ public type struct ObjectComparison {
                 compared.lines.push(f"  {tag:<9} archive objects of a stdlib root only one run used, left out: {unpaired}");
             }
             if (!changes.moved_modules.is_empty()) {
-                const found: Array<String> = VerifyJudges::archive_module_moves(&changes.moved_modules, &a, &b);
-                compared.lines.push(f"  {tag:<9} declared moved modules left out: {changes.moved_modules.length()}, {found.length()} problem(s)");
-                for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
+                ObjectComparison::declared_moves(tag, Str::new("modules"), changes.moved_modules.length(),
+                    VerifyJudges::archive_module_moves(&changes.moved_modules, &a, &b), moves_judged, compared);
             }
         }
         mut moved: Array<String> = Array::<String>::new();
@@ -204,6 +208,18 @@ public type struct ObjectComparison {
         ObjectComparison::list(Str::new("only-baseline"), &only_a_sorted, limit, baseline_list, tree_list, compared);
         ObjectComparison::list(Str::new("only-tree"), &only_b_sorted, limit, baseline_list, tree_list, compared);
         return moved_sorted.length() + only_a_sorted.length() + only_b_sorted.length();
+    }
+
+    /// The line of the `count` declared moves of `what`, whose objects a
+    /// judge has left out, finding `found`; the problems are added only
+    /// when `judged`.
+    private static declared_moves(tag: Str, what: Str, count: i64, found: Array<String>, judged: boolean, compared: mut &Compared) -> void {
+        if (!judged) {
+            compared.lines.push(f"  {tag:<9} declared moved {what} left out, not judged: {count} (both sides build this tree's stdlib, which the change edits; --baseline-stdlib judges them)");
+            return;
+        }
+        compared.lines.push(f"  {tag:<9} declared moved {what} left out: {count}, {found.length()} problem(s)");
+        for (problem in found.iterate_references()) { compared.problems.push(problem.clone()); }
     }
 
     /// The first `limit` of `paths` under `label`, then how many more

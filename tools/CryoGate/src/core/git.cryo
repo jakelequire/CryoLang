@@ -5,6 +5,8 @@ namespace cryogate::core::git;
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
 import std::fs::path::{ Path };
 
 import cryogate::core::child::{ Completion, Job, Outcome };
@@ -46,17 +48,10 @@ public type struct Git {
     }
 
     /// Whether anything tracked outside the paths `excluded` differs from
-    /// `HEAD`.  The index's cached file times are refreshed first: a build
-    /// rewrites a source's time without changing its bytes, and a stale
-    /// cache reads that as a change.  A checkout git cannot be run in reads
-    /// as clean.
+    /// `HEAD`.  The index's cached file times are refreshed first.  A
+    /// checkout git cannot be run in reads as clean.
     public changed_outside(&this, excluded: &Array<Str>) -> boolean {
-        mut refresh: Array<Str> = Array::<Str>::new();
-        refresh.push(Str::new("update-index"));
-        refresh.push(Str::new("-q"));
-        refresh.push(Str::new("--refresh"));
-        // Exits 1 when it refreshed an entry, which is what it is run for.
-        const _: Completion = this.run(&refresh);
+        this.refresh();
         mut compare: Array<Str> = Array::<Str>::new();
         compare.push(Str::new("diff-index"));
         compare.push(Str::new("--quiet"));
@@ -68,5 +63,48 @@ public type struct Git {
             Outcome::CouldNotStart(_) => { false }
             _                         => { !done.outcome.succeeded() }
         };
+    }
+
+    /// Whether the working tree's files below `directory` differ from
+    /// `commit`'s: a tracked file edited, added or removed since, or a file
+    /// git neither tracks nor ignores.  The index's cached file times are
+    /// refreshed first.  Refused when git cannot answer.
+    public differs_from(&this, commit: Str, directory: Str) -> Result<boolean, String> {
+        this.refresh();
+        mut compare: Array<Str> = Array::<Str>::new();
+        compare.push(Str::new("diff-index"));
+        compare.push(Str::new("--quiet"));
+        compare.push(commit);
+        compare.push(Str::new("--"));
+        compare.push(directory);
+        const compared: Completion = this.run(&compare);
+        match (compared.outcome.exit_code()) {
+            Option::Some(0) => { }
+            Option::Some(1) => { return Result::Ok(true); }
+            _               => { return Result::Err(f"git cannot compare {directory} with {commit} ({compared.outcome.describe().as_str()})"); }
+        }
+        mut untracked: Array<Str> = Array::<Str>::new();
+        untracked.push(Str::new("ls-files"));
+        untracked.push(Str::new("--others"));
+        untracked.push(Str::new("--exclude-standard"));
+        untracked.push(Str::new("--"));
+        untracked.push(directory);
+        const listed: Completion = this.run(&untracked);
+        if (!listed.outcome.succeeded()) {
+            return Result::Err(f"git cannot list the untracked files below {directory} ({listed.outcome.describe().as_str()})");
+        }
+        return Result::Ok(!listed.output().as_str().trim().is_empty());
+    }
+
+    /// Refresh the index's cached file times: a build rewrites a source's
+    /// time without changing its bytes, and a stale cache reads that as a
+    /// change.  Exits 1 when it refreshed an entry, which is what it is run
+    /// for.
+    private refresh(&this) -> void {
+        mut refresh: Array<Str> = Array::<Str>::new();
+        refresh.push(Str::new("update-index"));
+        refresh.push(Str::new("-q"));
+        refresh.push(Str::new("--refresh"));
+        const _: Completion = this.run(&refresh);
     }
 }

@@ -25,13 +25,14 @@ import cryogate::verify::runtime::{ RuntimeArchives };
 public type struct ObjectHashes {
     /// The rows of `population` in the checkout `repository`: every `.o`
     /// below a `build` directory under `tests/` or `examples/`, the objects
-    /// of the stdlib archives the run built, or the members of the runtime
-    /// archives one target's `runtime` directory holds - sorted by path.
-    public static rows(repository: Path, population: &ObjectPopulation, runtime: Path) -> Result<Array<String>, String> {
+    /// of the archives the run built of the stdlib in `stdlib`, or the
+    /// members of the runtime archives one target's `runtime` directory
+    /// holds - sorted by path.
+    public static rows(repository: Path, population: &ObjectPopulation, runtime: Path, stdlib: Path) -> Result<Array<String>, String> {
         return match (population) {
             ObjectPopulation::Tests    => { ObjectHashes::built(repository, Str::new("tests")) }
             ObjectPopulation::Examples => { ObjectHashes::built(repository, Str::new("examples")) }
-            ObjectPopulation::Stdlib   => { ObjectHashes::archives(repository) }
+            ObjectPopulation::Stdlib   => { ObjectHashes::archives(stdlib) }
             ObjectPopulation::Runtime  => { RuntimeArchives::rows(runtime) }
         };
     }
@@ -44,31 +45,33 @@ public type struct ObjectHashes {
     }
 
     /// Delete every directory a run's objects are read from - each build
-    /// directory under `tests/` and `examples/`, the prebuilt stdlib
-    /// archives and the runtime configurations' archives of every target -
-    /// so that the run's lists hold only what it built.  The stdlib and
-    /// runtime archives programs link are built by the compiler that links
-    /// them; one left over would be linked, and listed, as the run's own.
-    public static wipe(repository: Path) -> Result<(), String> {
-        for (directory in ObjectHashes::populated(repository)?.iterate_references()) {
+    /// directory under `tests/` and `examples/`, the prebuilt archives of
+    /// the stdlib in `stdlib` and the runtime configurations' archives of
+    /// every target - so that the run's lists hold only what it built.  The
+    /// stdlib and runtime archives programs link are built by the compiler
+    /// that links them; one left over would be linked, and listed, as the
+    /// run's own.
+    public static wipe(repository: Path, stdlib: Path) -> Result<(), String> {
+        for (directory in ObjectHashes::populated(repository, stdlib)?.iterate_references()) {
             match (Directory::remove_all(directory.as_path())) {
                 Result::Ok(_)  => { }
                 Result::Err(_) => { }
             }
         }
-        const left: Array<PathBuf> = ObjectHashes::populated(repository)?;
+        const left: Array<PathBuf> = ObjectHashes::populated(repository, stdlib)?;
         if (!left.is_empty()) {
             return Result::Err(f"could not clear {left[0].as_path().as_str()}; a warm build compiles nothing and hashes stale objects");
         }
         return Result::Ok(());
     }
 
-    /// Delete every target's prebuilt stdlib archives, so the next sweep
-    /// builds - and lists - the archives its own programs link.  One left
-    /// that cannot be removed is listed with the next sweep's.
-    public static clear_archives(repository: Path) -> Result<(), String> {
+    /// Delete every target's prebuilt archives of the stdlib in `stdlib`,
+    /// so the next sweep builds - and lists - the archives its own programs
+    /// link.  One left that cannot be removed is listed with the next
+    /// sweep's.
+    public static clear_archives(stdlib: Path) -> Result<(), String> {
         mut directories: Array<PathBuf> = Array::<PathBuf>::new();
-        ObjectHashes::prebuilt(repository, &directories)?;
+        ObjectHashes::prebuilt(stdlib, &directories)?;
         for (directory in directories.iterate_references()) {
             match (Directory::remove_all(directory.as_path())) {
                 Result::Ok(_)  => { }
@@ -79,12 +82,12 @@ public type struct ObjectHashes {
     }
 
     /// The directories `wipe` clears that exist.
-    private static populated(repository: Path) -> Result<Array<PathBuf>, String> {
+    private static populated(repository: Path, stdlib: Path) -> Result<Array<PathBuf>, String> {
         mut directories: Array<PathBuf> = Array::<PathBuf>::new();
         for (base in ObjectHashes::sweeps().iterate_references()) {
             ObjectHashes::build_directories(repository.join(*base).as_path(), &directories)?;
         }
-        ObjectHashes::prebuilt(repository, &directories)?;
+        ObjectHashes::prebuilt(stdlib, &directories)?;
         const runtime_bin: PathBuf = repository.join(Str::new("runtime/.bin"));
         if (runtime_bin.as_path().is_directory()) {
             for (target in Tree::names(runtime_bin.as_path(), &Array::<String>::new())?.iterate_references()) {
@@ -118,10 +121,10 @@ public type struct ObjectHashes {
         return Result::Ok(());
     }
 
-    /// Every target's `stdlib/.bin/<triple>/prebuilt` directory, added to
-    /// `found`.
-    private static prebuilt(repository: Path, found: mut &Array<PathBuf>) -> Result<(), String> {
-        const bin: PathBuf = repository.join(Str::new("stdlib/.bin"));
+    /// Every target's `.bin/<triple>/prebuilt` directory of the stdlib in
+    /// `stdlib`, added to `found`.
+    private static prebuilt(stdlib: Path, found: mut &Array<PathBuf>) -> Result<(), String> {
+        const bin: PathBuf = stdlib.join(Str::new(".bin"));
         if (!bin.as_path().is_directory()) { return Result::Ok(()); }
         for (target in Tree::names(bin.as_path(), &Array::<String>::new())?.iterate_references()) {
             const prebuilt: PathBuf = bin.join(target.as_str()).join(Str::new("prebuilt"));
@@ -157,11 +160,11 @@ public type struct ObjectHashes {
     /// manifest is not there yet is not built, and is left out.  Two
     /// archives of one target with the same options are refused: their
     /// objects could not be told apart.
-    private static archives(repository: Path) -> Result<Array<String>, String> {
+    private static archives(stdlib: Path) -> Result<Array<String>, String> {
         mut rows: Array<String> = Array::<String>::new();
         mut homes: HashMap<String, String> = HashMap::<String, String>::new();
         mut prebuilts: Array<PathBuf> = Array::<PathBuf>::new();
-        ObjectHashes::prebuilt(repository, &prebuilts)?;
+        ObjectHashes::prebuilt(stdlib, &prebuilts)?;
         for (prebuilt in prebuilts.iterate_references()) {
             const triple: String = match (prebuilt.as_path().parent()) {
                 Option::Some(parent) => { String::from_str(parent.file_name().unwrap_or(Str::new(""))) }
