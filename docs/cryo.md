@@ -170,7 +170,7 @@ const b: u8 = 200 + 100;   // error: 300 does not fit `u8`, and would silently t
 const c: i8 = 0 - 128;     // -128: held
 ```
 
-A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. An operand made only of literals beside one that is not - outside a shift - and a compound assignment's value made only of literals are their exact value, computed first, and take the other operand's type only where that type holds the value: with `x: i8`, `x + (200 / 2)` adds 100. Where the type does not hold it, the value keeps its default type and the operation widens the other operand to it, as an implicit conversion does: with `w: u8`, `w + (1 << 20)` is the `i32` 1048577, and `w + (200 + 100)` is an `i32` sum, which a `u8` place does not take (`E0200`). A negated literal is held the same way by a signed operand: beside an `i8`, `-129` keeps its default type rather than wrapping to 127, so `x + -129` is an `i32` sum. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value. A complement of a literal beside an unsigned operand is that operand's bit pattern, not a negative number: with `x: u32`, `x & ~0xFF` clears the low eight bits of `x`. An argument is held to its parameter the same way, including a parameter whose type the call's expected type decides: `const h: Holder<i16> = Holder::make(-3);` passes `-3` as an `i16`, while `-129` for an `i8` or `-3` for a `u16` is refused (`E0214`). An argument made only of literals passes its exact value and is held by its parameter as that value's literal would be: `take_i8(-(100 + 28))` passes -128, and `take_u8(200 + 100)` is refused (`E0214`).
+A literal an integer is compared with, or combined with by an operator, takes the integer's type the same way, so `x != 127` and `x != -128` with `x: i8` are both comparisons of two `i8`s. An operand made only of literals beside one that is not - outside a shift - and a compound assignment's value made only of literals are their exact value, computed first, and take the other operand's type only where that type holds the value: with `x: i8`, `x + (200 / 2)` adds 100. Where the type does not hold it, the value keeps its default type and the operation widens the other operand to it, as an implicit conversion does: with `w: u8`, `w + (1 << 20)` is the `i32` 1048577, and `w + (200 + 100)` is an `i32` sum, which a `u8` place does not take (`E0200`). A negated literal is held the same way by a signed operand: beside an `i8`, `-129` keeps its default type rather than wrapping to 127, so `x + -129` is an `i32` sum. A negated literal takes the type of a signed operand only: beside an unsigned one, `-1` keeps its default type rather than becoming a huge unsigned value. So does any negative value made by arithmetic on literals (`0 - 1`, `-(1 + 2)`). With `b: u8`, `b += -1` is refused (`E0200`): the `u8` holds no negative value, and the help writes `b -= 1`. With `x: u32`, `x + -1` is refused (`E0229`), since neither `u32` nor `i32` holds every value of the other, and the help writes `x - 1`; with `w: u8`, `w + -1` is the `i32` sum, which a `u8` place does not take. A complement of a literal beside an unsigned operand is that operand's bit pattern, not a negative number: with `x: u32`, `x & ~0xFF` clears the low eight bits of `x`. An argument is held to its parameter the same way, including a parameter whose type the call's expected type decides: `const h: Holder<i16> = Holder::make(-3);` passes `-3` as an `i16`, while `-129` for an `i8` or `-3` for a `u16` is refused (`E0214`). An argument made only of literals passes its exact value and is held by its parameter as that value's literal would be: `take_i8(-(100 + 28))` passes -128, and `take_u8(200 + 100)` is refused (`E0214`).
 
 A shift's amount does not type the value shifted: a literal shifted by an amount not made only of literals takes the integer type expected of the result, where one is - an initializer's, an assignment's, an argument's or a return's - so `const p: u64 = 1 << (u64::BITS - 1);` shifts at 64 bits, not at the `u32` amount's 32.  A shift's result is always the shifted value's type, and the amount's type never changes it: `b << n` with `b: u8` and `n: u64` is a `u8`.  Where no integer type is expected, a shifted literal takes the amount's type, and must be held by it as a literal stored at that type is: with `u: u8` and `n: i8`, `300 << u` and `-129 << n` are refused (`E0010`) rather than shifted as 44 and 127.
 
@@ -1288,16 +1288,39 @@ An overloaded name used as a value without a call is picked by its expected func
 
 Integer division truncates toward zero. The prefix forms `++x`, `--x` evaluate to the new value; the postfix forms `x++`, `x--` evaluate to the old value (C semantics).
 
-**Overflow.** Integer arithmetic **wraps** on overflow using two's-complement modular arithmetic, for both signed and unsigned types: the result is reduced modulo 2<sup>N</sup> for an N-bit type. There is no overflow trap and no automatic widening. For example, with `i32`:
+**Overflow.** An integer `+`, `-`, `*`, unary `-`, `++` or `--` (and the compound `+=`, `-=`, `*=`) *overflows* when its true result is outside its type's range, for signed and unsigned types alike. A compound assignment's type is its target's, since the target holds the right side's type: with `b: i16` and `x: u8`, `b += x` overflows where `b + x` is outside `i16`'s range, whatever `x`'s width and sign. What an overflow does is the build profile's `overflow_checks`:
+
+- **Checked** (`overflow_checks = true`, the `debug` profile's default): the program panics, naming the operation - `attempt to add with overflow`, `attempt to subtract with overflow`, `attempt to multiply with overflow`, `attempt to negate with overflow` - at the operator's place.
+- **Wrapping** (`overflow_checks = false`, the `release` profile's default and every other profile's): the result is the true result reduced modulo 2<sup>N</sup> for an N-bit type, two's complement. This is a defined result, never undefined behavior.
 
 ```cryo
-mut x: i32 = 2147483647;   // i32::MAX
-x = x + 1;                 // wraps to -2147483648 (i32::MIN), no trap
+mut x: i32 = i32::MAX;
+x = x + 1;   // debug: panics "attempt to add with overflow"; release: -2147483648
 ```
 
-This is a defined deterministic result, not undefined behavior, but it is *silent*: the language does not insert checks. Code that must detect overflow has to compare against the type's bounds before the operation. (Unsigned wrap is the usual `mod 2`<sup>`N`</sup>; e.g. `0u8 - 1u8 == 255`.)
+The optimization level has no part in it: a profile names its own setting in its table, and the command line's `--overflow-checks=on` or `--overflow-checks=off` overrides the profile for one build.
 
-**Division and modulo by zero** are *not* checked by the compiler and fault at runtime (on typical targets the CPU raises `SIGFPE`); the signed `i32::MIN / -1` / `i32::MIN % -1` cases overflow the result and fault the same way. Guard the divisor when it can be zero.
+```toml
+[profile.release]
+overflow_checks = true
+```
+
+Code that means to wrap says so, and wraps in every profile: each integer type has `wrapping_add`, `wrapping_subtract`, `wrapping_multiply`, `wrapping_negate` and `wrapping_power`. The methods that compute as the operators do overflow as they do: `power` as `*`, and a signed type's `abs` as unary `-`, so `i32::MIN.abs()` panics where checks are on and is `i32::MIN` where they are off. Code that must detect overflow asks `checked_add`, `checked_subtract`, `checked_multiply`, `checked_power` and `checked_abs` (`None` where the true result does not fit), `overflowing_add` and its kin (the wrapped result and whether it wrapped), or clamps with `saturating_add` and its kin. There is no automatic widening; `as` between integer types truncates or extends and never overflows.
+
+**Division and remainder** by zero panic in every profile (`attempt to divide by zero`), as do the signed `MIN / -1` and `MIN % -1`, whose quotient is one past the type's maximum.
+
+**A constant expression that overflows is refused** in every profile (`E0465`): an integer `+`, `-`, `*`, `/` or unary `-` whose operands are compile-time integers - literals, module constants and type constants such as `i32::MAX`, and expressions of them - and whose true result its type does not hold would overflow whenever it ran. The refusal names the value, and helps with a type that holds it and with the wrapping method:
+
+```cryo
+const SMALL: u8 = 200;
+const SUM: u8 = SMALL + 100;      // E0465: its value is 300, which `u8` does not hold
+const WIDE: u16 = (SMALL as u16) + 100;
+const WRAPPED: u8 = SMALL.wrapping_add(100);
+```
+
+A constant `MIN % -1` is refused the same way (`E0465`) though its value, 0, fits: the remainder is computed by a division whose quotient its type does not hold, so it panics whenever it runs, in every profile. The help computes it in the next wider type, `(i32::MIN as i64) % -1`.
+
+An overflow inside a larger constant expression is refused where it happens, once. A negated literal is one literal, so `-128` as an `i8` holds; and an expression made only of literals stored in a typed place is its exact value, judged whole by the literal rule (`E0010`).
 
 ### 5.2 Comparison
 
