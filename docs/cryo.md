@@ -1318,6 +1318,8 @@ const WIDE: u16 = (SMALL as u16) + 100;
 const WRAPPED: u8 = SMALL.wrapping_add(100);
 ```
 
+A constant `MIN % -1` is refused the same way (`E0465`) though its value, 0, fits: the remainder is computed by a division whose quotient its type does not hold, so it panics whenever it runs, in every profile. The help computes it in the next wider type, `(i32::MIN as i64) % -1`.
+
 An overflow inside a larger constant expression is refused where it happens, once. A negated literal is one literal, so `-128` as an `i8` holds; and an expression made only of literals stored in a typed place is its exact value, judged whole by the literal rule (`E0010`).
 
 ### 5.2 Comparison

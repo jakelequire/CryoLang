@@ -3659,12 +3659,16 @@ type struct SemaVisitor {
     /// null), of type `result` whose operands fold to constants and whose
     /// true result `result` does not hold: it overflows whenever it runs, a
     /// panic where the build checks for overflow and a wrapped value where it
-    /// does not, so it is refused in every profile.  An operand its own type
-    /// does not hold was refused where it was computed, so it reports nothing
-    /// more here; a division by a constant zero is no overflow.
+    /// does not, so it is refused in every profile.  A `%` is refused where
+    /// the division it is the remainder of overflows (`i32::MIN % -1`): its
+    /// true value 0 fits, but computing it panics in every profile.  An
+    /// operand its own type does not hold was refused where it was
+    /// computed, so it reports nothing more here; a division by a constant
+    /// zero is no overflow.
     refuse_constant_overflow(&this, e: ExpressionNode*, op: TokenType, left: ExpressionNode*, right: ExpressionNode*,
                              result: TypeRef) -> void {
-        if (op != TokenType::Plus && op != TokenType::Minus && op != TokenType::Star && op != TokenType::Slash) { return; }
+        if (op != TokenType::Plus && op != TokenType::Minus && op != TokenType::Star && op != TokenType::Slash
+            && op != TokenType::Percent) { return; }
         const t: Type* = this.arena.lookup(result);
         if (t == null || t.kind != TypeKind::Int) { return; }
         // An expression made only of literals, stored where an integer is
@@ -3688,13 +3692,48 @@ type struct SemaVisitor {
         }
         const width: u64 = t.int_kind().bit_width();
         const signed: boolean = t.int_kind().is_signed();
-        const computed: Option<FoldedInteger> = if (left == null) { values[0].negate() } else { values[0].apply(op, values[1]) };
-        if (op == TokenType::Slash && computed.is_none()) { return; }
+        // A remainder is computed by the division it is the remainder of,
+        // so that division's quotient is what must be held.
+        const remainder: boolean = op == TokenType::Percent;
+        const computed: Option<FoldedInteger> = if (left == null) { values[0].negate() }
+            else { values[0].apply(if (remainder) { TokenType::Slash } else { op }, values[1]) };
+        if ((op == TokenType::Slash || remainder) && computed.is_none()) { return; }
         if (computed.is_some() && computed.unwrap().held_in(width, signed)) { return; }
 
         const intern: InternTable* = this.ctx.intern_table;
         const written: string = ExpressionNode::spell(e, intern);
         const type_name: string = this.types.type_display_name(result);
+        if (remainder) {
+            // The quotient is one past the type's maximum, which the next
+            // wider type holds, and in it the remainder is computed without
+            // a panic; a 128-bit type has no wider one, so its remainder is
+            // written as the value it is.
+            const quotient: FoldedInteger = computed.unwrap();
+            mut panics: Diagnostic = Diagnostic::error(ErrorCode::E0465_CONSTANT_OVERFLOW,
+                fmt::format("`%s` always panics: the division it is the remainder of has the quotient %s, which `%s` does not hold",
+                    written, quotient.to_decimal_string(), type_name));
+            panics = panics.at_with_label(e.span, "this panics whenever it runs, so it is refused in every profile");
+            match (values[0].apply(op, values[1])) {
+                Option::Some(value) => {
+                    if (width < 128) {
+                        const wider: string = fmt::format("i%s", (width * 2).to_decimal_string()).into_raw();
+                        panics = panics.help_with_example(
+                            fmt::format("where the remainder %s is meant, compute it in `%s`, which holds the quotient",
+                                value.to_decimal_string(), wider),
+                            fmt::format("(%s as %s) %s %s", ExpressionNode::spell_operand(left, intern), wider,
+                                op.to_string(), ExpressionNode::spell_operand(right, intern)));
+                    } else {
+                        panics = panics.help_with_example(
+                            fmt::format("no integer type holds the quotient; where the remainder %s is meant, write it",
+                                value.to_decimal_string()),
+                            value.to_decimal_string());
+                    }
+                }
+                Option::None => { }
+            }
+            this.ctx.emit_diagnostic(panics);
+            return;
+        }
         mut refusal: Diagnostic = Diagnostic::error(ErrorCode::E0465_CONSTANT_OVERFLOW,
             if (computed.is_some()) {
                 fmt::format("`%s` overflows `%s`: its value is %s, which `%s` does not hold",
