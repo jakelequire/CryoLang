@@ -32,7 +32,13 @@ make verify              # build once; census, examples, lsp, cross, incr, relin
                          # runtime archive members); ARGS="--baseline HEAD --require-identical"
                          # proves a change moved no compiled output (baseline = REV's
                          # compiler/src AND runtime/, the rest from the tree; built in .verify/, cached;
-                         # its results recorded per program, so a new test re-runs only itself);
+                         # its results recorded per program in .verify/programs, so a new test
+                         # re-runs only itself; the tree's census records there too, under the
+                         # tree compiler's identity, so a later baseline built to the same
+                         # compiler runs none of its census); the tree's gates are replayed from
+                         # .verify/tree-runs only when EVERY input matches a passing run's: the
+                         # compiler's bytes, every file git lists, bin/ and tests/helpers/,
+                         # .toolchains, the C drivers, PATH, the gates and the target;
                          # a change that makes a refused program compile DECLARES its project in
                          # tests/started-compiling (refused before, builds now); one that corrects
                          # a program the baseline built, in tests/started-passing; with a

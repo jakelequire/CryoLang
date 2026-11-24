@@ -1,5 +1,6 @@
-///! One program's record of a baseline run, as verify stores it under the
-///! program's record key: written from a baseline census and read back.
+///! One program's record of a census run, as verify stores it under the
+///! program's record key: written from a census's output, sealed, kept in
+///! the checkout's store and read back.
 
 namespace cryogate::verify::record;
 
@@ -10,8 +11,15 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::clone::{ Clone };
 import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::encoding::sha256::{ Sha256 };
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+import std::time::clock::{ SystemTime };
 
 import cryogate::core::text::{ Text };
+import cryogate::core::tree::{ Tree };
 import cryogate::corpus::census::{ CensusReading };
 import cryogate::verify::objects::{ ObjectOwner };
 
@@ -238,6 +246,131 @@ public type struct BaselineRecord {
             return Option::None;
         }
         return Option::None;
+    }
+}
+
+/// A text verify keeps, ended by a line holding the digest of the text
+/// above it, so a file cut short or changed reads as no file.
+public type struct Seal {
+    /// `text`, whose lines are each ended, then `end` and its sha256.
+    public static close(text: Str) -> String {
+        mut sealed: String = String::from_str(text);
+        sealed.push(f"end {Sha256::digest(text.as_bytes()).to_hex().as_str()}\n".as_str());
+        return sealed;
+    }
+
+    /// The text `close` sealed, when the last line of `text` is `end` and
+    /// the digest of every line before it.
+    public static open(text: Str) -> Option<Str> {
+        if (!text.ends_with(&Str::new("\n"))) { return Option::None; }
+        const body: Str = text.byte_substring(0, text.length() - 1);
+        const covered_length: i64 = match (body.split_once_from_end(&Str::new("\n"))) {
+            Option::Some(parts) => { parts.first.length() + 1 }
+            Option::None        => { 0 }
+        };
+        const digest: Str = match (body.byte_substring(covered_length, body.length()).strip_prefix(&Str::new("end "))) {
+            Option::Some(digest) => { digest }
+            Option::None         => { return Option::None; }
+        };
+        const covered: Str = text.byte_substring(0, covered_length);
+        if (Sha256::digest(covered.as_bytes()).to_hex().as_str() != digest) { return Option::None; }
+        return Option::Some(covered);
+    }
+}
+
+/// The records verify keeps, `.verify/programs/<key>`, one file per program
+/// key.  A key holds the identity of the compiler that ran the program, so
+/// one store serves both sides of a run: the tree's records are the next
+/// baseline's when that baseline is this tree.  A record is written through
+/// a temporary and renamed into place, and ends with an `end` line holding
+/// the digest of the text above it; a record whose digest does not hold,
+/// or that names another program, is read as no record, and the program
+/// runs again and is recorded afresh.
+public type struct RecordStore {
+    /// The store's directory.
+    public directory: PathBuf;
+
+    /// A record not read for this many days is deleted.
+    public const KEPT_DAYS: i64 = 14;
+    /// At most this many records are kept, the most recently read.
+    public const KEPT_RECORDS: i64 = 20000;
+
+    /// The store of the checkout `repository`, created when it is not there.
+    public static of(repository: Path) -> Result<RecordStore, String> {
+        const directory: PathBuf = repository.join(Str::new(".verify/programs"));
+        return match (Directory::create_all(directory.as_path())) {
+            Result::Ok(_)      => { Result::Ok(RecordStore { directory: directory }) }
+            Result::Err(error) => { Result::Err(f"cannot create {directory.as_path().as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// The record of `name` stored under `key`; none when there is none,
+    /// when it does not open, or when it names another program.  A record
+    /// last written more than a day ago is written again, which stamps it
+    /// as read for `prune`.
+    public load(&this, key: Str, name: Str) -> Option<BaselineRecord> {
+        const path: PathBuf = this.directory.join(key);
+        const text: String = match (File::read_text(path.as_path())) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { return Option::None; }
+        };
+        const record: BaselineRecord = match (Seal::open(text.as_str())) {
+            Option::Some(covered) => { BaselineRecord::read(covered) }
+            Option::None          => { return Option::None; }
+        };
+        if (record.name.as_str() != name) { return Option::None; }
+        const written: i64 = match (path.as_path().metadata()) {
+            Result::Ok(metadata) => { metadata.modified_seconds() }
+            Result::Err(_)       => { 0 }
+        };
+        if (SystemTime::now().unix_seconds() - written > 86400) {
+            const _: Result<(), String> = this.save(key, &record);
+        }
+        return Option::Some(record);
+    }
+
+    /// Store `record` under `key`, replacing what is there.
+    public save(&this, key: Str, record: &BaselineRecord) -> Result<(), String> {
+        const path: PathBuf = this.directory.join(key);
+        const temporary: String = f"{path.as_path().as_str()}.tmp";
+        match (File::write_text(Path::from(temporary.as_str()), Seal::close(record.text().as_str()).as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot write {temporary.as_str()}: {error.describe()}"); }
+        }
+        return match (Path::from(temporary.as_str()).rename_to(path.as_path())) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot replace {path.as_path().as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// Delete every record not read for `KEPT_DAYS`, then the least
+    /// recently read beyond `KEPT_RECORDS`; the number deleted.  `now` is
+    /// the time in seconds since the epoch.
+    public prune(&this, now: i64) -> Result<i64, String> {
+        mut stamped: Array<Pair<String, i64>> = Array::<Pair<String, i64>>::new();
+        for (name in Tree::names(this.directory.as_path(), &Array::<String>::new())?.iterate_references()) {
+            const seconds: i64 = match (this.directory.join(name.as_str()).as_path().metadata()) {
+                Result::Ok(metadata) => { metadata.modified_seconds() }
+                Result::Err(_)       => { 0 }
+            };
+            stamped.push(Pair::new(name.clone(), seconds));
+        }
+        mut deleted: i64 = 0;
+        const oldest_kept: i64 = now - RecordStore::KEPT_DAYS * 86400;
+        mut left: Array<i64> = Array::<i64>::new();
+        for (entry in stamped.iterate_references()) {
+            if (entry.second >= oldest_kept) { left.push(entry.second); continue; }
+            if (File::remove(this.directory.join(entry.first.as_str()).as_path()).is_ok()) { deleted++; }
+        }
+        if (left.length() <= RecordStore::KEPT_RECORDS) { return Result::Ok(deleted); }
+        left.sort();
+        // The stamp of the oldest record kept: every one older goes.
+        const cutoff: i64 = left[left.length() - RecordStore::KEPT_RECORDS];
+        for (entry in stamped.iterate_references()) {
+            if (entry.second < oldest_kept || entry.second >= cutoff) { continue; }
+            if (File::remove(this.directory.join(entry.first.as_str()).as_path()).is_ok()) { deleted++; }
+        }
+        return Result::Ok(deleted);
     }
 }
 

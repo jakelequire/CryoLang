@@ -18,7 +18,7 @@ import std::fs::path::{ Path, PathBuf };
 
 import cryogate::baseline::cache::{ BaselineCache };
 import cryogate::baseline::clone::{ BaselineClone };
-import cryogate::baseline::keys::{ BaselineKey, Program, ProgramKeys, Programs };
+import cryogate::baseline::keys::{ BaselineKey, HostToolchain, Program, ProgramKeys, Programs };
 import cryogate::core::child::{ Completion };
 import cryogate::core::host::{ Host };
 import cryogate::core::git::{ Git };
@@ -32,7 +32,7 @@ import cryogate::verify::comparison::{ Compared };
 import cryogate::verify::declarations::{ Declaration, DeclaredChanges };
 import cryogate::verify::hashing::{ ObjectHashes };
 import cryogate::verify::objects::{ ObjectPopulation };
-import cryogate::verify::record::{ BaselineRecord };
+import cryogate::verify::record::{ BaselineRecord, RecordStore };
 import cryogate::verify::run::session::{ VerifySession, VerifySettings };
 import cryogate::verify::runtime::{ RuntimeArchives };
 
@@ -60,7 +60,7 @@ import cryogate::verify::runtime::{ RuntimeArchives };
 /// - `--keys <home>`: every program's record key computed over the working
 ///   tree for the baseline compiler in `home` (a `.verify/baseline/<key>`
 ///   directory), each of which must name a record of that program in the
-///   home's store; every one that does not is named;
+///   checkout's store, `.verify/programs`; every one that does not is named;
 /// - `--sync <clone> --at <rev>`: make `clone` the checkout verify builds a
 ///   baseline compiler from `rev` in;
 /// - `--baselines <directory> [--current <name>]`: the baseline homes in
@@ -232,41 +232,38 @@ public type struct VerifyGate {
     }
 
     /// `--keys`: each program's key over the working tree, for the baseline
-    /// compiler and runtime in `home`, looked up in the home's record store.
-    /// A key with no record, or with another program's, is named.
+    /// compiler and runtime in `home`, looked up in the checkout's record
+    /// store.  A key with no record that opens, or with another program's,
+    /// is named.
     private static check_keys(repository: Path, git: &Git, home: Str) -> i32 {
         const base: PathBuf = repository.join(home);
         const compiler: PathBuf = base.join(Host::executable_name(Str::new("cryo")).as_str());
         const runtime: PathBuf = base.join(Str::new("runtime"));
-        const store: PathBuf = base.join(Str::new("programs"));
         const programs: Array<Program> = match (Programs::discover(repository, git)) {
             Result::Ok(programs) => { programs }
             Result::Err(reason)  => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
         };
-        const keys: Array<Pair<String, String>> = match (ProgramKeys::of(repository, git, compiler.as_path(), runtime.as_path(), &programs)) {
+        const toolchain: HostToolchain = match (HostToolchain::of(repository)) {
+            Result::Ok(toolchain) => { toolchain }
+            Result::Err(reason)   => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
+        };
+        const store: RecordStore = match (RecordStore::of(repository)) {
+            Result::Ok(store)   => { store }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
+        };
+        const keys: Array<Pair<String, String>> = match (ProgramKeys::of(repository, git, compiler.as_path(), runtime.as_path(), &toolchain, &programs)) {
             Result::Ok(keys)    => { keys }
             Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
         };
         mut missing: i64 = 0;
-        mut differing: i64 = 0;
         for (key in keys.iterate_references()) {
-            const record: PathBuf = store.join(key.second.as_str());
-            match (File::read_text(record.as_path())) {
-                Result::Ok(text) => {
-                    const stored: BaselineRecord = BaselineRecord::read(text.as_str());
-                    if (stored.name.as_str() != key.first.as_str()) {
-                        fmt::println(f"  differs  {key.first.as_str()}: its key {key.second.as_str()} holds the record of {stored.name.as_str()}");
-                        differing++;
-                    }
-                }
-                Result::Err(_) => {
-                    fmt::println(f"  missing  {key.first.as_str()}: no record {key.second.as_str()}");
-                    missing++;
-                }
+            if (store.load(key.second.as_str(), key.first.as_str()).is_none()) {
+                fmt::println(f"  missing  {key.first.as_str()}: no record of it opens under {key.second.as_str()}");
+                missing++;
             }
         }
-        fmt::println(f"verify: {keys.length()} program key(s) for {home}: {keys.length() - missing - differing} recorded, {missing} missing, {differing} differ");
-        return if (missing == 0 && differing == 0) { 0 } else { 1 };
+        fmt::println(f"verify: {keys.length()} program key(s) for {home}: {keys.length() - missing} recorded, {missing} missing");
+        return if (missing == 0) { 0 } else { 1 };
     }
 
     /// `--compare`: the run directory `run`'s baseline and tree object

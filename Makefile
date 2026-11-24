@@ -244,7 +244,10 @@ Tests and gates
                          deps-flow and check-fast run
                          concurrently and their objects are hashed
                          (ARGS="--baseline HEAD --require-identical";
-                         --sequential runs them one at a time).
+                         --sequential runs them one at a time).  A run
+                         whose every input matches a passing run's is
+                         replayed from .verify/tree-runs; program records
+                         are kept in .verify/programs.
   make check-fast        verify-selftest, verify-pin and cryosmith-selftest;
                          builds only cryogate, its unit tests and cryosmith,
                          with the pin.

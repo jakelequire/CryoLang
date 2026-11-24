@@ -16,8 +16,9 @@ import std::fmt;
 import std::fs::directory::{ Directory };
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
-import std::time::clock::{ Instant };
+import std::time::clock::{ Instant, SystemTime };
 
+import cryogate::baseline::keys::{ HostToolchain };
 import cryogate::core::child::{ Completion, Job };
 import cryogate::core::git::{ Git };
 import cryogate::core::host::{ Host };
@@ -30,11 +31,12 @@ import cryogate::verify::declarations::{ Declaration, DeclarationKind, Declarati
 import cryogate::verify::gates::{ GateCommand };
 import cryogate::verify::judges::{ VerifyJudges };
 import cryogate::verify::objects::{ ObjectPopulation };
-import cryogate::verify::record::{ BaselineRecord };
+import cryogate::verify::record::{ BaselineRecord, RecordStore };
 import cryogate::verify::run::children::{ PopulationRun, VerifyChild };
 import cryogate::verify::run::compiler::{ BaselineCompiler };
 import cryogate::verify::run::declared::{ DeclaredBuilds };
 import cryogate::verify::run::programs::{ BaselinePrograms, BaselineTotals };
+import cryogate::verify::run::reuse::{ TreeRunCache };
 
 /// What a verify run is asked to do.
 public type struct VerifySettings {
@@ -95,11 +97,30 @@ public type struct VerifySession {
         const git: Git = Git::new(repository, logs);
         const table: Array<GateCommand> = GateCommand::table(cryogate.as_path().as_str());
 
+        const toolchain: HostToolchain = match (HostToolchain::of(repository)) {
+            Result::Ok(toolchain) => { toolchain }
+            Result::Err(reason)   => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); return 1; }
+        };
+        const store: RecordStore = match (RecordStore::of(repository)) {
+            Result::Ok(store)   => { store }
+            Result::Err(reason) => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); return 1; }
+        };
+        const tests: PathBuf = repository.join(Str::new("tests"));
+        const pinned: Pinned = match (TestGates::read(tests.join(Str::new("tests")).as_path())) {
+            Result::Ok(gates) => {
+                match (Pinned::read(tests.join(Str::new("test-roster.txt")).as_path(), &gates)) {
+                    Result::Ok(pinned)  => { pinned }
+                    Result::Err(reason) => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); return 1; }
+                }
+            }
+            Result::Err(reason) => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); return 1; }
+        };
+
         const revision: String = settings.baseline.clone().unwrap_or(String::new());
         mut phase: Option<BaselinePhase> = Option::None;
         if (settings.baseline.is_some()) {
             match (VerifySession::baseline(repository, logs, &git, revision.as_str(), triple.as_str(), cryo.as_str(),
-                                           cryogate.as_path().as_str(), directory)) {
+                                           cryogate.as_path().as_str(), directory, &pinned, &toolchain, &store)) {
                 Result::Ok(answer) => { phase = Option::Some(answer); }
                 Result::Err(problems) => {
                     for (problem in problems.iterate_references()) { fmt::println(f"verify: FAIL -- {problem.as_str()}"); }
@@ -111,11 +132,38 @@ public type struct VerifySession {
         const one_at_a_time: Str = if (settings.sequential) { Str::new(" (one at a time)") } else { Str::new("") };
         fmt::println(f"verify: gates over {shown_cryo.as_str()}: {Text::joined(&names, Str::new(", ")).as_str()}{one_at_a_time}");
         const tree_runtime: PathBuf = repository.join(Str::new("runtime/.bin")).join(triple.as_str());
-        const population: PopulationRun = match (PopulationRun::run(repository, &table, &names, cryo.as_str(),
-                                                                   directory, Str::new("tree"), tree_runtime.as_path(), settings.sequential)) {
-            Result::Ok(population) => { population }
-            Result::Err(reason)    => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); return 1; }
+        const cache: TreeRunCache = match (TreeRunCache::of(repository, &git, Path::from(cryo.as_str()), &toolchain, &names, triple.as_str())) {
+            Result::Ok(cache)   => { cache }
+            Result::Err(reason) => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); return 1; }
         };
+        const kept: Option<PopulationRun> = cache.replay(&table, &names, directory);
+        const replayed: boolean = kept.is_some();
+        const population: PopulationRun = match (kept) {
+            Option::Some(population) => {
+                fmt::println(f"verify: every input of the tree's gates is a passing run's; its results are taken from {PopulationRun::relative(repository, cache.entry().as_path().as_str()).as_str()}");
+                population
+            }
+            Option::None => {
+                match (PopulationRun::run(repository, &table, &names, cryo.as_str(), directory, Str::new("tree"),
+                                          tree_runtime.as_path(), settings.sequential)) {
+                    Result::Ok(population) => { population }
+                    Result::Err(reason)    => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); return 1; }
+                }
+            }
+        };
+        if (!replayed) {
+            // The census gate's log names the runner's, which a later run
+            // may delete; the run keeps its own copy.
+            match (VerifySession::runner_log(repository, directory.join(Str::new("census.log")).as_path())) {
+                Option::Some(log) => {
+                    match (File::copy(log.as_path(), directory.join(Str::new("tree.census.log")).as_path())) {
+                        Result::Ok(_)  => { }
+                        Result::Err(_) => { }
+                    }
+                }
+                Option::None => { }
+            }
+        }
         mut ok: boolean = true;
         for (gate in population.gates.iterate_references()) {
             fmt::println(gate.report(repository));
@@ -124,6 +172,20 @@ public type struct VerifySession {
         for (problem in VerifySession::object_lines(repository, &names, &population, directory).iterate_references()) {
             fmt::println(f"verify: FAIL -- {problem.as_str()}");
             ok = false;
+        }
+        if (names.contains(&census)) {
+            match (BaselinePrograms::record_tree(repository, &git, Path::from(cryo.as_str()), directory, &pinned.unit, &toolchain, &store)) {
+                Result::Ok(problems) => {
+                    for (problem in problems.iterate_references()) { fmt::println(f"verify: FAIL -- {problem.as_str()}"); ok = false; }
+                }
+                Result::Err(reason) => { fmt::println(f"verify: FAIL -- {reason.as_str()}"); ok = false; }
+            }
+        }
+        if (ok && !replayed) {
+            match (cache.store(directory, &population)) {
+                Result::Ok(_)       => { fmt::println(f"verify: the tree's gates passed; kept as {PopulationRun::relative(repository, cache.entry().as_path().as_str()).as_str()}"); }
+                Result::Err(reason) => { fmt::println(f"verify: the tree's run is not kept: {reason.as_str()}"); }
+            }
         }
 
         match (&phase) {
@@ -143,6 +205,10 @@ public type struct VerifySession {
                 }
             }
             Option::None => { }
+        }
+        match (store.prune(SystemTime::now().unix_seconds())) {
+            Result::Ok(_)       => { }
+            Result::Err(reason) => { fmt::println(f"verify: the record store was not pruned: {reason.as_str()}"); }
         }
         const verdict: Str = if (ok) { Str::new("OK") } else { Str::new("FAIL") };
         fmt::println(f"verify: {verdict} in {started.elapsed().as_seconds_f64():.0} s -- logs in {shown_run.as_str()}");
@@ -184,7 +250,8 @@ public type struct VerifySession {
     /// commit, its programs' records, and the judgements that must pass
     /// before the tree's gates run.  The problems when one fails.
     private static baseline(repository: Path, logs: &RunLogs, git: &Git, revision: Str, triple: Str, cryo: Str,
-                            cryogate: Str, directory: Path) -> Result<BaselinePhase, Array<String>> {
+                            cryogate: Str, directory: Path, pinned: &Pinned, toolchain: &HostToolchain,
+                            store: &RecordStore) -> Result<BaselinePhase, Array<String>> {
         const compiler: BaselineCompiler = VerifySession::one(BaselineCompiler::obtain(repository, logs, git, revision, triple))?;
         const declared: Array<Declaration> = VerifySession::declared_since(repository, git, compiler.commit.as_str(), Str::new("tests/started-compiling"));
         const fixed: Array<Declaration> = VerifySession::declared_since(repository, git, compiler.commit.as_str(), Str::new("tests/started-passing"));
@@ -192,10 +259,8 @@ public type struct VerifySession {
         fmt::println(VerifySession::declared_line(&fixed, revision, Str::new("pass")));
         const records: PathBuf = directory.join(Str::new("baseline"));
         VerifySession::one(VerifySession::created(records.as_path()))?;
-        const tests: PathBuf = repository.join(Str::new("tests"));
-        const gates: TestGates = VerifySession::one(TestGates::read(tests.join(Str::new("tests")).as_path()))?;
-        const pinned: Pinned = VerifySession::one(Pinned::read(tests.join(Str::new("test-roster.txt")).as_path(), &gates))?;
-        const totals: BaselineTotals = VerifySession::one(BaselinePrograms::record(repository, git, &compiler, records.as_path(), &pinned.unit, cryogate))?;
+        const totals: BaselineTotals = VerifySession::one(BaselinePrograms::record(repository, git, &compiler, records.as_path(),
+            &pinned.unit, cryogate, toolchain, store))?;
         // A baseline compiler that links no stdlib archive builds none, so
         // the archive population alone may be empty.
         if (totals.lists[0].is_empty() || totals.lists[1].is_empty() || totals.lists[3].is_empty()) {
@@ -259,14 +324,14 @@ public type struct VerifySession {
 
     /// The tree's census warnings against the baseline's records, the
     /// lines counting them printed: the unit suite's build warnings, and
-    /// each test project's when both runners list them.  The census gate's
-    /// own log names the runner log they are read from.
+    /// each test project's when both runners list them.  They are read from
+    /// the run's copy of the runner log the census gate's own log named.
     private static warnings(repository: Path, baseline: &BaselineTotals, declared: &Array<Declaration>, fixed: &Array<Declaration>,
                             directory: Path) -> Array<String> {
         mut problems: Array<String> = Array::<String>::new();
-        const reading: CensusReading = match (VerifySession::tree_census(repository, directory.join(Str::new("census.log")).as_path())) {
-            Option::Some(reading) => { reading }
-            Option::None          => {
+        const reading: CensusReading = match (File::read_text(directory.join(Str::new("tree.census.log")).as_path())) {
+            Result::Ok(log) => { CensusReading::of(&Text::lines(log.as_str())) }
+            Result::Err(_)  => {
                 problems.push(String::from_str(Str::new("the census gate named no runner log to read its warnings from")));
                 return problems;
             }
@@ -310,11 +375,10 @@ public type struct VerifySession {
         return problems;
     }
 
-    /// The census reading of the runner log the census gate's log
-    /// `gate_log` names on its last `log <path>` line, a relative path read
-    /// below `repository`; none when it names none, or one that is not
-    /// there.
-    private static tree_census(repository: Path, gate_log: Path) -> Option<CensusReading> {
+    /// The runner log the census gate's log `gate_log` names on its last
+    /// `log <path>` line, a relative path read below `repository`; none
+    /// when it names none, or one that is not there.
+    private static runner_log(repository: Path, gate_log: Path) -> Option<PathBuf> {
         const text: String = match (File::read_text(gate_log)) {
             Result::Ok(text) => { text }
             Result::Err(_)   => { return Option::None; }
@@ -340,10 +404,8 @@ public type struct VerifySession {
             }
         }
         if (named.is_empty()) { return Option::None; }
-        return match (File::read_text(repository.join(named.as_str()).as_path())) {
-            Result::Ok(log) => { Option::Some(CensusReading::of(&Text::lines(log.as_str()))) }
-            Result::Err(_)  => { Option::None }
-        };
+        const log: PathBuf = repository.join(named.as_str());
+        return if (log.as_path().is_file()) { Option::Some(log) } else { Option::None };
     }
 
     /// The comparison of the run directory `run`'s two object lists of
