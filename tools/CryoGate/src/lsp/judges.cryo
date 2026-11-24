@@ -410,6 +410,38 @@ public type struct Judges {
         return Result::Ok(Judgement::when(bad.is_empty(), Text::joined(&bad, Str::new("; "))));
     }
 
+    /// A `formatting` check of `file`: `expect` null wants no edit; a text
+    /// wants one edit, replacing the whole of the file's text with it.
+    public static formatting(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*) -> Result<Judgement, String> {
+        const edits: Array<JsonValue*> = Reading::elements(result, Str::new(""));
+        if (!Reading::present(check, Str::new("expect"))) {
+            return Result::Ok(Judgement::when(edits.is_empty(), f"want no edit, got {Reading::shown(Option::Some(result)).as_str()}"));
+        }
+        if (edits.length() != 1) {
+            return Result::Ok(Judgement::fail(f"want one edit, got {Reading::shown(Option::Some(result)).as_str()}"));
+        }
+        const edit: JsonValue* = *edits.get_reference(0).unwrap();
+        const text: String = fixture.text(Reading::text(check, Str::new("file")))?;
+        // The end of the text: its last line, and that line's length (the
+        // fixture's text is ASCII, so bytes are UTF-16 units).
+        mut last_line: i64 = 0;
+        mut last_start: i64 = 0;
+        for (mut at: i64 = 0; at < text.length(); at++) {
+            if (text.as_str().byte_at(at).unwrap_or(0) == 10) {
+                last_line++;
+                last_start = at + 1;
+            }
+        }
+        const from: Position = Position { line: 0, character: 0 };
+        const to: Position = Position { line: last_line, character: text.length() - last_start };
+        if (!from.matches(Reading::at(edit, Str::new("range.start"))) || !to.matches(Reading::at(edit, Str::new("range.end")))) {
+            return Result::Ok(Judgement::fail(f"want the edit to replace {from.json().as_str()}-{to.json().as_str()}, the whole text, got {Reading::shown(Reading::at(edit, Str::new("range"))).as_str()}"));
+        }
+        const got: Str = Reading::text(edit, Str::new("newText"));
+        const want: Str = Reading::text(check, Str::new("expect"));
+        return Result::Ok(Judgement::when(got == want, f"want {Reading::clipped(want).as_str()}, got {Reading::clipped(got).as_str()}"));
+    }
+
     /// A `signatureHelp` check: the active signature's label holds every
     /// `contains` text and no `excludes` one, the active parameter is
     /// `active`, its label (as its offsets cut it) is `param`, and `count`
