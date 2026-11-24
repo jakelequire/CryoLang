@@ -1357,6 +1357,17 @@ function holds(r: &Point, p: Point*) -> boolean {
 }
 ```
 
+**A value is not compared with a pointer or a function.** A struct, enum, number, boolean or other value has no address to compare, so beside a pointer, a function or `null` it is refused (E0229). The help writes the comparison the program can mean: beside a pointer to its own type, the value compared with the one the pointer points to (`v == *p`, where the type compares) and its address (`(&v as T*) == p`, where it is a place); beside a `void*`, its address; beside `null`, which a value never is, nothing - the comparison always answers the same and is removed. A function compares only with a function or `null`:
+
+```cryo
+function check(n: i64, p: i64*, f: () -> void) -> boolean {
+    return n == p;                  // error[E0229]: Cannot compare Int and Pointer
+    return n == *p;                 // the values
+    return (&n as i64*) == p;       // the addresses
+    return n == f;                  // error[E0229]: Cannot compare Int and Function
+}
+```
+
 ### 5.3 Logical
 
 | Operator | Description                    |
