@@ -107,9 +107,9 @@ public type struct VerifyGate {
         const git: Git = Git::new(repository, logs);
         const own_stdlib: boolean = parsed.has(Str::new("--baseline-stdlib"));
         const takes_own_stdlib: boolean = parsed.value(Str::new("--baseline")).is_some() || parsed.value(Str::new("--baseline-key")).is_some()
-            || parsed.value(Str::new("--sync")).is_some();
+            || parsed.value(Str::new("--sync")).is_some() || parsed.value(Str::new("--compare")).is_some();
         if (own_stdlib && !takes_own_stdlib) {
-            fmt::eprintln(f"cryogate verify: --baseline-stdlib names the stdlib of a baseline commit, so it goes with --baseline <rev>, --baseline-key <rev> or --sync <clone> --at <rev>; usage: {options.usage()}");
+            fmt::eprintln(f"cryogate verify: --baseline-stdlib names the stdlib of a baseline commit, so it goes with --baseline <rev>, --baseline-key <rev>, --sync <clone> --at <rev> or --compare <run> --against <rev>; usage: {options.usage()}");
             return 2;
         }
         mut limit: i64 = 40;
@@ -158,7 +158,7 @@ public type struct VerifyGate {
                     Option::Some(revision) => { revision }
                     Option::None           => { fmt::eprintln(f"cryogate verify: --compare needs --against; usage: {options.usage()}"); return 2; }
                 };
-                return VerifyGate::compare_run(repository, &git, run, revision, limit);
+                return VerifyGate::compare_run(repository, &git, run, revision, limit, own_stdlib);
             }
             Option::None => { }
         }
@@ -283,12 +283,17 @@ public type struct VerifyGate {
     }
 
     /// `--compare`: the run directory `run`'s baseline and tree object
-    /// lists compared with the declarations made against `revision`.
-    private static compare_run(repository: Path, git: &Git, run: Str, revision: Str, limit: i64) -> i32 {
+    /// lists compared with the declarations made against `revision`, as a
+    /// run whose baseline built against its own stdlib when `own_stdlib`.
+    private static compare_run(repository: Path, git: &Git, run: Str, revision: Str, limit: i64, own_stdlib: boolean) -> i32 {
         const declared: Array<Declaration> = VerifySession::declared_since(repository, git, revision, Str::new("tests/started-compiling"));
         const fixed: Array<Declaration> = VerifySession::declared_since(repository, git, revision, Str::new("tests/started-passing"));
         const changes: DeclaredChanges = DeclaredChanges::of(repository, &declared, &fixed);
-        const compared: Compared = match (VerifySession::compared(repository, revision, &changes, run, limit)) {
+        const moves_judged: boolean = match (VerifySession::moves_judged(git, revision, own_stdlib)) {
+            Result::Ok(judged)  => { judged }
+            Result::Err(reason) => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
+        };
+        const compared: Compared = match (VerifySession::compared(repository, revision, &changes, run, limit, moves_judged)) {
             Result::Ok(compared) => { compared }
             Result::Err(reason)  => { fmt::eprintln(f"cryogate verify: {reason.as_str()}"); return 1; }
         };

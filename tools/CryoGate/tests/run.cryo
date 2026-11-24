@@ -420,6 +420,109 @@ function a_kept_tree_run_whose_gate_log_does_not_pass_is_not_replayed() -> Resul
         Str::new("a kept run is judged again, and a failing log is never a pass"));
 }
 
+/// A baseline census that gave no verdict names its log; one whose unit
+/// build was refused names the refusal and its first error, and against
+/// the baseline's own stdlib says why and shows the two runs that judge.
+![test]
+function a_census_with_no_verdict_names_its_log_and_a_refused_build_shows_the_runs_that_judge() -> Result<(), TestError> {
+    mut unanswered: Array<String> = Array::<String>::new();
+    unanswered.push(String::from_str(Str::new("aggregate")));
+    unanswered.push(String::from_str(Str::new("negative/e0233.cryo")));
+    const log: Str = Str::new(".verify/runs/r/baseline/census.log");
+    const commit: Str = Str::new("84c064800aaaabbbbccccddddeeeeffff00001111");
+    expect_equal(BaselinePlan::no_verdict(&unanswered, &Array::<String>::new(), log, true, commit).as_str(),
+        Str::new("the baseline run gave no verdict for 2 program(s): aggregate negative/e0233.cryo"))?;
+    mut ran: Array<String> = Array::<String>::new();
+    ran.push(String::from_str(Str::new("project  p  FAILED")));
+    expect_equal(BaselinePlan::no_verdict(&unanswered, &ran, log, true, commit).as_str(),
+        Str::new("the baseline run gave no verdict for 2 program(s): aggregate negative/e0233.cryo; see its census log, .verify/runs/r/baseline/census.log"))?;
+    mut refused: Array<String> = Array::<String>::new();
+    refused.push(String::from_str(Str::new("warning[W0011]: extern C symbol")));
+    refused.push(String::from_str(Str::new("error[E0233]: cannot find `File::hard_link`: no matching static method, variant, or type")));
+    refused.push(String::from_str(Str::new(" --> ./tests/stdlib/fs_api.cryo:450:5")));
+    refused.push(String::from_str(Str::new("error[E0640]: enum `IoErrorKind` has no variant `CrossesDevices`")));
+    refused.push(String::from_str(Str::new("Test build failed (7 errors, 1 warnings)")));
+    const refusal: Str = Str::new(
+        "the baseline's census could not build the tree's unit tests (Test build failed (7 errors, 1 warnings)) and stopped there, so it gave no verdict for 2 program(s): aggregate negative/e0233.cryo; see .verify/runs/r/baseline/census.log\n"
+        "  first error: error[E0233]: cannot find `File::hard_link`: no matching static method, variant, or type --> ./tests/stdlib/fs_api.cryo:450:5");
+    mut own: String = String::from_str(refusal);
+    own.push(Str::new("\n"
+        "  why: --baseline-stdlib builds the tree's tests against the baseline commit's own stdlib, and the baseline's stdlib lacks API this tree's tests use\n"
+        "  help: judge the change in the default mode, where both compilers build against this tree's stdlib:\n"
+        "            make verify ARGS=\"--baseline 84c064800aaa --require-identical\"\n"
+        "        or name a baseline commit whose stdlib has that API, such as the commit that added it:\n"
+        "            make verify ARGS=\"--baseline <commit> --baseline-stdlib --require-identical\""));
+    expect_equal(BaselinePlan::no_verdict(&unanswered, &refused, log, true, commit).as_str(), own.as_str())?;
+    // A project the baseline's own stdlib refuses fails its census, and the
+    // run says why and shows the same two runs.
+    const failures: String = BaselinePlan::own_stdlib_failures(commit, log);
+    expect(failures.as_str().starts_with(&Str::new(
+        "under --baseline-stdlib the baseline builds this tree's tests against its commit's own stdlib, so a test using API that stdlib lacks fails there; the census log of the run that ran them says which (.verify/runs/r/baseline/census.log)\n"
+        "  help: judge the change in the default mode")), Str::new("why the projects failed"))?;
+    expect(failures.as_str().ends_with(&Str::new("--baseline <commit> --baseline-stdlib --require-identical\"")), Str::new("the runs that judge"))?;
+    mut checkout: String = String::from_str(refusal);
+    checkout.push(Str::new("\n"
+        "  help: a unit test the baseline compiler cannot build goes in a test project whose test.json is {\"outcome\": \"collect\"}, declared in tests/started-passing with what the baseline refused:\n"
+        "            <project> <what the baseline refused, and what the tree does>"));
+    return expect_equal(BaselinePlan::no_verdict(&unanswered, &refused, log, false, commit).as_str(), checkout.as_str());
+}
+
+/// A run whose two sides build against the tree's stdlib cannot show a move
+/// an edit of it makes, so it judges the declared moves only while the
+/// tree's stdlib is the baseline commit's; a run against the commit's own
+/// stdlib always judges them.
+![test]
+function declared_moves_are_judged_unless_the_tree_edits_the_stdlib_both_sides_build() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = Scratch::directory()?;
+    const root: Path = scratch.path();
+    const logs_home: TemporaryDirectory = Scratch::directory()?;
+    const logs: RunLogs = match (RunLogs::open(logs_home.path())) {
+        Result::Ok(logs)    => { logs }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    const git: Git = Git::new(root, &logs);
+    mut init: Array<Str> = Array::<Str>::new();
+    init.push(Str::new("init"));
+    init.push(Str::new("-q"));
+    expect(git.run(&init).outcome.succeeded(), Str::new("git init"))?;
+    Scratch::write(root.join(Str::new(".gitignore")).as_path(), Str::new(".bin/\n"))?;
+    Scratch::created(root.join(Str::new("stdlib")).as_path())?;
+    Scratch::write(root.join(Str::new("stdlib/a.cryo")).as_path(), Str::new("one"))?;
+    Scratch::write(root.join(Str::new("main.cryo")).as_path(), Str::new("main"))?;
+    mut add: Array<Str> = Array::<Str>::new();
+    add.push(Str::new("add"));
+    add.push(Str::new("-A"));
+    expect(git.run(&add).outcome.succeeded(), Str::new("git add"))?;
+    mut commit: Array<Str> = Array::<Str>::new();
+    commit.push(Str::new("-c"));
+    commit.push(Str::new("user.name=verify"));
+    commit.push(Str::new("-c"));
+    commit.push(Str::new("user.email=verify@localhost"));
+    commit.push(Str::new("commit"));
+    commit.push(Str::new("-q"));
+    commit.push(Str::new("-m"));
+    commit.push(Str::new("base"));
+    expect(git.run(&commit).outcome.succeeded(), Str::new("git commit"))?;
+    mut head: Array<Str> = Array::<Str>::new();
+    head.push(Str::new("rev-parse"));
+    head.push(Str::new("HEAD"));
+    const base: String = git.answer(&head);
+    expect(Scratch::judged(&git, base.as_str(), false)?, Str::new("the tree's stdlib is the commit's"))?;
+    Scratch::write(root.join(Str::new("main.cryo")).as_path(), Str::new("edited"))?;
+    expect(Scratch::judged(&git, base.as_str(), false)?, Str::new("an edit outside the stdlib"))?;
+    Scratch::created(root.join(Str::new("stdlib/.bin")).as_path())?;
+    Scratch::write(root.join(Str::new("stdlib/.bin/archive.a")).as_path(), Str::new("built"))?;
+    expect(Scratch::judged(&git, base.as_str(), false)?, Str::new("a build output git ignores"))?;
+    Scratch::write(root.join(Str::new("stdlib/b.cryo")).as_path(), Str::new("new"))?;
+    expect(!Scratch::judged(&git, base.as_str(), false)?, Str::new("a new stdlib file"))?;
+    expect(Scratch::judged(&git, base.as_str(), true)?, Str::new("against the commit's own stdlib"))?;
+    match (File::remove(root.join(Str::new("stdlib/b.cryo")).as_path())) { Result::Ok(_) => { } Result::Err(_) => { } }
+    Scratch::write(root.join(Str::new("stdlib/a.cryo")).as_path(), Str::new("two"))?;
+    expect(!Scratch::judged(&git, base.as_str(), false)?, Str::new("an edited stdlib file"))?;
+    return expect(VerifySession::moves_judged(&git, Str::new("0000000000000000000000000000000000000000"), false).is_err(),
+        Str::new("a commit git does not know is no answer"));
+}
+
 ![test]
 function the_tree_runs_key_reads_every_listed_file_and_what_git_ignores_below_bin() -> Result<(), TestError> {
     const scratch: TemporaryDirectory = Scratch::directory()?;
@@ -483,6 +586,14 @@ function the_tree_runs_key_reads_the_compilers_bytes_the_gates_and_the_target() 
 
 /// Scratch directories and files for the store's and the cache's tests.
 private type struct Scratch {
+    /// `VerifySession::moves_judged`, its refusal a test error.
+    private static judged(git: &Git, commit: Str, own_stdlib: boolean) -> Result<boolean, TestError> {
+        return match (VerifySession::moves_judged(git, commit, own_stdlib)) {
+            Result::Ok(judged)  => { Result::Ok(judged) }
+            Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
+        };
+    }
+
     private static directory() -> Result<TemporaryDirectory, TestError> {
         return match (TemporaryDirectory::create()) {
             Result::Ok(directory) => { Result::Ok(directory) }

@@ -35,7 +35,7 @@ import cryogate::verify::record::{ BaselineRecord, RecordStore };
 import cryogate::verify::run::children::{ PopulationRun, VerifyChild };
 import cryogate::verify::run::compiler::{ BaselineCompiler };
 import cryogate::verify::run::declared::{ DeclaredBuilds };
-import cryogate::verify::run::programs::{ BaselinePrograms, BaselineTotals };
+import cryogate::verify::run::programs::{ BaselinePlan, BaselinePrograms, BaselineTotals };
 import cryogate::verify::run::reuse::{ TreeRunCache };
 
 /// What a verify run is asked to do.
@@ -198,7 +198,7 @@ public type struct VerifySession {
                     ok = false;
                 }
                 const changes: DeclaredChanges = DeclaredChanges::of(repository, &answer.declared, &answer.fixed);
-                match (VerifySession::compared(repository, revision.as_str(), &changes, shown_run.as_str(), settings.list_limit)) {
+                match (VerifySession::compared(repository, revision.as_str(), &changes, shown_run.as_str(), settings.list_limit, answer.moves_judged)) {
                     Result::Ok(compared) => {
                         for (line in compared.lines.iterate_references()) { fmt::println(line.clone()); }
                         for (problem in compared.problems.iterate_references()) { fmt::println(f"verify: FAIL -- {problem.as_str()}"); ok = false; }
@@ -287,11 +287,26 @@ public type struct VerifySession {
             }
         }
         mut problems: Array<String> = VerifyJudges::baseline_census(&totals.census, &declared_names, &fixed_names, &namespaces);
+        if (own_stdlib && !problems.is_empty() && !totals.census.failed.is_empty()) {
+            problems.push(BaselinePlan::own_stdlib_failures(compiler.commit.as_str(),
+                PopulationRun::relative(repository, records.join(Str::new("census.log")).as_path().as_str()).as_str()));
+        }
         for (problem in DeclaredBuilds::check(repository, &declared, &fixed, &compiler, cryo, directory).iterate_references()) {
             problems.push(problem.clone());
         }
         if (!problems.is_empty()) { return Result::Err(problems); }
-        return Result::Ok(BaselinePhase { declared: declared, fixed: fixed, totals: totals });
+        const moves_judged: boolean = VerifySession::one(VerifySession::moves_judged(git, compiler.commit.as_str(), own_stdlib))?;
+        return Result::Ok(BaselinePhase { declared: declared, fixed: fixed, totals: totals, moves_judged: moves_judged });
+    }
+
+    /// Whether a run against the baseline `commit` judges every declared
+    /// move, the baseline's programs built against its own stdlib when
+    /// `own_stdlib`: unless they are, both sides build against this tree's
+    /// stdlib, and a move an edit of it makes cannot show, so when the tree
+    /// edits it the run cannot judge a declared move it does not see.
+    public static moves_judged(git: &Git, commit: Str, own_stdlib: boolean) -> Result<boolean, String> {
+        if (own_stdlib) { return Result::Ok(true); }
+        return Result::Ok(!git.differs_from(commit, Str::new("stdlib"))?);
     }
 
     /// The lines naming the tree's object lists, and a problem for each
@@ -415,14 +430,15 @@ public type struct VerifySession {
 
     /// The comparison of the run directory `run`'s two object lists of
     /// each population, with the declarations `changes`.
-    public static compared(repository: Path, revision: Str, changes: &DeclaredChanges, run: Str, limit: i64) -> Result<Compared, String> {
+    public static compared(repository: Path, revision: Str, changes: &DeclaredChanges, run: Str, limit: i64,
+                           moves_judged: boolean) -> Result<Compared, String> {
         mut baseline: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
         mut tree: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
         for (population in ObjectPopulation::all().iterate_references()) {
             baseline.push(VerifySession::list(repository, population.baseline_list(run).as_str())?);
             tree.push(VerifySession::list(repository, population.tree_list(run).as_str())?);
         }
-        return Result::Ok(ObjectComparison::against(revision, changes, baseline, tree, limit, run));
+        return Result::Ok(ObjectComparison::against(revision, changes, baseline, tree, limit, run, moves_judged));
     }
 
     /// A list file of the checkout `repository`, read as path to digest.
@@ -471,4 +487,6 @@ private type struct BaselinePhase {
     declared: Array<Declaration>;
     fixed: Array<Declaration>;
     totals: BaselineTotals;
+    /// Whether the run judges every declared move (`VerifySession::moves_judged`).
+    moves_judged: boolean;
 }

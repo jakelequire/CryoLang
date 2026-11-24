@@ -29,12 +29,18 @@ public type struct VerifyChild {
     /// checkout's the way its own flow always has.  `CRYO_RUNTIME` is
     /// `runtime` when one is given (the baseline's programs link the
     /// commit's runtime) and removed otherwise, so each compiler links the
-    /// runtime it builds; `CRYO_CC` defaults to `gcc` on Windows.
-    public static job(program: Str, runtime: Str, stdlib: Str) -> Job {
+    /// runtime it builds; `CRYO_CC` defaults to `gcc` on Windows.  With
+    /// `libraries_beside` - a baseline home's compiler, which holds its
+    /// libraries - the job can load no library but those
+    /// (`Job::load_libraries_beside`), so a home missing one fails to start
+    /// rather than running against the checkout's or an installed LLVM.
+    /// The tree's compiler has none beside it and finds them on PATH.
+    public static job(program: Str, runtime: Str, stdlib: Str, libraries_beside: boolean) -> Job {
         mut job: Job = Job::new(program);
         if (stdlib.is_empty()) { job.remove_variable(Str::new("CRYO_STDLIB")); } else { job.set_variable(Str::new("CRYO_STDLIB"), stdlib); }
         if (runtime.is_empty()) { job.remove_variable(Str::new("CRYO_RUNTIME")); } else { job.set_variable(Str::new("CRYO_RUNTIME"), runtime); }
         job.default_c_compiler();
+        if (libraries_beside) { job.load_libraries_beside(); }
         return job;
     }
 }
@@ -77,7 +83,7 @@ public type struct PopulationRun {
         const stdlib: ProgramStdlib = ProgramStdlib::of_checkout(repository);
         ObjectHashes::wipe(repository, stdlib.directory.as_path())?;
         const gate_runs: Array<GateRun> = PopulationRun::gates(repository, table, names, cryo, directory, Str::new(""),
-            &stdlib, sequential);
+            &stdlib, false, sequential);
         mut counts: Array<i64> = Array::<i64>::new();
         for (population in ObjectPopulation::all().iterate_references()) {
             const rows: Array<String> = ObjectHashes::rows(repository, population, runtime, stdlib.directory.as_path())?;
@@ -89,11 +95,13 @@ public type struct PopulationRun {
 
     /// Run the gates of `table` named in `names`, in that order, over
     /// `cryo` in the checkout `repository`, each logged to
-    /// `<directory>/<gate>.log`, with `runtime` as `VerifyChild::job` takes
-    /// it and the programs built against `stdlib`, and judge each run.  A
-    /// name the table does not hold runs nothing.
+    /// `<directory>/<gate>.log`, with `runtime` and `libraries_beside` as
+    /// `VerifyChild::job` takes them and the programs built against
+    /// `stdlib`, and judge each run.  A name the table does not hold runs
+    /// nothing.
     public static gates(repository: Path, table: &Array<GateCommand>, names: &Array<String>, cryo: Str,
-                        directory: Path, runtime: Str, stdlib: &ProgramStdlib, sequential: boolean) -> Array<GateRun> {
+                        directory: Path, runtime: Str, stdlib: &ProgramStdlib, libraries_beside: boolean,
+                        sequential: boolean) -> Array<GateRun> {
         const spelled: String = stdlib.spelling();
         const variable: String = stdlib.variable();
         mut scheduler: Scheduler = Scheduler::new();
@@ -106,7 +114,7 @@ public type struct PopulationRun {
         for (index in chosen.iterate_references()) {
             const gate: &GateCommand = &table[*index];
             const command: Array<String> = gate.command(cryo, spelled.as_str());
-            mut job: Job = VerifyChild::job(command[0].as_str(), runtime, variable.as_str());
+            mut job: Job = VerifyChild::job(command[0].as_str(), runtime, variable.as_str(), libraries_beside);
             for (index in 1..command.length()) { job.argument(command[index].as_str()); }
             job.directory(repository.as_str());
             const log: String = String::from_str(directory.join(f"{gate.name.as_str()}.log".as_str()).as_path().as_str());

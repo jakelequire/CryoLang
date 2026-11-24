@@ -26,6 +26,7 @@ import std::time::clock::{ Instant };
 import std::time::duration::{ Duration };
 
 import cryogate::core::host::{ Host };
+import cryogate::core::text::{ Text };
 
 /// What became of a job.
 public type enum Outcome {
@@ -228,6 +229,20 @@ public type struct Job {
     ![target(unix)]
     public default_c_compiler(mut &this) -> void { }
 
+    /// For a job running a compiler that keeps its libraries beside itself:
+    /// give it `LibrarySearch::variables()`, so a library missing there
+    /// stops the compiler starting instead of being loaded from a directory
+    /// on PATH.  A POSIX compiler is not searched for that way, and nothing
+    /// changes.
+    ![target(windows)]
+    public load_libraries_beside(mut &this) -> void {
+        for (variable in LibrarySearch::variables().iterate_references()) {
+            this.set_variable(variable.first.as_str(), variable.second.as_str());
+        }
+    }
+    ![target(unix)]
+    public load_libraries_beside(mut &this) -> void { }
+
     /// Write both output streams to the file `path`, created or truncated.
     public log_to(mut &this, path: Str) -> void { this.log = String::from_str(path); }
 
@@ -347,5 +362,98 @@ public type struct Job {
         }
         if (!has_separator) { return String::from_str(program); }
         return Host::absolute(program);
+    }
+}
+
+/// Where a Windows compiler that keeps `LLVM-C.dll` and `libclang.dll`
+/// beside itself finds them.  Windows looks for a library in the program's
+/// own directory and then on PATH, so a directory there holding either
+/// would let the compiler start without its own copy, against another
+/// build's.
+public type struct LibrarySearch {
+    /// The variables that leave a child only the copies beside its
+    /// compiler: `CRYO_CC` and `CRYO_AR`, the C driver and the archiver
+    /// named by the absolute path the inherited PATH gives them - they may
+    /// live in a directory holding a library (msys's mingw64\bin holds gcc,
+    /// ar and libclang.dll) - then `PATH`, the inherited one less every
+    /// directory holding either library.
+    public static variables() -> Array<Pair<String, String>> {
+        const inherited: String = match (env::var(Str::new("PATH"))) {
+            Option::Some(value) => { value }
+            Option::None        => { String::new() }
+        };
+        mut variables: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
+        mut drivers: Array<Str> = Array::<Str>::new();
+        drivers.push(Str::new("gcc"));
+        variables.push(Pair::new(String::from_str(Str::new("CRYO_CC")),
+                                 LibrarySearch::named_program(inherited.as_str(), Str::new("CRYO_CC"), &drivers)));
+        mut archivers: Array<Str> = Array::<Str>::new();
+        archivers.push(Str::new("ar"));
+        archivers.push(Str::new("llvm-ar"));
+        archivers.push(Str::new("llvm-ar-20"));
+        variables.push(Pair::new(String::from_str(Str::new("CRYO_AR")),
+                                 LibrarySearch::named_program(inherited.as_str(), Str::new("CRYO_AR"), &archivers)));
+        variables.push(Pair::new(String::from_str(Str::new("PATH")),
+                                 LibrarySearch::search_path_without(inherited.as_str(), Str::new(";"), &LibrarySearch::libraries())));
+        return variables;
+    }
+
+    /// The libraries a Windows compiler loads, by file name.
+    public static libraries() -> Array<Str> {
+        mut libraries: Array<Str> = Array::<Str>::new();
+        libraries.push(Str::new("LLVM-C.dll"));
+        libraries.push(Str::new("libclang.dll"));
+        return libraries;
+    }
+
+    /// The search path `search`, its directories separated by `separator`,
+    /// less every directory holding a file named in `libraries` and every
+    /// empty entry, in the order given.
+    public static search_path_without(search: Str, separator: Str, libraries: &Array<Str>) -> String {
+        mut kept: Array<String> = Array::<String>::new();
+        for (entry in search.split_nonempty(&separator)) {
+            mut supplies: boolean = false;
+            for (library in libraries.iterate_references()) {
+                if (Path::from(entry).join(*library).as_path().is_file()) { supplies = true; }
+            }
+            if (!supplies) { kept.push(String::from_str(entry)); }
+        }
+        return Text::joined(&kept, separator);
+    }
+
+    /// The program a compiler runs for the role the variable `variable`
+    /// names (`CRYO_CC`, `CRYO_AR`): the variable's own value when it is
+    /// set, else the first of `defaults` found, as the compiler tries them.
+    /// A bare name is given the absolute path of the first `;`-separated
+    /// directory of `search` holding it (with `.exe` when it names no
+    /// extension); a path, or a name found nowhere, is kept as it is, and
+    /// the compiler that cannot start it says so.
+    public static named_program(search: Str, variable: Str, defaults: &Array<Str>) -> String {
+        mut names: Array<String> = Array::<String>::new();
+        match (env::var(variable)) {
+            Option::Some(value) => { names.push(value); }
+            Option::None        => { for (name in defaults.iterate_references()) { names.push(String::from_str(*name)); } }
+        }
+        for (name in names.iterate_references()) {
+            match (LibrarySearch::located(search, name.as_str())) {
+                Option::Some(found) => { return found; }
+                Option::None        => { }
+            }
+        }
+        return names.get_reference(0).unwrap().clone();
+    }
+
+    /// The absolute path of the program `name` in the first `;`-separated
+    /// directory of `search` holding it, trying `name.exe` when `name` has
+    /// no extension; `None` for a name that is already a path, or one no
+    /// directory holds.
+    public static located(search: Str, name: Str) -> Option<String> {
+        if (name.contains(&Str::new("/")) || name.contains(&Str::new("\\"))) { return Option::None; }
+        const file: String = if (Path::from(name).extension().is_some()) { String::from_str(name) } else { f"{name}.exe" };
+        for (entry in search.split_nonempty(&Str::new(";"))) {
+            const candidate: PathBuf = Path::from(entry).join(file.as_str());
+            if (candidate.as_path().is_file()) { return Option::Some(String::from_str(candidate.as_path().as_str())); }
+        }
+        return Option::None;
     }
 }

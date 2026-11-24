@@ -19,7 +19,7 @@ import std::io::error::{ IoErrorKind };
 import cryogate::baseline::cache::{ BaselineCache };
 import cryogate::baseline::clone::{ BaselineClone };
 import cryogate::baseline::keys::{ BaselineKey, ProgramStdlib };
-import cryogate::core::child::{ Completion, Job };
+import cryogate::core::child::{ Completion, Job, LibrarySearch };
 import cryogate::core::git::{ Git };
 import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
@@ -72,6 +72,7 @@ public type struct BaselineCompiler {
             fmt::println(f"verify: building the baseline compiler for {revision} (compiler/src {BaselineCompiler::short(sources.as_str())}, {whose} stdlib) in .verify/src");
             BaselineCompiler::build(repository, logs, commit.as_str(), state.as_path(), home.as_path(), triple, stdlib_from_commit)?;
         }
+        BaselineCompiler::starts(repository, logs, compiler.as_path(), home.as_path(), runtime_home.as_path(), &stdlib)?;
         BaselineCache::mark(home.as_path())?;
         const _: Array<String> = BaselineCache::prune(homes.as_path(), key.as_str())?;
         // A runtime its compiler builds for itself lands below its sources;
@@ -103,7 +104,7 @@ public type struct BaselineCompiler {
             Option::Some(file) => { file }
             Option::None       => { return false; }
         };
-        mut job: Job = VerifyChild::job(this.compiler.as_path().as_str(), this.runtime_home.as_path().as_str(), this.stdlib.variable().as_str());
+        mut job: Job = VerifyChild::job(this.compiler.as_path().as_str(), this.runtime_home.as_path().as_str(), this.stdlib.variable().as_str(), true);
         job.argument(Str::new("test"));
         job.argument(Str::new("--suite=compile-fail"));
         job.argument(Str::new("--format=plain"));
@@ -146,7 +147,7 @@ public type struct BaselineCompiler {
             runtime_for_make = String::from_str(repository.join(Str::new("runtime")).as_path().as_str());
         }
         const log: PathBuf = state.join(Str::new("baseline-build.log"));
-        mut make: Job = VerifyChild::job(Str::new("make"), runtime_for_make.as_str(), Str::new(""));
+        mut make: Job = VerifyChild::job(Str::new("make"), runtime_for_make.as_str(), Str::new(""), false);
         make.argument(Str::new("--no-print-directory"));
         make.argument(Str::new("cryo"));
         make.directory(clone.as_path().as_str());
@@ -219,10 +220,42 @@ public type struct BaselineCompiler {
         return BaselineCompiler::copy(built.as_path(), home.join(Host::executable_name(Str::new("cryo")).as_str()).as_path());
     }
 
+    /// Refused unless the home `home`'s compiler `compiler` starts as its
+    /// programs' runs start it, loading only the libraries in its home:
+    /// `cryo version`, with `runtime` and `stdlib` as they are given, logged
+    /// to the run's `baseline-version` log.  The refusal names each library
+    /// of `bin/` the home lacks, and shows the commands that restore it.
+    private static starts(repository: Path, logs: &RunLogs, compiler: Path, home: Path, runtime: Path, stdlib: &ProgramStdlib) -> Result<(), String> {
+        mut job: Job = VerifyChild::job(compiler.as_str(), runtime.as_str(), stdlib.variable().as_str(), true);
+        job.argument(Str::new("version"));
+        const log: String = logs.file(Str::new("baseline-version"));
+        job.log_to(log.as_str());
+        const done: Completion = job.run();
+        if (done.outcome.succeeded()) { return Result::Ok(()); }
+        const shown_home: String = PopulationRun::relative(repository, home.as_str());
+        const bin: PathBuf = repository.join(Str::new("bin"));
+        mut lacking: Array<String> = Array::<String>::new();
+        for (name in Tree::names(bin.as_path(), &Array::<String>::new())?.iterate_references()) {
+            if (!name.as_str().to_ascii_lowercase().as_str().ends_with(&Str::new(".dll"))) { continue; }
+            if (!home.join(name.as_str()).as_path().is_file()) { lacking.push(name.clone()); }
+        }
+        mut text: String = f"the baseline compiler {PopulationRun::relative(repository, compiler.as_str()).as_str()} does not start ({done.outcome.describe().as_str()}; see {PopulationRun::relative(repository, log.as_str()).as_str()})";
+        if (!lacking.is_empty()) {
+            text.push(f": its home lacks {Text::joined(&lacking, Str::new(", ")).as_str()}, and a baseline compiler loads its libraries from its home alone, never from PATH".as_str());
+        }
+        text.push(f"\n  help: remove the home, and the next run builds it again with bin/'s libraries linked into it:\n            rm -rf {shown_home.as_str()}".as_str());
+        if (Host::os() != Str::new("windows")) { return Result::Err(text); }
+        for (name in LibrarySearch::libraries().iterate_references()) {
+            if (bin.join(*name).as_path().is_file()) { continue; }
+            text.push(f"\n        bin/ lacks {*name} too; copy the fetched toolchain's into it first, as `make pin` does:\n            cp .toolchains/llvm-win/bin/{*name} bin/".as_str());
+        }
+        return Result::Err(text);
+    }
+
     /// `pin build --no-incremental --build-dir=<output>` in `directory`,
     /// logged to `log`; refused unless it succeeds.
     private static step(pin: Str, directory: Path, output: Str, log: Path) -> Result<(), String> {
-        mut job: Job = VerifyChild::job(pin, Str::new(""), Str::new(""));
+        mut job: Job = VerifyChild::job(pin, Str::new(""), Str::new(""), false);
         job.argument(Str::new("build"));
         job.argument(Str::new("--no-incremental"));
         job.argument(f"--build-dir={output}".as_str());

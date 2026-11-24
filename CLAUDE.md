@@ -245,14 +245,14 @@ not done. The remaining limits are here so nobody rediscovers them:
   moves shows, in the archives and in the programs, and is declared as any
   other (`moved-archive:<module>`, `moved:<project>`,
   `moved-instances:<module>`).  This replaces building the stdlib before
-  and after at one path and hashing the objects by hand.  The cost: a tree
-  test that uses stdlib API REV lacks is refused by the baseline.  A
-  project is declared in `tests/started-compiling` (refused by REV with its
-  own stdlib, built by the tree), and its objects are left out.  The unit
-  suite is ONE build, so a unit test using the new API fails the baseline's
-  whole unit suite and nothing can declare that: run the option against a
-  REV that has the API (the commit that added it), or hold such a test in a
-  `collect` project.  A record made against REV's stdlib is keyed by that
+  and after at one path and hashing the objects by hand.  The moves are
+  declared for that run: the default run cannot show them, and while the
+  tree's stdlib differs from REV's it leaves the declared moves out
+  unjudged, so one stdlib change passes both runs with
+  `--require-identical`.  The cost: a tree test that uses stdlib API REV
+  lacks fails the baseline (a unit test stops the whole unit build), and the
+  run fails saying so - run the default mode, or the option against a REV
+  that has the API (the commit that added it).  A record made against REV's stdlib is keyed by that
   stdlib's origin and text and is never read by a default run, nor the
   reverse.
 

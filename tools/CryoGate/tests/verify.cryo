@@ -14,8 +14,11 @@ import std::test::assert::{ expect, expect_equal };
 import std::collections::hashmap::{ HashMap };
 import std::collections::pair::{ Pair };
 
+import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
+import std::fs::temporary::{ TemporaryDirectory };
 
+import cryogate::core::child::{ Job, LibrarySearch };
 import cryogate::core::host::{ Host };
 import cryogate::core::text::{ Text };
 import cryogate::verify::comparison::{ Compared, ObjectComparison };
@@ -25,6 +28,7 @@ import cryogate::verify::hashing::{ ObjectHashes };
 import cryogate::verify::judges::{ BaselineCensus, VerifyJudges };
 import cryogate::verify::objects::{ ObjectOwner };
 import cryogate::verify::record::{ BaselineRecord };
+import cryogate::verify::run::children::{ VerifyChild };
 import cryogate::verify::runtime::{ RuntimeArchives };
 import std::encoding::sha256::{ Sha256 };
 
@@ -132,6 +136,47 @@ type struct Checkout {
             Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
         };
     }
+
+    /// The file `from` given the second name `to`, or copied there where
+    /// the filesystem makes no link.
+    private static place(from: Path, to: Path) -> Result<(), TestError> {
+        return match (File::hard_link(from, to)) {
+            Result::Ok(_) => { Result::Ok(()) }
+            Result::Err(_) => {
+                match (File::copy(from, to)) {
+                    Result::Ok(_)      => { Result::Ok(()) }
+                    Result::Err(error) => { Result::Err(TestError::other(error.describe())) }
+                }
+            }
+        };
+    }
+}
+
+/// A baseline home's compiler loads only the libraries beside it: a copy
+/// of the pin with none beside it does not start, whatever PATH holds, and
+/// one with them beside it does.
+![target(windows)]
+![test]
+function a_compiler_run_with_its_libraries_beside_it_loads_none_from_path() -> Result<(), TestError> {
+    const root: PathBuf = Checkout::root()?;
+    const scratch: TemporaryDirectory = match (TemporaryDirectory::create()) {
+        Result::Ok(directory) => { directory }
+        Result::Err(error)    => { return Result::Err(TestError::other(error.describe())); }
+    };
+    const home: Path = scratch.path();
+    const compiler: PathBuf = home.join(Str::new("cryo.exe"));
+    Checkout::place(root.join(Str::new("bin/cryo.exe")).as_path(), compiler.as_path())?;
+    mut bare: Job = VerifyChild::job(compiler.as_path().as_str(), Str::new(""), Str::new(""), true);
+    bare.argument(Str::new("version"));
+    bare.log_to(home.join(Str::new("bare.log")).as_path().as_str());
+    expect(!bare.run().outcome.succeeded(), Str::new("with no library beside it, the compiler loaded one from PATH"))?;
+    for (name in LibrarySearch::libraries().iterate_references()) {
+        Checkout::place(root.join(Str::new("bin")).join(*name).as_path(), home.join(*name).as_path())?;
+    }
+    mut beside: Job = VerifyChild::job(compiler.as_path().as_str(), Str::new(""), Str::new(""), true);
+    beside.argument(Str::new("version"));
+    beside.log_to(home.join(Str::new("beside.log")).as_path().as_str());
+    return expect(beside.run().outcome.succeeded(), Str::new("with its libraries beside it, the compiler starts"));
 }
 
 ![test]
@@ -281,12 +326,12 @@ function a_unit_test_file_names_its_object_by_its_namespace() -> Result<(), Test
 /// A comparison over maps written as `Judged::map` text, the populations
 /// in the order tests, examples, stdlib, runtime.
 type struct Comparing {
-    private static of(changes: &DeclaredChanges, baseline: Array<Str>, tree: Array<Str>, limit: i64) -> Compared {
+    private static of(changes: &DeclaredChanges, baseline: Array<Str>, tree: Array<Str>, limit: i64, moves_judged: boolean) -> Compared {
         mut a: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
         mut b: Array<HashMap<String, String>> = Array::<HashMap<String, String>>::new();
         for (text in baseline.iterate_references()) { a.push(Judged::map(*text)); }
         for (text in tree.iterate_references()) { b.push(Judged::map(*text)); }
-        return ObjectComparison::against(Str::new("HEAD"), changes, a, b, limit, Str::new("run"));
+        return ObjectComparison::against(Str::new("HEAD"), changes, a, b, limit, Str::new("run"), moves_judged);
     }
 
     private static nothing_declared() -> DeclaredChanges {
@@ -297,6 +342,11 @@ type struct Comparing {
             moved_members: Array::<String>::new(),
             archive_files: Array::<String>::new(), problems: Array::<String>::new(),
         };
+    }
+
+    /// One test object and the archive objects `stdlib`.
+    private static archive(stdlib: Str) -> Array<Str> {
+        return Comparing::populations(Str::new("t/a.o=1"), Str::new(""), stdlib, Str::new(""));
     }
 
     private static populations(tests: Str, examples: Str, stdlib: Str, runtime: Str) -> Array<Str> {
@@ -316,7 +366,7 @@ function the_comparison_reports_each_population_as_verify_does() -> Result<(), T
         Comparing::populations(Str::new("t/build/a.o=1;t/build/b.o=1;t/build/x/std/deps/std/io.o=1"), Str::new(""),
             Str::new("stdlib-archive/w/O0/x.o=1;stdlib-archive/w/O2/x.o=1"), Str::new("runtime/freestanding/00-Sys.o=1")),
         Comparing::populations(Str::new("t/build/a.o=2;t/build/c.o=1"), Str::new(""),
-            Str::new("stdlib-archive/w/O0/x.o=1"), Str::new("runtime/freestanding/00-Sys.o=2")), 1);
+            Str::new("stdlib-archive/w/O0/x.o=1"), Str::new("runtime/freestanding/00-Sys.o=2")), 1, true);
     const shown: String = Text::joined(&compared.lines, Str::new("\n"));
     expect_equal(shown.as_str(), Str::new(
         "verify: objects against HEAD\n"
@@ -337,7 +387,7 @@ function a_long_list_names_how_many_more_and_where() -> Result<(), TestError> {
     const changes: DeclaredChanges = Comparing::nothing_declared();
     const compared: Compared = Comparing::of(&changes,
         Comparing::populations(Str::new("a.o=1;b.o=1;c.o=1"), Str::new(""), Str::new(""), Str::new("")),
-        Comparing::populations(Str::new("a.o=2;b.o=2;c.o=2"), Str::new(""), Str::new(""), Str::new("")), 2);
+        Comparing::populations(Str::new("a.o=2;b.o=2;c.o=2"), Str::new(""), Str::new(""), Str::new("")), 2, true);
     return expect_equal(compared.lines[4].as_str(),
         Str::new("      ... 1 more moved (full lists: run/baseline/base.tests.sha256, run/tree.tests.sha256)"));
 }
@@ -352,7 +402,7 @@ function a_declared_projects_objects_are_left_out_of_the_comparison() -> Result<
         Comparing::populations(Str::new("tests/tests/projects/p/build/a.o=1;tests/tests/projects/pq/build/a.o=1"),
             Str::new("examples/e/build/m.o=1"), Str::new(""), Str::new("")),
         Comparing::populations(Str::new("tests/tests/projects/p/build/a.o=2;tests/tests/projects/pq/build/a.o=1"),
-            Str::new("examples/e/build/m.o=2"), Str::new(""), Str::new("")), 40);
+            Str::new("examples/e/build/m.o=2"), Str::new(""), Str::new("")), 40, true);
     expect_equal(compared.lines[1].as_str(), Str::new("  tests     declared projects' objects left out: baseline 1, tree 1"))?;
     expect_equal(compared.lines[3].as_str(), Str::new("  examples  declared projects' objects left out: baseline 1, tree 1"))?;
     expect_equal(compared.changed, 0)?;
@@ -426,6 +476,49 @@ function an_example_declared_moved_must_move_one_of_its_objects() -> Result<(), 
     // A test project of the same name is not the example.
     return expect_equal(Judged::project_moves(Str::new("moved:examples/e"),
         Str::new("tests/tests/projects/examples/e/a.o=1"), Str::new("tests/tests/projects/examples/e/a.o=2")), 1);
+}
+
+/// A stdlib edit moves archive objects only where the baseline builds its
+/// own commit's stdlib; a run whose sides build one stdlib leaves the
+/// declared module out and judges nothing of it, while an undeclared move
+/// fails either run.
+![test]
+function a_declared_move_is_judged_only_where_the_stdlib_edit_can_show() -> Result<(), TestError> {
+    mut changes: DeclaredChanges = Comparing::nothing_declared();
+    changes.moved_modules.push(String::from_str(Str::new("moved-archive:std::m")));
+    const unmoved: Str = Str::new("stdlib-archive/t/O0/x/deps/std/m.o=1;stdlib-archive/t/O0/x/deps/std/n.o=1");
+    const judged: Compared = Comparing::of(&changes, Comparing::archive(unmoved), Comparing::archive(unmoved), 40, true);
+    expect_equal(judged.problems.length(), 1)?;
+    const unjudged: Compared = Comparing::of(&changes, Comparing::archive(unmoved), Comparing::archive(unmoved), 40, false);
+    expect_equal(unjudged.problems.length(), 0)?;
+    expect_equal(unjudged.changed, 0)?;
+    const shown: String = Text::joined(&unjudged.lines, Str::new("\n"));
+    expect(shown.as_str().contains(&Str::new(
+        "  stdlib    declared moved modules left out, not judged: 1 (both sides build this tree's stdlib, which the change edits; --baseline-stdlib judges them)\n"
+        "  stdlib    baseline     1  tree     1  moved 0")), Str::new("the module left out, unjudged"))?;
+    // Against the baseline's own stdlib the module moved, as declared.
+    const moved: Str = Str::new("stdlib-archive/t/O0/x/deps/std/m.o=2;stdlib-archive/t/O0/x/deps/std/n.o=1");
+    const own: Compared = Comparing::of(&changes, Comparing::archive(unmoved), Comparing::archive(moved), 40, true);
+    expect_equal(own.problems.length(), 0)?;
+    expect_equal(own.changed, 0)?;
+    // A module nothing declares that moved is a move whether judged or not.
+    const undeclared: Str = Str::new("stdlib-archive/t/O0/x/deps/std/m.o=1;stdlib-archive/t/O0/x/deps/std/n.o=2");
+    expect_equal(Comparing::of(&changes, Comparing::archive(unmoved), Comparing::archive(undeclared), 40, true).changed, 1)?;
+    expect_equal(Comparing::of(&changes, Comparing::archive(unmoved), Comparing::archive(undeclared), 40, false).changed, 1)?;
+    // Unjudged, a declared unit-suite module, project or example is left
+    // out the same way.
+    mut others: DeclaredChanges = Comparing::nothing_declared();
+    others.moved_instances.push(String::from_str(Str::new("moved-instances:std::m")));
+    others.moved_projects.push(String::from_str(Str::new("moved:p")));
+    others.moved_examples.push(String::from_str(Str::new("moved:examples/e")));
+    const tests: Str = Str::new("tests/build/x/deps/std/m.o=1;tests/tests/projects/p/build/a.o=1");
+    const example: Str = Str::new("examples/e/build/a.o=1");
+    expect_equal(Comparing::of(&others, Comparing::populations(tests, example, Str::new(""), Str::new("")),
+        Comparing::populations(tests, example, Str::new(""), Str::new("")), 40, true).problems.length(), 3)?;
+    const left_out: Compared = Comparing::of(&others, Comparing::populations(tests, example, Str::new(""), Str::new("")),
+        Comparing::populations(tests, example, Str::new(""), Str::new("")), 40, false);
+    expect_equal(left_out.problems.length(), 0)?;
+    return expect_equal(left_out.changed, 0);
 }
 
 ![test]
@@ -516,7 +609,7 @@ function runtimes_laid_out_differently_are_not_compared_and_their_declarations_n
     changes.moved_members.push(String::from_str(Str::new("moved-runtime:hosted-unwind/Sys.o")));
     const compared: Compared = Comparing::of(&changes,
         Comparing::populations(Str::new(""), Str::new(""), Str::new(""), Str::new("runtime/libcryort-core.a/00-Sys.o=1")),
-        Comparing::populations(Str::new(""), Str::new(""), Str::new(""), Str::new("runtime/hosted-unwind/00-Sys.o=2;runtime/hosted-unwind/01-Entry.o=1")), 40);
+        Comparing::populations(Str::new(""), Str::new(""), Str::new(""), Str::new("runtime/hosted-unwind/00-Sys.o=2;runtime/hosted-unwind/01-Entry.o=1")), 40, true);
     expect_equal(compared.lines[compared.lines.length() - 1].as_str(), Str::new(
         "  runtime   baseline     1  tree     2  NOT COMPARED: the baseline's runtime is laid out as tiers, the tree's as configurations"))?;
     expect_equal(compared.problems.length(), 0)?;
@@ -529,7 +622,7 @@ function a_declared_runtime_member_is_judged_before_the_runtime_is_compared() ->
     changes.moved_members.push(String::from_str(Str::new("moved-runtime:hosted-unwind/Sys.o")));
     const compared: Compared = Comparing::of(&changes,
         Comparing::populations(Str::new(""), Str::new(""), Str::new(""), Str::new("runtime/hosted-unwind/00-Sys.o=1;runtime/hosted-unwind/01-Entry.o=1")),
-        Comparing::populations(Str::new(""), Str::new(""), Str::new(""), Str::new("runtime/hosted-unwind/00-Sys.o=2;runtime/hosted-unwind/01-Entry.o=1")), 40);
+        Comparing::populations(Str::new(""), Str::new(""), Str::new(""), Str::new("runtime/hosted-unwind/00-Sys.o=2;runtime/hosted-unwind/01-Entry.o=1")), 40, true);
     const shown: String = Text::joined(&compared.lines, Str::new("\n"));
     expect(shown.as_str().ends_with(&Str::new(
         "  runtime   declared moved runtime members left out: 1, 0 problem(s)\n"

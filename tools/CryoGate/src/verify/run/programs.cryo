@@ -135,6 +135,63 @@ public type struct BaselinePlan {
         if (words[0].as_str() == Str::new("FAIL")) { return Option::Some(Pair::new(words[1].clone(), true)); }
         return Option::None;
     }
+
+    /// The problem a baseline run that gave the programs `unanswered` no
+    /// verdict is reported as.  `lines` is its census's log, which lies at
+    /// `log`, and is empty when no census ran.  A census whose unit-test
+    /// build was refused stops there, before the projects and compile-fail
+    /// files, so the refusal is named with its first error.  When the
+    /// programs built against the baseline commit `commit`'s own stdlib
+    /// (`own_stdlib`), the tree's tests use API that stdlib lacks, and the
+    /// help shows the two runs that can judge the change; otherwise the
+    /// baseline compiler refuses a unit test, and the help shows where such
+    /// a test goes.
+    public static no_verdict(unanswered: &Array<String>, lines: &Array<String>, log: Str, own_stdlib: boolean, commit: Str) -> String {
+        mut shown: Array<String> = Array::<String>::new();
+        for (index in 0..unanswered.length()) { if (index < 10) { shown.push(unanswered[index].clone()); } }
+        const count: String = f"no verdict for {unanswered.length()} program(s): {Text::joined(&shown, Str::new(" ")).as_str()}";
+        mut refusal: Option<String> = Option::None;
+        mut first_error: Array<String> = Array::<String>::new();
+        for (index in 0..lines.length()) {
+            const line: Str = lines[index].as_str().trim();
+            if (refusal.is_none() && line.starts_with(&Str::new("Test build failed"))) { refusal = Option::Some(String::from_str(line)); }
+            if (first_error.is_empty() && line.starts_with(&Str::new("error["))) {
+                first_error.push(String::from_str(line));
+                if (index + 1 < lines.length()) { first_error.push(String::from_str(lines[index + 1].as_str().trim())); }
+            }
+        }
+        const refused: String = match (refusal) {
+            Option::Some(line) => { line }
+            Option::None       => {
+                return if (lines.is_empty()) { f"the baseline run gave {count.as_str()}" } else { f"the baseline run gave {count.as_str()}; see its census log, {log}" };
+            }
+        };
+        mut text: String = f"the baseline's census could not build the tree's unit tests ({refused.as_str()}) and stopped there, so it gave {count.as_str()}; see {log}";
+        if (!first_error.is_empty()) { text.push(f"\n  first error: {Text::joined(&first_error, Str::new(" ")).as_str()}".as_str()); }
+        if (!own_stdlib) {
+            text.push(Str::new("\n  help: a unit test the baseline compiler cannot build goes in a test project whose test.json is {\"outcome\": \"collect\"}, declared in tests/started-passing with what the baseline refused:\n            <project> <what the baseline refused, and what the tree does>"));
+            return text;
+        }
+        text.push(Str::new("\n  why: --baseline-stdlib builds the tree's tests against the baseline commit's own stdlib, and the baseline's stdlib lacks API this tree's tests use"));
+        text.push(BaselinePlan::own_stdlib_help(commit).as_str());
+        return text;
+    }
+
+    /// The problem added when a baseline built against the commit `commit`'s
+    /// own stdlib fails programs nothing declares: each may be a test using
+    /// API that stdlib lacks, which the census log at `log` shows.
+    public static own_stdlib_failures(commit: Str, log: Str) -> String {
+        mut text: String = f"under --baseline-stdlib the baseline builds this tree's tests against its commit's own stdlib, so a test using API that stdlib lacks fails there; the census log of the run that ran them says which ({log})";
+        text.push(BaselinePlan::own_stdlib_help(commit).as_str());
+        return text;
+    }
+
+    /// The help for a change whose tests the baseline commit `commit`'s own
+    /// stdlib cannot build: the two runs that can judge it.
+    private static own_stdlib_help(commit: Str) -> String {
+        const short: Str = if (commit.length() > 12) { commit.byte_substring(0, 12) } else { commit };
+        return f"\n  help: judge the change in the default mode, where both compilers build against this tree's stdlib:\n            make verify ARGS=\"--baseline {short} --require-identical\"\n        or name a baseline commit whose stdlib has that API, such as the commit that added it:\n            make verify ARGS=\"--baseline <commit> --baseline-stdlib --require-identical\"";
+    }
 }
 
 /// What the baseline's records add up to.
@@ -268,7 +325,7 @@ public type struct BaselinePrograms {
             mut sweep: Array<String> = Array::<String>::new();
             sweep.push(String::from_str(Str::new("examples")));
             const runs: Array<GateRun> = PopulationRun::gates(repository, &GateCommand::table(cryogate), &sweep,
-                baseline.compiler.as_path().as_str(), directory, runtime, &baseline.stdlib, true);
+                baseline.compiler.as_path().as_str(), directory, runtime, &baseline.stdlib, true, true);
             fmt::println(runs[0].report(repository));
             const log: String = match (File::read_text(Path::from(runs[0].log.as_str()))) {
                 Result::Ok(text) => { text }
@@ -304,7 +361,7 @@ public type struct BaselinePrograms {
             const several: boolean = !plan.everything
                 && baseline.takes_several_patterns(repository, &negatives, directory.join(Str::new("patterns.log")).as_path());
             const patterns: Array<String> = plan.patterns(several);
-            mut job: Job = VerifyChild::job(baseline.compiler.as_path().as_str(), runtime, baseline.stdlib.variable().as_str());
+            mut job: Job = VerifyChild::job(baseline.compiler.as_path().as_str(), runtime, baseline.stdlib.variable().as_str(), true);
             job.argument(Str::new("test"));
             job.argument(Str::new("--format=plain"));
             job.argument(Str::new("-Werror=W0017"));
@@ -343,9 +400,13 @@ public type struct BaselinePrograms {
             if (!answered) { unanswered.push(name.clone()); }
         }
         if (!unanswered.is_empty()) {
-            mut shown: Array<String> = Array::<String>::new();
-            for (index in 0..unanswered.length()) { if (index < 10) { shown.push(unanswered[index].clone()); } }
-            return Result::Err(f"the baseline run gave no verdict for {unanswered.length()} program(s): {Text::joined(&shown, Str::new(" ")).as_str()}");
+            const census_log: PathBuf = directory.join(Str::new("census.log"));
+            const log_text: String = match (File::read_text(census_log.as_path())) {
+                Result::Ok(text) => { text }
+                Result::Err(_)   => { String::new() }
+            };
+            return Result::Err(BaselinePlan::no_verdict(&unanswered, &Text::lines(log_text.as_str()),
+                PopulationRun::relative(repository, census_log.as_path().as_str()).as_str(), baseline.stdlib.from_baseline, baseline.commit.as_str()));
         }
         for (index in 0..fresh.length()) {
             const name: Str = fresh[index].name.as_str();

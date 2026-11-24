@@ -684,10 +684,10 @@ the comparison reads:
   module's object in every archive both runs built is left out of the
   archive comparison, and at least one of them must have moved; a declared
   module whose archive objects are all unchanged fails, and so does a name
-  that is no module of the standard library.  A change to the library's
-  SOURCE never needs it: verify builds this tree's stdlib with both
-  compilers, so a source edit moves nothing there by construction - prove one
-  by building the library before and after at one path.
+  that is no module of the standard library.  An edit of the library's
+  SOURCE moves nothing there in the default run, which builds this tree's
+  stdlib with both compilers; a run against the baseline's own stdlib (below)
+  shows what it moves.
 - `moved-instances:<module>` in `tests/started-passing` - a standard-library
   module, by its full name, whose object in the unit suite's own build the
   change moves on purpose.  That object holds the generic instances of the
@@ -712,6 +712,30 @@ the comparison reads:
   one declares its member once per configuration whose archive it moved in.
   Against a baseline whose runtime is laid out as one archive per tier, the
   runtime population is reported as not compared: no member pairs with one.
+
+`ARGS="--baseline REV --baseline-stdlib --require-identical"` builds the
+baseline compiler and its programs against REV's own stdlib instead, in a
+home of its own in `.verify/baseline/`, so each object an edit of the stdlib
+moves shows, in the archives and in the programs, and is declared as above.
+Such a change declares those moves once, for that run.  The default run
+cannot show them, its two sides building one stdlib, so while the tree's
+stdlib differs from REV's it leaves the declared modules', projects' and
+examples' objects out without requiring them to have moved (`declared moved
+... left out, not judged`); a run against REV's own stdlib judges every
+declaration.  A stdlib change therefore passes both runs with
+`--require-identical`, and an undeclared move fails either.  The programs
+are this tree's tests, so one using API that REV's stdlib lacks fails the
+baseline - a unit test stops the whole unit build - and the run fails naming
+the refusal and the census log, and showing the two runs that can judge such
+a change: the default one, or `--baseline-stdlib` against a commit whose
+stdlib has that API.
+
+A baseline compiler lives in its home with the libraries it loads (on
+Windows `LLVM-C.dll` and `libclang.dll`, linked from `bin/`), and everything
+it runs is given a PATH holding no directory with either, so it loads its
+own and no other build's.  verify starts it once (`cryo version`) before its
+programs run; a home missing a library fails the run, naming the library
+and showing the command that has the next run build the home again.
 
 A line stays once committed: against a later baseline it is inert.
 Rewriting a line into another form with its reason kept declares nothing
