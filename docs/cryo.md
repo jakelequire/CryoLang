@@ -1327,12 +1327,19 @@ function is_seven(x: &i32) -> boolean {
 }
 ```
 
-The alternative - quietly dereferencing - was rejected because the comparison did not previously dereference: it compared the reference's *address* with `7`, which compiled and was silently false. Refusing it makes the one meaning explicit at the call site. What stays allowed: two references compared with each other, and a reference compared with `null`. Two references compare the values they refer to when the referent implements the operator's trait - `Eq` for `==` and `!=`, `Ord` for `<`, `>`, `<=` and `>=` - whatever kind of type it is, so `a == b` on two `&i64` is `a.equals(b)` and always agrees with it. When the referent does not implement `Eq`, `==` and `!=` compare the two references by identity. When it does not implement `Ord`, `<`, `>`, `<=` and `>=` are refused (E0229): an order of two addresses says nothing about the values. A user type is told to implement `Ord`; a float, which has no total order, is shown its values compared (`*a < *b`) and `total_compare`; any other referent is shown its values compared where its own operator orders them, and its addresses otherwise:
+The alternative - quietly dereferencing - was rejected because the comparison did not previously dereference: it compared the reference's *address* with `7`, which compiled and was silently false. Refusing it makes the one meaning explicit at the call site. What stays allowed: two references compared with each other, and a reference compared with `null`. Two references compare the values they refer to, by the referent's implementation of the operator's trait - `Eq` for `==` and `!=`, `Ord` for `<`, `>`, `<=` and `>=` - whatever kind of type it is, so `a == b` on two `&i64` is `a.equals(b)` and always agrees with it. When the referent does not implement the trait, the comparison is refused (E0229): two references never compare their addresses, since `a == b` reads as a comparison of values and an order of two addresses says nothing about them. The help writes what the program can mean. A referent whose own operator compares it is shown its values compared (`*a == *b`, `*a < *b`); a float, which has `Eq` but no total order, is shown its values compared and `total_compare` for an ordering. A user type is told to implement the trait, and beside `==` and `!=` is also shown its addresses compared, both references converted to pointers (`(a as T*) == (b as T*)`); any other referent is shown its addresses:
 
 ```cryo
 const four: i64 = 4;
 const other_four: i64 = 4;
 const same: boolean = &four == &other_four;     // true: 4 equals 4, at two addresses
+
+type struct Plain { value: i64; }
+
+function same_place(a: &Plain, b: &Plain) -> boolean {
+    return a == b;                            // error[E0229]: `Plain` does not implement `Eq`
+    return (a as Plain*) == (b as Plain*);    // compares the addresses
+}
 
 function earlier(a: &f64, b: &f64) -> boolean {
     return a < b;      // error[E0229]: `f64` does not implement `Ord`
@@ -2971,8 +2978,8 @@ b.x = 10;             // auto-deref: (*b.deref_mutable()).x - b has no field `x`
 **Reference operands.** A by-reference operand (`&T`, the common
 container/parameter case) overloads exactly like a value - `v[i]`, `a + b`,
 `-a`, and `a == b` all work when `a`/`v` is a `&T`. In particular `&x == &y`
-(where the referent implements `Eq`) compares **by value** (`x.equals(&y)`),
-not by pointer identity. A raw pointer `T*` is never unwrapped this way: `p ==
+compares **by value** (`x.equals(&y)`), never by pointer identity, and is
+refused where the referent does not implement `Eq`. A raw pointer `T*` is never unwrapped this way: `p ==
 null` and pointer arithmetic stay on the primitive path, and a reference is
 not compared with a pointer at all ([section 5.2](#52-comparison)).
 

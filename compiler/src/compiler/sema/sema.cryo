@@ -2783,21 +2783,17 @@ type struct SemaVisitor {
     /// `==` and `!=`, `Ord` for `<`, `>`, `<=` and `>=`), whatever kind of
     /// type the referent is.  `&i64 == &i64` is `i64`'s `equals`, so the
     /// operator on references always agrees with `equals` and `compare`.
-    /// Null when the referent does not implement the trait: `==` and `!=`
-    /// then compare the references by identity, and an ordering is refused
-    /// (`refuse_unordered_references`), since an order of two addresses says
-    /// nothing about the values.
+    /// Null when the referent does not implement the trait: the comparison
+    /// is refused (`refuse_reference_comparison`), since two references are
+    /// compared only by the values they refer to.
     referent_comparison_expr(mut &this, receiver: mut ExpressionNode*, ty: TypeRef,
                              rhs: mut ExpressionNode*, map: OperatorTraitMap,
                              op_tok: Token, span: SourceSpan) -> mut ExpressionNode* {
         const t: Type* = this.arena.lookup(ty);
         if (t == null || t.kind != TypeKind::Reference) { return null; }
         const trait_id: DefId = this.ctx.generic_registry.wellknown(map.lang);
-        if (!trait_id.is_valid()) { return null; }
-        if (this.trait_checker().select_impl(trait_id, t.as_reference().referent, 0) == null) {
-            if (map.lang == LangItem::Ord) {
-                this.refuse_unordered_references(receiver, rhs, ty, map, op_tok.kind, span);
-            }
+        if (!trait_id.is_valid() || this.trait_checker().select_impl(trait_id, t.as_reference().referent, 0) == null) {
+            this.refuse_reference_comparison(receiver, rhs, ty, map, op_tok.kind, span);
             return null;
         }
         return this.operator_desugar(receiver, rhs, map, trait_id, op_tok, span);
@@ -2877,16 +2873,22 @@ type struct SemaVisitor {
         return true;
     }
 
-    /// `a < b` (`>`, `<=`, `>=`) on two references to a type that does not
-    /// implement `Ord`, refused (E0229).  A user type is told to implement
-    /// it (`emit_operator_missing_impl`).  Any other referent is shown the
-    /// values compared, `*a < *b`, where its own operator orders them - a
-    /// float besides by `total_compare`, the total order it has - and the
-    /// addresses, both references converted to pointers, where nothing does.
-    refuse_unordered_references(mut &this, left: ExpressionNode*, right: ExpressionNode*,
+    /// `a OP b` on two references to a type that does not implement the
+    /// comparison's trait, refused (E0229): `==` and `!=` on them would
+    /// compare two addresses where the program reads two values, and an
+    /// order of two addresses says nothing about the values.  An ordering of
+    /// a user type is told to implement `Ord` (`emit_operator_missing_impl`).
+    /// Any other referent is shown the values compared, `*a OP *b`, where its
+    /// own operator compares them - a float besides by `total_compare`, the
+    /// total order it has.  Where nothing does, a user type beside `==` or
+    /// `!=` is shown both an implementation of `Eq`, which compares the
+    /// values, and the addresses, both references converted to pointers;
+    /// any other referent the addresses.
+    refuse_reference_comparison(mut &this, left: ExpressionNode*, right: ExpressionNode*,
                                 reference: TypeRef, map: OperatorTraitMap, op: TokenType,
                                 span: SourceSpan) -> void {
-        if (this.emit_operator_missing_impl(reference, map, op, span)) { return; }
+        const equality: boolean = map.lang == LangItem::Eq;
+        if (!equality && this.emit_operator_missing_impl(reference, map, op, span)) { return; }
         const referent: TypeRef = this.arena.lookup(reference).as_reference().referent;
         const referent_t: Type* = this.arena.lookup(referent);
         const shown: string = this.arena.format_display(referent_t);
@@ -2895,20 +2897,30 @@ type struct SemaVisitor {
         const b: string = this.reference_operand_text(right, "b", false);
         const a_value: string = this.reference_operand_text(left, "a", true);
         const b_value: string = this.reference_operand_text(right, "b", true);
-        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0229_INVALID_BINARY_OP,
+        const addresses: string = fmt::format("`(%s as %s*) %s (%s as %s*)`", a, shown, op_shown, b, shown).into_raw();
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0229_INVALID_BINARY_OP, if (equality) {
+            fmt::format("`%s` does not implement `Eq`, so `%s` does not compare two references to it",
+                shown, op_shown).into_raw()
+        } else {
             fmt::format("`%s` does not implement `Ord`, so `%s` does not order two references to it",
-                shown, op_shown).into_raw());
+                shown, op_shown).into_raw()
+        });
         diag = diag.at(span);
-        if (referent_t.kind == TypeKind::Float) {
+        const user_type: boolean = referent_t.kind == TypeKind::Struct || referent_t.kind == TypeKind::Enum
+            || referent_t.kind == TypeKind::InstantiatedType;
+        if (!equality && referent_t.kind == TypeKind::Float) {
             const receiver: string = if (a.starts_with("&")) { fmt::format("(%s)", a).into_raw() } else { a };
             diag = diag.help(fmt::format("%s; compare the values the references refer to, `%s %s %s`, or order them by `total_compare`, the IEEE-754 total order: `%s.total_compare(%s).%s()`",
                 TraitChecker::float_has_no_order(shown), a_value, op_shown, b_value, receiver, b, map.ord_pred).into_raw());
         } else if (this.checker.check_binary_op(op, referent, referent).success) {
             diag = diag.help(fmt::format("compare the values the references refer to: `%s %s %s`",
                 a_value, op_shown, b_value).into_raw());
+        } else if (user_type) {
+            diag = diag.help(fmt::format("compare the values by implementing `Eq` for it, `implement trait Eq ... for %s`, or compare the addresses, the references converted to pointers: %s",
+                shown, addresses).into_raw());
         } else {
-            diag = diag.help(fmt::format("compare the addresses, the references converted to pointers: `(%s as %s*) %s (%s as %s*)`",
-                a, shown, op_shown, b, shown).into_raw());
+            diag = diag.help(fmt::format("compare the addresses, the references converted to pointers: %s",
+                addresses).into_raw());
         }
         this.ctx.emit_diagnostic(diag);
     }
@@ -3408,10 +3420,11 @@ type struct SemaVisitor {
                     // `check_binary_op` passes a comparison of two references,
                     // or of a reference with `null` (any other pointer was
                     // refused, `reference_beside_address_refused`), as a
-                    // `boolean` of their identity.  Two references compare the values they refer
-                    // to instead, when the referent implements the comparison's
-                    // trait (`referent_comparison_expr`); a `null` operand keeps
-                    // the pointer null-check.
+                    // `boolean` of their identity.  Two references compare the
+                    // values they refer to instead, by the referent's
+                    // implementation of the comparison's trait, and are refused
+                    // where it has none (`referent_comparison_expr`); a `null`
+                    // operand keeps the pointer null-check.
                     const comparison: boolean = map.lang == LangItem::Eq || map.lang == LangItem::Ord;
                     const left_t: Type* = this.arena.lookup(lhs);
                     const right_t: Type* = this.arena.lookup(rhs);
