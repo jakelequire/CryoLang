@@ -613,12 +613,30 @@ type struct TraitChecker {
     /// `trait_def` is blocked by a method a table cannot hold, and one whose
     /// trait does not reach it never implements it.  An internal trait can
     /// be implemented only in the package that declares it, so the advice
-    /// to implement it is withheld and a type that does is asked for.  Any
-    /// other type gets `written_help`, the site's own advice.
+    /// to implement it is withheld and a type that does is asked for.  A
+    /// float, or a reference to one, is not `Ord` by design - a NaN is
+    /// unordered against every value - so no implementation is advised; it
+    /// is shown `total_compare`, the total order it has, in a comparator.
+    /// Any other type gets `written_help`, the site's own advice.
     bound_failure_help(&this, ty: TypeRef, trait_def: DefId, trait_shown: string, ty_shown: string,
                        written_help: string) -> string {
         if (this.borrowing_closure_not_thread_safe(ty, trait_def)) {
             return "write `move` before the closure, so it owns what it captures";
+        }
+        if (this.generic_registry != null && trait_def.equals(this.generic_registry.wellknown(LangItem::Ord))) {
+            const outer: Type* = this.arena.lookup(ty);
+            const by_reference: boolean = outer != null && outer.kind == TypeKind::Reference;
+            const float_t: Type* = if (by_reference) { this.arena.lookup(outer.as_reference().referent) } else { outer };
+            if (float_t != null && float_t.kind == TypeKind::Float) {
+                const float_shown: string = this.arena.format_display(float_t);
+                const comparator: string = if (by_reference) {
+                    fmt::format("(a: & %s, b: & %s) -> Ordering { return (*a).total_compare(*b); }", ty_shown, ty_shown).into_raw()
+                } else {
+                    fmt::format("(a: &%s, b: &%s) -> Ordering { return a.total_compare(b); }", ty_shown, ty_shown).into_raw()
+                };
+                return fmt::format("`%s` has no total order - a NaN is neither less than, equal to nor greater than any value - so it does not implement `Ord`; order by `total_compare`, the IEEE-754 total order, where a comparator is taken: `sort_by(%s)`",
+                    float_shown, comparator).into_raw();
+            }
         }
         if (this.is_primitive_trait(trait_def)) {
             const one: [DefId] = [trait_def];
