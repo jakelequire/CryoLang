@@ -1288,16 +1288,26 @@ An overloaded name used as a value without a call is picked by its expected func
 
 Integer division truncates toward zero. The prefix forms `++x`, `--x` evaluate to the new value; the postfix forms `x++`, `x--` evaluate to the old value (C semantics).
 
-**Overflow.** Integer arithmetic **wraps** on overflow using two's-complement modular arithmetic, for both signed and unsigned types: the result is reduced modulo 2<sup>N</sup> for an N-bit type. There is no overflow trap and no automatic widening. For example, with `i32`:
+**Overflow.** An integer `+`, `-`, `*`, unary `-`, `++` or `--` (and the compound `+=`, `-=`, `*=`) *overflows* when its true result is outside its type's range, for signed and unsigned types alike. What an overflow does is the build profile's `overflow_checks`:
+
+- **Checked** (`overflow_checks = true`, the `debug` profile's default): the program panics, naming the operation - `attempt to add with overflow`, `attempt to subtract with overflow`, `attempt to multiply with overflow`, `attempt to negate with overflow` - at the operator's place.
+- **Wrapping** (`overflow_checks = false`, the `release` profile's default and every other profile's): the result is the true result reduced modulo 2<sup>N</sup> for an N-bit type, two's complement. This is a defined result, never undefined behavior.
 
 ```cryo
-mut x: i32 = 2147483647;   // i32::MAX
-x = x + 1;                 // wraps to -2147483648 (i32::MIN), no trap
+mut x: i32 = i32::MAX;
+x = x + 1;   // debug: panics "attempt to add with overflow"; release: -2147483648
 ```
 
-This is a defined deterministic result, not undefined behavior, but it is *silent*: the language does not insert checks. Code that must detect overflow has to compare against the type's bounds before the operation. (Unsigned wrap is the usual `mod 2`<sup>`N`</sup>; e.g. `0u8 - 1u8 == 255`.)
+The optimization level has no part in it: a profile names its own setting in its table, and the command line's `--overflow-checks=on` or `--overflow-checks=off` overrides the profile for one build.
 
-**Division and modulo by zero** are *not* checked by the compiler and fault at runtime (on typical targets the CPU raises `SIGFPE`); the signed `i32::MIN / -1` / `i32::MIN % -1` cases overflow the result and fault the same way. Guard the divisor when it can be zero.
+```toml
+[profile.release]
+overflow_checks = true
+```
+
+Code that means to wrap says so, and wraps in every profile: each integer type has `wrapping_add`, `wrapping_subtract`, `wrapping_multiply` and `wrapping_negate`. Code that must detect overflow asks `checked_add`, `checked_subtract` and `checked_multiply` (`None` where the true result does not fit), `overflowing_add` and its kin (the wrapped result and whether it wrapped), or clamps with `saturating_add` and its kin. There is no automatic widening; `as` between integer types truncates or extends and never overflows.
+
+**Division and remainder** by zero panic in every profile (`attempt to divide by zero`), as do the signed `MIN / -1` and `MIN % -1`, whose quotient is one past the type's maximum.
 
 ### 5.2 Comparison
 

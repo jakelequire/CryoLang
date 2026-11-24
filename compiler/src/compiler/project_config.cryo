@@ -256,6 +256,19 @@ type struct VendorPin {
     }
 }
 
+/// A `[profile.<name>]` table: what the profile `name` sets in place of its
+/// built-in defaults.  Holds non-owning strings, so it is Copy.
+type struct ProfileTable {
+    name:            string;
+    /// `overflow_checks = true | false`; unset keeps the built-in default,
+    /// true for `debug` and false for every other profile.
+    overflow_checks: Option<boolean>;
+
+    static empty(name: string) -> ProfileTable {
+        return ProfileTable { name: name, overflow_checks: Option::None };
+    }
+}
+
 /// Parsed representation of a `cryoconfig` file.
 type struct ProjectConfig {
     project_name: string;
@@ -399,6 +412,9 @@ type struct ProjectConfig {
     /// See `VendorPin`.
     vendor_pins: [VendorPin];
 
+    /// Every `[profile.<name>]` table, in the order written.
+    profile_tables: [ProfileTable];
+
     /// `[test] format = "..."` - preferred output format for the
     /// project's test runner. One of "plain" / "pretty" / "compact",
     /// or "" when unset (runner falls back to its built-in default).
@@ -462,6 +478,7 @@ type struct ProjectConfig {
             libs:         [],
             dependencies: [],
             vendor_pins:  [],
+            profile_tables: [],
             test_format:  "",
             test_color:   "",
             error_count:  0,
@@ -586,6 +603,9 @@ type struct ProjectConfig {
         // section, or -1 when not inside one.  Set when the section header is
         // seen (mirrors current_bin_idx for `[[bin]]`).
         mut current_vendor_idx: i64  = -1;
+        // Index into config.profile_tables for the current `[profile.<name>]`
+        // section, or -1 when not inside one.
+        mut current_profile_idx: i64 = -1;
         mut pos: i64 = 0;
         const len: i64 = content.length() as i64;
 
@@ -636,6 +656,13 @@ type struct ProjectConfig {
                     current_bin_idx = -1;
                     current_lib_idx = -1;
                     current_vendor_idx = -1;
+                    current_profile_idx = -1;
+                    if (current_section.starts_with("profile.")) {
+                        const pname: string = current_section.substring(
+                            8, current_section.length() as i64 - 8);
+                        config.profile_tables.push(ProfileTable::empty(pname));
+                        current_profile_idx = config.profile_tables.length() as i64 - 1;
+                    }
                     // `[vendor.<Name>]` -> push a fresh pin and track its index,
                     // so the dotted-section keys below land on the right pin.
                     if (current_section.starts_with("vendor.")) {
@@ -668,6 +695,16 @@ type struct ProjectConfig {
             if (current_vendor_idx >= 0) {
                 match (key) {
                     "triple" => { config.vendor_pins[current_vendor_idx].triple = val; }
+                    _ => { ProjectConfig::report_unknown_key(current_section, key); }
+                }
+                continue;
+            }
+            if (current_profile_idx >= 0) {
+                match (key) {
+                    "overflow_checks" => {
+                        config.profile_tables[current_profile_idx].overflow_checks =
+                            Option::Some(ProjectConfig::parse_bool(val));
+                    }
                     _ => { ProjectConfig::report_unknown_key(current_section, key); }
                 }
                 continue;
@@ -830,9 +867,9 @@ type struct ProjectConfig {
                 "profile" => {
                     // `[profile] default = "debug"|"release"` selects the
                     // default build profile when the CLI doesn't pass one.
-                    // Per-profile knob tables (`[profile.debug]` etc.) are not
-                    // parsed yet; the built-in mapping (release => O2/no-debug,
-                    // debug => O0/+debug) is applied in the compiler instance.
+                    // The built-in mapping (release => O2/no-debug, debug =>
+                    // O0/+debug) is applied in the compiler instance; a
+                    // `[profile.<name>]` table is read above.
                     match (key) {
                         "default" => { config.profile = val; }
                         _ => { ProjectConfig::report_unknown_key("profile", key); }
@@ -1065,6 +1102,22 @@ type struct ProjectConfig {
     /// `release` does not. `-g` / `--debug-info` can still force it on.
     static profile_base_debug_info(name: string) -> boolean {
         return name.eq("debug");
+    }
+
+    /// Whether the profile `name` checks integer arithmetic for overflow:
+    /// its `[profile.<name>]` table's `overflow_checks` where the last such
+    /// table sets it, else true for `debug` and false for every other
+    /// profile.  The optimization level has no part in it.
+    overflow_checks_for(&this, name: string) -> boolean {
+        mut checks: boolean = name.eq("debug");
+        for (mut i: i64 = 0; i < this.profile_tables.length(); i++) {
+            if (!this.profile_tables[i].name.eq(name)) { continue; }
+            match (this.profile_tables[i].overflow_checks) {
+                Option::Some(set) => { checks = set; }
+                Option::None      => { }
+            }
+        }
+        return checks;
     }
 
     /// Search for a cryoconfig file starting from `start_dir` and walking upward.
@@ -1449,6 +1502,8 @@ implement trait Clone for struct ProjectConfig {
         for (mut i: i64 = 0; i < this.libs.length(); i++)          { libs_c.push(this.libs[i]); }
         for (mut i: i64 = 0; i < this.dependencies.length(); i++)  { deps_c.push(this.dependencies[i].clone()); }
         for (mut i: i64 = 0; i < this.vendor_pins.length(); i++)   { vendor_pins_c.push(this.vendor_pins[i]); }
+        mut profile_tables_c: [ProfileTable] = [];
+        for (mut i: i64 = 0; i < this.profile_tables.length(); i++) { profile_tables_c.push(this.profile_tables[i]); }
         return ProjectConfig {
             project_name:  this.project_name,
             output_dir:    this.output_dir,
@@ -1488,6 +1543,7 @@ implement trait Clone for struct ProjectConfig {
             libs:          libs_c,
             dependencies:  deps_c,
             vendor_pins:   vendor_pins_c,
+            profile_tables: profile_tables_c,
             test_format:   this.test_format,
             test_color:    this.test_color,
             error_count:   this.error_count,

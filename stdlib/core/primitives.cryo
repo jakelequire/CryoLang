@@ -7,23 +7,23 @@
 ///! Numeric operations that span types, such as `gcd` and the
 ///! floating-point functions, live in `std::math`.
 ///!
-///! ## Integer overflow contract (frozen for 1.0)
+///! ## Integer overflow
 ///!
-///! The arithmetic operators on every integer width are silent
-///! two's-complement **wrapping** on overflow - there is no trap and no
-///! diagnostic. Code that must detect overflow asks each width's
+///! Where the build checks for overflow (the `debug` profile's
+///! `overflow_checks`), an arithmetic operator whose true result leaves its
+///! type's range panics; elsewhere it wraps, two's complement. Code that
+///! means the wrap says so with `wrapping_add`, `wrapping_subtract`,
+///! `wrapping_multiply` and `wrapping_negate`, which wrap in every build,
+///! as `power` does. Code that must detect overflow asks each width's
 ///! `checked_add`, `checked_subtract`, `checked_multiply` and
-///! `checked_power`, which answer `None` where the operator would wrap,
-///! or `overflowing_add`, `overflowing_subtract` and
+///! `checked_power`, which answer `None` where the true result does not
+///! fit, or `overflowing_add`, `overflowing_subtract` and
 ///! `overflowing_multiply`, which answer the wrapped result with a flag
 ///! that it wrapped; it clamps with `saturating_add`,
 ///! `saturating_subtract` and `saturating_multiply`, which answer the
-///! bound the true result lies past. `wrapping_add`, `wrapping_subtract`,
-///! `wrapping_multiply` and `power` give what the operators give, for
-///! code that means the wrap. The wrapping `abs` methods below are one
-///! visible consequence of the operators (see each `abs`); the signed
-///! widths' `checked_abs` answers `None` for the one value `abs` wraps
-///! on.
+///! bound the true result lies past. The signed widths' `abs` negates as
+///! `-` does, so `MIN.abs()` overflows; `checked_abs` answers `None`
+///! there.
 ///!
 ///! Every width also counts its bits (`count_ones`, `count_zeros`,
 ///! `leading_zeros`, `trailing_zeros`) and rotates them (`rotate_left`,
@@ -151,9 +151,9 @@ implement char {
 }
 
 // Range bounds, width, abs, checked_abs and clamp for the signed integer
-// widths.  `abs` wraps at the type's `MIN` (two's complement has no positive
-// counterpart for the most-negative value): `i8::MIN.abs()` is `-128`, not
-// `128`; `checked_abs` answers `None` there instead.  Narrower widths
+// widths.  `abs` overflows at the type's `MIN` (two's complement has no
+// positive counterpart for the most-negative value), as `-` does;
+// `checked_abs` answers `None` there instead.  Narrower widths
 // delegate to `i64` for the decimal-write digit loop so the implementation
 // lives in one place (down in the `implement i64` block).
 implement i8 {
@@ -167,22 +167,19 @@ implement i8 {
     /// `to_decimal_buffer` needs.
     public const MAX_DECIMAL_DIGITS: i64 = 4;     // "-128"
 
-    /// The magnitude of this value. Wraps at `i8::MIN`, which has no
-    /// positive counterpart: `i8::MIN.abs()` is itself.
+    /// The magnitude of this value. `i8::MIN` has no positive counterpart,
+    /// so its negation overflows as `-` does: a panic where the build checks
+    /// for overflow, `i8::MIN` itself where it wraps.
     public abs(&this) -> i8 {
         if (this < 0) { return -this as i8; }
         return this;
     }
 
     /// `Some(|this|)`, or `None` for `MIN`, whose magnitude is not
-    /// representable: only it negates to a value still negative.
+    /// representable.
     public checked_abs(&this) -> Option<i8> {
-        if (this < 0) {
-            const neg: i8 = -this as i8;
-            if (neg < 0) { return Option::None; }
-            return Option::Some(neg);
-        }
-        return Option::Some(this);
+        if (this == i8::MIN) { return Option::None; }
+        return Option::Some(this.abs());
     }
 
     /// `this` confined to `[lo, hi]`.
@@ -228,22 +225,26 @@ implement i8 {
         return ((this as i64) * (other as i64)).clamp(i8::MIN as i64, i8::MAX as i64) as i8;
     }
 
-    /// `this + other` wrapped into `i8`'s range, two's complement: what
-    /// the `+` operator gives, named for code that means to wrap.
+    /// `this + other` wrapped into `i8`'s range, two's complement, whether
+    /// or not the build checks the `+` operator for overflow.
     public wrapping_add(&this, other: i8) -> i8 {
-        return this + other;
+        return intrinsics::wrapping_add8(this as u8, other as u8) as i8;
     }
 
-    /// `this - other` wrapped into `i8`'s range: what the `-` operator
-    /// gives.
+    /// `this - other` wrapped into `i8`'s range.
     public wrapping_subtract(&this, other: i8) -> i8 {
-        return this - other;
+        return intrinsics::wrapping_subtract8(this as u8, other as u8) as i8;
     }
 
-    /// `this * other` wrapped into `i8`'s range: what the `*` operator
-    /// gives.
+    /// `this * other` wrapped into `i8`'s range.
     public wrapping_multiply(&this, other: i8) -> i8 {
-        return this * other;
+        return intrinsics::wrapping_multiply8(this as u8, other as u8) as i8;
+    }
+
+    /// `-this` wrapped into `i8`'s range: `i8::MIN`, which has no positive
+    /// counterpart, negates to itself.
+    public wrapping_negate(&this) -> i8 {
+        return intrinsics::wrapping_subtract8(0, this as u8) as i8;
     }
 
     /// The wrapped sum, and true where it wrapped: where `checked_add`
@@ -264,8 +265,8 @@ implement i8 {
         return (this.wrapping_multiply(other), this.checked_multiply(other).is_none());
     }
 
-    /// `this` raised to `exponent`, wrapped into `i8`'s range as the
-    /// operators wrap.  Every value to the power 0 is 1, 0 included.
+    /// `this` raised to `exponent`, wrapped into `i8`'s range,
+    /// whatever the build's overflow checks.  Every value to the power 0 is 1, 0 included.
     public power(&this, exponent: u32) -> i8 {
         return (this as i64).power(exponent) as i8;
     }
@@ -333,22 +334,19 @@ implement i16 {
     /// size `to_decimal_buffer` needs.
     public const MAX_DECIMAL_DIGITS: i64 = 6;     // "-32768"
 
-    /// The magnitude of this value. Wraps at `i16::MIN`, which has no
-    /// positive counterpart: `i16::MIN.abs()` is itself.
+    /// The magnitude of this value. `i16::MIN` has no positive counterpart,
+    /// so its negation overflows as `-` does: a panic where the build checks
+    /// for overflow, `i16::MIN` itself where it wraps.
     public abs(&this) -> i16 {
         if (this < 0) { return -this as i16; }
         return this;
     }
 
     /// `Some(|this|)`, or `None` for `MIN`, whose magnitude is not
-    /// representable: only it negates to a value still negative.
+    /// representable.
     public checked_abs(&this) -> Option<i16> {
-        if (this < 0) {
-            const neg: i16 = -this as i16;
-            if (neg < 0) { return Option::None; }
-            return Option::Some(neg);
-        }
-        return Option::Some(this);
+        if (this == i16::MIN) { return Option::None; }
+        return Option::Some(this.abs());
     }
 
     /// `this` confined to `[lo, hi]`.
@@ -394,22 +392,26 @@ implement i16 {
         return ((this as i64) * (other as i64)).clamp(i16::MIN as i64, i16::MAX as i64) as i16;
     }
 
-    /// `this + other` wrapped into `i16`'s range, two's complement: what
-    /// the `+` operator gives, named for code that means to wrap.
+    /// `this + other` wrapped into `i16`'s range, two's complement, whether
+    /// or not the build checks the `+` operator for overflow.
     public wrapping_add(&this, other: i16) -> i16 {
-        return this + other;
+        return intrinsics::wrapping_add16(this as u16, other as u16) as i16;
     }
 
-    /// `this - other` wrapped into `i16`'s range: what the `-` operator
-    /// gives.
+    /// `this - other` wrapped into `i16`'s range.
     public wrapping_subtract(&this, other: i16) -> i16 {
-        return this - other;
+        return intrinsics::wrapping_subtract16(this as u16, other as u16) as i16;
     }
 
-    /// `this * other` wrapped into `i16`'s range: what the `*` operator
-    /// gives.
+    /// `this * other` wrapped into `i16`'s range.
     public wrapping_multiply(&this, other: i16) -> i16 {
-        return this * other;
+        return intrinsics::wrapping_multiply16(this as u16, other as u16) as i16;
+    }
+
+    /// `-this` wrapped into `i16`'s range: `i16::MIN`, which has no
+    /// positive counterpart, negates to itself.
+    public wrapping_negate(&this) -> i16 {
+        return intrinsics::wrapping_subtract16(0, this as u16) as i16;
     }
 
     /// The wrapped sum, and true where it wrapped: where `checked_add`
@@ -430,8 +432,8 @@ implement i16 {
         return (this.wrapping_multiply(other), this.checked_multiply(other).is_none());
     }
 
-    /// `this` raised to `exponent`, wrapped into `i16`'s range as the
-    /// operators wrap.  Every value to the power 0 is 1, 0 included.
+    /// `this` raised to `exponent`, wrapped into `i16`'s range,
+    /// whatever the build's overflow checks.  Every value to the power 0 is 1, 0 included.
     public power(&this, exponent: u32) -> i16 {
         return (this as i64).power(exponent) as i16;
     }
@@ -500,23 +502,20 @@ implement i32 {
     /// size `to_decimal_buffer` needs.
     public const MAX_DECIMAL_DIGITS: i64 = 11;    // "-2147483648"
 
-    /// Wraps at `i32::MIN`: the most-negative value has no
-    /// positive counterpart in two's complement, so `i32::MIN.abs()`
-    /// is itself; `checked_abs` answers `None` there.
+    /// `i32::MIN` has no positive counterpart in two's complement, so its
+    /// negation overflows as `-` does: a panic where the build checks for
+    /// overflow, `i32::MIN` itself where it wraps; `checked_abs` answers
+    /// `None` there.
     public abs(&this) -> i32 {
         if (this < 0) { return -this; }
         return this;
     }
 
     /// `Some(|this|)`, or `None` for `MIN`, whose magnitude is not
-    /// representable: only it negates to a value still negative.
+    /// representable.
     public checked_abs(&this) -> Option<i32> {
-        if (this < 0) {
-            const neg: i32 = -this;
-            if (neg < 0) { return Option::None; }
-            return Option::Some(neg);
-        }
-        return Option::Some(this);
+        if (this == i32::MIN) { return Option::None; }
+        return Option::Some(this.abs());
     }
 
     /// `this` confined to `[lo, hi]`.
@@ -562,22 +561,26 @@ implement i32 {
         return ((this as i64) * (other as i64)).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     }
 
-    /// `this + other` wrapped into `i32`'s range, two's complement: what
-    /// the `+` operator gives, named for code that means to wrap.
+    /// `this + other` wrapped into `i32`'s range, two's complement, whether
+    /// or not the build checks the `+` operator for overflow.
     public wrapping_add(&this, other: i32) -> i32 {
-        return this + other;
+        return intrinsics::wrapping_add32(this as u32, other as u32) as i32;
     }
 
-    /// `this - other` wrapped into `i32`'s range: what the `-` operator
-    /// gives.
+    /// `this - other` wrapped into `i32`'s range.
     public wrapping_subtract(&this, other: i32) -> i32 {
-        return this - other;
+        return intrinsics::wrapping_subtract32(this as u32, other as u32) as i32;
     }
 
-    /// `this * other` wrapped into `i32`'s range: what the `*` operator
-    /// gives.
+    /// `this * other` wrapped into `i32`'s range.
     public wrapping_multiply(&this, other: i32) -> i32 {
-        return this * other;
+        return intrinsics::wrapping_multiply32(this as u32, other as u32) as i32;
+    }
+
+    /// `-this` wrapped into `i32`'s range: `i32::MIN`, which has no
+    /// positive counterpart, negates to itself.
+    public wrapping_negate(&this) -> i32 {
+        return intrinsics::wrapping_subtract32(0, this as u32) as i32;
     }
 
     /// The wrapped sum, and true where it wrapped: where `checked_add`
@@ -598,8 +601,8 @@ implement i32 {
         return (this.wrapping_multiply(other), this.checked_multiply(other).is_none());
     }
 
-    /// `this` raised to `exponent`, wrapped into `i32`'s range as the
-    /// operators wrap.  Every value to the power 0 is 1, 0 included.
+    /// `this` raised to `exponent`, wrapped into `i32`'s range,
+    /// whatever the build's overflow checks.  Every value to the power 0 is 1, 0 included.
     public power(&this, exponent: u32) -> i32 {
         return (this as i64).power(exponent) as i32;
     }
@@ -668,22 +671,19 @@ implement i64 {
     /// size `to_decimal_buffer` needs.
     public const MAX_DECIMAL_DIGITS: i64 = 20;    // "-9223372036854775808"
 
-    /// The magnitude of this value. Wraps at `i64::MIN`, which has no
-    /// positive counterpart: `i64::MIN.abs()` is itself.
+    /// The magnitude of this value. `i64::MIN` has no
+    /// positive counterpart, so its negation overflows as `-` does: a panic
+    /// where the build checks for overflow, `i64::MIN` itself where it wraps.
     public abs(&this) -> i64 {
         if (this < 0) { return -this; }
         return this;
     }
 
     /// `Some(|this|)`, or `None` for `MIN`, whose magnitude is not
-    /// representable: only it negates to a value still negative.
+    /// representable.
     public checked_abs(&this) -> Option<i64> {
-        if (this < 0) {
-            const neg: i64 = -this;
-            if (neg < 0) { return Option::None; }
-            return Option::Some(neg);
-        }
-        return Option::Some(this);
+        if (this == i64::MIN) { return Option::None; }
+        return Option::Some(this.abs());
     }
 
     /// `this` confined to `[lo, hi]`.
@@ -716,7 +716,7 @@ implement i64 {
         if ((this == -1 && other == i64::MIN) || (other == -1 && this == i64::MIN)) {
             return Option::None;
         }
-        const product: i64 = this * other;
+        const product: i64 = this.wrapping_multiply(other);
         if (product / other != this) { return Option::None; }
         return Option::Some(product);
     }
@@ -738,22 +738,26 @@ implement i64 {
             if ((this < 0) == (other < 0)) { i64::MAX } else { i64::MIN });
     }
 
-    /// `this + other` wrapped into `i64`'s range, two's complement: what
-    /// the `+` operator gives, named for code that means to wrap.
+    /// `this + other` wrapped into `i64`'s range, two's complement, whether
+    /// or not the build checks the `+` operator for overflow.
     public wrapping_add(&this, other: i64) -> i64 {
-        return this + other;
+        return intrinsics::wrapping_add64(this as u64, other as u64) as i64;
     }
 
-    /// `this - other` wrapped into `i64`'s range: what the `-` operator
-    /// gives.
+    /// `this - other` wrapped into `i64`'s range.
     public wrapping_subtract(&this, other: i64) -> i64 {
-        return this - other;
+        return intrinsics::wrapping_subtract64(this as u64, other as u64) as i64;
     }
 
-    /// `this * other` wrapped into `i64`'s range: what the `*` operator
-    /// gives.
+    /// `this * other` wrapped into `i64`'s range.
     public wrapping_multiply(&this, other: i64) -> i64 {
-        return this * other;
+        return intrinsics::wrapping_multiply64(this as u64, other as u64) as i64;
+    }
+
+    /// `-this` wrapped into `i64`'s range: `i64::MIN`, which has no
+    /// positive counterpart, negates to itself.
+    public wrapping_negate(&this) -> i64 {
+        return intrinsics::wrapping_subtract64(0, this as u64) as i64;
     }
 
     /// The wrapped sum, and true where it wrapped: where `checked_add`
@@ -774,16 +778,16 @@ implement i64 {
         return (this.wrapping_multiply(other), this.checked_multiply(other).is_none());
     }
 
-    /// `this` raised to `exponent`, wrapped into `i64`'s range as the
-    /// operators wrap.  Every value to the power 0 is 1, 0 included.
+    /// `this` raised to `exponent`, wrapped into `i64`'s range,
+    /// whatever the build's overflow checks.  Every value to the power 0 is 1, 0 included.
     /// Squares the base once per bit of `exponent`.
     public power(&this, exponent: u32) -> i64 {
         mut result: i64 = 1;
         mut base: i64 = this;
         mut remaining: u32 = exponent;
         while (remaining > 0) {
-            if ((remaining & 1) == 1) { result = result * base; }
-            base = base * base;
+            if ((remaining & 1) == 1) { result = result.wrapping_multiply(base); }
+            base = base.wrapping_multiply(base);
             remaining = remaining >> 1;
         }
         return result;
@@ -938,20 +942,25 @@ implement u8 {
         return ((this as u64) * (other as u64)).clamp(0, u8::MAX as u64) as u8;
     }
 
-    /// `this + other` modulo 2^8: what the `+` operator gives, named for
-    /// code that means to wrap.
+    /// `this + other` modulo 2^8, whether or not the build checks the `+`
+    /// operator for overflow.
     public wrapping_add(&this, other: u8) -> u8 {
-        return this + other;
+        return intrinsics::wrapping_add8(this, other);
     }
 
-    /// `this - other` modulo 2^8: what the `-` operator gives.
+    /// `this - other` modulo 2^8.
     public wrapping_subtract(&this, other: u8) -> u8 {
-        return this - other;
+        return intrinsics::wrapping_subtract8(this, other);
     }
 
-    /// `this * other` modulo 2^8: what the `*` operator gives.
+    /// `this * other` modulo 2^8.
     public wrapping_multiply(&this, other: u8) -> u8 {
-        return this * other;
+        return intrinsics::wrapping_multiply8(this, other);
+    }
+
+    /// `0 - this` modulo 2^8.
+    public wrapping_negate(&this) -> u8 {
+        return intrinsics::wrapping_subtract8(0, this);
     }
 
     /// The wrapped sum, and true where it wrapped: where `checked_add`
@@ -972,7 +981,7 @@ implement u8 {
         return (this.wrapping_multiply(other), this.checked_multiply(other).is_none());
     }
 
-    /// `this` raised to `exponent`, modulo 2^8 as the operators wrap.
+    /// `this` raised to `exponent`, modulo 2^8, whatever the build's overflow checks.
     /// Every value to the power 0 is 1, 0 included.
     public power(&this, exponent: u32) -> u8 {
         return (this as u64).power(exponent) as u8;
@@ -1184,20 +1193,25 @@ implement u16 {
         return ((this as u64) * (other as u64)).clamp(0, u16::MAX as u64) as u16;
     }
 
-    /// `this + other` modulo 2^16: what the `+` operator gives, named for
-    /// code that means to wrap.
+    /// `this + other` modulo 2^16, whether or not the build checks the `+`
+    /// operator for overflow.
     public wrapping_add(&this, other: u16) -> u16 {
-        return this + other;
+        return intrinsics::wrapping_add16(this, other);
     }
 
-    /// `this - other` modulo 2^16: what the `-` operator gives.
+    /// `this - other` modulo 2^16.
     public wrapping_subtract(&this, other: u16) -> u16 {
-        return this - other;
+        return intrinsics::wrapping_subtract16(this, other);
     }
 
-    /// `this * other` modulo 2^16: what the `*` operator gives.
+    /// `this * other` modulo 2^16.
     public wrapping_multiply(&this, other: u16) -> u16 {
-        return this * other;
+        return intrinsics::wrapping_multiply16(this, other);
+    }
+
+    /// `0 - this` modulo 2^16.
+    public wrapping_negate(&this) -> u16 {
+        return intrinsics::wrapping_subtract16(0, this);
     }
 
     /// The wrapped sum, and true where it wrapped: where `checked_add`
@@ -1218,7 +1232,7 @@ implement u16 {
         return (this.wrapping_multiply(other), this.checked_multiply(other).is_none());
     }
 
-    /// `this` raised to `exponent`, modulo 2^16 as the operators wrap.
+    /// `this` raised to `exponent`, modulo 2^16, whatever the build's overflow checks.
     /// Every value to the power 0 is 1, 0 included.
     public power(&this, exponent: u32) -> u16 {
         return (this as u64).power(exponent) as u16;
@@ -1381,20 +1395,25 @@ implement u32 {
         return ((this as u64) * (other as u64)).clamp(0, u32::MAX as u64) as u32;
     }
 
-    /// `this + other` modulo 2^32: what the `+` operator gives, named for
-    /// code that means to wrap.
+    /// `this + other` modulo 2^32, whether or not the build checks the `+`
+    /// operator for overflow.
     public wrapping_add(&this, other: u32) -> u32 {
-        return this + other;
+        return intrinsics::wrapping_add32(this, other);
     }
 
-    /// `this - other` modulo 2^32: what the `-` operator gives.
+    /// `this - other` modulo 2^32.
     public wrapping_subtract(&this, other: u32) -> u32 {
-        return this - other;
+        return intrinsics::wrapping_subtract32(this, other);
     }
 
-    /// `this * other` modulo 2^32: what the `*` operator gives.
+    /// `this * other` modulo 2^32.
     public wrapping_multiply(&this, other: u32) -> u32 {
-        return this * other;
+        return intrinsics::wrapping_multiply32(this, other);
+    }
+
+    /// `0 - this` modulo 2^32.
+    public wrapping_negate(&this) -> u32 {
+        return intrinsics::wrapping_subtract32(0, this);
     }
 
     /// The wrapped sum, and true where it wrapped: where `checked_add`
@@ -1415,7 +1434,7 @@ implement u32 {
         return (this.wrapping_multiply(other), this.checked_multiply(other).is_none());
     }
 
-    /// `this` raised to `exponent`, modulo 2^32 as the operators wrap.
+    /// `this` raised to `exponent`, modulo 2^32, whatever the build's overflow checks.
     /// Every value to the power 0 is 1, 0 included.
     public power(&this, exponent: u32) -> u32 {
         return (this as u64).power(exponent) as u32;
@@ -1536,7 +1555,7 @@ implement u64 {
     /// `this + other`, or `None` where the sum passes `u64::MAX`: a
     /// wrapped sum is smaller than either operand.
     public checked_add(&this, other: u64) -> Option<u64> {
-        const sum: u64 = this + other;
+        const sum: u64 = this.wrapping_add(other);
         if (sum < this) { return Option::None; }
         return Option::Some(sum);
     }
@@ -1569,20 +1588,25 @@ implement u64 {
         return this.checked_multiply(other).unwrap_or(u64::MAX);
     }
 
-    /// `this + other` modulo 2^64: what the `+` operator gives, named for
-    /// code that means to wrap.
+    /// `this + other` modulo 2^64, whether or not the build checks the `+`
+    /// operator for overflow.
     public wrapping_add(&this, other: u64) -> u64 {
-        return this + other;
+        return intrinsics::wrapping_add64(this, other);
     }
 
-    /// `this - other` modulo 2^64: what the `-` operator gives.
+    /// `this - other` modulo 2^64.
     public wrapping_subtract(&this, other: u64) -> u64 {
-        return this - other;
+        return intrinsics::wrapping_subtract64(this, other);
     }
 
-    /// `this * other` modulo 2^64: what the `*` operator gives.
+    /// `this * other` modulo 2^64.
     public wrapping_multiply(&this, other: u64) -> u64 {
-        return this * other;
+        return intrinsics::wrapping_multiply64(this, other);
+    }
+
+    /// `0 - this` modulo 2^64.
+    public wrapping_negate(&this) -> u64 {
+        return intrinsics::wrapping_subtract64(0, this);
     }
 
     /// The wrapped sum, and true where it wrapped: where `checked_add`
@@ -1603,7 +1627,7 @@ implement u64 {
         return (this.wrapping_multiply(other), this.checked_multiply(other).is_none());
     }
 
-    /// `this` raised to `exponent`, modulo 2^64 as the operators wrap.
+    /// `this` raised to `exponent`, modulo 2^64, whatever the build's overflow checks.
     /// Every value to the power 0 is 1, 0 included.  Squares the base once
     /// per bit of `exponent`.
     public power(&this, exponent: u32) -> u64 {
@@ -1611,8 +1635,8 @@ implement u64 {
         mut base: u64 = this;
         mut remaining: u32 = exponent;
         while (remaining > 0) {
-            if ((remaining & 1) == 1) { result = result * base; }
-            base = base * base;
+            if ((remaining & 1) == 1) { result = result.wrapping_multiply(base); }
+            base = base.wrapping_multiply(base);
             remaining = remaining >> 1;
         }
         return result;
@@ -1925,9 +1949,9 @@ implement i64 {
     public to_decimal_buffer(&this, buffer: mut u8*) -> i64 {
         if (this < 0) {
             buffer[0] = 0x2D; // '-'
-            // `-i64::MIN` overflows in i64 but wraps to the correct u64
-            // magnitude.
-            const magnitude: u64 = (0 - this) as u64;
+            // `-i64::MIN` has no `i64`, but its wrapped negation's bits are
+            // the right `u64` magnitude.
+            const magnitude: u64 = this.wrapping_negate() as u64;
             return 1 + magnitude.to_decimal_buffer(buffer + 1);
         }
         const v: u64 = this as u64;
@@ -1984,7 +2008,7 @@ implement u128 {
     /// `this + other`, or `None` where the sum passes `u128::MAX`: a
     /// wrapped sum is smaller than either operand.
     public checked_add(&this, other: u128) -> Option<u128> {
-        const sum: u128 = this + other;
+        const sum: u128 = this.wrapping_add(other);
         if (sum < this) { return Option::None; }
         return Option::Some(sum);
     }
@@ -2017,20 +2041,25 @@ implement u128 {
         return this.checked_multiply(other).unwrap_or(u128::MAX);
     }
 
-    /// `this + other` modulo 2^128: what the `+` operator gives, named for
-    /// code that means to wrap.
+    /// `this + other` modulo 2^128, whether or not the build checks the
+    /// `+` operator for overflow.
     public wrapping_add(&this, other: u128) -> u128 {
-        return this + other;
+        return intrinsics::wrapping_add128(this, other);
     }
 
-    /// `this - other` modulo 2^128: what the `-` operator gives.
+    /// `this - other` modulo 2^128.
     public wrapping_subtract(&this, other: u128) -> u128 {
-        return this - other;
+        return intrinsics::wrapping_subtract128(this, other);
     }
 
-    /// `this * other` modulo 2^128: what the `*` operator gives.
+    /// `this * other` modulo 2^128.
     public wrapping_multiply(&this, other: u128) -> u128 {
-        return this * other;
+        return intrinsics::wrapping_multiply128(this, other);
+    }
+
+    /// `0 - this` modulo 2^128.
+    public wrapping_negate(&this) -> u128 {
+        return intrinsics::wrapping_subtract128(0, this);
     }
 
     /// The wrapped sum, and true where it wrapped: where `checked_add`
@@ -2051,7 +2080,7 @@ implement u128 {
         return (this.wrapping_multiply(other), this.checked_multiply(other).is_none());
     }
 
-    /// `this` raised to `exponent`, modulo 2^128 as the operators wrap.
+    /// `this` raised to `exponent`, modulo 2^128, whatever the build's overflow checks.
     /// Every value to the power 0 is 1, 0 included.  Squares the base once
     /// per bit of `exponent`.
     public power(&this, exponent: u32) -> u128 {
@@ -2059,8 +2088,8 @@ implement u128 {
         mut base: u128 = this;
         mut remaining: u32 = exponent;
         while (remaining > 0) {
-            if ((remaining & 1) == 1) { result = result * base; }
-            base = base * base;
+            if ((remaining & 1) == 1) { result = result.wrapping_multiply(base); }
+            base = base.wrapping_multiply(base);
             remaining = remaining >> 1;
         }
         return result;
@@ -2301,23 +2330,20 @@ implement i128 {
     /// size `to_decimal_buffer` needs.
     public const MAX_DECIMAL_DIGITS: i64 = 40;    // "-170141183460469231731687303715884105728"
 
-    /// Wraps at `i128::MIN`: the most-negative value has no positive
-    /// counterpart in two's complement, so `i128::MIN.abs()` is
-    /// itself; `checked_abs` answers `None` there.
+    /// `i128::MIN` has no positive counterpart in two's complement, so its
+    /// negation overflows as `-` does: a panic where the build checks for
+    /// overflow, `i128::MIN` itself where it wraps; `checked_abs` answers
+    /// `None` there.
     public abs(&this) -> i128 {
         if (this < 0) { return -this; }
         return this;
     }
 
     /// `Some(|this|)`, or `None` for `MIN`, whose magnitude is not
-    /// representable: only it negates to a value still negative.
+    /// representable.
     public checked_abs(&this) -> Option<i128> {
-        if (this < 0) {
-            const neg: i128 = -this;
-            if (neg < 0) { return Option::None; }
-            return Option::Some(neg);
-        }
-        return Option::Some(this);
+        if (this == i128::MIN) { return Option::None; }
+        return Option::Some(this.abs());
     }
 
     /// `this` confined to `[lo, hi]`.
@@ -2350,7 +2376,7 @@ implement i128 {
         if ((this == -1 && other == i128::MIN) || (other == -1 && this == i128::MIN)) {
             return Option::None;
         }
-        const product: i128 = this * other;
+        const product: i128 = this.wrapping_multiply(other);
         if (product / other != this) { return Option::None; }
         return Option::Some(product);
     }
@@ -2372,22 +2398,26 @@ implement i128 {
             if ((this < 0) == (other < 0)) { i128::MAX } else { i128::MIN });
     }
 
-    /// `this + other` wrapped into `i128`'s range, two's complement: what
-    /// the `+` operator gives, named for code that means to wrap.
+    /// `this + other` wrapped into `i128`'s range, two's complement,
+    /// whether or not the build checks the `+` operator for overflow.
     public wrapping_add(&this, other: i128) -> i128 {
-        return this + other;
+        return intrinsics::wrapping_add128(this as u128, other as u128) as i128;
     }
 
-    /// `this - other` wrapped into `i128`'s range: what the `-` operator
-    /// gives.
+    /// `this - other` wrapped into `i128`'s range.
     public wrapping_subtract(&this, other: i128) -> i128 {
-        return this - other;
+        return intrinsics::wrapping_subtract128(this as u128, other as u128) as i128;
     }
 
-    /// `this * other` wrapped into `i128`'s range: what the `*` operator
-    /// gives.
+    /// `this * other` wrapped into `i128`'s range.
     public wrapping_multiply(&this, other: i128) -> i128 {
-        return this * other;
+        return intrinsics::wrapping_multiply128(this as u128, other as u128) as i128;
+    }
+
+    /// `-this` wrapped into `i128`'s range: `i128::MIN`, which has no
+    /// positive counterpart, negates to itself.
+    public wrapping_negate(&this) -> i128 {
+        return intrinsics::wrapping_subtract128(0, this as u128) as i128;
     }
 
     /// The wrapped sum, and true where it wrapped: where `checked_add`
@@ -2408,16 +2438,16 @@ implement i128 {
         return (this.wrapping_multiply(other), this.checked_multiply(other).is_none());
     }
 
-    /// `this` raised to `exponent`, wrapped into `i128`'s range as the
-    /// operators wrap.  Every value to the power 0 is 1, 0 included.
+    /// `this` raised to `exponent`, wrapped into `i128`'s range,
+    /// whatever the build's overflow checks.  Every value to the power 0 is 1, 0 included.
     /// Squares the base once per bit of `exponent`.
     public power(&this, exponent: u32) -> i128 {
         mut result: i128 = 1;
         mut base: i128 = this;
         mut remaining: u32 = exponent;
         while (remaining > 0) {
-            if ((remaining & 1) == 1) { result = result * base; }
-            base = base * base;
+            if ((remaining & 1) == 1) { result = result.wrapping_multiply(base); }
+            base = base.wrapping_multiply(base);
             remaining = remaining >> 1;
         }
         return result;
@@ -2491,9 +2521,9 @@ implement i128 {
     public to_decimal_buffer(&this, buffer: mut u8*) -> i64 {
         if (this < 0) {
             buffer[0] = 0x2D; // '-'
-            // `-i128::MIN` overflows in i128 but wraps to the correct u128
-            // magnitude.
-            const magnitude: u128 = (0 - this) as u128;
+            // `-i128::MIN` has no `i128`, but its wrapped negation's bits
+            // are the right `u128` magnitude.
+            const magnitude: u128 = this.wrapping_negate() as u128;
             return 1 + magnitude.to_decimal_buffer(buffer + 1);
         }
         const v: u128 = this as u128;
@@ -2570,22 +2600,25 @@ implement usize {
         return (this as u64).saturating_multiply(other as u64) as usize;
     }
 
-    /// `this + other` modulo 2 to the `usize::BITS`: what the `+` operator
-    /// gives, named for code that means to wrap.
+    /// `this + other` modulo 2 to the `usize::BITS`, whether or not the
+    /// build checks the `+` operator for overflow.
     public wrapping_add(&this, other: usize) -> usize {
-        return this + other;
+        return (this as u64).wrapping_add(other as u64) as usize;
     }
 
-    /// `this - other` modulo 2 to the `usize::BITS`: what the `-` operator
-    /// gives.
+    /// `this - other` modulo 2 to the `usize::BITS`.
     public wrapping_subtract(&this, other: usize) -> usize {
-        return this - other;
+        return (this as u64).wrapping_subtract(other as u64) as usize;
     }
 
-    /// `this * other` modulo 2 to the `usize::BITS`: what the `*` operator
-    /// gives.
+    /// `this * other` modulo 2 to the `usize::BITS`.
     public wrapping_multiply(&this, other: usize) -> usize {
-        return this * other;
+        return (this as u64).wrapping_multiply(other as u64) as usize;
+    }
+
+    /// `0 - this` modulo 2 to the `usize::BITS`.
+    public wrapping_negate(&this) -> usize {
+        return (this as u64).wrapping_negate() as usize;
     }
 
     /// The wrapped sum, and true where it wrapped: where `checked_add`
@@ -2606,8 +2639,9 @@ implement usize {
         return (this.wrapping_multiply(other), this.checked_multiply(other).is_none());
     }
 
-    /// `this` raised to `exponent`, modulo 2 to the `usize::BITS` as the
-    /// operators wrap.  Every value to the power 0 is 1, 0 included.
+    /// `this` raised to `exponent`, modulo 2 to the `usize::BITS`, whatever
+    /// the build's overflow checks.  Every value to the power 0 is 1, 0
+    /// included.
     public power(&this, exponent: u32) -> usize {
         return (this as u64).power(exponent) as usize;
     }
@@ -2679,22 +2713,19 @@ implement isize {
     /// The width of an `isize` in bits: the target's pointer width.
     public const BITS: u32 = 64;
 
-    /// The magnitude of this value. Wraps at `isize::MIN`, which has no
-    /// positive counterpart: `isize::MIN.abs()` is itself.
+    /// The magnitude of this value. `isize::MIN` has no positive
+    /// counterpart, so its negation overflows as `-` does: a panic where
+    /// the build checks for overflow, `isize::MIN` itself where it wraps.
     public abs(&this) -> isize {
         if (this < 0) { return -this; }
         return this;
     }
 
     /// `Some(|this|)`, or `None` for `MIN`, whose magnitude is not
-    /// representable: only it negates to a value still negative.
+    /// representable.
     public checked_abs(&this) -> Option<isize> {
-        if (this < 0) {
-            const neg: isize = -this;
-            if (neg < 0) { return Option::None; }
-            return Option::Some(neg);
-        }
-        return Option::Some(this);
+        if (this == isize::MIN) { return Option::None; }
+        return Option::Some(this.abs());
     }
 
     /// `this` confined to `[lo, hi]`.
@@ -2743,22 +2774,26 @@ implement isize {
         return (this as i64).saturating_multiply(other as i64) as isize;
     }
 
-    /// `this + other` wrapped into `isize`'s range, two's complement: what
-    /// the `+` operator gives, named for code that means to wrap.
+    /// `this + other` wrapped into `isize`'s range, two's complement,
+    /// whether or not the build checks the `+` operator for overflow.
     public wrapping_add(&this, other: isize) -> isize {
-        return this + other;
+        return (this as i64).wrapping_add(other as i64) as isize;
     }
 
-    /// `this - other` wrapped into `isize`'s range: what the `-` operator
-    /// gives.
+    /// `this - other` wrapped into `isize`'s range.
     public wrapping_subtract(&this, other: isize) -> isize {
-        return this - other;
+        return (this as i64).wrapping_subtract(other as i64) as isize;
     }
 
-    /// `this * other` wrapped into `isize`'s range: what the `*` operator
-    /// gives.
+    /// `this * other` wrapped into `isize`'s range.
     public wrapping_multiply(&this, other: isize) -> isize {
-        return this * other;
+        return (this as i64).wrapping_multiply(other as i64) as isize;
+    }
+
+    /// `-this` wrapped into `isize`'s range: `isize::MIN`, which has no
+    /// positive counterpart, negates to itself.
+    public wrapping_negate(&this) -> isize {
+        return (this as i64).wrapping_negate() as isize;
     }
 
     /// The wrapped sum, and true where it wrapped: where `checked_add`
@@ -2779,8 +2814,8 @@ implement isize {
         return (this.wrapping_multiply(other), this.checked_multiply(other).is_none());
     }
 
-    /// `this` raised to `exponent`, wrapped into `isize`'s range as the
-    /// operators wrap.  Every value to the power 0 is 1, 0 included.
+    /// `this` raised to `exponent`, wrapped into `isize`'s range,
+    /// whatever the build's overflow checks.  Every value to the power 0 is 1, 0 included.
     public power(&this, exponent: u32) -> isize {
         return (this as i64).power(exponent) as isize;
     }
@@ -3501,14 +3536,14 @@ private function string_parse_radix_u64(s: string) -> u64 {
         match (u64::parse_radix_prefix(Slice::from_raw((s as u8*) + i, length - i), base as u32)) {
             Option::Some(run) => {
                 mut scale: u64 = 1;
-                for (mut k: i64 = 0; k < run.1; k++) { scale = scale * base; }
-                acc = acc * scale + run.0;
+                for (mut k: i64 = 0; k < run.1; k++) { scale = scale.wrapping_multiply(base); }
+                acc = acc.wrapping_multiply(scale).wrapping_add(run.0);
                 i += run.1;
             }
             Option::None => { break; }
         }
     }
-    if (negate) { return (0 - acc as i64) as u64; }
+    if (negate) { return acc.wrapping_negate(); }
     return acc;
 }
 

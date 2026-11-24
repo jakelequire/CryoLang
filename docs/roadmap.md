@@ -895,15 +895,12 @@ Jake's answers to the test-infrastructure plan.
    curated seed set in `tools/CryoFuzz/seeds/`.
 5. **The fixed-seed fuzz smoke blocks verify; the farm never does.**  At
    most 5 automatically filed bugs a night.
-6. **Integer overflow: decided as trapping in debug builds and wrapping in
-   release, NOT built.**  The compiler wraps in every profile, and
-   `docs/cryo.md` (Arithmetic Operators, "Overflow") states that rule; that
-   is the rule in force.  The decided rule would replace it, with
-   `overflow_checks` a profile key (true in `debug`, false in `release`,
-   settable in a custom profile, unchanged by `--opt-level`), and division
-   by zero and `MIN / -1` panicking in both profiles instead of faulting;
-   shifts by the width or more are decided separately.  Building it is a
-   language change that comes with its spec change.
+6. **Integer overflow traps in debug builds and wraps in release.**
+   `overflow_checks` is a profile key (true in `debug`, false in
+   `release`, settable in a `[profile.<name>]` table, unchanged by
+   `--opt-level`); division by zero and `MIN / -1` panic in both profiles;
+   shifts by the width or more are decided separately.  `docs/cryo.md`
+   (Arithmetic Operators, "Overflow") states the rule.
 7. **"The last release" means the pin until 1.0, then the tags.**
 8. **The edit-fuzz gate is written in Cryo**, as the first `cryofuzz`
    subcommand in `tools/CryoFuzz`.

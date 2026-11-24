@@ -20,6 +20,7 @@ import compiler::interpret::memory::{ AccessFault, Address, AllocationKind, Elem
 import compiler::interpret::outcome::{ Stop };
 import compiler::lex::{ TokenType };
 import compiler::lex::lexer::{ Lexer };
+import compiler::sema::helpers::{ is_negative_numeric_literal_expr };
 import compiler::resolver::res::{ DefId, Res, ResSlot };
 import compiler::types::{ TypeKind };
 import compiler::types::type_base::{ Type };
@@ -548,7 +549,19 @@ implement struct Interpreter {
         const b: u128 = if (shifting) { right_bits } else { this.widened(right_bits, right_kind, kind, span)? };
         const outcome: IntegerResult = operation.apply(kind, a, b, right_kind);
         if (!outcome.is_ok()) { return Result::Err(Interpreter::violation(outcome.fault.describe(), span)); }
+        if (this.checks_overflow(result) && kind.overflowed(operation, a, b, outcome.bits)) {
+            return Result::Err(Stop::panic(String::from_str(Str::new(operation.overflow_message(false))), span));
+        }
         return Result::Ok(Scalar::Integer(outcome.bits, kind));
+    }
+
+    /// Whether arithmetic of type `t` is checked for overflow: the build's
+    /// `overflow_checks`, on an integer type (not a `char`, a boolean or a
+    /// pointer).
+    checks_overflow(&this, t: TypeRef) -> boolean {
+        if (!this.ctx.options.overflow_checks) { return false; }
+        const ty: Type* = this.layout.type_of(t);
+        return ty != null && ty.kind == TypeKind::Int;
     }
 
     /// `bits` of `from` at `to`, which must hold its value.
@@ -876,7 +889,11 @@ implement struct Interpreter {
             const step: TokenType = if (op == TokenType::PlusPlus) { TokenType::Plus } else { TokenType::Minus };
             const updated: Scalar = match (old) {
                 Scalar::Integer(bits, kind) => {
-                    const outcome: IntegerResult = (if (op == TokenType::PlusPlus) { IntegerOperation::Add } else { IntegerOperation::Subtract }).apply(kind, bits, 1, kind);
+                    const operation: IntegerOperation = if (op == TokenType::PlusPlus) { IntegerOperation::Add } else { IntegerOperation::Subtract };
+                    const outcome: IntegerResult = operation.apply(kind, bits, 1, kind);
+                    if (this.checks_overflow(unary.operand.resolved_type) && kind.overflowed(operation, bits, 1, outcome.bits)) {
+                        return Result::Err(Stop::panic(String::from_str(Str::new(operation.overflow_message(false))), span));
+                    }
                     Scalar::Integer(outcome.bits, kind)
                 }
                 Scalar::Pointer(_) => { this.binary_value(step, Operand::Value(old), unary.operand.resolved_type, Operand::Value(one), unary.operand.resolved_type, unary.operand.resolved_type, span)? }
@@ -894,8 +911,18 @@ implement struct Interpreter {
                     Option::None => { from }
                 };
                 const operand: u128 = this.widened(bits, from, kind, span)?;
+                // A negation is `0 - operand`, reduced to the width.  A negated
+                // literal (`-128` as an `i8`) is one literal, whose range sema
+                // checked whole: no negation in it overflows.
+                const subtract: IntegerOperation = IntegerOperation::Subtract;
+                const negated: IntegerResult = subtract.apply(kind, 0, operand, kind);
+                if (op == TokenType::Minus && this.checks_overflow(expression.resolved_type)
+                        && !is_negative_numeric_literal_expr(expression)
+                        && kind.overflowed(subtract, 0, operand, negated.bits)) {
+                    return Result::Err(Stop::panic(String::from_str(Str::new(subtract.overflow_message(true))), span));
+                }
                 return match (op) {
-                    TokenType::Minus   => { Result::Ok(Operand::Value(Scalar::Integer(kind.reduce(0 - operand), kind))) }
+                    TokenType::Minus   => { Result::Ok(Operand::Value(Scalar::Integer(negated.bits, kind))) }
                     TokenType::Tilde   => { Result::Ok(Operand::Value(Scalar::Integer(kind.reduce(~operand), kind))) }
                     TokenType::Exclaim => { Result::Ok(Operand::Value(Scalar::Integer(kind.reduce(~operand), kind))) }
                     _ => { Result::Err(Interpreter::not_covered("this prefix operator on an integer", span)) }
