@@ -363,6 +363,7 @@ Run with `cryo test`. See [`docs/cryo.md` section 20](./docs/cryo.md#20-testing)
 | `cryo test --list`         | Print discovered tests without running.                           |
 | `cryo test --ignored`      | Also run `![ignore]`-marked tests.                                |
 | `cryo check <file>`        | Type-check without code generation.                               |
+| `cryo fmt [--check]`       | Lay out the `.cryo` files below the current directory.            |
 | `cryo fetch`               | Resolve `[dependencies]`; write `cryoconfig.lock`.                |
 | `cryo update`              | Re-resolve dependencies, ignoring the lock.                       |
 | `cryo demangle <symbol>`   | Decode a mangled Cryo symbol.                                     |
