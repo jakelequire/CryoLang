@@ -259,7 +259,8 @@ public type struct BaselinePrograms {
         }
         const plan: BaselinePlan = BaselinePlan::of(&keyed, &recorded);
         fmt::println(plan.line());
-        ObjectHashes::wipe(repository)?;
+        const stdlib: Path = baseline.stdlib.directory.as_path();
+        ObjectHashes::wipe(repository, stdlib)?;
         const runtime: Str = baseline.runtime_home.as_path().as_str();
         mut fresh: Array<BaselineRecord> = Array::<BaselineRecord>::new();
         if (!plan.examples.is_empty()) {
@@ -287,11 +288,11 @@ public type struct BaselinePrograms {
                 if (failed.contains(&program.name)) { fresh.push(BaselineRecord::new(program.name.as_str(), Str::new("FAILED"))); }
                 else if (built.contains(&program.name)) { fresh.push(BaselineRecord::new(program.name.as_str(), Str::new("ok"))); }
             }
-            BaselinePrograms::attach(&fresh, &ObjectHashes::rows(repository, &ObjectPopulation::Examples, Path::from(""))?);
+            BaselinePrograms::attach(&fresh, &ObjectHashes::rows(repository, &ObjectPopulation::Examples, Path::from(""), stdlib)?);
             mut archives: BaselineRecord = BaselineRecord::new(Programs::example_archives(), Str::new("ok"));
-            archives.rows = ObjectHashes::rows(repository, &ObjectPopulation::Stdlib, Path::from(""))?;
+            archives.rows = ObjectHashes::rows(repository, &ObjectPopulation::Stdlib, Path::from(""), stdlib)?;
             fresh.push(archives);
-            ObjectHashes::clear_archives(repository)?;
+            ObjectHashes::clear_archives(stdlib)?;
         }
         if (!plan.census.is_empty()) {
             const started: Instant = Instant::now();
@@ -310,23 +311,28 @@ public type struct BaselinePrograms {
             job.directory(repository.join(Str::new("tests")).as_path().as_str());
             job.log_to(directory.join(Str::new("census.log")).as_path().as_str());
             // `--records` reads the run's log again, and needs to know
-            // whether the run was filtered.
+            // whether the run was filtered and which stdlib it built against.
             mut patterns_text: String = String::new();
             for (pattern in patterns.iterate_references()) { patterns_text.push(f"{pattern.as_str()}\n".as_str()); }
             match (File::write_text(directory.join(Str::new("census.patterns")).as_path(), patterns_text.as_str())) {
                 Result::Ok(_)      => { }
                 Result::Err(error) => { return Result::Err(f"cannot write the census's patterns: {error.describe()}"); }
             }
+            match (File::write_text(directory.join(Str::new("census.stdlib")).as_path(), f"{baseline.stdlib.spelling().as_str()}\n".as_str())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { return Result::Err(f"cannot write the census's stdlib: {error.describe()}"); }
+            }
             // The runner's exit is not the verdict: its lines are.
             const done: Completion = job.run();
             const shown: Str = if (patterns.is_empty()) { Str::new("every program") } else { Str::new("the programs named") };
             fmt::println(f"  census    one run over {shown} ({patterns.length()} pattern(s)) in {started.elapsed().as_seconds_f64():.1} s");
-            const rows: Array<String> = ObjectHashes::rows(repository, &ObjectPopulation::Tests, Path::from(""))?;
-            for (record in BaselineRecord::of_census(&Text::lines(done.output().as_str()), &plan.census, &rows, unit_pinned).iterate_references()) {
+            const rows: Array<String> = ObjectHashes::rows(repository, &ObjectPopulation::Tests, Path::from(""), stdlib)?;
+            for (record in BaselineRecord::of_census(&Text::lines(done.output().as_str()), &plan.census, &rows, unit_pinned,
+                    baseline.stdlib.spelling().as_str()).iterate_references()) {
                 fresh.push(record.clone());
             }
             mut archives: BaselineRecord = BaselineRecord::new(Programs::census_archives(), Str::new("ok"));
-            archives.rows = ObjectHashes::rows(repository, &ObjectPopulation::Stdlib, Path::from(""))?;
+            archives.rows = ObjectHashes::rows(repository, &ObjectPopulation::Stdlib, Path::from(""), stdlib)?;
             fresh.push(archives);
         }
         mut unanswered: Array<String> = Array::<String>::new();
@@ -402,7 +408,8 @@ public type struct BaselinePrograms {
         for (program in programs.iterate_references()) {
             if (!program.name.as_str().starts_with(&Str::new("examples/"))) { names.push(program.name.clone()); }
         }
-        const made: Array<BaselineRecord> = BaselineRecord::of_census(&Text::lines(log.as_str()), &names, &Text::lines(rows.as_str()), unit_pinned);
+        const made: Array<BaselineRecord> = BaselineRecord::of_census(&Text::lines(log.as_str()), &names, &Text::lines(rows.as_str()), unit_pinned,
+            ProgramStdlib::of_checkout(repository).spelling().as_str());
         for (record in made.iterate_references()) {
             for (key in keys.iterate_references()) {
                 if (key.first.as_str() != record.name.as_str()) { continue; }
