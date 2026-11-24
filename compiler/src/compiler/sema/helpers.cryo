@@ -12,7 +12,7 @@
 namespace compiler::sema::helpers;
 
 import compiler::ast::{ LiteralKind };
-import compiler::const_table::{ ConstEval };
+import compiler::const_table::{ ConstEval, FoldedInteger };
 import compiler::resolver::symbol_str;
 import compiler::lex::{ TokenType };
 import compiler::ast::expression::{
@@ -44,10 +44,19 @@ public function sema_int_unsigned_bound(width: u64) -> u64 {
 /// type that holds the magnitude keeps ordinary code on i32 while preventing a
 /// wide bare literal (e.g. an i64::MIN magnitude at a variadic boundary) from
 /// silently truncating to its low 32 bits.
+///
+/// The choice is `FoldedInteger::default_primitive`'s, which a constant made
+/// only of literals is typed by too.
 public function sema_default_int_type(arena: TypeArena*, lit: LiteralExpr*) -> TypeRef {
-    if (!int_literal_exceeds(lit, i32::MAX as u64)) { return arena.get_i32(); }
-    if (!int_literal_exceeds(lit, i64::MAX as u64)) { return arena.get_i64(); }
-    return arena.get_u64();
+    const magnitude: u128 = match (Lexer::integer_literal_value(lit.value, lit.suffix)) {
+        Option::Some(value) => { value }
+        Option::None        => { u128::MAX }
+    };
+    return match (FoldedInteger::unsigned(magnitude).default_primitive()) {
+        "i32" => { arena.get_i32() }
+        "i64" => { arena.get_i64() }
+        _     => { arena.get_u64() }
+    };
 }
 
 /// The type named by a numeric literal's type suffix (`"u64"` -> `u64`), or an

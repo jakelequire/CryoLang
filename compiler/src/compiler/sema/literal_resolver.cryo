@@ -464,13 +464,13 @@ type struct LiteralResolver {
     /// type and the operation widens `peer` or is refused, where adopting
     /// `peer` would compute another number (`-129` beside an `i8` is 127).
     /// None when `operand` is not made only of integer literals or `peer` is
-    /// not an integer type, and when the value is negative, `peer` unsigned
-    /// and `operand` a bitwise operation: a complement of a literal there
-    /// (`x & ~0xFF` with `x: u32`) is a bit pattern of `peer`'s width rather
-    /// than a negative number, and is typed as any other constant operand
-    /// is.  A negative value made by arithmetic (`-1`, `0 - 1`) is a number
-    /// no unsigned type holds, so it keeps its default type.  None as well
-    /// when a literal in `operand` carries a type suffix: the suffix types it.
+    /// not an integer type.  A bit pattern (`is_bit_pattern`) beside an
+    /// unsigned `peer` is `peer`'s bits, not a negative number, and takes
+    /// `peer` where its width holds the pattern: with `x: u32`, `x & ~0xFF`
+    /// clears the low eight bits of `x`.  A negative value made by arithmetic
+    /// (`-1`, `0 - 1`) is a number no unsigned type holds, so it keeps its
+    /// default type.  None as well when a literal in `operand` carries a type
+    /// suffix: the suffix types it.
     operand_type_of_literal_value(&this, operand: ExpressionNode*, peer: TypeRef) -> Option<TypeRef> {
         if (!is_constant_numeric_expr(operand) || sema_expr_has_numeric_suffix(operand)) { return Option::None; }
         const folded: Option<i128> = try_fold_const_integer(operand);
@@ -479,17 +479,30 @@ type struct LiteralResolver {
         if (t == null || t.kind != TypeKind::Int) { return Option::None; }
         const it: IntegerKind = t.int_kind();
         const value: i128 = folded.unwrap();
+        const bound: u64 = sema_int_unsigned_bound(it.narrowest_bit_width());
         if (value < 0 && !it.is_signed()) {
-            const negation: UnaryExpr* = ExpressionNode::unary_of(operand);
-            const operation: BinaryExpr* = ExpressionNode::binary_of(operand);
-            const arithmetic: boolean = (negation != null && negation.op.kind == TokenType::Minus)
-                || (operation != null && (operation.op.kind == TokenType::Plus || operation.op.kind == TokenType::Minus
-                    || operation.op.kind == TokenType::Star || operation.op.kind == TokenType::Slash
-                    || operation.op.kind == TokenType::Percent));
-            return if (arithmetic) { Option::Some(TypeRef::invalid()) } else { Option::None };
+            if (!LiteralResolver::is_bit_pattern(operand)) { return Option::Some(TypeRef::invalid()); }
+            const pattern_held: boolean = bound == 0 || value >= -((bound / 2) as i128) - 1;
+            return Option::Some(if (pattern_held) { peer } else { TypeRef::invalid() });
         }
-        const held: boolean = sema_int_unsigned_bound(it.narrowest_bit_width()) == 0
-            || LiteralResolver::holds_value(it, value);
+        const held: boolean = bound == 0 || LiteralResolver::holds_value(it, value);
         return Option::Some(if (held) { peer } else { TypeRef::invalid() });
+    }
+
+    /// Whether `operand`, made only of integer literals, is a bit pattern
+    /// rather than a number: its value is negative and made by a complement
+    /// or a bitwise operation, not by a negation or arithmetic.  Beside an
+    /// operand of an integer type it is computed at that type's width, so it
+    /// is not written as the literal of its value (`literal_of_value`).
+    static is_bit_pattern(operand: ExpressionNode*) -> boolean {
+        const folded: Option<i128> = try_fold_const_integer(operand);
+        if (folded.is_none() || folded.unwrap() >= 0) { return false; }
+        const negation: UnaryExpr* = ExpressionNode::unary_of(operand);
+        const operation: BinaryExpr* = ExpressionNode::binary_of(operand);
+        const arithmetic: boolean = (negation != null && negation.op.kind == TokenType::Minus)
+            || (operation != null && (operation.op.kind == TokenType::Plus || operation.op.kind == TokenType::Minus
+                || operation.op.kind == TokenType::Star || operation.op.kind == TokenType::Slash
+                || operation.op.kind == TokenType::Percent));
+        return !arithmetic;
     }
 }

@@ -28,10 +28,14 @@
 ///!
 ///! A bare name is read the same way: an `IdentifierExpr` carries the
 ///! resolver's answer for it, and a `Def` is the constant's canonical name.
-///! A local, a type parameter or an unanswered slot names no module-level
-///! constant, and no leaf map stands in for them - a program-wide leaf index
-///! answers from any module with no import in hand, so it would answer a
-///! constant the writing module cannot see.
+///! A `Local` is the binding the resolver bound the name to: a local `const`
+///! is recorded under its binding's symbol where it is declared, so a use
+///! reaches the binding the scope rules chose - an inner block's `const`
+///! shadowing an outer one is another symbol - and a `mut` local, which is
+///! never recorded, is no constant.  A type parameter or an unanswered slot
+///! names no constant, and no leaf map stands in for them - a program-wide
+///! leaf index answers from any module with no import in hand, so it would
+///! answer a constant the writing module cannot see.
 ///!
 ///! `ConstEval` is the ONE folder for every position that wants a compile-time
 ///! integer: an array size, a `[value; N]` repeat count, and a `static_assert`
@@ -42,14 +46,18 @@
 ///!
 ///! A folded value is a `FoldedInteger`: wide enough for every value of every
 ///! integer type at once, so `u128::MAX` and `i128::MIN` are both constants,
-///! and a fold that would leave that range bails.
+///! and a fold that would leave that range bails.  The fold carries the type
+///! each value has (`ConstantValue`) and computes in it, so a constant is the
+///! value the running program computes.
 
 namespace compiler::const_table;
 
 import compiler::ast::{ declaration, expression, LiteralKind, node, TypeAnnotation };
 import compiler::resolver::{ symbol_str, intern_table };
 import compiler::resolver::res::{ Res, ResBase, ResSlot, DefTable, DefId, DefKey };
-import compiler::types::{ type_ref, arena };
+import compiler::types::{ type_ref, arena, IntegerKind };
+import compiler::diag::{ ErrorCode };
+import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::types::type_base::{ Type };
 import std::core::option::{ Option };
 import std::collections::hashmap::{ HashMap };
@@ -63,6 +71,7 @@ import compiler::lex::{ TokenType };
 import compiler::lex::lexer::{ Lexer };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
+import compiler::resolver::symbol_id::{ SymbolKey };
 import compiler::types::arena::{ TypeArena };
 import std::core::hash::{ FnvHasher };
 import std::alloc::allocator::{ GlobalAllocator };
@@ -83,7 +92,7 @@ const CONST_FOLDED:  i32 = 2;
 /// `init` is borrowed from the AST, which outlives the table.
 type struct ConstEntry {
     init:      ExpressionNode*;
-    value:     FoldedInteger;
+    value:     ConstantValue;
     state:     i32;
     /// The same initializer folded as a REAL, memoized separately.
     ///
@@ -105,9 +114,14 @@ type struct ConstEntry {
     /// choice to the expression, which is what an unannotated constant wants.
     int_typed: boolean;
     /// The primitive the declaration names, or "" for any other annotation
-    /// and for none.  An integer-typed constant's folded value is wrapped to
-    /// it, so the compile-time value is the one the program reads.
+    /// and for none.  An integer-typed constant's value is in that type
+    /// (`ConstantValue::in_type`), so the compile-time value is the one the
+    /// program reads.
     declared: string;
+    /// Whether the declaration is annotated.  An unannotated constant has
+    /// its initializer's type, and one made only of literals the type such a
+    /// value has where nothing expects one (`default_primitive`).
+    annotated: boolean;
 }
 
 
@@ -118,6 +132,8 @@ type struct ConstantTable {
     entries: [ConstEntry];
     /// The constant's definition -> index into `entries`.
     by_def: HashMap<DefKey, i64, GlobalAllocator, FnvHasher>;
+    /// A local `const` binding's symbol -> index into `entries`.
+    by_local: HashMap<SymbolKey, i64, GlobalAllocator, FnvHasher>;
 
     /// Module-level `type enum` declarations, so `Enum::Variant` folds to its
     /// discriminant.  Keyed by the enum's definition: the resolver says which
@@ -141,6 +157,7 @@ public:
             defs: defs,
             entries:      [],
             by_def:       HashMap::<DefKey, i64, GlobalAllocator, FnvHasher>::new(),
+            by_local:     HashMap::<SymbolKey, i64, GlobalAllocator, FnvHasher>::new(),
             enums:        [],
             enums_by_def: HashMap::<DefKey, i64, GlobalAllocator, FnvHasher>::new(),
             type_constant_owners: [],
@@ -184,43 +201,54 @@ public:
         return DefId::invalid();
     }
 
-    /// Record the constant `def` as initialized from `init`.
+    /// Record the constant `answer` names - a declaration's definition
+    /// (`Def`) or a local `const` binding's symbol (`Local`), the answer
+    /// every use of it is stamped with - as initialized from `init`.
     ///
-    /// Re-registering the same definition replaces its initializer rather
+    /// Re-registering the same constant replaces its initializer rather
     /// than adding a second entry, which keeps repeated passes over a module
-    /// idempotent.  A declaration with no definition records nothing.
-    /// `declared` is the primitive the declaration names (`declared_primitive`).
-    register(mut &this, def: DefId, init: ExpressionNode*,
-             declared: string) -> void {
-        if (!def.is_valid()) { return; }
+    /// idempotent.  Any other answer, and an invalid id, records nothing.
+    /// `declared` is the primitive the declaration names (`declared_primitive`),
+    /// and `annotated` whether it names a type at all.
+    register(mut &this, answer: Res, init: ExpressionNode*,
+             declared: string, annotated: boolean) -> void {
         const int_typed: boolean = declared.length() > 0
             && ResBase::reads_as_integer(ResBase::primitive_position(declared));
-        const key: DefKey = this.defs.table_key(def);
-        match (this.by_def.get(&key)) {
-            Option::Some(existing) => {
-                this.entries[existing].init       = init;
-                this.entries[existing].value      = FoldedInteger::unsigned(0);
-                this.entries[existing].state      = CONST_PENDING;
-                this.entries[existing].real_value = 0.0;
-                this.entries[existing].real_state = CONST_PENDING;
-                this.entries[existing].int_typed  = int_typed;
-                this.entries[existing].declared   = declared;
-                return;
-            }
-            Option::None => { }
+        const existing: i64 = this.index_of(answer);
+        if (existing >= 0) {
+            this.entries[existing].init       = init;
+            this.entries[existing].value      = ConstantValue::untyped(FoldedInteger::unsigned(0));
+            this.entries[existing].state      = CONST_PENDING;
+            this.entries[existing].real_value = 0.0;
+            this.entries[existing].real_state = CONST_PENDING;
+            this.entries[existing].int_typed  = int_typed;
+            this.entries[existing].declared   = declared;
+            this.entries[existing].annotated  = annotated;
+            return;
         }
 
         const idx: i64 = this.entries.length();
+        match (answer) {
+            Res::Def(d) => {
+                if (!d.is_valid()) { return; }
+                this.by_def.insert(this.defs.table_key(d), idx);
+            }
+            Res::Local(binding) => {
+                if (!binding.is_valid()) { return; }
+                this.by_local.insert(binding.table_key(), idx);
+            }
+            _ => { return; }
+        }
         this.entries.push(ConstEntry {
             init:           init,
-            value:          FoldedInteger::unsigned(0),
+            value:          ConstantValue::untyped(FoldedInteger::unsigned(0)),
             state:          CONST_PENDING,
             real_value:     0.0,
             real_state:     CONST_PENDING,
             int_typed:      int_typed,
             declared:       declared,
+            annotated:      annotated,
         });
-        this.by_def.insert(key, idx);
     }
 
     /// Record a module-level enum declaration under its definition - the
@@ -238,11 +266,20 @@ public:
         this.enums_by_def.insert(key, idx);
     }
 
-    /// The entry of the constant `d`, or -1 when `d` is no constant this
-    /// table holds.
-    index_of(&this, d: DefId) -> i64 {
-        if (!d.is_valid()) { return -1; }
-        return match (this.by_def.get(&this.defs.table_key(d))) {
+    /// The entry of the constant `answer` names, or -1 when it names no
+    /// constant this table holds.
+    index_of(&this, answer: Res) -> i64 {
+        mut found: Option<i64> = Option::None;
+        match (answer) {
+            Res::Def(d) => {
+                if (d.is_valid()) { found = this.by_def.get(&this.defs.table_key(d)); }
+            }
+            Res::Local(binding) => {
+                if (binding.is_valid()) { found = this.by_local.get(&binding.table_key()); }
+            }
+            _ => { }
+        }
+        return match (found) {
             Option::Some(i) => { i }
             Option::None    => { -1 }
         };
@@ -308,6 +345,27 @@ type struct FoldedInteger {
         if (this.negative && (this.bits as i128) < i64::MIN as i128) { return Option::None; }
         if (!this.negative && this.bits > u64::MAX as u128) { return Option::None; }
         return Option::Some(this.bits as u64);
+    }
+
+    /// The integer type a value with no type of its own has where nothing
+    /// expects one: `i32` when it holds the value, else `i64`, else `u64`;
+    /// "" for a value none of them holds.
+    default_primitive(&this) -> string {
+        if (this.held_in(32, true)) { return "i32"; }
+        if (this.held_in(64, true)) { return "i64"; }
+        if (this.held_in(64, false)) { return "u64"; }
+        return "";
+    }
+
+    /// The narrowest integer type wider than `width` that holds this value
+    /// and, for an unsigned `width`, every value of that type: an unsigned
+    /// one first, then a signed one.  "" when no type up to 128 bits does.
+    wider_type_holding(&this, width: u64, signed: boolean) -> string {
+        for (mut bits: u64 = width * 2; bits <= 128; bits = bits * 2) {
+            if (!signed && this.held_in(bits, false)) { return fmt::format("u%s", bits.to_decimal_string()).into_raw(); }
+            if (this.held_in(bits, true)) { return fmt::format("i%s", bits.to_decimal_string()).into_raw(); }
+        }
+        return "";
     }
 
     to_f64(&this) -> f64 {
@@ -459,6 +517,170 @@ type struct FoldedInteger {
 }
 
 
+/// A folded integer and the integer type the program computes it in.
+///
+/// `primitive` is that type: a constant's declared one, a cast's target, a
+/// suffixed literal's suffix, `u64` for `sizeof` and `alignof`, and an
+/// operation's from its operands.  It is "" for a value made only of
+/// unsuffixed literals, which is computed exactly, at no width, and takes the
+/// type of the operand beside it or of the constant it initializes.  An
+/// operation on a typed operand is computed at that type's width, as the
+/// running program computes it: a complement flips that many bits, and a
+/// left shift drops the bits shifted past it.
+///
+/// `overflow` is the first `+`, `-`, `*`, `/`, `%` or negation whose value its
+/// type does not hold, or null.  The program never has such a value -
+/// computing it panics, and a constant one is refused - so it is carried
+/// exactly and every value computed from it carries the mark: the one
+/// refusal is reported where the overflow is, and not again at each use.
+type struct ConstantValue {
+    value: FoldedInteger;
+    primitive: string;
+    overflow: ExpressionNode*;
+
+    static untyped(value: FoldedInteger) -> ConstantValue {
+        return ConstantValue { value: value, primitive: "", overflow: null };
+    }
+
+    static typed(value: FoldedInteger, primitive: string) -> ConstantValue {
+        return ConstantValue { value: value, primitive: primitive, overflow: null };
+    }
+
+    /// The width and signedness of the integer primitive `primitive`, a
+    /// `char` as the 32-bit unsigned scalar it is; None for "" and for every
+    /// primitive that is not an integer.
+    static integer_kind_of(primitive: string) -> Option<IntegerKind> {
+        return match (primitive) {
+            "i8"    => { Option::Some(IntegerKind::I8) }
+            "i16"   => { Option::Some(IntegerKind::I16) }
+            "i32"   => { Option::Some(IntegerKind::I32) }
+            "i64"   => { Option::Some(IntegerKind::I64) }
+            "i128"  => { Option::Some(IntegerKind::I128) }
+            "isize" => { Option::Some(IntegerKind::Isize) }
+            "u8"    => { Option::Some(IntegerKind::U8) }
+            "u16"   => { Option::Some(IntegerKind::U16) }
+            "u32"   => { Option::Some(IntegerKind::U32) }
+            "char"  => { Option::Some(IntegerKind::U32) }
+            "u64"   => { Option::Some(IntegerKind::U64) }
+            "u128"  => { Option::Some(IntegerKind::U128) }
+            "usize" => { Option::Some(IntegerKind::Usize) }
+            _       => { Option::None }
+        };
+    }
+
+    /// The type an operation on operands of types `left` and `right` is
+    /// computed in: the wider of two integer types, the one integer type of
+    /// the two, or "" when neither is one.  Two types of one width are the
+    /// left's; a program mixing them is refused where it is typed.
+    static common_primitive(left: string, right: string) -> string {
+        const l: Option<IntegerKind> = ConstantValue::integer_kind_of(left);
+        const r: Option<IntegerKind> = ConstantValue::integer_kind_of(right);
+        if (l.is_none()) { return if (r.is_some()) { right } else { "" }; }
+        if (r.is_some() && r.unwrap().bit_width() > l.unwrap().bit_width()) { return right; }
+        return left;
+    }
+
+    /// Whether the value's type holds it; an untyped value is held.
+    held(&this) -> boolean {
+        return match (ConstantValue::integer_kind_of(this.primitive)) {
+            Option::Some(kind) => { this.value.held_in(kind.bit_width(), kind.is_signed()) }
+            Option::None       => { true }
+        };
+    }
+
+    /// The value as an operand or a constant of the integer type `primitive`.
+    /// A value the type holds keeps it.  An untyped value the type's width
+    /// holds as a bit pattern is that pattern, as a literal is: with
+    /// `x: u32`, `x & ~0xFF` clears the low eight bits of `x`, and
+    /// `const B: i8 = 200` is -56.  Any other value keeps what it is, in a
+    /// type that does not hold it; where it is written that is refused.
+    in_type(&this, primitive: string) -> ConstantValue {
+        const converted: ConstantValue = ConstantValue {
+            value: this.value, primitive: primitive, overflow: this.overflow };
+        if (this.primitive == primitive || converted.held() || !this.primitive.is_empty()) { return converted; }
+        return match (ConstantValue::integer_kind_of(primitive)) {
+            Option::Some(kind) => {
+                if (!this.value.held_in(kind.bit_width(), !kind.is_signed())) { return converted; }
+                match (ConstEval::wrap_to_primitive(primitive, this.value)) {
+                    Option::Some(pattern) => {
+                        ConstantValue { value: pattern, primitive: primitive, overflow: this.overflow }
+                    }
+                    Option::None => { converted }
+                }
+            }
+            Option::None => { converted }
+        };
+    }
+
+    /// `op this`, the unary expression `at`.  A negation its type does not
+    /// hold overflows; a complement flips the bits of its type's width.
+    apply_unary(&this, at: ExpressionNode*, op: TokenType) -> Option<ConstantValue> {
+        if (op == TokenType::Exclaim) {
+            return Option::Some(ConstantValue::untyped(FoldedInteger::truth(this.value.is_zero())));
+        }
+        mut result: Option<FoldedInteger> = Option::None;
+        if (op == TokenType::Minus) { result = this.value.negate(); }
+        if (op == TokenType::Tilde) { result = this.value.bitwise_not(); }
+        if (result.is_none()) { return Option::None; }
+        if (op == TokenType::Tilde && ConstantValue::integer_kind_of(this.primitive).is_some()) {
+            result = ConstEval::wrap_to_primitive(this.primitive, result.unwrap());
+        }
+        mut folded: ConstantValue = ConstantValue {
+            value: result.unwrap(), primitive: this.primitive, overflow: this.overflow };
+        if (folded.overflow == null && !folded.held()) { folded.overflow = at; }
+        return Option::Some(folded);
+    }
+
+    /// `this op other`, the binary expression `at`.
+    ///
+    /// A shift has its left operand's type, which the count says nothing
+    /// about.  Every other operation brings both operands to their common
+    /// type and is computed in it; a comparison answers an untyped 0 or 1.
+    /// A `+`, `-`, `*` or `/` whose value its type does not hold overflows,
+    /// and so does a `%` whose division's quotient it does not hold.  None
+    /// past the range of every integer type and for a zero divisor.
+    apply(&this, at: ExpressionNode*, op: TokenType, other: ConstantValue) -> Option<ConstantValue> {
+        const carried: ExpressionNode* = if (this.overflow != null) { this.overflow } else { other.overflow };
+        if (op == TokenType::LessLess || op == TokenType::GreaterGreater) {
+            mut shifted: Option<FoldedInteger> = Option::None;
+            if (op == TokenType::LessLess && ConstantValue::integer_kind_of(this.primitive).is_some()) {
+                if (other.value.negative || other.value.bits >= 128) { return Option::None; }
+                shifted = ConstEval::wrap_to_primitive(this.primitive,
+                    FoldedInteger::unsigned(this.value.bits << other.value.bits));
+            } else {
+                shifted = this.value.apply(op, other.value);
+            }
+            return match (shifted) {
+                Option::Some(v) => { Option::Some(ConstantValue { value: v, primitive: this.primitive, overflow: carried }) }
+                Option::None    => { Option::None }
+            };
+        }
+
+        const primitive: string = ConstantValue::common_primitive(this.primitive, other.primitive);
+        const left: ConstantValue = this.in_type(primitive);
+        const right: ConstantValue = other.in_type(primitive);
+        const computed: Option<FoldedInteger> = left.value.apply(op, right.value);
+        if (computed.is_none()) { return Option::None; }
+        const arithmetic: boolean = op == TokenType::Plus || op == TokenType::Minus || op == TokenType::Star
+            || op == TokenType::Slash || op == TokenType::Percent;
+        const bitwise: boolean = op == TokenType::Amp || op == TokenType::Pipe || op == TokenType::Caret;
+        if (!arithmetic && !bitwise) {
+            return Option::Some(ConstantValue { value: computed.unwrap(), primitive: "", overflow: carried });
+        }
+        mut folded: ConstantValue = ConstantValue { value: computed.unwrap(), primitive: primitive, overflow: carried };
+        if (arithmetic && folded.overflow == null) {
+            // A remainder is computed by the division it is the remainder
+            // of, so that division's quotient is what must be held.
+            const judged: ConstantValue = if (op == TokenType::Percent) {
+                ConstantValue::typed(left.value.divide(right.value, false).unwrap(), primitive)
+            } else { folded };
+            if (!judged.held()) { folded.overflow = at; }
+        }
+        return Option::Some(folded);
+    }
+}
+
+
 /// Everything a compile-time integer fold is allowed to consult.
 ///
 /// A null capability is a NARROWER ENVIRONMENT, not a different rule.  Sema
@@ -494,22 +716,40 @@ type struct ConstEval {
     /// Booleans fold as 0/1 so a comparison composes with arithmetic; a caller
     /// that wants a count rejects a negative result itself.
     fold(&this, expr: ExpressionNode*) -> Option<FoldedInteger> {
+        return match (this.fold_value(expr)) {
+            Option::Some(folded) => { Option::Some(folded.value) }
+            Option::None         => { Option::None }
+        };
+    }
+
+    /// `fold`, with the type the value is computed in and the operation
+    /// that overflowed in it, if one did (`ConstantValue`).
+    fold_value(&this, expr: ExpressionNode*) -> Option<ConstantValue> {
         if (expr == null) { return Option::None; }
         const node: ExpressionNode* = expr;
 
         const lit: LiteralExpr* = ExpressionNode::literal_of(expr);
         if (lit != null) {
             if (lit.literal_kind == LiteralKind::Boolean) {
-                return Option::Some(FoldedInteger::truth(lit.value == "true"));
+                return Option::Some(ConstantValue::untyped(FoldedInteger::truth(lit.value == "true")));
             }
             // A character is its Unicode scalar value, read by the one
             // decoder of a character literal.
             if (lit.literal_kind == LiteralKind::Char) {
-                return Option::Some(FoldedInteger::unsigned(Lexer::char_literal_value(lit.value) as u128));
+                return Option::Some(ConstantValue::untyped(
+                    FoldedInteger::unsigned(Lexer::char_literal_value(lit.value) as u128)));
             }
             if (lit.literal_kind != LiteralKind::Integer) { return Option::None; }
+            // A suffix names the literal's type; an unsuffixed one has none.
             return match (Lexer::integer_literal_value(lit.value, lit.suffix)) {
-                Option::Some(v) => { Option::Some(FoldedInteger::unsigned(v)) }
+                Option::Some(v) => {
+                    const suffixed: boolean = ConstantValue::integer_kind_of(lit.suffix).is_some();
+                    Option::Some(ConstantValue {
+                        value: FoldedInteger::unsigned(v),
+                        primitive: if (suffixed) { lit.suffix } else { "" },
+                        overflow: null,
+                    })
+                }
                 Option::None    => { Option::None }
             };
         }
@@ -524,12 +764,23 @@ type struct ConstEval {
             return this.fold_scoped(sr);
         }
 
+        // A cast's value is its operand's wrapped to the target, in the
+        // target's type.
         const fold_cast: CastExpr* = ExpressionNode::cast_of(node);
         if (fold_cast != null) {
-            return match (this.fold(fold_cast.expression)) {
+            const target: string = this.primitive_name_of(fold_cast.target_annotation);
+            return match (this.fold_value(fold_cast.expression)) {
                 Option::Some(v) => {
-                    ConstEval::wrap_to_primitive(
-                        this.primitive_name_of(fold_cast.target_annotation), v)
+                    match (ConstEval::wrap_to_primitive(target, v.value)) {
+                        Option::Some(wrapped) => {
+                            Option::Some(ConstantValue {
+                                value: wrapped,
+                                primitive: if (ConstantValue::integer_kind_of(target).is_some()) { target } else { "" },
+                                overflow: v.overflow,
+                            })
+                        }
+                        Option::None => { Option::None }
+                    }
                 }
                 Option::None => { Option::None }
             };
@@ -543,7 +794,7 @@ type struct ConstEval {
             if (this.arena == null || !sz.operand_type.is_valid()) { return Option::None; }
             const t: Type* = this.arena.lookup(sz.operand_type);
             if (t == null) { return Option::None; }
-            return Option::Some(FoldedInteger::unsigned(t.size_bytes() as u128));
+            return Option::Some(ConstantValue::typed(FoldedInteger::unsigned(t.size_bytes() as u128), "u64"));
         }
 
         const al: AlignofExpr* = ExpressionNode::alignof_of(node);
@@ -551,31 +802,24 @@ type struct ConstEval {
             if (this.arena == null || !al.operand_type.is_valid()) { return Option::None; }
             const t: Type* = this.arena.lookup(al.operand_type);
             if (t == null) { return Option::None; }
-            return Option::Some(FoldedInteger::unsigned(t.alignment() as u128));
+            return Option::Some(ConstantValue::typed(FoldedInteger::unsigned(t.alignment() as u128), "u64"));
         }
 
         const u: UnaryExpr* = ExpressionNode::unary_of(node);
         if (u != null) {
-            return match (this.fold(u.operand)) {
-                Option::Some(a) => {
-                    match (u.op.kind) {
-                        TokenType::Minus   => { a.negate() }
-                        TokenType::Tilde   => { a.bitwise_not() }
-                        TokenType::Exclaim => { Option::Some(FoldedInteger::truth(a.is_zero())) }
-                        _                  => { Option::None }
-                    }
-                }
-                Option::None => { Option::None }
+            return match (this.fold_value(u.operand)) {
+                Option::Some(a) => { a.apply_unary(node, u.op.kind) }
+                Option::None    => { Option::None }
             };
         }
 
         const b: BinaryExpr* = ExpressionNode::binary_of(node);
         if (b != null) {
             // The right operand is not folded when the left is not a constant.
-            return match (this.fold(b.left)) {
+            return match (this.fold_value(b.left)) {
                 Option::Some(x) => {
-                    match (this.fold(b.right)) {
-                        Option::Some(y) => { x.apply(b.op.kind, y) }
+                    match (this.fold_value(b.right)) {
+                        Option::Some(y) => { x.apply(node, b.op.kind, y) }
                         Option::None    => { Option::None }
                     }
                 }
@@ -666,36 +910,31 @@ type struct ConstEval {
 
         // Anything else this environment can evaluate is integer-valued
         // (a named integer constant, an enum variant, `sizeof`), promoted.
-        return ConstEval::promoted(this.fold(expr));
+        return ConstEval::promoted(this.fold_value(expr));
     }
 
     /// A folded integer as a real.
-    static promoted(value: Option<FoldedInteger>) -> Option<f64> {
+    static promoted(value: Option<ConstantValue>) -> Option<f64> {
         return match (value) {
-            Option::Some(v) => { Option::Some(v.to_f64()) }
+            Option::Some(v) => { Option::Some(v.value.to_f64()) }
             Option::None    => { Option::None }
         };
     }
 
     /// The entry a bare name's STAMP denotes, or -1.  A `Def` is the
-    /// constant's definition, the key the table is built under; every
-    /// other answer - a local, a type parameter, a type, no answer - names
-    /// no module-level constant.
+    /// constant's definition and a `Local` a local `const` binding, the keys
+    /// the table is built under; every other answer - a type parameter, a
+    /// type, no answer - names no constant.
     stamped_index_of(&this, id: IdentifierExpr*) -> i64 {
         if (this.table == null) { return -1; }
         return match (id.res) {
-            ResSlot::Answered(r) => {
-                match (r) {
-                    Res::Def(d) => { this.table.index_of(d) }
-                    _ => { -1 }
-                }
-            }
+            ResSlot::Answered(r) => { this.table.index_of(r) }
             _ => { -1 }
         };
     }
 
     /// Fold a bare name: the constant its stamp names.
-    fold_named(&this, id: IdentifierExpr*) -> Option<FoldedInteger> {
+    fold_named(&this, id: IdentifierExpr*) -> Option<ConstantValue> {
         const idx: i64 = this.stamped_index_of(id);
         if (idx < 0) { return Option::None; }
         return this.fold_entry(idx);
@@ -716,7 +955,7 @@ type struct ConstEval {
     /// means it named a TYPE, so the member is a constant the type declares
     /// (`u8::MAX`, `Point::LIMIT`) or an enum variant of it.  Anything else
     /// is not a compile-time integer.
-    fold_scoped(&this, sr: ScopeResolutionExpr*) -> Option<FoldedInteger> {
+    fold_scoped(&this, sr: ScopeResolutionExpr*) -> Option<ConstantValue> {
         if (this.table == null || this.intern == null) { return Option::None; }
         return this.fold_scoped_res(
             sr.scope_res.require("ConstEval::fold_scoped"), sr);
@@ -728,12 +967,12 @@ type struct ConstEval {
     /// without requiring the slot a second time: `require` records a pending
     /// bug for an unstamped node, so asking twice would count one unstamped
     /// path as two.
-    fold_scoped_res(&this, r: Res, sr: ScopeResolutionExpr*) -> Option<FoldedInteger> {
+    fold_scoped_res(&this, r: Res, sr: ScopeResolutionExpr*) -> Option<ConstantValue> {
         if (this.table == null || this.intern == null) { return Option::None; }
 
         return match (r) {
             Res::Def(_) => {
-                const i: i64 = this.table.index_of(sr.member_def);
+                const i: i64 = this.table.index_of(Res::Def(sr.member_def));
                 if (i < 0) { return Option::None; }
                 return this.fold_entry(i);
             }
@@ -741,14 +980,17 @@ type struct ConstEval {
                 // A type's constant or `Enum::Variant`, one trailing segment
                 // past the type.
                 if (trailing != 1) { return Option::None; }
-                const constant: i64 = this.table.index_of(this.table.type_constant(
-                    this.table.type_constant_owner(base), sr.member_name));
+                const constant: i64 = this.table.index_of(Res::Def(this.table.type_constant(
+                    this.table.type_constant_owner(base), sr.member_name)));
                 if (constant >= 0) { return this.fold_entry(constant); }
                 return match (base) {
                     ResBase::Def(q) => {
                         return match (this.table.enums_by_def.get(&this.table.defs.table_key(q))) {
                             Option::Some(ei) => {
-                                ConstEval::variant_tag_of(this.table.enums[ei], sr.member_name)
+                                match (ConstEval::variant_tag_of(this.table.enums[ei], sr.member_name)) {
+                                    Option::Some(tag) => { Option::Some(ConstantValue::untyped(tag)) }
+                                    Option::None      => { Option::None }
+                                }
                             }
                             Option::None => { Option::None }
                         };
@@ -779,11 +1021,13 @@ type struct ConstEval {
     /// cycle guard: a constant reached from its own initializer is not a
     /// compile-time integer, and without the guard the recursion has no floor.
     ///
-    /// An integer-typed constant's value is its initializer's wrapped to the
-    /// declared type, as the stored global is: `const A: u8 = B + 200` with
-    /// `B` at 100 is 44 at every use, never 300 in an array size and 44 at
-    /// run time.
-    fold_entry(&this, idx: i64) -> Option<FoldedInteger> {
+    /// An integer-typed constant's value is its initializer's in the
+    /// declared type, as the stored global is: `const C: u16 = ~u8::MIN` is
+    /// the complement of a `u8`, 255, at every use, as the program reads it.
+    /// An unannotated one has its initializer's type, and one made only of
+    /// literals the type it has where nothing expects one.  A boolean one is
+    /// its truth.
+    fold_entry(&this, idx: i64) -> Option<ConstantValue> {
         if (this.table == null) { return Option::None; }
         if (idx < 0 || idx >= this.table.entries.length()) { return Option::None; }
 
@@ -795,14 +1039,20 @@ type struct ConstEval {
         if (init == null) { return Option::None; }
 
         this.table.entries[idx].state = CONST_FOLDING;
-        mut folded: Option<FoldedInteger> = this.fold(init);
-        if (this.table.entries[idx].int_typed) {
-            folded = match (folded) {
-                Option::Some(v) => {
-                    ConstEval::wrap_to_primitive(this.table.entries[idx].declared, v)
-                }
-                Option::None => { Option::None }
-            };
+        mut folded: Option<ConstantValue> = this.fold_value(init);
+        if (folded.is_some()) {
+            const v: ConstantValue = folded.unwrap();
+            const declared: string = this.table.entries[idx].declared;
+            if (ConstantValue::integer_kind_of(declared).is_some()) {
+                folded = Option::Some(v.in_type(declared));
+            } else if (this.table.entries[idx].int_typed) {
+                folded = match (ConstEval::wrap_to_primitive(declared, v.value)) {
+                    Option::Some(truth) => { Option::Some(ConstantValue::untyped(truth)) }
+                    Option::None        => { Option::None }
+                };
+            } else if (!this.table.entries[idx].annotated && v.primitive.is_empty()) {
+                folded = Option::Some(v.in_type(v.value.default_primitive()));
+            }
         }
         return match (folded) {
             Option::Some(v) => {
@@ -841,13 +1091,13 @@ type struct ConstEval {
         const r: Res = sr.scope_res.require("ConstEval::fold_scoped_real");
         return match (r) {
             Res::Def(_) => {
-                const i: i64 = this.table.index_of(sr.member_def);
+                const i: i64 = this.table.index_of(Res::Def(sr.member_def));
                 if (i < 0) { return Option::None; }
                 return this.fold_entry_real(i);
             }
             Res::TypeRelative(base, 1) => {
-                const constant: i64 = this.table.index_of(this.table.type_constant(
-                    this.table.type_constant_owner(base), sr.member_name));
+                const constant: i64 = this.table.index_of(Res::Def(this.table.type_constant(
+                    this.table.type_constant_owner(base), sr.member_name)));
                 if (constant >= 0) { return this.fold_entry_real(constant); }
                 return ConstEval::promoted(this.fold_scoped_res(r, sr));
             }
@@ -942,5 +1192,76 @@ type struct ConstEval {
             return Option::Some(FoldedInteger { bits: low | ~mask, negative: true });
         }
         return Option::Some(FoldedInteger::unsigned(low));
+    }
+
+    /// The refusal (E0465) of `e`, an integer `+`, `-`, `*`, `/` or `%`, or a
+    /// negation (`left` null), of the type `type_name` - `width` bits,
+    /// `signed` - whose operands are `values` and whose value that type does
+    /// not hold; for a `%`, whose division's quotient it does not hold.
+    /// `where` says when it is computed, completing the label: `this
+    /// overflows <where>`.  Its help writes the operation computed in a type
+    /// that holds the value.
+    static overflow_refusal(e: ExpressionNode*, op: TokenType, left: ExpressionNode*, right: ExpressionNode*,
+                            values: [FoldedInteger], type_name: string, width: u64, signed: boolean,
+                            where: string, intern: InternTable*) -> Diagnostic {
+        const written: string = ExpressionNode::spell(e, intern);
+        const remainder: boolean = op == TokenType::Percent;
+        const computed: Option<FoldedInteger> = if (left == null) { values[0].negate() }
+            else { values[0].apply(if (remainder) { TokenType::Slash } else { op }, values[1]) };
+        if (remainder) {
+            // The quotient is one past the type's maximum, which the next
+            // wider type holds, and in it the remainder is computed without
+            // a panic; a 128-bit type has no wider one, so its remainder is
+            // written as the value it is.
+            mut panics: Diagnostic = Diagnostic::error(ErrorCode::E0465_CONSTANT_OVERFLOW,
+                fmt::format("`%s` always panics: the division it is the remainder of has the quotient %s, which `%s` does not hold",
+                    written, computed.unwrap().to_decimal_string(), type_name));
+            panics = panics.at_with_label(e.span, fmt::format("this panics %s", where));
+            match (values[0].apply(op, values[1])) {
+                Option::Some(value) => {
+                    if (width < 128) {
+                        const wider: string = fmt::format("i%s", (width * 2).to_decimal_string()).into_raw();
+                        panics = panics.help_with_example(
+                            fmt::format("where the remainder %s is meant, compute it in `%s`, which holds the quotient",
+                                value.to_decimal_string(), wider),
+                            fmt::format("(%s as %s) %s %s", ExpressionNode::spell_operand(left, intern), wider,
+                                op.to_string(), ExpressionNode::spell_operand(right, intern)));
+                    } else {
+                        panics = panics.help_with_example(
+                            fmt::format("no integer type holds the quotient; where the remainder %s is meant, write it",
+                                value.to_decimal_string()),
+                            value.to_decimal_string());
+                    }
+                }
+                Option::None => { }
+            }
+            return panics;
+        }
+        mut refusal: Diagnostic = Diagnostic::error(ErrorCode::E0465_CONSTANT_OVERFLOW,
+            if (computed.is_some()) {
+                fmt::format("`%s` overflows `%s`: its value is %s, which `%s` does not hold",
+                    written, type_name, computed.unwrap().to_decimal_string(), type_name)
+            } else {
+                fmt::format("`%s` overflows `%s`: its value is past the range of every integer type", written, type_name)
+            });
+        refusal = refusal.at_with_label(e.span, fmt::format("this overflows %s", where));
+        // The value is kept by computing in the narrowest type that holds it
+        // and every value of the operation's type, so the other operand
+        // converts to it.
+        if (computed.is_some()) {
+            const wider: string = computed.unwrap().wider_type_holding(width, signed);
+            if (!wider.is_empty()) {
+                refusal = refusal.help_with_example(
+                    fmt::format("where the value %s is meant, compute and keep it in `%s`, which holds it",
+                        computed.unwrap().to_decimal_string(), wider),
+                    if (left == null) {
+                        fmt::format("-(%s as %s)", ExpressionNode::spell_operand(right, intern), wider)
+                    } else {
+                        fmt::format("(%s as %s) %s %s", ExpressionNode::spell_operand(left, intern), wider, op.to_string(),
+                            ExpressionNode::spell_operand(right, intern))
+                    });
+            }
+        }
+        return refusal;
     }
 }
