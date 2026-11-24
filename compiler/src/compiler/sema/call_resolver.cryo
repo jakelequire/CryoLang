@@ -6390,7 +6390,7 @@ type struct CallResolver {
                 instance_head = block.spell_head(this.intern);
             }
         }
-        const owning_trait: DeclName = this.binding.lookup_trait_defining_method(member.member);
+        const owning_trait: DefId = this.binding.lookup_trait_defining_method(member.member);
         mut unmet_member: TypeRef = TypeRef::invalid();
         mut unmet_associated: SymbolStr = SymbolStr::empty();
         mut unmet_owner: DefId = DefId::invalid();
@@ -6403,9 +6403,11 @@ type struct CallResolver {
             diag = this.explain_unmet_projection_bound(diag, method_name, type_display, unmet_bound,
                 unmet_member, unmet_associated, unmet_owner);
         } else if (owning_trait.is_valid()) {
-            const trait_str: string = this.intern.shown(owning_trait);
+            const trait_str: string = this.intern.shown(this.ctx.defs.path_of(owning_trait));
             diag = diag.with_note(fmt::format("the method `%s` is defined on trait `%s`", method_name, trait_str));
-            diag = diag.help(fmt::format("implement `%s` for `%s`, or change the receiver to a type that already does", trait_str, type_display));
+            diag = diag.help(this.trait_checker().bound_failure_help(lookup_ref, owning_trait, trait_str, type_display,
+                fmt::format("implement `%s` for `%s`, or change the receiver to a type that already does",
+                    trait_str, type_display).into_raw()));
         } else {
             const suggestion: SymbolStr = this.diag.suggest_similar_method(lookup_ref, member.member);
             if (suggestion.is_valid()) {
@@ -6460,9 +6462,12 @@ type struct CallResolver {
     /// `diag`, a call's E0358 for a trait default that a bound on one of the
     /// trait's associated types keeps off the receiver, with the bound and
     /// the binding that fails it.  Its help shows the fix where one is
-    /// certain: an item that is a reference to a built-in value type with
-    /// the trait is compared through `map`, which copies the values out; an
-    /// item of any other type that is no reference needs the trait.
+    /// certain: an item of a type that is no reference needs the trait, and
+    /// so does the referent of a reference that an implementation for
+    /// references gives the trait where its referent has it (`Ord for &T
+    /// where T: Ord`); a reference to a built-in value type with the trait,
+    /// which no such implementation gives it, is compared through `map`,
+    /// which copies the values out.
     explain_unmet_projection_bound(&this, diag: Diagnostic, method_name: string, type_display: string,
                                    unmet: const TraitRef*, member: TypeRef, associated: SymbolStr,
                                    owner: DefId) -> Diagnostic {
@@ -6474,10 +6479,18 @@ type struct CallResolver {
         mut explained: Diagnostic = diag.with_note(
             f"`{method_name}` is a method of `{owner_name}` only where `This::{associated_name}: {bound_name}`, and `{type_display}` binds `{associated_name}` to `{member_display}`, which does not implement `{bound_name}`");
         if (member_t == null || member_t.kind != TypeKind::Reference) {
-            return explained.help(f"implement `{bound_name}` for `{member_display}`");
+            return explained.help(this.trait_checker().bound_failure_help(member, unmet.definition(),
+                f"{bound_name}".into_raw(), member_display, f"implement `{bound_name}` for `{member_display}`".into_raw()));
         }
         const referent: TypeRef = member_t.as_reference().referent;
         const referent_t: Type* = this.arena.lookup(referent);
+        if (referent_t != null && this.trait_checker().reference_head_follows_referent(unmet.definition(), member)) {
+            const followed_display: string = this.arena.format_display(referent_t);
+            explained = explained.with_note(
+                f"a reference implements `{bound_name}` where the type it refers to does, and `{followed_display}` does not");
+            return explained.help(this.trait_checker().bound_failure_help(member, unmet.definition(),
+                f"{bound_name}".into_raw(), member_display, f"implement `{bound_name}` for `{followed_display}`".into_raw()));
+        }
         const built_in: boolean = referent_t != null && (referent_t.kind == TypeKind::Int
             || referent_t.kind == TypeKind::Float || referent_t.kind == TypeKind::Bool
             || referent_t.kind == TypeKind::Char);
@@ -6635,6 +6648,10 @@ type struct CallResolver {
             d = d.help(fmt::format(
                 "`%s` owns resources, so it isn't `Copy`, and `%s` is only available when `%s` is",
                 conc_str, method_str, param_str));
+        } else {
+            const help: string = this.trait_checker().bound_failure_help(concrete, tref.definition(),
+                trait_str, conc_str, "");
+            if (help != "") { d = d.help(help); }
         }
         this.ctx.emit_diagnostic(d);
     }

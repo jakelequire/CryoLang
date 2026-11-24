@@ -22,7 +22,7 @@ import compiler::ast::{
 };
 import compiler::types::{
     generic, user_defined, compound, type_base, arena, type_ref,
-    substitution, inference, generic_registry, ownership, TypeKind
+    substitution, inference, generic_registry, ownership, TypeKind, RefMutability
 };
 import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::resolver::{ intern_table, symbol_str };
@@ -613,12 +613,30 @@ type struct TraitChecker {
     /// `trait_def` is blocked by a method a table cannot hold, and one whose
     /// trait does not reach it never implements it.  An internal trait can
     /// be implemented only in the package that declares it, so the advice
-    /// to implement it is withheld and a type that does is asked for.  Any
-    /// other type gets `written_help`, the site's own advice.
+    /// to implement it is withheld and a type that does is asked for.  A
+    /// float, or a reference to one, is not `Ord` by design - a NaN is
+    /// unordered against every value - so no implementation is advised; it
+    /// is shown `total_compare`, the total order it has, in a comparator.
+    /// Any other type gets `written_help`, the site's own advice.
     bound_failure_help(&this, ty: TypeRef, trait_def: DefId, trait_shown: string, ty_shown: string,
                        written_help: string) -> string {
         if (this.borrowing_closure_not_thread_safe(ty, trait_def)) {
             return "write `move` before the closure, so it owns what it captures";
+        }
+        if (this.generic_registry != null && trait_def.equals(this.generic_registry.wellknown(LangItem::Ord))) {
+            const outer: Type* = this.arena.lookup(ty);
+            const by_reference: boolean = outer != null && outer.kind == TypeKind::Reference;
+            const float_t: Type* = if (by_reference) { this.arena.lookup(outer.as_reference().referent) } else { outer };
+            if (float_t != null && float_t.kind == TypeKind::Float) {
+                const float_shown: string = this.arena.format_display(float_t);
+                const comparator: string = if (by_reference) {
+                    fmt::format("(a: & %s, b: & %s) -> Ordering { return (*a).total_compare(*b); }", ty_shown, ty_shown).into_raw()
+                } else {
+                    fmt::format("(a: &%s, b: &%s) -> Ordering { return a.total_compare(b); }", ty_shown, ty_shown).into_raw()
+                };
+                return fmt::format("`%s` has no total order - a NaN is neither less than, equal to nor greater than any value - so it does not implement `Ord`; order by `total_compare`, the IEEE-754 total order, where a comparator is taken: `sort_by(%s)`",
+                    float_shown, comparator).into_raw();
+            }
         }
         if (this.is_primitive_trait(trait_def)) {
             const one: [DefId] = [trait_def];
@@ -691,6 +709,31 @@ type struct TraitChecker {
         if (head == null) { return false; }
         const no_trait_args: [TypeRef] = [];
         return this.impl_applies_at(head, head.trait_def, &no_trait_args, subject, depth);
+    }
+
+    /// Whether a head for the references of `reference`'s mutability
+    /// implements `trait_def` exactly where the referent does, its
+    /// where-clause bounding its own parameter by that trait
+    /// (`implement<T> trait Ord for &T where T: Ord`): then the reference
+    /// lacks the trait because what it refers to does.
+    reference_head_follows_referent(&this, trait_def: DefId, reference: TypeRef) -> boolean {
+        const t: Type* = this.arena.lookup(reference);
+        if (t == null || t.kind != TypeKind::Reference || this.generic_registry == null) { return false; }
+        const mutable: boolean = t.as_reference().mutability == RefMutability::Mutable;
+        const heads: [DeclarationNode*] = this.generic_registry.blanket_heads_of(trait_def);
+        for (mut h: i64 = 0; h < heads.length(); h++) {
+            const head: ImplBlock* = DeclarationNode::impl_of(heads[h]);
+            if (head == null || !head.target_reference || head.target_reference_mutable != mutable) { continue; }
+            const param: SymbolID = head.target_param();
+            for (mut b: i64 = 0; b < head.where_bounds.length(); b++) {
+                const bound: TraitBound* = &head.where_bounds[b];
+                if (!bound.subject_param().equals(param)) { continue; }
+                for (mut r: i64 = 0; r < bound.trait_refs.length(); r++) {
+                    if (bound.trait_refs[r].definition().equals(trait_def)) { return true; }
+                }
+            }
+        }
+        return false;
     }
 
     /// The implementation for references that gives a method call its

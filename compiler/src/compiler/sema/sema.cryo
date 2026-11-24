@@ -2663,16 +2663,13 @@ type struct SemaVisitor {
         // path (unwrapping a `Pair<..>*`'s pointee and finding its `Eq` impl is
         // exactly how `p == null` got miscompiled into `p.equals(&null)`).
         //
-        // References ARE unwrapped, but ONLY when `deref_ref` is set - which the
-        // callers do exclusively on the FAILURE path, i.e. after the primitive
-        // `check_binary_op`/`check_unary_op` already rejected the operands.  On
-        // the success path (reference + numeric arithmetic `&p + n`, reference
-        // identity comparison `refA == refB`) the primitive rule applies and
-        // must be preserved byte-identical, so those callers pass
-        // `deref_ref = false`.  With this split, `a + b` / `-a` on a `&T`
-        // parameter (the common by-reference case) overloads just like on a
-        // value, while the pointer-ish primitive paths are untouched.  Bounded
-        // depth guards a pathological `&&T`.
+        // References ARE unwrapped, but ONLY when `deref_ref` is set: after the
+        // primitive `check_binary_op`/`check_unary_op` rejected the operands,
+        // and for a comparison of a reference with a pointer.  Reference +
+        // numeric arithmetic (`&p + n`) keeps the primitive rule.  So `a + b` /
+        // `-a` on a `&T` parameter (the common by-reference case) overloads
+        // just like on a value, while the pointer-ish primitive paths are
+        // untouched.  Bounded depth guards a pathological `&&T`.
         if (deref_ref) {
             mut rdepth: i32 = 0;
             while (t != null && t.kind == TypeKind::Reference && rdepth < 4) {
@@ -2786,14 +2783,31 @@ type struct SemaVisitor {
     /// operand to reach a user `Eq`/`Ord` referent for value comparison: at least
     /// one operand is `&T`, and NEITHER operand is void (a `null` literal), so
     /// `ref == null` keeps its pointer null-check.  The user-vs-primitive decision
-    /// is left to `operator_overload_expr` (which only fires for a user referent),
-    /// so `&i32 == &i32` and pointer null-checks stay on the identity path.
+    /// is left to `operator_overload_expr`, which fires only for a user referent.
     comparison_unwraps_reference(&this, lhs: TypeRef, rhs: TypeRef) -> boolean {
         const lt: Type* = this.arena.lookup(lhs);
         const rt: Type* = this.arena.lookup(rhs);
         if (lt == null || rt == null) { return false; }
         if (lt.kind == TypeKind::Void || rt.kind == TypeKind::Void) { return false; }
         return lt.kind == TypeKind::Reference || rt.kind == TypeKind::Reference;
+    }
+
+    /// `a OP b` on two references: the values they refer to, compared by
+    /// the referent's implementation of the comparison's trait (`Eq` for
+    /// `==` and `!=`, `Ord` for `<`, `>`, `<=` and `>=`), whatever kind of
+    /// type the referent is.  `&i64 == &i64` is `i64`'s `equals`, so the
+    /// operator on references always agrees with `equals` and `compare`.
+    /// Null when the referent does not implement the trait: the references
+    /// then compare by identity.
+    referent_comparison_expr(mut &this, receiver: mut ExpressionNode*, ty: TypeRef,
+                             rhs: mut ExpressionNode*, map: OperatorTraitMap,
+                             op_tok: Token, span: SourceSpan) -> mut ExpressionNode* {
+        const t: Type* = this.arena.lookup(ty);
+        if (t == null || t.kind != TypeKind::Reference) { return null; }
+        const trait_id: DefId = this.ctx.generic_registry.wellknown(map.lang);
+        if (!trait_id.is_valid()) { return null; }
+        if (this.trait_checker().select_impl(trait_id, t.as_reference().referent, 0) == null) { return null; }
+        return this.operator_desugar(receiver, rhs, map, trait_id, op_tok, span);
     }
 
     /// Reflected operator overloading for a PRIMITIVE left operand: `2 * vec`,
@@ -3268,20 +3282,25 @@ type struct SemaVisitor {
                 // even though `check_binary_op` passed the generic param through.
                 // Concrete primitives fall straight through (no user impl).
                 if (map.valid && bin.desugared_call == null) {
-                    // References to a user `Eq`/`Ord` type compare BY VALUE, not by
-                    // identity: `&a == &b` -> `a.equals(&b)` (and `<`/`>` via `Ord`).
-                    // `check_binary_op` passes any reference comparison as a `bool`
-                    // (pointer identity); for the comparison traits we instead unwrap
-                    // the reference and overload when the referent is a user type
-                    // implementing the trait.  Everything else keeps identity: a
-                    // `null`/void operand (`ref == null` stays a pointer null-check),
-                    // and a reference to a primitive or a non-`Eq` type - those make
-                    // `operator_overload_expr` return null and fall through here.
-                    const succ_deref: boolean =
-                        (map.lang == LangItem::Eq || map.lang == LangItem::Ord)
-                        && this.comparison_unwraps_reference(lhs, rhs);
-                    const de: mut ExpressionNode* = this.operator_overload_expr(
-                        bin.left, lhs, bin.right, map, bin.op, e.span, succ_deref);
+                    // `check_binary_op` passes any comparison of references as a
+                    // `boolean` of their identity.  Two references compare the
+                    // values they refer to instead, when the referent implements
+                    // the comparison's trait (`referent_comparison_expr`).  A
+                    // reference beside a pointer reaches a user referent's
+                    // implementation; a `null` operand keeps the pointer
+                    // null-check.
+                    const comparison: boolean = map.lang == LangItem::Eq || map.lang == LangItem::Ord;
+                    const left_t: Type* = this.arena.lookup(lhs);
+                    const right_t: Type* = this.arena.lookup(rhs);
+                    const two_references: boolean = left_t != null && right_t != null
+                        && left_t.kind == TypeKind::Reference && right_t.kind == TypeKind::Reference;
+                    const de: mut ExpressionNode* =
+                        if (comparison && two_references) {
+                            this.referent_comparison_expr(bin.left, lhs, bin.right, map, bin.op, e.span)
+                        } else {
+                            this.operator_overload_expr(bin.left, lhs, bin.right, map, bin.op, e.span,
+                                comparison && this.comparison_unwraps_reference(lhs, rhs))
+                        };
                     if (de != null) { bin.desugared_call = de; return de.resolved_type; }
                 }
                 this.pin_string_append(bin, bin.op.kind, lhs);

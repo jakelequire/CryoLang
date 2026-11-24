@@ -1709,6 +1709,40 @@ type struct MonoCallSpecializer {
         return null;
     }
 
+    /// The type a path through a type parameter (`T::compare`, taken as a
+    /// value or called) names its method on: the type the copy binds to the
+    /// parameter, an instantiation as the specialization minted for it.  A
+    /// reference is not looked through, as a receiver is: with `T` bound to
+    /// `&i64`, `T::compare` is the method an implementation for references
+    /// gives `&i64`, which takes the `& &i64` the path is handed, and never
+    /// `i64`'s, which would read the reference as the value.
+    path_owner(&this, named: TypeRef) -> TypeRef {
+        const t: Type* = this.arena.lookup(named);
+        if (t != null && t.kind == TypeKind::InstantiatedType && t.as_instantiated().has_resolved_type()) {
+            return t.as_instantiated().resolved_type;
+        }
+        return named;
+    }
+
+    /// Place on `owner` the copy of each head for every type or for the
+    /// references (`for T`, `for &T`) of the trait whose item `d` is, that
+    /// applies to `owner` and declares the item: what a path through a type
+    /// parameter taken as a value names when such a head is the owner's
+    /// implementation.  A written implementation and a head for every type
+    /// never both apply (E0308), and a reference has no written one
+    /// (E0104), so a head placed here is the owner's implementation.
+    place_value_blanket_implementations(mut &this, d: DefId, owner: TypeRef) -> void {
+        const slot: i64 = this.generic_registry.trait_item_position(d);
+        if (slot < 0 || this.arena.contains_generic_param(owner)) { return; }
+        const blanket: [DeclarationNode*] = this.generic_registry.blanket_heads_of(this.decl_index.defs.parent_of(d));
+        for (mut h: i64 = 0; h < blanket.length(); h++) {
+            const head: mut ImplBlock* = DeclarationNode::impl_of(blanket[h]);
+            if (this.generic_registry.trait_item_method(head, slot) == null) { continue; }
+            if (!this.trait_spec.trait_checker.impl_applies(head, owner, 0)) { continue; }
+            this.blanket_implementation(blanket[h], owner);
+        }
+    }
+
     /// The type a receiver's methods are read from: `recv` behind any
     /// pointer or reference, an instantiation as the specialization minted
     /// for it.  An instantiation not minted yet is answered as itself.
@@ -1784,7 +1818,7 @@ type struct MonoCallSpecializer {
                 scope.spec_owner = concrete;
             }
         }
-        const owner: TypeRef = this.receiver_owner(scope.spec_owner);
+        const owner: TypeRef = this.path_owner(scope.spec_owner);
         const ot: Type* = this.arena.lookup(owner);
         if (ot == null) { return; }
         // An owner instance not minted yet is queued for the drain, which
@@ -1794,6 +1828,7 @@ type struct MonoCallSpecializer {
             this.queued_path_values.push(scope_e);
             return;
         }
+        this.place_value_blanket_implementations(scope.template_method, owner);
         const m_decl: DeclarationNode* = this.recorded_method_on(scope.template_method, owner);
         const m: MethodDecl* = DeclarationNode::method_of(m_decl);
         if (m == null || m.func == null) { return; }
@@ -2188,7 +2223,15 @@ type struct MonoCallSpecializer {
         for (mut i: i64 = 0; i < this.queued_binds.length(); i++) {
             const call: mut CallExpr* = this.queued_binds[i];
             if (call.resolved_callee.is_some()) { continue; }
-            const owner: TypeRef = this.receiver_owner(call.template_recv);
+            // A path names its method on the type itself; a receiver's
+            // call steps through it.
+            const path_call: boolean = ExpressionNode::scope_resolution_of(call.callee) != null
+                && !call.named_method.is_valid();
+            const owner: TypeRef = if (path_call) {
+                this.path_owner(call.template_recv)
+            } else {
+                this.receiver_owner(call.template_recv)
+            };
             const ot: Type* = this.arena.lookup(owner);
             if (ot == null) { continue; }
             if (ot.kind == TypeKind::InstantiatedType) {

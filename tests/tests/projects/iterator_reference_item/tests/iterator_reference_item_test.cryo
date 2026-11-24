@@ -1,8 +1,9 @@
-// An iterator whose Item is a reference is an iterator like any other: a
-// reference has no `Ord` of its own, so `min`/`max` are no methods of it,
-// and the implementation is accepted without them (their bodies are never
-// checked against the reference).  The negative test
-// E0358_iter_min_reference_item pins the refused call.
+// An iterator whose Item is a reference is an iterator like any other.  A
+// reference is `Eq` and `Ord` where what it refers to is, comparing the
+// values and never the addresses, so `min`/`max` are methods of an iterator
+// of `&i64` or `&Slice<u8>`, and an array of references sorts and searches
+// by value.  The negative test E0358_iter_min_reference_item pins the call
+// refused for a reference to a type with no `Ord`.
 ![config(testing)]
 namespace CryoTests::Tests::Projects::IteratorReferenceItem;
 
@@ -10,6 +11,7 @@ import std::core::result::{ Result };
 import std::core::option::{ Option };
 import std::core::iter::{ Iterator };
 import std::core::slice::{ Slice };
+import std::core::cmp::{ Ordering };
 import std::collections::array::{ Array };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect_equal };
@@ -112,4 +114,148 @@ function slice_item_map_filter_count() -> Result<(), TestError> {
     mut first_bytes: i64 = 0;
     for (piece in Halves::of(storage.as_slice())) { first_bytes = first_bytes * 10 + piece[0] as i64; }
     return expect_equal(first_bytes, 13);
+}
+
+// The values sit in an array, so their addresses ascend with the index
+// while the values do not: an order taken from the addresses gives a
+// different answer from the one taken from the values.
+
+![test]
+function reference_item_min_max() -> Result<(), TestError> {
+    mut values: Array<i64> = Array::new();
+    values.push(30);
+    values.push(10);
+    values.push(20);
+    values.push(10);
+    mut smallest: i64 = -1;
+    match (EachValue::over(values.as_slice()).min()) {
+        Option::Some(found) => { smallest = *found; }
+        Option::None => { }
+    }
+    expect_equal(smallest, 10)?;
+    mut largest: i64 = -1;
+    match (EachValue::over(values.as_slice()).max()) {
+        Option::Some(found) => { largest = *found; }
+        Option::None => { }
+    }
+    return expect_equal(largest, 30);
+}
+
+![test]
+function slice_item_min_max() -> Result<(), TestError> {
+    // Halves `[5, 1]` and `[3, 2, 9]`: the second orders first.
+    mut storage: Array<u8> = Array::new();
+    storage.push(5);
+    storage.push(1);
+    storage.push(3);
+    storage.push(2);
+    storage.push(9);
+    mut smallest: i64 = -1;
+    match (Halves::of(storage.as_slice()).min()) {
+        Option::Some(piece) => { smallest = piece.length(); }
+        Option::None => { }
+    }
+    expect_equal(smallest, 3)?;
+    mut largest: i64 = -1;
+    match (Halves::of(storage.as_slice()).max()) {
+        Option::Some(piece) => { largest = piece.length(); }
+        Option::None => { }
+    }
+    return expect_equal(largest, 2);
+}
+
+![test]
+function reference_array_sorts_and_searches_by_value() -> Result<(), TestError> {
+    mut values: Array<i64> = Array::new();
+    values.push(30);
+    values.push(10);
+    values.push(20);
+    const view: &Slice<i64> = values.as_slice();
+    mut stable: Array<&i64> = Array::new();
+    stable.push(&view[0]);
+    stable.push(&view[1]);
+    stable.push(&view[2]);
+    stable.sort();
+    expect_equal(*stable[0] * 10000 + *stable[1] * 100 + *stable[2], 102030)?;
+    mut unstable: Array<&i64> = Array::new();
+    unstable.push(&view[0]);
+    unstable.push(&view[1]);
+    unstable.push(&view[2]);
+    unstable.sort_unstable();
+    expect_equal(*unstable[0] * 10000 + *unstable[1] * 100 + *unstable[2], 102030)?;
+    // Equal values at another address are found.
+    const twenty: i64 = 20;
+    const probe: &i64 = &twenty;
+    mut found_at: i64 = -1;
+    match (stable.binary_search(&probe)) {
+        Result::Ok(at) => { found_at = at; }
+        Result::Err(_) => { }
+    }
+    expect_equal(found_at, 1)?;
+    mut index: i64 = -1;
+    match (unstable.index_of(&probe)) {
+        Option::Some(at) => { index = at; }
+        Option::None => { }
+    }
+    return expect_equal(index, 1);
+}
+
+![test]
+function slice_reference_array_sorts_by_value() -> Result<(), TestError> {
+    mut storage: Array<u8> = Array::new();
+    storage.push(5);
+    storage.push(1);
+    storage.push(3);
+    storage.push(2);
+    storage.push(9);
+    mut pieces: Array<&Slice<u8>> = Array::new();
+    for (piece in Halves::of(storage.as_slice())) { pieces.push(piece); }
+    pieces.sort();
+    return expect_equal(pieces[0].length() * 10 + pieces[1].length(), 32);
+}
+
+function order_through_path_value<T>(a: &T, b: &T) -> Ordering where T: Ord {
+    const compare: (&T, &T) -> Ordering = T::compare;
+    return compare(a, b);
+}
+
+function order_through_path_call<T>(a: &T, b: &T) -> Ordering where T: Ord {
+    return T::compare(a, b);
+}
+
+function order_through_method<T>(a: &T, b: &T) -> Ordering where T: Ord {
+    return a.compare(b);
+}
+
+// A path through a type parameter bound to a reference names the
+// reference's own method, as a call through the bound does: each form
+// orders the values.
+![test]
+function reference_compares_through_every_form() -> Result<(), TestError> {
+    mut values: Array<i64> = Array::new();
+    values.push(30);
+    values.push(10);
+    const view: &Slice<i64> = values.as_slice();
+    const high: &i64 = &view[0];
+    const low: &i64 = &view[1];
+    expect_equal(order_through_path_value(&high, &low).is_greater(), true)?;
+    expect_equal(order_through_path_call(&high, &low).is_greater(), true)?;
+    expect_equal(order_through_method(&high, &low).is_greater(), true)?;
+    expect_equal(order_through_path_value(&low, &high).is_less(), true)?;
+    expect_equal(order_through_path_call(&low, &high).is_less(), true)?;
+    return expect_equal(order_through_method(&low, &high).is_less(), true);
+}
+
+// The writable references compare as the read-only ones do.
+![test]
+function mutable_reference_compares_by_value() -> Result<(), TestError> {
+    mut values: Array<i64> = Array::new();
+    values.push(30);
+    values.push(10);
+    const view: mut &Slice<i64> = values.as_mutable_slice();
+    const high: mut &i64 = &view[0];
+    const low: mut &i64 = &view[1];
+    expect_equal(order_through_path_value(&high, &low).is_greater(), true)?;
+    expect_equal(order_through_path_call(&low, &high).is_less(), true)?;
+    return expect_equal(order_through_method(&high, &low).is_greater(), true);
 }
