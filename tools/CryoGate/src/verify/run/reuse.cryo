@@ -1,0 +1,231 @@
+///! The tree's gates taken from a passing run with the same inputs: every
+///! file of the checkout git lists, by its bytes; what the checkout holds
+///! that git ignores and a build reads; the compiler under test; the host's
+///! toolchain; the gates and the target.  Only a run whose every gate passed
+///! and whose object lists were all filled is kept, so a run taken from the
+///! cache can only be one that passed.
+
+namespace cryogate::verify::run::reuse;
+
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::encoding::sha256::{ Sha256 };
+import std::fmt;
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
+import std::fs::path::{ Path, PathBuf };
+
+import cryogate::baseline::cache::{ BaselineCache };
+import cryogate::baseline::keys::{ CompilerIdentity, HostToolchain, Inputs };
+import cryogate::baseline::listing::{ Listing };
+import cryogate::core::git::{ Git };
+import cryogate::core::text::{ Text };
+import cryogate::core::tree::{ Tree };
+import cryogate::verify::gates::{ GateCommand, GateVerdict };
+import cryogate::verify::objects::{ ObjectPopulation };
+import cryogate::verify::record::{ Seal };
+import cryogate::verify::run::children::{ GateRun, PopulationRun };
+
+/// The tree runs verify keeps, `.verify/tree-runs/<key>`, each the files a
+/// passing run left in its run directory and a `run` file naming them.
+public type struct TreeRunCache {
+    /// The directory of kept runs.
+    public directory: PathBuf;
+    /// The key of the run asked for.
+    public key: String;
+
+    /// The cache of the checkout `repository`, for the gates `names` over
+    /// the compiler `cryo` on the target `triple`.
+    public static of(repository: Path, git: &Git, cryo: Path, toolchain: &HostToolchain, names: &Array<String>,
+                     triple: Str) -> Result<TreeRunCache, String> {
+        mut hasher: Sha256 = Sha256::new();
+        Inputs::text(&hasher, Str::new("compiler"), CompilerIdentity::of(cryo)?.as_str());
+        Inputs::text(&hasher, Str::new("toolchain"), toolchain.digest.as_str());
+        Inputs::text(&hasher, Str::new("target"), triple);
+        for (name in names.iterate_references()) { Inputs::text(&hasher, Str::new("gate"), name.as_str()); }
+        TreeRunCache::feed_inputs(&hasher, repository, git)?;
+        const key: String = String::from_str(hasher.finish().to_hex().as_str().byte_substring(0, 32));
+        return Result::Ok(TreeRunCache { directory: repository.join(Str::new(".verify/tree-runs")), key: key });
+    }
+
+    /// Feed `hasher` the checkout's own inputs: every file git lists, the
+    /// files below `bin` and `tests/helpers` that git ignores (the libraries
+    /// the compiler loads, the helper objects tests link), by their bytes,
+    /// and `.toolchains` by each file's path, size and modification time,
+    /// since its hundreds of megabytes are fetched once and never edited.
+    public static feed_inputs(hasher: mut &Sha256, repository: Path, git: &Git) -> Result<(), String> {
+        mut everything: Array<Str> = Array::<Str>::new();
+        everything.push(Str::new("."));
+        Inputs::feed(hasher, repository, &Listing::of(git, &everything)?)?;
+        mut ignored: Array<Str> = Array::<Str>::new();
+        ignored.push(Str::new("bin"));
+        ignored.push(Str::new("tests/helpers"));
+        for (root in ignored.iterate_references()) {
+            const directory: PathBuf = repository.join(*root);
+            if (!directory.as_path().is_directory()) { continue; }
+            mut files: Array<String> = Array::<String>::new();
+            for (file in Tree::files(directory.as_path(), &Array::<String>::new())?.iterate_references()) {
+                files.push(f"{*root}/{file.as_str()}");
+            }
+            files.sort();
+            Inputs::feed(hasher, repository, &files)?;
+        }
+        const toolchains: PathBuf = repository.join(Str::new(".toolchains"));
+        if (toolchains.as_path().is_directory()) {
+            mut files: Array<String> = Tree::files(toolchains.as_path(), &Array::<String>::new())?;
+            files.sort();
+            for (file in files.iterate_references()) {
+                const stated: String = match (toolchains.join(file.as_str()).as_path().metadata()) {
+                    Result::Ok(metadata) => { f"{metadata.length()} {metadata.modified_seconds()}" }
+                    Result::Err(error)   => { return Result::Err(f"cannot read .toolchains/{file.as_str()}: {error.describe()}"); }
+                };
+                Inputs::text(hasher, f".toolchains/{file.as_str()}".as_str(), stated.as_str());
+            }
+        }
+        return Result::Ok(());
+    }
+
+    /// The kept run's directory.
+    public entry(&this) -> PathBuf { return this.directory.join(this.key.as_str()); }
+
+    /// The kept run, its files copied into the run directory `run`, with
+    /// each gate of `table` named in `names` judged again from its copied
+    /// log; none when no run is kept.  A kept run whose `run` file does not
+    /// open, whose files do not match the digests it names, or whose gate
+    /// does not pass on its log, is deleted, and the reason printed.
+    public replay(&this, table: &Array<GateCommand>, names: &Array<String>, run: Path) -> Option<PopulationRun> {
+        const entry: PathBuf = this.entry();
+        if (!entry.join(Str::new("run")).as_path().is_file()) { return Option::None; }
+        return match (TreeRunCache::replayed(entry.as_path(), table, names, run)) {
+            Result::Ok(population) => {
+                const _: Result<(), String> = BaselineCache::mark(entry.as_path());
+                Option::Some(population)
+            }
+            Result::Err(reason) => {
+                fmt::println(f"verify: the kept tree run {this.key.as_str()} does not hold ({reason.as_str()}); deleted, and the gates run");
+                match (Directory::remove_all(entry.as_path())) {
+                    Result::Ok(_)  => { }
+                    Result::Err(_) => { }
+                }
+                Option::None
+            }
+        };
+    }
+
+    /// Keep the run directory `run`'s files of `population`, a run in which
+    /// every gate passed and every object list was filled, under this key:
+    /// written beside the cache and renamed into place, then stamped, and
+    /// the cache pruned to the `BaselineCache::KEPT` most recently used.
+    public store(&this, run: Path, population: &PopulationRun) -> Result<(), String> {
+        const run_name: Str = run.file_name().unwrap_or(Str::new("run"));
+        const building: PathBuf = this.directory.join(f"{this.key.as_str()}.tmp-{run_name}".as_str());
+        TreeRunCache::created(building.as_path())?;
+        mut text: String = String::new();
+        mut files: Array<String> = Array::<String>::new();
+        for (gate in population.gates.iterate_references()) {
+            // Its time in tenths of a second.
+            text.push(f"gate {gate.name.as_str()} {(gate.seconds * 10.0) as i64}\n".as_str());
+            files.push(f"{gate.name.as_str()}.log");
+        }
+        for (count in population.counts.iterate_references()) { text.push(f"count {*count}\n".as_str()); }
+        for (population in ObjectPopulation::all().iterate_references()) { files.push(f"tree.{population.name()}.sha256"); }
+        if (run.join(Str::new("tree.census.log")).as_path().is_file()) { files.push(String::from_str(Str::new("tree.census.log"))); }
+        for (file in files.iterate_references()) {
+            const bytes: Array<u8> = TreeRunCache::read(run.join(file.as_str()).as_path())?;
+            TreeRunCache::write(building.join(file.as_str()).as_path(), &bytes)?;
+            text.push(f"file {Sha256::digest(bytes.as_slice()).to_hex().as_str()}  {file.as_str()}\n".as_str());
+        }
+        const run_file: PathBuf = building.join(Str::new("run"));
+        match (File::write_text(run_file.as_path(), Seal::close(text.as_str()).as_str())) {
+            Result::Ok(_)      => { }
+            Result::Err(error) => { return Result::Err(f"cannot write {run_file.as_path().as_str()}: {error.describe()}"); }
+        }
+        const entry: PathBuf = this.entry();
+        match (building.as_path().rename_to(entry.as_path())) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => {
+                // Another run kept the same inputs first; its files are these.
+                match (Directory::remove_all(building.as_path())) {
+                    Result::Ok(_)  => { }
+                    Result::Err(_) => { }
+                }
+            }
+        }
+        BaselineCache::mark(entry.as_path())?;
+        const _: Array<String> = BaselineCache::prune(this.directory.as_path(), this.key.as_str())?;
+        return Result::Ok(());
+    }
+
+    /// The kept run in `entry` copied into `run` and judged again.
+    private static replayed(entry: Path, table: &Array<GateCommand>, names: &Array<String>, run: Path) -> Result<PopulationRun, String> {
+        const run_text: String = match (File::read_text(entry.join(Str::new("run")).as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read its run file: {error.describe()}"); }
+        };
+        const opened: Str = match (Seal::open(run_text.as_str())) {
+            Option::Some(text) => { text }
+            Option::None       => { return Result::Err(String::from_str(Str::new("its run file is not sealed by its own digest"))); }
+        };
+        mut timed: Array<Pair<String, f64>> = Array::<Pair<String, f64>>::new();
+        mut counts: Array<i64> = Array::<i64>::new();
+        for (line in Text::lines(opened).iterate_references()) {
+            mut words: Array<String> = Array::<String>::new();
+            for (word in line.as_str().split_whitespace()) { words.push(String::from_str(word)); }
+            if (words.length() == 3 && words[0].as_str() == Str::new("gate")) {
+                const tenths: i64 = i64::try_from(words[2].as_str()).unwrap_or(0);
+                timed.push(Pair::new(words[1].clone(), (tenths as f64) / 10.0));
+            }
+            if (words.length() == 2 && words[0].as_str() == Str::new("count")) { counts.push(i64::try_from(words[1].as_str()).unwrap_or(-1)); }
+            if (words.length() == 3 && words[0].as_str() == Str::new("file")) {
+                const bytes: Array<u8> = TreeRunCache::read(entry.join(words[2].as_str()).as_path())?;
+                if (Sha256::digest(bytes.as_slice()).to_hex().as_str() != words[1].as_str()) {
+                    return Result::Err(f"{words[2].as_str()} is not the file it kept");
+                }
+                TreeRunCache::write(run.join(words[2].as_str()).as_path(), &bytes)?;
+            }
+        }
+        if (counts.length() != ObjectPopulation::all().length()) { return Result::Err(String::from_str(Str::new("it does not count every object population"))); }
+        if (timed.length() != names.length()) { return Result::Err(String::from_str(Str::new("it does not hold every gate"))); }
+        mut gates: Array<GateRun> = Array::<GateRun>::new();
+        for (index in 0..names.length()) {
+            if (timed[index].first.as_str() != names[index].as_str()) { return Result::Err(f"it holds {timed[index].first.as_str()} where {names[index].as_str()} ran"); }
+            for (gate in table.iterate_references()) {
+                if (gate.name.as_str() != names[index].as_str()) { continue; }
+                const log: PathBuf = run.join(f"{gate.name.as_str()}.log".as_str());
+                const text: String = match (File::read_text(log.as_path())) {
+                    Result::Ok(text)   => { text }
+                    Result::Err(error) => { return Result::Err(f"its {gate.name.as_str()} log is not there: {error.describe()}"); }
+                };
+                const verdict: GateVerdict = GateVerdict::of(gate, text.as_str(), 0);
+                if (!verdict.ok) { return Result::Err(f"its {gate.name.as_str()} log does not pass"); }
+                gates.push(GateRun { name: gate.name.clone(), verdict: verdict, seconds: timed[index].second, log: String::from_str(log.as_path().as_str()) });
+            }
+        }
+        return Result::Ok(PopulationRun { gates: gates, counts: counts });
+    }
+
+    private static read(path: Path) -> Result<Array<u8>, String> {
+        return match (File::read_bytes(path)) {
+            Result::Ok(bytes)  => { Result::Ok(bytes) }
+            Result::Err(error) => { Result::Err(f"cannot read {path.as_str()}: {error.describe()}") }
+        };
+    }
+
+    private static write(path: Path, bytes: &Array<u8>) -> Result<(), String> {
+        return match (File::write_bytes(path, bytes.as_slice())) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot write {path.as_str()}: {error.describe()}") }
+        };
+    }
+
+    private static created(directory: Path) -> Result<(), String> {
+        return match (Directory::create_all(directory)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(f"cannot create {directory.as_str()}: {error.describe()}") }
+        };
+    }
+}
