@@ -25,7 +25,7 @@ namespace compiler::sema::sema;
 import compiler::diag::{
     diagnostic, edit_distance, ErrorCode, snapshot, source_span, suggestion
 };
-import compiler::const_table::{ ConstEval, FoldedInteger };
+import compiler::const_table::{ ConstantValue, ConstEval, FoldedInteger };
 import compiler::ast::{
     cloner, declaration, expression, GenericAnnotation, ImplTraitAnnotation, LiteralKind,
     MemberPin, NamedAnnotation, node, node_locator, ObjectForm, pattern, PatternBinding, PatternElement, PointerAnnotation,
@@ -3225,7 +3225,9 @@ type struct SemaVisitor {
                 if (bin.op.kind != TokenType::Equal && !right_is_lit) {
                     match (this.literals.operand_type_of_literal_value(bin.right, lhs)) {
                         Option::Some(operand_type) => {
-                            bin.right = this.literals.literal_of_value(bin.right);
+                            if (!LiteralResolver::is_bit_pattern(bin.right)) {
+                                bin.right = this.literals.literal_of_value(bin.right);
+                            }
                             this.state.expected_type = operand_type;
                         }
                         Option::None => { }
@@ -3405,7 +3407,9 @@ type struct SemaVisitor {
                 else { this.literals.operand_type_of_literal_value(bin.right, lhs) };
             match (right_literal_type) {
                 Option::Some(operand_type) => {
-                    bin.right = this.literals.literal_of_value(bin.right);
+                    if (!LiteralResolver::is_bit_pattern(bin.right)) {
+                        bin.right = this.literals.literal_of_value(bin.right);
+                    }
                     this.state.expected_type = operand_type;
                 }
                 Option::None => {
@@ -3424,7 +3428,9 @@ type struct SemaVisitor {
                 else { this.literals.operand_type_of_literal_value(bin.left, rhs) };
             match (left_literal_type) {
                 Option::Some(operand_type) => {
-                    bin.left = this.literals.literal_of_value(bin.left);
+                    if (!LiteralResolver::is_bit_pattern(bin.left)) {
+                        bin.left = this.literals.literal_of_value(bin.left);
+                    }
                     this.state.expected_type = operand_type;
                 }
                 Option::None => {
@@ -3627,13 +3633,11 @@ type struct SemaVisitor {
                 if (compound) { fmt::format("%s %s= %s", place, opposite.to_string(), shown_magnitude) }
                 else { fmt::format("%s %s %s", place, opposite.to_string(), shown_magnitude) });
         } else if (base == TokenType::Amp || base == TokenType::Pipe || base == TokenType::Caret) {
-            // A compound's operand is typed by its target; a binary operand
-            // names its type, which no surrounding expected type supplies.
+            // A complement beside the unsigned operand is its bit pattern.
             const complement: string = (magnitude - 1).to_decimal_string();
             refusal = refusal.help_with_example(
                 fmt::format("for the bits of %s at `%s`'s width, write its complement", value, type_name),
-                if (compound) { fmt::format("%s %s ~%s", place, op.to_string(), complement) }
-                else { fmt::format("%s %s ~(%s as %s)", place, op.to_string(), complement, type_name) });
+                fmt::format("%s %s ~%s", place, op.to_string(), complement));
         } else if (base == TokenType::Star) {
             refusal = refusal.help_with_example(
                 fmt::format("where the wrapped product is meant, say so: `wrapping_multiply` by the bit pattern of %s wraps in every profile", value),
@@ -3682,10 +3686,12 @@ type struct SemaVisitor {
         for (mut i: i64 = 0; i < operands.length(); i++) {
             const operand_type: Type* = this.arena.lookup(operands[i].resolved_type);
             if (operand_type == null || operand_type.kind != TypeKind::Int) { return; }
-            match (evaluator.fold(operands[i])) {
-                Option::Some(value) => {
-                    if (!value.held_in(operand_type.int_kind().bit_width(), operand_type.int_kind().is_signed())) { return; }
-                    values.push(value);
+            // An operand that overflowed was refused where it was computed.
+            match (evaluator.fold_value(operands[i])) {
+                Option::Some(folded) => {
+                    const operand: ConstantValue = folded.in_type(operand_type.int_kind().to_string());
+                    if (operand.overflow != null || !operand.held()) { return; }
+                    values.push(operand.value);
                 }
                 Option::None => { return; }
             }
@@ -3701,66 +3707,12 @@ type struct SemaVisitor {
         if (computed.is_some() && computed.unwrap().held_in(width, signed)) { return; }
 
         const intern: InternTable* = this.ctx.intern_table;
-        const written: string = ExpressionNode::spell(e, intern);
         const type_name: string = this.types.type_display_name(result);
+        mut refusal: Diagnostic = ConstEval::overflow_refusal(e, op, left, right, values, type_name, width, signed,
+            "whenever it runs, so it is refused in every profile", intern);
         if (remainder) {
-            // The quotient is one past the type's maximum, which the next
-            // wider type holds, and in it the remainder is computed without
-            // a panic; a 128-bit type has no wider one, so its remainder is
-            // written as the value it is.
-            const quotient: FoldedInteger = computed.unwrap();
-            mut panics: Diagnostic = Diagnostic::error(ErrorCode::E0465_CONSTANT_OVERFLOW,
-                fmt::format("`%s` always panics: the division it is the remainder of has the quotient %s, which `%s` does not hold",
-                    written, quotient.to_decimal_string(), type_name));
-            panics = panics.at_with_label(e.span, "this panics whenever it runs, so it is refused in every profile");
-            match (values[0].apply(op, values[1])) {
-                Option::Some(value) => {
-                    if (width < 128) {
-                        const wider: string = fmt::format("i%s", (width * 2).to_decimal_string()).into_raw();
-                        panics = panics.help_with_example(
-                            fmt::format("where the remainder %s is meant, compute it in `%s`, which holds the quotient",
-                                value.to_decimal_string(), wider),
-                            fmt::format("(%s as %s) %s %s", ExpressionNode::spell_operand(left, intern), wider,
-                                op.to_string(), ExpressionNode::spell_operand(right, intern)));
-                    } else {
-                        panics = panics.help_with_example(
-                            fmt::format("no integer type holds the quotient; where the remainder %s is meant, write it",
-                                value.to_decimal_string()),
-                            value.to_decimal_string());
-                    }
-                }
-                Option::None => { }
-            }
-            this.ctx.emit_diagnostic(panics);
+            this.ctx.emit_diagnostic(refusal);
             return;
-        }
-        mut refusal: Diagnostic = Diagnostic::error(ErrorCode::E0465_CONSTANT_OVERFLOW,
-            if (computed.is_some()) {
-                fmt::format("`%s` overflows `%s`: its value is %s, which `%s` does not hold",
-                    written, type_name, computed.unwrap().to_decimal_string(), type_name)
-            } else {
-                fmt::format("`%s` overflows `%s`: its value is past the range of every integer type", written, type_name)
-            });
-        refusal = refusal.at_with_label(e.span, "this overflows whenever it runs, so it is refused in every profile");
-        // The value is kept by computing in the narrowest type that holds it
-        // and every value of `result`, so the other operand converts to it.
-        if (computed.is_some()) {
-            mut wider: string = "";
-            for (mut bits: u64 = width * 2; bits <= 128 && wider.is_empty(); bits = bits * 2) {
-                if (!signed && computed.unwrap().held_in(bits, false)) { wider = fmt::format("u%s", bits.to_decimal_string()).into_raw(); }
-                if (wider.is_empty() && computed.unwrap().held_in(bits, true)) { wider = fmt::format("i%s", bits.to_decimal_string()).into_raw(); }
-            }
-            if (!wider.is_empty()) {
-                refusal = refusal.help_with_example(
-                    fmt::format("where the value %s is meant, compute and keep it in `%s`, which holds it",
-                        computed.unwrap().to_decimal_string(), wider),
-                    if (left == null) {
-                        fmt::format("-(%s as %s)", ExpressionNode::spell_operand(right, intern), wider)
-                    } else {
-                        fmt::format("(%s as %s) %s %s", ExpressionNode::spell_operand(left, intern), wider, op.to_string(),
-                            ExpressionNode::spell_operand(right, intern))
-                    });
-            }
         }
         // A wrapped value is said so with the method that wraps in every
         // profile, on a receiver of the expression's own type.
