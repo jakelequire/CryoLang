@@ -1,13 +1,14 @@
 ///! Command-line parsing: long and short flags and options in every
-///! spelling, grouped short letters, repeated options, required and
-///! optional positional arguments, `--`, each error with the argument it
-///! names, and the help text.
+///! spelling, grouped short letters, repeated options, required, optional
+///! and repeated positional arguments, `--`, each error with the argument
+///! it names, and the help text.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::EnvArguments;
 
 import std::core::option::{ Option };
 import std::core::result::{ Result };
+import std::core::slice::{ Slice };
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
@@ -126,5 +127,42 @@ function each_error_names_its_argument() -> Result<(), TestError> {
 function help_text_lists_every_declaration() -> Result<(), TestError> {
     const help: String = search_parser().help_text();
     const want: string = "usage: search [options] <pattern> [<file>]\n\narguments:\n  <pattern>              what to look for\n  [<file>]               where to look\n\noptions:\n  -c, --count            print only a count\n  -v, --verbose          say more\n  -C, --context <lines>  lines around a match\n      --exclude <glob>   skip matching files\n";
+    return expect(help.as_str().equals(&Str::new(want)), help.as_str());
+}
+
+/// A parser taking any number of patterns, declared first, a required
+/// command and an optional target.
+function patterns_parser() -> ArgumentParser {
+    mut parser: ArgumentParser = ArgumentParser::new(Str::new("select"));
+    parser.flag(Str::new("exact"), Option::None, Str::new("whole names only"))
+        .repeated_positional(Str::new("pattern"), Str::new("what to select"))
+        .positional(Str::new("command"), Str::new("what to do"))
+        .optional_positional(Str::new("target"), Str::new("where to do it"));
+    return parser;
+}
+
+![test]
+function a_repeated_positional_takes_every_one_left() -> Result<(), TestError> {
+    const parser: ArgumentParser = patterns_parser();
+    const none: Array<String> = words("run");
+    const without: ParsedArguments = parser.parse(none.as_slice()).unwrap();
+    expect_equal(without.values(Str::new("pattern")).length(), 0)?;
+    expect(without.value(Str::new("target")).is_none(), Str::new("no target given"))?;
+    const many: Array<String> = words("run here alpha --exact beta -- -gamma");
+    const parsed: ParsedArguments = parser.parse(many.as_slice()).unwrap();
+    check_value(&parsed, "command", "run")?;
+    check_value(&parsed, "target", "here")?;
+    expect(parsed.flag(Str::new("exact")), Str::new("a flag between the patterns"))?;
+    const patterns: &Slice<String> = parsed.values(Str::new("pattern"));
+    expect_equal(patterns.length(), 3)?;
+    expect(patterns[0].as_str().equals(&Str::new("alpha")), patterns[0].as_str())?;
+    expect(patterns[1].as_str().equals(&Str::new("beta")), patterns[1].as_str())?;
+    return expect(patterns[2].as_str().equals(&Str::new("-gamma")), patterns[2].as_str());
+}
+
+![test]
+function help_text_shows_a_repeated_positional() -> Result<(), TestError> {
+    const help: String = patterns_parser().help_text();
+    const want: string = "usage: select [options] [<pattern>...] <command> [<target>]\n\narguments:\n  [<pattern>...]  what to select\n  <command>       what to do\n  [<target>]      where to do it\n\noptions:\n      --exact     whole names only\n";
     return expect(help.as_str().equals(&Str::new(want)), help.as_str());
 }

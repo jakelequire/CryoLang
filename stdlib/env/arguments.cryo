@@ -54,6 +54,7 @@ private type enum ArgumentShape with [Eq] {
     Option;
     Positional;
     OptionalPositional;
+    RepeatedPositional;
 }
 
 /// One declared argument: its name (an option's long name, without the
@@ -107,7 +108,8 @@ public type struct ParsedArguments {
         return Option::Some(found.values[found.values.length() - 1].as_str());
     }
 
-    /// Every value of the option `name`, in the order they were given.
+    /// Every value of the option or repeated positional argument `name`, in
+    /// the order they were given.
     ![caller_location]
     public values(&this, name: Str) -> &Slice<String> {
         return &this.find(name).values;
@@ -204,6 +206,13 @@ public type struct ArgumentParser {
     /// required one, whatever order they are declared in.
     public optional_positional(mut &this, name: Str, help: Str) -> mut &ArgumentParser {
         return this.declare(ArgumentShape::OptionalPositional, name, Option::None, Str::new(""), help);
+    }
+
+    /// Any number of positional arguments, none included: every one left
+    /// after the required and the optional ones, read with `values`. Only
+    /// the first one declared receives any.
+    public repeated_positional(mut &this, name: Str, help: Str) -> mut &ArgumentParser {
+        return this.declare(ArgumentShape::RepeatedPositional, name, Option::None, Str::new(""), help);
     }
 
     /// Read `arguments` - the command line after the program's own name -
@@ -316,6 +325,15 @@ public type struct ArgumentParser {
             parsed.arguments[i].add_value(positionals[next].as_str());
             next += 1;
         }
+        for (mut i: i64 = 0; i < this.specifications.length(); i++) {
+            if (this.specifications[i].shape != ArgumentShape::RepeatedPositional) {
+                continue;
+            }
+            while (next < positionals.length()) {
+                parsed.arguments[i].add_value(positionals[next].as_str());
+                next += 1;
+            }
+        }
         if (next < positionals.length()) {
             return Result::Err(ArgumentError::new(ArgumentErrorKind::UnexpectedPositional, positionals[next].as_str()));
         }
@@ -341,7 +359,7 @@ public type struct ArgumentParser {
         }
         for (mut i: i64 = 0; i < this.specifications.length(); i++) {
             const specification: &ArgumentSpecification = &this.specifications[i];
-            if (specification.shape == ArgumentShape::Positional || specification.shape == ArgumentShape::OptionalPositional) {
+            if (specification.shape != ArgumentShape::Flag && specification.shape != ArgumentShape::Option) {
                 text.push(Str::new(" "));
                 text.push(this.label(i).as_str());
             }
@@ -357,7 +375,7 @@ public type struct ArgumentParser {
         mut heading_written: boolean = false;
         for (mut i: i64 = 0; i < this.specifications.length(); i++) {
             const shape: ArgumentShape = this.specifications[i].shape;
-            if (shape == ArgumentShape::Positional || shape == ArgumentShape::OptionalPositional) {
+            if (shape != ArgumentShape::Flag && shape != ArgumentShape::Option) {
                 if (!heading_written) {
                     text.push(Str::new("\narguments:\n"));
                     heading_written = true;
@@ -415,7 +433,7 @@ public type struct ArgumentParser {
         return Option::None;
     }
 
-    /// How a declaration is shown: `<file>`, `[<file>]`, `-v, --verbose`
+    /// How a declaration is shown: `<file>`, `[<file>]`, `[<file>...]`, `-v, --verbose`
     /// or `-j, --jobs <count>`.
     private label(&this, index: i64) -> String {
         const specification: &ArgumentSpecification = &this.specifications[index];
@@ -430,6 +448,12 @@ public type struct ArgumentParser {
             label.push(Str::new("[<"));
             label.push(specification.name.as_str());
             label.push(Str::new(">]"));
+            return label;
+        }
+        if (specification.shape == ArgumentShape::RepeatedPositional) {
+            label.push(Str::new("[<"));
+            label.push(specification.name.as_str());
+            label.push(Str::new(">...]"));
             return label;
         }
         match (specification.short) {

@@ -8,6 +8,7 @@ namespace cryogate::verify::run::compiler;
 import std::collections::array::{ Array };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
+import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::fmt;
 import std::fs::directory::{ Directory };
@@ -21,7 +22,9 @@ import cryogate::core::child::{ Completion, Job };
 import cryogate::core::git::{ Git };
 import cryogate::core::host::{ Host };
 import cryogate::core::log::{ RunLogs };
+import cryogate::core::text::{ Text };
 import cryogate::core::tree::{ Tree };
+import cryogate::verify::record::{ BaselineRecord };
 import cryogate::verify::run::children::{ PopulationRun, VerifyChild };
 import cryogate::verify::runtime::{ RuntimeArchives };
 
@@ -71,6 +74,37 @@ public type struct BaselineCompiler {
         return Result::Ok(BaselineCompiler {
             compiler: compiler, home: home, commit: commit, runtime_home: runtime_home, runtime_archives: archives,
         });
+    }
+
+    /// Whether this compiler's `cryo test` selects by every pattern it is
+    /// given, and not only by its first, which it ignores the rest after.
+    /// Asked of its compile-fail suite alone, which builds nothing, in the
+    /// checkout `repository`'s tests: a pattern longer than any of the
+    /// compile-fail files `negatives` (`negative/<file>`) is named, so no
+    /// file holds it, then the first file's name.  Only a compiler that
+    /// reads the second pattern runs that file; one that refuses the
+    /// question gives it no verdict either.  The run is logged to `log`.
+    public takes_several_patterns(&this, repository: Path, negatives: &Array<String>, log: Path) -> boolean {
+        if (negatives.is_empty()) { return false; }
+        mut longest: Str = Str::new("");
+        for (name in negatives.iterate_references()) { if (name.length() > longest.length()) { longest = name.as_str(); } }
+        const file: Str = match (negatives[0].as_str().strip_prefix(&Str::new("negative/"))) {
+            Option::Some(file) => { file }
+            Option::None       => { return false; }
+        };
+        mut job: Job = VerifyChild::job(this.compiler.as_path().as_str(), this.runtime_home.as_path().as_str());
+        job.argument(Str::new("test"));
+        job.argument(Str::new("--suite=compile-fail"));
+        job.argument(Str::new("--format=plain"));
+        job.argument(f"{longest}-unmatched".as_str());
+        job.argument(file);
+        job.directory(repository.join(Str::new("tests")).as_path().as_str());
+        job.log_to(log.as_str());
+        const done: Completion = job.run();
+        mut asked: Array<String> = Array::<String>::new();
+        asked.push(negatives[0].clone());
+        return !BaselineRecord::of_census(&Text::lines(done.output().as_str()), &asked, &Array::<String>::new(),
+            &Array::<String>::new()).is_empty();
     }
 
     /// Build the compiler of `commit` in the clone `<state>/src` and

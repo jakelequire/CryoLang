@@ -5643,7 +5643,7 @@ color  = "auto"                     # auto | always | never
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------- |
 | `cryo build [file\|dir]` | Build a single `.cryo` file, or the project whose cryoconfig lives in `dir` (default `.`).                          |
 | `cryo run`               | Build the project and run the resulting executable.                                                                 |
-| `cryo test [pattern]`    | Build and run the project's `![test]` functions.                                                                    |
+| `cryo test [pattern...]` | Build and run the project's `![test]` functions, and its compile-fail files and test projects; each pattern selects what contains it. |
 | `cryo check <file>`      | Front-end + semantic analysis only; no codegen.                                                                     |
 | `cryo interpret <file>`  | Analyse the file as `check` does, then run its `main` by interpreting the typed program, checking memory and ownership as it goes (`tools/CryoSmith/INTERPRETER.md`). |
 | `cryo fmt [file\|dir ...]` | Lay out the files named and the `.cryo` files below the directories named (default `.`); `--check` changes nothing, lists the files that would change, and exits 1 if any would. |

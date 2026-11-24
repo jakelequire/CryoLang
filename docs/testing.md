@@ -227,17 +227,22 @@ as a timeout rather than letting the whole run stall.
 ## 4. Running tests
 
 ```
-cryo test [PATTERN] [FLAGS]
+cryo test [PATTERN...] [FLAGS]
 ```
 
-`PATTERN` is an optional substring filter on the test's fully-qualified name.
+Each `PATTERN` is a substring filter, and every suite reads the same ones: a
+unit test runs when its fully-qualified name contains any of them, a
+compile-fail file when its file name does, a project when its directory's
+name does. With none, everything runs. `cryo test Parser E0301 json_config`
+runs the parser's unit tests, the compile-fail files for E0301 and the
+`json_config` project in one run, with one build of the unit suite.
 
 | Flag | Effect |
 | --- | --- |
 | `--suite=unit\|compile-fail\|projects` | Run one suite alone; without it all three run, in that order |
 | `--list` | List matching unit tests without running them (refused beside `--suite=compile-fail` or `--suite=projects`) |
 | `--ignored` | Run only the `![ignore]`-marked tests |
-| `--exact` | Treat `PATTERN` as an exact name, not a substring |
+| `--exact` | A unit test's name must be one `PATTERN`, whole, not contain one |
 | `-q`, `--quiet` | Terse output |
 | `--timeout=N` | Per-test wall-clock limit in seconds (default 60; `0` disables) |
 | `--format=plain\|pretty\|compact` | Output layout |

@@ -103,13 +103,16 @@ public type struct BaselinePlan {
         return f"verify: baseline programs: {this.recorded} recorded, {this.missing.length()} to run (unit suite {unit_suite}, {projects} project(s), {negatives} compile-fail file(s), {this.examples.length()} example(s))";
     }
 
-    /// The filter each census run is given: none, for one run over
-    /// everything; else one run per program - the unit suite's tests by
-    /// their namespace, which no project or compile-fail file name holds, a
-    /// compile-fail file by its file name, a project by its name.
-    public patterns(&this) -> Array<String> {
+    /// The patterns the plan's one census run is given, `several` telling
+    /// whether the compiler that runs it reads every pattern and not only
+    /// its first.  None - a run over every census-side program - when every
+    /// one of them is to run, or when the compiler reads only one; else one
+    /// per program, which the run selects by any of them: the unit suite's
+    /// tests by their namespace, which no project or compile-fail file name
+    /// holds, a compile-fail file by its file name, a project by its name.
+    public patterns(&this, several: boolean) -> Array<String> {
         mut patterns: Array<String> = Array::<String>::new();
-        if (this.everything) { patterns.push(String::new()); return patterns; }
+        if (this.everything || !several) { return patterns; }
         for (name in Text::sorted_distinct(this.census.clone()).iterate_references()) {
             if (name.as_str() == Programs::unit_suite()) { patterns.push(String::from_str(Str::new("CryoTests::"))); continue; }
             match (name.as_str().strip_prefix(&Str::new("negative/"))) {
@@ -292,31 +295,35 @@ public type struct BaselinePrograms {
         }
         if (!plan.census.is_empty()) {
             const started: Instant = Instant::now();
-            const patterns: Array<String> = plan.patterns();
-            mut logs: Array<Array<String>> = Array::<Array<String>>::new();
-            for (index in 0..patterns.length()) {
-                mut job: Job = VerifyChild::job(baseline.compiler.as_path().as_str(), runtime);
-                job.argument(Str::new("test"));
-                job.argument(Str::new("--format=plain"));
-                job.argument(Str::new("-Werror=W0017"));
-                if (!patterns[index].is_empty()) { job.argument(patterns[index].as_str()); }
-                job.directory(repository.join(Str::new("tests")).as_path().as_str());
-                job.log_to(directory.join(f"census-{index:03}.log".as_str()).as_path().as_str());
-                // The runner's exit is not the verdict: its lines are.
-                const done: Completion = job.run();
-                logs.push(Text::lines(done.output().as_str()));
+            mut negatives: Array<String> = Array::<String>::new();
+            for (program in programs.iterate_references()) {
+                if (program.name.as_str().starts_with(&Str::new("negative/"))) { negatives.push(program.name.clone()); }
             }
-            fmt::println(f"  census    {logs.length()} run(s) in {started.elapsed().as_seconds_f64():.1} s");
+            const several: boolean = !plan.everything
+                && baseline.takes_several_patterns(repository, &negatives, directory.join(Str::new("patterns.log")).as_path());
+            const patterns: Array<String> = plan.patterns(several);
+            mut job: Job = VerifyChild::job(baseline.compiler.as_path().as_str(), runtime);
+            job.argument(Str::new("test"));
+            job.argument(Str::new("--format=plain"));
+            job.argument(Str::new("-Werror=W0017"));
+            for (pattern in patterns.iterate_references()) { job.argument(pattern.as_str()); }
+            job.directory(repository.join(Str::new("tests")).as_path().as_str());
+            job.log_to(directory.join(Str::new("census.log")).as_path().as_str());
+            // `--records` reads the run's log again, and needs to know
+            // whether the run was filtered.
+            mut patterns_text: String = String::new();
+            for (pattern in patterns.iterate_references()) { patterns_text.push(f"{pattern.as_str()}\n".as_str()); }
+            match (File::write_text(directory.join(Str::new("census.patterns")).as_path(), patterns_text.as_str())) {
+                Result::Ok(_)      => { }
+                Result::Err(error) => { return Result::Err(f"cannot write the census's patterns: {error.describe()}"); }
+            }
+            // The runner's exit is not the verdict: its lines are.
+            const done: Completion = job.run();
+            const shown: Str = if (patterns.is_empty()) { Str::new("every program") } else { Str::new("the programs named") };
+            fmt::println(f"  census    one run over {shown} ({patterns.length()} pattern(s)) in {started.elapsed().as_seconds_f64():.1} s");
             const rows: Array<String> = ObjectHashes::rows(repository, &ObjectPopulation::Tests, Path::from(""))?;
-            if (plan.everything) {
-                for (record in BaselineRecord::of_census(&logs[0], &plan.census, &rows, unit_pinned).iterate_references()) { fresh.push(record.clone()); }
-            } else {
-                const names: Array<String> = Text::sorted_distinct(plan.census.clone());
-                for (index in 0..names.length()) {
-                    mut one: Array<String> = Array::<String>::new();
-                    one.push(names[index].clone());
-                    for (record in BaselineRecord::of_census(&logs[index], &one, &rows, unit_pinned).iterate_references()) { fresh.push(record.clone()); }
-                }
+            for (record in BaselineRecord::of_census(&Text::lines(done.output().as_str()), &plan.census, &rows, unit_pinned).iterate_references()) {
+                fresh.push(record.clone());
             }
             mut archives: BaselineRecord = BaselineRecord::new(Programs::census_archives(), Str::new("ok"));
             archives.rows = ObjectHashes::rows(repository, &ObjectPopulation::Stdlib, Path::from(""))?;

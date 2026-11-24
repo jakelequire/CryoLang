@@ -15,11 +15,12 @@
 ///!
 ///! Argument parsing
 ///!
-///!   cryo test [pattern] [flags]
+///!   cryo test [pattern...] [flags]
 ///!
 ///!   pattern        Substring filter on the demangled test name. Only
-///!                  tests whose name contains `pattern` are run.
-///!   --exact        Treat `pattern` as an exact-match requirement.
+///!                  tests whose name contains one of the patterns are
+///!                  run; with none, every test is.
+///!   --exact        A test's name must be one of the patterns, whole.
 ///!   --ignored      Include `![ignore]`-marked tests instead of skipping.
 ///!   --list         Print each discovered test name and exit 0 without
 ///!                  running anything.
@@ -131,8 +132,9 @@ private type enum ColorMode {
 // RunOptions: parsed CLI args
 
 private type struct RunOptions {
-    /// Substring filter: empty means "match everything".
-    private filter:        String;
+    /// Substring filters, any of which selects a test: none means "match
+    /// everything".
+    private filters:       Array<String>;
     private exact:         boolean;
     private include_ignored: boolean;
     private list_only:     boolean;
@@ -187,7 +189,7 @@ private type struct RunOptions {
 
     private static default() -> RunOptions {
         return RunOptions {
-            filter:          String::new(),
+            filters:         Array::new(),
             exact:           false,
             include_ignored: false,
             list_only:       false,
@@ -217,8 +219,8 @@ private type struct RunOptions {
     /// refused.
     private static argument_parser() -> ArgumentParser {
         mut parser: ArgumentParser = ArgumentParser::new(Str::new("cryo test"));
-        parser.optional_positional(Str::new("pattern"), Str::new("run only the tests whose name contains this"))
-            .flag(Str::new("exact"), Option::None, Str::new("the pattern must be the whole test name"))
+        parser.repeated_positional(Str::new("pattern"), Str::new("run only the tests whose name contains one of these"))
+            .flag(Str::new("exact"), Option::None, Str::new("a test's name must be one of the patterns, whole"))
             .flag(Str::new("ignored"), Option::None, Str::new("run ignored tests too"))
             .flag(Str::new("list"), Option::None, Str::new("print the test names without running them"))
             .flag(Str::new("quiet"), Option::Some('q'), Str::new("print only failures and the summary"))
@@ -240,9 +242,9 @@ private type struct RunOptions {
     /// and leaves the environment's default in place.
     private static from_arguments(arguments: &ParsedArguments) -> RunOptions {
         mut options: RunOptions = RunOptions::default();
-        match (arguments.value(Str::new("pattern"))) {
-            Option::Some(pattern) => { options.filter = String::from_str(pattern); }
-            Option::None => { }
+        const patterns: &Slice<String> = arguments.values(Str::new("pattern"));
+        for (mut i: i64 = 0; i < patterns.length(); i++) {
+            options.filters.push(patterns[i].clone());
         }
         options.exact = arguments.flag(Str::new("exact"));
         options.include_ignored = arguments.flag(Str::new("ignored"));
@@ -524,17 +526,19 @@ private function choose_styles(opts: mut &RunOptions) -> void {
 
 // Filter matching
 
-/// Does `name` match `filter` under the current `exact` mode? An empty
-/// filter matches every test; useful for `cryo test` with no pattern.
+/// Does `name` match any of the filters under the current `exact` mode?
+/// No filter at all matches every test: `cryo test` with no pattern.
 private function name_matches(name: Str, opts: &RunOptions) -> boolean {
-    if (opts.filter.length() == 0) {
+    if (opts.filters.is_empty()) {
         return true;
     }
-    const pat: Str = opts.filter.as_str();
-    if (opts.exact) {
-        return name.equals(&pat);
+    for (filter in opts.filters.iterate_references()) {
+        const pat: Str = filter.as_str();
+        if (if (opts.exact) { name.equals(&pat) } else { name.contains(&pat) }) {
+            return true;
+        }
     }
-    return name.contains(&pat);
+    return false;
 }
 
 // Single-test execution

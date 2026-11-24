@@ -531,7 +531,7 @@ implement enum CommandKind {
             CommandKind::Init     => { "cryo init [dir]"                  }
             CommandKind::Build    => { "cryo build [file|dir] [flags]"  }
             CommandKind::Run      => { "cryo run [flags]"                 }
-            CommandKind::Test     => { "cryo test [pattern] [flags]"       }
+            CommandKind::Test     => { "cryo test [pattern...] [flags]"    }
             CommandKind::Check    => { "cryo check <file> [flags]"       }
             CommandKind::Fmt      => { "cryo fmt [file|dir ...] [--check]" }
             CommandKind::Interpret => { "cryo interpret <file> [flags]"  }
@@ -638,7 +638,9 @@ implement enum CommandKind {
                 fmt::printf("Builds the project's tests and runs them.  Behaves like `run`\n");
                 fmt::printf("but suppresses the user's `main` and drives every `![test]`\n");
                 fmt::printf("function from a synthesized test main.\n\n");
-                fmt::printf("An optional [pattern] positional filters which tests run.\n\n");
+                fmt::printf("Each [pattern] positional filters which tests run: a unit test,\n");
+                fmt::printf("a compile-fail file or a project runs when its name contains\n");
+                fmt::printf("any of them.  With none, everything runs.\n\n");
                 fmt::printf("Flags:\n");
                 fmt::printf("  --debug            Compiler logging on in every area (--log=debug)\n");
                 fmt::printf("  --log=SPEC         Compiler logging by area and level (cryo help log)\n");
@@ -651,7 +653,7 @@ implement enum CommandKind {
                 fmt::printf("                     projects (default: all three, in that order)\n");
                 fmt::printf("  --ignored          Run only tests marked ignored\n");
                 fmt::printf("  --list             List matching unit tests without running them\n");
-                fmt::printf("  --exact            Match [pattern] exactly instead of by substring\n");
+                fmt::printf("  --exact            A unit test's name must be one [pattern], whole\n");
                 fmt::printf("  -q, --quiet        Reduce test-runner output\n");
                 fmt::printf("  --jobs=N           Worker threads (0/auto = CPU count; 1 = sequential)\n");
                 fmt::printf("  --timeout=N        Per-test wall-clock limit in seconds (0 disables)\n");
@@ -929,8 +931,8 @@ implement enum FlagKind {
             }
             FlagKind::Exact => {
                 fmt::printf("--exact - Match the test pattern exactly\n\n");
-                fmt::printf("Test-runner flag: treats the [pattern] positional as an exact\n");
-                fmt::printf("match instead of a substring match.\n\n");
+                fmt::printf("Test-runner flag: a unit test runs when its name is one of the\n");
+                fmt::printf("[pattern] positionals, whole, instead of when it contains one.\n\n");
                 fmt::printf("Accepted by: test\n");
             }
             FlagKind::Quiet => {
@@ -1918,13 +1920,13 @@ type struct Executor {
         return status as int;
     }
 
-    /// `cryo test [pattern] [flags]`: build the project's tests and
+    /// `cryo test [pattern...] [flags]`: build the project's tests and
     /// run them.  Behaves like `cryo run` but forces `CompileMode::Test`
     /// so the user's `main` is suppressed and a synthesized test main
     /// drives every `![test]` function.  Accepts the same surface flags
     /// as `cryo run` (`--debug`, `--build-dir=...`, `--stdlib=...`)
     /// plus the test-runner flags forwarded to the produced binary:
-    /// optional positional pattern, `--ignored`, `--list`, `--exact`,
+    /// every positional pattern, `--ignored`, `--list`, `--exact`,
     /// `-q` / `--quiet`, and every option the compiler declares no flag
     /// for, which the runner judges.  The compile-fail and project suites
     /// follow the unit suite; `--suite=NAME` runs one of the three alone.
@@ -1934,7 +1936,7 @@ type struct Executor {
         const config_path: string = project_config::ProjectConfig::find_cryoconfig(".");
         if (config_path == "") {
             fmt::eprintf("Error: No cryoconfig found in '.' or parent directories.\n");
-            fmt::eprintf("Usage: cryo test [pattern] [flags]   (run from a Cryo project)\n");
+            fmt::eprintf("Usage: cryo test [pattern...] [flags]   (run from a Cryo project)\n");
             return 1;
         }
 
@@ -1997,13 +1999,21 @@ type struct Executor {
             }
         }
 
+        // Every positional is a pattern, and all three suites read the same
+        // ones: a unit test, a compile-fail file or a project runs when its
+        // name contains any of them.
+        mut patterns: [String] = [];
+        for (mut i: int = 0; i < args.positional_count(); i++) {
+            patterns.push(String::from_string(args.positional_at(i)));
+        }
+
         // Build the command for the produced test binary, forwarding the
-        // pattern (first positional) and the runner-side flags.  The leading
-        // binary path is host-normalized (`/`->`\` on Windows) so `cmd` can
-        // execute it; the appended flags carry no path separators.
+        // patterns and the runner-side flags.  The leading binary path is
+        // host-normalized (`/`->`\` on Windows) so `cmd` can execute it; the
+        // appended flags carry no path separators.
         mut cmd: String = exec_path(test_binary.as_str());
-        if (args.positional_count() > 0) {
-            cmd.push(fmt::format(" %s", args.input_file()).as_str());
+        for (mut i: i64 = 0; i < patterns.length(); i++) {
+            cmd.push(f" {patterns[i].as_str()}".as_str());
         }
         if (args.has_flag("ignored")) { cmd.push(Str::new(" --ignored")); }
         if (args.has_flag("list"))    { cmd.push(Str::new(" --list")); }
@@ -2073,8 +2083,6 @@ type struct Executor {
         // Compile-fail suite: run each tests/negative/*.cryo file through
         // `cryo check` and assert it fails with its declared error code.
         const proj_root: string = Executor::dir_of(config_path);
-        mut pattern: string = "";
-        if (args.positional_count() > 0) { pattern = args.input_file(); }
         mut jobs_value: string = "";
         if (args.has_arg("jobs")) { jobs_value = args.get_value("jobs"); }
         const jobs: u32 = Executor::suite_jobs(jobs_value);
@@ -2086,7 +2094,7 @@ type struct Executor {
             const neg_dir: path::PathBuf = path::Path::from(proj_root).join("tests/negative");
             const neg_res: NegSuiteResult =
                 Executor::run_negative_suite(self_exe.as_str(), stdlib_abs, neg_dir.as_path(),
-                                             pattern, fmt_choice, col_choice, jobs);
+                                             &patterns, fmt_choice, col_choice, jobs);
             neg_ran      = neg_res.ran;
             neg_failures = neg_res.failures;
             if (neg_failures > 0 && exit_code == 0) {
@@ -2108,7 +2116,7 @@ type struct Executor {
             const proj_dir: path::PathBuf = path::Path::from(proj_root).join("tests/projects");
             const proj_res: NegSuiteResult =
                 Executor::run_projects_suite(self_exe.as_str(), stdlib_abs, proj_dir.as_path(),
-                                             pattern, fmt_choice, col_choice, jobs, promoted.as_str());
+                                             &patterns, fmt_choice, col_choice, jobs, promoted.as_str());
             proj_ran      = proj_res.ran;
             proj_failures = proj_res.failures;
             if (proj_failures > 0 && exit_code == 0) {
@@ -2426,14 +2434,18 @@ type struct Executor {
         }
     }
 
-    /// Run every compile-fail case under `neg_dir`. Each file is compiled
-    /// on its own with `cryo check`; it must fail AND emit the code named by
-    /// its `![config(negative, <code>)]` directive. A case that compiles
-    /// cleanly, or emits a different code, is a real failure. `pattern`,
-    /// when non-empty, filters by filename substring (mirrors the runtime
-    /// runner's positional filter). `fmt_choice` / `col_choice` mirror the
-    /// unit runner's `--format=` / `--color=` surface so the two halves of
-    /// `cryo test` paint identically.
+    /// Whether a compile-fail file or a project named `name` is one of
+    /// `cryo test`'s `patterns` selects: every one when there are none,
+    /// else one whose name contains any of them, as the unit runner
+    /// selects a test.
+    static selected(name: Str, patterns: &[String]) -> boolean {
+        if (patterns.length() == 0) { return true; }
+        for (mut i: i64 = 0; i < patterns.length(); i++) {
+            if (name.contains(&patterns[i].as_str())) { return true; }
+        }
+        return false;
+    }
+
     /// Worker count for the compile-fail and project suites, resolved the way
     /// the unit runner resolves its own: `--jobs=N` (`cli_value`, "" when the
     /// flag is absent), else `CRYO_TEST_JOBS`; 0, neither, or a value that is
@@ -2485,20 +2497,27 @@ type struct Executor {
         }
     }
 
+    /// Run every compile-fail case under `neg_dir` whose file name
+    /// `patterns` selects. Each file is compiled on its own with `cryo
+    /// check`; it must fail AND emit the code named by its
+    /// `![config(negative, <code>)]` directive. A case that compiles
+    /// cleanly, or emits a different code, is a real failure.
+    /// `fmt_choice` / `col_choice` mirror the unit runner's `--format=` /
+    /// `--color=` surface so the two halves of `cryo test` paint
+    /// identically.
     static run_negative_suite(self_exe: Str, stdlib_abs: Str,
-                              neg_dir: path::Path, pattern: string,
+                              neg_dir: path::Path, patterns: &[String],
                               fmt_choice: string, col_choice: string,
                               jobs: u32)
             -> NegSuiteResult {
         // Collect the entries in directory order first.  Only the `cryo check`
         // children run on the worker pool; every verdict below is judged and
         // printed in this order, whatever order the children finish in.  A
-        // missing tests/negative, or a `cryo test <pattern>` that matches
-        // nothing here, prints no compile-fail section at all.
+        // missing tests/negative, or patterns that match nothing here, print
+        // no compile-fail section at all.
         const tmp: path::PathBuf = neg_tmp_path();
         const cryo_extension: str::Str = str::Str::new(".cryo");
-        const filter: str::Str = str::Str::new(pattern);
-        mut names:    [String] = [];
+        mut names:   [String] = [];
         mut contents: [String] = [];
         mut expects:  [String] = [];
         mut job_of:   [i64]    = [];
@@ -2508,7 +2527,7 @@ type struct Executor {
                 for (entry in entries) {
                     const name: str::Str = entry.name();
                     if (name.length() <= 5 || !name.ends_with(&cryo_extension)) { continue; }
-                    if (!filter.is_empty() && !name.contains(&filter)) { continue; }
+                    if (!Executor::selected(name, patterns)) { continue; }
                     const full: path::PathBuf = neg_dir.join(name);
                     const content: String = Executor::read_file_or_empty(full.as_path());
                     const expected: String = Executor::neg_code_from(content.as_str());
@@ -3061,7 +3080,8 @@ type struct Executor {
         }
     }
 
-    /// Run every multi-module test project under `projects_dir`. Each project
+    /// Run every multi-module test project under `projects_dir` whose
+    /// directory name `patterns` selects. Each project
     /// is a real Cryo package (its own `cryoconfig` + `src/`) carrying a
     /// `test.json` that selects how it is checked (collect / build / run).
     /// This is the `cryo test` META-RUNNER: it `chdir`s into each
@@ -3070,7 +3090,7 @@ type struct Executor {
     /// `projects_dir` is a clean no-op (returns {0,0}).  `build_flags` is
     /// written into every project's command after its verb.
     static run_projects_suite(self_exe: Str, stdlib_abs: Str,
-                              projects_dir: path::Path, pattern: string,
+                              projects_dir: path::Path, patterns: &[String],
                               fmt_choice: string, col_choice: string,
                               jobs: u32, build_flags: str::Str)
             -> NegSuiteResult {
@@ -3078,7 +3098,7 @@ type struct Executor {
         // requirements, and - for the ones that run - its command.  Only the
         // commands run on the worker pool; every verdict below is reported in
         // this order, whatever order the children finish in.  A missing or
-        // empty `projects_dir`, or a pattern no project matches, prints no
+        // empty `projects_dir`, or patterns no project matches, print no
         // section at all.
         //   verdict_of[i]: 0 run job_of[i], 1 malformed test.json, 2 ignored,
         //                  3 unknown requirement, 4 unmet requirement,
@@ -3086,7 +3106,6 @@ type struct Executor {
         //                  `expect.file` that could not be removed, 7 a
         //                  `rebuild` whose first build or replacement failed
         const tmp: path::PathBuf = neg_tmp_path();
-        const filter: str::Str = str::Str::new(pattern);
         mut names:      [String]   = [];
         mut verdict_of: [i32]      = [];
         mut reason_of:  [String]   = [];
@@ -3106,7 +3125,7 @@ type struct Executor {
         };
         for (entry in entries) {
             const name: str::Str = entry.name();
-            if (!filter.is_empty() && !name.contains(&filter)) { continue; }
+            if (!Executor::selected(name, patterns)) { continue; }
             const proj_dir: path::PathBuf = projects_dir.join(name);
             const marker: path::PathBuf = proj_dir.as_path().join("test.json");
             if (!marker.as_path().exists()) { continue; }
