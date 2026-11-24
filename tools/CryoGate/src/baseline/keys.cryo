@@ -2,8 +2,9 @@
 ///! the key each record is stored under, and the key of the baseline
 ///! compiler built from a commit.
 ///!
-///! A record is keyed by the baseline compiler's bytes, the runtime its
-///! programs link, the inputs every program reads, and the program's own
+///! A record is keyed by the identity of the compiler that ran it (its bytes
+///! less what two links of one build differ in), the host's toolchain, the
+///! runtime its programs link, the inputs every program reads, and the program's own
 ///! files with the ones its cryoconfig reaches outside its directory, so a
 ///! change that adds or edits a test runs the baseline over that test alone.
 ///! A record whose inputs changed has another key and is never read.
@@ -17,11 +18,12 @@ import std::collections::string::{ String };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::encoding::sha256::{ Sha256 };
+import std::env;
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
 
 import cryogate::baseline::listing::{ Listing };
-import cryogate::core::child::{ Completion };
+import cryogate::core::child::{ Completion, Job };
 import cryogate::core::git::{ Git };
 import cryogate::core::tree::{ Tree };
 
@@ -53,19 +55,23 @@ public type struct Programs {
     /// of examples/ holding a cryoconfig) as `examples/<name>`.  A project's
     /// and an example's files are its directory's and what its cryoconfig
     /// reaches outside it.
+    /// git lists the test sources and the examples once, and each
+    /// program's files are taken from that one listing.
     public static discover(repository: Path, git: &Git) -> Result<Array<Program>, String> {
         mut programs: Array<Program> = Array::<Program>::new();
-        mut tests_path: Array<Str> = Array::<Str>::new();
-        tests_path.push(Str::new("tests/tests"));
-        const tests: Array<String> = Listing::of(git, &tests_path)?;
+        mut listed_paths: Array<Str> = Array::<Str>::new();
+        listed_paths.push(Str::new("tests/tests"));
+        listed_paths.push(Str::new("examples"));
+        const listed: Array<String> = Listing::of(git, &listed_paths)?;
         const projects: Str = Str::new("tests/tests/projects/");
         const negatives: Str = Str::new("tests/tests/negative/");
         mut unit: Array<String> = Array::<String>::new();
-        for (file in tests.iterate_references()) {
+        for (file in listed.iterate_references()) {
+            if (!file.as_str().starts_with(&Str::new("tests/tests/"))) { continue; }
             if (!file.as_str().starts_with(&projects) && !file.as_str().starts_with(&negatives)) { unit.push(file.clone()); }
         }
         programs.push(Program { name: String::from_str(Programs::unit_suite()), files: unit });
-        for (file in tests.iterate_references()) {
+        for (file in listed.iterate_references()) {
             if (!file.as_str().starts_with(&negatives) || !file.as_str().ends_with(&Str::new(".cryo"))) { continue; }
             const base: Str = match (file.as_str().split_once_from_end(&Str::new("/"))) {
                 Option::Some(parts) => { parts.second }
@@ -75,21 +81,24 @@ public type struct Programs {
             own.push(file.clone());
             programs.push(Program { name: f"negative/{base}", files: own });
         }
-        Programs::homes(repository, git, Str::new("tests/tests/projects"), Str::new("test.json"), Str::new(""), &programs)?;
-        Programs::homes(repository, git, Str::new("examples"), Str::new("cryoconfig"), Str::new("examples/"), &programs)?;
+        Programs::homes(repository, git, &listed, Str::new("tests/tests/projects"), Str::new("test.json"), Str::new(""), &programs)?;
+        Programs::homes(repository, git, &listed, Str::new("examples"), Str::new("cryoconfig"), Str::new("examples/"), &programs)?;
         return Result::Ok(programs);
     }
 
     /// One program per directory of `parent` that holds `marker`, named
-    /// `<prefix><directory>`.
-    private static homes(repository: Path, git: &Git, parent: Str, marker: Str, prefix: Str, programs: mut &Array<Program>) -> Result<(), String> {
+    /// `<prefix><directory>`, its files those of `listed` below it.
+    private static homes(repository: Path, git: &Git, listed: &Array<String>, parent: Str, marker: Str, prefix: Str,
+                         programs: mut &Array<Program>) -> Result<(), String> {
         const names: Array<String> = Tree::names(repository.join(parent).as_path(), &Array::<String>::new())?;
         for (directory in names.iterate_references()) {
             const home: String = f"{parent}/{directory.as_str()}";
             if (!repository.join(home.as_str()).join(marker).as_path().is_file()) { continue; }
-            mut one: Array<Str> = Array::<Str>::new();
-            one.push(home.as_str());
-            mut files: Array<String> = Listing::of(git, &one)?;
+            const below: String = f"{home.as_str()}/";
+            mut files: Array<String> = Array::<String>::new();
+            for (file in listed.iterate_references()) {
+                if (file.as_str().starts_with(&below.as_str())) { files.push(file.clone()); }
+            }
             mut seen: Array<String> = Array::<String>::new();
             for (file in Listing::reached_outside(repository, git, home.as_str(), &seen)?.iterate_references()) {
                 files.push(file.clone());
@@ -103,17 +112,18 @@ public type struct Programs {
 /// The keys the baseline's records are stored under.
 public type struct ProgramKeys {
     /// Each program's key, and the two archive records' keys, as
-    /// `(name, key)` pairs: 32 hex digits of a sha256 seeded with the hex
-    /// digest of the baseline compiler `compiler`, fed the files of the
-    /// runtime home `runtime` (all but its build outputs, under `.bin`), then
-    /// the inputs every program reads, then the program's name and files.
-    public static of(repository: Path, git: &Git, compiler: Path, runtime: Path, programs: &Array<Program>) -> Result<Array<Pair<String, String>>, String> {
-        const compiler_bytes: Array<u8> = match (File::read_bytes(compiler)) {
-            Result::Ok(bytes)  => { bytes }
-            Result::Err(error) => { return Result::Err(f"cannot read {compiler.as_str()}: {error.describe()}"); }
-        };
+    /// `(name, key)` pairs: 32 hex digits of a sha256 seeded with the
+    /// identity of the compiler `compiler` and the host's `toolchain`, fed
+    /// the files of the runtime home `runtime` (all but its build outputs,
+    /// under `.bin`), then the inputs every program reads, then the
+    /// program's name and files.  Either side of a verify run computes them
+    /// over its own compiler and runtime, so a record one side made is the
+    /// other side's when the two compilers are one build.
+    public static of(repository: Path, git: &Git, compiler: Path, runtime: Path, toolchain: &HostToolchain,
+                     programs: &Array<Program>) -> Result<Array<Pair<String, String>>, String> {
         mut linked: Sha256 = Sha256::new();
-        linked.update(Sha256::digest(compiler_bytes.as_slice()).to_hex().as_str().as_bytes());
+        linked.update(CompilerIdentity::of(compiler)?.as_str().as_bytes());
+        linked.update(toolchain.digest.as_str().as_bytes());
         mut excluded: Array<String> = Array::<String>::new();
         excluded.push(String::from_str(Str::new(".bin")));
         mut runtime_files: Array<String> = Tree::files(runtime, &excluded)?;
@@ -191,6 +201,104 @@ public type struct ProgramKeys {
     private static shortened(hex: String) -> String { return String::from_str(hex.as_str().byte_substring(0, 32)); }
 }
 
+/// What a compiler binary is, as a key reads it: the same for two links of
+/// one build, and different for any other byte.
+public type struct CompilerIdentity {
+    /// How many bytes of stamp text follow the marker.
+    const STAMP_TEXT_LENGTH: i64 = 496;
+
+    /// The identity of the compiler binary at `path`.
+    public static of(path: Path) -> Result<String, String> {
+        return match (File::read_bytes(path)) {
+            Result::Ok(bytes)  => { Result::Ok(CompilerIdentity::digest(bytes)) }
+            Result::Err(error) => { Result::Err(f"cannot read {path.as_str()}: {error.describe()}") }
+        };
+    }
+
+    /// The hex sha256 of `bytes`, a compiler binary, with what differs
+    /// between two links of the same objects read as zeros: the stamp text
+    /// after the binary's one stamp marker (the commit it names, and the
+    /// fingerprint, a digest of the rest), and in a PE file the header's
+    /// link time and its checksum over the whole file.  The compiler's own
+    /// fingerprint reads its stamp text the same way.  A binary with no
+    /// single marker has its stamp read as it is.
+    public static digest(bytes: Array<u8>) -> String {
+        mut masked: Array<u8> = bytes;
+        const length: i64 = masked.length();
+        // The marker that opens the region `cryo stamp` rewrites.
+        const marker: Str = Str::new("CRYO-BUILD-STAMP");
+        mut found: i64 = -1;
+        mut markers: i64 = 0;
+        for (mut start: i64 = 0; start + marker.length() + CompilerIdentity::STAMP_TEXT_LENGTH <= length; start++) {
+            if (masked[start] != marker.byte_at(0).unwrap()) { continue; }
+            mut matched: boolean = true;
+            for (mut offset: i64 = 1; offset < marker.length(); offset++) {
+                if (masked[start + offset] != marker.byte_at(offset).unwrap()) { matched = false; break; }
+            }
+            if (matched) { markers++; found = start + marker.length(); }
+        }
+        if (markers == 1) {
+            for (mut offset: i64 = 0; offset < CompilerIdentity::STAMP_TEXT_LENGTH; offset++) { masked[found + offset] = 0; }
+        }
+        // The PE signature's offset is at 0x3c; the link time is 8 bytes
+        // past the signature, the checksum 88 bytes past it (64 into the
+        // optional header, for both PE32 and PE32+).
+        if (length >= 64 && masked[0] == 'M' && masked[1] == 'Z') {
+            const signature: i64 = (masked[60] as i64) + (masked[61] as i64) * 256 + (masked[62] as i64) * 65536 + (masked[63] as i64) * 16777216;
+            if (signature + 92 <= length && masked[signature] == 'P' && masked[signature + 1] == 'E'
+                && masked[signature + 2] == 0 && masked[signature + 3] == 0) {
+                for (mut offset: i64 = 0; offset < 4; offset++) {
+                    masked[signature + 8 + offset] = 0;
+                    masked[signature + 88 + offset] = 0;
+                }
+            }
+        }
+        return Sha256::digest(masked.as_slice()).to_hex();
+    }
+}
+
+/// What the host lends every build besides the checkout's listed files:
+/// the libraries beside the pins the compiler loads (which git ignores),
+/// the C drivers a link can pick and their versions, and the `PATH` they
+/// are found on.
+public type struct HostToolchain {
+    /// The hex sha256 of all of it.
+    public digest: String;
+
+    /// The host toolchain of the checkout `repository`: each `.dll` in its
+    /// `bin`, then `CRYO_CC`, then for each driver a link can pick - the one
+    /// `CRYO_CC` names, `gcc`, `clang`, `cc` - its name and what it prints
+    /// for `--version` (or how it failed), then `PATH`.
+    public static of(repository: Path) -> Result<HostToolchain, String> {
+        mut hasher: Sha256 = Sha256::new();
+        const bin: PathBuf = repository.join(Str::new("bin"));
+        mut libraries: Array<String> = Array::<String>::new();
+        if (bin.as_path().is_directory()) {
+            for (name in Tree::names(bin.as_path(), &Array::<String>::new())?.iterate_references()) {
+                if (name.as_str().to_ascii_lowercase().as_str().ends_with(&Str::new(".dll"))) { libraries.push(f"bin/{name.as_str()}"); }
+            }
+        }
+        libraries.sort();
+        Inputs::feed(&hasher, repository, &libraries)?;
+        const chosen: String = env::var(Str::new("CRYO_CC")).unwrap_or(String::new());
+        mut drivers: Array<String> = Array::<String>::new();
+        if (!chosen.is_empty()) { drivers.push(chosen.clone()); }
+        drivers.push(String::from_str(Str::new("gcc")));
+        drivers.push(String::from_str(Str::new("clang")));
+        drivers.push(String::from_str(Str::new("cc")));
+        Inputs::text(&hasher, Str::new("CRYO_CC"), chosen.as_str());
+        for (driver in drivers.iterate_references()) {
+            mut job: Job = Job::new(driver.as_str());
+            job.argument(Str::new("--version"));
+            const done: Completion = job.run();
+            const answer: String = if (done.outcome.succeeded()) { done.output() } else { done.outcome.describe() };
+            Inputs::text(&hasher, driver.as_str(), answer.as_str());
+        }
+        Inputs::text(&hasher, Str::new("PATH"), env::var(Str::new("PATH")).unwrap_or(String::new()).as_str());
+        return Result::Ok(HostToolchain { digest: hasher.finish().to_hex() });
+    }
+}
+
 /// The key of the baseline compiler built from a commit.
 public type struct BaselineKey {
     /// 16 hex digits of the sha256 of the commit's compiler/src tree, its
@@ -250,11 +358,22 @@ public type struct BaselineKey {
     }
 }
 
-/// Files fed to a digest, each as a NUL, its path, a NUL and its bytes.
-type struct Inputs {
+/// Files fed to a digest, each as a NUL, its path, a NUL and its bytes, and
+/// named values framed the same way.
+public type struct Inputs {
+    /// Feed `hasher` a NUL, `label`, a NUL and `value`.
+    public static text(hasher: mut &Sha256, label: Str, value: Str) -> void {
+        mut framed: String = String::new();
+        framed.push_byte(0);
+        framed.push(label);
+        framed.push_byte(0);
+        framed.push(value);
+        hasher.update(framed.as_str().as_bytes());
+    }
+
     /// Feed `hasher` each of `files` below `root` that is a file; a listed
     /// path that is not on disk is left out.
-    private static feed(hasher: mut &Sha256, root: Path, files: &Array<String>) -> Result<(), String> {
+    public static feed(hasher: mut &Sha256, root: Path, files: &Array<String>) -> Result<(), String> {
         for (file in files.iterate_references()) {
             const path: PathBuf = root.join(file.as_str());
             if (!path.as_path().is_file()) { continue; }

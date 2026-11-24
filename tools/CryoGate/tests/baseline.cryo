@@ -8,15 +8,17 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
-import std::fs::path::{ PathBuf };
+import std::fs::path::{ Path, PathBuf };
 import std::fs::temporary::{ TemporaryDirectory };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect };
 
 import std::collections::pair::{ Pair };
 import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
 
 import cryogate::baseline::cache::{ BaselineCache };
+import cryogate::baseline::keys::{ CompilerIdentity, HostToolchain };
 import cryogate::baseline::listing::{ Listing };
 import cryogate::core::text::{ Text };
 import cryogate::core::git::{ Git };
@@ -128,4 +130,107 @@ function a_projects_inputs_hold_the_package_its_cryoconfig_reaches_by_path() -> 
     }
     expect(shelf > 0, Str::new("the shelf package's files"))?;
     return expect(shelf == reached.length(), Str::new("nothing else: its own directory is not outside it"));
+}
+
+/// A compiler binary's bytes, made by hand: a PE header whose signature is
+/// at 128, and stamp markers at 400, 1000, ... with their text after them.
+private type struct Binary {
+    private static made(markers: i64) -> Array<u8> {
+        mut bytes: Array<u8> = Array::<u8>::new();
+        while (bytes.length() < 2048) { bytes.push(7); }
+        // `MZ`, and at 128 `PE`.
+        bytes[0] = 77;
+        bytes[1] = 90;
+        bytes[60] = 128;
+        bytes[61] = 0;
+        bytes[62] = 0;
+        bytes[63] = 0;
+        bytes[128] = 80;
+        bytes[129] = 69;
+        bytes[130] = 0;
+        bytes[131] = 0;
+        const marker: Str = Str::new("CRYO-BUILD-STAMP");
+        mut placed: i64 = 0;
+        while (placed < markers) {
+            const at: i64 = 400 + placed * 600;
+            for (offset in 0..marker.length()) { bytes[at + offset] = marker.byte_at(offset).unwrap(); }
+            placed++;
+        }
+        return bytes;
+    }
+
+    /// The identity of `bytes` with the byte at `at` changed.
+    private static changed_at(bytes: &Array<u8>, at: i64) -> String {
+        mut changed: Array<u8> = bytes.clone();
+        changed[at] = changed[at] + 1;
+        return CompilerIdentity::digest(changed);
+    }
+}
+
+![test]
+function a_compilers_identity_reads_its_stamp_link_time_and_checksum_as_zeros() -> Result<(), TestError> {
+    const bytes: Array<u8> = Binary::made(1);
+    const identity: String = CompilerIdentity::digest(bytes.clone());
+    // The link time is 8 bytes past the signature, the checksum 88, and the
+    // stamp text the 496 bytes after the marker's 16.
+    expect(Binary::changed_at(&bytes, 136) == identity, Str::new("the link time's first byte"))?;
+    expect(Binary::changed_at(&bytes, 139) == identity, Str::new("the link time's last byte"))?;
+    expect(Binary::changed_at(&bytes, 216) == identity, Str::new("the checksum's first byte"))?;
+    expect(Binary::changed_at(&bytes, 219) == identity, Str::new("the checksum's last byte"))?;
+    expect(Binary::changed_at(&bytes, 416) == identity, Str::new("the stamp text's first byte"))?;
+    expect(Binary::changed_at(&bytes, 911) == identity, Str::new("the stamp text's last byte"))?;
+    expect(Binary::changed_at(&bytes, 135) != identity, Str::new("the byte before the link time"))?;
+    expect(Binary::changed_at(&bytes, 140) != identity, Str::new("the byte after the link time"))?;
+    expect(Binary::changed_at(&bytes, 215) != identity, Str::new("the byte before the checksum"))?;
+    expect(Binary::changed_at(&bytes, 220) != identity, Str::new("the byte after the checksum"))?;
+    expect(Binary::changed_at(&bytes, 415) != identity, Str::new("the marker's last byte"))?;
+    expect(Binary::changed_at(&bytes, 912) != identity, Str::new("the byte after the stamp text"))?;
+    return expect(Binary::changed_at(&bytes, 2000) != identity, Str::new("a byte of code"));
+}
+
+![test]
+function a_binary_with_two_stamp_markers_has_its_stamp_read_as_it_is() -> Result<(), TestError> {
+    const bytes: Array<u8> = Binary::made(2);
+    const identity: String = CompilerIdentity::digest(bytes.clone());
+    expect(Binary::changed_at(&bytes, 500) != identity, Str::new("no single region: the first marker's text counts"))?;
+    return expect(Binary::changed_at(&bytes, 136) == identity, Str::new("the link time is still read as zeros"));
+}
+
+![test]
+function the_host_toolchain_reads_the_libraries_beside_the_pins() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = match (TemporaryDirectory::create()) {
+        Result::Ok(directory) => { directory }
+        Result::Err(error)    => { return Result::Err(TestError::other(error.describe())); }
+    };
+    const bin: PathBuf = scratch.path().join(Str::new("bin"));
+    match (Directory::create(bin.as_path())) {
+        Result::Ok(_)      => { }
+        Result::Err(error) => { return Result::Err(TestError::other(error.describe())); }
+    }
+    const library: PathBuf = bin.join(Str::new("LLVM-C.dll"));
+    Toolchains::write(library.as_path(), Str::new("one"))?;
+    const first: String = Toolchains::digest(scratch.path())?;
+    expect(Toolchains::digest(scratch.path())? == first, Str::new("the same host reads the same"))?;
+    Toolchains::write(library.as_path(), Str::new("two"))?;
+    const second: String = Toolchains::digest(scratch.path())?;
+    expect(second != first, Str::new("a library's bytes"))?;
+    Toolchains::write(bin.join(Str::new("notes.txt")).as_path(), Str::new("x"))?;
+    return expect(Toolchains::digest(scratch.path())? == second, Str::new("a file that is no library is git's to list"));
+}
+
+/// The host toolchain of a scratch checkout, and the files written into it.
+private type struct Toolchains {
+    private static write(path: Path, text: Str) -> Result<(), TestError> {
+        return match (File::write_text(path, text)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(TestError::other(error.describe())) }
+        };
+    }
+
+    private static digest(repository: Path) -> Result<String, TestError> {
+        return match (HostToolchain::of(repository)) {
+            Result::Ok(toolchain) => { Result::Ok(toolchain.digest.clone()) }
+            Result::Err(reason)   => { Result::Err(TestError::other(reason.as_str())) }
+        };
+    }
 }

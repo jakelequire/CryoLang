@@ -1,6 +1,8 @@
 ///! The baseline, one program at a time: which programs have no record
 ///! under their key and so must run, the runs that record them, and the
-///! object lists and census verdict the records add up to.
+///! object lists and census verdict the records add up to; and the records
+///! the tree's census leaves for a later baseline built to the same
+///! compiler.
 
 namespace cryogate::verify::run::programs;
 
@@ -12,12 +14,11 @@ import std::collections::string::{ String };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::fmt;
-import std::fs::directory::{ Directory };
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
 import std::time::clock::{ Instant };
 
-import cryogate::baseline::keys::{ Program, ProgramKeys, Programs };
+import cryogate::baseline::keys::{ HostToolchain, Program, ProgramKeys, Programs };
 import cryogate::core::child::{ Completion, Job };
 import cryogate::core::git::{ Git };
 import cryogate::core::text::{ Text };
@@ -26,7 +27,7 @@ import cryogate::verify::gates::{ GateCommand };
 import cryogate::verify::hashing::{ ObjectHashes };
 import cryogate::verify::judges::{ BaselineCensus };
 import cryogate::verify::objects::{ ObjectOwner, ObjectPopulation };
-import cryogate::verify::record::{ BaselineRecord };
+import cryogate::verify::record::{ BaselineRecord, RecordStore };
 import cryogate::verify::run::children::{ GateRun, PopulationRun, VerifyChild };
 import cryogate::verify::run::compiler::{ BaselineCompiler };
 import cryogate::verify::runtime::{ RuntimeArchives };
@@ -227,33 +228,30 @@ public type struct BaselineTotals {
 /// The baseline's programs, recorded and run.
 public type struct BaselinePrograms {
     /// The records of every program for `baseline` in the checkout
-    /// `repository`, the missing ones run first and stored; their object
-    /// lists are written to `directory` as `base.<population>.sha256`.
-    /// `unit_pinned` is the unit tests the roster pins on this host,
-    /// `cryogate` the gate runner the examples sweep runs under.
+    /// `repository`, read from `store` under the keys computed with the
+    /// host's `toolchain`, the missing ones run first and stored; their
+    /// object lists are written to `directory` as
+    /// `base.<population>.sha256`.  `unit_pinned` is the unit tests the
+    /// roster pins on this host, `cryogate` the gate runner the examples
+    /// sweep runs under.  A program run again although its record was
+    /// found must give the same record.
     public static record(repository: Path, git: &Git, baseline: &BaselineCompiler, directory: Path,
-                         unit_pinned: &Array<String>, cryogate: Str) -> Result<BaselineTotals, String> {
+                         unit_pinned: &Array<String>, cryogate: Str, toolchain: &HostToolchain,
+                         store: &RecordStore) -> Result<BaselineTotals, String> {
         const programs: Array<Program> = Programs::discover(repository, git)?;
         const keys: Array<Pair<String, String>> = ProgramKeys::of(repository, git, baseline.compiler.as_path(),
-            baseline.runtime_home.as_path(), &programs)?;
-        const store: PathBuf = baseline.home.join(Str::new("programs"));
-        match (Directory::create_all(store.as_path())) {
-            Result::Ok(_)      => { }
-            Result::Err(error) => { return Result::Err(f"cannot create {store.as_path().as_str()}: {error.describe()}"); }
-        }
+            baseline.runtime_home.as_path(), toolchain, &programs)?;
         mut held: Array<BaselineRecord> = Array::<BaselineRecord>::new();
         mut keyed: Array<String> = Array::<String>::new();
         mut recorded: Array<String> = Array::<String>::new();
         for (key in keys.iterate_references()) {
             keyed.push(key.first.clone());
-            match (File::read_text(store.join(key.second.as_str()).as_path())) {
-                Result::Ok(text) => {
-                    mut record: BaselineRecord = BaselineRecord::read(text.as_str());
-                    record.name = key.first.clone();
+            match (store.load(key.second.as_str(), key.first.as_str())) {
+                Option::Some(record) => {
                     held.push(record);
                     recorded.push(key.first.clone());
                 }
-                Result::Err(_) => { }
+                Option::None => { }
             }
         }
         const plan: BaselinePlan = BaselinePlan::of(&keyed, &recorded);
@@ -337,15 +335,21 @@ public type struct BaselinePrograms {
         }
         for (index in 0..fresh.length()) {
             const name: Str = fresh[index].name.as_str();
-            if (!name.starts_with(&Str::new("archives/"))) { continue; }
             for (record in held.iterate_references()) {
-                if (record.name.as_str() == name) { fresh[index] = BaselineTotals::merged(&fresh[index], record)?; }
+                if (record.name.as_str() != name) { continue; }
+                if (name.starts_with(&Str::new("archives/"))) { fresh[index] = BaselineTotals::merged(&fresh[index], record)?; continue; }
+                match (record.difference(&fresh[index])) {
+                    Option::Some(field) => {
+                        return Result::Err(f"the baseline ran {record.name.as_str()} again and its record differs from the one stored under its key ({field.as_str()}): the key misses an input, or the build is not deterministic");
+                    }
+                    Option::None => { }
+                }
             }
         }
         for (record in fresh.iterate_references()) {
             for (key in keys.iterate_references()) {
                 if (key.first.as_str() != record.name.as_str()) { continue; }
-                BaselinePrograms::store(store.join(key.second.as_str()).as_path(), record)?;
+                store.save(key.second.as_str(), record)?;
             }
         }
         mut every: Array<BaselineRecord> = Array::<BaselineRecord>::new();
@@ -365,6 +369,52 @@ public type struct BaselinePrograms {
         return Result::Ok(totals);
     }
 
+    /// The records of the census-side programs the tree's census gave a
+    /// verdict, made from the run directory `run`'s copy of the census
+    /// runner's log (`tree.census.log`) and its tests list as a baseline
+    /// census's are, and stored under the keys computed with the compiler
+    /// under test `cryo` and the checkout's runtime: a later baseline built
+    /// to the same compiler reads them instead of running its programs.  A
+    /// record already stored under a key must be the one the tree made;
+    /// the problems name each that is not.
+    public static record_tree(repository: Path, git: &Git, cryo: Path, run: Path, unit_pinned: &Array<String>,
+                              toolchain: &HostToolchain, store: &RecordStore) -> Result<Array<String>, String> {
+        mut problems: Array<String> = Array::<String>::new();
+        const log: String = match (File::read_text(run.join(Str::new("tree.census.log")).as_path())) {
+            Result::Ok(text) => { text }
+            Result::Err(_)   => { return Result::Ok(problems); }
+        };
+        const rows: String = match (File::read_text(run.join(Str::new("tree.tests.sha256")).as_path())) {
+            Result::Ok(text)   => { text }
+            Result::Err(error) => { return Result::Err(f"cannot read the tree's tests list: {error.describe()}"); }
+        };
+        const programs: Array<Program> = Programs::discover(repository, git)?;
+        const keys: Array<Pair<String, String>> = ProgramKeys::of(repository, git, cryo,
+            repository.join(Str::new("runtime")).as_path(), toolchain, &programs)?;
+        mut names: Array<String> = Array::<String>::new();
+        for (program in programs.iterate_references()) {
+            if (!program.name.as_str().starts_with(&Str::new("examples/"))) { names.push(program.name.clone()); }
+        }
+        const made: Array<BaselineRecord> = BaselineRecord::of_census(&Text::lines(log.as_str()), &names, &Text::lines(rows.as_str()), unit_pinned);
+        for (record in made.iterate_references()) {
+            for (key in keys.iterate_references()) {
+                if (key.first.as_str() != record.name.as_str()) { continue; }
+                match (store.load(key.second.as_str(), key.first.as_str())) {
+                    Option::Some(stored) => {
+                        match (stored.difference(record)) {
+                            Option::Some(field) => {
+                                problems.push(f"the tree's record of {record.name.as_str()} differs from the one stored under its key ({field.as_str()}): the key misses an input, or the build is not deterministic");
+                            }
+                            Option::None => { }
+                        }
+                    }
+                    Option::None => { store.save(key.second.as_str(), record)?; }
+                }
+            }
+        }
+        return Result::Ok(problems);
+    }
+
     /// Each of `rows` added to the record in `records` of the program that
     /// owns its object, when there is one.
     private static attach(records: mut &Array<BaselineRecord>, rows: &Array<String>) -> void {
@@ -378,19 +428,5 @@ public type struct BaselinePrograms {
                 if (records[index].name.as_str() == owner.as_str()) { records[index].rows.push(row.clone()); }
             }
         }
-    }
-
-    /// `record` written to `path` through a temporary beside it, renamed
-    /// into place, so a record is never read half-written.
-    private static store(path: Path, record: &BaselineRecord) -> Result<(), String> {
-        const temporary: String = f"{path.as_str()}.tmp";
-        match (File::write_text(Path::from(temporary.as_str()), record.text().as_str())) {
-            Result::Ok(_)      => { }
-            Result::Err(error) => { return Result::Err(f"cannot write {temporary.as_str()}: {error.describe()}"); }
-        }
-        return match (Path::from(temporary.as_str()).rename_to(path)) {
-            Result::Ok(_)      => { Result::Ok(()) }
-            Result::Err(error) => { Result::Err(f"cannot replace {path.as_str()}: {error.describe()}") }
-        };
     }
 }

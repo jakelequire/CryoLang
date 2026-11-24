@@ -10,17 +10,28 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
+import std::encoding::sha256::{ Sha256 };
+import std::fs::directory::{ Directory };
+import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
+import std::fs::temporary::{ TemporaryDirectory };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect, expect_equal };
+import std::time::clock::{ SystemTime };
 
+import cryogate::baseline::keys::{ HostToolchain };
+import cryogate::core::git::{ Git };
 import cryogate::core::host::{ Host };
+import cryogate::core::log::{ RunLogs };
 import cryogate::core::text::{ Text };
 import cryogate::verify::declarations::{ Declaration };
-import cryogate::verify::record::{ BaselineRecord };
-import cryogate::verify::run::children::{ PopulationRun };
+import cryogate::verify::gates::{ GateCommand, GateVerdict };
+import cryogate::verify::objects::{ ObjectPopulation };
+import cryogate::verify::record::{ BaselineRecord, RecordStore, Seal };
+import cryogate::verify::run::children::{ GateRun, PopulationRun };
 import cryogate::verify::run::declared::{ DeclaredBuilds };
 import cryogate::verify::run::programs::{ BaselinePlan, BaselineTotals };
+import cryogate::verify::run::reuse::{ TreeRunCache };
 import cryogate::verify::run::session::{ VerifySession };
 
 /// Inputs written as text: a list as names joined by `,`, a row as a
@@ -270,4 +281,238 @@ function the_declared_lines_are_listed_in_name_order_under_their_count() -> Resu
     declared.push(Declaration { name: String::from_str(Str::new("p")), reason: String::from_str(Str::new("first")) });
     return expect_equal(VerifySession::declared_line(&declared, Str::new("HEAD"), Str::new("pass")).as_str(),
         Str::new("verify: 2 program(s) declared as starting to pass since HEAD\n      p -- first\n      q -- second"));
+}
+
+![test]
+function a_sealed_text_opens_only_as_it_was_written() -> Result<(), TestError> {
+    const text: Str = Str::new("name p\nverdict ok\n");
+    const sealed: String = Seal::close(text);
+    expect(Seal::open(sealed.as_str()) == Option::Some(text), Str::new("as written"))?;
+    const changed: String = sealed.as_str().replace(&Str::new("verdict ok"), &Str::new("verdict FAILED"));
+    expect(Seal::open(changed.as_str()).is_none(), Str::new("a changed line"))?;
+    expect(Seal::open(text).is_none(), Str::new("no end line"))?;
+    expect(Seal::open(sealed.as_str().byte_substring(0, sealed.length() - 1)).is_none(), Str::new("the end line cut short"))?;
+    const without_first: Str = sealed.as_str().byte_substring(7, sealed.length());
+    expect(Seal::open(without_first).is_none(), Str::new("a line dropped"))?;
+    return expect(Seal::open(Seal::close(Str::new("")).as_str()) == Option::Some(Str::new("")), Str::new("nothing sealed opens to nothing"));
+}
+
+![test]
+function a_stored_record_is_read_back_only_under_its_key_and_name_and_seal() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = Scratch::directory()?;
+    const store: RecordStore = RecordStore { directory: scratch.path().join(Str::new("programs")) };
+    Scratch::created(store.directory.as_path())?;
+    const record: BaselineRecord = Given::record(Str::new("p"), Str::new("ok"), Given::list(Str::new("")));
+    Scratch::done(store.save(Str::new("k1"), &record))?;
+    expect(store.load(Str::new("k1"), Str::new("p")).is_some(), Str::new("its key and name"))?;
+    expect(store.load(Str::new("k1"), Str::new("q")).is_none(), Str::new("another program's name"))?;
+    expect(store.load(Str::new("k2"), Str::new("p")).is_none(), Str::new("another key"))?;
+    const path: PathBuf = store.directory.join(Str::new("k1"));
+    const text: String = Scratch::read(path.as_path())?;
+    Scratch::write(path.as_path(), text.as_str().replace(&Str::new("verdict ok"), &Str::new("verdict FAILED")).as_str())?;
+    expect(store.load(Str::new("k1"), Str::new("p")).is_none(), Str::new("a record changed on disk is no record"))?;
+    Scratch::done(store.save(Str::new("k1"), &record))?;
+    return expect(store.load(Str::new("k1"), Str::new("p")).is_some(), Str::new("and is written again"));
+}
+
+![test]
+function pruning_drops_records_not_read_for_the_kept_days() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = Scratch::directory()?;
+    const store: RecordStore = RecordStore { directory: scratch.path().join(Str::new("programs")) };
+    Scratch::created(store.directory.as_path())?;
+    const record: BaselineRecord = Given::record(Str::new("p"), Str::new("ok"), Given::list(Str::new("")));
+    Scratch::done(store.save(Str::new("k1"), &record))?;
+    Scratch::done(store.save(Str::new("k2"), &record))?;
+    const now: i64 = SystemTime::now().unix_seconds();
+    expect(Scratch::pruned(&store, now)? == 0, Str::new("records written now are kept"))?;
+    expect(Scratch::pruned(&store, now + (RecordStore::KEPT_DAYS - 1) * 86400)? == 0, Str::new("within the kept days"))?;
+    expect(Scratch::pruned(&store, now + (RecordStore::KEPT_DAYS + 1) * 86400)? == 2, Str::new("past them, both go"))?;
+    return expect(store.load(Str::new("k1"), Str::new("p")).is_none(), Str::new("and are gone"));
+}
+
+![test]
+function a_kept_tree_run_is_replayed_and_one_changed_on_disk_is_deleted_not_trusted() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = Scratch::directory()?;
+    const run: PathBuf = scratch.path().join(Str::new("run-1"));
+    Scratch::created(run.as_path())?;
+    Scratch::write(run.join(Str::new("census.log")).as_path(), Str::new("test-census: OK -- every pinned entry accounted for\n"))?;
+    Scratch::write(run.join(Str::new("tree.census.log")).as_path(), Str::new("runner output\n"))?;
+    for (population in ObjectPopulation::all().iterate_references()) {
+        Scratch::write(run.join(f"tree.{population.name()}.sha256".as_str()).as_path(), Given::row(Str::new("1"), Str::new("x.o")).as_str())?;
+    }
+    const table: Array<GateCommand> = GateCommand::table(Str::new("cryogate"));
+    const names: Array<String> = Given::list(Str::new("census"));
+    mut gates: Array<GateRun> = Array::<GateRun>::new();
+    gates.push(GateRun {
+        name: String::from_str(Str::new("census")), verdict: GateVerdict::of(&table[0], Str::new("test-census: OK -- x"), 0),
+        seconds: 12.5, log: String::from_str(run.join(Str::new("census.log")).as_path().as_str()),
+    });
+    mut counts: Array<i64> = Array::<i64>::new();
+    for (population in ObjectPopulation::all().iterate_references()) { counts.push(1); }
+    const cache: TreeRunCache = TreeRunCache { directory: scratch.path().join(Str::new("tree-runs")), key: String::from_str(Str::new("k")) };
+    Scratch::done(cache.store(run.as_path(), &PopulationRun { gates: gates, counts: counts }))?;
+
+    const again: PathBuf = scratch.path().join(Str::new("run-2"));
+    Scratch::created(again.as_path())?;
+    const replayed: PopulationRun = match (cache.replay(&table, &names, again.as_path())) {
+        Option::Some(population) => { population }
+        Option::None             => { return Result::Err(TestError::other(Str::new("the kept run was not replayed"))); }
+    };
+    expect(replayed.gates.length() == 1 && replayed.gates[0].verdict.ok, Str::new("its gate, judged again from its log"))?;
+    expect(replayed.gates[0].seconds == 12.5, Str::new("its time"))?;
+    expect(replayed.counts.length() == 4, Str::new("its counts"))?;
+    expect_equal(Scratch::read(again.join(Str::new("tree.census.log")).as_path())?.as_str(), Str::new("runner output\n"))?;
+
+    Scratch::write(cache.entry().join(Str::new("tree.tests.sha256")).as_path(), Given::row(Str::new("2"), Str::new("x.o")).as_str())?;
+    const third: PathBuf = scratch.path().join(Str::new("run-3"));
+    Scratch::created(third.as_path())?;
+    expect(cache.replay(&table, &names, third.as_path()).is_none(), Str::new("a kept list changed on disk is not replayed"))?;
+    return expect(!cache.entry().as_path().exists(), Str::new("and the kept run is deleted"));
+}
+
+![test]
+function a_kept_tree_run_whose_gate_log_does_not_pass_is_not_replayed() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = Scratch::directory()?;
+    const run: PathBuf = scratch.path().join(Str::new("run-1"));
+    Scratch::created(run.as_path())?;
+    Scratch::write(run.join(Str::new("census.log")).as_path(), Str::new("test-census: FAILED\n"))?;
+    for (population in ObjectPopulation::all().iterate_references()) {
+        Scratch::write(run.join(f"tree.{population.name()}.sha256".as_str()).as_path(), Str::new(""))?;
+    }
+    const table: Array<GateCommand> = GateCommand::table(Str::new("cryogate"));
+    mut gates: Array<GateRun> = Array::<GateRun>::new();
+    gates.push(GateRun {
+        name: String::from_str(Str::new("census")), verdict: GateVerdict::of(&table[0], Str::new("test-census: FAILED"), 1),
+        seconds: 1.0, log: String::from_str(run.join(Str::new("census.log")).as_path().as_str()),
+    });
+    mut counts: Array<i64> = Array::<i64>::new();
+    for (population in ObjectPopulation::all().iterate_references()) { counts.push(0); }
+    const cache: TreeRunCache = TreeRunCache { directory: scratch.path().join(Str::new("tree-runs")), key: String::from_str(Str::new("k")) };
+    Scratch::done(cache.store(run.as_path(), &PopulationRun { gates: gates, counts: counts }))?;
+    const again: PathBuf = scratch.path().join(Str::new("run-2"));
+    Scratch::created(again.as_path())?;
+    return expect(cache.replay(&table, &Given::list(Str::new("census")), again.as_path()).is_none(),
+        Str::new("a kept run is judged again, and a failing log is never a pass"));
+}
+
+![test]
+function the_tree_runs_key_reads_every_listed_file_and_what_git_ignores_below_bin() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = Scratch::directory()?;
+    const root: Path = scratch.path();
+    const logs_home: TemporaryDirectory = Scratch::directory()?;
+    const logs: RunLogs = match (RunLogs::open(logs_home.path())) {
+        Result::Ok(logs)    => { logs }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    const git: Git = Git::new(root, &logs);
+    mut init: Array<Str> = Array::<Str>::new();
+    init.push(Str::new("init"));
+    init.push(Str::new("-q"));
+    expect(git.run(&init).outcome.succeeded(), Str::new("git init"))?;
+    Scratch::write(root.join(Str::new(".gitignore")).as_path(), Str::new("*.o\nbin/*.dll\n"))?;
+    Scratch::write(root.join(Str::new("a.cryo")).as_path(), Str::new("one"))?;
+    Scratch::created(root.join(Str::new("bin")).as_path())?;
+    Scratch::write(root.join(Str::new("bin/x.dll")).as_path(), Str::new("library"))?;
+    const first: String = Scratch::inputs(root, &git)?;
+    expect(Scratch::inputs(root, &git)? == first, Str::new("the same checkout reads the same"))?;
+    Scratch::write(root.join(Str::new("a.cryo")).as_path(), Str::new("two"))?;
+    const edited: String = Scratch::inputs(root, &git)?;
+    expect(edited != first, Str::new("an untracked file's bytes"))?;
+    Scratch::write(root.join(Str::new("b.o")).as_path(), Str::new("output"))?;
+    expect(Scratch::inputs(root, &git)? == edited, Str::new("a file git ignores elsewhere is an output"))?;
+    Scratch::write(root.join(Str::new("bin/x.dll")).as_path(), Str::new("another library"))?;
+    return expect(Scratch::inputs(root, &git)? != edited, Str::new("a library git ignores below bin"));
+}
+
+![test]
+function the_tree_runs_key_reads_the_compilers_bytes_the_gates_and_the_target() -> Result<(), TestError> {
+    const scratch: TemporaryDirectory = Scratch::directory()?;
+    const root: Path = scratch.path();
+    const logs_home: TemporaryDirectory = Scratch::directory()?;
+    const logs: RunLogs = match (RunLogs::open(logs_home.path())) {
+        Result::Ok(logs)    => { logs }
+        Result::Err(reason) => { return Result::Err(TestError::other(reason.as_str())); }
+    };
+    const git: Git = Git::new(root, &logs);
+    mut init: Array<Str> = Array::<Str>::new();
+    init.push(Str::new("init"));
+    init.push(Str::new("-q"));
+    expect(git.run(&init).outcome.succeeded(), Str::new("git init"))?;
+    Scratch::write(root.join(Str::new(".gitignore")).as_path(), Str::new("build/\n"))?;
+    Scratch::created(root.join(Str::new("build")).as_path())?;
+    const compiler: PathBuf = root.join(Str::new("build/cryo"));
+    Scratch::write(compiler.as_path(), Str::new("compiler one"))?;
+    const toolchain: HostToolchain = HostToolchain { digest: String::from_str(Str::new("host")) };
+    const gates: Array<String> = Given::list(Str::new("census,examples"));
+    const first: String = Scratch::key(root, &git, compiler.as_path(), &toolchain, &gates, Str::new("x86_64-pc-windows-gnu"))?;
+    Scratch::write(compiler.as_path(), Str::new("compiler two"))?;
+    const second: String = Scratch::key(root, &git, compiler.as_path(), &toolchain, &gates, Str::new("x86_64-pc-windows-gnu"))?;
+    expect(second != first, Str::new("the compiler's bytes at the same path"))?;
+    expect(Scratch::key(root, &git, compiler.as_path(), &toolchain, &Given::list(Str::new("census")), Str::new("x86_64-pc-windows-gnu"))? != second,
+        Str::new("the gates"))?;
+    expect(Scratch::key(root, &git, compiler.as_path(), &toolchain, &gates, Str::new("x86_64-pc-linux-gnu"))? != second, Str::new("the target"))?;
+    const other_host: HostToolchain = HostToolchain { digest: String::from_str(Str::new("another host")) };
+    return expect(Scratch::key(root, &git, compiler.as_path(), &other_host, &gates, Str::new("x86_64-pc-windows-gnu"))? != second,
+        Str::new("the host toolchain"));
+}
+
+/// Scratch directories and files for the store's and the cache's tests.
+private type struct Scratch {
+    private static directory() -> Result<TemporaryDirectory, TestError> {
+        return match (TemporaryDirectory::create()) {
+            Result::Ok(directory) => { Result::Ok(directory) }
+            Result::Err(error)    => { Result::Err(TestError::other(error.describe())) }
+        };
+    }
+
+    private static created(path: Path) -> Result<(), TestError> {
+        return match (Directory::create_all(path)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(TestError::other(error.describe())) }
+        };
+    }
+
+    private static write(path: Path, text: Str) -> Result<(), TestError> {
+        return match (File::write_text(path, text)) {
+            Result::Ok(_)      => { Result::Ok(()) }
+            Result::Err(error) => { Result::Err(TestError::other(error.describe())) }
+        };
+    }
+
+    private static read(path: Path) -> Result<String, TestError> {
+        return match (File::read_text(path)) {
+            Result::Ok(text)   => { Result::Ok(text) }
+            Result::Err(error) => { Result::Err(TestError::other(error.describe())) }
+        };
+    }
+
+    private static done(result: Result<(), String>) -> Result<(), TestError> {
+        return match (result) {
+            Result::Ok(_)       => { Result::Ok(()) }
+            Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
+        };
+    }
+
+    private static pruned(store: &RecordStore, now: i64) -> Result<i64, TestError> {
+        return match (store.prune(now)) {
+            Result::Ok(count)   => { Result::Ok(count) }
+            Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
+        };
+    }
+
+    private static key(root: Path, git: &Git, compiler: Path, toolchain: &HostToolchain, gates: &Array<String>, triple: Str) -> Result<String, TestError> {
+        return match (TreeRunCache::of(root, git, compiler, toolchain, gates, triple)) {
+            Result::Ok(cache)   => { Result::Ok(cache.key.clone()) }
+            Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
+        };
+    }
+
+    /// The hex digest `TreeRunCache::feed_inputs` gives the checkout `root`.
+    private static inputs(root: Path, git: &Git) -> Result<String, TestError> {
+        mut hasher: Sha256 = Sha256::new();
+        return match (TreeRunCache::feed_inputs(&hasher, root, git)) {
+            Result::Ok(_)       => { Result::Ok(hasher.finish().to_hex()) }
+            Result::Err(reason) => { Result::Err(TestError::other(reason.as_str())) }
+        };
+    }
 }

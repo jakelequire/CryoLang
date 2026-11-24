@@ -23,9 +23,9 @@ upward, and no two files of one layer import each other in a cycle.
 |---|---|---|
 | `core/` | child processes, the scheduler, the heavy-run lock, run logs, the command-line parser, host facts, git, WSL, directory listings, text helpers, the unit-suite judge | the stdlib |
 | `corpus/` | the test corpus as read from disk and from a runner's output: the roster golden, `![target]` gates, discovery and merging (`roster`); a census run's reading and what the golden pins on this host (`census`) | core |
-| `baseline/` | verify's baseline: what git lists, each program's record key, the baseline compiler's key, the clone it is built in, the bounded cache of homes | core |
-| `verify/` | verify's decisions: the declaration files, object populations and owners, the runtime archives' members, a program's baseline record, the judges, the object comparison | core, corpus |
-| `verify/run/` | a verify run itself: the children it starts, the baseline compiler, the baseline's per-program records, the declared projects' builds, the run from start to report | core, corpus, baseline, verify's decisions |
+| `baseline/` | verify's baseline: what git lists, a compiler's identity and the host's toolchain, each program's record key, the baseline compiler's key, the clone it is built in, the bounded cache of homes | core |
+| `verify/` | verify's decisions: the declaration files, object populations and owners, the runtime archives' members, a program's record and the sealed store both sides keep records in, the judges, the object comparison | core, corpus |
+| `verify/run/` | a verify run itself: the children it starts, the baseline compiler, the per-program records of the baseline and of the tree's census, the declared projects' builds, the tree's gates replayed from a passing run with the same inputs, the run from start to report | core, corpus, baseline, verify's decisions |
 | `selfhost/` | selfhost's decisions: each arm's stages and directories, the per-module tree comparison, the stage archives, the digest of the mirrored sources, the arms' verdict, the fixed point and archives judged | core |
 | `selfhost/run/` | a selfhost run itself: one arm's stages, comparisons and report; the Linux arm inside WSL from a Windows host | core, selfhost's decisions |
 | `incremental/` | the incremental-build matrix's decisions: the source edits and the text they make, a build's program and objects as digests, an incremental build judged against a clean one | core |
