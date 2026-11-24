@@ -14,6 +14,7 @@ import std::fmt;
 import std::fs::directory::{ Directory };
 import std::fs::file::{ File };
 import std::fs::path::{ Path, PathBuf };
+import std::io::error::{ IoErrorKind };
 
 import cryogate::baseline::cache::{ BaselineCache };
 import cryogate::baseline::clone::{ BaselineClone };
@@ -188,10 +189,31 @@ public type struct BaselineCompiler {
             excluded.push(String::from_str(Str::new(".bin")));
             Tree::copy(clone.join(Str::new("stdlib")).as_path(), stdlib_home.as_path(), &excluded)?;
         }
+        // Each library beside the pins is linked into the home, so the
+        // compiler loads one beside itself, as a home's own file, and the
+        // homes store its bytes once.  A linked file is one file under both
+        // names, so the home's is never written through: one already there
+        // is removed first, since a copy over it would rewrite the pin's.
+        // Where the filesystem makes no link the library is copied.
         const bin: PathBuf = repository.join(Str::new("bin"));
         for (name in Tree::names(bin.as_path(), &Array::<String>::new())?.iterate_references()) {
-            if (name.as_str().to_ascii_lowercase().as_str().ends_with(&Str::new(".dll"))) {
-                BaselineCompiler::copy(bin.join(name.as_str()).as_path(), home.join(name.as_str()).as_path())?;
+            if (!name.as_str().to_ascii_lowercase().as_str().ends_with(&Str::new(".dll"))) { continue; }
+            const library: PathBuf = bin.join(name.as_str());
+            const placed: PathBuf = home.join(name.as_str());
+            if (placed.as_path().exists()) {
+                match (File::remove(placed.as_path())) {
+                    Result::Ok(_)      => { }
+                    Result::Err(error) => { return Result::Err(f"cannot replace the baseline's {name.as_str()}: {error.describe()}; delete {PopulationRun::relative(repository, home.as_str()).as_str()} and run verify again"); }
+                }
+            }
+            match (File::hard_link(library.as_path(), placed.as_path())) {
+                Result::Ok(_) => { }
+                Result::Err(error) => {
+                    const unlinkable: boolean = error.kind == IoErrorKind::CrossesDevices || error.kind == IoErrorKind::Unsupported;
+                    if (!unlinkable) { return Result::Err(f"cannot link bin/{name.as_str()} into the baseline's home: {error.describe()}"); }
+                    fmt::println(f"verify: bin/{name.as_str()} is copied into the baseline's home, not linked ({error.kind.description()}); a checkout on one NTFS or POSIX volume stores it once");
+                    BaselineCompiler::copy(library.as_path(), placed.as_path())?;
+                }
             }
         }
         return BaselineCompiler::copy(built.as_path(), home.join(Host::executable_name(Str::new("cryo")).as_str()).as_path());
