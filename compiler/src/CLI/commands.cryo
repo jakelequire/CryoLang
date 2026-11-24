@@ -1125,8 +1125,11 @@ type struct Executor {
                 }
             };
             match (SourceFormatter::format(text.as_str())) {
-                Result::Err(reason) => {
-                    fmt::eprintln(f"error: {name}: left as it is: {reason}");
+                Result::Err(refusal) => {
+                    fmt::eprintln(f"error: {name}: left as it is: {refusal.reason}");
+                    if (refusal.in_source) {
+                        fmt::eprintln(f"help: `cryo check {name}` reports where; once it is fixed, `cryo fmt {name}` lays the file out");
+                    }
                     refused = refused + 1;
                 }
                 Result::Ok(laid_out) => {
@@ -2756,14 +2759,18 @@ type struct Executor {
         return true;
     }
 
-    /// Parse a project's `test.json` into a `ProjSpec`. Returns `None` if the
-    /// file is malformed (the caller reports that as a failing project).
-    static parse_test_json(content: Str) -> Option<ProjSpec> {
+    /// Parse a project's `test.json` into a `ProjSpec`, or say what makes the
+    /// file malformed (the caller reports that as a failing project).  A key
+    /// whose value has the wrong shape makes the file malformed: read as
+    /// absent, it would drop the assertion it spells and pass whatever the
+    /// project does.
+    static parse_test_json(content: Str) -> Result<ProjSpec, String> {
         mut root: value::JsonValue = match (parser::parse(content)) {
             Result::Ok(v)      => { v }
-            Result::Err(e)     => { mem::drop(e); return Option::None; }
+            Result::Err(e)     => { return Result::Err(f"not JSON: {e.describe()}"); }
         };
         mut spec: ProjSpec = ProjSpec::empty();
+        mut problems: [String] = [];
 
         // Outcome selects the FIXTURE: collect (default) / build / run.
         // `compile_fail` is a recognized alias for `build` + `fails`, so the
@@ -2773,6 +2780,8 @@ type struct Executor {
         const run_str:   str::Str = str::Str::new("run");
         const interpret_str: str::Str = str::Str::new("interpret");
         const command_str: str::Str = str::Str::new("command");
+        const collect_str: str::Str = str::Str::new("collect");
+        const outcome_shape: string = "\"outcome\" names one of collect, build, compile_fail, run, interpret or command, as in \"outcome\": \"run\"";
         match (root.get(str::Str::new("outcome"))) {
             Option::Some(vp) => {
                 match (vp.as::<str::Str>()) {
@@ -2782,8 +2791,9 @@ type struct Executor {
                         else if (os.equals(&run_str)) { spec.outcome = 2; }
                         else if (os.equals(&interpret_str)) { spec.outcome = 3; }
                         else if (os.equals(&command_str)) { spec.outcome = 4; }
+                        else if (!os.equals(&collect_str)) { problems.push(String::from_string(outcome_shape)); }
                     }
-                    Option::None => { }
+                    Option::None => { problems.push(String::from_string(outcome_shape)); }
                 }
             }
             Option::None => { }
@@ -2792,21 +2802,22 @@ type struct Executor {
             Option::Some(vp) => {
                 match (vp.as::<boolean>()) {
                     Option::Some(b) => { spec.ignore = b; }
-                    Option::None    => { }
+                    Option::None    => { problems.push(String::from_string("\"ignore\" is true or false, as in \"ignore\": true")); }
                 }
             }
             Option::None => { }
         }
-        Executor::read_strings(&root, "requires", &spec.requires);
-        Executor::read_strings(&root, "environment", &spec.environment);
-        Executor::read_strings(&root, "arguments", &spec.arguments);
-        Executor::read_strings(&root, "command", &spec.command);
+        Executor::read_strings(&root, "requires", &spec.requires, &problems);
+        Executor::read_strings(&root, "environment", &spec.environment, &problems);
+        Executor::read_strings(&root, "arguments", &spec.arguments, &problems);
+        Executor::read_strings(&root, "command", &spec.command, &problems);
         // A step is a list of strings, its verb first, or an object naming
         // the file it writes and its text; anything else makes the file
         // malformed rather than running a different command.
-        mut malformed_step: boolean = false;
+        const step_shape: string = "a step is a list of strings, its verb first, as in [\"build\"], or names the file it writes and its text, as in { \"write\": \"build/src/a.cryo\", \"text\": \"...\" }";
         match (root.get(str::Str::new("steps"))) {
             Option::Some(sp) => {
+                if (!sp.is_array()) { problems.push(f"\"steps\" is a list of steps; {step_shape}"); }
                 for (mut i: i64 = 0; i < sp.length(); i++) {
                     match (sp.at(i)) {
                         Option::Some(step) => {
@@ -2818,12 +2829,12 @@ type struct Executor {
                                     Option::Some(fp) => {
                                         match (fp.as::<boolean>()) {
                                             Option::Some(b) => { one.refused = b; }
-                                            Option::None    => { malformed_step = true; }
+                                            Option::None    => { problems.push(String::from_string("a step's \"fails\" is true or false, as in { \"write\": \"build/src/a.cryo\", \"text\": \"...\", \"fails\": true }")); }
                                         }
                                     }
                                     Option::None => { }
                                 }
-                                if (one.write.is_empty() || step.get(str::Str::new("text")).is_none()) { malformed_step = true; }
+                                if (one.write.is_empty() || step.get(str::Str::new("text")).is_none()) { problems.push(String::from_string(step_shape)); }
                                 spec.steps.push(one);
                                 continue;
                             }
@@ -2832,13 +2843,13 @@ type struct Executor {
                                     Option::Some(av) => {
                                         match (av.as::<str::Str>()) {
                                             Option::Some(a) => { one.arguments.push(String::from_str(a)); }
-                                            Option::None    => { malformed_step = true; }
+                                            Option::None    => { problems.push(String::from_string(step_shape)); }
                                         }
                                     }
                                     Option::None => { }
                                 }
                             }
-                            if (one.arguments.length() == 0) { malformed_step = true; }
+                            if (one.arguments.length() == 0) { problems.push(String::from_string(step_shape)); }
                             spec.steps.push(one);
                         }
                         Option::None => { }
@@ -2851,8 +2862,10 @@ type struct Executor {
         // each commit a tree and a tag; anything less makes the file
         // malformed rather than building a repository the project did not
         // describe.
+        const fixture_shape: string = "a git fixture names itself, the directory it is made from and at least one commit with a tree and a tag, as in { \"name\": \"greeter\", \"from\": \"fixtures/greeter\", \"commits\": [{ \"tree\": \"v1\", \"tag\": \"v1\" }] }";
         match (root.get(str::Str::new("git_fixtures"))) {
             Option::Some(fp) => {
+                if (!fp.is_array()) { problems.push(f"\"git_fixtures\" is a list; {fixture_shape}"); }
                 for (mut i: i64 = 0; i < fp.length(); i++) {
                     match (fp.at(i)) {
                         Option::Some(fixture) => {
@@ -2871,7 +2884,7 @@ type struct Executor {
                                                     tag:  registry::VendorRegistry::text_field(commit, str::Str::new("tag"), str::Str::new("")),
                                                     commit: String::new(),
                                                 };
-                                                if (made.tree.is_empty() || made.tag.is_empty()) { malformed_step = true; }
+                                                if (made.tree.is_empty() || made.tag.is_empty()) { problems.push(String::from_string(fixture_shape)); }
                                                 one.commits.push(made);
                                             }
                                             Option::None => { }
@@ -2881,7 +2894,7 @@ type struct Executor {
                                 Option::None => { }
                             }
                             if (one.name.is_empty() || one.from.is_empty() || one.commits.length() == 0) {
-                                malformed_step = true;
+                                problems.push(String::from_string(fixture_shape));
                             }
                             spec.fixtures.push(one);
                         }
@@ -2898,7 +2911,7 @@ type struct Executor {
                     Option::Some(xp) => {
                         match (xp.as::<i64>()) {
                             Option::Some(n) => { spec.applied_exit_code = n; }
-                            Option::None    => { }
+                            Option::None    => { problems.push(String::from_string("the \"exit_code\" of \"applied\" is a whole number, as in \"applied\": { \"exit_code\": 0 }")); }
                         }
                     }
                     Option::None => { }
@@ -2910,14 +2923,14 @@ type struct Executor {
         // build the same project twice and prove nothing about the second
         // build, and a replacement missing either side names nothing to
         // copy: both make the test.json malformed.
-        mut rebuild_malformed: boolean = false;
+        const rebuild_shape: string = "\"rebuild\" replaces a file or changes the arguments, as in \"rebuild\": { \"replace\": [{ \"file\": \"src/value.cryo\", \"with\": \"edits/value.cryo\" }] } or \"rebuild\": { \"arguments\": [\"--release\"] }";
         match (root.get(str::Str::new("rebuild"))) {
             Option::Some(rp) => {
                 spec.rebuild = true;
-                if (!rp.is_object()) { rebuild_malformed = true; }
+                if (!rp.is_object()) { problems.push(String::from_string(rebuild_shape)); }
                 match (rp.get(str::Str::new("replace"))) {
                     Option::Some(list) => {
-                        if (!list.is_array()) { rebuild_malformed = true; }
+                        if (!list.is_array()) { problems.push(String::from_string(rebuild_shape)); }
                         for (mut i: i64 = 0; i < list.length(); i++) {
                             const entry: value::JsonValue* = list.at(i).unwrap();
                             const target: Option<str::Str> = match (entry.get(str::Str::new("file"))) {
@@ -2928,7 +2941,7 @@ type struct Executor {
                                 Option::Some(wp) => { wp.as::<str::Str>() }
                                 Option::None     => { Option::None }
                             };
-                            if (target.is_none() || source.is_none()) { rebuild_malformed = true; continue; }
+                            if (target.is_none() || source.is_none()) { problems.push(String::from_string(rebuild_shape)); continue; }
                             spec.rebuild_files.push(String::from_str(target.unwrap()));
                             spec.rebuild_sources.push(String::from_str(source.unwrap()));
                         }
@@ -2937,19 +2950,20 @@ type struct Executor {
                 }
                 if (rp.get(str::Str::new("arguments")).is_some()) {
                     spec.rebuild_sets_arguments = true;
-                    Executor::read_strings(rp, "arguments", &spec.rebuild_arguments);
+                    Executor::read_strings(rp, "arguments", &spec.rebuild_arguments, &problems);
                 }
-                if (spec.rebuild_files.length() == 0 && !spec.rebuild_sets_arguments) { rebuild_malformed = true; }
+                if (spec.rebuild_files.length() == 0 && !spec.rebuild_sets_arguments) { problems.push(String::from_string(rebuild_shape)); }
             }
             Option::None => { }
         }
         match (root.get(str::Str::new("expect"))) {
             Option::Some(ep) => {
+                if (!ep.is_object()) { problems.push(String::from_string("\"expect\" holds the assertions by name, as in \"expect\": { \"exit_code\": 0, \"output_contains\": [\"text\"] }")); }
                 match (ep.get(str::Str::new("exit_code"))) {
                     Option::Some(xp) => {
                         match (xp.as::<i64>()) {
                             Option::Some(n) => { spec.exit_code = n; }
-                            Option::None    => { }
+                            Option::None    => { problems.push(String::from_string("\"exit_code\" is a whole number, as in \"exit_code\": 0")); }
                         }
                     }
                     Option::None => { }
@@ -2958,7 +2972,7 @@ type struct Executor {
                     Option::Some(fp) => {
                         match (fp.as::<boolean>()) {
                             Option::Some(b) => { spec.fails = b; }
-                            Option::None    => { }
+                            Option::None    => { problems.push(String::from_string("\"fails\" is true or false, as in \"fails\": true")); }
                         }
                     }
                     Option::None => { }
@@ -2973,61 +2987,70 @@ type struct Executor {
                                 spec.fails = true;
                                 spec.output_contains.push(f"error[{ds}]");
                             }
-                            Option::None     => { }
+                            Option::None     => { problems.push(String::from_string("\"diagnostic\" names one error code, as in \"diagnostic\": \"E0201\"")); }
                         }
                     }
                     Option::None => { }
                 }
+                // One substring of stdout; several, or any output stream, are
+                // `output_contains`.
                 match (ep.get(str::Str::new("stdout_contains"))) {
                     Option::Some(sp) => {
                         match (sp.as::<str::Str>()) {
                             Option::Some(ss) => { spec.stdout_sub = String::from_str(ss); }
-                            Option::None     => { }
+                            Option::None     => { problems.push(String::from_string("\"stdout_contains\" is one string, as in \"stdout_contains\": \"text\"; for several, write \"output_contains\": [\"text\", \"more text\"]")); }
                         }
                     }
                     Option::None => { }
                 }
-                Executor::read_strings(ep, "output_contains", &spec.output_contains);
-                Executor::read_strings(ep, "output_excludes", &spec.output_excludes);
-                Executor::read_strings(ep, "output_in_order", &spec.output_in_order);
-                Executor::read_strings(ep, "stderr_contains", &spec.stderr_contains);
-                Executor::read_strings(ep, "stderr_excludes", &spec.stderr_excludes);
-                Executor::read_strings(ep, "stdout_line_prefixes", &spec.stdout_line_prefixes);
-                Executor::read_strings(ep, "stderr_line_prefixes", &spec.stderr_line_prefixes);
+                Executor::read_strings(ep, "output_contains", &spec.output_contains, &problems);
+                Executor::read_strings(ep, "output_excludes", &spec.output_excludes, &problems);
+                Executor::read_strings(ep, "output_in_order", &spec.output_in_order, &problems);
+                Executor::read_strings(ep, "stderr_contains", &spec.stderr_contains, &problems);
+                Executor::read_strings(ep, "stderr_excludes", &spec.stderr_excludes, &problems);
+                Executor::read_strings(ep, "stdout_line_prefixes", &spec.stdout_line_prefixes, &problems);
+                Executor::read_strings(ep, "stderr_line_prefixes", &spec.stderr_line_prefixes, &problems);
                 match (ep.get(str::Str::new("file"))) {
                     Option::Some(fp) => {
                         match (fp.as::<str::Str>()) {
                             Option::Some(fs) => { spec.file = String::from_str(fs); }
-                            Option::None     => { }
+                            Option::None     => { problems.push(String::from_string("\"file\" names one file, as in \"file\": \"build/src/a.cryo\"")); }
                         }
                     }
                     Option::None => { }
                 }
-                Executor::read_strings(ep, "file_contains", &spec.file_contains);
-                Executor::read_strings(ep, "file_excludes", &spec.file_excludes);
+                Executor::read_strings(ep, "file_contains", &spec.file_contains, &problems);
+                Executor::read_strings(ep, "file_excludes", &spec.file_excludes, &problems);
             }
             Option::None => { }
         }
         mem::drop(root);
-        if (malformed_step || rebuild_malformed) { return Option::None; }
         // A `command` project with nothing to run, or a `command` given to
         // another outcome, would judge a command the file does not describe.
-        if ((spec.outcome == 4) != (spec.command.length() > 0)) { return Option::None; }
-        return Option::Some(spec);
+        if ((spec.outcome == 4) != (spec.command.length() > 0)) {
+            problems.push(String::from_string("\"command\" goes with \"outcome\": \"command\", and that outcome needs one, as in \"outcome\": \"command\", \"command\": [\"fmt\", \"--check\", \"src\"]"));
+        }
+        if (problems.length() > 0) { return Result::Err(problems[0].clone()); }
+        return Result::Ok(spec);
     }
 
     /// Append each string of the array `object.key` to `into`; a missing key
-    /// or a non-string element adds nothing.
-    static read_strings(object: &value::JsonValue, key: string, into: mut &[String]) -> void {
+    /// adds nothing, and a value that is not a list of strings adds its
+    /// correct form to `problems`.
+    static read_strings(object: &value::JsonValue, key: string, into: mut &[String], problems: mut &[String]) -> void {
         match (object.get(str::Str::new(key))) {
             Option::Some(ap) => {
+                if (!ap.is_array()) {
+                    problems.push(f"\"{key}\" is a list of strings, as in \"{key}\": [\"text\"]");
+                    return;
+                }
                 const n: i64 = ap.length();
                 for (mut i: i64 = 0; i < n; i++) {
                     match (ap.at(i)) {
                         Option::Some(iv) => {
                             match (iv.as::<str::Str>()) {
                                 Option::Some(is) => { into.push(String::from_str(is)); }
-                                Option::None     => { }
+                                Option::None     => { problems.push(f"\"{key}\" is a list of strings, as in \"{key}\": [\"text\"]"); }
                             }
                         }
                         Option::None => { }
@@ -3090,15 +3113,14 @@ type struct Executor {
 
             const content: String = Executor::read_file_or_empty(marker.as_path());
             mut spec: ProjSpec = ProjSpec::empty();
-            mut parsed_ok: boolean = false;
-            match (Executor::parse_test_json(content.as_str())) {
-                Option::Some(s) => { spec = s; parsed_ok = true; }
-                Option::None    => { parsed_ok = false; }
-            }
             mut verdict: i32 = 0;
             mut reason: String = String::new();
-            if (!parsed_ok) {
-                verdict = 1;
+            match (Executor::parse_test_json(content.as_str())) {
+                Result::Ok(s)     => { spec = s; }
+                Result::Err(why)  => { verdict = 1; reason = why; }
+            }
+            if (verdict == 1) {
+                // Malformed: reported with its reason, nothing run.
             } else if (spec.ignore) {
                 verdict = 2;
             } else {
@@ -3252,8 +3274,8 @@ type struct Executor {
                 const verdict: i32 = verdict_of[i];
                 const reason: str::Str = reason_of[i].as_str();
                 if (verdict == 1) {
-                    Executor::proj_report(is_pretty, is_compact, color_on, false,
-                        str::Str::new("malformed test.json"));
+                    const malformed: String = f"malformed test.json: {reason}";
+                    Executor::proj_report(is_pretty, is_compact, color_on, false, malformed.as_str());
                     failures += 1; ran += 1; continue;
                 }
                 if (verdict == 2) {

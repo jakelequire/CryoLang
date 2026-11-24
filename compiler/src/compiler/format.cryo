@@ -98,30 +98,42 @@ type struct OpenBracket {
     is_attribute: boolean;
 }
 
+/// Why a file was left as it is.
+type struct LayoutRefusal {
+    reason: String;
+    /// The file itself is at fault - it does not lex, or its brackets do not
+    /// balance - so compiling it reports where.  Otherwise the laid-out text
+    /// would have lexed to other tokens: a defect of the formatter, which
+    /// compiling the file does not show.
+    in_source: boolean;
+}
+
 type struct SourceFormatter {
     /// Lay out `source` (a whole file).  `Err` says why the file was left as
     /// it is.
-    static format(source: Str) -> Result<String, String> {
+    static format(source: Str) -> Result<String, LayoutRefusal> {
         mut sink: DiagnosticSink = DiagnosticSink::new();
         mut lexer: Lexer = Lexer::new("<format>", String::with_null(source).into_raw(), &sink);
         const tokens: [Token] = lexer.lex();
         if (sink.has_errors()) {
-            return Result::Err(String::from("the file does not lex"));
+            return Result::Err(LayoutRefusal { reason: String::from("the file does not lex"), in_source: true });
         }
 
         const text_start: i64 = Lexer::text_start(source);
         mut lines: [SourceLine] = SourceFormatter::split_lines(source, text_start);
         SourceFormatter::mark_multiline_tokens(source, &tokens, &lines);
 
-        const laid_out: Result<boolean, String> = SourceFormatter::assign_indents(&tokens, &lines);
-        match (laid_out) {
-            Result::Err(reason) => { return Result::Err(reason); }
-            Result::Ok(_) => {}
+        match (SourceFormatter::assign_indents(&tokens, &lines)) {
+            Result::Ok(_)       => { }
+            Result::Err(reason) => { return Result::Err(LayoutRefusal { reason: reason, in_source: true }); }
         }
 
         const output: String = SourceFormatter::render(source, text_start, &lines);
         if (!SourceFormatter::same_tokens(&tokens, output.as_str())) {
-            return Result::Err(String::from("formatting would change the file's tokens (a formatter defect)"));
+            return Result::Err(LayoutRefusal {
+                reason: String::from("formatting would change the file's tokens (a formatter defect)"),
+                in_source: false,
+            });
         }
         return Result::Ok(output);
     }
@@ -567,17 +579,13 @@ type struct SourceFormatter {
         mut i: i64 = 0;
         mut j: i64 = 0;
         loop {
-            while (i < a.length() && SourceFormatter::is_space(pa[i])) { i = i + 1; }
-            while (j < b.length() && SourceFormatter::is_space(pb[j])) { j = j + 1; }
+            while (i < a.length() && pa[i].is_whitespace()) { i = i + 1; }
+            while (j < b.length() && pb[j].is_whitespace()) { j = j + 1; }
             if (i >= a.length() || j >= b.length()) { break; }
             if (pa[i] != pb[j]) { return false; }
             i = i + 1;
             j = j + 1;
         }
         return i >= a.length() && j >= b.length();
-    }
-
-    static is_space(b: u8) -> boolean {
-        return b == 32 || b == 9 || b == 10 || b == 13;
     }
 }

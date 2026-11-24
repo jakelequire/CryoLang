@@ -378,6 +378,19 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 | `"expect"` | per-outcome assertions (below) |
 | `"steps"` | commands of the compiler, and files the runner writes, before the outcome's own command (below) |
 
+A key written with a value of the wrong shape - `stdout_contains` as a list,
+`output_contains` as one string, `exit_code` as text, an `outcome` that
+names none of the six - makes the `test.json` malformed, and so does any other
+case below that says so. A malformed project fails, and its line names the
+key and the form it takes:
+
+```
+test (project) p ... FAILED (malformed test.json: "output_contains" is a list of strings, as in "output_contains": ["text"])
+```
+
+Read as absent, such a key would drop the assertion it spells and pass the
+project whatever it does.
+
 `make test-census` runs the suite with `-Werror=W0017`, which `cryo test`
 hands to every project's build too: a unit test or a project that discards a
 `![must_use]` result fails to build there, and `make examples` holds every
@@ -777,7 +790,9 @@ can sit.
     {"name": "...", "method": "rename" | "prepareRename", "at": "...",
      "new_name": "...", "refused": "part of the reason"},
     {"name": "...", "method": "codeAction", "at": "...", "code": "W0001",
-     "old": "x", "new_text": "_x", "fix_at": "...", "fix_old": ""}
+     "old": "x", "new_text": "_x", "fix_at": "...", "fix_old": ""},
+    {"name": "...", "method": "formatting", "file": "src/main.cryo",
+     "expect": "the whole laid-out text" | null}
   ]
 }
 ```
@@ -800,6 +815,8 @@ can sit.
   `at`, asks for its actions, and passes when one quickfix replaces exactly
   `old`'s width there with `new_text`; a fix that edits elsewhere names that
   place with `fix_at` and the text it replaces there with `fix_old`.
+- A formatting check passes on one edit replacing the whole of the file's
+  text with `expect`, or with `null` on no edit at all.
 - A completion check may carry `"details": {"label": "text"}` (the item's
   detail holds the text) and `"trigger": ":"` (sent as the editor sends one
   the typed character triggered).
