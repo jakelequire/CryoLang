@@ -1327,7 +1327,13 @@ function is_seven(x: &i32) -> boolean {
 }
 ```
 
-The alternative - quietly dereferencing - was rejected because the comparison did not previously dereference: it compared the reference's *address* with `7`, which compiled and was silently false. Refusing it makes the one meaning explicit at the call site. What stays allowed: two references compared with each other (by value when the referent implements `Eq`/`Ord`, by identity otherwise), and a reference compared with `null`.
+The alternative - quietly dereferencing - was rejected because the comparison did not previously dereference: it compared the reference's *address* with `7`, which compiled and was silently false. Refusing it makes the one meaning explicit at the call site. What stays allowed: two references compared with each other, and a reference compared with `null`. Two references compare the values they refer to when the referent implements the operator's trait - `Eq` for `==` and `!=`, `Ord` for `<`, `>`, `<=` and `>=` - whatever kind of type it is, so `a == b` on two `&i64` is `a.equals(b)` and always agrees with it; a referent that does not implement the trait compares by identity:
+
+```cryo
+const four: i64 = 4;
+const other_four: i64 = 4;
+const same: boolean = &four == &other_four;     // true: 4 equals 4, at two addresses
+```
 
 ### 5.3 Logical
 
