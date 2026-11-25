@@ -779,7 +779,7 @@ value through a raw pointer.
 
 ## Typed JSON through the derive list
 
-Built.  `std::json::convert` has `ToJson` and `FromJson`, implemented for
+Built.  `std::encoding::json::convert` has `ToJson` and `FromJson`, implemented for
 the primitives, `String`, `Str` (writing only), `Array<T>`, `Option<T>`,
 and a `HashMap` or `BTreeMap` keyed by `String`; the derive list writes
 both for a struct or a field-less enum, as follows.

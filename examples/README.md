@@ -14,7 +14,7 @@ builds and executes it.
 | 06 | [06-word-count](06-word-count/)        | File I/O (`File::read_bytes`), byte scanning, `HashMap` keyed top-N.          |
 | 07 | [07-shapes](07-shapes/)                | Traits, multiple impls, generics with `where` bounds, `math::square_root`.    |
 | 08 | [08-game-of-life](08-game-of-life/)    | 2D simulation on a torus, ANSI terminal output, `libc::usleep` for animation. |
-| 09 | [09-json-config](09-json-config/)      | `std::json` parsing, nested object/array walking, fallback defaults.          |
+| 09 | [09-json-config](09-json-config/)      | `std::encoding::json` parsing, nested object/array walking, fallback defaults. |
 | 10 | [10-expr-interpreter](10-expr-interpreter/) | Lexer + recursive-descent parser + evaluator over arithmetic.            |
 | 11 | [11-http-server](11-http-server/)      | `std::net::http` Router, four routes, drop discipline in handlers.            |
 | 12 | [12-guessing-game](12-guessing-game/)  | Stdin reads (`stdio::stdin().line()`), `random::generator::Rng::from_operating_system()` + `next_range`. |

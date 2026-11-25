@@ -543,7 +543,7 @@ CryoLang/
 |   +-- bootstrap/        Retired C++23 bootstrap; kept for historical reference only
 +-- docs/                 Language reference (cryo.md), grammar, mangling spec
 +-- examples/             Standalone example projects
-|   +-- 09-json-config    std::json parsing
+|   +-- 09-json-config    std::encoding::json parsing
 |   +-- 11-http-server    net::http server
 |   +-- ...
 +-- tests/                Repo-level test suite (uses ![test])

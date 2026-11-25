@@ -637,7 +637,7 @@ individual tests (section 3). The `PATTERN` argument to `cryo test` filters proj
 directory name just as it filters tests by name.
 
 > Why JSON rather than the INI `cryoconfig` format? `test.json` is read by the
-> standard library's own `std::json` parser, and keeping test metadata in a
+> standard library's own `std::encoding::json` parser, and keeping test metadata in a
 > separate file leaves `cryoconfig` to mean exactly what it means for every
 > other package - the build.
 
