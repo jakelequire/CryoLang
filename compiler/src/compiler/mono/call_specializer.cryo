@@ -1896,30 +1896,51 @@ type struct MonoCallSpecializer {
         // call names, whose method takes the parameters the bound gives it.
         mut found: DeclarationNode* = null;
         for (mut h: i64 = 0; h < heads.length(); h++) {
-            const m_decl: DeclarationNode* = this.generic_registry.trait_item_method(DeclarationNode::impl_of(heads[h]), slot);
+            const head: mut ImplBlock* = DeclarationNode::impl_of(heads[h]);
+            const m_decl: DeclarationNode* = this.generic_registry.trait_item_method(head, slot);
             const m: MethodDecl* = DeclarationNode::method_of(m_decl);
-            if (m == null || !this.takes_bound_params(m_decl, call)) { continue; }
+            if (m == null || !this.takes_bound_params(head, m_decl, call, owner)) { continue; }
             if (found != null) { return null; }
             found = m_decl;
         }
         return found;
     }
 
-    /// Whether `m`'s parameters after its receiver are exactly the call's
-    /// `bound_params`, in order.  A call no bound directs takes nothing.
-    takes_bound_params(&this, m_decl: DeclarationNode*, call: CallExpr*) -> boolean {
+    /// Whether `m`, `head`'s method, takes the call's `bound_params` after
+    /// its receiver, in order.  A parameter written in a type the
+    /// implementation lends its methods (`E` in `implement<E> trait From<E>
+    /// for ErrorReport where E: Error`) takes what it unifies with, and the
+    /// head is then the bound's only when it applies at the trait arguments
+    /// those bindings give it, its where-clause included; any other
+    /// parameter takes exactly its own type.  A call no bound directs takes
+    /// nothing.
+    takes_bound_params(&this, head: mut ImplBlock*, m_decl: DeclarationNode*, call: CallExpr*, owner: TypeRef) -> boolean {
         const m: MethodDecl* = DeclarationNode::method_of(m_decl);
         if (m.func == null || call.bound_params.length() == 0) { return false; }
-        mut k: i64 = 0;
+        mut formals: [TypeRef] = [];
         for (mut i: i64 = 0; i < DeclarationNode::fn_of(m.func).parameters.length(); i++) {
-            const p_decl: DeclarationNode* = DeclarationNode::fn_of(m.func).parameters[i];
-            const p: VarDecl* = DeclarationNode::var_of(p_decl);
+            const p: VarDecl* = DeclarationNode::var_of(DeclarationNode::fn_of(m.func).parameters[i]);
             if (p == null) { return false; }
-            if (p.is_receiver()) { continue; }
-            if (k >= call.bound_params.length() || !p.resolved_type.equals(call.bound_params[k])) { return false; }
-            k += 1;
+            if (!p.is_receiver()) { formals.push(p.resolved_type); }
         }
-        return k == call.bound_params.length();
+        if (formals.length() != call.bound_params.length()) { return false; }
+        mut lent: [TypeRef] = [];
+        for (mut i: i64 = 0; i < formals.length(); i++) { this.arena.generic_params_in(formals[i], &lent); }
+        mut infer: InferCtx = InferCtx::for_template(this.arena, lent);
+        for (mut i: i64 = 0; i < formals.length(); i++) {
+            if (!this.arena.contains_generic_param(formals[i])) {
+                if (!formals[i].equals(call.bound_params[i])) { return false; }
+            } else if (!infer.unify(formals[i], call.bound_params[i])) {
+                return false;
+            }
+        }
+        if (infer.params.length() == 0) { return true; }
+        const bindings: TypeSubstitution = TypeSubstitution::from_params(&infer.params, &infer.bindings);
+        mut trait_args: [TypeRef] = [];
+        for (mut i: i64 = 0; i < head.trait_arg_types.length(); i++) {
+            trait_args.push(bindings.apply(head.trait_arg_types[i], this.arena));
+        }
+        return this.trait_spec.trait_checker.impl_applies_at(head, head.trait_def, &trait_args, owner, 0);
     }
 
     /// The method of `owner` the definition `d` a path recorded names: a
