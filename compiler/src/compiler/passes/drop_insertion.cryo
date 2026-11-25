@@ -514,6 +514,11 @@ type struct DropInserter {
     /// subject is held in (see hoist_match_subject).
     discard_seq:  i64;
 
+    /// The `match` statement whose hoisted subject is being given a block of
+    /// its own (see the `StmtKind::Match` walk): met again as that block's
+    /// only statement, it hoists its subject there instead of wrapping again.
+    scoped_match: Stmt*;
+
     /// Blocks marked `after_return_releases` met since the last `return`,
     /// held back from the statement list to run behind that return's own
     /// releases.
@@ -599,6 +604,7 @@ type struct DropInserter {
             fired:           0,
             inserted:        0,
             discard_seq:     0,
+            scoped_match:    null,
             held_for_return: [],
             pending_arg_ids:    [],
             pending_arg_frames: [],
@@ -1428,9 +1434,25 @@ type struct DropInserter {
                 // normal binding path, and the match itself sees an Identifier
                 // subject (engaging consumption tracking + drop-glue
                 // suppression for arms that move the payload out).
+                //
+                // A `match` keeps its subject's temporaries until the match
+                // ends, and no longer: the hidden local and the match share a
+                // block of their own, so the local's scope-exit drop runs as
+                // the match finishes, not when the enclosing block does.
                 if (m.subject != null &&
                     ExpressionNode::identifier_of(m.subject) == null &&
                     this.type_needs_drop(m.subject.resolved_type)) {
+                    if (this.scoped_match != stmt) {
+                        const scope: mut Stmt* = Stmt::block(stmt.span);
+                        scope.generated = true;
+                        scope.as_block().statements.push(stmt);
+                        const outer_scoped: Stmt* = this.scoped_match;
+                        this.scoped_match = stmt;
+                        const scoped_diverges: boolean = this.walk_block(scope);
+                        this.scoped_match = outer_scoped;
+                        out.push(scope);
+                        return scoped_diverges;
+                    }
                     this.hoist_match_subject(m, out);
                 }
                 const d: boolean = this.walk_match_arms(stmt.span, m.subject, m.arms, false, out,

@@ -1,0 +1,66 @@
+namespace MatchedTemporaryReleasedWhenTheMatchEnds;
+import std::fmt::{ println };
+
+mut g_dropped: i32 = 0;
+
+type struct Counted { n: i32; }
+implement trait Drop for struct Counted {
+    drop(mut &this) -> void { g_dropped = g_dropped + 1; }
+}
+
+function failing(n: i32) -> Result<i32, Counted> { return Result::Err(Counted { n: n }); }
+function holding(n: i32) -> Option<Counted> { return Option::Some(Counted { n: n }); }
+
+function returns_from_an_arm() -> i32 {
+    match (failing(7)) {
+        Result::Ok(v) => { return v; }
+        Result::Err(error) => { return error.n; }
+    }
+}
+
+function main() -> i32 {
+    // The payload bound by value out of a matched call result.
+    match (failing(4)) {
+        Result::Ok(_) => { }
+        Result::Err(error) => { println(f"bound {error.n}"); }
+    }
+    println(f"after a payload bound out of a matched temporary: {g_dropped}");
+
+    // A temporary no arm binds out of is released as the match ends too.
+    g_dropped = 0;
+    match (holding(5)) {
+        Option::Some(_) => { println("some"); }
+        Option::None => { }
+    }
+    println(f"after a temporary no arm binds: {g_dropped}");
+
+    // One release per iteration, each before the next.
+    g_dropped = 0;
+    for (mut i: i32 = 0; i < 3; i++) {
+        match (failing(i)) {
+            Result::Ok(_) => { }
+            Result::Err(error) => { println(f"iteration {error.n} sees {g_dropped}"); }
+        }
+    }
+    println(f"after three iterations: {g_dropped}");
+
+    // A match inside an arm of a match on a temporary.
+    g_dropped = 0;
+    match (holding(1)) {
+        Option::Some(outer) => {
+            match (holding(2)) {
+                Option::Some(inner) => { println(f"nested {outer.n} {inner.n}"); }
+                Option::None => { }
+            }
+            println(f"after the inner match: {g_dropped}");
+        }
+        Option::None => { }
+    }
+    println(f"after the outer match: {g_dropped}");
+
+    // An arm that returns releases what it bound.
+    g_dropped = 0;
+    const returned: i32 = returns_from_an_arm();
+    println(f"returned {returned}, dropped {g_dropped}");
+    return 0;
+}
