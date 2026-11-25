@@ -5081,7 +5081,39 @@ type struct SemaVisitor {
                     this.types.type_display_name(from_ty), this.diag.truth_test_hint(from_ty)),
                 e.span);
         }
+        if (from_ty.is_valid() && to_ty.is_valid() && this.diag.kind_or_void(to_ty) == TypeKind::Char) {
+            this.refuse_constant_beyond_char(e, cast.expression);
+        }
         return cast.resolved_target;
+    }
+
+    /// Refuse (E0010) `<constant> as char` whose constant is no Unicode
+    /// scalar value.  A `char` holds U+0000 through U+D7FF and U+E000
+    /// through U+10FFFF, so a constant outside them - past U+10FFFF, a
+    /// surrogate code point, or below zero - makes a value no `char` holds,
+    /// whenever it runs.  A run-time operand is not judged here; an operand
+    /// its own type does not hold was refused where it was computed.
+    refuse_constant_beyond_char(&this, e: ExpressionNode*, operand: ExpressionNode*) -> void {
+        const operand_type: Type* = this.arena.lookup(operand.resolved_type);
+        if (operand_type == null || operand_type.kind != TypeKind::Int) { return; }
+        const evaluator: ConstEval = ConstEval::new(this.ctx.const_table, this.ctx.intern_table, null);
+        match (evaluator.fold_value(operand)) {
+            Option::Some(folded) => {
+                const constant: ConstantValue = folded.in_type(operand_type.int_kind().to_string());
+                if (constant.overflow != null || !constant.held()) { return; }
+                const value: FoldedInteger = constant.value;
+                const why: string = if (value.negative) { "it is below zero" }
+                    else { if (value.bits > 0x10FFFF) { "it is past U+10FFFF, the last Unicode scalar value" }
+                    else { if (value.bits >= 0xD800 && value.bits <= 0xDFFF) { "it is a surrogate code point, U+D800 to U+DFFF, which is no Unicode scalar value" }
+                    else { "" } } };
+                if (why.length() == 0) { return; }
+                this.ctx.emit_diagnostic(Diagnostic::error(ErrorCode::E0010_NUMBER_TOO_LARGE,
+                    fmt::format("`as char` makes no `char` of %s: %s", value.to_decimal_string(), why))
+                    .at_with_label(e.span, "no `char` holds this value")
+                    .help("a `char` holds a Unicode scalar value: U+0000 to U+D7FF, or U+E000 to U+10FFFF"));
+            }
+            Option::None => { }
+        }
     }
 
     /// True when the cast operand is `this` inside a BY-REFERENCE method.
