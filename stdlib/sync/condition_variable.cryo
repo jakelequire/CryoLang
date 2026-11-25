@@ -43,6 +43,7 @@ import std::ffi::libc::{
     ClockId, ETIMEDOUT, clock_gettime, pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init,
     pthread_cond_signal, pthread_cond_timedwait, pthread_cond_wait, timespec
 };
+import std::time::clock::{ Instant };
 import std::time::duration::{ Duration };
 import std::sys::syscall;
 import std::sync::mutex::{ Mutex, MutexGuard };
@@ -96,15 +97,25 @@ private function cond_wait_timeout_raw(cond: mut u8*, mtx: mut u8*, duration: &D
 }
 ![target(windows)]
 private function cond_wait_timeout_raw(cond: mut u8*, mtx: mut u8*, duration: &Duration) -> Option<boolean> {
-    // INFINITE would never time out, so the longest finite wait is one less.
-    mut milliseconds: u32 = syscall::INFINITE - 1;
-    match (u32::try_from(duration.as_milliseconds_ceiling())) {
-        Result::Ok(whole) => { if (whole < milliseconds) { milliseconds = whole; } }
-        Result::Err(_) => { }
+    // The system's timed wait counts in timer ticks and can report its time
+    // out before the whole duration has passed, so it waits again for what
+    // is left of it, read on the monotonic clock, until the deadline is
+    // behind it: a time out is answered only once the duration has passed.
+    const deadline: Instant = Instant::now().saturating_add(duration);
+    mut remaining: Duration = *duration;
+    loop {
+        // INFINITE would never time out, so the longest finite wait is one less.
+        mut milliseconds: u32 = syscall::INFINITE - 1;
+        match (u32::try_from(remaining.as_milliseconds_ceiling())) {
+            Result::Ok(whole) => { if (whole < milliseconds) { milliseconds = whole; } }
+            Result::Err(_) => { }
+        }
+        if (syscall::SleepConditionVariableSRW(cond, mtx, milliseconds, 0) != 0) { return Option::Some(false); }
+        if (syscall::GetLastError() != syscall::ERROR_TIMEOUT) { return Option::None; }
+        const now: Instant = Instant::now();
+        if (now >= deadline) { return Option::Some(true); }
+        remaining = deadline.saturating_duration_since(&now);
     }
-    if (syscall::SleepConditionVariableSRW(cond, mtx, milliseconds, 0) != 0) { return Option::Some(false); }
-    if (syscall::GetLastError() == syscall::ERROR_TIMEOUT) { return Option::Some(true); }
-    return Option::None;
 }
 
 /// The longest wait `cond_wait_timeout_raw` states as a deadline: about
@@ -194,7 +205,8 @@ public type struct ConditionVariable {
     }
 
     /// Wait as `wait` does, but for no longer than `duration`. Answers
-    /// true when the wait ended because `duration` passed, false when the
+    /// true when the wait ended because `duration` passed - never before
+    /// the whole of it has, on the monotonic clock - and false when the
     /// thread was woken. A wake can be spurious, as for `wait`, so check
     /// the condition waited for either way.
     public wait_timeout<T, A>(&this, mutex: &Mutex<T, A>, guard: mut &MutexGuard<T, A>, duration: Duration) -> boolean {
