@@ -669,9 +669,20 @@ counted in batches): 609 call sites over 20 methods - `length` 301, `eq`
 `split` 1.  Seven have no call site in the compiler: `parse_int`, `join`,
 `split_char`, `to_ascii_upper`, `extension`, `common_prefix_length` and
 `find_last_char`.  The tools and the tests call some of them too and were
-not counted.  It moves compiler objects throughout, so it is its own
-branch, proved by a byte-identical self-host and a verify whose moved
-objects are each explained.
+not counted.  It moves compiler objects throughout, and each batch is
+proved by a byte-identical self-host and a verify whose moved objects are
+each explained.
+
+Done: the three searches, `contains`, `starts_with` and `ends_with` (57
+sites), are internal; the compiler asks them of `Str::new(text)`.  Left:
+552 sites over 17 methods.  The ones that return a `string`
+(`substring`, `append`, `trim`, `replace`, `strip_prefix`, the path
+methods, `split_nonempty`) do not map one for one: `Str`'s answers are
+borrowed views, not NUL-terminated copies, so each site needs the owned
+form its consumer wants.  `find`, `find_last` and `find_char` answer `-1`
+where `Str` answers `Option`.  `length`, `is_empty` and `eq` accept a null
+`string` (as 0, true and equal-to-null) where `Str::new` of a null reads
+through it, so a site that can see null needs its own check first.
 
 ## The network codecs' visibility
 
