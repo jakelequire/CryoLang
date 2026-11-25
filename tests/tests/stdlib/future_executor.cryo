@@ -20,8 +20,10 @@ import std::future;
 import std::thread;
 import std::test::error::{ TestError };
 import std::test::assert::{ expect_equal, expect_true };
-import std::future::executor::{ Executor, JoinError };
+import std::future::executor::{ Executor, JoinError, Task };
 import std::future::ready::{ Ready };
+import std::future::timer::{ Sleep };
+import std::time::duration::{ Duration };
 
 async function doubled(n: i64) -> i64 {
     return n * 2;
@@ -115,4 +117,60 @@ function block_on_at_unit_output_alone() -> Result<(), TestError> {
     mut ex: Executor = Executor::new();
     ex.block_on(fe_unit_root());
     return expect_equal(1 as i64, 1 as i64);
+}
+
+// ---- Task::spawn and awaiting a JoinHandle -----------------------------------
+
+async function spawns_two_and_awaits_both() -> i64 {
+    const first: future::executor::JoinHandle<i64> = Task::spawn(doubled(20));
+    const second: future::executor::JoinHandle<i64> = Task::spawn(doubled(1));
+    const a: Result<i64, JoinError> = await first;
+    const b: Result<i64, JoinError> = await second;
+    return a.unwrap() + b.unwrap();
+}
+
+/// A task spawns onto the executor polling it, and awaiting the handles
+/// yields what each spawned task returned.
+![test]
+function task_spawn_inside_a_task_is_awaited() -> Result<(), TestError> {
+    mut ex: Executor = Executor::with_threads(2);
+    return expect_equal(ex.block_on(spawns_two_and_awaits_both()), 42 as i64);
+}
+
+async function napped(milliseconds: u64, value: i64) -> i64 {
+    await Sleep::new(Duration::from_milliseconds(milliseconds));
+    return value;
+}
+
+async function awaits_a_sleeping_task() -> i64 {
+    const sleeper: future::executor::JoinHandle<i64> = Task::spawn(napped(30, 7));
+    // The awaiting task parks on the handle: the only worker is free to run
+    // the sleeper, whose finish wakes this task again.
+    return (await sleeper).unwrap();
+}
+
+/// On one worker the awaiting task must park, not spin, or the sleeper it
+/// waits for never runs; its finish is what wakes the awaiting task.
+![test]
+function awaiting_parks_until_the_task_finishes() -> Result<(), TestError> {
+    mut ex: Executor = Executor::with_threads(1);
+    return expect_equal(ex.block_on(awaits_a_sleeping_task()), 7 as i64);
+}
+
+async function aborts_before_the_first_poll() -> boolean {
+    const doomed: future::executor::JoinHandle<i64> = Task::spawn(doubled(4));
+    // One worker, and it is running this task: the spawned one has not been
+    // polled yet, so the abort is seen before it ever runs.
+    doomed.abort();
+    match (await doomed) {
+        Result::Ok(_)                   => { return false; }
+        Result::Err(JoinError::Cancelled) => { return true; }
+        Result::Err(_)                  => { return false; }
+    }
+}
+
+![test]
+function an_aborted_task_awaits_as_cancelled() -> Result<(), TestError> {
+    mut ex: Executor = Executor::with_threads(1);
+    return expect_true(ex.block_on(aborts_before_the_first_poll()), "an aborted task must await as Cancelled");
 }

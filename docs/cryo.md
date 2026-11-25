@@ -4965,8 +4965,22 @@ mut ex: Executor = Executor::new();
 mut h1: JoinHandle<i64> = ex.spawn(work(1));
 mut h2: JoinHandle<i64> = ex.spawn(work(2));
 
-const a: i64 = h1.join();
-const b: i64 = h2.join();
+const a: Result<i64, JoinError> = h1.join();
+const b: Result<i64, JoinError> = h2.join();
+```
+
+Inside a task - an `async function main`, or any future an executor drives - `Task::spawn` starts another future on the executor polling the caller, and the task awaits the handle rather than blocking a worker on `join`. Each worker records its executor for the thread, which is where `Task::spawn` finds it; on any other thread there is no executor to find, and the call panics at its own place.
+
+```cryo
+import std::future::{ JoinHandle, Task };
+
+async function main() -> i32 {
+    const first: JoinHandle<i64> = Task::spawn(work(1));
+    const second: JoinHandle<i64> = Task::spawn(work(2));
+    const a: i64 = (await first).unwrap();
+    const b: i64 = (await second).unwrap();
+    return (a + b) as i32;
+}
 ```
 
 | Operation                                   | Meaning                                                                  |
@@ -4976,7 +4990,9 @@ const b: i64 = h2.join();
 | `Executor::with_threads_and_blocking(n, m)` | Same, and cap the blocking pool at `m` threads instead of the default.   |
 | `ex.spawn(fut)`                             | Schedule `fut` as an independent task; returns a `JoinHandle<T>`.        |
 | `ex.block_on(fut)`                          | Drive one future to completion on this executor and return its output.   |
-| `h.join()`                                  | Wait for the task and take its output.                                   |
+| `Task::spawn(fut)`                          | From inside a task, schedule `fut` on the executor polling it.           |
+| `h.join()`                                  | Block the thread until the task finishes; `Ok` its output, or `Err` why. |
+| `await h`                                   | The same `Result`, parking only the awaiting task.                       |
 | `h.abort()`                                 | Cancel the task.                                                         |
 | `h.detach()`                                | Let the task run without holding the handle. Dropping a handle detaches. |
 

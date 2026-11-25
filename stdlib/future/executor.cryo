@@ -17,6 +17,11 @@
 ///! condvar until a worker finishes it, then returns its value. `join`/`block_on`
 ///! never poll on the calling thread — the workers own all polling.
 ///!
+///! Inside a task, `Task::spawn(fut)` spawns on the executor polling the
+///! caller, which each worker publishes in a thread-local, and the task
+///! `await`s the `JoinHandle` (a `Future`) rather than blocking a worker in
+///! `join`.
+///!
 ///! ## Concurrent-poll safety
 ///!
 ///! With ≥2 workers a task can be woken (by itself mid-poll, or later by another
@@ -110,6 +115,11 @@ private type struct TaskCtl {
     private hs:      Atomic<u8>;   // HS_*
     private cancel:  Atomic<u8>;   // 1 == abort requested by the handle
     private panic:   PanicInfo;    // valid only when outcome == OUTCOME_PANICKED
+    // The waker of a task awaiting the handle, `Waker::noop()` when none is.
+    // Read and written only under the executor's `done_lock`, the lock the
+    // finishing task holds while it publishes HS_TASK_FIN: an awaiting poll
+    // either sees the task finished or leaves a waker the finish takes.
+    private joiner:  Waker;
 }
 
 /// The control block shared between a task and its `JoinHandle<O>`. Outlives the
@@ -124,14 +134,21 @@ private type struct TaskShared<O> {
 /// Handle-side teardown (detach or drop): announce the handle is gone, and if
 /// the task already finished, reclaim the block here (dropping a stored result).
 /// Otherwise the task frees it when it finishes and observes HS_HANDLE_GONE.
+/// A waker an earlier `await` of the handle left is taken out first, under
+/// `done_lock` as every touch of it is, and released after the unlock: nothing
+/// will await the handle again.
 ///
 /// A free generic function rather than a `TaskShared<O>` static method: a static
 /// method on a generic owner reached only through another generic's instantiation
 /// (here `JoinHandle<O>`) is not emitted by the monomorphizer (E0636 at codegen).
 /// The free generic function is the proven form (mirrors `thread::reap_detached`).
-private function detach_shared<O>(sh: mut TaskShared<O>*) -> void {
+private function detach_shared<O>(sh: mut TaskShared<O>*, exec: ExecInner*) -> void {
     const ctl: mut TaskCtl* = &sh.ctl;
+    const held: MutexGuard<(), GlobalAllocator> = exec.done_lock.lock();
+    const stale: Waker = Waker::take(&ctl.joiner);
     const prev: u8 = ctl.hs.swap(HS_HANDLE_GONE, MemoryOrder::AcqRel);
+    mem::drop(held);
+    mem::drop(stale);
     if (prev == HS_TASK_FIN) {
         const outcome: u8 = ctl.outcome.load(MemoryOrder::Acquire);
         mut alloc: GlobalAllocator = GlobalAllocator::new();
@@ -148,28 +165,28 @@ private function detach_shared<O>(sh: mut TaskShared<O>*) -> void {
 /// monomorphized vtable. `shared` points at the `TaskShared<O>` (and, at offset
 /// 0, the `TaskCtl`). `next` links the ready queue; `exec` lets a `Waker` reach
 /// the queue/condvars; `run_state` is the concurrent-poll guard (module doc).
-private type struct Task {
+private type struct ErasedTask {
     private poll_fn:    (mut u8*, mut u8*, Context*) -> u8;   // (fut, shared, cx) -> 1 Ready / 0 Pending
     private drop_fn:    (mut u8*) -> void;                     // drop the boxed future, free its box
     private dispose_fn: (mut u8*, u8) -> void;                 // (shared, drop_result) -> free the shared block
     private fut:        mut u8*;
     private shared:     mut u8*;
-    private next:       mut Task*;
+    private next:       mut ErasedTask*;
     private exec:       mut ExecInner*;
     private run_state:  Atomic<u8>;
 
     /// Build a ready-to-enqueue task around a boxed future + its shared control
     /// block. `run_state` starts SCHEDULED (the caller enqueues immediately) and
     /// `next` is unlinked; the vtable fn-ptrs are the future's monomorphized
-    /// thunks. Returned by value and moved into an `Arc<Task>`, whose raw
-    /// value pointer every `Task*` then is.
+    /// thunks. Returned by value and moved into an `Arc<ErasedTask>`, whose raw
+    /// value pointer every `ErasedTask*` then is.
     private static new(poll_fn:    (mut u8*, mut u8*, Context*) -> u8,
                drop_fn:    (mut u8*) -> void,
                dispose_fn: (mut u8*, u8) -> void,
                fut:        mut u8*,
                shared:     mut u8*,
-               exec:       mut ExecInner*) -> Task {
-        return Task {
+               exec:       mut ExecInner*) -> ErasedTask {
+        return ErasedTask {
             poll_fn:    poll_fn,
             drop_fn:    drop_fn,
             dispose_fn: dispose_fn,
@@ -185,7 +202,7 @@ private type struct Task {
     /// self-wake during the poll transferred the scheduling reference back to
     /// the queue, so the caller must NOT release it — and false when it finished
     /// or parked, in which case the caller releases the scheduling reference via
-    /// `task_decref`. The last release runs `Task::drop`, which finishes a
+    /// `task_decref`. The last release runs `ErasedTask::drop`, which finishes a
     /// still-unfinished (parked, never re-woken) task as CANCELLED before the
     /// box is freed. Honors a pending abort without polling. `&this` IS the heap
     /// box address, so the owning `Waker` carries it.
@@ -217,7 +234,7 @@ private type struct Task {
         // Pending. A wake during the poll left the state NOTIFIED; reschedule,
         // transferring the scheduling reference back to the queue. Otherwise the
         // state is still RUNNING and the task parks: a stored waker will wake it,
-        // or none will and the final `task_decref` cancels it via `Task::drop`.
+        // or none will and the final `task_decref` cancels it via `ErasedTask::drop`.
         match (this.run_state.compare_exchange(ST_RUNNING, ST_IDLE,
                                                MemoryOrder::AcqRel, MemoryOrder::Acquire)) {
             Result::Ok(_) => {
@@ -233,11 +250,11 @@ private type struct Task {
 
     /// Finish this task: drop its future, publish `outcome`, run the shared-block
     /// handshake, and wake any joiner. Does NOT free the task box (the owning
-    /// `Arc<Task>` reclaims it when the last reference drops). Nulls `fut` after
-    /// dropping the future so `Task::drop` knows finishing already ran and does
+    /// `Arc<ErasedTask>` reclaims it when the last reference drops). Nulls `fut` after
+    /// dropping the future so `ErasedTask::drop` knows finishing already ran and does
     /// not repeat it. On READY the future's `Output` was already moved into the
     /// shared block; on CANCELLED/PANICKED there is no result. Called at most
-    /// once per task (from `drive`, or from `Task::drop` when `fut` is non-null).
+    /// once per task (from `drive`, or from `ErasedTask::drop` when `fut` is non-null).
     private finish(mut &this, outcome: u8) -> void {
         const ctl:  mut TaskCtl*      = this.shared as mut TaskCtl*;
         const exec: ExecInner*    = this.exec;
@@ -245,22 +262,29 @@ private type struct Task {
         df(this.fut);
         this.fut = null;
         ctl.outcome.store(outcome, MemoryOrder::Release);
+        // The awaiting task's waker is taken and HS_TASK_FIN published under
+        // `done_lock`, which a polling handle holds while it reads the
+        // handshake and stores its waker, so no await can store a waker after
+        // the take and miss the wake. The swap is our last touch of the block
+        // when the handle is live: the joiner then owns reading and freeing
+        // it. The waker runs arbitrary code, so it is woken after the unlock.
+        const held: MutexGuard<(), GlobalAllocator> = exec.done_lock.lock();
+        const joiner: Waker = Waker::take(&ctl.joiner);
         const prev: u8 = ctl.hs.swap(HS_TASK_FIN, MemoryOrder::AcqRel);
+        if (prev != HS_HANDLE_GONE) {
+            // A joiner may be blocked on the completion condvar.
+            exec.task_done.notify_all();
+        }
+        mem::drop(held);
         if (prev == HS_HANDLE_GONE) {
             // No handle will read the block: dispose it here (drop the stored
-            // result only on READY). This swap was our last touch of the block.
+            // result only on READY).
             const disp: (mut u8*, u8) -> void = this.dispose_fn;
             mut drop_result: u8 = 0;
             if (outcome == OUTCOME_READY) { drop_result = 1; }
             disp(this.shared, drop_result);
         } else {
-            // Handle live: a joiner may be blocked on the completion condvar. The
-            // hs.swap above (Release) published HS_TASK_FIN — our last touch of
-            // the block; the joiner observes it and then owns reading+freeing the
-            // block, so we must not touch `ctl` after the broadcast below.
-            const held: MutexGuard<(), GlobalAllocator> = exec.done_lock.lock();
-            exec.task_done.notify_all();
-            mem::drop(held);
+            joiner.wake();
         }
     }
 
@@ -270,9 +294,9 @@ private type struct Task {
 /// (`fut` still non-null — it parked and was never re-woken, or the executor is
 /// tearing down), finish it as CANCELLED first so its future is dropped and any
 /// joiner is released; a finished task (`fut` null) needs nothing more. The
-/// `Arc<Task>` frees the box itself after this runs. Invoked by the `Arc` teardown
+/// `Arc<ErasedTask>` frees the box itself after this runs. Invoked by the `Arc` teardown
 /// through `task_decref`, never directly.
-implement trait Drop for struct Task {
+implement trait Drop for struct ErasedTask {
     drop(mut &this) -> void {
         if (this.fut != null) {
             this.finish(OUTCOME_CANCELLED);
@@ -280,17 +304,24 @@ implement trait Drop for struct Task {
     }
 }
 
+/// The executor whose worker is running on this thread: published by the
+/// worker for the thread's lifetime, as the reactor and the blocking pool are,
+/// so `Task::spawn` reaches the executor polling its caller. Null on any thread
+/// that is not an executor worker.
+![thread_local]
+private mut g_current_executor: mut ExecInner* = null;
+
 /// The ready queue and the shutdown flag, reached only through the executor's
 /// queue lock.
 private type struct ReadyQueue {
-    private head:     mut Task*;    // dequeue end (null when empty)
-    private tail:     mut Task*;    // enqueue end
+    private head:     mut ErasedTask*;    // dequeue end (null when empty)
+    private tail:     mut ErasedTask*;    // enqueue end
     private shutdown: boolean;  // set at Executor drop
 
     /// Unlink and return the oldest queued task, or null when the queue is
     /// empty.
-    private pop(mut &this) -> mut Task* {
-        const t: mut Task* = this.head;
+    private pop(mut &this) -> mut ErasedTask* {
+        const t: mut ErasedTask* = this.head;
         if (t == null) { return null; }
         this.head = t.next;
         if (this.head == null) { this.tail = null; }
@@ -300,7 +331,7 @@ private type struct ReadyQueue {
 }
 
 /// The shared executor state: a locked FIFO of ready tasks plus a second lock
-/// and condition variable joiners block on. Heap-pinned so a `Task`'s `exec`
+/// and condition variable joiners block on. Heap-pinned so an `ErasedTask`'s `exec`
 /// back-pointer and the worker threads reference a stable address.
 private type struct ExecInner {
     private queue: Mutex<ReadyQueue>;
@@ -315,7 +346,7 @@ private type struct ExecInner {
     /// Link `task` at the tail of the ready queue and wake one worker. The
     /// caller has already set `task.run_state = ST_SCHEDULED`, so a concurrent
     /// `wake()` sees SCHEDULED and does not double-link.
-    private enqueue(mut &this, task: mut Task*) -> void {
+    private enqueue(mut &this, task: mut ErasedTask*) -> void {
         mut held: MutexGuard<ReadyQueue, GlobalAllocator> = this.queue.lock();
         const queue: mut ReadyQueue* = held.as_mutable_pointer();
         task.next = null;
@@ -334,14 +365,14 @@ private type struct ExecInner {
     /// task (already transitioned to ST_RUNNING under the lock so no second
     /// worker can claim it), or null once shutdown is set (leaving any remaining
     /// queued tasks for `Executor::drop` to reclaim).
-    private take(mut &this) -> mut Task* {
+    private take(mut &this) -> mut ErasedTask* {
         mut held: MutexGuard<ReadyQueue, GlobalAllocator> = this.queue.lock();
         const queue: mut ReadyQueue* = held.as_mutable_pointer();
         while (queue.head == null && !queue.shutdown) {
             this.work_ready.wait(&this.queue, &held);
         }
         if (queue.shutdown) { return null; }
-        const t: mut Task* = queue.pop();
+        const t: mut ErasedTask* = queue.pop();
         // Claim the task for this worker before releasing the lock, so a wake
         // between dequeue and poll takes the RUNNING→NOTIFIED path (deferred
         // reschedule) rather than re-linking an already-dequeued task.
@@ -351,6 +382,8 @@ private type struct ExecInner {
     }
 
     /// A pool worker's body: pull ready tasks and drive them until shutdown.
+    /// The worker publishes its executor too, which is where `Task::spawn`
+    /// puts what a polled future spawns.
     private work(mut &this) -> void {
         // Publish this pool's reactor and blocking pool for the thread's
         // lifetime: every future this worker polls reaches them through
@@ -360,8 +393,9 @@ private type struct ExecInner {
         // `Context`, whose shape is fixed.
         Reactor::set_current(this.reactor);
         BlockingPool::set_current(this.blocking);
+        g_current_executor = &this;
         loop {
-            const task: mut Task* = this.take();
+            const task: mut ErasedTask* = this.take();
             if (task == null) { return; }
             // `drive` returns true when it re-enqueued the task (the
             // scheduling reference moved back to the queue), false when it
@@ -374,7 +408,7 @@ private type struct ExecInner {
 
     /// Reclaim every still-queued task (called from `Executor::drop` after the
     /// workers have joined). Releasing each task's scheduling reference — the
-    /// last reference for a never-driven task — runs `Task::drop`, which
+    /// last reference for a never-driven task — runs `ErasedTask::drop`, which
     /// finishes it CANCELLED (its future's drop + the shared-block handshake)
     /// and frees the box; tasks never driven would otherwise leak their boxed
     /// futures. One task is unlinked per lock acquisition and released after
@@ -383,7 +417,7 @@ private type struct ExecInner {
     private drain_cancelled(mut &this) -> void {
         loop {
             mut held: MutexGuard<ReadyQueue, GlobalAllocator> = this.queue.lock();
-            const t: Task* = held.as_mutable_pointer().pop();
+            const t: ErasedTask* = held.as_mutable_pointer().pop();
             mem::drop(held);
             if (t == null) { return; }
             task_decref(t);
@@ -395,40 +429,40 @@ private type struct ExecInner {
 /// Acquire one strong reference to `task`'s box. The owning waker's `clone_fn`
 /// and the wake path (handing the ready queue its own reference) call this; it
 /// pairs one-for-one with `task_decref`.
-private function task_incref(task: Task*) -> void {
-    Arc::<Task, GlobalAllocator>::increment_strong_count(task);
+private function task_incref(task: ErasedTask*) -> void {
+    Arc::<ErasedTask, GlobalAllocator>::increment_strong_count(task);
 }
 
 /// Release one strong reference to `task`'s box. The last release runs
-/// `Task::drop` (finishing an unfinished task) and frees the box. Pairs with
+/// `ErasedTask::drop` (finishing an unfinished task) and frees the box. Pairs with
 /// `task_incref`, the initial `Arc::new` scheduling reference, and each stored
 /// waker.
-private function task_decref(task: Task*) -> void {
-    Arc::<Task, GlobalAllocator>::decrement_strong_count(task);
+private function task_decref(task: ErasedTask*) -> void {
+    Arc::<ErasedTask, GlobalAllocator>::decrement_strong_count(task);
 }
 
 /// `Waker` `clone_fn` for an owning task waker: acquire a reference and return
-/// the same `Task*` handle, so the clone keeps the task alive until it drops. A
+/// the same `ErasedTask*` handle, so the clone keeps the task alive until it drops. A
 /// bare fn-ptr stored in the `Waker` vtable, so a free function.
 private function waker_arc_clone(data: mut u8*) -> mut u8* {
-    task_incref(data as Task*);
+    task_incref(data as ErasedTask*);
     return data;
 }
 
 /// `Waker` `drop_fn` for an owning task waker: release the reference the waker
 /// held. A bare fn-ptr stored in the `Waker` vtable, so a free function.
 private function waker_arc_drop(data: mut u8*) -> void {
-    task_decref(data as Task*);
+    task_decref(data as ErasedTask*);
 }
 
-/// The waker callback: `data` is the `Task*`. Reschedule it via the atomic
+/// The waker callback: `data` is the `ErasedTask*`. Reschedule it via the atomic
 /// run-state so it is enqueued at most once and never polled by two workers —
 /// see the module doc. Must be a free function: it is stored in the `Waker`
 /// vtable as a raw `(mut u8*) -> void` and invoked as `wake_fn(data)`, and Cryo
 /// cannot take a static method's address as a fn-ptr value (it resolves to the
 /// type, not the method) — nor could an instance method's `this`-ABI match.
 private function task_wake(data: mut u8*) -> void {
-    const task: mut Task* = data as mut Task*;
+    const task: mut ErasedTask* = data as mut ErasedTask*;
     loop {
         const s: u8 = task.run_state.load(MemoryOrder::Acquire);
         if (s == ST_IDLE) {
@@ -563,7 +597,7 @@ private function dispose_shared_thunk<O>(shared_raw: mut u8*, drop_result: u8) -
 }
 
 
-/// Box `fut` + its shared control block, wrap them in a `Task` with the
+/// Box `fut` + its shared control block, wrap them in an `ErasedTask` with the
 /// monomorphized vtable, and enqueue it. Generic-function references
 /// (`task_poll_thunk<F,O>` etc.) are taken here in a free generic function — the
 /// proven addressable-generic-fn shape (cf. `thread::os_create_thread`) — so this
@@ -581,6 +615,7 @@ where F: Future<O> {
     sh.ctl.hs      = Atomic::<u8>::new(HS_LIVE);
     sh.ctl.cancel  = Atomic::<u8>::new(0);
     sh.ctl.panic   = PanicInfo { msg: "", file: "", line: 0 };
+    sh.ctl.joiner  = Waker::noop();
 
     mut fbox: mut F* = null;
     match (alloc.allocate(Layout::of::<F>())) {
@@ -592,19 +627,19 @@ where F: Future<O> {
     }
     *fbox = fut;
 
-    // Box the task inside an `Arc<Task>`: the strong count is the box's
+    // Box the task inside an `Arc<ErasedTask>`: the strong count is the box's
     // lifetime. `Arc::new`'s initial count of 1 IS the scheduling reference,
     // handed to the ready queue by `into_raw` (which suppresses the handle's own
-    // drop). The `Task*` it yields is what `task_incref`/`task_decref` take.
-    mut arc_res: Result<Arc<Task, GlobalAllocator>, AllocationError> =
-        Arc::try_new(Task::new(task_poll_thunk::<F, O>, task_drop_thunk::<F>,
+    // drop). The `ErasedTask*` it yields is what `task_incref`/`task_decref` take.
+    mut arc_res: Result<Arc<ErasedTask, GlobalAllocator>, AllocationError> =
+        Arc::try_new(ErasedTask::new(task_poll_thunk::<F, O>, task_drop_thunk::<F>,
                                dispose_shared_thunk::<O>, fbox as mut u8*, sh as mut u8*, inner));
     match (arc_res) {
         Result::Ok(arc) => {
             inner.enqueue(arc.into_raw());
         }
         Result::Err(_)  => {
-            // `try_new` dropped the Task value; its `Drop` finished it CANCELLED
+            // `try_new` dropped the ErasedTask value; its `Drop` finished it CANCELLED
             // and dropped the boxed future, so only the shared block remains.
             alloc.deallocate(NonNull::new(sh as mut u8*), Layout::of::<TaskShared<O>>());
             panic("Executor::spawn: task allocation failed", intrinsics::location());
@@ -670,20 +705,31 @@ public type struct JoinHandle<O> {
     /// panicked). Consumes the handle and frees the block. Waiting on the
     /// handshake state (not merely `outcome`) guarantees the finishing worker is
     /// past its last touch of the block before we read+free it.
+    ///
+    /// `join` blocks the thread. Inside a task, `await` the handle instead:
+    /// it is a `Future` of the same `Result`, and parks only the awaiting task.
     public join(mut this) -> Result<O, JoinError> {
+        const ctl: TaskCtl* = &this.shared.ctl;
+        mut held: MutexGuard<(), GlobalAllocator> = this.exec.done_lock.lock();
+        while (ctl.hs.load(MemoryOrder::Acquire) != HS_TASK_FIN) {
+            this.exec.task_done.wait(&this.exec.done_lock, &held);
+        }
+        mem::drop(held);
+        return this.take_outcome();
+    }
+
+    /// Read the finished task's outcome out of the control block and free the
+    /// block. Called once HS_TASK_FIN has been observed, when the finishing
+    /// task no longer touches the block. Nulls `shared`, so the handle's
+    /// `Drop`, and any later poll, find it consumed.
+    private take_outcome(mut &this) -> Result<O, JoinError> {
         // Read the fields, then null `shared` to neutralize this handle's Drop
         // (it no-ops on a null `shared`) — the "consume" a destructure would give,
         // without a `: JoinHandle<O>` annotation (which misresolves to
         // `thread::JoinHandle` under `import thread`).
         const shared: mut TaskShared<O>* = this.shared;
-        const exec:   ExecInner*     = this.exec;
         this.shared = null;
         const ctl: TaskCtl* = &shared.ctl;
-        mut held: MutexGuard<(), GlobalAllocator> = exec.done_lock.lock();
-        while (ctl.hs.load(MemoryOrder::Acquire) != HS_TASK_FIN) {
-            exec.task_done.wait(&exec.done_lock, &held);
-        }
-        mem::drop(held);
         const outcome: u8 = ctl.outcome.load(MemoryOrder::Acquire);
         mut alloc: GlobalAllocator = GlobalAllocator::new();
         if (outcome == OUTCOME_READY) {
@@ -710,7 +756,7 @@ public type struct JoinHandle<O> {
     public detach(mut this) -> void {
         const shared: mut TaskShared<O>* = this.shared;
         this.shared = null;   // consume: neutralize this handle's Drop
-        detach_shared::<O>(shared);
+        detach_shared::<O>(shared, this.exec);
     }
 
     /// Request that the task be cancelled. It is reclaimed — its `Output` never
@@ -735,8 +781,69 @@ public type struct JoinHandle<O> {
 implement<O> trait Drop for struct JoinHandle<O> {
     drop(mut &this) -> void {
         if (this.shared == null) { return; }
-        detach_shared::<O>(this.shared);
+        detach_shared::<O>(this.shared, this.exec);
         this.shared = null;
+    }
+}
+
+/// Awaiting a handle parks the awaiting task until the spawned one finishes,
+/// then yields what `join` would: the task's `Output`, or why there is none.
+/// The handle is consumed by the `Ready` poll; polling it again panics.
+implement<O> trait Future<Result<O, JoinError>> for struct JoinHandle<O> {
+    poll(mut &this, cx: Context*) -> Poll<Result<O, JoinError>> {
+        if (this.shared == null) {
+            panic("JoinHandle polled after it completed", intrinsics::location());
+        }
+        const ctl: mut TaskCtl* = &this.shared.ctl;
+        const held: MutexGuard<(), GlobalAllocator> = this.exec.done_lock.lock();
+        if (ctl.hs.load(MemoryOrder::Acquire) != HS_TASK_FIN) {
+            // The waker this replaces is the same task's from an earlier poll;
+            // it is released after the unlock, as every waker is.
+            const replaced: Waker = Waker::replace(&ctl.joiner, cx.waker());
+            mem::drop(held);
+            mem::drop(replaced);
+            return Poll::Pending;
+        }
+        mem::drop(held);
+        return Poll::Ready(this.take_outcome());
+    }
+}
+
+/// The task-spawning entry points of the executor polling the caller.
+///
+/// Inside a task - an `async function main`, or any future an `Executor`
+/// drives - `Task::spawn` starts another future on the same executor and
+/// returns its `JoinHandle`, which the caller awaits:
+///
+/// ```cryo
+/// import std::future::{ Task, JoinHandle };
+///
+/// async function double(x: i64) -> i64 { return x * 2; }
+///
+/// async function main() -> i32 {
+///     const first: JoinHandle<i64> = Task::spawn(double(20));
+///     const second: JoinHandle<i64> = Task::spawn(double(1));
+///     const a: i64 = (await first).unwrap();
+///     const b: i64 = (await second).unwrap();
+///     return (a + b) as i32;   // 42
+/// }
+/// ```
+///
+/// There is no executor to find outside a task, so a call from any other
+/// thread panics; code there holds the `Executor` and calls its `spawn`.
+public type struct Task {
+    /// Spawn `future` on the executor polling the caller, and return a handle
+    /// to its `Output`. The executor's workers begin driving it at once.
+    /// Panics when the calling thread is not one of an executor's workers,
+    /// reporting the call's place.
+    ![caller_location]
+    public static spawn<F, O>(future: F) -> JoinHandle<O>
+    where F: Future<O> {
+        const inner: mut ExecInner* = g_current_executor;
+        if (inner == null) {
+            panic("Task::spawn called outside a task: no executor is polling this thread; spawn from inside an async function an Executor drives, or call Executor.spawn", intrinsics::location());
+        }
+        return spawn_on::<F, O>(inner, future);
     }
 }
 
