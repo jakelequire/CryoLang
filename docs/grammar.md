@@ -240,8 +240,12 @@ EnumDecl           ::= "type"? "enum" Ident Generics? (":" Type)?
                        (* the optional ":" Type is the explicit discriminant
                           base type, e.g. `type enum Foo : i32 { ... }` *)
 EnumVariant        ::= Ident
-                     | Ident "=" NumLit
+                     | Ident "=" Expression
                      | Ident "(" Type ("," Type)* ")"
+                       (* the Expression after "=" is the variant's
+                          discriminant, a compile-time integer folded once
+                          names are resolved; one that does not fold is
+                          refused (E0065) *)
 
 (* The traits the compiler implements for the type, field by field:
    `Eq`, `Ord`, `Hash`, `Clone`, `Debug` and `Default` (not `Default`

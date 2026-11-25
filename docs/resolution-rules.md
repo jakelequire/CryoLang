@@ -135,6 +135,20 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-11-25
 
+720. **An enum discriminant is a compile-time integer expression.**  It is
+     parsed as an expression and folded by `ConstEval`, the folder of
+     every other compile-time integer, once names are resolved; the type
+     arena's tags and a constant written `Enum::Variant` both read it
+     through `ConstEval::variant_tag`.  Its names are resolved where the
+     enum is declared, as a constant's initializer's are, so a variant of
+     the same enum is written `Enum::Variant` and a bare name is looked up
+     as any bare name is there.  A discriminant that does not fold is
+     E0065 at the variant, which replaces 647's E0102 for a float literal
+     in that place; one past 64 bits is E0010, an overflow in its
+     operands' type E0465, and a value two variants share E0064, now
+     checked when the tags are folded rather than before resolution.
+     (Jake; the scope of its names, the codes and the wording delegated)
+
 719. **The data model the text formats share is `std::encoding::value`,
      and a format's entry points are statics of its own type.**  `Value`,
      `Number`, `Object`, `ToValue`, `FromValue` and `DecodeError` carry no

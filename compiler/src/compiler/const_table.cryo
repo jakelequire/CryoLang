@@ -38,10 +38,11 @@
 ///! answer a constant the writing module cannot see.
 ///!
 ///! `ConstEval` is the ONE folder for every position that wants a compile-time
-///! integer: an array size, a `[value; N]` repeat count, and a `static_assert`
-///! condition.  They differ only in which capabilities exist at their point in
-///! the pipeline - an array size is fixed before any layout is computed, so
-///! `sizeof` is not a constant there - and a capability is passed as a
+///! integer: an array size, a `[value; N]` repeat count, an enum discriminant
+///! and a `static_assert` condition.  They differ only in which capabilities
+///! exist at their point in the pipeline - an array size and a discriminant
+///! are fixed before any layout is computed, so `sizeof` is not a constant
+///! there - and a capability is passed as a
 ///! pointer that may be null rather than as a separate folder.
 ///!
 ///! A folded value is a `FoldedInteger`: wide enough for every value of every
@@ -62,7 +63,7 @@ import compiler::types::type_base::{ Type };
 import std::core::option::{ Option };
 import std::collections::hashmap::{ HashMap };
 import std::fmt;
-import compiler::ast::declaration::{ DeclarationNode, EnumDecl };
+import compiler::ast::declaration::{ DeclarationNode, EnumDecl, EnumVariant };
 import compiler::ast::expression::{
     AlignofExpr, BinaryExpr, CastExpr, ExpressionNode, IdentifierExpr,
     LiteralExpr, ScopeResolutionExpr, SizeofExpr, UnaryExpr
@@ -72,6 +73,7 @@ import compiler::lex::lexer::{ Lexer };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::symbol_id::{ SymbolKey };
+import compiler::diag::source_span::{ SourceSpan };
 import compiler::types::arena::{ TypeArena };
 import std::core::hash::{ FnvHasher };
 import std::alloc::allocator::{ GlobalAllocator };
@@ -141,6 +143,10 @@ type struct ConstantTable {
     /// be matched against.
     enums: [EnumDecl*];
     enums_by_def: HashMap<DefKey, i64, GlobalAllocator, FnvHasher>;
+    /// The variants whose written discriminant is being folded: one reached
+    /// again from inside its own fold names itself, directly or through
+    /// another variant or constant, and is no compile-time integer.
+    folding_discriminants: [EnumVariant*];
 
     /// The constants each type declares (`Point::ORIGIN`, `i32::MAX`),
     /// parallel arrays: the owning type's definition (a primitive's
@@ -160,6 +166,7 @@ public:
             by_local:     HashMap::<SymbolKey, i64, GlobalAllocator, FnvHasher>::new(),
             enums:        [],
             enums_by_def: HashMap::<DefKey, i64, GlobalAllocator, FnvHasher>::new(),
+            folding_discriminants: [],
             type_constant_owners: [],
             type_constant_leaves: [],
             type_constant_defs:   [],
@@ -987,7 +994,7 @@ type struct ConstEval {
                     ResBase::Def(q) => {
                         return match (this.table.enums_by_def.get(&this.table.defs.table_key(q))) {
                             Option::Some(ei) => {
-                                match (ConstEval::variant_tag_of(this.table.enums[ei], sr.member_name)) {
+                                match (this.variant_tag_of(this.table.enums[ei], sr.member_name)) {
                                     Option::Some(tag) => { Option::Some(ConstantValue::untyped(tag)) }
                                     Option::None      => { Option::None }
                                 }
@@ -1005,13 +1012,53 @@ type struct ConstEval {
     /// The discriminant `decl` gives `member`, or None when it has no such
     /// variant.  A variant carrying a payload is a constructor, not a value,
     /// so it is not a compile-time integer.
-    static variant_tag_of(decl: EnumDecl*, member: SymbolStr) -> Option<FoldedInteger> {
+    variant_tag_of(&this, decl: EnumDecl*, member: SymbolStr) -> Option<FoldedInteger> {
         if (decl == null) { return Option::None; }
         const i: i64 = decl.variant_position(member);
         if (i < 0) { return Option::None; }
         if (DeclarationNode::variant_of(decl.variants[i]).associated_types.length() > 0) { return Option::None; }
-        const tags: [i64] = decl.variant_tags();
-        return Option::Some(FoldedInteger::of(tags[i] as i128));
+        return this.variant_tag(decl, i);
+    }
+
+    /// The discriminant of the variant at `position` in `decl`, or None when
+    /// it is not a compile-time integer.
+    ///
+    /// A written discriminant is its folded value; a variant with none takes
+    /// the one after its predecessor's, and the first such variant 0.  That
+    /// is what makes `{ A = 4; B; }` 4 and 5.  A null slot keeps its position
+    /// without taking a tag.  The type arena's tags and a constant written
+    /// `Enum::Variant` are both read here, so the two cannot disagree.
+    variant_tag(&this, decl: EnumDecl*, position: i64) -> Option<FoldedInteger> {
+        if (decl == null || position < 0 || position >= decl.variants.length()) { return Option::None; }
+        if (DeclarationNode::variant_of(decl.variants[position]) == null) { return Option::None; }
+        mut after: i128 = 0;
+        for (mut k: i64 = position; k >= 0; k--) {
+            const v: EnumVariant* = DeclarationNode::variant_of(decl.variants[k]);
+            if (v == null) { continue; }
+            if (v.discriminant != null) {
+                return match (this.discriminant_of(v)) {
+                    Option::Some(written) => { written.value.add(FoldedInteger::of(after)) }
+                    Option::None          => { Option::None }
+                };
+            }
+            after += 1;
+        }
+        return Option::Some(FoldedInteger::of(after - 1));
+    }
+
+    /// The value of `v`'s written discriminant, with the type it is computed
+    /// in and the operation that overflowed in it, if one did; None when it
+    /// has none or it does not fold.
+    discriminant_of(&this, v: EnumVariant*) -> Option<ConstantValue> {
+        if (v == null || v.discriminant == null) { return Option::None; }
+        if (this.table == null) { return this.fold_value(v.discriminant); }
+        for (mut i: i64 = 0; i < this.table.folding_discriminants.length(); i++) {
+            if (this.table.folding_discriminants[i] == v) { return Option::None; }
+        }
+        this.table.folding_discriminants.push(v);
+        const written: Option<ConstantValue> = this.fold_value(v.discriminant);
+        this.table.folding_discriminants.pop();
+        return written;
     }
 
     /// Fold one entry's initializer and memoize the value.
@@ -1192,6 +1239,40 @@ type struct ConstEval {
             return Option::Some(FoldedInteger { bits: low | ~mask, negative: true });
         }
         return Option::Some(FoldedInteger::unsigned(low));
+    }
+
+    /// The refusal (E0465) of the operation that overflowed in folding
+    /// `whole` to `folded`, its operands computed in their common type;
+    /// None when it overflowed inside a constant `whole` names, which is
+    /// refused at that constant's initializer and reported nothing more
+    /// here.  `where` completes the label, as `overflow_refusal`'s does.
+    overflow_in(&this, whole: ExpressionNode*, folded: ConstantValue, where: string) -> Option<Diagnostic> {
+        const at: ExpressionNode* = folded.overflow;
+        if (at == null) { return Option::None; }
+        const span: SourceSpan = whole.span;
+        const inside: boolean = at.span.file == span.file
+            && (at.span.start_line > span.start_line
+                || (at.span.start_line == span.start_line && at.span.start_col >= span.start_col))
+            && (at.span.end_line < span.end_line
+                || (at.span.end_line == span.end_line && at.span.end_col <= span.end_col));
+        if (!inside) { return Option::None; }
+        const unary: UnaryExpr* = ExpressionNode::unary_of(at);
+        const binary: BinaryExpr* = ExpressionNode::binary_of(at);
+        const left: ExpressionNode* = if (binary != null) { binary.left } else { null };
+        const right: ExpressionNode* = if (binary != null) { binary.right } else { unary.operand };
+        const op: TokenType = if (binary != null) { binary.op.kind } else { unary.op.kind };
+        const right_value: ConstantValue = this.fold_value(right).unwrap();
+        mut primitive: string = right_value.primitive;
+        mut values: [FoldedInteger] = [];
+        if (left != null) {
+            const left_value: ConstantValue = this.fold_value(left).unwrap();
+            primitive = ConstantValue::common_primitive(left_value.primitive, right_value.primitive);
+            values.push(left_value.in_type(primitive).value);
+        }
+        values.push(right_value.in_type(primitive).value);
+        const kind: IntegerKind = ConstantValue::integer_kind_of(primitive).unwrap();
+        return Option::Some(ConstEval::overflow_refusal(at, op, left, right, values, primitive,
+            kind.bit_width(), kind.is_signed(), where, this.intern));
     }
 
     /// The refusal (E0465) of `e`, an integer `+`, `-`, `*`, `/` or `%`, or a

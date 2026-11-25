@@ -60,6 +60,7 @@ import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::diag::suggestion::{ Applicability, Suggestion };
 import compiler::ast::node_locator::{ annotation_span };
+import compiler::const_table::{ ConstantValue, ConstEval, FoldedInteger };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::lang_item::{ LangItem };
 import compiler::resolver::resolver::{ Resolver };
@@ -3327,6 +3328,121 @@ type struct TypeResolutionPasses {
         }
     }
 
+    /// The discriminant of each of `node`'s variants, by position, as the
+    /// tag's 64-bit pattern.  A null slot, and a variant whose discriminant
+    /// is refused, is 0.
+    ///
+    /// The tags are folded here rather than when the enum is parsed because
+    /// a written discriminant may name a constant or a variant (`Flag::A |
+    /// Flag::B`) that only name resolution binds.  Refused here: a
+    /// discriminant that is not a compile-time integer (E0065), an operation
+    /// in one that overflows its type (E0465), a tag no 64-bit pattern
+    /// holds (E0010), and a tag two variants share (E0064) - an explicit one
+    /// or one a variant takes after its predecessor's.
+    static enum_discriminants(node: EnumDecl*, ctx: mut CompilationContext*) -> [i64] {
+        const ev: ConstEval = ConstEval::new(ctx.const_table, ctx.intern_table, null);
+        const name: string = ctx.intern_table.resolve(node.name);
+        mut tags: [i64] = [];
+        mut seen_tags: [i64] = [];
+        mut seen_names: [SymbolStr] = [];
+        for (mut i: i64 = 0; i < node.variants.length(); i++) {
+            const v_decl: DeclarationNode* = node.variants[i];
+            const v: EnumVariant* = DeclarationNode::variant_of(v_decl);
+            if (v == null) { tags.push(0); continue; }
+            const variant_name: string = ctx.intern_table.resolve(v.name);
+            if (v.discriminant != null) {
+                const written: Option<ConstantValue> = ev.discriminant_of(v);
+                if (written.is_none()) {
+                    mut refusal: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0065_NON_CONST_ENUM_DISCRIMINANT,
+                        fmt::format("the discriminant of `%s` is not a compile-time integer", variant_name))
+                        .at_with_label(v.discriminant.span, "not a compile-time integer");
+                    // A bare name that named nothing, spelled like one of
+                    // this enum's variants, is that variant: a variant is
+                    // named through its enum.
+                    const bare: IdentifierExpr* = ExpressionNode::identifier_of(v.discriminant);
+                    const named_nothing: boolean = bare != null && match (bare.res) {
+                        ResSlot::Answered(Res::Def(_))   => { false }
+                        ResSlot::Answered(Res::Local(_)) => { false }
+                        _                                => { true }
+                    };
+                    if (named_nothing && node.variant_position(bare.name) >= 0) {
+                        const leaf: string = ctx.intern_table.resolve(bare.name);
+                        refusal = refusal.help(fmt::format(
+                            "`%s` is a variant of `%s`, and a variant is named through its enum: write `%s::%s`",
+                            leaf, name, name, leaf));
+                    } else {
+                        refusal = refusal.help(fmt::format(
+                            "a compile-time integer is an integer literal, a named constant, a variant written `%s::Variant`, a cast between integer types, or arithmetic over them",
+                            name));
+                    }
+                    ctx.emit_diagnostic(refusal);
+                    tags.push(0);
+                    continue;
+                }
+                if (written.unwrap().overflow != null) {
+                    match (ev.overflow_in(v.discriminant, written.unwrap(),
+                            "where the discriminant is computed, in its operands' types")) {
+                        Option::Some(refusal) => { ctx.emit_diagnostic(refusal); }
+                        Option::None => { }
+                    }
+                    tags.push(0);
+                    continue;
+                }
+            }
+            const tag: Option<FoldedInteger> = ev.variant_tag(node, i);
+            // A variant after a refused discriminant takes no tag of its own;
+            // the refusal is reported where it was written.
+            if (tag.is_none()) { tags.push(0); continue; }
+            const pattern: Option<u64> = tag.unwrap().to_64_bit_pattern();
+            if (pattern.is_none()) {
+                const at: SourceSpan = if (v.discriminant != null) { v.discriminant.span } else { v_decl.span };
+                const label: string = if (v.discriminant != null) { "no 64-bit tag holds this value" }
+                    else { "the discriminant after its predecessor's, which no 64-bit tag holds" };
+                ctx.emit_diagnostic(Diagnostic::error(ErrorCode::E0010_NUMBER_TOO_LARGE,
+                    fmt::format("the discriminant of `%s`, %s, does not fit in 64 bits",
+                        variant_name, tag.unwrap().to_decimal_string()))
+                    .at_with_label(at, label));
+                tags.push(0);
+                continue;
+            }
+            const bits: i64 = pattern.unwrap() as i64;
+            tags.push(bits);
+            mut clash: i64 = -1;
+            for (mut k: i64 = 0; k < seen_tags.length(); k++) {
+                if (seen_tags[k] == bits) { clash = k; break; }
+            }
+            if (clash < 0) {
+                seen_tags.push(bits);
+                seen_names.push(v.name);
+                continue;
+            }
+            // The lowest non-negative tag no variant takes, searched over a
+            // bounded range so an enum of many clashes cannot spin.
+            mut free_tag: i64 = 0;
+            mut found_free: boolean = false;
+            for (mut candidate: i64 = 0; candidate < 1024; candidate += 1) {
+                mut taken: boolean = false;
+                for (mut k: i64 = 0; k < seen_tags.length(); k++) {
+                    if (seen_tags[k] == candidate) { taken = true; break; }
+                }
+                if (!taken) { free_tag = candidate; found_free = true; break; }
+            }
+            mut diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0064_DUPLICATE_ENUM_DISCRIMINANT,
+                fmt::format("variant `%s` shares discriminant %lld with `%s` in enum `%s`",
+                    variant_name, bits, ctx.intern_table.resolve(seen_names[clash]), name));
+            diag = diag.at_with_label(v_decl.span, fmt::format("duplicate discriminant %lld", bits));
+            if (found_free) {
+                diag = diag.help(fmt::format(
+                    "give `%s` a unique tag (e.g. `= %lld`) or remove the conflicting `= %lld` on the earlier variant",
+                    variant_name, free_tag, bits));
+            }
+            ctx.emit_diagnostic(diag);
+        }
+        return tags;
+    }
+
     /// Record a non-generic union's resolved fields and methods on its arena
     /// type (a StructType with is_union set); false when there is nothing to
     /// record - a template, or no arena type to record on.  A field whose type
@@ -4307,11 +4423,7 @@ type struct TypeResolutionPasses {
                 res_ctx.add_binding(gp.sym_id, gp.name, refs[gpi]);
             }
 
-            // Discriminants come from the declaration itself, which
-            // is also what a compile-time fold of `Enum::Variant`
-            // reads; computing them here as well would let the tag
-            // an expression sees drift from the tag the type carries.
-            const tags: [i64] = node.variant_tags();
+            const tags: [i64] = TypeResolutionPasses::enum_discriminants(node, ctx);
             for (mut j: i64 = 0; j < node.variants.length(); j++) {
                 const variant_decl: DeclarationNode* = node.variants[j];
                 const variant: EnumVariant* = DeclarationNode::variant_of(variant_decl);

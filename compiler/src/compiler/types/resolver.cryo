@@ -14,9 +14,8 @@ namespace compiler::types::resolver;
 
 import compiler::diag::{ diagnostic, ErrorCode, sink, source_span };
 import compiler::types::{
-    arena, type_ref, generic_registry, inference, ownership, IntegerKind, TypeKind, RefMutability
+    arena, type_ref, generic_registry, inference, ownership, TypeKind, RefMutability
 };
-import compiler::lex::{ TokenType };
 import compiler::ast::{
     ArrayAnnotation, declaration, expression, FunctionAnnotation, GenericAnnotation,
     ImplTraitAnnotation, NamedAnnotation, node, ObjectAnnotation, ProjectionAnnotation, statement,
@@ -41,7 +40,7 @@ import compiler::ast::declaration::{
     DeclarationNode, FieldDecl, FunctionDecl, GenericParamDecl, ImplBlock, MethodDecl,
     TraitDecl, TypeAliasDecl, VarDecl
 };
-import compiler::ast::expression::{ BinaryExpr, ExpressionNode, StructExpr, UnaryExpr };
+import compiler::ast::expression::{ ExpressionNode, StructExpr };
 import compiler::ast::statement::{ Stmt, StmtKind };
 import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::sink::{ DiagnosticSink };
@@ -264,36 +263,12 @@ type struct TypeResolver {
         const ev: ConstEval = ConstEval::new(this.const_table, this.intern_table, null);
         const size: Option<ConstantValue> = ev.fold_value(a.size_expr);
         if (size.is_some() && size.unwrap().overflow != null) {
-            const at: ExpressionNode* = size.unwrap().overflow;
-            // An overflow in a constant the size names is refused at the
-            // constant's initializer, and reports nothing more here.
-            const whole: SourceSpan = a.size_expr.span;
-            const inside: boolean = at.span.file == whole.file
-                && (at.span.start_line > whole.start_line
-                    || (at.span.start_line == whole.start_line && at.span.start_col >= whole.start_col))
-                && (at.span.end_line < whole.end_line
-                    || (at.span.end_line == whole.end_line && at.span.end_col <= whole.end_col));
-            if (!inside) { return 0; }
-            const unary: UnaryExpr* = ExpressionNode::unary_of(at);
-            const binary: BinaryExpr* = ExpressionNode::binary_of(at);
-            const left: ExpressionNode* = if (binary != null) { binary.left } else { null };
-            const right: ExpressionNode* = if (binary != null) { binary.right } else { unary.operand };
-            const op: TokenType = if (binary != null) { binary.op.kind } else { unary.op.kind };
-            // The operands as the operation computed them: in their common type.
-            const right_value: ConstantValue = ev.fold_value(right).unwrap();
-            mut primitive: string = right_value.primitive;
-            mut values: [FoldedInteger] = [];
-            if (left != null) {
-                const left_value: ConstantValue = ev.fold_value(left).unwrap();
-                primitive = ConstantValue::common_primitive(left_value.primitive, right_value.primitive);
-                values.push(left_value.in_type(primitive).value);
-            }
-            values.push(right_value.in_type(primitive).value);
-            const kind: IntegerKind = ConstantValue::integer_kind_of(primitive).unwrap();
-            if (this.diagnostics != null) {
-                this.diagnostics.emit(ConstEval::overflow_refusal(at, op, left, right, values, primitive,
-                    kind.bit_width(), kind.is_signed(),
-                    "where the array size is computed, in its operands' types", this.intern_table));
+            match (ev.overflow_in(a.size_expr, size.unwrap(),
+                    "where the array size is computed, in its operands' types")) {
+                Option::Some(refusal) => {
+                    if (this.diagnostics != null) { this.diagnostics.emit(refusal); }
+                }
+                Option::None => { }
             }
             return 0;
         }

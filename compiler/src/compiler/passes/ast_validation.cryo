@@ -15,12 +15,11 @@ import compiler::diag::{ diagnostic, ErrorCode, snapshot, source_span };
 import compiler::ast::{ declaration, expression, node, pattern, statement };
 import compiler::passes::pass_id::{ PassResult };
 import compiler::compilation_context::{ CompilationContext };
-import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::utils::log::{ Log, LogArea, LogLevel };
 import std::fmt;
 import std::fmt::display::{ Display };
 import compiler::ast::declaration::{
-    EnumDecl, EnumVariant, ExternBlock, FieldDecl,
+    EnumDecl, ExternBlock, FieldDecl,
     DeclarationNode, DeclKind, FunctionDecl, GenericParamDecl, ImplBlock,
     ImportDecl, IntrinsicDecl,
     MethodDecl, StructDecl, TraitDecl, TypeAliasDecl, UnionDecl,
@@ -28,7 +27,6 @@ import compiler::ast::declaration::{
 };
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::statement::{ BlockStmt, Stmt, StmtKind };
-import compiler::diag::diagnostic::{ Diagnostic };
 import compiler::diag::snapshot::{ DiagnosticSnapshot };
 import compiler::diag::source_span::{ SourceSpan };
 
@@ -251,57 +249,6 @@ type struct ASTValidator {
                 this.emit(ErrorCode::E0058_NULL_ENUM_VARIANT,
                     fmt::format("null variant at index %lld in enum `%s`", i, name),
                     d.span);
-            }
-        }
-
-        // Reject duplicate discriminants, including a collision between
-        // an explicit `= N` and an unannotated variant whose carry-forward
-        // tag lands on the same N.  Mirrors C semantics.
-        mut seen_tags: [i64] = [];
-        mut seen_names: [SymbolStr] = [];
-        mut next_tag: i64 = 0;
-        for (mut i: i64 = 0; i < node.variants.length(); i++) {
-            const v_decl: DeclarationNode* = node.variants[i];
-            const v: EnumVariant* = DeclarationNode::variant_of(v_decl);
-            if (v == null) { continue; }
-            mut tag: i64 = next_tag;
-            if (v.has_value) { tag = v.explicit_value; }
-            next_tag = tag + 1;
-            mut clash_idx: i64 = -1;
-            for (mut k: i64 = 0; k < seen_tags.length(); k++) {
-                if (seen_tags[k] == tag) { clash_idx = k; break; }
-            }
-            if (clash_idx >= 0) {
-                // Suggest the lowest non-negative integer not yet used
-                // by another variant.  Limited to a 1024-value search so
-                // a deeply-clashing enum doesn't spin; in practice the
-                // free slot is always within a handful of the user's
-                // existing tags.
-                mut free_tag: i64 = 0;
-                mut found_free: boolean = false;
-                for (mut cand: i64 = 0; cand < 1024; cand += 1) {
-                    mut taken: boolean = false;
-                    for (mut k: i64 = 0; k < seen_tags.length(); k++) {
-                        if (seen_tags[k] == cand) { taken = true; break; }
-                    }
-                    if (!taken) { free_tag = cand; found_free = true; break; }
-                }
-                mut diag: Diagnostic = Diagnostic::error(
-                    ErrorCode::E0064_DUPLICATE_ENUM_DISCRIMINANT,
-                    fmt::format("variant `%s` shares discriminant %lld with `%s` in enum `%s`",
-                        this.ctx.resolve_str(v.name), tag,
-                        this.ctx.resolve_str(seen_names[clash_idx]), name));
-                diag = diag.at_with_label(v_decl.span,
-                    fmt::format("duplicate discriminant %lld", tag));
-                if (found_free) {
-                    diag = diag.help(fmt::format(
-                        "give `%s` a unique tag (e.g. `= %lld`) or remove the conflicting `= %lld` on the earlier variant",
-                        this.ctx.resolve_str(v.name), free_tag, tag));
-                }
-                this.ctx.emit_diagnostic(diag);
-            } else {
-                seen_tags.push(tag);
-                seen_names.push(v.name);
             }
         }
 

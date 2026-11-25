@@ -19,6 +19,8 @@
 typedef int Celsius;                       /* scalar typedef        -> i32 alias */
 struct Vec2 { int x; int y; };             /* record                -> type struct */
 enum Mode { MODE_OFF = 0, MODE_ON = 7 };   /* named enum w/ explicit discriminants */
+/* a negative member, and one that takes the value after it */
+enum Sign { SIGN_NEG = -5, SIGN_NEXT, SIGN_BIG = 0x7FFFFFFF };
 
 /* anonymous enum -> one alias-namespaced `const` per constant (cit::FLAG_A, ...);
  * the negative member exercises the two's-complement width-truncation path. */

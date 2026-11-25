@@ -176,7 +176,7 @@ A shift's amount does not type the value shifted: a literal shifted by an amount
 
 An integer literal stored where a `char` is takes `char`, and must be at most `0x10FFFF`, the largest Unicode scalar value: `const c: char = 0x110000;` is refused (`E0010`).
 
-No integer type holds a value past `u128::MAX`, so an integer literal writing one is refused wherever it stands (`E0010`) rather than wrapped. A literal is a float only when it has a fraction or an exponent: `0xE` and `5usize` are integers. A float literal where only an integer stands - an enum discriminant, a directive argument, a fixed array's size - is refused rather than read as its integer part.
+No integer type holds a value past `u128::MAX`, so an integer literal writing one is refused wherever it stands (`E0010`) rather than wrapped. A literal is a float only when it has a fraction or an exponent: `0xE` and `5usize` are integers. A float literal where only an integer stands - an enum discriminant (E0065), a directive argument, a fixed array's size - is refused rather than read as its integer part.
 
 The standard library reads a literal's digits the same way: `u128::parse_literal(text, radix)` and `u64::parse_literal(text, radix)` take digits of `radix` with `_` separators anywhere among them, and answer `None` for a value past the type's maximum, a byte that is neither a digit nor `_`, or no digit at all. Neither reads a sign, a radix prefix or a suffix; `u64::parse_radix` is the same without the separators.
 
@@ -2267,6 +2267,26 @@ type enum ErrorCode {
     Internal = 500;
 }
 ```
+
+A variant's value is its **discriminant**, and it is written as a compile-time integer: the set an array size accepts (an integer literal, a named `const`, a variant written through its enum, a cast between integer types, and arithmetic, comparison, logical and bitwise operators over those). A variant with none takes the one after its predecessor's, and a first variant with none 0, so `{ A = 4; B; }` is 4 and 5.
+
+```cryo
+type enum Access : u32 {
+    Read      = 1 << 0;
+    Write     = 1 << 1;
+    Execute   = 1 << 2;
+    ReadWrite = Access::Read | Access::Write;
+}
+```
+
+A discriminant's names mean what they mean where the enum is declared, as a constant's initializer's do, so the enum's own variants are written `Access::Read` there as everywhere outside the enum's body; a bare `Read` names a constant called `Read` if the module has one. A discriminant may name a later variant (`X = E::Y + 10; Y = 3;`). `sizeof` and `alignof` are not constants here: a tag is fixed before any layout is computed.
+
+Refused at the variant:
+
+- a discriminant that is not a compile-time integer - a float literal, a call, two that name each other (E0065);
+- an operation in one that overflows its operands' type (E0465);
+- a value no 64-bit pattern holds, written or taken after a predecessor at `u64::MAX` (E0010);
+- two variants with the same value, however each was reached (E0064).
 
 ### 9.2 Variants with Payloads
 
