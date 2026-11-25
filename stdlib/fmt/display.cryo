@@ -25,7 +25,14 @@ import std::collections::array::{ Array };
 import std::collections::hashmap::{ HashMap };
 import std::collections::hashset::{ HashSet };
 import std::collections::pair::{ Pair };
+import std::collections::deque::{ Deque };
+import std::collections::btree_map::{ BTreeMap };
+import std::collections::btree_set::{ BTreeSet };
+import std::core::ops::{ Range, RangeFrom, RangeFull, RangeInclusive, RangeTo };
 import std::alloc::allocator::{ AllocationError, Allocator, GlobalAllocator };
+import std::alloc::box::{ Box };
+import std::alloc::rc::{ Rc };
+import std::alloc::arc::{ Arc };
 import std::core::primitives;
 import std::core::convert::{ ConversionError };
 import std::core::error::{ Error };
@@ -410,6 +417,14 @@ where T: Display {
     }
 }
 
+/// A reference debugs as the value it refers to.
+implement<T> trait Debug for &T
+where T: Debug {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        return (*this).fmt(f);
+    }
+}
+
 
 // Primitive Debug impls: default to Display for numeric types
 
@@ -542,6 +557,14 @@ implement trait Debug for struct Str {
             f.write_str(Str::from_raw(base + run_start, len - run_start))?;
         }
         return f.write_char(0x22 as char);
+    }
+}
+
+/// Quoted and escaped, as `Str` is.
+implement trait Debug for string {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        const view: Str = Str::new(this);
+        return (Debug for Str)::fmt(&view, f);
     }
 }
 
@@ -835,6 +858,271 @@ where A: Debug, B: Debug {
         const snd: const B* = &this.second;
         snd.fmt(f)?;
         return f.write_str(Str::new(")"));
+    }
+}
+
+// Slice and Deque render as `[a, b, c]`, as Array does; BTreeSet as
+// `{a, b, c}` and BTreeMap as `{k: v, k2: v2}`, in key order. Elements are
+// borrowed in place, so these work for owning element types.
+
+implement<T> trait Display for struct Slice<T>
+where T: Display {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        f.write_str(Str::new("["))?;
+        for (mut i: i64 = 0; i < this.length(); i++) {
+            if (i > 0) { f.write_str(Str::new(", "))?; }
+            match (this.get_reference(i)) {
+                Option::Some(element) => { element.fmt(f)?; }
+                Option::None => { }
+            }
+        }
+        return f.write_str(Str::new("]"));
+    }
+}
+
+implement<T> trait Debug for struct Slice<T>
+where T: Debug {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        f.write_str(Str::new("["))?;
+        for (mut i: i64 = 0; i < this.length(); i++) {
+            if (i > 0) { f.write_str(Str::new(", "))?; }
+            match (this.get_reference(i)) {
+                Option::Some(element) => { element.fmt(f)?; }
+                Option::None => { }
+            }
+        }
+        return f.write_str(Str::new("]"));
+    }
+}
+
+implement<T, A> trait Display for struct Deque<T, A>
+where T: Display, A: Allocator {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        f.write_str(Str::new("["))?;
+        for (mut i: i64 = 0; i < this.length(); i++) {
+            if (i > 0) { f.write_str(Str::new(", "))?; }
+            match (this.get_reference(i)) {
+                Option::Some(element) => { element.fmt(f)?; }
+                Option::None => { }
+            }
+        }
+        return f.write_str(Str::new("]"));
+    }
+}
+
+implement<T, A> trait Debug for struct Deque<T, A>
+where T: Debug, A: Allocator {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        f.write_str(Str::new("["))?;
+        for (mut i: i64 = 0; i < this.length(); i++) {
+            if (i > 0) { f.write_str(Str::new(", "))?; }
+            match (this.get_reference(i)) {
+                Option::Some(element) => { element.fmt(f)?; }
+                Option::None => { }
+            }
+        }
+        return f.write_str(Str::new("]"));
+    }
+}
+
+implement<T, A> trait Display for struct BTreeSet<T, A>
+where T: Display, A: Allocator {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        f.write_str(Str::new("{"))?;
+        mut first: boolean = true;
+        for (element in this.iterate_references()) {
+            if (!first) { f.write_str(Str::new(", "))?; }
+            first = false;
+            element.fmt(f)?;
+        }
+        return f.write_str(Str::new("}"));
+    }
+}
+
+implement<T, A> trait Debug for struct BTreeSet<T, A>
+where T: Debug, A: Allocator {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        f.write_str(Str::new("{"))?;
+        mut first: boolean = true;
+        for (element in this.iterate_references()) {
+            if (!first) { f.write_str(Str::new(", "))?; }
+            first = false;
+            element.fmt(f)?;
+        }
+        return f.write_str(Str::new("}"));
+    }
+}
+
+implement<K, V, A> trait Display for struct BTreeMap<K, V, A>
+where K: Display, V: Display, A: Allocator {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        f.write_str(Str::new("{"))?;
+        mut first: boolean = true;
+        for (entry in this.entries()) {
+            if (!first) { f.write_str(Str::new(", "))?; }
+            first = false;
+            entry.first.fmt(f)?;
+            f.write_str(Str::new(": "))?;
+            entry.second.fmt(f)?;
+        }
+        return f.write_str(Str::new("}"));
+    }
+}
+
+implement<K, V, A> trait Debug for struct BTreeMap<K, V, A>
+where K: Debug, V: Debug, A: Allocator {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        f.write_str(Str::new("{"))?;
+        mut first: boolean = true;
+        for (entry in this.entries()) {
+            if (!first) { f.write_str(Str::new(", "))?; }
+            first = false;
+            entry.first.fmt(f)?;
+            f.write_str(Str::new(": "))?;
+            entry.second.fmt(f)?;
+        }
+        return f.write_str(Str::new("}"));
+    }
+}
+
+// The ranges render as they are written: `1..5`, `1..=5`, `1..`, `..5`, `..`.
+// The bounds are formatted through pointers: a generic value field's `.fmt`
+// is ambiguous between `Display` and `Debug`, a pointer's is not.
+
+implement<T> trait Display for struct Range<T>
+where T: Display {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        const start: const T* = &this.start;
+        start.fmt(f)?;
+        f.write_str(Str::new(".."))?;
+        const end: const T* = &this.end;
+        return end.fmt(f);
+    }
+}
+
+implement<T> trait Debug for struct Range<T>
+where T: Debug {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        const start: const T* = &this.start;
+        start.fmt(f)?;
+        f.write_str(Str::new(".."))?;
+        const end: const T* = &this.end;
+        return end.fmt(f);
+    }
+}
+
+implement<T> trait Display for struct RangeInclusive<T>
+where T: Display {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        const start: const T* = &this.start;
+        start.fmt(f)?;
+        f.write_str(Str::new("..="))?;
+        const end: const T* = &this.end;
+        return end.fmt(f);
+    }
+}
+
+implement<T> trait Debug for struct RangeInclusive<T>
+where T: Debug {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        const start: const T* = &this.start;
+        start.fmt(f)?;
+        f.write_str(Str::new("..="))?;
+        const end: const T* = &this.end;
+        return end.fmt(f);
+    }
+}
+
+implement<T> trait Display for struct RangeFrom<T>
+where T: Display {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        const start: const T* = &this.start;
+        start.fmt(f)?;
+        return f.write_str(Str::new(".."));
+    }
+}
+
+implement<T> trait Debug for struct RangeFrom<T>
+where T: Debug {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        const start: const T* = &this.start;
+        start.fmt(f)?;
+        return f.write_str(Str::new(".."));
+    }
+}
+
+implement<T> trait Display for struct RangeTo<T>
+where T: Display {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        f.write_str(Str::new(".."))?;
+        const end: const T* = &this.end;
+        return end.fmt(f);
+    }
+}
+
+implement<T> trait Debug for struct RangeTo<T>
+where T: Debug {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        f.write_str(Str::new(".."))?;
+        const end: const T* = &this.end;
+        return end.fmt(f);
+    }
+}
+
+implement trait Display for struct RangeFull {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        return f.write_str(Str::new(".."));
+    }
+}
+
+implement trait Debug for struct RangeFull {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        return f.write_str(Str::new(".."));
+    }
+}
+
+// Box, Rc and Arc print as the value they own: the pointer is how the
+// value is held, not part of what it is.
+
+implement<T, A> trait Display for struct Box<T, A>
+where T: Display, A: Allocator {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        return this.get_reference().fmt(f);
+    }
+}
+
+implement<T, A> trait Debug for struct Box<T, A>
+where T: Debug, A: Allocator {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        return this.get_reference().fmt(f);
+    }
+}
+
+implement<T, A> trait Display for struct Rc<T, A>
+where T: Display, A: Allocator {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        return this.get_reference().fmt(f);
+    }
+}
+
+implement<T, A> trait Debug for struct Rc<T, A>
+where T: Debug, A: Allocator {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        return this.get_reference().fmt(f);
+    }
+}
+
+implement<T, A> trait Display for struct Arc<T, A>
+where T: Display, A: Allocator {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        return this.get_reference().fmt(f);
+    }
+}
+
+implement<T, A> trait Debug for struct Arc<T, A>
+where T: Debug, A: Allocator {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        return this.get_reference().fmt(f);
     }
 }
 

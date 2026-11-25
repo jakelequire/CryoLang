@@ -24,13 +24,16 @@ import std::collections::array::{ Array };
 import std::collections::hashmap::{ HashMap };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
+import std::fmt::display::{ Debug, Display, Formatter };
+import std::fmt::error::{ FormatError };
+import std::json::serializer;
 
 /// JSON's single number type, split by source representation so
 /// integers round-trip exactly. `Int` covers signed values that fit
 /// `i64`; `UInt` carries values in `(i64::MAX, u64::MAX]`; everything
 /// else (decimals, exponents, NaN-shaped inputs the parser accepts as
 /// floats) is `Float`.
-public type enum JsonNumber {
+public type enum JsonNumber with [Debug] {
     Int(i64);
     UInt(u64);
     Float(f64);
@@ -439,4 +442,49 @@ implement trait Drop for struct JsonObject {
 /// and `Array<JsonValue>::drop` releases each element.
 implement trait Drop for enum JsonValue {
     drop(mut &this) -> void { }
+}
+
+/// The compact JSON text, as `serializer::stringify` writes it:
+/// `{"name":"cryo","tags":[1,2]}`.
+implement trait Display for enum JsonValue {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        const text: String = serializer::stringify(this);
+        return f.write_str(text.as_str());
+    }
+}
+
+/// The tree, each node named by its variant:
+/// `Object({"tags": Array([Number(Int(1))])})`.
+implement trait Debug for enum JsonValue {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        match (&this) {
+            JsonValue::Null => { return f.write_str(Str::new("Null")); }
+            JsonValue::Bool(value) => { return f.debug_tuple("Bool").field(value).finish(); }
+            JsonValue::Number(value) => { return f.debug_tuple("Number").field(value).finish(); }
+            JsonValue::String(value) => { return f.debug_tuple("String").field(value).finish(); }
+            JsonValue::Array(value) => { return f.debug_tuple("Array").field(value).finish(); }
+            JsonValue::Object(value) => { return f.debug_tuple("Object").field(value).finish(); }
+        }
+    }
+}
+
+/// The entries in insertion order, each value as its tree:
+/// `{"name": String("cryo")}`.
+implement trait Debug for struct JsonObject {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        f.write_str(Str::new("{"))?;
+        for (mut i: i64 = 0; i < this.length(); i++) {
+            if (i > 0) { f.write_str(Str::new(", "))?; }
+            match (this.key_at(i)) {
+                Option::Some(key) => { (Debug for Str)::fmt(&key, f)?; }
+                Option::None => { }
+            }
+            f.write_str(Str::new(": "))?;
+            match (this.value_at(i)) {
+                Option::Some(value) => { (Debug for JsonValue)::fmt(value, f)?; }
+                Option::None => { }
+            }
+        }
+        return f.write_str(Str::new("}"));
+    }
 }

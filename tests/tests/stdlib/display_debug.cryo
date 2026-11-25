@@ -1,0 +1,202 @@
+///! `Display` and `Debug` on the standard library's own types: the
+///! collections, ranges and smart pointers print their contents, a path its
+///! text, a JSON value its compact text or its tree, and the time, HTTP,
+///! address and lock types what they hold.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::DisplayDebug;
+
+import std::alloc::{ Arc, Box, GlobalAllocator, Rc };
+import std::collections::{ Array, BTreeMap, BTreeSet, Deque, Str, String };
+import std::core::cmp::{ Ordering };
+import std::core::ops::{ Range, RangeFrom, RangeFull, RangeInclusive, RangeTo };
+import std::core::slice::{ Slice };
+import std::fs::{ FileType, Metadata, Path, PathBuf };
+import std::io::{ IoErrorKind };
+import std::json::{ JsonValue };
+import std::json::parser;
+import std::net::{ IpAddress, IpV4Address, IpV6Address, SocketAddress, Url };
+import std::net::http::headers::{ Headers };
+import std::net::http::method::{ Method };
+import std::net::http::request::{ Request };
+import std::net::http::response::{ Response };
+import std::net::http::status::{ StatusCode };
+import std::sync::{ Mutex, MutexGuard };
+import std::time::{ DateTime, Instant, SystemTime };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_equal };
+
+![test]
+function an_ordering_debugs_as_its_variant() -> Result<(), TestError> {
+    expect_equal(f"{Ordering::Less:?}".as_str(), Str::new("Less"))?;
+    expect_equal(f"{Ordering::Equal:?}".as_str(), Str::new("Equal"))?;
+    expect_equal(f"{Ordering::Greater:?}".as_str(), Str::new("Greater"))?;
+    return Result::Ok(());
+}
+
+![test]
+function ranges_print_as_they_are_written() -> Result<(), TestError> {
+    const range: Range<i64> = Range::new(1, 5);
+    expect_equal(f"{range}".as_str(), Str::new("1..5"))?;
+    expect_equal(f"{range:?}".as_str(), Str::new("1..5"))?;
+    const inclusive: RangeInclusive<i64> = RangeInclusive::new(1, 5);
+    expect_equal(f"{inclusive}".as_str(), Str::new("1..=5"))?;
+    const from: RangeFrom<i64> = RangeFrom::new(3);
+    expect_equal(f"{from:?}".as_str(), Str::new("3.."))?;
+    const to: RangeTo<i64> = RangeTo::new(4);
+    expect_equal(f"{to}".as_str(), Str::new("..4"))?;
+    const full: RangeFull = RangeFull::new();
+    expect_equal(f"{full}".as_str(), Str::new(".."))?;
+    return Result::Ok(());
+}
+
+![test]
+function a_slice_prints_its_elements() -> Result<(), TestError> {
+    mut numbers: Array<i64> = Array::new();
+    numbers.push(1);
+    numbers.push(2);
+    numbers.push(3);
+    const view: &Slice<i64> = numbers.as_slice();
+    expect_equal(f"{view}".as_str(), Str::new("[1, 2, 3]"))?;
+    mut words: Array<Str> = Array::new();
+    words.push(Str::new("a"));
+    words.push(Str::new("b"));
+    const word_view: &Slice<Str> = words.as_slice();
+    expect_equal(f"{word_view}".as_str(), Str::new("[a, b]"))?;
+    expect_equal(f"{word_view:?}".as_str(), Str::new("[\"a\", \"b\"]"))?;
+    return Result::Ok(());
+}
+
+![test]
+function a_deque_prints_front_to_back() -> Result<(), TestError> {
+    mut queue: Deque<i64> = Deque::new();
+    queue.push_back(1);
+    queue.push_back(2);
+    queue.push_front(0);
+    expect_equal(f"{queue}".as_str(), Str::new("[0, 1, 2]"))?;
+    expect_equal(f"{queue:?}".as_str(), Str::new("[0, 1, 2]"))?;
+    return Result::Ok(());
+}
+
+![test]
+function btree_collections_print_in_key_order() -> Result<(), TestError> {
+    mut set: BTreeSet<i64> = BTreeSet::new();
+    set.insert(3);
+    set.insert(1);
+    set.insert(2);
+    expect_equal(f"{set}".as_str(), Str::new("{1, 2, 3}"))?;
+    expect_equal(f"{set:?}".as_str(), Str::new("{1, 2, 3}"))?;
+    mut map: BTreeMap<i64, Str> = BTreeMap::new();
+    map.insert(2, Str::new("b"));
+    map.insert(1, Str::new("a"));
+    expect_equal(f"{map}".as_str(), Str::new("{1: a, 2: b}"))?;
+    expect_equal(f"{map:?}".as_str(), Str::new("{1: \"a\", 2: \"b\"}"))?;
+    return Result::Ok(());
+}
+
+![test]
+function box_rc_and_arc_print_their_value() -> Result<(), TestError> {
+    const boxed: Box<i64> = Box::new(5);
+    expect_equal(f"{boxed}".as_str(), Str::new("5"))?;
+    expect_equal(f"{boxed:?}".as_str(), Str::new("5"))?;
+    const counted: Rc<Str> = Rc::new(Str::new("x"));
+    expect_equal(f"{counted}".as_str(), Str::new("x"))?;
+    expect_equal(f"{counted:?}".as_str(), Str::new("\"x\""))?;
+    const shared: Arc<Str> = Arc::new(Str::new("y"));
+    expect_equal(f"{shared}".as_str(), Str::new("y"))?;
+    expect_equal(f"{shared:?}".as_str(), Str::new("\"y\""))?;
+    return Result::Ok(());
+}
+
+![test]
+function a_path_displays_its_text_and_debugs_it_quoted() -> Result<(), TestError> {
+    const path: Path = Path::new("src/main.cryo");
+    expect_equal(f"{path}".as_str(), Str::new("src/main.cryo"))?;
+    expect_equal(f"{path:?}".as_str(), Str::new("\"src/main.cryo\""))?;
+    const owned: PathBuf = PathBuf::from(Str::new("my \"notes\".txt"));
+    expect_equal(f"{owned}".as_str(), Str::new("my \"notes\".txt"))?;
+    expect_equal(f"{owned:?}".as_str(), Str::new("\"my \\\"notes\\\".txt\""))?;
+    return Result::Ok(());
+}
+
+![test]
+function file_types_and_metadata_debug_what_they_read() -> Result<(), TestError> {
+    expect_equal(f"{FileType::Directory:?}".as_str(), Str::new("Directory"))?;
+    const metadata: Metadata = Path::new(".").metadata().unwrap();
+    const text: String = f"{metadata:?}";
+    expect(text.as_str().starts_with(&Str::new("Metadata { file_type: Directory, length: ")),
+           Str::new("a directory's metadata debugs its type first"))?;
+    expect(text.as_str().contains(&Str::new(", modified_seconds: ")),
+           Str::new("the modification time is named"))?;
+    return Result::Ok(());
+}
+
+![test]
+function a_json_value_displays_compact_and_debugs_as_a_tree() -> Result<(), TestError> {
+    const value: JsonValue =
+        parser::parse(Str::new("{\"name\": \"cryo\", \"tags\": [1, true, null]}")).unwrap();
+    expect_equal(f"{value}".as_str(), Str::new("{\"name\":\"cryo\",\"tags\":[1,true,null]}"))?;
+    expect_equal(f"{value:?}".as_str(),
+        Str::new("Object({\"name\": String(\"cryo\"), \"tags\": Array([Number(Int(1)), Bool(true), Null])})"))?;
+    return Result::Ok(());
+}
+
+![test]
+function clock_readings_debug_their_fields() -> Result<(), TestError> {
+    const wall: SystemTime = SystemTime::from_unix_seconds(1700000000);
+    expect_equal(f"{wall:?}".as_str(), Str::new("SystemTime { unix_seconds: 1700000000, nanoseconds: 0 }"))?;
+    const now: Instant = Instant::now();
+    expect(f"{now:?}".as_str().starts_with(&Str::new("Instant { seconds: ")),
+           Str::new("an instant debugs its raw reading"))?;
+    expect_equal(f"{DateTime::from_unix_seconds(0):?}".as_str(), Str::new("1970-01-01T00:00:00Z"))?;
+    return Result::Ok(());
+}
+
+![test]
+function http_messages_debug_their_fields() -> Result<(), TestError> {
+    mut headers: Headers = Headers::new();
+    headers.append(Str::new("Host"), Str::new("example.com"));
+    headers.append(Str::new("Accept"), Str::new("*/*"));
+    expect_equal(f"{headers:?}".as_str(), Str::new("{\"host\": \"example.com\", \"accept\": \"*/*\"}"))?;
+    const request: Request = Request::new(Method::Get, Str::new("/"));
+    expect_equal(f"{request:?}".as_str(), Str::new(
+        "Request { method: Get, path: \"/\", version: \"HTTP/1.1\", headers: {}, params: {}, body_length: 0 }"))?;
+    const response: Response = Response::new(StatusCode::not_found());
+    expect_equal(f"{response:?}".as_str(), Str::new(
+        "Response { status: 404 Not Found, version: \"HTTP/1.1\", headers: {}, body_length: 0 }"))?;
+    expect_equal(f"{Method::Post:?}".as_str(), Str::new("Post"))?;
+    expect_equal(f"{StatusCode::ok():?}".as_str(), Str::new("200 OK"))?;
+    return Result::Ok(());
+}
+
+![test]
+function addresses_debug_as_their_text() -> Result<(), TestError> {
+    expect_equal(f"{IpV4Address::localhost():?}".as_str(), Str::new("127.0.0.1"))?;
+    expect_equal(f"{IpV6Address::localhost():?}".as_str(), Str::new("::1"))?;
+    expect_equal(f"{IpAddress::V6(IpV6Address::localhost()):?}".as_str(), Str::new("::1"))?;
+    expect_equal(f"{SocketAddress::localhost_v6(8080):?}".as_str(), Str::new("[::1]:8080"))?;
+    const url: Url = Url::parse(Str::new("https://example.com/a?b#c")).unwrap();
+    expect_equal(f"{url:?}".as_str(), Str::new("https://example.com/a?b#c"))?;
+    return Result::Ok(());
+}
+
+![test]
+function an_io_error_kind_debugs_as_its_variant() -> Result<(), TestError> {
+    expect_equal(f"{IoErrorKind::NotFound:?}".as_str(), Str::new("NotFound"))?;
+    return Result::Ok(());
+}
+
+![test]
+function a_mutex_debugs_without_taking_its_lock() -> Result<(), TestError> {
+    const mutex: Mutex<i64> = Mutex::new(7);
+    const _guard: MutexGuard<i64, GlobalAllocator> = mutex.lock();
+    expect_equal(f"{mutex:?}".as_str(), Str::new("Mutex { .. }"))?;
+    return Result::Ok(());
+}
+
+![test]
+function a_string_literal_debugs_quoted_and_escaped() -> Result<(), TestError> {
+    const text: string = "say \"hi\"\n";
+    expect_equal(f"{text:?}".as_str(), Str::new("\"say \\\"hi\\\"\\n\""))?;
+    return Result::Ok(());
+}
