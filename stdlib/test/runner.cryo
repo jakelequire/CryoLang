@@ -48,7 +48,8 @@
 ///! it and the usage to stderr and exits 2 without running anything.
 ///!
 ///! Exit code is 0 if every selected test passed (or was expected to
-///! panic and did). Any single failure -> 1.
+///! panic and did). Any single failure -> 1. Patterns that no test's name
+///! matches -> `NO_TEST_MATCHES_EXIT_CODE`.
 
 namespace std::test::runner;
 
@@ -90,6 +91,12 @@ import std::test::error::{ TestError };
 
 private const RULE_HEAVY: string = "================================================================================";
 private const RULE_THIN:  string = "--------------------------------------------------------------------------------";
+
+/// The exit code of a run whose patterns match no test's name. It is
+/// neither a pass nor a failure, so `cryo test`, whose patterns also select
+/// compile-fail files and projects, can tell a unit suite that selected
+/// nothing from one that failed.
+public const NO_TEST_MATCHES_EXIT_CODE: i32 = 3;
 
 // Live parallel feed tuning. `STALL_REPORT_SECS`: how long the feed may go
 // without a single test completing before it prints the in-flight "still
@@ -1582,12 +1589,17 @@ private type struct TestRunner {
         libc::printf("%s\n\n", RULE_HEAVY);
     }
 
-    /// Print the framed trailing summary block.
-    private print_summary(&this) -> void {
-        const verdict: Styled<Str> = if (this.counts.failed == 0) {
-            this.opts.pass_style.paint(Str::new("PASS"))
+    /// Print the framed trailing summary block. `matched_nothing`: the run's
+    /// patterns selected no test, which is no verdict on any test.
+    private print_summary(&this, matched_nothing: boolean) -> void {
+        const verdict: Styled<Str> = if (matched_nothing) {
+            this.opts.fail_style.paint(Str::new("NO TEST MATCHES THE PATTERNS"))
         } else {
-            this.opts.fail_style.paint(Str::new("FAIL"))
+            if (this.counts.failed == 0) {
+                this.opts.pass_style.paint(Str::new("PASS"))
+            } else {
+                this.opts.fail_style.paint(Str::new("FAIL"))
+            }
         };
         libc::printf("\n%s\n", RULE_HEAVY);
         libc::printf("  unit test summary\n");
@@ -1643,7 +1655,11 @@ private type struct TestRunner {
         // are no-ops here.
         this.report_finalize();
 
-        this.print_summary();
+        // Patterns that no test's name holds select nothing: that is not a
+        // pass, or a misspelt pattern reads exactly like a green run.
+        const matched_nothing: boolean = !this.opts.filters.is_empty() && to_run == 0;
+        this.print_summary(matched_nothing);
+        if (matched_nothing) { return NO_TEST_MATCHES_EXIT_CODE; }
         return if (this.counts.failed == 0) { 0 } else { 1 };
     }
 }

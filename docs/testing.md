@@ -236,6 +236,11 @@ compile-fail file when its file name does, a project when its directory's
 name does. With none, everything runs. `cryo test Parser E0301 json_config`
 runs the parser's unit tests, the compile-fail files for E0301 and the
 `json_config` project in one run, with one build of the unit suite.
+Patterns that select nothing in any suite the run reads fail it, so a
+misspelt one is not a green run of nothing: `cryo test Parsr` prints
+``error: no unit test, compile-fail file or project matches `Parsr` `` and
+exits 1. A unit test's name is its namespace path and function name
+(`TextConversions::...`), not its file's name.
 
 | Flag | Effect |
 | --- | --- |
@@ -256,7 +261,10 @@ Environment overrides (useful in CI): `CRYO_TEST_TIMEOUT`, `CRYO_TEST_FORMAT`,
 
 A built test binary takes the same flags, and `-j N` for `--jobs`. A flag it
 does not know is an error: it prints the flag and its usage to stderr and exits
-with code 2 before running anything.
+with code 2 before running anything. Given patterns that no test's name
+matches, it exits with code 3 (`std::test::runner::NO_TEST_MATCHES_EXIT_CODE`),
+which `cryo test` reads as a unit suite that selected nothing rather than one
+that failed.
 
 `cryo test` hands every option the compiler declares no flag for to the test
 binary as written - `cryo test --no-capture` reaches the runner's

@@ -34,6 +34,7 @@ import std::sync::atomic::{ Atomic, MemoryOrder };
 import std::json::parser;
 import std::json::value;
 import std::json::serializer;
+import std::test::runner::{ NO_TEST_MATCHES_EXIT_CODE };
 import cli;
 import std::ffi::libc;
 import compiler::codegen::llvm_types;
@@ -2080,6 +2081,9 @@ type struct Executor {
 
         mut exit_code: int = 0;
         mut unit_ok: boolean = true;
+        // The unit suite's patterns matched no test's name: the same patterns
+        // may still select a compile-fail file or a project.
+        mut unit_matched_nothing: boolean = false;
         if (runs_unit) {
             Log::debug(LogArea::Driver, f"running {cmd.as_str()}");
             // Flush parent stdio before spawning so the build's own output lands
@@ -2090,7 +2094,8 @@ type struct Executor {
                 fmt::eprintln(f"Error: failed to spawn '{test_binary.as_str()}'");
                 return 1;
             }
-            exit_code = status as int;
+            unit_matched_nothing = status == NO_TEST_MATCHES_EXIT_CODE;
+            exit_code = if (unit_matched_nothing) { 0 } else { status as int };
             unit_ok = exit_code == 0;
         }
 
@@ -2138,6 +2143,31 @@ type struct Executor {
             }
         }
 
+        // Patterns that select nothing in any suite the run reads fail it:
+        // a misspelt pattern would otherwise run nothing and pass.
+        const selected_nothing: boolean = patterns.length() > 0 && !args.has_flag("list")
+            && (!runs_unit || unit_matched_nothing) && neg_ran == 0 && proj_ran == 0;
+        if (selected_nothing) {
+            mut suites: [String] = [];
+            if (runs_unit)     { suites.push(String::from_str(Str::new("unit test"))); }
+            if (runs_negative) { suites.push(String::from_str(Str::new("compile-fail file"))); }
+            if (runs_projects) { suites.push(String::from_str(Str::new("project"))); }
+            mut named: String = String::new();
+            for (mut i: i64 = 0; i < suites.length(); i++) {
+                if (i > 0) { named.push(Str::new(if (i == suites.length() - 1) { " or " } else { ", " })); }
+                named.push(suites[i].as_str());
+            }
+            mut written: String = String::new();
+            for (mut i: i64 = 0; i < patterns.length(); i++) {
+                if (i > 0) { written.push(Str::new(", ")); }
+                written.push(f"`{patterns[i].as_str()}`".as_str());
+            }
+            const which: string = if (patterns.length() == 1) { "" } else { "any of " };
+            libc::fflush(null);
+            fmt::eprintln(f"error: no {named.as_str()} matches {which}{written.as_str()}");
+            exit_code = 1;
+        }
+
         // Unified OVERALL footer: a single verdict line that quotes every
         // suite the run selected, sitting beneath the per-suite summary
         // blocks the suites already printed.  A suite is quoted when it
@@ -2146,7 +2176,7 @@ type struct Executor {
         // run happened).
         if (!args.has_flag("list")) {
             const overall_pass: boolean =
-                unit_ok && (neg_failures == 0) && (proj_failures == 0);
+                unit_ok && (neg_failures == 0) && (proj_failures == 0) && !selected_nothing;
             const overall_active: boolean = Executor::neg_color_active(col_choice);
             fmt::printf("\n%s\n", TEST_RULE_HEAVY);
             if (overall_active && overall_pass) {
@@ -2158,7 +2188,7 @@ type struct Executor {
             }
             mut quoted: String = String::new();
             if (runs_unit) {
-                const unit_label: string = if (unit_ok) { "ok" } else { "failed" };
+                const unit_label: string = if (unit_matched_nothing) { "none matched" } else { if (unit_ok) { "ok" } else { "failed" } };
                 quoted.push(fmt::format("; unit: %s", unit_label).as_str());
             }
             if (neg_ran > 0 || suite == "compile-fail") {
