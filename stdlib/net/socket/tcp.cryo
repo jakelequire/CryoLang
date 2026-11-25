@@ -26,7 +26,8 @@
 ///! ```
 ///!
 ///! The methods are built on the futures below, which they lend the socket to
-///! for the length of one operation.
+///! for the length of one operation. The futures are internal to the standard
+///! library: a program awaits the methods.
 ///!
 ///! ## Async operations
 ///!
@@ -34,9 +35,10 @@
 ///! `TcpRead`, `TcpWrite`. Each attempts its syscall on a **non-blocking**
 ///! socket, and if the socket is not ready it registers the polling task's waker
 ///! with the current `Reactor` and returns `Pending`: the task sleeps until the
-///! OS reports readiness, and the retry then succeeds. Put a socket in
-///! non-blocking mode (`set_nonblocking(true)`) before using it this way —
-///! `TcpConnect` and `TcpAccept` do it for the sockets they produce.
+///! OS reports readiness, and the retry then succeeds. A socket must be
+///! non-blocking for this — `bind`, `TcpConnect` and `TcpAccept` leave the
+///! sockets they produce so, and `set_nonblocking(true)` does it for one
+///! adopted through `from_file_descriptor`.
 ///!
 ///! An operation takes everything it works on — the handle, and for a read or a
 ///! write the buffer too — and hands it back in its output (`TcpIo`,
@@ -95,19 +97,19 @@ private function tcp_socket_for(addr: &SocketAddress) -> i32 {
 
 // TcpStream: connected socket
 
-/// A connected TCP socket. Comes from `TcpConnect` (client) or `TcpAccept`
-/// (server), both of which leave it in non-blocking mode; bytes move through
-/// the `TcpRead`/`TcpWrite` futures, or through `BufferedStream<TcpStream>` via
-/// its `AsyncTransport` implementation. Owns its socket and closes it on
+/// A connected TCP socket. Comes from `TcpStream::connect` (client) or
+/// `listener.accept()` (server), both of which leave it in non-blocking mode;
+/// bytes move through `read_some` and `write_all`, or through
+/// `BufferedStream<TcpStream>` via its `AsyncTransport` implementation. Owns its socket and closes it on
 /// `drop`. A stream made with `from_file_descriptor(-1)` is a closed placeholder that
 /// `drop` leaves alone.
 public type struct TcpStream {
     private fd: i32;
 
     /// Wrap a raw file descriptor. The caller transfers ownership;
-    /// `drop` will close it. Used by `TcpAccept` to hand over the socket it
-    /// produced, and to leave a closed placeholder behind when a future takes
-    /// the real one.
+    /// `drop` will close it. Adopts a socket made or inherited outside the
+    /// library; call `set_nonblocking(true)` on it before awaiting its
+    /// methods. A negative descriptor makes a closed placeholder.
     public static from_file_descriptor(sock: i32) -> TcpStream {
         return TcpStream { fd: sock };
     }
@@ -131,9 +133,9 @@ public type struct TcpStream {
     }
 
     /// Put the socket in non-blocking mode, where reads and writes report
-    /// `WouldBlock` instead of sleeping the calling thread. Required before this
-    /// stream is used with `TcpRead`/`TcpWrite` — a blocking socket would stall
-    /// an executor's whole worker thread inside the syscall.
+    /// `WouldBlock` instead of sleeping the calling thread. Required before
+    /// this stream's methods are awaited — a blocking socket would stall an
+    /// executor's whole worker thread inside the syscall.
     public set_nonblocking(mut &this, on: boolean) -> Result<(), IoError> {
         if (sys::os_set_nonblocking(this.fd, on) < 0) {
             return Result::Err(sys::last_io_error());
@@ -283,7 +285,8 @@ public type struct TcpListener {
     }
 
     /// Wrap a raw listening descriptor. The caller transfers ownership;
-    /// `drop` closes it. Used by `TcpAccept` to hand the listener back.
+    /// `drop` closes it. Call `set_nonblocking(true)` on an adopted listener
+    /// before awaiting `accept`.
     public static from_file_descriptor(sock: i32) -> TcpListener {
         return TcpListener { fd: sock };
     }
@@ -295,7 +298,7 @@ public type struct TcpListener {
 
     /// Put the listener in non-blocking mode, where `accept` returns
     /// `WouldBlock` instead of sleeping the calling thread. Required before
-    /// this listener is used with `TcpAccept`.
+    /// `accept` is awaited.
     public set_nonblocking(mut &this, on: boolean) -> Result<(), IoError> {
         if (sys::os_set_nonblocking(this.fd, on) < 0) {
             return Result::Err(sys::last_io_error());
@@ -341,7 +344,7 @@ implement trait Drop for struct TcpListener {
 /// refuses to let a field be moved out of the outcome while the outcome itself
 /// would still drop it. `take_stream` swaps in a closed placeholder, leaving
 /// nothing behind to close.
-public type struct TcpIo {
+internal type struct TcpIo {
     private stream: TcpStream;
     private buf:    Array<u8>;
     private result: Result<i64, IoError>;
@@ -375,7 +378,7 @@ public type struct TcpIo {
 /// The outcome of an async `accept`: the listener handed back, plus the
 /// connection it produced. Both come out through their `take_*` methods, for
 /// the same reason as `TcpIo::take_stream`.
-public type struct TcpAccepted {
+internal type struct TcpAccepted {
     private listener: TcpListener;
     private result:   Result<TcpStream, IoError>;
 
@@ -408,7 +411,7 @@ public type struct TcpAccepted {
 ///
 /// Dropping the future before it completes closes the connection and releases
 /// the buffer: cancelling a read on a socket nobody else holds destroys it.
-public type struct TcpRead {
+internal type struct TcpRead {
     private stream: TcpStream;
     private buf:    Array<u8>;
     private rt: mut Reactor*;   // set while parked; null once the operation is over
@@ -486,7 +489,7 @@ implement trait Drop for struct TcpRead {
 /// starts another write for the remainder, which is why the buffer comes back
 /// untouched. Owns the socket and the buffer exactly as `TcpRead` does, and for
 /// the same reason.
-public type struct TcpWrite {
+internal type struct TcpWrite {
     private stream: TcpStream;
     private buf:    Array<u8>;
     private rt: mut Reactor*;
@@ -543,7 +546,7 @@ implement trait Drop for struct TcpWrite {
 /// listener's non-blocking mode, so it is set here — it is about to be used with
 /// these same futures. Owns the listener for the duration and hands it back in
 /// the `TcpAccepted`, so a server loop starts the next accept from that.
-public type struct TcpAccept {
+internal type struct TcpAccept {
     private listener: TcpListener;
     private rt: mut Reactor*;
 
@@ -607,7 +610,7 @@ implement trait Drop for struct TcpAccept {
 /// handshake started when the future is created; each poll asks the OS whether
 /// it finished, parking on writability in between. The socket is closed if the
 /// future is dropped before it completes.
-public type struct TcpConnect {
+internal type struct TcpConnect {
     private fd:      i32;         // < 0 once handed over, or if it could not be opened
     private addr:    [u8; 28];      // packed sockaddr, replayed on POSIX to poll the connect
     private addrlen: u32;

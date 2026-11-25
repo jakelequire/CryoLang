@@ -6,10 +6,9 @@
 ///! One context can produce many streams; `SSL_new` reference-counts
 ///! the `SSL_CTX`, so a stream outlives the connector if it has to.
 ///!
-///! Handshakes are async. `connect` / `accept` run one to completion; the
-///! `start_connect` / `start_accept` pair stops one step short and hands back
-///! the `TlsHandshake` future, for a caller that has to own it (to select over
-///! it, or to give it a deadline). There is no blocking form: driving a
+///! Handshakes are async. `connect` / `accept` run one to completion, and the
+///! future each returns can be raced or given a deadline like any other
+///! (`Futures::select`, `Futures::timeout`). There is no blocking form: driving a
 ///! handshake by spinning on `WANT_READ`/`WANT_WRITE` burns a thread per
 ///! connection, and a bidirectional handshake on blocking sockets cannot run
 ///! both sides on one thread at all.
@@ -164,10 +163,10 @@ public type struct TlsConnector {
     ///
     /// Everything up to the first `SSL_connect` happens here rather than on the
     /// first poll, so a setup failure is reported to the caller directly instead
-    /// of having to be carried inside the future. Callers wanting the whole
-    /// handshake in one step want `connect`; this exists for a caller that has
-    /// to own the future itself (to select over it, or to time it out).
-    public start_connect(&this, stream: TcpStream, hostname: Str) -> Result<TlsHandshake, IoError> {
+    /// of having to be carried inside the future. `connect` awaits it; a
+    /// caller that selects over a handshake or gives it a deadline passes
+    /// the future `connect` returns to `Futures::select` or `Futures::timeout`.
+    internal start_connect(&this, stream: TcpStream, hostname: Str) -> Result<TlsHandshake, IoError> {
         mut inner: TcpStream = stream;
         match (inner.set_nonblocking(true)) {
             Result::Ok(_)  => { }
@@ -260,7 +259,7 @@ public type struct TlsAcceptor {
     /// Mint the `SSL*` and hand back the handshake future, the server-side
     /// mirror of `start_connect`. A socket handed over by `TcpAccept` is
     /// already non-blocking, but it is set here rather than assumed.
-    public start_accept(&this, stream: TcpStream) -> Result<TlsHandshake, IoError> {
+    internal start_accept(&this, stream: TcpStream) -> Result<TlsHandshake, IoError> {
         mut inner: TcpStream = stream;
         match (inner.set_nonblocking(true)) {
             Result::Ok(_)  => { }

@@ -29,16 +29,16 @@ import std::collections::str::{ Str };
 import std::collections::string::{ String };
 import std::collections::array::{ Array };
 import std::future;
-import std::io::error;
+import std::io::error::{ IoError, IoErrorKind };
 import std::io::traits;
 import std::io::buffered::{ BufferedStream };
 import std::net::address::socket_address::{ SocketAddress };
-import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
+import std::net::socket::tcp::{ TcpListener, TcpStream };
 import std::net::tls::context::{ TlsAcceptor, TlsConnector };
 import std::net::tls::stream::{ TlsStream };
-import std::net::tls::future::{ TlsHandshake };
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect_equal };
+import std::time::duration::{ Duration };
 import std::future::combinator::{ Futures };
 import std::future::executor::{ Executor };
 
@@ -63,22 +63,14 @@ function ntls_bytes_eq(a: &Array<u8>, text: string) -> boolean {
 /// header line plus exactly `len` body bytes and answer with the same framing.
 /// Both reads come out of the one connection buffer.
 async function ntls_serve(listener: TcpListener, acceptor: TlsAcceptor) -> i64 {
-    mut acc: TcpAccepted = await TcpAccept::start(listener);
-    mut _lst: TcpListener = acc.take_listener();
-
-    mut sock: TcpStream = TcpStream::from_file_descriptor(-1);
-    match (acc.take_result()) {
-        Result::Ok(s)  => { sock = s; }
+    mut server: TcpListener = listener;
+    const sock: TcpStream = match (await server.accept()) {
+        Result::Ok(s)  => { s }
         Result::Err(_) => { return -1; }
-    }
-
-    mut ac: TlsAcceptor = acceptor;
-    mut hs: TlsHandshake = match (ac.start_accept(sock)) {
-        Result::Ok(h)  => { h }
-        Result::Err(_) => { return -2; }
     };
 
-    mut tls: TlsStream = match (await hs) {
+    const ac: TlsAcceptor = acceptor;
+    const tls: TlsStream = match (await ac.accept(sock)) {
         Result::Ok(t)  => { t }
         Result::Err(_) => { return -3; }
     };
@@ -106,19 +98,13 @@ async function ntls_serve(listener: TcpListener, acceptor: TlsAcceptor) -> i64 {
 }
 
 async function ntls_client(port: u16, connector: TlsConnector) -> i64 {
-    mut sock: TcpStream = TcpStream::from_file_descriptor(-1);
-    match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
-        Result::Ok(s)  => { sock = s; }
+    const sock: TcpStream = match (await TcpStream::connect(SocketAddress::localhost_v4(port))) {
+        Result::Ok(s)  => { s }
         Result::Err(_) => { return -20; }
-    }
-
-    mut cn: TlsConnector = connector;
-    mut hs: TlsHandshake = match (cn.start_connect(sock, Str::new("localhost"))) {
-        Result::Ok(h)  => { h }
-        Result::Err(_) => { return -21; }
     };
 
-    mut tls: TlsStream = match (await hs) {
+    const cn: TlsConnector = connector;
+    const tls: TlsStream = match (await cn.connect(sock, Str::new("localhost"))) {
         Result::Ok(t)  => { t }
         Result::Err(_) => { return -22; }
     };
@@ -163,13 +149,12 @@ function tls_conn_framed_round_trip() -> Result<(), TestError> {
         Result::Err(_) => { return bail(Str::new("TlsConnector::new failed")); }
     };
 
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
+    const listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => {
             return bail(Str::new("bind 127.0.0.1:0 failed"));
         }
     };
-    listener.set_nonblocking(true)?;
     const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
         Result::Err(_) => {
@@ -182,18 +167,36 @@ function tls_conn_framed_round_trip() -> Result<(), TestError> {
     return expect_equal(r, 0 as i64);
 }
 
-/// Connect to `port` and set up the client side for `hostname`, without a
-/// handshake: 1 when `start_connect` accepts the name, 0 when it refuses.
+/// The client handshake for `hostname`, on a connector and a socket this
+/// future owns, so a deadline that drops it drops both.
+async function ntls_connect_owned(connector: TlsConnector, sock: TcpStream, hostname: String)
+        -> Result<TlsStream, IoError> {
+    const cn: TlsConnector = connector;
+    const name: String = hostname;
+    return await cn.connect(sock, name.as_str());
+}
+
+/// Connect to `port` and start the client side for `hostname` against a
+/// listener that never answers: 0 when `connect` refuses the name before any
+/// handshake (`InvalidInput`), 1 when it accepts the name and the handshake is
+/// still waiting on the peer when the deadline drops it.
 async function ntls_start_for(port: u16, connector: TlsConnector, hostname: String) -> i64 {
-    mut sock: TcpStream = TcpStream::from_file_descriptor(-1);
-    match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
-        Result::Ok(s)  => { sock = s; }
+    const sock: TcpStream = match (await TcpStream::connect(SocketAddress::localhost_v4(port))) {
+        Result::Ok(s)  => { s }
         Result::Err(_) => { return -1; }
-    }
-    mut cn: TlsConnector = connector;
-    match (cn.start_connect(sock, hostname.as_str())) {
-        Result::Ok(_)  => { return 1; }
-        Result::Err(_) => { return 0; }
+    };
+    match (await Futures::timeout(Duration::from_milliseconds(200),
+                                  ntls_connect_owned(connector, sock, hostname))) {
+        Result::Ok(outcome) => {
+            match (outcome) {
+                Result::Ok(_) => { return -2; }
+                Result::Err(e) => {
+                    if (e.kind == IoErrorKind::InvalidInput) { return 0; }
+                    return -3;
+                }
+            }
+        }
+        Result::Err(_) => { return 1; }
     }
 }
 
@@ -201,11 +204,10 @@ async function ntls_start_for(port: u16, connector: TlsConnector, hostname: Stri
 function tls_connect_refuses_a_name_it_cannot_set() -> Result<(), TestError> {
     // OpenSSL takes no server name longer than 255 bytes. Connecting anyway
     // would send none, and would verify the chain but not the name.
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
+    const listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
-    listener.set_nonblocking(true)?;
     const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
         Result::Err(_) => { return bail(Str::new("local_address failed")); }

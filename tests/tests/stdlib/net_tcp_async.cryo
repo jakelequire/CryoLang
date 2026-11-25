@@ -1,17 +1,14 @@
-///! Async TCP - `TcpConnect` / `TcpAccept` / `TcpRead` / `TcpWrite` over
-///! loopback, driven by a real `Executor` (worker pool + reactor).
+///! Async TCP - `TcpStream::connect`, `listener.accept()`, `read_some` and
+///! `write_all` over loopback, driven by a real `Executor` (worker pool +
+///! reactor).
 ///!
 ///! Every test binds an EPHEMERAL port (`:0`) and reads the kernel-assigned port
 ///! back via `local_address()`, so concurrent runs never collide.
 ///!
-///! What these cover that a hand-inspection cannot: the read and write futures
-///! OWN their buffer. A future is moved between polls, so a buffer named by a
-///! raw pointer into the caller's frame would be written through a stale
-///! address; handing the array in and getting it back is what removes that
-///! possibility. The round trip proves the transfer works, and the timeout test
-///! proves the cancellation path - a dropped read releases its reactor
-///! registration, closes its socket, and frees its buffer - so a cancelled
-///! operation leaves nothing behind.
+///! The round trip proves the bytes move both ways. The timeout test proves the
+///! cancellation path: a read dropped by `Futures::timeout` before anything
+///! arrives releases its reactor registration, closes its socket and frees its
+///! buffer, so a cancelled operation leaves nothing behind.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::NetTcpAsync;
@@ -21,10 +18,9 @@ import std::core::result::{ Result };
 import std::core::drop;
 import std::collections::str::{ Str };
 import std::future;
+import std::io::error::{ IoError };
 import std::net::address::socket_address::{ SocketAddress };
-import std::net::socket::tcp::{
-    TcpAccept, TcpAccepted, TcpConnect, TcpIo, TcpListener, TcpRead, TcpStream, TcpWrite
-};
+import std::net::socket::tcp::{ TcpListener, TcpStream };
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect_equal };
 import std::time;
@@ -39,32 +35,18 @@ import std::future::timer::{ Sleep };
 /// Accept one connection, read what arrives, echo it straight back. Yields the
 /// number of bytes echoed.
 async function serve_echo(listener: TcpListener) -> i64 {
-    mut acc: TcpAccepted = await TcpAccept::start(listener);
-    mut _lst: TcpListener = acc.take_listener();
-
-    mut stream: TcpStream = TcpStream::from_file_descriptor(-1);
-    match (acc.take_result()) {
-        Result::Ok(s)  => { stream = s; }
+    mut server: TcpListener = listener;
+    mut stream: TcpStream = match (await server.accept()) {
+        Result::Ok(s)  => { s }
         Result::Err(_) => { return -1; }
-    }
-
-    // Sized with `resize`, not `with_capacity`: an array exposes only
-    // `[0, length)`, so a capacity-only buffer has nothing to read into.
-    mut rbuf: Array<u8> = Array::<u8>::new();
-    rbuf.resize(64, 0);
-    mut rio: TcpIo = await TcpRead::start(stream, rbuf);
-    mut s2:  TcpStream  = rio.take_stream();
-    mut got: Array<u8>  = rio.take_buffer();
-    match (rio.outcome()) {
-        Result::Ok(_)  => { }
-        Result::Err(_) => { return -2; }
-    }
-
-    mut wio: TcpIo = await TcpWrite::start(s2, got);
-    mut _s3:   TcpStream = wio.take_stream();
-    mut _back: Array<u8> = wio.take_buffer();
-    match (wio.outcome()) {
-        Result::Ok(k)  => { return k as i64; }
+    };
+    const got: Array<u8> = match (await stream.read_some(64)) {
+        Result::Ok(bytes) => { bytes }
+        Result::Err(_)    => { return -2; }
+    };
+    const length: i64 = got.length();
+    match (await stream.write_all(got)) {
+        Result::Ok(_)  => { return length; }
         Result::Err(_) => { return -3; }
     }
 }
@@ -72,33 +54,23 @@ async function serve_echo(listener: TcpListener) -> i64 {
 /// Connect, send five bytes, read the echo back, and check both the length and
 /// the content survived the round trip.
 async function echo_client(port: u16) -> i64 {
-    mut stream: TcpStream = TcpStream::from_file_descriptor(-1);
-    match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
-        Result::Ok(s)  => { stream = s; }
+    mut stream: TcpStream = match (await TcpStream::connect(SocketAddress::localhost_v4(port))) {
+        Result::Ok(s)  => { s }
         Result::Err(_) => { return -10; }
-    }
+    };
 
     mut out: Array<u8> = Array::<u8>::new();
     out.push(72); out.push(69); out.push(76); out.push(76); out.push(79);
-    mut wio: TcpIo = await TcpWrite::start(stream, out);
-    mut s2:   TcpStream = wio.take_stream();
-    mut sent: Array<u8> = wio.take_buffer();
-    // A write hands the buffer back untouched, so a short write still has the
-    // bytes it has not sent.
-    const sent_len: u64 = sent.length() as u64;
-    if (sent_len != 5) { return -11; }
-    match (wio.outcome()) {
-        Result::Ok(k)  => { if (k != 5) { return -12; } }
+    match (await stream.write_all(out)) {
+        Result::Ok(_)  => { }
         Result::Err(_) => { return -13; }
     }
 
-    mut rbuf: Array<u8> = Array::<u8>::new();
-    rbuf.resize(64, 0);
-    mut rio: TcpIo = await TcpRead::start(s2, rbuf);
-    mut _s3: TcpStream = rio.take_stream();
-    // A read hands back a buffer TRUNCATED to what arrived, so its length is the
-    // byte count - a 64-byte buffer that received 5 bytes comes back at 5.
-    mut echoed: Array<u8> = rio.take_buffer();
+    // A read hands back only what arrived: 5 bytes, though 64 were allowed.
+    const echoed: Array<u8> = match (await stream.read_some(64)) {
+        Result::Ok(bytes) => { bytes }
+        Result::Err(_)    => { return -16; }
+    };
     const len: u64 = echoed.length() as u64;
     mut first: u8 = 0;
     match (echoed.get(0)) {
@@ -120,37 +92,33 @@ async function echo_round_trip(port: u16, listener: TcpListener) -> i64 {
 /// Accept one connection and hold it open, sending nothing, so a peer's read has
 /// genuinely nothing to complete on.
 async function accept_and_hold(listener: TcpListener, hold_ms: u64) -> i64 {
-    mut acc: TcpAccepted = await TcpAccept::start(listener);
-    mut _lst: TcpListener = acc.take_listener();
-    mut stream: TcpStream = TcpStream::from_file_descriptor(-1);
-    match (acc.take_result()) {
-        Result::Ok(s)  => { stream = s; }
+    mut server: TcpListener = listener;
+    const _held: TcpStream = match (await server.accept()) {
+        Result::Ok(s)  => { s }
         Result::Err(_) => { return -20; }
-    }
+    };
     await Sleep::new(Duration::from_milliseconds(hold_ms));
     return 1;
 }
 
+/// One read on a stream this future owns, so dropping the future drops the
+/// read in flight and the stream with it.
+async function read_owned(stream: TcpStream, limit: i64) -> Result<Array<u8>, IoError> {
+    mut reading: TcpStream = stream;
+    return await reading.read_some(limit);
+}
+
 /// Connect, then read with a deadline the peer will never meet. The timeout
-/// drops the `TcpRead`, which is the whole cancellation path: deregister the
-/// waker, close the socket, free the buffer.
+/// drops the read in flight, which is the whole cancellation path: deregister
+/// the waker, close the socket, free the buffer.
 async function read_until_timeout(port: u16) -> i64 {
-    mut stream: TcpStream = TcpStream::from_file_descriptor(-1);
-    match (await TcpConnect::start(SocketAddress::localhost_v4(port))) {
-        Result::Ok(s)  => { stream = s; }
+    const stream: TcpStream = match (await TcpStream::connect(SocketAddress::localhost_v4(port))) {
+        Result::Ok(s)  => { s }
         Result::Err(_) => { return -30; }
-    }
-    mut rbuf: Array<u8> = Array::<u8>::new();
-    rbuf.resize(32, 0);
-    match (await Futures::timeout(Duration::from_milliseconds(80),
-                                  TcpRead::start(stream, rbuf))) {
-        Result::Ok(io)  => {
-            // Bytes arrived from a peer that sends none - or the socket ended.
-            mut done: TcpIo = io;
-            mut _s: TcpStream = done.take_stream();
-            mut _b: Array<u8> = done.take_buffer();
-            return -31;
-        }
+    };
+    match (await Futures::timeout(Duration::from_milliseconds(80), read_owned(stream, 32))) {
+        // Bytes arrived from a peer that sends none - or the socket ended.
+        Result::Ok(_)  => { return -31; }
         Result::Err(_) => { return 1; }
     }
 }
@@ -165,13 +133,10 @@ async function timed_out_read(port: u16, listener: TcpListener) -> i64 {
 
 ![test]
 function async_tcp_echo_round_trip() -> Result<(), TestError> {
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
+    const listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
-    // The accept future needs a non-blocking listener; an accepted socket is put
-    // in non-blocking mode by `TcpAccept` itself.
-    listener.set_nonblocking(true)?;
     const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
         Result::Err(_) => { return bail(Str::new("local_address failed")); }
@@ -184,11 +149,10 @@ function async_tcp_echo_round_trip() -> Result<(), TestError> {
 
 ![test]
 function async_tcp_read_timeout_cancels_cleanly() -> Result<(), TestError> {
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
+    const listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
-    listener.set_nonblocking(true)?;
     const port: u16 = match (listener.local_address()) {
         Result::Ok(a)  => { a.port }
         Result::Err(_) => { return bail(Str::new("local_address failed")); }

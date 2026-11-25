@@ -5,10 +5,10 @@
 ///! of scope, exactly like `TcpStream`. Unlike
 ///! TCP it is connectionless, so it deliberately does NOT implement the
 ///! `AsyncRead` / `AsyncWrite` / `AsyncTransport` stream traits - datagram
-///! boundaries don't survive a byte-stream abstraction. Instead it exposes
-///! `UdpSendTo`/`UdpReceiveFrom` (each datagram carries its peer address) and,
+///! boundaries don't survive a byte-stream abstraction. Instead it has
+///! `send_to`/`receive_from` (each datagram carries its peer address) and,
 ///! once `connect` has pinned a default peer, the address-less
-///! `UdpSend`/`UdpReceive`.
+///! `send`/`receive`.
 ///!
 ///! **Every operation that can wait suspends a task, never a thread**, as in
 ///! `net::socket::tcp`. `bind`, `unbound`, `connect`, `local_address` and
@@ -16,7 +16,8 @@
 ///! `connect` is local bookkeeping and exchanges no packets. Sending and
 ///! receiving are the `async` methods `send_to`, `receive_from`, and once
 ///! `connect` has pinned a peer `send` and `receive`, built on the futures
-///! `UdpSendTo` / `UdpReceiveFrom` / `UdpSend` / `UdpReceive`. There is
+///! `UdpSendTo` / `UdpReceiveFrom` / `UdpSend` / `UdpReceive`, which are
+///! internal to the standard library. There is
 ///! deliberately no blocking `send` or `receive`: a datagram source that
 ///! sleeps its calling thread cannot be composed with anything that suspends,
 ///! and it would stall an executor worker inside the syscall.
@@ -33,7 +34,7 @@
 ///! address. An array's heap block does not move with the future.
 ///!
 ///! IPv4 only for now: the underlying socket is AF_INET, so
-///! `bind`/`connect`/`UdpSendTo` reject an `IpAddress::V6` destination up front
+///! `bind`/`connect`/`send_to` reject an `IpAddress::V6` destination up front
 ///! with `IoErrorKind::Unsupported` (see `reject_ipv6`).
 
 namespace std::net::socket::udp;
@@ -57,27 +58,23 @@ import std::future::traits::{ Future };
 import std::future::reactor::{ INTEREST_READ, INTEREST_WRITE, Reactor };
 
 /// An IPv4 datagram socket. `bind` or `unbound` opens one in non-blocking
-/// mode; datagrams move through the `UdpSendTo`/`UdpReceiveFrom` futures, or
-/// `UdpSend`/`UdpReceive` once `connect` has pinned a peer. Owns its socket and
-/// closes it on `drop`.
+/// mode; datagrams move through `send_to`/`receive_from`, or `send`/`receive`
+/// once `connect` has pinned a peer. Owns its socket and closes it on `drop`.
 ///
 /// ```cryo
 /// import std::collections::array::{ Array };
 /// import std::future::executor::{ Executor };
 /// import std::net::address::socket_address::{ SocketAddress };
-/// import std::net::socket::udp::{ UdpIo, UdpReceived, UdpReceiveFrom, UdpSendTo, UdpSocket };
+/// import std::net::socket::udp::{ UdpSocket };
 ///
 /// async function round_trip(receiver: UdpSocket, sender: UdpSocket, to: SocketAddress) -> i64 {
+///     mut outgoing: UdpSocket = sender;
+///     mut incoming: UdpSocket = receiver;
 ///     mut payload: Array<u8> = Array::<u8>::new();
 ///     payload.push(0x68); payload.push(0x69);                  // "hi"
-///     mut sent: UdpIo = await UdpSendTo::start(sender, payload, to);
-///     mut _sender: UdpSocket = sent.take_socket();
-///
-///     mut buffer: Array<u8> = Array::<u8>::new();
-///     buffer.resize(64, 0);                                    // room to receive into
-///     mut got: UdpReceived = await UdpReceiveFrom::start(receiver, buffer);
-///     mut _receiver: UdpSocket = got.take_socket();
-///     return got.take_buffer().length();                          // 2
+///     (await outgoing.send_to(payload, to)).unwrap();
+///     const got: (Array<u8>, SocketAddress) = (await incoming.receive_from(64)).unwrap();
+///     return got.0.length();                                   // 2
 /// }
 ///
 /// const receiver: UdpSocket = UdpSocket::bind(SocketAddress::localhost_v4(0)).unwrap();
@@ -124,11 +121,10 @@ public type struct UdpSocket {
     }
 
     /// Wrap a raw file descriptor. The caller transfers ownership; `drop` will
-    /// close it. Used by the futures below to leave a closed placeholder behind
-    /// while one of them owns the real socket.
+    /// close it. A negative descriptor makes a closed placeholder.
     ///
     /// An adopted descriptor keeps whatever blocking mode it arrived in, so
-    /// call `set_nonblocking(true)` before handing it to a future.
+    /// call `set_nonblocking(true)` before awaiting its methods.
     public static from_file_descriptor(sock: i32) -> UdpSocket {
         return UdpSocket { fd: sock };
     }
@@ -269,7 +265,7 @@ implement trait Drop for struct UdpSocket {
 /// refuses to let a field be moved out of the outcome while the outcome itself
 /// would still drop it. `take_socket` swaps in a closed placeholder, leaving
 /// nothing behind to close.
-public type struct UdpIo {
+internal type struct UdpIo {
     private socket: UdpSocket;
     private buf:    Array<u8>;
     private result: Result<i64, IoError>;
@@ -303,7 +299,7 @@ public type struct UdpIo {
 /// datagram. A separate type rather than an optional field on `UdpIo` because a
 /// peer address is either always meaningful or never so, and a slot that is
 /// only sometimes filled is the kind of thing callers read anyway.
-public type struct UdpReceived {
+internal type struct UdpReceived {
     private socket: UdpSocket;
     private buf:    Array<u8>;
     private result: Result<(i64, SocketAddress), IoError>;
@@ -340,7 +336,7 @@ public type struct UdpReceived {
 /// Dropping the future before it completes releases its reactor registration
 /// and closes the socket: cancelling a send on a socket nobody else holds
 /// destroys it.
-public type struct UdpSendTo {
+internal type struct UdpSendTo {
     private socket: UdpSocket;
     private buf:    Array<u8>;
     private dest:   SocketAddress;
@@ -417,7 +413,7 @@ implement trait Drop for struct UdpSendTo {
 
 /// Send one datagram on a `connect`ed socket. Fails `NotConnected` if no default
 /// peer was pinned. Owns the socket and the buffer exactly as `UdpSendTo` does.
-public type struct UdpSend {
+internal type struct UdpSend {
     private socket: UdpSocket;
     private buf:    Array<u8>;
     private rt: mut Reactor*;
@@ -477,7 +473,7 @@ implement trait Drop for struct UdpSend {
 /// It receives up to `buf.length()` bytes. An array exposes only `[0, length)`,
 /// so a buffer from `with_capacity` alone has nothing to receive into: size it
 /// with `resize(n, 0)`.
-public type struct UdpReceiveFrom {
+internal type struct UdpReceiveFrom {
     private socket: UdpSocket;
     private buf:    Array<u8>;
     private rt: mut Reactor*;
@@ -550,7 +546,7 @@ implement trait Drop for struct UdpReceiveFrom {
 
 /// Receive on a `connect`ed socket, dropping the peer address - it can only be
 /// the connected peer. Truncates an oversized datagram, as `UdpReceiveFrom` does.
-public type struct UdpReceive {
+internal type struct UdpReceive {
     private socket: UdpSocket;
     private buf:    Array<u8>;
     private rt: mut Reactor*;
