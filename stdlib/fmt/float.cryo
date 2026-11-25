@@ -21,76 +21,19 @@
 ///! lives in `core::primitives`; this file is float-only because the
 ///! implementation needs `libm` (fabs / log10) which `core` deliberately
 ///! doesn't depend on.  Classification is libm-free (the `fpclass`
-///! intrinsic).
+///! intrinsic). Reading a float from text is `f64::try_from(text)` (or
+///! `text.parse::<f64>()`), with the other `TryFrom<Str>` readers.
 
 namespace std::fmt::float;
 
 import std::core::cmp;
+import std::core::convert::{ TryFrom };
 import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::primitives;
 import std::core::slice::{ Slice };
+import std::collections::str::{ Str };
 import std::ffi::libc;
-
-/// Parse the whole of `s` as an `f64`, read with C `strtod` semantics in
-/// the C locale: leading whitespace is skipped, and what follows must be
-/// one decimal or scientific number (`1.5`, `-2e3`) and nothing else, its
-/// decimal point `.` whatever numeric locale the program has set.
-/// Returns `None` when `s` holds no number, when any byte follows the
-/// number (`"1abc"`, `"1.5 "`, `"2,5"`), for a hexadecimal float
-/// (`"0x1p4"`), for `"inf"`, `"infinity"` and `"nan"` in any case, or
-/// when a copy the locale needs cannot be allocated.  The
-/// single funnel every float-from-text caller routes through.
-/// Caller-supplied strings must already be cleaned of digit separators
-/// (`_`), which a number does not contain.
-public function parse_f64(s: string) -> Option<f64> {
-    if (s == null) { return Option::None; }
-    const text: u8* = s as u8*;
-    // `strtod` also reads a hexadecimal float and the words `inf`,
-    // `infinity` and `nan` in any case; this reader takes none of them.
-    // A decimal number starts with a digit or its point.
-    mut first: u64 = 0;
-    while (text[first] == 0x20 || (text[first] >= 0x09 && text[first] <= 0x0D)) { first = first + 1; }
-    if (text[first] == 0x2B || text[first] == 0x2D) { first = first + 1; }
-    if (!text[first].is_digit() && text[first] != 0x2E) { return Option::None; }
-    if (text[first] == 0x30 && (text[first + 1] == 0x78 || text[first + 1] == 0x58)) { return Option::None; }
-    // `strtod` reads the numeric locale's decimal point. Under any locale
-    // but one whose point is `.`, text holding that point has a byte a
-    // C-locale read stops at, and any other text is read from a copy
-    // holding the locale's point in place of the first `.`.
-    const point: u8* = libc::localeconv().decimal_point;
-    const point_length: u64 = libc::strlen(point);
-    const point_is_dot: boolean = point_length == 0 || (point_length == 1 && point[0] == 0x2E);
-    mut source: mut u8* = null;
-    if (!point_is_dot) {
-        if (libc::strstr(text, point) != null) { return Option::None; }
-        const length: u64 = libc::strlen(text);
-        source = libc::malloc(length + point_length + 1);
-        if (source == null) { return Option::None; }
-        mut written: u64 = 0;
-        mut replaced: boolean = false;
-        for (mut index: u64 = 0; index < length; index++) {
-            if (!replaced && text[index] == 0x2E) {
-                libc::memcpy(source + written, point as void*, point_length);
-                written = written + point_length;
-                replaced = true;
-            } else {
-                source[written] = text[index];
-                written = written + 1;
-            }
-        }
-        source[written] = 0;
-    }
-    const read: u8* = if (point_is_dot) { text } else { source };
-    mut end: u8* = null;
-    const v: f64 = libc::strtod(read, &end);
-    // `strtod` leaves `endptr == s` when it converts nothing, and short of
-    // the terminating NUL when bytes follow the number.
-    const whole: boolean = end != read && end[0] == 0;
-    if (!point_is_dot) { libc::free(source); }
-    if (!whole) { return Option::None; }
-    return Option::Some(v);
-}
 
 /// Default fractional digits for fixed-point output.
 public const DEFAULT_DECIMALS: i64 = 6;
@@ -221,7 +164,7 @@ implement f64 {
                     n = n - ((point_length - 1) as i32);
                 }
             }
-            if (digits == 17 || parse_f64(out as string).unwrap_or(f64::NAN) == value) {
+            if (digits == 17 || f64::try_from(Str::from(out as string)).unwrap_or(f64::NAN) == value) {
                 return Option::Some(n as i64);
             }
         }

@@ -19,8 +19,7 @@ import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import std::json::value::{ JsonNumber, JsonObject, JsonValue };
 import std::json::error::{ JsonError, JsonErrorKind };
-import std::fmt::float;
-import std::ffi::libc;
+import std::core::convert::{ TryFrom };
 import std::core::mem;
 
 /// ASCII code points used by the parser. Names beat magic numbers.
@@ -277,25 +276,14 @@ private type struct Parser {
         const literal_len: u64 = end - start;
 
         if (has_fraction || has_exponent) {
-            // Float path. Build a NUL-terminated copy on the heap and
-            // hand it to `float::parse_f64`, which reads it with libc
+            // Float path: `f64::try_from` reads the literal with libc
             // `strtod` (IEEE-754 nearest rounding, so a printed value
             // reads back exactly) with `.` as the decimal point whatever
             // numeric locale the program has set.
-            const buf: mut u8* = libc::malloc(literal_len + 1);
-            if (buf == null) {
-                return Result::Err(this.err_at(
-                    JsonErrorKind::OutOfMemory,
-                    Str::new("allocation failed while parsing float literal")
-                ));
-            }
-            libc::memcpy(buf, (this.src + start) as void*, literal_len);
-            buf[literal_len] = 0;
-            const parsed: option::Option<f64> = float::parse_f64(buf as string);
-            libc::free(buf);
-            const v: f64 = match (parsed) {
-                option::Option::Some(value) => { value }
-                option::Option::None => {
+            const literal: Str = Str::from_raw(this.src + start, literal_len as i64);
+            const v: f64 = match (f64::try_from(literal)) {
+                Result::Ok(value) => { value }
+                Result::Err(_) => {
                     return Result::Err(this.err_at(
                         JsonErrorKind::InvalidNumber,
                         Str::new("unreadable number")

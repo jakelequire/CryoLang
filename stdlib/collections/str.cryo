@@ -27,7 +27,6 @@ import std::collections::pair::{ Pair };
 import std::encoding::utf8::{ Utf8, DecodedScalar };
 import std::ffi::libc;
 import std::core::mem;
-import std::fmt::float;
 
 /// A read-only view of UTF-8 text owned elsewhere: a string literal, a
 /// `String`, a file's bytes. Copying a `Str` copies the view, not the
@@ -922,17 +921,57 @@ implement trait TryFrom<Str> for i8 {
     }
 }
 
-// A decimal float, read by `fmt::float::parse_f64`: digits with an
-// optional point and exponent, and no `inf`, `nan` or hexadecimal form.
+// The whole of the text as one decimal or scientific number (`1.5`,
+// `-2e3`, `.5`), read with C `strtod` in the C locale, so the nearest
+// `f64` is chosen and a printed value reads back exactly. As for the
+// integers, nothing may come before or after the number, a blank
+// included (`" 1.5"`, `"1.5 "`, `"2,5"`), and there is no hexadecimal
+// float, no `inf`, `infinity` or `nan`, and no `_` separator. The decimal
+// point is `.` whatever numeric locale the program has set. Every
+// float-from-text reader in the standard library and the compiler comes
+// through here.
 implement trait TryFrom<Str> for f64 {
     static try_from(source: Str) -> Result<f64, ConversionError> {
-        mut terminated: String = String::with_null(source);
-        const parsed: Option<f64> = float::parse_f64(terminated.as_pointer() as string);
-        mem::drop(terminated);
-        match (parsed) {
-            Option::Some(value) => { return Result::Ok(value); }
-            Option::None => { return Result::Err(ConversionError::new("not a decimal number")); }
+        const refused: ConversionError = ConversionError::new("not a decimal number");
+        const bytes: &Slice<u8> = source.as_bytes();
+        mut first: i64 = 0;
+        if (first < bytes.length() && (bytes[first] == '+' as u8 || bytes[first] == '-' as u8)) { first = first + 1; }
+        // `strtod` also skips leading blanks and reads a hexadecimal float
+        // and the words `inf`, `infinity` and `nan`; a decimal number
+        // starts with a digit or its point.
+        if (first >= bytes.length() || !(bytes[first].is_digit() || bytes[first] == '.' as u8)) {
+            return Result::Err(refused);
         }
+        if (bytes[first] == '0' as u8 && first + 1 < bytes.length()
+                && (bytes[first + 1] == 'x' as u8 || bytes[first + 1] == 'X' as u8)) {
+            return Result::Err(refused);
+        }
+        // `strtod` reads the numeric locale's decimal point. Under a locale
+        // whose point is not `.`, text holding that point has a byte a
+        // C-locale read stops at, and any other text is read from a copy
+        // holding the locale's point in place of its first `.`.
+        const point: Str = Str::from(libc::localeconv().decimal_point as string);
+        const point_is_dot: boolean = point.is_empty() || point == Str::new(".");
+        mut terminated: String = String::new();
+        if (point_is_dot) {
+            terminated.append(source);
+        } else {
+            if (source.contains(&point)) { return Result::Err(refused); }
+            match (source.split_once(&Str::new("."))) {
+                Option::Some(parts) => { terminated.append(parts.first).append(point).append(parts.second); }
+                Option::None        => { terminated.append(source); }
+            }
+        }
+        const length: i64 = terminated.length();
+        const read: u8* = terminated.as_c_string();
+        mut end: u8* = null;
+        const value: f64 = libc::strtod(read, &end);
+        // `strtod` leaves `end` at the start when it converts nothing, and
+        // short of the end when bytes follow the number.
+        const whole: boolean = end != read && end == read + length;
+        mem::drop(terminated);
+        if (!whole) { return Result::Err(refused); }
+        return Result::Ok(value);
     }
 }
 
