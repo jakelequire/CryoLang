@@ -1,117 +1,180 @@
 ///! SHA-1 (RFC 3174).
 ///!
-///! Cryptographically broken for collision resistance - present only
-///! because the WebSocket handshake (RFC 6455) hard-codes it for the
-///! `Sec-WebSocket-Accept` value. Do not use it for security. A pure
-///! Cryo implementation keeps `net::ws` free of any external crypto
-///! dependency (no OpenSSL link for plain `ws://`).
+///! Cryptographically broken for collision resistance - present because
+///! protocols that predate that break name it, as the WebSocket handshake
+///! (RFC 6455) does for its `Sec-WebSocket-Accept` value. Do not use it for
+///! security; `Sha256` is the digest to reach for.
+///!
+///! `Sha1` hashes a message that arrives in pieces: `update` with each piece
+///! in order, then `finish` for the digest. `Sha1::digest` hashes one message
+///! held whole. Either way the digest is a `Sha1Digest`, its 20 bytes in the
+///! order the standard writes them, shown as 40 lowercase hexadecimal digits.
 
 namespace std::hash::sha1;
 
-import std::collections::array::{ Array };
-import std::core::mem;
+import std::collections::string::{ String };
+import std::core::cmp::{ Eq };
+import std::core::result::{ Result };
 import std::core::slice::{ Slice };
-import std::io::bytes::{ ByteWriter };
+import std::encoding::hex;
+import std::fmt::display::{ Display, Formatter };
+import std::fmt::error::{ FormatError };
 
-/// Bytes in a SHA-1 digest: 20.
-public const DIGEST_LENGTH: u64 = 20;
+/// Bytes in a digest.
+public const DIGEST_LENGTH: i64 = 20;
 
-/// Hash `len` bytes at `data`, writing the 20-byte digest to `out`.
-/// `out` must point to at least `DIGEST_LENGTH` bytes.
-public function sha1(data: u8*, len: i64, out: mut u8*) -> void {
-    mut h0: u32 = 0x67452301;
-    mut h1: u32 = 0xEFCDAB89;
-    mut h2: u32 = 0x98BADCFE;
-    mut h3: u32 = 0x10325476;
-    mut h4: u32 = 0xC3D2E1F0;
+/// Bytes in the block the compression function consumes.
+const BLOCK_LENGTH: i64 = 64;
 
-    // Build the padded message: original bytes, a 0x80 terminator, zero
-    // padding, then the 64-bit big-endian bit length, rounded to a
-    // multiple of 64 bytes.
-    const bit_len: i64 = len * 8;
-    mut total: i64 = len + 1 + 8;
-    const rem: i64 = total % 64;
-    if (rem != 0) { total = total + (64 - rem); }
+/// A SHA-1 digest: the hash's 20 bytes, most significant byte of the first
+/// word first.
+public type struct Sha1Digest with [Eq] {
+    private bytes: [u8; 20];
 
-    mut msg: Array<u8> = Array::<u8>::with_capacity(total);
-    mut i: i64 = 0;
-    while (i < len) { msg.push(data[i]); i++; }
-    msg.push(0x80);
-    while (msg.length() < total - 8) { msg.push(0); }
-    mut shift: i64 = 56;
-    while (shift >= 0) {
-        msg.push(((bit_len >> shift) & 0xFF) as u8);
-        shift = shift - 8;
+    /// The digest's bytes.
+    public as_bytes(&this) -> &Slice<u8> {
+        return this.bytes.as_slice();
     }
 
-    const p: u8* = msg.as_pointer();
-    mut chunk: i64 = 0;
-    while (chunk < total) {
-        mut w: [u32; 80];
-        mut t: i64 = 0;
-        while (t < 16) {
-            const b: i64 = chunk + t * 4;
-            w[t] = ((p[b]     as u32) << 24)
-                 | ((p[b + 1] as u32) << 16)
-                 | ((p[b + 2] as u32) << 8)
-                 |  (p[b + 3] as u32);
-            t++;
-        }
-        while (t < 80) {
-            const x: u32 = w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16];
-            w[t] = x.rotate_left(1);
-            t++;
-        }
+    /// The digest as 40 lowercase hexadecimal digits.
+    public to_hex(&this) -> String {
+        return hex::encode(this.as_bytes());
+    }
+}
 
-        mut a: u32 = h0;
-        mut b: u32 = h1;
-        mut c: u32 = h2;
-        mut d: u32 = h3;
-        mut e: u32 = h4;
+implement trait Display for struct Sha1Digest {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        const text: String = this.to_hex();
+        return f.write_str(text.as_str());
+    }
+}
 
-        mut r: i64 = 0;
-        while (r < 80) {
-            mut f: u32 = 0;
-            mut k: u32 = 0;
-            if (r < 20) {
-                f = (b & c) | ((~b) & d);
-                k = 0x5A827999;
-            } else {
-                if (r < 40) {
-                    f = b ^ c ^ d;
-                    k = 0x6ED9EBA1;
-                } else {
-                    if (r < 60) {
-                        f = (b & c) | (b & d) | (c & d);
-                        k = 0x8F1BBCDC;
-                    } else {
-                        f = b ^ c ^ d;
-                        k = 0xCA62C1D6;
-                    }
-                }
+/// A SHA-1 computation in progress: the message so far, fed in order by
+/// `update`, and closed by `finish`.
+public type struct Sha1 {
+    private state:          [u32; 5];
+    /// The bytes of a block not yet complete, `buffered` of them.
+    private block:          [u8; 64];
+    private buffered:       i64;
+    /// Bytes of message fed so far.
+    private message_length: u64;
+
+    /// A computation over the empty message.
+    public static new() -> Sha1 {
+        return Sha1 {
+            state: [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0],
+            block: [0; 64],
+            buffered: 0,
+            message_length: 0,
+        };
+    }
+
+    /// The digest of `data`, held whole.
+    public static digest(data: &Slice<u8>) -> Sha1Digest {
+        mut hasher: Sha1 = Sha1::new();
+        hasher.update(data);
+        return hasher.finish();
+    }
+
+    /// Append `data` to the message.
+    public update(mut &this, data: &Slice<u8>) -> void {
+        const length: i64 = data.length();
+        const p: u8* = data.as_pointer();
+        this.message_length += length as u64;
+        mut i: i64 = 0;
+        if (this.buffered > 0) {
+            while (i < length && this.buffered < BLOCK_LENGTH) {
+                this.block[this.buffered] = p[i];
+                this.buffered++;
+                i++;
             }
-            const temp: u32 = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[r]);
+            if (this.buffered < BLOCK_LENGTH) { return; }
+            Sha1::compress(&this.state, this.block.as_slice());
+            this.buffered = 0;
+        }
+        while (length - i >= BLOCK_LENGTH) {
+            Sha1::compress(&this.state, data.subslice(i, i + BLOCK_LENGTH));
+            i += BLOCK_LENGTH;
+        }
+        while (i < length) {
+            this.block[this.buffered] = p[i];
+            this.buffered++;
+            i++;
+        }
+    }
+
+    /// Close the message and give its digest.
+    public finish(mut this) -> Sha1Digest {
+        const bit_length: u64 = this.message_length * 8;
+        // A one bit, zeros up to 8 bytes short of a block boundary, then
+        // the message's length in bits, big-endian.
+        mut padding: [u8; 72] = [0; 72];
+        padding[0] = 0x80;
+        const zeros_to: i64 = if (this.buffered < 56) { 56 } else { 120 };
+        const padding_length: i64 = zeros_to - this.buffered;
+        for (mut b: i64 = 0; b < 8; b++) {
+            padding[padding_length + b] = ((bit_length >> ((56 - b * 8) as u64)) & 0xFF) as u8;
+        }
+        this.update(padding.as_slice().subslice(0, padding_length + 8));
+        mut digest: Sha1Digest = Sha1Digest { bytes: [0; 20] };
+        for (mut w: i64 = 0; w < 5; w++) {
+            const word: u32 = this.state[w];
+            digest.bytes[w * 4]     = ((word >> 24) & 0xFF) as u8;
+            digest.bytes[w * 4 + 1] = ((word >> 16) & 0xFF) as u8;
+            digest.bytes[w * 4 + 2] = ((word >> 8) & 0xFF) as u8;
+            digest.bytes[w * 4 + 3] = (word & 0xFF) as u8;
+        }
+        return digest;
+    }
+
+    /// Fold one 64-byte block into `state`.
+    private static compress(state: mut &[u32; 5], block: &Slice<u8>) -> void {
+        const p: u8* = block.as_pointer();
+        mut schedule: [u32; 80] = [0; 80];
+        for (mut t: i64 = 0; t < 16; t++) {
+            schedule[t] = ((p[t * 4] as u32) << 24)
+                        | ((p[t * 4 + 1] as u32) << 16)
+                        | ((p[t * 4 + 2] as u32) << 8)
+                        |  (p[t * 4 + 3] as u32);
+        }
+        for (mut t: i64 = 16; t < 80; t++) {
+            const mixed: u32 = schedule[t - 3] ^ schedule[t - 8] ^ schedule[t - 14] ^ schedule[t - 16];
+            schedule[t] = mixed.rotate_left(1);
+        }
+        mut a: u32 = state[0];
+        mut b: u32 = state[1];
+        mut c: u32 = state[2];
+        mut d: u32 = state[3];
+        mut e: u32 = state[4];
+        for (mut t: i64 = 0; t < 80; t++) {
+            // Each quarter of the rounds mixes b, c and d by its own
+            // function, under its own constant.
+            mut mixed: u32 = 0;
+            mut constant: u32 = 0;
+            if (t < 20) {
+                mixed = (b & c) | ((~b) & d);
+                constant = 0x5A827999;
+            } else if (t < 40) {
+                mixed = b ^ c ^ d;
+                constant = 0x6ED9EBA1;
+            } else if (t < 60) {
+                mixed = (b & c) | (b & d) | (c & d);
+                constant = 0x8F1BBCDC;
+            } else {
+                mixed = b ^ c ^ d;
+                constant = 0xCA62C1D6;
+            }
+            const temp: u32 = a.rotate_left(5).wrapping_add(mixed).wrapping_add(e).wrapping_add(constant).wrapping_add(schedule[t]);
             e = d;
             d = c;
             c = b.rotate_left(30);
             b = a;
             a = temp;
-            r++;
         }
-
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
-        chunk = chunk + 64;
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
     }
-    mem::drop(msg);
-
-    mut digest: ByteWriter = ByteWriter::over(Slice::<u8>::from_raw_mutable(out, DIGEST_LENGTH as i64));
-    digest.write_big_endian::<u32>(h0);
-    digest.write_big_endian::<u32>(h1);
-    digest.write_big_endian::<u32>(h2);
-    digest.write_big_endian::<u32>(h3);
-    digest.write_big_endian::<u32>(h4);
 }

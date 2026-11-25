@@ -1,93 +1,97 @@
-///! SHA-1 (RFC 3174) known-answer vectors.
+///! SHA-1 (RFC 3174) against the published test vectors, and the streaming
+///! hasher against the one-shot digest.
 ///!
-///! `sha1::sha1(data, len, out)` writes a 20-byte big-endian digest into
-///! the caller-provided `out` buffer. These tests feed the three canonical
-///! RFC 3174 / FIPS 180 vectors and compare all 20 digest bytes against the
-///! published values:
+///!   ""                                          da39a3ee...afd80709
+///!   "abc"                                       a9993e36...9cd0d89d
+///!   "The quick brown fox jumps over the lazy dog" 2fd4e1c6...1b93eb12
+///!   the 448-bit two-block message               84983e44...e54670f1
+///!   one million 'a'                             34aa973c...6534016f
 ///!
-///!   ""                                          -> da39a3ee...afd80709
-///!   "abc"                                       -> a9993e36...9cd0d89d
-///!   "The quick brown fox jumps over the lazy dog" -> 2fd4e1c6...1b93eb12
-///!
-///! Comparing raw digest bytes keeps the test free of any hex/base64
-///! formatter dependency: the assertion exercises exactly the SHA-1 output.
+///! A message fed in pieces must hash as the same message held whole,
+///! whatever the pieces' sizes, including pieces that end exactly on, one
+///! short of and one past a block boundary and a padding that needs a
+///! second block.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::Sha1T;
 
 import std::core::result::{ Result };
 import std::collections::str::{ Str };
-import std::hash::sha1::{ sha1 };
+import std::collections::string::{ String };
+import std::collections::array::{ Array };
+import std::hash::{ Sha1, Sha1Digest };
 import std::test::error::{ TestError };
-import std::test::assert::{ bail };
+import std::test::assert::{ expect };
 
-/// Hash `input` and compare the resulting 20-byte digest against the 20
-/// expected bytes at `want`. Both `want` and the SHA-1 output are compared
-/// byte-for-byte; any mismatch reports the first differing index.
-function check_sha1(input: Str, want: u8*) -> Result<(), TestError> {
-    mut digest: [u8; 20];
-    sha1::sha1(input.as_pointer(), input.length(), &digest[0]);
-    mut i: u64 = 0;
-    while (i < 20) {
-        if (digest[i] != want[i]) {
-            return bail(Str::new("SHA-1 digest byte mismatch"));
-        }
-        i++;
+const TWO_BLOCK: string = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+
+function digest_of(text: string) -> Sha1Digest {
+    return Sha1::digest(Str::new(text).as_bytes());
+}
+
+function check_hex(digest: &Sha1Digest, want: string) -> Result<(), TestError> {
+    const got: String = digest.to_hex();
+    return expect(got.as_str().equals(&Str::new(want)), Str::new(want));
+}
+
+/// `text` fed one piece at a time, piece `k` being `1 + k % step` bytes.
+function streamed(text: Str, step: i64) -> Sha1Digest {
+    mut hasher: Sha1 = Sha1::new();
+    const bytes: &Slice<u8> = text.as_bytes();
+    mut at: i64 = 0;
+    mut k: i64 = 0;
+    while (at < bytes.length()) {
+        mut end: i64 = at + 1 + k % step;
+        if (end > bytes.length()) { end = bytes.length(); }
+        hasher.update(bytes.subslice(at, end));
+        at = end;
+        k++;
+    }
+    return hasher.finish();
+}
+
+![test]
+function sha1_empty_string() -> Result<(), TestError> {
+    return check_hex(&digest_of(""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+}
+
+![test]
+function sha1_abc() -> Result<(), TestError> {
+    return check_hex(&digest_of("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+}
+
+![test]
+function sha1_quick_brown_fox() -> Result<(), TestError> {
+    return check_hex(&digest_of("The quick brown fox jumps over the lazy dog"),
+                     "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12");
+}
+
+/// 56 bytes: the padding no longer fits the block, so it takes a second.
+![test]
+function sha1_two_block_boundary() -> Result<(), TestError> {
+    return check_hex(&digest_of(TWO_BLOCK), "84983e441c3bd26ebaae4aa1f95129e5e54670f1");
+}
+
+![test]
+function sha1_of_a_million_a() -> Result<(), TestError> {
+    mut bytes: Array<u8> = Array::<u8>::with_capacity(1000000);
+    for (mut i: i64 = 0; i < 1000000; i++) { bytes.push(0x61); }
+    return check_hex(&Sha1::digest(bytes.as_slice()), "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
+}
+
+![test]
+function sha1_streaming_matches_one_shot_for_every_piece_size() -> Result<(), TestError> {
+    const text: Str = Str::new("The quick brown fox jumps over the lazy dog, then over 64 more bytes of it: abcdefghijklmnopqrstuvwxyz0123456789!");
+    const whole: Sha1Digest = Sha1::digest(text.as_bytes());
+    for (mut step: i64 = 1; step <= 70; step++) {
+        expect(streamed(text, step) == whole, Str::new("a message fed in pieces hashes as the message held whole"))?;
     }
     return Result::Ok(());
 }
 
-// "" -> da39a3ee5e6b4b0d3255bfef95601890afd80709
 ![test]
-function sha1_empty_string() -> Result<(), TestError> {
-    mut want: [u8; 20];
-    want[0]  = 0xda; want[1]  = 0x39; want[2]  = 0xa3; want[3]  = 0xee;
-    want[4]  = 0x5e; want[5]  = 0x6b; want[6]  = 0x4b; want[7]  = 0x0d;
-    want[8]  = 0x32; want[9]  = 0x55; want[10] = 0xbf; want[11] = 0xef;
-    want[12] = 0x95; want[13] = 0x60; want[14] = 0x18; want[15] = 0x90;
-    want[16] = 0xaf; want[17] = 0xd8; want[18] = 0x07; want[19] = 0x09;
-    return check_sha1(Str::new(""), &want[0]);
-}
-
-// "abc" -> a9993e364706816aba3e25717850c26c9cd0d89d
-![test]
-function sha1_abc() -> Result<(), TestError> {
-    mut want: [u8; 20];
-    want[0]  = 0xa9; want[1]  = 0x99; want[2]  = 0x3e; want[3]  = 0x36;
-    want[4]  = 0x47; want[5]  = 0x06; want[6]  = 0x81; want[7]  = 0x6a;
-    want[8]  = 0xba; want[9]  = 0x3e; want[10] = 0x25; want[11] = 0x71;
-    want[12] = 0x78; want[13] = 0x50; want[14] = 0xc2; want[15] = 0x6c;
-    want[16] = 0x9c; want[17] = 0xd0; want[18] = 0xd8; want[19] = 0x9d;
-    return check_sha1(Str::new("abc"), &want[0]);
-}
-
-// "The quick brown fox jumps over the lazy dog"
-//   -> 2fd4e1c67a2d28fced849ee1bb76e7391b93eb12
-![test]
-function sha1_quick_brown_fox() -> Result<(), TestError> {
-    mut want: [u8; 20];
-    want[0]  = 0x2f; want[1]  = 0xd4; want[2]  = 0xe1; want[3]  = 0xc6;
-    want[4]  = 0x7a; want[5]  = 0x2d; want[6]  = 0x28; want[7]  = 0xfc;
-    want[8]  = 0xed; want[9]  = 0x84; want[10] = 0x9e; want[11] = 0xe1;
-    want[12] = 0xbb; want[13] = 0x76; want[14] = 0xe7; want[15] = 0x39;
-    want[16] = 0x1b; want[17] = 0x93; want[18] = 0xeb; want[19] = 0x12;
-    return check_sha1(
-        Str::new("The quick brown fox jumps over the lazy dog"), &want[0]);
-}
-
-// A 56-byte input (one byte short of forcing a second padding block, the
-// boundary the message-length math is most likely to get wrong).
-//   "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
-//   -> 84983e441c3bd26ebaae4aa1f95129e5e54670f1
-![test]
-function sha1_two_block_boundary() -> Result<(), TestError> {
-    mut want: [u8; 20];
-    want[0]  = 0x84; want[1]  = 0x98; want[2]  = 0x3e; want[3]  = 0x44;
-    want[4]  = 0x1c; want[5]  = 0x3b; want[6]  = 0xd2; want[7]  = 0x6e;
-    want[8]  = 0xba; want[9]  = 0xae; want[10] = 0x4a; want[11] = 0xa1;
-    want[12] = 0xf9; want[13] = 0x51; want[14] = 0x29; want[15] = 0xe5;
-    want[16] = 0xe5; want[17] = 0x46; want[18] = 0x70; want[19] = 0xf1;
-    return check_sha1(
-        Str::new("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-        &want[0]);
+function sha1_digest_displays_as_its_hexadecimal_digits() -> Result<(), TestError> {
+    const shown: String = String::from(digest_of("abc"));
+    return expect(shown.as_str().equals(&Str::new("a9993e364706816aba3e25717850c26c9cd0d89d")),
+                  Str::new("a digest displays as its 40 lowercase hexadecimal digits"));
 }
