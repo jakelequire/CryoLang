@@ -2,7 +2,8 @@
 ///! reads as (compared through its JSON text, which spells the value
 ///! exactly), what is refused and with which kind, the alias-expansion
 ///! limit, and text written and read back; one struct decodes alike from
-///! JSON and from YAML.
+///! JSON and from YAML; a refusal prints its place and message and is an
+///! `Error`.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::YamlT;
@@ -13,7 +14,8 @@ import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import std::encoding::json;
 import std::encoding::yaml;
-import std::encoding::yaml::{ YamlErrorKind };
+import std::encoding::yaml::{ YamlError, YamlErrorKind };
+import std::core::error::{ ErrorReport };
 import std::encoding::value::{ FromValue, ToValue, Value };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect, expect_equal };
@@ -199,4 +201,18 @@ function one_struct_decodes_from_json_and_from_yaml() -> Result<(), TestError> {
     const written: String = yaml::Yaml::to_pretty_text(&b.to_value());
     expect_equal(written, String::from_str(Str::from("name: api\nport: 8080\ntags:\n  - a\n  - b\n")))?;
     return Result::Ok(());
+}
+
+![test]
+function a_refusal_prints_and_is_an_error() -> Result<(), TestError> {
+    const error: YamlError = match (yaml::Yaml::parse(Str::from("a:\n\tb: 2\n"))) {
+        Result::Ok(_) => { return Result::Err(TestError::failed(Str::from("the YAML must be refused"))); }
+        Result::Err(refusal) => { refusal }
+    };
+    expect_equal(f"{error}", String::from_str(Str::from("2:1: a tab in a line's indentation")))?;
+    expect_equal(f"{error:?}", String::from_str(Str::from("bad_indentation at 2:1: a tab in a line's indentation")))?;
+    // An `Error`: its report holds its message and no cause.
+    const report: ErrorReport = ErrorReport::from_error(&error);
+    expect_equal(String::from_str(report.message()), String::from_str(Str::from("2:1: a tab in a line's indentation")))?;
+    return expect(report.causes().next().is_none(), Str::from("a YAML refusal has no source"));
 }
