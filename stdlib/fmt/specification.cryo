@@ -193,7 +193,7 @@ private function radix_digits(val: u64, spec: &FormatSpec, out: mut u8*) -> i64 
 /// Body for an unsigned integer, written into `out` (`NUMBER_BODY_BYTES`):
 /// optional radix prefix + digits, the prefix its `head_len`.
 internal function fmt_uint_body(val: u64, spec: &FormatSpec, out: mut u8*) -> BodyText {
-    if (spec.scientific) { return fmt_float_body(val as f64, spec, out); }
+    if (spec.scientific) { return fmt_float_body(val as f64, false, spec, out); }
     mut head: i64 = 0;
     if (spec.radix != RADIX_NONE) {
         const prefix: Str = radix_prefix(spec);
@@ -211,7 +211,7 @@ internal function fmt_uint_body(val: u64, spec: &FormatSpec, out: mut u8*) -> Bo
 /// pattern `masked` (already narrowed to the value's own width by the
 /// caller) with no sign: `-1i8` in hex is `ff`.
 internal function fmt_sint_body(val: i64, masked: u64, spec: &FormatSpec, out: mut u8*) -> BodyText {
-    if (spec.scientific) { return fmt_float_body(val as f64, spec, out); }
+    if (spec.scientific) { return fmt_float_body(val as f64, false, spec, out); }
     if (spec.radix != RADIX_NONE) {
         return fmt_uint_body(masked, spec, out);
     }
@@ -227,13 +227,14 @@ internal function fmt_sint_body(val: i64, masked: u64, spec: &FormatSpec, out: m
 
 /// Body for a float, written into `out` (`NUMBER_BODY_BYTES`). With a
 /// precision, uses fixed fractional digits; without, the form `Display`
-/// writes; `e` writes the scientific form, six digits after the
+/// writes, at f32's width when `from_f32` says `val` was one widened;
+/// `e` writes the scientific form, six digits after the
 /// mantissa's point unless a precision says otherwise. A precision too long
 /// for `out` is written into an allocation sized to it and kept as the
 /// body's `String`. The sign is part of the text - a `+` before a value
 /// that is not negative under `+`, none before NaN - so `head_len` marks it
 /// for zero-fill.
-internal function fmt_float_body(val: f64, spec: &FormatSpec, out: mut u8*) -> BodyText {
+internal function fmt_float_body(val: f64, from_f32: boolean, spec: &FormatSpec, out: mut u8*) -> BodyText {
     const places: i64 = if (spec.has_precision) { spec.precision } else { DEFAULT_DECIMALS };
     const needed: i64 = F64_MAX_DIGITS + 1 + places;
     mut digits: mut u8* = out;
@@ -250,7 +251,8 @@ internal function fmt_float_body(val: f64, spec: &FormatSpec, out: mut u8*) -> B
     const formatted: Option<i64> = if (spec.scientific) {
         val.to_scientific_buffer(body, places)
     } else {
-        val.to_buffer_with(body, places)
+        if (spec.has_precision) { val.to_buffer_with(body, places) }
+        else { if (from_f32) { (val as f32).to_display_buffer(body) } else { val.to_display_buffer(body) } }
     };
     const written: i64 = sign_length + formatted.unwrap();
     const head: i64 = if (written > 0 && (digits[0] == 0x2D || digits[0] == 0x2B)) { 1 } else { 0 };

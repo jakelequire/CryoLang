@@ -1,17 +1,15 @@
 ///! Floating-point formatting.
 ///!
-///! Values in the "normal" magnitude range are written as fixed-point
-///! decimal with six fractional digits. Anything beyond
-///! |v| >= 1e16 or 0 < |v| < 1e-4 falls back to scientific notation
-///! so no precision vanishes into a giant zero-prefix or trailing-zero
-///! string.
-///!
-///! This is a first-cut formatter, correct for human-readable output
-///! but **not round-trippable**. A round-trip `f64 -> str -> f64` needs
-///! a Grisu or Ryu implementation; that's a follow-up.
+///! `Display` writes a float as the shortest text that reads back as the
+///! same value (`to_buffer_roundtrip`, at the float's own width): `3.5`,
+///! `0.1`, `1e+20`, and a whole value with `.0` after it, `2.0`. The
+///! fixed forms write a set number of fractional digits, six unless a
+///! precision says otherwise; in them anything beyond |v| >= 1e16 or
+///! 0 < |v| < 1e-4 falls back to scientific notation so no precision
+///! vanishes into a giant zero-prefix or trailing-zero string.
 ///!
 ///! NaN / +/-Infinity / +/-0 are all handled explicitly. Negative zero
-///! prints as `-0` so the sign isn't lost.
+///! prints with its sign.
 ///!
 ///! The public API is `f64.to_buffer(buffer)` / `f64.to_buffer_with(buffer,
 ///! decimals)` / `f64.to_buffer_roundtrip(buffer)`: extension methods on the
@@ -60,14 +58,44 @@ private const FIXED_FORM_HEAD: i64 = 19;
 /// `u64`, where a larger power would saturate the conversion.
 private const SCALED_DECIMALS: i64 = 17;
 
-// Extension methods on f32: widen to f64 and delegate.
-//
-// `f32 -> f64` is a free widening cast (no precision loss), so the
-// digit logic only lives in one place. Callers that need a true f32-
-// specific shortest-round-trip representation will get one when the
-// f64 path itself gains Grisu/Ryu; same future work, same code path.
+// Extension methods on f32: the fixed-decimal forms widen to f64 and
+// delegate, since `f32 -> f64` loses nothing. The round-trip form cannot:
+// the shortest text that reads back as an f32 is shorter than the one for
+// the same value widened, so it is checked by reading back at f32.
 
 implement f32 {
+    /// Write `this` as the shortest decimal text that reads back, through
+    /// `f32::try_from`, as this same value: 6, then 7, 8 and 9 significant
+    /// digits, the first that reads back (every finite f32 does at 9), so
+    /// `0.1` is `0.1` and not the widened value's `0.10000000149011612`.
+    /// Otherwise as `f64.to_buffer_roundtrip`.
+    public to_buffer_roundtrip(&this, buffer: mut &Slice<u8>) -> Option<i64> {
+        const value: f32 = this;
+        if (!value.is_finite()) {
+            return this.to_buffer_with(buffer, DEFAULT_DECIMALS);
+        }
+        if (buffer.length() < F64_MAX_DIGITS) { return Option::None; }
+        const out: mut u8* = buffer.as_mutable_pointer();
+        for (mut digits: i32 = 6; digits <= 9; digits++) {
+            const n: i32 = write_significant(out, value as f64, digits);
+            if (n < 0) { return Option::Some(0); }
+            if (digits == 9 || f32::try_from(Str::from(out as string)).unwrap_or(f32::NAN) == value) {
+                return Option::Some(n as i64);
+            }
+        }
+        return Option::Some(0);
+    }
+
+    /// `this` as `Display` writes it: `to_buffer_roundtrip`'s text, with
+    /// `.0` after a whole value written as digits alone. `buffer` needs
+    /// `F64_MAX_DIGITS` bytes.
+    internal to_display_buffer(&this, buffer: mut &Slice<u8>) -> Option<i64> {
+        return match (this.to_buffer_roundtrip(buffer)) {
+            Option::Some(written) => { Option::Some(append_point_zero(buffer, written)) }
+            Option::None          => { Option::None }
+        };
+    }
+
     /// `f64.to_buffer` of this value widened to `f64`.
     public to_buffer(&this, buffer: mut &Slice<u8>) -> Option<i64> {
         const v: f64 = this as f64;
@@ -145,34 +173,81 @@ implement f64 {
         }
         if (buffer.length() < F64_MAX_DIGITS) { return Option::None; }
         const out: mut u8* = buffer.as_mutable_pointer();
-        // `snprintf` writes the numeric locale's decimal point; each form
-        // has it replaced by `.` before it is checked and returned. The
-        // longest form, 24 bytes, leaves room for a point of several bytes.
-        const point: u8* = libc::localeconv().decimal_point;
-        const point_length: u64 = libc::strlen(point);
-        const point_is_dot: boolean = point_length == 0 || (point_length == 1 && point[0] == 0x2E);
         for (mut digits: i32 = 15; digits <= 17; digits++) {
-            mut n: i32 = libc::snprintf(out, 32, "%.*g" as u8*, digits, value);
+            const n: i32 = write_significant(out, value, digits);
             if (n < 0) { return Option::Some(0); }
-            if (!point_is_dot) {
-                const locale_point_at: u8* = libc::strstr(out, point);
-                if (locale_point_at != null) {
-                    const index: u64 = (n as u64) - libc::strlen(locale_point_at);
-                    out[index] = 0x2E; // '.'
-                    const rest: u64 = index + point_length;
-                    libc::memmove(out + index + 1, (out + rest) as void*, (n as u64) - rest + 1);
-                    n = n - ((point_length - 1) as i32);
-                }
-            }
             if (digits == 17 || f64::try_from(Str::from(out as string)).unwrap_or(f64::NAN) == value) {
                 return Option::Some(n as i64);
             }
         }
         return Option::Some(0);
     }
+
+    /// `this` as `Display` writes it: the shortest text that reads back as
+    /// this value (`to_buffer_roundtrip`: `3.5`, `0.1`, `1e+20`), with `.0`
+    /// after a whole value written as digits alone, so it still reads as a
+    /// float (`2.0`, not `2`). `buffer` needs `F64_MAX_DIGITS` bytes.
+    internal to_display_buffer(&this, buffer: mut &Slice<u8>) -> Option<i64> {
+        return match (this.to_buffer_roundtrip(buffer)) {
+            Option::Some(written) => { Option::Some(append_point_zero(buffer, written)) }
+            Option::None          => { Option::None }
+        };
+    }
 }
 
 // Private helpers
+
+/// `.0` written after the `written` bytes at the front of `buffer` when
+/// they are a sign and digits alone, a whole value; the bytes now
+/// written. A text with a point, an exponent, `inf` or `NaN` is left as it
+/// is. The round-trip form is at most 24 bytes, so the two fit.
+private function append_point_zero(buffer: mut &Slice<u8>, written: i64) -> i64 {
+    const out: mut u8* = buffer.as_mutable_pointer();
+    for (mut i: i64 = 0; i < written; i++) {
+        const byte: u8 = out[i];
+        if (byte != 0x2D && (byte < 0x30 || byte > 0x39)) { return written; }   // '-', '0'-'9'
+    }
+    if (written == 0) { return written; }
+    out[written] = 0x2E;       // '.'
+    out[written + 1] = 0x30;   // '0'
+    return written + 2;
+}
+
+/// `value` with `digits` significant digits in `%g` form at `out`, with the
+/// numeric locale's decimal point written as `.` and the exponent's digits
+/// at least two, as the C standard writes them (`1e+20`, `1e-05`), not the
+/// three a C library may write (`1e+020`), so the text is the same on every
+/// host; NUL-terminated. The bytes written, or a negative count when
+/// `snprintf` fails. `out` holds `F64_MAX_DIGITS` bytes: the longest form,
+/// 24 bytes, leaves room for a locale's point of several bytes before it is
+/// replaced.
+private function write_significant(out: mut u8*, value: f64, digits: i32) -> i32 {
+    mut n: i32 = libc::snprintf(out, F64_MAX_DIGITS as u64, "%.*g" as u8*, digits, value);
+    if (n < 0) { return n; }
+    const point: u8* = libc::localeconv().decimal_point;
+    const point_length: u64 = libc::strlen(point);
+    if (!(point_length == 0 || (point_length == 1 && point[0] == 0x2E))) {
+        const locale_point_at: u8* = libc::strstr(out, point);
+        if (locale_point_at != null) {
+            const index: u64 = (n as u64) - libc::strlen(locale_point_at);
+            out[index] = 0x2E; // '.'
+            const rest: u64 = index + point_length;
+            libc::memmove(out + index + 1, (out + rest) as void*, (n as u64) - rest + 1);
+            n = n - ((point_length - 1) as i32);
+        }
+    }
+    // The exponent's first digit follows `e` and its sign.
+    for (mut at: i32 = 0; at < n; at++) {
+        if (out[at] != 0x65) { continue; }   // 'e'
+        const first: i32 = at + 2;
+        while (n - first > 2 && out[first] == 0x30) {   // '0'
+            libc::memmove(out + first, (out + first + 1) as void*, (n - first) as u64);
+            n -= 1;
+        }
+        break;
+    }
+    return n;
+}
 
 /// `value` with `decimals` fractional digits: in scientific form when
 /// `scientific`, and otherwise when its magnitude is past the thresholds.
