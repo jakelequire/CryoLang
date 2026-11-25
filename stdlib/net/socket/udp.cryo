@@ -10,14 +10,16 @@
 ///! once `connect` has pinned a default peer, the address-less
 ///! `UdpSend`/`UdpReceive`.
 ///!
-///! **Every operation that can wait is a future**, as in `net::socket::tcp`.
-///! `bind`, `unbound`, `connect`, `local_address` and `set_broadcast` stay plain
-///! calls because none of them waits - UDP `connect` is local bookkeeping and
-///! exchanges no packets. Sending and receiving are `UdpSend` / `UdpSendTo` /
-///! `UdpReceive` / `UdpReceiveFrom`. There is deliberately no blocking `send` or
-///! `receive`: a datagram source that sleeps its calling thread cannot be composed
-///! with anything that suspends, and it would stall an executor worker inside
-///! the syscall.
+///! **Every operation that can wait suspends a task, never a thread**, as in
+///! `net::socket::tcp`. `bind`, `unbound`, `connect`, `local_address` and
+///! `set_broadcast` stay plain calls because none of them waits - UDP
+///! `connect` is local bookkeeping and exchanges no packets. Sending and
+///! receiving are the `async` methods `send_to`, `receive_from`, and once
+///! `connect` has pinned a peer `send` and `receive`, built on the futures
+///! `UdpSendTo` / `UdpReceiveFrom` / `UdpSend` / `UdpReceive`. There is
+///! deliberately no blocking `send` or `receive`: a datagram source that
+///! sleeps its calling thread cannot be composed with anything that suspends,
+///! and it would stall an executor worker inside the syscall.
 ///!
 ///! Sockets from `bind` and `unbound` are put in non-blocking mode there, since
 ///! that is the only mode the futures above can use. A socket adopted through
@@ -181,6 +183,65 @@ public type struct UdpSocket {
             return Result::Err(sys::last_io_error());
         }
         return Result::Ok(());
+    }
+
+    /// Send `bytes` as one datagram to `destination`, suspending the task
+    /// until the socket has room. Answers the number of bytes sent. The
+    /// bytes are taken owned: a borrowed slice could not be held across the
+    /// wait.
+    public async send_to(mut &this, bytes: Array<u8>, destination: SocketAddress) -> Result<i64, IoError> {
+        const payload: Array<u8> = bytes;
+        // The future owns the socket while it waits, so a closed placeholder
+        // stands in for it here until it comes back.
+        mut lent: UdpSocket = UdpSocket::from_file_descriptor(-1);
+        mem::swap::<UdpSocket>(&lent, this);
+        mut sent: UdpIo = await UdpSendTo::start(lent, payload, destination);
+        mut placeholder: UdpSocket = sent.take_socket();
+        mem::swap::<UdpSocket>(&placeholder, this);
+        return sent.outcome();
+    }
+
+    /// Send `bytes` as one datagram to the peer `connect` pinned, as
+    /// `send_to` does.
+    public async send(mut &this, bytes: Array<u8>) -> Result<i64, IoError> {
+        const payload: Array<u8> = bytes;
+        mut lent: UdpSocket = UdpSocket::from_file_descriptor(-1);
+        mem::swap::<UdpSocket>(&lent, this);
+        mut sent: UdpIo = await UdpSend::start(lent, payload);
+        mut placeholder: UdpSocket = sent.take_socket();
+        mem::swap::<UdpSocket>(&placeholder, this);
+        return sent.outcome();
+    }
+
+    /// Receive one datagram of at most `limit` bytes, suspending the task
+    /// until one arrives: its bytes, owned, and the address it came from.
+    /// A datagram longer than `limit` is cut to it.
+    public async receive_from(mut &this, limit: i64) -> Result<(Array<u8>, SocketAddress), IoError> {
+        mut buffer: Array<u8> = Array::<u8>::new();
+        buffer.resize(limit, 0);
+        mut lent: UdpSocket = UdpSocket::from_file_descriptor(-1);
+        mem::swap::<UdpSocket>(&lent, this);
+        mut received: UdpReceived = await UdpReceiveFrom::start(lent, buffer);
+        mut placeholder: UdpSocket = received.take_socket();
+        mem::swap::<UdpSocket>(&placeholder, this);
+        const bytes: Array<u8> = received.take_buffer();
+        const outcome: (i64, SocketAddress) = received.outcome()?;
+        return Result::Ok((bytes, outcome.1));
+    }
+
+    /// Receive one datagram of at most `limit` bytes from the peer `connect`
+    /// pinned, as `receive_from` does, without its address.
+    public async receive(mut &this, limit: i64) -> Result<Array<u8>, IoError> {
+        mut buffer: Array<u8> = Array::<u8>::new();
+        buffer.resize(limit, 0);
+        mut lent: UdpSocket = UdpSocket::from_file_descriptor(-1);
+        mem::swap::<UdpSocket>(&lent, this);
+        mut received: UdpIo = await UdpReceive::start(lent, buffer);
+        mut placeholder: UdpSocket = received.take_socket();
+        mem::swap::<UdpSocket>(&placeholder, this);
+        const bytes: Array<u8> = received.take_buffer();
+        received.outcome()?;
+        return Result::Ok(bytes);
     }
 }
 

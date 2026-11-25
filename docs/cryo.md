@@ -5042,7 +5042,18 @@ Because a future owns the resources of an in-flight operation, cancellation is c
 
 `std::net` is asynchronous. The reactor is `epoll` on Linux and IOCP with `\Device\Afd` on Windows, presented through one interface.
 
-Async I/O futures **own the handle and the buffer** for the duration of the operation and hand both back on completion. That is what makes them sound rather than merely careful: a future may move between polls, so a buffer identified by a pointer into the caller's frame would be written through a stale address.
+A program awaits the sockets' `async` methods. `TcpListener::bind` leaves the listener non-blocking; `listener.accept()` takes the next connection, `TcpStream::connect(address)` makes one, `stream.read_some(limit)` reads what has arrived as an owned `Array<u8>` (empty once the peer closes its end), and `stream.write_all(bytes)` writes every byte of an owned `Array<u8>`. `UdpSocket` has `send_to(bytes, destination)` and `receive_from(limit)`, and once `connect` has pinned a peer `send(bytes)` and `receive(limit)`. What a method writes is taken owned and what it reads is handed back owned, because a borrowed slice cannot be held across a suspension (`E0455`).
+
+```cryo
+async function echo(listener: TcpListener) -> Result<(), IoError> {
+    mut server: TcpListener = listener;
+    mut stream: TcpStream = (await server.accept())?;
+    const request: Array<u8> = (await stream.read_some(4096))?;
+    return await stream.write_all(request);
+}
+```
+
+The methods are built on futures that **own the handle and the buffer** for the duration of the operation and hand both back on completion. That is what makes them sound rather than merely careful: a future may move between polls, so a buffer identified by a pointer into the caller's frame would be written through a stale address.
 
 ```cryo
 mut io: TcpIo = await TcpRead::start(stream, buf);

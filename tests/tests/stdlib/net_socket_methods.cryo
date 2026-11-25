@@ -1,0 +1,138 @@
+///! The sockets' `async` methods over loopback, driven by a real `Executor`:
+///! `TcpListener.accept` on a listener `bind` left non-blocking by itself,
+///! `TcpStream::connect`, `read_some` and `write_all`, two connections through
+///! one listener (so `accept` hands the listener back), the empty read that
+///! says the peer closed, and `UdpSocket`'s `send_to`/`receive_from` and, once
+///! connected, `send`/`receive`.
+///!
+///! Every socket binds port 0 and reads the system's choice back with
+///! `local_address`, so concurrent runs never collide.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetSocketMethods;
+
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::io::error::{ IoError };
+import std::net::address::socket_address::{ SocketAddress };
+import std::net::socket::tcp::{ TcpListener, TcpStream };
+import std::net::socket::udp::{ UdpSocket };
+import std::future::combinator::{ Futures };
+import std::future::executor::{ Executor };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_equal };
+
+/// `length` bytes counting up from `seed`, wrapping at 256.
+function pattern(length: i64, seed: i64) -> Array<u8> {
+    mut bytes: Array<u8> = Array::<u8>::new();
+    for (mut i: i64 = 0; i < length; i++) { bytes.push(((seed + i) % 256) as u8); }
+    return bytes;
+}
+
+/// Accept `connections` connections one after another and echo each until
+/// its peer closes its end; answers the bytes echoed.
+async function serve_echo(listener: TcpListener, connections: i64) -> Result<i64, IoError> {
+    mut server: TcpListener = listener;
+    mut echoed: i64 = 0;
+    for (mut i: i64 = 0; i < connections; i++) {
+        mut stream: TcpStream = (await server.accept())?;
+        while (true) {
+            const bytes: Array<u8> = (await stream.read_some(4096))?;
+            if (bytes.length() == 0) { break; }
+            echoed = echoed + bytes.length();
+            (await stream.write_all(bytes))?;
+        }
+    }
+    return Result::Ok(echoed);
+}
+
+/// Connect, send `message`, close the sending half, and read until the
+/// server closes: what came back.
+async function send_and_hear(port: u16, message: Array<u8>) -> Result<Array<u8>, IoError> {
+    mut stream: TcpStream = (await TcpStream::connect(SocketAddress::localhost_v4(port)))?;
+    (await stream.write_all(message))?;
+    stream.shutdown_write()?;
+    mut heard: Array<u8> = Array::<u8>::new();
+    while (true) {
+        const bytes: Array<u8> = (await stream.read_some(1000))?;
+        if (bytes.length() == 0) { break; }
+        heard.append(bytes.as_slice());
+    }
+    return Result::Ok(heard);
+}
+
+/// Two clients in turn; each must hear its own message back whole. Answers
+/// the bytes heard, or -1 for a message that came back changed.
+async function two_clients(port: u16) -> Result<i64, IoError> {
+    const short: Array<u8> = (await send_and_hear(port, pattern(5, 72)))?;
+    const long: Array<u8> = (await send_and_hear(port, pattern(20000, 3)))?;
+    if (short.as_slice() != pattern(5, 72).as_slice()) { return Result::Ok(-1); }
+    if (long.as_slice() != pattern(20000, 3).as_slice()) { return Result::Ok(-1); }
+    return Result::Ok(short.length() + long.length());
+}
+
+/// The server's count, or -100 for an error.
+async function served(listener: TcpListener) -> i64 {
+    return match (await serve_echo(listener, 2)) {
+        Result::Ok(echoed) => { echoed }
+        Result::Err(_) => { -100 }
+    };
+}
+
+/// The clients' count, or -200 for an error.
+async function heard(port: u16) -> i64 {
+    return match (await two_clients(port)) {
+        Result::Ok(count) => { count }
+        Result::Err(_) => { -200 }
+    };
+}
+
+async function echo_both(listener: TcpListener, port: u16) -> (i64, i64) {
+    return await Futures::join(served(listener), heard(port));
+}
+
+![test]
+function tcp_methods_echo_two_connections_through_one_listener() -> Result<(), TestError> {
+    // No `set_nonblocking`: `bind` leaves the listener ready for `accept`.
+    const listener: TcpListener = TcpListener::bind(SocketAddress::localhost_v4(0))?;
+    const port: u16 = listener.local_address()?.port;
+    mut executor: Executor = Executor::new();
+    const outcome: (i64, i64) = executor.block_on(echo_both(listener, port));
+    expect_equal(outcome.0, 20005)?;
+    return expect_equal(outcome.1, 20005);
+}
+
+/// Receive one datagram on `receiver`, answer it to its sender, and hear
+/// the answer on `sender`; then the same through connected sockets.
+async function exchange(sender: UdpSocket, receiver: UdpSocket, receiver_port: u16, sender_port: u16)
+        -> Result<i64, IoError> {
+    mut out: UdpSocket = sender;
+    mut back: UdpSocket = receiver;
+    const sent: i64 = (await out.send_to(pattern(3, 104), SocketAddress::localhost_v4(receiver_port)))?;
+    const arrived: (Array<u8>, SocketAddress) = (await back.receive_from(64))?;
+    if (arrived.0.as_slice() != pattern(3, 104).as_slice()) { return Result::Ok(-1); }
+    if (arrived.1.port != sender_port) { return Result::Ok(-2); }
+    (await back.send_to(pattern(2, 111), arrived.1))?;
+    const answer: (Array<u8>, SocketAddress) = (await out.receive_from(64))?;
+    if (answer.0.as_slice() != pattern(2, 111).as_slice()) { return Result::Ok(-3); }
+    // Pinned to each other, the address-less forms.
+    out.connect(SocketAddress::localhost_v4(receiver_port))?;
+    back.connect(SocketAddress::localhost_v4(sender_port))?;
+    (await out.send(pattern(4, 1)))?;
+    const pinned: Array<u8> = (await back.receive(64))?;
+    if (pinned.as_slice() != pattern(4, 1).as_slice()) { return Result::Ok(-4); }
+    return Result::Ok(sent + answer.0.length() + pinned.length());
+}
+
+![test]
+function udp_methods_send_and_receive_datagrams() -> Result<(), TestError> {
+    const sender: UdpSocket = UdpSocket::bind(SocketAddress::localhost_v4(0))?;
+    const receiver: UdpSocket = UdpSocket::bind(SocketAddress::localhost_v4(0))?;
+    const sender_port: u16 = sender.local_address()?.port;
+    const receiver_port: u16 = receiver.local_address()?.port;
+    mut executor: Executor = Executor::new();
+    const outcome: Result<i64, IoError> = executor.block_on(exchange(sender, receiver, receiver_port, sender_port));
+    expect(outcome.is_ok(), Str::new("the datagrams moved without an error"))?;
+    return expect_equal(outcome.unwrap_or(0), 9);
+}

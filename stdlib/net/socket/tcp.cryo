@@ -5,13 +5,28 @@
 ///! descriptor on POSIX, a Winsock `SOCKET` held as an `i32` on Windows - and
 ///! close it when they go out of scope.
 ///!
-///! **Every operation that can wait is a future.** `bind` is the one entry point
-///! that stays a plain call, because binding does not wait; connecting,
-///! accepting, reading and writing are `TcpConnect` / `TcpAccept` / `TcpRead` /
-///! `TcpWrite`. There is deliberately no blocking `connect`, `accept`, `read` or
-///! `write`: a byte source that sleeps its calling thread cannot be composed with
-///! anything that suspends, and keeping one spelling of each operation is what
-///! lets `BufferedStream<TcpStream>` be the only buffered connection in the tree.
+///! **Every operation that can wait suspends a task, never a thread.** `bind`
+///! is the one entry point that stays a plain call, because binding does not
+///! wait; it leaves the listener non-blocking. The rest are `async` methods:
+///! `TcpStream::connect(address)`, `listener.accept()`,
+///! `stream.read_some(limit)` and `stream.write_all(bytes)`, each awaited
+///! inside an `async` function. There is deliberately no blocking `connect`,
+///! `accept`, `read` or `write`: a byte source that sleeps its calling thread
+///! cannot be composed with anything that suspends, and keeping one spelling
+///! of each operation is what lets `BufferedStream<TcpStream>` be the only
+///! buffered connection in the tree.
+///!
+///! ```cryo
+///! async function echo(listener: TcpListener) -> Result<(), IoError> {
+///!     mut server: TcpListener = listener;
+///!     mut stream: TcpStream = (await server.accept())?;
+///!     const request: Array<u8> = (await stream.read_some(4096))?;
+///!     return await stream.write_all(request);
+///! }
+///! ```
+///!
+///! The methods are built on the futures below, which they lend the socket to
+///! for the length of one operation.
 ///!
 ///! ## Async operations
 ///!
@@ -125,6 +140,44 @@ public type struct TcpStream {
         }
         return Result::Ok(());
     }
+
+    /// Connect to `remote`, suspending the task until the handshake
+    /// completes. The stream is non-blocking, ready for `read_some` and
+    /// `write_all`.
+    public static async connect(remote: SocketAddress) -> Result<TcpStream, IoError> {
+        return await TcpConnect::start(remote);
+    }
+
+    /// Read what the peer has sent, at most `limit` bytes, suspending the
+    /// task until at least one byte has arrived. The bytes come back owned,
+    /// so nothing borrowed is held across the wait; an empty array means
+    /// the peer closed its end.
+    public async read_some(mut &this, limit: i64) -> Result<Array<u8>, IoError> {
+        mut buffer: Array<u8> = Array::<u8>::new();
+        buffer.resize(limit, 0);
+        mut transfer: Transfer = await this.read_into(buffer);
+        const bytes: Array<u8> = transfer.take_buffer();
+        transfer.outcome()?;
+        return Result::Ok(bytes);
+    }
+
+    /// Write every byte of `bytes`, suspending the task while the socket
+    /// has no room and writing the rest after a short write. The bytes are
+    /// taken owned: a borrowed slice could not be held across the wait.
+    public async write_all(mut &this, bytes: Array<u8>) -> Result<(), IoError> {
+        mut pending: Array<u8> = bytes;
+        while (pending.length() > 0) {
+            mut transfer: Transfer = await this.write_from(pending);
+            const offered: Array<u8> = transfer.take_buffer();
+            const written: i64 = transfer.outcome()?;
+            if (written == 0) {
+                return Result::Err(IoError::new(IoErrorKind::WriteZero, 0));
+            }
+            pending = Array::<u8>::new();
+            pending.append(offered.as_slice().subslice(written, offered.length()));
+        }
+        return Result::Ok(());
+    }
 }
 
 implement trait Drop for struct TcpStream {
@@ -141,9 +194,8 @@ implement trait Drop for struct TcpStream {
 // TcpListener: bound + listening socket
 
 /// A TCP socket bound to a local address and listening for connections.
-/// `bind` makes one; `TcpAccept` takes the next connection from it, which
-/// needs the listener in non-blocking mode first. Owns its socket and closes
-/// it on `drop`.
+/// `bind` makes one, non-blocking; `accept` takes the next connection from
+/// it. Owns its socket and closes it on `drop`.
 ///
 /// ```cryo
 /// import std::core::result::{ Result };
@@ -151,18 +203,15 @@ implement trait Drop for struct TcpStream {
 /// import std::future::executor::{ Executor };
 /// import std::io::error::{ IoError };
 /// import std::net::address::socket_address::{ SocketAddress };
-/// import std::net::socket::tcp::{ TcpAccept, TcpAccepted, TcpConnect, TcpListener, TcpStream };
+/// import std::net::socket::tcp::{ TcpListener, TcpStream };
 ///
 /// async function accept_one(listener: TcpListener) -> boolean {
-///     mut accepted: TcpAccepted = await TcpAccept::start(listener);
-///     mut _listener: TcpListener = accepted.take_listener();
-///     return accepted.take_result().is_ok();
+///     mut server: TcpListener = listener;
+///     return (await server.accept()).is_ok();
 /// }
 ///
 /// async function connect_to(port: u16) -> boolean {
-///     const connected: Result<TcpStream, IoError> =
-///         await TcpConnect::start(SocketAddress::localhost_v4(port));
-///     return connected.is_ok();
+///     return (await TcpStream::connect(SocketAddress::localhost_v4(port))).is_ok();
 /// }
 ///
 /// async function both(listener: TcpListener, port: u16) -> (boolean, boolean) {
@@ -170,8 +219,7 @@ implement trait Drop for struct TcpStream {
 /// }
 ///
 /// // Port 0: the system picks a free port, read back with `local_address`.
-/// mut listener: TcpListener = TcpListener::bind(SocketAddress::localhost_v4(0)).unwrap();
-/// listener.set_nonblocking(true).unwrap();
+/// const listener: TcpListener = TcpListener::bind(SocketAddress::localhost_v4(0)).unwrap();
 /// const port: u16 = listener.local_address().unwrap().port;
 /// mut executor: Executor = Executor::new();
 /// const outcome: (boolean, boolean) = executor.block_on(both(listener, port));
@@ -210,7 +258,28 @@ public type struct TcpListener {
             sys::os_close_socket(sock);
             return Result::Err(err);
         }
+        // Accepting suspends a task rather than its thread, so the listener
+        // is non-blocking from the start.
+        if (sys::os_set_nonblocking(sock, true) < 0) {
+            const err: IoError = sys::last_io_error();
+            sys::os_close_socket(sock);
+            return Result::Err(err);
+        }
         return Result::Ok(TcpListener { fd: sock });
+    }
+
+    /// Take the next incoming connection, suspending the task until one
+    /// arrives. The connection is non-blocking, ready for `read_some` and
+    /// `write_all`, and the listener stays ready for the next `accept`.
+    public async accept(mut &this) -> Result<TcpStream, IoError> {
+        // The accept future owns the listener while it waits, so a closed
+        // placeholder stands in for it here until it comes back.
+        mut lent: TcpListener = TcpListener::from_file_descriptor(-1);
+        mem::swap::<TcpListener>(&lent, this);
+        mut accepted: TcpAccepted = await TcpAccept::start(lent);
+        mut placeholder: TcpListener = accepted.take_listener();
+        mem::swap::<TcpListener>(&placeholder, this);
+        return accepted.take_result();
     }
 
     /// Wrap a raw listening descriptor. The caller transfers ownership;
