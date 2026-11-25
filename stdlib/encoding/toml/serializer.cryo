@@ -1,0 +1,263 @@
+///! The writer behind `Toml::to_text` and `Toml::write_text`.
+///!
+///! A document is a table, so the value written must be an `Object`. Each
+///! table's keys that hold plain values come first, one `key = value` line
+///! each; then each key holding a table, under its `[header]`; then each
+///! key holding a non-empty array of nothing but tables, one `[[header]]`
+///! per element. A table nested in any other array is written inline.
+///!
+///! TOML has no null: a table's key holding `Value::Null` is left out, so
+///! a missing key reads back where the null was, and a null in an array is
+///! refused (`NotRepresentable`). A key is written bare when it is made of
+///! letters, digits, `_` and `-`, and quoted otherwise. A float is written
+///! so it reads back as a float: `1.0`, not `1`, and `inf`, `-inf` and
+///! `nan`.
+
+namespace std::encoding::toml::serializer;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::encoding::value::model::{ Number, Object, Value };
+import std::encoding::toml::error::{ TomlError, TomlErrorKind };
+import std::encoding::toml::parser::{ MAX_DEPTH };
+
+private const LF:         u8 = 10;
+private const QUOTE:      u8 = 34;
+private const DOT:        u8 = 46;
+private const BACKSLASH:  u8 = 92;
+private const UNDERSCORE: u8 = 95;
+private const MINUS:      u8 = 45;
+
+/// The TOML writer: every method appends to a `String` the caller owns.
+internal type struct Writer {
+    /// Append `value`, a document, to `out`.
+    internal static write_document(out: mut &String, value: &Value) -> Result<(), TomlError> {
+        match (value) {
+            Value::Object(table) => {
+                const path: Array<String> = Array::<String>::new();
+                return Writer::write_table(out, &table, &path);
+            }
+            _ => {
+                return Result::Err(Writer::not_representable(
+                    Str::new("a TOML document is a table, so only an object is written")));
+            }
+        }
+    }
+
+    /// A refusal of the writer's, which has no place in a source.
+    private static not_representable(msg: Str) -> TomlError {
+        return TomlError::new(TomlErrorKind::NotRepresentable, 0, 0, 0, String::from_str(msg));
+    }
+
+    /// Whether `value` is written as an array of tables: a non-empty array
+    /// of nothing but tables.
+    private static is_table_array(value: &Value) -> boolean {
+        match (value) {
+            Value::Array(items) => {
+                if (items.length() == 0) { return false; }
+                for (mut i: i64 = 0; i < items.length(); i++) {
+                    if (!items[i].is_object()) { return false; }
+                }
+                return true;
+            }
+            _ => { return false; }
+        }
+    }
+
+    /// Whether `value` is written on its table's `key = value` lines.
+    private static is_plain(value: &Value) -> boolean {
+        return !value.is_null() && !value.is_object() && !Writer::is_table_array(value);
+    }
+
+    /// `table`'s plain keys, then its tables and arrays of tables under
+    /// their headers. `path` is the keys that lead to it.
+    private static write_table(out: mut &String, table: &Object, path: &Array<String>) -> Result<(), TomlError> {
+        if (path.length() as u64 > MAX_DEPTH) {
+            return Result::Err(Writer::not_representable(Str::new("tables nested too deep")));
+        }
+        for (mut i: i64 = 0; i < table.length(); i++) {
+            const value: Value* = table.value_at(i).unwrap();
+            if (!Writer::is_plain(value)) { continue; }
+            Writer::write_key(out, table.key_at(i).unwrap());
+            out.append(" = ");
+            Writer::write_inline(out, value, 0)?;
+            out.push_byte(LF);
+        }
+        for (mut i: i64 = 0; i < table.length(); i++) {
+            const value: Value* = table.value_at(i).unwrap();
+            if (Writer::is_plain(value) || value.is_null()) { continue; }
+            mut inner: Array<String> = path.clone();
+            inner.push(String::from_str(table.key_at(i).unwrap()));
+            match (value) {
+                Value::Object(sub) => {
+                    if (Writer::needs_header(&sub)) { Writer::write_header(out, &inner, false); }
+                    Writer::write_table(out, &sub, &inner)?;
+                }
+                Value::Array(items) => {
+                    for (mut j: i64 = 0; j < items.length(); j++) {
+                        match (&items[j]) {
+                            Value::Object(element) => {
+                                Writer::write_header(out, &inner, true);
+                                Writer::write_table(out, &element, &inner)?;
+                            }
+                            _ => { }
+                        }
+                    }
+                }
+                _ => { }
+            }
+        }
+        return Result::Ok(());
+    }
+
+    /// Whether a table needs a header of its own: it has a plain key, or
+    /// nothing at all, since a table holding only tables is made by its
+    /// sub-tables' headers.
+    private static needs_header(table: &Object) -> boolean {
+        if (table.length() == 0) { return true; }
+        for (mut i: i64 = 0; i < table.length(); i++) {
+            if (Writer::is_plain(table.value_at(i).unwrap())) { return true; }
+        }
+        return false;
+    }
+
+    /// `[a.b]` or `[[a.b]]` on a line of its own, after a blank line
+    /// unless it opens the text.
+    private static write_header(out: mut &String, path: &Array<String>, array: boolean) -> void {
+        if (out.length() > 0) { out.push_byte(LF); }
+        out.append(if (array) { "[[" } else { "[" });
+        for (mut i: i64 = 0; i < path.length(); i++) {
+            if (i > 0) { out.push_byte(DOT); }
+            Writer::write_key(out, path[i].as_str());
+        }
+        out.append(if (array) { "]]" } else { "]" });
+        out.push_byte(LF);
+    }
+
+    /// A key, bare when its every byte is a letter, a digit, `_` or `-`,
+    /// and quoted otherwise.
+    private static write_key(out: mut &String, key: Str) -> void {
+        mut bare: boolean = key.length() > 0;
+        const bytes: u8* = key.as_pointer();
+        for (mut i: i64 = 0; bare && i < key.length(); i++) {
+            const b: u8 = bytes[i];
+            bare = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b.is_digit() || b == UNDERSCORE || b == MINUS;
+        }
+        if (bare) {
+            out.append(key);
+            return;
+        }
+        Writer::write_string(out, key);
+    }
+
+    /// A value on one line: a scalar, an array, or an inline table.
+    private static write_inline(out: mut &String, value: &Value, depth: u64) -> Result<(), TomlError> {
+        if (depth > MAX_DEPTH) {
+            return Result::Err(Writer::not_representable(Str::new("values nested too deep")));
+        }
+        match (value) {
+            Value::Null => {
+                return Result::Err(Writer::not_representable(Str::new("TOML has no null in an array")));
+            }
+            Value::Bool(b)   => { out.append(b); }
+            Value::Number(n) => { Writer::write_number(out, &n); }
+            Value::String(s) => { Writer::write_string(out, s.as_str()); }
+            Value::Array(items) => {
+                out.append("[");
+                for (mut i: i64 = 0; i < items.length(); i++) {
+                    if (i > 0) { out.append(", "); }
+                    Writer::write_inline(out, &items[i], depth + 1)?;
+                }
+                out.append("]");
+            }
+            Value::Object(table) => {
+                out.append("{");
+                mut written: i64 = 0;
+                for (mut i: i64 = 0; i < table.length(); i++) {
+                    const entry: Value* = table.value_at(i).unwrap();
+                    if (entry.is_null()) { continue; }
+                    out.append(if (written == 0) { " " } else { ", " });
+                    Writer::write_key(out, table.key_at(i).unwrap());
+                    out.append(" = ");
+                    Writer::write_inline(out, entry, depth + 1)?;
+                    written++;
+                }
+                out.append(if (written == 0) { "}" } else { " }" });
+            }
+        }
+        return Result::Ok(());
+    }
+
+    private static write_number(out: mut &String, n: &Number) -> void {
+        match (n) {
+            Number::Int(v)  => { out.append(v); }
+            // TOML's integers are 64-bit signed, so a larger one is written
+            // as the float nearest it.
+            Number::UInt(v) => {
+                if (v <= i64::MAX as u64) { out.append(v); } else { Writer::write_float(out, v as f64); }
+            }
+            Number::Float(v) => { Writer::write_float(out, v); }
+        }
+    }
+
+    private static write_float(out: mut &String, v: f64) -> void {
+        if (v.is_nan()) {
+            out.append("nan");
+            return;
+        }
+        if (v.is_infinite()) {
+            out.append(if (v < 0.0) { "-inf" } else { "inf" });
+            return;
+        }
+        mut buf: [u8; 32];
+        const written: i64 = v.to_buffer_roundtrip(&buf).unwrap();
+        out.append(Str::from_raw(&buf[0], written));
+        // A float's text with no fraction and no exponent would read back
+        // as an integer.
+        for (mut i: i64 = 0; i < written; i++) {
+            const b: u8 = buf[i];
+            if (b == DOT || b == 101 || b == 69) { return; }
+        }
+        out.append(".0");
+    }
+
+    /// A basic string: quotes and backslashes escaped, a control character
+    /// as its short escape or `\uXXXX`.
+    private static write_string(out: mut &String, s: Str) -> void {
+        out.push_byte(QUOTE);
+        const bytes: u8* = s.as_pointer();
+        for (mut i: i64 = 0; i < s.length(); i++) {
+            const b: u8 = bytes[i];
+            if (b == QUOTE) {
+                out.append("\\\"");
+            } else if (b == BACKSLASH) {
+                out.append("\\\\");
+            } else if (b == 8) {
+                out.append("\\b");
+            } else if (b == 9) {
+                out.append("\\t");
+            } else if (b == 10) {
+                out.append("\\n");
+            } else if (b == 12) {
+                out.append("\\f");
+            } else if (b == 13) {
+                out.append("\\r");
+            } else if (b < 32 || b == 127) {
+                out.append("\\u00");
+                out.push_byte(Writer::hex_digit(b >> 4));
+                out.push_byte(Writer::hex_digit(b & 15));
+            } else {
+                out.push_byte(b);
+            }
+        }
+        out.push_byte(QUOTE);
+    }
+
+    private static hex_digit(nibble: u8) -> u8 {
+        if (nibble < 10) { return 48 + nibble; }
+        return 55 + nibble;
+    }
+}

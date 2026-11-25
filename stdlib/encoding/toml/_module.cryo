@@ -1,0 +1,78 @@
+///! toml: TOML 1.0 text, read into and written from the shared data model
+///! `std::encoding::value::Value`.
+///!
+///! `Toml::parse(text)` reads a document from a `Str` into a
+///! `Result<Value, TomlError>`: its root table as a `Value::Object`.
+///! `Toml::to_text(&value)` writes a document as an owned `String`, and
+///! `Toml::write_text` appends one to a `String` the caller owns; both
+///! refuse a value TOML cannot spell (`TomlErrorKind::NotRepresentable`).
+///!
+///! The reader takes all of TOML 1.0: bare, quoted and dotted keys, tables,
+///! arrays of tables and inline tables, every string form with every
+///! escape, integers in every base with `_` between digits, floats with
+///! `inf` and `nan`, booleans, and dates and times. A table is an
+///! `Object`, an array (of values or of tables) an `Array`, an integer a
+///! `Number::Int`, a float a `Number::Float`. A date or time is a
+///! `Value::String` holding its RFC 3339 text - `1979-05-27T07:32:00Z`,
+///! `1979-05-27`, `07:32:00` - the date and the time joined by `T`.
+///! TOML's rules on defining tables are kept: a key or a table defined
+///! twice is refused, each with a `TomlErrorKind` of its own.
+///!
+///! The writer puts a table's values first and its tables after them,
+///! under `[header]`s; an array of tables under `[[header]]`s; anything
+///! else on one line. TOML has no null, so a table's null is left out and
+///! a null in an array is refused; a date read as text is written back as
+///! text.
+///!
+///! A type that reads and writes `Value` through `ToValue` and `FromValue`
+///! reads and writes TOML too: `Toml::parse` gives the `Value` its
+///! `from_value` takes.
+///!
+///! Sub-modules:
+///!   - `error`      - `TomlError`, `TomlErrorKind`
+///!   - `parser`     - the reader behind `Toml::parse` (with `MAX_DEPTH`)
+///!   - `serializer` - the writer behind `Toml`'s text writers
+
+namespace std::encoding::toml;
+
+import std::core::result::{ Result };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::encoding::value::model::{ Value };
+import std::encoding::toml::parser::{ Parser };
+import std::encoding::toml::serializer::{ Writer };
+
+module {
+    encoding::toml::error;
+    encoding::toml::parser;
+    encoding::toml::serializer;
+}
+
+export std::encoding::toml::error::{ TomlError, TomlErrorKind };
+
+/// The TOML text format: reading a `Value` from TOML text and writing one
+/// as TOML text.
+public type struct Toml {
+    /// Read a TOML document: its root table as a `Value::Object`, or a
+    /// `TomlError` pointing at the first byte that could not be read.
+    /// Arrays, inline tables and tables nest at most 256 deep
+    /// (`TomlErrorKind::DepthExceeded`).
+    public static parse(text: Str) -> Result<Value, TomlError> {
+        return Parser::read_document(text);
+    }
+
+    /// `value`, which must be an object, as a TOML document: its values as
+    /// `key = value` lines, then its tables under their headers, each line
+    /// ending with a line break.
+    public static to_text(value: &Value) -> Result<String, TomlError> {
+        mut out: String = String::new();
+        Writer::write_document(&out, value)?;
+        return Result::Ok(out);
+    }
+
+    /// Append `value`, which must be an object, to `out` as `to_text`
+    /// writes it. On a refusal `out` may hold part of the document.
+    public static write_text(out: mut &String, value: &Value) -> Result<(), TomlError> {
+        return Writer::write_document(out, value);
+    }
+}

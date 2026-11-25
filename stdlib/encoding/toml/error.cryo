@@ -1,0 +1,138 @@
+///! TomlError: why TOML text could not be read or a value could not be
+///! written as TOML, and where.
+///!
+///! `(kind, line, column, offset, msg)`, as `JsonError` and `YamlError`
+///! are: callers branch on `kind`, and `msg` says what was found for a
+///! person to read. Lines and columns are 1-indexed; `offset` is the byte
+///! index into the source. A value the writer refuses has no source, so
+///! its line, column and offset are 0.
+
+namespace std::encoding::toml::error;
+
+import std::core::drop::{ Drop };
+import std::core::error::{ Error };
+import std::core::result::{ Result };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::fmt::display::{ Display, Debug, Formatter };
+import std::fmt::error::{ FormatError };
+
+/// What stopped the reader, or the writer.
+public type enum TomlErrorKind with [Eq, Clone] {
+    /// The input ended inside a value: an unclosed string, array or
+    /// inline table, or a key with no value.
+    UnexpectedEof;
+    /// A character that cannot stand where it does: a key or value
+    /// malformed, a control character, a missing line break.
+    UnexpectedChar;
+    /// A `\X` escape TOML does not define, or one naming no Unicode
+    /// scalar value.
+    InvalidEscape;
+    /// A number TOML does not spell that way (`01`, `1__0`, `.5`), or an
+    /// integer no 64-bit signed integer holds.
+    InvalidNumber;
+    /// A date or time with a field out of its range (`2023-02-30`,
+    /// `24:00:00`) or a malformed one.
+    InvalidDateTime;
+    /// A key given a value twice in one table.
+    DuplicateKey;
+    /// A table defined twice, a table header naming a key that holds a
+    /// value, or a table extended in a way TOML forbids: by a header
+    /// after its dotted keys, or by dotted keys after its header.
+    TableRedefined;
+    /// Arrays, inline tables and tables nested deeper than
+    /// `parser::MAX_DEPTH`.
+    DepthExceeded;
+    /// A value the writer cannot write as TOML: a document that is not a
+    /// table, or a null in an array.
+    NotRepresentable;
+}
+
+implement enum TomlErrorKind {
+    /// A short, stable slug for the kind: `"unexpected_eof"`,
+    /// `"duplicate_key"`, ...
+    public label(&this) -> Str {
+        return Str::new(match (this) {
+            TomlErrorKind::UnexpectedEof    => { "unexpected_eof" }
+            TomlErrorKind::UnexpectedChar   => { "unexpected_char" }
+            TomlErrorKind::InvalidEscape    => { "invalid_escape" }
+            TomlErrorKind::InvalidNumber    => { "invalid_number" }
+            TomlErrorKind::InvalidDateTime  => { "invalid_date_time" }
+            TomlErrorKind::DuplicateKey     => { "duplicate_key" }
+            TomlErrorKind::TableRedefined   => { "table_redefined" }
+            TomlErrorKind::DepthExceeded    => { "depth_exceeded" }
+            TomlErrorKind::NotRepresentable => { "not_representable" }
+        });
+    }
+}
+
+/// Why TOML text could not be read or a value written, and where: the
+/// failure's kind, its position in the source (0 for the writer's), and a
+/// message for a person to read.
+public type struct TomlError {
+    public kind:   TomlErrorKind;
+    /// 1-indexed line of the offending byte; 0 for a value the writer
+    /// refused.
+    public line:   u64;
+    /// 1-indexed column of the offending byte; 0 for a value the writer
+    /// refused.
+    public column: u64;
+    /// 0-indexed byte offset into the source.
+    public offset: u64;
+    /// Human-readable detail. Owned, and released with the error.
+    public msg:    String;
+
+    /// An error of `kind` at the 1-indexed `line` and `column`, byte
+    /// `offset` from the start of the source, explained by `msg`, which the
+    /// error takes ownership of.
+    public static new(kind: TomlErrorKind, line: u64, column: u64, offset: u64, msg: String) -> TomlError {
+        return TomlError {
+            kind:   kind,
+            line:   line,
+            column: column,
+            offset: offset,
+            msg:    msg,
+        };
+    }
+
+    /// The human-readable message, borrowed for the error's lifetime; the
+    /// kind and the position stay available as fields.
+    public describe(&this) -> Str {
+        return this.msg.as_str();
+    }
+}
+
+implement trait Drop for struct TomlError {
+    drop(mut &this) -> void { }
+}
+
+/// The position and the message, `3:7: a key given a value twice`; a
+/// refusal of the writer's, which has no position, is the message alone.
+implement trait Display for struct TomlError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        if (this.line != 0) {
+            (Display for u64)::fmt(&this.line, f)?;
+            f.write_str(Str::new(":"))?;
+            (Display for u64)::fmt(&this.column, f)?;
+            f.write_str(Str::new(": "))?;
+        }
+        return f.write_str(this.msg.as_str());
+    }
+}
+
+/// The kind's slug before what `Display` writes:
+/// `duplicate_key at 3:7: a key given a value twice`, or
+/// `not_representable: TOML has no null in an array`.
+implement trait Debug for struct TomlError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        f.write_str(this.kind.label())?;
+        if (this.line != 0) {
+            f.write_str(Str::new(" at "))?;
+        } else {
+            f.write_str(Str::new(": "))?;
+        }
+        return (Display for TomlError)::fmt(this, f);
+    }
+}
+
+implement trait Error for struct TomlError { }

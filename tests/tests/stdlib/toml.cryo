@@ -1,0 +1,282 @@
+///! toml - the TOML 1.0 reader and writer: what each construct reads as
+///! (compared through its JSON text, which spells the value exactly), what
+///! is refused and with which kind and place, text written and read back,
+///! and one struct decoding alike from JSON, YAML and TOML; a refusal
+///! prints its place and message and is an `Error`.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::TomlT;
+
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::encoding::json;
+import std::encoding::yaml;
+import std::encoding::toml;
+import std::encoding::toml::{ TomlError, TomlErrorKind };
+import std::core::error::{ ErrorReport };
+import std::encoding::value::{ FromValue, ToValue, Value };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_equal };
+
+/// `text` read as TOML, written as JSON.
+function as_json(text: string) -> Result<String, TestError> {
+    return match (toml::Toml::parse(Str::from(text))) {
+        Result::Ok(value) => { Result::Ok(json::Json::to_text(&value)) }
+        Result::Err(error) => {
+            const message: String = f"the TOML must read: {error:?}";
+            Result::Err(TestError::failed(message.as_str()))
+        }
+    };
+}
+
+/// `text` read as TOML must read as the JSON text `expected`.
+function reads_as(text: string, expected: string) -> Result<(), TestError> {
+    return expect_equal(as_json(text)?, String::from_str(Str::from(expected)));
+}
+
+/// `text` must be refused with `kind`, at 1-indexed `line` and `column`.
+function refused(text: string, kind: TomlErrorKind, line: u64, column: u64) -> Result<(), TestError> {
+    return match (toml::Toml::parse(Str::from(text))) {
+        Result::Ok(_) => {
+            const message: String = f"the TOML must be refused: {text}";
+            Result::Err(TestError::failed(message.as_str()))
+        }
+        Result::Err(error) => {
+            expect_equal(error.kind.label(), kind.label())?;
+            expect_equal(error.line, line)?;
+            expect_equal(error.column, column)
+        }
+    };
+}
+
+![test]
+function keys_bare_quoted_and_dotted() -> Result<(), TestError> {
+    reads_as("key = 1\nbare_key-2 = 2\n\"quoted key\" = 3\n'literal.key' = 4\n1234 = 5\n",
+             "{\"key\":1,\"bare_key-2\":2,\"quoted key\":3,\"literal.key\":4,\"1234\":5}")?;
+    reads_as("a.b.c = 1\na . b . d = 2\nsite.\"google.com\" = true\n",
+             "{\"a\":{\"b\":{\"c\":1,\"d\":2}},\"site\":{\"google.com\":true}}")?;
+    return reads_as("\"\" = \"blank\"\n", "{\"\":\"blank\"}");
+}
+
+![test]
+function strings_in_every_form() -> Result<(), TestError> {
+    reads_as("a = \"tab\\there \\\"q\\\" \\\\ \\u00E9 \\U0001F600\"\n",
+             "{\"a\":\"tab\\there \\\"q\\\" \\\\ \u{e9} \u{1f600}\"}")?;
+    reads_as("a = 'C:\\path\\x'\n", "{\"a\":\"C:\\\\path\\\\x\"}")?;
+    // A line break right after the opening delimiter is not part of the
+    // string; a line-ending backslash joins the next non-blank text.
+    reads_as("a = \"\"\"\nRoses\nViolets\"\"\"\n", "{\"a\":\"Roses\\nViolets\"}")?;
+    reads_as("a = \"\"\"The quick \\\n\n    brown fox\"\"\"\n", "{\"a\":\"The quick brown fox\"}")?;
+    reads_as("a = '''\nfirst\n  second'''\n", "{\"a\":\"first\\n  second\"}")?;
+    // One or two quotes may end a multi-line string's text.
+    reads_as("a = \"\"\"\"one\"\"\"\"\nb = '''two'''''\n", "{\"a\":\"\\\"one\\\"\",\"b\":\"two''\"}")?;
+    return reads_as("a = \"line\\r\\nbreak\"\n", "{\"a\":\"line\\r\\nbreak\"}");
+}
+
+![test]
+function integers_in_every_base() -> Result<(), TestError> {
+    reads_as("a = +99\nb = 42\nc = 0\nd = -17\ne = 1_000\nf = 5_349_221\n",
+             "{\"a\":99,\"b\":42,\"c\":0,\"d\":-17,\"e\":1000,\"f\":5349221}")?;
+    reads_as("a = 0xDEADBEEF\nb = 0xdead_beef\nc = 0o755\nd = 0b1101_0110\n",
+             "{\"a\":3735928559,\"b\":3735928559,\"c\":493,\"d\":214}")?;
+    return reads_as("a = 9223372036854775807\nb = -9223372036854775808\n",
+                    "{\"a\":9223372036854775807,\"b\":-9223372036854775808}");
+}
+
+![test]
+function floats_with_infinity_and_nan() -> Result<(), TestError> {
+    reads_as("a = 1.0\nb = 3.1415\nc = -0.01\nd = 5e+22\ne = 1e06\nf = -2E-2\ng = 6.626e-34\nh = 224_617.445_991\n",
+             "{\"a\":1,\"b\":3.1415,\"c\":-0.01,\"d\":5e+22,\"e\":1000000,\"f\":-0.02,\"g\":6.626e-34,\"h\":224617.445991}")?;
+    // JSON has no infinity or NaN, so its writer spells them null; their
+    // kind shows in the TOML written back.
+    const value: Value = match (toml::Toml::parse(Str::from("a = inf\nb = +inf\nc = -inf\nd = nan\ne = -nan\n"))) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the TOML must read"))); }
+    };
+    const written: String = match (toml::Toml::to_text(&value)) {
+        Result::Ok(text) => { text }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the value must write"))); }
+    };
+    return expect_equal(written, String::from_str(Str::from("a = inf\nb = inf\nc = -inf\nd = nan\ne = nan\n")));
+}
+
+![test]
+function dates_and_times_read_as_their_text() -> Result<(), TestError> {
+    reads_as("a = 1979-05-27T07:32:00Z\nb = 1979-05-27T00:32:00-07:00\nc = 1979-05-27T00:32:00.999999+05:30\n",
+             "{\"a\":\"1979-05-27T07:32:00Z\",\"b\":\"1979-05-27T00:32:00-07:00\",\"c\":\"1979-05-27T00:32:00.999999+05:30\"}")?;
+    reads_as("a = 1979-05-27 07:32:00z\nb = 1979-05-27t07:32:00\nc = 1979-05-27\nd = 07:32:00\ne = 00:32:00.999\n",
+             "{\"a\":\"1979-05-27T07:32:00Z\",\"b\":\"1979-05-27T07:32:00\",\"c\":\"1979-05-27\",\"d\":\"07:32:00\",\"e\":\"00:32:00.999\"}")?;
+    return reads_as("leap = 2024-02-29\n", "{\"leap\":\"2024-02-29\"}");
+}
+
+![test]
+function arrays_and_inline_tables() -> Result<(), TestError> {
+    reads_as("a = [ 1, 2, 3 ]\nb = [\"x\", 'y']\nc = [ [ 1, 2 ], [\"a\", \"b\"] ]\nd = [ 0.1, 1, \"mixed\" ]\n",
+             "{\"a\":[1,2,3],\"b\":[\"x\",\"y\"],\"c\":[[1,2],[\"a\",\"b\"]],\"d\":[0.1,1,\"mixed\"]}")?;
+    reads_as("a = [\n  1, # one\n  2,\n]\nb = []\n", "{\"a\":[1,2],\"b\":[]}")?;
+    reads_as("name = { first = \"Tom\", last = \"Preston-Werner\" }\npoint = { x = 1, y.z = 2 }\nempty = {}\n",
+             "{\"name\":{\"first\":\"Tom\",\"last\":\"Preston-Werner\"},\"point\":{\"x\":1,\"y\":{\"z\":2}},\"empty\":{}}")?;
+    return reads_as("points = [ { x = 1 }, { x = 2 } ]\n", "{\"points\":[{\"x\":1},{\"x\":2}]}");
+}
+
+![test]
+function tables_and_arrays_of_tables() -> Result<(), TestError> {
+    reads_as("[table]\nkey = 1\n[table.inner]\nk = 2\n[other]\n",
+             "{\"table\":{\"key\":1,\"inner\":{\"k\":2}},\"other\":{}}")?;
+    // A super-table may be defined after its sub-table.
+    reads_as("[x.y.z.w]\n[x]\na = 1\n", "{\"x\":{\"y\":{\"z\":{\"w\":{}}},\"a\":1}}")?;
+    // A header may add a sub-table to a table dotted keys made.
+    reads_as("[fruit]\napple.color = \"red\"\n[fruit.apple.texture]\nsmooth = true\n",
+             "{\"fruit\":{\"apple\":{\"color\":\"red\",\"texture\":{\"smooth\":true}}}}")?;
+    reads_as("[[products]]\nname = \"Hammer\"\n[[products]]\n[[products]]\nname = \"Nail\"\n",
+             "{\"products\":[{\"name\":\"Hammer\"},{},{\"name\":\"Nail\"}]}")?;
+    return reads_as("[[fruits]]\nname = \"apple\"\n[fruits.physical]\ncolor = \"red\"\n[[fruits.varieties]]\nname = \"red delicious\"\n[[fruits]]\nname = \"banana\"\n",
+                    "{\"fruits\":[{\"name\":\"apple\",\"physical\":{\"color\":\"red\"},\"varieties\":[{\"name\":\"red delicious\"}]},{\"name\":\"banana\"}]}");
+}
+
+![test]
+function comments_blank_lines_and_line_breaks() -> Result<(), TestError> {
+    return reads_as("# a comment\r\n\r\nkey = \"value\" # after a value\r\n[t] # after a header\r\n  indented = 1\t\r\n",
+                    "{\"key\":\"value\",\"t\":{\"indented\":1}}");
+}
+
+![test]
+function definitions_twice_are_refused() -> Result<(), TestError> {
+    refused("a = 1\na = 2\n", TomlErrorKind::DuplicateKey, 2, 1)?;
+    refused("[t]\n[t]\n", TomlErrorKind::TableRedefined, 2, 1)?;
+    refused("a.b = 1\n[a]\n", TomlErrorKind::TableRedefined, 2, 1)?;
+    refused("[a.b.c]\nz = 9\n[a]\nb.c.t = 1\n", TomlErrorKind::TableRedefined, 4, 1)?;
+    refused("a = { x = 1 }\na.y = 2\n", TomlErrorKind::TableRedefined, 2, 1)?;
+    refused("a = [1]\n[[a]]\n", TomlErrorKind::TableRedefined, 2, 1)?;
+    refused("[[a]]\n[a]\n", TomlErrorKind::TableRedefined, 2, 1)?;
+    refused("a = 1\n[a.b]\n", TomlErrorKind::TableRedefined, 2, 1)?;
+    return refused("p = { a = 1, a = 2 }\n", TomlErrorKind::DuplicateKey, 1, 14);
+}
+
+![test]
+function malformed_text_is_refused_where_it_goes_wrong() -> Result<(), TestError> {
+    refused("a = 01\n", TomlErrorKind::InvalidNumber, 1, 5)?;
+    refused("a = 1__0\n", TomlErrorKind::InvalidNumber, 1, 5)?;
+    refused("a = .5\n", TomlErrorKind::UnexpectedChar, 1, 5)?;
+    refused("a = 1.\n", TomlErrorKind::InvalidNumber, 1, 5)?;
+    refused("a = +0x10\n", TomlErrorKind::InvalidNumber, 1, 5)?;
+    refused("a = 9223372036854775808\n", TomlErrorKind::InvalidNumber, 1, 5)?;
+    refused("a = 2023-02-29\n", TomlErrorKind::InvalidDateTime, 1, 5)?;
+    refused("a = 24:00:00\n", TomlErrorKind::InvalidDateTime, 1, 5)?;
+    refused("a = \"\\x\"\n", TomlErrorKind::InvalidEscape, 1, 7)?;
+    refused("a = \"\\uD800\"\n", TomlErrorKind::InvalidEscape, 1, 7)?;
+    refused("a = \"open\n", TomlErrorKind::UnexpectedChar, 1, 10)?;
+    refused("a = [1, 2\n", TomlErrorKind::UnexpectedEof, 2, 1)?;
+    refused("a = { b = 1,\n c = 2 }\n", TomlErrorKind::UnexpectedChar, 1, 13)?;
+    refused("a = { b = 1, }\n", TomlErrorKind::UnexpectedChar, 1, 14)?;
+    refused("a = 1 b = 2\n", TomlErrorKind::UnexpectedChar, 1, 7)?;
+    refused("a = truex\n", TomlErrorKind::UnexpectedChar, 1, 5)?;
+    refused("= 1\n", TomlErrorKind::UnexpectedChar, 1, 1)?;
+    refused("a\n", TomlErrorKind::UnexpectedChar, 1, 2)?;
+    return refused("a = 1\r b = 2\n", TomlErrorKind::UnexpectedChar, 1, 6);
+}
+
+![test]
+function written_text_reads_back_as_the_value() -> Result<(), TestError> {
+    // A table read from an inline table is a table like any other, so it is
+    // written back under a header of its own.
+    const text: string = "title = \"TOML\"\ncount = 1\n[owner]\nname = \"Tom\"\ndob = 1979-05-27T07:32:00-08:00\n[database]\nports = [8000, 8001]\ndata = [[\"delta\", \"phi\"], [3.14]]\ntemp = { cpu = 79.5, case = 72.0 }\n[servers.alpha]\nip = \"10.0.0.1\"\n[[products]]\nname = \"Hammer\"\n[[products]]\n\"odd key\" = \"a \\\"quote\\\"\\n\"\n";
+    const value: Value = match (toml::Toml::parse(Str::from(text))) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the TOML must read"))); }
+    };
+    const written: String = match (toml::Toml::to_text(&value)) {
+        Result::Ok(out) => { out }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the value must write"))); }
+    };
+    expect_equal(written.clone(), String::from_str(Str::from(
+        "title = \"TOML\"\ncount = 1\n\n[owner]\nname = \"Tom\"\ndob = \"1979-05-27T07:32:00-08:00\"\n\n[database]\nports = [8000, 8001]\ndata = [[\"delta\", \"phi\"], [3.14]]\n\n[database.temp]\ncpu = 79.5\ncase = 72.0\n\n[servers.alpha]\nip = \"10.0.0.1\"\n\n[[products]]\nname = \"Hammer\"\n\n[[products]]\n\"odd key\" = \"a \\\"quote\\\"\\n\"\n")))?;
+    const again: Value = match (toml::Toml::parse(written.as_str())) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the written text must read back"))); }
+    };
+    return expect_equal(json::Json::to_text(&again), json::Json::to_text(&value));
+}
+
+![test]
+function what_the_writer_refuses() -> Result<(), TestError> {
+    const not_a_table: Value = Value::integer_value(1);
+    match (toml::Toml::to_text(&not_a_table)) {
+        Result::Ok(_) => { return Result::Err(TestError::failed(Str::from("a document is a table"))); }
+        Result::Err(error) => { expect_equal(error.kind.label(), TomlErrorKind::NotRepresentable.label())?; }
+    }
+    const with_null: Value = match (json::Json::parse(Str::from("{\"gone\":null,\"list\":[1,null]}"))) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the JSON must read"))); }
+    };
+    return match (toml::Toml::to_text(&with_null)) {
+        Result::Ok(_) => { Result::Err(TestError::failed(Str::from("a null in an array is refused"))) }
+        Result::Err(error) => {
+            expect_equal(f"{error:?}", String::from_str(Str::from("not_representable: TOML has no null in an array")))
+        }
+    };
+}
+
+/// A configuration decoded from any of the three formats.
+type struct Service with [ToValue, FromValue] {
+    name: String;
+    port: i64;
+    tags: Array<String>;
+}
+
+/// `value` must decode as the `api` service on port 8080 tagged `a`, `b`.
+function decodes_as_the_service(value: &Value) -> Result<(), TestError> {
+    const service: Service = match (Service::from_value(value)) {
+        Result::Ok(decoded) => { decoded }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the value must decode"))); }
+    };
+    expect(service.name.as_str() == Str::from("api"), Str::from("the name is `api`"))?;
+    expect_equal(service.port, 8080)?;
+    expect_equal(service.tags.length(), 2)?;
+    return expect(service.tags[1].as_str() == Str::from("b"), Str::from("the second tag is `b`"));
+}
+
+![test]
+function one_struct_decodes_from_json_yaml_and_toml() -> Result<(), TestError> {
+    const from_json: Value = match (json::Json::parse(Str::from("{\"name\":\"api\",\"port\":8080,\"tags\":[\"a\",\"b\"]}"))) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the JSON must read"))); }
+    };
+    const from_yaml: Value = match (yaml::Yaml::parse(Str::from("name: api\nport: 8080\ntags:\n  - a\n  - b\n"))) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the YAML must read"))); }
+    };
+    const from_toml: Value = match (toml::Toml::parse(Str::from("name = \"api\"\nport = 8080\ntags = [\"a\", \"b\"]\n"))) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the TOML must read"))); }
+    };
+    decodes_as_the_service(&from_json)?;
+    decodes_as_the_service(&from_yaml)?;
+    decodes_as_the_service(&from_toml)?;
+    // And the struct written as TOML reads back as itself.
+    const service: Service = match (Service::from_value(&from_toml)) {
+        Result::Ok(decoded) => { decoded }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the TOML value must decode"))); }
+    };
+    return match (toml::Toml::to_text(&service.to_value())) {
+        Result::Ok(written) => {
+            expect_equal(written, String::from_str(Str::from("name = \"api\"\nport = 8080\ntags = [\"a\", \"b\"]\n")))
+        }
+        Result::Err(_) => { Result::Err(TestError::failed(Str::from("the struct must write"))) }
+    };
+}
+
+![test]
+function a_refusal_prints_and_is_an_error() -> Result<(), TestError> {
+    const error: TomlError = match (toml::Toml::parse(Str::from("a = 1\na = 2\n"))) {
+        Result::Ok(_) => { return Result::Err(TestError::failed(Str::from("the TOML must be refused"))); }
+        Result::Err(refusal) => { refusal }
+    };
+    expect_equal(f"{error}", String::from_str(Str::from("2:1: the key `a` is given a value twice")))?;
+    expect_equal(f"{error:?}", String::from_str(Str::from("duplicate_key at 2:1: the key `a` is given a value twice")))?;
+    const report: ErrorReport = ErrorReport::from_error(&error);
+    expect_equal(String::from_str(report.message()), String::from_str(Str::from("2:1: the key `a` is given a value twice")))?;
+    return expect(report.causes().next().is_none(), Str::from("a TOML refusal has no source"));
+}

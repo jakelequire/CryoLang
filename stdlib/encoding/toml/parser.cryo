@@ -1,0 +1,1107 @@
+///! The reader behind `Toml::parse`: TOML 1.0 text read into the shared
+///! `Value` model.
+///!
+///! Read: key/value pairs with bare, quoted and dotted keys; tables and
+///! arrays of tables; inline tables; arrays, their elements of any types;
+///! basic, literal and multi-line strings with every escape; integers in
+///! decimal, hexadecimal, octal and binary with `_` between digits; floats
+///! with fractions and exponents, `inf` and `nan`; booleans; and offset
+///! date-times, local date-times, local dates and local times.
+///!
+///! A table is an `Object` and an array of tables an `Array` of them. A
+///! date or time is a `Value::String` holding its RFC 3339 text, the date
+///! and the time joined by `T` and a `z` offset written `Z`; the other
+///! kinds map as their names say.
+///!
+///! TOML's rules on defining a table are kept: a key is given a value once,
+///! a table is opened by one header, a table its dotted keys made is not
+///! opened by a header, dotted keys do not add to a table a header opened,
+///! and an inline table and an array of values are complete as written.
+///! The reader tracks how each table was made in its own arena of tables,
+///! by index, and builds the `Value` once the text is read.
+
+namespace std::encoding::toml::parser;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::convert::{ TryFrom };
+import std::core::mem;
+import std::core::slice::{ Slice };
+import std::collections::array::{ Array };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::encoding::value::model::{ Number, Object, Value };
+import std::encoding::toml::error::{ TomlError, TomlErrorKind };
+
+private const HT:         u8 = 9;
+private const LF:         u8 = 10;
+private const CR:         u8 = 13;
+private const SPACE:      u8 = 32;
+private const QUOTE:      u8 = 34;   // "
+private const HASH:       u8 = 35;   // #
+private const APOSTROPHE: u8 = 39;   // '
+private const PLUS:       u8 = 43;   // +
+private const COMMA:      u8 = 44;   // ,
+private const MINUS:      u8 = 45;   // -
+private const DOT:        u8 = 46;   // .
+private const ZERO:       u8 = 48;   // 0
+private const COLON:      u8 = 58;   // :
+private const EQUALS:     u8 = 61;   // =
+private const UPPER_E:    u8 = 69;   // E
+private const UPPER_T:    u8 = 84;   // T
+private const UPPER_U:    u8 = 85;   // U
+private const UPPER_Z:    u8 = 90;   // Z
+private const LBRACK:     u8 = 91;   // [
+private const BACKSLASH:  u8 = 92;   // \
+private const RBRACK:     u8 = 93;   // ]
+private const UNDERSCORE: u8 = 95;   // _
+private const LOWER_B:    u8 = 98;   // b
+private const LOWER_E:    u8 = 101;  // e
+private const LOWER_F:    u8 = 102;  // f
+private const LOWER_I:    u8 = 105;  // i
+private const LOWER_N:    u8 = 110;  // n
+private const LOWER_O:    u8 = 111;  // o
+private const LOWER_R:    u8 = 114;  // r
+private const LOWER_T:    u8 = 116;  // t
+private const LOWER_U:    u8 = 117;  // u
+private const LOWER_X:    u8 = 120;  // x
+private const LOWER_Z:    u8 = 122;  // z
+private const LBRACE:     u8 = 123;  // {
+private const RBRACE:     u8 = 125;  // }
+private const DELETE:     u8 = 127;
+
+/// Arrays, inline tables and tables nest at most this deep, a table's
+/// depth counted in the keys that lead to it. The writer bounds its
+/// recursion by the same cap.
+internal const MAX_DEPTH: u64 = 256;
+
+/// How a table came to be, which decides what may add to it later.
+private type enum TableKind with [Eq] {
+    /// Made on the way to a header's table (`a` for `[a.b]`); a header
+    /// of its own may still open it.
+    Implicit;
+    /// Opened by a header, or an element of an array of tables.
+    Header;
+    /// Made by a dotted key (`a` for `a.b = 1`), or the table an inline
+    /// table is read into; only further dotted keys add to it.
+    Dotted;
+}
+
+/// What a key of a table holds.
+private type enum SlotKind with [Eq] {
+    /// A value written after `=`: a string, number, boolean, date or time,
+    /// array or inline table.
+    Plain;
+    /// A table of the arena.
+    Table;
+    /// An array of tables of the arena, each `[[key]]` adding one.
+    Tables;
+}
+
+/// One key's content: the field its kind names is the one that is set.
+private type struct Slot {
+    kind:   SlotKind;
+    value:  Value;
+    table:  i64;
+    tables: Array<i64>;
+
+    static plain(value: Value) -> Slot {
+        return Slot { kind: SlotKind::Plain, value: value, table: -1, tables: Array::<i64>::new() };
+    }
+
+    static table(index: i64) -> Slot {
+        return Slot { kind: SlotKind::Table, value: Value::Null, table: index, tables: Array::<i64>::new() };
+    }
+
+    static first_of_tables(index: i64) -> Slot {
+        mut tables: Array<i64> = Array::<i64>::new();
+        tables.push(index);
+        return Slot { kind: SlotKind::Tables, value: Value::Null, table: -1, tables: tables };
+    }
+}
+
+/// A table of the arena: its keys in the order written, what each holds,
+/// how it was made, and how many keys lead to it from the document.
+private type struct TomlTable {
+    keys:  Array<String>;
+    slots: Array<Slot>;
+    kind:  TableKind;
+    depth: u64;
+}
+
+/// The TOML reader: one per document read.
+internal type struct Parser {
+    private src:     u8*;
+    private len:     u64;
+    private pos:     u64;
+    private line:    u64;
+    private column:  u64;
+    /// Every table read so far; index 0 is the document's root.
+    private tables:  Array<TomlTable>;
+    /// The table the last header opened, which key/value lines add to.
+    private current: i64;
+
+    private static new(text: Str) -> Parser {
+        mut tables: Array<TomlTable> = Array::<TomlTable>::new();
+        tables.push(TomlTable { keys: Array::<String>::new(), slots: Array::<Slot>::new(),
+                                kind: TableKind::Header, depth: 0 });
+        return Parser {
+            src:     text.as_pointer(),
+            len:     text.length() as u64,
+            pos:     0,
+            line:    1,
+            column:  1,
+            tables:  tables,
+            current: 0,
+        };
+    }
+
+    /// Read a TOML document, for `Toml::parse`: its root table as a
+    /// `Value::Object`, or a `TomlError` pointing at the first byte that
+    /// could not be read.
+    internal static read_document(text: Str) -> Result<Value, TomlError> {
+        mut parser: Parser = Parser::new(text);
+        parser.read_lines()?;
+        return Result::Ok(parser.table_value(0));
+    }
+
+    // Cursor
+
+    private eof(&this) -> boolean {
+        return this.pos >= this.len;
+    }
+
+    private peek(&this) -> u8 {
+        if (this.pos >= this.len) { return 0; }
+        return this.src[this.pos];
+    }
+
+    /// The byte `ahead` bytes past the cursor, or 0 past the end.
+    private peek_at(&this, ahead: u64) -> u8 {
+        if (this.pos + ahead >= this.len) { return 0; }
+        return this.src[this.pos + ahead];
+    }
+
+    /// Advance one byte, keeping the line and column. The caller checks
+    /// `eof()` first.
+    private advance(mut &this) -> u8 {
+        const b: u8 = this.src[this.pos];
+        this.pos = this.pos + 1;
+        if (b == LF) {
+            this.line = this.line + 1;
+            this.column = 1;
+        } else {
+            this.column = this.column + 1;
+        }
+        return b;
+    }
+
+    /// Skip spaces and tabs, TOML's whitespace within a line.
+    private skip_blank(mut &this) -> void {
+        while (!this.eof() && (this.peek() == SPACE || this.peek() == HT)) { this.advance(); }
+    }
+
+    // Errors
+
+    private error_here(&this, kind: TomlErrorKind, msg: Str) -> TomlError {
+        return TomlError::new(kind, this.line, this.column, this.pos, String::from_str(msg));
+    }
+
+    private error_at(&this, kind: TomlErrorKind, line: u64, column: u64, offset: u64, msg: String) -> TomlError {
+        return TomlError::new(kind, line, column, offset, msg);
+    }
+
+    /// The input ended where `what` still needed more of it.
+    private error_eof(&this, what: Str) -> TomlError {
+        return TomlError::new(TomlErrorKind::UnexpectedEof, this.line, this.column, this.pos,
+                              f"unexpected end of input in {what}");
+    }
+
+    // Lines
+
+    /// Take one line break: a line feed, or a carriage return and a line
+    /// feed. A carriage return alone is no line break in TOML.
+    private newline(mut &this) -> Result<(), TomlError> {
+        if (this.peek() == CR) {
+            if (this.peek_at(1) != LF) {
+                return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar,
+                    Str::new("a carriage return not followed by a line feed")));
+            }
+            this.advance();
+        }
+        this.advance();
+        return Result::Ok(());
+    }
+
+    /// Skip a comment from its `#` to the end of its line, the line break
+    /// left in place. Control characters other than a tab are refused in
+    /// it, as everywhere in TOML text.
+    private skip_comment(mut &this) -> Result<(), TomlError> {
+        this.advance();
+        while (!this.eof()) {
+            const b: u8 = this.peek();
+            if (b == LF || b == CR) { return Result::Ok(()); }
+            if ((b < SPACE && b != HT) || b == DELETE) {
+                return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar,
+                    Str::new("a control character in a comment")));
+            }
+            this.advance();
+        }
+        return Result::Ok(());
+    }
+
+    /// After a key/value pair or a header: blanks, an optional comment,
+    /// then a line break or the end of the text.
+    private end_of_line(mut &this, after: Str) -> Result<(), TomlError> {
+        this.skip_blank();
+        if (this.eof()) { return Result::Ok(()); }
+        if (this.peek() == HASH) { this.skip_comment()?; }
+        if (this.eof()) { return Result::Ok(()); }
+        const b: u8 = this.peek();
+        if (b == LF || b == CR) { return this.newline(); }
+        return Result::Err(TomlError::new(TomlErrorKind::UnexpectedChar, this.line, this.column, this.pos,
+                                          f"expected a line break after {after}"));
+    }
+
+    /// Every line of the document, in order.
+    private read_lines(mut &this) -> Result<(), TomlError> {
+        while (true) {
+            this.skip_blank();
+            if (this.eof()) { return Result::Ok(()); }
+            const b: u8 = this.peek();
+            if (b == HASH) {
+                this.skip_comment()?;
+            } else if (b == LF || b == CR) {
+                this.newline()?;
+            } else if (b == LBRACK) {
+                this.read_header()?;
+                this.end_of_line(Str::new("a table header"))?;
+            } else {
+                this.read_key_value(this.current, 0)?;
+                this.end_of_line(Str::new("a value"))?;
+            }
+        }
+        return Result::Ok(());
+    }
+
+    // The arena of tables
+
+    private table_at(mut &this, index: i64) -> mut TomlTable* {
+        return this.tables.as_mutable_pointer() + index;
+    }
+
+    private slot_at(mut &this, table: i64, index: i64) -> mut Slot* {
+        return this.table_at(table).slots.as_mutable_pointer() + index;
+    }
+
+    /// The index of `key` among `table`'s keys, or -1.
+    private find(mut &this, table: i64, key: Str) -> i64 {
+        const t: mut TomlTable* = this.table_at(table);
+        for (mut i: i64 = 0; i < t.keys.length(); i++) {
+            if (t.keys[i].as_str() == key) { return i; }
+        }
+        return -1;
+    }
+
+    private add_slot(mut &this, table: i64, key: Str, slot: Slot) -> void {
+        const t: mut TomlTable* = this.table_at(table);
+        t.keys.push(String::from_str(key));
+        t.slots.push(slot);
+    }
+
+    /// A new, empty table of `kind`, `depth` keys from the document's
+    /// root, or `DepthExceeded` past `MAX_DEPTH`.
+    private new_table(mut &this, kind: TableKind, depth: u64) -> Result<i64, TomlError> {
+        if (depth > MAX_DEPTH) {
+            return Result::Err(this.error_here(TomlErrorKind::DepthExceeded, Str::new("tables nested too deep")));
+        }
+        this.tables.push(TomlTable { keys: Array::<String>::new(), slots: Array::<Slot>::new(),
+                                     kind: kind, depth: depth });
+        return Result::Ok(this.tables.length() - 1);
+    }
+
+    /// The table `index` as an `Object`, its tables and arrays of tables
+    /// built in turn. The values move out of the arena.
+    private table_value(mut &this, index: i64) -> Value {
+        mut object: Object = Object::new();
+        const count: i64 = this.table_at(index).keys.length();
+        for (mut i: i64 = 0; i < count; i++) {
+            const key: String = this.table_at(index).keys[i].clone();
+            const kind: SlotKind = this.slot_at(index, i).kind;
+            if (kind == SlotKind::Plain) {
+                mut taken: Value = Value::Null;
+                const slot: mut Slot* = this.slot_at(index, i);
+                mem::swap::<Value>(&taken, &slot.value);
+                object.insert(key, taken);
+            } else if (kind == SlotKind::Table) {
+                const sub: i64 = this.slot_at(index, i).table;
+                object.insert(key, this.table_value(sub));
+            } else {
+                mut list: Array<Value> = Array::<Value>::new();
+                const length: i64 = this.slot_at(index, i).tables.length();
+                for (mut j: i64 = 0; j < length; j++) {
+                    const sub: i64 = this.slot_at(index, i).tables[j];
+                    list.push(this.table_value(sub));
+                }
+                object.insert(key, Value::Array(list));
+            }
+        }
+        return Value::Object(object);
+    }
+
+    // Keys
+
+    /// `keys[0..=last]` joined by dots, for a message.
+    private static dotted(keys: &Array<String>, last: i64) -> String {
+        mut out: String = String::new();
+        for (mut i: i64 = 0; i <= last; i++) {
+            if (i > 0) { out.push_byte(DOT); }
+            out.append(keys[i].as_str());
+        }
+        return out;
+    }
+
+    /// A bare key's byte: a letter, a digit, `_` or `-`.
+    private static is_bare_key_byte(b: u8) -> boolean {
+        return (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b.is_digit() || b == UNDERSCORE || b == MINUS;
+    }
+
+    /// One key: bare, or a basic or literal string.
+    private read_simple_key(mut &this) -> Result<String, TomlError> {
+        if (this.eof()) { return Result::Err(this.error_eof(Str::new("a key"))); }
+        const b: u8 = this.peek();
+        if (b == QUOTE) { return this.read_basic_string(); }
+        if (b == APOSTROPHE) { return this.read_literal_string(); }
+        mut key: String = String::new();
+        while (!this.eof() && Parser::is_bare_key_byte(this.peek())) {
+            key.push_byte(this.advance());
+        }
+        if (key.length() == 0) {
+            return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar, Str::new("expected a key")));
+        }
+        return Result::Ok(key);
+    }
+
+    /// A key, its parts separated by dots with blanks allowed around them.
+    private read_key(mut &this) -> Result<Array<String>, TomlError> {
+        mut keys: Array<String> = Array::<String>::new();
+        while (true) {
+            keys.push(this.read_simple_key()?);
+            this.skip_blank();
+            if (this.peek() != DOT || this.eof()) { return Result::Ok(keys); }
+            this.advance();
+            this.skip_blank();
+        }
+        return Result::Ok(keys);
+    }
+
+    /// `key = value`, added to `table`. `depth` is the nesting of the
+    /// value's container: 0 on a line of its own, an inline table's depth
+    /// inside one.
+    private read_key_value(mut &this, table: i64, depth: u64) -> Result<(), TomlError> {
+        const line: u64 = this.line;
+        const column: u64 = this.column;
+        const offset: u64 = this.pos;
+        const keys: Array<String> = this.read_key()?;
+        this.skip_blank();
+        if (this.eof()) { return Result::Err(this.error_eof(Str::new("a key/value pair"))); }
+        if (this.peek() != EQUALS) {
+            return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar, Str::new("expected `=` after a key")));
+        }
+        this.advance();
+        this.skip_blank();
+        const value: Value = this.read_value(depth)?;
+        return this.assign(table, &keys, value, line, column, offset);
+    }
+
+    /// Give `keys` the value `value` in `table`: the tables a dotted key's
+    /// leading parts name are made, or must have been made by dotted keys,
+    /// and the last part must be new. The error points at the key.
+    private assign(mut &this, table: i64, keys: &Array<String>, value: Value,
+                   line: u64, column: u64, offset: u64) -> Result<(), TomlError> {
+        mut t: i64 = table;
+        const last: i64 = keys.length() - 1;
+        for (mut i: i64 = 0; i < last; i++) {
+            const index: i64 = this.find(t, keys[i].as_str());
+            if (index < 0) {
+                const depth: u64 = this.table_at(t).depth + 1;
+                const made: i64 = this.new_table(TableKind::Dotted, depth)?;
+                this.add_slot(t, keys[i].as_str(), Slot::table(made));
+                t = made;
+                continue;
+            }
+            const slot: mut Slot* = this.slot_at(t, index);
+            if (slot.kind == SlotKind::Table && this.table_at(slot.table).kind == TableKind::Dotted) {
+                t = slot.table;
+                continue;
+            }
+            const name: String = Parser::dotted(keys, i);
+            return Result::Err(this.error_at(TomlErrorKind::TableRedefined, line, column, offset,
+                f"`{name}` is already defined, so a dotted key cannot add to it"));
+        }
+        if (this.find(t, keys[last].as_str()) >= 0) {
+            const name: String = Parser::dotted(keys, last);
+            return Result::Err(this.error_at(TomlErrorKind::DuplicateKey, line, column, offset,
+                f"the key `{name}` is given a value twice"));
+        }
+        this.add_slot(t, keys[last].as_str(), Slot::plain(value));
+        return Result::Ok(());
+    }
+
+    // Headers
+
+    /// `[key]` or `[[key]]`: open a table, or add one to an array of
+    /// tables, and make it the table later lines add to.
+    private read_header(mut &this) -> Result<(), TomlError> {
+        const line: u64 = this.line;
+        const column: u64 = this.column;
+        const offset: u64 = this.pos;
+        this.advance();
+        const array: boolean = this.peek() == LBRACK && !this.eof();
+        if (array) { this.advance(); }
+        this.skip_blank();
+        const keys: Array<String> = this.read_key()?;
+        this.skip_blank();
+        if (this.eof()) { return Result::Err(this.error_eof(Str::new("a table header"))); }
+        if (this.peek() != RBRACK) {
+            return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar, Str::new("expected `]` to close a table header")));
+        }
+        this.advance();
+        if (array) {
+            if (this.peek() != RBRACK || this.eof()) {
+                return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar,
+                    Str::new("expected `]]` to close an array-of-tables header")));
+            }
+            this.advance();
+        }
+        return this.open(&keys, array, line, column, offset);
+    }
+
+    private open(mut &this, keys: &Array<String>, array: boolean,
+                 line: u64, column: u64, offset: u64) -> Result<(), TomlError> {
+        mut t: i64 = 0;
+        const last: i64 = keys.length() - 1;
+        for (mut i: i64 = 0; i < last; i++) {
+            const index: i64 = this.find(t, keys[i].as_str());
+            if (index < 0) {
+                const depth: u64 = this.table_at(t).depth + 1;
+                const made: i64 = this.new_table(TableKind::Implicit, depth)?;
+                this.add_slot(t, keys[i].as_str(), Slot::table(made));
+                t = made;
+                continue;
+            }
+            const slot: mut Slot* = this.slot_at(t, index);
+            if (slot.kind == SlotKind::Table) {
+                t = slot.table;
+            } else if (slot.kind == SlotKind::Tables) {
+                t = slot.tables[slot.tables.length() - 1];
+            } else {
+                const name: String = Parser::dotted(keys, i);
+                return Result::Err(this.error_at(TomlErrorKind::TableRedefined, line, column, offset,
+                    f"`{name}` holds a value, not a table"));
+            }
+        }
+        const name: String = Parser::dotted(keys, last);
+        const index: i64 = this.find(t, keys[last].as_str());
+        const depth: u64 = this.table_at(t).depth + 1;
+        if (index < 0) {
+            const made: i64 = this.new_table(TableKind::Header, depth)?;
+            if (array) {
+                this.add_slot(t, keys[last].as_str(), Slot::first_of_tables(made));
+            } else {
+                this.add_slot(t, keys[last].as_str(), Slot::table(made));
+            }
+            this.current = made;
+            return Result::Ok(());
+        }
+        const kind: SlotKind = this.slot_at(t, index).kind;
+        if (array) {
+            if (kind != SlotKind::Tables) {
+                return Result::Err(this.error_at(TomlErrorKind::TableRedefined, line, column, offset,
+                    f"`{name}` is not an array of tables"));
+            }
+            const made: i64 = this.new_table(TableKind::Header, depth)?;
+            this.slot_at(t, index).tables.push(made);
+            this.current = made;
+            return Result::Ok(());
+        }
+        if (kind == SlotKind::Tables) {
+            return Result::Err(this.error_at(TomlErrorKind::TableRedefined, line, column, offset,
+                f"`{name}` is an array of tables; `[[{name}]]` adds one to it"));
+        }
+        if (kind == SlotKind::Plain) {
+            return Result::Err(this.error_at(TomlErrorKind::TableRedefined, line, column, offset,
+                f"`{name}` holds a value, not a table"));
+        }
+        const opened: i64 = this.slot_at(t, index).table;
+        const made_as: TableKind = this.table_at(opened).kind;
+        if (made_as == TableKind::Header) {
+            return Result::Err(this.error_at(TomlErrorKind::TableRedefined, line, column, offset,
+                f"the table `{name}` is defined twice"));
+        }
+        if (made_as == TableKind::Dotted) {
+            return Result::Err(this.error_at(TomlErrorKind::TableRedefined, line, column, offset,
+                f"the table `{name}` was made by dotted keys, so a header cannot open it"));
+        }
+        this.table_at(opened).kind = TableKind::Header;
+        this.current = opened;
+        return Result::Ok(());
+    }
+
+    // Values
+
+    /// One value, inside containers `depth` deep.
+    private read_value(mut &this, depth: u64) -> Result<Value, TomlError> {
+        if (this.eof()) { return Result::Err(this.error_eof(Str::new("a value"))); }
+        const b: u8 = this.peek();
+        if (b == QUOTE) {
+            if (this.peek_at(1) == QUOTE && this.peek_at(2) == QUOTE) {
+                return Result::Ok(Value::String(this.read_multiline_string(QUOTE)?));
+            }
+            return Result::Ok(Value::String(this.read_basic_string()?));
+        }
+        if (b == APOSTROPHE) {
+            if (this.peek_at(1) == APOSTROPHE && this.peek_at(2) == APOSTROPHE) {
+                return Result::Ok(Value::String(this.read_multiline_string(APOSTROPHE)?));
+            }
+            return Result::Ok(Value::String(this.read_literal_string()?));
+        }
+        if (b == LBRACK) { return this.read_array(depth + 1); }
+        if (b == LBRACE) { return this.read_inline_table(depth + 1); }
+        if (b == LOWER_T) { this.keyword("true")?; return Result::Ok(Value::Bool(true)); }
+        if (b == LOWER_F) { this.keyword("false")?; return Result::Ok(Value::Bool(false)); }
+        if (b.is_digit() && this.at_date_or_time()) { return this.read_date_time(); }
+        if (b.is_digit() || b == PLUS || b == MINUS || b == LOWER_I || b == LOWER_N) {
+            return this.read_number();
+        }
+        return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar, Str::new("expected a value")));
+    }
+
+    /// The byte of a number's or a keyword's spelling: what a number's text
+    /// runs over before a delimiter.
+    private static is_number_byte(b: u8) -> boolean {
+        return (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b.is_digit()
+            || b == UNDERSCORE || b == PLUS || b == MINUS || b == DOT;
+    }
+
+    /// `word` at the cursor, standing alone.
+    private keyword(mut &this, word: string) -> Result<(), TomlError> {
+        const text: Str = Str::from(word);
+        const length: u64 = text.length() as u64;
+        mut matched: boolean = this.pos + length <= this.len;
+        for (mut i: u64 = 0; matched && i < length; i++) {
+            if (this.src[this.pos + i] != text.as_pointer()[i]) { matched = false; }
+        }
+        if (matched && this.pos + length < this.len && Parser::is_number_byte(this.src[this.pos + length])) {
+            matched = false;
+        }
+        if (!matched) {
+            return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar, Str::new("expected a value")));
+        }
+        for (mut i: u64 = 0; i < length; i++) { this.advance(); }
+        return Result::Ok(());
+    }
+
+    // Numbers
+
+    /// The end of a run of `radix` digits from `from` in `text`, `_` allowed
+    /// only between two digits, or -1 when the run is empty or an `_`
+    /// stands anywhere else.
+    private static digit_run(text: &Slice<u8>, from: i64, radix: u32) -> i64 {
+        mut i: i64 = from;
+        mut previous_digit: boolean = false;
+        while (i < text.length()) {
+            const b: u8 = text[i];
+            if (Parser::digit_value(b) < radix) {
+                previous_digit = true;
+            } else if (b == UNDERSCORE) {
+                if (!previous_digit) { return -1; }
+                if (i + 1 >= text.length() || Parser::digit_value(text[i + 1]) >= radix) { return -1; }
+                previous_digit = false;
+            } else {
+                break;
+            }
+            i++;
+        }
+        if (i == from) { return -1; }
+        return i;
+    }
+
+    /// A digit's value in any base up to 16, or 99 for a byte that is none.
+    private static digit_value(b: u8) -> u32 {
+        if (b.is_digit()) { return (b - ZERO) as u32; }
+        if (b >= 97 && b <= 102) { return (b - 87) as u32; }
+        if (b >= 65 && b <= 70) { return (b - 55) as u32; }
+        return 99;
+    }
+
+    /// `text[from..to]` without its underscores, appended to `out`.
+    private static append_digits(out: mut &String, text: &Slice<u8>, from: i64, to: i64) -> void {
+        for (mut i: i64 = from; i < to; i++) {
+            if (text[i] != UNDERSCORE) { out.push_byte(text[i]); }
+        }
+    }
+
+    /// An integer or a float, `inf` and `nan` included, read whole up to
+    /// the next delimiter.
+    private read_number(mut &this) -> Result<Value, TomlError> {
+        const line: u64 = this.line;
+        const column: u64 = this.column;
+        const start: u64 = this.pos;
+        while (!this.eof() && Parser::is_number_byte(this.peek())) { this.advance(); }
+        const text: &Slice<u8> = Slice::from_raw(this.src + start, (this.pos - start) as i64);
+        match (Parser::number_of(text)) {
+            Result::Ok(value) => { return Result::Ok(value); }
+            Result::Err(reason) => {
+                return Result::Err(this.error_at(TomlErrorKind::InvalidNumber, line, column, start,
+                                                 String::from_str(Str::from(reason))));
+            }
+        }
+    }
+
+    /// The number `text` spells, or why it spells none.
+    private static number_of(text: &Slice<u8>) -> Result<Value, string> {
+        mut i: i64 = 0;
+        mut negative: boolean = false;
+        const signed: boolean = text.length() > 0 && (text[0] == PLUS || text[0] == MINUS);
+        if (signed) {
+            negative = text[0] == MINUS;
+            i = 1;
+        }
+        const rest: Str = Str::from_raw(&text[0] + i, text.length() - i);
+        if (rest == Str::new("inf")) {
+            return Result::Ok(Value::Number(Number::Float(if (negative) { f64::NEGATIVE_INFINITY } else { f64::INFINITY })));
+        }
+        if (rest == Str::new("nan")) {
+            return Result::Ok(Value::Number(Number::Float(f64::NAN)));
+        }
+        if (text.length() - i >= 2 && text[i] == ZERO
+                && (text[i + 1] == LOWER_X || text[i + 1] == LOWER_O || text[i + 1] == LOWER_B)) {
+            if (signed) { return Result::Err("a sign before a hexadecimal, octal or binary integer"); }
+            const radix: u32 = if (text[i + 1] == LOWER_X) { 16 } else { if (text[i + 1] == LOWER_O) { 8 } else { 2 } };
+            const end: i64 = Parser::digit_run(text, i + 2, radix);
+            if (end != text.length()) { return Result::Err("a malformed integer"); }
+            mut digits: String = String::new();
+            Parser::append_digits(&digits, text, i + 2, end);
+            const magnitude: u64 = u64::parse_radix(digits.as_str().as_bytes(), radix).unwrap_or(u64::MAX);
+            if (magnitude > i64::MAX as u64) { return Result::Err("an integer no 64-bit signed integer holds"); }
+            return Result::Ok(Value::Number(Number::Int(magnitude as i64)));
+        }
+        // Decimal: an integer part, then a fraction, an exponent or both
+        // for a float.
+        const integer_end: i64 = Parser::digit_run(text, i, 10);
+        if (integer_end < 0) { return Result::Err("a malformed number"); }
+        if (text[i] == ZERO && integer_end > i + 1) { return Result::Err("a leading zero in a number"); }
+        mut end: i64 = integer_end;
+        mut is_float: boolean = false;
+        if (end < text.length() && text[end] == DOT) {
+            end = Parser::digit_run(text, end + 1, 10);
+            if (end < 0) { return Result::Err("a fraction with no digits"); }
+            is_float = true;
+        }
+        if (end < text.length() && (text[end] == LOWER_E || text[end] == UPPER_E)) {
+            mut exponent: i64 = end + 1;
+            if (exponent < text.length() && (text[exponent] == PLUS || text[exponent] == MINUS)) { exponent++; }
+            end = Parser::digit_run(text, exponent, 10);
+            if (end < 0) { return Result::Err("an exponent with no digits"); }
+            is_float = true;
+        }
+        if (end != text.length()) { return Result::Err("a malformed number"); }
+        mut clean: String = String::new();
+        Parser::append_digits(&clean, text, 0, end);
+        if (is_float) {
+            match (f64::try_from(clean.as_str())) {
+                Result::Ok(value) => {
+                    if (value.is_infinite()) { return Result::Err("a float out of range"); }
+                    return Result::Ok(Value::Number(Number::Float(value)));
+                }
+                Result::Err(_) => { return Result::Err("a malformed float"); }
+            }
+        }
+        // The magnitude is read as a `u64`, so `i64::MIN`'s, one past
+        // `i64::MAX`, is held before the sign applies.
+        const magnitude_text: Str = Str::from_raw(clean.as_str().as_pointer() + i, clean.length() - i);
+        const magnitude: u64 = u64::parse_radix(magnitude_text.as_bytes(), 10).unwrap_or(u64::MAX);
+        if (negative && magnitude == (i64::MAX as u64) + 1) { return Result::Ok(Value::Number(Number::Int(i64::MIN))); }
+        if (magnitude > i64::MAX as u64) { return Result::Err("an integer no 64-bit signed integer holds"); }
+        mut signed_value: i64 = magnitude as i64;
+        if (negative) { signed_value = -signed_value; }
+        return Result::Ok(Value::Number(Number::Int(signed_value)));
+    }
+
+    // Dates and times
+
+    /// Whether the cursor is at a date (`dddd-`) or a time (`dd:`).
+    private at_date_or_time(&this) -> boolean {
+        const digits4: boolean = this.peek_at(1).is_digit() && this.peek_at(2).is_digit() && this.peek_at(3).is_digit();
+        if (digits4 && this.peek_at(4) == MINUS) { return true; }
+        return this.peek_at(1).is_digit() && this.peek_at(2) == COLON;
+    }
+
+    /// `count` digits as a number, copied to `out`, or -1 when one is
+    /// missing.
+    private read_digits(mut &this, count: u64, out: mut &String) -> i64 {
+        mut value: i64 = 0;
+        for (mut i: u64 = 0; i < count; i++) {
+            if (this.eof() || !this.peek().is_digit()) { return -1; }
+            const b: u8 = this.advance();
+            out.push_byte(b);
+            value = value * 10 + (b - ZERO) as i64;
+        }
+        return value;
+    }
+
+    /// `expected` at the cursor, copied to `out`.
+    private take(mut &this, expected: u8, out: mut &String) -> boolean {
+        if (this.eof() || this.peek() != expected) { return false; }
+        out.push_byte(this.advance());
+        return true;
+    }
+
+    private static days_in_month(year: i64, month: i64) -> i64 {
+        if (month == 2) {
+            const leap: boolean = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            return if (leap) { 29 } else { 28 };
+        }
+        if (month == 4 || month == 6 || month == 9 || month == 11) { return 30; }
+        return 31;
+    }
+
+    /// An offset date-time, a local date-time, a local date or a local
+    /// time, as its RFC 3339 text.
+    private read_date_time(mut &this) -> Result<Value, TomlError> {
+        const line: u64 = this.line;
+        const column: u64 = this.column;
+        const start: u64 = this.pos;
+        mut out: String = String::new();
+        mut reason: string = "";
+        if (this.peek_at(2) == COLON) {
+            reason = this.read_time(&out);
+        } else {
+            reason = this.read_date(&out);
+            if (reason.length() == 0) {
+                const separated: boolean = (this.peek() == UPPER_T || this.peek() == LOWER_T) && this.peek_at(1).is_digit();
+                const spaced: boolean = this.peek() == SPACE && this.peek_at(1).is_digit()
+                    && this.peek_at(2).is_digit() && this.peek_at(3) == COLON;
+                if ((separated || spaced) && !this.eof()) {
+                    this.advance();
+                    out.push_byte(UPPER_T);
+                    reason = this.read_time(&out);
+                    if (reason.length() == 0) { reason = this.read_offset(&out); }
+                }
+            }
+        }
+        if (reason.length() == 0 && !this.eof() && Parser::is_number_byte(this.peek())) {
+            reason = "a malformed date or time";
+        }
+        if (reason.length() != 0) {
+            return Result::Err(this.error_at(TomlErrorKind::InvalidDateTime, line, column, start,
+                                             String::from_str(Str::from(reason))));
+        }
+        return Result::Ok(Value::String(out));
+    }
+
+    /// `YYYY-MM-DD` into `out`: "" when it is a date, else why not.
+    private read_date(mut &this, out: mut &String) -> string {
+        const year: i64 = this.read_digits(4, out);
+        if (year < 0 || !this.take(MINUS, out)) { return "a malformed date"; }
+        const month: i64 = this.read_digits(2, out);
+        if (month < 0 || !this.take(MINUS, out)) { return "a malformed date"; }
+        const day: i64 = this.read_digits(2, out);
+        if (day < 0) { return "a malformed date"; }
+        if (month < 1 || month > 12) { return "a month outside 01-12"; }
+        if (day < 1 || day > Parser::days_in_month(year, month)) { return "a day outside its month"; }
+        return "";
+    }
+
+    /// `HH:MM:SS` with an optional fraction into `out`: "" when it is a
+    /// time, else why not.
+    private read_time(mut &this, out: mut &String) -> string {
+        const hour: i64 = this.read_digits(2, out);
+        if (hour < 0 || !this.take(COLON, out)) { return "a malformed time"; }
+        const minute: i64 = this.read_digits(2, out);
+        if (minute < 0 || !this.take(COLON, out)) { return "a malformed time"; }
+        const second: i64 = this.read_digits(2, out);
+        if (second < 0) { return "a malformed time"; }
+        if (hour > 23) { return "an hour outside 00-23"; }
+        if (minute > 59) { return "a minute outside 00-59"; }
+        if (second > 60) { return "a second outside 00-60"; }
+        if (this.peek() == DOT && !this.eof()) {
+            out.push_byte(this.advance());
+            if (this.eof() || !this.peek().is_digit()) { return "a fraction of a second with no digits"; }
+            while (!this.eof() && this.peek().is_digit()) { out.push_byte(this.advance()); }
+        }
+        return "";
+    }
+
+    /// An optional offset, `Z` or `+HH:MM`/`-HH:MM`, into `out`: "" when
+    /// it is one or there is none, else why not.
+    private read_offset(mut &this, out: mut &String) -> string {
+        if (this.eof()) { return ""; }
+        const b: u8 = this.peek();
+        if (b == UPPER_Z || b == LOWER_Z) {
+            this.advance();
+            out.push_byte(UPPER_Z);
+            return "";
+        }
+        if (b != PLUS && b != MINUS) { return ""; }
+        out.push_byte(this.advance());
+        const hour: i64 = this.read_digits(2, out);
+        if (hour < 0 || !this.take(COLON, out)) { return "a malformed offset"; }
+        const minute: i64 = this.read_digits(2, out);
+        if (minute < 0) { return "a malformed offset"; }
+        if (hour > 23 || minute > 59) { return "an offset outside -23:59 to +23:59"; }
+        return "";
+    }
+
+    // Strings
+
+    /// A control character TOML refuses in a string: below a space other
+    /// than a tab, and DEL.
+    private static is_refused_control(b: u8) -> boolean {
+        return (b < SPACE && b != HT) || b == DELETE;
+    }
+
+    /// A `"..."` string, its escapes decoded.
+    private read_basic_string(mut &this) -> Result<String, TomlError> {
+        this.advance();
+        mut out: String = String::new();
+        while (true) {
+            if (this.eof()) { return Result::Err(this.error_eof(Str::new("a string"))); }
+            const b: u8 = this.peek();
+            if (b == QUOTE) {
+                this.advance();
+                return Result::Ok(out);
+            }
+            if (b == BACKSLASH) {
+                this.advance();
+                this.read_escape(&out)?;
+                continue;
+            }
+            if (b == LF || b == CR) {
+                return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar,
+                    Str::new("a line break in a single-line string")));
+            }
+            if (Parser::is_refused_control(b)) {
+                return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar,
+                    Str::new("a control character in a string")));
+            }
+            out.push_byte(this.advance());
+        }
+        return Result::Ok(out);
+    }
+
+    /// A `'...'` string, taken as written.
+    private read_literal_string(mut &this) -> Result<String, TomlError> {
+        this.advance();
+        mut out: String = String::new();
+        while (true) {
+            if (this.eof()) { return Result::Err(this.error_eof(Str::new("a string"))); }
+            const b: u8 = this.peek();
+            if (b == APOSTROPHE) {
+                this.advance();
+                return Result::Ok(out);
+            }
+            if (b == LF || b == CR) {
+                return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar,
+                    Str::new("a line break in a single-line string")));
+            }
+            if (Parser::is_refused_control(b)) {
+                return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar,
+                    Str::new("a control character in a string")));
+            }
+            out.push_byte(this.advance());
+        }
+        return Result::Ok(out);
+    }
+
+    /// A multi-line string delimited by three `quote`s: `"""` decodes
+    /// escapes and joins a line its `\` ends to the next, `'''` takes the
+    /// text as written. A line break right after the opening delimiter is
+    /// not part of the string, and one or two quotes may end it just
+    /// before the closing delimiter. A line break is read as a line feed.
+    private read_multiline_string(mut &this, quote: u8) -> Result<String, TomlError> {
+        this.advance();
+        this.advance();
+        this.advance();
+        if (this.peek() == LF || this.peek() == CR) { this.newline()?; }
+        mut out: String = String::new();
+        while (true) {
+            if (this.eof()) { return Result::Err(this.error_eof(Str::new("a multi-line string"))); }
+            const b: u8 = this.peek();
+            if (b == quote) {
+                mut run: u64 = 0;
+                while (this.peek_at(run) == quote && this.pos + run < this.len) { run++; }
+                if (run >= 3) {
+                    if (run > 5) {
+                        return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar,
+                            Str::new("too many quotes closing a multi-line string")));
+                    }
+                    for (mut i: u64 = 0; i < run - 3; i++) { out.push_byte(quote); }
+                    for (mut i: u64 = 0; i < run; i++) { this.advance(); }
+                    return Result::Ok(out);
+                }
+                for (mut i: u64 = 0; i < run; i++) { out.push_byte(this.advance()); }
+                continue;
+            }
+            if (b == LF || b == CR) {
+                this.newline()?;
+                out.push_byte(LF);
+                continue;
+            }
+            if (b == BACKSLASH && quote == QUOTE) {
+                this.advance();
+                if (this.ends_line_after_blanks()) {
+                    // A line-ending backslash: the line break and every
+                    // blank and line break after it are dropped.
+                    while (!this.eof()) {
+                        const c: u8 = this.peek();
+                        if (c == SPACE || c == HT) { this.advance(); }
+                        else if (c == LF || c == CR) { this.newline()?; }
+                        else { break; }
+                    }
+                    continue;
+                }
+                this.read_escape(&out)?;
+                continue;
+            }
+            if (Parser::is_refused_control(b)) {
+                return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar,
+                    Str::new("a control character in a string")));
+            }
+            out.push_byte(this.advance());
+        }
+        return Result::Ok(out);
+    }
+
+    /// Whether only blanks stand between the cursor and a line break.
+    private ends_line_after_blanks(&this) -> boolean {
+        mut ahead: u64 = 0;
+        while (this.peek_at(ahead) == SPACE || this.peek_at(ahead) == HT) { ahead++; }
+        const b: u8 = this.peek_at(ahead);
+        return b == LF || (b == CR && this.peek_at(ahead + 1) == LF);
+    }
+
+    /// One escape, its backslash already taken, decoded into `out`.
+    private read_escape(mut &this, out: mut &String) -> Result<(), TomlError> {
+        if (this.eof()) { return Result::Err(this.error_eof(Str::new("an escape"))); }
+        const c: u8 = this.peek();
+        if (c == LOWER_B)   { this.advance(); out.push_byte(8);  return Result::Ok(()); }
+        if (c == LOWER_T)   { this.advance(); out.push_byte(HT); return Result::Ok(()); }
+        if (c == LOWER_N)   { this.advance(); out.push_byte(LF); return Result::Ok(()); }
+        if (c == LOWER_F)   { this.advance(); out.push_byte(12); return Result::Ok(()); }
+        if (c == LOWER_R)   { this.advance(); out.push_byte(CR); return Result::Ok(()); }
+        if (c == QUOTE)     { this.advance(); out.push_byte(QUOTE); return Result::Ok(()); }
+        if (c == BACKSLASH) { this.advance(); out.push_byte(BACKSLASH); return Result::Ok(()); }
+        if (c == LOWER_U || c == UPPER_U) {
+            const width: i64 = if (c == LOWER_U) { 4 } else { 8 };
+            if (this.pos + 1 + width as u64 > this.len) {
+                return Result::Err(this.error_eof(Str::new("an escape")));
+            }
+            mut value: u64 = 0;
+            mut digits: i64 = 0;
+            match (u64::parse_radix_prefix(Slice::from_raw(this.src + this.pos + 1, width), 16)) {
+                Option::Some(run) => { value = run.0; digits = run.1; }
+                Option::None      => { }
+            }
+            if (digits < width) {
+                return Result::Err(this.error_here(TomlErrorKind::InvalidEscape,
+                    Str::new("an escape with too few hexadecimal digits")));
+            }
+            if (value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF)) {
+                return Result::Err(this.error_here(TomlErrorKind::InvalidEscape,
+                    Str::new("an escape naming no Unicode scalar value")));
+            }
+            for (mut i: i64 = 0; i <= width; i++) { this.advance(); }
+            out.push(value as u32 as char);
+            return Result::Ok(());
+        }
+        return Result::Err(this.error_here(TomlErrorKind::InvalidEscape, Str::new("an escape TOML does not define")));
+    }
+
+    // Arrays and inline tables
+
+    /// Blanks, line breaks and comments between an array's elements.
+    private skip_array_space(mut &this) -> Result<(), TomlError> {
+        while (!this.eof()) {
+            const b: u8 = this.peek();
+            if (b == SPACE || b == HT) { this.advance(); }
+            else if (b == LF || b == CR) { this.newline()?; }
+            else if (b == HASH) { this.skip_comment()?; }
+            else { return Result::Ok(()); }
+        }
+        return Result::Ok(());
+    }
+
+    private read_array(mut &this, depth: u64) -> Result<Value, TomlError> {
+        if (depth > MAX_DEPTH) {
+            return Result::Err(this.error_here(TomlErrorKind::DepthExceeded, Str::new("nesting too deep")));
+        }
+        this.advance();
+        mut items: Array<Value> = Array::<Value>::new();
+        while (true) {
+            this.skip_array_space()?;
+            if (this.eof()) { return Result::Err(this.error_eof(Str::new("an array"))); }
+            if (this.peek() == RBRACK) {
+                this.advance();
+                return Result::Ok(Value::Array(items));
+            }
+            items.push(this.read_value(depth)?);
+            this.skip_array_space()?;
+            if (this.eof()) { return Result::Err(this.error_eof(Str::new("an array"))); }
+            const b: u8 = this.peek();
+            if (b == COMMA) {
+                this.advance();
+                continue;
+            }
+            if (b == RBRACK) {
+                this.advance();
+                return Result::Ok(Value::Array(items));
+            }
+            return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar, Str::new("expected `,` or `]` in an array")));
+        }
+        return Result::Ok(Value::Array(items));
+    }
+
+    /// `{ key = value, ... }` on one line. Its keys follow the dotted-key
+    /// rules within it, and the table is complete once it closes: it is a
+    /// value of its key, which nothing later adds to.
+    private read_inline_table(mut &this, depth: u64) -> Result<Value, TomlError> {
+        if (depth > MAX_DEPTH) {
+            return Result::Err(this.error_here(TomlErrorKind::DepthExceeded, Str::new("nesting too deep")));
+        }
+        this.advance();
+        const table: i64 = this.new_table(TableKind::Dotted, depth)?;
+        this.skip_blank();
+        if (this.peek() == RBRACE && !this.eof()) {
+            this.advance();
+            return Result::Ok(this.table_value(table));
+        }
+        while (true) {
+            this.skip_blank();
+            if (this.peek() == LF || this.peek() == CR) {
+                return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar,
+                    Str::new("a line break in an inline table")));
+            }
+            this.read_key_value(table, depth)?;
+            this.skip_blank();
+            if (this.eof()) { return Result::Err(this.error_eof(Str::new("an inline table"))); }
+            const b: u8 = this.peek();
+            if (b == COMMA) {
+                this.advance();
+                continue;
+            }
+            if (b == RBRACE) {
+                this.advance();
+                return Result::Ok(this.table_value(table));
+            }
+            if (b == LF || b == CR) {
+                return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar,
+                    Str::new("a line break in an inline table")));
+            }
+            return Result::Err(this.error_here(TomlErrorKind::UnexpectedChar,
+                Str::new("expected `,` or `}` in an inline table")));
+        }
+        return Result::Ok(this.table_value(table));
+    }
+}
