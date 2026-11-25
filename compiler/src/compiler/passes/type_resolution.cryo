@@ -27,7 +27,7 @@ import compiler::compilation_context::{ CompilationContext };
 import compiler::module_graph::{ ModuleSpellingMatch };
 import compiler::types::{
     arena, compound, generic, generic_registry, ownership, resolver, type_base,
-    type_ref, TypeKind, user_defined
+    type_ref, IntegerKind, TypeKind, user_defined
 };
 import compiler::resolver::{ intern_table, symbol_str, resolver };
 import compiler::resolver::res::{ DeclVisibility, DefId, FamilyOwner, Res, ResBase, ResSlot };
@@ -3337,11 +3337,14 @@ type struct TypeResolutionPasses {
     /// Flag::B`) that only name resolution binds.  Refused here: a
     /// discriminant that is not a compile-time integer (E0065), an operation
     /// in one that overflows its type (E0465), a tag no 64-bit pattern
-    /// holds (E0010), and a tag two variants share (E0064) - an explicit one
-    /// or one a variant takes after its predecessor's.
-    static enum_discriminants(node: EnumDecl*, ctx: mut CompilationContext*) -> [i64] {
+    /// holds or the enum's declared integer `base` does not (E0010), and a
+    /// tag two variants share (E0064) - an explicit one or one a variant
+    /// takes after its predecessor's.
+    static enum_discriminants(node: EnumDecl*, base: TypeRef, ctx: mut CompilationContext*) -> [i64] {
         const ev: ConstEval = ConstEval::new(ctx.const_table, ctx.intern_table, null);
         const name: string = ctx.intern_table.resolve(node.name);
+        const base_type: Type* = if (base.is_valid()) { ctx.type_arena.lookup(base) } else { null };
+        const base_is_integer: boolean = base_type != null && base_type.kind == TypeKind::Int;
         mut tags: [i64] = [];
         mut seen_tags: [i64] = [];
         mut seen_names: [SymbolStr] = [];
@@ -3405,6 +3408,25 @@ type struct TypeResolutionPasses {
                     .at_with_label(at, label));
                 tags.push(0);
                 continue;
+            }
+            // A tag is stored in the base type, so one the base does not hold
+            // would be read back as another variant's, or as none.  A
+            // pointer-sized base holds only what it holds on every target.
+            if (base_is_integer) {
+                const base_kind: IntegerKind = base_type.int_kind();
+                if (!tag.unwrap().held_in(base_kind.narrowest_bit_width(), base_kind.is_signed())) {
+                    const at: SourceSpan = if (v.discriminant != null) { v.discriminant.span } else { v_decl.span };
+                    const label: string = if (v.discriminant != null) { fmt::format("`%s` does not hold this value", base_kind.to_string()).into_raw() }
+                        else { fmt::format("the discriminant after its predecessor's, which `%s` does not hold", base_kind.to_string()).into_raw() };
+                    ctx.emit_diagnostic(Diagnostic::error(ErrorCode::E0010_NUMBER_TOO_LARGE,
+                        fmt::format("the discriminant of `%s`, %s, does not fit `%s`, the base type of `%s`",
+                            variant_name, tag.unwrap().to_decimal_string(), base_kind.to_string(), name))
+                        .at_with_label(at, label)
+                        .help(fmt::format("give `%s` a base type that holds every discriminant, or a discriminant `%s` holds",
+                            name, base_kind.to_string())));
+                    tags.push(0);
+                    continue;
+                }
             }
             const bits: i64 = pattern.unwrap() as i64;
             tags.push(bits);
@@ -4423,7 +4445,18 @@ type struct TypeResolutionPasses {
                 res_ctx.add_binding(gp.sym_id, gp.name, refs[gpi]);
             }
 
-            const tags: [i64] = TypeResolutionPasses::enum_discriminants(node, ctx);
+            // The explicit discriminant base (`type enum Foo : i64`), if any,
+            // lowers the tag at the declared C-ABI width instead of the
+            // default i32, and bounds every tag the variants take.
+            mut base: TypeRef = TypeRef::invalid();
+            if (node.discriminant_annotation != null) {
+                base = ctx.type_resolver.resolve(node.discriminant_annotation, &res_ctx);
+                if (base.is_valid()) {
+                    et.set_discriminant_type(base);
+                }
+            }
+
+            const tags: [i64] = TypeResolutionPasses::enum_discriminants(node, base, ctx);
             for (mut j: i64 = 0; j < node.variants.length(); j++) {
                 const variant_decl: DeclarationNode* = node.variants[j];
                 const variant: EnumVariant* = DeclarationNode::variant_of(variant_decl);
@@ -4454,19 +4487,6 @@ type struct TypeResolutionPasses {
 
                 et.add_variant(EnumVariantInfo::new(
                     variant.name, payload_types, tags[j] as u64));
-            }
-
-            // Resolve the explicit discriminant base (`type enum Foo
-            // : i64`), if any, so codegen lowers the tag at the
-            // declared C-ABI width instead of the default i32 - fixing
-            // both FFI width round-trips and large-discriminant
-            // truncation (`Hi = 4294967296` -> 0 under an i32 tag).
-            if (node.discriminant_annotation != null) {
-                const disc: TypeRef = ctx.type_resolver.resolve(
-                    node.discriminant_annotation, &res_ctx);
-                if (disc.is_valid()) {
-                    et.set_discriminant_type(disc);
-                }
             }
 
             // See `sync_struct_members` - layout attrs are propagated

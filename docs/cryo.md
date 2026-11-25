@@ -2286,6 +2286,7 @@ Refused at the variant:
 - a discriminant that is not a compile-time integer - a float literal, a call, two that name each other (E0065);
 - an operation in one that overflows its operands' type (E0465);
 - a value no 64-bit pattern holds, written or taken after a predecessor at `u64::MAX` (E0010);
+- a value the enum's declared base type does not hold, written or taken after its predecessor's: `: u8` with `= 256`, or `= -1` under an unsigned base (E0010). A `usize` or `isize` base holds only what it holds on every target, as a literal of that type does;
 - two variants with the same value, however each was reached (E0064).
 
 ### 9.2 Variants with Payloads
