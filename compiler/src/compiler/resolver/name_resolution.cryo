@@ -1238,27 +1238,26 @@ type struct NameResolver {
         return false;
     }
 
-    /// The shortest `import` that makes the public declaration in `decl_ns`
-    /// reachable: the declaring module is the floor, and any module whose
-    /// re-export closure reaches it is offered instead when its path is
-    /// shorter.  Ties break on the path itself - shorter first, then byte
-    /// order - never on discovery order: a suggestion that varied with
-    /// directory enumeration would be a binding that varies with it, moved
-    /// somewhere harder to see.
-    reaching_import_for(&this, decl_module: ModulePath) -> string {
+    /// The shortest module a brace import can name the public type
+    /// `decl_module` declares under `name` through: the declaring module is
+    /// the floor, and a module whose export list offers that same
+    /// declaration under `name` - a facade's brace export, or a whole-module
+    /// re-export - is offered instead when its path is shorter and the
+    /// writer in `use_module` may name it.  Ties break on the path itself -
+    /// shorter first, then byte order - never on discovery order: a
+    /// suggestion that varied with directory enumeration would be a binding
+    /// that varies with it, moved somewhere harder to see.
+    reaching_import_for(&this, decl_module: ModulePath, name: SymbolStr, use_module: ModulePath) -> string {
         mut best: string = this.resolver.intern_table.shown(decl_module.decl_name());
+        const declared: SymbolID = this.resolver.export_in(decl_module, name, Namespace::Type);
+        if (!declared.is_valid()) { return best; }
         const graph: ModuleGraph* = this.ctx.module_graph;
         const count: i64 = graph.module_count() as i64;
         for (mut m: i64 = 0; m < count; m++) {
             const cand: const ModuleInfo* = graph.get_module(m);
-            if (cand.reexports.length() == 0) { continue; }
             if (cand.path().equals(decl_module)) { continue; }
-            const via: [ModulePath] = graph.reexport_closure(cand.path());
-            mut reaches: boolean = false;
-            for (mut i: i64 = 0; i < via.length(); i++) {
-                if (via[i].equals(decl_module)) { reaches = true; }
-            }
-            if (!reaches) { continue; }
+            if (!this.resolver.export_in(cand.path(), name, Namespace::Type).equals(declared)) { continue; }
+            if (this.ctx.hidden_from(this.ctx.module_def_of(cand.path()), use_module)) { continue; }
             const cand_str: string = this.resolver.intern_table.shown(cand.path().decl_name());
             const cand_len: i64 = cand_str.length() as i64;
             const best_len: i64 = best.length() as i64;
@@ -1282,22 +1281,30 @@ type struct NameResolver {
             this.resolver.intern_table.shown(imported.decl_name()), this.resolver.intern_table.resolve(alias)));
     }
 
-    /// `d`, a name written at `span` out of reach, with the fix `import
-    /// <imported>;` as help and as an edit adding that line after the file's
-    /// imports.  Every name the one import would reach is the same missing
-    /// import, so the diagnostics it fixes are one report.
-    with_import_fix(&this, d: Diagnostic, span: SourceSpan, imported: string) -> Diagnostic {
-        const line: string = fmt::format("import %s;", imported).into_raw();
+    /// `d`, a name written at `span` out of reach, with the import `line`
+    /// that fixes it as help and as an edit, labelled `label`, adding the
+    /// line after the file's imports.  Every name the one line would reach
+    /// is the same missing import, so the diagnostics it fixes are one
+    /// report, headed `headline`.
+    with_import_fix(&this, d: Diagnostic, span: SourceSpan, line: string, label: string,
+                    headline: string) -> Diagnostic {
         mut r: Diagnostic = d.help(fmt::format("add `%s` to bring it into scope", line));
         const root: ProgramNode* = this.ctx.artifacts.ast.root;
         if (root == null || root.span.file != span.file) { return r; }
         const after: u32 = root.import_anchor_line();
         if (after == 0) { return r; }
         const at: SourceSpan = SourceSpan::new(span.file, after + 1, 1, after + 1, 1);
-        r = r.suggest(Suggestion::machine_applicable(at, fmt::format("%s\n", line).into_raw(),
-            fmt::format("import `%s`", imported)));
-        return r.caused_by(fmt::format("import:%s:%s", span.file, imported),
-            fmt::format("names from `%s` are used here, and this file does not import it", imported));
+        r = r.suggest(Suggestion::machine_applicable(at, fmt::format("%s\n", line).into_raw(), label));
+        return r.caused_by(fmt::format("import:%s:%s", span.file, line), headline);
+    }
+
+    /// `d` with the fix for a path whose first segment names `imported` out
+    /// of the writer's reach: the plain `import <imported>;`, since a path
+    /// is written through the module's binding.
+    with_module_import_fix(&this, d: Diagnostic, span: SourceSpan, imported: string) -> Diagnostic {
+        return this.with_import_fix(d, span, fmt::format("import %s;", imported).into_raw(),
+            fmt::format("import `%s`", imported).into_raw(),
+            fmt::format("names from `%s` are used here, and this file does not import it", imported).into_raw());
     }
 
     /// Refuse a written type spelling that no scope binds and no module
@@ -1351,7 +1358,7 @@ type struct NameResolver {
                 d = d.at_with_label(span, "not reachable in this scope");
                 d = d.with_note(fmt::format("`%s` is the module it would name", owner));
                 d = this.with_import_alias_note(d, use_module, mods.any);
-                this.ctx.emit_diagnostic(this.with_import_fix(d, span, owner));
+                this.ctx.emit_diagnostic(this.with_module_import_fix(d, span, owner));
                 return true;
             }
             mut d: Diagnostic = Diagnostic::error(this.not_found_code(),
@@ -1399,7 +1406,15 @@ type struct NameResolver {
                 // shorter, equally correct import.
                 d = d.with_note(fmt::format("`%s` is declared in `%s`", written, owner));
                 if (offered) {
-                    d = this.with_import_fix(d, span, this.reaching_import_for(owner_path));
+                    // A plain import binds the module and no names from it,
+                    // so what makes a bare name reachable is the brace form
+                    // naming it.
+                    const through: string = this.reaching_import_for(owner_path, name, use_module);
+                    d = this.with_import_fix(d, span,
+                        fmt::format("import %s::{ %s };", through, written).into_raw(),
+                        fmt::format("import `%s` from `%s`", written, through).into_raw(),
+                        fmt::format("`%s` from `%s` is used here, and this file does not import it",
+                            written, through).into_raw());
                 } else {
                     // A private declaration is outside its module's export
                     // set, and an internal one is offered to its own package
@@ -1814,7 +1829,7 @@ type struct NameResolver {
                 // and only the full path fixes that.
                 d = d.with_note(fmt::format("`%s` is the module it would name", owner));
                 d = this.with_import_alias_note(d, use_module, any);
-                this.ctx.emit_diagnostic(this.with_import_fix(d, node.scope_span, owner));
+                this.ctx.emit_diagnostic(this.with_module_import_fix(d, node.scope_span, owner));
                 node.set_scope_res(Res::Err);
             } else {
                 // Binds in scope: a type wearing a module's spelling.  The
