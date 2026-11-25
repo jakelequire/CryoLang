@@ -4954,7 +4954,7 @@ import std::future;
 const n: i64 = future::block_on(add_later(1, 2));
 ```
 
-**`Executor`** is the real runtime: a worker pool with a ready queue, a reactor for I/O and timer readiness, a blocking pool for work no reactor can drive, and `catch_unwind` isolation at the poll boundary so one panicking task cannot take down a worker.
+**`Executor`** is the real runtime: a worker pool with a ready queue, a reactor for I/O and timer readiness, a blocking pool for work no reactor can drive, and `catch_unwind` isolation at the poll boundary so one panicking task cannot take down a worker. Under `--panic=unwind` a task that panics writes the same `panicked at <file>:<line>:<column> in <function>: <message>` report a thread's caught panic writes, and its handle is awaited or joined as `Err(JoinError::Panicked(info))`.
 
 The blocking pool exists because readiness is not universal. `getaddrinfo` has no non-blocking form on either platform, and a regular file is always "ready" as far as `epoll` is concerned, so neither can be parked on the reactor. Calling one directly inside a `poll` stalls a worker for its whole duration — on a single-threaded executor, the whole runtime. `std::future::blocking` runs such calls on threads nobody polls on and fires a `Waker` when they finish; `dns::Resolve` is the one that ships using it, so an `async` name lookup costs a worker nothing while it waits.
 

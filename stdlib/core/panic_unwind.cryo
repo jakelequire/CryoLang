@@ -81,13 +81,15 @@ private function run_catch_body<F, T>(data: mut u8*) -> void where F: () -> T {
 
 /// The runtime's unwind strategy stashes the in-flight panic's message/file/line
 /// before it raises; these read them back to build a caught panic's
-/// `PanicInfo`. Defined in `runtime/panic/unwind.cryo` (linked under
-/// `--panic=unwind`). Referenced only from the generic `catch_unwind` below and
-/// the unwind-only `taken_panic_info`, so an abort build never names them.
+/// `PanicInfo`, and write its report. Defined in `runtime/panic/unwind.cryo`
+/// (linked under `--panic=unwind`). Referenced only from the generic
+/// `catch_unwind` below and the unwind-only `taken_panic_info` and
+/// `report_taken_panic`, so an abort build never names them.
 private extern "C" {
     function __cryo_panic_taken_message() -> string;
     function __cryo_panic_taken_file() -> string;
     function __cryo_panic_taken_line() -> u32;
+    function __cryo_panic_write_report() -> void;
 }
 
 /// Run `f`, catching a panic that unwinds out of it. Returns `Ok(v)` with the
@@ -126,4 +128,15 @@ public function taken_panic_info() -> PanicInfo {
         file: __cryo_panic_taken_file(),
         line: __cryo_panic_taken_line(),
     };
+}
+
+/// Write the report of the panic this thread last caught -
+/// `panicked at <file>:<line>:<column> in <function>: <message>` - as an
+/// uncaught panic's is written, without ending the process. A spawned
+/// thread's body and an executor's task each report the panic they catch,
+/// so a panic is never silent when the code it ended is isolated from its
+/// siblings; whoever joins or awaits it reads the payload.
+![config(panic_unwind)]
+internal function report_taken_panic() -> void {
+    __cryo_panic_write_report();
 }

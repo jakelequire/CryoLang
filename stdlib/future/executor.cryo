@@ -40,8 +40,9 @@
 ///!
 ///! Under `--panic=unwind` the poll boundary runs inside `intrinsics::try_catch`
 ///! (via the `run_poll` trampoline, mirroring `panic_unwind::run_catch_body`): a
-///! panicking task is caught, finishes with outcome `PANICKED`, and its `join`
-///! returns `Err(Panicked)` — its sibling tasks keep running. `try_catch` is a
+///! panicking task is caught, its "panicked at" report is written as a
+///! thread's caught panic's is, it finishes with outcome `PANICKED`, and its
+///! `join` returns `Err(Panicked)` — its sibling tasks keep running. `try_catch` is a
 ///! compile error under the default `--panic=abort`, so the catch path is gated
 ///! `![config(panic_unwind)]`; under abort the boundary is a plain direct call
 ///! and a task panic aborts the whole process (the accepted degradation).
@@ -516,8 +517,9 @@ private function run_poll(data: mut u8*) -> void {
     pc.status = pf(pc.fut, pc.shared, pc.cx);
 }
 
-/// Poll boundary under the unwinding strategy: catch a panicking poll, report it
-/// as status 2 and fill `out_panic`. Gated `![config(panic_unwind)]` because
+/// Poll boundary under the unwinding strategy: catch a panicking poll, write
+/// its "panicked at" report as a thread's caught panic writes it, report it as
+/// status 2 and fill `out_panic`. Gated `![config(panic_unwind)]` because
 /// `intrinsics::try_catch` and the `__cryo_panic_taken_*` accessors are a
 /// compile error / undefined symbols under `--panic=abort`. Must be a file-scope
 /// free function — ConfigGating strips declarations, not method bodies.
@@ -529,6 +531,7 @@ private function poll_boundary(poll_fn: (mut u8*, mut u8*, Context*) -> u8, fut:
     const tramp: (mut u8*) -> void = run_poll;
     const caught: boolean = intrinsics::try_catch(tramp as void*, &pc as mut void*);
     if (caught) {
+        panic_unwind::report_taken_panic();
         *out_panic = panic_unwind::taken_panic_info();
         return 2;
     }
