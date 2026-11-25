@@ -5055,6 +5055,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `core::variadic_arguments`      | `VariadicArguments`, the compiler-assigned type of a function's `args...` bucket                                                 |
 | `core::drop`, `core::marker`, `core::cmp`, `core::clone` | `Drop`, the marker traits (`Copy`, `Send`, `Sync`), `Eq` / `Ord` / `Ordering`, `Clone` |
 | `collections::array` | `Array<T>`, the type `[T]` names                                                                                       |
+| `collections::string`, `collections::str` | `String` (owned text), `Str` (a borrowed view of text) and `Utf8Error` (what `from_utf8` refuses with) |
 | `core::slice`        | `Slice<T>`, backing the for-in lowering over fixed-size arrays (`for (x in arr)` where `arr: [T; N]`)                 |
 | `core::ops`          | `Range` / `RangeInclusive` / `RangeFrom` / `RangeTo` / `RangeFull`, backing range literals (`a..b` desugars to `Range::new`); `RangeBounds<T>`, implemented by all five forms (`RangeFull` for every `T`), answers each end as a `Bound<&T>` (`Included`, `Excluded`, `Unbounded`) |
 | `core::iter`         | `Iterator`, the trait the for-in sugar drives the scrutinee through                                                   |
