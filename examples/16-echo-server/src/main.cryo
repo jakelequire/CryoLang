@@ -1,0 +1,104 @@
+///! Echo server - `std::net`'s async socket methods over loopback.
+///!
+///! The server binds `127.0.0.1` on a port the system picks, accepts one
+///! connection and writes back every byte it reads until the client closes
+///! its end. The client connects, sends a line, closes its sending half and
+///! reads the echo to the end. Both run as tasks of the executor
+///! `async main` sets up, joined by `Futures::join`.
+///!
+///! What this example demonstrates:
+///!   - `TcpListener::bind` (non-blocking from the start) and
+///!     `await listener.accept()`.
+///!   - `await TcpStream::connect(address)`, `await stream.read_some(limit)`
+///!     and `await stream.write_all(bytes)`: what is read comes back owned,
+///!     and what is written is handed over owned, so nothing borrowed is
+///!     held across a wait.
+///!   - `?` on an `await`ed result, passing an `IoError` or a `Utf8Error`
+///!     into one `AnyError`.
+///!
+///! Run with:  cryo run
+
+namespace Main;
+
+import std::fmt;
+import std::future;
+import std::core::{ AnyError };
+import std::future::combinator::{ Futures };
+import std::net::{ SocketAddress, TcpListener, TcpStream };
+
+/// Accept one connection and echo it until the peer closes its end:
+/// answers the bytes echoed.
+async function serve_one(listener: TcpListener) -> Result<i64, AnyError> {
+    mut server: TcpListener = listener;
+    mut stream: TcpStream = (await server.accept())?;
+    mut echoed: i64 = 0;
+    while (true) {
+        const bytes: Array<u8> = (await stream.read_some(4096))?;
+        if (bytes.length() == 0) { break; }
+        echoed = echoed + bytes.length();
+        (await stream.write_all(bytes))?;
+    }
+    return Result::Ok(echoed);
+}
+
+/// Send `line` to the server on `port` and read its echo to the end.
+async function ask(port: u16, line: Str) -> Result<String, AnyError> {
+    mut stream: TcpStream = (await TcpStream::connect(SocketAddress::localhost_v4(port)))?;
+    mut message: Array<u8> = Array::new();
+    message.append(line.as_bytes());
+    (await stream.write_all(message))?;
+    stream.shutdown_write()?;
+    mut heard: Array<u8> = Array::new();
+    while (true) {
+        const bytes: Array<u8> = (await stream.read_some(4096))?;
+        if (bytes.length() == 0) { break; }
+        heard.append(bytes.as_slice());
+    }
+    return Result::Ok(String::from_utf8(heard)?);
+}
+
+async function server(listener: TcpListener) -> i64 {
+    return match (await serve_one(listener)) {
+        Result::Ok(echoed) => { echoed }
+        Result::Err(error) => {
+            fmt::println(f"server: {error}");
+            -1
+        }
+    };
+}
+
+async function client(port: u16) -> boolean {
+    const line: Str = Str::new("hello, echo");
+    fmt::println(f"client sent:  {line}");
+    return match (await ask(port, line)) {
+        Result::Ok(heard) => {
+            fmt::println(f"client heard: {heard}");
+            true
+        }
+        Result::Err(error) => {
+            fmt::println(f"client: {error}");
+            false
+        }
+    };
+}
+
+async function main() -> i32 {
+    const listener: TcpListener = match (TcpListener::bind(SocketAddress::localhost_v4(0))) {
+        Result::Ok(bound) => { bound }
+        Result::Err(error) => {
+            fmt::println(f"bind: {error}");
+            return 1;
+        }
+    };
+    const port: u16 = match (listener.local_address()) {
+        Result::Ok(address) => { address.port }
+        Result::Err(error) => {
+            fmt::println(f"local address: {error}");
+            return 1;
+        }
+    };
+    fmt::println("listening on 127.0.0.1, on a port the system chose");
+    const outcome: (i64, boolean) = await Futures::join(server(listener), client(port));
+    fmt::println(f"server echoed {outcome.0} bytes");
+    return if (outcome.0 == 11 && outcome.1) { 0 } else { 1 };
+}

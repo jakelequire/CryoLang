@@ -1,0 +1,62 @@
+///! HTTP GET - fetch a page with `std::net::http::Client`.
+///!
+///! Reads the URL from the command line (`http://example.com/` when none is
+///! given), fetches it, and prints the status, the number of body bytes and
+///! the body's first line. It reaches the network, so what it prints
+///! depends on the server; with no network it prints the error and exits 1.
+///!
+///! What this example demonstrates:
+///!   - `Client::new()` and `await client.get(url)`, an `async` method that
+///!     resolves the host, connects, speaks HTTP (or HTTPS, through TLS) and
+///!     follows redirects.
+///!   - `Url::parse` refusing a malformed address with a `UrlError`.
+///!   - One `AnyError` carrying a `UrlError` or an `IoError` through `?`,
+///!     printed with its message.
+///!
+///! Run with:  cryo run    or    cryo run -- http://example.com/
+
+namespace Main;
+
+import std::fmt;
+import std::env;
+import std::future;
+import std::core::{ AnyError };
+import std::net::{ Url };
+import std::net::http::{ Client, Response };
+
+/// GET `address`, following redirects.
+async function fetch(address: Str) -> Result<Response, AnyError> {
+    const url: Url = Url::parse(address)?;
+    const client: Client = Client::new()?;
+    return Result::Ok((await client.get(url))?);
+}
+
+/// The body's text up to its first line break.
+function first_line(body: &Array<u8>) -> String {
+    mut line: String = String::new();
+    for (mut i: i64 = 0; i < body.length(); i++) {
+        const byte: u8 = body.get(i).unwrap_or(0);
+        if (byte == 10 || byte == 13) { break; }
+        line.push_byte(byte);
+    }
+    return line;
+}
+
+async function main() -> i32 {
+    const arguments: Array<String> = env::args();
+    const address: String = if (arguments.length() > 1) { arguments[1].clone() }
+        else { String::from_str(Str::new("http://example.com/")) };
+    return match (await fetch(address.as_str())) {
+        Result::Ok(reply) => {
+            fmt::println(f"GET {address}");
+            fmt::println(f"status: {reply.status.as_u16()}");
+            fmt::println(f"body: {reply.body.length()} bytes");
+            fmt::println(f"first line: {first_line(&reply.body)}");
+            0
+        }
+        Result::Err(error) => {
+            fmt::println(f"GET {address} failed: {error}");
+            1
+        }
+    };
+}
