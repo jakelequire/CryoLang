@@ -781,14 +781,18 @@ yet is recorded with the change that builds it, not here.
      the connection chooses for itself are private; `Frame`, `Settings`,
      `HeaderField` and `RequestOnStream` are plain records with public
      fields; `Http2Connection` keeps its state private behind its
-     handshake, request, serve and frame-level calls.  Sockets, TLS
-     streams and their futures keep their handles private behind public
-     methods; the TLS error normaliser is private to the futures that use
-     it; the unused ALPN length constant, which held the wrong length, is
-     deleted.  WebSocket's records and handshake functions are public and
-     its own caps private.  (Jake for headers, the conversion, the
-     preface, the normaliser and the constant; the rest delegated under
-     587)
+     handshake, request, serve and frame-level calls.  Sockets and TLS
+     streams keep their handles private behind public methods, and the
+     operation futures behind those methods are internal: TCP's and UDP's
+     futures with their outcome records, the module `net::tls::future`,
+     `TlsStream::from_parts` and the contexts' `start_connect` and
+     `start_accept`, since a program awaits the sockets' and the
+     contexts' `async` methods.  The TLS error normaliser is private to
+     the futures that use it; the unused ALPN length constant, which held
+     the wrong length, is deleted.  WebSocket's records and handshake
+     functions are public and its own caps private.  (Jake for headers,
+     the conversion, the preface, the normaliser, the constant and the
+     internal futures; the rest delegated under 587)
 
 600. **The unused-code lints run on the package being built.**  W0001,
      W0002 and W0009 report a module that belongs to the package a build
@@ -1298,21 +1302,25 @@ yet is recorded with the change that builds it, not here.
      gated to POSIX, the only target that calls them.  (Jake; each split
      delegated)
 
-635. **`future` is marked.**  `Future`, `Poll`, `Waker`, `Context`,
-     `block_on`, the sample futures, `Sleep`, the combinators with
-     `Futures` and `Elapsed`, `Executor`, `JoinHandle` and `JoinError` are
-     public, and so is the blocking pool: `BlockingJob` with its `init`,
-     `arm`, `retain` and `release`, the job states, `BlockingPool` and its
-     default ceiling, since a caller embeds a job in a block of its own and
-     submits it.  A waker's vtable and data, a context's waker (read
+635. **`future` is marked.**  `Future`, `Poll`, `Waker` (with `new`, the
+     way to build a waker for an executor that is not the library's),
+     `Context`, `block_on`, `Ready`, `Sleep`, `Futures` and `Elapsed`,
+     `Executor`, `JoinHandle`, `JoinError` and `Task` are public.  The
+     combinators' machines (`Join`, `TryJoin`, `Select`, `Timeout`) are
+     internal: `Futures`' statics return `implement Future<...>`, so a
+     program names the output and never the machine.  The blocking pool is
+     internal - `BlockingJob`, the job states, `BlockingPool` and its
+     default ceiling - since work that blocks goes to
+     `Task::spawn_blocking`.  `PendingThenReady`, a fixture pending a set
+     number of times, is public in `std::test::pending`, beside the other
+     test support.  A waker's vtable and data, a context's waker (read
      through `waker()`), a sleep's deadline and arming, every combinator's
      children and progress, and a job's header past its methods are
-     private; a job's state is read through `arm`.  The pool's queue, its
-     threads' loop and a job's completion are private, and
-     `BlockingPool::set_current`, which an executor worker calls to publish
-     its pool, is internal, as the reactor is.  The executor's tasks,
-     queue, shared blocks, thunks and worker are private behind `spawn`,
-     `block_on` and the join handle.  (Jake; each split delegated)
+     private.  The pool's queue, its threads' loop and a job's completion
+     are private.  The executor's tasks, queue, shared blocks, thunks and
+     worker are private behind `spawn`, `block_on` and the join handle.
+     (Jake, the internal machines and the fixture's move included; each
+     split delegated)
 
 636. **`collections` is marked.**  `Array`, `String`, `HashMap`,
      `HashSet`, `Pair`, `RawBuffer` and `from_iter` are public with every

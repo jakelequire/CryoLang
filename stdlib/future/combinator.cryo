@@ -1,5 +1,9 @@
-///! std::future::combinator: running futures against each other — `Join`,
-///! `TryJoin`, `Select`, and `Timeout`.
+///! std::future::combinator: running futures against each other —
+///! `Futures::join`, `try_join`, `select` and `timeout`.
+///!
+///! Each returns `implement Future<...>`: a caller names the output, never the
+///! machine behind it. The machines (`Join`, `TryJoin`, `Select`, `Timeout`)
+///! are internal to the standard library.
 ///!
 ///! Each of these is an ordinary future that OWNS the futures it composes and
 ///! drives them from its own `poll`. Every child is polled with the same
@@ -78,7 +82,7 @@ public type struct Elapsed {
 /// Runs two futures concurrently and completes with both results once both have
 /// finished. Each child is polled only until it completes; its value is parked
 /// in an `Option` until the other one catches up.
-public type struct Join<A, B, OA, OB> {
+internal type struct Join<A, B, OA, OB> {
     private a:      A;
     private b:      B;
     private a_out:  Option<OA>;   // the value `a` produced, waiting for `b`
@@ -131,7 +135,7 @@ where A: Future<OA>, B: Future<OB> {
 ///
 /// `a` is polled first on every poll, the same documented bias `Select` carries:
 /// when both sides fail on one poll, the error reported is `a`'s.
-public type struct TryJoin<A, B, T1, T2, E> {
+internal type struct TryJoin<A, B, T1, T2, E> {
     private a:      A;
     private b:      B;
     private a_out:  Option<T1>;   // the value `a` produced, waiting for `b`
@@ -193,7 +197,7 @@ where A: Future<Result<T1, E>>, B: Future<Result<T2, E>> {
 /// consistently-ready `a` cannot starve `b` within one `select` — it only makes
 /// the choice predictable when both are ready at once, which is what a caller
 /// pairing an operation against a timeout wants.
-public type struct Select<A, B, OA, OB> {
+internal type struct Select<A, B, OA, OB> {
     private a:    A;
     private b:    B;
     private done: boolean;
@@ -228,7 +232,7 @@ where A: Future<OA>, B: Future<OB> {
 /// side effect has already happened.
 ///
 /// On expiry the operation is dropped with this future, cancelling it.
-public type struct Timeout<F, O> {
+internal type struct Timeout<F, O> {
     private fut:   F;
     private sleep: Sleep;
     private done:  boolean;
@@ -265,7 +269,7 @@ where F: Future<O> {
 /// constructible at all.
 public type struct Futures {
     /// Run `a` and `b` concurrently; complete with both values.
-    public static join<A, B, OA, OB>(a: A, b: B) -> Join<A, B, OA, OB>
+    public static join<A, B, OA, OB>(a: A, b: B) -> implement Future<(OA, OB)>
     where A: Future<OA>, B: Future<OB> {
         return Join::<A, B, OA, OB> {
             a: a, b: b,
@@ -277,7 +281,7 @@ public type struct Futures {
 
     /// Run `a` and `b` concurrently; complete with both values, or with the
     /// first error either reports, dropping the sibling.
-    public static try_join<A, B, T1, T2, E>(a: A, b: B) -> TryJoin<A, B, T1, T2, E>
+    public static try_join<A, B, T1, T2, E>(a: A, b: B) -> implement Future<Result<(T1, T2), E>>
     where A: Future<Result<T1, E>>, B: Future<Result<T2, E>> {
         return TryJoin::<A, B, T1, T2, E> {
             a: a, b: b,
@@ -288,19 +292,19 @@ public type struct Futures {
 
     /// Run `a` and `b` concurrently; complete as soon as either does, dropping
     /// the other.
-    public static select<A, B, OA, OB>(a: A, b: B) -> Select<A, B, OA, OB>
+    public static select<A, B, OA, OB>(a: A, b: B) -> implement Future<Selected<OA, OB>>
     where A: Future<OA>, B: Future<OB> {
         return Select::<A, B, OA, OB> { a: a, b: b, done: false };
     }
 
     /// Run `fut` with a deadline `dur` from now.
-    public static timeout<F, O>(dur: Duration, fut: F) -> Timeout<F, O>
+    public static timeout<F, O>(dur: Duration, fut: F) -> implement Future<Result<O, Elapsed>>
     where F: Future<O> {
         return Timeout::<F, O> { fut: fut, sleep: Sleep::new(dur), done: false };
     }
 
     /// Run `fut` with an absolute deadline.
-    public static timeout_at<F, O>(deadline: Instant, fut: F) -> Timeout<F, O>
+    public static timeout_at<F, O>(deadline: Instant, fut: F) -> implement Future<Result<O, Elapsed>>
     where F: Future<O> {
         return Timeout::<F, O> { fut: fut, sleep: Sleep::until(deadline), done: false };
     }
