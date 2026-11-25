@@ -4957,6 +4957,8 @@ const n: i64 = future::block_on(add_later(1, 2));
 
 The blocking pool exists because readiness is not universal. `getaddrinfo` has no non-blocking form on either platform, and a regular file is always "ready" as far as `epoll` is concerned, so neither can be parked on the reactor. Calling one directly inside a `poll` stalls a worker for its whole duration — on a single-threaded executor, the whole runtime. `std::future::blocking` runs such calls on threads nobody polls on and fires a `Waker` when they finish; `dns::Resolve` is the one that ships using it, so an `async` name lookup costs a worker nothing while it waits.
 
+A task hands its own blocking work - a closure - to the pool with `Task::spawn_blocking(work)`, and awaits the `JoinHandle` it returns for the closure's result.
+
 The pool creates threads only on demand and only when none is idle, so its ceiling costs nothing until the work arrives; jobs beyond it queue. Because one pool serves every offloading caller in an executor, that ceiling has to cover their combined in-flight count — a caller that holds one job while waiting on a second deadlocks against a ceiling too low to run both. The default is deliberately generous; `Executor::with_threads_and_blocking` overrides it.
 
 ```cryo
@@ -4991,6 +4993,7 @@ async function main() -> i32 {
 | `ex.spawn(fut)`                             | Schedule `fut` as an independent task; returns a `JoinHandle<T>`.        |
 | `ex.block_on(fut)`                          | Drive one future to completion on this executor and return its output.   |
 | `Task::spawn(fut)`                          | From inside a task, schedule `fut` on the executor polling it.           |
+| `Task::spawn_blocking(work)`                | From inside a task, run the closure `work` on the blocking pool.         |
 | `h.join()`                                  | Block the thread until the task finishes; `Ok` its output, or `Err` why. |
 | `await h`                                   | The same `Result`, parking only the awaiting task.                       |
 | `h.abort()`                                 | Cancel the task.                                                         |

@@ -24,6 +24,8 @@ import std::future::executor::{ Executor, JoinError, Task };
 import std::future::ready::{ Ready };
 import std::future::timer::{ Sleep };
 import std::time::duration::{ Duration };
+import std::alloc::arc::{ Arc };
+import std::sync::atomic::{ Atomic, MemoryOrder };
 
 async function doubled(n: i64) -> i64 {
     return n * 2;
@@ -173,4 +175,54 @@ async function aborts_before_the_first_poll() -> boolean {
 function an_aborted_task_awaits_as_cancelled() -> Result<(), TestError> {
     mut ex: Executor = Executor::with_threads(1);
     return expect_true(ex.block_on(aborts_before_the_first_poll()), "an aborted task must await as Cancelled");
+}
+
+// ---- Task::spawn_blocking ------------------------------------------------------
+
+async function greets_on_the_blocking_pool() -> String {
+    const name: String = String::from_str(Str::new("pool"));
+    const greeted: future::executor::JoinHandle<String> = Task::spawn_blocking(move () -> String {
+        mut text: String = String::from_str(Str::new("hello, "));
+        text.append(name.as_str());
+        return text;
+    });
+    return (await greeted).unwrap();
+}
+
+/// The work takes its captures with it and its result comes back whole.
+![test]
+function spawn_blocking_returns_the_work_result() -> Result<(), TestError> {
+    mut ex: Executor = Executor::with_threads(1);
+    const greeting: String = ex.block_on(greets_on_the_blocking_pool());
+    return expect_true(greeting.as_str().equals(&Str::new("hello, pool")), "the work's result");
+}
+
+async function raises(flag: Arc<Atomic<boolean>>) -> i64 {
+    flag.get_reference().store(true, MemoryOrder::Release);
+    return 0;
+}
+
+async function blocking_work_leaves_the_worker_free() -> boolean {
+    const flag: Arc<Atomic<boolean>> = Arc::new(Atomic::<boolean>::new(false));
+    const seen_by_work: Arc<Atomic<boolean>> = flag.clone();
+    // The work waits, on its own thread, for a flag only another task raises.
+    const waiting: future::executor::JoinHandle<boolean> = Task::spawn_blocking(move () -> boolean {
+        for (mut tries: i32 = 0; tries < 400; tries = tries + 1) {
+            if (seen_by_work.get_reference().load(MemoryOrder::Acquire)) { return true; }
+            thread::sleep(Duration::from_milliseconds(5));
+        }
+        return false;
+    });
+    const raiser: future::executor::JoinHandle<i64> = Task::spawn(raises(flag));
+    (await raiser).unwrap();
+    return (await waiting).unwrap();
+}
+
+/// On one worker, blocking work that ran on the worker would keep the task
+/// that raises its flag from ever running, and would give up after two
+/// seconds; on the blocking pool it sees the flag.
+![test]
+function spawn_blocking_runs_off_the_worker() -> Result<(), TestError> {
+    mut ex: Executor = Executor::with_threads(1);
+    return expect_true(ex.block_on(blocking_work_leaves_the_worker_free()), "the blocking work must not occupy the only worker");
 }

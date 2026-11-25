@@ -82,7 +82,8 @@ import std::future::poll::{ Poll };
 import std::future::waker::{ Context, Waker };
 import std::future::traits::{ Future };
 import std::future::reactor::{ Reactor };
-import std::future::blocking::{ BLOCKING_DEFAULT_THREADS, BlockingPool };
+import std::future::blocking::{ BLOCKING_DEFAULT_THREADS, BlockingJob, BlockingPool, JOB_PENDING };
+import std::core::option::{ Option };
 
 
 // Task outcome (published by the executor when a task finishes), read by a
@@ -844,6 +845,164 @@ public type struct Task {
             panic("Task::spawn called outside a task: no executor is polling this thread; spawn from inside an async function an Executor drives, or call Executor.spawn", intrinsics::location());
         }
         return spawn_on::<F, O>(inner, future);
+    }
+
+    /// Run `work` on the executor's blocking pool, a thread no task is polled
+    /// on, and return a handle to what it returns. For work that blocks and
+    /// has no future form - a long computation, a synchronous library call -
+    /// which run inside a task would stall a worker, and on a one-worker
+    /// executor every task, for its whole duration. Panics when the calling
+    /// thread is not one of an executor's workers, reporting the call's place.
+    ///
+    /// Once started, `work` runs to its end: aborting the handle stops the
+    /// wait, not the thread.
+    ![caller_location]
+    public static spawn_blocking<F, O>(work: F) -> JoinHandle<O>
+    where F: () -> O + Send, O: Send {
+        const inner: mut ExecInner* = g_current_executor;
+        if (inner == null) {
+            panic("Task::spawn_blocking called outside a task: no executor is polling this thread; spawn from inside an async function an Executor drives", intrinsics::location());
+        }
+        const offloaded: BlockingCallFuture<F, O> = BlockingCallFuture::<F, O> { work: Option::Some(work), call: null };
+        return spawn_on::<BlockingCallFuture<F, O>, O>(inner, offloaded);
+    }
+}
+
+/// A `Task::spawn_blocking` call's block, shared with the blocking pool: the
+/// job header first, since the pool reaches the block through it; the work,
+/// which a pool thread moves out and runs; and the work's result. `started`
+/// says the work was moved out - a job the pool cancels never starts, and its
+/// work is dropped unrun - `produced` that the result is written, and `taken`
+/// that the awaiting future moved it out.
+private type struct BlockingCall<F, O> {
+    private job:      BlockingJob;
+    private work:     F;
+    private output:   O;
+    private started:  boolean;
+    private produced: boolean;
+    private taken:    boolean;
+}
+
+/// `run_fn` for a `BlockingCall`: move the work out of the block, run it,
+/// and store its result through a raw pointer (the slot is uninitialized, so
+/// nothing may drop what it holds). `produced` is set last; the pool
+/// publishes the job's status under its lock after this returns, which
+/// orders every write here before the collecting side's read. A vtable
+/// fn-ptr, so a free function.
+private function blocking_call_run<F, O>(raw: mut u8*) -> void
+where F: () -> O {
+    const call: mut BlockingCall<F, O>* = raw as mut BlockingCall<F, O>*;
+    call.started = true;
+    const work_slot: F* = &call.work;
+    mut work: F;
+    // The block never drops `work` once `started` is set, so this is the
+    // one owner.
+    unsafe { work = *work_slot; }
+    const result: O = work();
+    const output_slot: mut O* = &call.output;
+    *output_slot = result;
+    call.produced = true;
+}
+
+/// `drop_fn` for a `BlockingCall`: drop the work if no thread started it,
+/// drop a result nobody took, and free the block. Runs on whichever side
+/// releases the block last. A vtable fn-ptr, so a free function.
+private function blocking_call_free<F, O>(raw: mut u8*) -> void {
+    const call: BlockingCall<F, O>* = raw as BlockingCall<F, O>*;
+    if (!call.started) {
+        pointer::drop_in_place::<F>(&call.work);
+    }
+    if (call.produced && !call.taken) {
+        pointer::drop_in_place::<O>(&call.output);
+    }
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
+    alloc.deallocate(NonNull::new(raw), Layout::of::<BlockingCall<F, O>>());
+}
+
+/// Allocate a `BlockingCall` holding `work`, its job header prepared with the
+/// block's vtable and its one reference held by the caller. A free generic
+/// function, as `spawn_on` is, because it takes generic-function references
+/// (`blocking_call_run::<F, O>`): taken in a method of a generic impl, they
+/// lower to null pointers.
+private function new_blocking_call<F, O>(work: F) -> mut BlockingCall<F, O>*
+where F: () -> O {
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
+    mut call: mut BlockingCall<F, O>* = null;
+    match (alloc.allocate(Layout::of::<BlockingCall<F, O>>())) {
+        Result::Ok(raw) => { call = raw.cast::<BlockingCall<F, O>>().as_pointer(); }
+        Result::Err(_)  => { panic("Task::spawn_blocking: allocation failed", intrinsics::location()); }
+    }
+    BlockingJob::initialize(&call.job, blocking_call_run::<F, O>, blocking_call_free::<F, O>);
+    const work_slot: mut F* = &call.work;
+    *work_slot = work;
+    call.started  = false;
+    call.produced = false;
+    call.taken    = false;
+    return call;
+}
+
+/// The task `Task::spawn_blocking` spawns: its first poll hands the work to
+/// the blocking pool, and it completes with the work's result once a pool
+/// thread has run it. Holding the work until that first poll means a task
+/// aborted before it ever runs submits nothing.
+private type struct BlockingCallFuture<F, O> {
+    private work: Option<F>;                 // until the first poll submits it
+    private call: mut BlockingCall<F, O>*;   // null before that and once the result is taken
+
+    /// Move the result out of the finished block and release this side's
+    /// reference to it.
+    private take_result(mut &this) -> O {
+        const call: mut BlockingCall<F, O>* = this.call;
+        this.call = null;
+        const output_slot: O* = &call.output;
+        mut result: O;
+        // `taken` makes the block's teardown leave the result alone, so this
+        // is its one owner.
+        unsafe { result = *output_slot; }
+        call.taken = true;
+        call.job.release();
+        return result;
+    }
+}
+
+implement<F, O> trait Future<O> for struct BlockingCallFuture<F, O> where F: () -> O {
+    poll(mut &this, cx: Context*) -> Poll<O> {
+        if (this.call == null) {
+            if (this.work.is_none()) {
+                panic("Task::spawn_blocking's task polled after it completed", intrinsics::location());
+            }
+            const call: mut BlockingCall<F, O>* = new_blocking_call::<F, O>(this.work.take().unwrap());
+            this.call = call;
+            // Every worker publishes its executor's pool, and this future runs
+            // only on a worker. A pool that is shutting down, or could not
+            // create a thread, refuses the job: then it runs here, slowly, but
+            // to an answer rather than a wait nothing ends.
+            const pool: mut BlockingPool* = BlockingPool::current();
+            if (!pool.submit(&call.job)) {
+                blocking_call_run::<F, O>(call as mut u8*);
+                return Poll::Ready(this.take_result());
+            }
+        }
+        // Arming reads the job's status under the pool's lock, so a result
+        // published between polls is collected now rather than waited for.
+        if (this.call.job.arm(cx.waker()) == JOB_PENDING) {
+            return Poll::Pending;
+        }
+        if (!this.call.produced) {
+            panic("Task::spawn_blocking: the executor shut down before the work ran", intrinsics::location());
+        }
+        return Poll::Ready(this.take_result());
+    }
+}
+
+/// A task dropped before its work finished releases this side's reference;
+/// a pool thread still running the work keeps the block until it is done.
+implement<F, O> trait Drop for struct BlockingCallFuture<F, O> {
+    drop(mut &this) -> void {
+        if (this.call == null) { return; }
+        const call: mut BlockingCall<F, O>* = this.call;
+        this.call = null;
+        call.job.release();
     }
 }
 
