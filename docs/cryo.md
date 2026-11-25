@@ -1228,7 +1228,7 @@ Inside a function marked `![caller_location]`, `location()` is instead the place
 ![caller_location]
 function expect_positive(n: i64) -> i64 {
     if (n <= 0) {
-        core::panic("expected a positive number", intrinsics::location());
+        panic("expected a positive number", intrinsics::location());
     }
     return n;
 }
@@ -1239,7 +1239,7 @@ function main() -> i32 {
 }
 ```
 
-`panic` takes the place as a `Location`, `core::panic(message, intrinsics::location())`, and a panic's report names all of it: `panicked at <file>:<line>:<column> in <function>: <message>`, here the file, line and column of `expect_positive(-1)` and the qualified name of `main`.  The checks the compiler inserts (division by zero, a `match` with no arm for its value, an out-of-range index) report their place the same way.  A place with no column leaves it out, and one with no function leaves out `in ...`.
+`panic` takes the place as a `Location`, `panic(message, intrinsics::location())`, and a panic's report names all of it: `panicked at <file>:<line>:<column> in <function>: <message>`, here the file, line and column of `expect_positive(-1)` and the qualified name of `main`.  The checks the compiler inserts (division by zero, a `match` with no arm for its value, an out-of-range index) report their place the same way.  A place with no column leaves it out, and one with no function leaves out `in ...`.
 
 ### 4.6 Overloading
 
@@ -3357,7 +3357,7 @@ The subject is a **type**, not a value, and each arm is a type rather than a pat
 static match (T) {
     u8 | u16 | u32 | u64 => { this.push_display(item) }
     string               => { this.push_view_bytes(Str::from(item)) }
-    _                    => { core::unreachable(); }
+    _                    => { unreachable(); }
 }
 ```
 
@@ -5088,7 +5088,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 
 | Module               | What it brings in                                                                                                     |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `core`               | `panic(message: string, loc: intrinsics::Location) -> never` (does not return; see §23.2, Panic strategies)           |
+| `core::panic`        | `panic(message: string, loc: intrinsics::Location) -> never` (does not return; see §23.2, Panic strategies), `assert(condition, message)`, `unreachable()`, `todo()` |
 | `core::option`       | `Option<T>` (`Some` / `None`) and its methods                                                                         |
 | `core::result`       | `Result<T, E>` (`Ok` / `Err`) and its methods                                                                         |
 | `core::primitives`   | Methods on built-in types (`(-5 as i32).abs()`, `(2.0).sqrt()`, `x.clamp(lo, hi)`, `char::is_digit`, ...)             |
@@ -5103,6 +5103,8 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `alloc::rc`          | `Rc<T>`                                                                                                               |
 
 The prelude is deliberately small. Anything else is an explicit `import` - notably, `printf` and the `print` / `println` / `eprint` / `eprintln` family live in `std::fmt` and are **not** auto-imported, and neither are the compiler intrinsics (`malloc`, `free`, ...) in `std::core::intrinsics`.
+
+`std::core` itself is not a prelude module: the prelude takes core's modules one by one, so a path through `core` (`core::mem::swap(...)`) reaches nothing in a file that does not import `std::core`, and `std::core::mem::swap(...)`, a path from the package root, always does. The `std::core` facade re-exports core's types and traits from their own modules, so one brace import names them: `import std::core::{ Ordering, TryFrom, NonNull, ErrorReport };`. Its exports bind nothing in a file that does not import them.
 
 Each module of the standard library offers its common names one level up, from its own facade, so a brace import of the module names them: `import std::sync::{ Atomic, Mutex };`, `import std::time::{ Duration, Instant };`, `import std::net::{ SocketAddress, TcpListener };`. The full path through the declaring module (`std::sync::mutex::{ Mutex }`) names the same declaration. Nothing is exported at the root of `std`: `import std::{ String };` is refused.
 
@@ -5441,7 +5443,7 @@ is refused with `E0900`, which names `CRYO_RUNTIME`.
 
 #### Panic strategies
 
-A panic - `core::panic`, a failed `expect` or `unwrap` - ends in the runtime's
+A panic - `panic`, a failed `expect` or `unwrap` - ends in the runtime's
 panic funnel, which reports `panicked at <file>:<line>:<column> in <function>:
 <message>` on stderr (no column when it is unknown, no function when it has no
 name). What happens next is the build's panic strategy, `panic = "unwind"` or

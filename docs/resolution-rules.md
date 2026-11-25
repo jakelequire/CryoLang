@@ -135,6 +135,19 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-11-25
 
+722. **The prelude binds the panic helpers from `std::core::panic`, and
+     `std::core` is not a prelude module.**  `panic`, `assert`,
+     `unreachable` and `todo` are declared in `std::core::panic`, which
+     the prelude lists in place of `core::_module`, so they stay bare in
+     every file through the same prelude tier.  A body path through
+     `core` (`core::panic(...)`, `core::mem::swap(...)`) reaches nothing
+     in a file that does not import `std::core`, a file of `std::core`'s
+     own children included: a module's parent is not in its view.  The
+     `std::core` facade re-exports core's types and traits from their
+     own modules with brace exports (`import std::core::{ TryFrom,
+     NonNull };`); since the module is out of the prelude, those exports
+     bind nothing bare.  (Jake)
+
 721. **YAML is `std::encoding::yaml`, a safe subset of YAML 1.2 with the
      core schema, read into and written from the shared `Value`.**
      `yaml::Yaml::parse(text)` reads the one document a text holds (none

@@ -1,0 +1,83 @@
+///! One-off codemod: the panic helpers are called bare.
+///!
+///!   core-panic-codemod <file>...
+///!
+///! `panic`, `assert`, `unreachable` and `todo` move to `std::core::panic`,
+///! which the prelude binds bare in every file, and `std::core` leaves the
+///! prelude, so a body path `core::panic(...)` no longer reaches them.  Each
+///! call spelled `core::<helper>(` whose `core` starts a path - the byte
+///! before it is neither part of an identifier nor a `:` - becomes
+///! `<helper>(`; `std::core::panic(` and `core::panic_unwind` are left
+///! alone.  Every file rewritten is printed with its count.
+
+namespace CorePanicCodemod;
+
+import std::fs::{ File };
+import std::env;
+import std::fmt::{ println };
+
+function is_path_byte(byte: u8) -> boolean {
+    return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+        || byte == 95 || byte == 58;
+}
+
+/// Whether `core` at `index` of `text` starts a path: the byte before it
+/// continues neither an identifier nor a path.
+function starts_path(text: Str, index: i64) -> boolean {
+    if (index == 0) { return true; }
+    match (text.byte_at(index - 1)) {
+        Option::Some(byte) => { return !is_path_byte(byte); }
+        Option::None => { return true; }
+    }
+}
+
+function rewrite(text: Str, count: mut &i64) -> String {
+    const helpers: [Str] = [Str::new("panic("), Str::new("assert("), Str::new("unreachable("), Str::new("todo(")];
+    const head: Str = Str::new("core::");
+    mut out: String = String::new();
+    mut i: i64 = 0;
+    while (i < text.length()) {
+        mut matched: i64 = 0;
+        if (i + head.length() <= text.length() && text.byte_substring(i, i + head.length()) == head && starts_path(text, i)) {
+            const rest: i64 = i + head.length();
+            for (mut h: i64 = 0; h < helpers.length(); h++) {
+                const end: i64 = rest + helpers[h].length();
+                if (end <= text.length() && text.byte_substring(rest, end) == helpers[h]) { matched = head.length(); }
+            }
+        }
+        if (matched > 0) {
+            i = i + matched;
+            *count = *count + 1;
+            continue;
+        }
+        out.append(text.byte_substring(i, i + 1));
+        i = i + 1;
+    }
+    return out;
+}
+
+function main() -> i32 {
+    const arguments: Array<String> = env::args();
+    if (arguments.length() < 2) {
+        println(f"usage: core-panic-codemod <file>...");
+        return 2;
+    }
+    mut total: i64 = 0;
+    for (mut a: i64 = 1; a < arguments.length(); a++) {
+        const file: Str = arguments[a].as_str();
+        match (File::read_text(file)) {
+            Result::Err(error) => { println(f"not read: {file}: {error}"); }
+            Result::Ok(text) => {
+                mut count: i64 = 0;
+                const rewritten: String = rewrite(text.as_str(), &count);
+                if (count == 0) { continue; }
+                match (File::write_text(file, rewritten.as_str())) {
+                    Result::Ok(_) => { println(f"{file}: {count} call(s)"); total = total + count; }
+                    Result::Err(error) => { println(f"not written: {file}: {error}"); }
+                }
+            }
+        }
+    }
+    println(f"rewrote {total} call(s)");
+    return 0;
+}

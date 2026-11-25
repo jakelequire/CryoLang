@@ -465,7 +465,7 @@ at a time with `for (line in BufferedReader::new(&file).lines()) { ... }`.
 is removed when the value is dropped. [`examples/15-files`](./examples/15-files/)
 runs all of it.
 
-The **prelude** (auto-imported into every file) currently re-exports `core::panic`, `core::option`, `core::result`, `core::primitives`, `core::intrinsics`, `core::variadic_arguments`, `core::slice`, `core::ops`, `core::iter`, `collections::array`, `alloc::box`, and `alloc::rc`.
+The **prelude** (auto-imported into every file) binds the names of `core::panic` (`panic`, `assert`, `unreachable`, `todo`), `core::option`, `core::result`, `core::primitives`, `core::variadic_arguments`, `core::slice`, `core::ops`, `core::iter`, `core::drop`, `core::marker`, `core::cmp`, `core::clone`, `collections::array`, `collections::string`, `collections::str`, `alloc::box`, and `alloc::rc`. The rest of `core` is one brace import away: `import std::core::{ TryFrom, NonNull };`.
 
 ---
 
