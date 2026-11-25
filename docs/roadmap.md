@@ -649,6 +649,42 @@ language's features; each is a branch of its own after the merge.
   opcodes, HTTP/2's frame types) carries its own `op_from_u8`.  The
   conversion answers `Option` (or `TryFrom`) for a value no variant holds.
 
+## Retire `string`'s text methods
+
+Decided: a literal's text methods are `Str`'s.  `string`'s own methods
+(`implement string` in `stdlib/core/primitives.cryo`: `length`,
+`substring`, `append`, `split`, `find`, `eq`, ...) stay public only
+because the compiler still calls them.  The work moves the compiler's text
+handling onto `Str` and `String`, then makes those methods internal (or
+deletes the ones nothing uses) in the same change.
+
+Measured by marking them internal in a scratch standard library and
+building `compiler/` against it, so that every call site is an `E0353`
+naming its method (the compiler stops at 500 reports, so the methods were
+counted in batches): 609 call sites over 20 methods - `length` 301, `eq`
+139, `substring` 52, `contains` 32, `starts_with` 23, `append` 13,
+`parent_directory` 9, `split_nonempty` and `find` 5 each, `trim`,
+`strip_prefix`, `replace` and `basename` 4 each, `is_empty` 3,
+`to_ascii_lower`, `stem`, `find_last`, `find_char` and `ends_with` 2 each,
+`split` 1.  Seven have no call site in the compiler: `parse_int`, `join`,
+`split_char`, `to_ascii_upper`, `extension`, `common_prefix_length` and
+`find_last_char`.  The tools and the tests call some of them too and were
+not counted.  It moves compiler objects throughout, so it is its own
+branch, proved by a byte-identical self-host and a verify whose moved
+objects are each explained.
+
+## The network codecs' visibility
+
+The operation futures of the sockets and of TLS are internal.  The HTTP/2
+codec (`Frame`, `Settings`, `HpackCodec`, `HeaderCodec`, `HeaderField`,
+`Http2Connection`, `RequestOnStream`, `BufferedStream.read_http2_frame`),
+WebSocket's `frame` and `handshake` modules and HTTP's `ChunkedEncoder`
+were approved to become internal too, and are still public: an HTTP/2
+connection takes a caller's own header codec (`new_client_with_codec`, a
+deliberate feature with a project test), and the codec tests reach the
+frames, HPACK and the chunked encoder through no other public user.
+Hiding them needs a ruling on the custom codec and a home for those tests.
+
 ## Compound assignment through traits of its own
 
 `a += b` evaluates `a.add(&b)` and stores the result in `a`, so on a
