@@ -1,0 +1,90 @@
+///! JSON with comments: `Json::parse` stays strict and refuses a comment,
+///! `Json::parse_with` and `JsonParseOptions::with_comments()` read `//` line
+///! and `/* */` block comments wherever whitespace may stand, a comment's
+///! spelling inside a string stays text, a refusal after comments points at
+///! the right line and column, and the writer writes no comment back.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::JsonComments;
+
+import std::core::result::{ Result };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::encoding::value::{ Value };
+import std::encoding::json::{ Json, JsonError, JsonErrorKind, JsonParseOptions };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_equal };
+
+/// `text` read with comments allowed, written back as compact JSON.
+function with_comments(text: string) -> Result<String, TestError> {
+    return match (Json::parse_with(Str::from(text), &JsonParseOptions::with_comments())) {
+        Result::Ok(value) => { Result::Ok(Json::to_text(&value)) }
+        Result::Err(error) => {
+            const message: String = f"the JSON must read: {error:?}";
+            Result::Err(TestError::failed(message.as_str()))
+        }
+    };
+}
+
+/// The refusal reading `text` under `options` must have `kind` at `line`
+/// and `column`.
+function refused(text: string, options: &JsonParseOptions, kind: JsonErrorKind, line: u64, column: u64)
+        -> Result<(), TestError> {
+    return match (Json::parse_with(Str::from(text), options)) {
+        Result::Ok(_) => { Result::Err(TestError::failed(Str::from("the JSON must be refused"))) }
+        Result::Err(error) => {
+            expect_equal(error.kind.label(), kind.label())?;
+            expect_equal(error.line, line)?;
+            expect_equal(error.column, column)
+        }
+    };
+}
+
+![test]
+function parse_stays_strict() -> Result<(), TestError> {
+    match (Json::parse(Str::from("{\"a\": 1 // one\n}"))) {
+        Result::Ok(_) => { return Result::Err(TestError::failed(Str::from("a comment is refused by default"))); }
+        Result::Err(error) => {
+            expect_equal(error.line, 1)?;
+            expect_equal(error.column, 9)?;
+        }
+    }
+    return refused("/* a */ 1", &JsonParseOptions::strict(), JsonErrorKind::UnexpectedChar, 1, 1);
+}
+
+![test]
+function line_and_block_comments_read_as_whitespace() -> Result<(), TestError> {
+    expect_equal(with_comments("// settings\n{\n  \"a\": 1, // the first\n  /* the\n     second */ \"b\": [1, /* x */ 2]\n} // end")?,
+                 String::from_str(Str::from("{\"a\":1,\"b\":[1,2]}")))?;
+    expect_equal(with_comments("/**/[/*a*/1/*b*/,/***/2]/* trailing */\n")?,
+                 String::from_str(Str::from("[1,2]")))?;
+    return expect_equal(with_comments("{\"k\"/*before the colon*/:/*after it*/true}//")?,
+                        String::from_str(Str::from("{\"k\":true}")));
+}
+
+![test]
+function a_comment_spelled_in_a_string_is_text() -> Result<(), TestError> {
+    return expect_equal(with_comments("{\"url\": \"http://x/*y*/\"}")?,
+                        String::from_str(Str::from("{\"url\":\"http://x/*y*/\"}")));
+}
+
+![test]
+function refusals_after_comments_point_at_their_place() -> Result<(), TestError> {
+    const comments: JsonParseOptions = JsonParseOptions::with_comments();
+    // The trailing comma's closing brace, on the third line, after a block
+    // comment that spans two.
+    refused("/* one\ntwo */\n{\"a\": 1,}", &comments, JsonErrorKind::KeyNotString, 3, 9)?;
+    // A slash that starts no comment is the character it is.
+    refused("{\"a\": 1 / 2}", &comments, JsonErrorKind::UnexpectedChar, 1, 9)?;
+    // A block comment the text never closes ends the input.
+    return refused("[1, /* open\n", &comments, JsonErrorKind::UnexpectedEof, 2, 1);
+}
+
+![test]
+function the_writer_writes_no_comments() -> Result<(), TestError> {
+    const value: Value = match (Json::parse_with(Str::from("{\"a\": /* kept out */ 1}"), &JsonParseOptions::with_comments())) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the JSON must read"))); }
+    };
+    return expect_equal(Json::to_pretty_text(&value), String::from_str(Str::from("{\n  \"a\": 1\n}")));
+}

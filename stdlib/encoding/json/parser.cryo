@@ -2,7 +2,8 @@
 ///!
 ///! Single-pass over a borrowed `Str`. Tracks `(line, column, offset)`
 ///! for error reporting. RFC 8259 strict: no trailing commas, no
-///! unquoted keys, no comments.
+///! unquoted keys, and no comments unless the caller asks for them, when
+///! `//` and `/* */` comments read as whitespace.
 ///!
 ///! `MAX_DEPTH` caps object/array nesting to prevent stack-blowup on
 ///! adversarial inputs. The default is generous for hand-authored data
@@ -28,10 +29,12 @@ private const LF:   u8 = 10;    // \n
 private const CR:   u8 = 13;    // \r
 private const SPACE: u8 = 32;
 private const QUOTE: u8 = 34;   // "
+private const STAR:  u8 = 42;   // *
 private const PLUS:  u8 = 43;   // +
 private const COMMA: u8 = 44;   // ,
 private const MINUS: u8 = 45;   // -
 private const DOT:   u8 = 46;   // .
+private const SLASH: u8 = 47;   // /
 private const ZERO:  u8 = 48;   // 0
 private const COLON: u8 = 58;   // :
 private const UPPER_E: u8 = 69; // E
@@ -61,8 +64,10 @@ private type struct Parser {
     private line:   u64;
     private column: u64;
     private depth:  u64;
+    /// Whether `//` and `/* */` comments stand where whitespace may.
+    private comments: boolean;
 
-    private static new(text: Str) -> Parser {
+    private static new(text: Str, comments: boolean) -> Parser {
         return Parser {
             src:    text.as_pointer(),
             len:    text.length() as u64,
@@ -70,6 +75,7 @@ private type struct Parser {
             line:   1,
             column: 1,
             depth:  0,
+            comments: comments,
         };
     }
 
@@ -98,12 +104,33 @@ private type struct Parser {
         return b;
     }
 
-    /// Skip ASCII whitespace per RFC 8259: SP, HT, LF, CR.
+    /// Skip ASCII whitespace per RFC 8259: SP, HT, LF, CR; and, when the
+    /// parser takes comments, a `//` comment to the end of its line and a
+    /// `/* */` comment to its close. Comments are skipped through `advance`,
+    /// so the line and column after one are the text's own. A block comment
+    /// the text never closes runs to the end of the input, where the reader
+    /// reports the input ending; a `/` that starts no comment is left for
+    /// the reader to refuse.
     private skip_ws(mut &this) -> void {
         while (this.pos < this.len) {
             const b: u8 = this.src[this.pos];
             if (b == SPACE || b == HT || b == LF || b == CR) {
                 this.advance();
+            } else if (b == SLASH && this.comments && this.pos + 1 < this.len
+                       && this.src[this.pos + 1] == SLASH) {
+                while (this.pos < this.len && this.src[this.pos] != LF) { this.advance(); }
+            } else if (b == SLASH && this.comments && this.pos + 1 < this.len
+                       && this.src[this.pos + 1] == STAR) {
+                this.advance();
+                this.advance();
+                while (this.pos < this.len
+                       && !(this.src[this.pos] == STAR && this.pos + 1 < this.len && this.src[this.pos + 1] == SLASH)) {
+                    this.advance();
+                }
+                if (this.pos < this.len) {
+                    this.advance();
+                    this.advance();
+                }
             } else {
                 return;
             }
@@ -591,9 +618,10 @@ private type struct Parser {
 /// non-whitespace produces `JsonErrorKind::TrailingData`.  Arrays and
 /// objects may nest at most 256 deep, counted together; deeper input
 /// fails with `JsonErrorKind::DepthExceeded`, so hostile input cannot
-/// exhaust the stack.
-internal function parse_document(text: Str) -> Result<Value, JsonError> {
-    mut p: Parser = Parser::new(text);
+/// exhaust the stack. With `comments`, `//` and `/* */` comments may stand
+/// wherever whitespace may.
+internal function parse_document(text: Str, comments: boolean) -> Result<Value, JsonError> {
+    mut p: Parser = Parser::new(text, comments);
     p.skip_ws();
     const v: Value = p.parse_value()?;
     p.skip_ws();
