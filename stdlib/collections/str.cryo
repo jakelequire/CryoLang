@@ -26,6 +26,8 @@ import std::collections::string::{ String };
 import std::collections::pair::{ Pair };
 import std::encoding::utf8::{ Utf8, DecodedScalar };
 import std::ffi::libc;
+import std::core::mem;
+import std::fmt::float;
 
 /// A read-only view of UTF-8 text owned elsewhere: a string literal, a
 /// `String`, a file's bytes. Copying a `Str` copies the view, not the
@@ -503,6 +505,14 @@ public type struct Str {
         return this.digits_value(16);
     }
 
+    /// This text read as a `T`: any type with a `TryFrom<Str>`, which the
+    /// integers (in decimal), the floats, `boolean` (`true` or `false`) and
+    /// `char` (exactly one character) have.
+    /// `const port: u16 = text.parse::<u16>()?;`
+    public parse<T>(&this) -> Result<T, ConversionError> where T: TryFrom<Str> {
+        return T::try_from(*this);
+    }
+
     /// The value these bytes write as digits of `radix`, every byte one,
     /// with the refusal saying which way they are not: empty, a byte that is
     /// no digit, or a value past `u64::MAX` - a run of digits that stops
@@ -890,5 +900,57 @@ implement trait TryFrom<Str> for i8 {
             return Result::Err(ConversionError::new("i8 out of range"));
         }
         return Result::Ok(value as i8);
+    }
+}
+
+// A decimal float, read by `fmt::float::parse_f64`: digits with an
+// optional point and exponent, and no `inf`, `nan` or hexadecimal form.
+implement trait TryFrom<Str> for f64 {
+    static try_from(source: Str) -> Result<f64, ConversionError> {
+        mut terminated: String = String::with_null(source);
+        const parsed: Option<f64> = float::parse_f64(terminated.as_pointer() as string);
+        mem::drop(terminated);
+        match (parsed) {
+            Option::Some(value) => { return Result::Ok(value); }
+            Option::None => { return Result::Err(ConversionError::new("not a decimal number")); }
+        }
+    }
+}
+
+// An `f64` that an `f32` holds: a finite value past `f32::MAX` is refused,
+// not rounded to infinity.
+implement trait TryFrom<Str> for f32 {
+    static try_from(source: Str) -> Result<f32, ConversionError> {
+        const value: f64 = f64::try_from(source)?;
+        if (value > f32::MAX as f64 || value < f32::MIN as f64) {
+            return Result::Err(ConversionError::new("f32 out of range"));
+        }
+        return Result::Ok(value as f32);
+    }
+}
+
+// Exactly `true` or `false`.
+implement trait TryFrom<Str> for boolean {
+    static try_from(source: Str) -> Result<boolean, ConversionError> {
+        if (source == Str::new("true")) { return Result::Ok(true); }
+        if (source == Str::new("false")) { return Result::Ok(false); }
+        return Result::Err(ConversionError::new("neither true nor false"));
+    }
+}
+
+// Exactly one Unicode scalar.
+implement trait TryFrom<Str> for char {
+    static try_from(source: Str) -> Result<char, ConversionError> {
+        mut found: Option<u32> = Option::None;
+        for (scalar in source.chars()) {
+            if (found.is_some()) {
+                return Result::Err(ConversionError::new("more than one character"));
+            }
+            found = Option::Some(scalar);
+        }
+        match (found) {
+            Option::Some(scalar) => { return Result::Ok(scalar as char); }
+            Option::None => { return Result::Err(ConversionError::new("empty input")); }
+        }
     }
 }

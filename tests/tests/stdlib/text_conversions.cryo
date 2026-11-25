@@ -1,0 +1,104 @@
+///! Text to and from values: `to_string` on anything `Display`, `parse` of
+///! a `Str` (or a `String`, through `Deref`) into any type with a
+///! `TryFrom<Str>`, and `String::from` of a `Display` value.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::TextConversions;
+
+import std::collections::{ Str, String };
+import std::fmt::{ Display, Formatter, FormatError };
+import std::time::{ Duration };
+import std::test::error::{ TestError };
+import std::test::assert::{ bail, expect_equal, expect_error };
+
+type struct Celsius {
+    degrees: i32;
+}
+
+implement trait Display for struct Celsius {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        const text: String = f"{this.degrees}C";
+        return f.write_str(text.as_str());
+    }
+}
+
+![test]
+function to_string_is_what_display_writes() -> Result<(), TestError> {
+    const count: i32 = -42;
+    expect_equal(count.to_string().as_str(), Str::new("-42"))?;
+    expect_equal(true.to_string().as_str(), Str::new("true"))?;
+    expect_equal('x'.to_string().as_str(), Str::new("x"))?;
+    expect_equal(Str::new("text").to_string().as_str(), Str::new("text"))?;
+    expect_equal(Duration::from_milliseconds(250).to_string().as_str(), Str::new("250ms"))?;
+    const weather: Celsius = Celsius { degrees: 21 };
+    expect_equal(weather.to_string().as_str(), Str::new("21C"))?;
+    return Result::Ok(());
+}
+
+![test]
+function integers_parse_in_decimal() -> Result<(), TestError> {
+    expect_equal(Str::new("42").parse::<i32>().unwrap(), 42)?;
+    expect_equal(Str::new("-7").parse::<i64>().unwrap(), -7)?;
+    expect_equal(Str::new("65535").parse::<u16>().unwrap(), 65535)?;
+    expect_error(&Str::new("65536").parse::<u16>(), "65536 is past u16")?;
+    expect_error(&Str::new("12a").parse::<i32>(), "12a is no integer")?;
+    return Result::Ok(());
+}
+
+![test]
+function floats_parse_as_decimal_numbers() -> Result<(), TestError> {
+    expect_equal(Str::new("3.5").parse::<f64>().unwrap(), 3.5)?;
+    expect_equal(Str::new("-1e3").parse::<f64>().unwrap(), -1000.0)?;
+    const quarter: f32 = 0.25;
+    expect_equal(Str::new("0.25").parse::<f32>().unwrap(), quarter)?;
+    expect_error(&Str::new("abc").parse::<f64>(), "abc is no number")?;
+    expect_error(&Str::new("inf").parse::<f64>(), "inf is not decimal")?;
+    expect_error(&Str::new("1.5x").parse::<f64>(), "1.5x has a byte after the number")?;
+    expect_error(&Str::new("").parse::<f64>(), "empty text is no number")?;
+    return Result::Ok(());
+}
+
+![test]
+function a_float_an_f32_cannot_hold_is_refused() -> Result<(), TestError> {
+    match (Str::new("1e39").parse::<f32>()) {
+        Result::Ok(_) => { return bail("1e39 parsed as an f32"); }
+        Result::Err(error) => { return expect_equal(error.describe(), Str::new("f32 out of range")); }
+    }
+}
+
+![test]
+function a_boolean_is_exactly_true_or_false() -> Result<(), TestError> {
+    expect_equal(Str::new("true").parse::<boolean>().unwrap(), true)?;
+    expect_equal(Str::new("false").parse::<boolean>().unwrap(), false)?;
+    expect_error(&Str::new("True").parse::<boolean>(), "True is not true")?;
+    expect_error(&Str::new("1").parse::<boolean>(), "1 is not true")?;
+    return Result::Ok(());
+}
+
+![test]
+function a_char_is_exactly_one_character() -> Result<(), TestError> {
+    expect_equal(Str::new("x").parse::<char>().unwrap(), 'x')?;
+    expect_equal(Str::new("é").parse::<char>().unwrap() as u32, 0xE9)?;
+    expect_error(&Str::new("").parse::<char>(), "empty text is no character")?;
+    match (Str::new("ab").parse::<char>()) {
+        Result::Ok(_) => { return bail("two characters parsed as one"); }
+        Result::Err(error) => { return expect_equal(error.describe(), Str::new("more than one character")); }
+    }
+}
+
+![test]
+function a_string_parses_through_its_text() -> Result<(), TestError> {
+    const port: String = String::from(8080);
+    expect_equal(port.parse::<u16>().unwrap(), 8080)?;
+    const blank: String = String::from(Str::new("  "));
+    expect_error(&blank.parse::<u16>(), "blanks are no number")?;
+    return Result::Ok(());
+}
+
+![test]
+function string_from_takes_any_display_value() -> Result<(), TestError> {
+    expect_equal(String::from(Duration::from_seconds(5)).as_str(), Str::new("5s"))?;
+    expect_equal(String::from(Celsius { degrees: -3 }).as_str(), Str::new("-3C"))?;
+    expect_equal(String::from('z').as_str(), Str::new("z"))?;
+    return Result::Ok(());
+}
