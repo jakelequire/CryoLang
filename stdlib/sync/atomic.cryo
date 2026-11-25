@@ -13,24 +13,24 @@
 ///! unsigned integers; every other type is reinterpreted onto the unsigned
 ///! intrinsic of its width: the signed integers bit for bit, `usize` and
 ///! `isize` onto the target's pointer width (`sizeof`, a constant, picks
-///! the arm), and `boolean` onto 8 bits as 0 or 1.
+///! the arm), `boolean` onto 8 bits as 0 or 1, `char` onto 32 bits as its
+///! code point, and `f32` and `f64` onto 32 and 64 bits as their bit
+///! patterns.
 ///!
 ///! Supported `T`: `u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`, `i32`,
-///! `i64`, `isize` and `boolean`.  Instantiating `Atomic<T>` with any other
-///! type - `i128` and `u128` among them, which no single-width atomic holds -
-///! is a compile error (E0645): the absence of a matching `static match` arm
-///! IS the type constraint.
+///! `i64`, `isize`, `boolean`, `char`, `f32` and `f64`.  Instantiating
+///! `Atomic<T>` with any other type - `i128` and `u128` among them, which no
+///! single-width atomic holds - is a compile error (E0645): the absence of a
+///! matching `static match` arm IS the type constraint.
 ///!
 ///! `fetch_add` and `fetch_subtract` are an integer cell's alone (`where T:
 ///! Integer`): on `Atomic<boolean>` they are refused, since arithmetic on the
 ///! 0/1 backing byte would store a byte that is neither.  `fetch_and`,
-///! `fetch_or` and `fetch_xor` take the integers and `boolean` too - AND, OR
-///! and XOR of two 0/1 bytes is again 0 or 1, so a boolean cell keeps its
-///! meaning.  No marker trait names "an integer or `boolean`", so those three
-///! carry no bound and their arm set is the constraint.  Every method of
-///! `Atomic<T>` without a bound is built for each `T` a program uses, so a
-///! cell type needs an arm in all of them: that is why there is no `char`
-///! or float cell, whose bitwise read-modify-writes would have no meaning.
+///! `fetch_or` and `fetch_xor` are a `Bitwise` cell's - the integers and
+///! `boolean`, since AND, OR and XOR of two 0/1 bytes is again 0 or 1.  A
+///! `char` or float cell loads, stores, swaps and compares-and-exchanges
+///! alone.  A float cell's `compare_exchange` compares bit patterns, not
+///! values: a NaN matches the same NaN, and `0.0` does not match `-0.0`.
 ///!
 ///! Every operation takes an `MemoryOrder` describing the memory-model
 ///! constraints around it.  When in doubt, `SeqCst` is the always-safe
@@ -48,6 +48,7 @@
 namespace std::sync::atomic;
 
 import std::core::intrinsics;
+import std::core::mem;
 import std::core::result::{ Result };
 import std::core::drop::{ Drop };
 
@@ -168,6 +169,9 @@ public type struct Atomic<T> {
                 word
             }
             boolean => { intrinsics::atomic_load_u8(&this.value as const u8*, MemoryOrder::to_u32(order)) != 0 }
+            char    => { intrinsics::atomic_load_u32(&this.value as const u32*, MemoryOrder::to_u32(order)) as char }
+            f32     => { mem::transmute::<u32, f32>(intrinsics::atomic_load_u32(&this.value as const u32*, MemoryOrder::to_u32(order))) }
+            f64     => { mem::transmute::<u64, f64>(intrinsics::atomic_load_u64(&this.value as const u64*, MemoryOrder::to_u32(order))) }
         };
     }
 
@@ -197,6 +201,9 @@ public type struct Atomic<T> {
                 const b: u8 = if (val) { 1 } else { 0 };
                 intrinsics::atomic_store_u8(&this.value as u8*, b, MemoryOrder::to_u32(order));
             }
+            char    => { intrinsics::atomic_store_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)); }
+            f32     => { intrinsics::atomic_store_u32(&this.value as u32*, mem::transmute::<f32, u32>(val), MemoryOrder::to_u32(order)); }
+            f64     => { intrinsics::atomic_store_u64(&this.value as u64*, mem::transmute::<f64, u64>(val), MemoryOrder::to_u32(order)); }
         }
     }
 
@@ -255,8 +262,9 @@ public type struct Atomic<T> {
         };
     }
 
-    /// AND the cell with `val`.  Returns the previous value.
-    public fetch_and(&this,val: T, order: MemoryOrder) -> T {
+    /// AND the cell with `val`.  Returns the previous value.  A `Bitwise`
+    /// cell's alone: an integer or `boolean` one.
+    public fetch_and(&this,val: T, order: MemoryOrder) -> T where T: Bitwise {
         return static match (T) {
             u8    => { intrinsics::atomic_and_u8(&this.value, val, MemoryOrder::to_u32(order)) }
             u16   => { intrinsics::atomic_and_u16(&this.value, val, MemoryOrder::to_u32(order)) }
@@ -283,8 +291,9 @@ public type struct Atomic<T> {
         };
     }
 
-    /// OR the cell with `val`.  Returns the previous value.
-    public fetch_or(&this,val: T, order: MemoryOrder) -> T {
+    /// OR the cell with `val`.  Returns the previous value.  A `Bitwise`
+    /// cell's alone: an integer or `boolean` one.
+    public fetch_or(&this,val: T, order: MemoryOrder) -> T where T: Bitwise {
         return static match (T) {
             u8    => { intrinsics::atomic_or_u8(&this.value, val, MemoryOrder::to_u32(order)) }
             u16   => { intrinsics::atomic_or_u16(&this.value, val, MemoryOrder::to_u32(order)) }
@@ -311,8 +320,9 @@ public type struct Atomic<T> {
         };
     }
 
-    /// XOR the cell with `val`.  Returns the previous value.
-    public fetch_xor(&this,val: T, order: MemoryOrder) -> T {
+    /// XOR the cell with `val`.  Returns the previous value.  A `Bitwise`
+    /// cell's alone: an integer or `boolean` one.
+    public fetch_xor(&this,val: T, order: MemoryOrder) -> T where T: Bitwise {
         return static match (T) {
             u8    => { intrinsics::atomic_xor_u8(&this.value, val, MemoryOrder::to_u32(order)) }
             u16   => { intrinsics::atomic_xor_u16(&this.value, val, MemoryOrder::to_u32(order)) }
@@ -364,6 +374,13 @@ public type struct Atomic<T> {
             boolean => {
                 const b: u8 = if (val) { 1 } else { 0 };
                 intrinsics::atomic_swap_u8(&this.value as u8*, b, MemoryOrder::to_u32(order)) != 0
+            }
+            char  => { intrinsics::atomic_swap_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as char }
+            f32   => {
+                mem::transmute::<u32, f32>(intrinsics::atomic_swap_u32(&this.value as u32*, mem::transmute::<f32, u32>(val), MemoryOrder::to_u32(order)))
+            }
+            f64   => {
+                mem::transmute::<u64, f64>(intrinsics::atomic_swap_u64(&this.value as u64*, mem::transmute::<f64, u64>(val), MemoryOrder::to_u32(order)))
             }
         };
     }
@@ -474,6 +491,32 @@ public type struct Atomic<T> {
                     MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok);
                 if (ok) { return Result::Ok(loaded != 0); }
                 return Result::Err(loaded != 0);
+            }
+            char => {
+                mut ok: boolean = false;
+                const loaded: u32 = intrinsics::atomic_cmpxchg_u32(
+                    &this.value as u32*, current as u32, next as u32,
+                    MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok);
+                if (ok) { return Result::Ok(loaded as char); }
+                return Result::Err(loaded as char);
+            }
+            // A float cell compares bit patterns, not values: a NaN matches
+            // the same NaN, and `0.0` does not match `-0.0`.
+            f32 => {
+                mut ok: boolean = false;
+                const loaded: u32 = intrinsics::atomic_cmpxchg_u32(
+                    &this.value as u32*, mem::transmute::<f32, u32>(current), mem::transmute::<f32, u32>(next),
+                    MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok);
+                if (ok) { return Result::Ok(mem::transmute::<u32, f32>(loaded)); }
+                return Result::Err(mem::transmute::<u32, f32>(loaded));
+            }
+            f64 => {
+                mut ok: boolean = false;
+                const loaded: u64 = intrinsics::atomic_cmpxchg_u64(
+                    &this.value as u64*, mem::transmute::<f64, u64>(current), mem::transmute::<f64, u64>(next),
+                    MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok);
+                if (ok) { return Result::Ok(mem::transmute::<u64, f64>(loaded)); }
+                return Result::Err(mem::transmute::<u64, f64>(loaded));
             }
         }
     }

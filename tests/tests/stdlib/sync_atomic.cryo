@@ -450,3 +450,61 @@ function atomic_usize_and_isize_are_64_bits() -> Result<(), TestError> {
     expect_equal(s.load(MemoryOrder::SeqCst), 42 as isize)?;
     return Result::Ok(());
 }
+
+// ---- Atomic<char>, Atomic<f32>, Atomic<f64> --------------------------------
+
+![test]
+function atomic_char_cell_holds_any_code_point() -> Result<(), TestError> {
+    const c: Atomic<char> = Atomic::<char>::new('a');
+    expect_equal(c.load(MemoryOrder::SeqCst), 'a')?;
+    c.store(0x1F600 as char, MemoryOrder::SeqCst);
+    expect_equal(c.load(MemoryOrder::SeqCst) as u32, 0x1F600 as u32)?;
+    expect_equal(c.swap('Z', MemoryOrder::SeqCst) as u32, 0x1F600 as u32)?;
+    match (c.compare_exchange('Z', '\0', MemoryOrder::SeqCst, MemoryOrder::SeqCst)) {
+        Result::Ok(previous) => { expect_equal(previous, 'Z')?; }
+        Result::Err(_)       => { return Result::Err(TestError::failed(Str::new("a char exchange of the code point held must succeed"))); }
+    }
+    match (c.compare_exchange('Z', 'q', MemoryOrder::SeqCst, MemoryOrder::SeqCst)) {
+        Result::Ok(_)      => { return Result::Err(TestError::failed(Str::new("a char exchange of another code point must fail"))); }
+        Result::Err(found) => { expect_equal(found, '\0')?; }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function atomic_float_cells_hold_their_values() -> Result<(), TestError> {
+    const single: Atomic<f32> = Atomic::<f32>::new(1.5);
+    expect_equal(single.load(MemoryOrder::SeqCst), 1.5 as f32)?;
+    single.store(-2.25, MemoryOrder::SeqCst);
+    expect_equal(single.swap(16777216.0, MemoryOrder::SeqCst), -2.25 as f32)?;
+    expect_equal(single.load(MemoryOrder::SeqCst), 16777216.0 as f32)?;
+    const double: Atomic<f64> = Atomic::<f64>::new(1e300);
+    expect_equal(double.load(MemoryOrder::SeqCst), 1e300)?;
+    double.store(-0.1, MemoryOrder::SeqCst);
+    expect_equal(double.swap(9007199254740993.0, MemoryOrder::SeqCst), -0.1)?;
+    match (double.compare_exchange(9007199254740993.0, 2.5, MemoryOrder::SeqCst, MemoryOrder::SeqCst)) {
+        Result::Ok(previous) => { expect_equal(previous, 9007199254740993.0)?; }
+        Result::Err(_)       => { return Result::Err(TestError::failed(Str::new("an f64 exchange of the value held must succeed"))); }
+    }
+    expect_equal(double.load(MemoryOrder::SeqCst), 2.5)?;
+    return Result::Ok(());
+}
+
+![test]
+function atomic_float_exchange_compares_bit_patterns() -> Result<(), TestError> {
+    // A NaN never equals itself, yet a NaN cell exchanges against the same NaN.
+    const nan_cell: Atomic<f64> = Atomic::<f64>::new(f64::NAN);
+    match (nan_cell.compare_exchange(f64::NAN, 1.0, MemoryOrder::SeqCst, MemoryOrder::SeqCst)) {
+        Result::Ok(previous) => { expect_equal(previous.is_nan(), true)?; }
+        Result::Err(_)       => { return Result::Err(TestError::failed(Str::new("a NaN cell must exchange against the same NaN"))); }
+    }
+    expect_equal(nan_cell.load(MemoryOrder::SeqCst), 1.0)?;
+    // `0.0 == -0.0`, yet a `0.0` cell does not exchange against `-0.0`.
+    const zero_cell: Atomic<f32> = Atomic::<f32>::new(0.0);
+    match (zero_cell.compare_exchange(-0.0, 1.0, MemoryOrder::SeqCst, MemoryOrder::SeqCst)) {
+        Result::Ok(_)      => { return Result::Err(TestError::failed(Str::new("a 0.0 cell must not exchange against -0.0"))); }
+        Result::Err(found) => { expect_equal(found.is_sign_negative(), false)?; }
+    }
+    expect_equal(zero_cell.load(MemoryOrder::SeqCst), 0.0 as f32)?;
+    return Result::Ok(());
+}
