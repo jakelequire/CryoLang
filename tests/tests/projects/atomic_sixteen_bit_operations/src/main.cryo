@@ -1,0 +1,48 @@
+// The 16-bit atomic intrinsics operate on a u16 in place and at its width.
+// The value under test sits between two u16 neighbours, so an operation
+// done at a wider width, or a carry out of the top bit, shows up as a
+// changed neighbour.  Each operation returns the value it found.
+namespace atomic_sixteen_bit_operations;
+
+import std::fmt;
+import std::core::intrinsics;
+
+type struct Row {
+    before: u16;
+    value:  u16;
+    after:  u16;
+}
+
+// The ordering the intrinsics take for a sequentially consistent operation
+// (`MemoryOrder::to_u32(MemoryOrder::SeqCst)`).
+const SEQ_CST: u32 = 7;
+
+function main() -> i32 {
+    mut row: Row = Row { before: 0x1111, value: 0, after: 0x2222 };
+
+    intrinsics::atomic_store_u16(&row.value, 0xFFFE, SEQ_CST);
+    const loaded: u16 = intrinsics::atomic_load_u16(&row.value, SEQ_CST);
+    const added: u16 = intrinsics::atomic_add_u16(&row.value, 3, SEQ_CST);
+    const after_add: u16 = row.value;
+    const subtracted: u16 = intrinsics::atomic_sub_u16(&row.value, 2, SEQ_CST);
+    const after_sub: u16 = row.value;
+    intrinsics::atomic_store_u16(&row.value, 0xF0F0, SEQ_CST);
+    const anded: u16 = intrinsics::atomic_and_u16(&row.value, 0xFF00, SEQ_CST);
+    const ored: u16 = intrinsics::atomic_or_u16(&row.value, 0x000F, SEQ_CST);
+    const xored: u16 = intrinsics::atomic_xor_u16(&row.value, 0xFFFF, SEQ_CST);
+    const swapped: u16 = intrinsics::atomic_swap_u16(&row.value, 0x1234, SEQ_CST);
+
+    mut ok: boolean = false;
+    const missed: u16 = intrinsics::atomic_cmpxchg_u16(&row.value, 0x9999, 0x4321, SEQ_CST, SEQ_CST, &ok);
+    const missed_ok: boolean = ok;
+    const hit: u16 = intrinsics::atomic_cmpxchg_u16(&row.value, 0x1234, 0x4321, SEQ_CST, SEQ_CST, &ok);
+
+    fmt::printf("load %x add %x then %x sub %x then %x\n",
+        loaded as u32, added as u32, after_add as u32, subtracted as u32, after_sub as u32);
+    fmt::printf("and %x or %x xor %x swap %x\n",
+        anded as u32, ored as u32, xored as u32, swapped as u32);
+    fmt::printf("cmpxchg miss %x %d hit %x %d now %x\n",
+        missed as u32, missed_ok as i32, hit as u32, ok as i32, row.value as u32);
+    fmt::printf("neighbours %x %x\n", row.before as u32, row.after as u32);
+    return 0;
+}
