@@ -673,15 +673,20 @@ not counted.  It moves compiler objects throughout, and each batch is
 proved by a byte-identical self-host and a verify whose moved objects are
 each explained.
 
-Done: the three searches, `contains`, `starts_with` and `ends_with` (57
-sites), are internal; the compiler asks them of `Str::new(text)`.  Left:
-552 sites over 17 methods.  The ones that return a `string`
+Done: the searches, `contains`, `starts_with`, `ends_with`, `is_empty`,
+`find`, `find_last`, `find_char` and `find_last_char` (69 sites), are
+internal; the compiler asks them of `Str::new(text)`.  Left: 540 sites
+over 13 methods - `length` 301, `eq` 139, `substring` 52, `append` 13,
+`parent_directory` 9, `split_nonempty` 5, `trim`, `strip_prefix`,
+`replace` and `basename` 4 each, `to_ascii_lower` and `stem` 2 each,
+`split` 1 - and the six with no compiler caller (`parse_int`, `join`,
+`split_char`, `to_ascii_upper`, `extension`, `common_prefix_length`).
+The ones that return a `string`
 (`substring`, `append`, `trim`, `replace`, `strip_prefix`, the path
 methods, `split_nonempty`) do not map one for one: `Str`'s answers are
 borrowed views, not NUL-terminated copies, so each site needs the owned
-form its consumer wants.  `find`, `find_last` and `find_char` answer `-1`
-where `Str` answers `Option`.  `length`, `is_empty` and `eq` accept a null
-`string` (as 0, true and equal-to-null) where `Str::new` of a null reads
+form its consumer wants.  `length` and `eq` accept a null `string` (as 0
+and equal-to-null) where `Str::new` of a null reads
 through it, so a site that can see null needs its own check first.
 
 ## The network codecs' visibility
