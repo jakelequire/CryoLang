@@ -19,12 +19,16 @@
 ///! Every operation below is defined in terms of that root: `parent` and
 ///! `file_name` stop at it, `pop` cannot climb above it, and `push` of a
 ///! rooted segment replaces rather than appends. Verbatim `\\?\` prefixes
-///! parse as UNC, which keeps them intact but does not give them their
-///! special "no normalisation" meaning.
+///! parse as UNC, which keeps them intact; `normalize` alone gives them
+///! their "no normalisation" meaning and returns them unchanged.
 ///!
 ///! `push` writes `/` on every target. Windows accepts `/` throughout the
 ///! Win32 file APIs, and the toolchain builds paths with `/` elsewhere, so
 ///! emitting it keeps one convention; `\` is still understood on input.
+///! `normalize` is the call that writes the OS's own form, for showing a
+///! path to a user or handing it to another program. So pushing onto a
+///! normalised Windows path gives `C:\a\b/c`, and `normalize()` again
+///! tidies it to `C:\a\b\c`.
 
 namespace std::fs::path;
 
@@ -351,6 +355,84 @@ public type struct Path {
                 return result;
             }
         }
+    }
+
+    /// This path tidied, and written the way this target writes paths: the
+    /// form to show a user or hand to another program. `push` and `join`
+    /// write `/` everywhere; `normalize` is the call that writes the OS's
+    /// own separators.
+    ///
+    /// - `.` segments are dropped, and a `..` removes the segment before
+    ///   it: `a/./b/../c` is `a/c`.
+    /// - A `..` directly after an absolute root is dropped, since nothing
+    ///   is above the root: `/../a` is `/a`, `C:\..\a` is `C:\a`. A
+    ///   relative path keeps its leading ones: `../../a` stays.
+    /// - Repeated separators are written once, and a trailing separator is
+    ///   dropped unless it is the root's own: `a//b/` is `a/b`, `/` stays.
+    /// - A path that is empty, or whose every segment cancels, is `.`.
+    ///
+    /// On Windows `/` and `\` are both read and every separator is written
+    /// `\`; the root is kept as written apart from its separators: `c:` is
+    /// not uppercased, a drive-relative `C:a\..\b` is `C:b`, and a UNC root
+    /// `\\server\share\` is never split or climbed. A verbatim `\\?\` path
+    /// is returned unchanged, since the prefix tells Windows to take the
+    /// text exactly as written. On Unix `\` is an ordinary byte of a name.
+    ///
+    /// This reads only the text, never the filesystem: `a/link/..` is `a`
+    /// even when `link` is a symbolic link to another directory.
+    /// `canonicalize` is the call that asks the filesystem.
+    public normalize(&this) -> PathBuf {
+        if (WINDOWS_SYNTAX && this.inner.starts_with(&Str::new("\\\\?\\"))) {
+            return PathBuf::from(this.inner);
+        }
+        mut native: u8 = if (WINDOWS_SYNTAX) { BACKSLASH } else { SEPARATOR };
+        const bytes: &Slice<u8> = this.inner.as_bytes();
+        const n: i64 = this.inner.length();
+        const root: i64 = Path::root_length(this.inner);
+        // `C:` names the drive's own working directory, which a `..` can
+        // climb out of; every other root is the top of its volume.
+        const climbable_root: boolean = root == 0 || (WINDOWS_SYNTAX && root == 2 && bytes[1] == COLON);
+
+        mut result: PathBuf = PathBuf::new();
+        for (mut i: i64 = 0; i < root; i++) {
+            if (Path::is_separator(bytes[i])) {
+                result.append(Str::from_raw(&native, 1));
+            } else {
+                result.append(this.inner.byte_substring(i, i + 1));
+            }
+        }
+
+        mut kept: Array<Str> = Array::<Str>::new();
+        mut start: i64 = root;
+        while (start < n) {
+            mut end: i64 = start;
+            while (end < n && !Path::is_separator(bytes[end])) { end = end + 1; }
+            const segment: Str = this.inner.byte_substring(start, end);
+            start = end + 1;
+            if (segment.is_empty() || segment == Str::new(".")) { continue; }
+            if (segment == Str::new("..")) {
+                const follows_a_name: boolean = match (kept.last()) {
+                    Option::Some(previous) => { *previous != Str::new("..") }
+                    Option::None           => { false }
+                };
+                if (follows_a_name) {
+                    kept.pop();
+                    continue;
+                }
+                if (!climbable_root) { continue; }
+            }
+            kept.push(segment);
+        }
+
+        for (mut k: i64 = 0; k < kept.length(); k++) {
+            if (k > 0) { result.append(Str::from_raw(&native, 1)); }
+            result.append(kept[k]);
+        }
+        if (result.view.inner.is_empty()) {
+            mut dot: u8 = DOT;
+            result.append(Str::from_raw(&dot, 1));
+        }
+        return result;
     }
 
     // What is at this path, whatever kind of entry it is. Each failure names

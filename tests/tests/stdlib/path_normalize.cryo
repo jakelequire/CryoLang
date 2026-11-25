@@ -1,0 +1,125 @@
+///! `Path.normalize`: the lexical tidy (`.`, `..`, repeated and trailing
+///! separators) and the target's own separators, one table per target.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::PathNormalize;
+
+import std::collections::{ Str };
+import std::fs::path::{ Path, PathBuf };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_equal };
+
+/// `input` normalised is exactly `wanted`.
+function normalizes(input: string, wanted: string) -> Result<(), TestError> {
+    const normal: PathBuf = Path::new(input).normalize();
+    return expect_equal(normal.as_path().as_str(), Str::new(wanted));
+}
+
+![test]
+![target(windows)]
+function windows_segments_are_tidied_and_written_with_backslashes() -> Result<(), TestError> {
+    normalizes("a/./b", "a\\b")?;
+    normalizes("a/b\\c", "a\\b\\c")?;
+    normalizes("a\\b\\..\\c", "a\\c")?;
+    normalizes("a\\\\\\b", "a\\b")?;
+    normalizes("a\\b\\", "a\\b")?;
+    normalizes("..\\..\\a", "..\\..\\a")?;
+    normalizes("a\\..\\..", "..")?;
+    normalizes("a/link/..", "a")?;
+    return Result::Ok(());
+}
+
+![test]
+![target(windows)]
+function windows_empty_and_cancelled_paths_are_a_dot() -> Result<(), TestError> {
+    normalizes("", ".")?;
+    normalizes(".", ".")?;
+    normalizes(".\\", ".")?;
+    normalizes("a\\..", ".")?;
+    return Result::Ok(());
+}
+
+![test]
+![target(windows)]
+function windows_roots_are_kept_and_never_climbed() -> Result<(), TestError> {
+    normalizes("C:\\", "C:\\")?;
+    normalizes("C:/", "C:\\")?;
+    normalizes("C:\\a\\", "C:\\a")?;
+    normalizes("C:/a/./b", "C:\\a\\b")?;
+    normalizes("C:\\..\\a", "C:\\a")?;
+    normalizes("c:\\x", "c:\\x")?;
+    normalizes("\\..\\a", "\\a")?;
+    normalizes("/", "\\")?;
+    return Result::Ok(());
+}
+
+![test]
+![target(windows)]
+function windows_drive_relative_paths_stay_relative() -> Result<(), TestError> {
+    normalizes("C:a\\..\\b", "C:b")?;
+    normalizes("C:..\\a", "C:..\\a")?;
+    normalizes("C:a\\..", "C:")?;
+    return Result::Ok(());
+}
+
+![test]
+![target(windows)]
+function windows_unc_roots_and_verbatim_paths() -> Result<(), TestError> {
+    normalizes("//server/share/x/../y", "\\\\server\\share\\y")?;
+    normalizes("\\\\server\\share\\..", "\\\\server\\share\\")?;
+    normalizes("\\\\server\\share", "\\\\server\\share")?;
+    normalizes("\\\\?\\C:\\a\\..\\b/", "\\\\?\\C:\\a\\..\\b/")?;
+    return Result::Ok(());
+}
+
+![test]
+![target(windows)]
+function windows_push_onto_a_normalised_path_writes_a_slash_until_normalised_again() -> Result<(), TestError> {
+    mut path: PathBuf = Path::new("C:/a/b").normalize();
+    expect_equal(path.as_path().as_str(), Str::new("C:\\a\\b"))?;
+    path.push(Str::new("c"));
+    expect_equal(path.as_path().as_str(), Str::new("C:\\a\\b/c"))?;
+    const again: PathBuf = path.normalize();
+    return expect_equal(again.as_path().as_str(), Str::new("C:\\a\\b\\c"));
+}
+
+![test]
+![target(unix)]
+function unix_segments_are_tidied() -> Result<(), TestError> {
+    normalizes("a/./b/../c", "a/c")?;
+    normalizes("a///b", "a/b")?;
+    normalizes("a//b/", "a/b")?;
+    normalizes("../../a", "../../a")?;
+    normalizes("a/../..", "..")?;
+    normalizes("a/link/..", "a")?;
+    return Result::Ok(());
+}
+
+![test]
+![target(unix)]
+function unix_empty_and_cancelled_paths_are_a_dot() -> Result<(), TestError> {
+    normalizes("", ".")?;
+    normalizes(".", ".")?;
+    normalizes("./", ".")?;
+    normalizes("a/..", ".")?;
+    return Result::Ok(());
+}
+
+![test]
+![target(unix)]
+function unix_root_is_kept_and_never_climbed() -> Result<(), TestError> {
+    normalizes("/", "/")?;
+    normalizes("//a", "/a")?;
+    normalizes("/../a", "/a")?;
+    normalizes("/a/", "/a")?;
+    return Result::Ok(());
+}
+
+![test]
+![target(unix)]
+function unix_backslash_is_part_of_a_name() -> Result<(), TestError> {
+    normalizes("a\\b", "a\\b")?;
+    normalizes("C:\\x/./y", "C:\\x/y")?;
+    normalizes("\\\\server\\share", "\\\\server\\share")?;
+    return Result::Ok(());
+}
