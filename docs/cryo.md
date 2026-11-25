@@ -5065,6 +5065,13 @@ The prelude is auto-imported into every Cryo source file. Currently:
 The prelude is deliberately small. Anything else is an explicit `import` - notably, `printf` and the `print` / `println` / `eprint` / `eprintln` family live in `std::fmt` and are **not** auto-imported, and neither are the compiler intrinsics (`malloc`, `free`, ...) in `std::core::intrinsics`.
 
 Each module of the standard library offers its common names one level up, from its own facade, so a brace import of the module names them: `import std::sync::{ Atomic, Mutex };`, `import std::time::{ Duration, Instant };`, `import std::net::{ SocketAddress, TcpListener };`. The full path through the declaring module (`std::sync::mutex::{ Mutex }`) names the same declaration. Nothing is exported at the root of `std`: `import std::{ String };` is refused.
+
+Several standard library types implement the operator traits (§10.6):
+
+- `Duration`: `a + b`, `a - b`, `d * n` and `d / n` (`n: u64`). Each panics where its `checked_*` method answers `None`: a sum or product past the largest span, a difference below zero, a division by zero.
+- `Instant`: `later - earlier` is the `Duration` between them, saturating at zero as `duration_since` does; `instant + duration` and `instant - duration` panic where `checked_add` and `checked_subtract` answer `None`.
+- `HashSet` and `BTreeSet`: `a | b` (union), `a & b` (intersection), `a - b` (difference) and `a ^ b` (symmetric difference) build a new set of clones, leaving both operands as they were.
+- `Path` and `PathBuf`: `path / segment` is `path.join(segment)`, so `project / "src" / "main.cryo"` builds a `PathBuf`. A segment carrying a root of its own replaces the path: `path / "/etc"` is `/etc`.
 ### 19.2 Module Map
 
 | Module            | Highlights                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |

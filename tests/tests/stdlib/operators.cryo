@@ -1,0 +1,134 @@
+///! The operators the standard library's own types implement: `Duration`
+///! and `Instant` arithmetic, set algebra on `HashSet` and `BTreeSet`, and
+///! `/` joining paths.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::Operators;
+
+import std::collections::{ BTreeSet, HashSet };
+import std::fs::{ Path, PathBuf };
+import std::time::{ Duration, Instant };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_equal };
+
+![test]
+function durations_add_subtract_multiply_and_divide() -> Result<(), TestError> {
+    const a: Duration = Duration::from_milliseconds(1500);
+    const b: Duration = Duration::from_milliseconds(700);
+    expect_equal((a + b).as_milliseconds(), 2200)?;
+    expect_equal((a - b).as_milliseconds(), 800)?;
+    expect_equal((a * 3).as_milliseconds(), 4500)?;
+    expect_equal((a / 4).as_microseconds(), 375000)?;
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function a_duration_sum_past_the_largest_span_panics() -> Result<(), TestError> {
+    const largest: Duration = Duration::new(u64::MAX, 999999999);
+    const _sum: Duration = largest + Duration::from_nanoseconds(1);
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function a_negative_duration_difference_panics() -> Result<(), TestError> {
+    const _difference: Duration = Duration::from_seconds(1) - Duration::from_seconds(2);
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function a_duration_product_past_the_largest_span_panics() -> Result<(), TestError> {
+    const _product: Duration = Duration::from_seconds(u64::MAX) * 2;
+    return Result::Ok(());
+}
+
+![test]
+![should_panic]
+function a_duration_divided_by_zero_panics() -> Result<(), TestError> {
+    mut divisor: u64 = 1;
+    divisor = divisor - 1;
+    const _quotient: Duration = Duration::from_seconds(1) / divisor;
+    return Result::Ok(());
+}
+
+![test]
+function instants_and_durations_combine() -> Result<(), TestError> {
+    const start: Instant = Instant::now();
+    const later: Instant = start + Duration::from_seconds(5);
+    expect_equal((later - start).as_seconds(), 5)?;
+    expect((later - Duration::from_seconds(5)) == start, Str::new("instant - duration undoes instant + duration"))?;
+    // An earlier reading minus a later one saturates at zero, as
+    // `duration_since` does.
+    expect((start - later).is_zero(), Str::new("earlier - later is zero"))?;
+    return Result::Ok(());
+}
+
+![test]
+function hash_sets_combine() -> Result<(), TestError> {
+    const one: i32 = 1;
+    const two: i32 = 2;
+    const three: i32 = 3;
+    const four: i32 = 4;
+    mut left: HashSet<i32> = HashSet::new();
+    mut right: HashSet<i32> = HashSet::new();
+    left.insert(one); left.insert(two); left.insert(three);
+    right.insert(two); right.insert(three); right.insert(four);
+    const either: HashSet<i32> = left | right;
+    const both: HashSet<i32> = left & right;
+    const only_left: HashSet<i32> = left - right;
+    const exactly_one: HashSet<i32> = left ^ right;
+    expect_equal(either.length(), 4)?;
+    expect(either.contains(&one) && either.contains(&four), Str::new("union holds both ends"))?;
+    expect_equal(both.length(), 2)?;
+    expect(both.contains(&two) && both.contains(&three), Str::new("intersection holds 2 and 3"))?;
+    expect_equal(only_left.length(), 1)?;
+    expect(only_left.contains(&one), Str::new("difference holds 1"))?;
+    expect_equal(exactly_one.length(), 2)?;
+    expect(exactly_one.contains(&one) && exactly_one.contains(&four), Str::new("symmetric difference holds 1 and 4"))?;
+    expect_equal(left.length(), 3)?;
+    expect_equal(right.length(), 3)?;
+    return Result::Ok(());
+}
+
+![test]
+function btree_sets_combine_in_order() -> Result<(), TestError> {
+    const one: i32 = 1;
+    const three: i32 = 3;
+    const five: i32 = 5;
+    const seven: i32 = 7;
+    mut left: BTreeSet<i32> = BTreeSet::new();
+    mut right: BTreeSet<i32> = BTreeSet::new();
+    left.insert(five); left.insert(one); left.insert(three);
+    right.insert(three); right.insert(seven);
+    const either: BTreeSet<i32> = left | right;
+    expect_equal(either.length(), 4)?;
+    expect_equal(*either.first().unwrap(), 1)?;
+    expect_equal(*either.last().unwrap(), 7)?;
+    const both: BTreeSet<i32> = left & right;
+    expect_equal(both.length(), 1)?;
+    expect(both.contains(&three), Str::new("intersection holds 3"))?;
+    const only_left: BTreeSet<i32> = left - right;
+    expect_equal(only_left.length(), 2)?;
+    expect(only_left.contains(&one) && only_left.contains(&five), Str::new("difference holds 1 and 5"))?;
+    const exactly_one: BTreeSet<i32> = left ^ right;
+    expect_equal(exactly_one.length(), 3)?;
+    expect(exactly_one.contains(&one) && exactly_one.contains(&five) && exactly_one.contains(&seven),
+        Str::new("symmetric difference holds 1, 5 and 7"))?;
+    return Result::Ok(());
+}
+
+![test]
+function slash_joins_paths() -> Result<(), TestError> {
+    const project: Path = Path::new("work/project");
+    const source: PathBuf = project / "src" / "main.cryo";
+    expect_equal(String::from(source.as_str()), String::from("work/project/src/main.cryo"))?;
+    const segment: Str = Str::new("lib");
+    const library: PathBuf = project / segment;
+    expect_equal(String::from(library.as_str()), String::from("work/project/lib"))?;
+    // A rooted right-hand side replaces the path, as `join` does.
+    const rooted: PathBuf = project / "/etc";
+    expect_equal(String::from(rooted.as_str()), String::from("/etc"))?;
+    return Result::Ok(());
+}
