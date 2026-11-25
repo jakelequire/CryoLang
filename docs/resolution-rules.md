@@ -133,6 +133,19 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-24
+
+716. **`String.append` adds text; `String.push` adds one `char`.**
+     `append` and `try_append` take any `T: Display`: text is copied in,
+     every other type is formatted, and `append` returns the string so
+     calls chain (`out.append(count).append(" items")`).  `push(c)`
+     appends one scalar, the element a `String` is a sequence of and the
+     one `pop` removes, so `push` means "add one element" on a `String`
+     as on an `Array`; `push_repeated(c, count)` appends `count` copies.
+     Every `char` is encoded by the one private encoder behind
+     `FormatWrite.write_char`, which writes a surrogate or an
+     out-of-range value as U+FFFD.  (Jake)
+
 ### 2026-11-23
 
 715. **Nothing is exported at the root of `std`.**  A standard library
@@ -726,7 +739,7 @@ yet is recorded with the change that builds it, not here.
      `Display` writes through `write_char`.  The format spec's fill, the
      JSON escape decoder and serializer, the HTTP client's decimal writers
      and the test runner's number text use these instead of their own
-     loops.  (Jake)
+     loops.  (Jake)  Superseded by 716.
 
 604. **A `?` in a generic body converts through a bound.**  A generic
      body is typed once, by its bounds, and every instance carries what
@@ -786,7 +799,7 @@ yet is recorded with the change that builds it, not here.
      so no stored value keeps a borrow of a hole past the call.
      `FormatWrite.write(arguments)` is a default every sink gets, and
      `Formatter.write(arguments)` writes through a formatter;
-     `String.push(f"...")` still builds the text first.  A number in a
+     `String.append(f"...")` still builds the text first.  A number in a
      hole with a spec is rendered on the stack.  `Stdout` and `Stderr`
      are no longer `FormatWrite` sinks: they write text through
      `io::Write.write`, whose name the default made ambiguous on them.
@@ -1379,7 +1392,7 @@ yet is recorded with the change that builds it, not here.
      scalar value, so no `char` holds one and UTF-8 has no encoding of
      one.  The lexer refuses it where it refuses a malformed octal escape,
      so the escape decoder only ever meets a scalar value, and the
-     compiler encodes a string's `\u{...}` through `String.push_char`; its
+     compiler encodes a string's `\u{...}` through `String.push`; its
      own UTF-8 encoder is gone.  An f-string's `\u{...}` is refused the
      same way (654).  (Jake; the code and wording delegated)
 

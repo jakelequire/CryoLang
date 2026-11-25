@@ -37,20 +37,20 @@ private const INITIAL_CAPACITY: i64 = 8;
 /// view most text functions take, so every `Str` method reads a `String`
 /// too (`s.contains(...)`, `s.split(...)`); `as_str` hands the view out.
 /// An f-string builds one, and so does `+` (`name + ", welcome"`), which
-/// copies both sides into a new string: in a loop, `push` onto one string.
+/// copies both sides into a new string: in a loop, `append` onto one string.
 ///
 /// ```cryo
 /// import std::collections::string::{ String };
 ///
 /// mut greeting: String = String::from("hello");
-/// greeting.push(", world");
+/// greeting.append(", world");
 /// const shouted: String = greeting.to_ascii_uppercase();   // "HELLO, WORLD"
 /// ```
 public type struct String<A = GlobalAllocator> {
     private buffer: RawBuffer<u8, A>;
     private view: Str;
 
-    /// Empty string. No heap storage until the first `push_*` /
+    /// Empty string. No heap storage until the first `append`, `push` or
     /// `reserve`.
     public static new() -> String {
         return String {
@@ -60,7 +60,7 @@ public type struct String<A = GlobalAllocator> {
     }
 
     /// An empty string that allocates through `alloc`. No storage until
-    /// the first push.
+    /// the first append.
     public static new_in(alloc: A) -> String<A> {
         return String::<A> {
             buffer: RawBuffer::new_in(alloc),
@@ -92,7 +92,7 @@ public type struct String<A = GlobalAllocator> {
     /// allocation failure.
     public static from_str(source: Str) -> String {
         mut string: String = String::with_capacity(source.length());
-        string.push(source);
+        string.append(source);
         return string;
     }
 
@@ -128,7 +128,7 @@ public type struct String<A = GlobalAllocator> {
     /// one.  Pairs with the `as_c_string()` borrow method.
     public static with_null(source: Str) -> String {
         mut string: String = String::with_capacity(source.length() + 1);
-        string.push(source);
+        string.append(source);
         string.push_byte(0 as u8);
         // Drop the terminator from the logical length; the byte stays in
         // the allocation at index `length`.
@@ -136,35 +136,36 @@ public type struct String<A = GlobalAllocator> {
         return string;
     }
 
-    /// A `String` holding `item`'s `Display` text, as `push` appends it:
+    /// A `String` holding `item`'s `Display` text, as `append` appends it:
     /// `String::from("hi")`, `String::from(65 as u32)`, `String::from(true)`,
     /// `String::from(some_str)`.  Panics on allocation failure.
     public static from<T>(item: T) -> String where T: Display {
         mut result: String = String::new();
-        result.push(item);
+        result.append(item);
         return result;
     }
 
     /// Append `item`'s `Display` text: a `String`, `Str` or `string`'s bytes
     /// verbatim (a `string`'s terminating NUL is not copied), a `char`
-    /// UTF-8-encoded, an integer in decimal (`s.push(65 as u8)` appends
+    /// UTF-8-encoded, an integer in decimal (`s.append(65 as u8)` appends
     /// `"65"`), and any other `Display` type as its `fmt` writes it, straight
-    /// into the string.  To append a single *raw* byte (not its decimal
-    /// text) use `push_byte`.  Panics on allocation failure; use `try_push`
-    /// for the fallible form.
-    public push<T>(mut &this, item: T) -> void
+    /// into the string.  Returns the string, so calls chain:
+    /// `out.append(count).append(" items")`.  To append a single *raw* byte
+    /// (not its decimal text) use `push_byte`.  Panics on allocation failure;
+    /// use `try_append` for the fallible form.
+    public append<T>(mut &this, item: T) -> mut &String<A>
     where T: Display {
-        match (this.try_push(item)) {
-            Result::Ok(_) => { return; }
+        match (this.try_append(item)) {
+            Result::Ok(_) => { return &this; }
             Result::Err(_) => {
-                core::panic("String::push: allocation failed", intrinsics::location());
+                core::panic("String::append: allocation failed", intrinsics::location());
             }
         }
     }
 
-    /// Fallible `push`: returns `AllocationError` instead of panicking.  Text is
-    /// copied in directly; every other type is formatted into the string.
-    public try_push<T>(mut &this, item: T) -> Result<(), AllocationError>
+    /// Fallible `append`: returns `AllocationError` instead of panicking.  Text
+    /// is copied in directly; every other type is formatted into the string.
+    public try_append<T>(mut &this, item: T) -> Result<(), AllocationError>
     where T: Display {
         return static match (T) {
             String  => { this.push_view_bytes(item.as_str()) }
@@ -174,11 +175,13 @@ public type struct String<A = GlobalAllocator> {
         };
     }
 
-    /// Append one Unicode scalar, UTF-8-encoded; a value in the surrogate
-    /// range is appended as the replacement character U+FFFD.  Panics on
-    /// allocation failure.
-    public push_char(mut &this, c: char) -> void {
-        this.push(c);
+    /// Append one character, UTF-8-encoded: the element a `String` is a
+    /// sequence of, which `pop` removes.  A value in the surrogate range is
+    /// appended as the replacement character U+FFFD.  Text, numbers and
+    /// every other `Display` type go through `append`.  Panics on allocation
+    /// failure.
+    public push(mut &this, c: char) -> void {
+        this.append(c);
     }
 
     /// Append `count` copies of the scalar `c`, UTF-8-encoded, growing the
@@ -187,7 +190,7 @@ public type struct String<A = GlobalAllocator> {
     public push_repeated(mut &this, c: char, count: i64) -> void {
         if (count <= 0) { return; }
         const start: i64 = this.view.length();
-        this.push(c);
+        this.append(c);
         const width: i64 = this.view.length() - start;
         const additional: i64 = match (width.checked_multiply(count - 1)) {
             Option::Some(n) => { n }
@@ -249,7 +252,7 @@ public type struct String<A = GlobalAllocator> {
     /// Borrow this String as a NUL-terminated C string (`u8*` /
     /// `const char*`) for handing to an `extern "C"` API.
     ///
-    /// A String built by `push`/`from_str` carries no trailing NUL, so
+    /// A String built by `append`/`from_str` carries no trailing NUL, so
     /// `as_pointer()` alone is not a valid C string. `as_c_string()` writes the
     /// terminator at index `length` - reserving one spare byte if the
     /// buffer is full - WITHOUT changing the logical length, mirroring
@@ -257,7 +260,7 @@ public type struct String<A = GlobalAllocator> {
     /// once the spare byte exists.
     ///
     /// The returned pointer borrows this String's buffer: it is valid
-    /// until the next mutating call (`push`, `clear`, drop) and must not
+    /// until the next mutating call (`append`, `push`, `clear`, drop) and must not
     /// be freed by the caller. Like C, an interior NUL ends the string
     /// early; the bytes are not otherwise validated.
     public as_c_string(mut &this) -> u8* {
@@ -285,7 +288,7 @@ public type struct String<A = GlobalAllocator> {
 
     /// Shrink `length` to `new_length`. No reallocation; capacity
     /// is unchanged. Bytes beyond `new_length` are no longer
-    /// considered part of the string; subsequent `push_*` calls
+    /// considered part of the string; a later `append` or `push`
     /// will overwrite them.
     ///
     /// **Not UTF-8-aware.** Truncating inside a multi-byte scalar
@@ -312,7 +315,7 @@ public type struct String<A = GlobalAllocator> {
             core::panic("String::insert: index is not a char boundary", intrinsics::location());
         }
         const old_length: i64 = this.view.length();
-        this.push(c);
+        this.append(c);
         const width: i64 = this.view.length() - old_length;
         mut encoded: [u8; 4];
         libc::memcpy(&encoded[0], this.buffer.pointer() + old_length, width as u64);
@@ -369,7 +372,7 @@ public type struct String<A = GlobalAllocator> {
 
 private:
     /// Append the bytes of a `Str` view verbatim (backs the `Str` / `string`
-    /// arms of `try_push`).  Empty input is a no-op.
+    /// arms of `try_append`).  Empty input is a no-op.
     push_view_bytes(mut &this, source: Str) -> Result<(), AllocationError> {
         const add: i64 = source.length();
         if (add == 0) {
@@ -397,7 +400,7 @@ private:
     }
 
     /// Render `item`'s `Display` text and append it (backs every non-text
-    /// arm of `try_push`).  Formats into a temporary `String` (always
+    /// arm of `try_append`).  Formats into a temporary `String` (always
     /// `GlobalAllocator`, so this works regardless of `A`) and copies the bytes
     /// in.  An in-memory sink only ever fails on allocation, so a `FormatError`
     /// is mapped back to an `AllocationError`.
@@ -489,13 +492,13 @@ implement trait Clone for struct String<GlobalAllocator> {
 
 // `a + b` on text is a new `String` holding `a`'s text then `b`'s; neither
 // side changes.  `a += b` builds a new string each time and copies `a` into
-// it, so a loop that adds piece by piece is quadratic: `push` onto one
+// it, so a loop that adds piece by piece is quadratic: `append` onto one
 // string instead.  Each panics on allocation failure.
 
 implement<A> trait Add<Str, String> for struct String<A> where A: Allocator {
     add(&this, rhs: &Str) -> String {
         mut sum: String = String::from_str(this.as_str());
-        sum.push(*rhs);
+        sum.append(*rhs);
         return sum;
     }
 }
@@ -503,7 +506,7 @@ implement<A> trait Add<Str, String> for struct String<A> where A: Allocator {
 implement<A> trait Add<string, String> for struct String<A> where A: Allocator {
     add(&this, rhs: &string) -> String {
         mut sum: String = String::from_str(this.as_str());
-        sum.push(*rhs);
+        sum.append(*rhs);
         return sum;
     }
 }
@@ -511,7 +514,7 @@ implement<A> trait Add<string, String> for struct String<A> where A: Allocator {
 implement<A> trait Add<String, String> for struct String<A> where A: Allocator {
     add(&this, rhs: &String) -> String {
         mut sum: String = String::from_str(this.as_str());
-        sum.push(rhs.as_str());
+        sum.append(rhs.as_str());
         return sum;
     }
 }
@@ -519,7 +522,7 @@ implement<A> trait Add<String, String> for struct String<A> where A: Allocator {
 implement<A> trait Add<char, String> for struct String<A> where A: Allocator {
     add(&this, rhs: &char) -> String {
         mut sum: String = String::from_str(this.as_str());
-        sum.push(*rhs);
+        sum.append(*rhs);
         return sum;
     }
 }
@@ -538,7 +541,7 @@ implement trait FromIterator<char> for struct String<GlobalAllocator> {
     static from_iterator<I>(source: I) -> String where I: Iterator<char> {
         mut out: String = String::new();
         for (c in source) {
-            out.push_char(c);
+            out.push(c);
         }
         return out;
     }
