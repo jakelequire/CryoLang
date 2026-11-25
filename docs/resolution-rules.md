@@ -168,9 +168,10 @@ yet is recorded with the change that builds it, not here.
 
 719. **The data model the text formats share is `std::encoding::value`,
      and a format's entry points are statics of its own type.**  `Value`,
-     `Number`, `Object`, `ToValue`, `FromValue` and `DecodeError` carry no
-     format's name; a type derives the conversions as `with [ToValue,
-     FromValue]`.  JSON is `json::Json::parse(text)`,
+     `Number`, `Object`, `ToValue`, `FromValue` and `ValueDecodeError` carry
+     no format's name; a type derives the conversions as `with [ToValue,
+     FromValue]`.  The model's error is `ValueDecodeError`, not
+     `DecodeError`, which is the byte codecs' (`std::encoding::error`).  JSON is `json::Json::parse(text)`,
      `Json::to_text(&value)` and `Json::to_pretty_text(&value)`; no free
      `parse` or `stringify` is kept beside them, and `std::encoding::json`
      offers only JSON's own names.

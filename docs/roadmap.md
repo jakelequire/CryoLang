@@ -798,13 +798,13 @@ both for a struct or a field-less enum, as follows.
   written as `null` unless the field says `skip_none`.  Every field's type
   must implement `ToValue`, and a refusal names the field.
 - **Reading.**  The generated `from_value` refuses a value that is not an
-  object with `DecodeError::unexpected(Str::new("an object"), value)`.
+  object with `ValueDecodeError::unexpected(Str::new("an object"), value)`.
   Each field reads the member under its key: a member present is read with
   the field type's `from_value`, and a refusal there is wrapped with
   `at_field(<key>)` so the error names the path; a member absent is the
   type's `default()` for a `default` or `skip` field (which needs
   `Default`), `None` for an `Option` field, and otherwise
-  `DecodeError::missing_field(<key>)`.  The struct is then built in one
+  `ValueDecodeError::missing_field(<key>)`.  The struct is then built in one
   literal.  A member the struct does not name is ignored.
 - **Enums.**  An enum whose variants carry nothing is written as its
   variant's name, `"Red"`, and read back from that string; another string
