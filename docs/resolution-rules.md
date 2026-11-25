@@ -135,6 +135,17 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-11-24
 
+717. **`ByteReader` and `ByteWriter` take the integer type as a type
+     argument and name the byte order.**  `read_big_endian<T>()`,
+     `read_little_endian<T>()`, `write_big_endian<T>(value)` and
+     `write_little_endian<T>(value)`, `where T: Integer`, replace one
+     method per width and order: the type sets how many bytes, every
+     width from `u8` to `i128` included, and the order is in the name,
+     since it is always a constant where the call is written.  A
+     one-byte type reads and writes the same in either order.  A read
+     that finds too few bytes fails with `UnexpectedEof` and does not
+     move.  (Jake)
+
 716. **`String.append` adds text; `String.push` adds one `char`.**
      `append` and `try_append` take any `T: Display`: text is copied in,
      every other type is formatted, and `append` returns the string so

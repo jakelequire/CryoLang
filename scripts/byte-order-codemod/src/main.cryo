@@ -1,18 +1,23 @@
-///! One-off codemod: rename the `String` method calls a compiler run
-///! refused, at the exact spans its diagnostics name.
+///! One-off codemod: rename the `ByteReader`/`ByteWriter` method calls a
+///! compiler run refused, at the exact spans its diagnostics name.
 ///!
-///!   string-append-codemod <base-directory> <log>...
+///!   byte-order-codemod <base-directory> <log>...
 ///!
 ///! Each `<log>` is a compiler run's output over sources whose paths it
 ///! prints relative to `<base-directory>`. An `error[E0358]: no method named
-///! `push` found on type `...String...`` names the method's own span, so the
-///! call is rewritten there: `push` to `append`, `try_push` to `try_append`,
-///! `push_char` to `push`. A text search cannot tell a `String`'s `push` from
-///! an `Array`'s; the type the compiler names can. Every rewrite is printed,
+///! `read_u32_big_endian` found on type `...ByteReader`` names the method's
+///! own span, so the call is rewritten there to the generic method with its
+///! type argument written out: `read_u32_big_endian(` to
+///! `read_big_endian::<u32>(`, `write_u16_little_endian(` to
+///! `write_little_endian::<u16>(`, and the one-byte `read_u8`/`write_i8`
+///! to `read_big_endian::<u8>`/`write_big_endian::<i8>`. The type argument
+///! is always written: inferred from a literal argument it would be `i64`,
+///! eight bytes. A text search cannot tell a `ByteWriter`'s `write_u8` from
+///! a `Hasher`'s; the type the compiler names can. Every rewrite is printed,
 ///! and a span whose text is not the refused name is printed as `MISMATCH`
 ///! and left alone.
 
-namespace StringAppendCodemod;
+namespace ByteOrderCodemod;
 
 import std::fs::{ File };
 import std::env;
@@ -27,10 +32,22 @@ type struct Site {
 
 /// The replacement for a refused method name, or `None` for a name this
 /// codemod does not rename.
-function replacement(name: Str) -> Option<Str> {
-    if (name == Str::new("push")) { return Option::Some(Str::new("append")); }
-    if (name == Str::new("try_push")) { return Option::Some(Str::new("try_append")); }
-    if (name == Str::new("push_char")) { return Option::Some(Str::new("push")); }
+function replacement(name: Str) -> Option<String> {
+    const access: Str = if (name.starts_with(&Str::new("read_"))) { Str::new("read") } else { Str::new("write") };
+    if (!name.starts_with(&Str::new("read_")) && !name.starts_with(&Str::new("write_"))) { return Option::None; }
+    const rest: Str = name.byte_substring(access.length() + 1, name.length());
+    if (rest == Str::new("u8") || rest == Str::new("i8")) {
+        return Option::Some(f"{access}_big_endian::<{rest}>");
+    }
+    for (order in [Str::new("big_endian"), Str::new("little_endian")]) {
+        const suffix: String = f"_{order}";
+        if (rest.ends_with(&suffix.as_str())) {
+            const width: Str = rest.byte_substring(0, rest.length() - suffix.length());
+            if (width == Str::new("u16") || width == Str::new("i16") || width == Str::new("u32") || width == Str::new("i32") || width == Str::new("u64") || width == Str::new("i64")) {
+                return Option::Some(f"{access}_{order}::<{width}>");
+            }
+        }
+    }
     return Option::None;
 }
 
@@ -92,7 +109,7 @@ function read_log(log: Str, sites: mut &Array<Site>) -> void {
                 if (line.starts_with(&marker)) {
                     pending = Option::None;
                     const found: Option<i64> = line.find(&Str::new("found on type `"));
-                    if (found.is_some() && line.byte_substring(found.unwrap(), line.length()).contains(&Str::new("collections::string::String"))) {
+                    if (found.is_some() && line.byte_substring(found.unwrap(), line.length()).contains(&Str::new("io::bytes::Byte"))) {
                         match (quoted(line, 0)) {
                             Option::Some(name) => {
                                 if (replacement(name).is_some()) { pending = Option::Some(String::from(name)); }
@@ -146,7 +163,7 @@ function rewrite_line(line: Str, path: Str, number: i64, sites: &Array<Site>, to
             println(f"MISMATCH {path}:{number}:{site.column} `{old_name}`: {text.trim()}");
             continue;
         }
-        const new_name: Str = replacement(old_name).unwrap();
+        const new_name: String = replacement(old_name).unwrap();
         const rewritten: String = f"{text.byte_substring(0, start)}{new_name}{text.byte_substring(end, text.length())}";
         println(f"{path}:{number}:{site.column} {old_name} -> {new_name}");
         current = rewritten;
@@ -158,7 +175,7 @@ function rewrite_line(line: Str, path: Str, number: i64, sites: &Array<Site>, to
 function main() -> i32 {
     const arguments: Array<String> = env::args();
     if (arguments.length() < 3) {
-        println(f"usage: string-append-codemod <base-directory> <log>...");
+        println(f"usage: byte-order-codemod <base-directory> <log>...");
         return 2;
     }
     const base: Str = arguments[1].as_str();

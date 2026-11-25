@@ -6,14 +6,31 @@
 ///! appends encoded integers to an `Array<u8>` it borrows, or writes them
 ///! into a fixed region it is given.
 ///!
-///! Every multi-byte method names its order in full - `big_endian` (most
-///! significant byte first, the network order of the wire protocols) or
+///! Every method names its order in full - `big_endian` (most significant
+///! byte first, the network order of the wire protocols) or
 ///! `little_endian` (least significant first) - so a call site says which
-///! layout it reads or writes, whatever the host's own order is.
+///! layout it reads or writes, whatever the host's own order is. The
+///! integer type is the method's type argument, and its width is the
+///! number of bytes: `reader.read_big_endian::<u32>()` takes 4,
+///! `writer.write_little_endian::<u16>(port)` writes 2. A one-byte type
+///! reads and writes the same either way. A signed type is written as its
+///! two's-complement bytes and read back from them.
+///!
+///! ```cryo
+///! mut out: Array<u8> = Array::new();
+///! mut writer: ByteWriter = ByteWriter::new(&out);
+///! writer.write_big_endian::<u16>(443);
+///! writer.write_little_endian::<i32>(-2);
+///!
+///! mut reader: ByteReader = ByteReader::new(out.as_slice());
+///! const port: u16 = reader.read_big_endian::<u16>()?;     // 443
+///! const delta: i32 = reader.read_little_endian::<i32>()?; // -2
+///! ```
 
 namespace std::io::bytes;
 
 import std::core::intrinsics;
+import std::core::marker::{ Integer };
 import std::core::result::{ Result };
 import std::core::slice::{ Slice };
 import std::collections::array::{ Array };
@@ -50,75 +67,50 @@ public type struct ByteReader {
         return this.bytes.length() - this.position;
     }
 
-    /// The next byte. Like every read here, it fails with `UnexpectedEof`,
-    /// and does not move, when too few bytes remain.
-    public read_u8(mut &this) -> Result<u8, IoError> {
-        return Result::Ok((this.read_big_endian(1)?) as u8);
+    /// The next `T`, most significant byte first: as many bytes as `T` is
+    /// wide. Like every read here, it fails with `UnexpectedEof`, and does
+    /// not move, when too few bytes remain.
+    public read_big_endian<T>(mut &this) -> Result<T, IoError> where T: Integer {
+        const value: u128 = this.read_bytes(ByteReader::width::<T>(), true)?;
+        return Result::Ok(ByteReader::narrow::<T>(value));
     }
 
-    /// The next byte, as a two's-complement `i8`.
-    public read_i8(mut &this) -> Result<i8, IoError> {
-        return Result::Ok((this.read_big_endian(1)?) as i8);
+    /// The next `T`, least significant byte first: as many bytes as `T` is
+    /// wide. Fails with `UnexpectedEof`, without moving, when too few
+    /// bytes remain.
+    public read_little_endian<T>(mut &this) -> Result<T, IoError> where T: Integer {
+        const value: u128 = this.read_bytes(ByteReader::width::<T>(), false)?;
+        return Result::Ok(ByteReader::narrow::<T>(value));
     }
 
-    /// The next 2 bytes as a `u16`, most significant first.
-    public read_u16_big_endian(mut &this) -> Result<u16, IoError> {
-        return Result::Ok((this.read_big_endian(2)?) as u16);
+    /// How many bytes a `T` takes.
+    private static width<T>() -> i64 where T: Integer {
+        return static match (T) {
+            u8 | i8                    => { 1 }
+            u16 | i16                  => { 2 }
+            u32 | i32                  => { 4 }
+            u64 | i64 | usize | isize  => { 8 }
+            u128 | i128                => { 16 }
+        };
     }
 
-    /// The next 2 bytes as a `u16`, least significant first.
-    public read_u16_little_endian(mut &this) -> Result<u16, IoError> {
-        return Result::Ok((this.read_little_endian(2)?) as u16);
-    }
-
-    /// The next 2 bytes as an `i16`, most significant first.
-    public read_i16_big_endian(mut &this) -> Result<i16, IoError> {
-        return Result::Ok((this.read_big_endian(2)?) as i16);
-    }
-
-    /// The next 2 bytes as an `i16`, least significant first.
-    public read_i16_little_endian(mut &this) -> Result<i16, IoError> {
-        return Result::Ok((this.read_little_endian(2)?) as i16);
-    }
-
-    /// The next 4 bytes as a `u32`, most significant first.
-    public read_u32_big_endian(mut &this) -> Result<u32, IoError> {
-        return Result::Ok((this.read_big_endian(4)?) as u32);
-    }
-
-    /// The next 4 bytes as a `u32`, least significant first.
-    public read_u32_little_endian(mut &this) -> Result<u32, IoError> {
-        return Result::Ok((this.read_little_endian(4)?) as u32);
-    }
-
-    /// The next 4 bytes as an `i32`, most significant first.
-    public read_i32_big_endian(mut &this) -> Result<i32, IoError> {
-        return Result::Ok((this.read_big_endian(4)?) as i32);
-    }
-
-    /// The next 4 bytes as an `i32`, least significant first.
-    public read_i32_little_endian(mut &this) -> Result<i32, IoError> {
-        return Result::Ok((this.read_little_endian(4)?) as i32);
-    }
-
-    /// The next 8 bytes as a `u64`, most significant first.
-    public read_u64_big_endian(mut &this) -> Result<u64, IoError> {
-        return this.read_big_endian(8);
-    }
-
-    /// The next 8 bytes as a `u64`, least significant first.
-    public read_u64_little_endian(mut &this) -> Result<u64, IoError> {
-        return this.read_little_endian(8);
-    }
-
-    /// The next 8 bytes as an `i64`, most significant first.
-    public read_i64_big_endian(mut &this) -> Result<i64, IoError> {
-        return Result::Ok((this.read_big_endian(8)?) as i64);
-    }
-
-    /// The next 8 bytes as an `i64`, least significant first.
-    public read_i64_little_endian(mut &this) -> Result<i64, IoError> {
-        return Result::Ok((this.read_little_endian(8)?) as i64);
+    /// The low bytes of `value` as a `T`: a signed `T` reads them as two's
+    /// complement.
+    private static narrow<T>(value: u128) -> T where T: Integer {
+        return static match (T) {
+            u8    => { value as u8 }
+            i8    => { value as i8 }
+            u16   => { value as u16 }
+            i16   => { value as i16 }
+            u32   => { value as u32 }
+            i32   => { value as i32 }
+            u64   => { value as u64 }
+            i64   => { value as i64 }
+            usize => { value as usize }
+            isize => { value as isize }
+            u128  => { value }
+            i128  => { value as i128 }
+        };
     }
 
     /// Claim the next `count` bytes and return the offset of the first,
@@ -132,24 +124,14 @@ public type struct ByteReader {
         return Result::Ok(start);
     }
 
-    private read_big_endian(mut &this, count: i64) -> Result<u64, IoError> {
+    /// The next `count` bytes, at most 16, as one number: the first byte
+    /// most significant when `big_endian`, least significant otherwise.
+    private read_bytes(mut &this, count: i64, big_endian: boolean) -> Result<u128, IoError> {
         const start: i64 = this.take(count)?;
-        mut value: u64 = 0;
-        mut i: i64 = 0;
-        while (i < count) {
-            value = (value << 8) | (this.bytes[start + i] as u64);
-            i = i + 1;
-        }
-        return Result::Ok(value);
-    }
-
-    private read_little_endian(mut &this, count: i64) -> Result<u64, IoError> {
-        const start: i64 = this.take(count)?;
-        mut value: u64 = 0;
-        mut i: i64 = count;
-        while (i > 0) {
-            i = i - 1;
-            value = (value << 8) | (this.bytes[start + i] as u64);
+        mut value: u128 = 0;
+        for (mut i: i64 = 0; i < count; i++) {
+            const at: i64 = if (big_endian) { start + i } else { start + count - 1 - i };
+            value = (value << 8) | (this.bytes[at] as u128);
         }
         return Result::Ok(value);
     }
@@ -187,79 +169,59 @@ public type struct ByteWriter {
         return this.written;
     }
 
-    /// Write one byte. Like every write here, it panics when a writer made
-    /// by `over` runs past the end of its region.
-    public write_u8(mut &this, value: u8) -> void {
-        this.put(value);
+    /// Write `value` most significant byte first, as many bytes as `T` is
+    /// wide. Like every write here, it panics when a writer made by `over`
+    /// runs past the end of its region.
+    public write_big_endian<T>(mut &this, value: T) -> void where T: Integer {
+        static match (T) {
+            u8    => { this.put(value); }
+            i8    => { this.put(value as u8); }
+            u16   => { this.put_big_endian(value as u64, 2); }
+            i16   => { this.put_big_endian(value as u64, 2); }
+            u32   => { this.put_big_endian(value as u64, 4); }
+            i32   => { this.put_big_endian(value as u64, 4); }
+            u64   => { this.put_big_endian(value, 8); }
+            i64   => { this.put_big_endian(value as u64, 8); }
+            usize => { this.put_big_endian(value as u64, 8); }
+            isize => { this.put_big_endian(value as u64, 8); }
+            u128  => {
+                this.put_big_endian((value >> 64) as u64, 8);
+                this.put_big_endian(value as u64, 8);
+            }
+            i128  => {
+                this.put_big_endian(((value as u128) >> 64) as u64, 8);
+                this.put_big_endian(value as u64, 8);
+            }
+        }
     }
 
-    /// Write `value` as one two's-complement byte.
-    public write_i8(mut &this, value: i8) -> void {
-        this.put(value as u8);
-    }
-
-    /// Write `value` as 2 bytes, most significant first.
-    public write_u16_big_endian(mut &this, value: u16) -> void {
-        this.write_big_endian(value as u64, 2);
-    }
-
-    /// Write `value` as 2 bytes, least significant first.
-    public write_u16_little_endian(mut &this, value: u16) -> void {
-        this.write_little_endian(value as u64, 2);
-    }
-
-    /// Write `value` as 2 two's-complement bytes, most significant first.
-    public write_i16_big_endian(mut &this, value: i16) -> void {
-        this.write_big_endian(value as u64, 2);
-    }
-
-    /// Write `value` as 2 two's-complement bytes, least significant first.
-    public write_i16_little_endian(mut &this, value: i16) -> void {
-        this.write_little_endian(value as u64, 2);
-    }
-
-    /// Write `value` as 4 bytes, most significant first.
-    public write_u32_big_endian(mut &this, value: u32) -> void {
-        this.write_big_endian(value as u64, 4);
-    }
-
-    /// Write `value` as 4 bytes, least significant first.
-    public write_u32_little_endian(mut &this, value: u32) -> void {
-        this.write_little_endian(value as u64, 4);
-    }
-
-    /// Write `value` as 4 two's-complement bytes, most significant first.
-    public write_i32_big_endian(mut &this, value: i32) -> void {
-        this.write_big_endian(value as u64, 4);
-    }
-
-    /// Write `value` as 4 two's-complement bytes, least significant first.
-    public write_i32_little_endian(mut &this, value: i32) -> void {
-        this.write_little_endian(value as u64, 4);
-    }
-
-    /// Write `value` as 8 bytes, most significant first.
-    public write_u64_big_endian(mut &this, value: u64) -> void {
-        this.write_big_endian(value, 8);
-    }
-
-    /// Write `value` as 8 bytes, least significant first.
-    public write_u64_little_endian(mut &this, value: u64) -> void {
-        this.write_little_endian(value, 8);
-    }
-
-    /// Write `value` as 8 two's-complement bytes, most significant first.
-    public write_i64_big_endian(mut &this, value: i64) -> void {
-        this.write_big_endian(value as u64, 8);
-    }
-
-    /// Write `value` as 8 two's-complement bytes, least significant first.
-    public write_i64_little_endian(mut &this, value: i64) -> void {
-        this.write_little_endian(value as u64, 8);
+    /// Write `value` least significant byte first, as many bytes as `T` is
+    /// wide.
+    public write_little_endian<T>(mut &this, value: T) -> void where T: Integer {
+        static match (T) {
+            u8    => { this.put(value); }
+            i8    => { this.put(value as u8); }
+            u16   => { this.put_little_endian(value as u64, 2); }
+            i16   => { this.put_little_endian(value as u64, 2); }
+            u32   => { this.put_little_endian(value as u64, 4); }
+            i32   => { this.put_little_endian(value as u64, 4); }
+            u64   => { this.put_little_endian(value, 8); }
+            i64   => { this.put_little_endian(value as u64, 8); }
+            usize => { this.put_little_endian(value as u64, 8); }
+            isize => { this.put_little_endian(value as u64, 8); }
+            u128  => {
+                this.put_little_endian(value as u64, 8);
+                this.put_little_endian((value >> 64) as u64, 8);
+            }
+            i128  => {
+                this.put_little_endian(value as u64, 8);
+                this.put_little_endian(((value as u128) >> 64) as u64, 8);
+            }
+        }
     }
 
     /// The low `count` bytes of `value`, most significant first.
-    private write_big_endian(mut &this, value: u64, count: u64) -> void {
+    private put_big_endian(mut &this, value: u64, count: u64) -> void {
         mut shift: u64 = count * 8;
         while (shift > 0) {
             shift = shift - 8;
@@ -268,13 +230,11 @@ public type struct ByteWriter {
     }
 
     /// The low `count` bytes of `value`, least significant first.
-    private write_little_endian(mut &this, value: u64, count: u64) -> void {
+    private put_little_endian(mut &this, value: u64, count: u64) -> void {
         mut rest: u64 = value;
-        mut i: u64 = 0;
-        while (i < count) {
+        for (mut i: u64 = 0; i < count; i++) {
             this.put(rest as u8);
             rest = rest >> 8;
-            i = i + 1;
         }
     }
 
