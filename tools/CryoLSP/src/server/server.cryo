@@ -27,8 +27,8 @@ import std::collections::string::{ String };
 import std::io::stdio;
 import std::io::error;
 import std::io::traits;
-import std::encoding::json::value;
-import std::encoding::json::serializer;
+import std::encoding::value;
+import std::encoding::json;
 import std::alloc::arena;
 import std::ffi::libc;
 import std::sys;
@@ -72,7 +72,7 @@ type struct Server {
     /// The id of the request being answered outside the compiler's hook -
     /// the one an analysis may be running for - and whether the client
     /// cancelled it while the analysis ran.
-    serving:    value::JsonValue;
+    serving:    value::Value;
     cancelled:  boolean;
     /// Inside the compiler's hook (`between_modules`).
     in_yield:   boolean;
@@ -88,7 +88,7 @@ type struct Server {
             reader:     stdio::stdin(),
             writer:     stdio::stdout(),
             outbound:   text_sync::OutboundRequests::new(),
-            serving:    value::JsonValue::Null,
+            serving:    value::Value::Null,
             cancelled:  false,
             in_yield:   false,
             guards:     0,
@@ -161,7 +161,7 @@ type struct Server {
                 mut msg: jsonrpc::IncomingMessage = jsonrpc::JsonRpcCodec::parse_incoming(body);
                 match (&msg) {
                     jsonrpc::IncomingMessage::Request(req) => {
-                        fmt::eprintln(f"cryolsp: request {req.method.as_str()} panicked at {info.file}:{info.line}: {info.msg}; params {serializer::stringify(&req.params).as_str()}{then}");
+                        fmt::eprintln(f"cryolsp: request {req.method.as_str()} panicked at {info.file}:{info.line}: {info.msg}; params {json::Json::to_text(&req.params).as_str()}{then}");
                         this.reply_error(&req.id, jsonrpc::INTERNAL_ERROR,
                             str::Str::from("the server panicked answering this request; see its log"));
                     }
@@ -190,9 +190,9 @@ type struct Server {
     }
 
     /// Whether two request ids are the same id.
-    static same_id(a: &value::JsonValue, b: &value::JsonValue) -> boolean {
-        mut sa: String = serializer::stringify(a);
-        mut sb: String = serializer::stringify(b);
+    static same_id(a: &value::Value, b: &value::Value) -> boolean {
+        mut sa: String = json::Json::to_text(a);
+        mut sb: String = json::Json::to_text(b);
         const same: boolean = sa.as_str().equals(&sb.as_str());
         mem::drop(sa);
         mem::drop(sb);
@@ -271,7 +271,7 @@ type struct Server {
                     this.serving = jsonrpc::JsonRpcCodec::clone_value(&req.id);
                     this.cancelled = false;
                     this.dispatch_request(&msg);
-                    this.serving = value::JsonValue::Null;
+                    this.serving = value::Value::Null;
                     this.cancelled = false;
                 }
             }
@@ -311,7 +311,7 @@ type struct Server {
                 }
 
                 if (method.equals(&str::Str::from("initialize"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         lifecycle::handle_initialize(&this.state, &req.params);
                     this.docs.utf8 = this.state.utf8_positions;
                     this.outbound.refresh_supported = this.state.semantic_tokens_refresh;
@@ -320,7 +320,7 @@ type struct Server {
                 }
 
                 if (method.equals(&str::Str::from("shutdown"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         lifecycle::handle_shutdown(&this.state);
                     this.reply_ok(&req.id, result);
                     return;
@@ -329,7 +329,7 @@ type struct Server {
                 if (method.equals(&str::Str::from("textDocument/hover"))) {
                     // Fully-qualified: bare `Hover::` would resolve to
                     // the wire-shape `lsp::protocol::lsp::Hover` struct.
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         lsp::handlers::hover::handle_hover(
                             &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
@@ -340,41 +340,41 @@ type struct Server {
                 // params as `textDocument/hover`; a struct type-decl
                 // body additionally lists the type's method signatures.
                 if (method.equals(&str::Str::from("cryo/expandHover"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         lsp::handlers::hover::handle_hover_verbose(
                             &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/definition"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         lsp::handlers::definition::handle_definition(
                             &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/references"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         lsp::handlers::references::handle_references(
                             &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/documentHighlight"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         lsp::handlers::references::handle_highlight(
                             &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/signatureHelp"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         signature_help::handle_signature_help(&this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/inlayHint"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         inlay_hints::handle_inlay_hints(&this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
@@ -402,45 +402,45 @@ type struct Server {
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/documentSymbol"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         lsp::handlers::symbols::handle_document_symbols(
                             &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("workspace/symbol"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         lsp::handlers::symbols::handle_workspace_symbols(
                             &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/completion"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         lsp::handlers::completion::handle_completion(
                             &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/semanticTokens/full"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         lsp::handlers::semantic_tokens::handle_semantic_tokens(
                             &this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/codeAction"))) {
-                    const result: value::JsonValue = code_action::handle(&req.params);
+                    const result: value::Value = code_action::handle(&req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/formatting"))) {
-                    const result: value::JsonValue = formatting::handle_formatting(&this.docs, &req.params);
+                    const result: value::Value = formatting::handle_formatting(&this.docs, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
                 }
                 if (method.equals(&str::Str::from("textDocument/codeLens"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         code_lens::handle_code_lens(&this.docs, &this.projects, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
@@ -449,7 +449,7 @@ type struct Server {
                 // TextDocumentContentProvider asks for the rendered
                 // text behind a `cryo-diagnostic:` virtual URI.
                 if (method.equals(&str::Str::from("cryo/renderedDiagnostic"))) {
-                    const result: value::JsonValue =
+                    const result: value::Value =
                         rendered_diagnostic::handle(&this.diag_cache, &req.params);
                     this.reply_ok(&req.id, result);
                     return;
@@ -511,7 +511,7 @@ type struct Server {
                 // into a cancellation.  Any other request was answered
                 // before the cancellation could be read.
                 if (method.equals(&str::Str::from("$/cancelRequest"))) {
-                    const id: value::JsonValue* = notif.params.get(str::Str::from("id")).unwrap_or(null);
+                    const id: value::Value* = notif.params.get(str::Str::from("id")).unwrap_or(null);
                     if (id != null && Server::same_id(id, &this.serving)) { this.cancelled = true; }
                     return;
                 }
@@ -525,14 +525,14 @@ type struct Server {
 
     // Replies
 
-    reply_ok(mut &this, id: &value::JsonValue, result: value::JsonValue) -> void {
+    reply_ok(mut &this, id: &value::Value, result: value::Value) -> void {
         if (this.cancelled && !this.in_yield && Server::same_id(id, &this.serving)) {
-            mut dropped: value::JsonValue = result;
+            mut dropped: value::Value = result;
             mem::drop(dropped);
             this.reply_error(id, jsonrpc::REQUEST_CANCELLED, str::Str::from("request cancelled"));
             return;
         }
-        const id_clone: value::JsonValue = jsonrpc::JsonRpcCodec::clone_value(id);
+        const id_clone: value::Value = jsonrpc::JsonRpcCodec::clone_value(id);
         const resp: jsonrpc::ResponseMessage =
             jsonrpc::ResponseMessage::success(id_clone, result);
         this.send_response(&resp);
@@ -540,8 +540,8 @@ type struct Server {
         mem::drop(owned);
     }
 
-    reply_error(mut &this, id: &value::JsonValue, code: i32, message: str::Str) -> void {
-        const id_clone: value::JsonValue = jsonrpc::JsonRpcCodec::clone_value(id);
+    reply_error(mut &this, id: &value::Value, code: i32, message: str::Str) -> void {
+        const id_clone: value::Value = jsonrpc::JsonRpcCodec::clone_value(id);
         const err: jsonrpc::ErrorObject =
             jsonrpc::ErrorObject::new(code, String::from_str(message));
         const resp: jsonrpc::ResponseMessage =

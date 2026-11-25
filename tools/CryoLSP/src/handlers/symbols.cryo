@@ -8,7 +8,7 @@ import std::core::option;
 import std::collections::str;
 import std::collections::string::{ String };
 import std::collections::array::{ Array };
-import std::encoding::json::value;
+import std::encoding::value;
 
 import compiler::compilation_context::{ CompilationContext };
 import compiler::ast::node::{ ProgramNode };
@@ -34,27 +34,27 @@ const WORKSPACE_LIMIT: i64 = 200;
 /// `textDocument/documentSymbol`: the document's declarations, members
 /// nested under the type that declares them.
 public function handle_document_symbols(docs: mut &docs::Docs, projects: mut &session::Projects,
-                                         params: &value::JsonValue) -> value::JsonValue {
+                                         params: &value::Value) -> value::Value {
     const asked: Asked = Asked::from(docs, projects, params);
-    mut out: Array<value::JsonValue> = Array::<value::JsonValue>::new();
-    if (asked.ctx == null || asked.module_idx < 0) { return value::JsonValue::Array(out); }
+    mut out: Array<value::Value> = Array::<value::Value>::new();
+    if (asked.ctx == null || asked.module_idx < 0) { return value::Value::Array(out); }
     const outline: Outline = Outline::new(asked.ctx, asked.module_idx);
     const program: ProgramNode* = asked.ctx.module_graph.get_module_ast(asked.module_idx as u32);
-    if (program == null) { return value::JsonValue::Array(out); }
+    if (program == null) { return value::Value::Array(out); }
     for (mut i: i64 = 0; i < program.statements.length(); i++) {
         const item: DeclarationNode* = NodeLocator::unwrap_decl_stmt(program.statements[i]).as_decl();
         if (Outline::owned_by_type(item)) { continue; }
         outline.nested(docs, &out, item);
     }
-    return value::JsonValue::Array(out);
+    return value::Value::Array(out);
 }
 
 /// `workspace/symbol`: the declarations of every analysed project whose
 /// name holds the query, ignoring case.
 public function handle_workspace_symbols(docs: mut &docs::Docs, projects: mut &session::Projects,
-                                          params: &value::JsonValue) -> value::JsonValue {
-    mut out: Array<value::JsonValue> = Array::<value::JsonValue>::new();
-    const q: value::JsonValue* = params.get(str::Str::from("query")).unwrap_or(null);
+                                          params: &value::Value) -> value::Value {
+    mut out: Array<value::Value> = Array::<value::Value>::new();
+    const q: value::Value* = params.get(str::Str::from("query")).unwrap_or(null);
     const query: str::Str = if (q == null) { str::Str::from("") } else {
         q.as::<str::Str>().unwrap_or(str::Str::from(""))
     };
@@ -74,7 +74,7 @@ public function handle_workspace_symbols(docs: mut &docs::Docs, projects: mut &s
             }
         }
     }
-    return value::JsonValue::Array(out);
+    return value::Value::Array(out);
 }
 
 
@@ -103,13 +103,13 @@ type struct Outline {
     }
 
     /// `n` with the members it declares nested under it.
-    nested(&this, docs: &docs::Docs, out: mut &Array<value::JsonValue>, n: DeclarationNode*) -> void {
+    nested(&this, docs: &docs::Docs, out: mut &Array<value::Value>, n: DeclarationNode*) -> void {
         if (!this.written_here(n)) { return; }
         const kind: i64 = Outline::kind_of(n);
         if (kind == 0) { return; }
         const name: string = this.name_of(n);
         if (name.length() == 0) { return; }
-        mut children: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+        mut children: Array<value::Value> = Array::<value::Value>::new();
         const members: [DeclarationNode*] = Outline::members(n);
         for (mut i: i64 = 0; i < members.length(); i++) { this.nested(docs, &children, members[i]); }
         // Each span is carried to the buffer on its own, so an edit since the
@@ -117,31 +117,31 @@ type struct Outline {
         // range is widened to hold it, as the protocol requires.
         const selection: lsp::Range = docs.range_of_span(this.name_span(n));
         const whole: lsp::Range = docs.range_of_span(this.whole_span(n)).covering(&selection);
-        mut s: value::JsonObject = value::JsonObject::new();
-        s.put("name", value::JsonValue::from(name));
-        s.put("kind", value::JsonValue::integer_value(kind));
+        mut s: value::Object = value::Object::new();
+        s.put("name", value::Value::from(name));
+        s.put("kind", value::Value::integer_value(kind));
         s.put("range", whole.to_json());
         s.put("selectionRange", selection.to_json());
-        s.put("children", value::JsonValue::Array(children));
-        out.push(value::JsonValue::Object(s));
+        s.put("children", value::Value::Array(children));
+        out.push(value::Value::Object(s));
     }
 
     /// `n` and every declaration under it whose name holds `query`, flat,
     /// each with its location, while there is room.
-    flat(&this, docs: &docs::Docs, out: mut &Array<value::JsonValue>, n: DeclarationNode*, query: str::Str) -> void {
+    flat(&this, docs: &docs::Docs, out: mut &Array<value::Value>, n: DeclarationNode*, query: str::Str) -> void {
         if (out.length() >= WORKSPACE_LIMIT || !this.written_here(n)) { return; }
         const kind: i64 = Outline::kind_of(n);
         if (kind == 0) { return; }
         const name: string = this.name_of(n);
         if (name.length() > 0 && Outline::holds(name, query)) {
-            mut loc: value::JsonObject = value::JsonObject::new();
-            loc.put("uri", value::JsonValue::String(conv::UriPath::uri_string_from_fs_path(this.file)));
+            mut loc: value::Object = value::Object::new();
+            loc.put("uri", value::Value::String(conv::UriPath::uri_string_from_fs_path(this.file)));
             loc.put("range", docs.range_of_span(this.name_span(n)).to_json());
-            mut s: value::JsonObject = value::JsonObject::new();
-            s.put("name", value::JsonValue::from(name));
-            s.put("kind", value::JsonValue::integer_value(kind));
-            s.put("location", value::JsonValue::Object(loc));
-            out.push(value::JsonValue::Object(s));
+            mut s: value::Object = value::Object::new();
+            s.put("name", value::Value::from(name));
+            s.put("kind", value::Value::integer_value(kind));
+            s.put("location", value::Value::Object(loc));
+            out.push(value::Value::Object(s));
         }
         const members: [DeclarationNode*] = Outline::members(n);
         for (mut i: i64 = 0; i < members.length(); i++) { this.flat(docs, out, members[i], query); }

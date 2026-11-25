@@ -24,9 +24,8 @@ import std::io::error::{ IoError };
 import std::io::file_descriptor;
 import std::io::file_descriptor::{ BorrowedFileDescriptor };
 import std::io::traits::{ Read, Write };
-import std::encoding::json::parser;
-import std::encoding::json::serializer;
-import std::encoding::json::value::{ JsonValue };
+import std::encoding::json;
+import std::encoding::value::{ Value };
 import std::process::child::{ Child, ChildStdin, ExitStatus };
 import std::process::command::{ Command, Stdio };
 import std::sync::channel;
@@ -134,13 +133,13 @@ public type struct Server {
     private input: Option<ChildStdin>;
     private arrivals: Receiver<Arrival>;
     private readers: Array<JoinHandle<i32>>;
-    private responses: Array<Pair<String, JsonValue>>;
+    private responses: Array<Pair<String, Value>>;
     private output_ended: boolean;
     private next_id: i64;
     /// The ids of the responses received so far, in arrival order.
     public arrived: Array<String>;
     /// Every notification received so far, in order.
-    public notifications: Array<JsonValue>;
+    public notifications: Array<Value>;
     /// Every line the server wrote to its error stream.
     public errors: Array<String>;
 
@@ -179,11 +178,11 @@ public type struct Server {
             input:         input,
             arrivals:      receiver,
             readers:       readers,
-            responses:     Array::<Pair<String, JsonValue>>::new(),
+            responses:     Array::<Pair<String, Value>>::new(),
             output_ended:  false,
             next_id:       0,
             arrived:       Array::<String>::new(),
-            notifications: Array::<JsonValue>::new(),
+            notifications: Array::<Value>::new(),
             errors:        Array::<String>::new(),
         });
     }
@@ -231,7 +230,7 @@ public type struct Server {
     }
 
     /// Send a request and wait up to `seconds` for its response.
-    public request(mut &this, method: Str, params: Str, seconds: i64) -> Option<JsonValue> {
+    public request(mut &this, method: Str, params: Str, seconds: i64) -> Option<Value> {
         const id: i64 = this.send_request(method, params)?;
         return this.wait_response(f"{id}".as_str(), seconds);
     }
@@ -244,7 +243,7 @@ public type struct Server {
     /// The response filed under `id` (its JSON text), waiting up to
     /// `seconds` for it; `None` when none arrives in time or the server's
     /// output ends first.
-    public wait_response(mut &this, id: Str, seconds: i64) -> Option<JsonValue> {
+    public wait_response(mut &this, id: Str, seconds: i64) -> Option<Value> {
         const started: Instant = Instant::now();
         loop {
             mut index: i64 = 0;
@@ -252,9 +251,9 @@ public type struct Server {
                 if (this.responses.get_reference(index).unwrap().first.as_str() == id) {
                     // The pair runs its destructor whole, so the response is
                     // swapped out of it rather than moved.
-                    mut taken: Pair<String, JsonValue> = this.responses.remove(index);
-                    mut response: JsonValue = JsonValue::Null;
-                    mem::swap::<JsonValue>(&response, &taken.second);
+                    mut taken: Pair<String, Value> = this.responses.remove(index);
+                    mut response: Value = Value::Null;
+                    mem::swap::<Value>(&response, &taken.second);
                     return Option::Some(response);
                 }
                 index++;
@@ -289,7 +288,7 @@ public type struct Server {
     private file(mut &this, arrival: Arrival) -> void {
         match (arrival) {
             Arrival::Message(body) => {
-                const message: JsonValue = match (parser::parse(body.as_str())) {
+                const message: Value = match (json::Json::parse(body.as_str())) {
                     Result::Ok(value) => { value }
                     Result::Err(_)    => { return; }
                 };
@@ -297,7 +296,7 @@ public type struct Server {
                 match (Reading::at(&message, Str::new("id"))) {
                     Option::Some(id) => {
                         if (!has_method) {
-                            const key: String = serializer::stringify(id);
+                            const key: String = json::Json::to_text(id);
                             this.arrived.push(key.clone());
                             this.responses.push(Pair::new(key, message));
                             return;

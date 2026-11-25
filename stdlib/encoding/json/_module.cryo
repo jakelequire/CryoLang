@@ -1,39 +1,80 @@
-///! json: RFC 8259 JSON parser and serializer.
+///! json: RFC 8259 JSON text, read into and written from the shared data
+///! model `std::encoding::value::Value`.
 ///!
-///! `JsonValue` is a tagged union over the six JSON types. `parse(text)`
-///! consumes a `Str` and returns `Result<JsonValue, JsonError>`;
-///! `stringify(v)` produces an owned `String` in compact form,
-///! `stringify_pretty(v)` indents with two spaces.
+///! `Json::parse(text)` reads a `Str` into a `Result<Value, JsonError>`;
+///! `Json::to_text(&value)` writes an owned `String` in compact form and
+///! `Json::to_pretty_text(&value)` indents with two spaces.
+///! `Json::write_text` and `Json::write_pretty_text` append to a `String`
+///! the caller owns instead.
 ///!
 ///! The parser is strict by RFC 8259: no trailing commas, no unquoted
 ///! keys, no comments. UTF-8 input is decoded into UTF-8 output; `\uXXXX`
 ///! escapes are decoded into the corresponding scalar value(s).
 ///!
 ///! Integer values up to `i64::MIN..=u64::MAX` round-trip exactly via
-///! `JsonNumber::Int` / `JsonNumber::UInt`; values containing a `.` or
-///! exponent become `JsonNumber::Float`. The `Number` variant therefore
-///! preserves the source kind and lossy float conversion only happens
-///! when the caller explicitly asks for `as_f64()`.
+///! `Number::Int` / `Number::UInt`; values containing a `.` or exponent
+///! become `Number::Float`. Lossy float conversion happens only when the
+///! caller asks for `as_f64()`.
 ///!
 ///! Sub-modules:
 ///!   - `error`      - `JsonError`, `JsonErrorKind`
-///!   - `value`      - `JsonValue`, `JsonNumber`, `JsonObject`
-///!   - `parser`     - `Parser` (with `Parser::MAX_DEPTH`), `parse(text)`
-///!   - `serializer` - `write_value`, `write_pretty`, `stringify`,
-///!                    `stringify_pretty`
-///!   - `convert`    - `ToJson`, `FromJson`, `JsonDecodeError`: a value
-///!                    of a Cryo type written as JSON and read back
+///!   - `parser`     - the reader behind `Json::parse` (with `MAX_DEPTH`)
+///!   - `serializer` - the writer behind `Json`'s text writers
 
 namespace std::encoding::json;
 
+import std::core::result::{ Result };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::encoding::value::model::{ Value };
+import std::encoding::json::parser;
+import std::encoding::json::serializer;
+
 module {
     encoding::json::error;
-    encoding::json::value;
     encoding::json::parser;
     encoding::json::serializer;
-    encoding::json::convert;
 }
 
 export std::encoding::json::error::{ JsonError, JsonErrorKind };
-export std::encoding::json::value::{ JsonNumber, JsonObject, JsonValue };
-export std::encoding::json::convert::{ FromJson, JsonDecodeError, ToJson };
+
+/// The JSON text format: reading a `Value` from JSON text and writing one
+/// as JSON text.
+public type struct Json {
+    /// Read a complete JSON document, or say where it stops being JSON:
+    /// the `JsonError` points at the first byte that failed. Trailing
+    /// whitespace is allowed; trailing non-whitespace is
+    /// `JsonErrorKind::TrailingData`. Arrays and objects nest at most 256
+    /// deep, counted together (`JsonErrorKind::DepthExceeded`).
+    public static parse(text: Str) -> Result<Value, JsonError> {
+        return parser::parse_document(text);
+    }
+
+    /// `value` as compact JSON text, no whitespace between tokens:
+    /// `{"name":"cryo","tags":[1,2]}`.
+    public static to_text(value: &Value) -> String {
+        mut out: String = String::new();
+        serializer::write_value_inner(&out, value, false, 0);
+        return out;
+    }
+
+    /// `value` as JSON text indented by two spaces, object members and
+    /// array elements one per line; an empty object or array stays on one
+    /// line.
+    public static to_pretty_text(value: &Value) -> String {
+        mut out: String = String::new();
+        serializer::write_value_inner(&out, value, true, 0);
+        return out;
+    }
+
+    /// Append `value`'s compact JSON text to `out`.
+    public static write_text(out: mut &String, value: &Value) -> void {
+        serializer::write_value_inner(out, value, false, 0);
+    }
+
+    /// Append `value`'s indented JSON text to `out`, as `to_pretty_text`
+    /// writes it.
+    public static write_pretty_text(out: mut &String, value: &Value) -> void {
+        serializer::write_value_inner(out, value, true, 0);
+    }
+}

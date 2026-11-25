@@ -17,7 +17,7 @@ import std::core::slice::{ Slice };
 import std::collections::array::{ Array };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
-import std::encoding::json::value::{ JsonNumber, JsonObject, JsonValue };
+import std::encoding::value::model::{ Number, Object, Value };
 import std::encoding::json::error::{ JsonError, JsonErrorKind };
 import std::core::convert::{ TryFrom };
 import std::core::mem;
@@ -137,7 +137,7 @@ private type struct Parser {
     /// Parse a single value. Caller is responsible for the surrounding
     /// `skip_ws` and trailing-data check; `parse(text)` is the public
     /// entry point that handles those.
-    private parse_value(mut &this) -> Result<JsonValue, JsonError> {
+    private parse_value(mut &this) -> Result<Value, JsonError> {
         if (this.eof()) { return Result::Err(this.err_eof()); }
         const b: u8 = this.peek();
         if (b == LBRACE) { return this.parse_object(); }
@@ -151,9 +151,9 @@ private type struct Parser {
 
     // Keywords
 
-    private parse_null(mut &this) -> Result<JsonValue, JsonError> {
+    private parse_null(mut &this) -> Result<Value, JsonError> {
         if (this.match_literal("null", 4)) {
-            return Result::Ok(JsonValue::Null);
+            return Result::Ok(Value::Null);
         }
         return Result::Err(this.err_at(
             JsonErrorKind::UnexpectedChar,
@@ -161,10 +161,10 @@ private type struct Parser {
         ));
     }
 
-    private parse_bool(mut &this) -> Result<JsonValue, JsonError> {
+    private parse_bool(mut &this) -> Result<Value, JsonError> {
         if (this.peek() == LOWER_T) {
             if (this.match_literal("true", 4)) {
-                return Result::Ok(JsonValue::Bool(true));
+                return Result::Ok(Value::Bool(true));
             }
             return Result::Err(this.err_at(
                 JsonErrorKind::UnexpectedChar,
@@ -172,7 +172,7 @@ private type struct Parser {
             ));
         }
         if (this.match_literal("false", 5)) {
-            return Result::Ok(JsonValue::Bool(false));
+            return Result::Ok(Value::Bool(false));
         }
         return Result::Err(this.err_at(
             JsonErrorKind::UnexpectedChar,
@@ -197,7 +197,7 @@ private type struct Parser {
 
     // Numbers
 
-    private parse_number(mut &this) -> Result<JsonValue, JsonError> {
+    private parse_number(mut &this) -> Result<Value, JsonError> {
         const start: u64 = this.pos;
         mut negative: boolean = false;
         mut has_fraction: boolean = false;
@@ -299,7 +299,7 @@ private type struct Parser {
                     Str::new("number out of range")
                 ));
             }
-            return Result::Ok(JsonValue::Number(JsonNumber::Float(v)));
+            return Result::Ok(Value::Number(Number::Float(v)));
         }
 
         // Integer path: the magnitude is read as a u64 and negated at the
@@ -326,23 +326,23 @@ private type struct Parser {
                 ));
             }
             if (acc == I64_MIN_MAG) {
-                return Result::Ok(JsonValue::Number(JsonNumber::Int(i64::MIN)));
+                return Result::Ok(Value::Number(Number::Int(i64::MIN)));
             }
             const v: i64 = -(acc as i64);
-            return Result::Ok(JsonValue::Number(JsonNumber::Int(v)));
+            return Result::Ok(Value::Number(Number::Int(v)));
         }
 
         if (acc <= i64::MAX as u64) {
-            return Result::Ok(JsonValue::Number(JsonNumber::Int(acc as i64)));
+            return Result::Ok(Value::Number(Number::Int(acc as i64)));
         }
-        return Result::Ok(JsonValue::Number(JsonNumber::UInt(acc)));
+        return Result::Ok(Value::Number(Number::UInt(acc)));
     }
 
     // Strings
 
-    private parse_string_value(mut &this) -> Result<JsonValue, JsonError> {
+    private parse_string_value(mut &this) -> Result<Value, JsonError> {
         const s: String = this.parse_string_raw()?;
-        return Result::Ok(JsonValue::String(s));
+        return Result::Ok(Value::String(s));
     }
 
     /// Parse a JSON string literal into an owned `String`. Assumes the
@@ -477,7 +477,7 @@ private type struct Parser {
 
     // Arrays
 
-    private parse_array(mut &this) -> Result<JsonValue, JsonError> {
+    private parse_array(mut &this) -> Result<Value, JsonError> {
         this.depth = this.depth + 1;
         if (this.depth > MAX_DEPTH) {
             return Result::Err(this.err_at(
@@ -486,19 +486,19 @@ private type struct Parser {
             ));
         }
         this.advance();   // consume '['
-        mut arr: Array<JsonValue> = Array::<JsonValue>::new();
+        mut arr: Array<Value> = Array::<Value>::new();
         this.skip_ws();
 
         // Empty array fast path.
         if (!this.eof() && this.peek() == RBRACK) {
             this.advance();
             this.depth = this.depth - 1;
-            return Result::Ok(JsonValue::Array(arr));
+            return Result::Ok(Value::Array(arr));
         }
 
         while (true) {
             this.skip_ws();
-            const v: JsonValue = this.parse_value()?;
+            const v: Value = this.parse_value()?;
             arr.push(v);
             this.skip_ws();
             if (this.eof()) {
@@ -509,7 +509,7 @@ private type struct Parser {
             if (b == RBRACK) {
                 this.advance();
                 this.depth = this.depth - 1;
-                return Result::Ok(JsonValue::Array(arr));
+                return Result::Ok(Value::Array(arr));
             }
             return Result::Err(this.err_at(
                 JsonErrorKind::UnexpectedChar,
@@ -517,12 +517,12 @@ private type struct Parser {
             ));
         }
         // Unreachable
-        return Result::Ok(JsonValue::Array(arr));
+        return Result::Ok(Value::Array(arr));
     }
 
     // Objects
 
-    private parse_object(mut &this) -> Result<JsonValue, JsonError> {
+    private parse_object(mut &this) -> Result<Value, JsonError> {
         this.depth = this.depth + 1;
         if (this.depth > MAX_DEPTH) {
             return Result::Err(this.err_at(
@@ -531,14 +531,14 @@ private type struct Parser {
             ));
         }
         this.advance();   // consume '{'
-        mut obj: JsonObject = JsonObject::new();
+        mut obj: Object = Object::new();
         this.skip_ws();
 
         // Empty object fast path.
         if (!this.eof() && this.peek() == RBRACE) {
             this.advance();
             this.depth = this.depth - 1;
-            return Result::Ok(JsonValue::Object(obj));
+            return Result::Ok(Value::Object(obj));
         }
 
         while (true) {
@@ -562,7 +562,7 @@ private type struct Parser {
             }
             this.advance();
             this.skip_ws();
-            const v: JsonValue = this.parse_value()?;
+            const v: Value = this.parse_value()?;
             obj.insert(key, v);
             this.skip_ws();
             if (this.eof()) {
@@ -573,7 +573,7 @@ private type struct Parser {
             if (b == RBRACE) {
                 this.advance();
                 this.depth = this.depth - 1;
-                return Result::Ok(JsonValue::Object(obj));
+                return Result::Ok(Value::Object(obj));
             }
             return Result::Err(this.err_at(
                 JsonErrorKind::UnexpectedChar,
@@ -581,29 +581,28 @@ private type struct Parser {
             ));
         }
         // Unreachable
-        return Result::Ok(JsonValue::Object(obj));
+        return Result::Ok(Value::Object(obj));
     }
 }
 
-// Public entry point
-
-/// Parse a complete JSON document. Returns the parsed value on success,
-/// or a `JsonError` pointing at the first byte that failed to parse.
-/// Trailing whitespace is allowed; trailing non-whitespace produces
-/// `JsonErrorKind::TrailingData`.  Arrays and objects may nest at most
-/// 256 deep, counted together; deeper input fails with
-/// `JsonErrorKind::DepthExceeded`, so hostile input cannot exhaust the stack.
-public function parse(text: Str) -> Result<JsonValue, JsonError> {
+/// Parse a complete JSON document, for `Json::parse`. Returns the parsed
+/// value on success, or a `JsonError` pointing at the first byte that
+/// failed to parse. Trailing whitespace is allowed; trailing
+/// non-whitespace produces `JsonErrorKind::TrailingData`.  Arrays and
+/// objects may nest at most 256 deep, counted together; deeper input
+/// fails with `JsonErrorKind::DepthExceeded`, so hostile input cannot
+/// exhaust the stack.
+internal function parse_document(text: Str) -> Result<Value, JsonError> {
     mut p: Parser = Parser::new(text);
     p.skip_ws();
-    const v: JsonValue = p.parse_value()?;
+    const v: Value = p.parse_value()?;
     p.skip_ws();
     if (p.pos < p.len) {
         // Drop the parsed tree before erroring: without this the entire value
         // (nested Strings/Arrays/objects + their HashMaps) leaks on every
         // trailing-data input - a remotely-triggerable leak for a server
         // parsing untrusted JSON.
-        mut owned: JsonValue = v;
+        mut owned: Value = v;
         mem::drop(owned);
         return Result::Err(JsonError::new(
             JsonErrorKind::TrailingData,

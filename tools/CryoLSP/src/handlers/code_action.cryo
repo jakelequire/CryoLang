@@ -20,14 +20,14 @@ import std::core::mem;
 import std::collections::str;
 import std::collections::string::{ String };
 import std::collections::array::{ Array };
-import std::encoding::json::value;
+import std::encoding::value;
 
 
 /// Handle a `textDocument/codeAction` request.  Walks the
 /// `context.diagnostics` array and emits one action per diagnostic
 /// that carries a `data.diagId` field.
-public function handle(params: &value::JsonValue) -> value::JsonValue {
-    mut actions: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+public function handle(params: &value::Value) -> value::Value {
+    mut actions: Array<value::Value> = Array::<value::Value>::new();
 
     match (params.get(str::Str::from("context"))) {
         Option::Some(ctx) => {
@@ -49,7 +49,7 @@ public function handle(params: &value::JsonValue) -> value::JsonValue {
         Option::None => { }
     }
 
-    return value::JsonValue::Array(actions);
+    return value::Value::Array(actions);
 }
 
 
@@ -62,8 +62,8 @@ type struct CodeActionBuilder {
     /// `actions`.  Order matches user expectations: quickfixes (the
     /// actionable items) come first, then the show-rendered convenience
     /// action.
-    static contribute_actions_for(diag: &value::JsonValue,
-                                  actions: mut &Array<value::JsonValue>) -> void {
+    static contribute_actions_for(diag: &value::Value,
+                                  actions: mut &Array<value::Value>) -> void {
         match (diag.get(str::Str::from("data"))) {
             Option::Some(data) => {
                 CodeActionBuilder::push_quickfix_actions(diag, data, actions);
@@ -77,8 +77,8 @@ type struct CodeActionBuilder {
     /// append it to `actions`.  Each action carries a `WorkspaceEdit`
     /// describing the multipart edit the IDE should apply on click; no
     /// client-side command is needed.
-    static push_quickfix_actions(diag: &value::JsonValue, data: &value::JsonValue,
-                                 actions: mut &Array<value::JsonValue>) -> void {
+    static push_quickfix_actions(diag: &value::Value, data: &value::Value,
+                                 actions: mut &Array<value::Value>) -> void {
         match (data.get(str::Str::from("suggestions"))) {
             Option::Some(suggestions) => {
                 const n: i64 = suggestions.length();
@@ -101,8 +101,8 @@ type struct CodeActionBuilder {
     /// Build one quickfix CodeAction from a serialized suggestion.
     /// Returns `None` when the suggestion has no parts (already filtered
     /// server-side, defensive guard).
-    static build_quickfix(diag: &value::JsonValue, sug: &value::JsonValue) -> Option<value::JsonValue> {
-        const parts_v: Option<value::JsonValue*> = sug.get(str::Str::from("parts"));
+    static build_quickfix(diag: &value::Value, sug: &value::Value) -> Option<value::Value> {
+        const parts_v: Option<value::Value*> = sug.get(str::Str::from("parts"));
         match (parts_v) {
             Option::None => { return Option::None; }
             Option::Some(parts) => {
@@ -140,8 +140,8 @@ type struct CodeActionBuilder {
 
                 // Build the WorkspaceEdit.  Group parts by uri because LSP
                 // `changes` is `{ uri -> [TextEdit] }`.
-                mut edit: value::JsonObject = value::JsonObject::new();
-                mut changes: value::JsonObject = value::JsonObject::new();
+                mut edit: value::Object = value::Object::new();
+                mut changes: value::Object = value::Object::new();
                 const total: i64 = parts.length();
                 for (mut i: i64 = 0; i < total; i++) {
                     match (parts.at(i)) {
@@ -149,34 +149,34 @@ type struct CodeActionBuilder {
                         Option::None    => { }
                     }
                 }
-                edit.put("changes", value::JsonValue::Object(changes));
+                edit.put("changes", value::Value::Object(changes));
 
-                // (We deliberately omit `diagnostics: [diag]` - JsonValue
+                // (We deliberately omit `diagnostics: [diag]` - Value
                 // has no clone method, and editors render the quickfix
                 // lightbulb on the diagnostic's gutter regardless.  The
                 // correlation field is only useful for advanced grouping
                 // UIs that don't yet exist on the Cryo side.)
-                mut action: value::JsonObject = value::JsonObject::new();
-                action.put("title", value::JsonValue::String(title));
-                action.put("kind", value::JsonValue::from("quickfix"));
-                action.put("edit", value::JsonValue::Object(edit));
+                mut action: value::Object = value::Object::new();
+                action.put("title", value::Value::String(title));
+                action.put("kind", value::Value::from("quickfix"));
+                action.put("edit", value::Value::Object(edit));
                 if (is_preferred) {
-                    action.put("isPreferred", value::JsonValue::Bool(true));
+                    action.put("isPreferred", value::Value::Bool(true));
                 }
-                return Option::Some(value::JsonValue::Object(action));
+                return Option::Some(value::Value::Object(action));
             }
         }
     }
 
     /// Read `(uri, range, newText)` from one serialized suggestion part,
     /// build its LSP `TextEdit` (`{ range, newText }`, range rebuilt from
-    /// scratch so it owns its JSON - JsonValue has no clone), and append it
+    /// scratch so it owns its JSON - Value has no clone), and append it
     /// to the TextEdit array under `uri` in `changes`.  No-op when any
     /// field is missing.
     ///
     /// Deliberately one method that owns the whole part -> changes
     /// insertion, rather than splitting it into a helper that returns a
-    /// `Pair<String, JsonValue>`.  Partially moving one field of such a
+    /// `Pair<String, Value>`.  Partially moving one field of such a
     /// pair into a call argument while borrowing another field in the same
     /// call hits a pinned-compiler bug: it accepts the moved-out field as
     /// the call argument but still drops it when the pair leaves scope,
@@ -187,10 +187,10 @@ type struct CodeActionBuilder {
     /// Keeping the edit in a single owned local (no struct field to
     /// partially move) sidesteps the compiler bug.  Minimal repro of the
     /// partial-move double-free is filed for a compiler-side fix.
-    static add_part_edit(changes: mut &value::JsonObject, part: &value::JsonValue) -> void {
-        const uri_v: Option<value::JsonValue*> = part.get(str::Str::from("uri"));
-        const range_v: Option<value::JsonValue*> = part.get(str::Str::from("range"));
-        const new_text_v: Option<value::JsonValue*> = part.get(str::Str::from("newText"));
+    static add_part_edit(changes: mut &value::Object, part: &value::Value) -> void {
+        const uri_v: Option<value::Value*> = part.get(str::Str::from("uri"));
+        const range_v: Option<value::Value*> = part.get(str::Str::from("range"));
+        const new_text_v: Option<value::Value*> = part.get(str::Str::from("newText"));
         if (uri_v.is_none() || range_v.is_none() || new_text_v.is_none()) {
             return;
         }
@@ -207,18 +207,18 @@ type struct CodeActionBuilder {
             Option::None    => { mem::drop(uri_str); mem::drop(new_text); return; }
         }
 
-        const range_copy: value::JsonValue = CodeActionBuilder::rebuild_range(range_v.unwrap());
-        mut edit_obj: value::JsonObject = value::JsonObject::new();
+        const range_copy: value::Value = CodeActionBuilder::rebuild_range(range_v.unwrap());
+        mut edit_obj: value::Object = value::Object::new();
         edit_obj.put("range", range_copy);
-        edit_obj.put("newText", value::JsonValue::String(new_text));
-        mut edit: value::JsonValue = value::JsonValue::Object(edit_obj);
+        edit_obj.put("newText", value::Value::String(new_text));
+        mut edit: value::Value = value::Value::Object(edit_obj);
 
         // Append this TextEdit to the array under `uri` in `changes`,
         // creating the array if absent.
         match (changes.get_mutable(uri_str.as_str())) {
             Option::Some(existing) => {
                 match (existing) {
-                    value::JsonValue::Array(arr) => {
+                    value::Value::Array(arr) => {
                         arr.push(edit);
                         mem::drop(uri_str);
                         return;
@@ -228,15 +228,15 @@ type struct CodeActionBuilder {
             }
             Option::None => { }
         }
-        mut fresh: Array<value::JsonValue> = Array::<value::JsonValue>::with_capacity(1);
+        mut fresh: Array<value::Value> = Array::<value::Value>::with_capacity(1);
         fresh.push(edit);
-        changes.insert(uri_str, value::JsonValue::Array(fresh));
+        changes.insert(uri_str, value::Value::Array(fresh));
     }
 
     /// Rebuild an LSP `Range` JSON object by reading its scalar fields
     /// out of `src`.  Missing or malformed fields collapse to 0, matching
     /// what `range_json_from_span` produces for a spanless diagnostic.
-    static rebuild_range(src: value::JsonValue*) -> value::JsonValue {
+    static rebuild_range(src: value::Value*) -> value::Value {
         const sl: i64 = CodeActionBuilder::read_range_pos(src, "start", "line");
         const sc: i64 = CodeActionBuilder::read_range_pos(src, "start", "character");
         const el: i64 = CodeActionBuilder::read_range_pos(src, "end",   "line");
@@ -244,7 +244,7 @@ type struct CodeActionBuilder {
         return CodeActionBuilder::build_range(sl, sc, el, ec);
     }
 
-    static read_range_pos(src: value::JsonValue*, anchor: string, field: string) -> i64 {
+    static read_range_pos(src: value::Value*, anchor: string, field: string) -> i64 {
         match (src.get(str::Str::from(anchor))) {
             Option::Some(pos) => {
                 match (pos.get(str::Str::from(field))) {
@@ -261,25 +261,25 @@ type struct CodeActionBuilder {
         }
     }
 
-    static build_range(sl: i64, sc: i64, el: i64, ec: i64) -> value::JsonValue {
-        mut o: value::JsonObject = value::JsonObject::new();
+    static build_range(sl: i64, sc: i64, el: i64, ec: i64) -> value::Value {
+        mut o: value::Object = value::Object::new();
         o.put("start", CodeActionBuilder::build_pos(sl, sc));
         o.put("end",   CodeActionBuilder::build_pos(el, ec));
-        return value::JsonValue::Object(o);
+        return value::Value::Object(o);
     }
 
-    static build_pos(line: i64, ch: i64) -> value::JsonValue {
-        mut o: value::JsonObject = value::JsonObject::new();
-        o.put("line",      value::JsonValue::integer_value(line));
-        o.put("character", value::JsonValue::integer_value(ch));
-        return value::JsonValue::Object(o);
+    static build_pos(line: i64, ch: i64) -> value::Value {
+        mut o: value::Object = value::Object::new();
+        o.put("line",      value::Value::integer_value(line));
+        o.put("character", value::Value::integer_value(ch));
+        return value::Value::Object(o);
     }
 
     /// Append the "Show full Cryo diagnostic" action backed by the
     /// diagnostic's `diagId`.  Skipped when the wire diagnostic carries
     /// no id.
-    static push_show_rendered_action(data: &value::JsonValue,
-                                     actions: mut &Array<value::JsonValue>) -> void {
+    static push_show_rendered_action(data: &value::Value,
+                                     actions: mut &Array<value::Value>) -> void {
         match (data.get(str::Str::from("diagId"))) {
             Option::Some(id_v) => {
                 match (id_v.as::<str::Str>()) {
@@ -295,22 +295,22 @@ type struct CodeActionBuilder {
     /// `cryo.openRenderedDiagnostic` command (registered by the
     /// CryoAnalyzer VS Code extension) which opens the virtual
     /// `cryo-diagnostic:` URI for `id`.
-    static build_show_rendered_action(id: str::Str) -> value::JsonValue {
+    static build_show_rendered_action(id: str::Str) -> value::Value {
         const title:   string = "Show full Cryo diagnostic";
         const cmd_id:  string = "cryo.openRenderedDiagnostic";
 
-        mut args: Array<value::JsonValue> = Array::<value::JsonValue>::with_capacity(1);
-        args.push(value::JsonValue::from(id));
+        mut args: Array<value::Value> = Array::<value::Value>::with_capacity(1);
+        args.push(value::Value::from(id));
 
-        mut cmd: value::JsonObject = value::JsonObject::new();
-        cmd.put("title", value::JsonValue::from(title));
-        cmd.put("command", value::JsonValue::from(cmd_id));
-        cmd.put("arguments", value::JsonValue::Array(args));
+        mut cmd: value::Object = value::Object::new();
+        cmd.put("title", value::Value::from(title));
+        cmd.put("command", value::Value::from(cmd_id));
+        cmd.put("arguments", value::Value::Array(args));
 
-        mut action: value::JsonObject = value::JsonObject::new();
-        action.put("title", value::JsonValue::from(title));
-        action.put("kind", value::JsonValue::from("quickfix"));
-        action.put("command", value::JsonValue::Object(cmd));
-        return value::JsonValue::Object(action);
+        mut action: value::Object = value::Object::new();
+        action.put("title", value::Value::from(title));
+        action.put("kind", value::Value::from("quickfix"));
+        action.put("command", value::Value::Object(cmd));
+        return value::Value::Object(action);
     }
 }

@@ -133,6 +133,17 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-25
+
+719. **The data model the text formats share is `std::encoding::value`,
+     and a format's entry points are statics of its own type.**  `Value`,
+     `Number`, `Object`, `ToValue`, `FromValue` and `DecodeError` carry no
+     format's name; a type derives the conversions as `with [ToValue,
+     FromValue]`.  JSON is `json::Json::parse(text)`,
+     `Json::to_text(&value)` and `Json::to_pretty_text(&value)`; no free
+     `parse` or `stringify` is kept beside them, and `std::encoding::json`
+     offers only JSON's own names.
+
 ### 2026-11-24
 
 718. **`string.parse_int` reads decimal text and can fail; a literal's

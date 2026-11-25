@@ -5,7 +5,7 @@
 ///!   - `DiagnosticConverter` `compiler::diag::diagnostic` -> LSP JSON
 ///!                           for `publishDiagnostics`.
 ///!
-///! Diagnostics are built directly as `JsonValue` rather than via the
+///! Diagnostics are built directly as `Value` rather than via the
 ///! LSP-side `Diagnostic` struct because both types are named
 ///! `Diagnostic` and the import-resolution path through both top-level
 ///! namespaces in the same file picks whichever was imported last -
@@ -21,7 +21,7 @@ import std::collections::str;
 import std::collections::string::{ String };
 import std::collections::array::{ Array };
 import std::core::hash::{ digest };
-import std::encoding::json::value;
+import std::encoding::value;
 
 import compiler::diag;
 import compiler::diag::severity;
@@ -148,7 +148,7 @@ type struct DiagnosticConverter {
     /// converted by `Docs::range_of_span`.  Spans without a location
     /// collapse to (0,0)-(0,0), which VS Code renders harmlessly at the top
     /// of the document.
-    static range_json_from_span(positions: &docs::Docs, span: source_span::SourceSpan) -> value::JsonValue {
+    static range_json_from_span(positions: &docs::Docs, span: source_span::SourceSpan) -> value::Value {
         return positions.range_of_span(span).to_json();
     }
 
@@ -179,7 +179,7 @@ type struct DiagnosticConverter {
     static build_publish_params(uri: str::Str, diags: &[diagnostic::Diagnostic],
                                 notice: Option<String>,
                                 cache: mut diag_render_cache::DiagRenderCache*,
-                                positions: &docs::Docs) -> value::JsonValue {
+                                positions: &docs::Docs) -> value::Value {
         // Open a publish cycle for this URI: drops the cache entries this
         // URI left last time and arms `cache.insert` to track the ids about
         // to be repopulated below (see DiagRenderCache).
@@ -192,7 +192,7 @@ type struct DiagnosticConverter {
         // file.  `plain()` config: no ANSI, no leading rule - the rendered
         // text lands in an LSP `message`, not a terminal.
         mut renderer: renderer::DiagRenderer = renderer::DiagRenderer::new(renderer::RenderConfig::plain());
-        mut arr: Array<value::JsonValue> = Array::<value::JsonValue>::with_capacity(diags.length());
+        mut arr: Array<value::Value> = Array::<value::Value>::with_capacity(diags.length());
         for (mut i: i64 = 0; i < diags.length(); i++) {
             if (DiagnosticConverter::diag_is_for_path(&diags[i], fs_path)) {
                 // Each place keeps its own squiggle; the report it belongs
@@ -211,23 +211,23 @@ type struct DiagnosticConverter {
         }
         mem::drop(fs_path_owned);
 
-        mut params: value::JsonObject = value::JsonObject::new();
-        params.put("uri", value::JsonValue::from(uri));
-        params.put("diagnostics", value::JsonValue::Array(arr));
-        return value::JsonValue::Object(params);
+        mut params: value::Object = value::Object::new();
+        params.put("uri", value::Value::from(uri));
+        params.put("diagnostics", value::Value::Array(arr));
+        return value::Value::Object(params);
     }
 
     /// A warning at the start of the document saying `message`: what the
     /// server says of a file the analysis did not read, which has no place
     /// of its own in the source.
-    static notice_json(message: String) -> value::JsonValue {
+    static notice_json(message: String) -> value::Value {
         const origin: lsp::Position = lsp::Position::new(0, 0);
-        mut o: value::JsonObject = value::JsonObject::new();
+        mut o: value::Object = value::Object::new();
         o.put("range", lsp::Range::new(origin, origin).to_json());
-        o.put("severity", value::JsonValue::integer_value(2));
-        o.put("source", value::JsonValue::from("cryolsp"));
-        o.put("message", value::JsonValue::String(message));
-        return value::JsonValue::Object(o);
+        o.put("severity", value::Value::integer_value(2));
+        o.put("source", value::Value::from("cryolsp"));
+        o.put("message", value::Value::String(message));
+        return value::Value::Object(o);
     }
 
     /// True when this diagnostic's source span belongs to `fs_path`.
@@ -259,15 +259,15 @@ type struct DiagnosticConverter {
     /// pair the editor renders as a clickable jump target beneath the
     /// diagnostic.
     static related_info_json(file: string, span: source_span::SourceSpan,
-                             message: String, positions: &docs::Docs) -> value::JsonValue {
-        mut loc: value::JsonObject = value::JsonObject::new();
-        loc.put("uri",   value::JsonValue::String(UriPath::uri_string_from_fs_path(file)));
+                             message: String, positions: &docs::Docs) -> value::Value {
+        mut loc: value::Object = value::Object::new();
+        loc.put("uri",   value::Value::String(UriPath::uri_string_from_fs_path(file)));
         loc.put("range", DiagnosticConverter::range_json_from_span(positions, span));
 
-        mut o: value::JsonObject = value::JsonObject::new();
-        o.put("location", value::JsonValue::Object(loc));
-        o.put("message", value::JsonValue::String(message));
-        return value::JsonValue::Object(o);
+        mut o: value::Object = value::Object::new();
+        o.put("location", value::Value::Object(loc));
+        o.put("message", value::Value::String(message));
+        return value::Value::Object(o);
     }
 
     /// Collect a diagnostic's secondary span labels and located child
@@ -276,8 +276,8 @@ type struct DiagnosticConverter {
     /// site - and so are spanless children: they have no editor position,
     /// but the rendered `message` still carries their text.
     static related_information_array(diag: &diagnostic::Diagnostic, report: &diagnostic::Diagnostic,
-                                     positions: &docs::Docs) -> Array<value::JsonValue> {
-        mut arr: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+                                     positions: &docs::Docs) -> Array<value::Value> {
+        mut arr: Array<value::Value> = Array::<value::Value>::new();
 
         // The other places of the folded report this diagnostic belongs
         // to, under the report's name: the one fix settles them all.
@@ -312,12 +312,12 @@ type struct DiagnosticConverter {
     /// LSP `DiagnosticTag` values for a code.  `Unnecessary` (1) fades the
     /// span - the right affordance for unused/dead code.  Codes with no tag
     /// yield an empty array.
-    static diagnostic_tags_array(code: diag::ErrorCode) -> Array<value::JsonValue> {
-        mut arr: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+    static diagnostic_tags_array(code: diag::ErrorCode) -> Array<value::Value> {
+        mut arr: Array<value::Value> = Array::<value::Value>::new();
         match (code) {
-            diag::ErrorCode::W0001_UNUSED_VARIABLE => { arr.push(value::JsonValue::integer_value(1)); }
-            diag::ErrorCode::W0002_UNUSED_FUNCTION => { arr.push(value::JsonValue::integer_value(1)); }
-            diag::ErrorCode::W0009_DEAD_CODE       => { arr.push(value::JsonValue::integer_value(1)); }
+            diag::ErrorCode::W0001_UNUSED_VARIABLE => { arr.push(value::Value::integer_value(1)); }
+            diag::ErrorCode::W0002_UNUSED_FUNCTION => { arr.push(value::Value::integer_value(1)); }
+            diag::ErrorCode::W0009_DEAD_CODE       => { arr.push(value::Value::integer_value(1)); }
             _                                => { }
         }
         return arr;
@@ -325,10 +325,10 @@ type struct DiagnosticConverter {
 
     /// `{ "href": <docs url> }` - makes the diagnostic's code a clickable
     /// link in the editor's problems panel and hover.
-    static code_description_json() -> value::JsonValue {
-        mut o: value::JsonObject = value::JsonObject::new();
-        o.put("href", value::JsonValue::from(ERROR_DOC_URL));
-        return value::JsonValue::Object(o);
+    static code_description_json() -> value::Value {
+        mut o: value::Object = value::Object::new();
+        o.put("href", value::Value::from(ERROR_DOC_URL));
+        return value::Value::Object(o);
     }
 
     /// Build a stable id for `diag` - a 16-char hex hash of the
@@ -353,41 +353,41 @@ type struct DiagnosticConverter {
     /// suggestion would apply, so a CodeAction handler can hand them
     /// straight to `WorkspaceEdit.changes[uri]` and the IDE will apply
     /// every part atomically.
-    static suggestion_to_json(sug: &suggestion::Suggestion, positions: &docs::Docs) -> value::JsonValue {
-        mut o: value::JsonObject = value::JsonObject::new();
+    static suggestion_to_json(sug: &suggestion::Suggestion, positions: &docs::Docs) -> value::Value {
+        mut o: value::Object = value::Object::new();
 
-        o.put("message", value::JsonValue::String(sug.message.clone()));
+        o.put("message", value::Value::String(sug.message.clone()));
 
         mut app: String = String::new();
         app.append(sug.applicability.wire_label());
-        o.put("applicability", value::JsonValue::String(app));
+        o.put("applicability", value::Value::String(app));
 
-        mut parts_arr: Array<value::JsonValue> =
-            Array::<value::JsonValue>::with_capacity(sug.parts.length());
+        mut parts_arr: Array<value::Value> =
+            Array::<value::Value>::with_capacity(sug.parts.length());
         for (mut i: i64 = 0; i < sug.parts.length(); i++) {
             const p: suggestion::SuggestionPart = sug.parts[i];
-            mut po: value::JsonObject = value::JsonObject::new();
+            mut po: value::Object = value::Object::new();
             po.put("range", DiagnosticConverter::range_json_from_span(positions, p.span));
             // Reconstruct a `file://` URI so the editor knows which document
             // the edit applies to.  Multi-file suggestions are rare today
             // but the field is essentially free and makes them work.
-            po.put("uri", value::JsonValue::String(UriPath::uri_string_from_fs_path(p.span.file)));
+            po.put("uri", value::Value::String(UriPath::uri_string_from_fs_path(p.span.file)));
             mut nt: String = String::new();
             nt.append(p.replacement);
-            po.put("newText", value::JsonValue::String(nt));
-            parts_arr.push(value::JsonValue::Object(po));
+            po.put("newText", value::Value::String(nt));
+            parts_arr.push(value::Value::Object(po));
         }
-        o.put("parts", value::JsonValue::Array(parts_arr));
+        o.put("parts", value::Value::Array(parts_arr));
 
-        return value::JsonValue::Object(o);
+        return value::Value::Object(o);
     }
 
     /// Build the JSON array of suggestions to embed under
     /// `diagnostic.data.suggestions`.  Spanless suggestions and parts
     /// without a file are skipped - the editor has no way to attach an
     /// edit to nothing.
-    static suggestions_array(diag: &diagnostic::Diagnostic, positions: &docs::Docs) -> Array<value::JsonValue> {
-        mut arr: Array<value::JsonValue> = Array::<value::JsonValue>::new();
+    static suggestions_array(diag: &diagnostic::Diagnostic, positions: &docs::Docs) -> Array<value::Value> {
+        mut arr: Array<value::Value> = Array::<value::Value>::new();
         for (mut i: i64 = 0; i < diag.suggestions.length(); i++) {
             const sug: &suggestion::Suggestion = &diag.suggestions[i];
             if (sug.parts.length() == 0) { continue; }
@@ -407,20 +407,20 @@ type struct DiagnosticConverter {
     static diag_to_json(diag: &diagnostic::Diagnostic, report: &diagnostic::Diagnostic,
                         renderer: mut renderer::DiagRenderer*,
                         cache: mut diag_render_cache::DiagRenderCache*,
-                        positions: &docs::Docs) -> value::JsonValue {
-        mut o: value::JsonObject = value::JsonObject::new();
+                        positions: &docs::Docs) -> value::Value {
+        mut o: value::Object = value::Object::new();
         o.put("range", DiagnosticConverter::range_json_from_span(positions, diag.span));
-        o.put("severity", value::JsonValue::integer_value(DiagnosticConverter::severity_int_from(diag.severity)));
+        o.put("severity", value::Value::integer_value(DiagnosticConverter::severity_int_from(diag.severity)));
 
         // Code: rendered as the canonical "E0102" / "W0001" string.
         mut code_str: String = String::new();
         code_str.append(diag.code.format());
-        o.put("code", value::JsonValue::String(code_str));
+        o.put("code", value::Value::String(code_str));
 
         // codeDescription: turns the code into a clickable docs link.
         o.put("codeDescription", DiagnosticConverter::code_description_json());
 
-        o.put("source", value::JsonValue::from("cryoc"));
+        o.put("source", value::Value::from("cryoc"));
 
         // `message`: the short headline only.  VS Code's problems panel
         // renders messages as a single line and its own UI already shows
@@ -430,7 +430,7 @@ type struct DiagnosticConverter {
         // virtual `cryo-diagnostic:` document - opened from the
         // "Show full Cryo diagnostic" code action - and reaches the
         // client via `cryo/renderedDiagnostic` keyed off the diagId.
-        o.put("message", value::JsonValue::String(diag.message.clone()));
+        o.put("message", value::Value::String(diag.message.clone()));
 
         // Render once for the cache so the virtual-doc view can fetch the
         // full report on demand.  Kept separate from the inline message
@@ -450,20 +450,20 @@ type struct DiagnosticConverter {
         // payloads (machine-applicable fixes auto-apply on click).
         mut id_for_data: String = String::from_str(id.as_str());
         mem::drop(id);
-        mut data_obj: value::JsonObject = value::JsonObject::new();
-        data_obj.put("diagId", value::JsonValue::String(id_for_data));
-        data_obj.put("suggestions", value::JsonValue::Array(DiagnosticConverter::suggestions_array(diag, positions)));
-        o.put("data", value::JsonValue::Object(data_obj));
+        mut data_obj: value::Object = value::Object::new();
+        data_obj.put("diagId", value::Value::String(id_for_data));
+        data_obj.put("suggestions", value::Value::Array(DiagnosticConverter::suggestions_array(diag, positions)));
+        o.put("data", value::Value::Object(data_obj));
 
         // tags: fade unused/dead code, strike deprecated.  An empty array is
         // a valid no-op; emitting it unconditionally keeps the move/ownership
         // story simple.
-        o.put("tags", value::JsonValue::Array(DiagnosticConverter::diagnostic_tags_array(diag.code)));
+        o.put("tags", value::Value::Array(DiagnosticConverter::diagnostic_tags_array(diag.code)));
 
         // relatedInformation: clickable navigation to every secondary span
         // and located child diagnostic.
-        o.put("relatedInformation", value::JsonValue::Array(DiagnosticConverter::related_information_array(diag, report, positions)));
+        o.put("relatedInformation", value::Value::Array(DiagnosticConverter::related_information_array(diag, report, positions)));
 
-        return value::JsonValue::Object(o);
+        return value::Value::Object(o);
     }
 }

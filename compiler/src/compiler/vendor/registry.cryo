@@ -39,9 +39,8 @@ import std::time::duration::{ Duration };
 import std::collections::string::{ String };
 import std::collections::str::{ Str };
 import std::core::option::{ Option };
-import std::encoding::json::{ value, parser, serializer };
-import std::encoding::json::value::{ JsonObject, JsonValue };
-import std::encoding::json::convert::{ ToJson };
+import std::encoding::json;
+import std::encoding::value::{ Object, ToValue, Value };
 import std::core::mem;
 
 const VENDOR_SCHEMA_VERSION: i64 = 1;
@@ -259,7 +258,7 @@ type struct VendorRegistry {
             Result::Ok(s)  => { s }
             Result::Err(_) => { return VendorRegistry::empty(); }
         };
-        mut root: JsonValue = match (parser::parse(content.as_str())) {
+        mut root: Value = match (json::Json::parse(content.as_str())) {
             Result::Ok(v)      => { v }
             Result::Err(e)     => { mem::drop(e); return VendorRegistry::empty(); }
         };
@@ -295,17 +294,17 @@ type struct VendorRegistry {
     /// would otherwise silently drop every registered library.
     save_global(&this) -> boolean {
         const path: PathBuf = VendorRegistry::registry_path();
-        mut root: JsonObject = JsonObject::new();
-        root.put("schema_version", JsonValue::integer_value(VENDOR_SCHEMA_VERSION));
+        mut root: Object = Object::new();
+        root.put("schema_version", Value::integer_value(VENDOR_SCHEMA_VERSION));
 
-        mut libs: Array<JsonValue> = Array::<JsonValue>::new();
+        mut libs: Array<Value> = Array::<Value>::new();
         for (mut i: i64 = 0; i < this.entries.length(); i++) {
             libs.push(VendorRegistry::entry_to_json(&this.entries[i]));
         }
-        root.put("libraries", JsonValue::Array(libs));
+        root.put("libraries", Value::Array(libs));
 
-        mut doc: JsonValue = JsonValue::Object(root);
-        mut text: String = serializer::stringify_pretty(&doc);
+        mut doc: Value = Value::Object(root);
+        mut text: String = json::Json::to_pretty_text(&doc);
         mem::drop(doc);
 
         const temporary: String = f"{path.as_path().as_str()}.tmp.{process::id()}";
@@ -379,7 +378,7 @@ type struct VendorRegistry {
 
     /// A string field of a JSON object as an owned String, or `fallback`
     /// when it is absent or not a string.
-    static text_field(parent: JsonValue*, key: Str, fallback: Str) -> String {
+    static text_field(parent: Value*, key: Str, fallback: Str) -> String {
         match (parent.get(key)) {
             Option::Some(field) => {
                 match (field.as::<Str>()) {
@@ -394,7 +393,7 @@ type struct VendorRegistry {
 
     /// The string elements of an array field of a JSON object, each owned
     /// (empty when the field is absent; a non-string element is skipped).
-    static text_list_field(parent: JsonValue*, key: Str) -> [String] {
+    static text_list_field(parent: Value*, key: Str) -> [String] {
         mut out: [String] = [];
         match (parent.get(key)) {
             Option::Some(list) => {
@@ -419,7 +418,7 @@ type struct VendorRegistry {
     /// `text_list_field` as `string`s for a `VendorLink` array, which the
     /// build's link command reads after the registry is gone (see
     /// `VendorLink`).
-    static link_list_field(parent: JsonValue*, key: Str) -> [string] {
+    static link_list_field(parent: Value*, key: Str) -> [string] {
         mut owned: [String] = VendorRegistry::text_list_field(parent, key);
         mut out: [string] = [];
         while (owned.length() > 0) {
@@ -429,7 +428,7 @@ type struct VendorRegistry {
     }
 
     /// Parse one library entry object.
-    static read_entry(ep: JsonValue*) -> VendorEntry {
+    static read_entry(ep: Value*) -> VendorEntry {
         mut entry: VendorEntry = VendorEntry {
             key:            VendorRegistry::text_field(ep, Str::new("key"), Str::new("")),
             name:           VendorRegistry::text_field(ep, Str::new("name"), Str::new("")),
@@ -469,7 +468,7 @@ type struct VendorRegistry {
     }
 
     /// Parse the `link` sub-object.
-    static read_link(lp: JsonValue*) -> VendorLink {
+    static read_link(lp: Value*) -> VendorLink {
         return VendorLink {
             system:          VendorRegistry::link_list_field(lp, Str::new("system")),
             search:          VendorRegistry::link_list_field(lp, Str::new("search")),
@@ -484,41 +483,41 @@ type struct VendorRegistry {
     }
 
     /// Serialize one entry to a JSON value.
-    static entry_to_json(entry: &VendorEntry) -> JsonValue {
-        mut obj: JsonObject = JsonObject::new();
-        obj.put("key",            entry.key.to_json());
-        obj.put("name",           entry.name.to_json());
-        obj.put("source_path",    entry.source_path.to_json());
-        obj.put("binding_source", entry.binding_source.to_json());
-        obj.put("headers",        entry.headers.to_json());
-        obj.put("include_dirs",   entry.include_dirs.to_json());
-        obj.put("defines",        entry.defines.to_json());
-        obj.put("language",       entry.language.to_json());
-        obj.put("std",            entry.std.to_json());
+    static entry_to_json(entry: &VendorEntry) -> Value {
+        mut obj: Object = Object::new();
+        obj.put("key",            entry.key.to_value());
+        obj.put("name",           entry.name.to_value());
+        obj.put("source_path",    entry.source_path.to_value());
+        obj.put("binding_source", entry.binding_source.to_value());
+        obj.put("headers",        entry.headers.to_value());
+        obj.put("include_dirs",   entry.include_dirs.to_value());
+        obj.put("defines",        entry.defines.to_value());
+        obj.put("language",       entry.language.to_value());
+        obj.put("std",            entry.std.to_value());
 
-        mut link: JsonObject = JsonObject::new();
-        link.put("system",         JsonValue::string_array(&entry.link.system));
-        link.put("search",         JsonValue::string_array(&entry.link.search));
-        link.put("static",         JsonValue::string_array(&entry.link.static_libs));
-        link.put("system_windows", JsonValue::string_array(&entry.link.system_windows));
-        link.put("search_windows", JsonValue::string_array(&entry.link.search_windows));
-        link.put("static_windows", JsonValue::string_array(&entry.link.static_windows));
-        link.put("system_unix",    JsonValue::string_array(&entry.link.system_unix));
-        link.put("search_unix",    JsonValue::string_array(&entry.link.search_unix));
-        link.put("static_unix",    JsonValue::string_array(&entry.link.static_unix));
-        obj.put("link", JsonValue::Object(link));
+        mut link: Object = Object::new();
+        link.put("system",         Value::string_array(&entry.link.system));
+        link.put("search",         Value::string_array(&entry.link.search));
+        link.put("static",         Value::string_array(&entry.link.static_libs));
+        link.put("system_windows", Value::string_array(&entry.link.system_windows));
+        link.put("search_windows", Value::string_array(&entry.link.search_windows));
+        link.put("static_windows", Value::string_array(&entry.link.static_windows));
+        link.put("system_unix",    Value::string_array(&entry.link.system_unix));
+        link.put("search_unix",    Value::string_array(&entry.link.search_unix));
+        link.put("static_unix",    Value::string_array(&entry.link.static_unix));
+        obj.put("link", Value::Object(link));
 
-        mut cache: Array<JsonValue> = Array::<JsonValue>::new();
+        mut cache: Array<Value> = Array::<Value>::new();
         for (mut i: i64 = 0; i < entry.cache.length(); i++) {
-            mut c: JsonObject = JsonObject::new();
-            c.put("triple", entry.cache[i].triple.to_json());
-            c.put("file",   entry.cache[i].file.to_json());
-            c.put("key",    entry.cache[i].key.to_json());
-            cache.push(JsonValue::Object(c));
+            mut c: Object = Object::new();
+            c.put("triple", entry.cache[i].triple.to_value());
+            c.put("file",   entry.cache[i].file.to_value());
+            c.put("key",    entry.cache[i].key.to_value());
+            cache.push(Value::Object(c));
         }
-        obj.put("cache", JsonValue::Array(cache));
+        obj.put("cache", Value::Array(cache));
 
-        return JsonValue::Object(obj);
+        return Value::Object(obj);
     }
 }
 

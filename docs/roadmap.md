@@ -779,32 +779,32 @@ value through a raw pointer.
 
 ## Typed JSON through the derive list
 
-Built.  `std::encoding::json::convert` has `ToJson` and `FromJson`, implemented for
+Built.  `std::encoding::value` has `ToValue` and `FromValue`, implemented for
 the primitives, `String`, `Str` (writing only), `Array<T>`, `Option<T>`,
 and a `HashMap` or `BTreeMap` keyed by `String`; the derive list writes
 both for a struct or a field-less enum, as follows.
 
-- **Spelling.**  `type struct Server with [ToJson, FromJson] { ... }`, the
+- **Spelling.**  `type struct Server with [ToValue, FromValue] { ... }`, the
   derive list that exists.  A field's options are a field directive:
   `![json(rename = "port_number")]` reads and writes the member under that
   key, `![json(skip)]` leaves the field out of both, `![json(default)]`
   reads a missing member as the field type's `default()`, and
   `![json(skip_none)]` leaves an `Option` field that holds `None` out of
   the written object.
-- **Writing.**  The generated `to_json` makes a `JsonObject` sized for the
+- **Writing.**  The generated `to_value` makes an `Object` sized for the
   fields not skipped and puts each one, in declaration order, under its
-  key (its rename, or the field's name) as the field's own `to_json()`,
-  then answers `JsonValue::Object`.  An `Option` field holding `None` is
+  key (its rename, or the field's name) as the field's own `to_value()`,
+  then answers `Value::Object`.  An `Option` field holding `None` is
   written as `null` unless the field says `skip_none`.  Every field's type
-  must implement `ToJson`, and a refusal names the field.
-- **Reading.**  The generated `from_json` refuses a value that is not an
-  object with `JsonDecodeError::unexpected(Str::new("an object"), value)`.
+  must implement `ToValue`, and a refusal names the field.
+- **Reading.**  The generated `from_value` refuses a value that is not an
+  object with `DecodeError::unexpected(Str::new("an object"), value)`.
   Each field reads the member under its key: a member present is read with
-  the field type's `from_json`, and a refusal there is wrapped with
+  the field type's `from_value`, and a refusal there is wrapped with
   `at_field(<key>)` so the error names the path; a member absent is the
   type's `default()` for a `default` or `skip` field (which needs
   `Default`), `None` for an `Option` field, and otherwise
-  `JsonDecodeError::missing_field(<key>)`.  The struct is then built in one
+  `DecodeError::missing_field(<key>)`.  The struct is then built in one
   literal.  A member the struct does not name is ignored.
 - **Enums.**  An enum whose variants carry nothing is written as its
   variant's name, `"Red"`, and read back from that string; another string

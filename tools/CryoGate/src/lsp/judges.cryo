@@ -23,7 +23,7 @@ import std::collections::string::{ String };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::slice::{ Slice };
-import std::encoding::json::value::{ JsonExtract, JsonValue };
+import std::encoding::value::{ Extract, Value };
 
 import cryogate::core::text::{ Text };
 import cryogate::lsp::fixture::{ Fixture };
@@ -50,7 +50,7 @@ public type struct Judgement {
 public type struct Judges {
     /// A `definition` check: `expect` null wants no location; a marker
     /// wants the single location starting there.
-    public static definition(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*) -> Result<Judgement, String> {
+    public static definition(fixture: mut &Fixture, check: Value*, result: Value*) -> Result<Judgement, String> {
         if (!Reading::present(check, Str::new("expect"))) {
             const empty: boolean = result.is_null() || (result.is_array() && result.length() == 0);
             return Result::Ok(Judgement::when(empty, f"got {Judges::describe_location(result).as_str()}"));
@@ -61,8 +61,8 @@ public type struct Judges {
     }
 
     /// Whether `result` is one location starting at the marker `expected`.
-    public static location_matches(fixture: mut &Fixture, result: JsonValue*, expected: Str) -> Result<boolean, String> {
-        mut location: JsonValue* = result;
+    public static location_matches(fixture: mut &Fixture, result: Value*, expected: Str) -> Result<boolean, String> {
+        mut location: Value* = result;
         if (result.is_array()) {
             if (result.length() != 1) { return Result::Ok(false); }
             location = result.at(0).unwrap();
@@ -75,9 +75,9 @@ public type struct Judges {
     }
 
     /// A location (or the first of a list) as `file:line:column`.
-    public static describe_location(result: JsonValue*) -> String {
+    public static describe_location(result: Value*) -> String {
         if (result.is_null()) { return String::from_str(Str::new("null")); }
-        mut location: JsonValue* = result;
+        mut location: Value* = result;
         if (result.is_array() && result.length() > 0) { location = result.at(0).unwrap(); }
         if (!Reading::has_text(location, Str::new("uri"))) { return Reading::shown(Option::Some(result)); }
         const uri: Str = Reading::text(location, Str::new("uri"));
@@ -91,9 +91,9 @@ public type struct Judges {
 
     /// A hover's text: the contents' value, a list's values on their own
     /// lines, or `None` for no hover.
-    public static hover_text(result: JsonValue*) -> Option<String> {
+    public static hover_text(result: Value*) -> Option<String> {
         if (result.is_null()) { return Option::None; }
-        const contents: JsonValue* = match (Reading::at(result, Str::new("contents"))) {
+        const contents: Value* = match (Reading::at(result, Str::new("contents"))) {
             Option::Some(found) => { found }
             Option::None        => { return Option::Some(String::new()); }
         };
@@ -101,7 +101,7 @@ public type struct Judges {
         if (contents.is_array()) {
             mut parts: Array<String> = Array::<String>::new();
             for (mut index: i64 = 0; index < contents.length(); index++) {
-                const part: JsonValue* = contents.at(index).unwrap();
+                const part: Value* = contents.at(index).unwrap();
                 parts.push(if (part.is_object()) { String::from_str(Reading::text(part, Str::new("value"))) } else { String::from_str(part.as::<Str>().unwrap_or(Str::new(""))) });
             }
             return Option::Some(Text::joined(&parts, Str::new("\n")));
@@ -111,7 +111,7 @@ public type struct Judges {
 
     /// A `hover` or `expandHover` check: `expect` null wants no hover;
     /// otherwise every `contains` text is in it and no `excludes` text is.
-    public static hover(check: JsonValue*, result: JsonValue*) -> Judgement {
+    public static hover(check: Value*, result: Value*) -> Judgement {
         const text: Option<String> = Judges::hover_text(result);
         const shown: String = match (&text) {
             Option::Some(found) => { f"'{found.as_str()}'" }
@@ -137,7 +137,7 @@ public type struct Judges {
     }
 
     /// The labels of a completion answer, a list or a `{items}` object.
-    public static completion_labels(result: JsonValue*) -> Array<String> {
+    public static completion_labels(result: Value*) -> Array<String> {
         mut labels: Array<String> = Array::<String>::new();
         for (item in Judges::completion_items(result).iterate_references()) {
             labels.push(String::from_str(Reading::text(*item, Str::new("label"))));
@@ -145,14 +145,14 @@ public type struct Judges {
         return labels;
     }
 
-    private static completion_items(result: JsonValue*) -> Array<JsonValue*> {
+    private static completion_items(result: Value*) -> Array<Value*> {
         if (result.is_object()) { return Reading::elements(result, Str::new("items")); }
         return Reading::elements(result, Str::new(""));
     }
 
     /// A `completion` check: every `includes` label offered, no `excludes`
     /// label, and each `details` label's detail holding its text.
-    public static completion(check: JsonValue*, result: JsonValue*) -> Judgement {
+    public static completion(check: Value*, result: Value*) -> Judgement {
         const labels: Array<String> = Judges::completion_labels(result);
         mut missing: Array<String> = Array::<String>::new();
         for (wanted in Reading::texts(check, Str::new("includes")).iterate_references()) {
@@ -163,7 +163,7 @@ public type struct Judges {
             if (Judges::holds(&labels, refused.as_str())) { unwanted.push(refused.clone()); }
         }
         mut wrong: Array<String> = Array::<String>::new();
-        const items: Array<JsonValue*> = Judges::completion_items(result);
+        const items: Array<Value*> = Judges::completion_items(result);
         for (label in Reading::keys(check, Str::new("details")).iterate_references()) {
             const wanted: Str = Reading::text(Reading::at(check, Str::new("details")).unwrap(), label.as_str());
             mut detail: Str = Str::new("");
@@ -178,7 +178,7 @@ public type struct Judges {
 
     /// A `references` or `documentHighlight` check: the set of location
     /// starts equals the markers'.  A location with no URI is in `relative`.
-    public static locations(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*, relative: Str) -> Result<Judgement, String> {
+    public static locations(fixture: mut &Fixture, check: Value*, result: Value*, relative: Str) -> Result<Judgement, String> {
         const fallback: String = fixture.uri(relative);
         mut got: Array<String> = Array::<String>::new();
         for (location in Reading::elements(result, Str::new("")).iterate_references()) {
@@ -192,7 +192,7 @@ public type struct Judges {
     }
 
     /// The position keys of the markers listed under `key`, sorted.
-    public static marker_keys(fixture: mut &Fixture, check: JsonValue*, key: Str) -> Result<Array<String>, String> {
+    public static marker_keys(fixture: mut &Fixture, check: Value*, key: Str) -> Result<Array<String>, String> {
         mut keys: Array<String> = Array::<String>::new();
         for (reference in Reading::texts(check, key).iterate_references()) {
             const place: Pair<String, Position> = fixture.at(reference.as_str())?;
@@ -204,7 +204,7 @@ public type struct Judges {
 
     /// The published diagnostics' `code:line:character` keys, sorted; a
     /// diagnostic with no code reads `null`.
-    public static diagnostic_keys(params: JsonValue*) -> Array<String> {
+    public static diagnostic_keys(params: Value*) -> Array<String> {
         mut keys: Array<String> = Array::<String>::new();
         for (diagnostic in Reading::elements(params, Str::new("diagnostics")).iterate_references()) {
             keys.push(Judges::diagnostic_key(*diagnostic));
@@ -212,7 +212,7 @@ public type struct Judges {
         return Judges::sorted(keys);
     }
 
-    private static diagnostic_key(diagnostic: JsonValue*) -> String {
+    private static diagnostic_key(diagnostic: Value*) -> String {
         const code: Str = if (Reading::has_text(diagnostic, Str::new("code"))) { Reading::text(diagnostic, Str::new("code")) } else { Str::new("null") };
         const start: Position = Position::read(Reading::at(diagnostic, Str::new("range.start"))).unwrap_or(Position { line: -1, character: -1 });
         return f"{code}:{start.line}:{start.character}";
@@ -220,7 +220,7 @@ public type struct Judges {
 
     /// The diagnostics a `diagnostics` check expects, as sorted keys, and
     /// the message text each one with a `message` must hold.
-    public static expected_diagnostics(fixture: mut &Fixture, check: JsonValue*) -> Result<Pair<Array<String>, Array<Pair<String, String>>>, String> {
+    public static expected_diagnostics(fixture: mut &Fixture, check: Value*) -> Result<Pair<Array<String>, Array<Pair<String, String>>>, String> {
         mut keys: Array<String> = Array::<String>::new();
         mut texts: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
         for (expected in Reading::elements(check, Str::new("expect")).iterate_references()) {
@@ -237,7 +237,7 @@ public type struct Judges {
 
     /// Whether a published set is exactly the expected one, each message
     /// holding its text.
-    public static diagnostics_hold(params: JsonValue*, keys: &Array<String>, texts: &Array<Pair<String, String>>) -> boolean {
+    public static diagnostics_hold(params: Value*, keys: &Array<String>, texts: &Array<Pair<String, String>>) -> boolean {
         if (Judges::diagnostic_keys(params) != *keys) { return false; }
         for (wanted in texts.iterate_references()) {
             mut said: boolean = false;
@@ -252,8 +252,8 @@ public type struct Judges {
 
     /// A published set as a failure prints it: each diagnostic's key and
     /// message.
-    public static described_diagnostics(params: Option<JsonValue*>) -> String {
-        const published: JsonValue* = match (params) {
+    public static described_diagnostics(params: Option<Value*>) -> String {
+        const published: Value* = match (params) {
             Option::Some(found) => { found }
             Option::None        => { return String::from_str(Str::new("None")); }
         };
@@ -265,7 +265,7 @@ public type struct Judges {
     }
 
     /// Every symbol's name, a nested one as `Parent/child`.
-    public static symbol_names(symbols: &Array<JsonValue*>, prefix: Str) -> Array<String> {
+    public static symbol_names(symbols: &Array<Value*>, prefix: Str) -> Array<String> {
         mut names: Array<String> = Array::<String>::new();
         for (symbol in symbols.iterate_references()) {
             const full: String = f"{prefix}{Reading::text(*symbol, Str::new("name"))}";
@@ -279,7 +279,7 @@ public type struct Judges {
     /// Every document symbol whose selection is not inside its range, as
     /// `Parent/child`: the protocol requires it, and an editor refuses the
     /// whole answer otherwise.
-    public static selection_outside(symbols: &Array<JsonValue*>, prefix: Str) -> Array<String> {
+    public static selection_outside(symbols: &Array<Value*>, prefix: Str) -> Array<String> {
         mut outside: Array<String> = Array::<String>::new();
         for (symbol in symbols.iterate_references()) {
             const full: String = f"{prefix}{Reading::text(*symbol, Str::new("name"))}";
@@ -299,8 +299,8 @@ public type struct Judges {
     }
 
     /// A `documentSymbol` or `workspaceSymbol` check.
-    public static symbols(check: JsonValue*, result: JsonValue*, document: boolean) -> Judgement {
-        const listed: Array<JsonValue*> = Reading::elements(result, Str::new(""));
+    public static symbols(check: Value*, result: Value*, document: boolean) -> Judgement {
+        const listed: Array<Value*> = Reading::elements(result, Str::new(""));
         const names: Array<String> = Judges::symbol_names(&listed, Str::new(""));
         mut missing: Array<String> = Array::<String>::new();
         for (wanted in Reading::texts(check, Str::new("includes")).iterate_references()) {
@@ -317,8 +317,8 @@ public type struct Judges {
 
     /// A `semanticTokens` check: at each marker the token starting there,
     /// as `type.modifier...` (it may carry more modifiers), or none.
-    public static semantic_tokens(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*) -> Result<Judgement, String> {
-        const data: Array<JsonValue*> = Reading::elements(result, Str::new("data"));
+    public static semantic_tokens(fixture: mut &Fixture, check: Value*, result: Value*) -> Result<Judgement, String> {
+        const data: Array<Value*> = Reading::elements(result, Str::new("data"));
         mut starts: Array<Pair<String, String>> = Array::<Pair<String, String>>::new();
         mut line: i64 = 0;
         mut start: i64 = 0;
@@ -349,7 +349,7 @@ public type struct Judges {
             for (token in starts.iterate_references()) {
                 if (token.first == key) { got = Option::Some(token.second.clone()); }
             }
-            const expectation: JsonValue* = Reading::at(check, Str::new("expect")).unwrap().get(reference.as_str()).unwrap();
+            const expectation: Value* = Reading::at(check, Str::new("expect")).unwrap().get(reference.as_str()).unwrap();
             const shown: String = match (&got) {
                 Option::Some(token) => { token.clone() }
                 Option::None        => { String::from_str(Str::new("None")) }
@@ -391,7 +391,7 @@ public type struct Judges {
 
     /// An `inlayHints` check: at each marker the label of the hint there,
     /// or none.
-    public static inlay_hints(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*) -> Result<Judgement, String> {
+    public static inlay_hints(fixture: mut &Fixture, check: Value*, result: Value*) -> Result<Judgement, String> {
         mut bad: Array<String> = Array::<String>::new();
         for (reference in Reading::keys(check, Str::new("expect")).iterate_references()) {
             const place: Pair<String, Position> = fixture.at(reference.as_str())?;
@@ -401,7 +401,7 @@ public type struct Judges {
                     got = Option::Some(String::from_str(Reading::text(*hint, Str::new("label"))));
                 }
             }
-            const expectation: JsonValue* = Reading::at(check, Str::new("expect")).unwrap().get(reference.as_str()).unwrap();
+            const expectation: Value* = Reading::at(check, Str::new("expect")).unwrap().get(reference.as_str()).unwrap();
             const want: Option<String> = if (expectation.is_null()) { Option::None } else { Option::Some(String::from_str(expectation.as::<Str>().unwrap_or(Str::new("")))) };
             if (got != want) {
                 bad.push(f"{reference.as_str()}: want {Judges::maybe(&want).as_str()}, got {Judges::maybe(&got).as_str()}");
@@ -412,15 +412,15 @@ public type struct Judges {
 
     /// A `formatting` check of `file`: `expect` null wants no edit; a text
     /// wants one edit, replacing the whole of the file's text with it.
-    public static formatting(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*) -> Result<Judgement, String> {
-        const edits: Array<JsonValue*> = Reading::elements(result, Str::new(""));
+    public static formatting(fixture: mut &Fixture, check: Value*, result: Value*) -> Result<Judgement, String> {
+        const edits: Array<Value*> = Reading::elements(result, Str::new(""));
         if (!Reading::present(check, Str::new("expect"))) {
             return Result::Ok(Judgement::when(edits.is_empty(), f"want no edit, got {Reading::shown(Option::Some(result)).as_str()}"));
         }
         if (edits.length() != 1) {
             return Result::Ok(Judgement::fail(f"want one edit, got {Reading::shown(Option::Some(result)).as_str()}"));
         }
-        const edit: JsonValue* = *edits.get_reference(0).unwrap();
+        const edit: Value* = *edits.get_reference(0).unwrap();
         const text: String = fixture.text(Reading::text(check, Str::new("file")))?;
         // The end of the text: its last line, and that line's length (the
         // fixture's text is ASCII, so bytes are UTF-16 units).
@@ -446,15 +446,15 @@ public type struct Judges {
     /// `contains` text and no `excludes` one, the active parameter is
     /// `active`, its label (as its offsets cut it) is `param`, and `count`
     /// signatures are offered; `expect` null wants no help.
-    public static signature_help(check: JsonValue*, result: JsonValue*) -> Judgement {
+    public static signature_help(check: Value*, result: Value*) -> Judgement {
         if (Reading::at(check, Str::new("expect")).is_some() && !Reading::present(check, Str::new("expect"))) {
             return Judgement::when(result.is_null(), f"got {Reading::shown(Option::Some(result)).as_str()}");
         }
-        const signatures: Array<JsonValue*> = Reading::elements(result, Str::new("signatures"));
+        const signatures: Array<Value*> = Reading::elements(result, Str::new("signatures"));
         if (signatures.is_empty()) { return Judgement::fail(f"no signature: {Reading::shown(Option::Some(result)).as_str()}"); }
         const chosen: i64 = Reading::integer(result, Str::new("activeSignature")).unwrap_or(0);
         if (chosen < 0 || chosen >= signatures.length()) { return Judgement::fail(f"no signature {chosen}: {Reading::shown(Option::Some(result)).as_str()}"); }
-        const signature: JsonValue* = *signatures.get_reference(chosen).unwrap();
+        const signature: Value* = *signatures.get_reference(chosen).unwrap();
         const label: Str = Reading::text(signature, Str::new("label"));
         const active: i64 = Reading::integer(result, Str::new("activeParameter")).unwrap_or(0);
         mut bad: Array<String> = Array::<String>::new();
@@ -477,10 +477,10 @@ public type struct Judges {
         const wanted_active: i64 = Reading::integer(check, Str::new("active")).unwrap_or(-1);
         if (active != wanted_active) { bad.push(f"active parameter {active}, want {wanted_active}"); }
         if (Reading::has_text(check, Str::new("param"))) {
-            const parameters: Array<JsonValue*> = Reading::elements(signature, Str::new("parameters"));
+            const parameters: Array<Value*> = Reading::elements(signature, Str::new("parameters"));
             mut got: Option<String> = Option::None;
             if (active >= 0 && active < parameters.length()) {
-                const offsets: Array<JsonValue*> = Reading::elements(*parameters.get_reference(active).unwrap(), Str::new("label"));
+                const offsets: Array<Value*> = Reading::elements(*parameters.get_reference(active).unwrap(), Str::new("label"));
                 if (offsets.length() == 2) {
                     const low: i64 = Reading::integer(*offsets.get_reference(0).unwrap(), Str::new("")).unwrap_or(0);
                     const high: i64 = Reading::integer(*offsets.get_reference(1).unwrap(), Str::new("")).unwrap_or(0);
@@ -512,7 +512,7 @@ public type struct Judges {
 
     /// A `prepareRename` check: the range starts at `expect` and the
     /// placeholder is `placeholder`.
-    public static prepare_rename(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*) -> Result<Judgement, String> {
+    public static prepare_rename(fixture: mut &Fixture, check: Value*, result: Value*) -> Result<Judgement, String> {
         const place: Pair<String, Position> = fixture.at(Reading::text(check, Str::new("expect")))?;
         const placeholder: Str = Reading::text(check, Str::new("placeholder"));
         const passed: boolean = place.second.matches(Reading::at(result, Str::new("range.start")))
@@ -522,13 +522,13 @@ public type struct Judges {
 
     /// A `rename` check: the edits start exactly at the markers, and each
     /// replaces `old`'s width on one line with `new_name`.
-    public static rename(fixture: mut &Fixture, check: JsonValue*, result: JsonValue*) -> Result<Judgement, String> {
+    public static rename(fixture: mut &Fixture, check: Value*, result: Value*) -> Result<Judgement, String> {
         const old: Str = Reading::text(check, Str::new("old"));
         const new_name: Str = Reading::text(check, Str::new("new_name"));
         mut got: Array<String> = Array::<String>::new();
         mut bad: Array<String> = Array::<String>::new();
         for (uri in Reading::keys(result, Str::new("changes")).iterate_references()) {
-            const edits: Array<JsonValue*> = Reading::elements(Reading::at(result, Str::new("changes")).unwrap().get(uri.as_str()).unwrap(), Str::new(""));
+            const edits: Array<Value*> = Reading::elements(Reading::at(result, Str::new("changes")).unwrap().get(uri.as_str()).unwrap(), Str::new(""));
             for (edit in edits.iterate_references()) {
                 const start: Position = Position::read(Reading::at(*edit, Str::new("range.start"))).unwrap_or(Position { line: -1, character: -1 });
                 const end: Position = Position::read(Reading::at(*edit, Str::new("range.end"))).unwrap_or(Position { line: -2, character: -1 });
@@ -546,7 +546,7 @@ public type struct Judges {
 
     /// Whether `diagnostic` is of `code` and underlines exactly `width`
     /// characters from `start`.
-    public static underlines(diagnostic: JsonValue*, code: Str, start: &Position, width: i64) -> boolean {
+    public static underlines(diagnostic: Value*, code: Str, start: &Position, width: i64) -> boolean {
         const end: Position = Position { line: start.line, character: start.character + width };
         return Reading::text(diagnostic, Str::new("code")) == code
             && start.matches(Reading::at(diagnostic, Str::new("range.start")))
@@ -555,13 +555,13 @@ public type struct Judges {
 
     /// A `codeAction` check's answer: one quickfix edit in `uri` starting at
     /// `fix_at`, on that line, replacing `replaced`'s width with `new_text`.
-    public static code_action(result: JsonValue*, uri: Str, fix_at: &Position, replaced: Str, new_text: Str) -> Judgement {
+    public static code_action(result: Value*, uri: Str, fix_at: &Position, replaced: Str, new_text: Str) -> Judgement {
         mut found: boolean = false;
         mut fixes: Array<String> = Array::<String>::new();
         for (action in Reading::elements(result, Str::new("")).iterate_references()) {
             if (Reading::text(*action, Str::new("kind")) != Str::new("quickfix")) { continue; }
             for (edit_uri in Reading::keys(*action, Str::new("edit.changes")).iterate_references()) {
-                const edits: Array<JsonValue*> = Reading::elements(Reading::at(*action, Str::new("edit.changes")).unwrap().get(edit_uri.as_str()).unwrap(), Str::new(""));
+                const edits: Array<Value*> = Reading::elements(Reading::at(*action, Str::new("edit.changes")).unwrap().get(edit_uri.as_str()).unwrap(), Str::new(""));
                 for (edit in edits.iterate_references()) {
                     const end: Position = Position::read(Reading::at(*edit, Str::new("range.end"))).unwrap_or(Position { line: -1, character: -1 });
                     const same_file: boolean = Locations::same_uri(edit_uri.as_str(), uri);

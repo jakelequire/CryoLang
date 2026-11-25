@@ -103,12 +103,12 @@ type struct DerivedNames {
             "compare"   => { Option::Some(LangItem::Ord) }
             "hash"      => { Option::Some(LangItem::Hash) }
             "clone"     => { Option::Some(LangItem::Clone) }
-            "ToJson"    => { Option::Some(LangItem::ToJson) }
-            "to_json"   => { Option::Some(LangItem::ToJson) }
-            "FromJson"  => { Option::Some(LangItem::FromJson) }
-            "JsonValue" => { Option::Some(LangItem::JsonValue) }
-            "JsonObject"      => { Option::Some(LangItem::JsonObject) }
-            "JsonDecodeError" => { Option::Some(LangItem::JsonDecodeError) }
+            "ToValue"   => { Option::Some(LangItem::ToValue) }
+            "to_value"  => { Option::Some(LangItem::ToValue) }
+            "FromValue" => { Option::Some(LangItem::FromValue) }
+            "Value"     => { Option::Some(LangItem::Value) }
+            "Object"    => { Option::Some(LangItem::Object) }
+            "DecodeError" => { Option::Some(LangItem::DecodeError) }
             "Str"       => { Option::Some(LangItem::Str) }
             _           => { Option::None }
         };
@@ -432,7 +432,7 @@ implement struct Parser {
             match (item) {
                 Option::None => {
                     this.refuse_derive(entry.span, f"`{entry.text}` cannot be derived",
-                        "a `with` clause generates implementations of `Eq`, `Ord`, `Hash`, `Clone`, `Debug`, `Default`, `ToJson` and `FromJson`, written by those names; implement any other trait by hand",
+                        "a `with` clause generates implementations of `Eq`, `Ord`, `Hash`, `Clone`, `Debug`, `Default`, `ToValue` and `FromValue`, written by those names; implement any other trait by hand",
                         entry.removal, f"remove `{entry.text}` from the `with` clause, and implement it by hand");
                 }
                 Option::Some(trait_item) => {
@@ -449,7 +449,7 @@ implement struct Parser {
                         this.refuse_derive(entry.span, "an enum cannot derive `Default`",
                             "which variant is the default is the type's own choice; implement `Default` by hand",
                             entry.removal, f"remove `{entry.text}` from the `with` clause, and implement `Default` by hand returning the default variant");
-                    } else if (shape.is_enum && (trait_item == LangItem::ToJson || trait_item == LangItem::FromJson)
+                    } else if (shape.is_enum && (trait_item == LangItem::ToValue || trait_item == LangItem::FromValue)
                             && shape.carries_values()) {
                         derived.push(trait_item);
                         this.refuse_derive(entry.span, f"`{entry.text}` cannot be derived for an enum whose variants carry values",
@@ -499,8 +499,8 @@ implement struct Parser {
             LangItem::Hash    => { this.derived_hash(shape) }
             LangItem::Clone   => { this.derived_clone(shape) }
             LangItem::Debug   => { this.derived_debug(shape) }
-            LangItem::ToJson   => { this.derived_to_json(shape) }
-            LangItem::FromJson => { this.derived_from_json(shape) }
+            LangItem::ToValue   => { this.derived_to_value(shape) }
+            LangItem::FromValue => { this.derived_from_value(shape) }
             _                 => { this.derived_default(shape) }
         };
         const text: string = head + " { " + method + " }";
@@ -781,21 +781,21 @@ implement struct Parser {
     }
 
     /// A struct as an object holding each field not skipped under its key,
-    /// in declaration order, as the field's own `to_json()`; one marked
+    /// in declaration order, as the field's own `to_value()`; one marked
     /// `skip_none` is left out when it writes `null`.  An enum, whose
     /// variants carry nothing, as its variant's name.
-    derived_to_json(&this, shape: &DerivedShape) -> string {
+    derived_to_value(&this, shape: &DerivedShape) -> string {
         mut body: string = "";
         if (shape.is_enum) {
             if (shape.variants.length() == 0) {
-                body = "return __derived_JsonValue::Null; ";
+                body = "return __derived_Value::Null; ";
             } else {
                 body = "const name: __derived_Str = match (&this) { ";
                 for (mut v: i64 = 0; v < shape.variants.length(); v++) {
                     body = body + shape.variant_pattern(shape.variants[v], "", this.ctx) + " => { __derived_Str::new(\""
                         + this.ctx.resolve_str(shape.variants[v].name) + "\") } ";
                 }
-                body = body + "}; return name.__derived_to_json(); ";
+                body = body + "}; return name.__derived_to_value(); ";
             }
         } else {
             mut written: [string] = [];
@@ -806,32 +806,32 @@ implement struct Parser {
                 const key: string = "\"" + options.key + "\"";
                 if (options.skip_none) {
                     const local: string = "written_" + fmt::format("%lld", i).into_raw();
-                    written.push("const " + local + ": __derived_JsonValue = this." + name + ".__derived_to_json(); "
+                    written.push("const " + local + ": __derived_Value = this." + name + ".__derived_to_value(); "
                         + "if (!" + local + ".is_null()) { members.put(" + key + ", " + local + "); } ");
                 } else {
-                    written.push("members.put(" + key + ", this." + name + ".__derived_to_json()); ");
+                    written.push("members.put(" + key + ", this." + name + ".__derived_to_value()); ");
                 }
             }
-            body = "mut members: __derived_JsonObject = __derived_JsonObject::with_capacity("
+            body = "mut members: __derived_Object = __derived_Object::with_capacity("
                 + fmt::format("%lld", written.length()).into_raw() + "); ";
             for (mut i: i64 = 0; i < written.length(); i++) { body = body + written[i]; }
-            body = body + "return __derived_JsonValue::Object(members); ";
+            body = body + "return __derived_Value::Object(members); ";
         }
-        return "to_json(&this) -> __derived_JsonValue { " + body + "}";
+        return "to_value(&this) -> __derived_Value { " + body + "}";
     }
 
     /// A struct read from an object, each field from the member under its
-    /// key through its type's `from_json`, a refusal there named by the key;
+    /// key through its type's `from_value`, a refusal there named by the key;
     /// an absent member is the type's `default()` for a `default` field, and
     /// otherwise what the type reads `null` as, or a missing member when it
     /// reads none.  A `skip` field is never read and is its type's
     /// `default()`.  Members the struct does not name are ignored.  An enum
     /// from the string naming one of its variants.
-    derived_from_json(&this, shape: &DerivedShape) -> string {
-        const refused: string = "return __derived_Result::Err(__derived_JsonDecodeError::";
+    derived_from_value(&this, shape: &DerivedShape) -> string {
+        const refused: string = "return __derived_Result::Err(__derived_DecodeError::";
         mut body: string = "";
         if (shape.is_enum) {
-            body = "match (value) { __derived_JsonValue::String(text) => { ";
+            body = "match (value) { __derived_Value::String(text) => { ";
             for (mut v: i64 = 0; v < shape.variants.length(); v++) {
                 const variant: string = this.ctx.resolve_str(shape.variants[v].name);
                 body = body + "if (text.as_str() == __derived_Str::new(\"" + variant + "\")) { return __derived_Result::Ok("
@@ -840,9 +840,9 @@ implement struct Parser {
             body = body + "} _ => { } } " + refused + "unexpected(__derived_Str::new(\"a " + shape.type_name
                 + "\"), value)); ";
         } else {
-            body = "match (value) { __derived_JsonValue::Object(_) => { } _ => { " + refused
+            body = "match (value) { __derived_Value::Object(_) => { } _ => { " + refused
                 + "unexpected(__derived_Str::new(\"an object\"), value)); } } "
-                + "const absent: __derived_JsonValue = __derived_JsonValue::Null; ";
+                + "const absent: __derived_Value = __derived_Value::Null; ";
             mut literal: string = shape.literal_type() + " { ";
             for (mut i: i64 = 0; i < shape.fields.length(); i++) {
                 const field: FieldDecl* = shape.fields[i];
@@ -852,20 +852,20 @@ implement struct Parser {
                 const local: string = "read_" + fmt::format("%lld", i).into_raw();
                 const key: string = "__derived_Str::new(\"" + options.key + "\")";
                 const by_default: string = "(__derived_Default for " + type_text + ")::default()";
-                const from_json: string = "(__derived_FromJson for " + type_text + ")::from_json";
+                const from_value: string = "(__derived_FromValue for " + type_text + ")::from_value";
                 if (options.skip) {
                     body = body + "const " + local + ": " + type_text + " = " + by_default + "; ";
                 } else {
                     const when_absent: string = if (options.defaulted) {
                         by_default
                     } else {
-                        "match (" + from_json + "(&absent)) { __derived_Result::Ok(read) => { read } "
+                        "match (" + from_value + "(&absent)) { __derived_Result::Ok(read) => { read } "
                             + "__derived_Result::Err(_) => { " + refused + "missing_field(" + key + ")); } }"
                     };
                     const member: string = "member_" + fmt::format("%lld", i).into_raw();
                     body = body + "const " + member + " = value.get(" + key + "); "
                         + "const " + local + ": " + type_text + " = if (" + member + ".is_some()) { "
-                        + "match (" + from_json + "(" + member + ".unwrap())) { "
+                        + "match (" + from_value + "(" + member + ".unwrap())) { "
                         + "__derived_Result::Ok(read) => { read } "
                         + "__derived_Result::Err(error) => { return __derived_Result::Err(error.at_field(" + key + ")); } } "
                         + "} else { " + when_absent + " }; ";
@@ -875,8 +875,8 @@ implement struct Parser {
             }
             body = body + "return __derived_Result::Ok(" + literal + " }); ";
         }
-        return "static from_json(value: &__derived_JsonValue) -> __derived_Result<" + shape.self_type()
-            + ", __derived_JsonDecodeError> { " + body + "}";
+        return "static from_value(value: &__derived_Value) -> __derived_Result<" + shape.self_type()
+            + ", __derived_DecodeError> { " + body + "}";
     }
 
     /// A field's type as an impl-qualified path's target spells it: as

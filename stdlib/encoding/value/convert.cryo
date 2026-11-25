@@ -1,0 +1,409 @@
+///! Typed values: a value of a Cryo type written as a `Value`
+///! (`ToValue`), and read back from one (`FromValue`), whatever text
+///! format the `Value` is read from or written as.
+///!
+///! ```cryo
+///! const ports: Array<u16> = ...;
+///! const text: String = json::Json::to_text(&ports.to_value());
+///! const back: Array<u16> = Array::<u16>::from_value(&json::Json::parse(text.as_str())?)?;
+///! ```
+///!
+///! The standard types implement both: `boolean`, every integer width,
+///! `f32`, `f64`, `String`, `Array<T>` (an array), and
+///! `HashMap<String, V>` and `BTreeMap<String, V>` (an object, one member
+///! per key), and `Option<T>` (`None` as `Null`). `Str` is written only.
+///! Reading checks the shape and the range: `300` read as a `u8` is a
+///! `DecodeError` naming where in the value it was and what was expected
+///! there, not a wrapped value.
+///!
+///! `TryFrom<&Value>` and `value.as::<T>()` stay the way to borrow a
+///! scalar out of a value in place; `FromValue` builds an owned value of any
+///! shape and says where reading it failed.
+
+namespace std::encoding::value::convert;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::alloc::allocator::{ GlobalAllocator };
+import std::core::default::{ Default };
+import std::core::hash::{ Hasher };
+import std::collections::hashmap::{ HashMap };
+import std::collections::btree_map::{ BTreeMap };
+import std::encoding::value::model::{ Number, Object, Value };
+
+/// A value that can be written as a `Value`.
+![language("to_json")]
+public type trait ToValue {
+    /// This value as a `Value` the caller owns.
+    to_value(&this) -> Value;
+}
+
+/// A value that can be read from a `Value`.
+![language("from_json")]
+public type trait FromValue {
+    /// Read a value of this type from `value`, or say where in it and why
+    /// it could not be read.
+    static from_value(value: &Value) -> Result<This, DecodeError>;
+}
+
+/// Why a `Value` could not be read as a type: where in it (`path`, from
+/// the value read: `.servers[2].port`, empty for the value itself), what
+/// was expected there and what was found. It prints as
+/// `at .servers[2].port: expected a u16, found a string`.
+![language("json_decode_error")]
+public type struct DecodeError {
+    private path: String;
+    private expected: Str;
+    private found: Str;
+
+    /// `value` was found where `expected` (`"a u16"`, `"an object"`) was
+    /// wanted.
+    public static unexpected(expected: Str, value: &Value) -> DecodeError {
+        const found: string = match (value) {
+            Value::Null      => { "null" }
+            Value::Bool(_)   => { "a boolean" }
+            Value::Number(_) => { "a number" }
+            Value::String(_) => { "a string" }
+            Value::Array(_)  => { "an array" }
+            Value::Object(_) => { "an object" }
+        };
+        return DecodeError { path: String::new(), expected: expected, found: Str::new(found) };
+    }
+
+    /// A number was found where `expected` was wanted, but it is out of
+    /// that type's range or is not a whole number.
+    public static out_of_range(expected: Str) -> DecodeError {
+        return DecodeError { path: String::new(), expected: expected,
+                                 found: Str::new("a number out of its range") };
+    }
+
+    /// An object has no member `name`, which the type being read needs.
+    public static missing_field(name: Str) -> DecodeError {
+        return DecodeError { path: f".{name}", expected: Str::new("a value"),
+                                 found: Str::new("nothing") };
+    }
+
+    /// This error, met reading the member `name` of an object.
+    public at_field(this, name: Str) -> DecodeError {
+        return DecodeError { path: f".{name}{this.path}", expected: this.expected, found: this.found };
+    }
+
+    /// This error, met reading the element `index` of an array.
+    public at_index(this, index: i64) -> DecodeError {
+        return DecodeError { path: f"[{index}]{this.path}", expected: this.expected, found: this.found };
+    }
+
+    /// Where the value that could not be read is: `.servers[2].port`, or
+    /// empty for the value read itself.
+    public path(&this) -> Str {
+        return this.path.as_str();
+    }
+
+    /// What was wanted there: `a u16`, `an object`.
+    public expected(&this) -> Str {
+        return this.expected;
+    }
+
+    /// What was there: `a string`, `a number out of its range`, `nothing`.
+    public found(&this) -> Str {
+        return this.found;
+    }
+}
+
+// A number read as an integer type: `value` must be a whole number from
+// `minimum` to `maximum`. Signed widths read through `i64`, unsigned
+// widths through `u64`.
+private function signed_from_value(value: &Value, minimum: i64, maximum: i64, expected: string) -> Result<i64, DecodeError> {
+    match (value) {
+        Value::Number(number) => {
+            match (number.as_i64()) {
+                Option::Some(whole) => {
+                    if (whole >= minimum && whole <= maximum) { return Result::Ok(whole); }
+                }
+                Option::None => { }
+            }
+            return Result::Err(DecodeError::out_of_range(Str::new(expected)));
+        }
+        _ => { return Result::Err(DecodeError::unexpected(Str::new(expected), value)); }
+    }
+}
+
+private function unsigned_from_value(value: &Value, maximum: u64, expected: string) -> Result<u64, DecodeError> {
+    match (value) {
+        Value::Number(number) => {
+            match (number.as_u64()) {
+                Option::Some(whole) => {
+                    if (whole <= maximum) { return Result::Ok(whole); }
+                }
+                Option::None => { }
+            }
+            return Result::Err(DecodeError::out_of_range(Str::new(expected)));
+        }
+        _ => { return Result::Err(DecodeError::unexpected(Str::new(expected), value)); }
+    }
+}
+
+// An unsigned value is written as `Int` when it fits, as the parser reads
+// it, so a value written and parsed again is the same `Number`.
+private function unsigned_to_value(value: u64) -> Value {
+    if (value <= i64::MAX as u64) { return Value::integer_value(value as i64); }
+    return Value::unsigned_integer_value(value);
+}
+
+implement trait ToValue for boolean {
+    to_value(&this) -> Value { return Value::Bool(this); }
+}
+
+implement trait FromValue for boolean {
+    static from_value(value: &Value) -> Result<boolean, DecodeError> {
+        return match (value) {
+            Value::Bool(b) => { Result::Ok(b) }
+            _                  => { Result::Err(DecodeError::unexpected(Str::new("a boolean"), value)) }
+        };
+    }
+}
+
+implement trait ToValue for i8 {
+    to_value(&this) -> Value { return Value::integer_value(this); }
+}
+
+implement trait FromValue for i8 {
+    static from_value(value: &Value) -> Result<i8, DecodeError> {
+        return Result::Ok(signed_from_value(value, i8::MIN, i8::MAX, "an i8")? as i8);
+    }
+}
+
+implement trait ToValue for i16 {
+    to_value(&this) -> Value { return Value::integer_value(this); }
+}
+
+implement trait FromValue for i16 {
+    static from_value(value: &Value) -> Result<i16, DecodeError> {
+        return Result::Ok(signed_from_value(value, i16::MIN, i16::MAX, "an i16")? as i16);
+    }
+}
+
+implement trait ToValue for i32 {
+    to_value(&this) -> Value { return Value::integer_value(this); }
+}
+
+implement trait FromValue for i32 {
+    static from_value(value: &Value) -> Result<i32, DecodeError> {
+        return Result::Ok(signed_from_value(value, i32::MIN, i32::MAX, "an i32")? as i32);
+    }
+}
+
+implement trait ToValue for i64 {
+    to_value(&this) -> Value { return Value::integer_value(this); }
+}
+
+implement trait FromValue for i64 {
+    static from_value(value: &Value) -> Result<i64, DecodeError> {
+        return signed_from_value(value, i64::MIN, i64::MAX, "an i64");
+    }
+}
+
+implement trait ToValue for u8 {
+    to_value(&this) -> Value { return unsigned_to_value(this); }
+}
+
+implement trait FromValue for u8 {
+    static from_value(value: &Value) -> Result<u8, DecodeError> {
+        return Result::Ok(unsigned_from_value(value, u8::MAX, "a u8")? as u8);
+    }
+}
+
+implement trait ToValue for u16 {
+    to_value(&this) -> Value { return unsigned_to_value(this); }
+}
+
+implement trait FromValue for u16 {
+    static from_value(value: &Value) -> Result<u16, DecodeError> {
+        return Result::Ok(unsigned_from_value(value, u16::MAX, "a u16")? as u16);
+    }
+}
+
+implement trait ToValue for u32 {
+    to_value(&this) -> Value { return unsigned_to_value(this); }
+}
+
+implement trait FromValue for u32 {
+    static from_value(value: &Value) -> Result<u32, DecodeError> {
+        return Result::Ok(unsigned_from_value(value, u32::MAX, "a u32")? as u32);
+    }
+}
+
+implement trait ToValue for u64 {
+    to_value(&this) -> Value { return unsigned_to_value(this); }
+}
+
+implement trait FromValue for u64 {
+    static from_value(value: &Value) -> Result<u64, DecodeError> {
+        return unsigned_from_value(value, u64::MAX, "a u64");
+    }
+}
+
+/// A NaN or an infinity has no JSON number; the serializer writes it as
+/// `null`, which reads back as an error, not as the number.
+implement trait ToValue for f64 {
+    to_value(&this) -> Value { return Value::Number(Number::Float(this)); }
+}
+
+implement trait FromValue for f64 {
+    static from_value(value: &Value) -> Result<f64, DecodeError> {
+        return match (value) {
+            Value::Number(number) => { Result::Ok(number.as_f64()) }
+            _                         => { Result::Err(DecodeError::unexpected(Str::new("an f64"), value)) }
+        };
+    }
+}
+
+/// Written as the number's value, which an `f64` holds exactly.
+implement trait ToValue for f32 {
+    to_value(&this) -> Value { return Value::Number(Number::Float(this)); }
+}
+
+/// The nearest `f32` to the number written.
+implement trait FromValue for f32 {
+    static from_value(value: &Value) -> Result<f32, DecodeError> {
+        return match (value) {
+            Value::Number(number) => { Result::Ok(number.as_f64() as f32) }
+            _                         => { Result::Err(DecodeError::unexpected(Str::new("an f32"), value)) }
+        };
+    }
+}
+
+implement<A> trait ToValue for struct String<A> {
+    to_value(&this) -> Value { return Value::from(this.as_str()); }
+}
+
+implement trait FromValue for struct String<GlobalAllocator> {
+    static from_value(value: &Value) -> Result<String, DecodeError> {
+        return match (value) {
+            Value::String(text) => { Result::Ok(String::from_str(text.as_str())) }
+            _                       => { Result::Err(DecodeError::unexpected(Str::new("a string"), value)) }
+        };
+    }
+}
+
+/// Written only: a `Str` borrows its text, so reading one is
+/// `value.as::<Str>()`, a view into the value read.
+implement trait ToValue for Str {
+    to_value(&this) -> Value { return Value::from(this); }
+}
+
+/// `null` reads as `None`, anything else as `Some` of the value read as `T`.
+implement<T> trait FromValue for enum Option<T> where T: FromValue {
+    static from_value(value: &Value) -> Result<Option<T>, DecodeError> {
+        if (value.is_null()) { return Result::Ok(Option::None); }
+        return Result::Ok(Option::Some(T::from_value(value)?));
+    }
+}
+
+/// `None` is written as `null`.
+implement<T> trait ToValue for enum Option<T> where T: ToValue {
+    to_value(&this) -> Value {
+        return match (this) {
+            Option::Some(inner) => { inner.to_value() }
+            Option::None        => { Value::Null }
+        };
+    }
+}
+
+implement<T, A> trait ToValue for struct Array<T, A> where T: ToValue {
+    to_value(&this) -> Value {
+        mut items: Array<Value> = Array::with_capacity(this.length());
+        for (item in this.iterate_references()) {
+            items.push(item.to_value());
+        }
+        return Value::Array(items);
+    }
+}
+
+/// A JSON array, each element read as `T`; an element that cannot be is
+/// named by its index in the error.
+implement<T> trait FromValue for struct Array<T, GlobalAllocator> where T: FromValue {
+    static from_value(value: &Value) -> Result<Array<T, GlobalAllocator>, DecodeError> {
+        match (value) {
+            Value::Array(elements) => {
+                mut items: Array<T> = Array::with_capacity(elements.length());
+                for (mut index: i64 = 0; index < elements.length(); index++) {
+                    match (T::from_value(&elements[index])) {
+                        Result::Ok(item) => { items.push(item); }
+                        Result::Err(error) => { return Result::Err(error.at_index(index)); }
+                    }
+                }
+                return Result::Ok(items);
+            }
+            _ => { return Result::Err(DecodeError::unexpected(Str::new("an array"), value)); }
+        }
+    }
+}
+
+/// A JSON object, one member per entry, in the map's iteration order.
+implement<V, H> trait ToValue for struct HashMap<String<GlobalAllocator>, V, GlobalAllocator, H> where V: ToValue {
+    to_value(&this) -> Value {
+        mut object: Object = Object::with_capacity(this.length());
+        for (entry in this.entries()) {
+            object.insert(String::from_str(entry.first.as_str()), entry.second.to_value());
+        }
+        return Value::Object(object);
+    }
+}
+
+/// A JSON object, each member's value read as `V`; one that cannot be is
+/// named by its key in the error. A key written twice keeps its last value.
+implement<V, H> trait FromValue for struct HashMap<String<GlobalAllocator>, V, GlobalAllocator, H> where V: FromValue, H: Hasher + Copy + Default {
+    static from_value(value: &Value) -> Result<HashMap<String<GlobalAllocator>, V, GlobalAllocator, H>, DecodeError> {
+        match (value) {
+            Value::Object(members) => {
+                mut map: HashMap<String<GlobalAllocator>, V, GlobalAllocator, H> = HashMap::new();
+                for (mut index: i64 = 0; index < members.length(); index++) {
+                    const key: Str = members.key_at(index).unwrap();
+                    match (V::from_value(members.value_at(index).unwrap())) {
+                        Result::Ok(item) => { map.insert(String::from_str(key), item); }
+                        Result::Err(error) => { return Result::Err(error.at_field(key)); }
+                    }
+                }
+                return Result::Ok(map);
+            }
+            _ => { return Result::Err(DecodeError::unexpected(Str::new("an object"), value)); }
+        }
+    }
+}
+
+/// A JSON object, one member per entry, in key order.
+implement<V> trait ToValue for struct BTreeMap<String<GlobalAllocator>, V, GlobalAllocator> where V: ToValue {
+    to_value(&this) -> Value {
+        mut object: Object = Object::with_capacity(this.length());
+        for (entry in this.entries()) {
+            object.insert(String::from_str(entry.first.as_str()), entry.second.to_value());
+        }
+        return Value::Object(object);
+    }
+}
+
+/// A JSON object, each member's value read as `V`; one that cannot be is
+/// named by its key in the error. A key written twice keeps its last value.
+implement<V> trait FromValue for struct BTreeMap<String<GlobalAllocator>, V, GlobalAllocator> where V: FromValue {
+    static from_value(value: &Value) -> Result<BTreeMap<String<GlobalAllocator>, V, GlobalAllocator>, DecodeError> {
+        match (value) {
+            Value::Object(members) => {
+                mut map: BTreeMap<String<GlobalAllocator>, V> = BTreeMap::new();
+                for (mut index: i64 = 0; index < members.length(); index++) {
+                    const key: Str = members.key_at(index).unwrap();
+                    match (V::from_value(members.value_at(index).unwrap())) {
+                        Result::Ok(item) => { map.insert(String::from_str(key), item); }
+                        Result::Err(error) => { return Result::Err(error.at_field(key)); }
+                    }
+                }
+                return Result::Ok(map);
+            }
+            _ => { return Result::Err(DecodeError::unexpected(Str::new("an object"), value)); }
+        }
+    }
+}
+
