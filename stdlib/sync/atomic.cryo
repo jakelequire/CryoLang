@@ -1,24 +1,36 @@
 ///! Atomic primitives for concurrent code.
 ///!
-///! A single generic `Atomic<T>` wraps one cell of integer-typed storage and
-///! exposes load, store, fetch_add/sub/and/or/xor, swap, and
-///! compare_exchange - all driven by the compiler's atomic intrinsics, which
-///! lower directly to LLVM's `atomicrmw` / `cmpxchg` / atomic `load` / `store`
-///! instructions.  No libc, no spin loops, no calls.
+///! A single generic `Atomic<T>` wraps one cell of storage and exposes load,
+///! store, fetch_add/sub/and/or/xor, swap, and compare_exchange - all driven
+///! by the compiler's atomic intrinsics, which lower directly to LLVM's
+///! `atomicrmw` / `cmpxchg` / atomic `load` / `store` instructions.  No libc,
+///! no spin loops, no calls.
 ///!
 ///! `T` is dispatched at compile time with `static match (T)`: each method
 ///! body keeps only the arm for the concrete `T` (the rest are pruned before
 ///! type-checking), so `Atomic<u32>::load` lowers to exactly the `u32` atomic
-///! and nothing else.  LLVM does not distinguish signed/unsigned for atomic
-///! integer memory ops, so the signed (`i32`/`i64`) and `boolean` arms bitcast
-///! onto the same unsigned intrinsics.
+///! and nothing else.  The intrinsics come in 8, 16, 32 and 64 bits over
+///! unsigned integers; every other type is reinterpreted onto the unsigned
+///! intrinsic of its width: the signed integers bit for bit, `usize` and
+///! `isize` onto the target's pointer width (`sizeof`, a constant, picks
+///! the arm), and `boolean` onto 8 bits as 0 or 1.
 ///!
-///! Supported `T`: `u8`, `u32`, `u64`, `i32`, `i64`, `boolean`.  Instantiating
-///! `Atomic<T>` with any other type is a compile error (E0645): the absence
-///! of a matching `static match` arm IS the type constraint (no trait bound
-///! needed).  `fetch_add` and `fetch_subtract` are an integer cell's alone
-///! (`where T: Integer`): on `Atomic<boolean>` they are refused, since
-///! arithmetic on the 0/1 backing byte would store a byte that is neither.
+///! Supported `T`: `u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`, `i32`,
+///! `i64`, `isize` and `boolean`.  Instantiating `Atomic<T>` with any other
+///! type - `i128` and `u128` among them, which no single-width atomic holds -
+///! is a compile error (E0645): the absence of a matching `static match` arm
+///! IS the type constraint.
+///!
+///! `fetch_add` and `fetch_subtract` are an integer cell's alone (`where T:
+///! Integer`): on `Atomic<boolean>` they are refused, since arithmetic on the
+///! 0/1 backing byte would store a byte that is neither.  `fetch_and`,
+///! `fetch_or` and `fetch_xor` take the integers and `boolean` too - AND, OR
+///! and XOR of two 0/1 bytes is again 0 or 1, so a boolean cell keeps its
+///! meaning.  No marker trait names "an integer or `boolean`", so those three
+///! carry no bound and their arm set is the constraint.  Every method of
+///! `Atomic<T>` without a bound is built for each `T` a program uses, so a
+///! cell type needs an arm in all of them: that is why there is no `char`
+///! or float cell, whose bitwise read-modify-writes would have no meaning.
 ///!
 ///! Every operation takes an `MemoryOrder` describing the memory-model
 ///! constraints around it.  When in doubt, `SeqCst` is the always-safe
@@ -138,10 +150,23 @@ public type struct Atomic<T> {
     public load(&this, order: MemoryOrder) -> T {
         return static match (T) {
             u8      => { intrinsics::atomic_load_u8(&this.value, MemoryOrder::to_u32(order)) }
+            u16     => { intrinsics::atomic_load_u16(&this.value, MemoryOrder::to_u32(order)) }
             u32     => { intrinsics::atomic_load_u32(&this.value, MemoryOrder::to_u32(order)) }
             u64     => { intrinsics::atomic_load_u64(&this.value, MemoryOrder::to_u32(order)) }
+            usize   => {
+                const word: usize = if (sizeof(usize) == 8) { intrinsics::atomic_load_u64(&this.value as const u64*, MemoryOrder::to_u32(order)) as usize }
+                else { intrinsics::atomic_load_u32(&this.value as const u32*, MemoryOrder::to_u32(order)) as usize };
+                word
+            }
+            i8      => { intrinsics::atomic_load_u8(&this.value as const u8*, MemoryOrder::to_u32(order)) as i8 }
+            i16     => { intrinsics::atomic_load_u16(&this.value as const u16*, MemoryOrder::to_u32(order)) as i16 }
             i32     => { intrinsics::atomic_load_u32(&this.value as const u32*, MemoryOrder::to_u32(order)) as i32 }
             i64     => { intrinsics::atomic_load_u64(&this.value as const u64*, MemoryOrder::to_u32(order)) as i64 }
+            isize   => {
+                const word: isize = if (sizeof(isize) == 8) { intrinsics::atomic_load_u64(&this.value as const u64*, MemoryOrder::to_u32(order)) as isize }
+                else { intrinsics::atomic_load_u32(&this.value as const u32*, MemoryOrder::to_u32(order)) as isize };
+                word
+            }
             boolean => { intrinsics::atomic_load_u8(&this.value as const u8*, MemoryOrder::to_u32(order)) != 0 }
         };
     }
@@ -153,10 +178,21 @@ public type struct Atomic<T> {
     public store(&this,val: T, order: MemoryOrder) -> void {
         static match (T) {
             u8      => { intrinsics::atomic_store_u8(&this.value, val, MemoryOrder::to_u32(order)); }
+            u16     => { intrinsics::atomic_store_u16(&this.value, val, MemoryOrder::to_u32(order)); }
             u32     => { intrinsics::atomic_store_u32(&this.value, val, MemoryOrder::to_u32(order)); }
             u64     => { intrinsics::atomic_store_u64(&this.value, val, MemoryOrder::to_u32(order)); }
+            usize   => {
+                if (sizeof(usize) == 8) { intrinsics::atomic_store_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)); }
+                else { intrinsics::atomic_store_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)); }
+            }
+            i8      => { intrinsics::atomic_store_u8(&this.value as u8*, val as u8, MemoryOrder::to_u32(order)); }
+            i16     => { intrinsics::atomic_store_u16(&this.value as u16*, val as u16, MemoryOrder::to_u32(order)); }
             i32     => { intrinsics::atomic_store_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)); }
             i64     => { intrinsics::atomic_store_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)); }
+            isize   => {
+                if (sizeof(isize) == 8) { intrinsics::atomic_store_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)); }
+                else { intrinsics::atomic_store_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)); }
+            }
             boolean => {
                 const b: u8 = if (val) { 1 } else { 0 };
                 intrinsics::atomic_store_u8(&this.value as u8*, b, MemoryOrder::to_u32(order));
@@ -168,13 +204,26 @@ public type struct Atomic<T> {
     /// integer cell's alone: `Atomic<boolean>` has no `fetch_add`.
     public fetch_add(&this,val: T, order: MemoryOrder) -> T where T: Integer {
         return static match (T) {
-            u8  => { intrinsics::atomic_add_u8(&this.value, val, MemoryOrder::to_u32(order)) }
-            u32 => { intrinsics::atomic_add_u32(&this.value, val, MemoryOrder::to_u32(order)) }
-            u64 => { intrinsics::atomic_add_u64(&this.value, val, MemoryOrder::to_u32(order)) }
-            i32 => { intrinsics::atomic_add_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
-            i64 => { intrinsics::atomic_add_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
+            u8    => { intrinsics::atomic_add_u8(&this.value, val, MemoryOrder::to_u32(order)) }
+            u16   => { intrinsics::atomic_add_u16(&this.value, val, MemoryOrder::to_u32(order)) }
+            u32   => { intrinsics::atomic_add_u32(&this.value, val, MemoryOrder::to_u32(order)) }
+            u64   => { intrinsics::atomic_add_u64(&this.value, val, MemoryOrder::to_u32(order)) }
+            usize => {
+                const word: usize = if (sizeof(usize) == 8) { intrinsics::atomic_add_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as usize }
+                else { intrinsics::atomic_add_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as usize };
+                word
+            }
+            i8    => { intrinsics::atomic_add_u8(&this.value as u8*, val as u8, MemoryOrder::to_u32(order)) as i8 }
+            i16   => { intrinsics::atomic_add_u16(&this.value as u16*, val as u16, MemoryOrder::to_u32(order)) as i16 }
+            i32   => { intrinsics::atomic_add_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
+            i64   => { intrinsics::atomic_add_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
+            isize => {
+                const word: isize = if (sizeof(isize) == 8) { intrinsics::atomic_add_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as isize }
+                else { intrinsics::atomic_add_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as isize };
+                word
+            }
             // No cell holds another integer: `load` and `store` refuse it.
-            _   => { unreachable() }
+            _     => { unreachable() }
         };
     }
 
@@ -183,24 +232,50 @@ public type struct Atomic<T> {
     /// `fetch_subtract`.
     public fetch_subtract(&this,val: T, order: MemoryOrder) -> T where T: Integer {
         return static match (T) {
-            u8  => { intrinsics::atomic_sub_u8(&this.value, val, MemoryOrder::to_u32(order)) }
-            u32 => { intrinsics::atomic_sub_u32(&this.value, val, MemoryOrder::to_u32(order)) }
-            u64 => { intrinsics::atomic_sub_u64(&this.value, val, MemoryOrder::to_u32(order)) }
-            i32 => { intrinsics::atomic_sub_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
-            i64 => { intrinsics::atomic_sub_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
+            u8    => { intrinsics::atomic_sub_u8(&this.value, val, MemoryOrder::to_u32(order)) }
+            u16   => { intrinsics::atomic_sub_u16(&this.value, val, MemoryOrder::to_u32(order)) }
+            u32   => { intrinsics::atomic_sub_u32(&this.value, val, MemoryOrder::to_u32(order)) }
+            u64   => { intrinsics::atomic_sub_u64(&this.value, val, MemoryOrder::to_u32(order)) }
+            usize => {
+                const word: usize = if (sizeof(usize) == 8) { intrinsics::atomic_sub_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as usize }
+                else { intrinsics::atomic_sub_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as usize };
+                word
+            }
+            i8    => { intrinsics::atomic_sub_u8(&this.value as u8*, val as u8, MemoryOrder::to_u32(order)) as i8 }
+            i16   => { intrinsics::atomic_sub_u16(&this.value as u16*, val as u16, MemoryOrder::to_u32(order)) as i16 }
+            i32   => { intrinsics::atomic_sub_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
+            i64   => { intrinsics::atomic_sub_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
+            isize => {
+                const word: isize = if (sizeof(isize) == 8) { intrinsics::atomic_sub_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as isize }
+                else { intrinsics::atomic_sub_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as isize };
+                word
+            }
             // No cell holds another integer: `load` and `store` refuse it.
-            _   => { unreachable() }
+            _     => { unreachable() }
         };
     }
 
     /// AND the cell with `val`.  Returns the previous value.
     public fetch_and(&this,val: T, order: MemoryOrder) -> T {
         return static match (T) {
-            u8  => { intrinsics::atomic_and_u8(&this.value, val, MemoryOrder::to_u32(order)) }
-            u32 => { intrinsics::atomic_and_u32(&this.value, val, MemoryOrder::to_u32(order)) }
-            u64 => { intrinsics::atomic_and_u64(&this.value, val, MemoryOrder::to_u32(order)) }
-            i32 => { intrinsics::atomic_and_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
-            i64 => { intrinsics::atomic_and_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
+            u8    => { intrinsics::atomic_and_u8(&this.value, val, MemoryOrder::to_u32(order)) }
+            u16   => { intrinsics::atomic_and_u16(&this.value, val, MemoryOrder::to_u32(order)) }
+            u32   => { intrinsics::atomic_and_u32(&this.value, val, MemoryOrder::to_u32(order)) }
+            u64   => { intrinsics::atomic_and_u64(&this.value, val, MemoryOrder::to_u32(order)) }
+            usize => {
+                const word: usize = if (sizeof(usize) == 8) { intrinsics::atomic_and_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as usize }
+                else { intrinsics::atomic_and_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as usize };
+                word
+            }
+            i8    => { intrinsics::atomic_and_u8(&this.value as u8*, val as u8, MemoryOrder::to_u32(order)) as i8 }
+            i16   => { intrinsics::atomic_and_u16(&this.value as u16*, val as u16, MemoryOrder::to_u32(order)) as i16 }
+            i32   => { intrinsics::atomic_and_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
+            i64   => { intrinsics::atomic_and_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
+            isize => {
+                const word: isize = if (sizeof(isize) == 8) { intrinsics::atomic_and_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as isize }
+                else { intrinsics::atomic_and_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as isize };
+                word
+            }
             boolean => {
                 const b: u8 = if (val) { 1 } else { 0 };
                 intrinsics::atomic_and_u8(&this.value as u8*, b, MemoryOrder::to_u32(order)) != 0
@@ -211,11 +286,24 @@ public type struct Atomic<T> {
     /// OR the cell with `val`.  Returns the previous value.
     public fetch_or(&this,val: T, order: MemoryOrder) -> T {
         return static match (T) {
-            u8  => { intrinsics::atomic_or_u8(&this.value, val, MemoryOrder::to_u32(order)) }
-            u32 => { intrinsics::atomic_or_u32(&this.value, val, MemoryOrder::to_u32(order)) }
-            u64 => { intrinsics::atomic_or_u64(&this.value, val, MemoryOrder::to_u32(order)) }
-            i32 => { intrinsics::atomic_or_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
-            i64 => { intrinsics::atomic_or_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
+            u8    => { intrinsics::atomic_or_u8(&this.value, val, MemoryOrder::to_u32(order)) }
+            u16   => { intrinsics::atomic_or_u16(&this.value, val, MemoryOrder::to_u32(order)) }
+            u32   => { intrinsics::atomic_or_u32(&this.value, val, MemoryOrder::to_u32(order)) }
+            u64   => { intrinsics::atomic_or_u64(&this.value, val, MemoryOrder::to_u32(order)) }
+            usize => {
+                const word: usize = if (sizeof(usize) == 8) { intrinsics::atomic_or_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as usize }
+                else { intrinsics::atomic_or_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as usize };
+                word
+            }
+            i8    => { intrinsics::atomic_or_u8(&this.value as u8*, val as u8, MemoryOrder::to_u32(order)) as i8 }
+            i16   => { intrinsics::atomic_or_u16(&this.value as u16*, val as u16, MemoryOrder::to_u32(order)) as i16 }
+            i32   => { intrinsics::atomic_or_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
+            i64   => { intrinsics::atomic_or_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
+            isize => {
+                const word: isize = if (sizeof(isize) == 8) { intrinsics::atomic_or_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as isize }
+                else { intrinsics::atomic_or_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as isize };
+                word
+            }
             boolean => {
                 const b: u8 = if (val) { 1 } else { 0 };
                 intrinsics::atomic_or_u8(&this.value as u8*, b, MemoryOrder::to_u32(order)) != 0
@@ -226,11 +314,24 @@ public type struct Atomic<T> {
     /// XOR the cell with `val`.  Returns the previous value.
     public fetch_xor(&this,val: T, order: MemoryOrder) -> T {
         return static match (T) {
-            u8  => { intrinsics::atomic_xor_u8(&this.value, val, MemoryOrder::to_u32(order)) }
-            u32 => { intrinsics::atomic_xor_u32(&this.value, val, MemoryOrder::to_u32(order)) }
-            u64 => { intrinsics::atomic_xor_u64(&this.value, val, MemoryOrder::to_u32(order)) }
-            i32 => { intrinsics::atomic_xor_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
-            i64 => { intrinsics::atomic_xor_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
+            u8    => { intrinsics::atomic_xor_u8(&this.value, val, MemoryOrder::to_u32(order)) }
+            u16   => { intrinsics::atomic_xor_u16(&this.value, val, MemoryOrder::to_u32(order)) }
+            u32   => { intrinsics::atomic_xor_u32(&this.value, val, MemoryOrder::to_u32(order)) }
+            u64   => { intrinsics::atomic_xor_u64(&this.value, val, MemoryOrder::to_u32(order)) }
+            usize => {
+                const word: usize = if (sizeof(usize) == 8) { intrinsics::atomic_xor_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as usize }
+                else { intrinsics::atomic_xor_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as usize };
+                word
+            }
+            i8    => { intrinsics::atomic_xor_u8(&this.value as u8*, val as u8, MemoryOrder::to_u32(order)) as i8 }
+            i16   => { intrinsics::atomic_xor_u16(&this.value as u16*, val as u16, MemoryOrder::to_u32(order)) as i16 }
+            i32   => { intrinsics::atomic_xor_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
+            i64   => { intrinsics::atomic_xor_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
+            isize => {
+                const word: isize = if (sizeof(isize) == 8) { intrinsics::atomic_xor_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as isize }
+                else { intrinsics::atomic_xor_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as isize };
+                word
+            }
             boolean => {
                 const b: u8 = if (val) { 1 } else { 0 };
                 intrinsics::atomic_xor_u8(&this.value as u8*, b, MemoryOrder::to_u32(order)) != 0
@@ -242,11 +343,24 @@ public type struct Atomic<T> {
     /// previous value.
     public swap(&this,val: T, order: MemoryOrder) -> T {
         return static match (T) {
-            u8  => { intrinsics::atomic_swap_u8(&this.value, val, MemoryOrder::to_u32(order)) }
-            u32 => { intrinsics::atomic_swap_u32(&this.value, val, MemoryOrder::to_u32(order)) }
-            u64 => { intrinsics::atomic_swap_u64(&this.value, val, MemoryOrder::to_u32(order)) }
-            i32 => { intrinsics::atomic_swap_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
-            i64 => { intrinsics::atomic_swap_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
+            u8    => { intrinsics::atomic_swap_u8(&this.value, val, MemoryOrder::to_u32(order)) }
+            u16   => { intrinsics::atomic_swap_u16(&this.value, val, MemoryOrder::to_u32(order)) }
+            u32   => { intrinsics::atomic_swap_u32(&this.value, val, MemoryOrder::to_u32(order)) }
+            u64   => { intrinsics::atomic_swap_u64(&this.value, val, MemoryOrder::to_u32(order)) }
+            usize => {
+                const word: usize = if (sizeof(usize) == 8) { intrinsics::atomic_swap_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as usize }
+                else { intrinsics::atomic_swap_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as usize };
+                word
+            }
+            i8    => { intrinsics::atomic_swap_u8(&this.value as u8*, val as u8, MemoryOrder::to_u32(order)) as i8 }
+            i16   => { intrinsics::atomic_swap_u16(&this.value as u16*, val as u16, MemoryOrder::to_u32(order)) as i16 }
+            i32   => { intrinsics::atomic_swap_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as i32 }
+            i64   => { intrinsics::atomic_swap_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as i64 }
+            isize => {
+                const word: isize = if (sizeof(isize) == 8) { intrinsics::atomic_swap_u64(&this.value as u64*, val as u64, MemoryOrder::to_u32(order)) as isize }
+                else { intrinsics::atomic_swap_u32(&this.value as u32*, val as u32, MemoryOrder::to_u32(order)) as isize };
+                word
+            }
             boolean => {
                 const b: u8 = if (val) { 1 } else { 0 };
                 intrinsics::atomic_swap_u8(&this.value as u8*, b, MemoryOrder::to_u32(order)) != 0
@@ -262,6 +376,14 @@ public type struct Atomic<T> {
             u8 => {
                 mut ok: boolean = false;
                 const loaded: u8 = intrinsics::atomic_cmpxchg_u8(
+                    &this.value, current, next,
+                    MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok);
+                if (ok) { return Result::Ok(loaded); }
+                return Result::Err(loaded);
+            }
+            u16 => {
+                mut ok: boolean = false;
+                const loaded: u16 = intrinsics::atomic_cmpxchg_u16(
                     &this.value, current, next,
                     MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok);
                 if (ok) { return Result::Ok(loaded); }
@@ -283,6 +405,36 @@ public type struct Atomic<T> {
                 if (ok) { return Result::Ok(loaded); }
                 return Result::Err(loaded);
             }
+            usize => {
+                mut ok: boolean = false;
+                const loaded: usize = if (sizeof(usize) == 8) {
+                    intrinsics::atomic_cmpxchg_u64(
+                        &this.value as u64*, current as u64, next as u64,
+                        MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok) as usize
+                } else {
+                    intrinsics::atomic_cmpxchg_u32(
+                        &this.value as u32*, current as u32, next as u32,
+                        MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok) as usize
+                };
+                if (ok) { return Result::Ok(loaded); }
+                return Result::Err(loaded);
+            }
+            i8 => {
+                mut ok: boolean = false;
+                const loaded: u8 = intrinsics::atomic_cmpxchg_u8(
+                    &this.value as u8*, current as u8, next as u8,
+                    MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok);
+                if (ok) { return Result::Ok(loaded as i8); }
+                return Result::Err(loaded as i8);
+            }
+            i16 => {
+                mut ok: boolean = false;
+                const loaded: u16 = intrinsics::atomic_cmpxchg_u16(
+                    &this.value as u16*, current as u16, next as u16,
+                    MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok);
+                if (ok) { return Result::Ok(loaded as i16); }
+                return Result::Err(loaded as i16);
+            }
             i32 => {
                 mut ok: boolean = false;
                 const loaded: u32 = intrinsics::atomic_cmpxchg_u32(
@@ -298,6 +450,20 @@ public type struct Atomic<T> {
                     MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok);
                 if (ok) { return Result::Ok(loaded as i64); }
                 return Result::Err(loaded as i64);
+            }
+            isize => {
+                mut ok: boolean = false;
+                const loaded: isize = if (sizeof(isize) == 8) {
+                    intrinsics::atomic_cmpxchg_u64(
+                        &this.value as u64*, current as u64, next as u64,
+                        MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok) as isize
+                } else {
+                    intrinsics::atomic_cmpxchg_u32(
+                        &this.value as u32*, current as u32, next as u32,
+                        MemoryOrder::to_u32(succ), MemoryOrder::to_u32(fail), &ok) as isize
+                };
+                if (ok) { return Result::Ok(loaded); }
+                return Result::Err(loaded);
             }
             boolean => {
                 const cur_b: u8  = if (current) { 1 } else { 0 };

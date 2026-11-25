@@ -375,3 +375,78 @@ function fence_relaxed_is_clamped_not_invalid() -> Result<(), TestError> {
     atomic::compiler_fence(MemoryOrder::Acquire);
     return Result::Ok(());
 }
+
+// ---- the 16-bit, 8-bit signed and pointer-width cells -----------------------
+
+![test]
+function atomic_u16_wraps_and_masks() -> Result<(), TestError> {
+    const a: Atomic<u16> = Atomic::<u16>::new(65535);
+    expect_equal(a.fetch_add(1, MemoryOrder::SeqCst), 65535 as u16)?;
+    expect_equal(a.load(MemoryOrder::SeqCst), 0 as u16)?;
+    a.store(0x1234, MemoryOrder::SeqCst);
+    expect_equal(a.fetch_and(0xFF00, MemoryOrder::SeqCst), 0x1234 as u16)?;
+    expect_equal(a.fetch_or(0x00AB, MemoryOrder::SeqCst), 0x1200 as u16)?;
+    expect_equal(a.fetch_xor(0xFFFF, MemoryOrder::SeqCst), 0x12AB as u16)?;
+    expect_equal(a.swap(7, MemoryOrder::SeqCst), 0xED54 as u16)?;
+    expect_equal(a.fetch_subtract(8, MemoryOrder::SeqCst), 7 as u16)?;
+    expect_equal(a.load(MemoryOrder::SeqCst), 65535 as u16)?;
+    return Result::Ok(());
+}
+
+![test]
+function atomic_i8_keeps_its_sign() -> Result<(), TestError> {
+    const a: Atomic<i8> = Atomic::<i8>::new(-1);
+    expect_equal(a.fetch_add(1, MemoryOrder::SeqCst), -1 as i8)?;
+    expect_equal(a.fetch_add(-128, MemoryOrder::SeqCst), 0 as i8)?;
+    expect_equal(a.load(MemoryOrder::SeqCst), -128 as i8)?;
+    expect_equal(a.fetch_or(1, MemoryOrder::SeqCst), -128 as i8)?;
+    expect_equal(a.fetch_and(-2, MemoryOrder::SeqCst), -127 as i8)?;
+    expect_equal(a.fetch_xor(-1, MemoryOrder::SeqCst), -128 as i8)?;
+    expect_equal(a.swap(-5, MemoryOrder::SeqCst), 127 as i8)?;
+    match (a.compare_exchange(-5, -6, MemoryOrder::SeqCst, MemoryOrder::SeqCst)) {
+        Result::Ok(previous) => { expect_equal(previous, -5 as i8)?; }
+        Result::Err(_)       => { return Result::Err(TestError::failed(Str::new("an i8 exchange of the value held must succeed"))); }
+    }
+    expect_equal(a.fetch_subtract(10, MemoryOrder::SeqCst), -6 as i8)?;
+    expect_equal(a.load(MemoryOrder::SeqCst), -16 as i8)?;
+    return Result::Ok(());
+}
+
+![test]
+function atomic_i16_keeps_its_sign() -> Result<(), TestError> {
+    const a: Atomic<i16> = Atomic::<i16>::new(-30000);
+    expect_equal(a.fetch_subtract(10000, MemoryOrder::SeqCst), -30000 as i16)?;
+    expect_equal(a.load(MemoryOrder::SeqCst), 25536 as i16)?;
+    expect_equal(a.fetch_add(-25537, MemoryOrder::SeqCst), 25536 as i16)?;
+    expect_equal(a.fetch_and(0x7FFF, MemoryOrder::SeqCst), -1 as i16)?;
+    expect_equal(a.fetch_xor(0x7FFF, MemoryOrder::SeqCst), 0x7FFF as i16)?;
+    expect_equal(a.fetch_or(-32768, MemoryOrder::SeqCst), 0 as i16)?;
+    expect_equal(a.swap(300, MemoryOrder::SeqCst), -32768 as i16)?;
+    match (a.compare_exchange(299, 0, MemoryOrder::SeqCst, MemoryOrder::SeqCst)) {
+        Result::Ok(_)       => { return Result::Err(TestError::failed(Str::new("an i16 exchange of a value not held must fail"))); }
+        Result::Err(actual) => { expect_equal(actual, 300 as i16)?; }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function atomic_usize_and_isize_are_64_bits() -> Result<(), TestError> {
+    // On this 64-bit host a `usize` cell carries past `u32`'s maximum.
+    const u: Atomic<usize> = Atomic::<usize>::new(0xFFFFFFFF);
+    expect_equal(u.fetch_add(1, MemoryOrder::SeqCst), 0xFFFFFFFF as usize)?;
+    expect_equal(u.load(MemoryOrder::SeqCst), 0x100000000 as u64 as usize)?;
+    expect_equal(u.fetch_xor(0x100000001 as u64 as usize, MemoryOrder::SeqCst), 0x100000000 as u64 as usize)?;
+    expect_equal(u.swap(9, MemoryOrder::SeqCst), 1 as usize)?;
+    match (u.compare_exchange(9, 10, MemoryOrder::SeqCst, MemoryOrder::SeqCst)) {
+        Result::Ok(previous) => { expect_equal(previous, 9 as usize)?; }
+        Result::Err(_)       => { return Result::Err(TestError::failed(Str::new("a usize exchange of the value held must succeed"))); }
+    }
+    const s: Atomic<isize> = Atomic::<isize>::new(-1);
+    expect_equal(s.fetch_subtract(isize::MAX, MemoryOrder::SeqCst), -1 as isize)?;
+    expect_equal(s.load(MemoryOrder::SeqCst), isize::MIN)?;
+    expect_equal(s.fetch_and(0xFF, MemoryOrder::SeqCst), isize::MIN)?;
+    expect_equal(s.fetch_or(-256, MemoryOrder::SeqCst), 0 as isize)?;
+    expect_equal(s.swap(42, MemoryOrder::SeqCst), -256 as isize)?;
+    expect_equal(s.load(MemoryOrder::SeqCst), 42 as isize)?;
+    return Result::Ok(());
+}
