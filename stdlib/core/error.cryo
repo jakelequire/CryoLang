@@ -17,6 +17,7 @@
 namespace std::core::error;
 
 import std::core::convert::{ From };
+import std::core::drop::{ Drop };
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::iter::{ Iterator };
@@ -86,6 +87,89 @@ public type struct ErrorReport {
 implement<E> trait From<E> for struct ErrorReport where E: Error {
     static from(error: E) -> ErrorReport {
         return ErrorReport::from_error(&error);
+    }
+}
+
+/// Any error, owned whole: the value of whatever type implements `Error`,
+/// moved to the heap and reached through its `Error` table. Any `Error`
+/// converts into one (`AnyError::new`, or `From`), so `?` in a function
+/// returning `Result<T, AnyError>` passes on errors of any types, and the
+/// caller still holds each error itself - its `source` chain included -
+/// where `ErrorReport` keeps only text. It prints as the error does.
+///
+/// An `AnyError` is no `Error` itself, so `From<E>` for it and `From<T>
+/// for T` never both convert one type.
+public type struct AnyError {
+    /// The heap allocation holding the error.
+    private value: mut u8*;
+    /// The error, through its `Error` table.
+    private object: virtual &Error;
+    /// Drops the error and frees `value`: the one function that knows its
+    /// type.
+    private release: (mut u8*) -> void;
+
+    /// `error`, moved into a carrier of its own.
+    public static new<E>(error: E) -> AnyError where E: Error {
+        return carry(error);
+    }
+
+    /// The error carried, through its `Error` table: its `source` chain,
+    /// and its `Display` and `Debug` text.
+    public error(&this) -> virtual &Error {
+        return this.object;
+    }
+}
+
+/// `error` moved to the heap, with the function that releases it.
+private function carry<E>(error: E) -> AnyError where E: Error {
+    const raw: mut E* = Box::new(error).into_raw();
+    const object: virtual &Error = &*raw;
+    return AnyError { value: raw as mut u8*, object: object, release: release_carried::<E> };
+}
+
+/// Drop the `E` at `value` and free its allocation.
+private function release_carried<E>(value: mut u8*) -> void {
+    const _owner: Box<E> = Box::from_raw(value as mut E*);
+}
+
+/// Any error becomes an `AnyError` holding it, which is how `?` passes an
+/// error on from a function returning `Result<T, AnyError>`.
+implement<E> trait From<E> for struct AnyError where E: Error {
+    static from(error: E) -> AnyError {
+        return carry(error);
+    }
+}
+
+implement trait Drop for struct AnyError {
+    drop(mut &this) -> void {
+        const release: (mut u8*) -> void = this.release;
+        release(this.value);
+    }
+}
+
+/// The error's own `Display` text.
+implement trait Display for struct AnyError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        return this.object.fmt(f);
+    }
+}
+
+/// The error's `Display` text, then each error in its chain of sources on
+/// a line of its own, as an `ErrorReport` debugs.
+implement trait Debug for struct AnyError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        this.object.fmt(f)?;
+        mut next: Option<virtual &Error> = this.object.source();
+        loop {
+            match (next) {
+                Option::Some(cause) => {
+                    f.write_str(Str::new("\ncaused by: "))?;
+                    cause.fmt(f)?;
+                    next = cause.source();
+                }
+                Option::None => { return Result::Ok(()); }
+            }
+        }
     }
 }
 

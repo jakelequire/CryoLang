@@ -1,0 +1,103 @@
+///! `AnyError` owns an error of any type: `?` passes a `JsonError` and a
+///! `DateTimeError` into one return type, an `AnyError` passes on as
+///! itself, and a program's own error type - implementing `Error`, a
+///! prelude name, with nothing imported for it - keeps its source chain.
+///! The error carried is dropped exactly once, with the carrier.
+
+namespace AnyErrorCarriesEveryErrorType;
+
+import std::core::{ AnyError };
+import std::encoding::json;
+import std::encoding::value::{ Value };
+import std::fmt::{ println };
+import std::fmt::display::{ Display, Debug, Formatter };
+import std::fmt::error::{ FormatError };
+import std::time::datetime::{ DateTime };
+
+mut g_dropped: i32 = 0;
+
+/// A program's own error, caused by a JSON refusal.
+type struct SettingsError {
+    cause: AnyError;
+}
+
+implement trait Display for struct SettingsError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        return f.write_str(Str::new("the settings could not be read"));
+    }
+}
+
+implement trait Debug for struct SettingsError {
+    fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
+        return f.write_str(Str::new("SettingsError"));
+    }
+}
+
+implement trait Error for struct SettingsError {
+    source(&this) -> Option<virtual &Error> {
+        return Option::Some(this.cause.error());
+    }
+}
+
+implement trait Drop for struct SettingsError {
+    drop(mut &this) -> void {
+        g_dropped = g_dropped + 1;
+    }
+}
+
+/// How many entries the JSON `text` holds; a `JsonError` passes on.
+function entries_of(text: string) -> Result<i64, AnyError> {
+    const value: Value = json::Json::parse(Str::from(text))?;
+    return Result::Ok(value.length());
+}
+
+/// The year of the RFC 3339 `text`; a `DateTimeError` passes on.
+function year_of(text: string) -> Result<i64, AnyError> {
+    const moment: DateTime = DateTime::parse_rfc3339(Str::from(text))?;
+    return Result::Ok(moment.year);
+}
+
+/// The entries of `text`; an `AnyError` passes on as it is.
+function entries_again(text: string) -> Result<i64, AnyError> {
+    const entries: i64 = entries_of(text)?;
+    return Result::Ok(entries);
+}
+
+/// The settings in `text`, refused as a `SettingsError` caused by the JSON.
+function settings(text: string) -> Result<i64, AnyError> {
+    return match (entries_of(text)) {
+        Result::Ok(n) => { Result::Ok(n) }
+        Result::Err(cause) => {
+            const refused: Result<i64, SettingsError> = Result::Err(SettingsError { cause: cause });
+            const entries: i64 = refused?;
+            Result::Ok(entries)
+        }
+    };
+}
+
+function show(label: string, outcome: Result<i64, AnyError>) -> void {
+    match (outcome) {
+        Result::Ok(n) => { println(f"{label}: {n}"); }
+        Result::Err(error) => { println(f"{label} refused: {error}"); }
+    }
+}
+
+function main() -> i32 {
+    show("entries", entries_again("[1, 2]"));
+    show("entries", entries_again("{"));
+    show("year", year_of("2026-11-25T10:00:00Z"));
+    show("year", year_of("not a date"));
+    {
+        const outcome: Result<i64, AnyError> = settings("[");
+        match (outcome) {
+            Result::Ok(_) => { println(f"settings read"); }
+            Result::Err(error) => {
+                println(f"settings refused: {error}");
+                println(f"{error:?}");
+                println(f"dropped before: {g_dropped}");
+            }
+        }
+    }
+    println(f"dropped after: {g_dropped}");
+    return 0;
+}
