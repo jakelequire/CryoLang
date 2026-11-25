@@ -838,6 +838,41 @@ implement trait TryFrom<Str> for u8 {
     }
 }
 
+implement trait TryFrom<Str> for usize {
+    static try_from(source: Str) -> Result<usize, ConversionError> {
+        const value: u64 = u64::try_from(source)?;
+        if (value > usize::MAX as u64) {
+            return Result::Err(ConversionError::new("usize overflow"));
+        }
+        return Result::Ok(value as usize);
+    }
+}
+
+// `u128` reads its digits itself, since `u64` stops at 2^64: every byte a
+// decimal digit, refused as for `u64` when there is none, a byte is no
+// digit, or the value passes `u128::MAX`.
+implement trait TryFrom<Str> for u128 {
+    static try_from(source: Str) -> Result<u128, ConversionError> {
+        if (source.length() == 0) {
+            return Result::Err(ConversionError::new("empty input"));
+        }
+        const bytes: &Slice<u8> = source.as_bytes();
+        mut value: u128 = 0;
+        for (mut at: i64 = 0; at < bytes.length(); at++) {
+            const byte: u8 = bytes[at];
+            if (byte < '0' as u8 || byte > '9' as u8) {
+                return Result::Err(ConversionError::new("non-digit byte"));
+            }
+            const digit: u128 = (byte - '0' as u8) as u128;
+            if (value > (u128::MAX - digit) / 10) {
+                return Result::Err(ConversionError::new("overflow"));
+            }
+            value = value * 10 + digit;
+        }
+        return Result::Ok(value);
+    }
+}
+
 // Signed decimal parsing.
 //
 // `i64::try_from` (over `Str`) is the canonical implementation;
@@ -918,6 +953,45 @@ implement trait TryFrom<Str> for i8 {
             return Result::Err(ConversionError::new("i8 out of range"));
         }
         return Result::Ok(value as i8);
+    }
+}
+
+implement trait TryFrom<Str> for isize {
+    static try_from(source: Str) -> Result<isize, ConversionError> {
+        const value: i64 = i64::try_from(source)?;
+        if (value < isize::MIN as i64 || value > isize::MAX as i64) {
+            return Result::Err(ConversionError::new("isize out of range"));
+        }
+        return Result::Ok(value as isize);
+    }
+}
+
+// `i128` reads as `i64` does, over a `u128` magnitude: an optional `+` or
+// `-`, then the digits `u128::try_from` reads.
+private const I128_MIN_MAGNITUDE: u128 = (i128::MAX as u128) + 1;
+
+implement trait TryFrom<Str> for i128 {
+    static try_from(source: Str) -> Result<i128, ConversionError> {
+        if (source.length() == 0) {
+            return Result::Err(ConversionError::new("empty input"));
+        }
+        const first: u8 = source.as_bytes()[0];
+        const negative: boolean = first == '-' as u8;
+        const start: i64 = if (negative || first == '+' as u8) { 1 } else { 0 };
+        if (start == source.length()) {
+            return Result::Err(ConversionError::new("sign with no digits"));
+        }
+        const magnitude: u128 = u128::try_from(source.byte_substring(start, source.length()))?;
+        if (negative) {
+            if (magnitude > I128_MIN_MAGNITUDE) {
+                return Result::Err(ConversionError::new("i128 underflow"));
+            }
+            return Result::Ok(magnitude.wrapping_negate() as i128);
+        }
+        if (magnitude > i128::MAX as u128) {
+            return Result::Err(ConversionError::new("i128 overflow"));
+        }
+        return Result::Ok(magnitude as i128);
     }
 }
 

@@ -135,6 +135,22 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-11-24
 
+718. **`string.parse_int` reads decimal text and can fail; a literal's
+     value is the lexer's to read.**  `parse_int<T>()`, `where T: Integer +
+     TryFrom<Str>`, returns `Result<T, ConversionError>` and is
+     `T::try_from(Str::new(text))`: one reader, so the two cannot
+     disagree, and bad input is an `Err`, never 0 or a wrapped value.
+     Every integer width, `usize`, `isize`, `u128` and `i128` included,
+     has `TryFrom<Str>`.  An integer literal's value, in an expression or
+     a pattern, is read only by `Lexer::integer_literal_value` from its
+     lexeme and the type suffix the lexer found in it; a literal or range
+     pattern keeps that suffix for each bound, and a `-` the parser
+     records before a pattern's lexeme negates the value at 128 bits.  A
+     range pattern's bounds are ordered as the subject's values are,
+     unsigned for an unsigned integer or a `char`.  Supersedes the
+     wrapping `parse_int` of 620 and the literal reading by
+     `string.parse_int` of 644.  (Jake)
+
 717. **`ByteReader` and `ByteWriter` take the integer type as a type
      argument and name the byte order.**  `read_big_endian<T>()`,
      `read_little_endian<T>()`, `write_big_endian<T>(value)` and
@@ -1026,7 +1042,7 @@ yet is recorded with the change that builds it, not here.
      `cmp::min`/`max`/`clamp` order any `Ord` type, `math::align_up`
      aligns a size, and `f32.min`/`max` and `f64.min`/`max` keep the
      NaN-ignoring float `min`/`max`.  `f32` has `f64`'s class methods.
-     (Jake)
+     (Jake)  The wrapping `parse_int` is superseded by 718.
 
 621. **A constant pattern is held to the subject's type.**  A constant
      pattern - a bare name, a module path or a type path - matches only
@@ -1349,7 +1365,8 @@ yet is recorded with the change that builds it, not here.
      `char.is_whitespace`.  A tuple index too large for a `u64` is no tuple
      index (E0204); it used to wrap.  `IoError::from_windows_error` and
      `IoError::from_wsa` are `match`es on the `syscall` constants.
-     (Jake; the identifier rule's home delegated)
+     (Jake; the identifier rule's home delegated)  Reading a literal's text
+     by `string.parse_int` is superseded by 718.
 
 645. **The compiler and the LSP split names and join paths through the
      standard library.**  A qualified name's head, leaf, parent and segment

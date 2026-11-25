@@ -1,0 +1,80 @@
+///! An integer pattern's value is read as an integer expression's is: by the
+///! lexer's literal reader, from the lexeme and the type suffix the lexer
+///! found in it, at the subject's full width, with a `-` negating it.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::IntegerLiteralPatterns;
+
+import std::core::result::{ Result };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect };
+
+function u128_arm(x: u128) -> i32 {
+    return match (x) {
+        0x1_0000_0000_0000_0005 => { 1 }
+        5                       => { 2 }
+        _                       => { 3 }
+    };
+}
+
+![test]
+function a_u128_pattern_past_u64_max_matches_its_whole_value() -> Result<(), TestError> {
+    const wide: u128 = 0x1_0000_0000_0000_0005;
+    expect(u128_arm(wide) == 1, "the 65-bit pattern matches the 65-bit value")?;
+    return expect(u128_arm(5) == 2, "the 65-bit pattern does not match its low 64 bits");
+}
+
+function u64_band(x: u64) -> i32 {
+    return match (x) {
+        0                         => { 0 }
+        1..0xFFFF_FFFF_FFFF_FFFF  => { 1 }
+    };
+}
+
+![test]
+function a_u64_range_reaching_u64_max_is_in_order() -> Result<(), TestError> {
+    expect(u64_band(0) == 0, "zero takes its own arm")?;
+    return expect(u64_band(18446744073709551615) == 1, "u64::MAX is inside 1..u64::MAX");
+}
+
+function i128_sign(x: i128) -> i32 {
+    return match (x) {
+        -0x1_0000_0000_0000_0000..-1 => { -1 }
+        0                            => { 0 }
+        _                            => { 1 }
+    };
+}
+
+![test]
+function a_negative_i128_range_keeps_its_width() -> Result<(), TestError> {
+    expect(i128_sign(-18446744073709551616) == -1, "-2^64 is the range's low bound")?;
+    expect(i128_sign(-1) == -1, "-1 is the range's high bound")?;
+    return expect(i128_sign(18446744073709551615) == 1, "a positive value is past the range");
+}
+
+function suffixed(x: u8) -> i32 {
+    return match (x) {
+        7u8    => { 1 }
+        0xFFu8 => { 2 }
+        0b10u8..0b101u8 => { 3 }
+        _      => { 4 }
+    };
+}
+
+![test]
+function a_suffixed_pattern_reads_its_digits_without_the_suffix() -> Result<(), TestError> {
+    expect(suffixed(7) == 1, "7u8")?;
+    expect(suffixed(255) == 2, "0xFFu8")?;
+    expect(suffixed(4) == 3, "4 is in 0b10u8..0b101u8")?;
+    return expect(suffixed(6) == 4, "6 is past every arm");
+}
+
+![test]
+function a_negative_suffixed_pattern_is_negated() -> Result<(), TestError> {
+    const x: i64 = -1;
+    const arm: i32 = match (x) {
+        -1i64 => { 1 }
+        _     => { 2 }
+    };
+    return expect(arm == 1, "-1i64 matches -1");
+}

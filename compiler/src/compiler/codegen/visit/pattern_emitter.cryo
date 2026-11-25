@@ -26,7 +26,8 @@ import compiler::resolver::{ intern_table };
 import std::ffi::libc;
 import std::fmt;
 import compiler::ast::pattern::{
-    BindingPattern, ConstantPattern, EnumPattern, MatchArmNode, Pattern, PatternKind, RangePattern
+    BindingPattern, ConstantPattern, EnumPattern, LiteralPattern, MatchArmNode, Pattern, PatternKind,
+    RangePattern
 };
 import compiler::diag::{ ErrorCode };
 import compiler::codegen::context::{ CodegenContext };
@@ -461,7 +462,7 @@ type struct PatternEmitter {
                             TokenType::EqualEqual);
                     } else {
                         const pat_val: LValue = this.lower_scalar_literal(
-                            this.cg.get_intern().resolve(lit.value), lit.literal_kind,
+                            this.cg.get_intern().resolve(lit.value), lit.suffix, lit.literal_kind,
                             minfo.subject_ty);
                         if (pat_val.is_valid()) {
                             const pat_val_coerced: LValue =
@@ -615,7 +616,7 @@ type struct PatternEmitter {
             PatternKind::Literal(lit) => {
                 if (minfo.enum_type == null) {
                     const raw: LValue = this.lower_scalar_literal(
-                        this.cg.get_intern().resolve(lit.value), lit.literal_kind,
+                        this.cg.get_intern().resolve(lit.value), lit.suffix, lit.literal_kind,
                         minfo.subject_ty);
                     if (raw.is_valid()) {
                         v = this.cg.expr_ops.coerce_icmp_operands(subject, raw, minfo.subject_ty);
@@ -845,9 +846,12 @@ type struct PatternEmitter {
     /// "0", and `true`/`false` intern to "true"/"false".  Integer literals
     /// are built at the subject's width and signedness so the icmp operands
     /// match without a lossy widen: `match (x: i64) { -1 => ... }` compares
-    /// against a real i64 `-1`, not a zero-extended i32.  Shared by a literal
+    /// against a real i64 `-1`, not a zero-extended i32.  An integer's value
+    /// is read from its `text` and the lexer's `suffix` by
+    /// `LiteralPattern::integer_bits`; a 128-bit one is built from all 128
+    /// bits, which `const_int`'s u64 would truncate.  Shared by a literal
     /// pattern and both bounds of a range pattern (`codegen_range_compare`).
-    lower_scalar_literal(mut &this, text: string, lit_kind: LiteralKind,
+    lower_scalar_literal(mut &this, text: string, suffix: string, lit_kind: LiteralKind,
                          subj_ty: TypeRef) -> LValue {
         if (lit_kind == LiteralKind::Char) {
             return LType::const_int(LType::i32(),
@@ -869,7 +873,12 @@ type struct PatternEmitter {
                 }
                 lit_signed = this.cg.int_type_is_signed(subj_ty);
             }
-            return LType::const_int(lit_ty, text.parse_int::<u64>(), lit_signed);
+            const bits: u128 = LiteralPattern::integer_bits(text, suffix)
+                .expect("an integer pattern past u128::MAX reached codegen; the lexer refuses it");
+            if (llvm::LLVMGetIntTypeWidth(lit_ty.raw) == 128) {
+                return LType::const_int_of_string(lit_ty, bits.to_decimal_string(), 10);
+            }
+            return LType::const_int(lit_ty, bits as u64, lit_signed);
         }
         // String / Float literal patterns don't lower to an `icmp` operand:
         // a string pattern is routed through the caller's string-compare
@@ -890,9 +899,9 @@ type struct PatternEmitter {
         const name_prefix: string = name_prefix_text;
         const intern: InternTable* = this.cg.get_intern();
         const lo_val: LValue = this.lower_scalar_literal(
-            intern.resolve(pat.low), pat.literal_kind, subj_ty);
+            intern.resolve(pat.low), pat.low_suffix, pat.literal_kind, subj_ty);
         const hi_val: LValue = this.lower_scalar_literal(
-            intern.resolve(pat.high), pat.literal_kind, subj_ty);
+            intern.resolve(pat.high), pat.high_suffix, pat.literal_kind, subj_ty);
         if (!lo_val.is_valid() || !hi_val.is_valid()) { return LValue::null(); }
 
         const lo_c: LValue = this.cg.expr_ops.coerce_icmp_operands(

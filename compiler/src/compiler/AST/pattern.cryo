@@ -13,6 +13,7 @@ import compiler::ast::statement::{ Stmt };
 import compiler::ast::expression::{ ExpressionNode };
 import compiler::ast::walk::{ Walk };
 import compiler::codegen::ast_arena::{ cryo_ast_arena_alloc };
+import compiler::lex::lexer::{ Lexer };
 import compiler::resolver::symbol_str::{ SymbolStr };
 import compiler::resolver::res::{ Res, ResSlot };
 import compiler::resolver::symbol_id::{ SymbolID };
@@ -41,9 +42,9 @@ type struct Pattern {
     }
 
     /// A literal whose text is `value`; `literal_kind` says which literal
-    /// the text spells.
-    static literal(value: SymbolStr, literal_kind: LiteralKind, span: SourceSpan) -> mut Pattern* {
-        return Pattern::of(PatternKind::Literal(LiteralPattern::new(value, literal_kind)), span);
+    /// the text spells, and `suffix` is an integer's type suffix.
+    static literal(value: SymbolStr, literal_kind: LiteralKind, suffix: string, span: SourceSpan) -> mut Pattern* {
+        return Pattern::of(PatternKind::Literal(LiteralPattern::new(value, literal_kind, suffix)), span);
     }
 
     /// A name, binding the whole subject; name resolution turns it into a
@@ -97,25 +98,54 @@ type enum PatternKind {
 /// A literal pattern: `value` is the literal's text.  Which literal that is
 /// cannot be recovered from the text - `0` and `'0'` both intern to "0", and
 /// `true` / `false` to "true" / "false" - so `literal_kind` says it, and
-/// codegen emits the constant it names.
+/// codegen emits the constant it names.  An integer's text is its lexeme,
+/// after a `-` for a negative one, and `suffix` is the type suffix the lexer
+/// found in that lexeme (`""` for none).
 type struct LiteralPattern {
     value:        SymbolStr;
     literal_kind: LiteralKind;
+    suffix:       string;
 
-    static new(value: SymbolStr, literal_kind: LiteralKind) -> LiteralPattern* {
-        return new LiteralPattern { value: value, literal_kind: literal_kind };
+    static new(value: SymbolStr, literal_kind: LiteralKind, suffix: string) -> LiteralPattern* {
+        return new LiteralPattern { value: value, literal_kind: literal_kind, suffix: suffix };
+    }
+
+    /// The value of an integer pattern written `text` (a lexeme, after a `-`
+    /// for a negative one) with the lexer's `suffix`, as the bits of its
+    /// two's-complement value at 128 bits: the magnitude is read by
+    /// `Lexer::integer_literal_value`, the one reader of an integer literal,
+    /// and a `-` negates it, wrapping.  `None` when the digits pass
+    /// `u128::MAX`.  The suffix is the lexer's, not found again in the text,
+    /// because a digit scan cannot tell `0x1f64` from `0x1u8`.
+    static integer_bits(text: string, suffix: string) -> Option<u128> {
+        if (text == null) { return Option::None; }
+        if (text.length() == 0 || text[0] != '-') {
+            return Lexer::integer_literal_value(text, suffix);
+        }
+        return match (Lexer::integer_literal_value(((text as u8*) + 1) as string, suffix)) {
+            Option::Some(magnitude) => { Option::Some(magnitude.wrapping_negate()) }
+            Option::None            => { Option::None }
+        };
     }
 }
 
 /// An inclusive range `low..high` (or `low..=high`).  Both bounds are the
-/// same kind of literal, integer or char, so they share `literal_kind`.
+/// same kind of literal, integer or char, so they share `literal_kind`; each
+/// integer bound keeps the type suffix the lexer found in it, as a
+/// `LiteralPattern` does.
 type struct RangePattern {
     low:          SymbolStr;
     high:         SymbolStr;
     literal_kind: LiteralKind;
+    low_suffix:   string;
+    high_suffix:  string;
 
-    static new(low: SymbolStr, high: SymbolStr, literal_kind: LiteralKind) -> RangePattern* {
-        return new RangePattern { low: low, high: high, literal_kind: literal_kind };
+    static new(low: SymbolStr, low_suffix: string, high: SymbolStr, high_suffix: string,
+               literal_kind: LiteralKind) -> RangePattern* {
+        return new RangePattern {
+            low: low, high: high, literal_kind: literal_kind,
+            low_suffix: low_suffix, high_suffix: high_suffix
+        };
     }
 }
 

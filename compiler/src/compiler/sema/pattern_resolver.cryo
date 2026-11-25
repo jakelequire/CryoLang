@@ -730,11 +730,28 @@ type struct PatternResolver {
                 }
                 if (range == null) { continue; }
 
-                const lo: i64 = sema_decode_range_bound(this.intern.resolve(range.low), range.literal_kind);
-                const hi: i64 = sema_decode_range_bound(this.intern.resolve(range.high), range.literal_kind);
-                if (lo > hi) {
+                // The bounds are ordered as the subject's values are: signed
+                // unless the subject is an unsigned integer or a char, so a
+                // `u64` bound past `i64::MAX` is a large value, not a negative one.
+                const lo: u128 = sema_decode_range_bound(
+                    this.intern.resolve(range.low), range.low_suffix, range.literal_kind);
+                const hi: u128 = sema_decode_range_bound(
+                    this.intern.resolve(range.high), range.high_suffix, range.literal_kind);
+                mut ordered_unsigned: boolean = range.literal_kind == LiteralKind::Char;
+                if (subject != null && subject.kind == TypeKind::Char) { ordered_unsigned = true; }
+                if (subject != null && subject.kind == TypeKind::Int && subject.int_kind().is_unsigned()) {
+                    ordered_unsigned = true;
+                }
+                if (ordered_unsigned && lo > hi) {
                     this.ctx.emit_error_at(ErrorCode::E0628_PATTERN_MATCHING_ERROR,
-                        fmt::format("range pattern lower bound (%lld) exceeds upper bound (%lld)", lo, hi),
+                        fmt::format("range pattern lower bound (%s) exceeds upper bound (%s)",
+                            lo.to_decimal_string(), hi.to_decimal_string()),
+                        pat.span);
+                }
+                if (!ordered_unsigned && (lo as i128) > (hi as i128)) {
+                    this.ctx.emit_error_at(ErrorCode::E0628_PATTERN_MATCHING_ERROR,
+                        fmt::format("range pattern lower bound (%s) exceeds upper bound (%s)",
+                            (lo as i128).to_decimal_string(), (hi as i128).to_decimal_string()),
                         pat.span);
                 }
             }
