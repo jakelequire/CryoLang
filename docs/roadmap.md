@@ -927,8 +927,6 @@ Jake's answers to the test-infrastructure plan.
 - **A module cycle's report.**  E0501 names the modules in a cycle; whether
   it prints the cycle as a path, in order, is open, and so is whether a
   cycle that crosses packages is E0501 too or an error of its own.
-- **`std::Range`.**  Nothing re-exports `Range` at the root of `std`, so the
-  path is refused today.  Whether `stdlib/lib.cryo` exports it there is open.
 - **Overlap of implementations bounded on a type.**  Two `implement` blocks
   whose heads overlap are refused when their bounds are on their own
   parameters; a block with a bound written on another type (`where

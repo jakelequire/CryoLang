@@ -133,6 +133,14 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-23
+
+715. **Nothing is exported at the root of `std`.**  A standard library
+     module offers its common names one level up, from its own facade
+     (`import std::sync::{ Mutex };`), and `stdlib/lib.cryo` exports
+     nothing: `import std::{ String };` and `std::Range` stay refused.
+     The text types are reached bare through the prelude instead.  (Jake)
+
 ### 2026-11-16
 
 709. **A path's scope segment is a type-namespace question, and a
@@ -4974,7 +4982,6 @@ dropped or deferred says so; a deferred one is listed in
 - **Q3.** A module cycle is E0501, which names the modules in the cycle.
   Whether it prints the cycle's path, in order, is open; see
   `docs/roadmap.md`.
-- **Q4.** Whether `std::Range` is a name: nothing re-exports `Range` at the
-  root of `std` today, so the path is refused.  Open; see
-  `docs/roadmap.md`.
+- **Q4.** *Answered by 715.* `std::Range` is not a name: nothing is
+  exported at the root of `std`.
 - **Q13.** *Answered by D68.*

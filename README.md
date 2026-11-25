@@ -438,10 +438,9 @@ entry_point = "src/tool/main.cryo"
 ### Working with files
 
 ```cryo
-import std::collections::string::{ String };
 import std::fmt::{ println };
 import std::fs::{ Directory, File, Path };
-import std::io::error::{ IoError };
+import std::io::{ IoError };
 
 function tidy() -> Result<(), IoError> {
     const config: String = File::read_text("config.toml")?;      // the whole file, checked as UTF-8
