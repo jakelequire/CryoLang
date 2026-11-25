@@ -326,7 +326,7 @@ normalised before the comparison.
   `cryo version` prints, with the matching change in the VS Code extension
   (ruling 343).
 - **`cryo version --verbose` shows the binary's sha256.**  The standard
-  library computes one (`std::encoding::sha256`); the report does not use
+  library computes one (`std::hash::Sha256`); the report does not use
   it yet.
 - **`make verify ARGS="--baseline REV"` works for a revision from before
   the version stamp,** `main` included (ruling 298: fixed after the merge).
