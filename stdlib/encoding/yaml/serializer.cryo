@@ -1,0 +1,232 @@
+///! The writer behind `Yaml`'s text writers.
+///!
+///! Two shapes: flow (`{name: cryo, tags: [1, 2]}`, on one line) and block
+///! (a mapping's entries and a sequence's items one per line, indented by
+///! two spaces). Text is written plain when the reader would read the same
+///! text back - it is not a null, boolean or number to the core schema,
+///! starts with no indicator and holds no `: ` or ` #` - and double-quoted,
+///! with escapes, otherwise. A float is always written as one (`1.0`, not
+///! `1`), and its infinities and NaN as `.inf`, `-.inf` and `.nan`.
+
+namespace std::encoding::yaml::serializer;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::encoding::value::model::{ Number, Object, Value };
+import std::encoding::yaml::parser::{ MAX_DEPTH, Parser, PlainKind };
+
+private const HT:        u8 = 9;
+private const LF:        u8 = 10;
+private const SPACE:     u8 = 32;
+private const QUOTE:     u8 = 34;
+private const HASH:      u8 = 35;
+private const COLON:     u8 = 58;
+private const BACKSLASH: u8 = 92;
+
+internal type struct Writer {
+    /// `value` as a document in block style, ending with a line break: a
+    /// non-empty collection over lines, anything else on one.
+    internal static write_block(out: mut &String, value: &Value) -> void {
+        match (value) {
+            Value::Array(items) => {
+                if (items.length() > 0) { Writer::write_block_sequence(out, &items, 0, 0, false); return; }
+            }
+            Value::Object(entries) => {
+                if (entries.length() > 0) { Writer::write_block_mapping(out, &entries, 0, 0, false); return; }
+            }
+            _ => { }
+        }
+        Writer::write_flow(out, value, 0);
+        out.push_byte(LF);
+    }
+
+    /// `value` in flow style, on one line.  `depth` is its nesting; a
+    /// value nested past `MAX_DEPTH`, which no parsed value is, is written
+    /// as null rather than recursed into without bound.
+    internal static write_flow(out: mut &String, value: &Value, depth: u64) -> void {
+        if (depth > MAX_DEPTH) { out.append("null"); return; }
+        match (value) {
+            Value::Null       => { out.append("null"); }
+            Value::Bool(b)    => { out.append(b); }
+            Value::Number(n)  => { Writer::write_number(out, &n); }
+            Value::String(s)  => { Writer::write_text(out, s.as_str(), true, false); }
+            Value::Array(items) => {
+                out.push_byte(91 as u8);   // [
+                for (mut i: i64 = 0; i < items.length(); i++) {
+                    if (i > 0) { out.append(", "); }
+                    Writer::write_flow(out, &items[i], depth + 1);
+                }
+                out.push_byte(93 as u8);   // ]
+            }
+            Value::Object(entries) => {
+                out.push_byte(123 as u8);  // {
+                for (mut i: i64 = 0; i < entries.length(); i++) {
+                    if (i > 0) { out.append(", "); }
+                    match (entries.key_at(i)) {
+                        Option::Some(key) => { Writer::write_text(out, key, true, true); }
+                        Option::None      => { }
+                    }
+                    out.append(": ");
+                    match (entries.value_at(i)) {
+                        Option::Some(entry) => { Writer::write_flow(out, entry, depth + 1); }
+                        Option::None        => { out.append("null"); }
+                    }
+                }
+                out.push_byte(125 as u8);  // }
+            }
+        }
+    }
+
+    /// A block sequence's items at `indent`, the first on the current line
+    /// when `first_inline` (after a parent's `- `).
+    private static write_block_sequence(out: mut &String, items: &Array<Value>, indent: i64, depth: u64,
+                                        first_inline: boolean) -> void {
+        for (mut i: i64 = 0; i < items.length(); i++) {
+            if (i > 0 || !first_inline) { out.push_repeated(' ', indent); }
+            out.push_byte(45 as u8);   // -
+            Writer::write_entry_value(out, &items[i], indent, depth, true);
+        }
+    }
+
+    /// A block mapping's entries at `indent`, the first on the current line
+    /// when `first_inline` (after a parent's `- `).
+    private static write_block_mapping(out: mut &String, entries: &Object, indent: i64, depth: u64,
+                                       first_inline: boolean) -> void {
+        for (mut i: i64 = 0; i < entries.length(); i++) {
+            if (i > 0 || !first_inline) { out.push_repeated(' ', indent); }
+            match (entries.key_at(i)) {
+                Option::Some(key) => { Writer::write_text(out, key, false, true); }
+                Option::None      => { }
+            }
+            out.push_byte(COLON);
+            match (entries.value_at(i)) {
+                Option::Some(entry) => { Writer::write_entry_value(out, entry, indent, depth, false); }
+                Option::None        => { out.append(" null\n"); }
+            }
+        }
+    }
+
+    /// The value after a `-` or a `key:`, through its line break: a
+    /// non-empty collection on the lines below (a mapping or sequence item
+    /// of a sequence from the dash's line), anything else on this line.
+    private static write_entry_value(out: mut &String, value: &Value, indent: i64, depth: u64,
+                                     after_dash: boolean) -> void {
+        if (depth + 1 <= MAX_DEPTH) {
+            match (value) {
+                Value::Array(items) => {
+                    if (items.length() > 0) {
+                        if (after_dash) {
+                            out.push_byte(SPACE);
+                            Writer::write_block_sequence(out, &items, indent + 2, depth + 1, true);
+                        } else {
+                            out.push_byte(LF);
+                            Writer::write_block_sequence(out, &items, indent + 2, depth + 1, false);
+                        }
+                        return;
+                    }
+                }
+                Value::Object(entries) => {
+                    if (entries.length() > 0) {
+                        if (after_dash) {
+                            out.push_byte(SPACE);
+                            Writer::write_block_mapping(out, &entries, indent + 2, depth + 1, true);
+                        } else {
+                            out.push_byte(LF);
+                            Writer::write_block_mapping(out, &entries, indent + 2, depth + 1, false);
+                        }
+                        return;
+                    }
+                }
+                _ => { }
+            }
+        }
+        out.push_byte(SPACE);
+        Writer::write_flow(out, value, depth + 1);
+        out.push_byte(LF);
+    }
+
+    private static write_number(out: mut &String, n: &Number) -> void {
+        match (n) {
+            Number::Int(v)  => { out.append(v); }
+            Number::UInt(v) => { out.append(v); }
+            Number::Float(v) => {
+                if (v != v) { out.append(".nan"); return; }
+                if (v - v != 0.0) {
+                    if (v < 0.0) { out.append("-.inf"); } else { out.append(".inf"); }
+                    return;
+                }
+                mut buffer: [u8; 32];
+                const written: i64 = v.to_buffer_roundtrip(&buffer).unwrap();
+                const text: Str = Str::from_raw(&buffer[0], written);
+                out.append(text);
+                // Digits alone would read back as an integer.
+                mut integral: boolean = true;
+                for (mut i: i64 = 0; i < written; i++) {
+                    const b: u8 = buffer[i];
+                    if (b == 46 || b == 101 || b == 69) { integral = false; }   // . e E
+                }
+                if (integral) { out.append(".0"); }
+            }
+        }
+    }
+
+    /// `text` plain where the reader reads it back as the same text, and
+    /// double-quoted otherwise.  A `key` is read as text whatever its
+    /// spelling, so `null` and `1` are plain keys; in `flow` a flow
+    /// indicator would end it.
+    private static write_text(out: mut &String, text: Str, flow: boolean, key: boolean) -> void {
+        if (Writer::plain_is_safe(text, flow, key)) {
+            out.append(text);
+            return;
+        }
+        out.push_byte(QUOTE);
+        const length: i64 = text.length();
+        const bytes: u8* = text.as_pointer();
+        for (mut i: i64 = 0; i < length; i++) {
+            const b: u8 = bytes[i];
+            if (b == QUOTE)          { out.push_byte(BACKSLASH); out.push_byte(QUOTE); }
+            else if (b == BACKSLASH) { out.push_byte(BACKSLASH); out.push_byte(BACKSLASH); }
+            else if (b == LF)        { out.append("\\n"); }
+            else if (b == HT)        { out.append("\\t"); }
+            else if (b == 13)        { out.append("\\r"); }
+            else if (b < 0x20 || b == 0x7F) {
+                match (out.write(f"\\x{b:02x}")) {
+                    Result::Ok(_)  => { }
+                    Result::Err(_) => { }
+                }
+            }
+            else { out.push_byte(b); }
+        }
+        out.push_byte(QUOTE);
+    }
+
+    /// Whether `text` written plain reads back as itself.
+    private static plain_is_safe(text: Str, flow: boolean, key: boolean) -> boolean {
+        const length: i64 = text.length();
+        if (length == 0) { return false; }
+        if (!key && Parser::plain_kind(text) != PlainKind::Text) { return false; }
+        const bytes: u8* = text.as_pointer();
+        const first: u8 = bytes[0];
+        // `-?:,[]{}#&*!|>'"%@` and the backquote start an indicator.
+        if (first == 45 || first == 63 || first == COLON || first == 44 || first == 91 || first == 93
+            || first == 123 || first == 125 || first == HASH || first == 38 || first == 42 || first == 33
+            || first == 124 || first == 62 || first == 39 || first == QUOTE || first == 37 || first == 64
+            || first == 96 || first == SPACE) {
+            return false;
+        }
+        if (bytes[length - 1] == SPACE || bytes[length - 1] == COLON) { return false; }
+        if (length >= 3 && first == 46 && bytes[1] == 46 && bytes[2] == 46) { return false; }   // ...
+        for (mut i: i64 = 0; i < length; i++) {
+            const b: u8 = bytes[i];
+            if (b < 0x20 || b == 0x7F) { return false; }
+            if (b == COLON && i + 1 < length && bytes[i + 1] == SPACE) { return false; }
+            if (b == HASH && bytes[i - 1] == SPACE) { return false; }
+            if (flow && (b == 44 || b == 91 || b == 93 || b == 123 || b == 125)) { return false; }
+            if (flow && b == COLON) { return false; }
+        }
+        return true;
+    }
+}

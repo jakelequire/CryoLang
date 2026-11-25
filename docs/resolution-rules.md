@@ -135,6 +135,23 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-11-25
 
+721. **YAML is `std::encoding::yaml`, a safe subset of YAML 1.2 with the
+     core schema, read into and written from the shared `Value`.**
+     `yaml::Yaml::parse(text)` reads the one document a text holds (none
+     is null, two or more `MultipleDocuments`), `Yaml::parse_all(text)`
+     every document; `Yaml::to_text(&value)` writes flow style on one
+     line and `Yaml::to_pretty_text(&value)` block style.  Read: block and
+     flow collections, plain, quoted and block scalars, comments,
+     documents, anchors and aliases, an alias being a copy of its node
+     and a document's copies bounded by `MAX_EXPANDED_NODES` nodes.
+     Refused, each with a `YamlErrorKind` of its own: tags outside the
+     core schema, complex keys (an anchor or a tag on a key among them),
+     the merge key `<<`, directives and a repeated key.  A plain scalar's
+     type is the core schema's, so `yes` is text; a key is text whatever
+     its spelling.  `Value`, `Object` and `Number` are `Clone`.  (Jake;
+     the subset's edges, the error kinds, the expansion limit and the
+     writer's shapes delegated)
+
 720. **An enum discriminant is a compile-time integer expression.**  It is
      parsed as an expression and folded by `ConstEval`, the folder of
      every other compile-time integer, once names are resolved; the type

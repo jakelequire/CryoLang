@@ -1,0 +1,202 @@
+///! yaml - the YAML 1.2 core-schema reader and writer: what each construct
+///! reads as (compared through its JSON text, which spells the value
+///! exactly), what is refused and with which kind, the alias-expansion
+///! limit, and text written and read back; one struct decodes alike from
+///! JSON and from YAML.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::YamlT;
+
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::encoding::json;
+import std::encoding::yaml;
+import std::encoding::yaml::{ YamlErrorKind };
+import std::encoding::value::{ FromValue, ToValue, Value };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_equal };
+
+/// `text` read as YAML, written as JSON.
+function as_json(text: string) -> Result<String, TestError> {
+    return match (yaml::Yaml::parse(Str::from(text))) {
+        Result::Ok(value) => { Result::Ok(json::Json::to_text(&value)) }
+        Result::Err(error) => {
+            const message: String = f"the YAML must read: {error.kind.label()} at {error.line}:{error.column}: {error.describe()}";
+            Result::Err(TestError::failed(message.as_str()))
+        }
+    };
+}
+
+/// `text` read as YAML must read as the JSON text `expected`.
+function reads_as(text: string, expected: string) -> Result<(), TestError> {
+    return expect_equal(as_json(text)?, String::from_str(Str::from(expected)));
+}
+
+/// `text` must be refused with `kind`, at 1-indexed `line`.
+function refused(text: string, kind: YamlErrorKind, line: u64) -> Result<(), TestError> {
+    return match (yaml::Yaml::parse(Str::from(text))) {
+        Result::Ok(_) => { Result::Err(TestError::failed(Str::from("the YAML must be refused"))) }
+        Result::Err(error) => {
+            expect_equal(error.kind.label(), kind.label())?;
+            expect_equal(error.line, line)
+        }
+    };
+}
+
+![test]
+function core_schema_scalars() -> Result<(), TestError> {
+    reads_as("a: 1\nb: -2\nc: 0x1F\nd: 0o17\ne: 1.5\nf: .5\ng: -1e3\nh: 18446744073709551615\n",
+             "{\"a\":1,\"b\":-2,\"c\":31,\"d\":15,\"e\":1.5,\"f\":0.5,\"g\":-1000,\"h\":18446744073709551615}")?;
+    reads_as("a: true\nb: False\nc: null\nd: ~\ne:\nf: NULL\n",
+             "{\"a\":true,\"b\":false,\"c\":null,\"d\":null,\"e\":null,\"f\":null}")?;
+    return reads_as("a: hello world\nb: 'it''s'\nc: \"tab\\there \\u00e9\"\nd: 12abc\n",
+                    "{\"a\":\"hello world\",\"b\":\"it's\",\"c\":\"tab\\there \u{e9}\",\"d\":\"12abc\"}");
+}
+
+![test]
+function yes_and_no_are_text() -> Result<(), TestError> {
+    return reads_as("a: yes\nb: no\nc: on\nd: off\ne: Yes\n",
+                    "{\"a\":\"yes\",\"b\":\"no\",\"c\":\"on\",\"d\":\"off\",\"e\":\"Yes\"}");
+}
+
+![test]
+function block_and_flow_collections() -> Result<(), TestError> {
+    reads_as("server:\n  host: localhost\n  ports:\n    - 80\n    - 443\n  tls: {enabled: true, cert: x.pem}\nlist: [1, two, 3.5]\n",
+             "{\"server\":{\"host\":\"localhost\",\"ports\":[80,443],\"tls\":{\"enabled\":true,\"cert\":\"x.pem\"}},\"list\":[1,\"two\",3.5]}")?;
+    // A sequence may sit at its key's indentation.
+    reads_as("items:\n- a\n- b\nafter: 1\n", "{\"items\":[\"a\",\"b\"],\"after\":1}")?;
+    // A mapping and a sequence as sequence items start on the dash's line.
+    return reads_as("- name: a\n  value: 1\n- - x\n  - y\n- []\n",
+                    "[{\"name\":\"a\",\"value\":1},[\"x\",\"y\"],[]]");
+}
+
+![test]
+function block_scalars_and_chomping() -> Result<(), TestError> {
+    reads_as("text: |\n  line one\n  line two\n\n  after blank\nnext: 1\n",
+             "{\"text\":\"line one\\nline two\\n\\nafter blank\\n\",\"next\":1}")?;
+    reads_as("text: >\n  folded one\n  folded two\n\n  para\n",
+             "{\"text\":\"folded one folded two\\npara\\n\"}")?;
+    return reads_as("strip: |-\n  a\n\nkeep: |+\n  b\n\nclip: |\n  c\n\n",
+                    "{\"strip\":\"a\",\"keep\":\"b\\n\\n\",\"clip\":\"c\\n\"}");
+}
+
+![test]
+function scalars_over_several_lines() -> Result<(), TestError> {
+    reads_as("key: this is\n  a long\n\n  value\n", "{\"key\":\"this is a long\\nvalue\"}")?;
+    return reads_as("q: \"one\n  two\"\nr: 'three\n\n  four'\n", "{\"q\":\"one two\",\"r\":\"three\\nfour\"}");
+}
+
+![test]
+function comments_and_documents() -> Result<(), TestError> {
+    reads_as("# leading\na: 1 # trailing\n# middle\nb: [1, # in flow\n  2]\n", "{\"a\":1,\"b\":[1,2]}")?;
+    reads_as("---\na: 1\n...\n", "{\"a\":1}")?;
+    reads_as("", "null")?;
+    match (yaml::Yaml::parse_all(Str::from("---\na: 1\n---\nb: 2\n...\n--- 3\n"))) {
+        Result::Ok(documents) => {
+            expect_equal(documents.length(), 3)?;
+            expect_equal(json::Json::to_text(&documents[2]), String::from_str(Str::from("3")))?;
+        }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the stream must read"))); }
+    }
+    return refused("---\na: 1\n---\nb: 2\n", YamlErrorKind::MultipleDocuments, 1);
+}
+
+![test]
+function anchors_and_aliases_copy_the_node() -> Result<(), TestError> {
+    return reads_as("base: &b {x: 1, y: 2}\ncopy: *b\nlist: [*b, *b]\n",
+                    "{\"base\":{\"x\":1,\"y\":2},\"copy\":{\"x\":1,\"y\":2},\"list\":[{\"x\":1,\"y\":2},{\"x\":1,\"y\":2}]}");
+}
+
+![test]
+function nested_aliases_past_the_limit_are_refused() -> Result<(), TestError> {
+    // Each level is ten copies of the one before: 10^6 nodes at the last.
+    return refused("a: &a [x, x, x, x, x, x, x, x, x, x]\nb: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\nc: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\nd: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c, *c]\ne: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d, *d]\nf: [*e, *e, *e, *e, *e, *e, *e, *e, *e, *e]\n",
+                   YamlErrorKind::ExpansionLimit, 5);
+}
+
+![test]
+function the_core_schema_tags() -> Result<(), TestError> {
+    reads_as("a: !!str 123\nb: !!float 3\nc: !!int \"7\"\nd: !!str\n", "{\"a\":\"123\",\"b\":3,\"c\":7,\"d\":\"\"}")?;
+    refused("a: !custom x\n", YamlErrorKind::UnsupportedTag, 1)?;
+    return refused("a: !!int abc\n", YamlErrorKind::UnsupportedTag, 1);
+}
+
+![test]
+function what_the_subset_refuses() -> Result<(), TestError> {
+    refused("? a\n: b\n", YamlErrorKind::ComplexKey, 1)?;
+    refused("[a, b]: c\n", YamlErrorKind::ComplexKey, 1)?;
+    refused("a: &x {b: 1}\nc:\n  <<: *x\n", YamlErrorKind::MergeKey, 3)?;
+    refused("%YAML 1.2\n---\na: 1\n", YamlErrorKind::UnsupportedDirective, 1)?;
+    refused("a: 1\na: 2\n", YamlErrorKind::DuplicateKey, 2)?;
+    refused("a: *nope\n", YamlErrorKind::UndefinedAlias, 1)?;
+    refused("a: 99999999999999999999\n", YamlErrorKind::InvalidNumber, 1)?;
+    refused("a:\n\tb: 1\n", YamlErrorKind::BadIndentation, 2)?;
+    refused("a: b: c\n", YamlErrorKind::UnexpectedChar, 1)?;
+    refused("a: \"\\q\"\n", YamlErrorKind::InvalidEscape, 1)?;
+    return refused("a: [1, 2\n", YamlErrorKind::UnexpectedEof, 2);
+}
+
+![test]
+function written_text_reads_back_as_the_value() -> Result<(), TestError> {
+    const value: Value = match (yaml::Yaml::parse(Str::from(
+        "name: cryo\ntags: [fast, 'a: b', \"\", '1', 'null', '- x']\nnested:\n  - {k: v}\n  - []\n  - n: 1.0\n    m: -.inf\nempty: {}\nnum: 42\nflag: false\nnothing: null\ntext: \"line\\nbreak\"\n"))) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the YAML must read"))); }
+    };
+    const flow: String = yaml::Yaml::to_text(&value);
+    expect_equal(flow.clone(), String::from_str(Str::from(
+        "{name: cryo, tags: [fast, \"a: b\", \"\", \"1\", \"null\", \"- x\"], nested: [{k: v}, [], {n: 1.0, m: -.inf}], empty: {}, num: 42, flag: false, nothing: null, text: \"line\\nbreak\"}")))?;
+    const block: String = yaml::Yaml::to_pretty_text(&value);
+    expect_equal(block.clone(), String::from_str(Str::from(
+        "name: cryo\ntags:\n  - fast\n  - \"a: b\"\n  - \"\"\n  - \"1\"\n  - \"null\"\n  - \"- x\"\nnested:\n  - k: v\n  - []\n  - n: 1.0\n    m: -.inf\nempty: {}\nnum: 42\nflag: false\nnothing: null\ntext: \"line\\nbreak\"\n")))?;
+    // Both shapes read back as the same value.
+    const from_block: Value = match (yaml::Yaml::parse(block.as_str())) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the block text must read back"))); }
+    };
+    const from_flow: Value = match (yaml::Yaml::parse(flow.as_str())) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the flow text must read back"))); }
+    };
+    expect_equal(yaml::Yaml::to_text(&from_block), flow.clone())?;
+    return expect_equal(yaml::Yaml::to_text(&from_flow), flow);
+}
+
+/// A configuration decoded from either format.
+type struct Service with [ToValue, FromValue] {
+    name: String;
+    port: i64;
+    tags: Array<String>;
+}
+
+![test]
+function one_struct_decodes_from_json_and_from_yaml() -> Result<(), TestError> {
+    const from_json: Value = match (json::Json::parse(Str::from("{\"name\":\"api\",\"port\":8080,\"tags\":[\"a\",\"b\"]}"))) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the JSON must read"))); }
+    };
+    const from_yaml: Value = match (yaml::Yaml::parse(Str::from("name: api\nport: 8080\ntags:\n  - a\n  - b\n"))) {
+        Result::Ok(read) => { read }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the YAML must read"))); }
+    };
+    const a: Service = match (Service::from_value(&from_json)) {
+        Result::Ok(service) => { service }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the JSON value must decode"))); }
+    };
+    const b: Service = match (Service::from_value(&from_yaml)) {
+        Result::Ok(service) => { service }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::from("the YAML value must decode"))); }
+    };
+    expect_equal(a.name.clone(), b.name.clone())?;
+    expect_equal(a.port, b.port)?;
+    expect_equal(b.port, 8080)?;
+    expect_equal(a.tags.length(), 2)?;
+    expect_equal(b.tags.length(), 2)?;
+    expect(b.tags[1].as_str() == Str::from("b"), Str::from("the second tag is `b`"))?;
+    // And the struct written as YAML reads back as itself.
+    const written: String = yaml::Yaml::to_pretty_text(&b.to_value());
+    expect_equal(written, String::from_str(Str::from("name: api\nport: 8080\ntags:\n  - a\n  - b\n")))?;
+    return Result::Ok(());
+}

@@ -1,0 +1,1342 @@
+///! The reader behind `Yaml::parse` and `Yaml::parse_all`: YAML 1.2 text,
+///! core schema, read into the shared `Value` model.
+///!
+///! Read: block mappings and sequences (a sequence may sit at its key's
+///! indentation), flow mappings and sequences, plain, single- and
+///! double-quoted scalars over several lines, literal `|` and folded `>`
+///! block scalars with their chomping and indentation indicators, comments,
+///! several documents separated by `---` and ended by `...`, and anchors
+///! with their aliases.
+///!
+///! Refused, each with a kind of its own: tags outside the core schema,
+///! complex keys (`? key`, a collection or an alias as a key, an anchor or
+///! a tag on a key), the merge key `<<`, directives, and a key a mapping
+///! already has.
+///!
+///! A plain scalar's type is the core schema's: `null`, `~` and an empty
+///! node are null; `true`/`false` (with their capitalized forms) are
+///! booleans; decimal, `0o` octal and `0x` hexadecimal integers and the
+///! decimal floats with `.inf` and `.nan` are numbers; everything else is
+///! text, so `yes`, `no`, `on` and `off` are text. A key is text whatever
+///! its spelling, since an `Object`'s keys are text.
+///!
+///! An alias is a copy of the node its anchor names. The copies a document
+///! makes are counted in nodes, and a document whose aliases would expand
+///! it past `MAX_EXPANDED_NODES` is refused before the copy is made, so a
+///! few lines of nested aliases cannot exhaust memory.
+
+namespace std::encoding::yaml::parser;
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::core::convert::{ TryFrom };
+import std::collections::array::{ Array };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+import std::encoding::value::model::{ Number, Object, Value };
+import std::encoding::yaml::error::{ YamlError, YamlErrorKind };
+
+private const HT:         u8 = 9;
+private const LF:         u8 = 10;
+private const CR:         u8 = 13;
+private const SPACE:      u8 = 32;
+private const BANG:       u8 = 33;   // !
+private const QUOTE:      u8 = 34;   // "
+private const HASH:       u8 = 35;   // #
+private const PERCENT:    u8 = 37;   // %
+private const AMPERSAND:  u8 = 38;   // &
+private const APOSTROPHE: u8 = 39;   // '
+private const STAR:       u8 = 42;   // *
+private const PLUS:       u8 = 43;   // +
+private const COMMA:      u8 = 44;   // ,
+private const MINUS:      u8 = 45;   // -
+private const DOT:        u8 = 46;   // .
+private const ZERO:       u8 = 48;   // 0
+private const COLON:      u8 = 58;   // :
+private const GREATER:    u8 = 62;   // >
+private const QUESTION:   u8 = 63;   // ?
+private const AT:         u8 = 64;   // @
+private const LBRACK:     u8 = 91;   // [
+private const BACKSLASH:  u8 = 92;   // \
+private const RBRACK:     u8 = 93;   // ]
+private const BACKTICK:   u8 = 96;   // `
+private const LBRACE:     u8 = 123;  // {
+private const PIPE:       u8 = 124;  // |
+private const RBRACE:     u8 = 125;  // }
+
+/// Collections nest at most this deep, block and flow counted together.
+/// The writer bounds its recursion by the same cap.
+internal const MAX_DEPTH: u64 = 256;
+
+/// The most nodes a document's aliases may copy, counted over all of
+/// them: generous for hand-written configuration, and far below what a
+/// few lines of nested aliases would otherwise expand to.
+internal const MAX_EXPANDED_NODES: u64 = 100000;
+
+/// Where a node starts, which decides what may start there: a block
+/// collection may begin at the start of a line or after a sequence's
+/// `- `, never on the line of a mapping key or of `---`.
+private type enum Place with [Eq] {
+    LineStart;
+    AfterDash;
+    AfterKey;
+    AfterDocumentStart;
+}
+
+/// A core-schema tag written on a node (`!!str`), or none.
+private type enum Tag with [Eq] {
+    None;
+    Str;
+    Int;
+    Float;
+    Bool;
+    Null;
+    Seq;
+    Map;
+}
+
+/// What a plain scalar's text is in the core schema. `Yaml`'s writer asks
+/// the same question to know whether text can be written plain.
+internal type enum PlainKind with [Eq] {
+    Null;
+    Bool;
+    Int;
+    Float;
+    Text;
+}
+
+/// A position in the text, for an error found once the node starting
+/// there has been read.
+private type struct Mark {
+    pos:    u64;
+    line:   u64;
+    column: u64;
+}
+
+/// The anchor and the tag written before a node.
+private type struct Properties {
+    anchor: Option<String>;
+    tag:    Tag;
+}
+
+internal type struct Parser {
+    private text:   Str;
+    private src:    u8*;
+    private len:    u64;
+    private pos:    u64;
+    /// 1-indexed line of `pos`.
+    private line:   u64;
+    /// Offset of the first byte of `pos`'s line; `pos - line_start` is the
+    /// column, which is a line's indentation at its first content byte.
+    private line_start: u64;
+    private depth:  u64;
+    /// Nodes the document's aliases have copied so far.
+    private expanded: u64;
+    private anchor_names:  Array<String>;
+    private anchor_values: Array<Value>;
+    private anchor_sizes:  Array<u64>;
+
+    private static new(text: Str) -> Parser {
+        return Parser {
+            text:          text,
+            src:           text.as_pointer(),
+            len:           text.length() as u64,
+            pos:           0,
+            line:          1,
+            line_start:    0,
+            depth:         0,
+            expanded:      0,
+            anchor_names:  Array::<String>::new(),
+            anchor_values: Array::<Value>::new(),
+            anchor_sizes:  Array::<u64>::new(),
+        };
+    }
+
+    /// The one document `text` holds: null for a stream with none, and
+    /// `YamlErrorKind::MultipleDocuments` for one with more.
+    internal static read_document(text: Str) -> Result<Value, YamlError> {
+        mut parser: Parser = Parser::new(text);
+        mut documents: Array<Value> = parser.read_stream()?;
+        if (documents.length() > 1) {
+            return Result::Err(YamlError::new(YamlErrorKind::MultipleDocuments, 1, 1, 0,
+                String::from_str(Str::new("the text holds more than one document; read it with `Yaml::parse_all`"))));
+        }
+        return match (documents.pop()) {
+            Option::Some(document) => { Result::Ok(document) }
+            Option::None           => { Result::Ok(Value::Null) }
+        };
+    }
+
+    /// Every document `text` holds, in order.
+    internal static read_documents(text: Str) -> Result<Array<Value>, YamlError> {
+        mut parser: Parser = Parser::new(text);
+        return parser.read_stream();
+    }
+
+    // Cursor
+
+    private eof(&this) -> boolean {
+        return this.pos >= this.len;
+    }
+
+    /// The byte `ahead` bytes past `pos`, or 0 past the end.
+    private peek_at(&this, ahead: u64) -> u8 {
+        if (this.pos + ahead >= this.len) { return 0; }
+        return this.src[this.pos + ahead];
+    }
+
+    private peek(&this) -> u8 {
+        return this.peek_at(0);
+    }
+
+    private column(&this) -> u64 {
+        return this.pos - this.line_start;
+    }
+
+    private advance(mut &this) -> void {
+        if (this.pos >= this.len) { return; }
+        const b: u8 = this.src[this.pos];
+        this.pos = this.pos + 1;
+        if (b == LF) {
+            this.line = this.line + 1;
+            this.line_start = this.pos;
+        }
+    }
+
+    private advance_by(mut &this, count: u64) -> void {
+        for (mut i: u64 = 0; i < count; i++) { this.advance(); }
+    }
+
+    /// Whether `b` ends a token: a space, a tab, a line end, or the end of
+    /// the text (`peek` answers 0 there).
+    private static is_blank(b: u8) -> boolean {
+        return b == SPACE || b == HT || b == LF || b == CR || b == 0;
+    }
+
+    private static is_line_end(b: u8) -> boolean {
+        return b == LF || b == CR || b == 0;
+    }
+
+    private static is_flow_indicator(b: u8) -> boolean {
+        return b == COMMA || b == LBRACK || b == RBRACK || b == LBRACE || b == RBRACE;
+    }
+
+    private skip_inline_space(mut &this) -> void {
+        while (!this.eof() && (this.peek() == SPACE || this.peek() == HT)) { this.advance(); }
+    }
+
+    /// Pass one line end, `\r\n` or `\n`, if `pos` is at one.
+    private pass_line_end(mut &this) -> void {
+        if (this.peek() == CR) { this.advance(); }
+        if (this.peek() == LF) { this.advance(); }
+    }
+
+    // Errors
+
+    private error(&this, kind: YamlErrorKind, msg: Str) -> YamlError {
+        return YamlError::new(kind, this.line, this.column() + 1, this.pos, String::from_str(msg));
+    }
+
+    private error_text(&this, kind: YamlErrorKind, msg: String) -> YamlError {
+        return YamlError::new(kind, this.line, this.column() + 1, this.pos, msg);
+    }
+
+    private mark(&this) -> Mark {
+        return Mark { pos: this.pos, line: this.line, column: this.column() + 1 };
+    }
+
+    private static error_at(at: Mark, kind: YamlErrorKind, msg: String) -> YamlError {
+        return YamlError::new(kind, at.line, at.column, at.pos, msg);
+    }
+
+    // Lines
+
+    /// Finish the line a node ended on: spaces, then a comment or nothing,
+    /// then the line end, which is consumed.
+    private finish_line(mut &this) -> Result<(), YamlError> {
+        this.skip_inline_space();
+        // A `#` starts a comment at a line's start or after a space or tab.
+        if (this.peek() == HASH && (this.pos == this.line_start
+                || this.src[this.pos - 1] == SPACE || this.src[this.pos - 1] == HT)) {
+            while (!Parser::is_line_end(this.peek())) { this.advance(); }
+        }
+        if (Parser::is_line_end(this.peek())) {
+            this.pass_line_end();
+            return Result::Ok(());
+        }
+        return Result::Err(this.error(YamlErrorKind::UnexpectedChar,
+            Str::new("unexpected text after the node on this line")));
+    }
+
+    /// Whether `pos`, at a line's start, is at a document marker: `---` or
+    /// `...` at column 0, followed by a blank or the end.
+    private at_document_marker(&this) -> boolean {
+        if (this.column() != 0) { return false; }
+        const b: u8 = this.peek();
+        if (b != MINUS && b != DOT) { return false; }
+        return this.peek_at(1) == b && this.peek_at(2) == b && Parser::is_blank(this.peek_at(3));
+    }
+
+    /// From the start of a line, pass blank and comment-only lines and
+    /// answer the indentation of the next line with content, leaving `pos`
+    /// at that line's start; -1 at the end of the text or at a document
+    /// marker.  A tab in the indentation of a line with content is refused.
+    private next_content_line(mut &this) -> Result<i64, YamlError> {
+        while (!this.eof()) {
+            mut indent: u64 = 0;
+            while (this.peek_at(indent) == SPACE) { indent++; }
+            mut ahead: u64 = indent;
+            while (this.peek_at(ahead) == SPACE || this.peek_at(ahead) == HT) { ahead++; }
+            const first: u8 = this.peek_at(ahead);
+            if (Parser::is_line_end(first) || first == HASH) {
+                // Blank or comment-only: pass the whole line.
+                while (!Parser::is_line_end(this.peek())) { this.advance(); }
+                this.pass_line_end();
+                continue;
+            }
+            if (ahead != indent) {
+                this.advance_by(indent);
+                return Result::Err(this.error(YamlErrorKind::BadIndentation,
+                    Str::new("a tab in a line's indentation")));
+            }
+            if (this.at_document_marker()) { return Result::Ok(-1); }
+            return Result::Ok(indent as i64);
+        }
+        return Result::Ok(-1);
+    }
+
+    // Documents
+
+    private read_stream(mut &this) -> Result<Array<Value>, YamlError> {
+        mut documents: Array<Value> = Array::<Value>::new();
+        while (true) {
+            this.anchor_names = Array::<String>::new();
+            this.anchor_values = Array::<Value>::new();
+            this.anchor_sizes = Array::<u64>::new();
+            this.expanded = 0;
+            const indent: i64 = this.next_content_line()?;
+            if (this.eof()) { break; }
+            if (indent == 0 && this.peek() == PERCENT) {
+                return Result::Err(this.error(YamlErrorKind::UnsupportedDirective,
+                    Str::new("a directive (`%YAML`, `%TAG`); this reader takes YAML 1.2 with the core schema and no directives")));
+            }
+            if (this.at_document_marker() && this.peek() == DOT) {
+                // `...` with no document open ends nothing.
+                this.advance_by(3);
+                this.finish_line()?;
+                continue;
+            }
+            mut document: Value = Value::Null;
+            if (this.at_document_marker()) {
+                this.advance_by(3);
+                document = this.read_block_node(-1, Place::AfterDocumentStart)?;
+            } else {
+                this.advance_by(indent as u64);
+                document = this.read_node_here(-1, Place::LineStart, Tag::None, false)?;
+            }
+            const after: i64 = this.next_content_line()?;
+            if (after >= 0) {
+                this.advance_by(after as u64);
+                return Result::Err(this.error(YamlErrorKind::UnexpectedChar,
+                    Str::new("a second node at the top level of the document")));
+            }
+            documents.push(document);
+            if (this.at_document_marker() && this.peek() == DOT) {
+                this.advance_by(3);
+                this.finish_line()?;
+            }
+            if (this.eof()) { break; }
+        }
+        return Result::Ok(documents);
+    }
+
+    // Nodes
+
+    /// A node that may start on this line after an indicator (`key:`, `-`,
+    /// `---`) or on the lines after it, indented past `parent`; null when
+    /// neither holds one.  Leaves `pos` at the start of the line after the
+    /// node.
+    private read_block_node(mut &this, parent: i64, place: Place) -> Result<Value, YamlError> {
+        this.skip_inline_space();
+        const properties: Properties = this.read_properties(Tag::None)?;
+        const anchor: Option<String> = properties.anchor;
+        const tag: Tag = properties.tag;
+        mut value: Value = Value::Null;
+        if (Parser::is_line_end(this.peek()) || this.peek() == HASH) {
+            this.finish_line()?;
+            const indent: i64 = this.next_content_line()?;
+            const compact: boolean = indent == parent && parent >= 0 && place == Place::AfterKey
+                && this.peek_at(indent as u64) == MINUS && Parser::is_blank(this.peek_at(indent as u64 + 1));
+            if (indent > parent || compact) {
+                this.advance_by(indent as u64);
+                value = this.read_node_here(parent, Place::LineStart, tag, false)?;
+            } else {
+                value = this.empty_node(tag)?;
+            }
+        } else {
+            const inline_properties: boolean = anchor.is_some() || tag != Tag::None;
+            value = this.read_node_here(parent, place, tag, inline_properties)?;
+        }
+        return this.anchored(anchor, value);
+    }
+
+    /// `&anchor` and `!tag`, in either order, before a node; `tag` is one
+    /// already written for it on an earlier line.
+    private read_properties(mut &this, tag: Tag) -> Result<Properties, YamlError> {
+        mut anchor: Option<String> = Option::None;
+        mut written: Tag = tag;
+        while (true) {
+            if (this.peek() == AMPERSAND && anchor.is_none()) {
+                this.advance();
+                anchor = Option::Some(this.read_name()?);
+                this.skip_inline_space();
+                continue;
+            }
+            if (this.peek() == BANG && written == Tag::None) {
+                written = this.read_tag()?;
+                this.skip_inline_space();
+                continue;
+            }
+            break;
+        }
+        return Result::Ok(Properties { anchor: anchor, tag: written });
+    }
+
+    /// An anchor's or an alias's name: the bytes up to a blank or a flow
+    /// indicator.
+    private read_name(mut &this) -> Result<String, YamlError> {
+        const start: u64 = this.pos;
+        while (!Parser::is_blank(this.peek()) && !Parser::is_flow_indicator(this.peek())) { this.advance(); }
+        if (this.pos == start) {
+            return Result::Err(this.error(YamlErrorKind::UnexpectedChar, Str::new("an anchor or alias with no name")));
+        }
+        return Result::Ok(String::from_str(this.text.byte_substring(start as i64, this.pos as i64)));
+    }
+
+    private read_tag(mut &this) -> Result<Tag, YamlError> {
+        const start: u64 = this.pos;
+        while (!Parser::is_blank(this.peek()) && !Parser::is_flow_indicator(this.peek())) { this.advance(); }
+        const written: Str = this.text.byte_substring(start as i64, this.pos as i64);
+        if (written == Str::new("!!str"))   { return Result::Ok(Tag::Str); }
+        if (written == Str::new("!!int"))   { return Result::Ok(Tag::Int); }
+        if (written == Str::new("!!float")) { return Result::Ok(Tag::Float); }
+        if (written == Str::new("!!bool"))  { return Result::Ok(Tag::Bool); }
+        if (written == Str::new("!!null"))  { return Result::Ok(Tag::Null); }
+        if (written == Str::new("!!seq"))   { return Result::Ok(Tag::Seq); }
+        if (written == Str::new("!!map"))   { return Result::Ok(Tag::Map); }
+        this.pos = start;
+        return Result::Err(this.error_text(YamlErrorKind::UnsupportedTag,
+            f"the tag `{written}` is not one of the core schema's (`!!str`, `!!int`, `!!float`, `!!bool`, `!!null`, `!!seq`, `!!map`)"));
+    }
+
+    /// The node an absent value is: null, or the empty value its tag asks
+    /// for.
+    private empty_node(&this, tag: Tag) -> Result<Value, YamlError> {
+        return match (tag) {
+            Tag::Str  => { Result::Ok(Value::String(String::new())) }
+            Tag::Seq  => { Result::Ok(Value::Array(Array::<Value>::new())) }
+            Tag::Map  => { Result::Ok(Value::Object(Object::new())) }
+            Tag::None => { Result::Ok(Value::Null) }
+            Tag::Null => { Result::Ok(Value::Null) }
+            _ => {
+                Result::Err(this.error(YamlErrorKind::UnsupportedTag,
+                    Str::new("a tag on an empty node it does not describe")))
+            }
+        };
+    }
+
+    /// Record `value` under `anchor`, when there is one, and answer it.
+    private anchored(mut &this, anchor: Option<String>, value: Value) -> Result<Value, YamlError> {
+        match (anchor) {
+            Option::Some(name) => {
+                this.anchor_sizes.push(Parser::node_count(&value));
+                this.anchor_values.push(value.clone());
+                this.anchor_names.push(name);
+            }
+            Option::None => { }
+        }
+        return Result::Ok(value);
+    }
+
+    /// How many nodes `value` is: itself and everything it holds.
+    private static node_count(value: &Value) -> u64 {
+        return match (value) {
+            Value::Array(items) => {
+                mut count: u64 = 1;
+                for (mut i: i64 = 0; i < items.length(); i++) { count = count + Parser::node_count(&items[i]); }
+                count
+            }
+            Value::Object(entries) => {
+                mut count: u64 = 1;
+                for (mut i: i64 = 0; i < entries.length(); i++) {
+                    match (entries.value_at(i)) {
+                        Option::Some(entry) => { count = count + Parser::node_count(entry); }
+                        Option::None        => { }
+                    }
+                }
+                count
+            }
+            _ => { 1 }
+        };
+    }
+
+    /// The node whose first byte `pos` is at.  `tag` is one written for it
+    /// before; `inline_properties` says an anchor or a tag stands before it
+    /// on its own line, which a key may not have.
+    private read_node_here(mut &this, parent: i64, place: Place, tag: Tag,
+                           inline_properties: boolean) -> Result<Value, YamlError> {
+        const properties: Properties = this.read_properties(tag)?;
+        const anchor: Option<String> = properties.anchor;
+        const node_tag: Tag = properties.tag;
+        if (Parser::is_line_end(this.peek()) || this.peek() == HASH) {
+            // Properties alone on the line: the node is on the lines after.
+            this.finish_line()?;
+            const indent: i64 = this.next_content_line()?;
+            mut value: Value = Value::Null;
+            if (indent > parent) {
+                this.advance_by(indent as u64);
+                value = this.read_node_here(parent, Place::LineStart, node_tag, false)?;
+            } else {
+                value = this.empty_node(node_tag)?;
+            }
+            return this.anchored(anchor, value);
+        }
+        const on_line: boolean = inline_properties || anchor.is_some() || node_tag != tag;
+        const value: Value = this.read_node_content(parent, place, node_tag, on_line)?;
+        return this.anchored(anchor, value);
+    }
+
+    private read_node_content(mut &this, parent: i64, place: Place, tag: Tag,
+                              inline_properties: boolean) -> Result<Value, YamlError> {
+        const column: i64 = this.column() as i64;
+        const b: u8 = this.peek();
+        const block_allowed: boolean = place == Place::LineStart || place == Place::AfterDash;
+        if (b == STAR) {
+            if (inline_properties || tag != Tag::None) {
+                return Result::Err(this.error(YamlErrorKind::UnsupportedTag, Str::new("an alias takes no anchor or tag")));
+            }
+            const value: Value = this.read_alias()?;
+            this.skip_inline_space();
+            if (this.peek() == COLON && Parser::is_blank(this.peek_at(1))) {
+                return Result::Err(this.error(YamlErrorKind::ComplexKey, Str::new("an alias as a key")));
+            }
+            this.finish_line()?;
+            return Result::Ok(value);
+        }
+        if (b == LBRACK || b == LBRACE) {
+            const value: Value = this.read_flow_node(tag)?;
+            this.skip_inline_space();
+            if (this.peek() == COLON && Parser::is_blank(this.peek_at(1))) {
+                return Result::Err(this.error(YamlErrorKind::ComplexKey, Str::new("a flow collection as a key")));
+            }
+            this.finish_line()?;
+            return Result::Ok(value);
+        }
+        if (b == PIPE || b == GREATER) {
+            const at: Mark = this.mark();
+            const text: String = this.read_block_scalar(parent)?;
+            return Parser::typed_scalar(text, false, tag, at);
+        }
+        if (b == MINUS && Parser::is_blank(this.peek_at(1))) {
+            if (!block_allowed) {
+                return Result::Err(this.error(YamlErrorKind::UnexpectedChar,
+                    Str::new("a block sequence cannot start on the line of its key or of `---`")));
+            }
+            if (tag != Tag::None && tag != Tag::Seq) {
+                return Result::Err(this.error(YamlErrorKind::UnsupportedTag, Str::new("a scalar tag on a sequence")));
+            }
+            return this.read_block_sequence(column);
+        }
+        if (b == QUESTION && Parser::is_blank(this.peek_at(1))) {
+            return Result::Err(this.error(YamlErrorKind::ComplexKey,
+                Str::new("a complex key (`? key`); this reader takes keys that are scalars on one line")));
+        }
+        if (b == AT || b == BACKTICK || b == PERCENT || b == HASH || Parser::is_flow_indicator(b)) {
+            return Result::Err(this.error(YamlErrorKind::UnexpectedChar, Str::new("a character that starts no node")));
+        }
+        // A scalar, which a `: ` after it on its line makes the first key of
+        // a mapping.
+        const plain: boolean = b != APOSTROPHE && b != QUOTE;
+        const at: Mark = this.mark();
+        const start_line: u64 = this.line;
+        const text: String = this.read_scalar_first_line()?;
+        this.skip_inline_space();
+        if (this.peek() == COLON && Parser::is_blank(this.peek_at(1)) && this.line == start_line) {
+            if (!block_allowed) {
+                return Result::Err(this.error(YamlErrorKind::UnexpectedChar,
+                    Str::new("a mapping cannot start on the line of its key or of `---`")));
+            }
+            if (inline_properties) {
+                return Result::Err(this.error(YamlErrorKind::ComplexKey,
+                    Str::new("a key with an anchor or a tag; put the anchor or tag on its own line before the mapping")));
+            }
+            if (tag != Tag::None && tag != Tag::Map) {
+                return Result::Err(this.error(YamlErrorKind::UnsupportedTag, Str::new("a scalar tag on a mapping")));
+            }
+            return this.read_block_mapping(column, text, plain);
+        }
+        if (plain) {
+            const whole: String = this.continue_plain(parent, text)?;
+            return Parser::typed_scalar(whole, true, tag, at);
+        }
+        this.finish_line()?;
+        return Parser::typed_scalar(text, false, tag, at);
+    }
+
+    private read_alias(mut &this) -> Result<Value, YamlError> {
+        this.advance();
+        const name: String = this.read_name()?;
+        mut i: i64 = this.anchor_names.length() - 1;
+        while (i >= 0) {
+            if (this.anchor_names[i].as_str() == name.as_str()) {
+                const size: u64 = this.anchor_sizes[i];
+                if (this.expanded + size > MAX_EXPANDED_NODES) {
+                    return Result::Err(this.error_text(YamlErrorKind::ExpansionLimit,
+                        f"the aliases would expand the document past {MAX_EXPANDED_NODES} nodes"));
+                }
+                this.expanded = this.expanded + size;
+                return Result::Ok(this.anchor_values[i].clone());
+            }
+            i--;
+        }
+        return Result::Err(this.error_text(YamlErrorKind::UndefinedAlias,
+            f"the alias `*{name.as_str()}` names no anchor before it in this document"));
+    }
+
+    // Block collections
+
+    private enter(mut &this) -> Result<(), YamlError> {
+        this.depth = this.depth + 1;
+        if (this.depth > MAX_DEPTH) {
+            return Result::Err(this.error_text(YamlErrorKind::DepthExceeded,
+                f"collections nested deeper than {MAX_DEPTH}"));
+        }
+        return Result::Ok(());
+    }
+
+    /// Refuse `key` as the next key of `entries`: the merge key, or one the
+    /// mapping already has.
+    private check_key(&this, entries: &Object, key: Str, plain: boolean) -> Result<(), YamlError> {
+        if (plain && key == Str::new("<<")) {
+            return Result::Err(this.error(YamlErrorKind::MergeKey,
+                Str::new("the merge key `<<`, which the core schema does not define")));
+        }
+        if (entries.contains(key)) {
+            return Result::Err(this.error_text(YamlErrorKind::DuplicateKey,
+                f"the key `{key}` appears twice in this mapping"));
+        }
+        return Result::Ok(());
+    }
+
+    /// The block mapping at `column` whose first key, already read, is
+    /// `first`; `pos` is at that key's `:`.
+    private read_block_mapping(mut &this, column: i64, first: String, first_plain: boolean) -> Result<Value, YamlError> {
+        this.enter()?;
+        mut entries: Object = Object::new();
+        mut key: String = first;
+        mut plain: boolean = first_plain;
+        while (true) {
+            this.check_key(&entries, key.as_str(), plain)?;
+            this.advance();   // the `:`
+            const value: Value = this.read_block_node(column, Place::AfterKey)?;
+            entries.insert(key, value);
+            const indent: i64 = this.next_content_line()?;
+            if (indent < column) { break; }
+            if (indent > column) {
+                this.advance_by(indent as u64);
+                return Result::Err(this.error(YamlErrorKind::BadIndentation,
+                    Str::new("a line indented past the mapping's keys")));
+            }
+            this.advance_by(indent as u64);
+            plain = this.peek() != APOSTROPHE && this.peek() != QUOTE;
+            key = this.read_block_key()?;
+        }
+        this.depth = this.depth - 1;
+        return Result::Ok(Value::Object(entries));
+    }
+
+    /// A key at the start of a mapping's line, up to its `:`.
+    private read_block_key(mut &this) -> Result<String, YamlError> {
+        const b: u8 = this.peek();
+        if (b == QUESTION && Parser::is_blank(this.peek_at(1))) {
+            return Result::Err(this.error(YamlErrorKind::ComplexKey,
+                Str::new("a complex key (`? key`); this reader takes keys that are scalars on one line")));
+        }
+        if (b == LBRACK || b == LBRACE || b == STAR) {
+            return Result::Err(this.error(YamlErrorKind::ComplexKey, Str::new("a collection or an alias as a key")));
+        }
+        if (b == AMPERSAND || b == BANG) {
+            return Result::Err(this.error(YamlErrorKind::ComplexKey, Str::new("a key with an anchor or a tag")));
+        }
+        if (b == MINUS && Parser::is_blank(this.peek_at(1))) {
+            return Result::Err(this.error(YamlErrorKind::UnexpectedChar,
+                Str::new("a sequence entry where the mapping expects a key")));
+        }
+        const start_line: u64 = this.line;
+        const key: String = this.read_scalar_first_line()?;
+        this.skip_inline_space();
+        if (this.line != start_line || this.peek() != COLON || !Parser::is_blank(this.peek_at(1))) {
+            return Result::Err(this.error(YamlErrorKind::UnexpectedChar, Str::new("expected `:` after the key")));
+        }
+        return Result::Ok(key);
+    }
+
+    /// The block sequence whose first `-` is at `pos`, column `column`.
+    private read_block_sequence(mut &this, column: i64) -> Result<Value, YamlError> {
+        this.enter()?;
+        mut items: Array<Value> = Array::<Value>::new();
+        while (true) {
+            this.advance();   // the `-`
+            const item: Value = this.read_block_node(column, Place::AfterDash)?;
+            items.push(item);
+            const indent: i64 = this.next_content_line()?;
+            if (indent < column) { break; }
+            if (indent > column) {
+                this.advance_by(indent as u64);
+                return Result::Err(this.error(YamlErrorKind::BadIndentation,
+                    Str::new("a line indented past the sequence's entries")));
+            }
+            if (this.peek_at(indent as u64) != MINUS || !Parser::is_blank(this.peek_at(indent as u64 + 1))) {
+                // A key at the sequence's column ends a sequence that is its
+                // mapping's value; anything else there is the caller's to refuse.
+                break;
+            }
+            this.advance_by(indent as u64);
+        }
+        this.depth = this.depth - 1;
+        return Result::Ok(Value::Array(items));
+    }
+
+    // Scalars
+
+    /// A scalar's first line: a quoted scalar whole (it may run over
+    /// lines), or a plain one up to a `: `, a ` #` or the line's end.
+    private read_scalar_first_line(mut &this) -> Result<String, YamlError> {
+        if (this.peek() == APOSTROPHE) { return this.read_single_quoted(); }
+        if (this.peek() == QUOTE) { return this.read_double_quoted(); }
+        return Result::Ok(String::from_str(this.read_plain_line(false)));
+    }
+
+    /// The plain text from `pos` to the first `: `, ` #` or line end (in a
+    /// flow collection also to a flow indicator), its trailing spaces
+    /// dropped.
+    private read_plain_line(mut &this, flow: boolean) -> Str {
+        const start: u64 = this.pos;
+        mut end: u64 = this.pos;
+        while (!this.eof()) {
+            const b: u8 = this.peek();
+            if (Parser::is_line_end(b)) { break; }
+            if (b == COLON) {
+                const next: u8 = this.peek_at(1);
+                if (Parser::is_blank(next) || (flow && Parser::is_flow_indicator(next))) { break; }
+            }
+            if (b == HASH && this.pos > start) {
+                const previous: u8 = this.src[this.pos - 1];
+                if (previous == SPACE || previous == HT) { break; }
+            }
+            if (flow && Parser::is_flow_indicator(b)) { break; }
+            this.advance();
+            if (b != SPACE && b != HT) { end = this.pos; }
+        }
+        return this.text.byte_substring(start as i64, end as i64);
+    }
+
+    /// A plain scalar's text with the lines that continue it: lines
+    /// indented past `parent` that start no comment, each joined by a
+    /// space, or by a line break per empty line between them.  Leaves
+    /// `pos` at the start of the line after the scalar.
+    private continue_plain(mut &this, parent: i64, first: String) -> Result<String, YamlError> {
+        mut text: String = first;
+        this.finish_line()?;
+        while (true) {
+            const saved_pos: u64 = this.pos;
+            const saved_line: u64 = this.line;
+            const saved_start: u64 = this.line_start;
+            mut empty_lines: i64 = 0;
+            mut indent: i64 = -1;
+            while (!this.eof()) {
+                mut spaces: u64 = 0;
+                while (this.peek_at(spaces) == SPACE || this.peek_at(spaces) == HT) { spaces++; }
+                if (Parser::is_line_end(this.peek_at(spaces))) {
+                    this.advance_by(spaces);
+                    this.pass_line_end();
+                    empty_lines++;
+                    continue;
+                }
+                indent = spaces as i64;
+                break;
+            }
+            if (indent <= parent || this.at_document_marker() || this.peek_at(indent as u64) == HASH) {
+                this.pos = saved_pos;
+                this.line = saved_line;
+                this.line_start = saved_start;
+                break;
+            }
+            this.advance_by(indent as u64);
+            const more: Str = this.read_plain_line(false);
+            if (this.peek() == COLON) {
+                return Result::Err(this.error(YamlErrorKind::UnexpectedChar,
+                    Str::new("a key on a line that continues a plain scalar; a key is on one line")));
+            }
+            if (empty_lines == 0) {
+                text.push_byte(SPACE);
+            } else {
+                for (mut i: i64 = 0; i < empty_lines; i++) { text.push_byte(LF); }
+            }
+            text.append(more);
+            this.finish_line()?;
+        }
+        return Result::Ok(text);
+    }
+
+    /// The line break and the leading whitespace of the lines a quoted
+    /// scalar continues on: one space for a break, or a line break per
+    /// empty line.  `pos` is at the break.
+    private fold_quoted_break(mut &this, out: mut &String) -> Result<(), YamlError> {
+        mut breaks: i64 = 0;
+        while (this.peek() == CR || this.peek() == LF) {
+            this.pass_line_end();
+            breaks++;
+            while (this.peek() == SPACE || this.peek() == HT) { this.advance(); }
+        }
+        if (this.eof()) {
+            return Result::Err(this.error(YamlErrorKind::UnexpectedEof, Str::new("the text ends inside a quoted scalar")));
+        }
+        if (this.at_document_marker()) {
+            return Result::Err(this.error(YamlErrorKind::UnexpectedChar, Str::new("a document marker inside a quoted scalar")));
+        }
+        if (breaks == 1) {
+            out.push_byte(SPACE);
+        } else {
+            for (mut i: i64 = 1; i < breaks; i++) { out.push_byte(LF); }
+        }
+        return Result::Ok(());
+    }
+
+    private read_single_quoted(mut &this) -> Result<String, YamlError> {
+        this.advance();
+        mut out: String = String::new();
+        mut kept: i64 = 0;
+        while (true) {
+            if (this.eof()) {
+                return Result::Err(this.error(YamlErrorKind::UnexpectedEof, Str::new("the text ends inside a quoted scalar")));
+            }
+            const b: u8 = this.peek();
+            if (b == APOSTROPHE) {
+                if (this.peek_at(1) != APOSTROPHE) { this.advance(); break; }
+                out.push_byte(APOSTROPHE);
+                this.advance_by(2);
+                kept = out.length();
+                continue;
+            }
+            if (b == LF || b == CR) {
+                out.truncate(kept);
+                this.fold_quoted_break(&out)?;
+                kept = out.length();
+                continue;
+            }
+            out.push_byte(b);
+            this.advance();
+            if (b != SPACE && b != HT) { kept = out.length(); }
+        }
+        return Result::Ok(out);
+    }
+
+    private read_double_quoted(mut &this) -> Result<String, YamlError> {
+        this.advance();
+        mut out: String = String::new();
+        mut kept: i64 = 0;
+        while (true) {
+            if (this.eof()) {
+                return Result::Err(this.error(YamlErrorKind::UnexpectedEof, Str::new("the text ends inside a quoted scalar")));
+            }
+            const b: u8 = this.peek();
+            if (b == QUOTE) { this.advance(); break; }
+            if (b == BACKSLASH && Parser::is_line_end(this.peek_at(1)) && this.peek_at(1) != 0) {
+                // An escaped line break joins the lines with nothing.
+                this.advance();
+                this.pass_line_end();
+                while (this.peek() == SPACE || this.peek() == HT) { this.advance(); }
+                kept = out.length();
+                continue;
+            }
+            if (b == BACKSLASH) {
+                this.read_escape(&out)?;
+                kept = out.length();
+                continue;
+            }
+            if (b == LF || b == CR) {
+                out.truncate(kept);
+                this.fold_quoted_break(&out)?;
+                kept = out.length();
+                continue;
+            }
+            out.push_byte(b);
+            this.advance();
+            if (b != SPACE && b != HT) { kept = out.length(); }
+        }
+        return Result::Ok(out);
+    }
+
+    /// One `\X` escape of a double-quoted scalar, `pos` at its `\`.
+    private read_escape(mut &this, out: mut &String) -> Result<(), YamlError> {
+        this.advance();
+        if (this.eof()) {
+            return Result::Err(this.error(YamlErrorKind::UnexpectedEof, Str::new("the text ends inside an escape")));
+        }
+        const c: u8 = this.peek();
+        this.advance();
+        if (c == ZERO)           { out.push_byte(0 as u8);   return Result::Ok(()); }
+        if (c == 97)             { out.push_byte(7 as u8);   return Result::Ok(()); }  // a
+        if (c == 98)             { out.push_byte(8 as u8);   return Result::Ok(()); }  // b
+        if (c == 116 || c == HT) { out.push_byte(HT);        return Result::Ok(()); }  // t
+        if (c == 110)            { out.push_byte(LF);        return Result::Ok(()); }  // n
+        if (c == 118)            { out.push_byte(11 as u8);  return Result::Ok(()); }  // v
+        if (c == 102)            { out.push_byte(12 as u8);  return Result::Ok(()); }  // f
+        if (c == 114)            { out.push_byte(CR);        return Result::Ok(()); }  // r
+        if (c == 101)            { out.push_byte(27 as u8);  return Result::Ok(()); }  // e
+        if (c == SPACE)          { out.push_byte(SPACE);     return Result::Ok(()); }
+        if (c == QUOTE)          { out.push_byte(QUOTE);     return Result::Ok(()); }
+        if (c == 47)             { out.push_byte(47 as u8);  return Result::Ok(()); }  // /
+        if (c == BACKSLASH)      { out.push_byte(BACKSLASH); return Result::Ok(()); }
+        if (c == 78)             { out.push(0x85 as char);   return Result::Ok(()); }  // N
+        if (c == 95)             { out.push(0xA0 as char);   return Result::Ok(()); }  // _
+        if (c == 76)             { out.push(0x2028 as char); return Result::Ok(()); }  // L
+        if (c == 80)             { out.push(0x2029 as char); return Result::Ok(()); }  // P
+        mut digits: u64 = 0;
+        if (c == 120) { digits = 2; }   // x
+        if (c == 117) { digits = 4; }   // u
+        if (c == 85)  { digits = 8; }   // U
+        if (digits == 0) {
+            return Result::Err(this.error(YamlErrorKind::InvalidEscape, Str::new("an escape YAML does not define")));
+        }
+        mut scalar: u32 = 0;
+        for (mut i: u64 = 0; i < digits; i++) {
+            const h: u8 = this.peek();
+            mut nibble: u32 = 16;
+            if (h >= 48 && h <= 57)  { nibble = (h - 48) as u32; }
+            if (h >= 97 && h <= 102) { nibble = (h - 87) as u32; }
+            if (h >= 65 && h <= 70)  { nibble = (h - 55) as u32; }
+            if (nibble == 16) {
+                return Result::Err(this.error(YamlErrorKind::InvalidEscape,
+                    Str::new("a hexadecimal escape with a byte that is no hexadecimal digit")));
+            }
+            scalar = scalar * 16 + nibble;
+            this.advance();
+        }
+        if (scalar > 0x10FFFF || (scalar >= 0xD800 && scalar <= 0xDFFF)) {
+            return Result::Err(this.error(YamlErrorKind::InvalidEscape, Str::new("an escape naming no Unicode scalar value")));
+        }
+        out.push(scalar as char);
+        return Result::Ok(());
+    }
+
+    /// A literal `|` or folded `>` block scalar, `pos` at its indicator.
+    /// Its lines are those indented at least as far as its first non-empty
+    /// line, or as its indentation indicator says, which must be past
+    /// `parent`.  Leaves `pos` at the start of the first line after it.
+    private read_block_scalar(mut &this, parent: i64) -> Result<String, YamlError> {
+        const folded: boolean = this.peek() == GREATER;
+        this.advance();
+        // Chomping: -1 strips the final line breaks, 0 keeps one, 1 keeps all.
+        mut chomping: i64 = 0;
+        mut explicit_indent: i64 = 0;
+        for (mut i: i64 = 0; i < 2; i++) {
+            const b: u8 = this.peek();
+            if (b == MINUS && chomping == 0) { chomping = -1; this.advance(); }
+            else if (b == PLUS && chomping == 0) { chomping = 1; this.advance(); }
+            else if (b >= 49 && b <= 57 && explicit_indent == 0) { explicit_indent = (b - 48) as i64; this.advance(); }
+        }
+        if (!Parser::is_blank(this.peek()) && this.peek() != HASH) {
+            return Result::Err(this.error(YamlErrorKind::UnexpectedChar, Str::new("unexpected text in a block scalar's header")));
+        }
+        this.finish_line()?;
+
+        mut indent: i64 = -1;
+        if (explicit_indent > 0) {
+            indent = explicit_indent;
+            if (parent > 0) { indent = parent + explicit_indent; }
+        }
+        mut out: String = String::new();
+        mut pending: i64 = 0;              // line breaks not yet written
+        mut has_content: boolean = false;
+        mut previous_more: boolean = false;
+        while (!this.eof()) {
+            mut spaces: i64 = 0;
+            while (this.peek_at(spaces as u64) == SPACE) { spaces++; }
+            const blank_line: boolean = Parser::is_line_end(this.peek_at(spaces as u64));
+            if (blank_line && (indent < 0 || spaces <= indent)) {
+                this.advance_by(spaces as u64);
+                this.pass_line_end();
+                pending++;
+                continue;
+            }
+            if (indent < 0) {
+                if (spaces <= parent) { break; }
+                indent = spaces;
+            }
+            if (spaces < indent || (spaces == 0 && this.at_document_marker())) { break; }
+            this.advance_by(indent as u64);
+            const start: u64 = this.pos;
+            while (!Parser::is_line_end(this.peek())) { this.advance(); }
+            const content: Str = this.text.byte_substring(start as i64, this.pos as i64);
+            const more: boolean = blank_line || (content.length() > 0
+                && (content.byte_at(0).unwrap() == SPACE || content.byte_at(0).unwrap() == HT));
+            if (!has_content) {
+                for (mut i: i64 = 0; i < pending; i++) { out.push_byte(LF); }
+            } else if (folded && pending == 0 && !previous_more && !more) {
+                out.push_byte(SPACE);
+            } else {
+                mut breaks: i64 = pending + 1;
+                if (folded && !previous_more && !more) { breaks = pending; }
+                for (mut i: i64 = 0; i < breaks; i++) { out.push_byte(LF); }
+            }
+            out.append(content);
+            has_content = true;
+            previous_more = more;
+            pending = 0;
+            this.pass_line_end();
+        }
+        if (chomping == 1) {
+            mut breaks: i64 = pending;
+            if (has_content) { breaks = pending + 1; }
+            for (mut i: i64 = 0; i < breaks; i++) { out.push_byte(LF); }
+        } else if (chomping == 0 && has_content) {
+            out.push_byte(LF);
+        }
+        return Result::Ok(out);
+    }
+
+    // Flow collections
+
+    /// Spaces, line breaks and comments between flow tokens.
+    private skip_flow_space(mut &this) -> void {
+        while (!this.eof()) {
+            const b: u8 = this.peek();
+            if (b == SPACE || b == HT || b == LF || b == CR) { this.advance(); continue; }
+            if (b == HASH) {
+                while (!Parser::is_line_end(this.peek())) { this.advance(); }
+                continue;
+            }
+            return;
+        }
+    }
+
+    /// A node inside a flow collection, or the collection `pos` opens.
+    private read_flow_node(mut &this, tag: Tag) -> Result<Value, YamlError> {
+        const properties: Properties = this.read_properties(tag)?;
+        const anchor: Option<String> = properties.anchor;
+        const node_tag: Tag = properties.tag;
+        const b: u8 = this.peek();
+        mut value: Value = Value::Null;
+        if (b == LBRACK) {
+            if (node_tag != Tag::None && node_tag != Tag::Seq) {
+                return Result::Err(this.error(YamlErrorKind::UnsupportedTag, Str::new("a scalar tag on a sequence")));
+            }
+            value = this.read_flow_sequence()?;
+        } else if (b == LBRACE) {
+            if (node_tag != Tag::None && node_tag != Tag::Map) {
+                return Result::Err(this.error(YamlErrorKind::UnsupportedTag, Str::new("a scalar tag on a mapping")));
+            }
+            value = this.read_flow_mapping()?;
+        } else if (b == STAR) {
+            if (node_tag != Tag::None || anchor.is_some()) {
+                return Result::Err(this.error(YamlErrorKind::UnsupportedTag, Str::new("an alias takes no anchor or tag")));
+            }
+            value = this.read_alias()?;
+        } else if (b == COMMA || b == RBRACK || b == RBRACE) {
+            value = this.empty_node(node_tag)?;
+        } else if (this.eof()) {
+            return Result::Err(this.error(YamlErrorKind::UnexpectedEof, Str::new("the text ends inside a flow collection")));
+        } else if (b == PIPE || b == GREATER || b == AT || b == BACKTICK || b == HASH) {
+            return Result::Err(this.error(YamlErrorKind::UnexpectedChar, Str::new("a character that starts no node in a flow collection")));
+        } else {
+            const plain: boolean = b != APOSTROPHE && b != QUOTE;
+            const at: Mark = this.mark();
+            const text: String = this.read_flow_scalar()?;
+            value = Parser::typed_scalar(text, plain, node_tag, at)?;
+        }
+        return this.anchored(anchor, value);
+    }
+
+    /// A scalar in a flow collection: quoted, or plain up to a flow
+    /// indicator, a `: ` or a comment, continued over line breaks.
+    private read_flow_scalar(mut &this) -> Result<String, YamlError> {
+        if (this.peek() == APOSTROPHE) { return this.read_single_quoted(); }
+        if (this.peek() == QUOTE) { return this.read_double_quoted(); }
+        mut text: String = String::from_str(this.read_plain_line(true));
+        while (!this.eof() && Parser::is_line_end(this.peek())) {
+            this.skip_flow_space();
+            const b: u8 = this.peek();
+            if (Parser::is_flow_indicator(b) || b == COLON || this.eof()) { break; }
+            text.push_byte(SPACE);
+            text.append(this.read_plain_line(true));
+        }
+        return Result::Ok(text);
+    }
+
+    private read_flow_sequence(mut &this) -> Result<Value, YamlError> {
+        this.enter()?;
+        this.advance();   // [
+        mut items: Array<Value> = Array::<Value>::new();
+        while (true) {
+            this.skip_flow_space();
+            if (this.eof()) {
+                return Result::Err(this.error(YamlErrorKind::UnexpectedEof, Str::new("the text ends inside a flow sequence")));
+            }
+            if (this.peek() == RBRACK) { this.advance(); break; }
+            if (this.peek() == QUESTION && Parser::is_blank(this.peek_at(1))) {
+                return Result::Err(this.error(YamlErrorKind::ComplexKey, Str::new("a complex key (`? key`) in a flow sequence")));
+            }
+            const item: Value = this.read_flow_node(Tag::None)?;
+            this.skip_flow_space();
+            if (this.peek() == COLON) {
+                return Result::Err(this.error(YamlErrorKind::ComplexKey,
+                    Str::new("a single-pair mapping inside a flow sequence; write it as `{key: value}`")));
+            }
+            items.push(item);
+            if (this.peek() == COMMA) { this.advance(); continue; }
+            if (this.peek() == RBRACK) { this.advance(); break; }
+            if (this.eof()) {
+                return Result::Err(this.error(YamlErrorKind::UnexpectedEof, Str::new("the text ends inside a flow sequence")));
+            }
+            return Result::Err(this.error(YamlErrorKind::UnexpectedChar, Str::new("expected `,` or `]` in a flow sequence")));
+        }
+        this.depth = this.depth - 1;
+        return Result::Ok(Value::Array(items));
+    }
+
+    private read_flow_mapping(mut &this) -> Result<Value, YamlError> {
+        this.enter()?;
+        this.advance();   // {
+        mut entries: Object = Object::new();
+        while (true) {
+            this.skip_flow_space();
+            if (this.eof()) {
+                return Result::Err(this.error(YamlErrorKind::UnexpectedEof, Str::new("the text ends inside a flow mapping")));
+            }
+            if (this.peek() == RBRACE) { this.advance(); break; }
+            const b: u8 = this.peek();
+            if (b == QUESTION && Parser::is_blank(this.peek_at(1))) {
+                return Result::Err(this.error(YamlErrorKind::ComplexKey, Str::new("a complex key (`? key`) in a flow mapping")));
+            }
+            if (b == LBRACK || b == LBRACE || b == STAR) {
+                return Result::Err(this.error(YamlErrorKind::ComplexKey, Str::new("a collection or an alias as a key")));
+            }
+            if (b == AMPERSAND || b == BANG) {
+                return Result::Err(this.error(YamlErrorKind::ComplexKey, Str::new("a key with an anchor or a tag")));
+            }
+            const plain: boolean = b != APOSTROPHE && b != QUOTE;
+            const key: String = this.read_flow_scalar()?;
+            this.check_key(&entries, key.as_str(), plain)?;
+            this.skip_flow_space();
+            mut value: Value = Value::Null;
+            if (this.peek() == COLON) {
+                this.advance();
+                this.skip_flow_space();
+                value = this.read_flow_node(Tag::None)?;
+                this.skip_flow_space();
+            }
+            entries.insert(key, value);
+            if (this.peek() == COMMA) { this.advance(); continue; }
+            if (this.peek() == RBRACE) { this.advance(); break; }
+            if (this.eof()) {
+                return Result::Err(this.error(YamlErrorKind::UnexpectedEof, Str::new("the text ends inside a flow mapping")));
+            }
+            return Result::Err(this.error(YamlErrorKind::UnexpectedChar, Str::new("expected `,` or `}` in a flow mapping")));
+        }
+        this.depth = this.depth - 1;
+        return Result::Ok(Value::Object(entries));
+    }
+
+    // The core schema
+
+    /// A scalar as the node `tag` makes it: a plain scalar with no tag is
+    /// typed by the core schema, a quoted or block one is text, and a tag
+    /// decides the type of either, refusing text the type does not read.
+    /// A refusal is reported at `at`, the scalar's first byte.
+    private static typed_scalar(text: String, plain: boolean, tag: Tag, at: Mark) -> Result<Value, YamlError> {
+        if (tag == Tag::Seq || tag == Tag::Map) {
+            return Result::Err(Parser::error_at(at, YamlErrorKind::UnsupportedTag,
+                String::from_str(Str::new("a collection tag on a scalar"))));
+        }
+        if (tag == Tag::Str || (tag == Tag::None && !plain)) {
+            return Result::Ok(Value::String(text));
+        }
+        const kind: PlainKind = Parser::plain_kind(text.as_str());
+        mut wanted: boolean = true;
+        if (tag == Tag::Null)  { wanted = kind == PlainKind::Null; }
+        if (tag == Tag::Bool)  { wanted = kind == PlainKind::Bool; }
+        if (tag == Tag::Int)   { wanted = kind == PlainKind::Int; }
+        if (tag == Tag::Float) { wanted = kind == PlainKind::Float || kind == PlainKind::Int; }
+        if (!wanted) {
+            return Result::Err(Parser::error_at(at, YamlErrorKind::UnsupportedTag,
+                f"the tag does not describe `{text.as_str()}`"));
+        }
+        if (kind == PlainKind::Null) { return Result::Ok(Value::Null); }
+        if (kind == PlainKind::Bool) {
+            const first: u8 = text.as_str().byte_at(0).unwrap();
+            return Result::Ok(Value::Bool(first == 116 || first == 84));   // t, T
+        }
+        if (kind == PlainKind::Float || tag == Tag::Float) { return Parser::float_value(text.as_str(), at); }
+        if (kind == PlainKind::Int) { return Parser::integer_value(text.as_str(), at); }
+        return Result::Ok(Value::String(text));
+    }
+
+    /// What the core schema reads plain `text` as.
+    internal static plain_kind(text: Str) -> PlainKind {
+        if (text.length() == 0 || text == Str::new("~") || text == Str::new("null")
+            || text == Str::new("Null") || text == Str::new("NULL")) {
+            return PlainKind::Null;
+        }
+        if (text == Str::new("true") || text == Str::new("True") || text == Str::new("TRUE")
+            || text == Str::new("false") || text == Str::new("False") || text == Str::new("FALSE")) {
+            return PlainKind::Bool;
+        }
+        if (Parser::is_core_integer(text)) { return PlainKind::Int; }
+        if (Parser::is_core_float(text)) { return PlainKind::Float; }
+        return PlainKind::Text;
+    }
+
+    private static is_digit_in(b: u8, radix: u64) -> boolean {
+        if (radix == 8)  { return b >= 48 && b <= 55; }
+        if (radix == 10) { return b >= 48 && b <= 57; }
+        return (b >= 48 && b <= 57) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70);
+    }
+
+    /// `[-+]?[0-9]+`, `0o[0-7]+` or `0x[0-9a-fA-F]+`.
+    private static is_core_integer(text: Str) -> boolean {
+        const bytes: u8* = text.as_pointer();
+        const length: i64 = text.length();
+        if (length > 2 && bytes[0] == ZERO && (bytes[1] == 111 || bytes[1] == 120)) {   // o, x
+            mut radix: u64 = 16;
+            if (bytes[1] == 111) { radix = 8; }
+            for (mut i: i64 = 2; i < length; i++) {
+                if (!Parser::is_digit_in(bytes[i], radix)) { return false; }
+            }
+            return true;
+        }
+        mut i: i64 = 0;
+        if (length > 0 && (bytes[0] == MINUS || bytes[0] == PLUS)) { i = 1; }
+        if (i >= length) { return false; }
+        while (i < length) {
+            if (!Parser::is_digit_in(bytes[i], 10)) { return false; }
+            i++;
+        }
+        return true;
+    }
+
+    /// `[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?`, or
+    /// `[-+]?\.inf` and `\.nan` in their three spellings.
+    private static is_core_float(text: Str) -> boolean {
+        const bytes: u8* = text.as_pointer();
+        const length: i64 = text.length();
+        mut i: i64 = 0;
+        if (length > 0 && (bytes[0] == MINUS || bytes[0] == PLUS)) { i = 1; }
+        const rest: Str = text.byte_substring(i, length);
+        if (rest == Str::new(".inf") || rest == Str::new(".Inf") || rest == Str::new(".INF")) { return true; }
+        if (i == 0 && (rest == Str::new(".nan") || rest == Str::new(".NaN") || rest == Str::new(".NAN"))) { return true; }
+        mut digits: i64 = 0;
+        while (i < length && Parser::is_digit_in(bytes[i], 10)) { i++; digits++; }
+        if (i < length && bytes[i] == DOT) {
+            i++;
+            mut fraction: i64 = 0;
+            while (i < length && Parser::is_digit_in(bytes[i], 10)) { i++; fraction++; }
+            if (digits == 0 && fraction == 0) { return false; }
+        } else if (digits == 0) {
+            return false;
+        }
+        if (i < length && (bytes[i] == 101 || bytes[i] == 69)) {   // e, E
+            i++;
+            if (i < length && (bytes[i] == MINUS || bytes[i] == PLUS)) { i++; }
+            mut exponent: i64 = 0;
+            while (i < length && Parser::is_digit_in(bytes[i], 10)) { i++; exponent++; }
+            if (exponent == 0) { return false; }
+        }
+        return i == length;
+    }
+
+    /// A core-schema integer's value: `Int` where `i64` holds it, else
+    /// `UInt` where `u64` does; one past both is refused.
+    private static integer_value(text: Str, at: Mark) -> Result<Value, YamlError> {
+        const bytes: u8* = text.as_pointer();
+        const length: i64 = text.length();
+        mut negative: boolean = false;
+        mut radix: u64 = 10;
+        mut i: i64 = 0;
+        if (length > 2 && bytes[0] == ZERO && (bytes[1] == 111 || bytes[1] == 120)) {
+            radix = 16;
+            if (bytes[1] == 111) { radix = 8; }
+            i = 2;
+        } else if (bytes[0] == MINUS || bytes[0] == PLUS) {
+            negative = bytes[0] == MINUS;
+            i = 1;
+        }
+        mut magnitude: u64 = 0;
+        while (i < length) {
+            const b: u8 = bytes[i];
+            mut digit: u64 = 0;
+            if (b >= 48 && b <= 57)  { digit = (b - 48) as u64; }
+            if (b >= 97 && b <= 102) { digit = (b - 87) as u64; }
+            if (b >= 65 && b <= 70)  { digit = (b - 55) as u64; }
+            if (magnitude > (u64::MAX - digit) / radix) {
+                return Result::Err(Parser::error_at(at, YamlErrorKind::InvalidNumber,
+                    f"the integer `{text}` is past what a 64-bit integer holds"));
+            }
+            magnitude = magnitude * radix + digit;
+            i++;
+        }
+        if (negative) {
+            const smallest: u64 = (i64::MAX as u64) + 1;
+            if (magnitude > smallest) {
+                return Result::Err(Parser::error_at(at, YamlErrorKind::InvalidNumber,
+                    f"the integer `{text}` is below what a 64-bit integer holds"));
+            }
+            if (magnitude == smallest) { return Result::Ok(Value::Number(Number::Int(i64::MIN))); }
+            return Result::Ok(Value::Number(Number::Int(0 - (magnitude as i64))));
+        }
+        if (magnitude <= i64::MAX as u64) { return Result::Ok(Value::Number(Number::Int(magnitude as i64))); }
+        return Result::Ok(Value::Number(Number::UInt(magnitude)));
+    }
+
+    /// A core-schema float's value, an integer's read as a float too.
+    private static float_value(text: Str, at: Mark) -> Result<Value, YamlError> {
+        const length: i64 = text.length();
+        mut sign: i64 = 0;
+        mut negative: boolean = false;
+        if (length > 0 && (text.byte_at(0).unwrap() == MINUS || text.byte_at(0).unwrap() == PLUS)) {
+            sign = 1;
+            negative = text.byte_at(0).unwrap() == MINUS;
+        }
+        const rest: Str = text.byte_substring(sign, length);
+        if (rest.length() == 4 && rest.byte_at(0).unwrap() == DOT) {
+            const first: u8 = rest.byte_at(1).unwrap();
+            if (first == 105 || first == 73) {   // i, I
+                mut infinite: f64 = f64::INFINITY;
+                if (negative) { infinite = 0.0 - f64::INFINITY; }
+                return Result::Ok(Value::Number(Number::Float(infinite)));
+            }
+            if (first == 110 || first == 78) {   // n, N
+                return Result::Ok(Value::Number(Number::Float(f64::NAN)));
+            }
+        }
+        // The number reader takes digits on both sides of a point, so `.5`
+        // and `5.` are given to it as `0.5` and `5.0`.
+        mut canonical: String = String::new();
+        if (negative) { canonical.push_byte(MINUS); }
+        const bytes: u8* = rest.as_pointer();
+        const rest_length: i64 = rest.length();
+        if (rest_length > 0 && bytes[0] == DOT) { canonical.push_byte(ZERO); }
+        for (mut i: i64 = 0; i < rest_length; i++) {
+            canonical.push_byte(bytes[i]);
+            const next_is_digit: boolean = i + 1 < rest_length && Parser::is_digit_in(bytes[i + 1], 10);
+            if (bytes[i] == DOT && !next_is_digit) { canonical.push_byte(ZERO); }
+        }
+        return match (f64::try_from(canonical.as_str())) {
+            Result::Ok(value) => { Result::Ok(Value::Number(Number::Float(value))) }
+            Result::Err(_) => {
+                Result::Err(Parser::error_at(at, YamlErrorKind::InvalidNumber, f"the float `{text}` could not be read"))
+            }
+        };
+    }
+}

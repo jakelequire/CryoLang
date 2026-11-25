@@ -1,0 +1,110 @@
+///! YamlError: why YAML text could not be read, and where.
+///!
+///! `(kind, line, column, offset, msg)`, as `JsonError` is: callers branch
+///! on `kind`, and `msg` says what was found for a person to read. Lines
+///! and columns are 1-indexed; `offset` is the byte index into the source.
+
+namespace std::encoding::yaml::error;
+
+import std::core::drop::{ Drop };
+import std::collections::string::{ String };
+import std::collections::str::{ Str };
+
+/// What stopped the reader. A YAML feature outside the subset this reader
+/// takes has a kind of its own, so a caller can tell "not YAML" from
+/// "YAML this reader refuses".
+public type enum YamlErrorKind with [Eq, Clone] {
+    /// The input ended inside a node: an unclosed quote, flow collection
+    /// or escape.
+    UnexpectedEof;
+    /// A character that neither starts nor ends a node where it stands.
+    UnexpectedChar;
+    /// A line indented where no node can start at that column, or
+    /// indented with a tab.
+    BadIndentation;
+    /// A `\X` escape in a double-quoted scalar that YAML does not define,
+    /// or one naming no Unicode scalar value.
+    InvalidEscape;
+    /// An integer of the core schema that no 64-bit integer holds.
+    InvalidNumber;
+    /// A mapping with the same key twice.
+    DuplicateKey;
+    /// An alias `*name` with no anchor `&name` before it in its document.
+    UndefinedAlias;
+    /// Aliases that would expand the document past
+    /// `parser::MAX_EXPANDED_NODES` nodes.
+    ExpansionLimit;
+    /// Collections nested deeper than `parser::MAX_DEPTH`.
+    DepthExceeded;
+    /// A tag outside the core schema, or a core-schema tag on a node it
+    /// does not describe (`!!int abc`).
+    UnsupportedTag;
+    /// A complex key: `? key`, or a collection or alias used as a key.
+    ComplexKey;
+    /// The merge key `<<`, which the core schema does not define.
+    MergeKey;
+    /// A directive line (`%YAML`, `%TAG`).
+    UnsupportedDirective;
+    /// More than one document where exactly one was asked for.
+    MultipleDocuments;
+}
+
+implement enum YamlErrorKind {
+    /// A short, stable slug for the kind: `"unexpected_eof"`,
+    /// `"duplicate_key"`, ...
+    public label(&this) -> Str {
+        return Str::new(match (this) {
+            YamlErrorKind::UnexpectedEof        => { "unexpected_eof" }
+            YamlErrorKind::UnexpectedChar       => { "unexpected_char" }
+            YamlErrorKind::BadIndentation       => { "bad_indentation" }
+            YamlErrorKind::InvalidEscape        => { "invalid_escape" }
+            YamlErrorKind::InvalidNumber        => { "invalid_number" }
+            YamlErrorKind::DuplicateKey         => { "duplicate_key" }
+            YamlErrorKind::UndefinedAlias       => { "undefined_alias" }
+            YamlErrorKind::ExpansionLimit       => { "expansion_limit" }
+            YamlErrorKind::DepthExceeded        => { "depth_exceeded" }
+            YamlErrorKind::UnsupportedTag       => { "unsupported_tag" }
+            YamlErrorKind::ComplexKey           => { "complex_key" }
+            YamlErrorKind::MergeKey             => { "merge_key" }
+            YamlErrorKind::UnsupportedDirective => { "unsupported_directive" }
+            YamlErrorKind::MultipleDocuments    => { "multiple_documents" }
+        });
+    }
+}
+
+/// Why YAML text could not be read, and where: the failure's kind, its
+/// position in the source, and a message for a person to read.
+public type struct YamlError {
+    public kind:   YamlErrorKind;
+    /// 1-indexed line of the offending byte.
+    public line:   u64;
+    /// 1-indexed column of the offending byte.
+    public column: u64;
+    /// 0-indexed byte offset into the source.
+    public offset: u64;
+    /// Human-readable detail. Owned, and released with the error.
+    public msg:    String;
+
+    /// An error of `kind` at the 1-indexed `line` and `column`, byte
+    /// `offset` from the start of the source, explained by `msg`, which the
+    /// error takes ownership of.
+    public static new(kind: YamlErrorKind, line: u64, column: u64, offset: u64, msg: String) -> YamlError {
+        return YamlError {
+            kind:   kind,
+            line:   line,
+            column: column,
+            offset: offset,
+            msg:    msg,
+        };
+    }
+
+    /// The human-readable message, borrowed for the error's lifetime; the
+    /// kind and the position stay available as fields.
+    public describe(&this) -> Str {
+        return this.msg.as_str();
+    }
+}
+
+implement trait Drop for struct YamlError {
+    drop(mut &this) -> void { }
+}
