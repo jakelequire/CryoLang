@@ -649,6 +649,16 @@ language's features; each is a branch of its own after the merge.
   opcodes, HTTP/2's frame types) carries its own `op_from_u8`.  The
   conversion answers `Option` (or `TryFrom`) for a value no variant holds.
 
+## Compound assignment through traits of its own
+
+`a += b` evaluates `a.add(&b)` and stores the result in `a`, so on a
+`String` every `+=` builds a new string and copies `a` into it: a loop
+that adds piece by piece is quadratic, and `String`'s documentation sends
+loops to `push`.  A trait per compound operator, which a type implements
+to change itself in place, would let `+=` on text append.  It is deferred
+language work; its trait names and how it relates to `Add` are still to be
+decided.
+
 ## Two major versions of one library in a build
 
 For v1.0 a build holds one version of each library, and entries asking for

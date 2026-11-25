@@ -15,7 +15,7 @@ import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::slice::{ Slice, SliceRange };
-import std::core::ops::{ Deref, IndexView };
+import std::core::ops::{ Add, Deref, IndexView };
 import std::alloc::allocator::{ AllocationError, AllocationErrorKind, Allocator, GlobalAllocator };
 import std::collections::raw_buffer::{ RawBuffer };
 import std::collections::str::{ Str, Utf8Error };
@@ -36,7 +36,8 @@ private const INITIAL_CAPACITY: i64 = 8;
 /// Owned, growable UTF-8 text. It dereferences to `Str`, the read-only
 /// view most text functions take, so every `Str` method reads a `String`
 /// too (`s.contains(...)`, `s.split(...)`); `as_str` hands the view out.
-/// An f-string builds one.
+/// An f-string builds one, and so does `+` (`name + ", welcome"`), which
+/// copies both sides into a new string: in a loop, `push` onto one string.
 ///
 /// ```cryo
 /// import std::collections::string::{ String };
@@ -483,6 +484,43 @@ where A: Allocator {
 implement trait Clone for struct String<GlobalAllocator> {
     clone(&this) -> String {
         return String::from_str(this.view);
+    }
+}
+
+// `a + b` on text is a new `String` holding `a`'s text then `b`'s; neither
+// side changes.  `a += b` builds a new string each time and copies `a` into
+// it, so a loop that adds piece by piece is quadratic: `push` onto one
+// string instead.  Each panics on allocation failure.
+
+implement<A> trait Add<Str, String> for struct String<A> where A: Allocator {
+    add(&this, rhs: &Str) -> String {
+        mut sum: String = String::from_str(this.as_str());
+        sum.push(*rhs);
+        return sum;
+    }
+}
+
+implement<A> trait Add<string, String> for struct String<A> where A: Allocator {
+    add(&this, rhs: &string) -> String {
+        mut sum: String = String::from_str(this.as_str());
+        sum.push(*rhs);
+        return sum;
+    }
+}
+
+implement<A> trait Add<String, String> for struct String<A> where A: Allocator {
+    add(&this, rhs: &String) -> String {
+        mut sum: String = String::from_str(this.as_str());
+        sum.push(rhs.as_str());
+        return sum;
+    }
+}
+
+implement<A> trait Add<char, String> for struct String<A> where A: Allocator {
+    add(&this, rhs: &char) -> String {
+        mut sum: String = String::from_str(this.as_str());
+        sum.push(*rhs);
+        return sum;
     }
 }
 
