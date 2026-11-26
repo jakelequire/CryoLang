@@ -340,7 +340,7 @@ The other direction stays: `boolean as` an integer type is `1` for `true` and `0
 
 ## 2. Type System
 
-Every value in Cryo has a known type at compile time. A binding's type is either written explicitly or inferred from its initialiser (local inference only - see [section 3](#3-variables-and-constants)). A number converts implicitly only to a type that holds every value of its own ([section 2.9](#29-casting-with-as)); any other conversion is written with `as`.
+Every value in Cryo has a known type at compile time. A binding's type is either written explicitly or inferred from its initialiser (local inference only - see [section 3](#3-variables-and-constants)). A number converts implicitly only to a type that holds every value of its own ([section 2.9](#29-casting-with-as)), and a value converts implicitly through an `![implicit]` converter only where its declared type is written - an argument or a typed binding ([section 16.1.1](#1611-implicit-converters)); any other conversion is written with `as`.
 
 ### 2.1 Primitive Types
 
@@ -1049,7 +1049,7 @@ mut   g_counter:  u64    = 0;
 const LIMIT:      i32    = Json::twice(3);   // 6, computed before `main`
 ```
 
-> **Local type inference.** The type annotation may be omitted when an initialiser is present; the binding adopts the initialiser's *concrete* type (`const x = 10;` infers `i32`, `mut p = Point { ... };` infers `Point`). Because the inferred type is the concrete one the initialiser produces - not an erased `implement Trait` - methods on it stay callable, so `mut it = arr.iter(); it.take(3)...` works without naming the iterator type. Inference is purely local: it reads only the initialiser of the same statement, never later uses. A binding with no initialiser therefore still needs an annotation (`mut y: int;`), and an initialiser that yields no value (`void`) cannot be inferred (both are `E0104`). There are still no implicit conversions and no flow- or program-level inference.
+> **Local type inference.** The type annotation may be omitted when an initialiser is present; the binding adopts the initialiser's *concrete* type (`const x = 10;` infers `i32`, `mut p = Point { ... };` infers `Point`). Because the inferred type is the concrete one the initialiser produces - not an erased `implement Trait` - methods on it stay callable, so `mut it = arr.iter(); it.take(3)...` works without naming the iterator type. Inference is purely local: it reads only the initialiser of the same statement, never later uses. A binding with no initialiser therefore still needs an annotation (`mut y: int;`), and an initialiser that yields no value (`void`) cannot be inferred (both are `E0104`). An inferred binding has no declared type, so no implicit conversion applies to its initialiser ([section 16.1.1](#1611-implicit-converters)), and there is no flow- or program-level inference.
 
 ---
 
@@ -4395,7 +4395,7 @@ type struct Gauge {
 | `![section("name")]`                                      | function / method                  | Place the emitted symbol in object-file section `name`.                                                                                                                                                                                                                                                                                                                                                                         |
 | `![naked]`                                                | function                           | Emit no prologue/epilogue (sets LLVM's `naked` attribute); the body must be a single `asm { … }` block that provides its own `ret`/`jmp`/exit. For a freestanding `_start` and other raw entry points. A non-`asm` body is an error (`E0151`).                                                                                                                                                                                  |
 | `![allow(name)]` / `![warn(name)]` / `![deny(name)]`      | any decl                           | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.* Each takes at most one `reason = "..."`, a non-empty string; a lint name is not checked, so an unknown one is accepted.                                                                                                                                                                                       |
-| `![implicit]`                                             | generic function / method          | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = ...` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f::<T>(...)`) there. Used by `VariadicArguments::next` so `const n: i64 = va.next()` reads cleanly. |
+| `![implicit]`                                             | function / method                  | Two roles. On a **generic** function or method it lets a call omit the generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = ...` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f::<T>(...)`) there. Used by `VariadicArguments::next` so `const n: i64 = va.next()` reads cleanly. On a **non-generic** function or static method of one parameter it makes the function a *converter*: a value of the parameter's type is converted to the return type where that type is declared. See [section 16.1.1](#1611-implicit-converters). |
 | `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]`   | any decl                           | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match.                                                                                                                                                                                            |
 | `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / union / enum              | Memory layout control. See [section 16.3](#163-memory-layout).                                                                                                                                                                                                                                                                                                                                                                  |
 | `![align(N)]`                                             | struct / union / enum / variable   | Minimum alignment in bytes; N must be a power of two. See [section 16.3](#163-memory-layout).                                                                                                                                                                                                                                                                                                                                   |
@@ -4406,6 +4406,41 @@ type struct Gauge {
 | `![json(rename = "key", skip, default, skip_none)]`       | field                              | Adjusts the field's member in a derived `ToValue` / `FromValue`: its key, left out entirely, read as `default()` when absent, left out when it writes `null`. See [section 10.8](#108-derived-implementations-with-). An unknown option is `E0152`. |
 
 A method declared in a trait body takes `![language]` and no other directive (`E0151`), and a directive written above an associated type is refused (`E0151`).
+
+#### 16.1.1 Implicit Converters
+
+A converter lets text be written where a `Str` or a `String` is declared, without spelling the constructor each time:
+
+```cryo
+const GREETING: Str = "Hello, world!";       // Str::new("Hello, world!")
+
+function main() -> int {
+    const local: Str = "local";               // Str::new("local")
+    mut owned: String = "owned";              // String::from_string("owned")
+    print_view("argument");                   // print_view(Str::new("argument"))
+    return 0;
+}
+
+function print_view(text: Str) -> void { fmt::println(f"{text}"); }
+```
+
+**How a converter is registered.** A function, or a static method of a struct, union or implementation, marked `![implicit]` with exactly one parameter, no type parameters and a resolved return type is the converter from its parameter's type to its return type. The compiler registers each one when it processes the directives, keyed by that pair of types, and the first registered for a pair is the one used. A declared type that is an instance of a generic type (`String<GlobalAllocator>`) is also reached by a converter to the generic type itself (`String`). The standard library registers `Str::new` (`string` to `Str`), `String::from_string` (`string` to `String`), and `Path::new` and `Path::from` (`string` and `Str` to `Path`). An instance method is never a converter.
+
+**Where a conversion applies.** Where a value's type is not the one declared and a converter from its type to the declared type is registered, the compiler wraps the value in a call to the converter:
+
+- a call's argument, against its parameter's type, for a function, a method or a static method;
+- a typed binding's initializer, `const x: T = value;` or `mut x: T = value;`, at module level as well as in a body.
+
+**Where it does not.** Nothing else converts, and the value must already have the declared type (`E0200`, or `E0214` for an operator's operand):
+
+- a returned value (`return "text";` from a function returning `Str`);
+- an assignment (`view = "text";`);
+- a struct literal's field (`Holder { text: "text" }`);
+- an operator's operand (`view == "text"`, refused as a mismatched argument);
+- a method call's receiver: `"text".char_count()` looks for `char_count` on `string` and finds none (`E0358`); write `Str::new("text").char_count()`;
+- an argument a variadic call passes past its declared parameters, which has no declared type to convert to.
+
+A converter is one call, not a chain: a value is never converted twice to reach a type.
 
 The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`, `![test_child]`) are documented in the next subsection.
 

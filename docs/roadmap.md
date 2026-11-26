@@ -686,12 +686,64 @@ interned or written to a sink, `String::from_str(view).into_raw()` where a
 text where `substring` took a length and clamped, so each slice's bounds
 were read at its site; the lexer slices its source with `Str::from_raw`,
 which reads only the token's bytes.  `Path` differs from the old path
-methods only at a root (the parent of `/x` is `/`, not `.`).  Left: 440
-sites over 2 methods - `length` 301 and `eq` 139 - and the six with no
-compiler caller (`parse_int`, `join`, `split_char`, `to_ascii_upper`,
-`extension`, `common_prefix_length`).  `length` and `eq` accept a null `string` (as 0
-and equal-to-null) where `Str::new` of a null reads
-through it, so a site that can see null needs its own check first.
+methods only at a root (the parent of `/x` is `/`, not `.`).
+
+That is where this item ends: every `string` method that copies text is
+internal.  `length` (301 compiler sites) and `eq` (139) are not retired by
+wrapping each receiver in `Str::new`, which a later change would rewrite
+again; they go with the next item, which changes what the compiler's text
+is.
+
+## The compiler's text is `Str` and `String`
+
+The compiler holds most of its text as `string`, a thin pointer whose
+length is a `strlen`, and that is why it still calls `string.length` and
+`string.eq`.  Its producers are few: the interner hands out every name
+(`intern.resolve`, 505 calls; 237 `string` locals are initialised from
+one), the lexer copies every lexeme, and type display, spans and the
+project configuration hold the rest.  Change each producer's type, let
+the compiler find every consumer, and fix each at its site; the
+`length`/`eq` sites then call `Str`'s own methods or `==`, and the two
+methods are retired.
+
+Done on the branch that made the copying methods internal, as this
+item's prerequisites:
+
+- **C0.**  A variadic call refuses an argument that is neither a
+  `VariadicArgument` nor a pointer (E0306), so a name that becomes a `Str`
+  and still feeds one of the compiler's 872 `fmt::format("...%s...")`
+  calls is reported rather than printed wrong.  `Str::new` of a null
+  `string` is the empty view, as `string.length` reads null as 0, so no
+  receiver's origin needs auditing.
+
+The units, in order, each its own measured change *(sizes are estimates)*:
+
+- **C1: the interner hands out `Str` (2-3 sessions).**  Its strings become
+  `Str` views into its arena, keeping the trailing NUL; `resolve` and
+  `shown` return `Str`, with one accessor for the C pointer the FFI needs.
+  The largest wave of consumers.  A resolved name stays valid until the
+  table is freed, as today.  The prediction to write down first: compiler
+  objects move, the standard library, runtime and tests move 0, and the
+  `length`/`eq` count falls by the share of interner-fed receivers.
+- **C2: tokens and the source text (1 session).**  A token's lexeme is a
+  `Str` view into the module's source, removing a heap copy per token.
+- **C3: display and diagnostics (1-2 sessions).**  Type display returns a
+  `String`; a span's file is a `Str` from the interner (or a file identity,
+  which is a design question to rule first).
+- **C4: configuration, paths, the command line (1-2 sessions).**  The
+  project configuration's fields become `String` or `PathBuf`, and its
+  `.eq("key")` sites become `==` on `Str`.
+- **C5: code generation and the FFI (1-2 sessions).**  Names reach LLVM
+  through the interner's C accessor or a `String`'s NUL-terminated copy;
+  the LLVM calls stay `string`-typed, since a NUL pointer is what they
+  want.
+- **C6: retire `string.length` and `eq` (half a session).**  Once marking
+  them internal in a scratch standard library reports no site, make them
+  internal and delete them, with the hidden methods nothing calls.
+
+C1 to C5 change compiler source only, so each is verified against its
+real parent; C6 changes the standard library and needs a synthetic
+baseline.  In all, 8 to 14 sessions, C1 the uncertain one.
 
 ## The network codecs' visibility
 
@@ -987,6 +1039,16 @@ Jake's answers to the test-infrastructure plan.
 
 ## Open questions
 
+- **One rule for reading a value as another type.**  Four mechanisms do
+  it today: dereferencing (`Deref`) gives a member access the target's
+  place; an `![implicit]` converter turns an argument or a typed binding's
+  initializer into the declared type, by value; `AsSlice` gives a
+  container's reference as a slice reference; and a fixed array answers a
+  trait's methods through its slice.  A by-value view of a receiver (a
+  `string` read as a `Str` for a method call) would be a fifth.  Whether
+  one rule should cover all of them - which places it applies at, whether
+  a receiver is one, and which mechanism wins where two could - is open,
+  and none is added until it is answered.
 - **How wide a `char` is**, and so what a character literal holds above
   255 (`'\u{e9}'` fits either way; `'\u{1F600}'` does not fit a byte).
   Undecided.
