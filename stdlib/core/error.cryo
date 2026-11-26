@@ -92,14 +92,14 @@ implement<E> trait From<E> for struct ErrorReport where E: Error {
 
 /// Any error, owned whole: the value of whatever type implements `Error`,
 /// moved to the heap and reached through its `Error` table. Any `Error`
-/// converts into one (`AnyError::new`, or `From`), so `?` in a function
-/// returning `Result<T, AnyError>` passes on errors of any types, and the
+/// converts into one (`BoxedError::new`, or `From`), so `?` in a function
+/// returning `Result<T, BoxedError>` passes on errors of any types, and the
 /// caller still holds each error itself - its `source` chain included -
 /// where `ErrorReport` keeps only text. It prints as the error does.
 ///
-/// An `AnyError` is no `Error` itself, so `From<E>` for it and `From<T>
+/// A `BoxedError` is no `Error` itself, so `From<E>` for it and `From<T>
 /// for T` never both convert one type.
-public type struct AnyError {
+public type struct BoxedError {
     /// The heap allocation holding the error.
     private value: mut u8*;
     /// The error, through its `Error` table.
@@ -109,7 +109,7 @@ public type struct AnyError {
     private release: (mut u8*) -> void;
 
     /// `error`, moved into a carrier of its own.
-    public static new<E>(error: E) -> AnyError where E: Error {
+    public static new<E>(error: E) -> BoxedError where E: Error {
         return carry(error);
     }
 
@@ -121,10 +121,10 @@ public type struct AnyError {
 }
 
 /// `error` moved to the heap, with the function that releases it.
-private function carry<E>(error: E) -> AnyError where E: Error {
+private function carry<E>(error: E) -> BoxedError where E: Error {
     const raw: mut E* = Box::new(error).into_raw();
     const object: virtual &Error = &*raw;
-    return AnyError { value: raw as mut u8*, object: object, release: release_carried::<E> };
+    return BoxedError { value: raw as mut u8*, object: object, release: release_carried::<E> };
 }
 
 /// Drop the `E` at `value` and free its allocation.
@@ -132,15 +132,15 @@ private function release_carried<E>(value: mut u8*) -> void {
     const _owner: Box<E> = Box::from_raw(value as mut E*);
 }
 
-/// Any error becomes an `AnyError` holding it, which is how `?` passes an
-/// error on from a function returning `Result<T, AnyError>`.
-implement<E> trait From<E> for struct AnyError where E: Error {
-    static from(error: E) -> AnyError {
+/// Any error becomes a `BoxedError` holding it, which is how `?` passes an
+/// error on from a function returning `Result<T, BoxedError>`.
+implement<E> trait From<E> for struct BoxedError where E: Error {
+    static from(error: E) -> BoxedError {
         return carry(error);
     }
 }
 
-implement trait Drop for struct AnyError {
+implement trait Drop for struct BoxedError {
     drop(mut &this) -> void {
         const release: (mut u8*) -> void = this.release;
         release(this.value);
@@ -148,7 +148,7 @@ implement trait Drop for struct AnyError {
 }
 
 /// The error's own `Display` text.
-implement trait Display for struct AnyError {
+implement trait Display for struct BoxedError {
     fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         return this.object.fmt(f);
     }
@@ -156,7 +156,7 @@ implement trait Display for struct AnyError {
 
 /// The error's `Display` text, then each error in its chain of sources on
 /// a line of its own, as an `ErrorReport` debugs.
-implement trait Debug for struct AnyError {
+implement trait Debug for struct BoxedError {
     fmt(&this, f: mut &Formatter) -> Result<(), FormatError> {
         this.object.fmt(f)?;
         mut next: Option<virtual &Error> = this.object.source();

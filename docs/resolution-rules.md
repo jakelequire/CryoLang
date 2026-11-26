@@ -138,11 +138,11 @@ yet is recorded with the change that builds it, not here.
 723. **`Error` is a prelude name; its carriers are imported.**  The prelude
      lists `core::common`, a module that re-exports `Error` alone from
      `std::core::error`, since a prelude module binds every name it offers
-     and `std::core::error` offers `ErrorReport` and `AnyError` too.  Both
+     and `std::core::error` offers `ErrorReport` and `BoxedError` too.  Both
      carriers are reached through `std::core::error` or the `std::core`
-     facade.  `AnyError` owns an error of any type and every `Error`
+     facade.  `BoxedError` owns an error of any type and every `Error`
      converts into it through `From`, beside `ErrorReport`'s `From`; neither
-     carrier implements `Error`.  (Jake; the carrier's name and API
+     carrier implements `Error`.  (Jake, who named the carrier `BoxedError`; its API
      delegated)
 
 722. **The prelude binds the panic helpers from `std::core::panic`, and

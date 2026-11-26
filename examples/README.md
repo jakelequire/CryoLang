@@ -21,7 +21,7 @@ builds and executes it.
 | 13 | [13-closures](13-closures/)            | Capturing closures over `Copy` values, passed through `(Args) -> Ret` slots. |
 | 14 | [14-threads](14-threads/)              | Native threads: `thread::spawn`/`join` (move data in & out), `sync::channel` channels, scoped fork-join over a borrowed atomic. |
 | 15 | [15-files](15-files/)                  | `File::read_text` and friends, `BufferedReader.lines()`, directories, `TemporaryDirectory`, errors naming their path. |
-| 16 | [16-echo-server](16-echo-server/)      | `async main`, `TcpListener::bind` + `await accept()`, `TcpStream::connect`, `read_some`/`write_all`, two tasks joined by `Futures::join`, one `AnyError`. |
+| 16 | [16-echo-server](16-echo-server/)      | `async main`, `TcpListener::bind` + `await accept()`, `TcpStream::connect`, `read_some`/`write_all`, two tasks joined by `Futures::join`, one `BoxedError`. |
 | 17 | [17-http-get](17-http-get/)            | `Client::new()` + `await client.get(url)` (HTTP or HTTPS), `Url::parse`, `[link] system = ["ssl", "crypto"]`; reaches the network. |
 
 ## Running
