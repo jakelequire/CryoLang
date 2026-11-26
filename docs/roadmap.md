@@ -689,7 +689,10 @@ which reads only the token's bytes.  `Path` differs from the old path
 methods only at a root (the parent of `/x` is `/`, not `.`).
 
 That is where this item ends: every `string` method that copies text is
-internal.  `length` (301 compiler sites) and `eq` (139) are not retired by
+internal, and the internal ones nothing calls are deleted - all but
+`append`, which `a + b` on two `string`s calls.  The public `join`,
+`extension` and `split_char` read through `Str` and copy into a `String`.
+`length` (301 compiler sites) and `eq` (139) are not retired by
 wrapping each receiver in `Str::new`, which a later change would rewrite
 again; they go with the next item, which changes what the compiler's text
 is.
