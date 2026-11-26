@@ -1045,8 +1045,9 @@ Jake's answers to the test-infrastructure plan.
 
 - **One rule for reading a value as another type.**  Four mechanisms do
   it today: dereferencing (`Deref`) gives a member access the target's
-  place; an `![implicit]` converter turns an argument or a typed binding's
-  initializer into the declared type, by value; `AsSlice` gives a
+  place; an `![implicit]` converter turns a value into the type declared
+  where it stands - an argument, a typed binding's initializer, a returned
+  or assigned value, a struct field - by value; `AsSlice` gives a
   container's reference as a slice reference; and a fixed array answers a
   trait's methods through its slice.  A by-value view of a receiver (a
   `string` read as a `Str` for a method call) would be a fifth.  Whether

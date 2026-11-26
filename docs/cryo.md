@@ -340,7 +340,7 @@ The other direction stays: `boolean as` an integer type is `1` for `true` and `0
 
 ## 2. Type System
 
-Every value in Cryo has a known type at compile time. A binding's type is either written explicitly or inferred from its initialiser (local inference only - see [section 3](#3-variables-and-constants)). A number converts implicitly only to a type that holds every value of its own ([section 2.9](#29-casting-with-as)), and a value converts implicitly through an `![implicit]` converter only where its declared type is written - an argument or a typed binding ([section 16.1.1](#1611-implicit-converters)); any other conversion is written with `as`.
+Every value in Cryo has a known type at compile time. A binding's type is either written explicitly or inferred from its initialiser (local inference only - see [section 3](#3-variables-and-constants)). A number converts implicitly only to a type that holds every value of its own ([section 2.9](#29-casting-with-as)), and a value converts implicitly through an `![implicit]` converter only where its declared type is written - an argument, a typed binding, a returned or assigned value, or a struct field ([section 16.1.1](#1611-implicit-converters)); any other conversion is written with `as`.
 
 ### 2.1 Primitive Types
 
@@ -4430,13 +4430,16 @@ function print_view(text: Str) -> void { fmt::println(f"{text}"); }
 **Where a conversion applies.** Where a value's type is not the one declared and a converter from its type to the declared type is registered, the compiler wraps the value in a call to the converter:
 
 - a call's argument, against its parameter's type, for a function, a method or a static method;
-- a typed binding's initializer, `const x: T = value;` or `mut x: T = value;`, at module level as well as in a body.
+- a typed binding's initializer, `const x: T = value;` or `mut x: T = value;`, at module level as well as in a body;
+- a returned value, against the function's declared return type (`return "text";` from a function returning `Str`);
+- an assigned value, against the type of the place assigned (`view = "text";`; a compound assignment is an operator, below);
+- a struct literal's field value, and a field's declared default, against the field's type (`Holder { text: "text" }`, `label: Str = "text";`).
+
+Each of these sites asks the same two questions in the same order: whether a trait makes the value's type into the declared one (a trait object, a slice reference), and if not, whether a converter is registered for the pair.
 
 **Where it does not.** Nothing else converts, and the value must already have the declared type (`E0200`, or `E0214` for an operator's operand):
 
-- a returned value (`return "text";` from a function returning `Str`);
-- an assignment (`view = "text";`);
-- a struct literal's field (`Holder { text: "text" }`);
+- an array literal's element;
 - an operator's operand (`view == "text"`, refused as a mismatched argument);
 - a method call's receiver: `"text".char_count()` looks for `char_count` on `string` and finds none (`E0358`); write `Str::new("text").char_count()`;
 - an argument a variadic call passes past its declared parameters, which has no declared type to convert to.

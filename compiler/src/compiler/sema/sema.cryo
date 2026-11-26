@@ -1312,7 +1312,7 @@ type struct SemaVisitor {
                     if (node.expression != null) { node.expression.span } else { stmt.span }, "a returned value",
                     SourceSpan::none());
                 if (!this.checker.can_assign(expr_type, declared)) {
-                    match (this.convert_through_trait(node.expression, expr_type, declared)) {
+                    match (this.convert_where_declared(node.expression, expr_type, declared)) {
                         TraitConversionOutcome::Converted(c) => { node.expression = c; }
                         TraitConversionOutcome::Refused => { }
                         TraitConversionOutcome::Mismatch => {
@@ -1892,28 +1892,21 @@ type struct SemaVisitor {
                         SourceSpan::covering(decl.name_span.end_point(), annotation_span(var_node.type_annotation))
                     } else { SourceSpan::none() });
                 if (!this.checker.can_assign(init_type, var_node.resolved_type)) {
-                    match (this.convert_through_trait(var_node.initializer, init_type, var_node.resolved_type)) {
+                    match (this.convert_where_declared(var_node.initializer, init_type, var_node.resolved_type)) {
                         TraitConversionOutcome::Converted(c) => {
                             var_node.set_initializer(c);
                             init_type = var_node.resolved_type;
                         }
                         TraitConversionOutcome::Refused => { }
                         TraitConversionOutcome::Mismatch => {
-                            const conv: mut ExpressionNode* = this.calls.build_implicit_conversion(
-                                this, var_node.initializer, init_type, var_node.resolved_type);
-                            if (conv != null) {
-                                var_node.set_initializer(conv);
-                                init_type = var_node.resolved_type;
-                            } else {
-                                const var_name: string = this.intern.resolve(var_node.name);
-                                const value_span: SourceSpan = if (var_node.initializer != null) { var_node.initializer.span } else { decl.span };
-                                const ann_span: SourceSpan = annotation_span(var_node.type_annotation);
-                                this.diag.emit_declared_mismatch(
-                                    ErrorCode::E0200_TYPE_MISMATCH, value_span, var_node.resolved_type,
-                                    var_node.type_annotation, init_type,
-                                    fmt::format("`%s` was declared with this type; the initializer must match", var_name).into_raw(),
-                                    ann_span, var_node.initializer);
-                            }
+                            const var_name: string = this.intern.resolve(var_node.name);
+                            const value_span: SourceSpan = if (var_node.initializer != null) { var_node.initializer.span } else { decl.span };
+                            const ann_span: SourceSpan = annotation_span(var_node.type_annotation);
+                            this.diag.emit_declared_mismatch(
+                                ErrorCode::E0200_TYPE_MISMATCH, value_span, var_node.resolved_type,
+                                var_node.type_annotation, init_type,
+                                fmt::format("`%s` was declared with this type; the initializer must match", var_name).into_raw(),
+                                ann_span, var_node.initializer);
                         }
                     }
                 }
@@ -3259,7 +3252,7 @@ type struct SemaVisitor {
                 && this.symbolic.symbolic_judgeable(lhs) && this.symbolic.symbolic_judgeable(rhs)
                 && !this.checker.can_assign(rhs, lhs)
                 && !this.types.indirection_spelling_compatible(rhs, lhs)) {
-                match (this.convert_through_trait(bin.right, rhs, lhs)) {
+                match (this.convert_where_declared(bin.right, rhs, lhs)) {
                     TraitConversionOutcome::Converted(c) => { bin.right = c; }
                     TraitConversionOutcome::Refused => { }
                     TraitConversionOutcome::Mismatch => {
@@ -4506,6 +4499,23 @@ type struct SemaVisitor {
         this.ctx.emit_error_at(ErrorCode::E0200_TYPE_MISMATCH,
             fmt::format("`delete` takes a pointer, and `%s` is not a pointer", this.arena.format_display(t)),
             operand.span);
+    }
+
+    /// Convert `expr`, of type `from`, where `to` is declared for it - a
+    /// typed binding's initializer, a returned value, an assigned value, a
+    /// struct literal's field: through a trait, and where no trait makes
+    /// the one into the other, through the `![implicit]` converter
+    /// registered for the pair.  A call's argument is converted by the
+    /// same two steps in the argument check.
+    convert_where_declared(mut &this, expr: mut ExpressionNode*, from: TypeRef, to: TypeRef) -> TraitConversionOutcome {
+        match (this.convert_through_trait(expr, from, to)) {
+            TraitConversionOutcome::Converted(c) => { return TraitConversionOutcome::Converted(c); }
+            TraitConversionOutcome::Refused      => { return TraitConversionOutcome::Refused; }
+            TraitConversionOutcome::Mismatch     => { }
+        }
+        const converted: mut ExpressionNode* = this.calls.build_implicit_conversion(this, expr, from, to);
+        if (converted == null) { return TraitConversionOutcome::Mismatch; }
+        return TraitConversionOutcome::Converted(converted);
     }
 
     /// Convert `expr`, of type `from`, where `to` is wanted and a trait
@@ -6083,7 +6093,7 @@ type struct SemaVisitor {
             return;
         }
         if (this.checker.can_assign(value_type, field_type)) { return; }
-        match (this.convert_through_trait(value_expr, value_type, field_type)) {
+        match (this.convert_where_declared(value_expr, value_type, field_type)) {
             TraitConversionOutcome::Converted(c) => { lit.field_inits[i].value = c; }
             TraitConversionOutcome::Refused => { }
             TraitConversionOutcome::Mismatch => {
@@ -6431,7 +6441,7 @@ type struct SemaVisitor {
             this.lambda.refuse_stored_closure(value_type, field_type, cloned.span, "a field", SourceSpan::none());
             this.lambda.refuse_held_scope_handle(value_type, cloned.span, "a field", false);
             if (!skip && !this.checker.can_assign(value_type, field_type)) {
-                match (this.convert_through_trait(cloned, value_type, field_type)) {
+                match (this.convert_where_declared(cloned, value_type, field_type)) {
                     TraitConversionOutcome::Converted(c) => { value = c; }
                     TraitConversionOutcome::Refused => { }
                     TraitConversionOutcome::Mismatch => {
