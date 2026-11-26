@@ -675,17 +675,18 @@ each explained.
 
 Done: the searches, `contains`, `starts_with`, `ends_with`, `is_empty`,
 `find`, `find_last`, `find_char` and `find_last_char` (69 sites), are
-internal; the compiler asks them of `Str::new(text)`.  Left: 540 sites
-over 13 methods - `length` 301, `eq` 139, `substring` 52, `append` 13,
-`parent_directory` 9, `split_nonempty` 5, `trim`, `strip_prefix`,
-`replace` and `basename` 4 each, `to_ascii_lower` and `stem` 2 each,
-`split` 1 - and the six with no compiler caller (`parse_int`, `join`,
-`split_char`, `to_ascii_upper`, `extension`, `common_prefix_length`).
-The ones that return a `string`
-(`substring`, `append`, `trim`, `replace`, `strip_prefix`, the path
-methods, `split_nonempty`) do not map one for one: `Str`'s answers are
-borrowed views, not NUL-terminated copies, so each site needs the owned
-form its consumer wants.  `length` and `eq` accept a null `string` (as 0
+internal; the compiler asks them of `Str::new(text)`.  So are the copying
+ones but `substring` - `append`, `trim`, `strip_prefix`, `replace`,
+`to_ascii_lower`, `split`, `split_nonempty`, `parent_directory`,
+`basename` and `stem` (48 sites) - answered through `Str`, a `String` and
+`Path`.  `Str`'s answers are borrowed views, not NUL-terminated copies, so
+each site takes the form its consumer wants: a view where the text is
+interned or written to a sink, `String::from_str(view).into_raw()` where a
+`string` is stored.  `Path` differs from the old path methods only at a
+root (the parent of `/x` is `/`, not `.`).  Left: 492 sites over 3
+methods - `length` 301, `eq` 139, `substring` 52 - and the six with no
+compiler caller (`parse_int`, `join`, `split_char`, `to_ascii_upper`,
+`extension`, `common_prefix_length`).  `length` and `eq` accept a null `string` (as 0
 and equal-to-null) where `Str::new` of a null reads
 through it, so a site that can see null needs its own check first.
 
