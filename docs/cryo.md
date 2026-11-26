@@ -1161,7 +1161,19 @@ function sum(count: i32, args...) -> i64 {
 Two limits are inherited from C varargs and no wrapper can remove them:
 
 - **Not count-safe.** Nothing records how many arguments were passed or their types; the callee must learn that out of band (a format string, a leading count, a sentinel).
-- **Default argument promotions apply.** A variadic call promotes `i8`/`i16`/`boolean` to `i32` and `f32` to `f64`. `VariadicArgument` is therefore implemented only for the promoted scalar set (`i32`, `u32`, `i64`, `u64`, `f64`, `string`); `va.next::<i8>()` is a compile error - read it as `i32` and narrow. Pass `i64`-typed values when reading with `next::<i64>()`.
+- **Only the C-promoted scalar set crosses.** A C variadic callee reads each argument as an `int`-or-wider integer, a `double` or a pointer, so `VariadicArgument` is implemented only for `i32`, `u32`, `i64`, `u64`, `f64` and `string`; `va.next::<i8>()` is a compile error - read it as `i32` and narrow. Pass `i64`-typed values when reading with `next::<i64>()`.
+
+A call checks the arguments it passes past the callee's declared parameters: each must have a type that implements `VariadicArgument`, or be a pointer. Any other value is refused (E0306, ``the trait bound `Str: VariadicArgument` is not satisfied``), because nothing records its type and the callee would read it back as other bytes - an aggregate such as `Str` or `String`, and a scalar narrower than those (`i8`, `u16`, `boolean`, `char`, `f32`), which the call does not widen. Convert a scalar first (`port as u32`, `ratio as f64`); write an aggregate with an f-string, or pass its pointer and length to a `%.*s` conversion. A type parameter is accepted when a bound in scope gives it `VariadicArgument`:
+
+```cryo
+function show<T>(value: T) -> string where T: VariadicArgument {
+    return fmt::format("%lld", value);   // accepted: T is bounded
+}
+
+const view: Str = Str::new("hello world").byte_substring(0, 5);
+fmt::format("[%s]", view);                       // error[E0306]: `Str: VariadicArgument`
+fmt::format("[%.*s]", view.length() as i32, view.as_pointer());   // accepted
+```
 
 ### 4.4 Extern Functions
 
