@@ -676,15 +676,18 @@ each explained.
 Done: the searches, `contains`, `starts_with`, `ends_with`, `is_empty`,
 `find`, `find_last`, `find_char` and `find_last_char` (69 sites), are
 internal; the compiler asks them of `Str::new(text)`.  So are the copying
-ones but `substring` - `append`, `trim`, `strip_prefix`, `replace`,
+ones - `substring`, `append`, `trim`, `strip_prefix`, `replace`,
 `to_ascii_lower`, `split`, `split_nonempty`, `parent_directory`,
-`basename` and `stem` (48 sites) - answered through `Str`, a `String` and
+`basename` and `stem` (100 sites) - answered through `Str`, a `String` and
 `Path`.  `Str`'s answers are borrowed views, not NUL-terminated copies, so
 each site takes the form its consumer wants: a view where the text is
 interned or written to a sink, `String::from_str(view).into_raw()` where a
-`string` is stored.  `Path` differs from the old path methods only at a
-root (the parent of `/x` is `/`, not `.`).  Left: 492 sites over 3
-methods - `length` 301, `eq` 139, `substring` 52 - and the six with no
+`string` is stored.  `byte_substring` takes an end and panics outside the
+text where `substring` took a length and clamped, so each slice's bounds
+were read at its site; the lexer slices its source with `Str::from_raw`,
+which reads only the token's bytes.  `Path` differs from the old path
+methods only at a root (the parent of `/x` is `/`, not `.`).  Left: 440
+sites over 2 methods - `length` 301 and `eq` 139 - and the six with no
 compiler caller (`parse_int`, `join`, `split_char`, `to_ascii_upper`,
 `extension`, `common_prefix_length`).  `length` and `eq` accept a null `string` (as 0
 and equal-to-null) where `Str::new` of a null reads
