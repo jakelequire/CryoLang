@@ -51,8 +51,8 @@ import std::net::address::url::{ Url };
 import std::net::http::client::{ Client };
 import std::net::http2::server::{ Http2Server };
 import std::net::http2::connection::{ Http2Connection };
-import std::net::http2::frame::{ Frame };
-import std::net::http2::settings::{ Settings };
+import std::net::http2::frame;
+import std::net::http2::settings;
 import std::io::bytes::{ ByteReader, ByteWriter };
 import std::core::mem;
 import std::test::error::{ TestError };
@@ -68,6 +68,37 @@ mut g_headers_seen: i64 = 0;
 
 /// The fixed reply body. 14 octets.
 const REPLY_LEN: i64 = 14;
+
+/// One frame as a peer written by hand reads it off the wire: its header
+/// is taken by `read_head` once `ensure` holds the nine octets, and its
+/// payload, `length` octets, is read after it.
+type struct RawFrame {
+    ftype:     u8;
+    flags:     u8;
+    stream_id: u32;
+    length:    i64;
+    payload:   Array<u8>;
+
+    /// The header of the frame at the front of `c`, consumed: a 24-bit
+    /// length, the type, the flags, and the stream with its reserved bit
+    /// cleared. The payload is left to read.
+    static read_head(c: mut &BufferedStream<TcpStream>) -> RawFrame {
+        const head: &Slice<u8> = c.buffered();
+        const length: i64 = ((head[0] as i64) << 16) | ((head[1] as i64) << 8) | (head[2] as i64);
+        const ftype: u8 = head[3];
+        const flags: u8 = head[4];
+        const stream_id: u32 = (((head[5] as u32) & 0x7F) << 24) | ((head[6] as u32) << 16)
+            | ((head[7] as u32) << 8) | (head[8] as u32);
+        c.consume(frame::FRAME_HEADER_LENGTH);
+        return RawFrame { ftype: ftype, flags: flags, stream_id: stream_id, length: length,
+                          payload: Array::<u8>::new() };
+    }
+
+    /// Whether any bit of `flag` is set in the frame's flags.
+    has_flag(&this, flag: u8) -> boolean {
+        return (this.flags & flag) != 0;
+    }
+}
 
 /// Headers the SERVER synthesizes onto every request it rebuilds, over and above
 /// whatever the client sent: `host`, mapped back from the `:authority`
@@ -288,12 +319,25 @@ async function h2_handshake_then_close(port: u16) -> i64 {
     }
 }
 
+/// The answer `h2_settings_client` reports when the server acknowledged the
+/// SETTINGS frame: the values were taken.
+const SETTINGS_TAKEN: i64 = -66;
+
 /// A client that sends the preface and a SETTINGS frame with
-/// `SETTINGS_ENABLE_PUSH = 2`, which the protocol forbids, then reads two
-/// frames: the server's own SETTINGS and its answer. Returns the error code
-/// of a GOAWAY answer, or a negative step code; an acknowledgement in its
-/// place, which means the value was taken, is -66.
+/// `SETTINGS_ENABLE_PUSH = 2`, which the protocol forbids. Answers as
+/// `h2_settings_client` does.
 async function h2_bad_settings_client(port: u16) -> i64 {
+    mut payload: Array<u8> = Array::<u8>::new();
+    settings::push_entry(&payload, settings::SETTINGS_ENABLE_PUSH, 2);
+    const answer: i64 = await h2_settings_client(port, payload);
+    return answer;
+}
+
+/// A client that sends the preface and a SETTINGS frame carrying `payload`,
+/// then reads two frames: the server's own SETTINGS and its answer. Returns
+/// the error code of a GOAWAY answer, `SETTINGS_TAKEN` for an
+/// acknowledgement, or a negative step code.
+async function h2_settings_client(port: u16, payload: Array<u8>) -> i64 {
     mut sock: TcpStream = match (await TcpStream::connect(SocketAddress::localhost_v4(port))) {
         Result::Ok(v)  => { v }
         Result::Err(_) => { return -60; }
@@ -303,29 +347,35 @@ async function h2_bad_settings_client(port: u16) -> i64 {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -61; }
     }
-    mut queued: boolean = false;
-    {
-        mut payload: Array<u8> = Array::<u8>::new();
-        settings::push_entry(&payload, settings::SETTINGS_ENABLE_PUSH, 2);
-        queued = c.queue_http2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice()).is_ok();
-    }
+    const queued: boolean = c.queue_http2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice()).is_ok();
     if (!queued) { return -62; }
     match (await c.flush()) {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -63; }
     }
-    mut first: Frame = match (await c.read_http2_frame(16384)) {
-        Result::Ok(f)  => { f }
+    match (await c.ensure(frame::FRAME_HEADER_LENGTH)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -64; }
+    }
+    mut first: RawFrame = RawFrame::read_head(&c);
+    first.payload = match (await c.read_exact(first.length)) {
+        Result::Ok(p)  => { p }
         Result::Err(_) => { return -64; }
     };
     const first_is_settings: boolean = first.ftype == frame::FRAME_SETTINGS && !first.has_flag(frame::FLAG_ACK);
     mem::drop(first);
     if (!first_is_settings) { return -65; }
-    mut answer: Frame = match (await c.read_http2_frame(16384)) {
-        Result::Ok(f)  => { f }
+    match (await c.ensure(frame::FRAME_HEADER_LENGTH)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -67; }
+    }
+    mut answer: RawFrame = RawFrame::read_head(&c);
+    answer.payload = match (await c.read_exact(answer.length)) {
+        Result::Ok(p)  => { p }
         Result::Err(_) => { return -67; }
     };
-    if (answer.ftype != frame::FRAME_GOAWAY) { return -66; }
+    if (answer.ftype == frame::FRAME_SETTINGS && answer.has_flag(frame::FLAG_ACK)) { return SETTINGS_TAKEN; }
+    if (answer.ftype != frame::FRAME_GOAWAY) { return -69; }
     mut fields: ByteReader = ByteReader::new(answer.payload.as_slice());
     const last_stream: u32 = fields.read_big_endian::<u32>().unwrap_or(999);
     const code: u32 = fields.read_big_endian::<u32>().unwrap_or(999);
@@ -390,8 +440,13 @@ async function h2_raw_server(listener: TcpListener, case: i64) -> i64 {
     mut data: i64 = 0;
     mut changed: boolean = false;
     loop {
-        mut fr: Frame = match (await c.read_http2_frame(16384)) {
-            Result::Ok(f)  => { f }
+        match (await c.ensure(frame::FRAME_HEADER_LENGTH)) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return -204; }
+        }
+        mut fr: RawFrame = RawFrame::read_head(&c);
+        fr.payload = match (await c.read_exact(fr.length)) {
+            Result::Ok(p)  => { p }
             Result::Err(_) => { return -204; }
         };
         const ftype: u8 = fr.ftype;
@@ -540,8 +595,13 @@ async function h2_bad_preface_client(port: u16) -> i64 {
         Result::Ok(_)  => { }
         Result::Err(_) => { return -72; }
     }
-    mut answer: Frame = match (await c.read_http2_frame(16384)) {
-        Result::Ok(f)  => { f }
+    match (await c.ensure(frame::FRAME_HEADER_LENGTH)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -73; }
+    }
+    mut answer: RawFrame = RawFrame::read_head(&c);
+    answer.payload = match (await c.read_exact(answer.length)) {
+        Result::Ok(p)  => { p }
         Result::Err(_) => { return -73; }
     };
     if (answer.ftype != frame::FRAME_GOAWAY) { return -74; }
@@ -647,8 +707,13 @@ async function h2_raw_client_of_server(port: u16, case: i64) -> i64 {
     mut ended: boolean = false;
     mut granted: boolean = false;
     loop {
-        mut fr: Frame = match (await c.read_http2_frame(16384)) {
-            Result::Ok(f)  => { f }
+        match (await c.ensure(frame::FRAME_HEADER_LENGTH)) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return -405; }
+        }
+        mut fr: RawFrame = RawFrame::read_head(&c);
+        fr.payload = match (await c.read_exact(fr.length)) {
+            Result::Ok(p)  => { p }
             Result::Err(_) => { return -405; }
         };
         const ftype: u8 = fr.ftype;
@@ -914,47 +979,68 @@ function h2c_loopback_forbidden_setting_is_answered_with_goaway() -> Result<(), 
     return expect_equal(g_served, 0 as i64);
 }
 
-/// The code a refused setting carries, or `u32::MAX` when it was taken.
-function refusal_code(outcome: Result<(), u32>) -> u32 {
-    return match (outcome) {
-        Result::Ok(_)     => { u32::MAX }
-        Result::Err(code) => { code }
+async function h2_join_settings(port: u16, server: Http2Server, payload: Array<u8>) -> (i64, i64) {
+    return await Futures::join(h2_serve_one(server, h2_handler),
+                               h2_settings_client(port, payload));
+}
+
+/// What a server answers a client whose SETTINGS frame carries `payload`:
+/// the GOAWAY's error code, `SETTINGS_TAKEN`, or a negative step code.
+function server_answer_to_settings(payload: Array<u8>) -> i64 {
+    mut server: Http2Server = match (h2_bind()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return -1000; }
     };
+    const port: u16 = match (server.local_address()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { return -1001; }
+    };
+    mut ex: Executor = Executor::new();
+    const pair: (i64, i64) = ex.block_on(h2_join_settings(port, server, payload));
+    return pair.1;
+}
+
+/// What a server answers a SETTINGS frame carrying the one entry `id`, `value`.
+function server_answer_to_setting(id: u16, value: u32) -> i64 {
+    mut payload: Array<u8> = Array::<u8>::new();
+    settings::push_entry(&payload, id, value);
+    return server_answer_to_settings(payload);
 }
 
 ![test]
 function settings_take_each_bound_and_refuse_past_it() -> Result<(), TestError> {
-    mut s: Settings = Settings::defaults();
-    expect_equal(refusal_code(s.apply_one(settings::SETTINGS_ENABLE_PUSH, 0)), u32::MAX)?;
-    expect_equal(refusal_code(s.apply_one(settings::SETTINGS_ENABLE_PUSH, 1)), u32::MAX)?;
-    expect_equal(refusal_code(s.apply_one(settings::SETTINGS_ENABLE_PUSH, 2)), frame::PROTOCOL_ERROR)?;
-    expect_equal(s.enable_push, 1)?;
-    expect_equal(refusal_code(s.apply_one(settings::SETTINGS_INITIAL_WINDOW_SIZE, 2147483647)), u32::MAX)?;
-    expect_equal(refusal_code(s.apply_one(settings::SETTINGS_INITIAL_WINDOW_SIZE, 2147483648)),
-        frame::FLOW_CONTROL_ERROR)?;
-    expect_equal(s.initial_window_size, 2147483647)?;
-    expect_equal(refusal_code(s.apply_one(settings::SETTINGS_MAX_FRAME_SIZE, 16384)), u32::MAX)?;
-    expect_equal(refusal_code(s.apply_one(settings::SETTINGS_MAX_FRAME_SIZE, 16777215)), u32::MAX)?;
-    expect_equal(refusal_code(s.apply_one(settings::SETTINGS_MAX_FRAME_SIZE, 16383)), frame::PROTOCOL_ERROR)?;
-    expect_equal(refusal_code(s.apply_one(settings::SETTINGS_MAX_FRAME_SIZE, 16777216)), frame::PROTOCOL_ERROR)?;
-    expect_equal(refusal_code(s.apply_one(settings::SETTINGS_MAX_FRAME_SIZE, 0)), frame::PROTOCOL_ERROR)?;
-    expect_equal(s.max_frame_size, 16777215)?;
+    expect_equal(server_answer_to_setting(settings::SETTINGS_ENABLE_PUSH, 0), SETTINGS_TAKEN)?;
+    expect_equal(server_answer_to_setting(settings::SETTINGS_ENABLE_PUSH, 1), SETTINGS_TAKEN)?;
+    expect_equal(server_answer_to_setting(settings::SETTINGS_ENABLE_PUSH, 2), frame::PROTOCOL_ERROR as i64)?;
+    expect_equal(server_answer_to_setting(settings::SETTINGS_INITIAL_WINDOW_SIZE, 2147483647), SETTINGS_TAKEN)?;
+    expect_equal(server_answer_to_setting(settings::SETTINGS_INITIAL_WINDOW_SIZE, 2147483648),
+        frame::FLOW_CONTROL_ERROR as i64)?;
+    expect_equal(server_answer_to_setting(settings::SETTINGS_MAX_FRAME_SIZE, 16384), SETTINGS_TAKEN)?;
+    expect_equal(server_answer_to_setting(settings::SETTINGS_MAX_FRAME_SIZE, 16777215), SETTINGS_TAKEN)?;
+    expect_equal(server_answer_to_setting(settings::SETTINGS_MAX_FRAME_SIZE, 16383), frame::PROTOCOL_ERROR as i64)?;
+    expect_equal(server_answer_to_setting(settings::SETTINGS_MAX_FRAME_SIZE, 16777216), frame::PROTOCOL_ERROR as i64)?;
+    expect_equal(server_answer_to_setting(settings::SETTINGS_MAX_FRAME_SIZE, 0), frame::PROTOCOL_ERROR as i64)?;
     // An identifier the protocol does not define is ignored, whatever its value.
-    return expect_equal(refusal_code(s.apply_one(0x99, u32::MAX)), u32::MAX);
+    return expect_equal(server_answer_to_setting(0x99, u32::MAX), SETTINGS_TAKEN);
 }
 
+/// A payload is applied entry by entry and refused at the first entry out
+/// of bounds, with that entry's code; a payload that is not whole entries
+/// is a FRAME_SIZE_ERROR.
 ![test]
 function settings_payload_stops_at_the_first_refusal() -> Result<(), TestError> {
-    mut s: Settings = Settings::defaults();
     mut payload: Array<u8> = Array::<u8>::new();
     settings::push_entry(&payload, settings::SETTINGS_HEADER_TABLE_SIZE, 100);
     settings::push_entry(&payload, settings::SETTINGS_ENABLE_PUSH, 5);
-    settings::push_entry(&payload, settings::SETTINGS_MAX_FRAME_SIZE, 20000);
-    expect_equal(refusal_code(s.apply_payload(payload.as_slice())), frame::PROTOCOL_ERROR)?;
-    expect_equal(s.header_table_size, 100)?;
-    expect_equal(s.max_frame_size, 16384)?;
+    settings::push_entry(&payload, settings::SETTINGS_INITIAL_WINDOW_SIZE, 2147483648);
+    expect_equal(server_answer_to_settings(payload.clone()), frame::PROTOCOL_ERROR as i64)?;
+    mut window_first: Array<u8> = Array::<u8>::new();
+    settings::push_entry(&window_first, settings::SETTINGS_HEADER_TABLE_SIZE, 100);
+    settings::push_entry(&window_first, settings::SETTINGS_INITIAL_WINDOW_SIZE, 2147483648);
+    settings::push_entry(&window_first, settings::SETTINGS_ENABLE_PUSH, 5);
+    expect_equal(server_answer_to_settings(window_first), frame::FLOW_CONTROL_ERROR as i64)?;
     payload.push(0);
-    return expect_equal(refusal_code(s.apply_payload(payload.as_slice())), frame::FRAME_SIZE_ERROR);
+    return expect_equal(server_answer_to_settings(payload), frame::FRAME_SIZE_ERROR as i64);
 }
 
 /// A client ends a connection whose server says it accepts pushed streams.

@@ -747,15 +747,16 @@ baseline.  In all, 8 to 14 sessions, C1 the uncertain one.
 
 ## The network codecs' visibility
 
-The operation futures of the sockets and of TLS are internal.  The HTTP/2
-codec (`Frame`, `Settings`, `HpackCodec`, `HeaderCodec`, `HeaderField`,
-`Http2Connection`, `RequestOnStream`, `BufferedStream.read_http2_frame`),
-WebSocket's `frame` and `handshake` modules and HTTP's `ChunkedEncoder`
-were approved to become internal too, and are still public: an HTTP/2
-connection takes a caller's own header codec (`new_client_with_codec`, a
-deliberate feature with a project test), and the codec tests reach the
-frames, HPACK and the chunked encoder through no other public user.
-Hiding them needs a ruling on the custom codec and a home for those tests.
+The operation futures of the sockets and of TLS are internal, and so are
+HTTP/2's `Frame`, `Settings` and `BufferedStream.read_http2_frame` and
+WebSocket's `frame` and `handshake` modules; HTTP's chunked encoder, which
+nothing called, is deleted.  `HeaderCodec` and `Http2Connection` stay
+public, since an HTTP/2 connection takes a caller's own header codec
+(`new_client_with_codec`).  `HpackCodec`, `HeaderField` and
+`RequestOnStream`, approved to become internal with them, are still
+public: each is named by a public signature of those two
+(`Http2Connection`'s default codec, `HeaderCodec`'s methods,
+`read_request`), so hiding them needs those signatures to change first.
 
 ## Compound assignment through traits of its own
 

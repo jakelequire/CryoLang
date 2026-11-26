@@ -133,6 +133,20 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-26
+
+724. **The HTTP/2 and WebSocket wire records are internal.**  HTTP/2's
+     decoded `Frame`, the `Settings` record a connection folds and the
+     buffered stream's `read_http2_frame` are internal to the standard
+     library, and WebSocket's `frame` and `handshake` modules are internal
+     modules.  `HeaderCodec` and `Http2Connection` stay public, so a
+     connection still takes a caller's own header codec; the protocol's
+     constants and `queue_http2_frame` stay public.  A test peer writes
+     and reads frames by hand.  The chunked encoder, which nothing in the
+     standard library called, is deleted with its module.  (Jake for the
+     records and the two public types; the encoder's deletion is
+     provisional)
+
 ### 2026-11-25
 
 723. **`Error` is a prelude name; its carriers are imported.**  The prelude

@@ -1,4 +1,4 @@
-///! HTTP/1.1 framing: chunked bodies both ways, repeated header fields, and
+///! HTTP/1.1 framing: chunked request and response bodies, repeated header fields, and
 ///! the refusals that keep a peer and this parser agreeing on where a
 ///! message ends.
 ///!
@@ -22,7 +22,6 @@ import std::io::buffered::{ BufferedStream };
 import std::net::http::headers::{ Headers };
 import std::net::http::request::{ Request };
 import std::net::http::response::{ Response };
-import std::net::http::chunked::{ ChunkedEncoder };
 import std::net::http::connection;
 import std::test::error::{ TestError };
 import std::test::assert::{ bail, expect, expect_equal };
@@ -190,36 +189,6 @@ function a_response_without_framing_is_read_to_the_end() -> Result<(), TestError
     const got: String = future::block_on(response_body(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nall of it")).unwrap();
     return expect_equal(got.as_str(), Str::new("all of it"));
-}
-
-/// Encoded chunks decode back to the bytes written, in order.
-![test]
-function an_encoded_chunked_body_decodes_back() -> Result<(), TestError> {
-    mut wire: Array<u8> = Array::new();
-    for (byte in Str::new("POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").as_bytes().iter()) { wire.push(byte); }
-    mut encoder: ChunkedEncoder = ChunkedEncoder::new();
-    encoder.encode(Str::new("hello").as_bytes(), &wire).unwrap();
-    encoder.encode(Str::new("").as_bytes(), &wire).unwrap();
-    encoder.encode(Str::new(" world, at more than sixteen bytes").as_bytes(), &wire).unwrap();
-    encoder.finish(&wire).unwrap();
-    for (byte in Str::new("GET /b HTTP/1.1\r\n\r\n").as_bytes().iter()) { wire.push(byte); }
-    mut c: BufferedStream<MemTransport> = BufferedStream::<MemTransport>::of(MemTransport::of(wire.as_slice(), 0));
-    const first: Request = future::block_on(c.read_request()).unwrap();
-    const second: Request = future::block_on(c.read_request()).unwrap();
-    expect_equal(text_of(&first.body), Str::new("hello world, at more than sixteen bytes"))?;
-    return expect_equal(second.path.as_str(), Str::new("/b"));
-}
-
-/// Nothing is encoded after the last chunk.
-![test]
-function an_encoder_refuses_a_chunk_after_finishing() -> Result<(), TestError> {
-    mut wire: Array<u8> = Array::new();
-    mut encoder: ChunkedEncoder = ChunkedEncoder::new();
-    encoder.finish(&wire).unwrap();
-    match (encoder.encode(Str::new("late").as_bytes(), &wire)) {
-        Result::Ok(_)  => { return bail(Str::new("a chunk after the last one must be refused")); }
-        Result::Err(e) => { return expect(e.kind == IoErrorKind::InvalidInput, Str::new("refused as InvalidInput")); }
-    }
 }
 
 /// Repeated fields are kept in order; `insert` replaces every one.
