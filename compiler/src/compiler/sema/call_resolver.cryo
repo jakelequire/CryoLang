@@ -1073,11 +1073,67 @@ type struct CallResolver {
     }
 
     /// The call's type, once resolved; a call that names a `Drop`
-    /// implementation's `drop` is refused once it is known to (E0453).
+    /// implementation's `drop` is refused once it is known to (E0453), and
+    /// a variadic argument its callee cannot read back (E0306).
     resolve_call(mut &this, visitor: mut SemaVisitor*, call_e: ExpressionNode*, call: mut CallExpr*) -> TypeRef {
         const answer: TypeRef = this.resolve_call_as_written(visitor, call_e, call);
         this.refuse_destructor_call(call_e, call);
+        this.refuse_unreadable_variadic_arguments(call);
         return answer;
+    }
+
+    /// The function a call is bound to: the definition its callee names, or
+    /// the method it was selected or pinned to.  Null for a call of a
+    /// computed value, which names no declaration.
+    called_function(&this, call: CallExpr*) -> FunctionDecl* {
+        if (call.callee == null) { return null; }
+        const def: DefId = this.family_callee(call.callee);
+        if (def.is_valid()) {
+            const named_def: DeclarationNode* = this.ctx.decl_index.declaration_of(def);
+            return if (named_def != null) { DeclarationNode::fn_of(named_def) } else { null };
+        }
+        if (ExpressionNode::member_access_of(call.callee) == null) { return null; }
+        const named: DeclarationNode* = call.method_named(this.ctx.decl_index);
+        if (named == null) { return null; }
+        const method: MethodDecl* = DeclarationNode::method_of(named);
+        return if (method != null) { DeclarationNode::fn_of(method.func) } else { DeclarationNode::fn_of(named) };
+    }
+
+    /// Refuse each argument a variadic call passes past its callee's
+    /// declared parameters whose type is neither a `VariadicArgument` nor a
+    /// pointer.  The tail is passed by the C convention, which records no
+    /// types: the callee reads each argument back as a `VariadicArgument`
+    /// type or a pointer, so any other value - an aggregate such as `Str`, or
+    /// a scalar narrower than `i32` or `f64` - is read as different bytes
+    /// than were passed, and prints or computes something else.
+    refuse_unreadable_variadic_arguments(mut &this, call: CallExpr*) -> void {
+        const readable: DefId = this.ctx.get_generic_registry().wellknown(LangItem::VariadicArgument);
+        if (!readable.is_valid()) { return; }
+        const callee: FunctionDecl* = this.called_function(call);
+        if (callee == null || !callee.is_variadic) { return; }
+        for (mut i: i64 = callee.fixed_param_count() as i64; i < call.arguments.length(); i++) {
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            const t: Type* = this.arena.lookup(arg.resolved_type);
+            if (t == null || t.kind == TypeKind::Error || t.kind == TypeKind::Pointer) { continue; }
+            const has: boolean = if (t.kind == TypeKind::GenericParam) {
+                this.binding.param_bounded_by(t.as_generic_param(), readable)
+            } else {
+                this.trait_checker().type_implements_trait(arg.resolved_type, readable, 0)
+            };
+            if (has) { continue; }
+            const shown: string = this.types.type_display_name(arg.resolved_type);
+            const trait_shown: string = this.intern.shown(this.ctx.defs.leaf_of(readable));
+            mut d: Diagnostic = Diagnostic::error(
+                ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                fmt::format("the trait bound `%s: %s` is not satisfied", shown, trait_shown));
+            d = d.at_with_label(arg.span, "passed as a variadic argument here");
+            d = d.with_note(fmt::format("a variadic argument is passed with no type, and is read back as a `%s` type or a pointer",
+                trait_shown));
+            d = d.help(fmt::format("convert the value to a type that implements `%s`, or format it with an f-string",
+                trait_shown));
+            this.ctx.emit_diagnostic(d);
+        }
     }
 
     resolve_call_as_written(mut &this, visitor: mut SemaVisitor*, call_e: ExpressionNode*, call: mut CallExpr*) -> TypeRef {
