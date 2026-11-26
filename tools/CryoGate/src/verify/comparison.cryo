@@ -26,6 +26,9 @@ public type struct Compared {
     public problems: Array<String>;
     /// The number of objects that differ.
     public changed: i64;
+    /// The number of archive objects that differ, the declared modules'
+    /// included: what an `archive:` line's claim needs.
+    public archive_differing: i64;
 }
 
 /// verify's comparison of the baseline's objects with the tree's.
@@ -58,7 +61,8 @@ public type struct ObjectComparison {
     /// and examples' objects without requiring them to have moved.
     public static against(revision: Str, changes: &DeclaredChanges, baseline: Array<HashMap<String, String>>,
                           tree: Array<HashMap<String, String>>, limit: i64, run: Str, moves_judged: boolean) -> Compared {
-        mut compared: Compared = Compared { lines: Array::<String>::new(), problems: Array::<String>::new(), changed: 0 };
+        mut compared: Compared = Compared { lines: Array::<String>::new(), problems: Array::<String>::new(), changed: 0,
+                                            archive_differing: 0 };
         for (problem in changes.problems.iterate_references()) { compared.problems.push(problem.clone()); }
         compared.lines.push(f"verify: objects against {revision}");
         const populations: Array<ObjectPopulation> = ObjectPopulation::all();
@@ -66,16 +70,14 @@ public type struct ObjectComparison {
         for (mut i: i64 = 0; i < populations.length(); i++) {
             if (populations[i].is_stdlib() && !tree[i].is_empty()) { archive_linked = true; }
         }
-        mut archive_changed: i64 = 0;
         for (mut i: i64 = 0; i < populations.length(); i++) {
             const baseline_list: String = populations[i].baseline_list(run);
             const tree_list: String = populations[i].tree_list(run);
             const changed: i64 = ObjectComparison::population(&populations[i], baseline[i].clone(), tree[i].clone(), changes,
                 archive_linked, moves_judged, limit, baseline_list.as_str(), tree_list.as_str(), &compared);
             compared.changed = compared.changed + changed;
-            if (populations[i].is_stdlib()) { archive_changed = changed; }
         }
-        for (problem in VerifyJudges::archive_moves(&changes.archive_files, archive_changed).iterate_references()) {
+        for (problem in VerifyJudges::archive_moves(&changes.archive_files, compared.archive_differing).iterate_references()) {
             compared.problems.push(problem.clone());
         }
         return compared;
@@ -177,9 +179,14 @@ public type struct ObjectComparison {
             if (unpaired > 0) {
                 compared.lines.push(f"  {tag:<9} archive objects of a stdlib root only one run used, left out: {unpaired}");
             }
+            compared.archive_differing = ObjectComparison::differing(&a, &b);
             if (!changes.moved_modules.is_empty()) {
                 ObjectComparison::declared_moves(tag, Str::new("modules"), changes.moved_modules.length(),
                     VerifyJudges::archive_module_moves(&changes.moved_modules, &a, &b), moves_judged, compared);
+            }
+            if (!changes.deleted_modules.is_empty()) {
+                ObjectComparison::declared_moves(tag, Str::new("deleted modules"), changes.deleted_modules.length(),
+                    VerifyJudges::archive_module_deletions(&changes.deleted_modules, &a, &b), moves_judged, compared);
             }
         }
         mut moved: Array<String> = Array::<String>::new();
@@ -231,6 +238,22 @@ public type struct ObjectComparison {
         if (paths.length() > limit) {
             compared.lines.push(f"      ... {paths.length() - limit} more {label} (full lists: {baseline_list}, {tree_list})");
         }
+    }
+
+    /// How many paths of `a` and `b` differ: in both with another digest,
+    /// or in one only.
+    private static differing(a: &HashMap<String, String>, b: &HashMap<String, String>) -> i64 {
+        mut count: i64 = 0;
+        for (entry in a.entries()) {
+            match (b.get_reference(entry.first)) {
+                Option::Some(digest) => { if (digest.as_str() != entry.second.as_str()) { count++; } }
+                Option::None         => { count++; }
+            }
+        }
+        for (entry in b.entries()) {
+            if (!a.contains_key(entry.first)) { count++; }
+        }
+        return count;
     }
 
     /// The paths of `hashes` that start with one of `prefixes`.

@@ -323,6 +323,46 @@ function a_unit_test_file_names_its_object_by_its_namespace() -> Result<(), Test
         Str::new("no such file"));
 }
 
+/// An `archive:` file the baseline fails through the archive is answered
+/// by the declared module's own move: the module the fix is in is the one
+/// that moves, and it is left out of the comparison as declared.  With
+/// nothing in the archive moved, the claim is still refused.
+![test]
+function an_archive_file_is_answered_by_its_declared_modules_move() -> Result<(), TestError> {
+    mut changes: DeclaredChanges = Comparing::nothing_declared();
+    changes.moved_modules.push(String::from_str(Str::new("moved-archive:std::m")));
+    changes.archive_files.push(String::from_str(Str::new("archive:lang/u.cryo")));
+    const before: Str = Str::new("stdlib-archive/t/O0/x/deps/std/m.o=1;stdlib-archive/t/O0/x/deps/std/n.o=1");
+    const after: Str = Str::new("stdlib-archive/t/O0/x/deps/std/m.o=2;stdlib-archive/t/O0/x/deps/std/n.o=1");
+    const answered: Compared = Comparing::of(&changes, Comparing::archive(before), Comparing::archive(after), 40, true);
+    expect_equal(answered.problems.length(), 0)?;
+    expect_equal(answered.changed, 0)?;
+    mut unmoved: DeclaredChanges = Comparing::nothing_declared();
+    unmoved.archive_files.push(String::from_str(Str::new("archive:lang/u.cryo")));
+    const refused: Compared = Comparing::of(&unmoved, Comparing::archive(before), Comparing::archive(before), 40, true);
+    return expect_equal(refused.problems.length(), 1);
+}
+
+/// A `moved-archive:` module the tree no longer declares is one the change
+/// deletes: its objects are in the baseline's archives and none of the
+/// tree's, and they are left out.  Still in the tree's archives, or never
+/// in the baseline's, it is refused.
+![test]
+function a_deleted_archive_module_is_only_in_the_baselines_archives() -> Result<(), TestError> {
+    mut changes: DeclaredChanges = Comparing::nothing_declared();
+    changes.deleted_modules.push(String::from_str(Str::new("moved-archive:std::gone")));
+    const with: Str = Str::new("stdlib-archive/t/O0/x/deps/std/gone.o=1;stdlib-archive/t/O0/x/deps/std/n.o=1");
+    const without: Str = Str::new("stdlib-archive/t/O0/x/deps/std/n.o=1");
+    const deleted: Compared = Comparing::of(&changes, Comparing::archive(with), Comparing::archive(without), 40, true);
+    expect_equal(deleted.problems.length(), 0)?;
+    expect_equal(deleted.changed, 0)?;
+    expect_equal(Comparing::of(&changes, Comparing::archive(with), Comparing::archive(with), 40, true).problems.length(), 1)?;
+    expect_equal(Comparing::of(&changes, Comparing::archive(without), Comparing::archive(without), 40, true).problems.length(), 1)?;
+    // Undeclared, the deletion is a change like any other.
+    return expect_equal(Comparing::of(&Comparing::nothing_declared(), Comparing::archive(with), Comparing::archive(without),
+        40, true).changed, 1);
+}
+
 /// A comparison over maps written as `Judged::map` text, the populations
 /// in the order tests, examples, stdlib, runtime.
 type struct Comparing {
@@ -338,8 +378,8 @@ type struct Comparing {
         return DeclaredChanges {
             names: Array::<String>::new(), units: Array::<Pair<String, String>>::new(),
             moved_projects: Array::<String>::new(), moved_examples: Array::<String>::new(),
-            moved_modules: Array::<String>::new(), moved_instances: Array::<String>::new(),
-            moved_members: Array::<String>::new(),
+            moved_modules: Array::<String>::new(), deleted_modules: Array::<String>::new(),
+            moved_instances: Array::<String>::new(), moved_members: Array::<String>::new(),
             archive_files: Array::<String>::new(), problems: Array::<String>::new(),
         };
     }
