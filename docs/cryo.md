@@ -2613,7 +2613,7 @@ function halve<T>(x: T) -> T {
 | Trait                                                                                                         | Purpose                                                                                                           |
 | ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `Copy`                                                                                                        | Marker for types that are bitwise-copyable (no `Drop` impl).                                                      |
-| `Primitive`, `Numeric` (`: Primitive`), `Integer` (`: Numeric`), `SignedInteger` / `UnsignedInteger` (`: Integer`), `Float` (`: Numeric`) | The primitive traits: markers the built-in value types alone have - see [section 11.8](#118-primitive-traits).    |
+| `Primitive`, `Numeric` (`: Primitive`), `Integer` (`: Numeric`), `SignedInteger` / `UnsignedInteger` (`: Integer`), `Float` (`: Numeric`), `Bitwise` | The primitive traits: markers the built-in value types alone have - see [section 11.8](#118-primitive-traits).    |
 | `Drop`                                                                                                        | Explicit destructor; types implementing it are non-`Copy`.                                                        |
 | `Clone`                                                                                                       | Explicit deep duplication via `clone()`.                                                                          |
 | `Default`                                                                                                     | A canonical zero value: `static default() -> This`.                                                               |
@@ -3457,7 +3457,7 @@ A `_` arm takes every allowed type no arm names. An arm naming a type outside th
 
 ### 11.8 Primitive Traits
 
-`std::core::marker` declares six marker traits, in the prelude, that the built-in value types alone have:
+`std::core::marker` declares seven marker traits, in the prelude, that the built-in value types alone have:
 
 | Trait             | Supertrait  | Types                                                                 |
 | ----------------- | ----------- | --------------------------------------------------------------------- |
@@ -3467,6 +3467,7 @@ A `_` arm takes every allowed type no arm names. An arm naming a type outside th
 | `SignedInteger`   | `Integer`   | `i8`, `i16`, `i32`, `i64`, `i128`, `isize`                            |
 | `UnsignedInteger` | `Integer`   | `u8`, `u16`, `u32`, `u64`, `u128`, `usize`                            |
 | `Float`           | `Numeric`   | `f32`, `f64`                                                          |
+| `Bitwise`         |             | every integer, `boolean`: the types whose values combine bit by bit under AND, OR and XOR into another value of the type |
 
 They have no methods. The compiler decides each from the type, as it decides `Copy`, so no implementation of one is written, and an `implement` of one is refused (E0312) - for another type, which a `static match` over the trait's types would have no arm for, and for a built-in type, which has it already. A trait may name one as a supertrait (`type trait Halve : UnsignedInteger { ... }`); it can then be implemented only for a type the primitive trait admits.
 
