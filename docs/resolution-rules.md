@@ -153,6 +153,13 @@ yet is recorded with the change that builds it, not here.
      parameter.  It answers bounds only: member lookup on a parameter is
      unchanged.  (Jake, the v1 freeze)
 
+730. **A `match` arm is a statement of its own.**  The temporaries an
+     arm's value borrows are released when the arm ends, before the arm's
+     locals, as the compiled code does; `cryo interpret` and the spec
+     follow it.  An `if` expression's branch stays an expression, whose
+     temporaries are released with the enclosing statement's.  (Jake, the
+     v1 freeze)
+
 ### 2026-11-26
 
 725. **`Str`'s text methods take their text by value.**  `contains`,

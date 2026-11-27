@@ -1,0 +1,64 @@
+/// A `match` arm is a statement of its own: the temporaries its value
+/// borrows are released when the arm ends, before the arm's own locals,
+/// and before the statement holding the `match` goes on.  An `if` branch
+/// is an expression, and its temporaries are released with the enclosing
+/// statement's.  Each release appends a digit to `log`; the exit code
+/// names the first order that is not the one written here.
+namespace MatchArmReleasesItsTemporaries::Main;
+
+mut log: u64 = 0;
+
+type struct Tracked {
+    code: u64;
+}
+
+implement trait Drop for struct Tracked {
+    drop(mut &this) -> void { log = log * 10 + this.code; }
+}
+
+type struct Viewer {
+    of: &Tracked;
+}
+
+implement trait Drop for struct Viewer {
+    drop(mut &this) -> void { log = log * 10 + 5; }
+}
+
+function peek(tracked: &Tracked) -> u64 {
+    return tracked.code;
+}
+
+function look(viewer: &Viewer) -> u64 {
+    return viewer.of.code;
+}
+
+function take(value: u64) -> u64 {
+    log = log * 10 + 9;
+    return value;
+}
+
+function main() -> i32 {
+    const chosen: u64 = 1;
+
+    // The arm's temporary is released at the arm's end, then `take` runs.
+    const first: u64 = take(match (chosen == 1) { true => { peek(&(Tracked { code: 2 })) } false => { 0 } });
+    if (log != 29 || first != 2) { return 1; }
+    log = 0;
+
+    // The branch's temporary is released after `take`, with the statement's.
+    const second: u64 = take(if (chosen == 1) { peek(&(Tracked { code: 3 })) } else { 0 });
+    if (log != 93 || second != 3) { return 2; }
+    log = 0;
+
+    // A temporary borrowing an arm local is released first, then the local.
+    const third: u64 = take(match (chosen == 1) {
+        true => {
+            const held: Tracked = Tracked { code: 4 };
+            look(&(Viewer { of: &held }))
+        }
+        false => { 0 }
+    });
+    if (log != 549 || third != 4) { return 3; }
+
+    return 0;
+}
